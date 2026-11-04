@@ -17,6 +17,11 @@ pub struct LocationService {
     bindings: HashMap<String, Vec<Binding>>,
     /// Maximum contacts per AOR.
     max_contacts_per_aor: usize,
+    /// Running total of bindings across all AORs, kept exact by every
+    /// mutating method so capacity checks read it in O(1).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+    total: usize,
 }
 
 impl LocationService {
@@ -25,6 +30,7 @@ impl LocationService {
         Self {
             bindings: HashMap::new(),
             max_contacts_per_aor: MAX_CONTACTS_PER_AOR,
+            total: 0,
         }
     }
 
@@ -33,6 +39,7 @@ impl LocationService {
         Self {
             bindings: HashMap::new(),
             max_contacts_per_aor: max_contacts,
+            total: 0,
         }
     }
 
@@ -57,6 +64,7 @@ impl LocationService {
                 });
             }
             bindings.push(binding);
+            self.total += 1;
         }
 
         Ok(())
@@ -82,6 +90,7 @@ impl LocationService {
             })?;
 
         bindings.remove(pos);
+        self.total = self.total.saturating_sub(1);
 
         // Remove AOR if no more bindings
         if bindings.is_empty() {
@@ -102,6 +111,7 @@ impl LocationService {
             .ok_or_else(|| RegistrarError::AorNotFound {
                 aor: aor.to_string(),
             })?;
+        self.total = self.total.saturating_sub(bindings.len());
 
         Ok(bindings.len())
     }
@@ -150,6 +160,14 @@ impl LocationService {
             .and_then(|bindings| bindings.iter_mut().find(|b| b.contact_uri() == contact_uri))
     }
 
+    /// Gets a mutable reference to a binding by its binding key
+    /// (see [`Binding::binding_key`]).
+    pub fn get_binding_by_key_mut(&mut self, aor: &str, binding_key: &str) -> Option<&mut Binding> {
+        self.bindings
+            .get_mut(aor)
+            .and_then(|bindings| bindings.iter_mut().find(|b| b.binding_key() == binding_key))
+    }
+
     /// Gets all bindings for a specific instance-id (RFC 5626).
     ///
     /// This is useful for finding all flows from a single UA instance.
@@ -191,6 +209,7 @@ impl LocationService {
             })?;
 
         bindings.remove(pos);
+        self.total = self.total.saturating_sub(1);
 
         // Remove AOR if no more bindings
         if bindings.is_empty() {
@@ -214,7 +233,7 @@ impl LocationService {
 
     /// Returns the total number of bindings.
     pub fn total_bindings(&self) -> usize {
-        self.bindings.values().map(std::vec::Vec::len).sum()
+        self.total
     }
 
     /// Returns the number of registered AORs.
@@ -248,6 +267,7 @@ impl LocationService {
         for aor in empty_aors {
             self.bindings.remove(&aor);
         }
+        self.total = self.total.saturating_sub(removed);
 
         removed
     }
@@ -528,5 +548,40 @@ mod tests {
             .remove_binding_by_key("sip:alice@example.com", "<urn:uuid:test>:1")
             .unwrap();
         assert_eq!(service.binding_count("sip:alice@example.com"), 0);
+    }
+
+    #[test]
+    fn test_total_counter_tracks_every_mutation() {
+        let mut service = LocationService::new();
+        let a = "sip:alice@example.com";
+        service
+            .add_binding(test_binding(a, "sip:a@10.0.0.1"))
+            .unwrap();
+        service
+            .add_binding(test_binding(a, "sip:a@10.0.0.2"))
+            .unwrap();
+        // Same key replaces, count unchanged.
+        service
+            .add_binding(test_binding(a, "sip:a@10.0.0.2"))
+            .unwrap();
+        service
+            .add_binding(test_binding("sip:bob@example.com", "sip:b@10.0.0.3"))
+            .unwrap();
+        assert_eq!(service.total_bindings(), 3);
+        service.remove_binding(a, "sip:a@10.0.0.1").unwrap();
+        assert_eq!(service.total_bindings(), 2);
+        assert_eq!(service.remove_all_bindings(a).unwrap(), 1);
+        assert_eq!(service.total_bindings(), 1);
+        service
+            .remove_binding_by_key("sip:bob@example.com", "sip:b@10.0.0.3")
+            .unwrap();
+        assert_eq!(service.total_bindings(), 0);
+
+        let mut expired = test_binding(a, "sip:a@10.0.0.9");
+        expired.remove();
+        service.add_binding(expired).unwrap();
+        assert_eq!(service.total_bindings(), 1);
+        assert_eq!(service.cleanup_expired(), 1);
+        assert_eq!(service.total_bindings(), 0);
     }
 }

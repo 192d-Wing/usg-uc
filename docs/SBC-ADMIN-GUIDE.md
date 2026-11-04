@@ -7,7 +7,7 @@ The USG SBC is a SIP Session Border Controller that provides:
 - **B2BUA call control** — Back-to-back user agent with full call state management
 - **SIP registration** — Binding storage and location service; REGISTER authentication via OIDC Bearer tokens (`SBC_AUTH_MODE=bearer`). Digest auth is compiled in but not configurable from `sbc.toml`; REGISTER is unauthenticated unless bearer mode is enabled.
 - **Call routing** — Dial plans with pattern matching, number transforms, trunk selection
-- **Media relay** — RTP/SRTP relay with codec transcoding
+- **Media relay** — RTP/SRTP relay (anchored; no transcoding in the live relay path)
 - **Header manipulation** — Per-trunk and global SIP header rewriting
 - **Topology hiding** — Via/Contact/Call-ID anonymization
 - **Rate limiting** — Per-IP and global DoS protection
@@ -123,7 +123,10 @@ cluster_id = "dc-east-1"
 # Maximum concurrent calls
 max_calls = 10000
 
-# Maximum concurrent registrations
+# Maximum registration bindings per node (enforced). Counted by binding key
+# (+sip.instance/reg-id, else contact URI) after authentication; a REGISTER
+# that would exceed it gets 503 Retry-After: 60. Refreshes, re-registration
+# of an existing binding and de-registration are always allowed. 0 is rejected.
 max_registrations = 50000
 ```
 
@@ -398,13 +401,37 @@ strategy = "least_connections"   # selection strategy
 
 ### Trunk Failover
 
-When a trunk returns an error (4xx/5xx/6xx), the SBC automatically tries the next trunk in failover order (sorted by priority). The maximum number of retries is controlled by `routing.max_failover_attempts`.
+The SBC router and the dial-plan router return the selected route groups; the remaining usable trunks, in selection order, form the failover list (capped by `routing.max_failover_attempts`).
 
-Failover is transparent to the calling party — they never see intermediate failures.
+The call moves to the next trunk when the current trunk answers **408, 500, 502, 503 or 504**, when Timer B fires, or when the trunk URI cannot be resolved. 503 and timeouts are the RFC 3263 §4.3 triggers; 500/502/504 are local B2BUA policy. The SBC does **not** fail over on any other 4xx (for example 486) or on 6xx; those are relayed to the caller. It also does not fail over once a 2xx or a reliable (100rel) 18x carrying SDP has been relayed to the caller; a 180 without SDP, an unreliable 183, or a reliable 18x without SDP does not stop failover.
 
-### Trunk Cooldown
+Each failover attempt is a new B-leg INVITE (new Call-ID, branch, From tag, CSeq) with the same SDP and the translated number. Intermediate failures are not shown to the caller. When all trunks are exhausted, the last trunk's final response is relayed (Timer B exhausted gives 408).
 
-When a trunk accumulates `max_failures` consecutive failures, it enters cooldown for `cooldown_secs` and is excluded from selection. After the cooldown period, it automatically becomes available again.
+Limitations: a transport send error to a trunk does not trigger failover; the failover INVITE keeps the original Request-URI host and scheme and the UDP Via transport (see the POA&M in [NIST-800-53-CONTROLS.md](NIST-800-53-CONTROLS.md)).
+
+### Trunk Capacity and Cooldown
+
+- `max_calls` is enforced **per SBC node**. A trunk at `max_calls` is skipped. When every trunk in the route is full or down, the caller gets `503` with `Retry-After: 5`. `max_calls = 0` is rejected by validation.
+- A trunk that answers 503 goes into cooldown for `cooldown_secs`. The trunk's own `Retry-After` header is ignored.
+- After `max_failures` consecutive failures a trunk enters cooldown for `cooldown_secs` and is excluded from selection; it becomes available again afterwards. `max_failures = 0` is rejected.
+
+### Trunk OPTIONS Health
+
+Config-file trunks can be probed with SIP OPTIONS:
+
+```toml
+  [[trunk_groups.trunks]]
+  id = "bulkvs-1"
+  # ...
+  options_ping_enabled = true        # default false
+  options_ping_interval_secs = 30    # default 30; must be 5..=3600 when enabled
+```
+
+A trunk that the OPTIONS monitor (or, in agent mode, a gRPC `PublishTrunkStatus` report) marks down is skipped by new calls; in-flight calls are not affected. It is used again when it is marked up. Trunks created through the API are monitored the same way.
+
+### Number Translation
+
+The translated number from the SBC router (`transformed_number`) or the dial plan (`destination`) is written to the user part of the B-leg Request-URI and To header (also on failover attempts). The per-callee concurrency limit (`per_callee_max_concurrent`) is keyed on the dialed number, before translation. A translated number longer than 64 characters or containing characters outside the RFC 3261 unreserved/user-unreserved set (for example `;`, `?`, `%`, `@`, `<`, `>`, spaces or line breaks) is rejected: the caller gets 500 and nothing is sent to the trunk. The Request-URI host is still taken from the A-leg Request-URI, not from the trunk.
 
 ---
 
@@ -412,10 +439,11 @@ When a trunk accumulates `max_failures` consecutive failures, it enters cooldown
 
 ```toml
 [media]
-# Media relay mode: "Relay" (full B2BUA) or "PassThrough" (direct)
+# Media relay mode: only "Relay" is accepted. "PassThrough" and
+# "SignalingOnly" are rejected by validation; media.realm_modes must be empty.
 default_mode = "Relay"
 
-# Supported codecs in preference order (uc-types CodecId variant names)
+# Must be the default set (order-insensitive); any other list is rejected
 codecs = ["Opus", "G722", "G711Ulaw", "G711Alaw"]
 
 # RTP port range for media relay
@@ -445,9 +473,15 @@ fingerprint_file = "/run/sbc/dtls-fingerprint"
 
 Values for `profile`, `fingerprint_hash` and `codecs` are the Rust enum variant names (see `deploy/config/config.toml` for the canonical example).
 
-### Codec Transcoding
+### Media Mode and Codecs
 
-When the A-leg and B-leg negotiate different codecs, the SBC automatically transcodes between them. Supported codecs:
+The live relay always anchors media (`Relay`) and does not transcode. The `Transcoder` in `sbc-media-core` is not in the live relay path. Validation therefore rejects:
+
+- `media.default_mode` other than `"Relay"` (the `sbc-media` pod also refuses any `SBC_MEDIA_DEFAULT_MODE` other than `relay` at startup);
+- any entry in `media.realm_modes`;
+- a `media.codecs` list that is not exactly the default set (order does not matter; subsets, single codecs and duplicates are rejected; an empty list is rejected by the "at least one codec" check).
+
+Codec names:
 
 | Codec | Config name | Payload Type | Clock Rate | Bandwidth |
 |-------|-------------|-------------|------------|-----------|
@@ -455,8 +489,6 @@ When the A-leg and B-leg negotiate different codecs, the SBC automatically trans
 | G.711 A-law (PCMA) | `G711Alaw` | 8 | 8 kHz | 64 kbps |
 | G.722 | `G722` | 9 | 16 kHz | 64 kbps |
 | Opus | `Opus` | 111 (dynamic) | 48 kHz | 6-510 kbps |
-
-Transcoding is implemented in `sbc-media-core` (`media_pipeline.rs`, `Transcoder`) and runs in the daemon's in-process media plane or the `sbc-media` pod.
 
 ---
 
@@ -807,7 +839,7 @@ The SBC implements controls from NIST 800-53 Rev5 (wiring state in parentheses):
 - **AU-2**: Audit logging (planned — `uc-audit` is library-only; only `tracing` logs today)
 - **CM-2/CM-6**: Configuration management (wired)
 - **IA-2**: REGISTER authentication (wired for OIDC Bearer via `SBC_AUTH_MODE=bearer`; digest not configurable; SIP mTLS planned)
-- **SC-5**: DoS protection (rate limiting, `max_calls` admission — wired)
+- **SC-5**: DoS protection (rate limiting, `max_calls` admission, per-trunk `max_calls`, `per_callee_max_concurrent`, `max_registrations` — wired, per node)
 - **SC-7**: Boundary protection (topology hiding — wired)
 - **SC-8**: Transmission confidentiality (TLS 1.3 SIP listeners, AEAD SRTP — wired)
 - **SC-13**: Cryptographic protection (FIPS aws-lc-rs provider — wired)
@@ -819,6 +851,5 @@ See [NIST-800-53-CONTROLS.md](NIST-800-53-CONTROLS.md) for details.
 
 - Each active call uses 2 RTP relay tasks (A→B and B→A)
 - RTP port range should be sized for `2 * max_concurrent_calls` ports
-- Transcoding adds ~100us per RTP packet (negligible vs network jitter)
 - The jitter buffer and codec state are per-session (no shared state contention)
 - Rate limiter uses per-IP token buckets with O(1) check time

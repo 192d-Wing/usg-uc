@@ -94,6 +94,11 @@ impl CallLimiter {
             .map_or(RateLimitAction::Allow, |limiter| limiter.check(source))
     }
 
+    /// Configured per-callee concurrency cap (0 = unlimited).
+    pub fn per_callee_max_concurrent(&self) -> u32 {
+        self.config.per_callee_max_concurrent
+    }
+
     /// Whether a new call to `callee` would exceed the concurrency cap.
     pub fn callee_at_capacity(&self, callee: &str) -> bool {
         if self.config.per_callee_max_concurrent == 0 {

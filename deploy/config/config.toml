@@ -37,8 +37,9 @@ tcp_idle_timeout_secs = 300
 # api_listen = "10.0.1.10:8080"
 
 [media]
+# Only "Relay" is accepted; per-realm overrides (realm_modes) are rejected
+# by validation, and codecs must be the default set (any order).
 default_mode = "Relay"
-# Per-realm overrides: realm_modes = { "external" = "PassThrough" }
 codecs = ["Opus", "G722", "G711Ulaw", "G711Alaw"]
 rtp_port_min = 16384
 rtp_port_max = 32768

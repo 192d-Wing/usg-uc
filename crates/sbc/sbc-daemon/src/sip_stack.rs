@@ -46,7 +46,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uc_routing::{
     DestinationType, DialPattern, DialPlan, DialPlanEntry, Direction, NumberTransform, Router,
-    RouterConfig, SelectionStrategy, Trunk, TrunkConfig, TrunkGroup, TrunkProtocol,
+    RouterConfig, RoutingError, SelectionStrategy, Trunk, TrunkConfig, TrunkGroup, TrunkOutcome,
+    TrunkProtocol,
 };
 use uc_types::address::SbcSocketAddr;
 
@@ -145,6 +146,11 @@ pub struct SipStackConfig {
     /// Maximum concurrent calls — INVITEs beyond this are rejected with
     /// 503 (admission control, `general.max_calls`).
     pub max_calls: u32,
+    /// Maximum registration bindings held by this node
+    /// (`general.max_registrations`). A REGISTER that would add bindings
+    /// past it gets 503 + Retry-After; refreshes and de-registrations are
+    /// always accepted.
+    pub max_registrations: u32,
 }
 
 impl Default for SipStackConfig {
@@ -158,6 +164,7 @@ impl Default for SipStackConfig {
             require_auth: false,
             auth_credentials: HashMap::new(),
             max_calls: 1000,
+            max_registrations: 50_000,
         }
     }
 }
@@ -185,6 +192,9 @@ struct ServerInviteState {
     /// retransmission (RFC 3261 §17.2.1) and, for a non-2xx final, on
     /// Timer G until the ACK arrives.
     last_response: Option<SipMessage>,
+    /// Call-ID of the request that opened the transaction; a later request
+    /// with the same branch but another Call-ID is a new request.
+    call_id: String,
 }
 
 /// State for server non-INVITE transaction.
@@ -194,6 +204,9 @@ struct ServerNonInviteState {
     created_at: Instant,
     /// Last response sent; re-sent on a request retransmission (§17.2.2).
     last_response: Option<SipMessage>,
+    /// Call-ID of the request that opened the transaction (see
+    /// `ServerInviteState::call_id`).
+    call_id: String,
 }
 
 /// State for client INVITE transaction.
@@ -306,8 +319,22 @@ struct CallAddresses {
     b_leg_sip_call_id: String,
     /// SBC's local SIP address for Via/Contact headers.
     local_addr: String,
-    /// Failover trunk IDs for retry on B-leg failure.
-    failover_trunks: Vec<String>,
+    /// Remaining failover targets `(trunk_group_id, trunk_id)`, in try
+    /// order, for retrying the initial INVITE when the B-leg trunk fails.
+    failover_targets: Vec<(String, String)>,
+    /// Per-trunk `max_calls` slot this call holds. Released exactly once,
+    /// by whoever removes this record from `call_correlation.addresses`.
+    trunk_lease: Option<TrunkLease>,
+    /// VPS per-callee concurrency slot (dialed number) this call holds;
+    /// released with the record like `trunk_lease`.
+    vps_callee: Option<String>,
+    /// The initial B-leg INVITE as built (translated user, rewritten SDP,
+    /// manipulated headers). Kept only when failover targets exist; a
+    /// failover re-sends it with a fresh Call-ID, branch and From tag.
+    b_leg_invite: Option<Arc<SipRequest>>,
+    /// A reliable (RSeq) 18x carrying SDP was relayed to the caller: the
+    /// early media is committed to this trunk, so no more failover.
+    early_media_committed: bool,
     /// Via header values from the original A-leg INVITE (responses to the
     /// A-leg must carry these, not the B-leg's Via).
     a_leg_via: Vec<String>,
@@ -372,6 +399,143 @@ struct CallAddresses {
     last_reinvite_ack: Option<(String, SipMessage, SbcSocketAddr)>,
     /// When the B-leg answered (for the audit trail's call duration).
     established_at: Option<Instant>,
+}
+
+/// A per-trunk call slot (`trunk_groups[].trunks[].max_calls`) held by a
+/// call.
+#[derive(Clone, Debug)]
+struct TrunkLease {
+    group_id: String,
+    trunk_id: String,
+    /// When the slot was taken (INVITE sent), for setup-time statistics.
+    started: Instant,
+}
+
+/// A call routed to a trunk: the reserved slot, where to send the INVITE,
+/// what is left to fail over to and the number to put on the wire.
+struct TrunkRoute {
+    lease: TrunkLease,
+    destination: SbcSocketAddr,
+    failover: Vec<(String, String)>,
+    /// Destination number after SBC-router / dial-plan transforms.
+    translated: String,
+}
+
+/// Outcome of trunk routing for an INVITE no registered user answers.
+enum TrunkRouting {
+    Routed(TrunkRoute),
+    /// No pattern / dial plan entry / trunk group matches the number.
+    NoRoute,
+    /// A route matched but every trunk is down, cooling down or at
+    /// `max_calls`.
+    Unavailable,
+    /// The transformed number is unsafe to put in a Request-URI.
+    InvalidTranslation,
+}
+
+/// `Retry-After` (seconds) on the 503 sent when every trunk of the matched
+/// route is full or down (RFC 3261 §21.5.4).
+const TRUNK_UNAVAILABLE_RETRY_AFTER_SECS: u32 = 5;
+
+/// `Retry-After` (seconds) on the 503 sent when `general.max_registrations`
+/// is reached (RFC 3261 §21.5.4).
+const REGISTRATION_CAPACITY_RETRY_AFTER_SECS: u32 = 60;
+
+/// Longest translated user part put on a B-leg Request-URI.
+const MAX_B_LEG_USER_LEN: usize = 64;
+
+/// Whether a translated number is safe as a B-leg Request-URI / To user.
+///
+/// Transforms (dial plan prefix rules, SBC route-pattern masks) run on the
+/// attacker-controlled dialed digits, so the result is checked before it
+/// goes on the wire. Accepts the RFC 3261 §25.1 `unreserved` set plus the
+/// `user-unreserved` characters that cannot end the user part; `;`, `?` and
+/// `/` (parameter/header delimiters downstream), `%` escapes, `@`, `<`, `>`,
+/// whitespace and CR/LF are rejected.
+///
+/// ## NIST 800-53 Rev5: SI-10 (Information Input Validation)
+fn is_safe_b_leg_user(user: &str) -> bool {
+    !user.is_empty()
+        && user.len() <= MAX_B_LEG_USER_LEN
+        && user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.!~*'()&=+$,".contains(&b))
+}
+
+/// B-leg final statuses that fail the call over to the next trunk: the
+/// trunk (not the callee) failed. Never 486/other 4xx/6xx — failing over
+/// on a callee's reject would ring the callee through other carriers.
+///
+/// RFC 3263 §4.3 names only 503 and timeouts (408 / Timer B, which also
+/// fails over) as next-server triggers. Failing over on 500, 502 and 504
+/// is local B2BUA policy beyond RFC 3263; the B-leg retry is a new UAC
+/// request, so it is permitted. A trunk URI that does not resolve also
+/// moves to the next target.
+///
+/// POAM: transport send errors on the B-leg (RFC 3263 §4.3) do not trigger
+/// failover; transports do not report send failures back to the SIP stack,
+/// so such a call fails only via Timer B.
+const fn is_failover_status(status: u16) -> bool {
+    matches!(status, 408 | 500 | 502 | 503 | 504)
+}
+
+/// Replaces (or appends) `;name=value` on a header value, outside any
+/// `<...>` URI.
+fn replace_header_param(header_value: &str, name: &str, value: &str) -> String {
+    let params_start = header_value.rfind('>').map_or(0, |p| p + 1);
+    let (head, params) = header_value.split_at(params_start);
+    let mut out = String::with_capacity(header_value.len() + value.len());
+    out.push_str(head);
+    let mut replaced = false;
+    for (i, part) in params.split(';').enumerate() {
+        if i == 0 {
+            out.push_str(part);
+            continue;
+        }
+        out.push(';');
+        let key = part.split('=').next().unwrap_or("").trim();
+        if key.eq_ignore_ascii_case(name) {
+            out.push_str(name);
+            out.push('=');
+            out.push_str(value);
+            replaced = true;
+        } else {
+            out.push_str(part);
+        }
+    }
+    if !replaced {
+        out.push(';');
+        out.push_str(name);
+        out.push('=');
+        out.push_str(value);
+    }
+    out
+}
+
+/// Takes a slot on the first still-usable failover target, dropping the
+/// targets tried. Returns the lease and the trunk's SIP URI.
+fn acquire_next_target(
+    router: &mut Router,
+    targets: &mut Vec<(String, String)>,
+) -> Option<(TrunkLease, String)> {
+    let mut consumed = 0;
+    let mut found = None;
+    for (group_id, trunk_id) in targets.iter() {
+        consumed += 1;
+        if let Some(uri) = router.acquire_trunk(group_id, trunk_id) {
+            found = Some((
+                TrunkLease {
+                    group_id: group_id.clone(),
+                    trunk_id: trunk_id.clone(),
+                    started: Instant::now(),
+                },
+                uri,
+            ));
+            break;
+        }
+    }
+    targets.drain(..consumed);
+    found
 }
 
 /// Records a call-lifecycle event on the audit trail (NIST AU-2); a no-op
@@ -907,6 +1071,12 @@ impl SipStack {
     /// (RFC 3261 §17.2.3: top Via branch + CSeq method), returns what to do
     /// about it — re-send the last response, or nothing while the first copy
     /// is still being processed. `None` means the request is new.
+    ///
+    /// A retransmission is a copy of the same request, so a stored transaction
+    /// whose Call-ID differs is a branch collision (a client that reuses
+    /// branch values, or a forged one), not a retransmission: the request is
+    /// treated as new instead of being swallowed or answered with another
+    /// call's response.
     async fn answer_request_retransmit(
         &self,
         req: &SipRequest,
@@ -914,15 +1084,22 @@ impl SipStack {
     ) -> Option<ProcessResult> {
         let branch = req.headers.via_branch()?;
         let key = TransactionKey::server(&branch, req.method.to_string());
+        let call_id = req.headers.call_id().unwrap_or("");
         let mut txns = self.transactions.write().await;
         let (resend, last) = if req.method == Method::Invite {
-            let st = txns.server_invite.get_mut(&key)?;
+            let st = txns
+                .server_invite
+                .get_mut(&key)
+                .filter(|st| st.call_id == call_id)?;
             (
                 st.transaction.receive_request().unwrap_or(false),
                 st.last_response.clone(),
             )
         } else {
-            let st = txns.server_non_invite.get_mut(&key)?;
+            let st = txns
+                .server_non_invite
+                .get_mut(&key)
+                .filter(|st| st.call_id == call_id)?;
             (
                 st.transaction.receive_request().unwrap_or(false),
                 st.last_response.clone(),
@@ -947,27 +1124,48 @@ impl SipStack {
             return;
         };
         let key = TransactionKey::server(&branch, req.method.to_string());
+        let call_id = req.headers.call_id().unwrap_or("").to_string();
         let now = Instant::now();
         let mut txns = self.transactions.write().await;
         txns.sweep_if_needed();
+        // An entry with the same branch but another Call-ID belongs to an
+        // earlier request (see `answer_request_retransmit`); replace it.
         if req.method == Method::Invite {
-            txns.server_invite
-                .entry(key.clone())
-                .or_insert_with(|| ServerInviteState {
+            if txns
+                .server_invite
+                .get(&key)
+                .is_some_and(|st| st.call_id == call_id)
+            {
+                return;
+            }
+            txns.server_invite.insert(
+                key.clone(),
+                ServerInviteState {
                     transaction: ServerInviteTransaction::new(key, TransportType::Unreliable),
                     source,
                     created_at: now,
                     last_response: None,
-                });
+                    call_id,
+                },
+            );
         } else {
-            txns.server_non_invite
-                .entry(key.clone())
-                .or_insert_with(|| ServerNonInviteState {
+            if txns
+                .server_non_invite
+                .get(&key)
+                .is_some_and(|st| st.call_id == call_id)
+            {
+                return;
+            }
+            txns.server_non_invite.insert(
+                key.clone(),
+                ServerNonInviteState {
                     transaction: ServerNonInviteTransaction::new(key, TransportType::Unreliable),
                     source,
                     created_at: now,
                     last_response: None,
-                });
+                    call_id,
+                },
+            );
         }
     }
 
@@ -1226,7 +1424,7 @@ impl SipStack {
             } else {
                 addrs.a_leg_source
             };
-            self.cleanup_terminated_call(call, &addrs).await;
+            self.cleanup_terminated_call(call, false).await;
             return vec![
                 ProcessResult::Response {
                     message: resp,
@@ -1240,6 +1438,11 @@ impl SipStack {
         }
 
         if branch == addrs.b_leg_branch {
+            // RFC 3261 §17.1.1.2: Timer B is a 408; the trunk failed the
+            // call, so try the next one first.
+            if let Some(retry) = self.try_failover(call, &addrs, None).await {
+                return vec![retry];
+            }
             warn!(
                 call_id = %addrs.a_leg_sip_call_id,
                 "No final response from B-leg (Timer B); failing call with 408"
@@ -1252,7 +1455,7 @@ impl SipStack {
                 }
             }
             let resp = build_a_leg_response(timeout, &addrs);
-            self.cleanup_terminated_call(call, &addrs).await;
+            self.cleanup_terminated_call(call, true).await;
             return vec![ProcessResult::Response {
                 message: SipMessage::Response(resp),
                 destination: addrs.a_leg_source,
@@ -1311,7 +1514,7 @@ impl SipStack {
                     destination: addrs.b_leg_destination,
                 });
             }
-            self.cleanup_terminated_call(&call, &addrs).await;
+            self.cleanup_terminated_call(&call, false).await;
         }
         out
     }
@@ -1595,7 +1798,7 @@ impl SipStack {
                     status = code,
                     "Far leg's dialog is gone; releasing call"
                 );
-                self.cleanup_terminated_call(internal_id, addrs).await;
+                self.cleanup_terminated_call(internal_id, false).await;
             } else {
                 info!(
                     call_id = %addrs.a_leg_sip_call_id,
@@ -1745,31 +1948,369 @@ impl SipStack {
 
     /// Removes all state for a call the SBC is tearing down (dialog correlation,
     /// call record, INVITE transactions, RTP ports, media session).
-    async fn cleanup_terminated_call(&self, internal_id: &CallId, addrs: &CallAddresses) {
+    ///
+    /// `trunk_failed` marks the B-leg trunk as having failed the call (Timer
+    /// B), which counts toward its `max_failures` cooldown.
+    async fn cleanup_terminated_call(&self, internal_id: &CallId, trunk_failed: bool) {
         {
             let mut calls = self.calls.write().await;
             calls.calls.remove(internal_id);
         }
-        {
-            let mut corr = self.call_correlation.write().await;
-            corr.a_leg.remove(&addrs.a_leg_sip_call_id);
-            corr.b_leg.remove(&addrs.b_leg_sip_call_id);
-            corr.addresses.remove(internal_id);
-        }
+        self.finish_call_record(internal_id, trunk_failed).await;
         // INVITE transactions are left to run out (Timer D/H/I) so late
         // retransmissions are still absorbed; `poll_timers` prunes them.
         self.pending_2xx
             .write()
             .await
             .retain(|_, p| &p.call != internal_id);
-        for port in &addrs.rtp_ports {
-            self.release_rtp_port(*port);
-        }
         if let Some(ref pipeline) = self.media_pipeline {
             let key = internal_id.to_string();
             let _ = pipeline.stop_relay(&key).await;
             let _ = pipeline.remove_session(&key).await;
         }
+    }
+
+    /// Removes a call's correlation record and releases what it held (RTP
+    /// ports, trunk slot, VPS callee slot).
+    ///
+    /// Release is tied to the record actually removed from
+    /// `call_correlation.addresses`, never to a caller's clone, so it happens
+    /// exactly once however many teardown paths race (BYE crossing CANCEL,
+    /// retransmitted BYE, Timer B during a BYE) and always for the trunk the
+    /// call holds *now* (a failover swaps the lease in place).
+    ///
+    /// Lock order: `call_correlation` is released before `router` / `vps`
+    /// are taken; neither is held across an `.await` on another lock.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+    async fn finish_call_record(&self, internal_id: &CallId, trunk_failed: bool) -> bool {
+        let removed = {
+            let mut corr = self.call_correlation.write().await;
+            let Some(removed) = corr.addresses.remove(internal_id) else {
+                return false;
+            };
+            corr.a_leg.remove(&removed.a_leg_sip_call_id);
+            corr.b_leg.remove(&removed.b_leg_sip_call_id);
+            removed
+        };
+        for port in &removed.rtp_ports {
+            self.release_rtp_port(*port);
+        }
+        let outcome = match (removed.established_at, removed.trunk_lease.as_ref()) {
+            (Some(at), Some(lease)) => TrunkOutcome::Completed {
+                setup_ms: u64::try_from(at.saturating_duration_since(lease.started).as_millis())
+                    .unwrap_or(u64::MAX),
+            },
+            _ if trunk_failed => TrunkOutcome::Failed,
+            _ => TrunkOutcome::Abandoned,
+        };
+        self.release_slots(
+            removed.trunk_lease.as_ref(),
+            removed.vps_callee.as_deref(),
+            outcome,
+        )
+        .await;
+        true
+    }
+
+    /// Releases a trunk slot and/or a VPS callee slot.
+    async fn release_slots(
+        &self,
+        lease: Option<&TrunkLease>,
+        vps_callee: Option<&str>,
+        outcome: TrunkOutcome,
+    ) {
+        if let (Some(lease), Some(router)) = (lease, self.router.as_ref()) {
+            router
+                .write()
+                .await
+                .release_trunk(&lease.group_id, &lease.trunk_id, outcome);
+        }
+        if let (Some(callee), Some(vps)) = (vps_callee, self.vps.as_ref()) {
+            vps.lock().await.call_ended(callee);
+        }
+    }
+
+    /// Whether the router knows a trunk with this ID (any group).
+    pub async fn has_trunk(&self, trunk_id: &str) -> bool {
+        match self.router.as_ref() {
+            Some(router) => router.read().await.has_trunk(trunk_id),
+            None => false,
+        }
+    }
+
+    /// Applies an OPTIONS-ping reachability change to trunk selection: an
+    /// unreachable trunk is skipped by routing and failover until it answers
+    /// again. Returns how many router trunks matched `trunk_id`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, CP-8 (alternate telecommunications)
+    pub async fn set_trunk_reachable(&self, trunk_id: &str, reachable: bool) -> usize {
+        let Some(router) = self.router.as_ref() else {
+            return 0;
+        };
+        router
+            .write()
+            .await
+            .set_trunk_reachable(trunk_id, reachable)
+    }
+
+    /// Active (reserved) calls on a trunk, if the router knows it.
+    pub async fn trunk_active_calls(&self, group_id: &str, trunk_id: &str) -> Option<u32> {
+        let router = self.router.as_ref()?;
+        router.read().await.trunk_active_calls(group_id, trunk_id)
+    }
+
+    /// Concurrent calls the VPS counts against a dialed number.
+    pub async fn vps_callee_concurrent_calls(&self, callee: &str) -> Option<u32> {
+        let vps = self.vps.as_ref()?;
+        Some(vps.lock().await.callee_concurrent_calls(callee))
+    }
+
+    /// Routes a number no registered user answers to a trunk: the SBC
+    /// router's route groups (CSS / partition / route pattern / route list)
+    /// first, then the dial plan. Reserves a `max_calls` slot on the chosen
+    /// trunk; a trunk whose URI does not resolve counts as failed and the
+    /// next failover target is tried.
+    async fn route_to_trunk(&self, dest_user: &str, css: Option<&str>) -> TrunkRouting {
+        let Some(router_lock) = self.router.as_ref() else {
+            warn!("No router configured on SIP stack");
+            return TrunkRouting::NoRoute;
+        };
+
+        let sbc_match = if let Some(ref sbc) = self.sbc_router {
+            sbc.read().await.route(dest_user, css)
+        } else {
+            None
+        };
+
+        let mut matched_trunks = false;
+        let decision = {
+            let mut router = router_lock.write().await;
+            let mut decision = None;
+            if let Some(ref result) = sbc_match {
+                info!(
+                    pattern = %result.pattern_id,
+                    partition = %result.partition_id,
+                    destination = %result.transformed_number,
+                    css = ?css,
+                    "Routed via SBC CSS/Partition"
+                );
+                match router.route_to_groups(&result.transformed_number, &result.route_group_ids) {
+                    Ok(d) => decision = Some(d),
+                    Err(RoutingError::AllTrunksFailed { trunks_tried }) if trunks_tried > 0 => {
+                        matched_trunks = true;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "SBC route groups match no trunk group; trying dial plan");
+                    }
+                }
+            }
+            if decision.is_none() && !matched_trunks {
+                debug!(dest = %dest_user, "Attempting dial plan routing");
+                match router.route(dest_user) {
+                    Ok(d) => decision = Some(d),
+                    Err(RoutingError::AllTrunksFailed { trunks_tried }) if trunks_tried > 0 => {
+                        matched_trunks = true;
+                    }
+                    Err(e) => warn!(dest = %dest_user, error = %e, "Dial plan routing failed"),
+                }
+            }
+            decision
+        };
+
+        let Some(decision) = decision else {
+            return if matched_trunks {
+                TrunkRouting::Unavailable
+            } else {
+                TrunkRouting::NoRoute
+            };
+        };
+
+        let mut lease = TrunkLease {
+            group_id: decision.trunk_group_id,
+            trunk_id: decision.trunk_id,
+            started: Instant::now(),
+        };
+        let translated = decision.destination;
+        let mut failover = decision.failover_targets;
+
+        // The transformed number goes on the wire; the dialed number keeps
+        // driving routing, VPS and audit (no partition bypass by dialing a
+        // "translated-looking" number).
+        if translated != dest_user && !is_safe_b_leg_user(&translated) {
+            warn!(
+                dest = %dest_user,
+                translated = %translated.escape_default(),
+                "Number transform produced an invalid Request-URI user; rejecting call"
+            );
+            router_lock.write().await.release_trunk(
+                &lease.group_id,
+                &lease.trunk_id,
+                TrunkOutcome::Abandoned,
+            );
+            return TrunkRouting::InvalidTranslation;
+        }
+
+        let mut uri = decision.trunk_uri;
+        loop {
+            if let Some(destination) = resolve_sip_uri_to_addr(&uri) {
+                info!(
+                    trunk_group = %lease.group_id,
+                    trunk_id = %lease.trunk_id,
+                    destination = %translated,
+                    failover_targets = failover.len(),
+                    "Routed to trunk"
+                );
+                return TrunkRouting::Routed(TrunkRoute {
+                    lease,
+                    destination,
+                    failover,
+                    translated,
+                });
+            }
+            warn!(trunk_id = %lease.trunk_id, trunk_uri = %uri, "Could not resolve trunk URI; trying next trunk");
+            let next = {
+                let mut router = router_lock.write().await;
+                router.release_trunk(&lease.group_id, &lease.trunk_id, TrunkOutcome::Failed);
+                acquire_next_target(&mut router, &mut failover)
+            };
+            match next {
+                Some((l, u)) => {
+                    lease = l;
+                    uri = u;
+                }
+                None => return TrunkRouting::Unavailable,
+            }
+        }
+    }
+
+    /// Retries the initial INVITE on the next usable failover trunk after
+    /// the current trunk failed it (`status` is the final response, `None`
+    /// for Timer B). Returns `None` when no failover applies, so the caller
+    /// fails the call as before.
+    ///
+    /// Failover is skipped once the callee answered or a reliable 18x with
+    /// SDP reached the caller (the early media is committed to this trunk).
+    /// The old slot is released as failed and, on 503, the trunk goes into
+    /// cooldown (RFC 3261 §21.5.4, RFC 3263 §4.3).
+    ///
+    /// ## NIST 800-53 Rev5: CP-8 (Telecommunications Services), SC-5
+    // POAM: the failover INVITE keeps the original Request-URI scheme/host
+    // and Via transport instead of the target trunk's protocol (pre-existing
+    // on the primary path too), so a UDP->TLS trunk failover can advertise
+    // the wrong transport. Follow-up: derive scheme/transport from the
+    // target trunk.
+    async fn try_failover(
+        &self,
+        internal_id: &CallId,
+        addrs: &CallAddresses,
+        status: Option<u16>,
+    ) -> Option<ProcessResult> {
+        if addrs.b_leg_answered || addrs.early_media_committed {
+            return None;
+        }
+        let template = addrs.b_leg_invite.as_ref()?;
+        let router_lock = self.router.as_ref()?;
+        let old_lease = addrs.trunk_lease.as_ref()?;
+        if addrs.failover_targets.is_empty() {
+            return None;
+        }
+
+        let mut remaining = addrs.failover_targets.clone();
+        let (lease, new_dest) = loop {
+            let next = acquire_next_target(&mut *router_lock.write().await, &mut remaining)?;
+            // DNS (if any) runs outside the router lock.
+            if let Some(dest) = resolve_sip_uri_to_addr(&next.1) {
+                break (next.0, dest);
+            }
+            warn!(trunk_id = %next.0.trunk_id, trunk_uri = %next.1, "Could not resolve failover trunk URI");
+            router_lock.write().await.release_trunk(
+                &next.0.group_id,
+                &next.0.trunk_id,
+                TrunkOutcome::Failed,
+            );
+        };
+
+        // Same request (translated user, SDP, manipulated headers), new
+        // client transaction and B-leg dialog: fresh Call-ID, branch, From tag.
+        let mut request = SipRequest::clone(template);
+        let new_call_id = generate_call_id(&self.config.domain);
+        let new_branch = generate_branch();
+        request.headers.set(HeaderName::CallId, &new_call_id);
+        request.headers.set(HeaderName::CSeq, "1 INVITE");
+        if let Some(via) = request.headers.get_value(&HeaderName::Via) {
+            let via = replace_header_param(via, "branch", &new_branch);
+            request.headers.set(HeaderName::Via, via);
+        }
+        let new_from = request
+            .headers
+            .get_value(&HeaderName::From)
+            .map(|f| replace_header_param(f, "tag", &generate_tag()))
+            .unwrap_or_default();
+        request.headers.set(HeaderName::From, &new_from);
+        let new_to = request
+            .headers
+            .get_value(&HeaderName::To)
+            .unwrap_or_default()
+            .to_string();
+        let new_template = Arc::new(request.clone());
+
+        // Swap the lease in place only if the call is still on the attempt
+        // that failed; otherwise (torn down, or another failover won) give
+        // the new slot back.
+        let swapped = {
+            let mut corr = self.call_correlation.write().await;
+            let current = corr
+                .addresses
+                .get(internal_id)
+                .is_some_and(|e| e.b_leg_branch == addrs.b_leg_branch);
+            if current {
+                corr.b_leg.remove(&addrs.b_leg_sip_call_id);
+                corr.b_leg.insert(new_call_id.clone(), internal_id.clone());
+                corr.addresses.get_mut(internal_id).and_then(|entry| {
+                    entry.b_leg_destination = new_dest;
+                    entry.b_leg_sip_call_id.clone_from(&new_call_id);
+                    entry.failover_targets = remaining;
+                    entry.b_leg_branch.clone_from(&new_branch);
+                    entry.b_leg_from = new_from;
+                    entry.b_leg_to = new_to;
+                    entry.dialog_to_tag = None;
+                    entry.b_leg_invite = Some(new_template);
+                    entry.trunk_lease.replace(lease.clone())
+                })
+            } else {
+                None
+            }
+        };
+
+        let Some(failed) = swapped else {
+            router_lock.write().await.release_trunk(
+                &lease.group_id,
+                &lease.trunk_id,
+                TrunkOutcome::Abandoned,
+            );
+            return Some(ProcessResult::NoAction);
+        };
+        {
+            let mut router = router_lock.write().await;
+            router.release_trunk(&failed.group_id, &failed.trunk_id, TrunkOutcome::Failed);
+            if status == Some(503) {
+                router.cooldown_trunk(&failed.group_id, &failed.trunk_id);
+            }
+        }
+        // POAM: trunk failover has no dedicated uc-audit event type yet; it
+        // is logged at warn. Add `TrunkFailover` to uc_audit::event (AU-2).
+        warn!(
+            call_id = %addrs.a_leg_sip_call_id,
+            failed_trunk = %old_lease.trunk_id,
+            status = status.map_or_else(|| "timeout".to_string(), |s| s.to_string()),
+            next_trunk = %lease.trunk_id,
+            "Trunk failover: retrying INVITE on next trunk"
+        );
+        Some(ProcessResult::Forward {
+            message: SipMessage::Request(request),
+            destination: new_dest,
+        })
     }
 
     /// Tears down a call whose DTLS-SRTP media handshake failed at runtime (after
@@ -1798,13 +2339,13 @@ impl SipStack {
                 call_id,
                 "media failure before dialog confirmed; cleaning up without BYE"
             );
-            self.cleanup_terminated_call(&internal_id, &addrs).await;
+            self.cleanup_terminated_call(&internal_id, false).await;
             return Vec::new();
         }
 
         let a_bye = Self::build_leg_bye(&addrs, false);
         let b_bye = Self::build_leg_bye(&addrs, true);
-        self.cleanup_terminated_call(&internal_id, &addrs).await;
+        self.cleanup_terminated_call(&internal_id, false).await;
 
         warn!(
             call_id,
@@ -2031,7 +2572,9 @@ impl SipStack {
                     .with_protocol(protocol)
                     .with_priority(t_config.priority)
                     .with_weight(t_config.weight)
-                    .with_max_calls(t_config.max_calls);
+                    .with_max_calls(t_config.max_calls)
+                    .with_cooldown_secs(u64::from(t_config.cooldown_secs))
+                    .with_max_failures(t_config.max_failures);
 
                 group.add_trunk(Trunk::new(trunk_config));
             }
@@ -2561,6 +3104,20 @@ impl SipStack {
                 .set(HeaderName::ContentType, "application/sdp");
         }
 
+        // A reliable 18x (RFC 3262, RSeq) carrying SDP commits the caller to
+        // this trunk's early media: no failover after it.
+        if a_response.body.is_some()
+            && resp
+                .headers
+                .iter()
+                .any(|h| h.name.as_str().eq_ignore_ascii_case("RSeq"))
+        {
+            let mut corr = self.call_correlation.write().await;
+            if let Some(a) = corr.addresses.get_mut(internal_id) {
+                a.early_media_committed = true;
+            }
+        }
+
         info!(
             status = status_code,
             call_id = %addrs.a_leg_sip_call_id,
@@ -2734,89 +3291,14 @@ impl SipStack {
         internal_id: &CallId,
         addrs: &CallAddresses,
     ) -> ProcessResult {
-        // Check for failover trunks before giving up
-        if !addrs.failover_trunks.is_empty()
-            && let Some(ref router_lock) = self.router
+        // A trunk failure (408/5xx, not a callee reject) fails over to the
+        // next trunk of the route before the caller hears about it.
+        if is_failover_status(status_code)
+            && let Some(retry) = self
+                .try_failover(internal_id, addrs, Some(status_code))
+                .await
         {
-            let mut remaining = addrs.failover_trunks.clone();
-            let next_trunk_id = remaining.remove(0);
-
-            // Look up trunk URI from router
-            let router = router_lock.read().await;
-            let trunk_addr = router
-                .get_trunk_group(
-                    addrs
-                        .failover_trunks
-                        .first()
-                        .map_or("default", |t| t.as_str()),
-                )
-                .and_then(|_| resolve_sip_uri_to_addr(&format!("sip:{next_trunk_id}")));
-            drop(router);
-
-            if let Some(new_dest) = trunk_addr {
-                let new_call_id = generate_call_id(&self.config.domain);
-                let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
-
-                let new_uri = SipUri::new(new_dest.ip().to_string()).with_port(new_dest.port());
-                let builder = RequestBuilder::invite(new_uri)
-                    .via_auto("UDP", local_ip, Some(new_dest.port()))
-                    .call_id(&new_call_id)
-                    .cseq(1)
-                    .max_forwards(70);
-
-                if let Ok(new_request) = builder.build_with_defaults() {
-                    // The retry INVITE carries a fresh Via branch and From
-                    // tag generated by the builder; capture them so the
-                    // stored dialog state matches what went on the wire.
-                    // Without this, process_response's branch validation
-                    // (it matches the top Via branch against b_leg_branch)
-                    // would silently drop every response to the failover
-                    // INVITE, and a CANCEL would mirror the stale branch.
-                    let new_branch = new_request
-                        .headers
-                        .get_value(&HeaderName::Via)
-                        .and_then(|v| extract_param(v, "branch").map(String::from))
-                        .unwrap_or_else(generate_branch);
-                    let new_from = new_request
-                        .headers
-                        .get_value(&HeaderName::From)
-                        .unwrap_or_default()
-                        .to_string();
-                    let new_to = new_request
-                        .headers
-                        .get_value(&HeaderName::To)
-                        .unwrap_or_default()
-                        .to_string();
-                    {
-                        let mut corr = self.call_correlation.write().await;
-                        corr.b_leg.remove(&addrs.b_leg_sip_call_id);
-                        corr.b_leg.insert(new_call_id.clone(), internal_id.clone());
-                        if let Some(addr_entry) = corr.addresses.get_mut(internal_id) {
-                            addr_entry.b_leg_destination = new_dest;
-                            addr_entry.b_leg_sip_call_id.clone_from(&new_call_id);
-                            addr_entry.failover_trunks = remaining;
-                            addr_entry.b_leg_branch = new_branch;
-                            addr_entry.b_leg_from = new_from;
-                            addr_entry.b_leg_to = new_to;
-                            // New transaction: a tagged response will be
-                            // re-learned for the dialog.
-                            addr_entry.dialog_to_tag = None;
-                        }
-                    }
-
-                    info!(
-                        failed_trunk = %addrs.b_leg_sip_call_id,
-                        next_trunk = %next_trunk_id,
-                        call_id = %addrs.a_leg_sip_call_id,
-                        "Trunk failover: retrying with next trunk"
-                    );
-
-                    return ProcessResult::Forward {
-                        message: SipMessage::Request(new_request),
-                        destination: new_dest,
-                    };
-                }
-            }
+            return retry;
         }
 
         // No failover available — fail the call
@@ -2839,20 +3321,21 @@ impl SipStack {
             let _ = pipeline.remove_session(&call_id_str).await;
         }
 
-        // Cleanup call state
+        // Cleanup call state; RTP ports (C12), the trunk slot and the VPS
+        // slot go with the correlation record.
         {
             let mut calls = self.calls.write().await;
             calls.calls.remove(internal_id);
         }
+        self.finish_call_record(internal_id, is_failover_status(status_code))
+            .await;
+        if status_code == 503
+            && let (Some(lease), Some(router)) = (addrs.trunk_lease.as_ref(), self.router.as_ref())
         {
-            let mut corr = self.call_correlation.write().await;
-            corr.a_leg.remove(&addrs.a_leg_sip_call_id);
-            corr.b_leg.remove(&addrs.b_leg_sip_call_id);
-            corr.addresses.remove(internal_id);
-        }
-        // Release allocated RTP ports (C12).
-        for port in &addrs.rtp_ports {
-            self.release_rtp_port(*port);
+            router
+                .write()
+                .await
+                .cooldown_trunk(&lease.group_id, &lease.trunk_id);
         }
 
         warn!(
@@ -3001,8 +3484,68 @@ impl SipStack {
         // write lock through the location_service sync so both stores are
         // updated atomically (H5).
         let mut registrar_guard = self.registrar.write().await;
-        let reg_response = match registrar_guard.process_register(&register_req) {
-            Ok(resp) => resp,
+
+        // general.max_registrations: refuse a REGISTER that would add
+        // bindings past the node's cap. The registrar runs the check after
+        // digest authentication succeeds (so an unauthenticated sender gets
+        // 401, never a capacity signal) and before it stores anything, all
+        // under the registrar write lock, so it is atomic with the insert.
+        // New bindings are counted with the registrar's own de-dup: a
+        // contact already bound for the AoR by contact URI or
+        // +sip.instance/reg-id is an update whatever its Call-ID (RFC 3261
+        // §10.3 step 7, e.g. a rebooted phone), repeated contacts count
+        // once, and expires=0 / `Contact: *` / a query add nothing. Existing
+        // phones can therefore always refresh or re-register at the cap.
+        //
+        // ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+        let max = self.config.max_registrations as usize;
+        let mut over: Option<usize> = None;
+        let admitted =
+            registrar_guard.process_register_with_admission(&register_req, |total, new| {
+                let fits = total.saturating_add(new) <= max;
+                if !fits {
+                    over = Some(total);
+                }
+                fits
+            });
+        let reg_response = match admitted {
+            Ok(Some(resp)) => resp,
+            Ok(None) => {
+                let authenticated = registrar_guard.config().require_auth || self.bearer.is_some();
+                drop(registrar_guard);
+                warn!(
+                    aor = %aor,
+                    bindings = over.unwrap_or(0),
+                    max_registrations = self.config.max_registrations,
+                    "Registration capacity reached, rejecting REGISTER with 503"
+                );
+                // NIST 800-53 Rev5: AU-3 — the identity is only asserted as
+                // authenticated when digest or bearer auth actually ran.
+                let identity = if authenticated {
+                    aor.clone()
+                } else {
+                    format!("unauthenticated:{aor}")
+                };
+                audit(uc_audit::AuditEvent::AuthorizationDecision(
+                    uc_audit::event::AuthorizationDecision {
+                        identity,
+                        resource: req.uri.to_string(),
+                        action: "REGISTER".to_string(),
+                        granted: false,
+                        policy: "max-registrations".to_string(),
+                    },
+                ));
+                let mut unavailable =
+                    create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+                unavailable.headers.set(
+                    HeaderName::RetryAfter,
+                    REGISTRATION_CAPACITY_RETRY_AFTER_SECS.to_string(),
+                );
+                return ProcessResult::Response {
+                    message: SipMessage::Response(unavailable),
+                    destination: source,
+                };
+            }
             Err(e) => {
                 warn!(error = %e, aor = %aor, "Registration processing failed");
                 return ProcessResult::Response {
@@ -3309,6 +3852,11 @@ impl SipStack {
         // docs/VPS-ARCHITECTURE.md.
         //
         // ## NIST 800-53 Rev5: AC-3 (Access Enforcement), SC-5 (DoS Protection)
+        //
+        // `per_callee_max_concurrent` is checked and the slot reserved in one
+        // step, keyed on the dialed (pre-translation) number; the slot rides
+        // the call record and is released with it.
+        let mut vps_callee: Option<String> = None;
         if let Some(ref vps) = self.vps {
             let direction = if self
                 .inbound_trunk_map
@@ -3327,7 +3875,8 @@ impl SipStack {
             if let Some(from) = req.headers.get_value(&HeaderName::From) {
                 attempt = attempt.with_from_uri(extract_uri_from_header(from));
             }
-            let verdict = vps.lock().await.screen_call(&attempt);
+            let (verdict, reserved) = vps.lock().await.screen_and_reserve(&attempt);
+            vps_callee = reserved;
             match verdict.action() {
                 uc_vps::VpsAction::Allow => {}
                 uc_vps::VpsAction::Reject {
@@ -3375,12 +3924,14 @@ impl SipStack {
         //    c) Try SBC router (CSS/Partition)
         //    d) Try dial plan router
         //    e) Fall back to announcement
-        let failover_trunks: Vec<String> = Vec::new();
         // Direction of the outbound leg: true when it crosses to an untrusted
         // (trunk/carrier) destination, false for a registered internal user.
         // Gates topology hiding so only outside-facing legs are anonymized
         // (rewriting an inside-facing leg's Via/Contact would misroute it).
         let mut b_leg_external = false;
+        // Trunk slot, failover targets and translated number when the call
+        // is routed to a trunk.
+        let mut trunk_route: Option<TrunkRoute> = None;
         let b_leg_destination = {
             // Check DID → user mapping first (e.g., +12139160002 → jwillman)
             let mapped_user = self.lookup_did(&dest_user).await;
@@ -3436,11 +3987,11 @@ impl SipStack {
             if let Some(contact) = found_contact {
                 resolve_sip_uri_to_addr(&contact)
             } else {
-                // Not registered — try SBC router (CSS-based), then dial plan, then direct
-                let mut routed = None;
-
-                // Identify which trunk group this inbound call came from (by source IP)
-                // and get its assigned CSS for routing
+                // Not registered — route to a trunk: SBC router (CSS-based),
+                // then dial plan.
+                //
+                // Identify which trunk group this inbound call came from (by
+                // source IP) and get its assigned CSS for routing
                 let source_ip = match source.ip() {
                     std::net::IpAddr::V6(v6) => v6
                         .to_ipv4_mapped()
@@ -3460,73 +4011,75 @@ impl SipStack {
                     );
                 }
 
-                // 1. Route via SBC router (CSS/Partition → Route Pattern → Route List → Route Group)
-                if let Some(ref sbc) = self.sbc_router {
-                    let sbc_r = sbc.read().await;
-                    let css_ref = css_id_owned.as_deref();
-                    if let Some(result) = sbc_r.route(&dest_user, css_ref) {
-                        info!(
-                            pattern = %result.pattern_id,
-                            partition = %result.partition_id,
-                            destination = %result.transformed_number,
-                            css = ?css_ref,
-                            "Routed via SBC CSS/Partition"
+                match self
+                    .route_to_trunk(&dest_user, css_id_owned.as_deref())
+                    .await
+                {
+                    TrunkRouting::Routed(route) => {
+                        // Routed to a trunk/carrier — this outbound leg faces
+                        // an untrusted zone, so topology hiding (if enabled)
+                        // applies.
+                        b_leg_external = true;
+                        let destination = route.destination;
+                        trunk_route = Some(route);
+                        Some(destination)
+                    }
+                    TrunkRouting::NoRoute => {
+                        warn!(dest = %dest_aor, "No route found — playing announcement");
+                        self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                        self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
+                            .await;
+                        return self
+                            .play_announcement_to_caller(
+                                req,
+                                source,
+                                crate::announcement::AnnouncementType::NumberNotInService,
+                            )
+                            .await;
+                    }
+                    TrunkRouting::Unavailable => {
+                        // Every trunk of the matched route is down, cooling
+                        // down or at max_calls: 503 + Retry-After (RFC 3261
+                        // §21.5.4), no queuing.
+                        //
+                        // ## NIST 800-53 Rev5: SC-5, SI-17 (Fail-Safe Procedures)
+                        warn!(call_id = %a_leg_call_id, dest = %dest_user, "No usable trunk (all down or at capacity), rejecting INVITE with 503");
+                        audit_invite_denied(req, source, "no-usable-trunk");
+                        self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                        self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
+                            .await;
+                        let mut unavailable =
+                            create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+                        unavailable.headers.set(
+                            HeaderName::RetryAfter,
+                            TRUNK_UNAVAILABLE_RETRY_AFTER_SECS.to_string(),
                         );
-                        if let Some(rg_id) = result.route_group_ids.first() {
-                            routed = resolve_sip_uri_to_addr(&format!("sip:{rg_id}"));
-                        }
+                        return ProcessResult::Response {
+                            message: SipMessage::Response(unavailable),
+                            destination: source,
+                        };
+                    }
+                    TrunkRouting::InvalidTranslation => {
+                        audit_invite_denied(req, source, "number-translation-invalid");
+                        self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                        self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
+                            .await;
+                        let server_err =
+                            create_response_from_request(req, StatusCode::SERVER_INTERNAL_ERROR);
+                        return ProcessResult::Response {
+                            message: SipMessage::Response(server_err),
+                            destination: source,
+                        };
                     }
                 }
-
-                // 2. Route via dial plan → trunk group → trunk
-                if routed.is_none() {
-                    if let Some(ref router_lock) = self.router {
-                        let mut dial_router = router_lock.write().await;
-                        info!(dest = %dest_user, "Attempting dial plan routing");
-                        match dial_router.route(&dest_user) {
-                            Ok(decision) => {
-                                info!(
-                                    trunk_id = %decision.trunk_id,
-                                    trunk_uri = %decision.trunk_uri,
-                                    destination = %decision.destination,
-                                    "Routed via dial plan"
-                                );
-                                routed = resolve_sip_uri_to_addr(&decision.trunk_uri);
-                                if routed.is_none() {
-                                    warn!(trunk_uri = %decision.trunk_uri, "Could not resolve trunk URI to address");
-                                }
-                            }
-                            Err(e) => {
-                                warn!(dest = %dest_user, error = %e, "Dial plan routing failed");
-                            }
-                        }
-                    } else {
-                        warn!("No router configured on SIP stack");
-                    }
-                }
-
-                if routed.is_none() {
-                    warn!(dest = %dest_aor, "No route found — playing announcement");
-                    self.in_flight_invites.write().await.remove(&a_leg_call_id);
-                    return self
-                        .play_announcement_to_caller(
-                            req,
-                            source,
-                            crate::announcement::AnnouncementType::NumberNotInService,
-                        )
-                        .await;
-                }
-
-                // Routed to a trunk/carrier — this outbound leg faces an
-                // untrusted zone, so topology hiding (if enabled) applies.
-                b_leg_external = true;
-                routed
             }
         };
 
         let Some(b_leg_destination) = b_leg_destination else {
             warn!(dest = %dest_aor, "Cannot resolve destination — playing announcement");
             self.in_flight_invites.write().await.remove(&a_leg_call_id);
+            self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
+                .await;
             return self
                 .play_announcement_to_caller(
                     req,
@@ -3534,6 +4087,15 @@ impl SipStack {
                     crate::announcement::AnnouncementType::NumberNotInService,
                 )
                 .await;
+        };
+
+        // Number translation (SBC route-pattern / dial-plan transforms): the
+        // B-leg Request-URI and To carry the translated number; the dialed
+        // number stays the key for VPS, audit and retransmit detection. A
+        // B2BUA builds its own To as a new UAC (RFC 3261 §8.1.1.2).
+        let (trunk_lease, failover_targets, b_leg_user) = match trunk_route {
+            Some(route) => (Some(route.lease), route.failover, route.translated),
+            None => (None, Vec::new(), dest_user.clone()),
         };
 
         // 4. Create B2BUA call
@@ -3647,7 +4209,7 @@ impl SipStack {
         let b_leg_sip_call_id = generate_call_id(&self.config.domain);
         let b_leg_branch = generate_branch();
 
-        let mut b_leg_uri = SipUri::new(&dest_host).with_user(&dest_user);
+        let mut b_leg_uri = SipUri::new(&dest_host).with_user(&b_leg_user);
         if let Some(port) = req.uri.port {
             b_leg_uri.port = Some(port);
         }
@@ -3658,7 +4220,7 @@ impl SipStack {
                 SipUri::new(&self.config.domain).with_user(&self.config.instance_name),
                 None,
             )
-            .to_uri(SipUri::new(&dest_host).with_user(&dest_user), None)
+            .to_uri(SipUri::new(&dest_host).with_user(&b_leg_user), None)
             .call_id(&b_leg_sip_call_id)
             .cseq(1)
             .max_forwards(b_leg_max_forwards)
@@ -3673,6 +4235,12 @@ impl SipStack {
             Err(e) => {
                 error!(error = %e, "Failed to build B-leg INVITE");
                 self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                self.release_slots(
+                    trunk_lease.as_ref(),
+                    vps_callee.as_deref(),
+                    TrunkOutcome::Abandoned,
+                )
+                .await;
                 self.release_rtp_port(b_leg_rtp_port);
                 if let Some(ref pipeline) = self.media_pipeline {
                     let _ = pipeline.remove_session(&session_key).await;
@@ -3718,6 +4286,10 @@ impl SipStack {
                 .await
                 .hide_b2bua_request(&mut b_leg_request.headers);
         }
+
+        // Failover re-sends this exact INVITE (fresh Call-ID/branch/tag), so
+        // keep a copy only when there is somewhere to fail over to.
+        let b_leg_invite = (!failover_targets.is_empty()).then(|| Arc::new(b_leg_request.clone()));
 
         // 8. Store call state and correlation
         {
@@ -3775,7 +4347,11 @@ impl SipStack {
                     a_leg_sip_call_id: a_leg_call_id.clone(),
                     b_leg_sip_call_id: b_leg_sip_call_id.clone(),
                     local_addr: local_sip_addr,
-                    failover_trunks,
+                    failover_targets,
+                    trunk_lease,
+                    vps_callee,
+                    b_leg_invite,
+                    early_media_committed: false,
                     a_leg_via,
                     a_leg_from,
                     a_leg_to,
@@ -4005,21 +4581,13 @@ impl SipStack {
             bye_request
         };
 
-        // Clean up call state
+        // Clean up call state; RTP ports (C12) and the trunk / VPS slots
+        // are released with the correlation record, exactly once.
         {
             let mut calls = self.calls.write().await;
             calls.calls.remove(&internal_id);
         }
-        {
-            let mut corr = self.call_correlation.write().await;
-            corr.a_leg.remove(&addrs.a_leg_sip_call_id);
-            corr.b_leg.remove(&addrs.b_leg_sip_call_id);
-            corr.addresses.remove(&internal_id);
-        }
-        // Release allocated RTP ports (C12).
-        for port in &addrs.rtp_ports {
-            self.release_rtp_port(*port);
-        }
+        self.finish_call_record(&internal_id, false).await;
 
         info!(
             call_id = %sip_call_id,
@@ -4169,21 +4737,13 @@ impl SipStack {
         ));
         b_cancel.headers.set(HeaderName::ContentLength, "0");
 
-        // Clean up
+        // Clean up; RTP ports (C12) and the trunk / VPS slots are released
+        // with the correlation record, exactly once.
         {
             let mut calls = self.calls.write().await;
             calls.calls.remove(&internal_id);
         }
-        {
-            let mut corr = self.call_correlation.write().await;
-            corr.a_leg.remove(&addrs.a_leg_sip_call_id);
-            corr.b_leg.remove(&addrs.b_leg_sip_call_id);
-            corr.addresses.remove(&internal_id);
-        }
-        // Release allocated RTP ports (C12).
-        for port in &addrs.rtp_ports {
-            self.release_rtp_port(*port);
-        }
+        self.finish_call_record(&internal_id, false).await;
 
         info!(call_id = %sip_call_id, "Call cancelled");
         audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Canceled);
@@ -6478,7 +7038,11 @@ mod tests {
             a_leg_sip_call_id: "aleg-callid".to_string(),
             b_leg_sip_call_id: "bleg-callid".to_string(),
             local_addr: "10.0.0.9:5060".to_string(),
-            failover_trunks: vec![],
+            failover_targets: vec![],
+            trunk_lease: None,
+            vps_callee: None,
+            b_leg_invite: None,
+            early_media_committed: false,
             a_leg_via: vec!["SIP/2.0/UDP 10.0.0.1;branch=z9hG4bK-a".to_string()],
             a_leg_from: "<sip:caller@10.0.0.1>;tag=callertag".to_string(),
             a_leg_to: "<sip:callee@sbc>".to_string(),
@@ -7314,6 +7878,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reused_branch_with_new_call_id_is_a_new_request() {
+        // A client that reuses branch values (SIPp restarted under the same
+        // PID does) must not have its new request swallowed as a
+        // retransmission of an earlier call's transaction.
+        let (stack, _) = ringing_call().await;
+        let first = alice_request("INVITE", 1, None, Some(ALICE_SDP));
+        let second = String::from_utf8(first.to_vec())
+            .unwrap()
+            .replace("Call-ID: call-relay@test", "Call-ID: call-other@test");
+        let results = flatten(
+            stack
+                .process_message(&Bytes::from(second), alice(), None)
+                .await,
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, ProcessResult::Forward { .. })),
+            "new INVITE forwarded, not answered from the old transaction: {results:?}"
+        );
+        assert_eq!(stack.call_count().await, 2, "second call created");
+    }
+
+    #[tokio::test]
     async fn timers_retransmit_the_invite_and_a_lost_final_response() {
         let (stack, b_invite) = ringing_call().await;
 
@@ -7528,6 +8116,1060 @@ mod tests {
                 .terminate_call_on_media_failure("nope")
                 .await
                 .is_empty()
+        );
+    }
+
+    // ── Trunk routing: translation, failover, call limits ──────────────
+
+    /// Trunk group "carriers": t1 (127.0.0.2, priority 1) and t2
+    /// (127.0.0.3, priority 2), each `max_calls`. The dial plan sends `+1…`
+    /// there and strips the `+1` (the translated number). Alice's address
+    /// is an admitted trunk source.
+    async fn trunk_stack(
+        max_calls: u32,
+        transform: (&str, &str),
+        vps: Option<uc_vps::VpsEngine>,
+    ) -> SipStack {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        let routing = sbc_config::RoutingConfig {
+            use_dial_plan: true,
+            max_failover_attempts: 3,
+            default_trunk_group: "carriers".to_string(),
+        };
+        let dial_plans = vec![sbc_config::DialPlanConfig {
+            id: "plan".to_string(),
+            name: "Plan".to_string(),
+            active: true,
+            entries: vec![sbc_config::DialPlanEntryConfig {
+                direction: "both".to_string(),
+                pattern_type: "prefix".to_string(),
+                pattern_value: "+1".to_string(),
+                trunk_group: "carriers".to_string(),
+                transform_type: transform.0.to_string(),
+                transform_value: transform.1.to_string(),
+                priority: 1,
+                ..Default::default()
+            }],
+        }];
+        let trunk = |id: &str, host: &str, priority: u32| sbc_config::TrunkConfigSchema {
+            id: id.to_string(),
+            host: host.to_string(),
+            port: 5060,
+            protocol: "udp".to_string(),
+            priority,
+            max_calls,
+            max_failures: 3,
+            ..Default::default()
+        };
+        let groups = vec![sbc_config::TrunkGroupConfig {
+            id: "carriers".to_string(),
+            name: "Carriers".to_string(),
+            strategy: "priority".to_string(),
+            trunks: vec![trunk("t1", "127.0.0.2", 1), trunk("t2", "127.0.0.3", 2)],
+            zone: None,
+        }];
+        stack.init_router_from_config(&routing, &dial_plans, &groups);
+        if let Some(engine) = vps {
+            stack.set_vps_engine(engine);
+        }
+        stack
+            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        stack
+    }
+
+    fn t1() -> SbcSocketAddr {
+        SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(127, 0, 0, 2), 5060)
+    }
+
+    fn t2() -> SbcSocketAddr {
+        SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(127, 0, 0, 3), 5060)
+    }
+
+    const DIALED: &str = "+15551234567";
+
+    /// A request from alice for call `call_id` to `user`. INVITE and CANCEL
+    /// of one transaction share the branch.
+    fn caller_request(
+        method: &str,
+        user: &str,
+        call_id: &str,
+        cseq: u32,
+        to_tag: Option<&str>,
+        body: Option<&str>,
+    ) -> Bytes {
+        let to = to_tag.map_or_else(
+            || format!("<sip:{user}@sbc.local>"),
+            |t| format!("<sip:{user}@sbc.local>;tag={t}"),
+        );
+        let mut msg = format!(
+            "{method} sip:{user}@sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-{call_id}-{cseq}\r\n\
+             From: <sip:alice@example.com>;tag=a-{call_id}\r\n\
+             To: {to}\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Contact: <sip:alice@192.168.1.1:5060>\r\n"
+        );
+        match body {
+            Some(b) => drop(write!(
+                msg,
+                "Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{b}",
+                b.len()
+            )),
+            None => msg.push_str("Content-Length: 0\r\n\r\n"),
+        }
+        Bytes::from(msg)
+    }
+
+    async fn place_call(stack: &SipStack, call_id: &str) -> Vec<ProcessResult> {
+        flatten(
+            stack
+                .process_message(
+                    &caller_request("INVITE", DIALED, call_id, 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        )
+    }
+
+    async fn active(stack: &SipStack, trunk: &str) -> u32 {
+        stack
+            .trunk_active_calls("carriers", trunk)
+            .await
+            .expect("trunk exists")
+    }
+
+    async fn trunk_state(stack: &SipStack, trunk: &str) -> uc_routing::TrunkState {
+        stack
+            .router()
+            .expect("router")
+            .read()
+            .await
+            .get_trunk_group("carriers")
+            .and_then(|g| g.get_trunk(trunk))
+            .expect("trunk exists")
+            .state()
+    }
+
+    async fn assert_all_released(stack: &SipStack) {
+        assert_eq!(active(stack, "t1").await, 0, "t1 slots released");
+        assert_eq!(active(stack, "t2").await, 0, "t2 slots released");
+        if let Some(n) = stack.vps_callee_concurrent_calls(DIALED).await {
+            assert_eq!(n, 0, "VPS callee slot released");
+        }
+        assert!(stack.call_correlation.read().await.addresses.is_empty());
+    }
+
+    fn vps_with_callee_cap(cap: u32) -> uc_vps::VpsEngine {
+        uc_vps::VpsEngine::new(&uc_vps::VpsConfig {
+            enabled: true,
+            tdos: uc_vps::TdosConfig {
+                per_source_cps: 0,
+                register_per_source_rps: 0,
+                per_callee_max_concurrent: cap,
+                ..uc_vps::TdosConfig::default()
+            },
+            ..uc_vps::VpsConfig::default()
+        })
+        .expect("valid VPS config")
+    }
+
+    #[tokio::test]
+    async fn translated_number_is_on_b_leg_request_uri_and_to() {
+        let stack = trunk_stack(10, ("strip_prefix", "2"), None).await;
+        let results = place_call(&stack, "xlate@test").await;
+        let (b_invite, dest) = forwarded(&results, &Method::Invite).expect("INVITE to trunk");
+        assert_eq!(dest, t1());
+        assert_eq!(b_invite.uri.user.as_deref(), Some("5551234567"));
+        let to = b_invite.headers.get_value(&HeaderName::To).unwrap();
+        assert!(
+            to.contains("sip:5551234567@"),
+            "To carries the translated number: {to}"
+        );
+        let wire =
+            String::from_utf8_lossy(&SipMessage::Request(b_invite.clone()).to_bytes()).into_owned();
+        assert!(wire.starts_with("INVITE sip:5551234567@"), "{wire}");
+        assert_eq!(active(&stack, "t1").await, 1);
+
+        // 200 then BYE from the caller releases the slot.
+        let b_invite = b_invite.clone();
+        stack
+            .process_message(
+                &response_to(&b_invite, 200, Some("bobtag"), Some(BOB_SDP)),
+                t1(),
+                None,
+            )
+            .await;
+        stack
+            .process_message(
+                &caller_request("BYE", DIALED, "xlate@test", 2, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        assert_all_released(&stack).await;
+        let stats = stack
+            .router()
+            .unwrap()
+            .read()
+            .await
+            .get_trunk_group("carriers")
+            .and_then(|g| g.get_trunk("t1"))
+            .map(|t| t.stats().calls_succeeded);
+        assert_eq!(stats, Some(1), "answered call counted as a success");
+    }
+
+    #[tokio::test]
+    async fn unsafe_translation_is_rejected_with_500_and_nothing_sent() {
+        for prefix in ["@evil.example;", "x\r\nX-Injected: 1"] {
+            let stack = trunk_stack(10, ("add_prefix", prefix), None).await;
+            let results = place_call(&stack, "inject@test").await;
+            assert!(forwarded(&results, &Method::Invite).is_none());
+            assert!(responded(&results, 500).is_some(), "500 for {prefix:?}");
+            assert_all_released(&stack).await;
+        }
+    }
+
+    #[test]
+    fn safe_b_leg_user_charset() {
+        for ok in [
+            "5551234567",
+            "+15551234567",
+            "*67",
+            "user.name",
+            "a-b_c!~'()&=+$,",
+        ] {
+            assert!(is_safe_b_leg_user(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "a@b",
+            "a;b",
+            "a?b",
+            "a/b",
+            "a>b",
+            "a<b",
+            "a b",
+            "a\r\nb",
+            "a%40b",
+            "#123",
+            &"9".repeat(65),
+        ] {
+            assert!(!is_safe_b_leg_user(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn replace_header_param_rewrites_or_appends() {
+        assert_eq!(
+            replace_header_param(
+                "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKold;rport",
+                "branch",
+                "z9hG4bKnew"
+            ),
+            "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKnew;rport"
+        );
+        assert_eq!(
+            replace_header_param("<sip:sbc@d;tag=inuri>;tag=old", "tag", "new"),
+            "<sip:sbc@d;tag=inuri>;tag=new"
+        );
+        assert_eq!(
+            replace_header_param("<sip:sbc@d>", "tag", "t"),
+            "<sip:sbc@d>;tag=t"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_on_503_retries_next_trunk_with_same_sdp() {
+        let stack = trunk_stack(10, ("strip_prefix", "2"), None).await;
+        let results = place_call(&stack, "fo@test").await;
+        let (first, _) = forwarded(&results, &Method::Invite).expect("INVITE to t1");
+        let first = first.clone();
+
+        let results = flatten(
+            stack
+                .process_message(&response_to(&first, 503, Some("t1tag"), None), t1(), None)
+                .await,
+        );
+        let (ack, ack_dest) = forwarded(&results, &Method::Ack).expect("503 ACKed");
+        assert_eq!(ack_dest, t1());
+        assert_eq!(ack.headers.call_id(), first.headers.call_id());
+        assert!(
+            responded(&results, 503).is_none(),
+            "caller does not see the 503"
+        );
+        let (retry, dest) = forwarded(&results, &Method::Invite).expect("INVITE to t2");
+        assert_eq!(dest, t2());
+        assert_eq!(retry.body, first.body, "same SDP offer");
+        assert_eq!(retry.uri.user.as_deref(), Some("5551234567"));
+        assert_ne!(retry.headers.call_id(), first.headers.call_id());
+        assert_ne!(retry.headers.via_branch(), first.headers.via_branch());
+        assert_ne!(retry.headers.from_tag(), first.headers.from_tag());
+        assert_eq!(retry.headers.cseq(), Some("1 INVITE"));
+        assert_eq!(active(&stack, "t1").await, 0);
+        assert_eq!(active(&stack, "t2").await, 1);
+        assert_eq!(
+            trunk_state(&stack, "t1").await,
+            uc_routing::TrunkState::Cooldown,
+            "503 puts the trunk into cooldown"
+        );
+
+        // The new branch is accepted; 200 + BYE from the callee releases t2.
+        let retry = retry.clone();
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&retry, 200, Some("bobtag"), Some(BOB_SDP)),
+                    t2(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 200).is_some(), "200 from t2 relayed");
+        stack
+            .process_message(&bob_request(&retry, "BYE", 1, None), t2(), None)
+            .await;
+        assert_all_released(&stack).await;
+    }
+
+    #[tokio::test]
+    async fn failover_exhausted_relays_last_error_and_releases() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "exhaust@test").await;
+        let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+        let first = first.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&first, 500, Some("x"), None), t1(), None)
+                .await,
+        );
+        let (retry, _) = forwarded(&results, &Method::Invite).expect("failover to t2");
+        let retry = retry.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&retry, 502, Some("y"), None), t2(), None)
+                .await,
+        );
+        let (_, dest) = responded(&results, 502).expect("last error relayed");
+        assert_eq!(dest, alice());
+        assert!(forwarded(&results, &Method::Invite).is_none());
+        assert_all_released(&stack).await;
+    }
+
+    #[tokio::test]
+    async fn callee_reject_does_not_fail_over() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "busy@test").await;
+        let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+        let first = first.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&first, 486, Some("x"), None), t1(), None)
+                .await,
+        );
+        assert!(responded(&results, 486).is_some());
+        assert!(
+            forwarded(&results, &Method::Invite).is_none(),
+            "no failover on 486"
+        );
+        assert_all_released(&stack).await;
+        assert_eq!(
+            trunk_state(&stack, "t1").await,
+            uc_routing::TrunkState::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn no_failover_after_reliable_early_media() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "early@test").await;
+        let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+        let first = first.clone();
+        // Reliable 183 with SDP (RFC 3262 RSeq).
+        let mut early =
+            String::from_utf8_lossy(&response_to(&first, 183, Some("x"), Some(BOB_SDP)))
+                .into_owned();
+        early = early.replacen(
+            "Content-Type:",
+            "Require: 100rel\r\nRSeq: 1\r\nContent-Type:",
+            1,
+        );
+        stack.process_message(&Bytes::from(early), t1(), None).await;
+        let results = flatten(
+            stack
+                .process_message(&response_to(&first, 503, Some("x"), None), t1(), None)
+                .await,
+        );
+        assert!(
+            responded(&results, 503).is_some(),
+            "503 relayed, no failover"
+        );
+        assert!(forwarded(&results, &Method::Invite).is_none());
+        assert_all_released(&stack).await;
+    }
+
+    #[tokio::test]
+    async fn timer_b_fails_over_then_408_when_exhausted() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "timerb@test").await;
+        let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+        let first = first.clone();
+        let internal = stack
+            .call_correlation
+            .read()
+            .await
+            .a_leg
+            .get("timerb@test")
+            .cloned()
+            .unwrap();
+
+        let out = stack
+            .fail_timed_out_request(&first.headers.via_branch().unwrap(), &internal)
+            .await;
+        let (retry, dest) = forwarded(&out, &Method::Invite).expect("Timer B fails over");
+        assert_eq!(dest, t2());
+        assert_eq!(active(&stack, "t1").await, 0);
+        assert_eq!(active(&stack, "t2").await, 1);
+
+        let out = stack
+            .fail_timed_out_request(&retry.headers.via_branch().unwrap(), &internal)
+            .await;
+        assert!(responded(&out, 408).is_some(), "exhausted: 408 to caller");
+        assert_all_released(&stack).await;
+    }
+
+    #[tokio::test]
+    async fn options_down_trunk_is_skipped() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        assert_eq!(stack.set_trunk_reachable("t1", false).await, 1);
+        let results = place_call(&stack, "down@test").await;
+        let (_, dest) = forwarded(&results, &Method::Invite).unwrap();
+        assert_eq!(dest, t2(), "down trunk skipped");
+
+        stack.set_trunk_reachable("t1", true).await;
+        let results = place_call(&stack, "up@test").await;
+        let (_, dest) = forwarded(&results, &Method::Invite).unwrap();
+        assert_eq!(dest, t1(), "trunk back in service");
+    }
+
+    #[tokio::test]
+    async fn trunk_at_max_calls_is_skipped_then_503_when_all_full() {
+        let stack = trunk_stack(1, ("none", ""), None).await;
+        let r1 = place_call(&stack, "c1@test").await;
+        assert_eq!(forwarded(&r1, &Method::Invite).unwrap().1, t1());
+        let r2 = place_call(&stack, "c2@test").await;
+        assert_eq!(forwarded(&r2, &Method::Invite).unwrap().1, t2());
+
+        let r3 = place_call(&stack, "c3@test").await;
+        assert!(forwarded(&r3, &Method::Invite).is_none());
+        let (resp, _) = responded(&r3, 503).expect("503 when every trunk is full");
+        assert_eq!(resp.headers.get_value(&HeaderName::RetryAfter), Some("5"));
+
+        // CANCEL before answer and BYE from the callee both release.
+        stack
+            .process_message(
+                &caller_request("CANCEL", DIALED, "c1@test", 1, None, None),
+                alice(),
+                None,
+            )
+            .await;
+        assert_eq!(active(&stack, "t1").await, 0);
+        let (b2, _) = forwarded(&r2, &Method::Invite).unwrap();
+        let b2 = b2.clone();
+        stack
+            .process_message(
+                &response_to(&b2, 200, Some("bobtag"), Some(BOB_SDP)),
+                t2(),
+                None,
+            )
+            .await;
+        stack
+            .process_message(&bob_request(&b2, "BYE", 1, None), t2(), None)
+            .await;
+        assert_all_released(&stack).await;
+
+        // Retransmitted BYE / CANCEL after teardown do not double-release.
+        stack
+            .process_message(&bob_request(&b2, "BYE", 1, None), t2(), None)
+            .await;
+        stack
+            .process_message(
+                &caller_request("CANCEL", DIALED, "c1@test", 1, None, None),
+                alice(),
+                None,
+            )
+            .await;
+        assert_all_released(&stack).await;
+        let r4 = place_call(&stack, "c4@test").await;
+        assert_eq!(forwarded(&r4, &Method::Invite).unwrap().1, t1());
+    }
+
+    #[tokio::test]
+    async fn early_bye_from_caller_releases() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        place_call(&stack, "ebye@test").await;
+        stack
+            .process_message(
+                &caller_request("BYE", DIALED, "ebye@test", 2, None, None),
+                alice(),
+                None,
+            )
+            .await;
+        assert_all_released(&stack).await;
+    }
+
+    #[tokio::test]
+    async fn per_callee_max_concurrent_rejects_the_next_call() {
+        let stack = trunk_stack(10, ("none", ""), Some(vps_with_callee_cap(1))).await;
+        let r1 = place_call(&stack, "v1@test").await;
+        let (b1, _) = forwarded(&r1, &Method::Invite).expect("first call allowed");
+        let b1 = b1.clone();
+        assert_eq!(stack.vps_callee_concurrent_calls(DIALED).await, Some(1));
+
+        let r2 = place_call(&stack, "v2@test").await;
+        assert!(forwarded(&r2, &Method::Invite).is_none());
+        assert!(
+            responded(&r2, uc_vps::CONCURRENCY_CAP_STATUS).is_some(),
+            "second concurrent call to the callee rejected"
+        );
+        assert_eq!(
+            active(&stack, "t1").await,
+            1,
+            "rejected call took no trunk slot"
+        );
+
+        stack
+            .process_message(
+                &response_to(&b1, 200, Some("bobtag"), Some(BOB_SDP)),
+                t1(),
+                None,
+            )
+            .await;
+        stack
+            .process_message(
+                &caller_request("BYE", DIALED, "v1@test", 2, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        assert_all_released(&stack).await;
+        let r3 = place_call(&stack, "v3@test").await;
+        assert!(
+            forwarded(&r3, &Method::Invite).is_some(),
+            "slot freed by BYE"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_trunks_down_503_releases_vps_slot() {
+        let stack = trunk_stack(10, ("none", ""), Some(vps_with_callee_cap(1))).await;
+        stack.set_trunk_reachable("t1", false).await;
+        stack.set_trunk_reachable("t2", false).await;
+        let r = place_call(&stack, "none@test").await;
+        assert!(responded(&r, 503).is_some());
+        assert_eq!(stack.vps_callee_concurrent_calls(DIALED).await, Some(0));
+    }
+
+    fn register_msg(user: &str, call_id: &str, cseq: u32, expires: u32) -> Bytes {
+        Bytes::from(format!(
+            "REGISTER sip:sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-{call_id}-{cseq}\r\n\
+             From: <sip:{user}@sbc.local>;tag=r{cseq}\r\n\
+             To: <sip:{user}@sbc.local>\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: {cseq} REGISTER\r\n\
+             Contact: <sip:{user}@127.0.0.1:5060>\r\n\
+             Expires: {expires}\r\n\
+             Content-Length: 0\r\n\r\n"
+        ))
+    }
+
+    async fn register_status(stack: &SipStack, msg: &Bytes) -> (u16, Option<String>) {
+        match stack.process_message(msg, bob(), None).await {
+            ProcessResult::Response {
+                message: SipMessage::Response(r),
+                ..
+            } => (
+                r.status.code(),
+                r.headers
+                    .get_value(&HeaderName::RetryAfter)
+                    .map(String::from),
+            ),
+            other => panic!("expected a response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn max_registrations_rejects_new_bindings_but_allows_refresh() {
+        let stack = SipStack::new(SipStackConfig {
+            max_registrations: 1,
+            ..SipStackConfig::default()
+        });
+        assert_eq!(
+            register_status(&stack, &register_msg("u1", "r-u1", 1, 3600))
+                .await
+                .0,
+            200
+        );
+
+        let (code, retry) = register_status(&stack, &register_msg("u2", "r-u2", 1, 3600)).await;
+        assert_eq!(code, 503, "second AoR over the cap");
+        assert_eq!(retry.as_deref(), Some("60"));
+
+        // Refresh of the existing binding is always allowed.
+        assert_eq!(
+            register_status(&stack, &register_msg("u1", "r-u1", 2, 3600))
+                .await
+                .0,
+            200
+        );
+        // De-registration is always allowed and frees the slot.
+        assert_eq!(
+            register_status(&stack, &register_msg("u1", "r-u1", 3, 0))
+                .await
+                .0,
+            200
+        );
+        assert_eq!(
+            register_status(&stack, &register_msg("u2", "r-u2", 2, 3600))
+                .await
+                .0,
+            200
+        );
+    }
+
+    // ── QA additions (dead-config features) ─────────────────────────────
+
+    /// Sends `status` from t1 for the first B-leg INVITE of a fresh call and
+    /// returns the stack plus the resulting outputs.
+    async fn first_trunk_answers(status: u16, call_id: &str) -> (SipStack, Vec<ProcessResult>) {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, call_id).await;
+        let (first, dest) = forwarded(&results, &Method::Invite).expect("INVITE to t1");
+        assert_eq!(dest, t1());
+        let first = first.clone();
+        let out = flatten(
+            stack
+                .process_message(
+                    &response_to(&first, status, Some("t1tag"), None),
+                    t1(),
+                    None,
+                )
+                .await,
+        );
+        (stack, out)
+    }
+
+    #[tokio::test]
+    async fn qa_every_failover_status_moves_call_to_second_trunk() {
+        for status in [408_u16, 500, 502, 503, 504] {
+            let (stack, out) = first_trunk_answers(status, &format!("fo{status}@qa")).await;
+            let (retry, dest) =
+                forwarded(&out, &Method::Invite).unwrap_or_else(|| panic!("{status} fails over"));
+            assert_eq!(dest, t2(), "{status}: retry goes to t2");
+            assert!(
+                responded(&out, status).is_none(),
+                "{status} hidden from caller"
+            );
+            assert_eq!(active(&stack, "t1").await, 0, "{status}: t1 released");
+            assert_eq!(active(&stack, "t2").await, 1, "{status}: t2 reserved");
+            let expect = if status == 503 {
+                uc_routing::TrunkState::Cooldown
+            } else {
+                uc_routing::TrunkState::Available
+            };
+            assert_eq!(
+                trunk_state(&stack, "t1").await,
+                expect,
+                "{status}: t1 state"
+            );
+            // Caller CANCEL during the failover attempt releases t2.
+            let retry = retry.clone();
+            stack
+                .process_message(
+                    &caller_request("CANCEL", DIALED, &format!("fo{status}@qa"), 1, None, None),
+                    alice(),
+                    None,
+                )
+                .await;
+            stack
+                .process_message(&response_to(&retry, 487, Some("t2tag"), None), t2(), None)
+                .await;
+            assert_all_released(&stack).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn qa_client_and_global_errors_never_fail_over() {
+        for status in [400_u16, 403, 404, 480, 484, 486, 488, 600, 603, 604, 606] {
+            let (stack, out) = first_trunk_answers(status, &format!("nofo{status}@qa")).await;
+            assert!(
+                forwarded(&out, &Method::Invite).is_none(),
+                "{status} must not fail over"
+            );
+            let (_, dest) =
+                responded(&out, status).unwrap_or_else(|| panic!("{status} relayed to caller"));
+            assert_eq!(dest, alice());
+            assert_all_released(&stack).await;
+            assert_eq!(
+                trunk_state(&stack, "t1").await,
+                uc_routing::TrunkState::Available,
+                "{status}: no cooldown"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn qa_failover_still_happens_after_unreliable_or_sdp_less_18x() {
+        // 180 without SDP, 183 with SDP but unreliable, reliable 180 without SDP.
+        let cases: [(&str, u16, Option<&str>, bool); 3] = [
+            ("p180", 180, None, false),
+            ("p183", 183, Some(BOB_SDP), false),
+            ("r180", 180, None, true),
+        ];
+        for (tag, code, body, reliable) in cases {
+            let stack = trunk_stack(10, ("none", ""), None).await;
+            let call_id = format!("{tag}@qa");
+            let results = place_call(&stack, &call_id).await;
+            let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+            let first = first.clone();
+            let mut prov =
+                String::from_utf8_lossy(&response_to(&first, code, Some("x"), body)).into_owned();
+            if reliable {
+                prov = prov.replacen(
+                    "Content-Length:",
+                    "Require: 100rel\r\nRSeq: 1\r\nContent-Length:",
+                    1,
+                );
+            }
+            stack.process_message(&Bytes::from(prov), t1(), None).await;
+            let out = flatten(
+                stack
+                    .process_message(&response_to(&first, 503, Some("x"), None), t1(), None)
+                    .await,
+            );
+            let (_, dest) = forwarded(&out, &Method::Invite)
+                .unwrap_or_else(|| panic!("{tag}: failover after provisional"));
+            assert_eq!(dest, t2());
+            assert_eq!(active(&stack, "t2").await, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn qa_failover_then_caller_bye_releases() {
+        let (stack, out) = first_trunk_answers(500, "fobye@qa").await;
+        let (retry, _) = forwarded(&out, &Method::Invite).unwrap();
+        let retry = retry.clone();
+        stack
+            .process_message(
+                &response_to(&retry, 200, Some("bobtag"), Some(BOB_SDP)),
+                t2(),
+                None,
+            )
+            .await;
+        stack
+            .process_message(
+                &caller_request("BYE", DIALED, "fobye@qa", 2, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        assert_all_released(&stack).await;
+    }
+
+    #[tokio::test]
+    async fn qa_bye_cancel_race_releases_exactly_once() {
+        let stack = trunk_stack(1, ("none", ""), Some(vps_with_callee_cap(5))).await;
+        let results = place_call(&stack, "race@qa").await;
+        let (b, _) = forwarded(&results, &Method::Invite).unwrap();
+        let b = b.clone();
+        let cancel = caller_request("CANCEL", DIALED, "race@qa", 1, None, None);
+        let bye = caller_request("BYE", DIALED, "race@qa", 2, None, None);
+        let bob_bye = bob_request(&b, "BYE", 1, None);
+        let (_, _, _) = tokio::join!(
+            stack.process_message(&cancel, alice(), None),
+            stack.process_message(&bye, alice(), None),
+            stack.process_message(&bob_bye, t1(), None),
+        );
+        assert_all_released(&stack).await;
+        // Capacity is fully restored (no double-decrement hiding a leak):
+        // max_calls=1 on each trunk, so two calls fit and a third is 503.
+        let r1 = place_call(&stack, "race2@qa").await;
+        assert_eq!(forwarded(&r1, &Method::Invite).unwrap().1, t1());
+        let r2 = place_call(&stack, "race3@qa").await;
+        assert_eq!(forwarded(&r2, &Method::Invite).unwrap().1, t2());
+        let r3 = place_call(&stack, "race4@qa").await;
+        assert!(responded(&r3, 503).is_some());
+        assert_eq!(stack.vps_callee_concurrent_calls(DIALED).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn qa_trunk_marked_down_mid_call_then_up() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "mid@qa").await;
+        let (b, _) = forwarded(&results, &Method::Invite).unwrap();
+        let b = b.clone();
+        stack.set_trunk_reachable("t1", false).await;
+        assert_eq!(
+            trunk_state(&stack, "t1").await,
+            uc_routing::TrunkState::Failed
+        );
+        let r2 = place_call(&stack, "mid2@qa").await;
+        assert_eq!(
+            forwarded(&r2, &Method::Invite).unwrap().1,
+            t2(),
+            "down t1 skipped"
+        );
+        // The in-progress t1 call still tears down and releases its slot.
+        stack
+            .process_message(
+                &response_to(&b, 200, Some("bobtag"), Some(BOB_SDP)),
+                t1(),
+                None,
+            )
+            .await;
+        stack
+            .process_message(&bob_request(&b, "BYE", 1, None), t1(), None)
+            .await;
+        assert_eq!(active(&stack, "t1").await, 0);
+        assert_eq!(
+            trunk_state(&stack, "t1").await,
+            uc_routing::TrunkState::Failed
+        );
+        stack.set_trunk_reachable("t1", true).await;
+        assert_eq!(
+            trunk_state(&stack, "t1").await,
+            uc_routing::TrunkState::Available
+        );
+        let r3 = place_call(&stack, "mid3@qa").await;
+        assert_eq!(
+            forwarded(&r3, &Method::Invite).unwrap().1,
+            t1(),
+            "t1 back up"
+        );
+        // Unknown trunk IDs touch nothing.
+        assert_eq!(stack.set_trunk_reachable("nope", false).await, 0);
+    }
+
+    #[tokio::test]
+    async fn qa_header_injection_in_translated_number_is_rejected() {
+        let long = "9".repeat(60);
+        for prefix in [
+            ">",
+            ";maddr=evil.example",
+            "?X-Evil=1&",
+            "\r\n",
+            "\n",
+            "\r",
+            "a b",
+            "%0d%0a",
+            "<sip:evil@evil.example>",
+            long.as_str(),
+        ] {
+            let stack = trunk_stack(10, ("add_prefix", prefix), None).await;
+            let results = place_call(&stack, "inj@qa").await;
+            assert!(
+                forwarded(&results, &Method::Invite).is_none(),
+                "nothing on the wire for {prefix:?}"
+            );
+            assert!(responded(&results, 500).is_some(), "500 for {prefix:?}");
+            assert_all_released(&stack).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn qa_translated_number_on_failover_invite_wire_bytes() {
+        let stack = trunk_stack(10, ("strip_prefix", "2"), None).await;
+        let results = place_call(&stack, "wire@qa").await;
+        let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+        let first = first.clone();
+        let out = flatten(
+            stack
+                .process_message(&response_to(&first, 503, Some("t"), None), t1(), None)
+                .await,
+        );
+        let (retry, _) = forwarded(&out, &Method::Invite).unwrap();
+        let wire =
+            String::from_utf8_lossy(&SipMessage::Request(retry.clone()).to_bytes()).into_owned();
+        assert!(wire.starts_with("INVITE sip:5551234567@"), "{wire}");
+        let to_line = wire
+            .lines()
+            .find(|l| l.starts_with("To:"))
+            .expect("To header");
+        assert!(to_line.contains("sip:5551234567@"), "{to_line}");
+        assert!(
+            !to_line.contains("tag="),
+            "fresh B-leg To has no tag: {to_line}"
+        );
+        assert!(
+            !wire.contains(DIALED),
+            "dialed number not leaked in R-URI/To"
+        );
+    }
+
+    #[tokio::test]
+    async fn qa_config_cooldown_and_max_failures_reach_router() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        let groups = vec![sbc_config::TrunkGroupConfig {
+            id: "g".to_string(),
+            name: "G".to_string(),
+            strategy: "priority".to_string(),
+            trunks: vec![sbc_config::TrunkConfigSchema {
+                id: "tx".to_string(),
+                host: "127.0.0.9".to_string(),
+                port: 5060,
+                protocol: "udp".to_string(),
+                priority: 1,
+                max_calls: 7,
+                max_failures: 2,
+                cooldown_secs: 77,
+                ..Default::default()
+            }],
+            zone: None,
+        }];
+        stack.init_router_from_config(&sbc_config::RoutingConfig::default(), &[], &groups);
+        let router = stack.router().expect("router").read().await;
+        let cfg = router
+            .get_trunk_group("g")
+            .and_then(|g| g.get_trunk("tx"))
+            .expect("trunk")
+            .config()
+            .clone();
+        drop(router);
+        assert_eq!(cfg.max_calls, 7);
+        assert_eq!(cfg.max_failures, 2);
+        assert_eq!(cfg.cooldown_secs, 77);
+    }
+
+    fn register_raw(
+        user: &str,
+        call_id: &str,
+        cseq: u32,
+        contacts: &str,
+        expires: Option<u32>,
+    ) -> Bytes {
+        let exp = expires.map_or_else(String::new, |e| format!("Expires: {e}\r\n"));
+        Bytes::from(format!(
+            "REGISTER sip:sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-{call_id}-{cseq}\r\n\
+             From: <sip:{user}@sbc.local>;tag=r{cseq}\r\n\
+             To: <sip:{user}@sbc.local>\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: {cseq} REGISTER\r\n\
+             {contacts}{exp}\
+             Content-Length: 0\r\n\r\n"
+        ))
+    }
+
+    #[tokio::test]
+    async fn qa_max_registrations_counts_bindings_and_allows_deregistration_forms() {
+        let stack = SipStack::new(SipStackConfig {
+            max_registrations: 2,
+            ..SipStackConfig::default()
+        });
+        let ok = |code: (u16, Option<String>)| code.0;
+        assert_eq!(
+            ok(register_status(&stack, &register_msg("u1", "q-u1", 1, 3600)).await),
+            200
+        );
+        assert_eq!(
+            ok(register_status(&stack, &register_msg("u2", "q-u2", 1, 3600)).await),
+            200
+        );
+        // A third binding (new AoR) is rejected with Retry-After.
+        let (code, ra) = register_status(&stack, &register_msg("u3", "q-u3", 1, 3600)).await;
+        assert_eq!((code, ra.as_deref()), (503, Some("60")));
+        // A multi-contact REGISTER for a new AoR at the cap is rejected too.
+        let three = "Contact: <sip:u5@127.0.0.1:1>\r\nContact: <sip:u5@127.0.0.1:2>\r\n";
+        assert_eq!(
+            ok(register_status(&stack, &register_raw("u5", "q-u5", 1, three, Some(3600))).await),
+            503
+        );
+        // A query (no Contact) at the cap is allowed.
+        assert_eq!(
+            ok(register_status(&stack, &register_raw("u2", "q-u2", 2, "", None)).await),
+            200
+        );
+        // Per-contact expires=0 de-registration at the cap is allowed and frees a slot.
+        let off = "Contact: <sip:u1@127.0.0.1:5060>;expires=0\r\n";
+        assert_eq!(
+            ok(register_status(&stack, &register_raw("u1", "q-u1", 2, off, None)).await),
+            200
+        );
+        assert_eq!(
+            ok(register_status(&stack, &register_msg("u3", "q-u3", 2, 3600)).await),
+            200
+        );
+        // Wildcard de-registration at the cap is allowed and frees a slot.
+        assert_eq!(
+            ok(register_status(
+                &stack,
+                &register_raw("u2", "q-u2", 3, "Contact: *\r\n", Some(0))
+            )
+            .await),
+            200
+        );
+        assert_eq!(
+            ok(register_status(&stack, &register_msg("u4", "q-u4", 1, 3600)).await),
+            200
+        );
+    }
+
+    /// RFC 3261 §10.3 step 7: a REGISTER for an existing contact with a new
+    /// Call-ID (UA reboot) replaces that binding; it does not add one. At
+    /// the cap this must not lock the phone out.
+    #[tokio::test]
+    async fn qa_max_registrations_allows_rebooted_phone_same_contact_new_call_id() {
+        let stack = SipStack::new(SipStackConfig {
+            max_registrations: 1,
+            ..SipStackConfig::default()
+        });
+        assert_eq!(
+            register_status(&stack, &register_msg("u1", "boot-1", 1, 3600))
+                .await
+                .0,
+            200
+        );
+        let (code, _) = register_status(&stack, &register_msg("u1", "boot-2", 1, 3600)).await;
+        assert_eq!(code, 200, "same contact, new Call-ID replaces the binding");
+    }
+
+    /// QA finding F2 / NIST-001: a multi-contact REGISTER is counted with the
+    /// registrar's de-dup, so re-registering already-bound contacts under a
+    /// new Call-ID does not over-count, and only the genuinely new contact
+    /// of a mixed REGISTER counts.
+    #[tokio::test]
+    async fn max_registrations_counts_multi_contact_register_after_dedup() {
+        let stack = SipStack::new(SipStackConfig {
+            max_registrations: 2,
+            ..SipStackConfig::default()
+        });
+        let two = "Contact: <sip:u1@127.0.0.1:1>\r\nContact: <sip:u1@127.0.0.1:2>\r\n";
+        assert_eq!(
+            register_status(&stack, &register_raw("u1", "mc-1", 1, two, Some(3600)))
+                .await
+                .0,
+            200,
+            "two contacts fit a cap of two"
+        );
+        // Same two contacts after a reboot (new Call-ID): 0 net-new.
+        assert_eq!(
+            register_status(&stack, &register_raw("u1", "mc-2", 1, two, Some(3600)))
+                .await
+                .0,
+            200,
+            "re-registering bound contacts adds nothing"
+        );
+        // One bound contact plus one new one is a single net-new binding,
+        // which no longer fits.
+        let plus = "Contact: <sip:u1@127.0.0.1:1>\r\nContact: <sip:u1@127.0.0.1:3>\r\n";
+        assert_eq!(
+            register_status(&stack, &register_raw("u1", "mc-2", 2, plus, Some(3600)))
+                .await
+                .0,
+            503
         );
     }
 }

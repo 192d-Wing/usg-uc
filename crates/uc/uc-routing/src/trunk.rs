@@ -195,6 +195,36 @@ impl TrunkConfig {
         self.max_calls = max;
         self
     }
+
+    /// Sets the cooldown period after `max_failures` consecutive failures.
+    #[must_use]
+    pub fn with_cooldown_secs(mut self, secs: u64) -> Self {
+        self.cooldown_secs = secs;
+        self
+    }
+
+    /// Sets the consecutive-failure count that puts the trunk into cooldown.
+    #[must_use]
+    pub fn with_max_failures(mut self, max: u32) -> Self {
+        self.max_failures = max;
+        self
+    }
+}
+
+/// How a call that held a trunk slot ended, for [`Trunk`] accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrunkOutcome {
+    /// The trunk answered the call; `setup_ms` is INVITE-to-answer time.
+    Completed {
+        /// Call setup time in milliseconds.
+        setup_ms: u64,
+    },
+    /// The trunk failed the call (timeout, transport error, 5xx). Counts
+    /// toward `max_failures` / cooldown.
+    Failed,
+    /// The call went away for a reason that is not the trunk's fault
+    /// (CANCEL, callee reject, local failure). Releases the slot only.
+    Abandoned,
 }
 
 /// A SIP trunk/carrier.
@@ -294,9 +324,52 @@ impl Trunk {
         self.state = TrunkState::Disabled;
     }
 
-    /// Records a call attempt.
+    /// Records a call attempt (takes one of the `max_calls` slots).
     pub fn start_call(&mut self) {
-        self.stats.active_calls += 1;
+        self.stats.active_calls = self.stats.active_calls.saturating_add(1);
+    }
+
+    /// Releases a call slot without counting a success or a failure.
+    pub fn abandon_call(&mut self) {
+        self.stats.active_calls = self.stats.active_calls.saturating_sub(1);
+    }
+
+    /// Releases a call slot with the given outcome.
+    pub fn end_call(&mut self, outcome: TrunkOutcome) {
+        match outcome {
+            TrunkOutcome::Completed { setup_ms } => self.complete_call(setup_ms),
+            TrunkOutcome::Failed => self.fail_call(),
+            TrunkOutcome::Abandoned => self.abandon_call(),
+        }
+    }
+
+    /// Applies an out-of-band reachability probe result (SIP OPTIONS ping).
+    ///
+    /// Unreachable marks the trunk `Failed` so selection skips it; reachable
+    /// returns a `Failed` trunk to `Available`. An operator `Disabled` trunk
+    /// and a trunk in `Cooldown` are left alone.
+    pub fn set_reachable(&mut self, reachable: bool) {
+        match (reachable, self.state) {
+            (false, TrunkState::Available | TrunkState::Busy) => {
+                self.state = TrunkState::Failed;
+            }
+            (false, TrunkState::Cooldown) => {
+                // Keep the cooldown timer but stay unusable once it lapses.
+                self.state = TrunkState::Failed;
+                self.cooldown_until = None;
+            }
+            (true, TrunkState::Failed) => self.state = TrunkState::Available,
+            _ => {}
+        }
+    }
+
+    /// Puts the trunk into cooldown now, regardless of the failure count
+    /// (e.g. the trunk answered 503, RFC 3261 §21.5.4). A disabled or
+    /// probe-failed trunk keeps its state.
+    pub fn start_cooldown(&mut self) {
+        if matches!(self.state, TrunkState::Available | TrunkState::Busy) {
+            self.enter_cooldown();
+        }
     }
 
     /// Records a successful call completion.
@@ -314,8 +387,11 @@ impl Trunk {
         }
         self.stats.record_failure();
 
-        // Check if we need to enter cooldown
-        if self.stats.consecutive_failures >= self.config.max_failures {
+        // Check if we need to enter cooldown. A disabled or probe-failed
+        // trunk stays in that state (cooldown would expire it to Available).
+        if self.stats.consecutive_failures >= self.config.max_failures
+            && matches!(self.state, TrunkState::Available | TrunkState::Busy)
+        {
             self.enter_cooldown();
         }
     }
@@ -573,6 +649,80 @@ mod tests {
 
         assert_eq!(trunk.state(), TrunkState::Cooldown);
         assert!(!trunk.is_usable());
+    }
+
+    #[test]
+    fn test_trunk_end_call_outcomes_never_underflow() {
+        let mut trunk = Trunk::new(TrunkConfig::new("t", "t.example.com").with_max_calls(1));
+        trunk.start_call();
+        assert!(trunk.is_at_capacity());
+        assert!(!trunk.is_usable());
+        trunk.end_call(TrunkOutcome::Abandoned);
+        assert_eq!(trunk.stats().active_calls, 0);
+        assert_eq!(trunk.stats().calls_attempted, 0);
+
+        trunk.start_call();
+        trunk.end_call(TrunkOutcome::Completed { setup_ms: 50 });
+        assert_eq!(trunk.stats().active_calls, 0);
+        assert_eq!(trunk.stats().calls_succeeded, 1);
+
+        trunk.start_call();
+        trunk.end_call(TrunkOutcome::Failed);
+        assert_eq!(trunk.stats().active_calls, 0);
+        assert_eq!(trunk.stats().calls_failed, 1);
+
+        // Extra releases are clamped at zero.
+        trunk.end_call(TrunkOutcome::Abandoned);
+        trunk.end_call(TrunkOutcome::Failed);
+        assert_eq!(trunk.stats().active_calls, 0);
+    }
+
+    #[test]
+    fn test_trunk_max_failures_and_cooldown_config() {
+        let config = TrunkConfig::new("t", "t.example.com")
+            .with_max_failures(1)
+            .with_cooldown_secs(3600);
+        assert_eq!(config.cooldown_secs, 3600);
+        let mut trunk = Trunk::new(config);
+        trunk.start_call();
+        trunk.fail_call();
+        assert_eq!(trunk.state(), TrunkState::Cooldown);
+    }
+
+    #[test]
+    fn test_trunk_start_cooldown() {
+        let mut trunk = Trunk::new(TrunkConfig::new("t", "t.example.com"));
+        trunk.start_cooldown();
+        assert_eq!(trunk.state(), TrunkState::Cooldown);
+        assert!(!trunk.is_usable());
+
+        let mut disabled = Trunk::new(TrunkConfig::new("d", "d.example.com"));
+        disabled.disable();
+        disabled.start_cooldown();
+        assert_eq!(disabled.state(), TrunkState::Disabled);
+    }
+
+    #[test]
+    fn test_trunk_set_reachable() {
+        let mut trunk = Trunk::new(TrunkConfig::new("t", "t.example.com"));
+        trunk.set_reachable(false);
+        assert_eq!(trunk.state(), TrunkState::Failed);
+        assert!(!trunk.is_usable());
+        trunk.set_reachable(true);
+        assert!(trunk.is_usable());
+
+        // Never overrides an operator disable.
+        trunk.disable();
+        trunk.set_reachable(true);
+        assert_eq!(trunk.state(), TrunkState::Disabled);
+        trunk.set_reachable(false);
+        assert_eq!(trunk.state(), TrunkState::Disabled);
+
+        // Up does not cut a cooldown short.
+        let mut cooling = Trunk::new(TrunkConfig::new("c", "c.example.com"));
+        cooling.start_cooldown();
+        cooling.set_reachable(true);
+        assert_eq!(cooling.state(), TrunkState::Cooldown);
     }
 
     #[test]

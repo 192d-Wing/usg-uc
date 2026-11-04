@@ -45,7 +45,8 @@ tcp_idle_timeout_secs = 300
 
 [media]
 default_mode = "Relay"
-codecs = ["G711Ulaw", "G711Alaw", "G722"]
+# media.codecs is not enforced (no SDP codec filtering); only the default
+# list is accepted, so it is omitted here.
 rtp_port_min = 16384
 rtp_port_max = 16484
 

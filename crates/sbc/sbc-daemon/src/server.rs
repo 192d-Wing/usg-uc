@@ -240,6 +240,7 @@ impl Server {
             instance_name: config.general.instance_name.clone(),
             domain: config.general.instance_name.clone(),
             max_calls: config.general.max_calls,
+            max_registrations: config.general.max_registrations,
             ..SipStackConfig::default()
         }
     }
@@ -439,12 +440,15 @@ impl Server {
         // black-holes).
         let media_failure_rx = if Self::remote_media_urls().is_empty() {
             // Ports / mode / SRTP come from the [media] config; the codec list and
-            // RTCP-mux keep the pipeline defaults.
+            // RTCP-mux keep the pipeline defaults. `validate_config` only admits
+            // `media.default_mode = Relay`, an empty `media.realm_modes` and the
+            // default `media.codecs` set: the live call path always anchors
+            // media and nothing filters SDP codecs (CM-6), so other values would
+            // be silently ignored.
             //
             // The config's mode is uc_types::MediaMode; the pipeline uses
-            // uc_media_engine::MediaMode. They share Relay/PassThrough; the
-            // config-only SignalingOnly has no relay-engine equivalent, so it maps
-            // to the least-involved engine mode (PassThrough).
+            // uc_media_engine::MediaMode. The non-Relay arms below are
+            // unreachable for a validated config and kept for exhaustiveness.
             let default_mode = match config.media.default_mode {
                 uc_types::MediaMode::Relay => uc_media_engine::MediaMode::Relay,
                 uc_types::MediaMode::PassThrough | uc_types::MediaMode::SignalingOnly => {
