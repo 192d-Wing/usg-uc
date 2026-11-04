@@ -18,7 +18,9 @@
 //!
 //! ## Evaluation order (`VpsEngine::screen_call`)
 //!
-//! 1. Dynamic blocklist (source IP, caller prefix)
+//! 0. Operator source-IP blocklist (applies to emergency calls too)
+//! 1. Emergency numbers (`emergency_numbers`) bypass every stage below,
+//!    starting with the dynamic caller-prefix blocklist
 //! 2. Per-source call-attempt rate limit (escalates to timed block)
 //! 3. Per-callee concurrency cap
 //! 4. STIR/SHAKEN screening (inbound trunk calls)
@@ -47,6 +49,7 @@ pub mod blocklist;
 pub mod call_limiter;
 pub mod config;
 pub mod context;
+pub mod emergency;
 pub mod engine;
 pub mod error;
 pub mod verdict;
@@ -55,9 +58,10 @@ pub use blocklist::Blocklist;
 pub use call_limiter::{CallLimiter, CallLimiterConfig};
 pub use config::{
     AttestationLevel, ScreeningMode, StirShakenScreeningConfig, TdosConfig, VpsConfig,
-    VpsDefaultAction, VpsRuleAction, VpsRuleConfig,
+    VpsDefaultAction, VpsRuleAction, VpsRuleConfig, default_emergency_numbers,
 };
 pub use context::{CallAttempt, CallDirection, StirShakenStatus, uri_user};
+pub use emergency::EmergencyNumbers;
 pub use engine::{VpsEngine, VpsStats};
 pub use error::{VpsError, VpsResult};
 pub use verdict::{VerdictSource, VpsAction, VpsVerdict};

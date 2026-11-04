@@ -57,7 +57,8 @@ pub use route_pattern::RoutePattern;
 pub use router::{Router, RouterConfig, RoutingDecision};
 pub use sbc_router::{SbcRouter, SbcRoutingResult};
 pub use trunk::{
-    SelectionStrategy, Trunk, TrunkConfig, TrunkGroup, TrunkOutcome, TrunkProtocol, TrunkState,
+    Admission, SelectionStrategy, Trunk, TrunkConfig, TrunkGroup, TrunkOutcome, TrunkProtocol,
+    TrunkState, default_emergency_reserve,
 };
 
 /// Default routing priority.

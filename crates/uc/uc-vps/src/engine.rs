@@ -4,6 +4,7 @@ use crate::blocklist::Blocklist;
 use crate::call_limiter::{CallLimiter, CallLimiterConfig};
 use crate::config::{ScreeningMode, VpsConfig, VpsDefaultAction, VpsRuleAction, VpsRuleConfig};
 use crate::context::{CallAttempt, CallDirection};
+use crate::emergency::EmergencyNumbers;
 use crate::error::{VpsError, VpsResult};
 use crate::verdict::{VerdictSource, VpsVerdict};
 use chrono::{Datelike, Timelike};
@@ -33,6 +34,8 @@ pub struct VpsStats {
     pub rejected_stir_shaken: u64,
     /// Attempts rejected by a policy rule or default-deny.
     pub rejected_policy: u64,
+    /// Emergency calls let through without screening.
+    pub emergency_bypassed: u64,
 }
 
 /// The Voice Protection System engine.
@@ -42,6 +45,7 @@ pub struct VpsStats {
 #[derive(Debug)]
 pub struct VpsEngine {
     config: VpsConfig,
+    emergency: EmergencyNumbers,
     policy: PolicyEngine,
     limiter: CallLimiter,
     blocklist: Blocklist,
@@ -81,6 +85,7 @@ impl VpsEngine {
 
         Ok(Self {
             limiter: CallLimiter::new(CallLimiterConfig::from(&config.tdos)),
+            emergency: EmergencyNumbers::new(&config.emergency_numbers),
             config: config.clone(),
             policy,
             blocklist,
@@ -138,6 +143,16 @@ impl VpsEngine {
             .with_priority(RulePriority::custom(rule.priority))
     }
 
+    /// Whether `dialed` (a Request-URI, or its user part) is a configured
+    /// emergency number. Evaluated whether or not the VPS is enabled, so
+    /// the SIP stack can apply the same classification to its own
+    /// capacity limits. Allocation-free.
+    ///
+    /// ## 47 CFR 9.16; NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+    pub fn is_emergency(&self, dialed: &str) -> bool {
+        self.emergency.matches(dialed)
+    }
+
     /// Screens a call attempt. See the crate docs for evaluation order.
     pub fn screen_call(&mut self, attempt: &CallAttempt) -> VpsVerdict {
         if !self.config.enabled {
@@ -145,13 +160,30 @@ impl VpsEngine {
         }
         self.stats.screened += 1;
 
-        // 1. Blocklist.
+        // 0. Operator source-IP blocks apply to every call, emergency
+        // included: an operator who blocked an abusive source must be able
+        // to stop it dialing 911 too.
         if let Some(source) = attempt.source_ip
             && self.blocklist.is_source_blocked(source)
         {
             self.stats.rejected_blocklist += 1;
             return VpsVerdict::drop_silently(VerdictSource::Blocklist);
         }
+
+        // 1. Emergency numbers are not screened out by number/caller
+        // policy: caller blocklist, rate limit, per-callee cap, STIR/SHAKEN
+        // and deny rules would all block a 911 call (47 CFR 9.16). The SIP
+        // stack still enforces ACLs, authentication, the transport flood
+        // limiter and the bounded emergency reserve, and audits the bypass.
+        if let Some(ref callee) = attempt.callee
+            && self.is_emergency(callee)
+        {
+            self.stats.emergency_bypassed += 1;
+            self.stats.allowed += 1;
+            return VpsVerdict::allow(VerdictSource::EmergencyBypass);
+        }
+
+        // 1b. Caller-prefix blocklist.
         if let Some(ref caller) = attempt.caller
             && let Some(prefix) = self.blocklist.caller_block_match(caller)
         {
@@ -311,7 +343,10 @@ impl VpsEngine {
     /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
     pub fn screen_and_reserve(&mut self, attempt: &CallAttempt) -> (VpsVerdict, Option<String>) {
         let verdict = self.screen_call(attempt);
+        // An emergency call takes no slot, so held emergency calls never
+        // fill the cap against further ones.
         if !verdict.is_allowed()
+            || verdict.source() == VerdictSource::EmergencyBypass
             || !self.config.enabled
             || self.limiter.per_callee_max_concurrent() == 0
         {
@@ -715,5 +750,167 @@ mod tests {
             ..enabled_config()
         };
         assert!(VpsEngine::new(&config).is_err());
+    }
+
+    fn emergency(source: IpAddr, callee: &str) -> CallAttempt {
+        CallAttempt::new(source)
+            .with_caller("+12135551000")
+            .with_callee(callee)
+    }
+
+    #[test]
+    fn emergency_match_is_exact_after_separator_strip() {
+        let engine = VpsEngine::new(&enabled_config()).unwrap();
+        for dialed in [
+            "911",
+            "933",
+            "112",
+            "+911",
+            "9-1-1",
+            "(911)",
+            "sip:911@pbx.example.com",
+            "tel:911",
+            "911;phone-context=+1",
+            "sip:911;user=phone@pbx.example.com",
+        ] {
+            assert!(engine.is_emergency(dialed), "{dialed}");
+        }
+        for dialed in [
+            "9111",
+            "+1911",
+            "91",
+            "",
+            "988",
+            "sip:pbx.example.com",
+            "911a",
+        ] {
+            assert!(!engine.is_emergency(dialed), "{dialed}");
+        }
+        let none = VpsEngine::new(&VpsConfig {
+            emergency_numbers: Vec::new(),
+            ..enabled_config()
+        })
+        .unwrap();
+        assert!(!none.is_emergency("911"));
+        // Classification works with the VPS disabled (the SIP stack uses it
+        // for its own capacity limits).
+        assert!(
+            VpsEngine::new(&VpsConfig::default())
+                .unwrap()
+                .is_emergency("911")
+        );
+    }
+
+    #[test]
+    fn emergency_bypasses_full_per_callee_cap_without_reserving() {
+        let config = VpsConfig {
+            tdos: TdosConfig {
+                per_source_cps: 0,
+                per_callee_max_concurrent: 1,
+                ..TdosConfig::default()
+            },
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        // The cap for 911 is already full.
+        engine.call_started("911");
+        assert!(engine.limiter.callee_at_capacity("911"));
+        let (v, key) = engine.screen_and_reserve(&emergency(ip(1), "911"));
+        assert!(v.is_allowed());
+        assert_eq!(v.source(), VerdictSource::EmergencyBypass);
+        assert!(key.is_none(), "an emergency call takes no slot");
+        assert_eq!(engine.callee_concurrent_calls("911"), 1);
+        assert_eq!(engine.stats().emergency_bypassed, 1);
+        // A non-emergency callee is still capped.
+        engine.call_started("+12135552000");
+        let (v, _) = engine.screen_and_reserve(&attempt(ip(2)));
+        assert_eq!(v.source(), VerdictSource::ConcurrencyCap);
+    }
+
+    #[test]
+    fn emergency_bypasses_rate_limit_blocklist_and_deny_rules() {
+        let config = VpsConfig {
+            tdos: TdosConfig {
+                per_source_cps: 1,
+                per_source_burst: 1,
+                ..TdosConfig::default()
+            },
+            default_action: VpsDefaultAction::Deny,
+            blocked_caller_prefixes: vec!["+1213".to_string()],
+            rules: vec![VpsRuleConfig {
+                id: "deny-911".to_string(),
+                callee_prefix: Some("9".to_string()),
+                action: VpsRuleAction::Deny,
+                ..VpsRuleConfig::default()
+            }],
+            stir_shaken: StirShakenScreeningConfig {
+                mode: ScreeningMode::Enforce,
+                require_identity_header: true,
+                ..StirShakenScreeningConfig::default()
+            },
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        for _ in 0..5 {
+            let attempt = emergency(ip(9), "911")
+                .with_caller("+12135550100")
+                .with_direction(CallDirection::Inbound);
+            let v = engine.screen_call(&attempt);
+            assert!(v.is_allowed());
+            assert_eq!(v.source(), VerdictSource::EmergencyBypass);
+        }
+        // The same caller dialing anything else is still rejected.
+        assert!(
+            !engine
+                .screen_call(&attempt(ip(9)).with_caller("+12135550100"))
+                .is_allowed()
+        );
+        assert_eq!(engine.stats().emergency_bypassed, 5);
+    }
+
+    #[test]
+    fn operator_source_block_still_rejects_emergency_calls() {
+        // Decision 7: operator source-IP blocks are not bypassed.
+        let mut engine = VpsEngine::new(&enabled_config()).unwrap();
+        engine.block_source(ip(9), None);
+        let v = engine.screen_call(&emergency(ip(9), "911"));
+        assert_eq!(*v.action(), VpsAction::Drop);
+        assert_eq!(v.source(), VerdictSource::Blocklist);
+        assert_eq!(engine.stats().emergency_bypassed, 0);
+        // Another source dialing 911 is still bypassed.
+        assert!(engine.screen_call(&emergency(ip(10), "911")).is_allowed());
+    }
+
+    #[test]
+    fn emergency_numbers_validated() {
+        let bad = |list: &[&str]| VpsConfig {
+            emergency_numbers: list.iter().map(|s| (*s).to_string()).collect(),
+            ..VpsConfig::default()
+        };
+        assert!(bad(&["911", "*99#", "+112"]).validate().is_ok());
+        assert!(bad(&[]).validate().is_ok());
+        for list in [&[""][..], &["91 1"], &["911@x"], &["+"], &["9;1"]] {
+            assert!(bad(list).validate().is_err(), "{list:?}");
+        }
+        assert!(
+            bad(&["1234567890123456789012345678901234"])
+                .validate()
+                .is_err()
+        );
+        let many: Vec<String> = (0..33).map(|i| i.to_string()).collect();
+        assert!(
+            VpsConfig {
+                emergency_numbers: many,
+                ..VpsConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert_eq!(
+            VpsConfig::default().emergency_numbers,
+            vec!["911", "933", "112"]
+        );
+        let parsed: VpsConfig = toml::from_str("enabled = true").unwrap();
+        assert_eq!(parsed.emergency_numbers, vec!["911", "933", "112"]);
     }
 }

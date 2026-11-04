@@ -1121,6 +1121,14 @@ impl Runtime {
                 graceful: drain_result.drained,
             },
         ));
+        // The audit writer runs on its own thread; let it drain the queue
+        // (including the shutdown record) before the process exits (AU-5).
+        if !tokio::task::spawn_blocking(|| uc_audit::flush(std::time::Duration::from_secs(2)))
+            .await
+            .unwrap_or(false)
+        {
+            warn!("Audit queue not drained before shutdown");
+        }
         if drain_result.drained {
             warn!(
                 duration_ms = drain_result.drain_duration_ms,
@@ -1365,16 +1373,13 @@ fn spawn_trunk_health_feed(
                 () = signal.wait_for_shutdown() => break,
                 event = rx.recv() => match event {
                     Ok(ev) => {
-                        let n = stack.set_trunk_reachable(&ev.trunk_id, ev.reachable).await;
-                        // POAM: reachability changes have no dedicated uc-audit
-                        // event type yet; logged here (AU-2).
-                        info!(
-                            trunk_id = %ev.trunk_id,
-                            reachable = ev.reachable,
-                            router_trunks = n,
-                            source = "options",
-                            "Trunk reachability changed"
-                        );
+                        stack
+                            .apply_trunk_reachability_change(
+                                &ev.trunk_id,
+                                ev.reachable,
+                                uc_audit::event::ReachabilitySource::Options,
+                            )
+                            .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
                         warn!(missed, "Trunk health feed lagged; resyncing from snapshot");

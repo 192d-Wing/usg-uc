@@ -97,3 +97,7 @@ rand = "0.8"
 [[bin]]
 name = "sbc-daemon"
 path = "src/main.rs"
+
+[dev-dependencies]
+# Thread-local audit capture for tests asserting audit records.
+uc-audit = { workspace = true, features = ["test-capture"] }

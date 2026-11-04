@@ -27,6 +27,27 @@ impl TrunkState {
     }
 }
 
+/// Default emergency headroom for a limit of `max_calls`: 10%, at least 1.
+///
+/// ## 47 CFR 9.16; NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+pub const fn default_emergency_reserve(max_calls: u32) -> u32 {
+    let tenth = max_calls / 10;
+    if tenth == 0 { 1 } else { tenth }
+}
+
+/// How a call is admitted to trunk capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Admission {
+    /// Normal call: a trunk at `max_calls` is skipped.
+    #[default]
+    Normal,
+    /// Emergency call (47 CFR 9.16): may use the trunk's emergency reserve
+    /// on top of `max_calls`, so held normal calls never block an emergency
+    /// call. The reserve is bounded (SC-5); reachability, enable state and
+    /// cooldown still apply; the slot is still counted and released.
+    Emergency,
+}
+
 /// Trunk protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrunkProtocol {
@@ -115,6 +136,9 @@ pub struct TrunkConfig {
     pub weight: u32,
     /// Maximum concurrent calls.
     pub max_calls: u32,
+    /// Extra calls above `max_calls` that only emergency calls may use.
+    /// `None` uses [`default_emergency_reserve`] of `max_calls`.
+    pub emergency_reserve_calls: Option<u32>,
     /// Cooldown period after failure (seconds).
     pub cooldown_secs: u64,
     /// Maximum consecutive failures before cooldown.
@@ -136,6 +160,7 @@ impl Default for TrunkConfig {
             priority: DEFAULT_PRIORITY,
             weight: DEFAULT_WEIGHT,
             max_calls: 100,
+            emergency_reserve_calls: None,
             cooldown_secs: 60,
             max_failures: 3,
             outbound_enabled: true,
@@ -194,6 +219,19 @@ impl TrunkConfig {
     pub fn with_max_calls(mut self, max: u32) -> Self {
         self.max_calls = max;
         self
+    }
+
+    /// Sets the emergency-only headroom above `max_calls`.
+    #[must_use]
+    pub const fn with_emergency_reserve_calls(mut self, reserve: u32) -> Self {
+        self.emergency_reserve_calls = Some(reserve);
+        self
+    }
+
+    /// Emergency-only headroom above `max_calls` in effect for this trunk.
+    pub fn emergency_reserve(&self) -> u32 {
+        self.emergency_reserve_calls
+            .unwrap_or_else(|| default_emergency_reserve(self.max_calls))
     }
 
     /// Sets the cooldown period after `max_failures` consecutive failures.
@@ -280,7 +318,25 @@ impl Trunk {
 
     /// Returns whether the trunk is usable for outbound calls.
     pub fn is_usable(&self) -> bool {
-        self.state().is_usable() && self.config.outbound_enabled && !self.is_at_capacity()
+        self.is_usable_for(Admission::Normal)
+    }
+
+    /// Whether the trunk can take a call admitted as `admission`.
+    pub fn is_usable_for(&self, admission: Admission) -> bool {
+        self.state().is_usable()
+            && self.config.outbound_enabled
+            && match admission {
+                Admission::Normal => !self.is_at_capacity(),
+                // Bounded headroom: emergency calls may use the reserve,
+                // never more (SC-5); normal calls never reach it.
+                Admission::Emergency => {
+                    self.stats.active_calls
+                        < self
+                            .config
+                            .max_calls
+                            .saturating_add(self.config.emergency_reserve())
+                }
+            }
     }
 
     /// Returns whether the trunk is at capacity.
@@ -367,8 +423,24 @@ impl Trunk {
     /// (e.g. the trunk answered 503, RFC 3261 §21.5.4). A disabled or
     /// probe-failed trunk keeps its state.
     pub fn start_cooldown(&mut self) {
+        self.start_cooldown_for(std::time::Duration::from_secs(self.config.cooldown_secs));
+    }
+
+    /// Like [`Self::start_cooldown`] but for `duration` instead of
+    /// `cooldown_secs` (e.g. the trunk's `Retry-After`, RFC 3261 §21.5.4).
+    pub fn start_cooldown_for(&mut self, duration: std::time::Duration) {
         if matches!(self.state, TrunkState::Available | TrunkState::Busy) {
-            self.enter_cooldown();
+            self.state = TrunkState::Cooldown;
+            self.cooldown_until = Some(Instant::now() + duration);
+        }
+    }
+
+    /// When the current cooldown ends, if the trunk is cooling down.
+    pub fn cooldown_until(&self) -> Option<Instant> {
+        if self.state == TrunkState::Cooldown {
+            self.cooldown_until
+        } else {
+            None
         }
     }
 
@@ -503,7 +575,16 @@ impl TrunkGroup {
 
     /// Selects a trunk for routing.
     pub fn select_trunk(&mut self) -> Option<&str> {
-        let usable: Vec<_> = self.trunks.iter().filter(|(_, t)| t.is_usable()).collect();
+        self.select_trunk_for(Admission::Normal)
+    }
+
+    /// Selects a trunk for a call admitted as `admission`.
+    pub fn select_trunk_for(&mut self, admission: Admission) -> Option<&str> {
+        let usable: Vec<_> = self
+            .trunks
+            .iter()
+            .filter(|(_, t)| t.is_usable_for(admission))
+            .collect();
 
         if usable.is_empty() {
             return None;
@@ -555,7 +636,16 @@ impl TrunkGroup {
 
     /// Returns an ordered list of trunk IDs for failover.
     pub fn failover_order(&self) -> Vec<&str> {
-        let mut usable: Vec<_> = self.trunks.iter().filter(|(_, t)| t.is_usable()).collect();
+        self.failover_order_for(Admission::Normal)
+    }
+
+    /// Failover order for a call admitted as `admission`.
+    pub fn failover_order_for(&self, admission: Admission) -> Vec<&str> {
+        let mut usable: Vec<_> = self
+            .trunks
+            .iter()
+            .filter(|(_, t)| t.is_usable_for(admission))
+            .collect();
 
         usable.sort_by_key(|(_, t)| t.priority());
         usable.into_iter().map(|(id, _)| id.as_str()).collect()
@@ -825,5 +915,80 @@ mod tests {
 
         assert_eq!(group.trunk_count(), 2);
         assert_eq!(group.usable_trunk_count(), 1);
+    }
+
+    #[test]
+    fn emergency_admission_ignores_max_calls_only() {
+        let mut trunk = Trunk::new(TrunkConfig::new("t", "t.example.com").with_max_calls(1));
+        trunk.start_call();
+        assert!(!trunk.is_usable());
+        assert!(trunk.is_usable_for(Admission::Emergency));
+        // Default reserve for max_calls=1 is 1: the second slot is the last.
+        trunk.start_call();
+        assert!(!trunk.is_usable_for(Admission::Emergency));
+        trunk.end_call(TrunkOutcome::Abandoned);
+        trunk.start_cooldown();
+        assert!(!trunk.is_usable_for(Admission::Emergency));
+        trunk.reset();
+        trunk.set_reachable(false);
+        assert!(!trunk.is_usable_for(Admission::Emergency));
+        trunk.set_reachable(true);
+        trunk.disable();
+        assert!(!trunk.is_usable_for(Admission::Emergency));
+
+        let mut group = TrunkGroup::new("g", "g");
+        let mut full = Trunk::new(TrunkConfig::new("full", "f.example.com").with_max_calls(1));
+        full.start_call();
+        group.add_trunk(full);
+        assert!(group.select_trunk().is_none());
+        assert_eq!(group.failover_order(), Vec::<&str>::new());
+        assert_eq!(group.select_trunk_for(Admission::Emergency), Some("full"));
+        assert_eq!(group.failover_order_for(Admission::Emergency), vec!["full"]);
+    }
+
+    #[test]
+    fn emergency_reserve_is_bounded_and_configurable() {
+        assert_eq!(default_emergency_reserve(0), 1);
+        assert_eq!(default_emergency_reserve(9), 1);
+        assert_eq!(default_emergency_reserve(100), 10);
+        let mut trunk = Trunk::new(
+            TrunkConfig::new("t", "t.example.com")
+                .with_max_calls(2)
+                .with_emergency_reserve_calls(2),
+        );
+        for _ in 0..2 {
+            trunk.start_call();
+        }
+        // Normal calls never use the reserve.
+        assert!(!trunk.is_usable());
+        assert!(trunk.is_usable_for(Admission::Emergency));
+        trunk.start_call();
+        assert!(!trunk.is_usable());
+        assert!(trunk.is_usable_for(Admission::Emergency));
+        trunk.start_call();
+        // max_calls + reserve reached: emergency skipped too.
+        assert!(!trunk.is_usable_for(Admission::Emergency));
+    }
+
+    #[test]
+    fn start_cooldown_for_uses_given_duration() {
+        let mut trunk = Trunk::new(TrunkConfig::new("t", "t.example.com").with_cooldown_secs(30));
+        let before = Instant::now();
+        trunk.start_cooldown_for(std::time::Duration::from_secs(120));
+        let until = trunk.cooldown_until().unwrap();
+        assert!(until >= before + std::time::Duration::from_secs(120));
+        assert!(until < before + std::time::Duration::from_secs(121));
+        assert!(!trunk.is_usable());
+
+        let mut short = Trunk::new(TrunkConfig::new("s", "s.example.com"));
+        short.start_cooldown_for(std::time::Duration::ZERO);
+        assert!(short.is_usable(), "an elapsed cooldown lapses to Available");
+
+        let mut dflt = Trunk::new(TrunkConfig::new("d", "d.example.com").with_cooldown_secs(30));
+        let before = Instant::now();
+        dflt.start_cooldown();
+        let until = dflt.cooldown_until().unwrap();
+        assert!(until >= before + std::time::Duration::from_secs(30));
+        assert!(until < before + std::time::Duration::from_secs(31));
     }
 }

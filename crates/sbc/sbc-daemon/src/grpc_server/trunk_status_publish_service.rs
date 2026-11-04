@@ -18,7 +18,7 @@ use std::time::Instant;
 use sbc_grpc_api::sbc::trunk_status_publish_service_server::TrunkStatusPublishService;
 use sbc_grpc_api::sbc::{PublishTrunkStatusRequest, PublishTrunkStatusResponse};
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::api_server::AppState;
 use crate::trunk_monitor::TrunkHealthStatus;
@@ -181,8 +181,13 @@ impl TrunkStatusPublishService for TrunkStatusPublishServiceImpl {
                     debug!(%trunk_id, "Ignoring reachability for unknown trunk");
                     continue;
                 }
-                let n = stack.set_trunk_reachable(&trunk_id, reachable).await;
-                info!(%trunk_id, reachable, router_trunks = n, source = "agent", "Trunk reachability changed");
+                stack
+                    .apply_trunk_reachability_change(
+                        &trunk_id,
+                        reachable,
+                        uc_audit::event::ReachabilitySource::Agent,
+                    )
+                    .await;
             }
         }
 

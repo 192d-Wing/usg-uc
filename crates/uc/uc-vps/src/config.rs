@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Root VPS configuration (`[vps]` section).
 ///
 /// ## NIST 800-53 Rev5: CM-2 (Baseline Configuration)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VpsConfig {
     /// Master enable. When false, `screen_call` always allows.
@@ -36,6 +36,44 @@ pub struct VpsConfig {
     /// Statically configured blocked caller-number prefixes (no expiry).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blocked_caller_prefixes: Vec<String>,
+
+    /// Emergency numbers (dialed Request-URI user, exact match after
+    /// stripping `+` and visual separators). Calls to these bypass VPS
+    /// screening (blocklist, rate limit, per-callee cap, STIR/SHAKEN and
+    /// policy rules) and the SBC's call-capacity limits; they are still
+    /// audited. Default `["911", "933", "112"]`. Empty disables the bypass.
+    ///
+    /// ## 47 CFR 9.16 (MLTS 911 direct dialing, no blocking); NIST 800-53 Rev5: SC-5
+    pub emergency_numbers: Vec<String>,
+}
+
+/// Most entries accepted in `emergency_numbers`.
+pub const MAX_EMERGENCY_NUMBERS: usize = 32;
+
+/// Longest entry accepted in `emergency_numbers`.
+pub const MAX_EMERGENCY_NUMBER_LEN: usize = 32;
+
+/// The default emergency-number list.
+pub fn default_emergency_numbers() -> Vec<String> {
+    ["911", "933", "112"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+impl Default for VpsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tdos: TdosConfig::default(),
+            stir_shaken: StirShakenScreeningConfig::default(),
+            rules: Vec::new(),
+            default_action: VpsDefaultAction::default(),
+            blocked_sources: Vec::new(),
+            blocked_caller_prefixes: Vec::new(),
+            emergency_numbers: default_emergency_numbers(),
+        }
+    }
 }
 
 impl VpsConfig {
@@ -82,6 +120,24 @@ impl VpsConfig {
         for source in &self.blocked_sources {
             if source.parse::<std::net::IpAddr>().is_err() {
                 return Err(format!("blocked_sources: invalid IP address {source}"));
+            }
+        }
+        if self.emergency_numbers.len() > MAX_EMERGENCY_NUMBERS {
+            return Err(format!(
+                "emergency_numbers: at most {MAX_EMERGENCY_NUMBERS} entries"
+            ));
+        }
+        for number in &self.emergency_numbers {
+            let valid = !number.is_empty()
+                && number.len() <= MAX_EMERGENCY_NUMBER_LEN
+                && number
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'*' | b'#'))
+                && number.bytes().any(|b| b != b'+');
+            if !valid {
+                return Err(format!(
+                    "emergency_numbers: invalid entry {number:?} (digits, '*', '#', '+' only)"
+                ));
             }
         }
         if self.tdos.per_source_cps > 0 && self.tdos.per_source_burst < self.tdos.per_source_cps {

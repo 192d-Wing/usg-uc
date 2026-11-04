@@ -2,8 +2,9 @@
 
 use crate::dialplan::{DialPlan, DialPlanResult};
 use crate::error::{RoutingError, RoutingResult};
-use crate::trunk::{Trunk, TrunkGroup, TrunkOutcome};
+use crate::trunk::{Admission, Trunk, TrunkGroup, TrunkOutcome};
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// Routing decision.
 #[derive(Debug, Clone)]
@@ -209,6 +210,18 @@ impl Router {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn route(&mut self, destination: &str) -> RoutingResult<RoutingDecision> {
+        self.route_for(destination, Admission::Normal)
+    }
+
+    /// [`Self::route`] for a call admitted as `admission`.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    pub fn route_for(
+        &mut self,
+        destination: &str,
+        admission: Admission,
+    ) -> RoutingResult<RoutingDecision> {
         self.stats.requests += 1;
 
         let dial_plan_result = if self.config.use_dial_plan {
@@ -219,7 +232,7 @@ impl Router {
 
         let trunk_group_id = self.resolve_trunk_group(dial_plan_result.as_ref(), destination)?;
         let (trunk_id, trunk_uri, failover_trunks) =
-            self.select_trunk_from_group(&trunk_group_id)?;
+            self.select_trunk_from_group(&trunk_group_id, admission)?;
         let failover_targets = failover_trunks
             .iter()
             .map(|t| (trunk_group_id.clone(), t.clone()))
@@ -265,6 +278,7 @@ impl Router {
     fn select_trunk_from_group(
         &mut self,
         trunk_group_id: &str,
+        admission: Admission,
     ) -> RoutingResult<(String, String, Vec<String>)> {
         let trunk_count = self
             .trunk_groups
@@ -277,16 +291,15 @@ impl Router {
             }
         })?;
 
-        let trunk_id =
-            trunk_group
-                .select_trunk()
-                .map(String::from)
-                .ok_or(RoutingError::AllTrunksFailed {
-                    trunks_tried: trunk_count,
-                })?;
+        let trunk_id = trunk_group
+            .select_trunk_for(admission)
+            .map(String::from)
+            .ok_or(RoutingError::AllTrunksFailed {
+                trunks_tried: trunk_count,
+            })?;
 
         let failover_trunks: Vec<String> = trunk_group
-            .failover_order()
+            .failover_order_for(admission)
             .into_iter()
             .filter(|id| *id != trunk_id)
             .take(self.config.max_failover_attempts)
@@ -324,9 +337,23 @@ impl Router {
         destination: &str,
         group_id: &str,
     ) -> RoutingResult<RoutingDecision> {
+        self.route_to_group_for(destination, group_id, Admission::Normal)
+    }
+
+    /// [`Self::route_to_group`] for a call admitted as `admission`.
+    ///
+    /// # Errors
+    /// Returns an error if the group does not exist or has no usable trunk.
+    pub fn route_to_group_for(
+        &mut self,
+        destination: &str,
+        group_id: &str,
+        admission: Admission,
+    ) -> RoutingResult<RoutingDecision> {
         self.stats.requests += 1;
 
-        let (trunk_id, trunk_uri, failover_trunks) = self.select_trunk_from_group(group_id)?;
+        let (trunk_id, trunk_uri, failover_trunks) =
+            self.select_trunk_from_group(group_id, admission)?;
         let failover_targets = failover_trunks
             .iter()
             .map(|t| (group_id.to_string(), t.clone()))
@@ -358,6 +385,19 @@ impl Router {
         destination: &str,
         group_ids: &[String],
     ) -> RoutingResult<RoutingDecision> {
+        self.route_to_groups_for(destination, group_ids, Admission::Normal)
+    }
+
+    /// [`Self::route_to_groups`] for a call admitted as `admission`.
+    ///
+    /// # Errors
+    /// As [`Self::route_to_groups`].
+    pub fn route_to_groups_for(
+        &mut self,
+        destination: &str,
+        group_ids: &[String],
+        admission: Admission,
+    ) -> RoutingResult<RoutingDecision> {
         if group_ids.is_empty() {
             return Err(RoutingError::NoRoute {
                 destination: destination.to_string(),
@@ -369,7 +409,7 @@ impl Router {
                 .trunk_groups
                 .get(group_id.as_str())
                 .map_or(0, TrunkGroup::trunk_count);
-            let Ok(mut decision) = self.route_to_group(destination, group_id) else {
+            let Ok(mut decision) = self.route_to_group_for(destination, group_id, admission) else {
                 continue;
             };
             let max = self.config.max_failover_attempts;
@@ -381,7 +421,7 @@ impl Router {
                     continue;
                 }
                 if let Some(group) = self.trunk_groups.get(later.as_str()) {
-                    for t in group.failover_order() {
+                    for t in group.failover_order_for(admission) {
                         if decision.failover_targets.len() >= max {
                             break;
                         }
@@ -402,11 +442,21 @@ impl Router {
     /// (enabled, reachable, not in cooldown, below `max_calls`). Returns the
     /// trunk's SIP URI, or `None` when it cannot take the call.
     pub fn acquire_trunk(&mut self, group_id: &str, trunk_id: &str) -> Option<String> {
+        self.acquire_trunk_for(group_id, trunk_id, Admission::Normal)
+    }
+
+    /// [`Self::acquire_trunk`] for a call admitted as `admission`.
+    pub fn acquire_trunk_for(
+        &mut self,
+        group_id: &str,
+        trunk_id: &str,
+        admission: Admission,
+    ) -> Option<String> {
         let trunk = self
             .trunk_groups
             .get_mut(group_id)
             .and_then(|g| g.get_trunk_mut(trunk_id))?;
-        if !trunk.is_usable() {
+        if !trunk.is_usable_for(admission) {
             return None;
         }
         // POAM: the trunk `max_calls` reservation is counted per node only; in a cluster of N nodes the
@@ -429,14 +479,19 @@ impl Router {
         }
     }
 
-    /// Puts a trunk into cooldown immediately (e.g. it answered 503).
-    pub fn cooldown_trunk(&mut self, group_id: &str, trunk_id: &str) {
+    /// Puts a trunk into cooldown immediately (e.g. it answered 503), for
+    /// `duration` (the trunk's `Retry-After`, RFC 3261 §21.5.4) or the
+    /// trunk's `cooldown_secs` when `None`. The caller bounds `duration`.
+    pub fn cooldown_trunk(&mut self, group_id: &str, trunk_id: &str, duration: Option<Duration>) {
         if let Some(trunk) = self
             .trunk_groups
             .get_mut(group_id)
             .and_then(|g| g.get_trunk_mut(trunk_id))
         {
-            trunk.start_cooldown();
+            match duration {
+                Some(d) => trunk.start_cooldown_for(d),
+                None => trunk.start_cooldown(),
+            }
         }
     }
 
@@ -830,7 +885,75 @@ mod tests {
     #[test]
     fn test_cooldown_trunk() {
         let mut router = setup_test_router();
-        router.cooldown_trunk("us-trunks", "us-1");
+        router.cooldown_trunk("us-trunks", "us-1", None);
         assert_eq!(router.route("+15551234567").unwrap().trunk_id, "us-2");
+    }
+
+    #[test]
+    fn cooldown_trunk_override_duration() {
+        let mut router = setup_test_router();
+        let before = std::time::Instant::now();
+        router.cooldown_trunk("us-trunks", "us-1", Some(Duration::from_secs(120)));
+        let trunk = router
+            .get_trunk_group("us-trunks")
+            .and_then(|g| g.get_trunk("us-1"))
+            .unwrap();
+        let until = trunk.cooldown_until().unwrap();
+        assert!(until >= before + Duration::from_secs(120));
+        assert!(until < before + Duration::from_secs(121));
+        assert_eq!(router.route("+15551234567").unwrap().trunk_id, "us-2");
+        // Unknown IDs are ignored.
+        router.cooldown_trunk("missing", "us-1", Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn emergency_admission_routes_past_max_calls_but_not_cooldown() {
+        let mut router = Router::new(
+            RouterConfig::default()
+                .with_dial_plan(false)
+                .with_default_trunk_group("g"),
+        );
+        let mut group = TrunkGroup::new("g", "G");
+        group.add_trunk(Trunk::new(
+            TrunkConfig::new("a", "a.example.com")
+                .with_priority(1)
+                .with_max_calls(1)
+                .with_emergency_reserve_calls(3),
+        ));
+        group.add_trunk(Trunk::new(
+            TrunkConfig::new("b", "b.example.com")
+                .with_priority(2)
+                .with_max_calls(1)
+                .with_emergency_reserve_calls(3),
+        ));
+        router.add_trunk_group(group);
+        router.route("1").unwrap();
+        router.route("1").unwrap();
+        assert!(router.route("1").is_err());
+
+        let d = router.route_for("911", Admission::Emergency).unwrap();
+        assert_eq!(d.trunk_id, "a");
+        assert_eq!(d.failover_targets, vec![("g".to_string(), "b".to_string())]);
+        assert_eq!(router.trunk_active_calls("g", "a"), Some(2));
+        assert!(router.acquire_trunk("g", "b").is_none());
+        assert!(
+            router
+                .acquire_trunk_for("g", "b", Admission::Emergency)
+                .is_some()
+        );
+        let groups = vec!["g".to_string()];
+        assert!(router.route_to_groups("911", &groups).is_err());
+        assert!(
+            router
+                .route_to_groups_for("911", &groups, Admission::Emergency)
+                .is_ok()
+        );
+
+        router.cooldown_trunk("g", "a", None);
+        router.cooldown_trunk("g", "b", None);
+        assert!(matches!(
+            router.route_for("911", Admission::Emergency),
+            Err(RoutingError::AllTrunksFailed { .. })
+        ));
     }
 }

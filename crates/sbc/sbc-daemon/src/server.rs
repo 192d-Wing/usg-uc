@@ -15,6 +15,7 @@ use crate::cluster::ClusterManager;
 use crate::shutdown::ShutdownSignal;
 use crate::sip_stack::{ProcessResult, SipStack, SipStackConfig};
 use proto_registrar::BearerAuthenticator;
+use proto_sip::{Method, SipMessage};
 use sbc_config::SbcConfig;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -236,11 +237,31 @@ impl Server {
 
     /// Builds `SipStackConfig` from `SbcConfig`.
     fn build_sip_config(config: &SbcConfig) -> SipStackConfig {
+        if config
+            .vps
+            .as_ref()
+            .is_some_and(|v| v.emergency_numbers.is_empty())
+        {
+            // 47 CFR 9.16: with no list, emergency calls get no capacity reserve.
+            warn!(
+                "vps.emergency_numbers is empty: emergency calls are subject to every call limit"
+            );
+        }
         SipStackConfig {
             instance_name: config.general.instance_name.clone(),
             domain: config.general.instance_name.clone(),
             max_calls: config.general.max_calls,
+            emergency_reserve_calls: config.general.effective_emergency_reserve_calls(),
             max_registrations: config.general.max_registrations,
+            emergency_numbers: uc_vps::EmergencyNumbers::new(
+                &config
+                    .vps
+                    .as_ref()
+                    .map_or_else(uc_vps::default_emergency_numbers, |v| {
+                        v.emergency_numbers.clone()
+                    }),
+            ),
+            trunk_retry_after_max_secs: config.general.trunk_retry_after_max_secs,
             ..SipStackConfig::default()
         }
     }
@@ -1281,7 +1302,8 @@ impl Server {
                                     let result = sip_stack
                                         .process_message(&data, source, zone.as_deref())
                                         .await;
-                                    Self::handle_result(result, transport.as_ref(), &stats).await;
+                                    Self::handle_result(result, &transport, &stats, &sip_stack)
+                                        .await;
                                 });
                             }
                         }
@@ -1557,7 +1579,7 @@ impl Server {
                             .sip_stack
                             .process_message(&frame, peer, ctx.zone_name.as_deref())
                             .await;
-                        Self::handle_result(result, transport.as_ref(), &ctx.stats).await;
+                        Self::handle_result(result, &transport, &ctx.stats, &ctx.sip_stack).await;
                     }
                 }
                 Ok(Err(uc_transport::TransportError::ConnectionClosed)) => {
@@ -1577,7 +1599,29 @@ impl Server {
     }
 
     /// Handles a single `ProcessResult`, sending responses/forwards via the transport.
-    async fn handle_result(result: ProcessResult, transport: &dyn Transport, stats: &ServerStats) {
+    ///
+    /// A forwarded INVITE's send outcome goes back to the SIP stack so a
+    /// failed first send fails over at once (`SipStack::on_invite_sent`);
+    /// whatever that yields is sent from a spawned task, so a chain of dead
+    /// failover targets (each up to the 30 s send timeout) never stalls the
+    /// caller's receive loop (on TCP/TLS, the A-leg connection's reader).
+    fn handle_result<'a, T: Transport + 'static>(
+        result: ProcessResult,
+        transport: &'a Arc<T>,
+        stats: &'a Arc<ServerStats>,
+        sip_stack: &'a Arc<SipStack>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(Self::handle_result_inner(
+            result, transport, stats, sip_stack,
+        ))
+    }
+
+    async fn handle_result_inner<T: Transport + 'static>(
+        result: ProcessResult,
+        transport: &Arc<T>,
+        stats: &Arc<ServerStats>,
+        sip_stack: &Arc<SipStack>,
+    ) {
         match result {
             ProcessResult::Response {
                 message,
@@ -1607,7 +1651,7 @@ impl Server {
                 destination,
             } => {
                 let request_bytes = message.to_bytes();
-                match tokio::time::timeout(
+                let sent = match tokio::time::timeout(
                     std::time::Duration::from_secs(30),
                     transport.send(&request_bytes, &destination),
                 )
@@ -1616,19 +1660,41 @@ impl Server {
                     Ok(Ok(())) => {
                         stats.messages_sent.fetch_add(1, Ordering::Relaxed);
                         debug!(destination = %destination, "Request forwarded");
+                        true
                     }
                     Ok(Err(e)) => {
                         warn!(error = %e, "Failed to forward request");
+                        false
                     }
                     Err(_) => {
                         warn!(destination = %destination, "Forward request timed out (30s)");
+                        false
+                    }
+                };
+                // NIST 800-53 Rev5: CP-8 — RFC 3261 §8.1.3.1 transport errors
+                // are reported to the TU.
+                //
+                // NIST 800-53 Rev5: SC-5 — the failover follow-up (already
+                // decided exactly once by on_invite_sent) is sent off the
+                // receive loop.
+                if matches!(&message, SipMessage::Request(r) if r.method == Method::Invite) {
+                    let follow_ups = sip_stack.on_invite_sent(&message, sent).await;
+                    if !follow_ups.is_empty() {
+                        let transport = Arc::clone(transport);
+                        let stats = Arc::clone(stats);
+                        let sip_stack = Arc::clone(sip_stack);
+                        tokio::spawn(async move {
+                            for follow_up in follow_ups {
+                                Self::handle_result(follow_up, &transport, &stats, &sip_stack)
+                                    .await;
+                            }
+                        });
                     }
                 }
             }
             ProcessResult::Multiple(results) => {
                 for sub_result in results {
-                    // Box::pin to allow recursive async call
-                    Box::pin(Self::handle_result(sub_result, transport, stats)).await;
+                    Self::handle_result(sub_result, transport, stats, sip_stack).await;
                 }
             }
             ProcessResult::NoAction => {
@@ -1655,7 +1721,7 @@ impl Server {
         loop {
             tick.tick().await;
             for result in sip_stack.poll_timers().await {
-                Self::handle_result(result, transport.as_ref(), &stats).await;
+                Self::handle_result(result, &transport, &stats, &sip_stack).await;
             }
         }
     }

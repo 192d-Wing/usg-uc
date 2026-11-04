@@ -97,9 +97,34 @@ fn validate_general(config: &crate::schema::GeneralConfig) -> ConfigResult<()> {
         });
     }
 
+    // The emergency reserve is enforced by admission control; an
+    // out-of-range value is rejected, not ignored.
+    //
+    // ## 47 CFR 9.16; NIST 800-53 Rev5: CM-6, SC-5
+    if let Some(reserve) = config.emergency_reserve_calls
+        && !(1..=config.max_calls).contains(&reserve)
+    {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "emergency_reserve_calls must be 1-{} (max_calls)",
+                config.max_calls
+            ),
+        });
+    }
+
     if config.max_registrations == 0 {
         return Err(ConfigError::Validation {
             message: "max_registrations must be greater than 0".to_string(),
+        });
+    }
+
+    if !(1..=crate::schema::MAX_TRUNK_RETRY_AFTER_SECS).contains(&config.trunk_retry_after_max_secs)
+    {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "trunk_retry_after_max_secs must be 1-{}",
+                crate::schema::MAX_TRUNK_RETRY_AFTER_SECS
+            ),
         });
     }
 
@@ -525,6 +550,16 @@ fn validate_trunks(group: &crate::schema::TrunkGroupConfig) -> ConfigResult<()> 
                 message: format!(
                     "trunk '{}' (group '{}'): max_calls must be greater than 0",
                     trunk.id, group.id
+                ),
+            });
+        }
+        if let Some(reserve) = trunk.emergency_reserve_calls
+            && !(1..=trunk.max_calls).contains(&reserve)
+        {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "trunk '{}' (group '{}'): emergency_reserve_calls must be 1-{} (max_calls)",
+                    trunk.id, group.id, trunk.max_calls
                 ),
             });
         }
@@ -1487,6 +1522,42 @@ mod tests {
     }
 
     #[test]
+    fn emergency_reserve_calls_default_and_bounds() {
+        let mut config = SbcConfig::default();
+        assert_eq!(config.general.emergency_reserve_calls, None);
+        assert_eq!(config.general.effective_emergency_reserve_calls(), 1000);
+        config.general.max_calls = 5;
+        assert_eq!(config.general.effective_emergency_reserve_calls(), 1);
+        for ok in [1, 5] {
+            config.general.emergency_reserve_calls = Some(ok);
+            assert!(super::validate_config(&config).is_ok(), "{ok}");
+            assert_eq!(config.general.effective_emergency_reserve_calls(), ok);
+        }
+        for bad in [0, 6, u32::MAX] {
+            config.general.emergency_reserve_calls = Some(bad);
+            assert_rejected(&config, "emergency_reserve_calls");
+        }
+        config.general.emergency_reserve_calls = None;
+
+        let mut group = trunk_group("tg");
+        group.trunks[0].max_calls = 20;
+        assert_eq!(group.trunks[0].effective_emergency_reserve_calls(), 2);
+        group.trunks[0].emergency_reserve_calls = Some(20);
+        config.trunk_groups = vec![group.clone()];
+        assert!(super::validate_config(&config).is_ok());
+        for bad in [0, 21] {
+            group.trunks[0].emergency_reserve_calls = Some(bad);
+            config.trunk_groups = vec![group.clone()];
+            assert_rejected(&config, "emergency_reserve_calls");
+        }
+
+        let parsed =
+            crate::load_from_str("[general]\nmax_calls = 100\nemergency_reserve_calls = 7\n")
+                .unwrap();
+        assert_eq!(parsed.general.effective_emergency_reserve_calls(), 7);
+    }
+
+    #[test]
     fn test_trunk_options_ping_interval_bounds() {
         let mut config = SbcConfig::default();
         let mut group = trunk_group("tg");
@@ -1578,5 +1649,42 @@ audit_enabled = true
         let config = crate::load_from_str(DEPLOY_CONFIG_TOML).expect("deploy/config/config.toml");
         assert_eq!(config.general.instance_name, "sbc-01");
         super::validate_config(&config).expect("deploy/config/config.toml must validate");
+    }
+
+    #[test]
+    fn trunk_retry_after_max_secs_bounds() {
+        let mut config = crate::SbcConfig::default();
+        assert_eq!(config.general.trunk_retry_after_max_secs, 300);
+        for ok in [1, 300, 3600] {
+            config.general.trunk_retry_after_max_secs = ok;
+            assert!(super::validate_config(&config).is_ok(), "{ok}");
+        }
+        for bad in [0, 3601, u32::MAX] {
+            config.general.trunk_retry_after_max_secs = bad;
+            assert!(super::validate_config(&config).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn emergency_numbers_parse_default_and_reject_invalid() {
+        let config = crate::load_from_str("[vps]\nenabled = true\n").unwrap();
+        assert_eq!(
+            config.vps.as_ref().unwrap().emergency_numbers,
+            vec!["911", "933", "112"]
+        );
+        let config = crate::load_from_str(
+            "[general]\ntrunk_retry_after_max_secs = 60\n[vps]\nemergency_numbers = [\"911\", \"+999\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.general.trunk_retry_after_max_secs, 60);
+        assert_eq!(
+            config.vps.as_ref().unwrap().emergency_numbers,
+            vec!["911", "+999"]
+        );
+        assert!(super::validate_config(&config).is_ok());
+        let mut bad = config;
+        bad.vps.as_mut().unwrap().emergency_numbers = vec!["9-1-1".to_string()];
+        assert!(super::validate_config(&bad).is_err());
+        assert!(crate::load_from_str("[general]\ntrunk_retry_after_max_secs = 0\n").is_err());
     }
 }

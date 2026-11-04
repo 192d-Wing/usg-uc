@@ -339,9 +339,74 @@ pub struct AppState {
     >,
 }
 
+/// Gauge: audit records dropped (queue full or writer thread dead).
+pub const METRIC_AUDIT_RECORDS_DROPPED: &str = "audit_records_dropped";
+/// Gauge: 1 while the audit writer thread runs, 0 once it has exited.
+pub const METRIC_AUDIT_WRITER_ALIVE: &str = "audit_writer_alive";
+/// Gauge: emergency INVITEs admitted through the emergency bypass.
+pub const METRIC_EMERGENCY_ADMISSIONS: &str = "emergency_calls_admitted";
+
+/// Registers the daemon's audit and emergency gauges, refreshed by
+/// [`AppState::refresh_daemon_metrics`] before each export.
+///
+/// ## NIST 800-53 Rev5: AU-5, SI-4 (System Monitoring)
+fn register_daemon_metrics(metrics: &mut MetricRegistry) {
+    metrics.register_gauge(
+        METRIC_AUDIT_RECORDS_DROPPED,
+        "Audit records dropped because the audit queue was full or its writer had exited",
+    );
+    metrics.register_gauge(
+        METRIC_AUDIT_WRITER_ALIVE,
+        "1 while the audit writer thread runs, 0 after it has exited",
+    );
+    metrics.register_gauge(
+        METRIC_EMERGENCY_ADMISSIONS,
+        "Emergency INVITEs admitted through the emergency bypass (47 CFR 9.16)",
+    );
+}
+
+/// Health of the audit pipeline: unhealthy once the writer thread has
+/// exited (every record is dropped), degraded after any drop.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+fn audit_component_status() -> ComponentStatus {
+    let dropped = uc_audit::dropped_records();
+    if !uc_audit::writer_alive() {
+        ComponentStatus::unhealthy(
+            "audit",
+            format!("audit writer thread exited; {dropped} records dropped"),
+        )
+    } else if dropped > 0 {
+        ComponentStatus::degraded("audit", format!("{dropped} audit records dropped"))
+    } else {
+        ComponentStatus::healthy("audit")
+    }
+}
+
 impl AppState {
+    /// Sets the audit and emergency gauges from their sources. Call before
+    /// exporting `metrics`.
+    ///
+    /// ## NIST 800-53 Rev5: AU-5, SI-4 (System Monitoring)
+    pub fn refresh_daemon_metrics(&self) {
+        let as_gauge = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+        if let Some(g) = self.metrics.gauge(METRIC_AUDIT_RECORDS_DROPPED) {
+            g.set(as_gauge(uc_audit::dropped_records()));
+        }
+        if let Some(g) = self.metrics.gauge(METRIC_AUDIT_WRITER_ALIVE) {
+            g.set(i64::from(uc_audit::writer_alive()));
+        }
+        if let (Some(g), Some(stack)) = (
+            self.metrics.gauge(METRIC_EMERGENCY_ADMISSIONS),
+            self.sip_stack.as_ref(),
+        ) {
+            g.set(as_gauge(stack.emergency_admissions()));
+        }
+    }
+
     /// Creates new application state.
-    pub fn new(metrics: MetricRegistry, stats: Arc<ServerStats>) -> Self {
+    pub fn new(mut metrics: MetricRegistry, stats: Arc<ServerStats>) -> Self {
+        register_daemon_metrics(&mut metrics);
         Self {
             metrics,
             stats,
@@ -372,10 +437,11 @@ impl AppState {
 
     /// Creates new application state with TLS acceptor for certificate reload support.
     pub fn with_tls(
-        metrics: MetricRegistry,
+        mut metrics: MetricRegistry,
         stats: Arc<ServerStats>,
         tls_acceptor: Arc<ReloadableTlsAcceptor>,
     ) -> Self {
+        register_daemon_metrics(&mut metrics);
         Self {
             metrics,
             stats,
@@ -459,6 +525,7 @@ impl AppState {
             ComponentStatus::healthy("sbc_core"),
             ComponentStatus::healthy("sip_transport"),
             ComponentStatus::healthy("media_engine"),
+            audit_component_status(),
         ];
 
         // Note: Cluster health is checked asynchronously via check_health_async
@@ -480,6 +547,7 @@ impl AppState {
             ComponentStatus::healthy("sbc_core"),
             ComponentStatus::healthy("sip_transport"),
             ComponentStatus::healthy("media_engine"),
+            audit_component_status(),
         ];
 
         // Check cluster health if configured
@@ -1028,6 +1096,8 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
                     .get("max_calls")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(100) as u32,
+                // Default emergency headroom (10% of max_calls, min 1).
+                emergency_reserve_calls: None,
                 cooldown_secs: t
                     .get("cooldown_seconds")
                     .and_then(serde_json::Value::as_u64)
@@ -1411,6 +1481,27 @@ mod tests {
         let metrics = SbcMetrics::standard();
         let stats = Arc::new(ServerStats::default());
         Arc::new(AppState::new(metrics, stats))
+    }
+
+    #[test]
+    fn health_and_metrics_expose_audit_pipeline_and_emergency_admissions() {
+        // No audit logger in this process: the pipeline reports healthy.
+        let mut state = AppState::new(SbcMetrics::standard(), Arc::new(ServerStats::default()));
+        let audit = state
+            .check_health()
+            .components
+            .into_iter()
+            .find(|c| c.name == "audit")
+            .expect("audit component");
+        assert_eq!(audit.status, uc_health::HealthStatus::Healthy);
+        state.sip_stack = Some(Arc::new(crate::sip_stack::SipStack::new(
+            crate::sip_stack::SipStackConfig::default(),
+        )));
+        state.refresh_daemon_metrics();
+        let text = state.metrics.export();
+        assert!(text.contains("sbc_audit_records_dropped 0"), "{text}");
+        assert!(text.contains("sbc_audit_writer_alive 1"), "{text}");
+        assert!(text.contains("sbc_emergency_calls_admitted 0"), "{text}");
     }
 
     #[test]

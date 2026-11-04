@@ -123,6 +123,15 @@ cluster_id = "dc-east-1"
 # Maximum concurrent calls
 max_calls = 10000
 
+# Extra concurrent calls above max_calls that only emergency calls may use
+# (see "Emergency Calls"). Default: 10% of max_calls, at least 1. When set it
+# must be 1..=max_calls.
+# emergency_reserve_calls = 1000
+
+# Upper bound (seconds) for a trunk's Retry-After on 503. Default 300,
+# accepted range 1..=3600.
+trunk_retry_after_max_secs = 300
+
 # Maximum registration bindings per node (enforced). Counted by binding key
 # (+sip.instance/reg-id, else contact URI) after authentication; a REGISTER
 # that would exceed it gets 503 Retry-After: 60. Refreshes, re-registration
@@ -407,13 +416,36 @@ The call moves to the next trunk when the current trunk answers **408, 500, 502,
 
 Each failover attempt is a new B-leg INVITE (new Call-ID, branch, From tag, CSeq) with the same SDP and the translated number. Intermediate failures are not shown to the caller. When all trunks are exhausted, the last trunk's final response is relayed (Timer B exhausted gives 408).
 
-Limitations: a transport send error to a trunk does not trigger failover; the failover INVITE keeps the original Request-URI host and scheme and the UDP Via transport (see the POA&M in [NIST-800-53-CONTROLS.md](NIST-800-53-CONTROLS.md)).
+A transport error on the **first send** of a B-leg INVITE also fails over at once, without waiting for Timer B (32 s): a UDP send error, a TCP/TLS connect, handshake or write failure, or the 30 s send timeout. The failed attempt counts as a trunk failure but does not start a cooldown, and each attempt fails over at most once. If no trunk is left the caller gets 503 (RFC 3261 §8.1.3.1). Send failures of retransmissions, ACK, CANCEL and in-dialog requests are only logged.
+
+Limitations: the failover INVITE keeps the original Request-URI host and scheme and the UDP Via transport (see the POA&M in [NIST-800-53-CONTROLS.md](NIST-800-53-CONTROLS.md)).
 
 ### Trunk Capacity and Cooldown
 
 - `max_calls` is enforced **per SBC node**. A trunk at `max_calls` is skipped. When every trunk in the route is full or down, the caller gets `503` with `Retry-After: 5`. `max_calls = 0` is rejected by validation.
-- A trunk that answers 503 goes into cooldown for `cooldown_secs`. The trunk's own `Retry-After` header is ignored.
+- A trunk that answers 503 goes into cooldown. If the 503 carries `Retry-After` with delta-seconds, the cooldown is that many seconds (down to 1 s), capped at `general.trunk_retry_after_max_secs` (default 300, max 3600). A trailing comment or `;duration=` parameter is ignored. A missing, zero or malformed value uses `cooldown_secs`.
+- Emergency calls may exceed a trunk's `max_calls` by its `emergency_reserve_calls` (default 10% of `max_calls`, at least 1; when set must be 1..=`max_calls`). Normal calls never use the reserve.
 - After `max_failures` consecutive failures a trunk enters cooldown for `cooldown_secs` and is excluded from selection; it becomes available again afterwards. `max_failures = 0` is rejected.
+
+### Emergency Calls
+
+Emergency numbers are set in the VPS section and apply whether or not the VPS is enabled. If `[vps]` is absent or disabled, the default list is used.
+
+```toml
+[vps]
+# Exact match on the dialed Request-URI user, before number translation.
+# "+" and visual separators (- . ( ) space) are ignored; no prefix match
+# (9111 and 988 are not emergency numbers). At most 32 entries of at most
+# 32 characters, using digits, *, # and +. An empty list turns the bypass
+# off (a warning is logged at startup).
+emergency_numbers = ["911", "933", "112"]
+```
+
+For an emergency call the SBC skips the VPS caller-prefix blocklist, rate limits, `per_callee_max_concurrent`, STIR/SHAKEN screening and deny rules. It can use the emergency reserve above `general.max_calls` and above each trunk's `max_calls`. Past `max_calls + emergency_reserve_calls` it gets 503 like any other call; that 503 carries no `Retry-After`.
+
+Still enforced for emergency calls: operator source-IP block entries in the VPS, source admission (ACL), authentication, the per-source-IP flood limiter, draining, Max-Forwards, trunk reachability and trunk cooldown.
+
+Each admitted emergency call is audited as an `AuthorizationDecision` with `policy = "emergency-bypass"` and the source IP, and counted in `sbc_emergency_calls_admitted`.
 
 ### Trunk OPTIONS Health
 
@@ -615,7 +647,14 @@ audit_enabled = false            # NIST AU-2 audit trail (uc-audit, SHA-384 hash
 audit_path = "/var/log/sbc/audit.log"   # JSON lines; omit to emit audit records on the log (target "audit")
 ```
 
-`level` is the base log level; `-v` / `-vv` raise it to debug / trace and `RUST_LOG`, when set, overrides the filter entirely. The subscriber is configured from this section before anything else logs. With `audit_enabled`, the daemon records startup/shutdown, REGISTER authentication outcomes (bearer or digest), INVITE admission and VPS rejections, call establishment and termination (with duration and reason), and rate-limit rejections; each record carries a sequence number and a SHA-384 hash chain for tamper evidence (`uc-audit`).
+`level` is the base log level; `-v` / `-vv` raise it to debug / trace and `RUST_LOG`, when set, overrides the filter entirely. The subscriber is configured from this section before anything else logs. With `audit_enabled`, the daemon records startup/shutdown, REGISTER authentication outcomes (bearer or digest), INVITE admission and VPS rejections, call establishment and termination (with duration and reason), rate-limit rejections, emergency-bypass grants, trunk failovers (`TrunkFailover`, reason: status, timeout or transport error) and trunk reachability changes (`TrunkReachabilityChanged`, source: OPTIONS or trunk agent). `AuthorizationDecision` records carry `source_ip` when it is known. Each record carries a sequence number and a SHA-384 hash chain for tamper evidence (`uc-audit`).
+
+Audit writes never block call handling. Records go onto a queue of 4096 and a background thread writes them. If the queue is full or the writer thread has died, the record is **dropped** and counted, and an error is logged at most once every 10 s. On shutdown the daemon waits up to 2 s for the queue to drain; records still queued after that are lost. Watch these:
+
+- health component `audit`: unhealthy when the writer thread has exited, degraded once any record has been dropped (it stays degraded until restart);
+- gauge `sbc_audit_records_dropped` (records dropped so far);
+- gauge `sbc_audit_writer_alive` (1 or 0);
+- gauge `sbc_emergency_calls_admitted` (emergency calls admitted so far).
 
 ---
 
@@ -836,10 +875,10 @@ See [CNSA-2-COMPLIANCE.md](CNSA-2-COMPLIANCE.md) for details.
 The SBC implements controls from NIST 800-53 Rev5 (wiring state in parentheses):
 
 - **AC-3/AC-4**: Source admission (trunk IP or active registration) and routing / topology hiding (wired)
-- **AU-2**: Audit logging (planned — `uc-audit` is library-only; only `tracing` logs today)
+- **AU-2/AU-3/AU-5**: Audit logging (wired, opt-in via `logging.audit_enabled`; non-blocking writer, drops counted and exposed in health and metrics)
 - **CM-2/CM-6**: Configuration management (wired)
 - **IA-2**: REGISTER authentication (wired for OIDC Bearer via `SBC_AUTH_MODE=bearer`; digest not configurable; SIP mTLS planned)
-- **SC-5**: DoS protection (rate limiting, `max_calls` admission, per-trunk `max_calls`, `per_callee_max_concurrent`, `max_registrations` — wired, per node)
+- **SC-5**: DoS protection (rate limiting, `max_calls` admission, per-trunk `max_calls`, `per_callee_max_concurrent`, `max_registrations` — wired, per node; bounded emergency reserve)
 - **SC-7**: Boundary protection (topology hiding — wired)
 - **SC-8**: Transmission confidentiality (TLS 1.3 SIP listeners, AEAD SRTP — wired)
 - **SC-13**: Cryptographic protection (FIPS aws-lc-rs provider — wired)
