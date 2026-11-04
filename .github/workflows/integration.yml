@@ -239,8 +239,10 @@ jobs:
         run: docker compose -f "$COMPOSE" kill sbc-media-2
 
       - name: Post-kill calls must survive on node 1
+        # --no-deps: sipp-uac depends (via sbc-signaling) on both media nodes,
+        # so a plain `run` would start the killed node again.
         run: |
-          docker compose -f "$COMPOSE" run --rm sipp-uac \
+          docker compose -f "$COMPOSE" run --rm --no-deps sipp-uac \
             172.28.1.10:5060 -sf /scenarios/sipp-uac-media.xml \
             -r 5 -l 20 -m 20 -mi 172.28.2.30 -p 5070 \
             -recv_timeout 10000 -timeout 60s -trace_err

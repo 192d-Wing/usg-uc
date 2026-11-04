@@ -192,6 +192,9 @@ struct ServerInviteState {
     /// retransmission (RFC 3261 §17.2.1) and, for a non-2xx final, on
     /// Timer G until the ACK arrives.
     last_response: Option<SipMessage>,
+    /// Call-ID of the request that opened the transaction; a later request
+    /// with the same branch but another Call-ID is a new request.
+    call_id: String,
 }
 
 /// State for server non-INVITE transaction.
@@ -201,6 +204,9 @@ struct ServerNonInviteState {
     created_at: Instant,
     /// Last response sent; re-sent on a request retransmission (§17.2.2).
     last_response: Option<SipMessage>,
+    /// Call-ID of the request that opened the transaction (see
+    /// `ServerInviteState::call_id`).
+    call_id: String,
 }
 
 /// State for client INVITE transaction.
@@ -1065,6 +1071,12 @@ impl SipStack {
     /// (RFC 3261 §17.2.3: top Via branch + CSeq method), returns what to do
     /// about it — re-send the last response, or nothing while the first copy
     /// is still being processed. `None` means the request is new.
+    ///
+    /// A retransmission is a copy of the same request, so a stored transaction
+    /// whose Call-ID differs is a branch collision (a client that reuses
+    /// branch values, or a forged one), not a retransmission: the request is
+    /// treated as new instead of being swallowed or answered with another
+    /// call's response.
     async fn answer_request_retransmit(
         &self,
         req: &SipRequest,
@@ -1072,15 +1084,22 @@ impl SipStack {
     ) -> Option<ProcessResult> {
         let branch = req.headers.via_branch()?;
         let key = TransactionKey::server(&branch, req.method.to_string());
+        let call_id = req.headers.call_id().unwrap_or("");
         let mut txns = self.transactions.write().await;
         let (resend, last) = if req.method == Method::Invite {
-            let st = txns.server_invite.get_mut(&key)?;
+            let st = txns
+                .server_invite
+                .get_mut(&key)
+                .filter(|st| st.call_id == call_id)?;
             (
                 st.transaction.receive_request().unwrap_or(false),
                 st.last_response.clone(),
             )
         } else {
-            let st = txns.server_non_invite.get_mut(&key)?;
+            let st = txns
+                .server_non_invite
+                .get_mut(&key)
+                .filter(|st| st.call_id == call_id)?;
             (
                 st.transaction.receive_request().unwrap_or(false),
                 st.last_response.clone(),
@@ -1105,27 +1124,48 @@ impl SipStack {
             return;
         };
         let key = TransactionKey::server(&branch, req.method.to_string());
+        let call_id = req.headers.call_id().unwrap_or("").to_string();
         let now = Instant::now();
         let mut txns = self.transactions.write().await;
         txns.sweep_if_needed();
+        // An entry with the same branch but another Call-ID belongs to an
+        // earlier request (see `answer_request_retransmit`); replace it.
         if req.method == Method::Invite {
-            txns.server_invite
-                .entry(key.clone())
-                .or_insert_with(|| ServerInviteState {
+            if txns
+                .server_invite
+                .get(&key)
+                .is_some_and(|st| st.call_id == call_id)
+            {
+                return;
+            }
+            txns.server_invite.insert(
+                key.clone(),
+                ServerInviteState {
                     transaction: ServerInviteTransaction::new(key, TransportType::Unreliable),
                     source,
                     created_at: now,
                     last_response: None,
-                });
+                    call_id,
+                },
+            );
         } else {
-            txns.server_non_invite
-                .entry(key.clone())
-                .or_insert_with(|| ServerNonInviteState {
+            if txns
+                .server_non_invite
+                .get(&key)
+                .is_some_and(|st| st.call_id == call_id)
+            {
+                return;
+            }
+            txns.server_non_invite.insert(
+                key.clone(),
+                ServerNonInviteState {
                     transaction: ServerNonInviteTransaction::new(key, TransportType::Unreliable),
                     source,
                     created_at: now,
                     last_response: None,
-                });
+                    call_id,
+                },
+            );
         }
     }
 
@@ -7835,6 +7875,30 @@ mod tests {
         let (_, dest) = responded(&results, 100).expect("last provisional re-sent (§17.2.1)");
         assert_eq!(dest, alice());
         assert_eq!(stack.call_count().await, 1, "no second call");
+    }
+
+    #[tokio::test]
+    async fn reused_branch_with_new_call_id_is_a_new_request() {
+        // A client that reuses branch values (SIPp restarted under the same
+        // PID does) must not have its new request swallowed as a
+        // retransmission of an earlier call's transaction.
+        let (stack, _) = ringing_call().await;
+        let first = alice_request("INVITE", 1, None, Some(ALICE_SDP));
+        let second = String::from_utf8(first.to_vec())
+            .unwrap()
+            .replace("Call-ID: call-relay@test", "Call-ID: call-other@test");
+        let results = flatten(
+            stack
+                .process_message(&Bytes::from(second), alice(), None)
+                .await,
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, ProcessResult::Forward { .. })),
+            "new INVITE forwarded, not answered from the old transaction: {results:?}"
+        );
+        assert_eq!(stack.call_count().await, 2, "second call created");
     }
 
     #[tokio::test]
