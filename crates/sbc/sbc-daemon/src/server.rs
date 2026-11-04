@@ -1300,7 +1300,12 @@ impl Server {
                                 let source = msg.source;
                                 tokio::spawn(async move {
                                     let result = sip_stack
-                                        .process_message(&data, source, zone.as_deref())
+                                        .process_message_on(
+                                            &data,
+                                            source,
+                                            zone.as_deref(),
+                                            uc_types::address::TransportType::Udp,
+                                        )
                                         .await;
                                     Self::handle_result(result, &transport, &stats, &sip_stack)
                                         .await;
@@ -1577,7 +1582,14 @@ impl Server {
 
                         let result = ctx
                             .sip_stack
-                            .process_message(&frame, peer, ctx.zone_name.as_deref())
+                            // RFC 3261 §17: responses and forwards ride this
+                            // stream, so its transactions use reliable timers.
+                            .process_message_on(
+                                &frame,
+                                peer,
+                                ctx.zone_name.as_deref(),
+                                transport.transport_type(),
+                            )
                             .await;
                         Self::handle_result(result, &transport, &ctx.stats, &ctx.sip_stack).await;
                     }

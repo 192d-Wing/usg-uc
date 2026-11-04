@@ -651,8 +651,8 @@ audit_path = "/var/log/sbc/audit.log"   # JSON lines; omit to emit audit records
 
 Audit writes never block call handling. Records go onto a queue of 4096 and a background thread writes them. If the queue is full or the writer thread has died, the record is **dropped** and counted, and an error is logged at most once every 10 s. On shutdown the daemon waits up to 2 s for the queue to drain; records still queued after that are lost. Watch these:
 
-- health component `audit`: unhealthy when the writer thread has exited, degraded once any record has been dropped (it stays degraded until restart);
-- gauge `sbc_audit_records_dropped` (records dropped so far);
+- health component `audit`: unhealthy when the writer thread has exited; degraded while the last dropped record is less than 60 s old (message `N audit records dropped, last Ns ago`), healthy again after that. The 60 s window is fixed, not configurable;
+- gauge `sbc_audit_records_dropped` (records dropped since start; never reset). Because health recovers after 60 s, a short burst of drops between health polls can leave no trace in health status. Alert on any increase of this counter (for example `increase(sbc_audit_records_dropped[5m]) > 0`), not only on the `audit` health status;
 - gauge `sbc_audit_writer_alive` (1 or 0);
 - gauge `sbc_emergency_calls_admitted` (emergency calls admitted so far).
 

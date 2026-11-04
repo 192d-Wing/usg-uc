@@ -42,7 +42,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tower_http::trace::TraceLayer;
@@ -365,21 +365,51 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
     );
 }
 
+/// How long after the most recent dropped audit record the `audit` health
+/// component stays degraded. The cumulative `sbc_audit_records_dropped`
+/// counter is never reset, so alerting on its rate still sees every drop.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+pub const AUDIT_DROP_DEGRADED_WINDOW: Duration = Duration::from_secs(60);
+
 /// Health of the audit pipeline: unhealthy once the writer thread has
-/// exited (every record is dropped), degraded after any drop.
+/// exited (every record is dropped), degraded while records were dropped
+/// within [`AUDIT_DROP_DEGRADED_WINDOW`], healthy otherwise.
 ///
 /// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
 fn audit_component_status() -> ComponentStatus {
-    let dropped = uc_audit::dropped_records();
-    if !uc_audit::writer_alive() {
-        ComponentStatus::unhealthy(
+    audit_status_from(
+        uc_audit::writer_alive(),
+        uc_audit::dropped_records(),
+        uc_audit::last_drop_elapsed(),
+        AUDIT_DROP_DEGRADED_WINDOW,
+    )
+}
+
+/// Pure decision behind [`audit_component_status`].
+///
+/// ## NIST 800-53 Rev5: AU-5, SI-4 (System Monitoring)
+fn audit_status_from(
+    writer_alive: bool,
+    dropped: u64,
+    last_drop: Option<Duration>,
+    window: Duration,
+) -> ComponentStatus {
+    if !writer_alive {
+        return ComponentStatus::unhealthy(
             "audit",
             format!("audit writer thread exited; {dropped} records dropped"),
-        )
-    } else if dropped > 0 {
-        ComponentStatus::degraded("audit", format!("{dropped} audit records dropped"))
-    } else {
-        ComponentStatus::healthy("audit")
+        );
+    }
+    match last_drop {
+        Some(ago) if ago < window => ComponentStatus::degraded(
+            "audit",
+            format!(
+                "{dropped} audit records dropped, last {}s ago",
+                ago.as_secs()
+            ),
+        ),
+        _ => ComponentStatus::healthy("audit"),
     }
 }
 
@@ -1502,6 +1532,63 @@ mod tests {
         assert!(text.contains("sbc_audit_records_dropped 0"), "{text}");
         assert!(text.contains("sbc_audit_writer_alive 1"), "{text}");
         assert!(text.contains("sbc_emergency_calls_admitted 0"), "{text}");
+    }
+
+    #[test]
+    fn audit_status_recovers_after_drop_window() {
+        use uc_health::HealthStatus;
+        let w = AUDIT_DROP_DEGRADED_WINDOW;
+        let dead = audit_status_from(false, 7, None, w);
+        assert_eq!(dead.status, HealthStatus::Unhealthy);
+        assert_eq!(
+            audit_status_from(false, 7, Some(Duration::from_secs(1)), w).status,
+            HealthStatus::Unhealthy
+        );
+        let recent = audit_status_from(true, 7, Some(Duration::from_secs(5)), w);
+        assert_eq!(recent.status, HealthStatus::Degraded);
+        assert_eq!(
+            recent.message.as_deref(),
+            Some("7 audit records dropped, last 5s ago")
+        );
+        let old = audit_status_from(true, 7, Some(Duration::from_secs(61)), w);
+        assert_eq!(old.status, HealthStatus::Healthy);
+        assert_eq!(
+            audit_status_from(true, 7, Some(w), w).status,
+            HealthStatus::Healthy
+        );
+        assert_eq!(
+            audit_status_from(true, 0, None, w).status,
+            HealthStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn qa_audit_status_window_boundary() {
+        use uc_health::HealthStatus;
+        let w = AUDIT_DROP_DEGRADED_WINDOW;
+        assert_eq!(w, Duration::from_secs(60));
+        let just_under = Duration::from_millis(59_999);
+        let s = audit_status_from(true, 2, Some(just_under), w);
+        assert_eq!(s.status, HealthStatus::Degraded);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("2 audit records dropped, last 59s ago")
+        );
+        let s = audit_status_from(true, 1, Some(Duration::ZERO), w);
+        assert_eq!(s.status, HealthStatus::Degraded);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("1 audit records dropped, last 0s ago")
+        );
+        assert_eq!(
+            audit_status_from(true, 1, Some(w + Duration::from_millis(1)), w).status,
+            HealthStatus::Healthy
+        );
+        // A zero window never reports degraded.
+        assert_eq!(
+            audit_status_from(true, 1, Some(Duration::ZERO), Duration::ZERO).status,
+            HealthStatus::Healthy
+        );
     }
 
     #[test]
