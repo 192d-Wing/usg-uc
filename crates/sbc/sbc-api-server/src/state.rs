@@ -181,15 +181,18 @@ impl AppState {
             // POAM: tonic's rustls defaults are used (TLS 1.2+1.3, default
             // suites) on both ends of this channel, not the uc-transport CNSA
             // 2.0 config; the chart's certificates are ECDSA P-384.
-            let read = |p: &std::path::Path| {
-                std::fs::read_to_string(p)
+            async fn read(p: &std::path::Path) -> Result<String, StateError> {
+                tokio::fs::read_to_string(p)
+                    .await
                     .map_err(|e| StateError::Grpc(format!("{}: {e}", p.display())))
-            };
+            }
             let tls_cfg = tonic::transport::ClientTlsConfig::new()
-                .ca_certificate(tonic::transport::Certificate::from_pem(read(&tls.ca)?))
+                .ca_certificate(tonic::transport::Certificate::from_pem(
+                    read(&tls.ca).await?,
+                ))
                 .identity(tonic::transport::Identity::from_pem(
-                    read(&tls.cert)?,
-                    read(&tls.key)?,
+                    read(&tls.cert).await?,
+                    read(&tls.key).await?,
                 ));
             endpoint = endpoint
                 .tls_config(tls_cfg)
