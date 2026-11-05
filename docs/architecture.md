@@ -25,6 +25,8 @@ flowchart TB
 | --- | --- | --- |
 | 0 — Foundation | `uc-types`, `uc-crypto`, `uc-audit` | Shared types, CNSA 2.0 cryptography (aws-lc-rs / FIPS), audit logging |
 | 1 — Transport | `uc-transport` | UDP/TCP/TLS transport for SIP |
+
+> **Egress flow layer (sbc-daemon):** each `ProcessResult` carries a `Flow` (the leg's transport plus, for a trunk, the right to dial it with a configured TLS name). `FlowTable` turns it into the UDP socket, the accepted connection, or a cached, certificate-verified trunk connection with its own reader task. Requests are never written to the connection they were triggered from unless that is the target leg.
 | 2 — Protocol core | `proto-sip`, `proto-transaction`, `proto-dialog`, `proto-b2bua`, `proto-registrar`, `proto-sdp`, `proto-rtp`, `proto-srtp`, `proto-dtls`, `proto-stun`, `proto-turn`, `proto-ice`, `proto-stir-shaken` | RFC protocol implementations |
 | 3 — Media engine | `uc-codecs`, `uc-media-engine` | Codec encode/decode (G.711 et al.), transcoding, media relay |
 | 4 — Security | `uc-acl`, `uc-auth`, `uc-dos-protection` | Access control, digest auth, rate limiting |

@@ -490,3 +490,32 @@ fn router_emergency_admission_and_cooldown_override() {
         "cooldown still applies to emergency calls"
     );
 }
+
+// NIST 800-53 Rev5: SC-8, SC-23 (POA&M-5) — a TLS trunk needs trunk trust
+// anchors; the per-trunk TLS keys are accepted only on TLS trunks.
+#[test]
+fn test_tls_trunk_requires_trunk_ca_and_accepts_tls_keys() {
+    let trunk = r#"
+[[trunk_groups]]
+id = "g1"
+name = "g1"
+strategy = "priority"
+  [[trunk_groups.trunks]]
+  id = "t1"
+  host = "sip.example.net"
+  port = 5061
+  protocol = "tls"
+  tls_server_name = "sip.example.net"
+"#;
+    let err = load_from_str(trunk).unwrap_err().to_string();
+    assert!(err.contains("trunk_tls_ca_path"), "{err}");
+
+    let ok = format!("[security]\ntrunk_tls_ca_path = \"/etc/sbc/trunk-ca.pem\"\n{trunk}");
+    let config = load_from_str(&ok).unwrap();
+    let t = &config.trunk_groups[0].trunks[0];
+    assert_eq!(t.tls_server_name.as_deref(), Some("sip.example.net"));
+    assert!(!t.tls_client_cert, "mTLS to trunks defaults off");
+
+    let udp = ok.replace("protocol = \"tls\"", "protocol = \"udp\"");
+    assert!(load_from_str(&udp).is_err(), "TLS-only keys on a UDP trunk");
+}

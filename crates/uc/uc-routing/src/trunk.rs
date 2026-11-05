@@ -147,6 +147,16 @@ pub struct TrunkConfig {
     pub outbound_enabled: bool,
     /// Whether inbound calling is enabled.
     pub inbound_enabled: bool,
+    /// TLS server name to verify the trunk certificate against when
+    /// `protocol` is TLS. `None` verifies against `host` (DNS name or, for
+    /// an IP literal, an IP SAN).
+    ///
+    /// ## NIST 800-53 Rev5: SC-23 (Session Authenticity)
+    pub tls_server_name: Option<String>,
+    /// Present the SBC certificate to this trunk (mutual TLS).
+    ///
+    /// ## NIST 800-53 Rev5: IA-3 (Device Identification and Authentication)
+    pub tls_client_cert: bool,
 }
 
 impl Default for TrunkConfig {
@@ -165,6 +175,8 @@ impl Default for TrunkConfig {
             max_failures: 3,
             outbound_enabled: true,
             inbound_enabled: true,
+            tls_server_name: None,
+            tls_client_cert: false,
         }
     }
 }
@@ -241,6 +253,25 @@ impl TrunkConfig {
         self
     }
 
+    /// Sets the TLS server name verified on the trunk certificate.
+    #[must_use]
+    pub fn with_tls_server_name(mut self, name: impl Into<String>) -> Self {
+        self.tls_server_name = Some(name.into());
+        self
+    }
+
+    /// Presents the SBC certificate to this trunk (mutual TLS).
+    #[must_use]
+    pub const fn with_tls_client_cert(mut self, on: bool) -> Self {
+        self.tls_client_cert = on;
+        self
+    }
+
+    /// Name the trunk's TLS certificate is verified against.
+    pub fn tls_name(&self) -> &str {
+        self.tls_server_name.as_deref().unwrap_or(&self.host)
+    }
+
     /// Sets the consecutive-failure count that puts the trunk into cooldown.
     #[must_use]
     pub fn with_max_failures(mut self, max: u32) -> Self {
@@ -276,17 +307,36 @@ pub struct Trunk {
     stats: TrunkStats,
     /// Cooldown expiry time.
     cooldown_until: Option<Instant>,
+    /// `config.host`, shared: built once so a per-call endpoint read is an
+    /// `Arc` clone, not an allocation.
+    host_shared: std::sync::Arc<str>,
+    /// `config.tls_name()`, shared (see `host_shared`).
+    tls_name_shared: std::sync::Arc<str>,
 }
 
 impl Trunk {
     /// Creates a new trunk.
     pub fn new(config: TrunkConfig) -> Self {
+        let host_shared = std::sync::Arc::from(config.host.as_str());
+        let tls_name_shared = std::sync::Arc::from(config.tls_name());
         Self {
             config,
             state: TrunkState::Available,
             stats: TrunkStats::default(),
             cooldown_until: None,
+            host_shared,
+            tls_name_shared,
         }
+    }
+
+    /// The configured host, shared (no allocation per call).
+    pub fn host_shared(&self) -> &std::sync::Arc<str> {
+        &self.host_shared
+    }
+
+    /// The TLS server name ([`TrunkConfig::tls_name`]), shared.
+    pub fn tls_name_shared(&self) -> &std::sync::Arc<str> {
+        &self.tls_name_shared
     }
 
     /// Returns the trunk ID.

@@ -77,6 +77,7 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_vps(config)?;
     validate_zones(&config.zones)?;
     validate_trunk_groups(config)?;
+    validate_trunk_tls(config)?;
     validate_routing(config)?;
     validate_header_manipulation(config)?;
     validate_topology_hiding(config)?;
@@ -647,6 +648,88 @@ fn validate_trunk_groups(config: &SbcConfig) -> ConfigResult<()> {
     }
 
     Ok(())
+}
+
+/// Outbound TLS to trunks: trust anchors, verified name, client cert.
+/// Every key is enforced by the egress flow layer or rejected here.
+///
+/// ## NIST 800-53 Rev5: SC-8, SC-23 (Session Authenticity), IA-3, CM-6
+fn validate_trunk_tls(config: &SbcConfig) -> ConfigResult<()> {
+    let mut any_tls = false;
+    for group in &config.trunk_groups {
+        for trunk in &group.trunks {
+            let is_tls = trunk.protocol == "tls";
+            any_tls |= is_tls;
+            let what = |key: &str, why: &str| ConfigError::Validation {
+                message: format!("trunk '{}' (group '{}'): {key} {why}", trunk.id, group.id),
+            };
+            // RFC 3261 §8.1.1.8, §18.2.2, §20.42: the Via sent-by and
+            // Contact on a TCP/TLS leg name the SBC's listener of that
+            // transport, where the trunk sends in-dialog requests and
+            // late responses. Without one the SBC would advertise a port
+            // nothing listens on.
+            let listener_missing = match trunk.protocol.as_str() {
+                "tls" => config.transport.tls_listen.is_empty(),
+                "tcp" => config.transport.tcp_listen.is_empty(),
+                _ => false,
+            };
+            if listener_missing {
+                return Err(what(
+                    "protocol",
+                    &format!(
+                        "= \"{}\" needs a transport.{}_listen address",
+                        trunk.protocol, trunk.protocol
+                    ),
+                ));
+            }
+            if let Some(name) = &trunk.tls_server_name {
+                if !is_tls {
+                    return Err(what("tls_server_name", "requires protocol = \"tls\""));
+                }
+                // A DNS name (RFC 6125) or IP literal; never a SIP header value.
+                if name.is_empty()
+                    || name.len() > 253
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
+                    // Must also be what rustls will verify against: rejects
+                    // "host:5061", "::::" and other non-name/non-IP shapes.
+                    || rustls_pki_types::ServerName::try_from(name.as_str()).is_err()
+                {
+                    return Err(what(
+                        "tls_server_name",
+                        "must be a DNS name or IP address (letters, digits, '.', '-', ':')",
+                    ));
+                }
+            }
+            if trunk.tls_client_cert {
+                if !is_tls {
+                    return Err(what("tls_client_cert", "requires protocol = \"tls\""));
+                }
+                if config.security.tls_cert_path.is_none() {
+                    return Err(what(
+                        "tls_client_cert",
+                        "needs security.tls_cert_path / tls_key_path",
+                    ));
+                }
+            }
+        }
+    }
+    match (&config.security.trunk_tls_ca_path, any_tls) {
+        (None, true) => Err(ConfigError::Validation {
+            message: "a trunk uses protocol = \"tls\" but security.trunk_tls_ca_path is not set \
+                      (PEM bundle of CAs that issue trunk server certificates)"
+                .to_string(),
+        }),
+        (Some(p), true) if !p.is_absolute() => Err(ConfigError::Validation {
+            message: "security.trunk_tls_ca_path must be an absolute path".to_string(),
+        }),
+        (Some(_), false) => Err(ConfigError::Validation {
+            message: "security.trunk_tls_ca_path is set but no trunk uses protocol = \"tls\""
+                .to_string(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 fn validate_trunks(group: &crate::schema::TrunkGroupConfig) -> ConfigResult<()> {
@@ -1822,6 +1905,8 @@ max_passport_age_secs = 120
             let mut group = trunk_group("tg1");
             group.trunks[0].protocol = (*protocol).to_string();
             config.trunk_groups = vec![group];
+            config.security.trunk_tls_ca_path =
+                (*protocol == "tls").then(|| "/etc/sbc/trunk-ca.pem".into());
             assert!(validate_config(&config).is_ok(), "protocol {protocol}");
         }
 
@@ -2311,6 +2396,198 @@ max_passport_age_secs = 120
         assert!(validate_config(&config).is_ok());
         config.cdr.syslog.facility = 24;
         assert_rejected(&config, "facility");
+    }
+    // NIST 800-53 Rev5: SC-8, SC-23 — outbound trunk TLS keys are enforced
+    // or rejected, never ignored.
+    // RFC-001 (RFC 3261 §18.2.2, §20.42): a TCP/TLS trunk needs a listener
+    // of that transport, or the Via/Contact would name a dead port.
+    #[test]
+    fn stream_trunk_requires_matching_listener() {
+        for (proto, port) in [("tls", 5061), ("tcp", 5060)] {
+            let mut c = SbcConfig::default();
+            let mut g = trunk_group("g1");
+            g.trunks[0].protocol = proto.to_string();
+            g.trunks[0].port = port;
+            c.trunk_groups = vec![g];
+            if proto == "tls" {
+                c.security.trunk_tls_ca_path = Some("/etc/sbc/trunk-ca.pem".into());
+            }
+            super::validate_config(&c).unwrap();
+            if proto == "tls" {
+                c.transport.tls_listen.clear();
+            } else {
+                c.transport.tcp_listen.clear();
+            }
+            let err = super::validate_config(&c).unwrap_err().to_string();
+            assert!(err.contains(&format!("transport.{proto}_listen")), "{err}");
+        }
+        // A UDP trunk needs no stream listener.
+        let mut c = SbcConfig::default();
+        c.transport.tcp_listen.clear();
+        c.transport.tls_listen.clear();
+        c.trunk_groups = vec![trunk_group("g1")];
+        super::validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn trunk_tls_keys_validated() {
+        let tls_cfg = || {
+            let mut c = SbcConfig::default();
+            let mut g = trunk_group("g1");
+            g.trunks[0].protocol = "tls".to_string();
+            g.trunks[0].port = 5061;
+            c.trunk_groups = vec![g];
+            c
+        };
+        // A TLS trunk needs trunk trust anchors.
+        let c = tls_cfg();
+        let err = super::validate_config(&c).unwrap_err().to_string();
+        assert!(err.contains("trunk_tls_ca_path"), "{err}");
+        let mut c = tls_cfg();
+        c.security.trunk_tls_ca_path = Some("trunks.pem".into());
+        assert!(
+            super::validate_config(&c).is_err(),
+            "relative path rejected"
+        );
+        c.security.trunk_tls_ca_path = Some("/etc/sbc/trunk-ca.pem".into());
+        super::validate_config(&c).unwrap();
+
+        // Server name: TLS only, no header metacharacters.
+        c.trunk_groups[0].trunks[0].tls_server_name = Some("sip.example.net".to_string());
+        super::validate_config(&c).unwrap();
+        c.trunk_groups[0].trunks[0].tls_server_name = Some("bad\r\nVia: x".to_string());
+        assert!(super::validate_config(&c).is_err());
+        c.trunk_groups[0].trunks[0].tls_server_name = None;
+
+        // mTLS to the trunk needs the SBC certificate.
+        c.trunk_groups[0].trunks[0].tls_client_cert = true;
+        assert!(super::validate_config(&c).is_err());
+        c.security.tls_cert_path = Some("/etc/sbc/cert.pem".into());
+        c.security.tls_key_path = Some("/etc/sbc/key.pem".into());
+        super::validate_config(&c).unwrap();
+
+        // TLS-only keys on a UDP trunk are rejected, as is an unused CA.
+        let mut c = SbcConfig::default();
+        c.trunk_groups = vec![trunk_group("g1")];
+        c.trunk_groups[0].trunks[0].tls_server_name = Some("sip.example.net".to_string());
+        assert!(super::validate_config(&c).is_err());
+        c.trunk_groups[0].trunks[0].tls_server_name = None;
+        c.trunk_groups[0].trunks[0].tls_client_cert = true;
+        assert!(super::validate_config(&c).is_err());
+        c.trunk_groups[0].trunks[0].tls_client_cert = false;
+        c.security.trunk_tls_ca_path = Some("/etc/sbc/trunk-ca.pem".into());
+        assert!(super::validate_config(&c).is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod qa_trunk_tls_edges {
+    use crate::schema::{SbcConfig, TrunkConfigSchema, TrunkGroupConfig};
+
+    fn group(id: &str, proto: &str) -> TrunkGroupConfig {
+        TrunkGroupConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            strategy: "priority".to_string(),
+            trunks: vec![TrunkConfigSchema {
+                id: format!("{id}-t"),
+                host: "sip.example.net".to_string(),
+                port: if proto == "tls" { 5061 } else { 5060 },
+                protocol: proto.to_string(),
+                ..TrunkConfigSchema::default()
+            }],
+            zone: None,
+        }
+    }
+
+    fn cfg(groups: Vec<TrunkGroupConfig>, ca: Option<&str>) -> SbcConfig {
+        let mut c = SbcConfig {
+            trunk_groups: groups,
+            ..SbcConfig::default()
+        };
+        c.security.trunk_tls_ca_path = ca.map(Into::into);
+        c
+    }
+
+    fn err(c: &SbcConfig) -> String {
+        super::validate_config(c).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn tls_trunk_in_a_later_group_still_needs_ca() {
+        let c = cfg(vec![group("a", "udp"), group("b", "tls")], None);
+        assert!(err(&c).contains("trunk_tls_ca_path"));
+        let c = cfg(
+            vec![group("a", "udp"), group("b", "tls")],
+            Some("/etc/sbc/trunk-ca.pem"),
+        );
+        super::validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn trunk_ca_path_empty_or_relative_rejected() {
+        for p in ["", "trunk-ca.pem", "./trunk-ca.pem", "../etc/ca.pem"] {
+            let c = cfg(vec![group("a", "tls")], Some(p));
+            assert!(err(&c).contains("absolute"), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn unused_trunk_ca_rejected_for_tcp_only() {
+        let c = cfg(vec![group("a", "tcp")], Some("/etc/sbc/trunk-ca.pem"));
+        assert!(err(&c).contains("no trunk uses"));
+    }
+
+    #[test]
+    fn tls_server_name_shapes() {
+        // 253 octets in labels of at most 63 (RFC 1035 §2.3.4).
+        let max_name = format!("{0}.{0}.{0}.{1}", "a".repeat(63), "a".repeat(61));
+        assert_eq!(max_name.len(), 253);
+        for ok in ["sip.example.net", "192.0.2.10", "2001:db8::1", &max_name] {
+            let mut c = cfg(vec![group("a", "tls")], Some("/etc/sbc/trunk-ca.pem"));
+            c.trunk_groups[0].trunks[0].tls_server_name = Some(ok.to_string());
+            assert!(super::validate_config(&c).is_ok(), "{ok:?} rejected");
+        }
+        for bad in [
+            "",
+            &"a".repeat(254),
+            "sip example.net",
+            "sip_example.net",
+            "sip.example.net\r\n",
+            "sip.example.net;transport=udp",
+            "*.example.net",
+            "sip.example.net/",
+            "host:5061",
+            "::::",
+            "sip..example.net",
+            &"a".repeat(64),
+        ] {
+            let mut c = cfg(vec![group("a", "tls")], Some("/etc/sbc/trunk-ca.pem"));
+            c.trunk_groups[0].trunks[0].tls_server_name = Some(bad.to_string());
+            assert!(super::validate_config(&c).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn tls_keys_rejected_on_tcp_trunk() {
+        let mut c = cfg(vec![group("a", "tcp")], None);
+        c.trunk_groups[0].trunks[0].tls_server_name = Some("sip.example.net".to_string());
+        assert!(err(&c).contains("requires protocol"));
+        let mut c = cfg(vec![group("a", "tcp")], None);
+        c.trunk_groups[0].trunks[0].tls_client_cert = true;
+        assert!(err(&c).contains("requires protocol"));
+    }
+
+    #[test]
+    fn tls_client_cert_needs_cert_and_key_pair() {
+        let mut c = cfg(vec![group("a", "tls")], Some("/etc/sbc/trunk-ca.pem"));
+        c.trunk_groups[0].trunks[0].tls_client_cert = true;
+        c.security.tls_cert_path = Some("/etc/sbc/cert.pem".into());
+        assert!(super::validate_config(&c).is_err(), "cert without key");
+        c.security.tls_cert_path = None;
+        c.security.tls_key_path = Some("/etc/sbc/key.pem".into());
+        assert!(super::validate_config(&c).is_err(), "key without cert");
     }
 }
 

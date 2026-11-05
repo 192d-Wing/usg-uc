@@ -13,6 +13,7 @@
 //! - **IA-2**: Identification and Authentication - REGISTER handling
 //! - **SC-8**: Transmission Confidentiality and Integrity
 
+use crate::flow::{Flow, LegFlow};
 use bytes::Bytes;
 use proto_b2bua::{
     B2buaMode, Call, CallConfig, CallId, MediaAddress, SdpRewriter, extract_media_address,
@@ -182,6 +183,15 @@ pub struct SipStackConfig {
     /// Bound on a trunk's 503 `Retry-After` honoured as its cooldown
     /// (`general.trunk_retry_after_max_secs`, RFC 3261 §21.5.4).
     pub trunk_retry_after_max_secs: u32,
+    /// SBC listener ports per transport, advertised in Via sent-by and
+    /// Contact (`transport.udp_listen` / `tcp_listen` / `tls_listen`).
+    pub udp_port: u16,
+    /// TCP listener port.
+    pub tcp_port: u16,
+    /// TLS listener port.
+    pub tls_port: u16,
+    /// WebSocket listener port (`transport.ws_listen`, RFC 7118).
+    pub ws_port: u16,
 }
 
 impl Default for SipStackConfig {
@@ -199,6 +209,10 @@ impl Default for SipStackConfig {
             max_registrations: 50_000,
             emergency_numbers: uc_vps::EmergencyNumbers::new(&uc_vps::default_emergency_numbers()),
             trunk_retry_after_max_secs: sbc_config::schema::DEFAULT_TRUNK_RETRY_AFTER_MAX_SECS,
+            udp_port: 5060,
+            tcp_port: 5060,
+            tls_port: 5061,
+            ws_port: 5062,
         }
     }
 }
@@ -221,6 +235,8 @@ struct TransactionStore {
 struct ServerInviteState {
     transaction: ServerInviteTransaction,
     source: SbcSocketAddr,
+    /// Transport the request arrived on; Timer G re-sends ride it.
+    flow: LegFlow,
     created_at: Instant,
     /// Last response sent on this transaction: re-sent on an INVITE
     /// retransmission (RFC 3261 §17.2.1) and, for a non-2xx final, on
@@ -247,6 +263,9 @@ struct ServerNonInviteState {
 struct ClientInviteState {
     transaction: ClientInviteTransaction,
     destination: SbcSocketAddr,
+    /// Transport the INVITE is sent on; Timer A re-sends ride it and it
+    /// selects the reliable/unreliable timers (RFC 3261 §17.1.1.2).
+    flow: LegFlow,
     created_at: Instant,
     /// The INVITE on the wire, retransmitted on Timer A (§17.1.1.2).
     request: SipMessage,
@@ -319,6 +338,8 @@ impl FirstSendLedger {
 struct ClientNonInviteState {
     transaction: ClientNonInviteTransaction,
     destination: SbcSocketAddr,
+    /// Transport the request is sent on (Timer E re-sends, §17.1.2.2).
+    flow: LegFlow,
     created_at: Instant,
     /// The request on the wire, retransmitted on Timer E (§17.1.2.2).
     request: SipMessage,
@@ -473,11 +494,24 @@ struct CallAddresses {
     a_leg_source: SbcSocketAddr,
     /// B-leg destination address (where to forward requests).
     b_leg_destination: SbcSocketAddr,
+    /// Transport of the A-leg: the one the INVITE arrived on. Everything
+    /// toward the caller (responses, BYE, re-INVITE, timer 408) uses it.
+    a_leg_flow: LegFlow,
+    /// Transport of the B-leg: the trunk's configured protocol (or the
+    /// registered contact's transport). Replaced with `b_leg_destination`
+    /// on failover.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8; RFC 3261 §18.1.1, §26.2
+    b_leg_flow: LegFlow,
+    /// SBC sent-by (`host:port`) for A-leg Via/Contact, the listener of the
+    /// A-leg transport (RFC 3261 §18.1.1).
+    a_leg_local_addr: String,
     /// A-leg SIP Call-ID.
     a_leg_sip_call_id: String,
     /// B-leg SIP Call-ID.
     b_leg_sip_call_id: String,
-    /// SBC's local SIP address for Via/Contact headers.
+    /// SBC's local SIP address (`host:port` of the B-leg transport's
+    /// listener) for B-leg Via/Contact headers.
     local_addr: String,
     /// Remaining failover targets `(trunk_group_id, trunk_id)`, in try
     /// order, for retrying the initial INVITE when the B-leg trunk fails.
@@ -492,6 +526,10 @@ struct CallAddresses {
     /// manipulated headers). Kept only when failover targets exist; a
     /// failover re-sends it with a fresh Call-ID, branch and From tag.
     b_leg_invite: Option<Arc<SipRequest>>,
+    /// Request-URI of the current B-leg INVITE attempt (primary, or the
+    /// failover that replaced it). RFC 3261 §9.1: a CANCEL's Request-URI
+    /// MUST be identical to the INVITE it cancels.
+    b_leg_ruri: Option<SipUri>,
     /// STIR facts to redo the B-leg STIR step on failover (kept with
     /// `b_leg_invite`, which is stored before that step).
     stir_egress: Option<Arc<crate::stir::StirEgress>>,
@@ -559,7 +597,7 @@ struct CallAddresses {
     pending_reinvite: Option<PendingReinvite>,
     /// ACK sent for the last relayed re-INVITE's 2xx (keyed by that
     /// re-INVITE's client branch) — re-sent if the 2xx is retransmitted.
-    last_reinvite_ack: Option<(String, SipMessage, SbcSocketAddr)>,
+    last_reinvite_ack: Option<(String, SipMessage, SbcSocketAddr, LegFlow)>,
     /// When the B-leg answered (for the audit trail's call duration).
     established_at: Option<Instant>,
     /// CDR facts gathered over the call's life; emitted once by
@@ -567,6 +605,35 @@ struct CallAddresses {
     ///
     /// ## NIST 800-53 Rev5: AU-3, AU-12
     cdr: crate::cdr::CdrDraft,
+}
+
+impl CallAddresses {
+    /// Flow of one leg: the callee's (`target_b_leg`) or the caller's.
+    fn leg_flow(&self, target_b_leg: bool) -> LegFlow {
+        if target_b_leg {
+            self.b_leg_flow.clone()
+        } else {
+            self.a_leg_flow.clone()
+        }
+    }
+
+    /// Destination and flow of one leg.
+    fn leg_target(&self, target_b_leg: bool) -> (SbcSocketAddr, LegFlow) {
+        if target_b_leg {
+            (self.b_leg_destination, self.b_leg_flow.clone())
+        } else {
+            (self.a_leg_source, self.a_leg_flow.clone())
+        }
+    }
+
+    /// SBC sent-by for Via/Contact on one leg (RFC 3261 §18.1.1).
+    fn leg_sent_by(&self, target_b_leg: bool) -> &str {
+        if target_b_leg {
+            &self.local_addr
+        } else {
+            &self.a_leg_local_addr
+        }
+    }
 }
 
 /// A per-trunk call slot (`trunk_groups[].trunks[].max_calls`) held by a
@@ -586,6 +653,8 @@ struct TrunkLease {
 struct TrunkRoute {
     lease: TrunkLease,
     destination: SbcSocketAddr,
+    /// The trunk's Request-URI host/port and flow.
+    endpoint: TrunkEndpoint,
     failover: Vec<(String, String)>,
     /// Destination number after SBC-router / dial-plan transforms.
     translated: String,
@@ -593,7 +662,7 @@ struct TrunkRoute {
 
 /// Outcome of trunk routing for an INVITE no registered user answers.
 enum TrunkRouting {
-    Routed(TrunkRoute),
+    Routed(Box<TrunkRoute>),
     /// No pattern / dial plan entry / trunk group matches the number.
     NoRoute,
     /// A route matched but every trunk is down, cooling down or at
@@ -758,6 +827,84 @@ fn retry_after_tail_ok(tail: &[u8]) -> bool {
 
 /// Replaces (or appends) `;name=value` on a header value, outside any
 /// `<...>` URI.
+/// Splits a sent-by / hostport (`host`, `host:port`, `[v6]` or `[v6]:port`)
+/// into host (brackets kept) and port.
+fn split_sent_by(s: &str) -> (&str, Option<u16>) {
+    let s = s.trim();
+    if s.starts_with('[') {
+        return match s.find(']') {
+            Some(end) => (
+                &s[..=end],
+                s[end + 1..].strip_prefix(':').and_then(|p| p.parse().ok()),
+            ),
+            None => (s, None),
+        };
+    }
+    match s.rsplit_once(':') {
+        // A single ':' separates the port; more is a bare IPv6 literal.
+        Some((h, p)) if !h.contains(':') => (h, p.parse().ok()),
+        _ => (s, None),
+    }
+}
+
+/// `host:port` with an IPv6 host bracketed.
+fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Rewrites the top Via of an SBC-built request for another leg transport:
+/// transport token, sent-by port (the listener of that transport) and
+/// branch; the sent-by host (possibly topology-hidden) and other params
+/// are kept.
+///
+/// ## RFC 3261 §18.1.1, §20.42
+fn retarget_via(via: &str, flow: &LegFlow, port: u16, branch: &str) -> String {
+    let rest = via
+        .trim()
+        .split_once(char::is_whitespace)
+        .map_or(via, |(_, r)| r)
+        .trim_start();
+    let (sent_by, params) = rest.split_once(';').unwrap_or((rest, ""));
+    let (host, _) = split_sent_by(sent_by);
+    let mut out = format!("SIP/2.0/{} {}", flow.via_token(), host_port(host, port));
+    if !params.is_empty() {
+        out.push(';');
+        out.push_str(params);
+    }
+    replace_header_param(&out, "branch", branch)
+}
+
+/// Rewrites the SBC Contact of a request for another leg transport
+/// (`sips:` on TLS, RFC 3261 §8.1.1.8), keeping host and header params.
+fn retarget_contact(contact: &str, flow: &LegFlow, port: u16) -> String {
+    let (uri_part, trailing) = match (contact.find('<'), contact.find('>')) {
+        (Some(a), Some(b)) if a < b => (&contact[a + 1..b], &contact[b + 1..]),
+        _ => (contact.split(';').next().unwrap_or(contact), ""),
+    };
+    let host = uri_part.parse::<SipUri>().map_or_else(
+        |_| {
+            let hp = uri_part.split_once(':').map_or(uri_part, |(_, r)| r);
+            let hp = hp.rsplit_once('@').map_or(hp, |(_, h)| h);
+            split_sent_by(hp.split(';').next().unwrap_or(hp))
+                .0
+                .to_string()
+        },
+        |u| u.host,
+    );
+    let user = uri_part
+        .parse::<SipUri>()
+        .ok()
+        .and_then(|u| u.user)
+        .map(|u| format!("{u}@"))
+        .unwrap_or_default();
+    let sent_by = format!("{user}{}", host_port(&host, port));
+    format!("{}{trailing}", leg_contact(&sent_by, flow))
+}
+
 fn replace_header_param(header_value: &str, name: &str, value: &str) -> String {
     let params_start = header_value.rfind('>').map_or(0, |p| p + 1);
     let (head, params) = header_value.split_at(params_start);
@@ -947,6 +1094,8 @@ struct PendingReinvite {
 struct Pending2xx {
     response: SipMessage,
     destination: SbcSocketAddr,
+    /// The A-leg transport the 2xx is retransmitted on.
+    flow: LegFlow,
     /// CSeq number of the INVITE answered (the ACK must carry it).
     cseq: u32,
     call: CallId,
@@ -967,6 +1116,8 @@ pub enum ProcessResult {
         message: SipMessage,
         /// Destination address.
         destination: SbcSocketAddr,
+        /// Transport/connection it goes out on (RFC 3261 §18.2.2).
+        flow: Flow,
     },
     /// Forward request to another destination.
     Forward {
@@ -974,6 +1125,11 @@ pub enum ProcessResult {
         message: SipMessage,
         /// Destination address.
         destination: SbcSocketAddr,
+        /// Transport/connection it goes out on: the target leg's, never
+        /// the one the triggering message arrived on (RFC 3261 §18.1.1).
+        ///
+        /// ## NIST 800-53 Rev5: SC-8
+        flow: Flow,
     },
     /// Multiple actions (e.g., 100 Trying + forward INVITE, or BYE + 200 OK).
     Multiple(Vec<Self>),
@@ -1292,12 +1448,13 @@ impl SipStack {
     /// the caller (SBC as UAS on the A-leg). Mirrors the BYE construction in
     /// [`Self::handle_bye`] so an SBC-initiated teardown is dialog-correct.
     fn build_leg_bye(addrs: &CallAddresses, target_b_leg: bool) -> proto_sip::message::SipRequest {
-        let (dest, other_call_id) = if target_b_leg {
-            (&addrs.b_leg_destination, &addrs.b_leg_sip_call_id)
+        let (dest, flow) = addrs.leg_target(target_b_leg);
+        let other_call_id = if target_b_leg {
+            &addrs.b_leg_sip_call_id
         } else {
-            (&addrs.a_leg_source, &addrs.a_leg_sip_call_id)
+            &addrs.a_leg_sip_call_id
         };
-        let uri = SipUri::new(dest.ip().to_string()).with_port(dest.port());
+        let uri = leg_request_uri(None, &dest.ip().to_string(), dest.port(), &flow);
         let mut bye = proto_sip::message::SipRequest::new(Method::Bye, uri);
         bye.headers.set(HeaderName::CallId, other_call_id);
         if target_b_leg {
@@ -1323,9 +1480,10 @@ impl SipStack {
         }
         bye.headers.set(HeaderName::MaxForwards, "70");
         let branch = generate_branch();
+        // RFC 3261 §18.1.1: the Via names the leg's real transport.
         bye.headers.add(Header::new(
             HeaderName::Via,
-            format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
+            crate::flow::via_for(&flow, addrs.leg_sent_by(target_b_leg), &branch),
         ));
         bye.headers.set(HeaderName::ContentLength, "0");
         bye
@@ -1345,12 +1503,13 @@ impl SipStack {
         cseq: u32,
         body: Option<&[u8]>,
     ) -> proto_sip::message::SipRequest {
-        let (dest, other_call_id) = if target_b_leg {
-            (&addrs.b_leg_destination, &addrs.b_leg_sip_call_id)
+        let (dest, flow) = addrs.leg_target(target_b_leg);
+        let other_call_id = if target_b_leg {
+            &addrs.b_leg_sip_call_id
         } else {
-            (&addrs.a_leg_source, &addrs.a_leg_sip_call_id)
+            &addrs.a_leg_sip_call_id
         };
-        let uri = SipUri::new(dest.ip().to_string()).with_port(dest.port());
+        let uri = leg_request_uri(None, &dest.ip().to_string(), dest.port(), &flow);
         let method_name = method.to_string();
         let mut inv = proto_sip::message::SipRequest::new(method.clone(), uri);
         inv.headers.set(HeaderName::CallId, other_call_id);
@@ -1375,14 +1534,15 @@ impl SipStack {
             .set(HeaderName::CSeq, format!("{cseq} {method_name}"));
         inv.headers.set(HeaderName::MaxForwards, "70");
         let branch = generate_branch();
+        let sent_by = addrs.leg_sent_by(target_b_leg);
         inv.headers.add(Header::new(
             HeaderName::Via,
-            format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
+            crate::flow::via_for(&flow, sent_by, &branch),
         ));
         if *method != Method::Ack {
             // Target-refresh Contact: subsequent in-dialog requests come back to us.
             inv.headers
-                .set(HeaderName::Contact, format!("<sip:{}>", addrs.local_addr));
+                .set(HeaderName::Contact, leg_contact(sent_by, &flow));
         }
         match body {
             Some(sdp) if !sdp.is_empty() => {
@@ -1450,6 +1610,7 @@ impl SipStack {
             (true, Some(message)) => Some(ProcessResult::Response {
                 message,
                 destination: source,
+                flow: Flow::Reply,
             }),
             _ => Some(ProcessResult::NoAction),
         }
@@ -1490,6 +1651,7 @@ impl SipStack {
                     // retransmission) runs only on unreliable transports.
                     transaction: ServerInviteTransaction::new(key, txn_transport),
                     source,
+                    flow: LegFlow::inbound(transport),
                     created_at: now,
                     last_response: None,
                     call_id,
@@ -1522,21 +1684,28 @@ impl SipStack {
     /// recorded on their server transaction, forwarded requests open a client
     /// transaction that retransmits and times them out.
     ///
-    /// `transport` is the transport the result is sent on; it selects
-    /// reliable or unreliable transaction timers (RFC 3261 §17.1).
-    async fn track_result(&self, result: &ProcessResult, transport: AddrTransport) {
+    /// Each forward's own `flow` is the transport it is sent on; it selects
+    /// reliable or unreliable transaction timers (RFC 3261 §17.1) and is
+    /// kept for retransmissions. `Flow::Reply` must already be resolved
+    /// (see [`resolve_reply`]).
+    async fn track_result(&self, result: &ProcessResult) {
         match result {
             ProcessResult::Response { message, .. } => self.record_server_response(message).await,
             ProcessResult::Forward {
                 message,
                 destination,
+                flow,
             } => {
-                self.open_client_transaction(message, *destination, transport)
+                let Flow::Leg(flow) = flow else {
+                    error!("Unresolved reply flow on a forwarded request; not tracked");
+                    return;
+                };
+                self.open_client_transaction(message, *destination, flow.clone())
                     .await;
             }
             ProcessResult::Multiple(results) => {
                 for r in results {
-                    Box::pin(self.track_result(r, transport)).await;
+                    Box::pin(self.track_result(r)).await;
                 }
             }
             ProcessResult::NoAction | ProcessResult::Error { .. } => {}
@@ -1580,8 +1749,9 @@ impl SipStack {
         &self,
         message: &SipMessage,
         destination: SbcSocketAddr,
-        transport: AddrTransport,
+        flow: LegFlow,
     ) {
+        let transport = flow.transport;
         let SipMessage::Request(req) = message else {
             return;
         };
@@ -1609,6 +1779,7 @@ impl SipStack {
                 .or_insert_with(|| ClientInviteState {
                     transaction: ClientInviteTransaction::new(key, txn_transport(transport)),
                     destination,
+                    flow,
                     created_at: now,
                     request: message.clone(),
                     ack: None,
@@ -1622,6 +1793,7 @@ impl SipStack {
                 .or_insert_with(|| ClientNonInviteState {
                     transaction: ClientNonInviteTransaction::new(key, txn_transport(transport)),
                     destination,
+                    flow,
                     created_at: now,
                     request: message.clone(),
                     call,
@@ -1668,6 +1840,7 @@ impl SipStack {
         call: &CallId,
         response: &SipMessage,
         destination: SbcSocketAddr,
+        flow: LegFlow,
         cseq: u32,
     ) {
         let now = Instant::now();
@@ -1677,6 +1850,7 @@ impl SipStack {
             Pending2xx {
                 response: response.clone(),
                 destination,
+                flow,
                 cseq,
                 call: call.clone(),
                 interval: t1,
@@ -1706,6 +1880,7 @@ impl SipStack {
                         out.push(ProcessResult::Forward {
                             message: st.request.clone(),
                             destination: st.destination,
+                            flow: st.flow.clone().into(),
                         });
                     }
                     Some(TimerType::TimerB) => {
@@ -1719,6 +1894,7 @@ impl SipStack {
                     Some(TimerType::TimerE) => out.push(ProcessResult::Forward {
                         message: st.request.clone(),
                         destination: st.destination,
+                        flow: st.flow.clone().into(),
                     }),
                     Some(TimerType::TimerF) => {
                         if let Some(call) = &st.call {
@@ -1735,6 +1911,7 @@ impl SipStack {
                             out.push(ProcessResult::Response {
                                 message: r.clone(),
                                 destination: st.source,
+                                flow: st.flow.clone().into(),
                             });
                         }
                     }
@@ -1755,11 +1932,11 @@ impl SipStack {
         for (branch, call) in timed_out {
             timeouts.extend(self.fail_timed_out_request(&branch, &call).await);
         }
-        // The 408s ride their server transactions; the BYEs get client ones.
-        // Timer-loop results go out on the UDP timer socket, so their
-        // transactions are unreliable (correct B-leg transport is POA&M-5).
+        // The 408s ride their server transactions; the BYEs get client ones
+        // on the leg's own flow (RFC 3261 §17.1.2.2: reliable timers on
+        // TCP/TLS legs).
         for r in &timeouts {
-            self.track_result(r, AddrTransport::Udp).await;
+            self.track_result(r).await;
         }
         out.extend(timeouts);
         out.extend(self.retransmit_pending_2xx().await);
@@ -1791,12 +1968,9 @@ impl SipStack {
                 "Relayed in-dialog request got no response; releasing call"
             );
             let (resp, dest) = Self::build_reinvite_response(timeout, p, &addrs);
+            let resp_flow = addrs.leg_flow(!p.from_a_leg);
             let bye = Self::build_leg_bye(&addrs, p.from_a_leg);
-            let bye_dest = if p.from_a_leg {
-                addrs.b_leg_destination
-            } else {
-                addrs.a_leg_source
-            };
+            let (bye_dest, bye_flow) = addrs.leg_target(p.from_a_leg);
             self.cleanup_terminated_call(
                 call,
                 false,
@@ -1807,10 +1981,12 @@ impl SipStack {
                 ProcessResult::Response {
                     message: resp,
                     destination: dest,
+                    flow: resp_flow.into(),
                 },
                 ProcessResult::Forward {
                     message: SipMessage::Request(bye),
                     destination: bye_dest,
+                    flow: bye_flow.into(),
                 },
             ];
         }
@@ -1841,6 +2017,7 @@ impl SipStack {
             return vec![ProcessResult::Response {
                 message: SipMessage::Response(resp),
                 destination: addrs.a_leg_source,
+                flow: addrs.a_leg_flow.clone().into(),
             }];
         }
 
@@ -1935,11 +2112,13 @@ impl SipStack {
             vec![ProcessResult::Response {
                 message: SipMessage::Response(resp),
                 destination: addrs.a_leg_source,
+                flow: addrs.a_leg_flow.clone().into(),
             }]
         };
-        // Sent on the UDP timer socket (see `poll_timers`).
+        // Each result carries its leg's flow: the failover INVITE the next
+        // trunk's, the 503 the caller's (RFC 3261 §18.1.1, §18.2.2).
         for r in &out {
-            self.track_result(r, AddrTransport::Udp).await;
+            self.track_result(r).await;
         }
         out
     }
@@ -1961,6 +2140,7 @@ impl SipStack {
                     out.push(ProcessResult::Response {
                         message: p.response.clone(),
                         destination: p.destination,
+                        flow: p.flow.clone().into(),
                     });
                     p.interval = (p.interval * 2).min(t2);
                     p.next_at = now + p.interval;
@@ -1984,14 +2164,14 @@ impl SipStack {
             );
             audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Failed);
             if addrs.dialog_to_tag.is_some() {
-                out.push(ProcessResult::Forward {
-                    message: SipMessage::Request(Self::build_leg_bye(&addrs, false)),
-                    destination: addrs.a_leg_source,
-                });
-                out.push(ProcessResult::Forward {
-                    message: SipMessage::Request(Self::build_leg_bye(&addrs, true)),
-                    destination: addrs.b_leg_destination,
-                });
+                for target_b_leg in [false, true] {
+                    let (destination, flow) = addrs.leg_target(target_b_leg);
+                    out.push(ProcessResult::Forward {
+                        message: SipMessage::Request(Self::build_leg_bye(&addrs, target_b_leg)),
+                        destination,
+                        flow: flow.into(),
+                    });
+                }
             }
             self.cleanup_terminated_call(&call, false, crate::cdr::CdrEnd::dialog_lost(true, 200))
                 .await;
@@ -2017,6 +2197,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
                 destination: source,
+                flow: Flow::Reply,
             };
         }
         self.handle_in_dialog_request(req, source).await
@@ -2039,6 +2220,7 @@ impl SipStack {
         let respond = |status: StatusCode| ProcessResult::Response {
             message: SipMessage::Response(create_response_from_request(req, status)),
             destination: source,
+            flow: Flow::Reply,
         };
 
         // 1. Match the dialog: Call-ID on either leg, and the request's From
@@ -2097,8 +2279,12 @@ impl SipStack {
                 }
             }
             if method == Method::Invite {
-                ok.headers
-                    .set(HeaderName::Contact, format!("<sip:{}>", addrs.local_addr));
+                // The Contact faces the requester's leg (RFC 3261 §12.1.1).
+                let orig_flow = addrs.leg_flow(!from_a_leg);
+                ok.headers.set(
+                    HeaderName::Contact,
+                    leg_contact(addrs.leg_sent_by(!from_a_leg), &orig_flow),
+                );
                 let last = if from_a_leg {
                     &addrs.a_leg_last_sdp
                 } else {
@@ -2118,6 +2304,7 @@ impl SipStack {
                     &internal_id,
                     &ok,
                     source,
+                    addrs.leg_flow(!from_a_leg),
                     req.headers.cseq_parsed().map_or(1, |c| c.sequence),
                 )
                 .await;
@@ -2126,6 +2313,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: ok,
                 destination: source,
+                flow: Flow::Reply,
             };
         };
 
@@ -2229,11 +2417,13 @@ impl SipStack {
                     StatusCode::TRYING,
                 )),
                 destination: source,
+                flow: Flow::Reply,
             });
         }
         results.push(ProcessResult::Forward {
             message: SipMessage::Request(fwd),
             destination: dest,
+            flow: addrs.leg_flow(from_a_leg).into(),
         });
         ProcessResult::Multiple(results)
     }
@@ -2256,10 +2446,13 @@ impl SipStack {
             return ProcessResult::NoAction;
         }
         let (mut relayed, orig_dest) = Self::build_reinvite_response(resp.status, pending, addrs);
+        // The originator's leg: the response goes back on its transport.
+        let orig_flow = addrs.leg_flow(!pending.from_a_leg);
         if code < 200 {
             return ProcessResult::Response {
                 message: relayed,
                 destination: orig_dest,
+                flow: orig_flow.into(),
             };
         }
 
@@ -2294,6 +2487,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: relayed,
                 destination: orig_dest,
+                flow: orig_flow.into(),
             };
         }
 
@@ -2302,8 +2496,10 @@ impl SipStack {
             unreachable!("build_reinvite_response builds a response")
         };
         relay_session_timer_response_headers(&resp.headers, &mut ok.headers);
-        ok.headers
-            .set(HeaderName::Contact, format!("<sip:{}>", addrs.local_addr));
+        ok.headers.set(
+            HeaderName::Contact,
+            leg_contact(addrs.leg_sent_by(!pending.from_a_leg), &orig_flow),
+        );
         let mut answer_sdp = None;
         if let Some(body) = resp.body.as_ref().filter(|b| !b.is_empty()) {
             let sdp_str = String::from_utf8_lossy(body);
@@ -2343,6 +2539,7 @@ impl SipStack {
         let mut results = vec![ProcessResult::Response {
             message: relayed.clone(),
             destination: orig_dest,
+            flow: orig_flow.clone().into(),
         }];
         let mut ack_record = None;
         if pending.method == Method::Invite {
@@ -2356,16 +2553,18 @@ impl SipStack {
                 pending.fwd_cseq,
                 None,
             );
-            let ack_dest = if pending.from_a_leg {
-                addrs.b_leg_destination
-            } else {
-                addrs.a_leg_source
-            };
+            let (ack_dest, ack_flow) = addrs.leg_target(pending.from_a_leg);
             let ack = SipMessage::Request(ack);
-            ack_record = Some((pending.fwd_branch.clone(), ack.clone(), ack_dest));
+            ack_record = Some((
+                pending.fwd_branch.clone(),
+                ack.clone(),
+                ack_dest,
+                ack_flow.clone(),
+            ));
             results.push(ProcessResult::Forward {
                 message: ack,
                 destination: ack_dest,
+                flow: ack_flow.into(),
             });
             let orig_call_id = if pending.from_a_leg {
                 &addrs.a_leg_sip_call_id
@@ -2377,6 +2576,7 @@ impl SipStack {
                 internal_id,
                 &relayed,
                 orig_dest,
+                orig_flow,
                 cseq_number(&pending.orig_cseq),
             )
             .await;
@@ -2696,7 +2896,13 @@ impl SipStack {
 
         let mut uri = decision.trunk_uri;
         loop {
-            if let Some(destination) = resolve_sip_uri_to_addr(&uri) {
+            // Endpoint from the trunk's config (keeps the hostname as the TLS
+            // server name); DNS runs outside the router lock.
+            let endpoint =
+                TrunkEndpoint::of(&*router_lock.read().await, &lease.group_id, &lease.trunk_id);
+            if let Some((endpoint, destination)) =
+                endpoint.and_then(|e| e.resolve().map(|d| (e, d)))
+            {
                 info!(
                     trunk_group = %lease.group_id,
                     trunk_id = %lease.trunk_id,
@@ -2704,12 +2910,13 @@ impl SipStack {
                     failover_targets = failover.len(),
                     "Routed to trunk"
                 );
-                return TrunkRouting::Routed(TrunkRoute {
+                return TrunkRouting::Routed(Box::new(TrunkRoute {
                     lease,
                     destination,
+                    endpoint,
                     failover,
                     translated,
-                });
+                }));
             }
             warn!(trunk_id = %lease.trunk_id, trunk_uri = %uri, "Could not resolve trunk URI; trying next trunk");
             let next = {
@@ -2744,11 +2951,12 @@ impl SipStack {
     /// attempt already failed over finds no match.
     ///
     /// ## NIST 800-53 Rev5: CP-8 (Telecommunications Services), SC-5
-    // POAM: the failover INVITE keeps the original Request-URI scheme/host
-    // and Via transport instead of the target trunk's protocol (pre-existing
-    // on the primary path too), so a UDP->TLS trunk failover can advertise
-    // the wrong transport. Follow-up: derive scheme/transport from the
-    // target trunk.
+    ///
+    /// The retried INVITE is addressed and sent per the next trunk's
+    /// configured protocol (`sips:`/TLS, TCP, UDP), never downgraded to the
+    /// failed attempt's transport (POA&M-5 closed).
+    ///
+    /// ## NIST 800-53 Rev5: SC-8; RFC 3261 §18.1.1, §26.2; RFC 3263 §4.3
     async fn try_failover(
         &self,
         internal_id: &CallId,
@@ -2766,15 +2974,16 @@ impl SipStack {
         }
 
         let mut remaining = addrs.failover_targets.clone();
-        let (lease, new_dest) = loop {
-            let next = acquire_next_target(
-                &mut *router_lock.write().await,
-                &mut remaining,
-                old_lease.admission,
-            )?;
+        let (lease, new_dest, endpoint) = loop {
+            let (next, endpoint) = {
+                let mut router = router_lock.write().await;
+                let next = acquire_next_target(&mut router, &mut remaining, old_lease.admission)?;
+                let endpoint = TrunkEndpoint::of(&router, &next.0.group_id, &next.0.trunk_id);
+                (next, endpoint)
+            };
             // DNS (if any) runs outside the router lock.
-            if let Some(dest) = resolve_sip_uri_to_addr(&next.1) {
-                break (next.0, dest);
+            if let Some((endpoint, dest)) = endpoint.and_then(|e| e.resolve().map(|d| (e, d))) {
+                break (next.0, dest, endpoint);
             }
             warn!(trunk_id = %next.0.trunk_id, trunk_uri = %next.1, "Could not resolve failover trunk URI");
             router_lock.write().await.release_trunk(
@@ -2791,10 +3000,29 @@ impl SipStack {
         let new_branch = generate_branch();
         request.headers.set(HeaderName::CallId, &new_call_id);
         request.headers.set(HeaderName::CSeq, "1 INVITE");
+        // The wire format follows the *next* trunk, not the template's:
+        // Request-URI scheme/host/port/transport, Via transport and sent-by
+        // port, Contact scheme (RFC 3261 §18.1.1, §19.1.1, §26.2; RFC 3263
+        // §4.1). The user part (translated number) is kept.
+        //
+        // NIST 800-53 Rev5: SC-8 — a sips/TLS trunk is reached only over TLS.
+        let new_flow = endpoint.flow.clone();
+        let sent_by_port = self.signaling_port(new_flow.transport);
+        request.uri = leg_request_uri(
+            template.uri.user.as_deref(),
+            &endpoint.host,
+            endpoint.port,
+            &new_flow,
+        );
         if let Some(via) = request.headers.get_value(&HeaderName::Via) {
-            let via = replace_header_param(via, "branch", &new_branch);
+            let via = retarget_via(via, &new_flow, sent_by_port, &new_branch);
             request.headers.set(HeaderName::Via, via);
         }
+        if let Some(contact) = request.headers.get_value(&HeaderName::Contact) {
+            let contact = retarget_contact(contact, &new_flow, sent_by_port);
+            request.headers.set(HeaderName::Contact, contact);
+        }
+        let new_local_addr = host_port(split_sent_by(&addrs.local_addr).0, sent_by_port);
         let new_from = request
             .headers
             .get_value(&HeaderName::From)
@@ -2830,16 +3058,22 @@ impl SipStack {
                 corr.b_leg.insert(new_call_id.clone(), internal_id.clone());
                 corr.addresses.get_mut(internal_id).and_then(|entry| {
                     entry.b_leg_destination = new_dest;
+                    entry.b_leg_flow = new_flow.clone();
+                    entry.local_addr = new_local_addr;
                     entry.b_leg_sip_call_id.clone_from(&new_call_id);
                     entry.failover_targets = remaining;
                     entry.b_leg_branch.clone_from(&new_branch);
                     entry.b_leg_from = new_from;
                     entry.b_leg_to = new_to;
                     entry.dialog_to_tag = None;
+                    entry.b_leg_ruri = Some(new_template.uri.clone());
                     entry.b_leg_invite = Some(new_template);
                     if addrs.stir_egress.is_some() {
                         entry.cdr.stir_attestation = stir_signed.map(crate::stir::cdr_attestation);
                     }
+                    // POAM: POA&M-46 — CDR schema v1 records no per-attempt
+                    // B-leg transport; the attempt's transport is in the
+                    // warn log.
                     entry
                         .cdr
                         .record_failover(cause.cdr_outcome(), &lease.trunk_id, &new_call_id);
@@ -2870,6 +3104,7 @@ impl SipStack {
             failed_trunk = %old_lease.trunk_id,
             cause = ?cause,
             next_trunk = %lease.trunk_id,
+            transport = new_flow.name(),
             "Trunk failover: retrying INVITE on next trunk"
         );
         // NIST 800-53 Rev5: AU-2, CP-8 — no lock is held here; the audit
@@ -2886,18 +3121,16 @@ impl SipStack {
         Some(ProcessResult::Forward {
             message: SipMessage::Request(request),
             destination: new_dest,
+            flow: new_flow.into(),
         })
     }
 
     /// Tears down a call whose DTLS-SRTP media handshake failed at runtime (after
     /// the 200 OK): the SBC initiated the teardown, so it BYEs **both** legs
-    /// (neither peer sends one). Returns the serialized BYEs paired with their
-    /// destinations for the caller to send; the call state is removed here.
+    /// (neither peer sends one). Returns the BYEs, each on its leg's flow, for
+    /// the caller to send; the call state is removed here.
     /// Empty if the call is already gone or the dialog never confirmed.
-    pub async fn terminate_call_on_media_failure(
-        &self,
-        call_id: &str,
-    ) -> Vec<(bytes::Bytes, SbcSocketAddr)> {
+    pub async fn terminate_call_on_media_failure(&self, call_id: &str) -> Vec<ProcessResult> {
         let internal_id = CallId::from(call_id);
         let addrs = {
             let corr = self.call_correlation.read().await;
@@ -2931,12 +3164,18 @@ impl SipStack {
         );
         audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Failed);
 
+        // Each BYE on its own leg's flow (NIST 800-53 Rev5: SC-8).
         vec![
-            (SipMessage::Request(a_bye).to_bytes(), addrs.a_leg_source),
-            (
-                SipMessage::Request(b_bye).to_bytes(),
-                addrs.b_leg_destination,
-            ),
+            ProcessResult::Forward {
+                message: SipMessage::Request(a_bye),
+                destination: addrs.a_leg_source,
+                flow: addrs.a_leg_flow.clone().into(),
+            },
+            ProcessResult::Forward {
+                message: SipMessage::Request(b_bye),
+                destination: addrs.b_leg_destination,
+                flow: addrs.b_leg_flow.clone().into(),
+            },
         ]
     }
 
@@ -2993,6 +3232,7 @@ impl SipStack {
         Some(ProcessResult::Response {
             message: SipMessage::Response(response),
             destination: source,
+            flow: Flow::Reply,
         })
     }
 
@@ -3079,12 +3319,29 @@ impl SipStack {
         self.zone_registry = Some(registry);
     }
 
-    /// The host and port the SBC advertises as itself (Via sent-by and
-    /// Contact) on an outbound leg: the egress zone's external IP when it has
-    /// one, else that zone's signaling IP, else the configured domain. The
-    /// port is the standard SIP port; the zone registry carries no port.
-    fn b_leg_signaling_addr(&self, ingress: Option<&str>, b_leg_external: bool) -> (String, u16) {
-        const SIP_PORT: u16 = 5060;
+    /// The SBC's listener port for `transport` (Via sent-by / Contact port,
+    /// RFC 3261 §18.1.1: for TLS the TLS listener, not the UDP port).
+    pub(crate) const fn signaling_port(&self, transport: AddrTransport) -> u16 {
+        match transport {
+            AddrTransport::Tls | AddrTransport::WebSocketSecure => self.config.tls_port,
+            // RFC 7118 §5: a WS leg advertises the WebSocket listener.
+            AddrTransport::WebSocket => self.config.ws_port,
+            AddrTransport::Tcp | AddrTransport::Sctp => self.config.tcp_port,
+            AddrTransport::Udp => self.config.udp_port,
+        }
+    }
+
+    /// The host the SBC advertises as itself (Via sent-by and Contact) on an
+    /// outbound leg: the egress zone's external IP when it has one, else
+    /// that zone's signaling IP, else the configured domain. The port is
+    /// the SBC listener for `transport` ([`Self::signaling_port`]).
+    fn b_leg_signaling_addr(
+        &self,
+        ingress: Option<&str>,
+        b_leg_external: bool,
+        transport: AddrTransport,
+    ) -> (String, u16) {
+        let port = self.signaling_port(transport);
         let host = self.zone_registry.as_ref().and_then(|reg| {
             let zone = self
                 .egress_media_zone(ingress, b_leg_external)
@@ -3093,7 +3350,7 @@ impl SipStack {
                 .or_else(|| reg.signaling_ip(&zone))
                 .map(|ip| ip.to_string())
         });
-        (host.unwrap_or_else(|| self.config.domain.clone()), SIP_PORT)
+        (host.unwrap_or_else(|| self.config.domain.clone()), port)
     }
 
     /// Returns the effective signaling IP for a zone, falling back to source IP.
@@ -3215,7 +3472,14 @@ impl SipStack {
                     .with_max_calls(t_config.max_calls)
                     .with_emergency_reserve_calls(t_config.effective_emergency_reserve_calls())
                     .with_cooldown_secs(u64::from(t_config.cooldown_secs))
-                    .with_max_failures(t_config.max_failures);
+                    .with_max_failures(t_config.max_failures)
+                    .with_tls_client_cert(t_config.tls_client_cert);
+                // NIST 800-53 Rev5: SC-23 — the name the trunk certificate
+                // is verified against comes from config only.
+                let trunk_config = match &t_config.tls_server_name {
+                    Some(name) => trunk_config.with_tls_server_name(name),
+                    None => trunk_config,
+                };
 
                 group.add_trunk(Trunk::new(trunk_config));
             }
@@ -3451,7 +3715,7 @@ impl SipStack {
             "Processing SIP message"
         );
 
-        let result = match message {
+        let mut result = match message {
             SipMessage::Request(_) => {
                 self.process_request(message, source, receiving_zone, transport)
                     .await
@@ -3461,7 +3725,10 @@ impl SipStack {
         // Everything a handler puts on the wire rides a transaction: responses
         // are recorded for retransmission, forwarded requests get a client
         // transaction that retransmits and times them out (RFC 3261 §17).
-        self.track_result(&result, transport).await;
+        // Replies are pinned to the receive transport first, so every
+        // result leaves here with a concrete flow.
+        resolve_reply(&mut result, transport);
+        self.track_result(&result).await;
         result
     }
 
@@ -3576,9 +3843,11 @@ impl SipStack {
                                 .ack
                                 .get_or_insert_with(|| Self::build_non2xx_ack(invite, resp))
                                 .clone();
+                            // §17.1.1.3: the ACK rides the INVITE's transport.
                             ack_action = Some(ProcessResult::Forward {
                                 message: ack,
                                 destination: st.destination,
+                                flow: st.flow.clone().into(),
                             });
                         }
                         // 2xx always reaches the TU: their retransmissions
@@ -3649,12 +3918,13 @@ impl SipStack {
         // 2b. Retransmitted 2xx to a relayed re-INVITE: re-ACK it (§13.2.2.4).
         if cseq.method == Method::Invite
             && (200..300).contains(&status_code)
-            && let Some((ack_branch, ack, dest)) = addrs.last_reinvite_ack.as_ref()
+            && let Some((ack_branch, ack, dest, flow)) = addrs.last_reinvite_ack.as_ref()
             && *ack_branch == branch
         {
             return ProcessResult::Forward {
                 message: ack.clone(),
                 destination: *dest,
+                flow: flow.clone().into(),
             };
         }
 
@@ -3799,6 +4069,7 @@ impl SipStack {
         ProcessResult::Response {
             message: SipMessage::Response(a_response),
             destination: addrs.a_leg_source,
+            flow: addrs.a_leg_flow.clone().into(),
         }
     }
 
@@ -3818,6 +4089,7 @@ impl SipStack {
             return ProcessResult::Forward {
                 message: SipMessage::Request(ack),
                 destination: addrs.b_leg_destination,
+                flow: addrs.b_leg_flow.clone().into(),
             };
         }
 
@@ -3905,8 +4177,12 @@ impl SipStack {
         // tag, and the INVITE's CSeq number with method ACK (RFC 3261
         // §13.2.2.4). The previous bare ACK (Call-ID + "1 ACK" only) was
         // unmatchable, so far ends kept retransmitting their 200 OK.
-        let b_leg_uri = SipUri::new(addrs.b_leg_destination.ip().to_string())
-            .with_port(addrs.b_leg_destination.port());
+        let b_leg_uri = leg_request_uri(
+            None,
+            &addrs.b_leg_destination.ip().to_string(),
+            addrs.b_leg_destination.port(),
+            &addrs.b_leg_flow,
+        );
         let mut ack_request = proto_sip::message::SipRequest::new(Method::Ack, b_leg_uri);
         ack_request
             .headers
@@ -3924,7 +4200,7 @@ impl SipStack {
         let branch = generate_branch();
         ack_request.headers.add(Header::new(
             HeaderName::Via,
-            format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
+            crate::flow::via_for(&addrs.b_leg_flow, &addrs.local_addr, &branch),
         ));
         ack_request.headers.set(HeaderName::ContentLength, "0");
 
@@ -3940,6 +4216,7 @@ impl SipStack {
             internal_id,
             &a_message,
             addrs.a_leg_source,
+            addrs.a_leg_flow.clone(),
             cseq_number(&addrs.a_leg_cseq),
         )
         .await;
@@ -3948,10 +4225,12 @@ impl SipStack {
             ProcessResult::Response {
                 message: a_message,
                 destination: addrs.a_leg_source,
+                flow: addrs.a_leg_flow.clone().into(),
             },
             ProcessResult::Forward {
                 message: SipMessage::Request(ack_request),
                 destination: addrs.b_leg_destination,
+                flow: addrs.b_leg_flow.clone().into(),
             },
         ])
     }
@@ -4035,6 +4314,7 @@ impl SipStack {
         ProcessResult::Response {
             message: SipMessage::Response(a_response),
             destination: addrs.a_leg_source,
+            flow: addrs.a_leg_flow.clone().into(),
         }
     }
 
@@ -4069,6 +4349,7 @@ impl SipStack {
                         StatusCode::BAD_REQUEST,
                     )),
                     destination: source,
+                    flow: Flow::Reply,
                 };
             }
         };
@@ -4105,6 +4386,7 @@ impl SipStack {
                     return ProcessResult::Response {
                         message: SipMessage::Response(response),
                         destination: source,
+                        flow: Flow::Reply,
                     };
                 }
                 BearerResult::Forbidden { reason } => {
@@ -4121,6 +4403,7 @@ impl SipStack {
                             StatusCode::FORBIDDEN,
                         )),
                         destination: source,
+                        flow: Flow::Reply,
                     };
                 }
             }
@@ -4237,6 +4520,7 @@ impl SipStack {
                 return ProcessResult::Response {
                     message: SipMessage::Response(unavailable),
                     destination: source,
+                    flow: Flow::Reply,
                 };
             }
             Err(e) => {
@@ -4247,6 +4531,7 @@ impl SipStack {
                         StatusCode::SERVER_INTERNAL_ERROR,
                     )),
                     destination: source,
+                    flow: Flow::Reply,
                 };
             }
         };
@@ -4280,6 +4565,10 @@ impl SipStack {
                 let binding_count = reg_response.contacts.len();
                 {
                     let mut loc = self.location_service.write().await;
+                    // Other devices' bindings keep the flow they were
+                    // latched to when they registered (keyed by Call-ID).
+                    let previous: Vec<proto_registrar::Binding> =
+                        loc.lookup(&aor).into_iter().cloned().collect();
                     let _ = loc.remove_all_bindings(&aor);
                     let src_ip = match source.ip() {
                         std::net::IpAddr::V6(v6) => v6
@@ -4294,29 +4583,26 @@ impl SipStack {
                         .and_then(|s| s.split('@').next())
                         .unwrap_or("unknown");
                     // The pinhole is only reachable over the transport the
-                    // REGISTER used — take it from the top Via
-                    // ("SIP/2.0/TLS ..."), not a hardcoded udp.
-                    let via_transport = req
-                        .headers
-                        .get_value(&HeaderName::Via)
-                        .and_then(|v| {
-                            v.split_whitespace()
-                                .next()
-                                .and_then(|proto| proto.rsplit('/').next())
-                                .map(str::to_ascii_lowercase)
-                        })
-                        .unwrap_or_else(|| "udp".to_string());
+                    // REGISTER actually arrived on. That is the receiver's
+                    // observation, not the (sender-asserted) Via token.
+                    // NIST 800-53 Rev5: SC-8 — a binding learned over TLS is
+                    // only ever reached over that TLS connection.
+                    let recv_transport = LegFlow::inbound(transport).name();
                     for binding in &reg_response.contacts {
-                        // The binding created/refreshed by *this* REGISTER
-                        // (same Call-ID) is reachable via the source pinhole;
-                        // also fix any wildcard host that can never be routed.
+                        // Only the binding created/refreshed by *this*
+                        // REGISTER (same Call-ID) is reachable via the source
+                        // pinhole. Another device's wildcard Contact is not
+                        // latched to this source (SEC-008: that would hand
+                        // this peer's flow to the other device's AOR binding);
+                        // it stays unroutable (see `binding_target`).
+                        // NIST 800-53 Rev5: SC-8, AC-3
                         let is_this_device = binding.call_id() == call_id;
-                        if is_this_device || binding.contact_uri().contains("0.0.0.0") {
+                        if is_this_device {
                             // SipUri's display brackets IPv6 hosts.
                             let contact_uri = proto_sip::uri::SipUri::new(src_ip.clone())
                                 .with_user(aor_user)
                                 .with_port(src_port)
-                                .with_param("transport", Some(via_transport.clone()))
+                                .with_param("transport", Some(recv_transport.to_string()))
                                 .to_string();
                             let mut latched = proto_registrar::Binding::new(
                                 &aor,
@@ -4327,7 +4613,26 @@ impl SipStack {
                             // Keep the negotiated expiry instead of resetting
                             // the binding to the default lifetime.
                             let _ = latched.set_expires(binding.remaining_seconds());
+                            latched.set_source_addr(std::net::SocketAddr::from(source));
+                            latched.set_source_transport(recv_transport);
                             let _ = loc.add_binding(latched);
+                        } else if let Some(prev) = previous.iter().find(|p| {
+                            p.call_id() == binding.call_id() && p.source_transport().is_some()
+                        }) {
+                            let mut kept = proto_registrar::Binding::new(
+                                &aor,
+                                prev.contact_uri(),
+                                binding.call_id(),
+                                binding.cseq(),
+                            );
+                            let _ = kept.set_expires(binding.remaining_seconds());
+                            if let Some(a) = prev.source_addr() {
+                                kept.set_source_addr(a);
+                            }
+                            if let Some(t) = prev.source_transport() {
+                                kept.set_source_transport(t);
+                            }
+                            let _ = loc.add_binding(kept);
                         } else {
                             let _ = loc.add_binding(binding.clone());
                         }
@@ -4413,6 +4718,7 @@ impl SipStack {
         ProcessResult::Response {
             message: SipMessage::Response(response),
             destination: source,
+            flow: Flow::Reply,
         }
     }
 
@@ -4498,6 +4804,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: SipMessage::Response(forbidden),
                 destination: source,
+                flow: Flow::Reply,
             };
         }
 
@@ -4540,6 +4847,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: SipMessage::Response(unavailable),
                 destination: source,
+                flow: Flow::Reply,
             };
         }
 
@@ -4565,6 +4873,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: SipMessage::Response(unavailable),
                 destination: source,
+                flow: Flow::Reply,
             };
         }
 
@@ -4619,6 +4928,7 @@ impl SipStack {
                 return ProcessResult::Response {
                     message: SipMessage::Response(unavailable),
                     destination: source,
+                    flow: Flow::Reply,
                 };
             };
             slot
@@ -4642,6 +4952,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: SipMessage::Response(too_many_hops),
                 destination: source,
+                flow: Flow::Reply,
             };
         }
         let b_leg_max_forwards = incoming_max_forwards - 1;
@@ -4681,6 +4992,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: SipMessage::Response(rejection),
                 destination: source,
+                flow: Flow::Reply,
             };
         }
 
@@ -4755,6 +5067,7 @@ impl SipStack {
                     return ProcessResult::Response {
                         message: SipMessage::Response(rejection),
                         destination: source,
+                        flow: Flow::Reply,
                     };
                 }
                 uc_vps::VpsAction::Drop => {
@@ -4798,6 +5111,9 @@ impl SipStack {
         // Trunk slot, failover targets and translated number when the call
         // is routed to a trunk.
         let mut trunk_route: Option<TrunkRoute> = None;
+        // Transport toward the callee: the registered contact's, or the
+        // trunk's configured protocol (set below). NIST 800-53 Rev5: SC-8.
+        let b_leg_flow: LegFlow;
         let b_leg_destination = {
             // Check DID → user mapping first (e.g., +12139160002 → jwillman)
             let mapped_user = self.lookup_did(&dest_user).await;
@@ -4813,9 +5129,8 @@ impl SipStack {
                 for aor in &candidates {
                     let bindings = loc.lookup(aor);
                     if let Some(binding) = bindings.first() {
-                        let contact = binding.contact_uri().to_string();
-                        info!(aor = %aor, contact = %contact, "Routing to registered user");
-                        found_contact = Some(contact);
+                        info!(aor = %aor, contact = %binding.contact_uri(), "Routing to registered user");
+                        found_contact = Some((*binding).clone());
                         break;
                     }
                 }
@@ -4828,9 +5143,8 @@ impl SipStack {
                             let aor = format!("sip:{user}@{ip}");
                             let bindings = loc.lookup(&aor);
                             if let Some(binding) = bindings.first() {
-                                let contact = binding.contact_uri().to_string();
-                                info!(aor = %aor, contact = %contact, zone = zone_name, "Routing to registered user via zone lookup");
-                                found_contact = Some(contact);
+                                info!(aor = %aor, contact = %binding.contact_uri(), zone = zone_name, "Routing to registered user via zone lookup");
+                                found_contact = Some((*binding).clone());
                                 break;
                             }
                         }
@@ -4843,15 +5157,20 @@ impl SipStack {
                 // Direct AOR lookup (no DID mapping)
                 let bindings = loc.lookup(&dest_aor);
                 if let Some(binding) = bindings.first() {
-                    let contact = binding.contact_uri().to_string();
-                    info!(aor = %dest_aor, contact = %contact, "Routing to registered user");
-                    found_contact = Some(contact);
+                    info!(aor = %dest_aor, contact = %binding.contact_uri(), "Routing to registered user");
+                    found_contact = Some((*binding).clone());
                 }
             }
             drop(loc);
 
-            if let Some(contact) = found_contact {
-                resolve_sip_uri_to_addr(&contact)
+            if let Some(binding) = found_contact {
+                if let Some((flow, dest)) = binding_target(&binding) {
+                    b_leg_flow = flow;
+                    Some(dest)
+                } else {
+                    b_leg_flow = LegFlow::UDP;
+                    None
+                }
             } else {
                 // Not registered — route to a trunk: SBC router (CSS-based),
                 // then dial plan.
@@ -4887,7 +5206,8 @@ impl SipStack {
                         // applies.
                         b_leg_external = true;
                         let destination = route.destination;
-                        trunk_route = Some(route);
+                        b_leg_flow = route.endpoint.flow.clone();
+                        trunk_route = Some(*route);
                         Some(destination)
                     }
                     TrunkRouting::NoRoute => {
@@ -4926,6 +5246,7 @@ impl SipStack {
                         return ProcessResult::Response {
                             message: SipMessage::Response(unavailable),
                             destination: source,
+                            flow: Flow::Reply,
                         };
                     }
                     TrunkRouting::InvalidTranslation => {
@@ -4939,6 +5260,7 @@ impl SipStack {
                         return ProcessResult::Response {
                             message: SipMessage::Response(server_err),
                             destination: source,
+                            flow: Flow::Reply,
                         };
                     }
                 }
@@ -4965,9 +5287,14 @@ impl SipStack {
         // B-leg Request-URI and To carry the translated number; the dialed
         // number stays the key for VPS, audit and retransmit detection. A
         // B2BUA builds its own To as a new UAC (RFC 3261 §8.1.1.2).
-        let (trunk_lease, failover_targets, b_leg_user) = match trunk_route {
-            Some(route) => (Some(route.lease), route.failover, route.translated),
-            None => (None, Vec::new(), dest_user.clone()),
+        let (trunk_lease, failover_targets, b_leg_user, trunk_endpoint) = match trunk_route {
+            Some(route) => (
+                Some(route.lease),
+                route.failover,
+                route.translated,
+                Some(route.endpoint),
+            ),
+            None => (None, Vec::new(), dest_user.clone(), None),
         };
 
         // 4. Create B2BUA call
@@ -4996,8 +5323,15 @@ impl SipStack {
 
         // 5. The SBC's own signaling address for the B-leg Via/Contact (and
         // for every later in-dialog request on that leg).
-        let (local_ip, local_port) = self.b_leg_signaling_addr(receiving_zone, b_leg_external);
-        let local_sip_addr = format!("{local_ip}:{local_port}");
+        // RFC 3261 §18.1.1: the sent-by port is the listener of the B-leg
+        // transport; the A-leg's is the listener the INVITE arrived on.
+        let (local_ip, local_port) =
+            self.b_leg_signaling_addr(receiving_zone, b_leg_external, b_leg_flow.transport);
+        let local_sip_addr = host_port(&local_ip, local_port);
+        let a_leg_local_addr = {
+            let (ip, port) = self.b_leg_signaling_addr(receiving_zone, false, transport);
+            host_port(&ip, port)
+        };
 
         // 6. Media session + B-leg SDP rewrite. With the media pipeline present,
         // allocate the relay's A/B ports (backed by real sockets), advertise the
@@ -5083,13 +5417,30 @@ impl SipStack {
         let b_leg_sip_call_id = generate_call_id(&self.config.domain);
         let b_leg_branch = generate_branch();
 
-        let mut b_leg_uri = SipUri::new(&dest_host).with_user(&b_leg_user);
-        if let Some(port) = req.uri.port {
-            b_leg_uri.port = Some(port);
-        }
+        // Toward a trunk the Request-URI is the trunk's own (scheme from its
+        // protocol, its host/port), the same derivation failover uses
+        // (RFC 3261 §19.1.1, §26.2; RFC 3263 §4.1). Toward a registered
+        // user it keeps the dialed host.
+        let b_leg_uri = trunk_endpoint.as_ref().map_or_else(
+            || {
+                let mut uri = SipUri::new(&dest_host).with_user(&b_leg_user);
+                if let Some(port) = req.uri.port {
+                    uri.port = Some(port);
+                }
+                uri
+            },
+            |e| leg_request_uri(Some(&b_leg_user), &e.host, e.port, &b_leg_flow),
+        );
+        let contact_uri = match b_leg_flow.transport {
+            AddrTransport::Tls => SipUri::new_sips(&local_ip).with_port(local_port),
+            AddrTransport::Udp => SipUri::new(&local_ip).with_port(local_port),
+            _ => SipUri::new(&local_ip)
+                .with_port(local_port)
+                .with_param("transport", Some(b_leg_flow.name().to_string())),
+        };
 
         let mut builder = RequestBuilder::invite(b_leg_uri)
-            .via_auto("UDP", &local_ip, Some(local_port))
+            .via_auto(b_leg_flow.via_token(), &local_ip, Some(local_port))
             .from_auto(
                 SipUri::new(&self.config.domain).with_user(&self.config.instance_name),
                 None,
@@ -5098,7 +5449,7 @@ impl SipStack {
             .call_id(&b_leg_sip_call_id)
             .cseq(1)
             .max_forwards(b_leg_max_forwards)
-            .contact_uri(SipUri::new(&local_ip).with_port(local_port));
+            .contact_uri(contact_uri);
 
         if let Some(ref sdp) = b_leg_sdp {
             builder = builder.body_sdp(sdp.as_bytes().to_vec());
@@ -5124,6 +5475,7 @@ impl SipStack {
                 return ProcessResult::Response {
                     message: SipMessage::Response(server_err),
                     destination: source,
+                    flow: Flow::Reply,
                 };
             }
         };
@@ -5342,6 +5694,9 @@ impl SipStack {
                 CallAddresses {
                     a_leg_source: source,
                     b_leg_destination,
+                    a_leg_flow: LegFlow::inbound(transport),
+                    b_leg_flow: b_leg_flow.clone(),
+                    a_leg_local_addr,
                     a_leg_sip_call_id: a_leg_call_id.clone(),
                     b_leg_sip_call_id: b_leg_sip_call_id.clone(),
                     local_addr: local_sip_addr,
@@ -5349,6 +5704,7 @@ impl SipStack {
                     trunk_lease,
                     vps_callee,
                     b_leg_invite,
+                    b_leg_ruri: Some(b_leg_request.uri.clone()),
                     stir_egress,
                     early_media_committed: false,
                     a_leg_via,
@@ -5400,10 +5756,12 @@ impl SipStack {
             ProcessResult::Response {
                 message: SipMessage::Response(trying),
                 destination: source,
+                flow: Flow::Reply,
             },
             ProcessResult::Forward {
                 message: SipMessage::Request(b_leg_request),
                 destination: b_leg_destination,
+                flow: b_leg_flow.into(),
             },
         ])
     }
@@ -5480,6 +5838,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
                 destination: source,
+                flow: Flow::Reply,
             };
         };
 
@@ -5488,6 +5847,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
                 destination: source,
+                flow: Flow::Reply,
             };
         };
         let addrs = a.clone();
@@ -5516,15 +5876,25 @@ impl SipStack {
         // received), send CANCEL instead of BYE (H6). A BYE in an early
         // dialog is invalid per RFC 3261 §15 and will be rejected by
         // conformant UAs.
-        let (other_call_id, other_dest) = if is_from_a_leg {
-            (&addrs.b_leg_sip_call_id, addrs.b_leg_destination)
+        let other_call_id = if is_from_a_leg {
+            &addrs.b_leg_sip_call_id
         } else {
-            (&addrs.a_leg_sip_call_id, addrs.a_leg_source)
+            &addrs.a_leg_sip_call_id
         };
+        // The other leg's own transport (NIST 800-53 Rev5: SC-8): a BYE from
+        // the caller goes to the trunk over the trunk's flow, never back down
+        // the caller's connection.
+        let (other_dest, other_flow) = addrs.leg_target(is_from_a_leg);
+        let other_sent_by = addrs.leg_sent_by(is_from_a_leg);
 
         let use_cancel = is_from_a_leg && addrs.dialog_to_tag.is_none();
 
-        let other_uri = SipUri::new(other_dest.ip().to_string()).with_port(other_dest.port());
+        let other_uri = leg_request_uri(
+            None,
+            &other_dest.ip().to_string(),
+            other_dest.port(),
+            &other_flow,
+        );
         let forward_request = if use_cancel {
             // Early dialog: send CANCEL mirroring the original INVITE
             // (same Via branch, From, To without tag).
@@ -5534,12 +5904,11 @@ impl SipStack {
             cancel_req.headers.set(HeaderName::From, &addrs.b_leg_from);
             cancel_req.headers.set(HeaderName::To, &addrs.b_leg_to);
             cancel_req.headers.set(HeaderName::MaxForwards, "70");
+            // RFC 3261 §9.1: same Via (transport, sent-by, branch) as the
+            // INVITE being cancelled.
             cancel_req.headers.add(Header::new(
                 HeaderName::Via,
-                format!(
-                    "SIP/2.0/UDP {};branch={}",
-                    addrs.local_addr, addrs.b_leg_branch
-                ),
+                crate::flow::via_for(&other_flow, other_sent_by, &addrs.b_leg_branch),
             ));
             cancel_req.headers.set(HeaderName::ContentLength, "0");
             cancel_req
@@ -5575,7 +5944,7 @@ impl SipStack {
             let branch = generate_branch();
             bye_request.headers.add(Header::new(
                 HeaderName::Via,
-                format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
+                crate::flow::via_for(&other_flow, other_sent_by, &branch),
             ));
             bye_request.headers.set(HeaderName::ContentLength, "0");
             bye_request
@@ -5614,10 +5983,12 @@ impl SipStack {
             ProcessResult::Response {
                 message: SipMessage::Response(ok_response),
                 destination: source,
+                flow: Flow::Reply,
             },
             ProcessResult::Forward {
                 message: SipMessage::Request(forward_request),
                 destination: other_dest,
+                flow: other_flow.into(),
             },
         ])
     }
@@ -5666,6 +6037,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
                 destination: source,
+                flow: Flow::Reply,
             };
         };
         let internal_id = id.clone();
@@ -5675,6 +6047,7 @@ impl SipStack {
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
                 destination: source,
+                flow: Flow::Reply,
             };
         };
         let addrs = a.clone();
@@ -5724,8 +6097,17 @@ impl SipStack {
         // CANCEL to B-leg. RFC 3261 §9.1: a CANCEL must mirror the INVITE
         // it cancels — same Via branch, From, To (no tag), and CSeq number
         // with method CANCEL. A fresh branch made it unmatchable.
-        let b_uri = SipUri::new(addrs.b_leg_destination.ip().to_string())
-            .with_port(addrs.b_leg_destination.port());
+        // RFC 3261 §9.1: the Request-URI is the current attempt's INVITE
+        // Request-URI (updated on failover); the socket-address form is only
+        // a fallback for records that predate it.
+        let b_uri = addrs.b_leg_ruri.clone().unwrap_or_else(|| {
+            leg_request_uri(
+                None,
+                &addrs.b_leg_destination.ip().to_string(),
+                addrs.b_leg_destination.port(),
+                &addrs.b_leg_flow,
+            )
+        });
         let mut b_cancel = proto_sip::message::SipRequest::new(Method::Cancel, b_uri);
         b_cancel
             .headers
@@ -5736,10 +6118,7 @@ impl SipStack {
         b_cancel.headers.set(HeaderName::MaxForwards, "70");
         b_cancel.headers.add(Header::new(
             HeaderName::Via,
-            format!(
-                "SIP/2.0/UDP {};branch={}",
-                addrs.local_addr, addrs.b_leg_branch
-            ),
+            crate::flow::via_for(&addrs.b_leg_flow, &addrs.local_addr, &addrs.b_leg_branch),
         ));
         b_cancel.headers.set(HeaderName::ContentLength, "0");
 
@@ -5763,14 +6142,17 @@ impl SipStack {
             ProcessResult::Response {
                 message: SipMessage::Response(cancel_ok),
                 destination: source,
+                flow: Flow::Reply,
             },
             ProcessResult::Response {
                 message: SipMessage::Response(terminated),
                 destination: source,
+                flow: Flow::Reply,
             },
             ProcessResult::Forward {
                 message: SipMessage::Request(b_cancel),
                 destination: addrs.b_leg_destination,
+                flow: addrs.b_leg_flow.clone().into(),
             },
         ])
     }
@@ -5800,6 +6182,7 @@ impl SipStack {
         ProcessResult::Response {
             message: SipMessage::Response(response),
             destination: source,
+            flow: Flow::Reply,
         }
     }
 
@@ -5828,6 +6211,7 @@ impl SipStack {
                 return ProcessResult::Response {
                     message: SipMessage::Response(response),
                     destination: source,
+                    flow: Flow::Reply,
                 };
             }
         }
@@ -5841,6 +6225,7 @@ impl SipStack {
         ProcessResult::Response {
             message: SipMessage::Response(response),
             destination: source,
+            flow: Flow::Reply,
         }
     }
 
@@ -6372,6 +6757,7 @@ impl SipStack {
                     return ProcessResult::Response {
                         message: SipMessage::Response(unavailable),
                         destination: source,
+                        flow: Flow::Reply,
                     };
                 }
             }
@@ -6524,6 +6910,7 @@ impl SipStack {
         ProcessResult::Response {
             message: SipMessage::Response(ok_response),
             destination: source,
+            flow: Flow::Reply,
         }
     }
 }
@@ -6855,6 +7242,179 @@ pub fn resolve_trunk_host_ips(host: &str) -> Vec<std::net::IpAddr> {
         .unwrap_or_default()
 }
 
+/// Pins every [`Flow::Reply`] in `result` to the transport the triggering
+/// message arrived on (RFC 3261 §18.2.2).
+fn resolve_reply(result: &mut ProcessResult, inbound: AddrTransport) {
+    match result {
+        ProcessResult::Response { flow, .. } | ProcessResult::Forward { flow, .. } => {
+            if matches!(flow, Flow::Reply) {
+                *flow = Flow::Leg(LegFlow::inbound(inbound));
+            }
+        }
+        ProcessResult::Multiple(results) => {
+            for r in results {
+                resolve_reply(r, inbound);
+            }
+        }
+        ProcessResult::NoAction | ProcessResult::Error { .. } => {}
+    }
+}
+
+/// Where one trunk attempt goes on the wire, from the trunk's config only
+/// (never from SIP headers): host and port for the Request-URI, the
+/// resolved address, and the flow (protocol, TLS server name).
+///
+/// ## NIST 800-53 Rev5: SC-8, SC-23; RFC 3263 §4.1
+#[derive(Debug, Clone)]
+struct TrunkEndpoint {
+    host: Arc<str>,
+    port: u16,
+    flow: LegFlow,
+}
+
+impl TrunkEndpoint {
+    /// Reads the endpoint of a configured trunk. The host and TLS name are
+    /// shared `Arc`s built at config load, so this does not allocate.
+    fn of(router: &Router, group_id: &str, trunk_id: &str) -> Option<Self> {
+        let trunk = router.get_trunk_group(group_id)?.get_trunk(trunk_id)?;
+        let cfg = trunk.config();
+        Some(Self {
+            host: Arc::clone(trunk.host_shared()),
+            port: cfg.port,
+            flow: LegFlow::trunk_shared(cfg.protocol, trunk.tls_name_shared(), cfg.tls_client_cert),
+        })
+    }
+
+    /// Resolves the trunk host. An IP literal is parsed in place; a
+    /// hostname is resolved with a blocking lookup inside
+    /// `tokio::task::block_in_place`, which keeps other tasks running but
+    /// does hold this worker thread for the lookup.
+    fn resolve(&self) -> Option<SbcSocketAddr> {
+        resolve_host_port(&self.host, self.port)
+    }
+}
+
+/// Request-URI toward a leg: `sips:` for TLS (RFC 3261 §26.2; the SBC never
+/// puts a `sips` URI on a TCP/UDP hop), `;transport=tcp` for TCP, and no
+/// `transport` parameter for UDP (§19.1.1, default). Built from config
+/// and enum values only.
+///
+/// ## RFC 3261 §19.1.1, §26.2; RFC 5630 §3
+fn leg_request_uri(user: Option<&str>, host: &str, port: u16, flow: &LegFlow) -> SipUri {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let mut uri = match flow.transport {
+        AddrTransport::Tls => SipUri::new_sips(host),
+        _ => SipUri::new(host),
+    }
+    .with_port(port);
+    if let Some(user) = user {
+        uri = uri.with_user(user);
+    }
+    match flow.transport {
+        AddrTransport::Udp | AddrTransport::Tls => uri,
+        AddrTransport::Tcp => uri.with_param("transport", Some("tcp".to_string())),
+        AddrTransport::WebSocket | AddrTransport::WebSocketSecure => {
+            uri.with_param("transport", Some("ws".to_string()))
+        }
+        AddrTransport::Sctp => uri.with_param("transport", Some("sctp".to_string())),
+    }
+}
+
+/// Contact value for the SBC on a leg (`<sips:host:port>` on TLS,
+/// RFC 3261 §8.1.1.8).
+fn leg_contact(sent_by: &str, flow: &LegFlow) -> String {
+    match flow.transport {
+        AddrTransport::Udp => format!("<sip:{sent_by}>"),
+        AddrTransport::Tls => format!("<sips:{sent_by}>"),
+        AddrTransport::Tcp => format!("<sip:{sent_by};transport=tcp>"),
+        AddrTransport::WebSocket | AddrTransport::WebSocketSecure => {
+            format!("<sip:{sent_by};transport=ws>")
+        }
+        AddrTransport::Sctp => format!("<sip:{sent_by};transport=sctp>"),
+    }
+}
+
+/// Flow toward a registered contact: its `transport` parameter (or `sips`
+/// scheme) picks the accepted connection it registered over; the SBC never
+/// dials a registered user (the parameter is attacker-chosen at REGISTER).
+///
+/// ## NIST 800-53 Rev5: SC-8, SI-10
+fn contact_flow(contact: &str) -> LegFlow {
+    let Ok(uri) = contact.parse::<SipUri>() else {
+        return LegFlow::UDP;
+    };
+    let transport = match uri.transport().map(str::to_ascii_lowercase).as_deref() {
+        Some("tls") => AddrTransport::Tls,
+        Some("tcp") if uri.scheme.requires_tls() => AddrTransport::Tls,
+        Some("tcp") => AddrTransport::Tcp,
+        Some("ws") => AddrTransport::WebSocket,
+        Some("wss") => AddrTransport::WebSocketSecure,
+        _ if uri.scheme.requires_tls() => AddrTransport::Tls,
+        _ => AddrTransport::Udp,
+    };
+    LegFlow::inbound(transport)
+}
+
+/// Flow and destination toward a registered binding.
+///
+/// A binding latched by REGISTER records the transport and source address
+/// it arrived on: requests go back on that transport to that address only
+/// (for TCP/TLS/WS, the accepted connection; it is never dialled), whatever
+/// the Contact URI says. A binding without a recorded flow is only used
+/// when its Contact names UDP: a stream Contact could otherwise point at
+/// another peer's accepted connection and inject requests into it.
+///
+/// ## NIST 800-53 Rev5: SC-8, SC-23 (Session Authenticity)
+///
+/// ## RFC 3261 §18.2.2; RFC 5626 §5.3
+fn binding_target(binding: &proto_registrar::Binding) -> Option<(LegFlow, SbcSocketAddr)> {
+    if let (Some(t), Some(addr)) = (binding.source_transport(), binding.source_addr()) {
+        let transport = match t {
+            "udp" => AddrTransport::Udp,
+            "tcp" => AddrTransport::Tcp,
+            "tls" => AddrTransport::Tls,
+            "ws" => AddrTransport::WebSocket,
+            "wss" => AddrTransport::WebSocketSecure,
+            other => {
+                warn!(transport = %other, "Binding has an unknown source transport; not routable");
+                return None;
+            }
+        };
+        return Some((LegFlow::inbound(transport), SbcSocketAddr::from(addr)));
+    }
+    let flow = contact_flow(binding.contact_uri());
+    if flow.transport != AddrTransport::Udp {
+        warn!(
+            contact = %binding.contact_uri(),
+            "Stream Contact without a registered connection; not routable"
+        );
+        return None;
+    }
+    // A wildcard Contact (0.0.0.0 / [::]) with no recorded flow names no
+    // reachable host (SEC-008).
+    resolve_sip_uri_to_addr(binding.contact_uri())
+        .filter(|d| !std::net::SocketAddr::from(*d).ip().is_unspecified())
+        .map(|d| (flow, d))
+}
+
+/// Resolves `host:port` (IP literal, bracketed IPv6, or hostname).
+fn resolve_host_port(host: &str, port: u16) -> Option<SbcSocketAddr> {
+    use std::net::ToSocketAddrs;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ipv4) = bare.parse::<std::net::Ipv4Addr>() {
+        return Some(SbcSocketAddr::new_v4(ipv4, port));
+    }
+    if let Ok(ipv6) = bare.parse::<std::net::Ipv6Addr>() {
+        return Some(SbcSocketAddr::new_v6(ipv6, port));
+    }
+    let addr_str = format!("{host}:{port}");
+    let resolved = tokio::task::block_in_place(|| addr_str.to_socket_addrs());
+    resolved
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .map(SbcSocketAddr::from)
+}
+
 fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
     use std::net::ToSocketAddrs;
 
@@ -7039,8 +7599,29 @@ fn extract_param<'a>(header_value: &'a str, name: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// For server tests: a stack with trunks t1 (127.0.0.2:5061) and t2
+    /// (127.0.0.3:5061), both TLS, and a placed call's primary B-leg INVITE
+    /// result (to t1).
+    pub(crate) async fn tls_failover_call(call_id: &str) -> (SipStack, ProcessResult) {
+        let stack = trunk_stack_protos(["tls", "tls"]).await;
+        let primary = place_call(&stack, call_id)
+            .await
+            .into_iter()
+            .find(|r| {
+                matches!(r, ProcessResult::Forward { message: SipMessage::Request(q), .. }
+                    if q.method == Method::Invite)
+            })
+            .expect("primary INVITE");
+        (stack, primary)
+    }
+
+    /// Active calls on carrier trunk `trunk` (server tests).
+    pub(crate) async fn carrier_active(stack: &SipStack, trunk: &str) -> u32 {
+        active(stack, trunk).await
+    }
 
     #[test]
     fn latch_rewrites_unspecified_v6_host_with_brackets() {
@@ -7120,11 +7701,11 @@ mod tests {
         // B-leg Via/Contact: trunk legs advertise the external zone's public
         // IP; internal legs the ingress zone's signaling IP.
         assert_eq!(
-            stack.b_leg_signaling_addr(Some("inside"), true),
+            stack.b_leg_signaling_addr(Some("inside"), true, AddrTransport::Udp),
             ("203.0.113.6".to_string(), 5060)
         );
         assert_eq!(
-            stack.b_leg_signaling_addr(Some("inside"), false),
+            stack.b_leg_signaling_addr(Some("inside"), false, AddrTransport::Udp),
             ("10.0.1.10".to_string(), 5060)
         );
 
@@ -7547,6 +8128,7 @@ mod tests {
                 if let ProcessResult::Response {
                     message,
                     destination,
+                    ..
                 } = &results[0]
                 {
                     if let SipMessage::Response(resp) = message {
@@ -7561,6 +8143,7 @@ mod tests {
                 if let ProcessResult::Forward {
                     message,
                     destination,
+                    ..
                 } = &results[1]
                 {
                     assert!(message.is_request(), "Forward should be a request");
@@ -8165,6 +8748,9 @@ mod tests {
         CallAddresses {
             a_leg_source: SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(10, 0, 0, 1), 5060),
             b_leg_destination: SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(10, 0, 0, 2), 5060),
+            a_leg_flow: LegFlow::UDP,
+            b_leg_flow: LegFlow::UDP,
+            a_leg_local_addr: "10.0.0.9:5060".to_string(),
             a_leg_sip_call_id: "aleg-callid".to_string(),
             b_leg_sip_call_id: "bleg-callid".to_string(),
             local_addr: "10.0.0.9:5060".to_string(),
@@ -8172,6 +8758,7 @@ mod tests {
             trunk_lease: None,
             vps_callee: None,
             b_leg_invite: None,
+            b_leg_ruri: None,
             stir_egress: None,
             early_media_committed: false,
             a_leg_via: vec!["SIP/2.0/UDP 10.0.0.1;branch=z9hG4bK-a".to_string()],
@@ -8413,6 +9000,7 @@ mod tests {
             ProcessResult::Forward {
                 message: SipMessage::Request(req),
                 destination,
+                ..
             } if req.method == *method => Some((req, *destination)),
             _ => None,
         })
@@ -8426,6 +9014,7 @@ mod tests {
             ProcessResult::Response {
                 message: SipMessage::Response(resp),
                 destination,
+                ..
             } if resp.status.code() == status => Some((resp, *destination)),
             _ => None,
         })
@@ -9227,8 +9816,12 @@ mod tests {
 
         let byes = stack.terminate_call_on_media_failure("call-1").await;
         assert_eq!(byes.len(), 2, "must BYE both legs");
-        assert_eq!(byes[0].1.to_string(), addrs.a_leg_source.to_string());
-        assert_eq!(byes[1].1.to_string(), addrs.b_leg_destination.to_string());
+        let dest = |r: &ProcessResult| match r {
+            ProcessResult::Forward { destination, .. } => *destination,
+            _ => panic!("BYE forward"),
+        };
+        assert_eq!(dest(&byes[0]), addrs.a_leg_source);
+        assert_eq!(dest(&byes[1]), addrs.b_leg_destination);
 
         // Call state is removed.
         let corr = stack.call_correlation.read().await;
@@ -9273,7 +9866,26 @@ mod tests {
         transform: (&str, &str),
         vps: Option<uc_vps::VpsEngine>,
     ) -> SipStack {
-        let mut stack = SipStack::new(config);
+        trunk_stack_full(config, max_calls, transform, vps, ["udp", "udp"]).await
+    }
+
+    /// [`trunk_stack`] with trunk protocols for t1 / t2 (TLS trunks listen
+    /// on 5061, `tls_server_name` unset so the host is verified).
+    async fn trunk_stack_protos(protos: [&str; 2]) -> SipStack {
+        trunk_stack_full(SipStackConfig::default(), 10, ("none", ""), None, protos).await
+    }
+
+    /// Routing, dial plan and the "carriers" group (t1 = 127.0.0.2,
+    /// t2 = 127.0.0.3) used by [`trunk_stack`].
+    fn carrier_routing(
+        max_calls: u32,
+        transform: (&str, &str),
+        protos: [&str; 2],
+    ) -> (
+        sbc_config::RoutingConfig,
+        Vec<sbc_config::DialPlanConfig>,
+        Vec<sbc_config::TrunkGroupConfig>,
+    ) {
         let routing = sbc_config::RoutingConfig {
             use_dial_plan: true,
             max_failover_attempts: 3,
@@ -9306,23 +9918,39 @@ mod tests {
                 },
             ],
         }];
-        let trunk = |id: &str, host: &str, priority: u32| sbc_config::TrunkConfigSchema {
-            id: id.to_string(),
-            host: host.to_string(),
-            port: 5060,
-            protocol: "udp".to_string(),
-            priority,
-            max_calls,
-            max_failures: 3,
-            ..Default::default()
-        };
+        let trunk =
+            |id: &str, host: &str, priority: u32, proto: &str| sbc_config::TrunkConfigSchema {
+                id: id.to_string(),
+                host: host.to_string(),
+                port: if proto == "tls" { 5061 } else { 5060 },
+                protocol: proto.to_string(),
+                priority,
+                max_calls,
+                max_failures: 3,
+                ..Default::default()
+            };
         let groups = vec![sbc_config::TrunkGroupConfig {
             id: "carriers".to_string(),
             name: "Carriers".to_string(),
             strategy: "priority".to_string(),
-            trunks: vec![trunk("t1", "127.0.0.2", 1), trunk("t2", "127.0.0.3", 2)],
+            trunks: vec![
+                trunk("t1", "127.0.0.2", 1, protos[0]),
+                trunk("t2", "127.0.0.3", 2, protos[1]),
+            ],
             zone: None,
         }];
+        (routing, dial_plans, groups)
+    }
+
+    async fn trunk_stack_full(
+        config: SipStackConfig,
+        max_calls: u32,
+        transform: (&str, &str),
+        vps: Option<uc_vps::VpsEngine>,
+        protos: [&str; 2],
+    ) -> SipStack {
+        let mut stack = SipStack::new(config);
+        let (routing, dial_plans, groups) = carrier_routing(max_calls, transform, protos);
         stack.init_router_from_config(&routing, &dial_plans, &groups);
         if let Some(engine) = vps {
             stack.set_vps_engine(engine);
@@ -9701,7 +10329,8 @@ mod tests {
 
     #[tokio::test]
     async fn reliable_invite_client_txn_has_no_timer_a_but_times_out_on_timer_b() {
-        let stack = trunk_stack(10, ("none", ""), None).await;
+        // The B-leg transaction follows the trunk's transport (POA&M-5).
+        let stack = trunk_stack_protos(["tcp", "tcp"]).await;
         let results = place_call_on(&stack, "tcp-a@test", AddrTransport::Tcp).await;
         assert!(forwarded(&results, &Method::Invite).is_some());
         {
@@ -9763,7 +10392,14 @@ mod tests {
     /// Places a call over `transport` then CANCELs it over the same
     /// transport; returns what the timers produce 600 ms later.
     async fn cancel_on(transport: AddrTransport) -> Vec<ProcessResult> {
-        let stack = trunk_stack(10, ("none", ""), None).await;
+        // The trunk uses the same transport as the caller here, so the
+        // CANCEL's client transaction is reliable exactly when it is.
+        let proto = if transport == AddrTransport::Udp {
+            "udp"
+        } else {
+            "tls"
+        };
+        let stack = trunk_stack_protos([proto, proto]).await;
         let id = "nict@test";
         place_call_on(&stack, id, transport).await;
         let out = flatten(
@@ -13413,5 +14049,750 @@ mod tests {
                 .unwrap()
                 .as_str()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // POA&M-5 (SC-8): every emitted message carries its leg's flow; the
+    // failover INVITE is addressed and sent per the next trunk.
+    // ------------------------------------------------------------------
+
+    fn flow_of<'a>(results: &'a [ProcessResult], method: &Method) -> &'a LegFlow {
+        results
+            .iter()
+            .find_map(|r| match r {
+                ProcessResult::Forward {
+                    message: SipMessage::Request(req),
+                    flow: Flow::Leg(f),
+                    ..
+                } if req.method == *method => Some(f),
+                _ => None,
+            })
+            .expect("forward with a resolved flow")
+    }
+
+    fn response_flow(results: &[ProcessResult], status: u16) -> LegFlow {
+        results
+            .iter()
+            .find_map(|r| match r {
+                ProcessResult::Response {
+                    message: SipMessage::Response(resp),
+                    flow: Flow::Leg(f),
+                    ..
+                } if resp.status.code() == status => Some(f.clone()),
+                _ => None,
+            })
+            .expect("response with a resolved flow")
+    }
+
+    async fn client_invite_mode(stack: &SipStack, branch: &str) -> TransportType {
+        stack
+            .transactions
+            .read()
+            .await
+            .client_invite
+            .get(&TransactionKey::client(branch, "INVITE"))
+            .expect("client INVITE txn")
+            .transaction
+            .transport()
+    }
+
+    // RFC 3261 §18.1.1, §26.2; NIST 800-53 Rev5: SC-8.
+    #[tokio::test]
+    async fn failover_udp_to_tls_trunk_uses_sips_ruri_tls_via_and_tls_flow() {
+        let stack = trunk_stack_protos(["udp", "tls"]).await;
+        let results = place_call(&stack, "u2t@test").await;
+        let (first, dest) = forwarded(&results, &Method::Invite).unwrap();
+        let first = first.clone();
+        assert_eq!(dest, t1());
+        assert_eq!(flow_of(&results, &Method::Invite), &LegFlow::UDP);
+        assert_eq!(
+            first.uri.to_string(),
+            format!("sip:{DIALED}@127.0.0.2:5060")
+        );
+        assert!(
+            first
+                .headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .starts_with("SIP/2.0/UDP ")
+        );
+
+        let out = flatten(
+            stack
+                .process_message(&response_to(&first, 503, Some("t1"), None), t1(), None)
+                .await,
+        );
+        let (retry, dest) = forwarded(&out, &Method::Invite).expect("failover");
+        assert_eq!(dest.port(), 5061);
+        assert_eq!(
+            retry.uri.to_string(),
+            format!("sips:{DIALED}@127.0.0.3:5061")
+        );
+        let via = retry.headers.get_value(&HeaderName::Via).unwrap();
+        assert!(via.starts_with("SIP/2.0/TLS sbc.local:5061;"), "{via}");
+        let contact = retry.headers.get_value(&HeaderName::Contact).unwrap();
+        assert!(contact.starts_with("<sips:"), "{contact}");
+        let flow = flow_of(&out, &Method::Invite);
+        assert_eq!(flow.transport, AddrTransport::Tls);
+        assert_eq!(flow.dial.as_deref(), Some("127.0.0.3"));
+        let branch = retry.headers.via_branch().unwrap();
+        assert_eq!(
+            client_invite_mode(&stack, &branch).await,
+            TransportType::Reliable
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_tls_to_udp_trunk_uses_sip_ruri_udp_via_and_unreliable_txn() {
+        let stack = trunk_stack_protos(["tls", "udp"]).await;
+        let results = place_call(&stack, "t2u@test").await;
+        let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+        let first = first.clone();
+        assert_eq!(
+            first.uri.to_string(),
+            format!("sips:{DIALED}@127.0.0.2:5061")
+        );
+        assert_eq!(
+            flow_of(&results, &Method::Invite).transport,
+            AddrTransport::Tls
+        );
+        // The TLS attempt fails to send (connect/handshake/verify): the next
+        // trunk's own flow is used, never a downgrade of this attempt.
+        let out = flatten(ProcessResult::Multiple(
+            stack
+                .on_invite_sent(&SipMessage::Request(first), false)
+                .await,
+        ));
+        let (retry, dest) = forwarded(&out, &Method::Invite).expect("failover");
+        assert_eq!(dest, t2());
+        assert_eq!(
+            retry.uri.to_string(),
+            format!("sip:{DIALED}@127.0.0.3:5060")
+        );
+        assert!(retry.uri.transport().is_none());
+        let via = retry.headers.get_value(&HeaderName::Via).unwrap();
+        assert!(via.starts_with("SIP/2.0/UDP sbc.local:5060;"), "{via}");
+        assert_eq!(flow_of(&out, &Method::Invite), &LegFlow::UDP);
+        let branch = retry.headers.via_branch().unwrap();
+        assert_eq!(
+            client_invite_mode(&stack, &branch).await,
+            TransportType::Unreliable
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_to_tcp_trunk_adds_transport_param() {
+        let stack = trunk_stack_protos(["udp", "tcp"]).await;
+        let results = place_call(&stack, "u2tcp@test").await;
+        let first = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let out = flatten(
+            stack
+                .process_message(&response_to(&first, 503, Some("t1"), None), t1(), None)
+                .await,
+        );
+        let (retry, _) = forwarded(&out, &Method::Invite).expect("failover");
+        assert_eq!(retry.uri.transport(), Some("tcp"));
+        assert!(
+            retry
+                .headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .starts_with("SIP/2.0/TCP ")
+        );
+        assert_eq!(flow_of(&out, &Method::Invite).transport, AddrTransport::Tcp);
+    }
+
+    // NIST 800-53 Rev5: SC-8 — all TLS targets dead: 503 to the caller on
+    // its own connection, no plaintext attempt.
+    #[tokio::test]
+    async fn tls_trunks_all_dead_gives_503_on_caller_flow_without_plaintext_retry() {
+        let stack = trunk_stack_protos(["tls", "tls"]).await;
+        let results = place_call_on(&stack, "dead@test", AddrTransport::Tcp).await;
+        let first = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let out = flatten(ProcessResult::Multiple(
+            stack
+                .on_invite_sent(&SipMessage::Request(first), false)
+                .await,
+        ));
+        let retry = forwarded(&out, &Method::Invite).unwrap().0.clone();
+        assert_eq!(flow_of(&out, &Method::Invite).transport, AddrTransport::Tls);
+        let out = flatten(ProcessResult::Multiple(
+            stack
+                .on_invite_sent(&SipMessage::Request(retry), false)
+                .await,
+        ));
+        assert!(forwarded(&out, &Method::Invite).is_none(), "{out:?}");
+        assert_eq!(
+            response_flow(&out, 503),
+            LegFlow::inbound(AddrTransport::Tcp)
+        );
+    }
+
+    // RFC 3261 §17.1.1.2, §18.2.2: Timer B's 408 goes to the caller on its
+    // stream connection, not the UDP socket.
+    #[tokio::test]
+    async fn timer_b_408_on_tcp_call_rides_the_caller_connection() {
+        let stack = trunk_stack_protos(["tcp", "tcp"]).await;
+        let results = place_call_on(&stack, "tb-tcp@test", AddrTransport::Tcp).await;
+        let first = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let internal = internal_id(&stack, "tb-tcp@test").await;
+        let out = stack
+            .fail_timed_out_request(&first.headers.via_branch().unwrap(), &internal)
+            .await;
+        // Timer B -> failover result carries the next trunk's flow.
+        let retry = forwarded(&out, &Method::Invite).unwrap().0.clone();
+        assert_eq!(flow_of(&out, &Method::Invite).transport, AddrTransport::Tcp);
+        assert!(flow_of(&out, &Method::Invite).dial.is_some());
+        let out = stack
+            .fail_timed_out_request(&retry.headers.via_branch().unwrap(), &internal)
+            .await;
+        assert_eq!(
+            response_flow(&out, 408),
+            LegFlow::inbound(AddrTransport::Tcp)
+        );
+    }
+
+    // RFC 3261 §17.2.1: Timer G re-sends ride the server txn's flow.
+    #[tokio::test]
+    async fn timer_g_retransmission_carries_the_udp_flow_and_bye_the_leg_flows() {
+        let stack = trunk_stack_protos(["tls", "tls"]).await;
+        let results = place_call_on(&stack, "g@test", AddrTransport::Udp).await;
+        let (b_invite, dest) = forwarded(&results, &Method::Invite).unwrap();
+        let (b_invite, dest) = (b_invite.clone(), dest);
+        stack
+            .process_message_on(
+                &response_to(&b_invite, 486, Some("t"), None),
+                dest,
+                None,
+                AddrTransport::Tls,
+            )
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let results = stack.poll_timers().await;
+        assert_eq!(response_flow(&results, 486), LegFlow::UDP);
+    }
+
+    #[tokio::test]
+    async fn bye_from_tls_caller_goes_to_trunk_on_trunk_flow() {
+        let stack = trunk_stack_protos(["tls", "udp"]).await;
+        let results = place_call_on(&stack, "bye@test", AddrTransport::Tls).await;
+        let (inv, dest) = forwarded(&results, &Method::Invite).unwrap();
+        let inv = inv.clone();
+        answer(&stack, &inv, dest).await;
+        let internal = internal_id(&stack, "bye@test").await;
+        let addrs = stack
+            .call_correlation
+            .read()
+            .await
+            .addresses
+            .get(&internal)
+            .cloned()
+            .unwrap();
+        // SBC-initiated teardown: each BYE on its own leg's flow and Via.
+        let byes = stack
+            .terminate_call_on_media_failure(&internal.to_string())
+            .await;
+        assert_eq!(byes.len(), 2);
+        let mut seen = Vec::new();
+        for r in &byes {
+            let ProcessResult::Forward {
+                message: SipMessage::Request(b),
+                destination,
+                flow: Flow::Leg(f),
+            } = r
+            else {
+                panic!("BYE forward");
+            };
+            let via = b.headers.get_value(&HeaderName::Via).unwrap().to_string();
+            seen.push((*destination, f.transport, via));
+        }
+        assert_eq!(seen[0].0, addrs.a_leg_source);
+        assert_eq!(seen[0].1, AddrTransport::Tls);
+        assert!(
+            seen[0].2.starts_with("SIP/2.0/TLS sbc.local:5061"),
+            "{}",
+            seen[0].2
+        );
+        assert_eq!(seen[1].0, addrs.b_leg_destination);
+        assert_eq!(seen[1].1, AddrTransport::Tls);
+        assert!(seen[1].2.starts_with("SIP/2.0/TLS "), "{}", seen[1].2);
+    }
+
+    // Regression for the primary-path misroute: a TLS caller's INVITE to a
+    // TLS trunk is addressed to the trunk with the trunk's flow (dial), not
+    // the caller's connection.
+    #[tokio::test]
+    async fn primary_invite_from_tls_caller_targets_tls_trunk_flow() {
+        let stack = trunk_stack_protos(["tls", "tls"]).await;
+        let results = place_call_on(&stack, "prim@test", AddrTransport::Tls).await;
+        let (inv, dest) = forwarded(&results, &Method::Invite).unwrap();
+        assert_eq!(dest.port(), 5061);
+        assert_ne!(dest, alice());
+        let f = flow_of(&results, &Method::Invite);
+        assert_eq!(f.transport, AddrTransport::Tls);
+        assert_eq!(
+            f.dial.as_deref(),
+            Some("127.0.0.2"),
+            "dial the trunk, not the caller"
+        );
+        assert!(inv.uri.scheme.requires_tls());
+        // The 100 Trying replies on the caller's own TLS connection.
+        assert_eq!(
+            response_flow(&results, 100),
+            LegFlow::inbound(AddrTransport::Tls)
+        );
+    }
+
+    #[test]
+    fn retarget_helpers_keep_host_and_params() {
+        let via = retarget_via(
+            "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKold;rport",
+            &LegFlow::trunk(uc_routing::TrunkProtocol::Tls, "h", false),
+            5061,
+            "z9hG4bKnew",
+        );
+        assert_eq!(via, "SIP/2.0/TLS 10.0.0.1:5061;branch=z9hG4bKnew;rport");
+        let via = retarget_via(
+            "SIP/2.0/TLS [2001:db8::1]:5061;branch=b",
+            &LegFlow::UDP,
+            5060,
+            "c",
+        );
+        assert_eq!(via, "SIP/2.0/UDP [2001:db8::1]:5060;branch=c");
+        assert_eq!(
+            retarget_contact(
+                "<sip:10.0.0.1:5060>",
+                &LegFlow::inbound(AddrTransport::Tls),
+                5061
+            ),
+            "<sips:10.0.0.1:5061>"
+        );
+        assert_eq!(
+            retarget_contact("<sips:10.0.0.1:5061>;expires=60", &LegFlow::UDP, 5060),
+            "<sip:10.0.0.1:5060>;expires=60"
+        );
+        assert_eq!(split_sent_by("[::1]:5"), ("[::1]", Some(5)));
+        assert_eq!(split_sent_by("::1"), ("::1", None));
+    }
+
+    // NIST 800-53 Rev5: SC-8, SI-10 — a registered contact's transport picks
+    // only an accepted connection; never a dial.
+    #[test]
+    fn contact_flow_never_dials() {
+        assert_eq!(contact_flow("sip:a@192.0.2.1:5060"), LegFlow::UDP);
+        assert_eq!(
+            contact_flow("sip:a@192.0.2.1:5061;transport=tls"),
+            LegFlow::inbound(AddrTransport::Tls)
+        );
+        assert_eq!(
+            contact_flow("sips:a@192.0.2.1:5061"),
+            LegFlow::inbound(AddrTransport::Tls)
+        );
+        assert_eq!(
+            contact_flow("sip:a@192.0.2.1;transport=TCP"),
+            LegFlow::inbound(AddrTransport::Tcp)
+        );
+        assert!(contact_flow("sips:a@h;transport=tcp").dial.is_none());
+        assert_eq!(contact_flow("garbage"), LegFlow::UDP);
+    }
+
+    // ---------------- Fix round 1 (SEC-002/-003, RFC-002, RFC-004) --------
+
+    fn tls_phone() -> SbcSocketAddr {
+        SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 0, 2, 10), 40_000)
+    }
+
+    /// REGISTER for carol whose Contact names no transport and whose Via
+    /// claims UDP; it arrives on `transport` from [`tls_phone`].
+    async fn register_carol(stack: &SipStack, transport: AddrTransport) {
+        let register = Bytes::from_static(
+            b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 192.0.2.10:5061;branch=z9hG4bK-carol\r\n\
+            From: <sip:carol@sbc.local>;tag=c1\r\n\
+            To: <sip:carol@sbc.local>\r\n\
+            Call-ID: reg-carol@test\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:carol@192.0.2.10:5061>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\r\n",
+        );
+        let r = stack
+            .process_message_on(&register, tls_phone(), None, transport)
+            .await;
+        assert!(
+            matches!(&r, ProcessResult::Response { message: SipMessage::Response(resp), .. }
+                if resp.status == StatusCode::OK),
+            "{r:?}"
+        );
+    }
+
+    async fn call_carol(stack: &SipStack, id: &str) -> Vec<ProcessResult> {
+        // Source admission (AC-3): alice is a registered endpoint.
+        let register = Bytes::from_static(
+            b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-alice\r\n\
+            From: <sip:alice@example.com>;tag=a1\r\n\
+            To: <sip:alice@example.com>\r\n\
+            Call-ID: reg-alice@test\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:alice@192.168.1.1:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\r\n",
+        );
+        stack
+            .process_message_on(&register, alice(), None, AddrTransport::Udp)
+            .await;
+        flatten(
+            stack
+                .process_message_on(
+                    &caller_request("INVITE", "carol", id, 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                    AddrTransport::Udp,
+                )
+                .await,
+        )
+    }
+
+    // SEC-002 (NIST 800-53 Rev5: SC-8): a phone registered over TLS is
+    // reached only on its TLS connection (the REGISTER's observed transport
+    // and source), whatever its Contact or Via says; never UDP.
+    #[tokio::test]
+    async fn tls_registered_binding_is_reached_on_its_tls_connection() {
+        let stack = SipStack::new(SipStackConfig::default());
+        register_carol(&stack, AddrTransport::Tls).await;
+        {
+            let loc = stack.location_service.read().await;
+            let b = loc.lookup("sip:carol@sbc.local");
+            assert_eq!(b.len(), 1);
+            assert_eq!(b[0].source_transport(), Some("tls"));
+            assert_eq!(
+                b[0].source_addr(),
+                Some(std::net::SocketAddr::from(tls_phone()))
+            );
+            assert!(
+                b[0].contact_uri().ends_with(";transport=tls"),
+                "{}",
+                b[0].contact_uri()
+            );
+        }
+        let results = call_carol(&stack, "sec2-tls@test").await;
+        let (_, dest) = forwarded(&results, &Method::Invite).expect("INVITE to carol");
+        assert_eq!(dest, tls_phone(), "the registering connection's peer");
+        let flow = flow_of(&results, &Method::Invite);
+        assert_eq!(flow, &LegFlow::inbound(AddrTransport::Tls));
+        assert!(flow.dial.is_none(), "a registered user is never dialled");
+    }
+
+    // The same REGISTER over UDP stays UDP (no upgrade from the Contact).
+    #[tokio::test]
+    async fn udp_registered_binding_stays_udp() {
+        let stack = SipStack::new(SipStackConfig::default());
+        register_carol(&stack, AddrTransport::Udp).await;
+        let results = call_carol(&stack, "sec2-udp@test").await;
+        let (_, dest) = forwarded(&results, &Method::Invite).expect("INVITE to carol");
+        assert_eq!(dest, tls_phone());
+        assert_eq!(flow_of(&results, &Method::Invite), &LegFlow::UDP);
+    }
+
+    // SEC-003: a binding with a stream Contact but no recorded connection
+    // (not learned from a REGISTER on that connection) is not used: it
+    // could name another peer's accepted connection.
+    #[tokio::test]
+    async fn stream_binding_without_its_own_connection_is_not_routed() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .location_service
+            .write()
+            .await
+            .add_binding(proto_registrar::Binding::new(
+                "sip:carol@sbc.local",
+                "sip:carol@192.0.2.99:5061;transport=tls",
+                "reg@test",
+                1,
+            ))
+            .unwrap();
+        let results = call_carol(&stack, "sec3@test").await;
+        assert!(
+            forwarded(&results, &Method::Invite).is_none(),
+            "{results:?}"
+        );
+    }
+
+    // SEC-008: a REGISTER latches only its own binding; another device's
+    // wildcard Contact for the same AOR is not pinned to this source/flow
+    // and stays unroutable.
+    #[tokio::test]
+    async fn register_does_not_latch_another_devices_wildcard_contact() {
+        let stack = SipStack::new(SipStackConfig::default());
+        let mut other = proto_registrar::Binding::new(
+            "sip:carol@sbc.local",
+            "sip:carol@0.0.0.0:5070",
+            "other-device@test",
+            1,
+        );
+        let _ = other.set_expires(3600);
+        // Seeded in the registrar (the authoritative store synced from).
+        stack
+            .registrar
+            .write()
+            .await
+            .registrar_mut()
+            .location_mut()
+            .add_binding(other)
+            .unwrap();
+        register_carol(&stack, AddrTransport::Tls).await;
+        let loc = stack.location_service.read().await;
+        let bindings: Vec<_> = loc.lookup("sip:carol@sbc.local").into_iter().collect();
+        let other = bindings
+            .iter()
+            .find(|b| b.call_id() == "other-device@test")
+            .expect("other device's binding kept");
+        assert!(other.source_transport().is_none(), "{other:?}");
+        assert!(other.source_addr().is_none(), "{other:?}");
+        assert!(other.contact_uri().contains("0.0.0.0"), "{other:?}");
+        assert_eq!(binding_target(other), None);
+        let own = bindings
+            .iter()
+            .find(|b| b.call_id() == "reg-carol@test")
+            .expect("own binding");
+        assert_eq!(own.source_transport(), Some("tls"));
+    }
+
+    #[test]
+    fn binding_target_prefers_recorded_flow() {
+        let mut b = proto_registrar::Binding::new("sip:c@x", "sip:c@192.0.2.1:5060", "id", 1);
+        assert_eq!(
+            binding_target(&b),
+            Some((
+                LegFlow::UDP,
+                SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 0, 2, 1), 5060)
+            ))
+        );
+        b.set_source_addr(std::net::SocketAddr::from(tls_phone()));
+        b.set_source_transport("tls");
+        assert_eq!(
+            binding_target(&b),
+            Some((LegFlow::inbound(AddrTransport::Tls), tls_phone()))
+        );
+        b.set_source_transport("bogus");
+        assert_eq!(binding_target(&b), None);
+    }
+
+    /// CANCELs call `id` from alice and returns the B-leg CANCEL.
+    async fn cancel_call(stack: &SipStack, id: &str) -> SipRequest {
+        let out = flatten(
+            stack
+                .process_message(
+                    &caller_request("CANCEL", DIALED, id, 1, None, None),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        forwarded(&out, &Method::Cancel)
+            .expect("B-leg CANCEL")
+            .0
+            .clone()
+    }
+
+    // RFC-002 (RFC 3261 §9.1): the CANCEL Request-URI equals the INVITE's,
+    // on the primary attempt and after a failover changed it.
+    #[tokio::test]
+    async fn cancel_request_uri_matches_the_current_invite() {
+        let stack = trunk_stack_protos(["udp", "tls"]).await;
+        let results = place_call(&stack, "rfc2-primary@test").await;
+        let (invite, _) = forwarded(&results, &Method::Invite).unwrap();
+        let invite = invite.clone();
+        let cancel = cancel_call(&stack, "rfc2-primary@test").await;
+        assert_eq!(cancel.uri, invite.uri);
+
+        let results = place_call(&stack, "rfc2-failover@test").await;
+        let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+        let first = first.clone();
+        let out = flatten(
+            stack
+                .process_message(&response_to(&first, 503, Some("t1"), None), t1(), None)
+                .await,
+        );
+        let (retry, _) = forwarded(&out, &Method::Invite).expect("failover");
+        let retry = retry.clone();
+        assert_ne!(retry.uri, first.uri);
+        let cancel = cancel_call(&stack, "rfc2-failover@test").await;
+        assert_eq!(cancel.uri, retry.uri, "CANCEL follows the failover attempt");
+        assert_eq!(
+            cancel.uri.to_string(),
+            format!("sips:{DIALED}@127.0.0.3:5061")
+        );
+        assert!(
+            cancel
+                .headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .starts_with("SIP/2.0/TLS ")
+        );
+    }
+
+    // RFC-004 (RFC 7118 §5): a WS leg advertises the WebSocket listener.
+    #[test]
+    fn ws_leg_advertises_ws_listener_port() {
+        let stack = SipStack::new(SipStackConfig {
+            udp_port: 5060,
+            tcp_port: 5070,
+            tls_port: 5071,
+            ws_port: 8080,
+            ..SipStackConfig::default()
+        });
+        assert_eq!(stack.signaling_port(AddrTransport::WebSocket), 8080);
+        assert_eq!(stack.signaling_port(AddrTransport::Tcp), 5070);
+        assert_eq!(stack.signaling_port(AddrTransport::Tls), 5071);
+    }
+
+    // PR 160: STIR re-sign still works when failing over to a TLS trunk.
+    #[tokio::test]
+    async fn stir_resign_survives_failover_to_tls_trunk() {
+        let mut q = qa_stir_stack(sbc_config::StirFailurePolicy::Mark, 0, 500, true, false).await;
+        let (r, d, g) = carrier_routing(10, ("none", ""), ["udp", "tls"]);
+        q.stack.init_router_from_config(&r, &d, &g);
+        let results = flatten(
+            q.stack
+                .process_message(&qa_invite("qa-tls@test", None), alice(), None)
+                .await,
+        );
+        let first = forwarded(&results, &Method::Invite).expect("t1").0.clone();
+        let first_id = first
+            .headers
+            .get_value(&HeaderName::Identity)
+            .expect("signed")
+            .to_owned();
+        let out = flatten(
+            q.stack
+                .process_message(&response_to(&first, 503, Some("t1"), None), t1(), None)
+                .await,
+        );
+        let (retry, _) = forwarded(&out, &Method::Invite).expect("failover");
+        assert!(retry.uri.scheme.requires_tls());
+        assert_eq!(flow_of(&out, &Method::Invite).transport, AddrTransport::Tls);
+        let id = retry
+            .headers
+            .get_value(&HeaderName::Identity)
+            .expect("re-signed");
+        assert_ne!(id, first_id);
+    }
+
+    // ---------------- QA additions (POA&M-5) ----------------
+
+    // RFC 3261 §9.1, §18.1.1: the CANCEL follows the INVITE's B-leg flow —
+    // the TLS trunk connection — not the caller's connection or UDP.
+    #[tokio::test]
+    async fn qa_cancel_on_tls_trunk_b_leg_rides_trunk_flow() {
+        for caller in [AddrTransport::Udp, AddrTransport::Tls, AddrTransport::Tcp] {
+            let stack = trunk_stack_protos(["tls", "udp"]).await;
+            let id = format!("qa-cancel-{caller:?}@test");
+            let results = place_call_on(&stack, &id, caller).await;
+            let (inv, inv_dest) = forwarded(&results, &Method::Invite).unwrap();
+            let inv_branch = inv.headers.via_branch().unwrap();
+            let out = flatten(
+                stack
+                    .process_message_on(
+                        &caller_request("CANCEL", DIALED, &id, 1, None, None),
+                        alice(),
+                        None,
+                        caller,
+                    )
+                    .await,
+            );
+            let (cancel, dest) = forwarded(&out, &Method::Cancel).expect("CANCEL relayed");
+            assert_eq!(dest, inv_dest, "{caller:?}");
+            assert_eq!(dest.port(), 5061);
+            let f = flow_of(&out, &Method::Cancel);
+            assert_eq!(f.transport, AddrTransport::Tls, "{caller:?}");
+            assert_eq!(
+                f.dial.as_deref(),
+                Some("127.0.0.2"),
+                "trunk conn, not caller"
+            );
+            assert!(cancel.uri.scheme.requires_tls(), "{}", cancel.uri);
+            let via = cancel.headers.get_value(&HeaderName::Via).unwrap();
+            assert!(via.starts_with("SIP/2.0/TLS sbc.local:5061;"), "{via}");
+            // §9.1: CANCEL carries the INVITE's branch.
+            assert_eq!(cancel.headers.via_branch().unwrap(), inv_branch);
+            // 200 OK to the CANCEL goes to the caller on its own flow.
+            assert_eq!(response_flow(&out, 200), LegFlow::inbound(caller));
+        }
+    }
+
+    // RFC 3261 §13.2.2.4, §18.1.1: the SBC's ACK for a trunk's 2xx (and the
+    // re-ACK for a retransmitted 2xx) goes on the trunk's stream flow with a
+    // matching Via; the 200 goes to the caller on the caller's connection.
+    #[tokio::test]
+    async fn qa_ack_for_2xx_on_stream_trunk_rides_trunk_flow() {
+        for (proto, t, via_pfx) in [
+            ("tls", AddrTransport::Tls, "SIP/2.0/TLS sbc.local:5061;"),
+            ("tcp", AddrTransport::Tcp, "SIP/2.0/TCP "),
+        ] {
+            let stack = trunk_stack_protos([proto, "udp"]).await;
+            let id = format!("qa-ack-{proto}@test");
+            let results = place_call_on(&stack, &id, AddrTransport::Tls).await;
+            let (inv, dest) = forwarded(&results, &Method::Invite).unwrap();
+            let inv = inv.clone();
+            stack
+                .process_message_on(&response_to(&inv, 180, Some("bobtag"), None), dest, None, t)
+                .await;
+            let ok = response_to(&inv, 200, Some("bobtag"), Some(BOB_SDP));
+            let out = flatten(stack.process_message_on(&ok, dest, None, t).await);
+            let (ack, ack_dest) = forwarded(&out, &Method::Ack).expect("ACK to trunk");
+            assert_eq!(ack_dest, dest);
+            let f = flow_of(&out, &Method::Ack);
+            assert_eq!(f.transport, t, "{proto}");
+            assert!(f.dial.is_some(), "{proto}: ACK on the dialled trunk conn");
+            let via = ack.headers.get_value(&HeaderName::Via).unwrap();
+            assert!(via.starts_with(via_pfx), "{proto}: {via}");
+            if t == AddrTransport::Tls {
+                assert!(ack.uri.scheme.requires_tls(), "{}", ack.uri);
+            } else {
+                assert_eq!(ack.uri.transport(), Some("tcp"));
+            }
+            assert_eq!(
+                response_flow(&out, 200),
+                LegFlow::inbound(AddrTransport::Tls),
+                "{proto}: 200 to the TLS caller on its connection"
+            );
+            // Retransmitted 200: re-ACK on the same trunk flow.
+            let out = flatten(stack.process_message_on(&ok, dest, None, t).await);
+            assert!(forwarded(&out, &Method::Ack).is_some(), "{proto}: re-ACK");
+            assert_eq!(flow_of(&out, &Method::Ack), f);
+        }
+    }
+
+    // Trunk connection closed mid-call: the SBC's media-failure BYE toward
+    // a TLS trunk still names the dialled trunk flow (so the flow table
+    // re-dials with verification); toward a TCP caller it names the
+    // accepted connection only (never dialled, never UDP).
+    #[tokio::test]
+    async fn qa_teardown_bye_flows_after_trunk_conn_loss() {
+        let stack = trunk_stack_protos(["tls", "udp"]).await;
+        let results = place_call_on(&stack, "qa-bye@test", AddrTransport::Tcp).await;
+        let (inv, dest) = forwarded(&results, &Method::Invite).unwrap();
+        let inv = inv.clone();
+        answer(&stack, &inv, dest).await;
+        let internal = internal_id(&stack, "qa-bye@test").await;
+        let byes = stack
+            .terminate_call_on_media_failure(&internal.to_string())
+            .await;
+        let flows: Vec<LegFlow> = byes
+            .iter()
+            .map(|r| match r {
+                ProcessResult::Forward {
+                    flow: Flow::Leg(f), ..
+                } => f.clone(),
+                other => panic!("BYE forward expected: {other:?}"),
+            })
+            .collect();
+        assert_eq!(flows.len(), 2);
+        assert_eq!(flows[0], LegFlow::inbound(AddrTransport::Tcp));
+        assert!(flows[0].dial.is_none(), "caller leg is never dialled");
+        assert_eq!(flows[1].transport, AddrTransport::Tls);
+        assert_eq!(flows[1].dial.as_deref(), Some("127.0.0.2"));
     }
 }

@@ -12,6 +12,8 @@
 
 #[cfg(feature = "cluster")]
 use crate::cluster::ClusterManager;
+use crate::flow::{Flow, LegFlow};
+use crate::flows::{FlowKey, FlowTable};
 use crate::shutdown::ShutdownSignal;
 use crate::sip_stack::{ProcessResult, SipStack, SipStackConfig};
 use proto_registrar::BearerAuthenticator;
@@ -59,6 +61,32 @@ struct StreamLoopContext {
     rate_limit_enabled: bool,
     zone_name: Option<String>,
     conn_semaphore: Arc<tokio::sync::Semaphore>,
+    flows: Arc<FlowTable>,
+}
+
+/// Where the message that produced a result arrived: replies to that peer
+/// go straight back on it without a flow-table lookup.
+#[derive(Clone)]
+enum Origin {
+    /// Timer loop / media teardown: no triggering message.
+    None,
+    /// A UDP socket.
+    Udp(Arc<UdpTransport>),
+    /// A stream connection, its peer and its flow-table key.
+    Stream {
+        conn: Arc<dyn Transport>,
+        peer: SbcSocketAddr,
+        key: FlowKey,
+    },
+}
+
+/// Everything `handle_result` needs to put a result on the wire.
+#[derive(Clone)]
+struct SendCtx {
+    flows: Arc<FlowTable>,
+    stats: Arc<ServerStats>,
+    sip_stack: Arc<SipStack>,
+    origin: Origin,
 }
 
 /// SBC server state.
@@ -83,6 +111,9 @@ pub struct Server {
     ws_listeners: RwLock<Vec<Arc<WebSocketListener>>>,
     /// SIP stack for message processing.
     sip_stack: Arc<SipStack>,
+    /// Live transports per flow (UDP sockets, accepted and egress stream
+    /// connections). NIST 800-53 Rev5: SC-8.
+    flows: Arc<FlowTable>,
     /// Per-source rate limiter for `DoS` protection.
     rate_limiter: Arc<Mutex<RateLimiter>>,
     /// Global (all-sources) rate limiter — backstop against distributed
@@ -147,6 +178,7 @@ impl Server {
             tls_listeners: RwLock::new(Vec::new()),
             ws_listeners: RwLock::new(Vec::new()),
             sip_stack,
+            flows: Arc::new(FlowTable::new(crate::flows::DEFAULT_MAX_EGRESS_CONNECTIONS)),
             rate_limiter,
             global_limiter,
             zone_registry: None,
@@ -267,6 +299,7 @@ impl Server {
             tls_listeners: RwLock::new(Vec::new()),
             ws_listeners: RwLock::new(Vec::new()),
             sip_stack,
+            flows: Arc::new(FlowTable::new(crate::flows::DEFAULT_MAX_EGRESS_CONNECTIONS)),
             rate_limiter,
             global_limiter,
             zone_registry: None,
@@ -306,6 +339,32 @@ impl Server {
                     }),
             ),
             trunk_retry_after_max_secs: config.general.trunk_retry_after_max_secs,
+            // RFC 3261 §18.1.1: Via sent-by / Contact name the listener of
+            // the transport a request goes out on. No default port is
+            // invented for a stream transport without a listener (RFC-001):
+            // 0 means "none", and is never advertised because validation
+            // rejects a trunk of that transport and no accepted or
+            // registered flow of it can exist.
+            udp_port: config
+                .transport
+                .udp_listen
+                .first()
+                .map_or(5060, std::net::SocketAddr::port),
+            tcp_port: config
+                .transport
+                .tcp_listen
+                .first()
+                .map_or(0, std::net::SocketAddr::port),
+            tls_port: config
+                .transport
+                .tls_listen
+                .first()
+                .map_or(0, std::net::SocketAddr::port),
+            ws_port: config
+                .transport
+                .ws_listen
+                .first()
+                .map_or(0, std::net::SocketAddr::port),
             ..SipStackConfig::default()
         }
     }
@@ -797,6 +856,11 @@ impl Server {
         &self.stats
     }
 
+    /// Returns the egress flow table.
+    pub const fn flows(&self) -> &Arc<FlowTable> {
+        &self.flows
+    }
+
     /// Returns the SIP stack.
     pub fn sip_stack(&self) -> &Arc<SipStack> {
         &self.sip_stack
@@ -831,24 +895,25 @@ impl Server {
         // DTLS-SRTP media-failure teardown: drain call ids whose handshake failed
         // at runtime and BYE both legs (fail-closed). Needs a bound UDP transport
         // to send from; the SBC binds a single wildcard listener, so any works.
+        if let Some(udp) = self.udp_transports.read().await.first() {
+            self.flows.set_default_udp(Arc::clone(udp));
+        }
+        self.load_trunk_tls_clients()?;
+
+        // Each BYE goes out on its leg's flow (NIST 800-53 Rev5: SC-8).
         if let Some(mut rx) = self.media_failure_rx.take() {
-            let sip_stack = Arc::clone(&self.sip_stack);
-            let transport = self.udp_transports.read().await.first().map(Arc::clone);
-            if let Some(transport) = transport {
-                tokio::spawn(async move {
-                    while let Some(call_id) = rx.recv().await {
-                        for (bytes, dest) in
-                            sip_stack.terminate_call_on_media_failure(&call_id).await
-                        {
-                            if let Err(e) = transport.send(&bytes, &dest).await {
-                                warn!(error = %e, call_id, dest = %dest, "media-failure BYE send failed");
-                            }
-                        }
+            let ctx = self.send_ctx(Origin::None);
+            tokio::spawn(async move {
+                while let Some(call_id) = rx.recv().await {
+                    for bye in ctx
+                        .sip_stack
+                        .terminate_call_on_media_failure(&call_id)
+                        .await
+                    {
+                        Self::dispatch(bye, &ctx).await;
                     }
-                });
-            } else {
-                warn!("media-failure teardown disabled: no UDP transport bound");
-            }
+                }
+            });
         }
 
         // Out-of-process equivalent of the mpsc drain above: subscribe to EACH
@@ -858,62 +923,55 @@ impl Server {
         // that mirrors the in-process channel's best-effort semantics.
         #[cfg(feature = "grpc")]
         if !self.remote_media.is_empty() {
-            match self.udp_transports.read().await.first().map(Arc::clone) {
-                Some(transport) => {
-                    for (node, controller) in self.remote_media.iter().cloned().enumerate() {
-                        let sip_stack = Arc::clone(&self.sip_stack);
-                        let transport = Arc::clone(&transport);
-                        let pool = self.media_pool.clone();
-                        tokio::spawn(async move {
-                            use sbc_grpc_api::sbc::media_event::Event;
-                            // A dropped event stream means the node is gone (or
-                            // restarting): mark it down at once so new calls
-                            // route away instead of queuing on its channel for a
-                            // connect timeout each (NIST 800-53 Rev5: SC-5, CP-10).
-                            let mark_down = || async {
-                                if let Some(pool) = &pool {
-                                    pool.mark_node_down(node).await;
-                                }
-                            };
-                            let mut stream = match controller.watch_media_events().await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    warn!(node, error = %e, "failed to open media node event stream");
-                                    mark_down().await;
-                                    return;
-                                }
-                            };
-                            loop {
-                                match stream.message().await {
-                                    Ok(Some(event)) => {
-                                        let Some(Event::Failure(f)) = event.event else {
-                                            continue;
-                                        };
-                                        for (bytes, dest) in sip_stack
-                                            .terminate_call_on_media_failure(&f.call_id)
-                                            .await
-                                        {
-                                            if let Err(e) = transport.send(&bytes, &dest).await {
-                                                warn!(error = %e, call_id = f.call_id, dest = %dest, "media-failure BYE send failed");
-                                            }
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        warn!(node, "media node event stream closed");
-                                        mark_down().await;
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        warn!(node, error = %e, "media node event stream error");
-                                        mark_down().await;
-                                        break;
-                                    }
+            for (node, controller) in self.remote_media.iter().cloned().enumerate() {
+                let ctx = self.send_ctx(Origin::None);
+                let pool = self.media_pool.clone();
+                tokio::spawn(async move {
+                    use sbc_grpc_api::sbc::media_event::Event;
+                    // A dropped event stream means the node is gone (or
+                    // restarting): mark it down at once so new calls
+                    // route away instead of queuing on its channel for a
+                    // connect timeout each (NIST 800-53 Rev5: SC-5, CP-10).
+                    let mark_down = || async {
+                        if let Some(pool) = &pool {
+                            pool.mark_node_down(node).await;
+                        }
+                    };
+                    let mut stream = match controller.watch_media_events().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(node, error = %e, "failed to open media node event stream");
+                            mark_down().await;
+                            return;
+                        }
+                    };
+                    loop {
+                        match stream.message().await {
+                            Ok(Some(event)) => {
+                                let Some(Event::Failure(f)) = event.event else {
+                                    continue;
+                                };
+                                for bye in ctx
+                                    .sip_stack
+                                    .terminate_call_on_media_failure(&f.call_id)
+                                    .await
+                                {
+                                    Self::dispatch(bye, &ctx).await;
                                 }
                             }
-                        });
+                            Ok(None) => {
+                                warn!(node, "media node event stream closed");
+                                mark_down().await;
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(node, error = %e, "media node event stream error");
+                                mark_down().await;
+                                break;
+                            }
+                        }
                     }
-                }
-                None => warn!("media event drain disabled: no UDP transport bound"),
+                });
             }
         }
 
@@ -928,6 +986,92 @@ impl Server {
             .live_transports
             .store(bound as u64, Ordering::SeqCst);
 
+        Ok(())
+    }
+
+    /// A send context with this server's shared handles.
+    fn send_ctx(&self, origin: Origin) -> SendCtx {
+        SendCtx {
+            flows: Arc::clone(&self.flows),
+            stats: Arc::clone(&self.stats),
+            sip_stack: Arc::clone(&self.sip_stack),
+            origin,
+        }
+    }
+
+    /// Loads the client TLS configs for `protocol = "tls"` trunks: trust
+    /// anchors from `security.trunk_tls_ca_path` (never `tls_ca_path`, the
+    /// client-issuing CA), `security.min_tls_version`, and for trunks with
+    /// `tls_client_cert` the SBC certificate as the client certificate.
+    /// Certificate verification cannot be turned off. Without the CA path
+    /// (validation guarantees no TLS trunk then) no egress TLS is possible:
+    /// a TLS flow fails closed.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-13, SC-23, IA-3
+    fn load_trunk_tls_clients(&self) -> Result<(), ServerError> {
+        let sec = &self.config.security;
+        let Some(ca_path) = sec.trunk_tls_ca_path.as_ref() else {
+            return Ok(());
+        };
+        let tls_error = |reason: String| ServerError::BindFailed {
+            address: "trunk-tls".to_string(),
+            reason,
+        };
+        let min_version = uc_transport::tls::MinTlsVersion::parse(&sec.min_tls_version)
+            .ok_or_else(|| {
+                tls_error(format!(
+                    "unsupported security.min_tls_version {:?}",
+                    sec.min_tls_version
+                ))
+            })?;
+        let roots = || {
+            uc_transport::tls::load_root_store(ca_path)
+                .map_err(|e| tls_error(format!("loading {}: {e}", ca_path.display())))
+        };
+        let plain =
+            uc_transport::tls::create_client_config_with(uc_transport::tls::TlsClientOptions {
+                roots: roots()?,
+                min_version,
+                client_auth: None,
+            })
+            .map_err(|e| tls_error(format!("building trunk TLS client config: {e}")))?;
+        let wants_mtls = self
+            .config
+            .trunk_groups
+            .iter()
+            .flat_map(|g| &g.trunks)
+            .any(|t| t.tls_client_cert);
+        let mtls = match (wants_mtls, &sec.tls_cert_path, &sec.tls_key_path) {
+            (true, Some(cert), Some(key)) => {
+                let chain = uc_transport::tls::load_certs(cert)
+                    .map_err(|e| tls_error(format!("loading {}: {e}", cert.display())))?;
+                let key = uc_transport::tls::load_private_key(key)
+                    .map_err(|e| tls_error(format!("loading {}: {e}", key.display())))?;
+                Some(Arc::new(
+                    uc_transport::tls::create_client_config_with(
+                        uc_transport::tls::TlsClientOptions {
+                            roots: roots()?,
+                            min_version,
+                            client_auth: Some((chain, key)),
+                        },
+                    )
+                    .map_err(|e| tls_error(format!("building trunk mTLS client config: {e}")))?,
+                ))
+            }
+            (true, _, _) => {
+                return Err(tls_error(
+                    "trunk tls_client_cert needs security.tls_cert_path / tls_key_path".to_string(),
+                ));
+            }
+            _ => None,
+        };
+        self.flows.set_tls_clients(Arc::new(plain), mtls);
+        info!(
+            ca = %ca_path.display(),
+            min_tls_version = %sec.min_tls_version,
+            mtls = wants_mtls,
+            "Trunk TLS client credentials loaded (certificate verification on)"
+        );
         Ok(())
     }
 
@@ -1154,6 +1298,7 @@ impl Server {
             let rate_limiter = Arc::clone(&self.rate_limiter);
             let global_limiter = Arc::clone(&self.global_limiter);
             let rate_limit_enabled = self.config.rate_limit.enabled;
+            let flows = Arc::clone(&self.flows);
 
             // Determine zone for this transport from its local bind address
             let zone_name = self.zone_for_transport(&transport);
@@ -1169,6 +1314,7 @@ impl Server {
                     global_limiter,
                     rate_limit_enabled,
                     zone_name,
+                    flows,
                 )
                 .await;
             });
@@ -1180,20 +1326,40 @@ impl Server {
         // plus §13.3.1.4 2xx retransmission. Re-sends go out the first UDP
         // socket (the one receive loops also answer from when zones share a
         // bind).
-        if let Some(transport) = self.udp_transports.read().await.first().map(Arc::clone) {
-            let sip_stack = Arc::clone(&self.sip_stack);
-            let stats = Arc::clone(&self.stats);
+        // Every timer result carries its leg's flow, so the loop runs for
+        // stream-only deployments too (RFC 3261 §17.1.2.2, §18).
+        {
+            let ctx = self.send_ctx(Origin::None);
             handles.push(tokio::spawn(async move {
-                Self::transaction_timer_loop(sip_stack, transport, stats).await;
+                Self::transaction_timer_loop(ctx).await;
             }));
-        } else {
-            warn!("No UDP transport bound; SIP retransmission timers are not driven");
         }
 
         // Spawn accept loops for stream listeners (SIP over TCP / TLS).
         // Each accepted connection gets its own receive task; responses go
         // back over the connection the request arrived on (RFC 3261 §18).
         let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(10_000));
+        // Readers for SBC-dialled trunk connections: trunk responses and
+        // in-dialog requests enter the SIP stack like any received message.
+        {
+            let ctx = StreamLoopContext {
+                shutdown: self.shutdown.clone(),
+                stats: Arc::clone(&self.stats),
+                sip_stack: Arc::clone(&self.sip_stack),
+                rate_limiter: Arc::clone(&self.rate_limiter),
+                global_limiter: Arc::clone(&self.global_limiter),
+                rate_limit_enabled: self.config.rate_limit.enabled,
+                zone_name: None,
+                conn_semaphore: Arc::clone(&conn_semaphore),
+                flows: Arc::clone(&self.flows),
+            };
+            self.flows.set_reader(Arc::new(move |conn, peer, key| {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    Self::stream_connection_loop(conn, peer, ctx, Some(key)).await;
+                });
+            }));
+        }
         for listener in tcp_listeners {
             let zone_name = self.zone_for_local_ip(listener.local_addr().ip());
             let ctx = StreamLoopContext {
@@ -1205,6 +1371,7 @@ impl Server {
                 rate_limit_enabled: self.config.rate_limit.enabled,
                 zone_name,
                 conn_semaphore: Arc::clone(&conn_semaphore),
+                flows: Arc::clone(&self.flows),
             };
             handles.push(tokio::spawn(async move {
                 Self::tcp_accept_loop(listener, ctx).await;
@@ -1221,6 +1388,7 @@ impl Server {
                 rate_limit_enabled: self.config.rate_limit.enabled,
                 zone_name,
                 conn_semaphore: Arc::clone(&conn_semaphore),
+                flows: Arc::clone(&self.flows),
             };
             handles.push(tokio::spawn(async move {
                 Self::tls_accept_loop(listener, ctx).await;
@@ -1237,6 +1405,7 @@ impl Server {
                 rate_limit_enabled: self.config.rate_limit.enabled,
                 zone_name,
                 conn_semaphore: Arc::clone(&conn_semaphore),
+                flows: Arc::clone(&self.flows),
             };
             handles.push(tokio::spawn(async move {
                 Self::ws_accept_loop(listener, ctx).await;
@@ -1301,6 +1470,7 @@ impl Server {
         global_limiter: Arc<Mutex<RateLimiter>>,
         rate_limit_enabled: bool,
         zone_name: Option<String>,
+        flows: Arc<FlowTable>,
     ) {
         debug!(
             transport_idx = idx,
@@ -1349,14 +1519,18 @@ impl Server {
                             // so slow operations (e.g. JWKS refresh) do not
                             // block the receive loop.
                             {
-                                let sip_stack = sip_stack.clone();
-                                let transport = transport.clone();
-                                let stats = stats.clone();
+                                let ctx = SendCtx {
+                                    flows: Arc::clone(&flows),
+                                    stats: Arc::clone(&stats),
+                                    sip_stack: Arc::clone(&sip_stack),
+                                    origin: Origin::Udp(Arc::clone(&transport)),
+                                };
                                 let zone = zone_name.clone();
                                 let data = msg.data;
                                 let source = msg.source;
                                 tokio::spawn(async move {
-                                    let result = sip_stack
+                                    let result = ctx
+                                        .sip_stack
                                         .process_message_on(
                                             &data,
                                             source,
@@ -1364,8 +1538,7 @@ impl Server {
                                             uc_types::address::TransportType::Udp,
                                         )
                                         .await;
-                                    Self::handle_result(result, &transport, &stats, &sip_stack)
-                                        .await;
+                                    Self::dispatch(result, &ctx).await;
                                 });
                             }
                         }
@@ -1485,7 +1658,8 @@ impl Server {
                     debug!(peer = %peer, "Accepted SIP TCP connection");
                     let conn_ctx = ctx.clone();
                     tokio::spawn(async move {
-                        Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx).await;
+                        Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx, None)
+                            .await;
                         drop(permit);
                     });
                 }
@@ -1516,7 +1690,8 @@ impl Server {
                     debug!(peer = %peer, "Accepted SIP WebSocket connection");
                     let conn_ctx = ctx.clone();
                     tokio::spawn(async move {
-                        Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx).await;
+                        Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx, None)
+                            .await;
                         drop(permit);
                     });
                 }
@@ -1561,8 +1736,13 @@ impl Server {
                         {
                             Ok(Ok(transport)) => {
                                 debug!(peer = %peer, "TLS handshake completed");
-                                Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx)
-                                    .await;
+                                Self::stream_connection_loop(
+                                    Arc::new(transport),
+                                    peer,
+                                    conn_ctx,
+                                    None,
+                                )
+                                .await;
                             }
                             Ok(Err(e)) => {
                                 warn!(peer = %peer, error = %e, "TLS handshake failed");
@@ -1590,21 +1770,55 @@ impl Server {
     /// Stream transports deliver byte chunks, not datagrams, so messages are
     /// re-framed here via Content-Length (RFC 3261 §18.3) before entering the
     /// SIP stack. Responses go back over this same connection.
-    async fn stream_connection_loop<T: Transport + 'static>(
-        transport: Arc<T>,
+    ///
+    /// An accepted connection (`egress = None`) is registered in the flow
+    /// table for its lifetime so timer re-sends, 408s and in-dialog requests
+    /// toward this peer use it (RFC 3261 §18.2.2); a dialled trunk
+    /// connection (`egress = Some(key)`) was registered by the table. Either
+    /// is removed when the loop ends.
+    async fn stream_connection_loop(
+        transport: Arc<dyn Transport>,
         peer: SbcSocketAddr,
         ctx: StreamLoopContext,
+        egress: Option<FlowKey>,
     ) {
         let mut buf = bytes::BytesMut::new();
+        let key = egress.unwrap_or_else(|| {
+            ctx.flows
+                .register_accepted(transport.transport_type(), peer, Arc::clone(&transport));
+            (transport.transport_type(), peer, None, false)
+        });
+        let send_ctx = SendCtx {
+            flows: Arc::clone(&ctx.flows),
+            stats: Arc::clone(&ctx.stats),
+            sip_stack: Arc::clone(&ctx.sip_stack),
+            origin: Origin::Stream {
+                conn: Arc::clone(&transport),
+                peer,
+                key: key.clone(),
+            },
+        };
+        // The reader wakes this often to notice a connection the flow table
+        // closed (stalled write, SC-5); 300 s without data is idle.
+        let tick = std::time::Duration::from_secs(2);
+        let idle_limit = std::time::Duration::from_secs(300);
+        let mut idle = std::time::Duration::ZERO;
 
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(300), transport.recv()).await
-            {
+            match tokio::time::timeout(tick, transport.recv()).await {
                 Err(_elapsed) => {
-                    warn!(peer = %peer, "Stream connection idle timeout (300s), closing");
-                    break;
+                    if transport.is_closed() {
+                        debug!(peer = %peer, "Stream connection closed by the flow table");
+                        break;
+                    }
+                    idle += tick;
+                    if idle >= idle_limit {
+                        warn!(peer = %peer, "Stream connection idle timeout (300s), closing");
+                        break;
+                    }
                 }
                 Ok(Ok(chunk)) => {
+                    idle = std::time::Duration::ZERO;
                     buf.extend_from_slice(&chunk.data);
                     if buf.len() > uc_transport::MAX_STREAM_MESSAGE_SIZE {
                         warn!(
@@ -1616,6 +1830,11 @@ impl Server {
                     }
 
                     while let Some(frame) = next_sip_frame(&mut buf) {
+                        // PERF-010: stop parsing once the flow table has
+                        // closed this connection (stalled write, SC-5).
+                        if transport.is_closed() {
+                            break;
+                        }
                         ctx.stats.messages_received.fetch_add(1, Ordering::Relaxed);
 
                         if ctx.rate_limit_enabled
@@ -1648,7 +1867,11 @@ impl Server {
                                 transport.transport_type(),
                             )
                             .await;
-                        Self::handle_result(result, &transport, &ctx.stats, &ctx.sip_stack).await;
+                        // NIST 800-53 Rev5: SC-5 — only a reply back on this
+                        // connection is written inline (bounded by the write
+                        // deadline); dials and sends to other peers go to
+                        // their lanes so this reader keeps reading.
+                        Self::dispatch(result, &send_ctx).await;
                     }
                 }
                 Ok(Err(uc_transport::TransportError::ConnectionClosed)) => {
@@ -1664,51 +1887,166 @@ impl Server {
             }
         }
 
+        ctx.flows.remove(&key, &transport);
         let _ = transport.close().await;
     }
 
-    /// Handles a single `ProcessResult`, sending responses/forwards via the transport.
+    /// Writes one message on its flow. A reply to the peer the triggering
+    /// message came from goes straight back on that socket/connection;
+    /// anything else is resolved by the flow table (UDP socket, accepted
+    /// connection, or a dialled, certificate-verified trunk connection).
+    /// Never retried on another transport.
     ///
-    /// A forwarded INVITE's send outcome goes back to the SIP stack so a
-    /// failed first send fails over at once (`SipStack::on_invite_sent`);
-    /// whatever that yields is sent from a spawned task, so a chain of dead
-    /// failover targets (each up to the 30 s send timeout) never stalls the
-    /// caller's receive loop (on TCP/TLS, the A-leg connection's reader).
-    fn handle_result<'a, T: Transport + 'static>(
-        result: ProcessResult,
-        transport: &'a Arc<T>,
-        stats: &'a Arc<ServerStats>,
-        sip_stack: &'a Arc<SipStack>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-        Box::pin(Self::handle_result_inner(
-            result, transport, stats, sip_stack,
-        ))
+    /// ## NIST 800-53 Rev5: SC-8; RFC 3261 §18.1.1, §18.2.2
+    async fn send_on_flow(
+        ctx: &SendCtx,
+        flow: &Flow,
+        dest: &SbcSocketAddr,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let Flow::Leg(flow) = flow else {
+            // process_message_on resolves replies; reaching here is a bug.
+            return Err("unresolved reply flow".to_string());
+        };
+        let udp = match &ctx.origin {
+            Origin::Stream { conn, key, .. } if Self::is_origin_reply(&ctx.origin, flow, dest) => {
+                return ctx
+                    .flows
+                    .write(key, conn, bytes, dest)
+                    .await
+                    .map_err(|e| e.to_string());
+            }
+            Origin::Udp(u) => Some(u),
+            _ => None,
+        };
+        Self::send_flow_table(ctx, flow, dest, bytes, udp).await
     }
 
-    async fn handle_result_inner<T: Transport + 'static>(
+    /// True when `flow`/`dest` is the connection the triggering message
+    /// arrived on (no lookup, no dial).
+    fn is_origin_reply(origin: &Origin, flow: &LegFlow, dest: &SbcSocketAddr) -> bool {
+        matches!(origin, Origin::Stream { conn, peer, .. }
+            if flow.dial.is_none() && *peer == *dest && conn.transport_type() == flow.transport)
+    }
+
+    /// Puts a result on the wire without letting a stream dial or a slow
+    /// stream peer hold the calling loop: UDP sends and replies back on the
+    /// origin connection run inline (UDP does not block; the origin write
+    /// has the flow table's write deadline), every other stream send is
+    /// queued on its destination's lane ([`FlowTable::enqueue`]), which
+    /// keeps per-connection order. An origin reply also queues when that
+    /// connection's lane has a send queued or running, so it cannot
+    /// overtake it (RFC-006). A forwarded INVITE dropped by a full lane is
+    /// reported as a failed send so it fails over at once (PERF-007).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, CP-8; RFC 3261 §17.1.1.2, §17.2.1 (timer accuracy), §8.1.3.1
+    fn dispatch<'a>(
         result: ProcessResult,
-        transport: &Arc<T>,
-        stats: &Arc<ServerStats>,
-        sip_stack: &Arc<SipStack>,
-    ) {
+        ctx: &'a SendCtx,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let lane = match &result {
+                ProcessResult::Multiple(_) => {
+                    let ProcessResult::Multiple(results) = result else {
+                        return;
+                    };
+                    for r in results {
+                        Self::dispatch(r, ctx).await;
+                    }
+                    return;
+                }
+                ProcessResult::Response {
+                    destination, flow, ..
+                }
+                | ProcessResult::Forward {
+                    destination, flow, ..
+                } => match flow {
+                    Flow::Leg(l) if l.transport != uc_types::address::TransportType::Udp => {
+                        let key = (l.transport, *destination);
+                        (!Self::is_origin_reply(&ctx.origin, l, destination)
+                            || ctx.flows.lane_busy(&key))
+                        .then_some(key)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            match lane {
+                None => Self::handle_result(result, ctx).await,
+                Some(key) => {
+                    // Kept only for INVITEs, to report a dropped send.
+                    let invite = match &result {
+                        ProcessResult::Forward {
+                            message: m @ SipMessage::Request(r),
+                            ..
+                        } if r.method == Method::Invite => Some(m.clone()),
+                        _ => None,
+                    };
+                    let job_ctx = ctx.clone();
+                    let queued = ctx.flows.enqueue(
+                        key,
+                        Box::pin(async move {
+                            Self::handle_result(result, &job_ctx).await;
+                        }),
+                    );
+                    if !queued && let Some(invite) = invite {
+                        for follow_up in ctx.sip_stack.on_invite_sent(&invite, false).await {
+                            Self::dispatch(follow_up, ctx).await;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    async fn send_flow_table(
+        ctx: &SendCtx,
+        flow: &LegFlow,
+        dest: &SbcSocketAddr,
+        bytes: &[u8],
+        udp: Option<&Arc<UdpTransport>>,
+    ) -> Result<(), String> {
+        ctx.flows
+            .send(flow, dest, bytes, udp)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Handles a single `ProcessResult`, sending each message on its flow.
+    ///
+    /// A forwarded INVITE's send outcome goes back to the SIP stack so a
+    /// failed first send (including a TLS connect, handshake or certificate
+    /// failure) fails over at once (`SipStack::on_invite_sent`); whatever
+    /// that yields goes through [`Self::dispatch`], so a stream failover
+    /// target is sent on its lane (in order with a later CANCEL) and never
+    /// stalls the caller's receive loop.
+    fn handle_result<'a>(
+        result: ProcessResult,
+        ctx: &'a SendCtx,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(Self::handle_result_inner(result, ctx))
+    }
+
+    async fn handle_result_inner(result: ProcessResult, ctx: &SendCtx) {
         match result {
             ProcessResult::Response {
                 message,
                 destination,
+                flow,
             } => {
                 let response_bytes = message.to_bytes();
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(30),
-                    transport.send(&response_bytes, &destination),
+                    Self::send_on_flow(ctx, &flow, &destination, &response_bytes),
                 )
                 .await
                 {
                     Ok(Ok(())) => {
-                        stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+                        ctx.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
                         debug!(destination = %destination, "Response sent");
                     }
                     Ok(Err(e)) => {
-                        warn!(error = %e, "Failed to send response");
+                        warn!(error = %e, destination = %destination, "Failed to send response");
                     }
                     Err(_) => {
                         warn!(destination = %destination, "Send response timed out (30s)");
@@ -1718,21 +2056,22 @@ impl Server {
             ProcessResult::Forward {
                 message,
                 destination,
+                flow,
             } => {
                 let request_bytes = message.to_bytes();
                 let sent = match tokio::time::timeout(
                     std::time::Duration::from_secs(30),
-                    transport.send(&request_bytes, &destination),
+                    Self::send_on_flow(ctx, &flow, &destination, &request_bytes),
                 )
                 .await
                 {
                     Ok(Ok(())) => {
-                        stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+                        ctx.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
                         debug!(destination = %destination, "Request forwarded");
                         true
                     }
                     Ok(Err(e)) => {
-                        warn!(error = %e, "Failed to forward request");
+                        warn!(error = %e, destination = %destination, "Failed to forward request");
                         false
                     }
                     Err(_) => {
@@ -1744,26 +2083,16 @@ impl Server {
                 // are reported to the TU.
                 //
                 // NIST 800-53 Rev5: SC-5 — the failover follow-up (already
-                // decided exactly once by on_invite_sent) is sent off the
-                // receive loop.
+                // decided exactly once by on_invite_sent) goes to its lane.
                 if matches!(&message, SipMessage::Request(r) if r.method == Method::Invite) {
-                    let follow_ups = sip_stack.on_invite_sent(&message, sent).await;
-                    if !follow_ups.is_empty() {
-                        let transport = Arc::clone(transport);
-                        let stats = Arc::clone(stats);
-                        let sip_stack = Arc::clone(sip_stack);
-                        tokio::spawn(async move {
-                            for follow_up in follow_ups {
-                                Self::handle_result(follow_up, &transport, &stats, &sip_stack)
-                                    .await;
-                            }
-                        });
+                    for follow_up in ctx.sip_stack.on_invite_sent(&message, sent).await {
+                        Self::dispatch(follow_up, ctx).await;
                     }
                 }
             }
             ProcessResult::Multiple(results) => {
                 for sub_result in results {
-                    Self::handle_result(sub_result, transport, stats, sip_stack).await;
+                    Self::handle_result(sub_result, ctx).await;
                 }
             }
             ProcessResult::NoAction => {
@@ -1777,20 +2106,19 @@ impl Server {
 
     /// Ticks the SIP stack's transaction timers every 100 ms (a fraction of
     /// T1 = 500 ms) and puts the resulting retransmissions, timeouts and
-    /// teardowns on the wire. Like the receive loops it has no shutdown arm:
+    /// teardowns on the wire, each on its leg's own flow (POA&M-5: no longer
+    /// all on the UDP socket). Like the receive loops it has no shutdown arm:
     /// BYEs sent while draining still need their retransmissions, and
     /// `Server::run` aborts the task once draining completes.
-    async fn transaction_timer_loop(
-        sip_stack: Arc<SipStack>,
-        transport: Arc<UdpTransport>,
-        stats: Arc<ServerStats>,
-    ) {
+    async fn transaction_timer_loop(ctx: SendCtx) {
         let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            for result in sip_stack.poll_timers().await {
-                Self::handle_result(result, &transport, &stats, &sip_stack).await;
+            // NIST 800-53 Rev5: SC-5 — stream sends go to their lanes, so
+            // a dial or a stalled peer never delays another call's timers.
+            for result in ctx.sip_stack.poll_timers().await {
+                Self::dispatch(result, &ctx).await;
             }
         }
     }
@@ -2133,5 +2461,252 @@ mod tests {
     fn content_length_request_line_colon_not_confused() {
         // The request-line contains ':' but is not a header.
         assert_eq!(parse_content_length(b"REGISTER sip:a SIP/2.0\r\n\r\n"), 0);
+    }
+
+    // SEC-001/PERF-001 (fix round 1): a stream peer that stops reading does
+    // not delay the timer loop's other sends (a UDP retransmission and a
+    // healthy stream peer's message); its own send is evicted after the
+    // write deadline.
+    #[tokio::test]
+    async fn dispatch_does_not_wait_on_a_stalled_stream_peer() {
+        use crate::flow::{Flow, LegFlow};
+        use std::net::Ipv4Addr;
+        use uc_types::address::TransportType as T;
+
+        let flows = Arc::new(FlowTable::new(4).with_timeouts(
+            std::time::Duration::from_millis(300),
+            crate::flows::DIAL_FAILURE_BACKOFF,
+        ));
+        let udp = Arc::new(
+            UdpTransport::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        );
+        let watcher = UdpTransport::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        flows.set_default_udp(udp);
+
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let laddr = *listener.local_addr();
+        // Peer 1 never reads; peer 2 does.
+        let _stalled_client = uc_transport::tcp::TcpTransport::connect(laddr)
+            .await
+            .unwrap();
+        let (stalled, stalled_peer) = listener.accept().await.unwrap();
+        let healthy_client = uc_transport::tcp::TcpTransport::connect(laddr)
+            .await
+            .unwrap();
+        let (healthy, healthy_peer) = listener.accept().await.unwrap();
+        let stalled: Arc<dyn Transport> = Arc::new(stalled);
+        flows.register_accepted(T::Tcp, stalled_peer, Arc::clone(&stalled));
+        flows.register_accepted(T::Tcp, healthy_peer, Arc::new(healthy));
+        let chunk = vec![b'x'; 60_000];
+        // Two stalls in a row: the window is really full, not a hiccup.
+        let mut stalls = 0;
+        while stalls < 2 {
+            let r = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                stalled.send(&chunk, &stalled_peer),
+            )
+            .await;
+            stalls = if r.is_err() { stalls + 1 } else { 0 };
+        }
+
+        let ctx = SendCtx {
+            flows: Arc::clone(&flows),
+            stats: Arc::new(ServerStats::default()),
+            sip_stack: Arc::new(SipStack::new(crate::sip_stack::SipStackConfig::default())),
+            origin: Origin::None,
+        };
+        let msg = || {
+            SipMessage::parse(&bytes::Bytes::from_static(
+                b"SIP/2.0 408 Request Timeout\r\nVia: SIP/2.0/UDP 192.0.2.1;branch=z9hG4bKt\r\n\
+                  Call-ID: c\r\nCSeq: 1 INVITE\r\nFrom: <sip:a@x>;tag=1\r\n\
+                  To: <sip:b@x>;tag=2\r\nContent-Length: 0\r\n\r\n",
+            ))
+            .unwrap()
+        };
+        let response = |destination, flow| ProcessResult::Response {
+            message: msg(),
+            destination,
+            flow,
+        };
+        let batch = ProcessResult::Multiple(vec![
+            response(stalled_peer, Flow::Leg(LegFlow::inbound(T::Tcp))),
+            response(*watcher.local_addr(), Flow::UDP),
+            response(healthy_peer, Flow::Leg(LegFlow::inbound(T::Tcp))),
+        ]);
+        let t0 = std::time::Instant::now();
+        Server::dispatch(batch, &ctx).await;
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(100),
+            "dispatch waited on a stream send: {:?}",
+            t0.elapsed()
+        );
+        let secs = std::time::Duration::from_secs(1);
+        let got = tokio::time::timeout(secs, watcher.recv())
+            .await
+            .expect("UDP send not delayed")
+            .unwrap();
+        assert!(got.data.starts_with(b"SIP/2.0 408"));
+        let got = tokio::time::timeout(secs, healthy_client.recv())
+            .await
+            .expect("healthy stream peer not delayed")
+            .unwrap();
+        assert!(got.data.starts_with(b"SIP/2.0 408"));
+
+        // The stalled peer's send hits the write deadline: closed, evicted.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while flows.stats.stream_write_timeouts.load(Ordering::Relaxed) == 0
+                || !stalled.is_closed()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("stalled connection evicted");
+    }
+
+    fn tls_lane(host: [u8; 4]) -> crate::flows::LaneKey {
+        (
+            uc_types::address::TransportType::Tls,
+            SbcSocketAddr::new_v4(Ipv4Addr::from(host), 5061),
+        )
+    }
+
+    fn none_ctx(stack: &Arc<SipStack>, flows: &Arc<FlowTable>) -> SendCtx {
+        SendCtx {
+            flows: Arc::clone(flows),
+            stats: Arc::new(ServerStats::default()),
+            sip_stack: Arc::clone(stack),
+            origin: Origin::None,
+        }
+    }
+
+    // PERF-008/SEC-006 (fix round 2): a failed INVITE's failover follow-up
+    // goes through dispatch onto its destination's lane (here held by an
+    // earlier send), not onto a free-running task.
+    #[tokio::test]
+    async fn invite_failover_follow_up_is_sent_on_its_lane() {
+        use crate::sip_stack::tests::{carrier_active, tls_failover_call};
+        let (stack, primary) = tls_failover_call("r2-follow@test").await;
+        let stack = Arc::new(stack);
+        // No TLS client config: the t1 send fails closed at once.
+        let flows = Arc::new(FlowTable::new(4));
+        assert!(flows.enqueue(tls_lane([127, 0, 0, 3]), Box::pin(std::future::pending())));
+        let ctx = none_ctx(&stack, &flows);
+        Server::dispatch(primary, &ctx).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while carrier_active(&stack, "t2").await != 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed over to t2");
+        // Queued behind the t2 lane's earlier send: not attempted yet (a
+        // fail-closed attempt would have released t2 again).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(carrier_active(&stack, "t1").await, 0);
+        assert_eq!(carrier_active(&stack, "t2").await, 1);
+        assert!(flows.lane_busy(&tls_lane([127, 0, 0, 3])));
+    }
+
+    // PERF-007 (fix round 2): an INVITE dropped by a full lane is reported
+    // as a failed send and fails over at once, not on Timer B.
+    #[tokio::test]
+    async fn invite_dropped_by_a_full_lane_fails_over_at_once() {
+        use crate::sip_stack::tests::{carrier_active, tls_failover_call};
+        let (stack, primary) = tls_failover_call("r2-full@test").await;
+        let stack = Arc::new(stack);
+        let flows = Arc::new(FlowTable::new(4));
+        while flows.enqueue(tls_lane([127, 0, 0, 2]), Box::pin(std::future::pending())) {}
+        assert!(flows.enqueue(tls_lane([127, 0, 0, 3]), Box::pin(std::future::pending())));
+        let dropped = flows.stats.lane_dropped.load(Ordering::Relaxed);
+        let ctx = none_ctx(&stack, &flows);
+        Server::dispatch(primary, &ctx).await;
+        assert_eq!(
+            flows.stats.lane_dropped.load(Ordering::Relaxed),
+            dropped + 1
+        );
+        assert_eq!(carrier_active(&stack, "t1").await, 0);
+        assert_eq!(carrier_active(&stack, "t2").await, 1);
+    }
+
+    // RFC-006 (fix round 2): a reply on the origin connection queues behind
+    // a send already on that connection's lane instead of overtaking it.
+    #[tokio::test]
+    async fn origin_reply_waits_for_its_busy_lane() {
+        use crate::flow::{Flow, LegFlow};
+        use uc_types::address::TransportType as T;
+
+        let flows = Arc::new(FlowTable::new(4));
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let client = uc_transport::tcp::TcpTransport::connect(*listener.local_addr())
+            .await
+            .unwrap();
+        let (conn, peer) = listener.accept().await.unwrap();
+        let conn: Arc<dyn Transport> = Arc::new(conn);
+        flows.register_accepted(T::Tcp, peer, Arc::clone(&conn));
+        let key: FlowKey = (T::Tcp, peer, None, false);
+
+        assert!(!flows.lane_busy(&(T::Tcp, peer)));
+        let (go, wait) = tokio::sync::oneshot::channel::<()>();
+        {
+            let (flows, conn, key) = (Arc::clone(&flows), Arc::clone(&conn), key.clone());
+            assert!(flows.clone().enqueue(
+                (T::Tcp, peer),
+                Box::pin(async move {
+                    let _ = wait.await;
+                    let _ = flows.write(&key, &conn, b"FIRST", &peer).await;
+                }),
+            ));
+        }
+        assert!(flows.lane_busy(&(T::Tcp, peer)));
+
+        let ctx = SendCtx {
+            flows: Arc::clone(&flows),
+            stats: Arc::new(ServerStats::default()),
+            sip_stack: Arc::new(SipStack::new(SipStackConfig::default())),
+            origin: Origin::Stream {
+                conn: Arc::clone(&conn),
+                peer,
+                key,
+            },
+        };
+        let reply = SipMessage::parse(&bytes::Bytes::from_static(
+            b"SIP/2.0 200 OK\r\nVia: SIP/2.0/TCP 192.0.2.1;branch=z9hG4bKo\r\n\
+              Call-ID: o\r\nCSeq: 1 OPTIONS\r\nFrom: <sip:a@x>;tag=1\r\n\
+              To: <sip:b@x>;tag=2\r\nContent-Length: 0\r\n\r\n",
+        ))
+        .unwrap();
+        Server::dispatch(
+            ProcessResult::Response {
+                message: reply,
+                destination: peer,
+                flow: Flow::Leg(LegFlow::inbound(T::Tcp)),
+            },
+            &ctx,
+        )
+        .await;
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(200), client.recv()).await;
+        assert!(early.is_err(), "reply overtook the queued send: {early:?}");
+
+        go.send(()).unwrap();
+        let mut got = Vec::new();
+        while got.len() < 5 + 12 {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv())
+                .await
+                .expect("both sends arrive")
+                .unwrap();
+            got.extend_from_slice(&chunk.data);
+        }
+        assert!(got.starts_with(b"FIRST"), "{got:?}");
+        assert!(got[5..].starts_with(b"SIP/2.0 200 OK"), "{got:?}");
     }
 }
