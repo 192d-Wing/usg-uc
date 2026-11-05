@@ -12,5 +12,14 @@ categories.workspace = true
 [lints]
 workspace = true
 
+# Pure and synchronous: no network, file or crypto dependencies. Signing and
+# signature verification are injected through the `Signer` / `VerifyingKey`
+# traits (implemented in `uc-sti` on top of `uc-crypto`).
 [dependencies]
 uc-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+
+[dev-dependencies]
+proptest = { version = "1.6", default-features = false, features = ["std"] }

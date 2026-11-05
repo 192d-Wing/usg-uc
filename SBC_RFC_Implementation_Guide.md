@@ -367,11 +367,15 @@ This document provides a comprehensive summary of RFCs required for implementing
 - **Origination Identifier Validation:** Must validate calling party identity against PASSporT
 - **438 Response:** Must generate "438 Invalid Identity Header" for validation failures
 - **428 Response:** Must generate "428 Use Identity Header" when identity required but absent
+- **436 / 437 Responses:** "436 Bad Identity Info" when the `info` URI cannot be used or dereferenced; "437 Unsupported Credential" when the credential is untrusted or its algorithm unsupported
+- **403 Stale Date:** when `iat` is outside the freshness window (RFC 8224 §6.2.2)
+
+**USG SBC status (sbc-daemon):** Wired, off by default. On `verify = true` trunks the verifier maps failures to 428/436/437/438 and 403 "Stale Date" (`proto-stir-shaken/src/verification.rs` `FailureReason::sip_code`), with a `Reason: SIP;cause=N;text="..."` header. These responses are sent only with `failure_policy = "reject"`; the **default is `mark`** (forward with `verstat=TN-Validation-Failed`). The signer sets `Date` to match `iat`. Not implemented: `div` PASSporTs (RFC 8946), replay cache, certificate revocation. See `docs/SBC-ADMIN-GUIDE.md` (STIR/SHAKEN).
 
 **CNSA 2.0 Notes:**
 - PASSporT signatures must transition to ML-DSA-87
 - ES384 (ECDSA with P-384 and SHA-384) acceptable during transition
-- NO ES256 (P-256/SHA-256)
+- NO ES256 (P-256/SHA-256), except where SHAKEN requires it: the USG SBC uses ES256 under a documented CNSA exception (ATIS-1000074; NIST POA&M-27, see `docs/CNSA-2-COMPLIANCE.md`)
 
 ---
 
@@ -761,7 +765,7 @@ These are deviations in the shipped code from the guidance above. They are recor
 ### Security RFCs
 - [RFC 5630 - SIPS URI](https://datatracker.ietf.org/doc/html/rfc5630)
 - [RFC 8224 - SIP Identity](https://datatracker.ietf.org/doc/html/rfc8224)
-- [RFC 8225 - PASSporT](https://www.rfc-editor.org/rfc/rfc8224)
+- [RFC 8225 - PASSporT](https://www.rfc-editor.org/rfc/rfc8225)
 - [RFC 5763 - DTLS-SRTP Framework](https://datatracker.ietf.org/doc/html/rfc5763)
 - [RFC 5764 - DTLS-SRTP](https://datatracker.ietf.org/doc/html/rfc5764)
 

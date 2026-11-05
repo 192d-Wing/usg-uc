@@ -722,34 +722,60 @@ impl Default for SecurityConfig {
     }
 }
 
-/// STIR/SHAKEN configuration.
+/// STIR/SHAKEN configuration (`[stir_shaken]`).
 ///
-/// ## NIST 800-53 Rev5: IA-9 (Service Identification)
+/// Breaking change (schema for 0.10): `verification_enabled` now defaults to
+/// `false` (it previously defaulted to `true` and verified nothing), the
+/// signing/verification settings are nested, and `default_attestation` is a
+/// typed A/B/C that defaults to `C`. The flat v0.9 keys
+/// (`certificate_path`, `private_key_path`, `certificate_url`,
+/// `ca_bundle_path`, `default_attestation`, `max_passport_age_secs`) are
+/// accepted as deprecated aliases for one release; see
+/// [`StirShakenConfig::normalized`].
+///
+/// ## NIST 800-53 Rev5: IA-9 (Service Identification), CM-6 (secure defaults)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+// NIST 800-53 Rev5: CM-6 (a misspelt key is an error, never silently ignored)
+#[serde(default, deny_unknown_fields)]
 pub struct StirShakenConfig {
-    /// Enable STIR/SHAKEN signing for outbound calls.
+    /// Sign outbound INVITEs on trunks with `stir_shaken.sign = true`.
     pub signing_enabled: bool,
 
-    /// Enable STIR/SHAKEN verification for inbound calls.
+    /// Verify inbound Identity on trunks with `stir_shaken.verify = true`.
+    /// Requires `verification.trust_anchors_path`.
     pub verification_enabled: bool,
 
-    /// Path to STI certificate (P-384).
+    /// `PASSporT` algorithm. `ES256` is mandatory for SHAKEN interop
+    /// (CNSA-EXCEPTION: ATIS-1000074). `ES384` is reserved for bilateral
+    /// profiles and rejected by validation in this release.
+    pub algorithm: StirAlgorithm,
+
+    /// Signing (authentication service) settings.
+    pub signing: StirSigningConfig,
+
+    /// Attestation policy.
+    pub attestation: StirAttestationConfig,
+
+    /// Verification service settings.
+    pub verification: StirVerificationConfig,
+
+    /// Deprecated alias for `signing.certificate_path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub certificate_path: Option<PathBuf>,
-
-    /// Path to STI private key (P-384).
+    /// Deprecated alias for `signing.private_key_path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub private_key_path: Option<PathBuf>,
-
-    /// Certificate URL for x5u header.
+    /// Deprecated alias for `signing.certificate_url`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub certificate_url: Option<String>,
-
-    /// Default attestation level for signing.
-    pub default_attestation: String,
-
-    /// Maximum `PASSporT` age in seconds.
-    pub max_passport_age_secs: u64,
-
-    /// CA bundle path for certificate verification.
+    /// Deprecated alias for `attestation.default`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_attestation: Option<String>,
+    /// Deprecated alias for `verification.max_passport_age_secs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_passport_age_secs: Option<u64>,
+    /// Deprecated alias for `verification.trust_anchors_path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ca_bundle_path: Option<PathBuf>,
 }
 
@@ -757,13 +783,295 @@ impl Default for StirShakenConfig {
     fn default() -> Self {
         Self {
             signing_enabled: false,
-            verification_enabled: true,
+            verification_enabled: false,
+            algorithm: StirAlgorithm::Es256,
+            signing: StirSigningConfig::default(),
+            attestation: StirAttestationConfig::default(),
+            verification: StirVerificationConfig::default(),
             certificate_path: None,
             private_key_path: None,
             certificate_url: None,
-            default_attestation: "B".to_string(),
-            max_passport_age_secs: 60,
+            default_attestation: None,
+            max_passport_age_secs: None,
             ca_bundle_path: None,
+        }
+    }
+}
+
+impl StirShakenConfig {
+    /// Folds the deprecated flat keys into the nested structure and returns
+    /// the result plus the deprecated keys that were used (for a startup
+    /// warning).
+    ///
+    /// # Errors
+    /// A deprecated key and its replacement are both set to different
+    /// values, or `default_attestation` is not A/B/C.
+    pub fn normalized(&self) -> Result<(Self, Vec<&'static str>), String> {
+        fn fold<T: Clone + PartialEq>(
+            old: Option<&T>,
+            new: &mut Option<T>,
+            key: &'static str,
+            used: &mut Vec<&'static str>,
+        ) -> Result<(), String> {
+            if let Some(o) = old {
+                used.push(key);
+                match new {
+                    Some(n) if n != o => {
+                        return Err(format!(
+                            "stir_shaken.{key} (deprecated) conflicts with its nested replacement"
+                        ));
+                    }
+                    _ => *new = Some(o.clone()),
+                }
+            }
+            Ok(())
+        }
+        let mut out = self.clone();
+        let mut used = Vec::new();
+        fold(
+            self.certificate_path.as_ref(),
+            &mut out.signing.certificate_path,
+            "certificate_path",
+            &mut used,
+        )?;
+        fold(
+            self.private_key_path.as_ref(),
+            &mut out.signing.private_key_path,
+            "private_key_path",
+            &mut used,
+        )?;
+        fold(
+            self.certificate_url.as_ref(),
+            &mut out.signing.certificate_url,
+            "certificate_url",
+            &mut used,
+        )?;
+        fold(
+            self.ca_bundle_path.as_ref(),
+            &mut out.verification.trust_anchors_path,
+            "ca_bundle_path",
+            &mut used,
+        )?;
+        // Nested non-Option keys count as set when they differ from their
+        // default, so an alias that disagrees with them is a conflict too.
+        let attest = match self.default_attestation.as_deref() {
+            None => None,
+            Some("A") => Some(StirAttestation::A),
+            Some("B") => Some(StirAttestation::B),
+            Some("C") => Some(StirAttestation::C),
+            Some(_) => return Err("stir_shaken.default_attestation must be A, B, or C".into()),
+        };
+        let mut nested_attest = (out.attestation.default
+            != StirAttestationConfig::default().default)
+            .then_some(out.attestation.default);
+        fold(
+            attest.as_ref(),
+            &mut nested_attest,
+            "default_attestation",
+            &mut used,
+        )?;
+        if let Some(a) = nested_attest {
+            out.attestation.default = a;
+        }
+        let default_age = StirVerificationConfig::default().max_passport_age_secs;
+        let mut nested_age = (out.verification.max_passport_age_secs != default_age)
+            .then_some(out.verification.max_passport_age_secs);
+        fold(
+            self.max_passport_age_secs.as_ref(),
+            &mut nested_age,
+            "max_passport_age_secs",
+            &mut used,
+        )?;
+        if let Some(age) = nested_age {
+            out.verification.max_passport_age_secs = age;
+        }
+        out.certificate_path = None;
+        out.private_key_path = None;
+        out.certificate_url = None;
+        out.ca_bundle_path = None;
+        out.default_attestation = None;
+        out.max_passport_age_secs = None;
+        Ok((out, used))
+    }
+}
+
+/// `PASSporT` signature algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StirAlgorithm {
+    /// ECDSA P-256 / SHA-256 (SHAKEN mandatory; CNSA-EXCEPTION).
+    #[default]
+    #[serde(rename = "ES256")]
+    Es256,
+    /// ECDSA P-384 / SHA-384 (CNSA 2.0; non-interoperable for SHAKEN).
+    /// Reserved: rejected by validation in this release.
+    // POAM: ES384 bilateral PASSporT signing (needs P-384 STI certificates).
+    #[serde(rename = "ES384")]
+    Es384,
+}
+
+/// Where the signing key lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StirKeySource {
+    /// PKCS#8 DER/PEM file (owner-only permissions enforced).
+    #[default]
+    File,
+    /// PKCS#11 token. Reserved; rejected by validation in this release.
+    // POAM: PKCS#11/HSM custody of the STIR signing key.
+    Pkcs11,
+}
+
+/// `[stir_shaken.signing]`.
+///
+/// ## NIST 800-53 Rev5: SC-12, SC-17, SC-28
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+// NIST 800-53 Rev5: CM-6 (a misspelt key is an error, never silently ignored)
+#[serde(default, deny_unknown_fields)]
+pub struct StirSigningConfig {
+    /// Public HTTPS URL of the signing certificate (`PASSporT` `x5u`).
+    pub certificate_url: Option<String>,
+    /// PKCS#8 P-256 private key. Must not be group/world accessible and
+    /// must not be a symlink.
+    pub private_key_path: Option<PathBuf>,
+    /// The STI-CA-issued certificate (PEM) published at `certificate_url`;
+    /// used for the startup key/cert match and expiry self-check.
+    pub certificate_path: Option<PathBuf>,
+    /// Key custody.
+    pub key_source: StirKeySource,
+}
+
+/// Attestation level as configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StirAttestation {
+    /// Full.
+    A,
+    /// Partial.
+    B,
+    /// Gateway (default).
+    #[default]
+    C,
+}
+
+/// `[stir_shaken.attestation]`: first matching rule wins, then the
+/// `owned_numbers` A/B rule, then `default`.
+///
+/// ## NIST 800-53 Rev5: IA-9
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+// NIST 800-53 Rev5: CM-6 (a misspelt key is an error, never silently ignored)
+#[serde(default, deny_unknown_fields)]
+pub struct StirAttestationConfig {
+    /// Attestation when no rule matches.
+    pub default: StirAttestation,
+    /// Calling-number prefixes this operator owns (digits, optional trailing
+    /// `*`). An authenticated caller with an owned number gets A; an
+    /// authenticated caller without one gets B.
+    pub owned_numbers: Vec<String>,
+    /// Explicit rules, evaluated in order before `owned_numbers`.
+    pub rules: Vec<StirAttestationRule>,
+}
+
+/// One attestation rule. Every set field must match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct StirAttestationRule {
+    /// Ingress trunk group id.
+    pub source_trunk: Option<String>,
+    /// Ingress zone (realm).
+    pub source_realm: Option<String>,
+    /// Caller authenticated (registered endpoint).
+    pub authenticated: Option<bool>,
+    /// Calling-number prefix (digits).
+    pub orig_prefix: Option<String>,
+    /// Attestation to apply.
+    pub attest: StirAttestation,
+}
+
+/// What to do when verification fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum StirFailurePolicy {
+    /// Forward without verstat.
+    PassThrough,
+    /// Forward with `verstat=TN-Validation-Failed` (default).
+    #[default]
+    Mark,
+    /// Reject with the RFC 8224 §6.2.2 code (436/437/438).
+    Reject,
+}
+
+/// `[stir_shaken.verification]`.
+///
+/// ## NIST 800-53 Rev5: IA-5(2), SC-7, SC-5, SC-17
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// NIST 800-53 Rev5: CM-6 (a misspelt key is an error, never silently ignored)
+#[serde(default, deny_unknown_fields)]
+pub struct StirVerificationConfig {
+    /// Failure policy.
+    pub failure_policy: StirFailurePolicy,
+    /// Reject an INVITE with no Identity (428) on verify trunks.
+    pub require_identity: bool,
+    /// Certificate fetch deadline (100..=5000 ms).
+    pub cert_fetch_timeout_ms: u64,
+    /// Cached certificates (1..=100000).
+    pub cert_cache_entries: usize,
+    /// Positive cache TTL cap (seconds).
+    pub cert_cache_ttl_secs: u64,
+    /// Negative cache TTL (seconds).
+    pub negative_cache_ttl_secs: u64,
+    /// Maximum certificate response body (bytes, 1024..=65536).
+    pub max_cert_bytes: usize,
+    /// Concurrent certificate fetches (1..=1024).
+    pub max_concurrent_fetches: usize,
+    /// STI-CR trust anchors: a PEM bundle file or a directory of PEM files.
+    pub trust_anchors_path: Option<PathBuf>,
+    /// Trust-anchor reload interval (seconds, >= 60).
+    pub trust_anchor_refresh_secs: u64,
+    /// Optional `x5u` host allow-list (exact, case-insensitive). Empty =
+    /// any public host.
+    pub x5u_allow_hosts: Vec<String>,
+    /// Maximum `PASSporT` age in seconds (RFC 8224 §6.2.2), 10..=300.
+    pub max_passport_age_secs: u64,
+}
+
+impl Default for StirVerificationConfig {
+    fn default() -> Self {
+        Self {
+            failure_policy: StirFailurePolicy::Mark,
+            require_identity: false,
+            cert_fetch_timeout_ms: 1500,
+            cert_cache_entries: 4096,
+            cert_cache_ttl_secs: 3600,
+            negative_cache_ttl_secs: 60,
+            max_cert_bytes: 16 * 1024,
+            max_concurrent_fetches: 32,
+            trust_anchors_path: None,
+            trust_anchor_refresh_secs: 86_400,
+            x5u_allow_hosts: Vec::new(),
+            max_passport_age_secs: 60,
+        }
+    }
+}
+
+/// Per-trunk STIR/SHAKEN settings (`[[trunk_groups.trunks]] stir_shaken`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrunkStirConfig {
+    /// Sign INVITEs sent to this trunk.
+    pub sign: bool,
+    /// Verify Identity on INVITEs received from this trunk.
+    pub verify: bool,
+    /// Drop inbound Identity headers instead of passing them through to the
+    /// B-leg. `false` marks the trunk trusted: its Identity is relayed
+    /// verbatim and the call is not re-signed.
+    pub strip_inbound_identity: bool,
+}
+
+impl Default for TrunkStirConfig {
+    fn default() -> Self {
+        Self {
+            sign: false,
+            verify: false,
+            strip_inbound_identity: true,
         }
     }
 }
@@ -1097,6 +1405,8 @@ pub struct TrunkConfigSchema {
     pub options_ping_enabled: bool,
     /// OPTIONS ping interval in seconds (5-3600) when enabled.
     pub options_ping_interval_secs: u32,
+    /// STIR/SHAKEN per-trunk behaviour.
+    pub stir_shaken: TrunkStirConfig,
 }
 
 impl TrunkConfigSchema {
@@ -1124,6 +1434,7 @@ impl Default for TrunkConfigSchema {
             max_failures: 5,
             options_ping_enabled: false,
             options_ping_interval_secs: 30,
+            stir_shaken: TrunkStirConfig::default(),
         }
     }
 }

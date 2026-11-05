@@ -63,6 +63,8 @@ impl CallService for CallServiceImpl {
                         "Routing" | "Proceeding" => 1, // EARLY
                         _ => 0,                        // INITIAL
                     },
+                    attestation: s.attestation.clone(),
+                    verstat: s.verstat.clone(),
                     ..Default::default()
                 })
                 .collect();

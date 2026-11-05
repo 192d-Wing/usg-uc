@@ -28,7 +28,7 @@ flowchart TB
 | 2 — Protocol core | `proto-sip`, `proto-transaction`, `proto-dialog`, `proto-b2bua`, `proto-registrar`, `proto-sdp`, `proto-rtp`, `proto-srtp`, `proto-dtls`, `proto-stun`, `proto-turn`, `proto-ice`, `proto-stir-shaken` | RFC protocol implementations |
 | 3 — Media engine | `uc-codecs`, `uc-media-engine` | Codec encode/decode (G.711 et al.), transcoding, media relay |
 | 4 — Security | `uc-acl`, `uc-auth`, `uc-dos-protection` | Access control, digest auth, rate limiting |
-| 5 — Orchestration | `uc-policy`, `uc-routing`, `uc-cdr` | Policy, dial-plan routing, call detail records |
+| 5 — Orchestration | `uc-policy`, `uc-routing`, `uc-cdr`, `uc-sti` | Policy, dial-plan routing, call detail records, STIR/SHAKEN services (x5u cert cache, trust anchors, attestation policy, signing key) |
 | 6 — Recording | `uc-siprec` | SIPREC call recording |
 | 7 — Management | `uc-api`, `uc-metrics`, `uc-health`, `uc-telemetry` | Management APIs and observability |
 | 8 — HA & clustering | `uc-cluster`, `uc-discovery`, `uc-storage`, `uc-state-sync`, `uc-aaa`, `uc-user-mgmt`, `uc-phone-mgmt`, `uc-snmp`, `uc-syslog` | Cluster membership, state replication, user/phone management |

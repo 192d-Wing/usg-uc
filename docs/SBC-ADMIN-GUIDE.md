@@ -658,9 +658,81 @@ Audit writes never block call handling. Records go onto a queue of 4096 and a ba
 
 ---
 
+## STIR/SHAKEN
+
+The SBC can sign outbound INVITEs (authentication service, RFC 8224 §5) and verify inbound Identity headers (verification service, RFC 8224 §6.2, ATIS-1000074). Both are off by default and enabled per trunk.
+
+**Breaking change (0.10):** `verification_enabled` now defaults to `false` (it was `true` and verified nothing). The flat keys `certificate_path`, `private_key_path`, `certificate_url`, `ca_bundle_path`, `default_attestation` and `max_passport_age_secs` are accepted for one release as deprecated aliases (a warning is logged) and map to the nested keys below. `default_attestation` now defaults to `C`.
+
+```toml
+[stir_shaken]
+signing_enabled = true
+verification_enabled = true
+algorithm = "ES256"                    # SHAKEN mandates ES256 (CNSA exception); ES384 is rejected
+
+[stir_shaken.signing]
+certificate_url = "https://certs.example.com/sti.pem"   # x5u; https only
+private_key_path = "/etc/sbc/certs/sti.key"             # PKCS#8 P-256; regular file, mode 0600/0400, owned by the SBC user, not a symlink
+certificate_path = "/etc/sbc/certs/sti.pem"             # must match the key, be valid now, carry TNAuthList
+key_source = "file"                                     # "pkcs11" is reserved and rejected
+
+[stir_shaken.attestation]
+default = "C"
+owned_numbers = ["1202555*"]          # A needs an owned number provisioned for the caller's own registration (see below); authenticated otherwise = B
+[[stir_shaken.attestation.rules]]     # evaluated first; first match wins
+source_trunk = "pbx-group"
+orig_prefix = "1703"
+attest = "B"
+
+[stir_shaken.verification]
+failure_policy = "mark"               # "mark" (verstat=TN-Validation-Failed, continue) | "pass-through" | "reject"
+require_identity = false              # true: 428 when a verify trunk sends no Identity
+trust_anchors_path = "/etc/sbc/certs/sti-cr"   # STI-CR PEM bundle or directory (*.pem/*.crt/*.cer)
+trust_anchor_refresh_secs = 86400     # also reloaded on SIGHUP
+cert_fetch_timeout_ms = 1500          # 100..=5000
+cert_cache_entries = 4096             # 1..=100000
+cert_cache_ttl_secs = 3600            # capped by Cache-Control and the cert's notAfter
+negative_cache_ttl_secs = 60
+max_cert_bytes = 16384
+max_concurrent_fetches = 32           # beyond this (or 4 per x5u host) an INVITE fails fast (cert-fetch-busy)
+x5u_allow_hosts = []                  # optional allow-list; empty = any public host on port 443
+max_passport_age_secs = 60
+
+[[trunk_groups.trunks]]
+id = "carrier-a"
+host = "198.51.100.10"
+stir_shaken = { sign = true, verify = true, strip_inbound_identity = true }
+```
+
+Per-trunk `sign`/`verify` require the global switch; validation rejects them otherwise. `strip_inbound_identity = false` marks a trunk trusted: its Identity headers are relayed to the B-leg verbatim and the call is not re-signed.
+
+**Signing.** The PASSporT is signed after routing, number translation and header manipulation, so `orig`/`dest` match the wire: `orig` is the B-leg P-Asserted-Identity user (else From), `dest` the B-leg Request-URI user. The B-leg From stays the SBC's own identity. Toward a `sign = true` trunk the SBC adds a P-Asserted-Identity with the caller's number (unless a header-manipulation rule already set one): the A-leg P-Asserted-Identity when the call comes from a configured trunk (RFC 3325 trust domain; a PAI from any other source is ignored), else the A-leg From user when the source is a trunk or an authenticated endpoint. The value is rebuilt as `<sip:NUMBER@domain;user=phone>`. The B-leg `Date` header is set to the signing time, replacing any relayed A-leg `Date`, so it matches `iat` (RFC 8224 §4.1). If no number qualifies, the INVITE is sent unsigned and a `StirSignFailure` (`bad-number`) is audited. Trunks with `sign = false` get no added PAI.
+
+**Attestation for registered endpoints.** A call from a registered phone (not a trunk) counts as authenticated only when REGISTER authentication is enabled and the INVITE arrives from the same source IP, port and transport on which a successful REGISTER for that AOR was received, and that registration is still live. The From user must be the AOR user or a DID mapped to it. Consequences:
+
+- **A** requires a REGISTER over **TCP or TLS** and the INVITE on that same flow, with the calling number provisioned for that registration and listed in `owned_numbers`.
+- **UDP-registered phones get at most B**, because a UDP source can be spoofed and the SBC does not challenge INVITEs.
+- Bindings created through the management API or by cluster replication, and phones registered on another cluster node, do not count. Calls from them get the default (C) unless a rule matches.
+- These limits apply to the built-in decision. `[[stir_shaken.attestation.rules]]` are evaluated first and set whatever level they name, so a rule with `attest = "A"` overrides them; write rules accordingly.
+- TCP/TLS flows are matched by address and port, not by connection, so behind a shared NAT a reused source port can inherit the previous phone's binding until it expires (POA&M-36). On failover the Identity is removed and the step is redone for the next trunk: re-signed with a fresh `iat` if it signs, no Identity or added PAI if it does not (a relayed Identity from a trusted ingress trunk is relayed again).
+
+**Verification.** The certificate named by `info`/`x5u` is fetched over HTTPS only, after an SSRF check (loopback, private, link-local/metadata, CGNAT, multicast, ULA, documentation and mapped forms are refused; the connection goes to the vetted address; no redirects; body and time limits), validated to the trust anchors, and cached. A cache miss waits up to `cert_fetch_timeout_ms`. The result sets `verstat` on the B-leg P-Asserted-Identity URI (on the From only when there is no PAI), is passed to `[vps.stir_shaken]` screening (so `mode = "enforce"` with `minimum_attestation` can block), and is recorded in the CDR. `reject` answers 436 Bad Identity Info (bad info / certificate unobtainable), 437 Unsupported Credential (untrusted certificate / algorithm), 403 Stale Date (`iat` outside `max_passport_age_secs`) or 438 Invalid Identity Header (any other failure), with `Reason: SIP;cause=<code>;text="..."`; 428 Use Identity Header with `require_identity`. `ppt=div` PASSporTs are ignored (RFC 8946 is not implemented). There is no replay cache and no revocation checking. National-format numbers (no leading `+`) are compared and signed as received, without country-code normalisation (POA&M-44). `orig` is accepted if it matches either the PAI or the From (POA&M-45). Identity headers from a trunk with `strip_inbound_identity = false` are relayed whatever the verification result (POA&M-42).
+
+`[stir_shaken]` and its `signing`, `attestation` and `verification` tables reject unknown keys. A deprecated flat key that disagrees with its nested replacement (including `max_passport_age_secs` and `default_attestation`) is an error.
+
+**CDR (schema v2).** `stir_attestation` (level the SBC signed with), `stir_verstat`, `stir_verify_reason`, `stir_inbound_attestation`, `stir_x5u_host` (host only). CSV inserts the four new columns before `prev_hash,hash`.
+
+**Audit.** `StirKeyLoaded`, `StirTrustAnchorsReloaded`, `StirTrustAnchorReloadFailed`, `StirSignFailure` and `StirVerifyFailure` (aggregated: one per trunk and reason per 10 s, with a count and the last source IP and Call-ID hash), and `StirAuditEventsDropped` (the aggregator table was full and events were dropped; also counted in `stir_audit_events_dropped_total`).
+
+**Metrics.** `stir_sign_ok_total`, `stir_sign_failed_total`, `stir_verify_passed_total`, `stir_verify_failed_total`, `stir_verify_absent_total`, `stir_verify_rejected_total`, `stir_verify_parked_calls`, `stir_cert_cache_entries`, `stir_signing_cert_expiry_seconds`, `stir_audit_events_dropped_total` (unlabelled gauges).
+
+**Metrics.** `stir_sign_ok_total`, `stir_sign_failed_total`, `stir_verify_{passed,failed,absent,rejected}_total`, `stir_verify_parked_calls`, `stir_cert_cache_entries`, `stir_signing_cert_expiry_seconds`.
+
+---
+
 ## Call Detail Records
 
-Each call attempt that passes source admission produces one Call Detail Record (CDR, schema v1) when it ends: answered, cancelled, failed, rejected at admission, by policy or for lack of a route, or rejected by the trunk with a 4xx/5xx/6xx. INVITEs that only draw a 401/407 challenge produce no CDR unless `record_auth_challenges = true`. Traffic dropped by the ACL or DoS protection, and INVITEs refused by source admission (403, neither a trunk nor registered; audited as an `AuthorizationDecision`), produce no CDR. A retransmitted INVITE that is rejected again within 32 s does not produce a second CDR.
+Each call attempt that passes source admission produces one Call Detail Record (CDR, schema v2; readers and `sbc-cli cdrs verify` accept v1 files) when it ends: answered, cancelled, failed, rejected at admission, by policy or for lack of a route, or rejected by the trunk with a 4xx/5xx/6xx. INVITEs that only draw a 401/407 challenge produce no CDR unless `record_auth_challenges = true`. Traffic dropped by the ACL or DoS protection, and INVITEs refused by source admission (403, neither a trunk nor registered; audited as an `AuthorizationDecision`), produce no CDR. A retransmitted INVITE that is rejected again within 32 s does not produce a second CDR.
 
 ```toml
 [cdr]
@@ -709,7 +781,7 @@ The daemon gRPC `CdrService` does no per-user permission check (sbc-api enforces
 
 **Cluster.** CDRs are per node, so `node_id` and `sequence` identify where a record came from. The daemon has no dialog takeover yet (an in-dialog request for a call this node does not hold gets 481), so `failover_takeover` is never set and a call lost in a node crash produces no CDR on any node.
 
-**Known gaps (POA&M).** An operator `TerminateCall` produces no `operator_terminated` CDR, because the RPC is not implemented. No BYE is sent to either leg at shutdown. SCTP A-legs are recorded with `transport = "tcp"`. `stir_attestation` is always empty in schema v1. The syslog sink sends no client certificate. Its TLS 1.3 connection does not restrict cipher suites to the CNSA 2.0 set. See the POA&M in [NIST-800-53-CONTROLS.md](NIST-800-53-CONTROLS.md).
+**Known gaps (POA&M).** An operator `TerminateCall` produces no `operator_terminated` CDR, because the RPC is not implemented. No BYE is sent to either leg at shutdown. SCTP A-legs are recorded with `transport = "tcp"`. `stir_attestation` is always empty in schema v1 records (written before the STIR/SHAKEN release). The syslog sink sends no client certificate. Its TLS 1.3 connection does not restrict cipher suites to the CNSA 2.0 set. See the POA&M in [NIST-800-53-CONTROLS.md](NIST-800-53-CONTROLS.md).
 
 ---
 

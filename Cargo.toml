@@ -38,6 +38,7 @@ members = [
     "crates/uc/uc-vps",
     "crates/uc/uc-routing",
     "crates/uc/uc-cdr",
+    "crates/uc/uc-sti",
 
     # Layer 6: Recording (uc-* = reusable)
     "crates/uc/uc-siprec",
@@ -194,6 +195,7 @@ uc-policy = { path = "crates/uc/uc-policy" }
 uc-vps = { path = "crates/uc/uc-vps" }
 uc-routing = { path = "crates/uc/uc-routing" }
 uc-cdr = { path = "crates/uc/uc-cdr" }
+uc-sti = { path = "crates/uc/uc-sti" }
 uc-api = { path = "crates/uc/uc-api" }
 uc-metrics = { path = "crates/uc/uc-metrics" }
 uc-health = { path = "crates/uc/uc-health" }

@@ -64,7 +64,11 @@ pub fn to_proto(r: &CallRecord) -> CdrRecord {
         codec: r.codec.clone(),
         srtp: r.srtp.clone(),
         emergency: r.emergency,
-        stir_attestation: r.stir_attestation.map(|a| format!("{a:?}")),
+        stir_attestation: r.stir_attestation.map(|a| a.as_str().to_string()),
+        stir_verstat: r.stir_verstat.map(|v| v.as_str().to_string()),
+        stir_verify_reason: r.stir_verify_reason.clone(),
+        stir_inbound_attestation: r.stir_inbound_attestation.map(|a| a.as_str().to_string()),
+        stir_x5u_host: r.stir_x5u_host.clone(),
         failover_takeover: r.failover_takeover,
         prev_hash: r.prev_hash.clone(),
         hash: r.hash.clone(),
@@ -95,7 +99,7 @@ pub fn from_proto(p: &CdrRecord) -> Result<CallRecord, String> {
             }))
         })
         .collect::<Result<_, String>>()?;
-    let v = serde_json::json!({
+    let mut v = serde_json::json!({
         "schema_version": p.schema_version,
         "record_id": p.record_id,
         "node_id": p.node_id,
@@ -138,6 +142,20 @@ pub fn from_proto(p: &CdrRecord) -> Result<CallRecord, String> {
         "prev_hash": p.prev_hash,
         "hash": p.hash,
     });
+    // Schema v2 fields, added separately to stay under json!'s macro
+    // recursion limit.
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("stir_verstat".into(), serde_json::json!(p.stir_verstat));
+        obj.insert(
+            "stir_verify_reason".into(),
+            serde_json::json!(p.stir_verify_reason),
+        );
+        obj.insert(
+            "stir_inbound_attestation".into(),
+            serde_json::json!(p.stir_inbound_attestation),
+        );
+        obj.insert("stir_x5u_host".into(), serde_json::json!(p.stir_x5u_host));
+    }
     serde_json::from_value(v).map_err(|e| format!("invalid CDR record: {e}"))
 }
 
@@ -169,9 +187,15 @@ mod tests {
             release_cause: ReleaseCause::TimerB,
             q850_cause: Some(16),
             stir_attestation: Some(Attestation::B),
+            stir_verstat: Some(uc_cdr::Verstat::TnValidationPassed),
+            stir_inbound_attestation: Some(Attestation::A),
+            stir_x5u_host: Some("cert.example.invalid".into()),
             ..Default::default()
         };
-        assert_eq!(from_proto(&to_proto(&r)).unwrap(), r);
+        let p = to_proto(&r);
+        assert_eq!(p.stir_attestation.as_deref(), Some("B"));
+        assert_eq!(p.stir_verstat.as_deref(), Some("tn-validation-passed"));
+        assert_eq!(from_proto(&p).unwrap(), r);
     }
 
     #[test]

@@ -4,9 +4,9 @@
 //!
 //! Response shapes match the daemon's old REST output verbatim so the
 //! existing dashboard doesn't break: `{calls: [{call_id, state, from,
-//! to, start_time, duration_secs}], total, active}`. The daemon's
-//! `CallInfo` proto has more fields (STIR/SHAKEN, transport, media
-//! mode) — we just don't surface them in this read API yet.
+//! to, start_time, duration_secs, attestation, verstat}], total, active}`.
+//! `attestation`/`verstat` (STIR/SHAKEN, ATIS-1000074) are additive; other
+//! `CallInfo` fields (transport, media mode) are not surfaced yet.
 
 use std::sync::Arc;
 
@@ -43,6 +43,9 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                         // GetCall for detail).
                         "start_time": 0,
                         "duration_secs": c.duration_secs,
+                        // NIST 800-53 Rev5: IA-9 — STIR/SHAKEN outcome.
+                        "attestation": c.attestation,
+                        "verstat": c.verstat,
                     })
                 })
                 .collect();

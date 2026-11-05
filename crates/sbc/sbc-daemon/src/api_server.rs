@@ -364,6 +364,52 @@ pub const METRIC_CDR_WRITER_ALIVE: &str = "cdr_writer_alive";
 /// Gauge: epoch seconds of the last CDR file write (0 = never).
 pub const METRIC_CDR_LAST_WRITE: &str = "cdr_last_write_timestamp_seconds";
 
+/// STIR/SHAKEN gauges (bounded names; no per-host or per-number labels).
+///
+/// ## NIST 800-53 Rev5: SI-4 (System Monitoring), IA-9
+pub const STIR_METRICS: &[(&str, &str)] = &[
+    (
+        "stir_sign_ok_total",
+        "INVITEs signed with a SHAKEN PASSporT",
+    ),
+    (
+        "stir_sign_failed_total",
+        "Signing attempts that failed (INVITE sent unsigned)",
+    ),
+    (
+        "stir_verify_passed_total",
+        "Inbound Identity verifications passed",
+    ),
+    (
+        "stir_verify_failed_total",
+        "Inbound Identity verifications failed",
+    ),
+    (
+        "stir_verify_absent_total",
+        "INVITEs on verify trunks without an Identity header",
+    ),
+    (
+        "stir_verify_rejected_total",
+        "INVITEs rejected by the STIR failure policy (403/428/436/437/438)",
+    ),
+    (
+        "stir_verify_parked_calls",
+        "INVITEs currently waiting on an x5u certificate fetch",
+    ),
+    (
+        "stir_cert_cache_entries",
+        "Cached STI certificates (positive and negative)",
+    ),
+    (
+        "stir_signing_cert_expiry_seconds",
+        "Seconds until the STIR signing certificate expires",
+    ),
+    (
+        "stir_audit_events_dropped_total",
+        "STIR failure audit events dropped because the aggregation table was full",
+    ),
+];
+
 /// Registers the daemon's audit and emergency gauges, refreshed by
 /// [`AppState::refresh_daemon_metrics`] before each export.
 ///
@@ -409,6 +455,9 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
         ),
     ] {
         metrics.register_gauge(name, help);
+    }
+    for (name, help) in STIR_METRICS {
+        metrics.register_gauge(*name, *help);
     }
 }
 
@@ -527,6 +576,50 @@ impl AppState {
             ] {
                 if let Some(g) = self.metrics.gauge(name) {
                     g.set(as_gauge(v));
+                }
+            }
+        }
+        if let Some(stir) = self.sip_stack.as_ref().and_then(|s| s.stir()) {
+            use std::sync::atomic::Ordering::Relaxed;
+            let m = &stir.metrics;
+            for (name, v) in [
+                ("stir_sign_ok_total", as_gauge(m.sign_ok.load(Relaxed))),
+                (
+                    "stir_sign_failed_total",
+                    as_gauge(m.sign_failed.load(Relaxed)),
+                ),
+                (
+                    "stir_verify_passed_total",
+                    as_gauge(m.verify_passed.load(Relaxed)),
+                ),
+                (
+                    "stir_verify_failed_total",
+                    as_gauge(m.verify_failed.load(Relaxed)),
+                ),
+                (
+                    "stir_verify_absent_total",
+                    as_gauge(m.verify_absent.load(Relaxed)),
+                ),
+                (
+                    "stir_verify_rejected_total",
+                    as_gauge(m.verify_rejected.load(Relaxed)),
+                ),
+                ("stir_verify_parked_calls", m.parked.load(Relaxed)),
+                (
+                    "stir_cert_cache_entries",
+                    i64::try_from(stir.cert_cache_entries()).unwrap_or(i64::MAX),
+                ),
+                (
+                    "stir_signing_cert_expiry_seconds",
+                    stir.signing_cert_expiry_secs().unwrap_or(0),
+                ),
+                (
+                    "stir_audit_events_dropped_total",
+                    as_gauge(stir.audit_events_dropped()),
+                ),
+            ] {
+                if let Some(g) = self.metrics.gauge(name) {
+                    g.set(v);
                 }
             }
         }

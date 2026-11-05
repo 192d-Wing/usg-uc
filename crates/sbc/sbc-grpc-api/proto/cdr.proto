@@ -87,13 +87,22 @@ message CdrRecord {
     optional string codec = 35;
     optional string srtp = 36;
     bool emergency = 37;
-    // Placeholder; always unset in schema v1.
+    // Attestation (A|B|C) this SBC signed the B-leg INVITE with.
     optional string stir_attestation = 38;
     // Set when this node took the dialog over from a failed peer; timing is partial.
     bool failover_takeover = 39;
     // Hex SHA-384 chain values; empty when the hash chain is disabled.
     string prev_hash = 40;
     string hash = 41;
+    // Schema v2 (STIR/SHAKEN verification). Additive.
+    // tn-validation-passed | tn-validation-failed | no-tn-validation
+    optional string stir_verstat = 42;
+    // Fixed failure-reason token (bad-signature, expired-iat, ...).
+    optional string stir_verify_reason = 43;
+    // Attestation (A|B|C) of the verified inbound PASSporT.
+    optional string stir_inbound_attestation = 44;
+    // Host of the inbound x5u certificate URL (no path).
+    optional string stir_x5u_host = 45;
 }
 
 // Filter for ListCdrs. Unset/empty fields match everything.

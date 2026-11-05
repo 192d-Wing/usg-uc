@@ -5222,6 +5222,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
+dependencies = [
+ "bitflags 2.13.2",
+ "chacha20",
+ "core_detect",
+ "num-traits",
+ "rand 0.10.3",
+ "rand_xorshift",
+ "regex-syntax",
+ "unarray",
+]
+
+[[package]]
 name = "prost"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5396,6 +5412,10 @@ dependencies = [
 name = "proto-stir-shaken"
 version = "0.9.0"
 dependencies = [
+ "base64 0.22.1",
+ "proptest",
+ "serde",
+ "serde_json",
  "uc-types",
 ]
 
@@ -5655,6 +5675,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_xorshift"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
+dependencies = [
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5687,6 +5716,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
 dependencies = [
  "aws-lc-rs",
+ "pem",
  "rustls-pki-types",
  "time",
  "yasna",
@@ -6205,6 +6235,7 @@ dependencies = [
  "proto-rtp",
  "proto-sip",
  "proto-srtp",
+ "proto-stir-shaken",
  "proto-stun",
  "proto-transaction",
  "rand 0.8.8",
@@ -6239,6 +6270,7 @@ dependencies = [
  "uc-cdr",
  "uc-cluster",
  "uc-codecs",
+ "uc-crypto",
  "uc-discovery",
  "uc-dos-protection",
  "uc-health",
@@ -6247,6 +6279,7 @@ dependencies = [
  "uc-phone-mgmt",
  "uc-routing",
  "uc-state-sync",
+ "uc-sti",
  "uc-storage",
  "uc-telemetry",
  "uc-transport",
@@ -7713,7 +7746,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -8436,6 +8469,8 @@ name = "uc-crypto"
 version = "0.9.0"
 dependencies = [
  "aws-lc-rs",
+ "rustls-pki-types",
+ "rustls-webpki",
  "thiserror 2.0.21",
  "uc-types",
  "zeroize",
@@ -8569,6 +8604,33 @@ dependencies = [
  "tracing-subscriber",
  "uc-cluster",
  "uc-storage",
+]
+
+[[package]]
+name = "uc-sti"
+version = "0.9.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "nix 0.31.3",
+ "proto-stir-shaken",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "uc-crypto",
+ "uc-types",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -8726,6 +8788,12 @@ dependencies = [
  "tempfile",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
 name = "unicase"

@@ -31,6 +31,10 @@ uc-transport = { workspace = true, features = ["websocket"] }
 uc-audit.workspace = true
 # Call Detail Records (schema v1, file/syslog sinks, ring).
 uc-cdr.workspace = true
+# STIR/SHAKEN: protocol (pure) + services (cert cache, anchors, signer).
+proto-stir-shaken.workspace = true
+uc-sti.workspace = true
+uc-crypto.workspace = true
 chrono.workspace = true
 uc-telemetry.workspace = true
 proto-sip = { workspace = true, features = ["digest-auth"] }

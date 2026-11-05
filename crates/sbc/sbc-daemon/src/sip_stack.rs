@@ -100,8 +100,12 @@ pub struct SipStack {
     /// Used to resolve which CSS to use for routing inbound calls from trunks.
     inbound_trunk_map:
         RwLock<std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>>,
-    /// Directory number mapping: DID → username for inbound call routing.
-    did_map: RwLock<std::collections::HashMap<String, String>>,
+    /// Directory number mapping: DID → username for inbound call routing,
+    /// with the reverse user → TN index the STIR binding uses.
+    did_map: RwLock<crate::stir_binding::DidMap>,
+    /// Received REGISTER flow → AORs, so the STIR binding of an endpoint
+    /// INVITE is O(1) (SEC-008). Bounded by `max_registrations`.
+    stir_flows: RwLock<crate::stir_binding::StirFlows>,
     /// Call-IDs currently being played an announcement (dedup retransmits).
     /// Arc so the spawned playback task can remove its entry when done —
     /// previously entries were never removed (unbounded growth from
@@ -111,6 +115,8 @@ pub struct SipStack {
     /// (see docs/VPS-ARCHITECTURE.md). Mutex: screening mutates rate
     /// counters and stats.
     vps: Option<tokio::sync::Mutex<uc_vps::VpsEngine>>,
+    /// STIR/SHAKEN signing and verification (None when both are disabled).
+    stir: Option<Arc<crate::stir::StirService>>,
     /// Registration statistics.
     registrations_active: AtomicU64,
     registrations_total: AtomicU64,
@@ -486,6 +492,9 @@ struct CallAddresses {
     /// manipulated headers). Kept only when failover targets exist; a
     /// failover re-sends it with a fresh Call-ID, branch and From tag.
     b_leg_invite: Option<Arc<SipRequest>>,
+    /// STIR facts to redo the B-leg STIR step on failover (kept with
+    /// `b_leg_invite`, which is stored before that step).
+    stir_egress: Option<Arc<crate::stir::StirEgress>>,
     /// A reliable (RSeq) 18x carrying SDP was relayed to the caller: the
     /// early media is committed to this trunk, so no more failover.
     early_media_committed: bool,
@@ -1039,11 +1048,13 @@ impl SipStack {
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
-            did_map: RwLock::new(std::collections::HashMap::new()),
+            did_map: RwLock::new(crate::stir_binding::DidMap::default()),
+            stir_flows: RwLock::new(crate::stir_binding::StirFlows::default()),
             announcement_calls: Arc::new(
                 tokio::sync::RwLock::new(std::collections::HashSet::new()),
             ),
             vps: None,
+            stir: None,
         }
     }
 
@@ -1099,11 +1110,13 @@ impl SipStack {
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
-            did_map: RwLock::new(std::collections::HashMap::new()),
+            did_map: RwLock::new(crate::stir_binding::DidMap::default()),
+            stir_flows: RwLock::new(crate::stir_binding::StirFlows::default()),
             announcement_calls: Arc::new(
                 tokio::sync::RwLock::new(std::collections::HashSet::new()),
             ),
             vps: None,
+            stir: None,
         }
     }
 
@@ -2794,6 +2807,14 @@ impl SipStack {
             .unwrap_or_default()
             .to_string();
         let new_template = Arc::new(request.clone());
+        // STIR for this trunk on the wire copy only (the template stays
+        // pre-STIR): fresh iat, or no Identity/PAI if it does not sign.
+        let stir_signed = match (self.stir.as_ref(), addrs.stir_egress.as_deref()) {
+            (Some(stir), Some(e)) => {
+                stir.apply_egress(&mut request.headers, Some(&lease.trunk_id), e)
+            }
+            _ => None,
+        };
 
         // Swap the lease in place only if the call is still on the attempt
         // that failed; otherwise (torn down, or another failover won) give
@@ -2816,6 +2837,9 @@ impl SipStack {
                     entry.b_leg_to = new_to;
                     entry.dialog_to_tag = None;
                     entry.b_leg_invite = Some(new_template);
+                    if addrs.stir_egress.is_some() {
+                        entry.cdr.stir_attestation = stir_signed.map(crate::stir::cdr_attestation);
+                    }
                     entry
                         .cdr
                         .record_failover(cause.cdr_outcome(), &lease.trunk_id, &new_call_id);
@@ -2970,6 +2994,16 @@ impl SipStack {
             message: SipMessage::Response(response),
             destination: source,
         })
+    }
+
+    /// Sets the STIR/SHAKEN service.
+    pub fn set_stir(&mut self, stir: Arc<crate::stir::StirService>) {
+        self.stir = Some(stir);
+    }
+
+    /// The STIR/SHAKEN service, if enabled.
+    pub const fn stir(&self) -> Option<&Arc<crate::stir::StirService>> {
+        self.stir.as_ref()
     }
 
     /// Sets the Voice Protection System engine for call screening.
@@ -3470,7 +3504,7 @@ impl SipStack {
         }
 
         match method {
-            Method::Register => self.handle_register(message, source).await,
+            Method::Register => self.handle_register(message, source, transport).await,
             Method::Invite => {
                 self.handle_invite(message, source, receiving_zone, transport)
                     .await
@@ -4011,7 +4045,12 @@ impl SipStack {
     /// - Binding storage in `LocationService`
     /// - Expiration enforcement (min/max/default)
     /// - Wildcard removal (Contact: *)
-    async fn handle_register(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
+    async fn handle_register(
+        &self,
+        message: SipMessage,
+        source: SbcSocketAddr,
+        transport: AddrTransport,
+    ) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
                 reason: "Expected request".to_string(),
@@ -4291,6 +4330,26 @@ impl SipStack {
                             let _ = loc.add_binding(latched);
                         } else {
                             let _ = loc.add_binding(binding.clone());
+                        }
+                    }
+                    // STIR flow index (SEC-008/SEC-009): the flow this
+                    // REGISTER actually arrived on (received source and
+                    // transport, not the declared Contact) now binds the
+                    // AOR, or no longer does after a de-registration.
+                    {
+                        let key = crate::stir_binding::flow_key(source.ip(), src_port, transport);
+                        let this_bound =
+                            reg_response.contacts.iter().any(|b| b.call_id() == call_id);
+                        let mut flows = self.stir_flows.write().await;
+                        if this_bound {
+                            let cap = self.config.max_registrations as usize;
+                            let indexed = flows
+                                .bind(key, &aor, cap, |k, a| Self::flow_has_binding(&loc, a, k));
+                            if !indexed {
+                                debug!(aor = %aor, "STIR flow index full; flow not indexed");
+                            }
+                        } else {
+                            flows.unbind(&key, &aor);
                         }
                     }
                     // Update active count while holding the loc lock.
@@ -4587,6 +4646,44 @@ impl SipStack {
         }
         let b_leg_max_forwards = incoming_max_forwards - 1;
 
+        // STIR/SHAKEN verification (RFC 8224 §6.2) on INVITEs from trunks
+        // with `stir_shaken.verify`. Before VPS so `[vps.stir_shaken]`
+        // screening sees the outcome. A certificate cache miss waits here
+        // (bounded by cert_fetch_timeout_ms) on this INVITE's task only.
+        //
+        // ## NIST 800-53 Rev5: IA-9, SI-10, SC-5
+        let stir_in = match self.stir.as_ref() {
+            Some(stir) => stir.inbound(req, source.ip(), &a_leg_call_id).await,
+            None => crate::stir::InboundStir::default(),
+        };
+        if let Some(reason) = stir_in.reject {
+            let code = reason.sip_code();
+            warn!(
+                call_id = %a_leg_call_id,
+                code,
+                reason = reason.as_str(),
+                "STIR/SHAKEN verification failed, rejecting INVITE"
+            );
+            self.in_flight_invites.write().await.remove(&a_leg_call_id);
+            reject_cdr(code, uc_cdr::ReleaseCause::PolicyDenied);
+            let mut rejection = create_response_from_request(
+                req,
+                StatusCode::new(code).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
+            );
+            // RFC 8224 §6.2.2: the registered phrase on the status line
+            // (403 "Stale Date" rather than "Forbidden") and a Reason header
+            // carrying the failure code.
+            rejection.reason = Some(reason.sip_reason_phrase().to_owned());
+            rejection.headers.set(
+                HeaderName::Reason,
+                format!("SIP;cause={code};text=\"{}\"", reason.sip_reason_phrase()),
+            );
+            return ProcessResult::Response {
+                message: SipMessage::Response(rejection),
+                destination: source,
+            };
+        }
+
         // 1. Build 100 Trying for A-leg
         let trying = create_response_from_request(req, StatusCode::TRYING);
 
@@ -4619,7 +4716,8 @@ impl SipStack {
             let mut attempt = uc_vps::CallAttempt::new(source.ip())
                 .with_callee(dest_user.clone())
                 .with_request_uri(req.uri.to_string())
-                .with_direction(direction);
+                .with_direction(direction)
+                .with_stir_shaken(stir_in.vps_status);
             if let Some(from) = req.headers.get_value(&HeaderName::From) {
                 attempt = attempt.with_from_uri(extract_uri_from_header(from));
             }
@@ -5063,9 +5161,79 @@ impl SipStack {
                 .hide_b2bua_request(&mut b_leg_request.headers);
         }
 
-        // Failover re-sends this exact INVITE (fresh Call-ID/branch/tag), so
-        // keep a copy only when there is somewhere to fail over to.
+        // Failover re-sends this INVITE (fresh Call-ID/branch/tag), so keep
+        // a copy only when there is somewhere to fail over to. It is taken
+        // before the STIR step so each attempt redoes that step for its own
+        // trunk (no stale Identity/iat, no PAI toward sign=false trunks).
         let b_leg_invite = (!failover_targets.is_empty()).then(|| Arc::new(b_leg_request.clone()));
+
+        // 7d. STIR/SHAKEN on the B-leg: relay a trusted trunk's Identity
+        // verbatim, otherwise on a `sign = true` egress trunk assert the
+        // caller's number in P-Asserted-Identity (RFC 3325 trust domain:
+        // A-leg PAI only from a trunk peer) and sign at egress (after
+        // translation and header manipulation, so orig/dest match the
+        // wire), then set (or strip) verstat (ATIS-1000074 §5.3.1).
+        //
+        // ## NIST 800-53 Rev5: IA-9; RFC 8224 §5; RFC 3325 §5
+        let mut stir_signed: Option<proto_stir_shaken::Attestation> = None;
+        let mut stir_egress: Option<Arc<crate::stir::StirEgress>> = None;
+        if let Some(stir) = self.stir.as_ref() {
+            let source_trunk = self
+                .lookup_inbound_trunk(source.ip())
+                .await
+                .map(|(group, _)| group);
+            // Endpoint callers are "authenticated" only when this INVITE is
+            // bound to a registration from this flow and REGISTER auth is
+            // on; the caller TN is then the one provisioned for that AOR,
+            // never an arbitrary From (SEC-001). Only looked up when some
+            // trunk this call may use signs (PERF-008): otherwise nothing
+            // consumes it.
+            let may_sign = trunk_lease
+                .as_ref()
+                .is_some_and(|l| stir.signs(&l.trunk_id))
+                || failover_targets.iter().any(|(_, t)| stir.signs(t));
+            let binding = if may_sign && source_trunk.is_none() && self.register_auth_enabled() {
+                self.stir_endpoint_binding(source, transport, &from_uri)
+                    .await
+            } else {
+                None
+            };
+            let authenticated = binding.is_some();
+            let assigned_tn = binding.flatten();
+            // SEC-009: the flow match proves the provisioned TN only when the
+            // source cannot be spoofed off-path. A UDP-bound caller is still
+            // authenticated (its number is asserted) but is capped at B.
+            // POAM: no per-INVITE digest challenge, so a UDP caller has no
+            // path to A.
+            let attest_tn = assigned_tn
+                .as_deref()
+                .filter(|_| crate::stir_binding::flow_is_connection_oriented(transport))
+                .and_then(proto_stir_shaken::canonicalize_tn);
+            let egress = crate::stir::StirEgress {
+                caller_pai: crate::stir::caller_identity(
+                    &req.headers,
+                    source_trunk.is_some(),
+                    assigned_tn.as_deref(),
+                    &self.config.domain,
+                ),
+                source_trunk,
+                source_realm: receiving_zone.map(str::to_owned),
+                authenticated,
+                assigned_tn: attest_tn,
+                call_id: a_leg_call_id.clone(),
+                dest_user: b_leg_user.clone(),
+                passthrough_identity: stir_in.passthrough_identity.clone(),
+                verstat: stir_in.egress_verstat,
+            };
+            stir_signed = stir.apply_egress(
+                &mut b_leg_request.headers,
+                trunk_lease.as_ref().map(|l| l.trunk_id.as_str()),
+                &egress,
+            );
+            if b_leg_invite.is_some() {
+                stir_egress = Some(Arc::new(egress));
+            }
+        }
 
         // CDR draft: the facts known at admission/routing (AU-3).
         let cdr_draft = if self.cdr.is_some() {
@@ -5110,6 +5278,11 @@ impl SipStack {
                 media_anchored: media_a_leg_port.is_some(),
                 media_node,
                 emergency,
+                stir_attestation: stir_signed.map(crate::stir::cdr_attestation),
+                stir_verstat: stir_in.cdr_verstat.map(crate::stir::cdr_verstat),
+                stir_verify_reason: stir_in.reason.map(|r| r.as_str().to_string()),
+                stir_inbound_attestation: stir_in.inbound_attest.map(crate::stir::cdr_attestation),
+                stir_x5u_host: stir_in.x5u_host.clone(),
                 ..crate::cdr::CdrDraft::default()
             }
         } else {
@@ -5176,6 +5349,7 @@ impl SipStack {
                     trunk_lease,
                     vps_callee,
                     b_leg_invite,
+                    stir_egress,
                     early_media_committed: false,
                     a_leg_via,
                     a_leg_from,
@@ -5720,6 +5894,14 @@ impl SipStack {
                     b_leg_destination: addrs
                         .map(|a| a.b_leg_destination.to_string())
                         .unwrap_or_default(),
+                    attestation: addrs
+                        .and_then(|a| a.cdr.stir_attestation.or(a.cdr.stir_inbound_attestation))
+                        .map(|a| a.as_str().to_string())
+                        .unwrap_or_default(),
+                    verstat: addrs
+                        .and_then(|a| a.cdr.stir_verstat)
+                        .map(|v| v.as_str().to_string())
+                        .unwrap_or_default(),
                 }
             })
             .collect()
@@ -5935,6 +6117,105 @@ impl SipStack {
                     .is_some_and(|contact_ip| contact_ip.to_canonical() == ip)
             })
         })
+    }
+
+    /// Whether `aor` still has a live binding whose contact is the flow
+    /// `key` (IP, port and, when the contact says, transport). Looks at
+    /// that one AOR's bindings only.
+    fn flow_has_binding(
+        loc: &LocationService,
+        aor: &str,
+        key: &crate::stir_binding::FlowKey,
+    ) -> bool {
+        let (ip, port, transport) = *key;
+        let transport_name = transport.to_string();
+        loc.lookup(aor).iter().any(|b| {
+            b.contact_uri().parse::<SipUri>().is_ok_and(|c| {
+                c.host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|h| h.to_canonical() == ip)
+                    && c.port.unwrap_or_else(|| transport.default_sip_port()) == port
+                    && c.params.iter().all(|(k, v)| {
+                        !k.eq_ignore_ascii_case("transport")
+                            || v.as_deref()
+                                .is_none_or(|t| t.eq_ignore_ascii_case(&transport_name))
+                    })
+            })
+        })
+    }
+
+    /// Records that `aor` registered from `source` over `transport` in the
+    /// STIR flow index (tests that seed the location service directly).
+    #[cfg(test)]
+    async fn index_stir_flow(&self, aor: &str, source: SbcSocketAddr, transport: AddrTransport) {
+        let key = crate::stir_binding::flow_key(source.ip(), source.port(), transport);
+        let cap = self.config.max_registrations as usize;
+        let _ = self
+            .stir_flows
+            .write()
+            .await
+            .bind(key, aor, cap, |_, _| true);
+    }
+
+    /// STIR caller binding for an endpoint INVITE (RFC 8588 §4 attestation
+    /// inputs). `None`: the INVITE is not bound to a registration from this
+    /// flow (received IP, port and transport of the REGISTER, re-checked
+    /// against the AOR's live binding), so the caller is not authenticated.
+    /// `Some(tn)`: bound to a registered AOR; `tn` is the number provisioned
+    /// for that AOR (the AOR user when it is a TN, else a DID mapped to it),
+    /// or `None` when it has none.
+    ///
+    /// The From user must be the bound AOR user, or a DID mapped to it, so a
+    /// registered endpoint cannot claim another subscriber's number.
+    ///
+    /// O(1) per INVITE (SEC-008): one flow-index lookup, the bindings of at
+    /// most [`crate::stir_binding::MAX_AORS_PER_FLOW`] AORs, and keyed DID
+    /// index lookups; no scan of the location service or DID map.
+    ///
+    /// The binding store is the in-process `location_service` in every
+    /// mode: REGISTER always writes it, including when a cluster
+    /// `AsyncLocationService` is attached (that store is not consulted by
+    /// the SIP stack). POAM: a phone registered on another cluster node is
+    /// unbound here, so its INVITEs are not attested A/B on this node.
+    ///
+    /// ## NIST 800-53 Rev5: IA-3 (Device Identification and Authentication), IA-9, SI-10
+    async fn stir_endpoint_binding(
+        &self,
+        source: SbcSocketAddr,
+        transport: AddrTransport,
+        from_uri: &str,
+    ) -> Option<Option<String>> {
+        let from_user = from_uri.parse::<SipUri>().ok()?.user?;
+        let key = crate::stir_binding::flow_key(source.ip(), source.port(), transport);
+        let candidates: Vec<String> = self.stir_flows.read().await.get(&key)?.to_vec();
+        let bound_users: Vec<String> = {
+            let loc = self.location_service.read().await;
+            candidates
+                .iter()
+                .filter(|aor| Self::flow_has_binding(&loc, aor, &key))
+                .filter_map(|aor| aor.parse::<SipUri>().ok().and_then(|u| u.user))
+                .collect()
+        };
+        if bound_users.is_empty() {
+            return None;
+        }
+        let from_tn = proto_stir_shaken::canonicalize_tn(&from_user);
+        let dids = self.did_map.read().await;
+        if bound_users.contains(&from_user) {
+            if from_tn.is_some() {
+                return Some(Some(from_user));
+            }
+            // Extension AOR: its provisioned DID (lowest, deterministic).
+            return Some(dids.first_tn_of(&from_user).cloned());
+        }
+        // From is a DID: accepted only when mapped to a bound AOR user.
+        let from_tn = from_tn?;
+        bound_users
+            .iter()
+            .any(|u| dids.user_has_tn(u, from_tn.as_str()))
+            .then_some(Some(from_user))
     }
 
     /// Adds a DID → username mapping for inbound call routing.
@@ -6323,6 +6604,11 @@ pub struct CallSummary {
     pub a_leg_source: String,
     /// B-leg destination address.
     pub b_leg_destination: String,
+    /// STIR/SHAKEN attestation: signed on the B-leg, else verified inbound
+    /// (`"A"`/`"B"`/`"C"`, empty when none).
+    pub attestation: String,
+    /// Inbound verification status token (empty when not verified).
+    pub verstat: String,
 }
 
 /// Summary of a registration (for gRPC API).
@@ -6557,7 +6843,7 @@ fn admitted_media_addr(media: &MediaAddress) -> Option<SbcSocketAddr> {
 
 /// Resolves a trunk host (IP literal or hostname) to every address it names.
 /// A hostname is resolved synchronously; failures yield an empty list.
-fn resolve_trunk_host_ips(host: &str) -> Vec<std::net::IpAddr> {
+pub fn resolve_trunk_host_ips(host: &str) -> Vec<std::net::IpAddr> {
     use std::net::ToSocketAddrs;
 
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -7886,6 +8172,7 @@ mod tests {
             trunk_lease: None,
             vps_callee: None,
             b_leg_invite: None,
+            stir_egress: None,
             early_media_committed: false,
             a_leg_via: vec!["SIP/2.0/UDP 10.0.0.1;branch=z9hG4bK-a".to_string()],
             a_leg_from: "<sip:caller@10.0.0.1>;tag=callertag".to_string(),
@@ -12042,5 +12329,1089 @@ mod tests {
             let back: uc_cdr::CallRecord = serde_json::from_str(&line).unwrap();
             assert_eq!(back, c);
         }
+    }
+
+    // ── STIR/SHAKEN in the INVITE path ─────────────────────────────────
+
+    /// [`trunk_stack`] plus a STIR service: alice (192.168.1.1) is a config
+    /// trunk with `verify = true`; t1 has `sign = true`.
+    async fn stir_stack(
+        policy: sbc_config::StirFailurePolicy,
+        require_identity: bool,
+    ) -> (SipStack, crate::stir::test_support::StiFiles) {
+        let mut stack = trunk_stack(10, ("none", ""), None).await;
+        let f = crate::stir::test_support::sti_files();
+        let mut c = sbc_config::SbcConfig::default();
+        let ss = &mut c.stir_shaken;
+        ss.signing_enabled = true;
+        ss.signing.private_key_path = Some(f.key.clone());
+        ss.signing.certificate_path = Some(f.cert.clone());
+        ss.signing.certificate_url = Some("https://cert.example.com/a.pem".into());
+        ss.verification_enabled = true;
+        ss.verification.trust_anchors_path = Some(f.anchors.clone());
+        ss.verification.failure_policy = policy;
+        ss.verification.require_identity = require_identity;
+        ss.verification.cert_fetch_timeout_ms = 200;
+        let trunk = |id: &str, host: &str, stir| sbc_config::TrunkConfigSchema {
+            id: id.into(),
+            host: host.into(),
+            stir_shaken: stir,
+            ..Default::default()
+        };
+        c.trunk_groups.push(sbc_config::TrunkGroupConfig {
+            id: "carriers".into(),
+            name: String::new(),
+            strategy: "priority".into(),
+            trunks: vec![
+                trunk(
+                    "t1",
+                    "127.0.0.2",
+                    sbc_config::TrunkStirConfig {
+                        sign: true,
+                        ..Default::default()
+                    },
+                ),
+                trunk(
+                    "alice-trunk",
+                    "192.168.1.1",
+                    sbc_config::TrunkStirConfig {
+                        verify: true,
+                        ..Default::default()
+                    },
+                ),
+            ],
+            zone: None,
+        });
+        stack.set_stir(Arc::new(crate::stir::test_support::service(&c)));
+        (stack, f)
+    }
+
+    fn invite_with_identity(call_id: &str, identity: Option<&str>) -> Bytes {
+        let raw = caller_request("INVITE", DIALED, call_id, 1, None, Some(ALICE_SDP));
+        let Some(id) = identity else {
+            return raw;
+        };
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        Bytes::from(text.replacen("Contact:", &format!("Identity: {id}\r\nContact:"), 1))
+    }
+
+    fn response_status(results: &[ProcessResult]) -> Option<(u16, Option<String>)> {
+        results.iter().find_map(|r| match r {
+            ProcessResult::Response {
+                message: SipMessage::Response(resp),
+                ..
+            } if resp.status.code() >= 300 => Some((
+                resp.status.code(),
+                resp.headers
+                    .get_value(&HeaderName::Reason)
+                    .map(str::to_owned),
+            )),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn stir_missing_identity_with_require_is_428() {
+        let (stack, _f) = stir_stack(sbc_config::StirFailurePolicy::Mark, true).await;
+        let results = flatten(
+            stack
+                .process_message(&invite_with_identity("stir-428@test", None), alice(), None)
+                .await,
+        );
+        let (code, reason) = response_status(&results).expect("rejected");
+        assert_eq!(code, 428);
+        assert_eq!(
+            reason.as_deref(),
+            Some("SIP;cause=428;text=\"Use Identity Header\"")
+        );
+        assert!(forwarded(&results, &Method::Invite).is_none());
+        assert_all_released(&stack).await;
+    }
+
+    /// RFC 8224 §6.2.2: an undecodable Identity is 438 under `reject`.
+    #[tokio::test]
+    async fn stir_malformed_identity_reject_is_438() {
+        let (stack, _f) = stir_stack(sbc_config::StirFailurePolicy::Reject, false).await;
+        let bad = "eyJh.eyJh.c2ln;info=<https://cert.example.com/a.pem>;ppt=\"shaken\"";
+        let results = flatten(
+            stack
+                .process_message(
+                    &invite_with_identity("stir-438@test", Some(bad)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (code, reason) = response_status(&results).expect("rejected");
+        assert_eq!(code, 438);
+        assert!(reason.unwrap().contains("cause=438"));
+        assert_all_released(&stack).await;
+    }
+
+    /// Default `mark`: the call continues with verstat=TN-Validation-Failed
+    /// on the B-leg From, no inbound Identity is relayed (untrusted ingress),
+    /// and the B-leg From (SBC identity, not a TN) is not signed.
+    #[tokio::test]
+    async fn stir_failed_identity_mark_forwards_with_failed_verstat() {
+        let (stack, _f) = stir_stack(sbc_config::StirFailurePolicy::Mark, false).await;
+        // SSRF target in info/x5u: refused without a fetch (bad-info).
+        let token = {
+            let h = r#"{"alg":"ES256","ppt":"shaken","typ":"passport","x5u":"https://169.254.169.254/c"}"#;
+            let p = r#"{"attest":"A","dest":{"tn":["15551234567"]},"iat":1,"orig":{"tn":"12025550100"},"origid":"u"}"#;
+            let mut t = String::new();
+            proto_stir_shaken::jws::b64url_encode_into(h.as_bytes(), &mut t);
+            t.push('.');
+            proto_stir_shaken::jws::b64url_encode_into(p.as_bytes(), &mut t);
+            t.push('.');
+            proto_stir_shaken::jws::b64url_encode_into(&[7u8; 64], &mut t);
+            t
+        };
+        let id = format!("{token};info=<https://169.254.169.254/c>;alg=ES256;ppt=\"shaken\"");
+        let results = flatten(
+            stack
+                .process_message(
+                    &invite_with_identity("stir-mark@test", Some(&id)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("call continues");
+        let from = b_invite.headers.get_value(&HeaderName::From).unwrap();
+        assert!(from.contains(";verstat=TN-Validation-Failed>"), "{from}");
+        assert!(!b_invite.headers.contains(&HeaderName::Identity));
+        let stir = stack.stir().unwrap();
+        assert_eq!(stir.metrics.verify_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(stir.metrics.sign_failed.load(Ordering::Relaxed), 1);
+    }
+
+    // ── QA: STIR/SHAKEN daemon paths (verified, parked+CANCEL, failover) ──
+
+    const QA_X5U: &str = "https://cert.example.com/a.pem";
+    const QA_ORIG: &str = "+12025550100";
+
+    struct QaStir {
+        stack: SipStack,
+        files: crate::stir::test_support::StiFiles,
+        source: Arc<crate::stir::test_support::FakeSource>,
+        cdr: Arc<uc_cdr::CdrEmitter>,
+    }
+
+    /// CDR-enabled trunk stack with a STIR service whose x5u fetch is served
+    /// by a [`crate::stir::test_support::FakeSource`] returning the real
+    /// test end-entity certificate after `fetch_delay_ms`.
+    async fn qa_stir_stack(
+        policy: sbc_config::StirFailurePolicy,
+        fetch_delay_ms: u64,
+        fetch_timeout_ms: u64,
+        t2_sign: bool,
+        manip_pai: bool,
+    ) -> QaStir {
+        qa_stir_stack_with(
+            policy,
+            fetch_delay_ms,
+            fetch_timeout_ms,
+            t2_sign,
+            manip_pai,
+            |_| {},
+        )
+        .await
+    }
+
+    /// [`qa_stir_stack`] with a final tweak of the STIR config.
+    async fn qa_stir_stack_with(
+        policy: sbc_config::StirFailurePolicy,
+        fetch_delay_ms: u64,
+        fetch_timeout_ms: u64,
+        t2_sign: bool,
+        manip_pai: bool,
+        tweak: impl FnOnce(&mut sbc_config::SbcConfig),
+    ) -> QaStir {
+        let (mut stack, cdr) = cdr_stack().await;
+        if manip_pai {
+            stack.init_manipulator_from_config(&sbc_config::HeaderManipulationConfig {
+                global_rules: vec![sbc_config::ManipulationRuleConfig {
+                    name: "qa-pai".into(),
+                    direction: "outbound".into(),
+                    action: "set".into(),
+                    header: "P-Asserted-Identity".into(),
+                    value: format!("<sip:{QA_ORIG}@sbc.test;user=phone>"),
+                }],
+                trunk_rules: vec![],
+            });
+        }
+        let files = crate::stir::test_support::sti_files();
+        let mut c = sbc_config::SbcConfig::default();
+        let ss = &mut c.stir_shaken;
+        ss.signing_enabled = true;
+        ss.signing.private_key_path = Some(files.key.clone());
+        ss.signing.certificate_path = Some(files.cert.clone());
+        ss.signing.certificate_url = Some(QA_X5U.into());
+        ss.verification_enabled = true;
+        ss.verification.trust_anchors_path = Some(files.anchors.clone());
+        ss.verification.failure_policy = policy;
+        ss.verification.cert_fetch_timeout_ms = fetch_timeout_ms;
+        let trunk = |id: &str, host: &str, stir| sbc_config::TrunkConfigSchema {
+            id: id.into(),
+            host: host.into(),
+            stir_shaken: stir,
+            ..Default::default()
+        };
+        c.trunk_groups.push(sbc_config::TrunkGroupConfig {
+            id: "carriers".into(),
+            name: String::new(),
+            strategy: "priority".into(),
+            trunks: vec![
+                trunk(
+                    "t1",
+                    "127.0.0.2",
+                    sbc_config::TrunkStirConfig {
+                        sign: true,
+                        ..Default::default()
+                    },
+                ),
+                trunk(
+                    "t2",
+                    "127.0.0.3",
+                    sbc_config::TrunkStirConfig {
+                        sign: t2_sign,
+                        ..Default::default()
+                    },
+                ),
+                trunk(
+                    "alice-trunk",
+                    "192.168.1.1",
+                    sbc_config::TrunkStirConfig {
+                        verify: true,
+                        strip_inbound_identity: true,
+                        ..Default::default()
+                    },
+                ),
+            ],
+            zone: None,
+        });
+        tweak(&mut c);
+        let source = Arc::new(crate::stir::test_support::FakeSource {
+            body: std::fs::read_to_string(&files.cert).unwrap(),
+            delay: std::time::Duration::from_millis(fetch_delay_ms),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let svc = crate::stir::test_support::service_with_source(
+            &c,
+            Arc::clone(&source) as Arc<dyn uc_sti::fetch::CertSource>,
+        );
+        stack.set_stir(Arc::new(svc));
+        QaStir {
+            stack,
+            files,
+            source,
+            cdr,
+        }
+    }
+
+    /// A real ES256 Identity for orig=QA_ORIG, dest=DIALED, signed by the
+    /// test STI key (chains to the configured anchors).
+    fn qa_identity(files: &crate::stir::test_support::StiFiles, iat_offset: i64) -> String {
+        let now = uc_sti::cache::unix_now();
+        let signer =
+            uc_sti::signer::FileSigner::load(&files.key, &files.cert, QA_X5U, now).unwrap();
+        let iat = u64::try_from(i64::try_from(now).unwrap() + iat_offset).unwrap();
+        uc_sti::sign_identity(
+            &signer,
+            QA_X5U,
+            proto_stir_shaken::Attestation::Full,
+            proto_stir_shaken::canonicalize_tn(QA_ORIG).unwrap(),
+            proto_stir_shaken::canonicalize_tn(DIALED).unwrap(),
+            iat,
+        )
+        .unwrap()
+    }
+
+    fn qa_invite(call_id: &str, identity: Option<&str>) -> Bytes {
+        let raw = invite_with_identity(call_id, identity);
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        Bytes::from(text.replacen(
+            "Contact:",
+            &format!("P-Asserted-Identity: <sip:{QA_ORIG}@example.com;user=phone>\r\nContact:"),
+            1,
+        ))
+    }
+
+    /// Verified-passes path end to end in the daemon: cache miss → fetch →
+    /// chain to anchors → ES256 verify → verstat Passed on the B-leg, VPS
+    /// status VerifiedA, CDR v2 fields; a second call hits the cache.
+    #[tokio::test]
+    async fn qa_stir_valid_identity_passes_and_records_cdr() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Reject, 0, 1000, false, false).await;
+        let id = qa_identity(&q.files, 0);
+        let results = flatten(
+            q.stack
+                .process_message(&qa_invite("qa-pass@test", Some(&id)), alice(), None)
+                .await,
+        );
+        assert!(response_status(&results).is_none(), "not rejected");
+        let (b_invite, dest) = forwarded(&results, &Method::Invite).expect("forwarded");
+        assert_eq!(dest, t1());
+        // t1 signs, so the caller's PAI is on the B-leg and carries verstat.
+        let pai = b_invite
+            .headers
+            .get_value(&HeaderName::PAssertedIdentity)
+            .unwrap();
+        assert!(pai.contains(";verstat=TN-Validation-Passed>"), "{pai}");
+        let stir = q.stack.stir().unwrap();
+        assert_eq!(stir.metrics.verify_passed.load(Ordering::Relaxed), 1);
+        assert_eq!(stir.metrics.parked.load(Ordering::Relaxed), 0);
+        assert_eq!(q.source.calls.load(Ordering::SeqCst), 1);
+
+        q.stack
+            .process_message(
+                &caller_request("CANCEL", DIALED, "qa-pass@test", 1, None, None),
+                alice(),
+                None,
+            )
+            .await;
+        let r = one_cdr(&q.cdr);
+        assert_eq!(
+            r.stir_verstat,
+            Some(uc_cdr::record::Verstat::TnValidationPassed)
+        );
+        assert_eq!(
+            r.stir_inbound_attestation,
+            Some(uc_cdr::record::Attestation::A)
+        );
+        assert_eq!(r.stir_x5u_host.as_deref(), Some("cert.example.com"));
+        assert_eq!(r.stir_verify_reason, None);
+
+        // Second call: cache hit, no new fetch.
+        let id2 = qa_identity(&q.files, 0);
+        let results = flatten(
+            q.stack
+                .process_message(&qa_invite("qa-pass2@test", Some(&id2)), alice(), None)
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Invite).is_some());
+        assert_eq!(q.source.calls.load(Ordering::SeqCst), 1, "cache hit");
+        assert_eq!(stir.metrics.verify_passed.load(Ordering::Relaxed), 2);
+    }
+
+    /// Valid signature but stale iat → 438 under reject (RFC 8224 §6.2).
+    #[tokio::test]
+    async fn qa_stir_stale_iat_rejected_403_stale_date() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Reject, 0, 1000, false, false).await;
+        let id = qa_identity(&q.files, -3600);
+        let results = flatten(
+            q.stack
+                .process_message(&qa_invite("qa-stale@test", Some(&id)), alice(), None)
+                .await,
+        );
+        // RFC 8224 §6.2.2: stale iat is 403 "Stale Date", not 438.
+        let (code, reason) = response_status(&results).expect("rejected");
+        assert_eq!(code, 403);
+        let reason = reason.unwrap();
+        assert!(reason.contains("cause=403"), "{reason}");
+        assert!(reason.contains("Stale Date"), "{reason}");
+        let phrase = results.iter().find_map(|r| match r {
+            ProcessResult::Response {
+                message: SipMessage::Response(resp),
+                ..
+            } if resp.status.code() == 403 => resp.reason.clone(),
+            _ => None,
+        });
+        assert_eq!(phrase.as_deref(), Some("Stale Date"));
+        assert!(forwarded(&results, &Method::Invite).is_none());
+        assert_all_released(&q.stack).await;
+    }
+
+    /// Valid token whose dest does not match the R-URI → 438 (dest binding).
+    #[tokio::test]
+    async fn qa_stir_dest_mismatch_rejected() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Reject, 0, 1000, false, false).await;
+        let id = qa_identity(&q.files, 0);
+        let raw = String::from_utf8_lossy(&qa_invite("qa-dest@test", Some(&id))).into_owned();
+        let raw = raw.replace("+15551234567", "+15559990000");
+        let results = flatten(
+            q.stack
+                .process_message(&Bytes::from(raw), alice(), None)
+                .await,
+        );
+        let (code, _) = response_status(&results).expect("rejected");
+        assert_eq!(code, 438);
+        assert_all_released(&q.stack).await;
+    }
+
+    /// Fetch slower than cert_fetch_timeout_ms → 436 cert-fetch-timeout under
+    /// reject, parked gauge returns to 0, and the cache still fills.
+    #[tokio::test]
+    async fn qa_stir_fetch_timeout_reject_436_then_cache_fills() {
+        let q = qa_stir_stack(
+            sbc_config::StirFailurePolicy::Reject,
+            300,
+            100,
+            false,
+            false,
+        )
+        .await;
+        let id = qa_identity(&q.files, 0);
+        let results = flatten(
+            q.stack
+                .process_message(&qa_invite("qa-to@test", Some(&id)), alice(), None)
+                .await,
+        );
+        let (code, reason) = response_status(&results).expect("rejected");
+        assert_eq!(code, 436, "{reason:?}");
+        let stir = q.stack.stir().unwrap();
+        assert_eq!(stir.metrics.parked.load(Ordering::Relaxed), 0);
+        assert_all_released(&q.stack).await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(stir.cert_cache_entries(), 1, "fetch outlived the caller");
+    }
+
+    /// CANCEL arrives while the INVITE is parked on a cert fetch. The caller
+    /// cancelled, so the B-leg INVITE must not be sent (or, if sent, the
+    /// call must be torn down), and nothing may leak.
+    #[tokio::test]
+    async fn qa_stir_cancel_while_cert_fetch_pending() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Mark, 300, 1000, false, false).await;
+        let id = qa_identity(&q.files, 0);
+        let invite = qa_invite("qa-cancel@test", Some(&id));
+        let cancel = caller_request("CANCEL", DIALED, "qa-cancel@test", 1, None, None);
+        let (inv_res, cancel_res) =
+            tokio::join!(q.stack.process_message(&invite, alice(), None), async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                q.stack.process_message(&cancel, alice(), None).await
+            });
+        let inv_res = flatten(inv_res);
+        let cancel_res = flatten(cancel_res);
+        let stir = q.stack.stir().unwrap();
+        assert_eq!(stir.metrics.parked.load(Ordering::Relaxed), 0);
+        let cancel_code = cancel_res.iter().find_map(|r| match r {
+            ProcessResult::Response {
+                message: SipMessage::Response(resp),
+                ..
+            } => Some(resp.status.code()),
+            _ => None,
+        });
+        let b_invite = forwarded(&inv_res, &Method::Invite).map(|(r, _)| r.clone());
+        // Observed behaviour: CANCEL is serialised behind the parked INVITE,
+        // so the B-leg INVITE goes out and is immediately CANCELled. Accept
+        // that, but require the B-leg CANCEL to match the B-leg INVITE.
+        if let Some(b_invite) = b_invite {
+            let (b_cancel, dest) = forwarded(&cancel_res, &Method::Cancel).unwrap_or_else(|| {
+                panic!("B-leg INVITE sent but never CANCELled ({cancel_code:?})")
+            });
+            assert_eq!(dest, t1());
+            assert_eq!(b_cancel.headers.call_id(), b_invite.headers.call_id());
+            assert_eq!(b_cancel.headers.via_branch(), b_invite.headers.via_branch());
+        }
+        assert!(responded(&cancel_res, 487).is_some() || responded(&inv_res, 487).is_some());
+        assert_all_released(&q.stack).await;
+    }
+
+    /// RFC 8224 §6.2.2 at the daemon: malformed Identity values under
+    /// `reject` are refused with 436/437/438 + Reason, never forwarded.
+    #[tokio::test]
+    async fn qa_stir_malformed_identity_table() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Reject, 0, 500, false, false).await;
+        let good = qa_identity(&q.files, 0);
+        let tok = good.split(';').next().unwrap().to_owned();
+        let (h, rest) = tok.split_once('.').unwrap();
+        let (p, sig) = rest.split_once('.').unwrap();
+        let cases: Vec<(&str, String, &[u16])> = vec![
+            ("no info", tok.clone(), &[436]),
+            (
+                "http info",
+                format!("{tok};info=<http://cert.example.com/a.pem>"),
+                &[436],
+            ),
+            (
+                "alg none",
+                format!("{tok};info=<{QA_X5U}>;alg=none"),
+                &[437, 438],
+            ),
+            (
+                "alg ES384",
+                format!("{tok};info=<{QA_X5U}>;alg=ES384;ppt=\"shaken\""),
+                &[437, 438],
+            ),
+            (
+                "empty sig",
+                format!("{h}.{p}.;info=<{QA_X5U}>;ppt=\"shaken\""),
+                &[438],
+            ),
+            (
+                "tampered sig",
+                // Flip the last char to a different valid one (it ends in
+                // 'A' about 1 in 16 runs, which would not tamper).
+                format!(
+                    "{h}.{p}.{}{};info=<{QA_X5U}>",
+                    &sig[..sig.len() - 1],
+                    if sig.ends_with('A') { 'Q' } else { 'A' }
+                ),
+                &[438],
+            ),
+            ("two parts", format!("{h}.{p};info=<{QA_X5U}>"), &[438]),
+            (
+                "oversized",
+                format!("{};info=<{QA_X5U}>", "a".repeat(6000)),
+                &[438],
+            ),
+            (
+                "info mismatch",
+                format!("{tok};info=<https://other.example.com/a.pem>"),
+                &[436, 438],
+            ),
+            ("garbage", "%%%;;;<<>>".to_owned(), &[436, 438]),
+        ];
+        for (i, (name, value, codes)) in cases.iter().enumerate() {
+            let cid = format!("qa-mal-{i}@test");
+            let results = flatten(
+                q.stack
+                    .process_message(&qa_invite(&cid, Some(value)), alice(), None)
+                    .await,
+            );
+            let got = response_status(&results);
+            let (code, reason) = got
+                .clone()
+                .unwrap_or_else(|| panic!("{name}: not rejected"));
+            assert!(codes.contains(&code), "{name}: got {code}, want {codes:?}");
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains(&format!("cause={code}"))),
+                "{name}: Reason {reason:?}"
+            );
+            assert!(forwarded(&results, &Method::Invite).is_none(), "{name}");
+        }
+        assert_all_released(&q.stack).await;
+    }
+
+    /// Duplicate Identity headers: one valid, one garbage. Must not crash;
+    /// verification uses the SHAKEN one or fails, but never forwards an
+    /// inbound Identity on an untrusted (strip) trunk.
+    #[tokio::test]
+    async fn qa_stir_duplicate_identity_headers() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Mark, 0, 1000, false, false).await;
+        let good = qa_identity(&q.files, 0);
+        let both = format!("{good}\r\nIdentity: junk.junk.junk;info=<{QA_X5U}>");
+        let results = flatten(
+            q.stack
+                .process_message(&qa_invite("qa-dup@test", Some(&both)), alice(), None)
+                .await,
+        );
+        let (b, _) = forwarded(&results, &Method::Invite).expect("mark continues");
+        // Only the SBC's own signature (t1 signs), never an inbound value.
+        let ids: Vec<&str> = b
+            .headers
+            .get_all(&HeaderName::Identity)
+            .map(|h| h.value.as_str())
+            .collect();
+        assert!(ids.len() <= 1, "{ids:?}");
+        assert!(
+            ids.iter().all(|v| *v != good && !v.contains("junk")),
+            "{ids:?}"
+        );
+        let pai = b.headers.get_value(&HeaderName::PAssertedIdentity).unwrap();
+        assert!(pai.contains("verstat=TN-Validation-"), "{pai}");
+    }
+
+    /// Outbound signing on t1 (sign=true), then 503 → failover to t2 with
+    /// sign=false. The retry must not carry t1's Identity.
+    #[tokio::test]
+    async fn qa_stir_failover_to_unsigned_trunk_drops_identity() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Mark, 0, 500, false, true).await;
+        let results = flatten(
+            q.stack
+                .process_message(&qa_invite("qa-fo@test", None), alice(), None)
+                .await,
+        );
+        let (first, dest) = forwarded(&results, &Method::Invite).expect("INVITE to t1");
+        assert_eq!(dest, t1());
+        assert!(first.headers.contains(&HeaderName::Identity), "t1 signed");
+        let first = first.clone();
+        let results = flatten(
+            q.stack
+                .process_message(&response_to(&first, 503, Some("t1tag"), None), t1(), None)
+                .await,
+        );
+        let (retry, dest) = forwarded(&results, &Method::Invite).expect("failover");
+        assert_eq!(dest, t2());
+        assert!(
+            !retry.headers.contains(&HeaderName::Identity),
+            "t2 has sign=false but the failover INVITE carries t1's Identity"
+        );
+        // The QA stack's manipulation rule sets this PAI on every attempt.
+        assert!(retry.headers.contains(&HeaderName::PAssertedIdentity));
+    }
+
+    /// Failover re-signs for the next trunk: a new token (fresh iat, new
+    /// ES256 signature), not the first trunk's Identity re-sent.
+    #[tokio::test]
+    async fn qa_stir_failover_resigns_with_fresh_iat() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Mark, 0, 500, true, false).await;
+        let results = flatten(
+            q.stack
+                .process_message(&qa_invite("qa-fo3@test", None), alice(), None)
+                .await,
+        );
+        let (first, _) = forwarded(&results, &Method::Invite).expect("INVITE to t1");
+        let first = first.clone();
+        let first_id = first
+            .headers
+            .get_value(&HeaderName::Identity)
+            .expect("t1 signed")
+            .to_owned();
+        let v = proto_stir_shaken::Verifier::default();
+        let first_iat = v
+            .prepare([first_id.as_str()])
+            .unwrap()
+            .unwrap()
+            .passport
+            .claims
+            .iat;
+        let results = flatten(
+            q.stack
+                .process_message(&response_to(&first, 503, Some("t1tag"), None), t1(), None)
+                .await,
+        );
+        let (retry, dest) = forwarded(&results, &Method::Invite).expect("failover");
+        assert_eq!(dest, t2());
+        assert_eq!(retry.headers.get_all(&HeaderName::Identity).count(), 1);
+        let retry_id = retry.headers.get_value(&HeaderName::Identity).unwrap();
+        assert_ne!(retry_id, first_id, "re-signed, not re-sent");
+        let p = v.prepare([retry_id]).unwrap().unwrap();
+        assert!(p.passport.claims.iat >= first_iat);
+        assert!(uc_sti::cache::unix_now().saturating_sub(p.passport.claims.iat) < 5);
+        assert_eq!(p.passport.claims.orig.as_str(), "12025550100");
+        // RFC-002: the re-signed retry's Date matches its fresh iat.
+        let want =
+            chrono::DateTime::from_timestamp(i64::try_from(p.passport.claims.iat).unwrap(), 0)
+                .unwrap()
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string();
+        assert_eq!(retry.headers.get_all(&HeaderName::Date).count(), 1);
+        assert_eq!(
+            retry.headers.get_value(&HeaderName::Date),
+            Some(want.as_str())
+        );
+        assert_eq!(
+            retry
+                .headers
+                .get_all(&HeaderName::PAssertedIdentity)
+                .count(),
+            1
+        );
+        let stir = q.stack.stir().unwrap();
+        assert_eq!(stir.metrics.sign_ok.load(Ordering::Relaxed), 2);
+    }
+
+    /// Registered-endpoint INVITE from `src` with `from_user` (and an
+    /// optional endpoint-supplied PAI) to DIALED.
+    fn endpoint_invite(
+        call_id: &str,
+        src: SbcSocketAddr,
+        from_user: &str,
+        pai: Option<&str>,
+    ) -> Bytes {
+        let pai = pai.map_or_else(String::new, |p| format!("P-Asserted-Identity: {p}\r\n"));
+        Bytes::from(format!(
+            "INVITE sip:{DIALED}@sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {src};branch=z9hG4bK-{call_id}\r\n\
+             From: <sip:{from_user}@sbc.local>;tag=e-{call_id}\r\n\
+             To: <sip:{DIALED}@sbc.local>\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 1 INVITE\r\n\
+             {pai}Contact: <sip:{from_user}@{src}>\r\n\
+             Content-Type: application/sdp\r\n\
+             Content-Length: {}\r\n\r\n{ALICE_SDP}",
+            ALICE_SDP.len()
+        ))
+    }
+
+    /// Attestation of the forwarded INVITE's Identity, if signed.
+    fn forwarded_attest(
+        results: &[ProcessResult],
+    ) -> (Option<proto_stir_shaken::Attestation>, Option<String>) {
+        let Some((b, _)) = forwarded(results, &Method::Invite) else {
+            return (None, None);
+        };
+        let attest = b.headers.get_value(&HeaderName::Identity).map(|id| {
+            let p = proto_stir_shaken::Verifier::default()
+                .prepare([id])
+                .unwrap()
+                .unwrap();
+            (
+                p.passport.claims.attest,
+                p.passport.claims.orig.as_str().to_owned(),
+            )
+        });
+        (attest.as_ref().map(|a| a.0), attest.map(|a| a.1))
+    }
+
+    /// Sends an endpoint INVITE and flattens the results.
+    async fn send(
+        stack: &SipStack,
+        call_id: &str,
+        src: SbcSocketAddr,
+        from: &str,
+        pai: Option<&str>,
+    ) -> Vec<ProcessResult> {
+        send_on(stack, call_id, src, from, pai, AddrTransport::Tcp).await
+    }
+
+    /// [`send`] over `transport`.
+    async fn send_on(
+        stack: &SipStack,
+        call_id: &str,
+        src: SbcSocketAddr,
+        from: &str,
+        pai: Option<&str>,
+        transport: AddrTransport,
+    ) -> Vec<ProcessResult> {
+        flatten(
+            stack
+                .process_message_on(
+                    &endpoint_invite(call_id, src, from, pai),
+                    src,
+                    None,
+                    transport,
+                )
+                .await,
+        )
+    }
+
+    /// SEC-001: an endpoint is "authenticated" only when its INVITE is bound
+    /// to a registration from the same source address, and only the number
+    /// provisioned for that AOR is attested A. A registered user presenting
+    /// another owned number, an unbound port, or its own PAI gets no A.
+    #[tokio::test]
+    async fn sec001_registered_user_other_owned_number_not_a() {
+        let mut q = qa_stir_stack_with(
+            sbc_config::StirFailurePolicy::Mark,
+            0,
+            500,
+            false,
+            false,
+            |c| c.stir_shaken.attestation.owned_numbers = vec!["+1202555*".into()],
+        )
+        .await;
+        q.stack.config.require_auth = true;
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 7), 5060);
+        for (aor, user) in [
+            ("sip:+12025550100@sbc.local", "+12025550100"),
+            ("sip:bob@sbc.local", "bob"),
+        ] {
+            q.stack
+                .location_service
+                .write()
+                .await
+                .add_binding(proto_registrar::Binding::new(
+                    aor,
+                    format!("sip:{user}@198.51.100.7:5060;transport=tcp"),
+                    "reg@test",
+                    1,
+                ))
+                .unwrap();
+            q.stack.index_stir_flow(aor, src, AddrTransport::Tcp).await;
+        }
+        q.stack.add_did_mapping("+12025550142", "bob").await;
+
+        // Own AOR number: A.
+        let (a, orig) =
+            forwarded_attest(&send(&q.stack, "sec1-own@test", src, "+12025550100", None).await);
+        assert_eq!(a, Some(proto_stir_shaken::Attestation::Full));
+        assert_eq!(orig.as_deref(), Some("12025550100"));
+
+        // Another owned number from the same registered endpoint: never A
+        // (the number is not asserted or signed at all).
+        let r = send(&q.stack, "sec1-other@test", src, "+12025550199", None).await;
+        let (a, orig) = forwarded_attest(&r);
+        assert_ne!(a, Some(proto_stir_shaken::Attestation::Full));
+        assert_ne!(orig.as_deref(), Some("12025550199"));
+        if let Some((b, _)) = forwarded(&r, &Method::Invite) {
+            assert!(
+                b.headers
+                    .get_all(&HeaderName::PAssertedIdentity)
+                    .all(|h| !h.value.contains("12025550199"))
+            );
+        }
+
+        // Endpoint-supplied PAI is ignored: orig stays the AOR's number.
+        let (a, orig) = forwarded_attest(
+            &send(
+                &q.stack,
+                "sec1-pai@test",
+                src,
+                "+12025550100",
+                Some("<sip:+12025550199@sbc.local;user=phone>"),
+            )
+            .await,
+        );
+        assert_eq!(a, Some(proto_stir_shaken::Attestation::Full));
+        assert_eq!(orig.as_deref(), Some("12025550100"));
+
+        // Same IP, different port: not bound to the registration, no A.
+        let other_port = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 7), 5070);
+        let (a, _) = forwarded_attest(
+            &send(&q.stack, "sec1-port@test", other_port, "+12025550100", None).await,
+        );
+        assert_ne!(a, Some(proto_stir_shaken::Attestation::Full));
+
+        // Extension AOR: the DID provisioned for it is asserted and A.
+        let (a, orig) = forwarded_attest(&send(&q.stack, "sec1-ext@test", src, "bob", None).await);
+        assert_eq!(a, Some(proto_stir_shaken::Attestation::Full));
+        assert_eq!(orig.as_deref(), Some("12025550142"));
+
+        // Bound over TCP, INVITE over UDP from the same address: a different
+        // flow, so unbound.
+        let (a, _) = forwarded_attest(
+            &send_on(
+                &q.stack,
+                "sec1-flow@test",
+                src,
+                "+12025550100",
+                None,
+                AddrTransport::Udp,
+            )
+            .await,
+        );
+        assert_ne!(a, Some(proto_stir_shaken::Attestation::Full));
+
+        // REGISTER auth off: nobody is "authenticated", so no A.
+        q.stack.config.require_auth = false;
+        let (a, _) =
+            forwarded_attest(&send(&q.stack, "sec1-noauth@test", src, "+12025550100", None).await);
+        assert_ne!(a, Some(proto_stir_shaken::Attestation::Full));
+    }
+
+    /// SEC-008/SEC-009: the binding comes from the flow index, re-checked
+    /// against the live location binding. A location binding the index never
+    /// saw, or an index entry whose binding is gone, is unbound; a UDP-bound
+    /// caller is authenticated (its own TN is asserted) but capped at B.
+    #[tokio::test]
+    async fn sec009_udp_flow_capped_at_b_and_index_rechecked() {
+        let mut q = qa_stir_stack_with(
+            sbc_config::StirFailurePolicy::Mark,
+            0,
+            500,
+            false,
+            false,
+            |c| c.stir_shaken.attestation.owned_numbers = vec!["+1202555*".into()],
+        )
+        .await;
+        q.stack.config.require_auth = true;
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 8), 5060);
+        let aor = "sip:+12025550100@sbc.local";
+        let contact = "sip:+12025550100@198.51.100.8:5060;transport=udp";
+        q.stack
+            .location_service
+            .write()
+            .await
+            .add_binding(proto_registrar::Binding::new(aor, contact, "reg@test", 1))
+            .unwrap();
+
+        // In the location service but never indexed (no REGISTER seen on
+        // this flow): unbound, so not signed with this number.
+        let udp = |id: &'static str| {
+            let stack = &q.stack;
+            async move { send_on(stack, id, src, "+12025550100", None, AddrTransport::Udp).await }
+        };
+        let (a, _) = forwarded_attest(&udp("sec9-unindexed@test").await);
+        assert_eq!(a, None);
+
+        // Indexed UDP flow: B with the caller's own TN, never A.
+        q.stack.index_stir_flow(aor, src, AddrTransport::Udp).await;
+        let (a, orig) = forwarded_attest(&udp("sec9-udp@test").await);
+        assert_eq!(a, Some(proto_stir_shaken::Attestation::Partial));
+        assert_eq!(orig.as_deref(), Some("12025550100"));
+
+        // The binding is removed (expiry, API delete): the stale index entry
+        // is not trusted.
+        q.stack.delete_registration(aor, contact).await.unwrap();
+        let (a, _) = forwarded_attest(&udp("sec9-stale@test").await);
+        assert_eq!(a, None);
+    }
+
+    /// Item 2: with a cluster `AsyncLocationService` attached the REGISTER
+    /// path still writes the in-process `location_service` and the flow
+    /// index, so the STIR binding sees cluster-mode registrations (signing
+    /// is not silently disabled).
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn stir_binding_sees_registrations_with_async_location_service() {
+        let storage = Arc::new(
+            uc_storage::StorageManager::new(uc_storage::StorageConfig::in_memory())
+                .await
+                .unwrap(),
+        );
+        let stack = SipStack::new_with_location_service(
+            SipStackConfig::default(),
+            Arc::new(AsyncLocationService::new(storage)),
+        );
+        assert!(stack.has_async_location_service());
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 10), 40_001);
+        let reg = Bytes::from(format!(
+            "REGISTER sip:sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/TLS {src};branch=z9hG4bK-c1\r\n\
+             From: <sip:+12025550100@sbc.local>;tag=r\r\n\
+             To: <sip:+12025550100@sbc.local>\r\n\
+             Call-ID: reg-cluster@test\r\n\
+             CSeq: 1 REGISTER\r\n\
+             Contact: <sip:+12025550100@10.0.0.6:5061;transport=tls>\r\n\
+             Expires: 300\r\n\
+             Content-Length: 0\r\n\r\n"
+        ));
+        let _ = stack
+            .process_message_on(&reg, src, None, AddrTransport::Tls)
+            .await;
+        assert_eq!(
+            stack
+                .stir_endpoint_binding(src, AddrTransport::Tls, "sip:+12025550100@sbc.local")
+                .await,
+            Some(Some("+12025550100".to_owned()))
+        );
+    }
+
+    /// Item 2 / SEC-008: a real REGISTER (UDP and TCP) feeds the STIR flow
+    /// index from the received source and transport, on the same
+    /// `location_service` the binding check reads; de-registration removes
+    /// it.
+    #[tokio::test]
+    async fn register_indexes_received_flow() {
+        let stack = SipStack::new(SipStackConfig::default());
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 9), 40_000);
+        let reg = |expires: u32| {
+            Bytes::from(format!(
+                "REGISTER sip:sbc.local SIP/2.0\r\n\
+                 Via: SIP/2.0/TCP {src};branch=z9hG4bK-r{expires}\r\n\
+                 From: <sip:alice@sbc.local>;tag=r\r\n\
+                 To: <sip:alice@sbc.local>\r\n\
+                 Call-ID: reg-flow@test\r\n\
+                 CSeq: {} REGISTER\r\n\
+                 Contact: <sip:alice@10.0.0.5:5060;transport=tcp>\r\n\
+                 Expires: {expires}\r\n\
+                 Content-Length: 0\r\n\r\n",
+                if expires == 0 { 2 } else { 1 }
+            ))
+        };
+        let _ = stack
+            .process_message_on(&reg(300), src, None, AddrTransport::Tcp)
+            .await;
+        let key = crate::stir_binding::flow_key(src.ip(), src.port(), AddrTransport::Tcp);
+        assert_eq!(
+            stack.stir_flows.read().await.get(&key),
+            Some(&["sip:alice@sbc.local".to_owned()][..])
+        );
+        // The declared (private) Contact is not the flow: the latched
+        // binding is the received source, which the check accepts.
+        assert!(SipStack::flow_has_binding(
+            &*stack.location_service.read().await,
+            "sip:alice@sbc.local",
+            &key
+        ));
+        let other = crate::stir_binding::flow_key(src.ip(), src.port(), AddrTransport::Udp);
+        assert!(stack.stir_flows.read().await.get(&other).is_none());
+        let _ = stack
+            .process_message_on(&reg(0), src, None, AddrTransport::Tcp)
+            .await;
+        assert!(stack.stir_flows.read().await.get(&key).is_none());
+    }
+
+    /// NIST-009: verification failures are audited once per (trunk, reason)
+    /// per window with a count, and the remainder is flushed.
+    #[tokio::test]
+    async fn stir_verify_failure_audit_is_aggregated() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Mark, 0, 500, false, false).await;
+        let cap = uc_audit::capture::start();
+        for i in 0..3 {
+            let _ = q
+                .stack
+                .process_message(
+                    &qa_invite(&format!("agg-{i}@test"), Some("garbage")),
+                    alice(),
+                    None,
+                )
+                .await;
+        }
+        let counts = |events: &[uc_audit::AuditEvent]| -> Vec<u64> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    uc_audit::AuditEvent::StirVerifyFailure(f) => {
+                        assert_eq!(f.source_trunk, "alice-trunk");
+                        Some(f.count)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(counts(&cap.events()), vec![1]);
+        q.stack
+            .stir()
+            .unwrap()
+            .flush_audit(std::time::Instant::now() + std::time::Duration::from_secs(11));
+        assert_eq!(counts(&cap.events()), vec![1, 2]);
+    }
+
+    /// User decision (POA&M-33): on a sign=true trunk the caller's number
+    /// from a trust-domain peer's PAI goes into the B-leg PAI, is signed as
+    /// `orig`, and carries verstat; From stays the SBC URI.
+    #[tokio::test]
+    async fn qa_stir_caller_pai_propagated_and_signed() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Reject, 0, 1000, false, false).await;
+        let id = qa_identity(&q.files, 0);
+        let results = flatten(
+            q.stack
+                .process_message(&qa_invite("qa-pai@test", Some(&id)), alice(), None)
+                .await,
+        );
+        let (b, dest) = forwarded(&results, &Method::Invite).expect("forwarded");
+        assert_eq!(dest, t1());
+        let pai = b.headers.get_value(&HeaderName::PAssertedIdentity).unwrap();
+        assert!(pai.starts_with(&format!("<sip:{QA_ORIG}@")), "{pai}");
+        assert!(pai.contains(";verstat=TN-Validation-Passed>"), "{pai}");
+        let from = b.headers.get_value(&HeaderName::From).unwrap();
+        assert!(!from.contains("verstat"), "{from}");
+        assert!(!from.contains(QA_ORIG), "{from}");
+        let ident = b.headers.get_value(&HeaderName::Identity).expect("signed");
+        let p = proto_stir_shaken::Verifier::default()
+            .prepare([ident])
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.passport.claims.orig.as_str(), "12025550100");
+    }
+
+    /// Failover between two sign=true trunks: the retry carries a valid
+    /// Identity whose dest matches the retry's R-URI.
+    #[tokio::test]
+    async fn qa_stir_failover_to_signed_trunk_keeps_valid_identity() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Mark, 0, 500, true, true).await;
+        let results = flatten(
+            q.stack
+                .process_message(&qa_invite("qa-fo2@test", None), alice(), None)
+                .await,
+        );
+        let (first, _) = forwarded(&results, &Method::Invite).expect("INVITE to t1");
+        let first = first.clone();
+        let results = flatten(
+            q.stack
+                .process_message(&response_to(&first, 503, Some("t1tag"), None), t1(), None)
+                .await,
+        );
+        let (retry, _) = forwarded(&results, &Method::Invite).expect("failover");
+        let id = retry
+            .headers
+            .get_value(&HeaderName::Identity)
+            .expect("signed");
+        let p = proto_stir_shaken::Verifier::default()
+            .prepare([id])
+            .unwrap()
+            .unwrap();
+        let ruri_user = retry.uri.user.as_deref().unwrap();
+        assert_eq!(
+            p.passport.claims.dest[0].as_str(),
+            proto_stir_shaken::canonicalize_tn(ruri_user)
+                .unwrap()
+                .as_str()
+        );
     }
 }

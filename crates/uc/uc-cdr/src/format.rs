@@ -41,8 +41,11 @@ pub fn header_json_line(header: &FileHeader) -> CdrResult<String> {
     Ok(serde_json::to_string(header)?)
 }
 
-/// Fixed v1 CSV columns, in order. `sequence` is the second column and
+/// Fixed v2 CSV columns, in order. `sequence` is the second column and
 /// `hash` the last so the writer can resume from a file's last row.
+///
+/// v2 inserts the four `stir_*` verification columns after
+/// `failover_takeover` (before the hash pair, which must stay last).
 pub const CSV_COLUMNS: &[&str] = &[
     "schema_version",
     "sequence",
@@ -83,9 +86,16 @@ pub const CSV_COLUMNS: &[&str] = &[
     "emergency",
     "stir_attestation",
     "failover_takeover",
+    "stir_verstat",
+    "stir_verify_reason",
+    "stir_inbound_attestation",
+    "stir_x5u_host",
     "prev_hash",
     "hash",
 ];
+
+/// Number of CSV columns in schema v1 (readers accept both widths).
+pub const CSV_COLUMNS_V1: usize = 41;
 
 /// CSV header row (no trailing newline).
 pub fn csv_header() -> String {
@@ -164,11 +174,7 @@ pub fn to_csv_row(r: &CallRecord) -> CdrResult<String> {
     let mut out = String::with_capacity(512);
     let b_ids = serde_json::to_string(&r.b_call_ids)?;
     let tried = serde_json::to_string(&r.trunks_tried)?;
-    let stir = r.stir_attestation.map(|a| match a {
-        crate::record::Attestation::A => "A",
-        crate::record::Attestation::B => "B",
-        crate::record::Attestation::C => "C",
-    });
+    let stir = r.stir_attestation.map(crate::record::Attestation::as_str);
     let mut first = true;
     let mut sep = |out: &mut String| {
         if !first {
@@ -221,6 +227,17 @@ pub fn to_csv_row(r: &CallRecord) -> CdrResult<String> {
     col!(push_num(r.emergency, &mut out));
     col!(push_opt(stir, &mut out));
     col!(push_num(r.failover_takeover, &mut out));
+    col!(push_opt(
+        r.stir_verstat.map(crate::record::Verstat::as_str),
+        &mut out
+    ));
+    col!(push_opt(r.stir_verify_reason.as_deref(), &mut out));
+    col!(push_opt(
+        r.stir_inbound_attestation
+            .map(crate::record::Attestation::as_str),
+        &mut out
+    ));
+    col!(push_opt(r.stir_x5u_host.as_deref(), &mut out));
     col!(out.push_str(&r.prev_hash));
     col!(out.push_str(&r.hash));
     Ok(out)

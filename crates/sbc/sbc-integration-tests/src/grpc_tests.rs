@@ -317,6 +317,7 @@ mod proto_message_tests {
             duration_secs: 60,
             media_mode: "relay".to_string(),
             transport: "UDP".to_string(),
+            verstat: String::new(),
             a_leg: Some(CallLegInfo {
                 local_addr: "192.168.1.1:5060".to_string(),
                 remote_addr: "192.168.1.100:5060".to_string(),
@@ -963,6 +964,7 @@ mod serialization_tests {
             duration_secs: 300,
             media_mode: "relay".to_string(),
             transport: "TLS".to_string(),
+            verstat: String::new(),
             a_leg: None,
             b_leg: None,
             attestation: "A".to_string(),

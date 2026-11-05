@@ -71,8 +71,10 @@ pub use interface::{ResolvedZone, resolve_zones};
 pub use schema::TelemetryConfig;
 pub use schema::{
     DialPlanConfig, DialPlanEntryConfig, HeaderManipulationConfig, ManipulationRuleConfig,
-    RoutingConfig, SbcConfig, SrtpMode, TopologyHidingConfig, TrunkConfigSchema, TrunkGroupConfig,
-    TrunkManipulationRuleConfig, ZoneConfig,
+    RoutingConfig, SbcConfig, SrtpMode, StirAlgorithm, StirAttestation, StirAttestationConfig,
+    StirAttestationRule, StirFailurePolicy, StirKeySource, StirShakenConfig, StirSigningConfig,
+    StirVerificationConfig, TopologyHidingConfig, TrunkConfigSchema, TrunkGroupConfig,
+    TrunkManipulationRuleConfig, TrunkStirConfig, ZoneConfig,
 };
 
 use std::path::Path;

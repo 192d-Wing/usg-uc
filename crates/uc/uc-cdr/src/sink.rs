@@ -650,7 +650,7 @@ fn csv_resume_from(rec: &[String]) -> Option<ResumePoint> {
             clean: true,
         });
     }
-    if rec.len() != format::CSV_COLUMNS.len() {
+    if rec.len() != format::CSV_COLUMNS.len() && rec.len() != format::CSV_COLUMNS_V1 {
         return None;
     }
     let seq: u64 = rec.get(1)?.parse().ok()?;

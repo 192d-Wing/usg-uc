@@ -21,6 +21,13 @@
 //! | Key Exchange | ECDH P-384, P-521 | ECDH P-256, RSA, DH |
 //! | Signatures | ECDSA P-384, P-521 | ECDSA P-256, RSA |
 //!
+//! ### Interop exceptions
+//!
+//! [`interop`] holds algorithms that external standards mandate and CNSA 2.0
+//! forbids (ES256 for STIR/SHAKEN). They are feature-gated
+//! (`stir-shaken-es256`), never re-exported here, and used for caller-identity
+//! signatures only.
+//!
 //! ## NIST 800-53 Rev5 Controls
 //!
 //! This crate implements:
@@ -70,7 +77,10 @@ pub mod ecdsa;
 pub mod error;
 pub mod hash;
 pub mod hkdf;
+pub mod interop;
 pub mod random;
+#[cfg(feature = "stir-shaken-es256")]
+pub mod x509;
 
 pub use error::{CryptoError, CryptoResult};
 

@@ -6,9 +6,9 @@
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **IA-2**: Identification and Authentication (Organizational Users)
 //! - **IA-9**: Service Identification and Authentication
-//! - **AU-2**: Event Logging (verification results)
+//! - **SI-10**: Information Input Validation (strict Identity/PASSporT decode)
+//! - **SC-23**: Session Authenticity (signed `orig`/`dest`/`iat` binding)
 //!
 //! ## RFC Compliance
 //!
@@ -16,10 +16,23 @@
 //! - **RFC 8225**: PASSporT: Personal Assertion Token
 //! - **RFC 8226**: Secure Telephone Identity Credentials
 //!
+//! - **RFC 8588**: PASSporT Extension for SHAKEN
+//! - **ATIS-1000074**: SHAKEN framework (verstat, x5u)
+//!
 //! ## CNSA 2.0 Compliance
 //!
-//! This implementation uses ES384 (ECDSA with P-384 and SHA-384) for
-//! PASSporT signatures, meeting CNSA 2.0 requirements. ES256 is NOT supported.
+//! SHAKEN mandates ES256 (ECDSA P-256 / SHA-256), which CNSA 2.0 does not
+//! permit. This crate contains no cryptography: signing and verification are
+//! injected through [`Signer`] and [`VerifyingKey`]. The ES256 implementation
+//! lives in `uc_crypto::interop::ecdsa_p256` behind the `stir-shaken-es256`
+//! feature (CNSA-EXCEPTION: ATIS-1000074). ES384 is accepted for bilateral,
+//! non-SHAKEN profiles only; `ppt=shaken` with any `alg` other than ES256 is
+//! rejected to prevent algorithm confusion.
+//!
+//! ## Layering
+//!
+//! Pure and synchronous. Certificate fetch, chain validation and caching are
+//! in `uc-sti`.
 //!
 //! ## Attestation Levels
 //!
@@ -46,38 +59,24 @@
 #![allow(clippy::use_self)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic))]
 
+pub mod canon;
 pub mod error;
 pub mod identity;
+pub mod jws;
 pub mod passport;
 pub mod verification;
 
+pub use canon::{TelephoneNumber, canonicalize_tn};
 pub use error::{StirShakenError, StirShakenResult};
-pub use identity::{Identity, IdentityHeader};
-pub use passport::{Attestation, OrigId, PASSporT, PASSporTClaims, PASSporTHeader};
-pub use verification::{VerificationResult, VerificationStatus, Verifier};
-
-/// PASSporT media type.
-pub const PASSPORT_MEDIA_TYPE: &str = "passport";
-
-/// PASSporT algorithm (CNSA 2.0 compliant).
-pub const PASSPORT_ALGORITHM: &str = "ES384";
-
-/// PASSporT type.
-pub const PASSPORT_TYPE: &str = "passport";
+pub use identity::IdentityHeader;
+pub use passport::{
+    Alg, Attestation, DecodedPassport, PASSporT, PPT_DIV, PPT_SHAKEN, PassportClaims,
+    PassportHeader, Signer,
+};
+pub use verification::{
+    CallContext, FailureReason, KeyResolver, PreparedIdentity, TnAuthEntry, TnAuthScope,
+    VerificationResult, VerifiedKey, Verifier, VerifyingKey, Verstat,
+};
 
 /// Identity header name.
 pub const IDENTITY_HEADER: &str = "Identity";
-
-/// Maximum PASSporT age in seconds (default 60).
-pub const MAX_PASSPORT_AGE: u64 = 60;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_constants() {
-        assert_eq!(PASSPORT_ALGORITHM, "ES384");
-        assert_eq!(PASSPORT_TYPE, "passport");
-    }
-}
