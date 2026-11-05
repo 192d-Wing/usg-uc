@@ -7,7 +7,7 @@
 
 > **Status legend.** *Wired (sbc-daemon | sbc-media-core | soft client)* — a shipped binary has a call site for this (the binary is named). *Library-only* — implemented and tested in a `proto-*`/`uc-*` crate, but no shipped binary calls it. *Planned* — not implemented. A row that says only "Full"/"Complete" describes crate-level capability; the wiring column/annotation says what the running SBC actually does.
 
-**Dependency facts behind the wiring labels** (from `Cargo.toml`): `sbc-daemon` depends on proto-sip, proto-transaction, proto-dialog, proto-b2bua, proto-registrar, proto-jwt, proto-rtp, proto-srtp, proto-dtls, proto-stun and `sbc-media-core` — but **not** proto-sdp or proto-stir-shaken. `sbc-media-core` (linked into `sbc-daemon` and `sbc-media`) depends on proto-dtls, proto-rtp, proto-srtp. `client-sip-ua` lists proto-sdp, proto-registrar, proto-stun and proto-turn but has no source references to them. Nothing depends on proto-stir-shaken. The SBC does not run ICE (it anchors media and latches symmetrically). SBC DTLS-SRTP termination is a Go sidecar (`sbc-media-core/src/dtls_sidecar.rs`), not proto-dtls.
+**Dependency facts behind the wiring labels** (from `Cargo.toml`): `sbc-daemon` depends on proto-sip, proto-transaction, proto-dialog, proto-b2bua, proto-registrar, proto-jwt, proto-rtp, proto-srtp, proto-dtls, proto-stun, proto-stir-shaken, `uc-sti` and `sbc-media-core` — but **not** proto-sdp. `sbc-media-core` (linked into `sbc-daemon` and `sbc-media`) depends on proto-dtls, proto-rtp, proto-srtp. `client-sip-ua` lists proto-sdp, proto-registrar, proto-stun and proto-turn but has no source references to them. proto-stir-shaken is used by `sbc-daemon` and `uc-sti`. The SBC does not run ICE (it anchors media and latches symmetrically). SBC DTLS-SRTP termination is a Go sidecar (`sbc-media-core/src/dtls_sidecar.rs`), not proto-dtls.
 
 ---
 
@@ -41,7 +41,7 @@
 | **RFC 6086** | INFO Method | Method enum entry. Library-only — daemon returns 405 |
 | **RFC 6665** | SIP Events (SUBSCRIBE/NOTIFY) | Method enum entries, header support. Library-only — daemon returns 405; client only reads Subscription-State on REFER NOTIFY |
 | **RFC 7118** | WebSocket Transport for SIP | Transport: WS/WSS. Wired (sbc-daemon `transport.ws_listen`, plain WS); WSS planned — the transport does not terminate TLS |
-| **RFC 8224** | STIR Identity | Header name defined. Library-only |
+| **RFC 8224** | STIR Identity | Header name defined; reason phrases 428/436/437/438 in `response.rs` (test `stir_reason_phrases`). Wired (sbc-daemon STIR path, off by default) |
 
 ### Key Files
 - `src/lib.rs` — module exports, max message size
@@ -438,20 +438,25 @@
 
 **Primary Standard:** RFC 8224/8225/8226
 
-**Wiring note:** **Library-only.** No crate in the workspace depends on proto-stir-shaken (workspace member only); sbc-daemon neither signs nor verifies Identity headers.
+**Wiring note:** **Wired (sbc-daemon), off by default.** `sbc-daemon` (`src/stir.rs`, `src/sip_stack.rs`) and `uc-sti` use proto-stir-shaken to sign B-leg INVITEs toward `sign = true` trunks and verify Identity on `verify = true` trunks. The crate itself is pure and synchronous; certificate fetch/cache/anchors/signing key live in `uc-sti`, ES256 and X.509 in `uc-crypto` (`interop::ecdsa_p256`, `x509`).
 
 ### RFCs Referenced
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| **RFC 8224** | Authenticated Identity Management | **Full** — SIP Identity header parsing/generation. **Library-only** |
-| **RFC 8225** | PASSporT | **Full** — JWT-like token, compact form, x5u certificate URL. **Library-only** |
-| **RFC 8226** | Secure Telephone Identity Credentials | Referenced. Library-only |
+| **RFC 8224** | Authenticated Identity Management | **Partial — Wired (sbc-daemon)**. Identity header parse/generate with `info`, `alg`, `ppt` (`identity.rs`; 4 KiB, 16 params); verification service with 428/436/437/438 and 403 Stale Date (`verification.rs` `FailureReason::sip_code`, tests `codes`, `qa_stir_stale_iat_rejected_403_stale_date`); authentication service sets `Date` to match `iat` (`sbc-daemon/src/stir.rs` `sign_outbound`). TN canonicalisation §8.3 strips separators and `+`, but non-E.164 numbers are not converted by local policy (RFC-004, POA&M-44). Verifier accepts `orig` matching PAI or From (RFC-005, POA&M-45). No replay cache (POA&M-43). |
+| **RFC 8225** | PASSporT | **Partial — Wired (sbc-daemon)**. Compact form, deterministic §9 JSON, strict decode (duplicate members, `alg=none`, `crit`, `typ` rejected) (`passport.rs`, tests `sign_decode_roundtrip`, `malformed_cases`, proptests). ES256 only for `ppt=shaken` (CNSA exception POA&M-27); ES384 rejected (POA&M-32). |
+| **RFC 8226** | Secure Telephone Identity Credentials | **Partial — Wired (sbc-daemon)**. TNAuthList extracted and scope-checked for TN/range (`uc-crypto/src/x509.rs`, test `tn_auth_list_parse_and_scope`); SPC scope not checked against TN ownership (POA&M-30); no CRL/OCSP (POA&M-28). |
+| **RFC 8588** | SHAKEN PASSporT extension | **Wired (sbc-daemon)**. `attest` A/B/C and `origid` (required on decode); attestation policy in `uc-sti/src/policy.rs` (test `matrix`). |
+| **RFC 8946** | `div` PASSporT | **Missing.** `ppt=div` is ignored, not verified (test `div_is_ignored`). |
+| ATIS-1000074 | SHAKEN | **Partial — Wired (sbc-daemon)**. `info` must equal `x5u`; `verstat` placed on PAI, else From (`apply_verstat`, test `verstat_rewrite`). |
 
 ### Key Files
-- `src/lib.rs` — attestation levels (A/B/C), RFC listing
-- `src/passport.rs` — PASSporT per RFC 8225
-- `src/identity.rs` — Identity header per RFC 8224, ES384 algorithm
+- `src/canon.rs` — TN canonicalisation (RFC 8224 §8.3)
+- `src/jws.rs` — base64url and compact JWS split (4 KiB cap)
+- `src/passport.rs` — PASSporT per RFC 8225 / RFC 8588
+- `src/identity.rs` — Identity header per RFC 8224
+- `src/verification.rs` — verifier, failure reasons and SIP codes, verstat
 
 ---
 
@@ -464,7 +469,7 @@
 4. **Comprehensive test coverage** — all crates have `#[cfg(test)]` modules exercising standards-specific behavior
 
 ### Wiring Gaps (crate capability not reached by any shipped binary)
-- **proto-sdp**, **proto-turn**, **proto-stir-shaken** — entire crates library-only
+- **proto-sdp**, **proto-turn** — entire crates library-only (proto-stir-shaken is now wired in sbc-daemon)
 - **proto-dialog** — only `refer.rs` reaches a binary (soft client); dialog store, session timer, subscriptions, forking unused
 - **proto-ice** — soft client only (checks, nomination; STUN via settings); the SBC does not run ICE; RFC 7675 consent and §10 keepalives unused
 - **proto-dtls** — soft client only; SBC DTLS termination is the Go sidecar
@@ -569,9 +574,10 @@
 | RFC 7714 | AES-GCM for SRTP | proto-srtp, proto-sdp, proto-dtls | sbc-media-core, soft client |
 | RFC 7840 | Multiple Phone Numbers | proto-dialog | library |
 | RFC 8068 | Pending Additions | proto-dialog | library |
-| RFC 8224 | STIR Identity | proto-sip, proto-stir-shaken | library |
-| RFC 8225 | PASSporT | proto-stir-shaken | library |
-| RFC 8226 | Secure Telephone Identity Credentials | proto-stir-shaken | library |
+| RFC 8224 | STIR Identity | proto-sip, proto-stir-shaken | sbc-daemon (off by default) |
+| RFC 8225 | PASSporT | proto-stir-shaken | sbc-daemon (off by default) |
+| RFC 8226 | Secure Telephone Identity Credentials | proto-stir-shaken, uc-crypto | sbc-daemon (off by default) |
+| RFC 8588 | SHAKEN PASSporT | proto-stir-shaken, uc-sti | sbc-daemon (off by default) |
 | RFC 8445 | ICE | proto-stun, proto-ice | soft client (host candidates); sbc-daemon: library |
 | RFC 8489 | STUN (updated) | proto-stun | sbc-daemon, soft client |
 | RFC 8656 | TURN (updated) | proto-turn | library |

@@ -142,7 +142,7 @@ fn answered_call_content_is_correct_on_disk() {
     assert!(r.media_anchored);
     assert!(r.emergency);
     // Stamped by the writer.
-    assert_eq!(r.schema_version, 1);
+    assert_eq!(r.schema_version, uc_cdr::SCHEMA_VERSION);
     assert_eq!(r.node_id, "qa-node");
     assert_eq!(r.record_id, "qa-node-0");
     assert_eq!(r.hash.len(), 96);
@@ -668,4 +668,39 @@ fn csv_resume_after_row_with_embedded_newline() {
     assert!(e.flush(T));
     let page = e.ring().query(&CdrFilter::default(), None, 10);
     assert_eq!(page.records[0].sequence, 2);
+}
+
+/// QA: STIR v2 fields survive the emitter end to end and the file verifies.
+#[test]
+fn qa_stir_v2_fields_on_disk_and_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = emitter(dir.path(), |_| {});
+    let mut sent = answered();
+    sent.stir_attestation = Some(uc_cdr::record::Attestation::B);
+    sent.stir_verstat = Some(uc_cdr::record::Verstat::TnValidationFailed);
+    sent.stir_verify_reason = Some("bad-signature".into());
+    sent.stir_inbound_attestation = Some(uc_cdr::record::Attestation::A);
+    sent.stir_x5u_host = Some("cert.example.invalid".into());
+    let mut plain = answered();
+    plain.a_call_id = "a-2@10.0.0.1".into();
+    assert!(e.emit(sent.clone()));
+    assert!(e.emit(plain));
+    assert!(e.shutdown(T));
+    let files = cdr_files(dir.path());
+    let got = records(&files[0]);
+    assert_eq!(got[0].stir_verstat, sent.stir_verstat);
+    assert_eq!(got[0].stir_verify_reason, sent.stir_verify_reason);
+    assert_eq!(
+        got[0].stir_inbound_attestation,
+        sent.stir_inbound_attestation
+    );
+    assert_eq!(got[0].stir_x5u_host, sent.stir_x5u_host);
+    assert_eq!(got[1].stir_verstat, None);
+    let raw = std::fs::read_to_string(&files[0]).unwrap();
+    assert!(
+        raw.contains(r#""stir_verstat":"tn-validation-failed""#),
+        "{raw}"
+    );
+    assert_eq!(verify_all(dir.path()), 2);
+    assert!(verify_sidecar(&files[0]).unwrap());
 }

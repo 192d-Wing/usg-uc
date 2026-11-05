@@ -266,6 +266,16 @@ pub struct CdrDraft {
     pub srtp: Option<String>,
     /// Emergency call.
     pub emergency: bool,
+    /// Attestation the B-leg INVITE was signed with.
+    pub stir_attestation: Option<uc_cdr::Attestation>,
+    /// Inbound verification outcome.
+    pub stir_verstat: Option<uc_cdr::Verstat>,
+    /// Inbound verification failure reason token.
+    pub stir_verify_reason: Option<String>,
+    /// Attestation of the verified inbound PASSporT.
+    pub stir_inbound_attestation: Option<uc_cdr::Attestation>,
+    /// Host of the inbound `x5u`.
+    pub stir_x5u_host: Option<String>,
 }
 
 impl CdrDraft {
@@ -357,6 +367,11 @@ impl CdrDraft {
             codec: self.codec,
             srtp: self.srtp,
             emergency: self.emergency,
+            stir_attestation: self.stir_attestation,
+            stir_verstat: self.stir_verstat,
+            stir_verify_reason: self.stir_verify_reason,
+            stir_inbound_attestation: self.stir_inbound_attestation,
+            stir_x5u_host: self.stir_x5u_host,
             ..CallRecord::default()
         };
         r.compute_durations();

@@ -45,8 +45,9 @@ pub use error::{CdrError, CdrResult};
 pub use format::CdrFormat;
 pub use pii::{HmacKey, PiiPolicy};
 pub use record::{
-    Attestation, CallRecord, Direction, Disposition, FileHeader, ReleaseCause, ReleaseSide,
-    SCHEMA_VERSION, Transport, TrunkAttempt, TrunkOutcome,
+    Attestation, CallRecord, Direction, Disposition, FileHeader, MIN_READ_SCHEMA_VERSION,
+    ReleaseCause, ReleaseSide, SCHEMA_VERSION, Transport, TrunkAttempt, TrunkOutcome, Verstat,
+    is_readable_schema,
 };
 pub use ring::{CdrFilter, CdrPage, CdrRing};
 pub use sink::{

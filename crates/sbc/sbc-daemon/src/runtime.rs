@@ -459,6 +459,32 @@ impl Runtime {
             });
         }
 
+        // STIR/SHAKEN: signing key, trust anchors, certificate cache. A
+        // configured-but-unloadable setup refuses startup rather than run
+        // with signing/verification silently off.
+        //
+        // ## NIST 800-53 Rev5: CM-6, SC-12, SC-17
+        let stir = {
+            let cfg = self.config.read().await;
+            crate::stir::StirService::from_config(&cfg).map_err(|reason| {
+                RuntimeError::InitFailed {
+                    component: "stir_shaken".to_string(),
+                    reason,
+                }
+            })?
+        }
+        .map(Arc::new);
+        if let Some(ref s) = stir {
+            if !server.set_stir(Arc::clone(s)) {
+                return Err(RuntimeError::InitFailed {
+                    component: "stir_shaken".to_string(),
+                    reason: "SIP stack already shared; STIR/SHAKEN not attached".to_string(),
+                });
+            }
+            s.spawn_anchor_refresh();
+            s.spawn_audit_flush();
+        }
+
         // Attach the out-of-process media plane if configured
         // (SBC_MEDIA_CONTROLLER_URL). Must run here, while the SipStack Arc is
         // still uniquely held (as set_zone_registry above relies on), and before
@@ -1116,9 +1142,17 @@ impl Runtime {
         let reload_interval = self.reload_check_interval;
 
         let reload_cdr = cdr.clone();
+        let reload_stir = stir.clone();
         let reload_handle = tokio::spawn(async move {
-            Self::config_reload_loop(reload_signal, config_ref, args, reload_interval, reload_cdr)
-                .await;
+            Self::config_reload_loop(
+                reload_signal,
+                config_ref,
+                args,
+                reload_interval,
+                reload_cdr,
+                reload_stir,
+            )
+            .await;
         });
 
         // Run main SIP server loop
@@ -1229,6 +1263,7 @@ impl Runtime {
         args: Args,
         poll_interval: Duration,
         cdr: Option<Arc<crate::cdr::CdrContext>>,
+        stir: Option<Arc<crate::stir::StirService>>,
     ) {
         let mut interval = tokio::time::interval(poll_interval);
 
@@ -1240,6 +1275,10 @@ impl Runtime {
 
                         let config_path = args.effective_config_path();
                         info!(path = %config_path.display(), "SIGHUP received, reloading configuration");
+                        // SIGHUP also reloads the STI-CR trust anchors.
+                        if let Some(ref s) = stir {
+                            s.reload_anchors().await;
+                        }
 
                         if Path::new(&config_path).exists() {
                             match load_from_file(&config_path) {

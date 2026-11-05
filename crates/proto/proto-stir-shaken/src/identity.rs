@@ -1,285 +1,233 @@
-//! SIP Identity header handling per RFC 8224.
+//! SIP Identity header (RFC 8224 §4.1).
+//!
+//! ```text
+//! Identity = "Identity" HCOLON signed-identity-digest SEMI ident-info
+//!            *( SEMI ident-info-params )
+//! ident-info = "info" EQUAL ident-info-uri
+//! ident-info-uri = LAQUOT absoluteURI RAQUOT
+//! ident-info-params = ident-info-alg / ident-type / ident-info-extension
+//! ident-info-alg = "alg" EQUAL token
+//! ident-type = "ppt" EQUAL token          ; quoted-string accepted too
+//! ```
+//!
+//! ## NIST 800-53 Rev5: SI-10 (Information Input Validation)
 
 use crate::error::{StirShakenError, StirShakenResult};
-use crate::passport::PASSporT;
+use crate::passport::Alg;
 
-/// Identity info parameter.
+/// Maximum Identity header value length accepted (DoS bound).
+pub const MAX_IDENTITY_HEADER_LEN: usize = 4096;
+
+/// Maximum number of header parameters accepted.
+const MAX_PARAMS: usize = 16;
+
+/// A parsed Identity header value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IdentityInfo {
-    /// URL to retrieve the signing certificate.
-    Url(String),
-}
-
-impl std::fmt::Display for IdentityInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Url(url) => write!(f, "<{url}>"),
-        }
-    }
-}
-
-/// SIP Identity header value.
-#[derive(Debug, Clone)]
 pub struct IdentityHeader {
-    /// PASSporT token (base64url encoded).
-    token: String,
-    /// Info parameter (certificate URL).
-    info: IdentityInfo,
-    /// Algorithm parameter.
-    alg: String,
-    /// PPT extension.
-    ppt: String,
+    /// The compact PASSporT (`signed-identity-digest`).
+    pub token: String,
+    /// The `info` URI (angle brackets removed).
+    pub info: String,
+    /// The `alg` parameter, if present.
+    pub alg: Option<Alg>,
+    /// The `ppt` parameter, if present (quotes removed).
+    pub ppt: Option<String>,
 }
 
 impl IdentityHeader {
-    /// Creates a new Identity header.
-    pub fn new(token: impl Into<String>, info: IdentityInfo) -> Self {
+    /// Builds a SHAKEN Identity header for an already-signed token.
+    #[must_use]
+    pub fn shaken(token: String, info: String, alg: Alg) -> Self {
         Self {
-            token: token.into(),
-            info,
-            alg: "ES384".to_string(),
-            ppt: "shaken".to_string(),
-        }
-    }
-
-    /// Creates from a PASSporT.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    pub fn from_passport(passport: &PASSporT) -> StirShakenResult<Self> {
-        let token = passport.to_compact()?;
-
-        let info = passport
-            .certificate_url()
-            .map(|url| IdentityInfo::Url(url.to_string()))
-            .ok_or_else(|| StirShakenError::MissingField {
-                field: "x5u".to_string(),
-            })?;
-
-        Ok(Self::new(token, info))
-    }
-
-    /// Returns the token.
-    pub fn token(&self) -> &str {
-        &self.token
-    }
-
-    /// Returns the info parameter.
-    pub fn info(&self) -> &IdentityInfo {
-        &self.info
-    }
-
-    /// Returns the algorithm.
-    pub fn alg(&self) -> &str {
-        &self.alg
-    }
-
-    /// Returns the PPT extension.
-    pub fn ppt(&self) -> &str {
-        &self.ppt
-    }
-
-    /// Formats as SIP header value.
-    pub fn to_header_value(&self) -> String {
-        format!(
-            "{};info={};alg={};ppt={}",
-            self.token, self.info, self.alg, self.ppt
-        )
-    }
-
-    /// Parses from SIP header value.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    pub fn parse(value: &str) -> StirShakenResult<Self> {
-        // Find the token (everything before first ';')
-        let parts: Vec<&str> = value.splitn(2, ';').collect();
-        if parts.is_empty() {
-            return Err(StirShakenError::InvalidPASSporT {
-                reason: "Empty Identity header".to_string(),
-            });
-        }
-
-        let token = parts[0].trim().to_string();
-
-        // Parse parameters
-        let mut info: Option<IdentityInfo> = None;
-        let mut alg = "ES384".to_string();
-        let mut ppt = "shaken".to_string();
-
-        if parts.len() > 1 {
-            for param in parts[1].split(';') {
-                let param = param.trim();
-                if let Some(pos) = param.find('=') {
-                    let name = param[..pos].trim().to_lowercase();
-                    let value = param[pos + 1..].trim();
-
-                    match name.as_str() {
-                        "info" => {
-                            // Remove angle brackets if present
-                            let url = value.trim_start_matches('<').trim_end_matches('>');
-                            info = Some(IdentityInfo::Url(url.to_string()));
-                        }
-                        "alg" => {
-                            alg = value.to_string();
-                        }
-                        "ppt" => {
-                            ppt = value.to_string();
-                        }
-                        _ => {} // Ignore unknown parameters
-                    }
-                }
-            }
-        }
-
-        let info = info.ok_or_else(|| StirShakenError::MissingField {
-            field: "info".to_string(),
-        })?;
-
-        // Validate algorithm (CNSA 2.0)
-        if alg != "ES384" {
-            return Err(StirShakenError::InvalidAlgorithm { algorithm: alg });
-        }
-
-        Ok(Self {
             token,
+            info,
+            alg: Some(alg),
+            ppt: Some(crate::passport::PPT_SHAKEN.to_owned()),
+        }
+    }
+
+    /// Parses a header value (everything after `Identity:`).
+    ///
+    /// # Errors
+    /// - [`StirShakenError::Malformed`]: oversize, bad token charset,
+    ///   duplicate or malformed parameters, unknown `alg`.
+    /// - [`StirShakenError::BadInfo`]: `info` missing, or not an `https:` URI
+    ///   (RFC 8224 §6.2.2 → 436).
+    pub fn parse(value: &str) -> StirShakenResult<Self> {
+        if value.len() > MAX_IDENTITY_HEADER_LEN {
+            return Err(StirShakenError::Malformed { reason: "too-long" });
+        }
+        let value = value.trim();
+        let (token, mut rest) = value.split_once(';').unwrap_or((value, ""));
+        let token = token.trim();
+        if token.is_empty()
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(StirShakenError::Malformed { reason: "token" });
+        }
+
+        let mut info = None;
+        let mut alg = None;
+        let mut ppt: Option<String> = None;
+        let mut count = 0;
+        while !rest.trim().is_empty() {
+            count += 1;
+            if count > MAX_PARAMS {
+                return Err(StirShakenError::Malformed { reason: "params" });
+            }
+            let (name, after) = rest
+                .split_once('=')
+                .ok_or(StirShakenError::Malformed { reason: "param" })?;
+            let name = name.trim();
+            let after = after.trim_start();
+            let (val, next) = if let Some(uri) = after.strip_prefix('<') {
+                let end = uri
+                    .find('>')
+                    .ok_or(StirShakenError::Malformed { reason: "laquot" })?;
+                let (u, tail) = uri.split_at(end);
+                (u, tail.get(1..).unwrap_or(""))
+            } else if let Some(q) = after.strip_prefix('"') {
+                let end = q
+                    .find('"')
+                    .ok_or(StirShakenError::Malformed { reason: "quote" })?;
+                let (u, tail) = q.split_at(end);
+                (u, tail.get(1..).unwrap_or(""))
+            } else {
+                let end = after.find(';').unwrap_or(after.len());
+                let (u, tail) = after.split_at(end);
+                (u.trim_end(), tail)
+            };
+            let next = next.trim_start();
+            rest = match next.strip_prefix(';') {
+                Some(r) => r,
+                None if next.is_empty() => "",
+                None => return Err(StirShakenError::Malformed { reason: "param" }),
+            };
+            if val.bytes().any(|b| b.is_ascii_control()) {
+                return Err(StirShakenError::Malformed { reason: "param" });
+            }
+            let dup = || StirShakenError::Malformed {
+                reason: "duplicate-param",
+            };
+            if name.eq_ignore_ascii_case("info") {
+                if info.replace(val.to_owned()).is_some() {
+                    return Err(dup());
+                }
+            } else if name.eq_ignore_ascii_case("alg") {
+                let a = Alg::parse(val).ok_or(StirShakenError::UnsupportedAlgorithm)?;
+                if alg.replace(a).is_some() {
+                    return Err(dup());
+                }
+            } else if name.eq_ignore_ascii_case("ppt") && ppt.replace(val.to_owned()).is_some() {
+                return Err(dup());
+            }
+            // Other ident-info-extension params are ignored (RFC 8224 §4.1).
+        }
+
+        let info = info.ok_or(StirShakenError::BadInfo { reason: "missing" })?;
+        // RFC 8224 §12 / ATIS-1000074 §5.3.1: only https certificate URIs
+        // are dereferenced.
+        let is_https = info
+            .get(..8)
+            .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
+        if !is_https || info.len() <= 8 {
+            return Err(StirShakenError::BadInfo { reason: "scheme" });
+        }
+        Ok(Self {
+            token: token.to_owned(),
             info,
             alg,
             ppt,
         })
     }
-}
 
-/// Full identity information combining header and parsed PASSporT.
-#[derive(Debug)]
-pub struct Identity {
-    /// The Identity header.
-    header: IdentityHeader,
-    /// Certificate URL.
-    certificate_url: String,
-}
-
-impl Identity {
-    /// Creates a new identity.
-    pub fn new(header: IdentityHeader) -> Self {
-        let certificate_url = match &header.info {
-            IdentityInfo::Url(url) => url.clone(),
-        };
-
-        Self {
-            header,
-            certificate_url,
+    /// Serialises the header value. Only fields this crate produced or
+    /// validated are emitted, so no CR/LF can reach the wire.
+    #[must_use]
+    pub fn to_header_value(&self) -> String {
+        let mut s = String::with_capacity(self.token.len() + self.info.len() + 32);
+        s.push_str(&self.token);
+        s.push_str(";info=<");
+        s.push_str(&self.info);
+        s.push('>');
+        if let Some(a) = self.alg {
+            s.push_str(";alg=");
+            s.push_str(a.as_str());
         }
-    }
-
-    /// Returns the Identity header.
-    pub fn header(&self) -> &IdentityHeader {
-        &self.header
-    }
-
-    /// Returns the certificate URL.
-    pub fn certificate_url(&self) -> &str {
-        &self.certificate_url
-    }
-
-    /// Returns the token.
-    pub fn token(&self) -> &str {
-        self.header.token()
+        if let Some(p) = &self.ppt {
+            s.push_str(";ppt=\"");
+            s.push_str(p);
+            s.push('"');
+        }
+        s
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::passport::{Attestation, OrigId, PASSporTClaims, PASSporTHeader, TelephoneNumber};
 
     #[test]
-    fn test_identity_info() {
-        let info = IdentityInfo::Url("https://cert.example.com/cert.pem".to_string());
-        assert_eq!(info.to_string(), "<https://cert.example.com/cert.pem>");
+    fn parse_shaken_header() {
+        let h = IdentityHeader::parse(
+            "eyJh.eyJh.c2ln;info=<https://cert.example.invalid/a.pem>;alg=ES256;ppt=\"shaken\"",
+        )
+        .unwrap();
+        assert_eq!(h.token, "eyJh.eyJh.c2ln");
+        assert_eq!(h.info, "https://cert.example.invalid/a.pem");
+        assert_eq!(h.alg, Some(Alg::Es256));
+        assert_eq!(h.ppt.as_deref(), Some("shaken"));
+        assert_eq!(IdentityHeader::parse(&h.to_header_value()).unwrap(), h);
     }
 
     #[test]
-    fn test_identity_header_creation() {
-        let header = IdentityHeader::new(
-            "test-token",
-            IdentityInfo::Url("https://cert.example.com/cert.pem".to_string()),
+    fn whitespace_and_unquoted_ppt() {
+        let h = IdentityHeader::parse(
+            "a.b.c ; info = <https://x.invalid/c;v=1> ; ppt=shaken ; foo=bar",
+        )
+        .unwrap();
+        assert_eq!(h.info, "https://x.invalid/c;v=1");
+        assert_eq!(h.ppt.as_deref(), Some("shaken"));
+    }
+
+    #[test]
+    fn rejects() {
+        assert!(matches!(
+            IdentityHeader::parse("a.b.c"),
+            Err(StirShakenError::BadInfo { .. })
+        ));
+        assert!(matches!(
+            IdentityHeader::parse("a.b.c;info=<http://x/c>"),
+            Err(StirShakenError::BadInfo { .. })
+        ));
+        assert!(matches!(
+            IdentityHeader::parse("a.b.c;info=<https://x/c>;alg=none"),
+            Err(StirShakenError::UnsupportedAlgorithm)
+        ));
+        assert!(IdentityHeader::parse("a.b.c;info=<https://x/c>;info=<https://y/c>").is_err());
+        assert!(IdentityHeader::parse("a b.c;info=<https://x/c>").is_err());
+        assert!(IdentityHeader::parse("a.b.c;info=<https://x/c").is_err());
+        assert!(IdentityHeader::parse(";info=<https://x/c>").is_err());
+        assert!(IdentityHeader::parse("a.b.c;info=<https://x/c>junk").is_err());
+        assert!(
+            IdentityHeader::parse(&format!("{};info=<https://x/c>", "a".repeat(5000))).is_err()
         );
-
-        assert_eq!(header.token(), "test-token");
-        assert_eq!(header.alg(), "ES384");
-        assert_eq!(header.ppt(), "shaken");
+        assert!(IdentityHeader::parse("a.b.c;info=<https://x/\r\nc>").is_err());
     }
 
-    #[test]
-    fn test_identity_header_format() {
-        let header = IdentityHeader::new(
-            "test.token.signature",
-            IdentityInfo::Url("https://cert.example.com/cert.pem".to_string()),
-        );
+    proptest::proptest! {
+        #[test]
+        fn parse_never_panics(s in "\\PC{0,300}") {
+            let _ = IdentityHeader::parse(&s);
+        }
 
-        let value = header.to_header_value();
-        assert!(value.contains("test.token.signature"));
-        assert!(value.contains("info="));
-        assert!(value.contains("alg=ES384"));
-        assert!(value.contains("ppt=shaken"));
-    }
-
-    #[test]
-    fn test_identity_header_parse() {
-        let value =
-            "header.claims.sig;info=<https://cert.example.com/cert.pem>;alg=ES384;ppt=shaken";
-        let header = IdentityHeader::parse(value).unwrap();
-
-        assert_eq!(header.token(), "header.claims.sig");
-        assert_eq!(header.alg(), "ES384");
-        assert_eq!(header.ppt(), "shaken");
-
-        let IdentityInfo::Url(url) = header.info();
-        assert_eq!(url, "https://cert.example.com/cert.pem");
-    }
-
-    #[test]
-    fn test_identity_header_parse_invalid_alg() {
-        let value = "token;info=<https://example.com>;alg=ES256;ppt=shaken";
-        assert!(IdentityHeader::parse(value).is_err());
-    }
-
-    #[test]
-    fn test_identity_header_parse_missing_info() {
-        let value = "token;alg=ES384";
-        assert!(IdentityHeader::parse(value).is_err());
-    }
-
-    #[test]
-    fn test_identity_from_passport() {
-        let orig = TelephoneNumber::new("15551234567").unwrap();
-        let dest = vec![TelephoneNumber::new("15559876543").unwrap()];
-        let claims = PASSporTClaims::new(orig, dest, Attestation::Full)
-            .with_iat(1234567890)
-            .with_origid(OrigId::new("test-id"));
-
-        let header = PASSporTHeader::new().with_x5u("https://cert.example.com/cert.pem");
-
-        let mut passport = PASSporT::new(header, claims);
-        passport.set_signature("test-signature");
-
-        let identity_header = IdentityHeader::from_passport(&passport).unwrap();
-        assert!(!identity_header.token().is_empty());
-    }
-
-    #[test]
-    fn test_identity() {
-        let header = IdentityHeader::new(
-            "test-token",
-            IdentityInfo::Url("https://cert.example.com/cert.pem".to_string()),
-        );
-
-        let identity = Identity::new(header);
-        assert_eq!(
-            identity.certificate_url(),
-            "https://cert.example.com/cert.pem"
-        );
-        assert_eq!(identity.token(), "test-token");
+        #[test]
+        fn roundtrip(tok in "[A-Za-z0-9_-]{1,40}\\.[A-Za-z0-9_-]{1,40}\\.[A-Za-z0-9_-]{1,40}",
+                     host in "[a-z]{1,20}") {
+            let h = IdentityHeader::shaken(tok, format!("https://{host}.invalid/c.pem"), Alg::Es256);
+            proptest::prop_assert_eq!(IdentityHeader::parse(&h.to_header_value()).unwrap(), h);
+        }
     }
 }

@@ -75,11 +75,16 @@ message CallInfo {
     // B-leg (callee side) information.
     CallLegInfo b_leg = 12;
 
-    // STIR/SHAKEN attestation level (if applicable).
+    // STIR/SHAKEN attestation level (if applicable): the level this SBC
+    // signed the B-leg with, else the verified inbound level. "A"|"B"|"C"|"".
     string attestation = 13;
 
     // Call direction: "inbound" or "outbound".
     string direction = 14;
+
+    // Inbound STIR/SHAKEN verification (ATIS-1000074 verstat):
+    // "tn-validation-passed" | "tn-validation-failed" | "no-tn-validation" | "".
+    string verstat = 15;
 }
 
 // Information about one leg of a B2BUA call.

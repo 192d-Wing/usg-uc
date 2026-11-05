@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+### Added (SBC, STIR/SHAKEN)
+
+- **STIR/SHAKEN verification and signing in the call path** — inbound INVITEs are verified (RFC 8224/8225/8588, ATIS-1000074) after Max-Forwards and before VPS. The verstat result is written into From/P-Asserted-Identity and fed to VPS enforcement. Outbound INVITEs to trunks with `sign = true` are signed at egress after manipulation and topology hiding, and any inbound Identity is stripped unless the trunk is trusted. Failures follow `verification.failure_policy` (`pass-through` | `mark` | `reject`). Rejects carry a `Reason: SIP;cause=N` header and produce a PolicyDenied CDR (`sbc-daemon`, `proto-sip`)
+- **New crate `uc-sti`** — STI certificate fetch over HTTPS with SSRF protection (all resolved addresses are vetted, no redirects, body cap, timeout), a bounded single-flight certificate cache, trust anchors reloaded on SIGHUP and on a timer, the A/B/C attestation policy, and a file signing key (opened `O_NOFOLLOW`, mode 0600/0400, owned by the daemon user, zeroized) (`uc-sti`)
+- **ES256 and STI certificate validation in `uc-crypto`** — behind the new `stir-shaken-es256` feature: `interop::ecdsa_p256` and `x509::verify_sti_chain` (rustls-webpki on aws-lc-rs FIPS, TNAuthList per RFC 8226). This is a documented **CNSA 2.0 exception**: ATIS-1000074 requires ES256 (P-256) (`uc-crypto`)
+- **SIP response codes** — 428 Use Identity Header, 436 Bad Identity Info, 437 Unsupported Credential, 438 Invalid Identity Header. A stale or future `iat` gets **403 Stale Date** (RFC 8224 §6.2.2) (`proto-sip`, `proto-stir-shaken`)
+- **Per-trunk switches** — `stir_shaken = { sign, verify, strip_inbound_identity }` on a trunk. They need the matching global switch (`sbc-config`)
+- **Audit events, for SIEM parsers** — `StirSignFailure`, `StirVerifyFailure` (aggregated per trunk and reason, with `count`, last `source_ip` and Call-ID hash), `StirTrustAnchorsReloaded`, `StirTrustAnchorReloadFailed`, `StirKeyLoaded`, and `StirAuditEventsDropped` (Security, `count`/`total`, AU-5) when the aggregator drops events. Strict-schema parsers must accept them (`uc-audit`, `sbc-daemon`)
+- **gRPC** — `CallInfo.verstat` (field 15); `CdrRecord` fields 42-45 for the STIR CDR fields. The CDR attestation mapping uses stable strings instead of debug formatting (`sbc-grpc-api`)
+- **Metrics** — STIR gauges and counters on the daemon metrics endpoint (`sbc-daemon`)
+
+### Changed (BREAKING, SBC, STIR/SHAKEN)
+
+- **`stir_shaken.verification_enabled` now defaults to `false`** — before this release it defaulted to `true` but did not verify anything. With verification on, `verification.trust_anchors_path` (STI-CR bundle, file or directory) is required, and the daemon refuses to start without it. The shipped `deploy/config/config.toml` used to set `verification_enabled = true` with no anchors, and would fail validation now. It has been migrated
+- **Default attestation is now `C`** (was `B`). Set `stir_shaken.attestation.default` and `owned_numbers` to get A/B
+- **`[stir_shaken]` is nested and strict** — new `[stir_shaken.signing]`, `[stir_shaken.attestation]` and `[stir_shaken.verification]` sections with `deny_unknown_fields`, so a misspelled key now stops startup. The old flat keys (`default_attestation`, `certificate_path`, `private_key_path`, `certificate_url`, `max_passport_age_secs`, `ca_bundle_path`) are **deprecated aliases**: still accepted, with a startup warning. Setting an old key and its new key together is an error. `certificate_url` must be `https`, and `pkcs11` keys are rejected
+- **Attestation A needs a TCP/TLS REGISTER flow** — an endpoint INVITE gets A only on the connection flow its REGISTER came in on. Bindings created another way (API, replication) are not attested. **For UDP endpoints the most you get is B**
+- **CDR schema v2** — `schema_version = 2` adds `stir_verstat`, `stir_verify_reason`, `stir_inbound_attestation` and `stir_x5u_host` (JSONL fields and CSV columns). When these fields are absent, v1 records serialise exactly as before, and existing v1 files still verify. The verifier rejects a file that mixes v1 and v2 records. Billing/SIEM parsers must accept v2 and the wider CSV
+- **`proto-stir-shaken` API rewritten** — the structural-only `verify_identity` and the hand-written base64 are gone. They are replaced by `IdentityHeader::parse`, the `Signer`/`VerifyingKey`/`KeyResolver` traits and the two-stage `Verifier::prepare`/`verify`. `KeyResolver::cached` returns `Option<Arc<VerifiedKey>>`. `Attestation` is now an alias for `uc_types::AttestationLevel`. Code that uses the crate must be ported
+- **Audit event set grows** — see the new `Stir*` events above
+
 ### Added (SBC, CDR)
 
 - **Call Detail Records (schema v1)** — the daemon writes one CDR per INVITE that reaches admission through a bounded queue to a dedicated writer thread (emits never block signalling; overflow is dropped and counted). Records are SHA-384 hash-chained with a per-file `.sha384` sidecar, rotated by size/interval and pruned by `retention_files`/`retention_days`. PII handling is `full`, `mask_caller` or `hash` (HMAC with `pii_hash_key_file`, opened `O_NOFOLLOW`, must be a 0400/0600 regular file >= 48 bytes). CSV output guards against formula injection by prefixing `'`, which also applies to E.164 numbers such as `'+15551234567` (NIST AU-2/AU-3/AU-9/AU-12) (`uc-cdr`, `sbc-daemon`)

@@ -19,7 +19,7 @@
 // so a record is bound to the node that wrote it.
 
 use crate::error::{CdrError, CdrResult};
-use crate::record::{CallRecord, FileHeader, SCHEMA_VERSION};
+use crate::record::{CallRecord, FileHeader, is_readable_schema};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use uc_crypto::hash::Sha384;
@@ -145,7 +145,7 @@ pub fn verify_reader<R: Read>(reader: R) -> CdrResult<VerifyReport> {
     }
     let header: FileHeader = serde_json::from_slice(&buf)
         .map_err(|e| CdrError::verify(1, format!("bad header: {e}")))?;
-    if header.kind != "header" || header.schema_version != SCHEMA_VERSION {
+    if header.kind != "header" || !is_readable_schema(header.schema_version) {
         return Err(CdrError::verify(1, "unsupported header"));
     }
     let chained = !header.chain_start.is_empty();
@@ -176,7 +176,9 @@ pub fn verify_reader<R: Read>(reader: R) -> CdrResult<VerifyReport> {
         }
         let rec: CallRecord = serde_json::from_slice(&buf)
             .map_err(|e| CdrError::verify(line_no, format!("bad record: {e}")))?;
-        if rec.schema_version != SCHEMA_VERSION {
+        // A file holds one schema version (the writer opens a new file on
+        // start); v1 and v2 files are both readable.
+        if rec.schema_version != header.schema_version {
             return Err(CdrError::verify(line_no, "schema_version mismatch"));
         }
         if rec.node_id != header.node_id {
@@ -289,6 +291,152 @@ pub fn verify_sidecar(path: &Path) -> CdrResult<bool> {
 mod tests {
     use super::*;
     use crate::format::{header_json_line, new_header, to_json_line};
+    use crate::record::{Attestation, SCHEMA_VERSION, Verstat};
+
+    /// A v1 file (header and records at schema 1, no v2 fields) written by
+    /// the previous release still verifies: unset v2 fields are not
+    /// serialised, so the chain hash is unchanged.
+    #[test]
+    fn v1_file_still_verifies() {
+        let mut h = new_header("n1", 0, to_hex(&GENESIS), 0);
+        h.schema_version = 1;
+        let mut out = header_json_line(&h).unwrap();
+        out.push('\n');
+        let mut r = CallRecord {
+            schema_version: 1,
+            node_id: "n1".into(),
+            record_id: "n1-0".into(),
+            stir_attestation: Some(Attestation::B),
+            ..Default::default()
+        };
+        seal(&mut r, &GENESIS).unwrap();
+        let line = to_json_line(&r).unwrap();
+        assert!(!line.contains("stir_verstat"), "{line}");
+        out.push_str(&line);
+        out.push('\n');
+        assert_eq!(verify_reader(out.as_bytes()).unwrap().records, 1);
+    }
+
+    #[test]
+    fn v2_fields_roundtrip_in_chain() {
+        let mut out = header_json_line(&new_header("n1", 0, to_hex(&GENESIS), 0)).unwrap();
+        out.push('\n');
+        let mut r = CallRecord {
+            schema_version: SCHEMA_VERSION,
+            node_id: "n1".into(),
+            record_id: "n1-0".into(),
+            stir_verstat: Some(Verstat::TnValidationFailed),
+            stir_verify_reason: Some("bad-signature".into()),
+            stir_inbound_attestation: Some(Attestation::A),
+            stir_x5u_host: Some("cert.example.invalid".into()),
+            ..Default::default()
+        };
+        seal(&mut r, &GENESIS).unwrap();
+        let line = to_json_line(&r).unwrap();
+        assert!(
+            line.contains(r#""stir_verstat":"tn-validation-failed""#),
+            "{line}"
+        );
+        out.push_str(&line);
+        out.push('\n');
+        assert_eq!(verify_reader(out.as_bytes()).unwrap().records, 1);
+        // Mixed versions in one file are rejected.
+        let mut bad = header_json_line(&new_header("n1", 0, to_hex(&GENESIS), 0)).unwrap();
+        bad.push('\n');
+        let mut r1 = r.clone();
+        r1.schema_version = 1;
+        seal(&mut r1, &GENESIS).unwrap();
+        bad.push_str(&to_json_line(&r1).unwrap());
+        bad.push('\n');
+        assert!(verify_reader(bad.as_bytes()).is_err());
+    }
+
+    /// QA: one chained file per version, `first` sequence and chain start.
+    fn versioned_file(
+        version: u16,
+        first: u64,
+        n: u64,
+        start: [u8; HASH_LEN],
+    ) -> (String, [u8; HASH_LEN]) {
+        let mut h = new_header("n1", 0, to_hex(&start), first);
+        h.schema_version = version;
+        let mut out = header_json_line(&h).unwrap();
+        out.push('\n');
+        let mut prev = start;
+        for i in first..first + n {
+            let mut r = CallRecord {
+                schema_version: version,
+                node_id: "n1".into(),
+                sequence: i,
+                record_id: format!("n1-{i}"),
+                ..Default::default()
+            };
+            if version >= 2 {
+                r.stir_verstat = Some(Verstat::TnValidationPassed);
+                r.stir_inbound_attestation = Some(Attestation::A);
+                r.stir_x5u_host = Some("cert.example.invalid".into());
+            }
+            prev = seal(&mut r, &prev).unwrap();
+            out.push_str(&to_json_line(&r).unwrap());
+            out.push('\n');
+        }
+        (out, prev)
+    }
+
+    /// QA: upgrade path. A v1 file followed by a v2 file that continues its
+    /// chain verifies as one sequence (what `sbc-cli cdrs verify` runs).
+    #[test]
+    fn qa_v1_then_v2_files_verify_across_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let (v1, last) = versioned_file(1, 0, 3, GENESIS);
+        let (v2, _) = versioned_file(SCHEMA_VERSION, 3, 2, last);
+        let p1 = dir.path().join("a.jsonl");
+        let p2 = dir.path().join("b.jsonl");
+        std::fs::write(&p1, v1).unwrap();
+        std::fs::write(&p2, &v2).unwrap();
+        let reps = verify_files(&[p1.as_path(), p2.as_path()]).unwrap();
+        assert_eq!(reps.iter().map(|r| r.records).sum::<u64>(), 5);
+
+        // A v2 file that does not continue the v1 chain is rejected.
+        let (v2_bad, _) = versioned_file(SCHEMA_VERSION, 3, 2, GENESIS);
+        std::fs::write(&p2, v2_bad).unwrap();
+        assert!(verify_files(&[p1.as_path(), p2.as_path()]).is_err());
+    }
+
+    /// QA: tampering with any v2 STIR field breaks the record hash.
+    #[test]
+    fn qa_v2_stir_field_tamper_detected() {
+        let (good, _) = versioned_file(SCHEMA_VERSION, 0, 2, GENESIS);
+        assert_eq!(verify_reader(good.as_bytes()).unwrap().records, 2);
+        for (from, to) in [
+            ("tn-validation-passed", "tn-validation-failed"),
+            (
+                r#""stir_inbound_attestation":"A""#,
+                r#""stir_inbound_attestation":"C""#,
+            ),
+            ("cert.example.invalid", "evil.example.invalid"),
+        ] {
+            let bad = good.replacen(from, to, 1);
+            assert_ne!(bad, good, "{from}");
+            assert!(
+                verify_reader(bad.as_bytes()).is_err(),
+                "{from} tamper accepted"
+            );
+        }
+        // Stripping a v2 field entirely is also detected.
+        let stripped = good.replacen(r#","stir_x5u_host":"cert.example.invalid""#, "", 1);
+        assert_ne!(stripped, good);
+        assert!(verify_reader(stripped.as_bytes()).is_err());
+    }
+
+    /// QA: future (v3) and zero schema headers are refused.
+    #[test]
+    fn qa_unknown_schema_versions_rejected() {
+        for v in [0, SCHEMA_VERSION + 1] {
+            let (f, _) = versioned_file(v, 0, 1, GENESIS);
+            assert!(verify_reader(f.as_bytes()).is_err(), "schema {v} accepted");
+        }
+    }
 
     fn chain_file(n: u64) -> String {
         let mut out = header_json_line(&new_header("n1", 0, to_hex(&GENESIS), 0)).unwrap();

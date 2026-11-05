@@ -102,6 +102,25 @@ pub enum AuditEvent {
 
     /// CDRs were read in bulk through the management plane.
     CdrExport(CdrExport),
+
+    /// Outbound `PASSporT` signing failed (call continues unsigned).
+    StirSignFailure(StirSignFailure),
+
+    /// Inbound Identity verification failed (aggregated per trunk + reason).
+    StirVerifyFailure(StirVerifyFailure),
+
+    /// STI-CR trust anchors (re)loaded.
+    StirTrustAnchorsReloaded(StirTrustAnchorsReloaded),
+
+    /// STI-CR trust-anchor reload failed; the previous set stays active.
+    StirTrustAnchorReloadFailed(StirTrustAnchorReloadFailed),
+
+    /// The STIR signing key and certificate were loaded and self-checked.
+    StirKeyLoaded(StirKeyLoaded),
+
+    /// STIR failure audit events were dropped because an aggregation table
+    /// was full (AU-5 capacity alert).
+    StirAuditEventsDropped(StirAuditEventsDropped),
 }
 
 impl AuditEvent {
@@ -115,10 +134,17 @@ impl AuditEvent {
             Self::AuthenticationAttempt(_) => AuditEventType::Authentication,
             Self::AuthorizationDecision(_) | Self::CdrExport(_) => AuditEventType::Authorization,
             Self::ConfigurationChange(_) => AuditEventType::Configuration,
-            Self::CryptoKeyOperation(_) => AuditEventType::Cryptographic,
+            Self::CryptoKeyOperation(_) | Self::StirSignFailure(_) | Self::StirKeyLoaded(_) => {
+                AuditEventType::Cryptographic
+            }
             Self::DosDetected(_)
             | Self::StirShakenVerification(_)
-            | Self::RateLimitTriggered(_) => AuditEventType::Security,
+            | Self::RateLimitTriggered(_)
+            | Self::StirVerifyFailure(_)
+            | Self::StirAuditEventsDropped(_) => AuditEventType::Security,
+            Self::StirTrustAnchorsReloaded(_) | Self::StirTrustAnchorReloadFailed(_) => {
+                AuditEventType::Configuration
+            }
             Self::SystemStartup(_)
             | Self::SystemShutdown(_)
             | Self::TrunkFailover(_)
@@ -462,9 +488,121 @@ pub struct CdrExport {
     pub outcome: String,
 }
 
+/// Outbound STIR signing failure.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-3, SC-13
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirSignFailure {
+    /// Hex SHA-384 prefix of the A-leg Call-ID (no raw Call-ID).
+    pub call_id_hash: String,
+    /// Egress trunk.
+    pub trunk: String,
+    /// Fixed reason token: `key-unusable`, `cert-expired`, `no-attestation`,
+    /// `bad-number`.
+    pub reason: String,
+    /// Failures folded into this event (>= 1); one event is emitted per
+    /// (`trunk`, `reason`) per aggregation window.
+    pub count: u64,
+}
+
+/// Inbound STIR verification failures, aggregated.
+///
+/// One event is emitted per (`source_trunk`, `reason`) per aggregation window
+/// so an attacker sending bad Identity headers cannot flood the audit log.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-3, IA-9, SI-10
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirVerifyFailure {
+    /// Hex SHA-384 prefix of the first Call-ID in the window.
+    pub call_id_hash: String,
+    /// Ingress trunk.
+    pub source_trunk: String,
+    /// Source IP of the first failure in the window.
+    pub source_ip: Option<IpAddr>,
+    /// Host of the `x5u` URL (no path), if known.
+    pub x5u_host: Option<String>,
+    /// Fixed failure reason token (see `proto_stir_shaken::FailureReason`).
+    pub reason: String,
+    /// Action taken: `pass`, `mark` or `reject`.
+    pub action: String,
+    /// Failures folded into this event (>= 1).
+    pub count: u64,
+}
+
+/// Trust-anchor set loaded.
+///
+/// ## NIST 800-53 Rev5: SC-17 (PKI Certificates), CM-6
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirTrustAnchorsReloaded {
+    /// Anchors loaded.
+    pub count: u64,
+    /// Hex SHA-384 over the concatenated anchor DER.
+    pub sha384: String,
+}
+
+/// Trust-anchor reload failure.
+///
+/// ## NIST 800-53 Rev5: SC-17, AU-5
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirTrustAnchorReloadFailed {
+    /// Error text (path / parse error; never key material).
+    pub reason: String,
+}
+
+/// STIR failure events dropped since the previous report because an
+/// aggregation table was full of live keys.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirAuditEventsDropped {
+    /// Events dropped since the previous report (>= 1).
+    pub count: u64,
+    /// Total dropped since startup.
+    pub total: u64,
+}
+
+/// Signing key loaded.
+///
+/// ## NIST 800-53 Rev5: SC-12, SC-17
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirKeyLoaded {
+    /// Hex SHA-384 fingerprint of the signing certificate.
+    pub cert_fingerprint_sha384: String,
+    /// Certificate `notAfter` (Unix seconds).
+    pub not_after: u64,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn stir_events_serialize_and_categorize() {
+        let e = AuditEvent::StirVerifyFailure(StirVerifyFailure {
+            call_id_hash: "ab".into(),
+            source_trunk: "carrier".into(),
+            source_ip: None,
+            x5u_host: Some("cert.example.invalid".into()),
+            reason: "bad-signature".into(),
+            action: "mark".into(),
+            count: 3,
+        });
+        assert_eq!(e.event_type(), AuditEventType::Security);
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""type":"stir_verify_failure""#), "{json}");
+        let k = AuditEvent::StirKeyLoaded(StirKeyLoaded {
+            cert_fingerprint_sha384: "00".into(),
+            not_after: 1,
+        });
+        assert_eq!(k.event_type(), AuditEventType::Cryptographic);
+        let d = AuditEvent::StirAuditEventsDropped(StirAuditEventsDropped { count: 2, total: 5 });
+        assert_eq!(d.event_type(), AuditEventType::Security);
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            json.contains(r#""type":"stir_audit_events_dropped""#),
+            "{json}"
+        );
+    }
+
     use super::*;
 
     #[test]

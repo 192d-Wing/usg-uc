@@ -12,7 +12,21 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 /// Current record schema version. Bumping it is breaking for parsers.
-pub const SCHEMA_VERSION: u16 = 1;
+///
+/// v2 (STIR/SHAKEN) adds `stir_verstat`, `stir_verify_reason`,
+/// `stir_inbound_attestation` and `stir_x5u_host`. They are omitted from JSON
+/// when unset, so a v1 record re-serialises byte-identically and its chain
+/// hash still verifies.
+pub const SCHEMA_VERSION: u16 = 2;
+
+/// Oldest schema version readers accept.
+pub const MIN_READ_SCHEMA_VERSION: u16 = 1;
+
+/// True if `v` is a schema version this crate can read.
+#[must_use]
+pub const fn is_readable_schema(v: u16) -> bool {
+    v >= MIN_READ_SCHEMA_VERSION && v <= SCHEMA_VERSION
+}
 
 /// Longest stored string field, in bytes. Longer values (attacker-controlled
 /// From/To users, Call-IDs) are truncated at a UTF-8 boundary.
@@ -278,7 +292,10 @@ pub struct TrunkAttempt {
     pub at_ms: u64,
 }
 
-/// STIR/SHAKEN attestation level (RFC 8588). Placeholder in v1.
+/// STIR/SHAKEN attestation level (RFC 8588).
+///
+/// Kept separate from `uc_types::AttestationLevel` so the CDR wire form
+/// (`"A"`/`"B"`/`"C"`) is pinned by this crate's schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Attestation {
     /// Full attestation.
@@ -287,6 +304,42 @@ pub enum Attestation {
     B,
     /// Gateway attestation.
     C,
+}
+
+impl Attestation {
+    /// `"A"`, `"B"` or `"C"`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::B => "B",
+            Self::C => "C",
+        }
+    }
+}
+
+/// STIR verification status (ATIS-1000074 verstat), schema v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Verstat {
+    /// `TN-Validation-Passed`.
+    TnValidationPassed,
+    /// `TN-Validation-Failed`.
+    TnValidationFailed,
+    /// `No-TN-Validation`.
+    NoTnValidation,
+}
+
+impl Verstat {
+    /// Lower-case token, as serialised.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TnValidationPassed => "tn-validation-passed",
+            Self::TnValidationFailed => "tn-validation-failed",
+            Self::NoTnValidation => "no-tn-validation",
+        }
+    }
 }
 
 /// A Call Detail Record, schema v1.
@@ -373,8 +426,20 @@ pub struct CallRecord {
     pub srtp: Option<String>,
     /// Emergency call.
     pub emergency: bool,
-    /// STIR/SHAKEN attestation. Always `None` in v1.
+    /// STIR/SHAKEN attestation this SBC signed the B-leg INVITE with.
     pub stir_attestation: Option<Attestation>,
+    /// Verification outcome of the inbound Identity (v2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stir_verstat: Option<Verstat>,
+    /// Fixed failure-reason token when verification failed (v2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stir_verify_reason: Option<String>,
+    /// Attestation carried by the verified inbound PASSporT (v2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stir_inbound_attestation: Option<Attestation>,
+    /// Host part of the inbound `x5u` (no path: limits PII/cardinality) (v2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stir_x5u_host: Option<String>,
     /// This node took the dialog over from a failed peer; timing is partial.
     pub failover_takeover: bool,
     /// Hex SHA-384 of the previous record (empty when chaining is off).
@@ -418,6 +483,8 @@ impl CallRecord {
             &mut self.media_node,
             &mut self.codec,
             &mut self.srtp,
+            &mut self.stir_verify_reason,
+            &mut self.stir_x5u_host,
         ]
         .into_iter()
         .flatten()

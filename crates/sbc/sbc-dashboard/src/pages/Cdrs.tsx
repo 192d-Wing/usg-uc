@@ -222,6 +222,20 @@ export function Cdrs() {
                 ? `${c.final_trunk}${c.failover_count > 0 ? ` (+${c.failover_count} failover)` : ''}`
                 : '—',
           },
+          {
+            id: 'stir',
+            header: 'STIR',
+            cell: (c) => {
+              const parts: string[] = [];
+              if (c.stir_attestation) parts.push(`signed ${c.stir_attestation}`);
+              if (c.stir_verstat === 'tn-validation-passed')
+                parts.push(`verified ${c.stir_inbound_attestation ?? ''}`.trim());
+              if (c.stir_verstat === 'tn-validation-failed')
+                parts.push(`failed (${c.stir_verify_reason ?? 'unknown'})`);
+              if (c.stir_verstat === 'no-tn-validation') parts.push('no identity');
+              return parts.length ? parts.join(', ') : '—';
+            },
+          },
           { id: 'source', header: 'Source', cell: (c) => `${c.source_ip}:${c.source_port}` },
           { id: 'callid', header: 'Call-ID', cell: (c) => c.a_call_id || '—' },
         ]}

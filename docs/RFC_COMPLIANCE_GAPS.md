@@ -69,6 +69,25 @@ Call Detail Records read SIP and SDP facts and ship records to syslog. This code
 | RFC 5425 TLS transport | Partial | Wired (sbc-daemon, opt-in) | TLS 1.3 only (`uc_transport::tls::create_client_config`; suites and key-exchange groups are not restricted to CNSA 2.0, POA&M-26). The server is authenticated against `cdr.syslog.ca_path` or `security.tls_ca_path`. **Gap:** §4.2 mutual authentication is absent because no client certificate is sent (NIST-06, POA&M-15). No test performs a TLS handshake |
 | SIP transport recorded in the CDR | Gap | Wired (sbc-daemon) | SCTP (RFC 4168) A-legs are recorded as `tcp`: schema v1 has no `sctp` value (POA&M-20) |
 
+### sbc-daemon STIR/SHAKEN (RFC 8224, 8225, 8226, 8588, ATIS-1000074)
+
+Off by default; enabled per trunk (`stir_shaken.sign` / `verify`). Code: `proto-stir-shaken`, `uc-sti`, `uc-crypto` (`interop::ecdsa_p256`, `x509`), `sbc-daemon/src/stir.rs`, `stir_binding.rs`, `sip_stack.rs`.
+
+| Behaviour | Status | Wiring | Notes |
+|-----------|--------|--------|-------|
+| RFC 8224 §4.1 Identity header grammar (`info`, `alg`, `ppt`) | Complete | Wired (sbc-daemon) | Duplicate params rejected, unknown ignored, 4 KiB / 16-param caps. Tests `parse_shaken_header`, `rejects`, `qa_stir_malformed_identity_table` |
+| RFC 8224 §6.2.2 / §13 response codes 428, 436, 437, 438, 403 Stale Date | Complete | Wired (sbc-daemon), only with `failure_policy = "reject"` (default `mark`) | `Reason: SIP;cause=N;text=".."` added. Tests `codes`, `stir_missing_identity_with_require_is_428`, `qa_stir_stale_iat_rejected_403_stale_date`, `stir_reason_phrases` |
+| RFC 8224 §4.1 / §6.1 Date corresponds to `iat` | Complete | Wired (sbc-daemon) | Signer replaces B-leg `Date`. Test `sign_outbound_adds_identity_on_sign_trunks_only` |
+| RFC 8224 §8.3 TN canonicalisation | Partial | Wired (sbc-daemon) | Separators and `+` stripped; non-E.164 numbers are not converted to E.164 by local policy (RFC-004, POA&M-44) |
+| RFC 8224 §5 / ATIS `orig` source (PAI else From) | Partial | Wired (sbc-daemon) | Signer uses PAI else From; verifier accepts a match on either PAI or From (RFC-005, POA&M-45) |
+| RFC 8225 PASSporT encoding (§9 deterministic JSON) and strict decode | Complete | Wired (sbc-daemon) | Tests `sign_decode_roundtrip`, `malformed_cases`, proptests |
+| RFC 8225 / ATIS-1000074 ES256 signatures | Complete (CNSA exception) | Wired (sbc-daemon) | ES256 is a CNSA 2.0 deviation (POA&M-27), compiled into every SBC build (POA&M-39). ES384 rejected (POA&M-32) |
+| RFC 8226 STI certificate chain and TNAuthList | Partial | Wired (sbc-daemon) | Chain to STI-CR anchors; TN/range scope checked; SPC scope not checked (POA&M-30); **no CRL/OCSP** (POA&M-28) |
+| RFC 8588 `attest`, `origid` | Complete | Wired (sbc-daemon) | Policy `uc-sti/src/policy.rs`; UDP-registered endpoints capped at B, A needs a TCP/TLS registration on the same flow |
+| RFC 8946 `div` PASSporT | Missing | — | `ppt=div` ignored (test `div_is_ignored`) |
+| Replay protection (RFC 8224 §12 guidance) | Missing | — | No replay cache (decision D7, POA&M-43); only `iat` freshness |
+| ATIS-1000074 §5.3.1 `info == x5u`, verstat on PAI else From | Complete | Wired (sbc-daemon) | Tests `verstat_rewrite`, `stir_failed_identity_mark_forwards_with_failed_verstat` |
+
 ---
 
 ## proto-transaction (RFC 3261 §17 + RFC 3262)

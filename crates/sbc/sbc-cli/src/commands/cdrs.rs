@@ -179,6 +179,31 @@ async fn fetch(
     }
 }
 
+/// Compact STIR/SHAKEN column: signed attestation `S:A`, inbound
+/// verification `V:P`/`V:F`/`V:N` (passed/failed/none), `-` when neither.
+#[cfg(feature = "grpc")]
+fn stir_column(r: &uc_cdr::CallRecord) -> String {
+    let mut s = String::new();
+    if let Some(a) = r.stir_attestation {
+        s.push_str("S:");
+        s.push_str(a.as_str());
+    }
+    if let Some(v) = r.stir_verstat {
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(match v {
+            uc_cdr::Verstat::TnValidationPassed => "V:P",
+            uc_cdr::Verstat::TnValidationFailed => "V:F",
+            uc_cdr::Verstat::NoTnValidation => "V:N",
+        });
+    }
+    if s.is_empty() {
+        s.push('-');
+    }
+    s
+}
+
 #[cfg(feature = "grpc")]
 async fn query_async(args: &Args, cmd: CdrsCommand) -> CommandResult {
     use sbc_grpc_api::sbc::GetCdrRequest;
@@ -201,13 +226,21 @@ async fn query_async(args: &Args, cmd: CdrsCommand) -> CommandResult {
                 return Ok(());
             }
             println!(
-                "{:<20}  {:<13}  {:<16}  {:<16}  {:<14}  {:>4}  {:>9}  {:<8}",
-                "RECORD", "SETUP(ms)", "CALLER", "CALLEE", "DISPOSITION", "SIP", "DUR(s)", "TRUNK"
+                "{:<20}  {:<13}  {:<16}  {:<16}  {:<14}  {:>4}  {:>9}  {:<8}  {:<6}",
+                "RECORD",
+                "SETUP(ms)",
+                "CALLER",
+                "CALLEE",
+                "DISPOSITION",
+                "SIP",
+                "DUR(s)",
+                "TRUNK",
+                "STIR"
             );
-            println!("{}", "-".repeat(112));
+            println!("{}", "-".repeat(120));
             for r in &recs {
                 println!(
-                    "{:<20}  {:<13}  {:<16.16}  {:<16.16}  {:<14}  {:>4}  {:>9}  {:<8}",
+                    "{:<20}  {:<13}  {:<16.16}  {:<16.16}  {:<14}  {:>4}  {:>9}  {:<8}  {:<6}",
                     r.record_id,
                     r.setup_ms,
                     r.caller.escape_default().to_string(),
@@ -216,6 +249,7 @@ async fn query_async(args: &Args, cmd: CdrsCommand) -> CommandResult {
                     r.final_sip_status,
                     format!("{}.{}", r.duration_ms / 1000, (r.duration_ms % 1000) / 100),
                     r.final_trunk.as_deref().unwrap_or("-"),
+                    stir_column(r),
                 );
             }
         }

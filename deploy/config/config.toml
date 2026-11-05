@@ -65,14 +65,27 @@ min_tls_version = "1.3"
 require_mtls = false
 
 [stir_shaken]
+# Verification is off until STI-CR trust anchors are configured (it was on by
+# default before 0.10 but verified nothing). Enable per trunk with
+# `stir_shaken = { verify = true }` / `{ sign = true }`.
 signing_enabled = false
-verification_enabled = true
-# certificate_path = "/etc/sbc/certs/sti.crt"
-# private_key_path = "/etc/sbc/certs/sti.key"
-# certificate_url = "https://certs.example.com/sti.crt"
-default_attestation = "B"
+verification_enabled = false
+# SHAKEN mandates ES256 (documented CNSA 2.0 exception).
+algorithm = "ES256"
+
+[stir_shaken.signing]
+# certificate_url = "https://certs.example.com/sti.pem"
+# private_key_path = "/etc/sbc/certs/sti.key"   # PKCS#8 P-256, mode 0600/0400
+# certificate_path = "/etc/sbc/certs/sti.pem"
+
+[stir_shaken.attestation]
+default = "C"
+# owned_numbers = ["1202555*"]
+
+[stir_shaken.verification]
+failure_policy = "mark"     # pass-through | mark | reject
 max_passport_age_secs = 60
-# ca_bundle_path = "/etc/sbc/certs/ca-bundle.crt"
+# trust_anchors_path = "/etc/sbc/certs/sti-cr"
 
 [rate_limit]
 enabled = true

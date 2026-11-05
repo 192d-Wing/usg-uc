@@ -72,7 +72,7 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_media(&config.media)?;
     validate_security(&config.security)?;
     validate_logging(&config.logging)?;
-    validate_stir_shaken(&config.stir_shaken)?;
+    validate_stir_shaken(config)?;
     validate_rate_limit(&config.rate_limit)?;
     validate_vps(config)?;
     validate_zones(&config.zones)?;
@@ -376,41 +376,170 @@ fn validate_logging(config: &crate::schema::LoggingConfig) -> ConfigResult<()> {
     Ok(())
 }
 
-fn validate_stir_shaken(config: &crate::schema::StirShakenConfig) -> ConfigResult<()> {
-    // If signing is enabled, certificate and key must be provided
-    if config.signing_enabled {
-        if config.certificate_path.is_none() {
-            return Err(ConfigError::Validation {
-                message: "STIR/SHAKEN signing requires certificate_path".to_string(),
-            });
-        }
+/// `[stir_shaken]` and per-trunk `stir_shaken` validation.
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings), SC-13, SC-17, IA-9
+fn validate_stir_shaken(config: &SbcConfig) -> ConfigResult<()> {
+    use crate::schema::StirAlgorithm;
+    let err = |message: String| Err(ConfigError::Validation { message });
+    let (ss, _deprecated) = config
+        .stir_shaken
+        .normalized()
+        .map_err(|message| ConfigError::Validation { message })?;
 
-        if config.private_key_path.is_none() {
-            return Err(ConfigError::Validation {
-                message: "STIR/SHAKEN signing requires private_key_path".to_string(),
-            });
-        }
-
-        if config.certificate_url.is_none() {
-            return Err(ConfigError::Validation {
-                message: "STIR/SHAKEN signing requires certificate_url".to_string(),
-            });
-        }
+    // CNSA-EXCEPTION: ATIS-1000074 mandates ES256 for ppt=shaken. ES384
+    // (bilateral) is reserved and not implemented, so it is rejected rather
+    // than silently signing with ES256.
+    if ss.algorithm == StirAlgorithm::Es384 {
+        return err(
+            "stir_shaken.algorithm = \"ES384\" is not supported in this release (SHAKEN requires ES256)"
+                .to_string(),
+        );
     }
 
-    // NOTE (relaxed rule): `verification_enabled = true` without
-    // `ca_bundle_path` is NOT rejected. The shipped deploy config
-    // (deploy/config/config.toml) explicitly enables verification without a
-    // CA bundle, and the daemon has no verification code path today.
-    // Tighten this once verification is implemented.
-
-    // Validate attestation level
-    match config.default_attestation.as_str() {
-        "A" | "B" | "C" => Ok(()),
-        _ => Err(ConfigError::Validation {
-            message: "default_attestation must be A, B, or C".to_string(),
-        }),
+    // An accepted-but-unimplemented key source is rejected even with
+    // signing off, so enabling signing later cannot surprise (CM-6).
+    if ss.signing.key_source == crate::schema::StirKeySource::Pkcs11 {
+        return err("stir_shaken.signing.key_source = \"pkcs11\" is not supported yet".into());
     }
+    if ss.signing_enabled {
+        validate_stir_signing(&ss.signing)?;
+    }
+    validate_stir_verification(&ss)?;
+    validate_stir_attestation(&ss.attestation)?;
+
+    // Per-trunk switches are enforced or rejected, never silently ignored.
+    for g in &config.trunk_groups {
+        for t in &g.trunks {
+            if t.stir_shaken.sign && !ss.signing_enabled {
+                return err(format!(
+                    "trunk {}: stir_shaken.sign requires stir_shaken.signing_enabled",
+                    t.id
+                ));
+            }
+            if t.stir_shaken.verify && !ss.verification_enabled {
+                return err(format!(
+                    "trunk {}: stir_shaken.verify requires stir_shaken.verification_enabled",
+                    t.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_stir_signing(sig: &crate::schema::StirSigningConfig) -> ConfigResult<()> {
+    use crate::schema::StirKeySource;
+    let err = |message: String| Err(ConfigError::Validation { message });
+    {
+        if sig.key_source == StirKeySource::Pkcs11 {
+            return err("stir_shaken.signing.key_source = \"pkcs11\" is not supported yet".into());
+        }
+        if sig.private_key_path.is_none() {
+            return err("STIR/SHAKEN signing requires signing.private_key_path".to_string());
+        }
+        if sig.certificate_path.is_none() {
+            return err("STIR/SHAKEN signing requires signing.certificate_path".to_string());
+        }
+        match sig.certificate_url.as_deref() {
+            None => return err("STIR/SHAKEN signing requires signing.certificate_url".to_string()),
+            Some(u) if !is_https_url(u) => {
+                return err("stir_shaken.signing.certificate_url must be an https:// URL".into());
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_stir_verification(ss: &crate::schema::StirShakenConfig) -> ConfigResult<()> {
+    let err = |message: String| Err(ConfigError::Validation { message });
+    let v = &ss.verification;
+    if ss.verification_enabled && v.trust_anchors_path.is_none() {
+        return err(
+            "stir_shaken.verification_enabled requires verification.trust_anchors_path".to_string(),
+        );
+    }
+    let bounded = |name: &str, val: u64, lo: u64, hi: u64| -> ConfigResult<()> {
+        if (lo..=hi).contains(&val) {
+            Ok(())
+        } else {
+            err(format!(
+                "stir_shaken.verification.{name} must be {lo}..={hi}"
+            ))
+        }
+    };
+    bounded("cert_fetch_timeout_ms", v.cert_fetch_timeout_ms, 100, 5000)?;
+    bounded(
+        "cert_cache_entries",
+        v.cert_cache_entries as u64,
+        1,
+        100_000,
+    )?;
+    bounded("cert_cache_ttl_secs", v.cert_cache_ttl_secs, 60, 86_400)?;
+    bounded(
+        "negative_cache_ttl_secs",
+        v.negative_cache_ttl_secs,
+        1,
+        3600,
+    )?;
+    bounded("max_cert_bytes", v.max_cert_bytes as u64, 1024, 65_536)?;
+    bounded(
+        "max_concurrent_fetches",
+        v.max_concurrent_fetches as u64,
+        1,
+        1024,
+    )?;
+    bounded(
+        "trust_anchor_refresh_secs",
+        v.trust_anchor_refresh_secs,
+        60,
+        604_800,
+    )?;
+    bounded("max_passport_age_secs", v.max_passport_age_secs, 10, 300)?;
+    if v.x5u_allow_hosts.len() > 256
+        || v.x5u_allow_hosts
+            .iter()
+            .any(|h| h.is_empty() || h.len() > 253 || h.contains(['/', ':', '@', ' ']))
+    {
+        return err(
+            "stir_shaken.verification.x5u_allow_hosts entries must be bare host names (max 256)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_stir_attestation(a: &crate::schema::StirAttestationConfig) -> ConfigResult<()> {
+    let err = |message: String| Err(ConfigError::Validation { message });
+    if a.owned_numbers.len() > 10_000 || a.rules.len() > 1024 {
+        return err("stir_shaken.attestation: at most 10000 owned_numbers and 1024 rules".into());
+    }
+    for n in &a.owned_numbers {
+        let digits = n.strip_suffix('*').unwrap_or(n);
+        let digits = digits.strip_prefix('+').unwrap_or(digits);
+        if digits.is_empty() || digits.len() > 32 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return err(format!(
+                "stir_shaken.attestation.owned_numbers entry {n:?} must be digits with an optional trailing *"
+            ));
+        }
+    }
+    for r in &a.rules {
+        if let Some(p) = &r.orig_prefix
+            && (p.is_empty() || p.len() > 32 || !p.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return err("stir_shaken.attestation.rules orig_prefix must be digits".into());
+        }
+    }
+    Ok(())
+}
+
+fn is_https_url(u: &str) -> bool {
+    u.get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        && u.len() > 8
+        && u.len() <= 1024
+        && !u.bytes().any(|b| b.is_ascii_control() || b == b' ')
 }
 
 fn validate_vps(config: &SbcConfig) -> ConfigResult<()> {
@@ -1174,6 +1303,346 @@ mod tests {
         assert!(validate_config(&config).is_err());
     }
 
+    fn stir_signing_ok() -> SbcConfig {
+        let mut config = SbcConfig::default();
+        let s = &mut config.stir_shaken;
+        s.signing_enabled = true;
+        s.signing.private_key_path = Some("/etc/sbc/sti.key".into());
+        s.signing.certificate_path = Some("/etc/sbc/sti.pem".into());
+        s.signing.certificate_url = Some("https://cert.example.invalid/sti.pem".into());
+        config
+    }
+
+    #[test]
+    fn stir_defaults_are_off_and_valid() {
+        let config = SbcConfig::default();
+        assert!(!config.stir_shaken.verification_enabled);
+        assert!(!config.stir_shaken.signing_enabled);
+        assert_eq!(
+            config.stir_shaken.attestation.default,
+            crate::schema::StirAttestation::C
+        );
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn stir_signing_rules() {
+        validate_config(&stir_signing_ok()).unwrap();
+        let mut c = stir_signing_ok();
+        c.stir_shaken.signing.certificate_url = Some("http://cert.example.invalid/a".into());
+        assert_rejected(&c, "https");
+        let mut c = stir_signing_ok();
+        c.stir_shaken.signing.key_source = crate::schema::StirKeySource::Pkcs11;
+        assert_rejected(&c, "pkcs11");
+        let mut c = stir_signing_ok();
+        c.stir_shaken.algorithm = crate::schema::StirAlgorithm::Es384;
+        assert_rejected(&c, "ES384");
+    }
+
+    #[test]
+    fn stir_verification_rules() {
+        let mut c = SbcConfig::default();
+        c.stir_shaken.verification_enabled = true;
+        assert_rejected(&c, "trust_anchors_path");
+        c.stir_shaken.verification.trust_anchors_path = Some("/etc/sbc/sti-cr".into());
+        validate_config(&c).unwrap();
+        c.stir_shaken.verification.cert_fetch_timeout_ms = 50;
+        assert_rejected(&c, "cert_fetch_timeout_ms");
+        c.stir_shaken.verification.cert_fetch_timeout_ms = 1500;
+        c.stir_shaken.verification.cert_cache_entries = 0;
+        assert_rejected(&c, "cert_cache_entries");
+        c.stir_shaken.verification.cert_cache_entries = 100_001;
+        assert_rejected(&c, "cert_cache_entries");
+        c.stir_shaken.verification.cert_cache_entries = 10;
+        c.stir_shaken.verification.x5u_allow_hosts = vec!["https://x".into()];
+        assert_rejected(&c, "x5u_allow_hosts");
+    }
+
+    #[test]
+    fn stir_trunk_switch_requires_global() {
+        let mut c = SbcConfig::default();
+        c.trunk_groups.push(crate::schema::TrunkGroupConfig {
+            id: "g".into(),
+            name: String::new(),
+            strategy: "priority".into(),
+            trunks: vec![TrunkConfigSchema {
+                id: "t1".into(),
+                host: "192.0.2.1".into(),
+                stir_shaken: crate::schema::TrunkStirConfig {
+                    sign: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            zone: None,
+        });
+        assert_rejected(&c, "signing_enabled");
+    }
+
+    #[test]
+    fn stir_deprecated_aliases() {
+        let toml_src = r#"
+[stir_shaken]
+signing_enabled = true
+certificate_path = "/etc/sbc/sti.pem"
+private_key_path = "/etc/sbc/sti.key"
+certificate_url = "https://cert.example.invalid/sti.pem"
+default_attestation = "B"
+max_passport_age_secs = 30
+"#;
+        let c: SbcConfig = toml::from_str(toml_src).unwrap();
+        let (n, used) = c.stir_shaken.normalized().unwrap();
+        assert_eq!(used.len(), 5);
+        assert_eq!(
+            n.signing.certificate_path.as_deref(),
+            Some(std::path::Path::new("/etc/sbc/sti.pem"))
+        );
+        assert_eq!(n.attestation.default, crate::schema::StirAttestation::B);
+        assert_eq!(n.verification.max_passport_age_secs, 30);
+        validate_config(&c).unwrap();
+
+        let mut bad = c.clone();
+        bad.stir_shaken.signing.certificate_path = Some("/other".into());
+        assert_rejected(&bad, "conflicts");
+        let mut bad = c;
+        bad.stir_shaken.default_attestation = Some("Z".into());
+        assert_rejected(&bad, "default_attestation");
+    }
+
+    fn stir_verify_ok() -> SbcConfig {
+        let mut c = SbcConfig::default();
+        c.stir_shaken.verification_enabled = true;
+        c.stir_shaken.verification.trust_anchors_path = Some("/etc/sbc/sti-cr".into());
+        c
+    }
+
+    /// QA: every numeric bound, both edges, one key at a time.
+    #[test]
+    fn qa_stir_every_verification_bound() {
+        type Set = fn(&mut crate::schema::StirVerificationConfig, u64);
+        let cases: &[(&str, Set, u64, u64)] = &[
+            (
+                "cert_fetch_timeout_ms",
+                |v, x| v.cert_fetch_timeout_ms = x,
+                100,
+                5000,
+            ),
+            (
+                "cert_cache_entries",
+                |v, x| v.cert_cache_entries = usize::try_from(x).unwrap(),
+                1,
+                100_000,
+            ),
+            (
+                "cert_cache_ttl_secs",
+                |v, x| v.cert_cache_ttl_secs = x,
+                60,
+                86_400,
+            ),
+            (
+                "negative_cache_ttl_secs",
+                |v, x| v.negative_cache_ttl_secs = x,
+                1,
+                3600,
+            ),
+            (
+                "max_cert_bytes",
+                |v, x| v.max_cert_bytes = usize::try_from(x).unwrap(),
+                1024,
+                65_536,
+            ),
+            (
+                "max_concurrent_fetches",
+                |v, x| v.max_concurrent_fetches = usize::try_from(x).unwrap(),
+                1,
+                1024,
+            ),
+            (
+                "trust_anchor_refresh_secs",
+                |v, x| v.trust_anchor_refresh_secs = x,
+                60,
+                604_800,
+            ),
+            (
+                "max_passport_age_secs",
+                |v, x| v.max_passport_age_secs = x,
+                10,
+                300,
+            ),
+        ];
+        for &(name, set, lo, hi) in cases {
+            for ok in [lo, hi] {
+                let mut c = stir_verify_ok();
+                set(&mut c.stir_shaken.verification, ok);
+                assert!(validate_config(&c).is_ok(), "{name}={ok}");
+            }
+            for bad in [lo - 1, hi + 1] {
+                let mut c = stir_verify_ok();
+                set(&mut c.stir_shaken.verification, bad);
+                assert_rejected(&c, name);
+            }
+        }
+        // Bounds apply even when verification is off (no silent acceptance).
+        let mut c = SbcConfig::default();
+        c.stir_shaken.verification.cert_fetch_timeout_ms = 0;
+        assert_rejected(&c, "cert_fetch_timeout_ms");
+    }
+
+    #[test]
+    fn qa_stir_allow_hosts_and_attestation_syntax() {
+        for bad in ["", "a b", "h:443", "u@h", "h/p"] {
+            let mut c = stir_verify_ok();
+            c.stir_shaken.verification.x5u_allow_hosts = vec![bad.into()];
+            assert_rejected(&c, "x5u_allow_hosts");
+        }
+        let mut c = stir_verify_ok();
+        c.stir_shaken.verification.x5u_allow_hosts = vec!["cert.example.com".into()];
+        validate_config(&c).unwrap();
+        c.stir_shaken.verification.x5u_allow_hosts = vec!["h".into(); 257];
+        assert_rejected(&c, "x5u_allow_hosts");
+
+        for good in ["+1202555*", "1202555", "1*"] {
+            let mut c = SbcConfig::default();
+            c.stir_shaken.attestation.owned_numbers = vec![good.into()];
+            assert!(validate_config(&c).is_ok(), "{good}");
+        }
+        for bad in ["", "*", "+", "12a", "1*2", &"1".repeat(33)] {
+            let mut c = SbcConfig::default();
+            c.stir_shaken.attestation.owned_numbers = vec![bad.to_string()];
+            assert_rejected(&c, "owned_numbers");
+        }
+        let toml_src = r#"
+[stir_shaken.attestation]
+default = "A"
+[[stir_shaken.attestation.rules]]
+orig_prefix = "12x"
+attest = "A"
+"#;
+        let c: SbcConfig = toml::from_str(toml_src).unwrap();
+        assert_rejected(&c, "orig_prefix");
+        assert!(
+            toml::from_str::<SbcConfig>("[stir_shaken.attestation]\ndefault = \"D\"\n").is_err(),
+            "attestation.default is a typed enum"
+        );
+    }
+
+    #[test]
+    fn qa_stir_trunk_verify_requires_global_and_unknown_trunk_key() {
+        let toml_src = r#"
+[[trunk_groups]]
+id = "g"
+strategy = "priority"
+[[trunk_groups.trunks]]
+id = "t1"
+host = "192.0.2.1"
+stir_shaken = { verify = true }
+"#;
+        let c: SbcConfig = toml::from_str(toml_src).unwrap();
+        assert_rejected(&c, "verification_enabled");
+        // deny_unknown_fields on the per-trunk table.
+        let typo = toml_src.replace("verify = true", "verfy = true");
+        assert!(toml::from_str::<SbcConfig>(&typo).is_err());
+    }
+
+    #[test]
+    fn qa_stir_failure_policy_and_algorithm_strings() {
+        for (s, want) in [
+            (
+                "pass-through",
+                crate::schema::StirFailurePolicy::PassThrough,
+            ),
+            ("mark", crate::schema::StirFailurePolicy::Mark),
+            ("reject", crate::schema::StirFailurePolicy::Reject),
+        ] {
+            let c: SbcConfig = toml::from_str(&format!(
+                "[stir_shaken.verification]\nfailure_policy = \"{s}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(c.stir_shaken.verification.failure_policy, want);
+        }
+        assert!(
+            toml::from_str::<SbcConfig>("[stir_shaken.verification]\nfailure_policy = \"drop\"\n")
+                .is_err()
+        );
+        let c: SbcConfig = toml::from_str("[stir_shaken]\nalgorithm = \"ES384\"\n").unwrap();
+        assert_rejected(&c, "ES384");
+        let c: SbcConfig =
+            toml::from_str("[stir_shaken.signing]\nkey_source = \"pkcs11\"\n").unwrap();
+        // NIST-008: pkcs11 is rejected even with signing off.
+        assert_rejected(&c, "pkcs11");
+    }
+
+    #[test]
+    fn qa_stir_ca_bundle_alias_and_conflicts() {
+        let toml_src = r#"
+[stir_shaken]
+verification_enabled = true
+ca_bundle_path = "/etc/sbc/sti-cr"
+"#;
+        let c: SbcConfig = toml::from_str(toml_src).unwrap();
+        let (n, used) = c.stir_shaken.normalized().unwrap();
+        assert_eq!(used, vec!["ca_bundle_path"]);
+        assert_eq!(
+            n.verification.trust_anchors_path.as_deref(),
+            Some(std::path::Path::new("/etc/sbc/sti-cr"))
+        );
+        validate_config(&c).unwrap();
+        // Same value under both: accepted, not a conflict.
+        let mut same = c.clone();
+        same.stir_shaken.verification.trust_anchors_path = Some("/etc/sbc/sti-cr".into());
+        validate_config(&same).unwrap();
+        let mut bad = c;
+        bad.stir_shaken.verification.trust_anchors_path = Some("/other".into());
+        assert_rejected(&bad, "ca_bundle_path");
+    }
+
+    /// QA: the deprecated top-level `max_passport_age_secs` silently wins
+    /// over a different nested value; every other alias reports a conflict.
+    #[test]
+    fn qa_stir_max_age_alias_conflict_is_reported() {
+        let toml_src = "
+[stir_shaken]
+max_passport_age_secs = 30
+[stir_shaken.verification]
+max_passport_age_secs = 120
+";
+        let c: SbcConfig = toml::from_str(toml_src).unwrap();
+        assert!(c.stir_shaken.normalized().is_err());
+        // Alias alone, or agreeing with the nested key, still folds.
+        let c: SbcConfig = toml::from_str("[stir_shaken]\nmax_passport_age_secs = 30\n").unwrap();
+        let (n, used) = c.stir_shaken.normalized().unwrap();
+        assert_eq!(n.verification.max_passport_age_secs, 30);
+        assert_eq!(used, vec!["max_passport_age_secs"]);
+        let c: SbcConfig = toml::from_str(
+            "[stir_shaken]\nmax_passport_age_secs = 30\n[stir_shaken.verification]\nmax_passport_age_secs = 30\n",
+        )
+        .unwrap();
+        assert!(c.stir_shaken.normalized().is_ok());
+        let c: SbcConfig = toml::from_str(
+            "[stir_shaken]\ndefault_attestation = \"A\"\n[stir_shaken.attestation]\ndefault = \"B\"\n",
+        )
+        .unwrap();
+        assert!(c.stir_shaken.normalized().is_err());
+    }
+
+    /// `[stir_shaken]` and its nested tables reject unknown keys; the
+    /// deprecated flat aliases are still accepted.
+    #[test]
+    fn stir_unknown_keys_rejected() {
+        for src in [
+            "[stir_shaken]\nsigning_enabeld = true\n",
+            "[stir_shaken.signing]\nprivate_key = \"/k\"\n",
+            "[stir_shaken.attestation]\ndefualt = \"A\"\n",
+            "[stir_shaken.verification]\nmax_age = 30\n",
+        ] {
+            assert!(toml::from_str::<SbcConfig>(src).is_err(), "{src}");
+        }
+        let ok = "[stir_shaken]\ncertificate_path = \"/c\"\nprivate_key_path = \"/k\"\n\
+                  certificate_url = \"https://x/c\"\nca_bundle_path = \"/a\"\n\
+                  default_attestation = \"B\"\nmax_passport_age_secs = 30\n";
+        assert!(toml::from_str::<SbcConfig>(ok).is_ok());
+    }
+
     #[test]
     fn test_invalid_tls_version() {
         let mut config = SbcConfig::default();
@@ -1891,9 +2360,7 @@ require_mtls = false
 
 [stir_shaken]
 signing_enabled = false
-verification_enabled = true
-default_attestation = "B"
-max_passport_age_secs = 60
+verification_enabled = false
 
 [rate_limit]
 enabled = true

@@ -191,6 +191,23 @@ impl Server {
         )
     }
 
+    /// Attaches the STIR/SHAKEN service to the SIP stack. Returns false when
+    /// the stack is already shared.
+    pub fn set_stir(&mut self, stir: Arc<crate::stir::StirService>) -> bool {
+        Arc::get_mut(&mut self.sip_stack).map_or_else(
+            || {
+                tracing::error!(
+                    "Cannot set STIR/SHAKEN on SIP stack — Arc has multiple references"
+                );
+                false
+            },
+            |stack| {
+                stack.set_stir(stir);
+                true
+            },
+        )
+    }
+
     /// Determines which zone a transport belongs to based on its local bind address.
     fn zone_for_transport(&self, transport: &UdpTransport) -> Option<String> {
         self.zone_for_local_ip(transport.local_addr().ip())

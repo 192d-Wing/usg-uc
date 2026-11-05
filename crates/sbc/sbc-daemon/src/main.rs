@@ -67,6 +67,8 @@ mod sdp_dtls;
 mod server;
 mod shutdown;
 mod sip_stack;
+mod stir;
+mod stir_binding;
 mod zone;
 
 // The media plane (RTP/SRTP relay, DTLS-SRTP termination, the MediaController

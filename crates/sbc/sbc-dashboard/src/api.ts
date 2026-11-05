@@ -139,6 +139,11 @@ export type CdrRecord = {
   srtp: string | null;
   emergency: boolean;
   stir_attestation: 'A' | 'B' | 'C' | null;
+  /** Schema v2: absent on v1 records. */
+  stir_verstat?: 'tn-validation-passed' | 'tn-validation-failed' | 'no-tn-validation';
+  stir_verify_reason?: string;
+  stir_inbound_attestation?: 'A' | 'B' | 'C';
+  stir_x5u_host?: string;
   failover_takeover: boolean;
   prev_hash: string;
   hash: string;

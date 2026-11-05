@@ -125,10 +125,12 @@ Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_ver
 
 ### STIR/SHAKEN
 
-- **PASSporT Signing/Verification**: ES384 (ECDSA P-384 with SHA-384); ES256 is rejected (`proto-stir-shaken/src/verification.rs`).
-- **Certificate**: P-384 ECDSA
-- **Forbidden**: ES256, RS256
-- **Implementation**: `proto-stir-shaken` crate — **Library-only**. No `crates/sbc` binary depends on it; the `[stir_shaken]` config section is parsed by `sbc-config` but not used by `sbc-daemon`.
+- **CNSA exception (documented, POA&M-27):** SHAKEN mandates ES256 (ECDSA P-256 / SHA-256; RFC 8225 §5.2, ATIS-1000074), and every STI-CA issues P-256 certificates. ES256 lives only in `uc_crypto::interop::ecdsa_p256`, compiled with the `stir-shaken-es256` feature, not re-exported from the CNSA surface. **The feature is not optional for the SBC:** `uc-sti` depends on `uc-crypto` with `stir-shaken-es256` enabled unconditionally (`crates/uc/uc-sti/Cargo.toml`) and `sbc-daemon` always depends on `uc-sti`, so every `sbc-daemon` binary contains the ES256 code, whether or not `[stir_shaken]` is enabled (POA&M-39). At runtime it is reached only when signing or verification is configured; the using modules carry a `CNSA-EXCEPTION` tag (`uc-crypto/src/x509.rs`, `uc-sti/src/cache.rs`, `proto-stir-shaken/src/passport.rs`, `sbc-daemon/src/stir.rs`, `sbc-config`), though `uc-sti/src/signer.rs` does not. It is used for caller-identity signatures only, never for confidentiality. The CNSA `uc_crypto::ecdsa` module still exposes P-384 only.
+- **Algorithm confusion:** `ppt=shaken` PASSporTs with any `alg` other than ES256 (including `none` and ES384) are rejected (`proto-stir-shaken/src/passport.rs`).
+- **ES384:** reserved for bilateral profiles; `stir_shaken.algorithm = "ES384"` is rejected by validation in this release (POA&M-32).
+- **STI certificate chains:** validated with rustls-webpki (aws-lc FIPS provider) to the STI-CR anchors, ECDSA P-256/P-384 signatures only (`uc_crypto::x509`).
+- **x5u fetch TLS:** TLS 1.2/1.3 on the aws-lc provider (`uc-sti/src/fetch.rs` `tls_config`) against the system web PKI. Suites and key-exchange groups are the provider defaults: CNSA suites are neither required nor preferred (POA&M-40; same class of gap as POA&M-26). Public STI repositories do not all offer the CNSA suite; the fetched chain's trust comes from the STI-CR anchors, not the transport.
+- **Implementation**: `proto-stir-shaken` (pure protocol), `uc-sti` (fetch/cache/anchors/signer), `sbc-daemon/src/stir.rs` (call path).
 
 ### JWT (OIDC Bearer REGISTER and Management API)
 
