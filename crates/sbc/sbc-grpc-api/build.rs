@@ -7,6 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protos = [
         "proto/config.proto",
         "proto/call.proto",
+        "proto/cdr.proto",
         "proto/registration.proto",
         "proto/health.proto",
         "proto/system.proto",

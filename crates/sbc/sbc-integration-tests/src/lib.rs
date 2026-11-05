@@ -26,6 +26,9 @@
 )]
 
 #[cfg(test)]
+mod cdr_tests;
+
+#[cfg(test)]
 mod config_tests;
 
 #[cfg(test)]

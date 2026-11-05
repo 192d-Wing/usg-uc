@@ -93,6 +93,15 @@ pub enum AuditEvent {
 
     /// A trunk became reachable or unreachable.
     TrunkReachabilityChanged(TrunkReachabilityChanged),
+
+    /// The CDR pipeline failed to write or is dropping records.
+    CdrSinkFailure(CdrSinkFailure),
+
+    /// A CDR file was closed and its digest sidecar written.
+    CdrFileRotated(CdrFileRotated),
+
+    /// CDRs were read in bulk through the management plane.
+    CdrExport(CdrExport),
 }
 
 impl AuditEvent {
@@ -104,7 +113,7 @@ impl AuditEvent {
                 AuditEventType::Call
             }
             Self::AuthenticationAttempt(_) => AuditEventType::Authentication,
-            Self::AuthorizationDecision(_) => AuditEventType::Authorization,
+            Self::AuthorizationDecision(_) | Self::CdrExport(_) => AuditEventType::Authorization,
             Self::ConfigurationChange(_) => AuditEventType::Configuration,
             Self::CryptoKeyOperation(_) => AuditEventType::Cryptographic,
             Self::DosDetected(_)
@@ -113,7 +122,9 @@ impl AuditEvent {
             Self::SystemStartup(_)
             | Self::SystemShutdown(_)
             | Self::TrunkFailover(_)
-            | Self::TrunkReachabilityChanged(_) => AuditEventType::System,
+            | Self::TrunkReachabilityChanged(_)
+            | Self::CdrSinkFailure(_)
+            | Self::CdrFileRotated(_) => AuditEventType::System,
         }
     }
 }
@@ -401,6 +412,56 @@ pub struct TrunkReachabilityChanged {
     pub source: ReachabilitySource,
 }
 
+/// CDR pipeline failure.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdrSinkFailure {
+    /// `"write_error"`, `"queue_full"` or `"writer_dead"`.
+    pub reason: String,
+    /// Error text or drop count; never record content.
+    pub detail: String,
+}
+
+/// CDR file rotation.
+///
+/// ## NIST 800-53 Rev5: AU-9 (Protection of Audit Information), AU-11
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdrFileRotated {
+    /// Closed file path.
+    pub file: String,
+    /// Hex SHA-384 of the closed file.
+    pub sha384: String,
+}
+
+/// Bulk CDR read (export) by a management user. CDRs carry PII.
+///
+/// ## NIST 800-53 Rev5: AU-2, AC-3, SI-12
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdrExport {
+    /// Authenticated principal: the REST user in sbc-api; in the daemon the
+    /// gRPC client certificate name (`cert:<name>`), or `unauthenticated`
+    /// on a loopback listener without mTLS.
+    pub user: String,
+    /// End user the authenticated principal says it acts for (gRPC
+    /// `x-sbc-user`). Caller-asserted, never the principal. Additive.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub on_behalf_of: String,
+    /// Filter as given (query string form).
+    pub filter: String,
+    /// Records returned.
+    pub count: u64,
+    /// Export format.
+    pub format: String,
+    /// Outcome: `success`, `truncated`, `failed`, `busy` or `denied`.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records)
+    #[serde(default)]
+    pub outcome: String,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -457,6 +518,20 @@ mod tests {
         assert!(json.contains(r#""source_ip":"192.0.2.7""#));
         let back = as_authz(serde_json::from_str(&json).unwrap()).unwrap();
         assert_eq!(back.source_ip, Some("192.0.2.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn cdr_export_is_authorization_and_outcome_is_additive() {
+        let old = r#"{"user":"op1","filter":"","count":2,"format":"csv"}"#;
+        let e: CdrExport = serde_json::from_str(old).unwrap();
+        assert_eq!(e.outcome, "");
+        assert_eq!(e.on_behalf_of, "");
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("on_behalf_of"), "{json}");
+        assert_eq!(
+            AuditEvent::CdrExport(e).event_type(),
+            AuditEventType::Authorization
+        );
     }
 
     #[test]

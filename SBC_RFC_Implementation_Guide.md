@@ -731,6 +731,13 @@ Target (by 2035):
    - Complete migration to post-quantum algorithms
    - Remove all classical asymmetric cryptography
 
+### Recorded Implementation Deviations (CDR change)
+
+These are deviations in the shipped code from the guidance above. They are recorded so the security profile and the NIST POA&M in `docs/NIST-800-53-CONTROLS.md` stay aligned.
+
+1. **CDR syslog (RFC 5424 / 5425 / 6587) does not use `uc-syslog`.** `uc-syslog` has no TLS and pulls in tokio, so `uc-cdr` (`src/sink.rs` `SyslogSink`) hand-formats RFC 5424 messages: MSGID `CDR`, UTF-8 BOM, JSON MSG and RFC 6587 octet counting. `sbc-daemon/src/cdr.rs` `TlsSyslogConnector` supplies the TLS transport. That transport is TLS 1.3 only (`uc_transport::tls::create_client_config`). Like the SIP-TLS configs, it does not restrict cipher suites or key-exchange groups, so the suite list in "TLS/DTLS Configuration" is not enforced on it either (POA&M-26). It presents no client certificate, so RFC 5425 mutual authentication is absent (POA&M-15). See `docs/RFC_COMPLIANCE_GAPS.md`, section "sbc-daemon CDR".
+2. **The sbc-api to sbc-daemon gRPC channel is not on the CNSA 2.0 TLS profile.** Both the daemon's tonic `ServerTlsConfig` and sbc-api's client use tonic's default rustls provider and suites, which allow TLS 1.2, AES-128 and X25519. The suite settings in "TLS/DTLS Configuration" above are therefore **not** enforced on this channel. The Helm chart's certificates are ECDSA P-384, but that does not make the negotiated suite compliant. Tracked as POA&M-16 (`// POAM: SEC-9` in `sbc-daemon/src/grpc_server/mod.rs`, `// POAM:` in `sbc-api-server/src/state.rs`). Cross-reference: `docs/CNSA-2-COMPLIANCE.md`.
+
 ---
 
 ## Sources

@@ -82,6 +82,22 @@
         auth_type: digest
 
   tasks:
+    # ── CDR directory (bare-metal / VM installs) ────────
+    # CDRs are on by default (NIST 800-53 AU-12) and the daemon refuses to
+    # start when `cdr.directory` is not writable. Container images and the
+    # Helm chart create it already; set sbc_host_install=true when the
+    # daemon runs directly on the inventory host.
+    - name: Create the CDR directory
+      ansible.builtin.file:
+        path: "{{ sbc_cdr_directory | default('/var/lib/usg-sbc/cdr') }}"
+        state: directory
+        owner: "{{ sbc_service_user | default('sbc') }}"
+        group: "{{ sbc_service_user | default('sbc') }}"
+        mode: "0750"
+      become: true
+      when: sbc_host_install | default(false) | bool
+      tags: [cdr]
+
     # ── Wait for SBC API ────────────────────────────────
     - name: Wait for SBC API to be ready
       ansible.builtin.uri:

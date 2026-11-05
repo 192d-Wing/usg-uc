@@ -226,6 +226,13 @@ spec:
           volumeMounts:
             - { name: config-rendered, mountPath: /etc/sbc/config.toml, subPath: config.toml, readOnly: true }
             - { name: data, mountPath: /var/lib/sbc }
+            {{- if and .Values.sbcDaemon.cdr.enabled .Values.sbcDaemon.cdr.persistence.enabled }}
+            # Dedicated CDR volume (AU-4): CDR growth cannot fill /var/lib/sbc.
+            - { name: cdr, mountPath: {{ .Values.sbcDaemon.cdr.directory | quote }} }
+            {{- end }}
+            {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+            - { name: grpc-tls, mountPath: /etc/sbc/grpc-tls, readOnly: true }
+            {{- end }}
             - { name: logs, mountPath: /var/log/sbc }
             {{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
             # Shared with the terminator sidecar: read the fingerprint file +
@@ -298,6 +305,17 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if and .Values.sbcDaemon.cdr.enabled .Values.sbcDaemon.cdr.persistence.enabled }}
+        - name: cdr
+          persistentVolumeClaim:
+            claimName: {{ include "sbc.fullname" . }}-cdr
+        {{- end }}
+        {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+        - name: grpc-tls
+          secret:
+            secretName: {{ include "sbc.grpcServerTlsSecret" . }}
+            defaultMode: 0440
+        {{- end }}
         - name: logs
           emptyDir: {}
         {{- if .Values.sbcDaemon.dtlsTerminate.enabled }}

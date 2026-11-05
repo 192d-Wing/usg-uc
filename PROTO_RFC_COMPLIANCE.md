@@ -28,7 +28,7 @@
 | **RFC 3311** | UPDATE Method | Method enum entry. **Wired (sbc-daemon)** — relayed in-dialog via `handle_update` → `handle_in_dialog_request` (`sip_stack.rs`) |
 | **RFC 3323** | Privacy Mechanism for SIP | **Implemented** — topology hiding module. **Wired (sbc-daemon)** — `TopologyHider::hide_b2bua_request` on external B-leg (`sip_stack.rs`) |
 | **RFC 3325** | P-Asserted-Identity | Header support, topology hiding. **Wired (sbc-daemon)** via topology hider only |
-| **RFC 3326** | Reason Header | Header name defined. Library-only |
+| **RFC 3326** | Reason Header | Header name defined in proto-sip. **Wired (sbc-daemon, CDR only)**: `sbc-daemon/src/cdr.rs` reads every `Reason` header field (`sip_stack.rs` `reason_headers()`, `CdrEnd::with_reasons`). Splitting on `,` and `;` respects quoted strings and quoted-pairs (RFC 3261 §25.1, `split_unquoted`). The first `protocol=Q.850` cause in 1..=127 is recorded as `q850_cause`. The daemon does not add or rewrite Reason. Tests `q850_parses_rfc3326_reason`, `q850_from_separate_reason_headers`, `cdr_answered_then_callee_bye_with_q850` |
 | **RFC 3327** | Path Header | **Full** — `path_headers()`, `prepend_path()`, validation. **Library-only** — daemon REGISTER handling never reads or inserts Path |
 | **RFC 3428** | MESSAGE Method | Method enum entry. Library-only — daemon returns 405 |
 | **RFC 3455** | P-Headers | Header names defined. Library-only |
@@ -485,6 +485,10 @@
 1. **proto-rtp**: Mixer/translator reception reports have `jitter`, `last_sr`, `delay_since_last_sr` hardcoded to 0 — would need per-source JitterCalculator and SR timestamp tracking
 2. **proto-stun**: SASLprep (RFC 4013) is simplified — full compliance noted as incomplete in comments
 
+### CDR syslog sink (not a proto-* crate)
+
+`uc-cdr` hand-formats the CDR syslog output. It does not use `uc-syslog`, which has no TLS support. The format is RFC 5424: PRI = facility * 8 + 6 (informational), VERSION `1`, an RFC 3339 UTC timestamp with milliseconds and `Z`, the sanitised hostname (`node_id`), APP-NAME `usg-sbc`, PROCID `-`, MSGID `CDR`, STRUCTURED-DATA as NILVALUE `-`, and MSG as the UTF-8 BOM (§6.4) followed by the record's canonical JSON. Framing is RFC 6587 octet counting; the count includes the 3 BOM octets. The transport is RFC 5425 over TLS 1.3 only (`uc_transport::tls::create_client_config`). Cipher suites and key-exchange groups are not restricted, so the suite is not CNSA 2.0 enforced (NIST POA&M-26). Gap: RFC 5425 §4.2 mutual authentication is absent because no client certificate is sent (NIST POA&M-15). Tests: `syslog_octet_counted_rfc5424`, `syslog_sink_octet_counted_frames_via_fake_connector`. No test performs a TLS handshake.
+
 ### Complete RFC Index
 
 "Shipped in" names the binary with a call site; "library" means no shipped binary calls it. "soft client" = `client-*` crates (Tauri/FFI client).
@@ -496,11 +500,11 @@
 | RFC 3261 | SIP | proto-sip, proto-transaction, proto-dialog, proto-registrar, proto-b2bua | sbc-daemon, soft client (message layer, transactions, registrar); dialog layer, proxy/routing/redirect/options: library |
 | RFC 3262 | 100rel / PRACK | proto-transaction | library |
 | RFC 3263 | Locating SIP Servers | proto-sip | soft client (via uc-dns) |
-| RFC 3264 | Offer/Answer Model with SDP | proto-sdp, proto-b2bua | library (daemon relays SDP opaquely) |
+| RFC 3264 | Offer/Answer Model with SDP | proto-sdp, proto-b2bua | library (daemon relays SDP opaquely; its CDR code reads the answer and skips port-0 `m=audio` per §6, see docs/SDP_RFC_Compliance.md) |
 | RFC 3311 | UPDATE Method | proto-sip, proto-transaction | sbc-daemon |
 | RFC 3323 | Privacy Mechanism for SIP | proto-sip | sbc-daemon |
 | RFC 3325 | P-Asserted-Identity | proto-sip | sbc-daemon (topology hider) |
-| RFC 3326 | Reason Header | proto-sip | library |
+| RFC 3326 | Reason Header | proto-sip; sbc-daemon `cdr.rs` | proto-sip + sbc-daemon (CDR Q.850 extraction) |
 | RFC 3327 | Path Header | proto-sip, proto-registrar | library |
 | RFC 3428 | MESSAGE Method | proto-sip | library |
 | RFC 3455 | P-Headers | proto-sip | library |
@@ -535,6 +539,8 @@
 | RFC 5359 | Line Event Package | proto-dialog | library |
 | RFC 5362 | Resource Lists Event Package | proto-dialog | library |
 | RFC 5373 | Call Completion | proto-dialog | library |
+| RFC 5424 | The Syslog Protocol | uc-cdr (`sink.rs` `SyslogSink`, hand-formatted; not uc-syslog) | sbc-daemon (CDR syslog sink, opt-in) |
+| RFC 5425 | TLS Transport for Syslog | uc-cdr, sbc-daemon `cdr.rs` `TlsSyslogConnector` | sbc-daemon (CDR syslog sink, TLS 1.3 only, server-auth only: no client certificate) |
 | RFC 5389 | STUN | proto-stun | sbc-daemon (zone external-IP discovery), soft client (ICE checks); long-term credentials: library |
 | RFC 5626 | SIP Outbound | proto-registrar | sbc-daemon (instance-id/reg-id, CRLF ping); flow manager: library |
 | RFC 5627 | GRUU | proto-registrar | library |
@@ -552,6 +558,7 @@
 | RFC 6188 | AES-256-CM | proto-sdp | library |
 | RFC 6347 | DTLS 1.2 | proto-dtls | soft client (SBC uses Go sidecar) |
 | RFC 6446 | Session Recording | proto-dialog | library |
+| RFC 6587 | Syslog over TCP (octet-counting framing) | uc-cdr | sbc-daemon (CDR syslog sink; octet counting only) |
 | RFC 6665 | SIP Events | proto-sip, proto-dialog | library |
 | RFC 6910 | Auto-Configuration | proto-dialog | library |
 | RFC 7092 | B2BUA Taxonomy | proto-b2bua | sbc-daemon |

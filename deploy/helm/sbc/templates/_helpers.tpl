@@ -8,6 +8,27 @@
 {{- printf "%s-%s" (include "sbc.name" .) .Values.site.name | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
+{{/* Secret with the daemon gRPC server certificate (sbcDaemon.grpcMtls). */}}
+{{- define "sbc.grpcServerTlsSecret" -}}
+{{- .Values.sbcDaemon.grpcMtls.serverSecretName | default (printf "%s-grpc-server-tls" (include "sbc.fullname" .)) -}}
+{{- end }}
+
+{{/* Secret with the sbc-api gRPC client certificate (sbcDaemon.grpcMtls). */}}
+{{- define "sbc.grpcClientTlsSecret" -}}
+{{- .Values.sbcDaemon.grpcMtls.clientSecretName | default (printf "%s-grpc-client-tls" (include "sbc.fullname" .)) -}}
+{{- end }}
+
+{{/* TOML array for grpc.allowed_client_names (sbcDaemon.grpcMtls). */}}
+{{- define "sbc.grpcAllowedClientNames" -}}
+{{- $names := .Values.sbcDaemon.grpcMtls.allowedClientNames | default (list (printf "%s-sbc-api" (include "sbc.fullname" .))) -}}
+[{{- range $i, $n := $names }}{{ if $i }}, {{ end }}{{ $n | quote }}{{ end -}}]
+{{- end -}}
+
+{{/* Daemon gRPC URL for in-cluster clients (https when grpcMtls is on). */}}
+{{- define "sbc.daemonGrpcUrl" -}}
+{{- printf "%s://%s-grpc.%s.svc.cluster.local:9091" (ternary "https" "http" .Values.sbcDaemon.grpcMtls.enabled) (include "sbc.fullname" .) .Release.Namespace -}}
+{{- end }}
+
 {{- define "sbc.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
@@ -205,10 +226,23 @@ scrape_interval_secs = 15
 # `enabled` defaults to false in the schema, so it MUST be set true
 # here or the gRPC server never starts and sbc-api's writes silently
 # skip the SIP-router refresh step.
+#
+# CdrService (CDRs = PII) is mounted only when this listener requires mTLS
+# or is loopback-bound; with sbcDaemon.grpcMtls.enabled=false the CDR API
+# answers 503 (NIST 800-53 Rev5: AC-3, SC-8, SI-12).
 enabled = true
 listen_addr = {{ .Values.sbcDaemon.config.grpc_listen | quote }}
 enable_reflection = false
-require_mtls = false
+require_mtls = {{ .Values.sbcDaemon.grpcMtls.enabled }}
+{{- if .Values.sbcDaemon.grpcMtls.enabled }}
+tls_cert_path = "/etc/sbc/grpc-tls/tls.crt"
+tls_key_path = "/etc/sbc/grpc-tls/tls.key"
+tls_ca_path = "/etc/sbc/grpc-tls/ca.crt"
+# Only these client certificate names (SAN DNS/URI or subject CN) may call
+# the gRPC API; default is the chart's sbc-api client certificate CN
+# (NIST 800-53 Rev5: AC-3, IA-3).
+allowed_client_names = {{ include "sbc.grpcAllowedClientNames" . }}
+{{- end }}
 
 # Phone provisioning HTTP server. Without this section the daemon leaves
 # AppState::provisioning = None and /provision/<MAC>.{cfg,xml} returns 503.
@@ -242,4 +276,17 @@ level = "info"
 format = "json"
 output = "stdout"
 audit_enabled = true
+
+# Call Detail Records (NIST 800-53 Rev5 AU-12). The directory is its own
+# volume (sbcDaemon.cdr.persistence, mounted at cdr.directory) so a CDR
+# burst cannot fill the user/config store on the data volume. Retention is
+# sized to it: retention_files * rotate_size_mb <= the CDR volume (AU-4).
+# The daemon refuses to start if it cannot write here.
+[cdr]
+enabled = {{ .Values.sbcDaemon.cdr.enabled }}
+directory = {{ .Values.sbcDaemon.cdr.directory | quote }}
+format = {{ .Values.sbcDaemon.cdr.format | quote }}
+rotate_size_mb = {{ .Values.sbcDaemon.cdr.rotateSizeMb }}
+retention_days = {{ .Values.sbcDaemon.cdr.retentionDays }}
+retention_files = {{ .Values.sbcDaemon.cdr.retentionFiles }}
 {{- end }}

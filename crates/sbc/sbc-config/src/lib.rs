@@ -392,4 +392,37 @@ media:
         let err = result.unwrap_err();
         assert!(err.to_string().contains("TOML parse error"));
     }
+
+    #[test]
+    fn cdr_table_parses_and_rejects_unknown_keys() {
+        let cfg = load_from_str(
+            r#"
+[cdr]
+format = "csv"
+directory = "/srv/cdr"
+rotate_interval = "15m"
+record_unanswered = "routed"
+pii = "mask_caller"
+on_failure = "reject_new_calls"
+
+[cdr.syslog]
+enabled = true
+target = "tls://collector.example:6514"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.cdr.format, crate::schema::CdrFormatConfig::Csv);
+        assert_eq!(
+            cfg.cdr.record_unanswered,
+            crate::schema::CdrRecordUnanswered::Routed
+        );
+        assert_eq!(
+            cfg.cdr.on_failure,
+            crate::schema::CdrOnFailure::RejectNewCalls
+        );
+        assert!(cfg.cdr.syslog.enabled);
+        assert_eq!(cfg.cdr.ring_capacity, 10_000);
+        assert!(load_from_str("[cdr]\nbogus = 1\n").is_err());
+        assert!(load_from_str("[cdr]\npii = \"plain\"\n").is_err());
+    }
 }

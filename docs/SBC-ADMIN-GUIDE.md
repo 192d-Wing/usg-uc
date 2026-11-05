@@ -658,6 +658,61 @@ Audit writes never block call handling. Records go onto a queue of 4096 and a ba
 
 ---
 
+## Call Detail Records
+
+Each call attempt that passes source admission produces one Call Detail Record (CDR, schema v1) when it ends: answered, cancelled, failed, rejected at admission, by policy or for lack of a route, or rejected by the trunk with a 4xx/5xx/6xx. INVITEs that only draw a 401/407 challenge produce no CDR unless `record_auth_challenges = true`. Traffic dropped by the ACL or DoS protection, and INVITEs refused by source admission (403, neither a trunk nor registered; audited as an `AuthorizationDecision`), produce no CDR. A retransmitted INVITE that is rejected again within 32 s does not produce a second CDR.
+
+```toml
+[cdr]
+enabled = true
+format = "jsonl"                    # jsonl (default) | csv
+directory = "/var/lib/usg-sbc/cdr"  # absolute path; created 0750, files 0640
+# node_id = "sbc-a"                 # default: general.instance_name, then $HOSTNAME
+rotate_size_mb = 100                # 1..=4096
+rotate_interval = "1h"              # "0" = size only, otherwise 5m..=24h (s, m, h)
+retention_files = 168               # closed files kept; 0 = no count limit
+retention_days = 90                 # 0 = no age limit (both 0 is rejected)
+fsync_interval_ms = 1000            # 0 = fsync after every record; max 60000
+queue_capacity = 8192               # 64..=1000000
+ring_capacity = 10000               # recent CDRs kept in memory for the API; 0..=200000
+hash_chain = true                   # SHA-384 chain over records
+record_unanswered = "all"           # all | routed | none
+record_auth_challenges = false
+pii = "full"                        # full | mask_caller | hash
+# pii_hash_key_file = "/etc/usg-sbc/cdr-hmac.key"   # required with pii = "hash"
+on_failure = "continue"             # continue | reject_new_calls
+
+[cdr.syslog]
+enabled = false
+target = "tls://collector.example.net:6514"   # TLS only (RFC 5425)
+# ca_path = "/etc/usg-sbc/syslog-ca.pem"
+facility = 16
+```
+
+The table rejects unknown keys. Validation also rejects a relative `directory` or key path, `pii = "hash"` without `pii_hash_key_file`, a key file given with any other `pii` mode, out-of-range sizes and intervals, a `node_id` outside `[A-Za-z0-9._-]{1,64}`, a syslog `target` that is not `tls://host:port`, and `retention_files = 0` together with `retention_days = 0`. The `[cdr.syslog]` keys are validated even while `syslog.enabled = false`. When CDRs are enabled and the directory cannot be created or written, the daemon refuses to start (AU-5).
+
+**Files.** Files are named `cdr-{node}-{YYYYmmddTHHMMSS}.{jsonl|csv}` (UTC), with `_NNN` added if the name already exists. A JSONL file starts with a header line `{"schema_version":1,"type":"header","node_id":..,"created_ms":..,"chain_start":..,"first_sequence":..}`, followed by one record per line. A CSV file starts with a `# usg-sbc cdr ...` comment line carrying the same values, then a fixed header row. A CSV value that starts with `= + - @`, TAB or CR gets a leading `'` so spreadsheets do not run it as a formula, so E.164 numbers appear as `'+1...`. When a file is closed by rotation or shutdown, a `<file>.sha384` sidecar in `sha384sum` format is written next to it. Retention deletes the oldest closed files and their sidecars. The open file is never deleted.
+
+**Integrity.** The chain and sidecars are tamper-evident only. They are unkeyed and unsigned, so anyone who can write the CDR directory can rewrite records, chain and sidecars together (no AU-10 non-repudiation; signing is on the POA&M). Anchor the files off-host by keeping the `CdrFileRotated` audit events (enable the uc-audit chain and forward it) or by enabling the syslog sink; `cdrs verify` prints a reminder. With `hash_chain = true`, each record carries `prev_hash` and `hash`, where `hash` is SHA-384 over the previous hash followed by the record's canonical JSON with `hash` empty. The `sequence` number continues across restarts and the chain continues from the last complete record of the newest file. A torn final line (crash mid-write), or a CSV row with a quoted CR/LF, is skipped and reported as `chain_ok = false`; the sequence is never reset while records exist. If none of the newest 8 files holds a complete record, startup fails rather than reuse record ids. `sbc-cli cdrs verify <file>...` checks the header, sequence continuity and every hash, and checks that each file continues the one before it. A CSV file is covered by its sidecar digest only.
+
+**PII.** By default numbers are stored as received. `mask_caller` replaces all but the last four characters of the caller fields with `*`. `hash` replaces caller and callee fields with hex HMAC-SHA-384 under the key file, which must hold at least 48 bytes and must not be a symlink or readable by group or other (mode 0600 or 0400); the daemon refuses to start otherwise. The file is opened with `O_NOFOLLOW` and its type and mode are checked on the open handle. A Kubernetes Secret volume fails this check, because Secret files are `..data/` symlinks with mode 0644 (or 0440) by default. Mount the key with `subPath` (a regular file, not a symlink) and `defaultMode: 0400`, or copy it in an initContainer (`install -m 0400 /secret/key /var/lib/sbc/keys/cdr-hmac.key`) and point `pii_hash_key_file` at the copy. The Helm chart has no PII key option and mounts no key; add the volume to the daemon Deployment as described. A symlinked parent directory is not detected. CDR content is never written to the tracing log. Hot reload applies changes to `pii`, `record_unanswered` and the retention keys. Changes to sinks, the directory or the format need a restart.
+
+**Failure handling.** Emitting a CDR never blocks call handling. If the queue is full or the writer has stopped, the record is dropped and counted. The health component `cdr` reports unhealthy when the writer has exited or a file write failed in the last 60 s, and degraded when a record was dropped or the syslog sink failed in the last 5 minutes. The syslog sink runs on its own thread with its own queue (4096 records, DNS resolution capped at 5 s, at most one lookup in flight, and the last good collector address reused while the resolver fails): a slow or unreachable collector never delays file writes; records it cannot take are counted in `sbc_cdr_syslog_dropped_total` and kept in the file. With `on_failure = "reject_new_calls"`, new non-emergency INVITEs get `503` (with `Retry-After`) while the `cdr` health component is unhealthy, and each refusal is audited as an `AuthorizationDecision` with policy `cdr-unavailable`. Emergency calls are always admitted. Writer failures, drops and file rotations are also recorded on the audit trail (`CdrSinkFailure`, `CdrFileRotated`).
+
+**Metrics.** `sbc_cdr_emitted_total`, `sbc_cdr_dropped_queue_full_total`, `sbc_cdr_dropped_writer_dead_total`, `sbc_cdr_write_errors_total`, `sbc_cdr_syslog_dropped_total`, `sbc_cdr_queue_depth`, `sbc_cdr_rotations_total`, `sbc_cdr_writer_alive` and `sbc_cdr_last_write_timestamp_seconds`.
+
+**Deployment.** The daemon fails to start when the CDR directory is not writable. The error names the directory and the `cdr.directory` and `cdr.enabled` keys. The container image creates `/var/lib/usg-sbc/cdr` owned by the `sbc` user. The Helm chart sets `cdr.directory = "/var/lib/sbc/cdr"` on its own 1 GiB volume (`sbcDaemon.cdr.persistence`), so a CDR burst cannot fill the user/config store; the defaults keep 48 files of 16 MiB. Keep `retentionFiles * rotateSizeMb` below the volume size. On a host install, create the directory yourself or run the Ansible playbook with `-e sbc_host_install=true --tags cdr`. Calls still up at shutdown get a CDR with `release_cause = "shutdown"` before the writer closes its file.
+
+**Access.** sbc-api serves `GET /api/v1/cdrs` (filters `start`, `end` in epoch ms, `caller`, `callee`, `disposition`, `trunk`, `page_token`, `page_size` up to 500), `GET /api/v1/cdrs/{record_id}` and `GET /api/v1/cdrs/stats` with the `cdr:read` permission, and `GET /api/v1/cdrs/export?format=jsonl|csv` with `cdr:export`. Each export is audited (`CdrExport` with an `outcome` of `success`, `truncated`, `failed` or `busy`; caller and callee filter values are recorded as `<redacted>`), a refused `cdr:*` request is audited as an `AuthorizationDecision`, one export runs at a time per sbc-api replica, and an export returns at most 50 000 records. The legacy admin credential holds both permissions. An OIDC operator needs the role `cdr-reader`, `auditor` or `fleet-admin` (read), or `cdr-exporter` or `fleet-admin` (export), or the scope `cdr:read` / `cdr:export`. The `config-admin` scope alone does not grant CDR access. These endpoints read the node's in-memory ring. The files remain the durable record. There is no delete or purge endpoint. The CLI equivalents are `sbc-cli cdrs list|show|export` (gRPC, `--features grpc`) and `sbc-cli cdrs verify` (offline).
+
+The daemon gRPC `CdrService` does no per-user permission check (sbc-api enforces `cdr:read` / `cdr:export`), so it is mounted only when `grpc.require_mtls = true` or `grpc.listen_addr` is a loopback address; otherwise the daemon logs a warning and sbc-api answers the CDR endpoints with 503. In Helm, set `sbcDaemon.grpcMtls.enabled = true` with a cert-manager `clusterIssuer` (ECDSA P-384 server and client certificates are issued) or existing `serverSecretName`/`clientSecretName` Secrets; sbc-api then dials the daemon over mTLS (`SBC_DAEMON_GRPC_TLS_{CA,CERT,KEY}_FILE`). This cannot yet be combined with `sbcTrunkAgent.enabled`. With `require_mtls`, the daemon also checks every gRPC call (all services) against `grpc.allowed_client_names`: the client certificate must have a SAN DNS name, SAN URI or subject CN on the list, or the call fails with `PERMISSION_DENIED` and an `AuthorizationDecision` deny (policy `grpc.allowed_client_names`) is audited. An empty list admits any certificate that chains to `tls_ca_path` and logs a startup warning. The chart sets the list to its sbc-api client certificate CN (`<release>-sbc-api`) unless `sbcDaemon.grpcMtls.allowedClientNames` is given. Use a dedicated issuer for this CA (`issuerKind: Issuer`, a namespaced CA Issuer used for nothing else): with a shared ClusterIssuer, other workloads can obtain certificates from the same CA. The daemon audits every gRPC CDR read as `CdrExport`. The `user` is the authenticated certificate name (`cert:<name>@<peer>`), and the caller-asserted `x-sbc-user` (`api:<user>` or `cli:<user>`) is recorded separately as `on_behalf_of`. On a loopback listener without mTLS there is no authentication: `user` is `unauthenticated@<peer>`, and access relies on host or pod isolation (POA&M). `sbc-cli cdrs` has no TLS client: run it against a loopback listener on the host. The gRPC server and the sbc-api client use tonic's default TLS suites, not the CNSA 2.0 profile (POA&M); the P-384 certificates alone do not make the negotiated suite compliant.
+
+**Cluster.** CDRs are per node, so `node_id` and `sequence` identify where a record came from. The daemon has no dialog takeover yet (an in-dialog request for a call this node does not hold gets 481), so `failover_takeover` is never set and a call lost in a node crash produces no CDR on any node.
+
+**Known gaps (POA&M).** An operator `TerminateCall` produces no `operator_terminated` CDR, because the RPC is not implemented. No BYE is sent to either leg at shutdown. SCTP A-legs are recorded with `transport = "tcp"`. `stir_attestation` is always empty in schema v1. The syslog sink sends no client certificate. Its TLS 1.3 connection does not restrict cipher suites to the CNSA 2.0 set. See the POA&M in [NIST-800-53-CONTROLS.md](NIST-800-53-CONTROLS.md).
+
+---
+
 ## Monitoring
 
 ### Health Endpoints
@@ -689,6 +744,7 @@ tls_cert_path = "/etc/sbc/grpc-cert.pem"   # optional; TLS off when unset
 tls_key_path = "/etc/sbc/grpc-key.pem"
 tls_ca_path = "/etc/sbc/grpc-ca.pem"       # client CA for mTLS
 require_mtls = false             # enforced for gRPC when true
+# allowed_client_names = ["sbc-api"]   # client cert SAN DNS/URI or CN; needs require_mtls; max 64
 max_connections = 100
 request_timeout_secs = 30
 enable_reflection = false        # requires --features grpc-reflection

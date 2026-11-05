@@ -345,6 +345,24 @@ pub const METRIC_AUDIT_RECORDS_DROPPED: &str = "audit_records_dropped";
 pub const METRIC_AUDIT_WRITER_ALIVE: &str = "audit_writer_alive";
 /// Gauge: emergency INVITEs admitted through the emergency bypass.
 pub const METRIC_EMERGENCY_ADMISSIONS: &str = "emergency_calls_admitted";
+/// Gauge: CDRs accepted onto the writer queue.
+pub const METRIC_CDR_EMITTED: &str = "cdr_emitted_total";
+/// Gauge: CDRs dropped because the queue was full.
+pub const METRIC_CDR_DROPPED_QUEUE_FULL: &str = "cdr_dropped_queue_full_total";
+/// Gauge: CDRs dropped because the writer had exited.
+pub const METRIC_CDR_DROPPED_WRITER_DEAD: &str = "cdr_dropped_writer_dead_total";
+/// Gauge: CDR file sink write failures.
+pub const METRIC_CDR_WRITE_ERRORS: &str = "cdr_write_errors_total";
+/// Gauge: CDRs the syslog sink skipped because its own queue was full.
+pub const METRIC_CDR_SYSLOG_DROPPED: &str = "cdr_syslog_dropped_total";
+/// Gauge: CDRs waiting on the writer queue.
+pub const METRIC_CDR_QUEUE_DEPTH: &str = "cdr_queue_depth";
+/// Gauge: CDR file rotations.
+pub const METRIC_CDR_ROTATIONS: &str = "cdr_rotations_total";
+/// Gauge: 1 while the CDR writer thread runs.
+pub const METRIC_CDR_WRITER_ALIVE: &str = "cdr_writer_alive";
+/// Gauge: epoch seconds of the last CDR file write (0 = never).
+pub const METRIC_CDR_LAST_WRITE: &str = "cdr_last_write_timestamp_seconds";
 
 /// Registers the daemon's audit and emergency gauges, refreshed by
 /// [`AppState::refresh_daemon_metrics`] before each export.
@@ -363,6 +381,68 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
         METRIC_EMERGENCY_ADMISSIONS,
         "Emergency INVITEs admitted through the emergency bypass (47 CFR 9.16)",
     );
+    // NIST 800-53 Rev5: AU-5 (CDR pipeline failure visibility)
+    for (name, help) in [
+        (METRIC_CDR_EMITTED, "CDRs accepted onto the writer queue"),
+        (
+            METRIC_CDR_DROPPED_QUEUE_FULL,
+            "CDRs dropped because the writer queue was full",
+        ),
+        (
+            METRIC_CDR_DROPPED_WRITER_DEAD,
+            "CDRs dropped because the CDR writer thread had exited",
+        ),
+        (METRIC_CDR_WRITE_ERRORS, "CDR file sink write failures"),
+        (
+            METRIC_CDR_SYSLOG_DROPPED,
+            "CDRs not forwarded to syslog because the syslog queue was full (file copy kept)",
+        ),
+        (METRIC_CDR_QUEUE_DEPTH, "CDRs waiting on the writer queue"),
+        (METRIC_CDR_ROTATIONS, "CDR file rotations"),
+        (
+            METRIC_CDR_WRITER_ALIVE,
+            "1 while the CDR writer thread runs, 0 after it has exited",
+        ),
+        (
+            METRIC_CDR_LAST_WRITE,
+            "Epoch seconds of the last successful CDR file write (0 = never)",
+        ),
+    ] {
+        metrics.register_gauge(name, help);
+    }
+}
+
+/// Health of the CDR pipeline (component `cdr`): unhealthy when the writer
+/// is dead or a file write failed in the last 60 s, degraded after recent
+/// drops or syslog errors. Healthy when CDRs are disabled.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+fn cdr_component_status(cdr: Option<&crate::cdr::CdrContext>) -> ComponentStatus {
+    let Some(cdr) = cdr else {
+        return ComponentStatus::healthy("cdr");
+    };
+    let e = cdr.emitter();
+    let s = e.stats();
+    match e.health() {
+        uc_cdr::CdrHealth::Healthy => ComponentStatus::healthy("cdr"),
+        uc_cdr::CdrHealth::Degraded => ComponentStatus::degraded(
+            "cdr",
+            format!(
+                "{} CDRs dropped, {} sink errors, {} not forwarded to syslog",
+                s.dropped(),
+                s.sink_errors,
+                s.sink_dropped
+            ),
+        ),
+        uc_cdr::CdrHealth::Unhealthy => ComponentStatus::unhealthy(
+            "cdr",
+            if s.writer_alive {
+                format!("CDR file write failing ({} errors)", s.write_errors)
+            } else {
+                format!("CDR writer thread exited; {} CDRs dropped", s.dropped())
+            },
+        ),
+    }
 }
 
 /// How long after the most recent dropped audit record the `audit` health
@@ -431,6 +511,24 @@ impl AppState {
             self.sip_stack.as_ref(),
         ) {
             g.set(as_gauge(stack.emergency_admissions()));
+        }
+        if let Some(cdr) = self.sip_stack.as_ref().and_then(|s| s.cdr()) {
+            let s = cdr.emitter().stats();
+            for (name, v) in [
+                (METRIC_CDR_EMITTED, s.emitted),
+                (METRIC_CDR_DROPPED_QUEUE_FULL, s.dropped_queue_full),
+                (METRIC_CDR_DROPPED_WRITER_DEAD, s.dropped_writer_dead),
+                (METRIC_CDR_WRITE_ERRORS, s.write_errors),
+                (METRIC_CDR_SYSLOG_DROPPED, s.sink_dropped),
+                (METRIC_CDR_QUEUE_DEPTH, s.queue_depth),
+                (METRIC_CDR_ROTATIONS, s.rotations),
+                (METRIC_CDR_WRITER_ALIVE, u64::from(s.writer_alive)),
+                (METRIC_CDR_LAST_WRITE, s.last_write_ms / 1000),
+            ] {
+                if let Some(g) = self.metrics.gauge(name) {
+                    g.set(as_gauge(v));
+                }
+            }
         }
     }
 
@@ -556,6 +654,12 @@ impl AppState {
             ComponentStatus::healthy("sip_transport"),
             ComponentStatus::healthy("media_engine"),
             audit_component_status(),
+            cdr_component_status(
+                self.sip_stack
+                    .as_ref()
+                    .and_then(|s| s.cdr())
+                    .map(AsRef::as_ref),
+            ),
         ];
 
         // Note: Cluster health is checked asynchronously via check_health_async
@@ -578,6 +682,12 @@ impl AppState {
             ComponentStatus::healthy("sip_transport"),
             ComponentStatus::healthy("media_engine"),
             audit_component_status(),
+            cdr_component_status(
+                self.sip_stack
+                    .as_ref()
+                    .and_then(|s| s.cdr())
+                    .map(AsRef::as_ref),
+            ),
         ];
 
         // Check cluster health if configured
@@ -646,7 +756,7 @@ impl ApiServer {
     /// exists yet) plus its own kubelet probes:
     ///
     /// - Health probes (`/healthz`, `/readyz`) — daemon pod's liveness.
-    /// - `/cdrs` — read-only CDR list, no gRPC service.
+    /// - (`/cdrs` moved to sbc-api over the gRPC `CdrService`.)
     /// - `/dialplans` and `/dialplans/{id}/entries` (GET only) — read-
     ///   only views of the SIP router's current dial-plan state. The
     ///   write endpoints moved to sbc-api in PR3+PR5.
@@ -660,7 +770,6 @@ impl ApiServer {
         let api_routes = Router::new()
             .route("/dialplans", get(get_dial_plans))
             .route("/dialplans/{plan_id}/entries", get(get_dial_plan_entries))
-            .route("/cdrs", get(get_cdrs))
             .layer(axum::middleware::from_fn(api_auth_middleware));
 
         Router::new()
@@ -910,30 +1019,6 @@ async fn readiness_probe(State(state): State<Arc<AppState>>) -> impl IntoRespons
 // `start_trunk_services`) are kept further down because runtime.rs and
 // the gRPC sync services still call into them.
 // ============================================================================
-
-// ============================================================================
-// CDR Routes
-// ============================================================================
-
-/// List CDR records.
-async fn get_cdrs(
-    State(_state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    let _start = params.get("start");
-    let _end = params.get("end");
-    let _caller = params.get("caller");
-    let _callee = params.get("callee");
-    let _status = params.get("status");
-
-    // CDR storage not yet implemented — return empty
-    Json(serde_json::json!({
-        "cdrs": [],
-        "total": 0,
-        "page": 1,
-        "page_size": 50
-    }))
-}
 
 // ============================================================================
 // Call Ladder Routes
@@ -1532,6 +1617,59 @@ mod tests {
         assert!(text.contains("sbc_audit_records_dropped 0"), "{text}");
         assert!(text.contains("sbc_audit_writer_alive 1"), "{text}");
         assert!(text.contains("sbc_emergency_calls_admitted 0"), "{text}");
+    }
+
+    #[test]
+    fn health_and_metrics_expose_cdr_pipeline() {
+        let emitter = uc_cdr::CdrEmitter::start(
+            uc_cdr::CdrEmitterConfig {
+                node_id: "n1".into(),
+                file: None,
+                ..Default::default()
+            },
+            Vec::new(),
+            None,
+        )
+        .expect("emitter");
+        let mut stack =
+            crate::sip_stack::SipStack::new(crate::sip_stack::SipStackConfig::default());
+        stack.set_cdr(Arc::new(crate::cdr::CdrContext::new(
+            Arc::clone(&emitter),
+            &sbc_config::schema::CdrConfig::default(),
+        )));
+        let mut state = AppState::new(SbcMetrics::standard(), Arc::new(ServerStats::default()));
+        state.sip_stack = Some(Arc::new(stack));
+        let cdr = |state: &AppState| {
+            state
+                .check_health()
+                .components
+                .into_iter()
+                .find(|c| c.name == "cdr")
+                .expect("cdr component")
+        };
+        assert_eq!(cdr(&state).status, uc_health::HealthStatus::Healthy);
+        assert!(emitter.emit(uc_cdr::CallRecord::default()));
+        assert!(emitter.flush(Duration::from_secs(5)));
+        state.refresh_daemon_metrics();
+        let text = state.metrics.export();
+        assert!(text.contains("sbc_cdr_emitted_total 1"), "{text}");
+        assert!(text.contains("sbc_cdr_writer_alive 1"), "{text}");
+        assert!(
+            text.contains("sbc_cdr_dropped_writer_dead_total 0"),
+            "{text}"
+        );
+
+        // Writer gone: unhealthy, and further CDRs count as dropped.
+        assert!(emitter.shutdown(Duration::from_secs(5)));
+        assert!(!emitter.emit(uc_cdr::CallRecord::default()));
+        assert_eq!(cdr(&state).status, uc_health::HealthStatus::Unhealthy);
+        state.refresh_daemon_metrics();
+        let text = state.metrics.export();
+        assert!(text.contains("sbc_cdr_writer_alive 0"), "{text}");
+        assert!(
+            text.contains("sbc_cdr_dropped_writer_dead_total 1"),
+            "{text}"
+        );
     }
 
     #[test]

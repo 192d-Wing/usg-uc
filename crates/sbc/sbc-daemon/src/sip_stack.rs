@@ -134,6 +134,10 @@ pub struct SipStack {
     /// Per-user request limiter (`rate_limit.per_user_rps`), keyed by the
     /// From user. `None` when disabled.
     user_limiter: Option<tokio::sync::Mutex<uc_dos_protection::KeyedRateLimiter>>,
+    /// CDR pipeline (`[cdr]`). `None` when CDRs are disabled.
+    ///
+    /// ## NIST 800-53 Rev5: AU-12 (Audit Record Generation)
+    cdr: Option<Arc<crate::cdr::CdrContext>>,
 }
 
 /// SIP stack configuration.
@@ -549,6 +553,11 @@ struct CallAddresses {
     last_reinvite_ack: Option<(String, SipMessage, SbcSocketAddr)>,
     /// When the B-leg answered (for the audit trail's call duration).
     established_at: Option<Instant>,
+    /// CDR facts gathered over the call's life; emitted once by
+    /// `finish_call_record`.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3, AU-12
+    cdr: crate::cdr::CdrDraft,
 }
 
 /// A per-trunk call slot (`trunk_groups[].trunks[].max_calls`) held by a
@@ -641,6 +650,15 @@ enum FailoverCause {
 }
 
 impl FailoverCause {
+    /// The failed attempt's outcome for the CDR `trunks_tried` list.
+    const fn cdr_outcome(self) -> uc_cdr::TrunkOutcome {
+        match self {
+            Self::Status(code, _) => uc_cdr::TrunkOutcome::Status(code),
+            Self::Timeout => uc_cdr::TrunkOutcome::Timeout,
+            Self::TransportError => uc_cdr::TrunkOutcome::TransportError,
+        }
+    }
+
     fn audit_reason(self) -> uc_audit::event::FailoverReason {
         match self {
             Self::Status(code, _) => uc_audit::event::FailoverReason::Status(code),
@@ -788,6 +806,32 @@ fn acquire_next_target(
     }
     targets.drain(..consumed);
     found
+}
+
+/// Final status of a handler result sent to the A-leg (for a reject CDR);
+/// 480 when the result carries no final response.
+fn final_status(result: &ProcessResult) -> u16 {
+    match result {
+        ProcessResult::Response {
+            message: SipMessage::Response(r),
+            ..
+        } if r.status.code() >= 200 => r.status.code(),
+        ProcessResult::Multiple(v) => v
+            .iter()
+            .map(final_status)
+            .find(|c| *c != 480)
+            .unwrap_or(480),
+        _ => 480,
+    }
+}
+
+/// Every Reason header value (RFC 3326), for the CDR Q.850 cause.
+fn reason_headers(headers: &proto_sip::header::Headers) -> impl Iterator<Item = &str> {
+    // RFC 3326 §2: several Reason header fields may be present.
+    headers
+        .iter()
+        .filter(|h| h.name.as_str().eq_ignore_ascii_case("Reason"))
+        .map(|h| h.value.as_str())
 }
 
 /// Records a call-lifecycle event on the audit trail (NIST AU-2); a no-op
@@ -991,6 +1035,7 @@ impl SipStack {
             in_flight_invites: RwLock::new(HashSet::new()),
             pending_2xx: RwLock::new(HashMap::new()),
             user_limiter: None,
+            cdr: None,
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -1050,6 +1095,7 @@ impl SipStack {
             in_flight_invites: RwLock::new(HashSet::new()),
             pending_2xx: RwLock::new(HashMap::new()),
             user_limiter: None,
+            cdr: None,
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -1738,7 +1784,12 @@ impl SipStack {
             } else {
                 addrs.a_leg_source
             };
-            self.cleanup_terminated_call(call, false).await;
+            self.cleanup_terminated_call(
+                call,
+                false,
+                crate::cdr::CdrEnd::dialog_lost(addrs.b_leg_answered, 408),
+            )
+            .await;
             return vec![
                 ProcessResult::Response {
                     message: resp,
@@ -1772,7 +1823,8 @@ impl SipStack {
                 }
             }
             let resp = build_a_leg_response(timeout, &addrs);
-            self.cleanup_terminated_call(call, true).await;
+            self.cleanup_terminated_call(call, true, crate::cdr::CdrEnd::timer_b())
+                .await;
             return vec![ProcessResult::Response {
                 message: SipMessage::Response(resp),
                 destination: addrs.a_leg_source,
@@ -1865,7 +1917,8 @@ impl SipStack {
                 }
             }
             let resp = build_a_leg_response(unavailable, &addrs);
-            self.cleanup_terminated_call(&call, true).await;
+            self.cleanup_terminated_call(&call, true, crate::cdr::CdrEnd::transport_error())
+                .await;
             vec![ProcessResult::Response {
                 message: SipMessage::Response(resp),
                 destination: addrs.a_leg_source,
@@ -1927,7 +1980,8 @@ impl SipStack {
                     destination: addrs.b_leg_destination,
                 });
             }
-            self.cleanup_terminated_call(&call, false).await;
+            self.cleanup_terminated_call(&call, false, crate::cdr::CdrEnd::dialog_lost(true, 200))
+                .await;
         }
         out
     }
@@ -2211,7 +2265,12 @@ impl SipStack {
                     status = code,
                     "Far leg's dialog is gone; releasing call"
                 );
-                self.cleanup_terminated_call(internal_id, false).await;
+                self.cleanup_terminated_call(
+                    internal_id,
+                    false,
+                    crate::cdr::CdrEnd::dialog_lost(addrs.b_leg_answered, code),
+                )
+                .await;
             } else {
                 info!(
                     call_id = %addrs.a_leg_sip_call_id,
@@ -2364,12 +2423,18 @@ impl SipStack {
     ///
     /// `trunk_failed` marks the B-leg trunk as having failed the call (Timer
     /// B), which counts toward its `max_failures` cooldown.
-    async fn cleanup_terminated_call(&self, internal_id: &CallId, trunk_failed: bool) {
+    async fn cleanup_terminated_call(
+        &self,
+        internal_id: &CallId,
+        trunk_failed: bool,
+        end: crate::cdr::CdrEnd,
+    ) {
         {
             let mut calls = self.calls.write().await;
             calls.remove(internal_id);
         }
-        self.finish_call_record(internal_id, trunk_failed).await;
+        self.finish_call_record(internal_id, trunk_failed, end)
+            .await;
         // INVITE transactions are left to run out (Timer D/H/I) so late
         // retransmissions are still absorbed; `poll_timers` prunes them.
         self.pending_2xx
@@ -2395,9 +2460,18 @@ impl SipStack {
     /// Lock order: `call_correlation` is released before `router` / `vps`
     /// are taken; neither is held across an `.await` on another lock.
     ///
-    /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
-    async fn finish_call_record(&self, internal_id: &CallId, trunk_failed: bool) -> bool {
-        let removed = {
+    /// The same exactly-once removal emits the call's CDR (`end` describes
+    /// how it ended), after `call_correlation` is released; emission is a
+    /// non-blocking queue push.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection), AU-12
+    async fn finish_call_record(
+        &self,
+        internal_id: &CallId,
+        trunk_failed: bool,
+        end: crate::cdr::CdrEnd,
+    ) -> bool {
+        let mut removed = {
             let mut corr = self.call_correlation.write().await;
             let Some(removed) = corr.addresses.remove(internal_id) else {
                 return false;
@@ -2423,6 +2497,9 @@ impl SipStack {
             outcome,
         )
         .await;
+        if let Some(cdr) = &self.cdr {
+            cdr.emit_call(std::mem::take(&mut removed.cdr), &end);
+        }
         true
     }
 
@@ -2739,6 +2816,9 @@ impl SipStack {
                     entry.b_leg_to = new_to;
                     entry.dialog_to_tag = None;
                     entry.b_leg_invite = Some(new_template);
+                    entry
+                        .cdr
+                        .record_failover(cause.cdr_outcome(), &lease.trunk_id, &new_call_id);
                     entry.trunk_lease.replace(lease.clone())
                 })
             } else {
@@ -2811,13 +2891,15 @@ impl SipStack {
                 call_id,
                 "media failure before dialog confirmed; cleaning up without BYE"
             );
-            self.cleanup_terminated_call(&internal_id, false).await;
+            self.cleanup_terminated_call(&internal_id, false, crate::cdr::CdrEnd::media_failure())
+                .await;
             return Vec::new();
         }
 
         let a_bye = Self::build_leg_bye(&addrs, false);
         let b_bye = Self::build_leg_bye(&addrs, true);
-        self.cleanup_terminated_call(&internal_id, false).await;
+        self.cleanup_terminated_call(&internal_id, false, crate::cdr::CdrEnd::media_failure())
+            .await;
 
         warn!(
             call_id,
@@ -2900,6 +2982,51 @@ impl SipStack {
     /// ## NIST 800-53 Rev5: SI-4 (System Monitoring), SC-5
     pub fn emergency_admissions(&self) -> u64 {
         self.emergency_admissions.load(Ordering::Relaxed)
+    }
+
+    /// Attaches the CDR pipeline. Call before the stack is shared.
+    pub fn set_cdr(&mut self, cdr: Arc<crate::cdr::CdrContext>) {
+        self.cdr = Some(cdr);
+    }
+
+    /// The CDR pipeline, when enabled.
+    pub fn cdr(&self) -> Option<&Arc<crate::cdr::CdrContext>> {
+        self.cdr.as_ref()
+    }
+
+    /// Ends every call still up with a `shutdown` CDR (plan §5). Call
+    /// after draining, before flushing the CDR writer.
+    ///
+    // POAM: no BYE is sent to either leg at shutdown; the far ends learn of
+    // it from session timers / RTP loss. Plan §6 failover takeover CDRs
+    // (`failover_takeover = true`) need a dialog takeover path, which the
+    // daemon does not have (unknown-dialog requests get 481).
+    ///
+    /// ## NIST 800-53 Rev5: AU-12 (Audit Record Generation)
+    pub async fn end_remaining_calls_for_shutdown(&self) -> usize {
+        let remaining: Vec<(CallId, bool)> = self
+            .call_correlation
+            .read()
+            .await
+            .addresses
+            .iter()
+            .map(|(id, a)| (id.clone(), a.b_leg_answered))
+            .collect();
+        let n = remaining.len();
+        for (id, answered) in remaining {
+            self.cleanup_terminated_call(&id, false, crate::cdr::CdrEnd::shutdown(answered))
+                .await;
+        }
+        n
+    }
+
+    /// Emits the CDR for an INVITE refused before a call was stored.
+    ///
+    /// ## NIST 800-53 Rev5: AU-2, AU-12
+    fn cdr_reject(&self, r: &crate::cdr::Rejection<'_>) {
+        if let Some(cdr) = &self.cdr {
+            cdr.emit_rejected(r);
+        }
     }
 
     /// Enters draining mode: new INVITEs are rejected with 503 while
@@ -3344,7 +3471,10 @@ impl SipStack {
 
         match method {
             Method::Register => self.handle_register(message, source).await,
-            Method::Invite => self.handle_invite(message, source, receiving_zone).await,
+            Method::Invite => {
+                self.handle_invite(message, source, receiving_zone, transport)
+                    .await
+            }
             Method::Ack => self.handle_ack(message).await,
             Method::Bye => self.handle_bye(message, source).await,
             Method::Cancel => self.handle_cancel(message, source).await,
@@ -3565,6 +3695,14 @@ impl SipStack {
             }
         }
 
+        // First 18x: ring time / post-dial delay for the CDR (AU-3).
+        if status_code > 100 && addrs.cdr.ring_ms.is_none() {
+            let mut corr = self.call_correlation.write().await;
+            if let Some(a) = corr.addresses.get_mut(internal_id) {
+                a.cdr.record_ringing();
+            }
+        }
+
         // Build provisional response for A-leg with the A-leg dialog's
         // own Via/From/To/CSeq.
         let mut a_response = build_a_leg_response(resp.status, addrs);
@@ -3718,6 +3856,7 @@ impl SipStack {
                 a.b_leg_answered = true;
                 a.a_leg_last_sdp.clone_from(&a_response.body);
                 a.established_at = Some(Instant::now());
+                a.cdr.record_answer(resp.body.as_deref());
             }
         }
         audit(uc_audit::AuditEvent::CallEstablished(
@@ -3836,8 +3975,13 @@ impl SipStack {
             let mut calls = self.calls.write().await;
             calls.remove(internal_id);
         }
-        self.finish_call_record(internal_id, is_failover_status(status_code))
-            .await;
+        self.finish_call_record(
+            internal_id,
+            is_failover_status(status_code),
+            crate::cdr::CdrEnd::trunk_final(status_code)
+                .with_reasons(reason_headers(&resp.headers)),
+        )
+        .await;
         if status_code == 503
             && let (Some(lease), Some(router)) = (addrs.trunk_lease.as_ref(), self.router.as_ref())
         {
@@ -4227,6 +4371,7 @@ impl SipStack {
         message: SipMessage,
         source: SbcSocketAddr,
         receiving_zone: Option<&str>,
+        transport: AddrTransport,
     ) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -4235,6 +4380,7 @@ impl SipStack {
         };
 
         let a_leg_call_id = req.headers.call_id().unwrap_or("unknown").to_string();
+        let invite_received_ms = crate::cdr::now_ms();
 
         debug!(uri = %req.uri, call_id = %a_leg_call_id, "Processing INVITE");
 
@@ -4244,6 +4390,39 @@ impl SipStack {
         if req.headers.to_tag().is_some() {
             return self.handle_in_dialog_request(req, source).await;
         }
+
+        // Emergency calls (dialed Request-URI user, before any translation);
+        // see the admission bypass below.
+        let emergency = self
+            .config
+            .emergency_numbers
+            .matches(req.uri.user.as_deref().unwrap_or(""));
+
+        // CDR for an INVITE refused before the call is stored (plan §0
+        // reject sites). Rejections the RFC answers with a challenge
+        // (401/407) and ACL/DoS drops never reach these sites, and the
+        // source-admission 403 below is an ACL-layer reject (audited as an
+        // AuthorizationDecision, no CDR) so a spoofed-source flood cannot
+        // fill the CDR volume. Every reject site is after the retransmit
+        // check, and `CdrContext::emit_rejected` drops repeats of a
+        // Call-ID, so a retransmitted INVITE yields one CDR.
+        //
+        // ## NIST 800-53 Rev5: AU-2, AU-12
+        let from_header = req.headers.get_value(&HeaderName::From).unwrap_or("");
+        let from_uri = extract_uri_from_header(from_header);
+        let reject_cdr = |status: u16, cause: uc_cdr::ReleaseCause| {
+            self.cdr_reject(&crate::cdr::Rejection {
+                a_call_id: &a_leg_call_id,
+                from: &from_uri,
+                callee: req.uri.user.as_deref().unwrap_or(""),
+                source,
+                transport,
+                zone: receiving_zone,
+                emergency,
+                status,
+                cause,
+            });
+        };
 
         // Source admission: only configured trunks and currently registered
         // endpoints may place calls. Checked before any per-call state exists.
@@ -4297,7 +4476,33 @@ impl SipStack {
         if self.draining.load(Ordering::Relaxed) {
             info!(call_id = %a_leg_call_id, "Draining — rejecting new INVITE");
             self.in_flight_invites.write().await.remove(&a_leg_call_id);
+            reject_cdr(503, uc_cdr::ReleaseCause::Draining);
             let unavailable = create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+            return ProcessResult::Response {
+                message: SipMessage::Response(unavailable),
+                destination: source,
+            };
+        }
+
+        // `cdr.on_failure = "reject_new_calls"`: while the CDR pipeline is
+        // unhealthy, new calls that could not be accounted for are refused.
+        // Emergency calls are never refused for an accounting failure.
+        //
+        // ## NIST 800-53 Rev5: AU-5(4); 47 CFR 9.16
+        if !emergency && self.cdr.as_ref().is_some_and(|c| c.rejecting_new_calls()) {
+            warn!(
+                call_id = %a_leg_call_id,
+                "CDR pipeline unhealthy (cdr.on_failure = reject_new_calls); rejecting INVITE"
+            );
+            audit_invite_denied(req, source, "cdr-unavailable");
+            self.in_flight_invites.write().await.remove(&a_leg_call_id);
+            reject_cdr(503, uc_cdr::ReleaseCause::PolicyDenied);
+            let mut unavailable =
+                create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+            unavailable.headers.set(
+                HeaderName::RetryAfter,
+                TRUNK_UNAVAILABLE_RETRY_AFTER_SECS.to_string(),
+            );
             return ProcessResult::Response {
                 message: SipMessage::Response(unavailable),
                 destination: source,
@@ -4312,10 +4517,6 @@ impl SipStack {
         // the transport flood limiter still apply; every bypass is audited.
         //
         // ## 47 CFR 9.16; NIST 800-53 Rev5: SC-5, AU-2
-        let emergency = self
-            .config
-            .emergency_numbers
-            .matches(req.uri.user.as_deref().unwrap_or(""));
         let admission = if emergency {
             Admission::Emergency
         } else {
@@ -4353,6 +4554,7 @@ impl SipStack {
                     "Maximum concurrent calls reached, rejecting INVITE"
                 );
                 self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                reject_cdr(503, uc_cdr::ReleaseCause::AdmissionMaxCalls);
                 let unavailable =
                     create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
                 return ProcessResult::Response {
@@ -4447,6 +4649,7 @@ impl SipStack {
                         &format!("vps:{}", verdict.matched_rule().unwrap_or("rate-limit")),
                     );
                     self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                    reject_cdr(*status_code, uc_cdr::ReleaseCause::PolicyDenied);
                     let rejection = create_response_from_request(
                         req,
                         StatusCode::new(*status_code).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
@@ -4594,13 +4797,15 @@ impl SipStack {
                         self.in_flight_invites.write().await.remove(&a_leg_call_id);
                         self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
                             .await;
-                        return self
+                        let result = self
                             .play_announcement_to_caller(
                                 req,
                                 source,
                                 crate::announcement::AnnouncementType::NumberNotInService,
                             )
                             .await;
+                        reject_cdr(final_status(&result), uc_cdr::ReleaseCause::NoRoute);
+                        return result;
                     }
                     TrunkRouting::Unavailable => {
                         // Every trunk of the matched route is down, cooling
@@ -4611,6 +4816,7 @@ impl SipStack {
                         warn!(call_id = %a_leg_call_id, dest = %dest_user, "No usable trunk (all down or at capacity), rejecting INVITE with 503");
                         audit_invite_denied(req, source, "no-usable-trunk");
                         self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                        reject_cdr(503, uc_cdr::ReleaseCause::NoRoute);
                         self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
                             .await;
                         let mut unavailable =
@@ -4627,6 +4833,7 @@ impl SipStack {
                     TrunkRouting::InvalidTranslation => {
                         audit_invite_denied(req, source, "number-translation-invalid");
                         self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                        reject_cdr(500, uc_cdr::ReleaseCause::NoRoute);
                         self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
                             .await;
                         let server_err =
@@ -4645,13 +4852,15 @@ impl SipStack {
             self.in_flight_invites.write().await.remove(&a_leg_call_id);
             self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
                 .await;
-            return self
+            let result = self
                 .play_announcement_to_caller(
                     req,
                     source,
                     crate::announcement::AnnouncementType::NumberNotInService,
                 )
                 .await;
+            reject_cdr(final_status(&result), uc_cdr::ReleaseCause::NoRoute);
+            return result;
         };
 
         // Number translation (SBC route-pattern / dial-plan transforms): the
@@ -4708,6 +4917,7 @@ impl SipStack {
         let (a_media_bind, mut a_media_ip_str) = self.zone_media_bind(receiving_zone, source.ip());
         let (b_media_bind, mut b_media_ip_str) =
             self.zone_media_bind(egress_zone.as_deref(), source.ip());
+        let mut media_node: Option<String> = None;
         let (b_leg_rtp_port, media_a_leg_port) = if let Some(ref pipeline) = self.media_pipeline {
             match pipeline
                 .create_session_with_zones(&session_key, None, a_media_bind, b_media_bind)
@@ -4719,6 +4929,7 @@ impl SipStack {
                     // to both legs — the relay lives on the node, not here. Absent
                     // (monolith / co-located split), keep our zone media IP.
                     if let Some(node_ip) = ports.media_ip {
+                        media_node = Some(node_ip.to_string());
                         a_media_ip_str = node_ip.to_string();
                         b_media_ip_str.clone_from(&a_media_ip_str);
                     }
@@ -4856,6 +5067,55 @@ impl SipStack {
         // keep a copy only when there is somewhere to fail over to.
         let b_leg_invite = (!failover_targets.is_empty()).then(|| Arc::new(b_leg_request.clone()));
 
+        // CDR draft: the facts known at admission/routing (AU-3).
+        let cdr_draft = if self.cdr.is_some() {
+            // Caller translation: the B-leg From user after header
+            // manipulation, when a rule changed it. The B2BUA's own default
+            // From identity (`instance_name`) is not a translation.
+            let caller = crate::cdr::uri_user(&from_uri).to_string();
+            let caller_translated = b_leg_request
+                .headers
+                .get_value(&HeaderName::From)
+                .map(extract_uri_from_header)
+                .map(|u| crate::cdr::uri_user(&u).to_string())
+                .filter(|u| !u.is_empty() && *u != caller && *u != self.config.instance_name);
+            let from_trunk = self
+                .inbound_trunk_map
+                .read()
+                .await
+                .contains_key(&source.ip());
+            crate::cdr::CdrDraft {
+                setup_ms: invite_received_ms,
+                a_call_id: a_leg_call_id.clone(),
+                b_call_ids: vec![b_leg_sip_call_id.clone()],
+                internal_call_id: internal_call_id.to_string(),
+                direction: if from_trunk {
+                    uc_cdr::Direction::Inbound
+                } else if b_leg_external {
+                    uc_cdr::Direction::Outbound
+                } else {
+                    uc_cdr::Direction::Internal
+                },
+                caller,
+                caller_translated,
+                callee_dialed: dest_user.clone(),
+                callee_translated: (b_leg_user != dest_user).then(|| b_leg_user.clone()),
+                source_ip: source.ip().to_string(),
+                source_port: source.port(),
+                transport: crate::cdr::transport_of(transport),
+                ingress_zone: receiving_zone.map(str::to_string),
+                egress_zone: egress_zone.clone(),
+                trunk_group: trunk_lease.as_ref().map(|l| l.group_id.clone()),
+                current_trunk: trunk_lease.as_ref().map(|l| l.trunk_id.clone()),
+                media_anchored: media_a_leg_port.is_some(),
+                media_node,
+                emergency,
+                ..crate::cdr::CdrDraft::default()
+            }
+        } else {
+            crate::cdr::CdrDraft::default()
+        };
+
         // 8. Store call state and correlation
         {
             let mut calls = self.calls.write().await;
@@ -4940,6 +5200,7 @@ impl SipStack {
                     pending_reinvite: None,
                     last_reinvite_ack: None,
                     established_at: None,
+                    cdr: cdr_draft,
                 },
             );
         }
@@ -5152,7 +5413,13 @@ impl SipStack {
             let mut calls = self.calls.write().await;
             calls.remove(&internal_id);
         }
-        self.finish_call_record(&internal_id, false).await;
+        self.finish_call_record(
+            &internal_id,
+            false,
+            crate::cdr::CdrEnd::bye(is_from_a_leg, addrs.b_leg_answered)
+                .with_reasons(reason_headers(&req.headers)),
+        )
+        .await;
 
         info!(
             call_id = %sip_call_id,
@@ -5308,7 +5575,12 @@ impl SipStack {
             let mut calls = self.calls.write().await;
             calls.remove(&internal_id);
         }
-        self.finish_call_record(&internal_id, false).await;
+        self.finish_call_record(
+            &internal_id,
+            false,
+            crate::cdr::CdrEnd::cancel().with_reasons(reason_headers(&req.headers)),
+        )
+        .await;
 
         info!(call_id = %sip_call_id, "Call cancelled");
         audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Canceled);
@@ -7638,6 +7910,7 @@ mod tests {
             pending_reinvite: None,
             last_reinvite_ack: None,
             established_at: None,
+            cdr: crate::cdr::CdrDraft::default(),
         }
     }
 
@@ -11126,5 +11399,648 @@ mod tests {
             !stack.call_correlation.read().await.addresses.is_empty(),
             "dialog kept"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // CDR emission (plan §8): exactly one CDR per call on every teardown
+    // path, reject-site CDRs, no CDR for auth challenges.
+    // ------------------------------------------------------------------
+
+    fn cdr_emitter() -> Arc<uc_cdr::CdrEmitter> {
+        uc_cdr::CdrEmitter::start(
+            uc_cdr::CdrEmitterConfig {
+                node_id: "test".into(),
+                file: None,
+                ..Default::default()
+            },
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A trunk stack with a ring-only CDR pipeline.
+    async fn cdr_stack_cfg(
+        config: SipStackConfig,
+        cdr: sbc_config::schema::CdrConfig,
+    ) -> (SipStack, Arc<uc_cdr::CdrEmitter>) {
+        let mut stack = trunk_stack_cfg(config, 10, ("none", ""), None).await;
+        let emitter = cdr_emitter();
+        stack.set_cdr(Arc::new(crate::cdr::CdrContext::new(
+            Arc::clone(&emitter),
+            &cdr,
+        )));
+        (stack, emitter)
+    }
+
+    async fn cdr_stack() -> (SipStack, Arc<uc_cdr::CdrEmitter>) {
+        cdr_stack_cfg(
+            SipStackConfig::default(),
+            sbc_config::schema::CdrConfig::default(),
+        )
+        .await
+    }
+
+    /// Every CDR written so far, oldest first.
+    fn cdrs(emitter: &uc_cdr::CdrEmitter) -> Vec<uc_cdr::CallRecord> {
+        assert!(emitter.flush(std::time::Duration::from_secs(5)));
+        let page = emitter
+            .ring()
+            .query(&uc_cdr::CdrFilter::default(), None, 500);
+        page.records.iter().rev().map(|r| (**r).clone()).collect()
+    }
+
+    fn one_cdr(emitter: &uc_cdr::CdrEmitter) -> uc_cdr::CallRecord {
+        let all = cdrs(emitter);
+        assert_eq!(all.len(), 1, "exactly one CDR: {all:#?}");
+        all.into_iter().next().unwrap()
+    }
+
+    fn attempts(r: &uc_cdr::CallRecord) -> Vec<(&str, uc_cdr::TrunkOutcome)> {
+        r.trunks_tried
+            .iter()
+            .map(|t| (t.trunk_id.as_str(), t.status))
+            .collect()
+    }
+
+    async fn answer(stack: &SipStack, inv: &SipRequest, from: SbcSocketAddr) {
+        stack
+            .process_message(&response_to(inv, 180, Some("bobtag"), None), from, None)
+            .await;
+        stack
+            .process_message(
+                &response_to(inv, 200, Some("bobtag"), Some(BOB_SDP)),
+                from,
+                None,
+            )
+            .await;
+    }
+
+    async fn internal_id(stack: &SipStack, a_call_id: &str) -> CallId {
+        stack
+            .call_correlation
+            .read()
+            .await
+            .a_leg
+            .get(a_call_id)
+            .cloned()
+            .expect("call stored")
+    }
+
+    #[tokio::test]
+    async fn cdr_answered_then_caller_bye() {
+        let (stack, em) = cdr_stack().await;
+        let r = place_call(&stack, "ans@cdr").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        answer(&stack, &inv, t1()).await;
+        let bye = caller_request("BYE", DIALED, "ans@cdr", 2, Some("bobtag"), None);
+        stack.process_message(&bye, alice(), None).await;
+        // A retransmitted BYE does not produce a second CDR.
+        stack.process_message(&bye, alice(), None).await;
+        let c = one_cdr(&em);
+        assert_eq!(c.disposition, uc_cdr::Disposition::Answered);
+        assert_eq!(c.release_cause, uc_cdr::ReleaseCause::Normal);
+        assert_eq!(c.release_side, uc_cdr::ReleaseSide::Caller);
+        assert_eq!(c.final_sip_status, 200);
+        assert_eq!(c.a_call_id, "ans@cdr");
+        assert_eq!(c.caller, "alice");
+        assert_eq!(c.callee_dialed, DIALED);
+        assert_eq!(c.source_ip, alice().ip().to_string());
+        assert_eq!(c.direction, uc_cdr::Direction::Inbound);
+        assert_eq!(c.trunk_group.as_deref(), Some("carriers"));
+        assert_eq!(c.final_trunk.as_deref(), Some("t1"));
+        assert_eq!(
+            attempts(&c),
+            vec![("t1", uc_cdr::TrunkOutcome::Status(200))]
+        );
+        assert_eq!(c.failover_count, 0);
+        assert_eq!(c.codec.as_deref(), Some("PCMU"));
+        assert!(c.ring_ms.is_some() && c.answer_ms.is_some() && c.pdd_ms.is_some());
+        assert!(!c.emergency);
+        assert_eq!(c.record_id, "test-0");
+        assert_all_released(&stack).await;
+    }
+
+    /// QA: answered, translated call through a real file sink. Checks
+    /// timestamp ordering, durations, pre/post translation and the on-disk
+    /// chain.
+    #[tokio::test]
+    async fn qa_cdr_answered_translated_call_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stack = trunk_stack(10, ("strip_prefix", "2"), None).await;
+        let em = uc_cdr::CdrEmitter::start(
+            uc_cdr::CdrEmitterConfig {
+                node_id: "qa".into(),
+                file: Some(uc_cdr::FileSinkConfig {
+                    directory: dir.path().to_path_buf(),
+                    rotate_interval: None,
+                    fsync_interval: std::time::Duration::ZERO,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        stack.set_cdr(Arc::new(crate::cdr::CdrContext::new(
+            Arc::clone(&em),
+            &sbc_config::schema::CdrConfig::default(),
+        )));
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let r = place_call(&stack, "qa-ans@cdr").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        answer(&stack, &inv, t1()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let bye = caller_request("BYE", DIALED, "qa-ans@cdr", 2, Some("bobtag"), None);
+        stack.process_message(&bye, alice(), None).await;
+        assert!(em.shutdown(std::time::Duration::from_secs(5)));
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(uc_cdr::verify_file(&files[0]).unwrap().records, 1);
+        let text = std::fs::read_to_string(&files[0]).unwrap();
+        let c: uc_cdr::CallRecord = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+        assert!(c.setup_ms >= before);
+        let ring = c.ring_ms.unwrap();
+        let ans = c.answer_ms.unwrap();
+        assert!(
+            c.setup_ms <= ring && ring <= ans && ans <= c.end_ms,
+            "{c:#?}"
+        );
+        assert_eq!(c.duration_ms, c.end_ms - ans);
+        assert!(c.duration_ms >= 15, "BYE came >=20 ms after answer: {c:#?}");
+        assert_eq!(c.pdd_ms, Some(ring - c.setup_ms));
+        assert_eq!(c.callee_dialed, DIALED);
+        assert_eq!(c.callee_translated.as_deref(), Some("5551234567"));
+        assert_eq!(c.final_trunk.as_deref(), Some("t1"));
+        assert_eq!(c.b_call_ids.len(), 1);
+        assert_ne!(c.b_call_ids[0], c.a_call_id, "B-leg has its own Call-ID");
+        assert!(!c.emergency);
+    }
+
+    /// Plan gap: a calling-number rewrite (header manipulation on the B-leg
+    /// From) is recorded as `caller_translated`; untouched calls leave it
+    /// unset.
+    #[tokio::test]
+    async fn cdr_caller_translated_from_b_leg_from() {
+        let (mut stack, em) = cdr_stack().await;
+        stack.init_manipulator_from_config(&sbc_config::HeaderManipulationConfig {
+            global_rules: vec![sbc_config::ManipulationRuleConfig {
+                name: "calling-number".to_string(),
+                direction: "both".to_string(),
+                action: "set".to_string(),
+                header: "From".to_string(),
+                value: "<sip:+12025550100@sbc.test>;tag=sbc1".to_string(),
+            }],
+            trunk_rules: Vec::new(),
+        });
+        let r = place_call(&stack, "xlate@cdr").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        assert!(
+            inv.headers
+                .get_value(&HeaderName::From)
+                .is_some_and(|f| f.contains("+12025550100")),
+            "manipulation applied to the B-leg From"
+        );
+        answer(&stack, &inv, t1()).await;
+        let bye = caller_request("BYE", DIALED, "xlate@cdr", 2, Some("bobtag"), None);
+        stack.process_message(&bye, alice(), None).await;
+        let c = one_cdr(&em);
+        assert_eq!(c.caller_translated.as_deref(), Some("+12025550100"));
+        assert_ne!(c.caller, "+12025550100");
+    }
+
+    /// QA: an answered 911 call is flagged emergency and keeps the dialed
+    /// number.
+    #[tokio::test]
+    async fn qa_cdr_answered_emergency_call_flagged() {
+        let (stack, em) = cdr_stack().await;
+        let r = place_call_to(&stack, "911", "qa-e911@cdr").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        answer(&stack, &inv, t1()).await;
+        let bye = caller_request("BYE", "911", "qa-e911@cdr", 2, Some("bobtag"), None);
+        stack.process_message(&bye, alice(), None).await;
+        let c = one_cdr(&em);
+        assert!(c.emergency);
+        assert_eq!(c.callee_dialed, "911");
+        assert_eq!(c.callee_translated, None);
+        assert_eq!(c.caller_translated, None, "From not rewritten");
+        assert_eq!(c.disposition, uc_cdr::Disposition::Answered);
+    }
+
+    #[tokio::test]
+    async fn cdr_answered_then_callee_bye_with_q850() {
+        let (stack, em) = cdr_stack().await;
+        let r = place_call(&stack, "cbye@cdr").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        answer(&stack, &inv, t1()).await;
+        let bye = bob_request(&inv, "BYE", 2, None);
+        let bye = String::from_utf8(bye.to_vec()).unwrap().replacen(
+            "Content-Length",
+            "Reason: Q.850;cause=16;text=\"Normal\"\r\nContent-Length",
+            1,
+        );
+        stack.process_message(&Bytes::from(bye), t1(), None).await;
+        let c = one_cdr(&em);
+        assert_eq!(c.release_side, uc_cdr::ReleaseSide::Callee);
+        assert_eq!(c.disposition, uc_cdr::Disposition::Answered);
+        assert_eq!(c.q850_cause, Some(16));
+    }
+
+    #[tokio::test]
+    async fn cdr_cancel_before_answer() {
+        let (stack, em) = cdr_stack().await;
+        place_call(&stack, "can@cdr").await;
+        stack
+            .process_message(
+                &caller_request("CANCEL", DIALED, "can@cdr", 1, None, None),
+                alice(),
+                None,
+            )
+            .await;
+        let c = one_cdr(&em);
+        assert_eq!(c.disposition, uc_cdr::Disposition::Cancelled);
+        assert_eq!(c.release_cause, uc_cdr::ReleaseCause::Cancel);
+        assert_eq!(c.release_side, uc_cdr::ReleaseSide::Caller);
+        assert_eq!(c.final_sip_status, 487);
+        assert_eq!(c.duration_ms, 0);
+        assert!(c.answer_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn cdr_trunk_busy() {
+        let (stack, em) = cdr_stack().await;
+        let r = place_call(&stack, "busy@cdr").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        stack
+            .process_message(&response_to(&inv, 486, Some("t1tag"), None), t1(), None)
+            .await;
+        let c = one_cdr(&em);
+        assert_eq!(c.disposition, uc_cdr::Disposition::Busy);
+        assert_eq!(c.release_cause, uc_cdr::ReleaseCause::TrunkError);
+        assert_eq!(c.release_side, uc_cdr::ReleaseSide::Callee);
+        assert_eq!(c.final_sip_status, 486);
+        assert_eq!(
+            attempts(&c),
+            vec![("t1", uc_cdr::TrunkOutcome::Status(486))]
+        );
+    }
+
+    #[tokio::test]
+    async fn cdr_timer_b_on_last_trunk() {
+        let (stack, em) = cdr_stack().await;
+        let r = place_call(&stack, "tb@cdr").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        let id = internal_id(&stack, "tb@cdr").await;
+        // t1 times out: fail over to t2, which times out too.
+        let out = stack
+            .fail_timed_out_request(&inv.headers.via_branch().unwrap(), &id)
+            .await;
+        let retry = flatten(ProcessResult::Multiple(out));
+        let retry = forwarded(&retry, &Method::Invite).unwrap().0.clone();
+        let out = stack
+            .fail_timed_out_request(&retry.headers.via_branch().unwrap(), &id)
+            .await;
+        assert!(responded(&out, 408).is_some());
+        let c = one_cdr(&em);
+        assert_eq!(c.disposition, uc_cdr::Disposition::NoAnswer);
+        assert_eq!(c.release_cause, uc_cdr::ReleaseCause::TimerB);
+        assert_eq!(c.release_side, uc_cdr::ReleaseSide::Sbc);
+        assert_eq!(c.final_sip_status, 408);
+        assert_eq!(
+            attempts(&c),
+            vec![
+                ("t1", uc_cdr::TrunkOutcome::Timeout),
+                ("t2", uc_cdr::TrunkOutcome::Timeout)
+            ]
+        );
+        assert_eq!(c.failover_count, 1);
+        assert_all_released(&stack).await;
+    }
+
+    #[tokio::test]
+    async fn cdr_media_failure_after_answer() {
+        let (stack, em) = cdr_stack().await;
+        let r = place_call(&stack, "mf@cdr").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        answer(&stack, &inv, t1()).await;
+        let id = internal_id(&stack, "mf@cdr").await;
+        let byes = stack.terminate_call_on_media_failure(&id.to_string()).await;
+        assert_eq!(byes.len(), 2);
+        assert_eq!(
+            stack
+                .terminate_call_on_media_failure(&id.to_string())
+                .await
+                .len(),
+            0,
+            "second media failure is a no-op"
+        );
+        let c = one_cdr(&em);
+        assert_eq!(c.disposition, uc_cdr::Disposition::MediaFailure);
+        assert_eq!(c.release_cause, uc_cdr::ReleaseCause::MediaFailure);
+        assert_eq!(c.release_side, uc_cdr::ReleaseSide::Sbc);
+        assert!(c.answer_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn cdr_failover_then_answer_lists_trunk_attempts() {
+        let (stack, em) = cdr_stack().await;
+        let r = place_call(&stack, "fo@cdr").await;
+        let first = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        let out = flatten(
+            stack
+                .process_message(&response_to(&first, 503, Some("t1tag"), None), t1(), None)
+                .await,
+        );
+        let (retry, dest) = forwarded(&out, &Method::Invite).unwrap();
+        assert_eq!(dest, t2());
+        let retry = retry.clone();
+        answer(&stack, &retry, t2()).await;
+        stack
+            .process_message(
+                &caller_request("BYE", DIALED, "fo@cdr", 2, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        let c = one_cdr(&em);
+        assert_eq!(c.disposition, uc_cdr::Disposition::Answered);
+        assert_eq!(c.failover_count, 1);
+        assert_eq!(c.b_call_ids.len(), 2);
+        assert_eq!(c.b_call_ids[0], first.headers.call_id().unwrap());
+        assert_eq!(c.b_call_ids[1], retry.headers.call_id().unwrap());
+        assert_eq!(
+            attempts(&c),
+            vec![
+                ("t1", uc_cdr::TrunkOutcome::Status(503)),
+                ("t2", uc_cdr::TrunkOutcome::Status(200))
+            ]
+        );
+        assert_eq!(c.final_trunk.as_deref(), Some("t2"));
+    }
+
+    #[tokio::test]
+    async fn cdr_bye_cancel_race_emits_exactly_one() {
+        let (stack, em) = cdr_stack().await;
+        let results = place_call(&stack, "race@cdr").await;
+        let b = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let cancel = caller_request("CANCEL", DIALED, "race@cdr", 1, None, None);
+        let bye = caller_request("BYE", DIALED, "race@cdr", 2, None, None);
+        let bob_bye = bob_request(&b, "BYE", 1, None);
+        let _ = tokio::join!(
+            stack.process_message(&cancel, alice(), None),
+            stack.process_message(&bye, alice(), None),
+            stack.process_message(&bob_bye, t1(), None),
+        );
+        one_cdr(&em);
+        assert_eq!(em.stats().emitted, 1);
+    }
+
+    #[tokio::test]
+    async fn cdr_trunk_407_is_not_recorded_unless_configured() {
+        let (stack, em) = cdr_stack().await;
+        let r = place_call(&stack, "auth@cdr").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        let out = flatten(
+            stack
+                .process_message(&response_to(&inv, 407, Some("t1tag"), None), t1(), None)
+                .await,
+        );
+        assert!(responded(&out, 407).is_some(), "407 relayed to the caller");
+        assert_eq!(cdrs(&em), Vec::new(), "no CDR for an auth challenge");
+        assert_all_released(&stack).await;
+
+        let (stack, em) = cdr_stack_cfg(
+            SipStackConfig::default(),
+            sbc_config::schema::CdrConfig {
+                record_auth_challenges: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let r = place_call(&stack, "auth2@cdr").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        stack
+            .process_message(&response_to(&inv, 407, Some("t1tag"), None), t1(), None)
+            .await;
+        assert_eq!(one_cdr(&em).final_sip_status, 407);
+    }
+
+    #[tokio::test]
+    async fn cdr_register_challenge_is_not_recorded() {
+        let (stack, em) = cdr_stack_cfg(
+            SipStackConfig {
+                require_auth: true,
+                ..SipStackConfig::default()
+            },
+            sbc_config::schema::CdrConfig::default(),
+        )
+        .await;
+        let (status, _) = register_status(&stack, &register_msg("alice", "reg@cdr", 1, 3600)).await;
+        assert_eq!(status, 401);
+        assert_eq!(cdrs(&em), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn cdr_reject_sites() {
+        let config = SipStackConfig {
+            max_calls: 1,
+            emergency_reserve_calls: 0,
+            ..SipStackConfig::default()
+        };
+        let (stack, em) = cdr_stack_cfg(config, sbc_config::schema::CdrConfig::default()).await;
+
+        // 403: source admission.
+        let mallory = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(203, 0, 113, 9), 5060);
+        let r = flatten(
+            stack
+                .process_message(
+                    &caller_request("INVITE", DIALED, "deny@cdr", 1, None, None),
+                    mallory,
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&r, 403).is_some());
+        // SEC-2: the source-admission 403 is an ACL-layer reject (audited,
+        // no CDR), so a spoofed-source flood cannot fill the CDR volume.
+        assert_eq!(cdrs(&em), Vec::new());
+
+        // 503: max_calls (one call held). The INVITE is retransmitted
+        // twice and rejected each time; it still yields one CDR.
+        place_call(&stack, "held@cdr").await;
+        for _ in 0..3 {
+            let r = place_call(&stack, "full@cdr").await;
+            assert!(responded(&r, 503).is_some());
+        }
+
+        // 503: draining.
+        stack.set_draining();
+        let r = place_call(&stack, "drain@cdr").await;
+        assert!(responded(&r, 503).is_some());
+
+        let got: Vec<_> = cdrs(&em)
+            .into_iter()
+            .map(|c| {
+                assert_eq!(c.release_side, uc_cdr::ReleaseSide::Sbc);
+                assert_eq!(c.disposition, uc_cdr::Disposition::Rejected);
+                (c.a_call_id, c.final_sip_status, c.release_cause)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "full@cdr".to_string(),
+                    503,
+                    uc_cdr::ReleaseCause::AdmissionMaxCalls
+                ),
+                ("drain@cdr".to_string(), 503, uc_cdr::ReleaseCause::Draining),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cdr_no_route_announcement_is_a_reject() {
+        // No router at all: every number is unroutable and gets the
+        // announcement (200) or 480 when it cannot play.
+        let mut stack = SipStack::new(SipStackConfig::default());
+        let em = cdr_emitter();
+        stack.set_cdr(Arc::new(crate::cdr::CdrContext::new(
+            Arc::clone(&em),
+            &sbc_config::schema::CdrConfig::default(),
+        )));
+        stack
+            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        let r = place_call(&stack, "noroute@cdr").await;
+        let status = [200, 480]
+            .into_iter()
+            .find(|c| responded(&r, *c).is_some())
+            .unwrap_or_else(|| panic!("announcement answer or 480: {r:?}"));
+        let c = one_cdr(&em);
+        assert_eq!(c.disposition, uc_cdr::Disposition::Rejected);
+        assert_eq!(c.release_cause, uc_cdr::ReleaseCause::NoRoute);
+        assert_eq!(c.final_sip_status, status);
+    }
+
+    #[tokio::test]
+    async fn cdr_no_usable_trunk_is_a_no_route_reject() {
+        let (stack, em) = cdr_stack().await;
+        stack.set_trunk_reachable("t1", false).await;
+        stack.set_trunk_reachable("t2", false).await;
+        let r = place_call(&stack, "down@cdr").await;
+        assert!(responded(&r, 503).is_some());
+        let c = one_cdr(&em);
+        assert_eq!(c.release_cause, uc_cdr::ReleaseCause::NoRoute);
+        assert_eq!(c.final_sip_status, 503);
+    }
+
+    #[tokio::test]
+    async fn cdr_record_unanswered_routed_skips_rejects() {
+        let (stack, em) = cdr_stack_cfg(
+            SipStackConfig::default(),
+            sbc_config::schema::CdrConfig {
+                record_unanswered: sbc_config::schema::CdrRecordUnanswered::Routed,
+                ..Default::default()
+            },
+        )
+        .await;
+        stack.set_draining();
+        place_call(&stack, "drain@cdr").await;
+        assert_eq!(cdrs(&em), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn cdr_reject_new_calls_admits_emergency_only() {
+        let (stack, em) = cdr_stack_cfg(
+            SipStackConfig::default(),
+            sbc_config::schema::CdrConfig {
+                on_failure: sbc_config::schema::CdrOnFailure::RejectNewCalls,
+                ..Default::default()
+            },
+        )
+        .await;
+        // Healthy pipeline: calls are admitted.
+        let r = place_call(&stack, "ok@cdr").await;
+        assert!(forwarded(&r, &Method::Invite).is_some());
+        // Writer stopped: the pipeline is unhealthy.
+        assert!(em.shutdown(std::time::Duration::from_secs(5)));
+        assert_eq!(em.health(), uc_cdr::CdrHealth::Unhealthy);
+        let r = place_call(&stack, "refused@cdr").await;
+        assert!(responded(&r, 503).is_some(), "non-emergency refused");
+        let r = place_call_to(&stack, "911", "e911@cdr").await;
+        assert!(
+            forwarded(&r, &Method::Invite).is_some(),
+            "emergency always admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cdr_continue_mode_admits_while_unhealthy() {
+        let (stack, em) = cdr_stack().await;
+        assert!(em.shutdown(std::time::Duration::from_secs(5)));
+        let r = place_call(&stack, "cont@cdr").await;
+        assert!(forwarded(&r, &Method::Invite).is_some());
+    }
+
+    #[tokio::test]
+    async fn cdr_shutdown_ends_remaining_calls() {
+        let (stack, em) = cdr_stack().await;
+        let r = place_call(&stack, "up@cdr").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        answer(&stack, &inv, t1()).await;
+        place_call(&stack, "ringing@cdr").await;
+        assert_eq!(stack.end_remaining_calls_for_shutdown().await, 2);
+        let all = cdrs(&em);
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter()
+                .all(|c| c.release_cause == uc_cdr::ReleaseCause::Shutdown)
+        );
+        assert!(
+            all.iter()
+                .any(|c| c.disposition == uc_cdr::Disposition::Answered)
+        );
+        assert_all_released(&stack).await;
+    }
+
+    #[tokio::test]
+    async fn cdr_hostile_from_is_capped_and_valid_json() {
+        let (stack, em) = cdr_stack().await;
+        let user = format!("a\"b{}", "x".repeat(10_000));
+        let invite =
+            String::from_utf8(caller_request("INVITE", DIALED, "evil@cdr", 1, None, None).to_vec())
+                .unwrap()
+                .replacen(
+                    "sip:alice@example.com",
+                    &format!("sip:{user}@example.com"),
+                    1,
+                );
+        stack
+            .process_message(&Bytes::from(invite), alice(), None)
+            .await;
+        stack
+            .process_message(
+                &caller_request("CANCEL", DIALED, "evil@cdr", 1, None, None),
+                alice(),
+                None,
+            )
+            .await;
+        for c in cdrs(&em) {
+            assert!(c.caller.len() <= uc_cdr::record::MAX_FIELD_LEN);
+            let line = serde_json::to_string(&c).unwrap();
+            let back: uc_cdr::CallRecord = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, c);
+        }
     }
 }

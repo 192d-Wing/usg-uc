@@ -36,6 +36,15 @@ async fn main() -> ExitCode {
         "sbc-api-server starting"
     );
 
+    // Management-plane audit events (e.g. CdrExport, CDR permission
+    // denials) go to the tracing output, target "audit". Fail closed: a
+    // management API that serves PII must not run unaudited.
+    // NIST 800-53 Rev5: AU-2, AU-5, AU-12
+    if let Err(e) = uc_audit::init() {
+        error!(error = %e, "audit logger init failed; refusing to start");
+        return ExitCode::from(5);
+    }
+
     let cfg = match config::Config::from_env() {
         Ok(c) => c,
         Err(e) => {

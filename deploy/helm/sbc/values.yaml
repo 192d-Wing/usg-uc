@@ -405,6 +405,48 @@ sbcDaemon:
     storageClass: ""        # empty = cluster default; on microk8s = "microk8s-hostpath"
     # accessMode: ReadWriteOnce because the SBC is single-replica per site.
     accessMode: ReadWriteOnce
+  # Call Detail Records ([cdr] in config.toml), about 1 KiB per call.
+  # Disabling CDRs is an AU-12 deviation. CDRs get their own volume
+  # (cdr.persistence) mounted at `directory`, so a flood of rejected calls
+  # cannot fill the data volume above. Keep
+  # retentionFiles * rotateSizeMb below cdr.persistence.size (AU-4); the
+  # defaults use 48 * 16 MiB = 768 MiB of a 1 GiB volume. Retention deletes
+  # the oldest closed file once either limit is hit, so size the volume for
+  # the evidence window you need (retentionDays).
+  cdr:
+    enabled: true
+    directory: /var/lib/sbc/cdr
+    format: jsonl          # jsonl | csv
+    rotateSizeMb: 16
+    retentionDays: 90
+    retentionFiles: 48
+    persistence:
+      enabled: true
+      size: 1Gi
+      storageClass: ""
+      accessMode: ReadWriteOnce
+  # mTLS on the daemon gRPC listener. Required for sbc-api to serve the CDR
+  # API (CdrService carries PII and is mounted only on an mTLS or loopback
+  # listener); while disabled /api/v1/cdrs* answers 503. Provide either a
+  # cert-manager issuer (the chart then issues ECDSA P-384 server and client
+  # certificates, CNSA 2.0) or two existing Secrets holding tls.crt, tls.key
+  # and ca.crt. sbcTrunkAgent has no gRPC TLS client yet and cannot be
+  # enabled together with this (POAM).
+  #
+  # The daemon also checks the client certificate name on every RPC against
+  # allowedClientNames (grpc.allowed_client_names). Empty = only the chart's
+  # sbc-api client certificate (CN <release>-sbc-api). Use a DEDICATED
+  # issuer for this CA (issuerKind: Issuer, a namespaced CA Issuer used for
+  # nothing else): with a shared ClusterIssuer any workload that can request
+  # a certificate from it chains to the same CA. The `clusterIssuer` value
+  # holds the issuer name for either kind.
+  grpcMtls:
+    enabled: false
+    clusterIssuer: ""
+    issuerKind: ClusterIssuer   # Issuer recommended (dedicated, namespaced)
+    allowedClientNames: []
+    serverSecretName: ""   # default <release>-grpc-server-tls
+    clientSecretName: ""   # default <release>-grpc-client-tls
   resources:
     requests: { cpu: "500m", memory: "512Mi" }
     limits:   { cpu: "2",    memory: "2Gi"   }

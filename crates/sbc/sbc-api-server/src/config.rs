@@ -54,6 +54,24 @@ pub struct Config {
     /// forge its address. Empty = trust `X-Real-IP` unconditionally
     /// (a startup warning is logged).
     pub trusted_proxies: Vec<ipnet::IpNet>,
+
+    /// Client certificate for mTLS to the daemon's gRPC listener
+    /// (`SBC_DAEMON_GRPC_TLS_{CA,CERT,KEY}_FILE`, all three or none). The
+    /// daemon serves `CdrService` (PII) only over mTLS or loopback.
+    ///
+    /// ## NIST 800-53 Rev5: IA-3 (Device Identification and Authentication), SC-8
+    pub daemon_grpc_tls: Option<GrpcClientTls>,
+}
+
+/// PEM file paths for the daemon gRPC mTLS client.
+#[derive(Debug, Clone)]
+pub struct GrpcClientTls {
+    /// CA that signed the daemon's server certificate.
+    pub ca: std::path::PathBuf,
+    /// Client certificate chain.
+    pub cert: std::path::PathBuf,
+    /// Client private key.
+    pub key: std::path::PathBuf,
 }
 
 impl Config {
@@ -97,6 +115,26 @@ impl Config {
             reason,
         })?;
 
+        let tls_var = |k: &'static str| std::env::var(k).ok().filter(|s| !s.is_empty());
+        let daemon_grpc_tls = match (
+            tls_var("SBC_DAEMON_GRPC_TLS_CA_FILE"),
+            tls_var("SBC_DAEMON_GRPC_TLS_CERT_FILE"),
+            tls_var("SBC_DAEMON_GRPC_TLS_KEY_FILE"),
+        ) {
+            (None, None, None) => None,
+            (Some(ca), Some(cert), Some(key)) => Some(GrpcClientTls {
+                ca: ca.into(),
+                cert: cert.into(),
+                key: key.into(),
+            }),
+            _ => {
+                return Err(ConfigError::Invalid {
+                    var: "SBC_DAEMON_GRPC_TLS_{CA,CERT,KEY}_FILE",
+                    reason: "set all three or none".to_string(),
+                });
+            }
+        };
+
         Ok(Self {
             listen_addr,
             database_url,
@@ -105,6 +143,7 @@ impl Config {
             oidc_issuer,
             oidc_audience,
             trusted_proxies,
+            daemon_grpc_tls,
         })
     }
 }

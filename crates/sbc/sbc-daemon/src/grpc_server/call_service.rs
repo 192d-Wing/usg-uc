@@ -98,6 +98,8 @@ impl CallService for CallServiceImpl {
         )))
     }
 
+    // POAM: TerminateCall is not implemented, so no `operator_terminated`
+    // CDR is produced.
     async fn terminate_call(
         &self,
         request: Request<TerminateCallRequest>,

@@ -60,6 +60,13 @@ tonic = { workspace = true }
 # gets proxied to the daemon's still-running REST endpoint.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# CDR schema v1 formatting (JSONL/CSV export) and the CdrExport audit event.
+uc-cdr.workspace = true
+uc-audit.workspace = true
+
 uuid = { version = "1", features = ["v4"] }
 thiserror.workspace = true
 ipnet.workspace = true
+
+[dev-dependencies]
+uc-audit = { workspace = true, features = ["test-capture"] }

@@ -54,6 +54,21 @@ The **Wiring** column says which shipped binary calls the code: `sbc-daemon` (SI
 | Admission-ceiling 503 (`general.max_calls`, + emergency reserve) | Gap | Wired (sbc-daemon) | The 503 sent when `general.max_calls` (or `max_calls + emergency_reserve_calls` for an emergency call) is reached carries **no `Retry-After`** (§21.5.4 SHOULD), so callers, including emergency callers, may redial at once |
 | Translated number in B-leg R-URI user and To (§8.1.1, §25.1) | Complete | Wired (sbc-daemon) | Restricted to unreserved/user-unreserved characters, max 64; otherwise 500. Tests `translated_number_is_on_b_leg_request_uri_and_to`, `qa_header_injection_in_translated_number_is_rejected`, `qa_translated_number_on_failover_invite_wire_bytes` |
 
+### sbc-daemon CDR (RFC 3326, RFC 3264, RFC 5424 / 5425 / 6587)
+
+Call Detail Records read SIP and SDP facts and ship records to syslog. This code is in `sbc-daemon/src/cdr.rs` and `uc-cdr/src/sink.rs`; it does not use proto-sdp or uc-syslog.
+
+| Behaviour | Status | Wiring | Notes |
+|-----------|--------|--------|-------|
+| RFC 3326 Reason: every header field, comma-separated values, quoted `text` | Complete | Wired (sbc-daemon) | `sip_stack.rs` `reason_headers()` feeds `CdrEnd::with_reasons`. `split_unquoted` follows the RFC 3261 §25.1 quoted-string and quoted-pair rules for `,` and `;`. The first `protocol=Q.850` cause in 1..=127 wins. Tests `q850_parses_rfc3326_reason`, `q850_from_separate_reason_headers`, `cdr_answered_then_callee_bye_with_q850` |
+| RFC 3264 §6 port 0 = rejected stream | Complete | Wired (sbc-daemon) | `media_facts` skips `m=audio 0` and `0/n` and takes the first payload of the first accepted audio stream from the answer. Test `media_facts_skips_rejected_audio_stream` |
+| RFC 8866 §5.14 attribute scoping to the m-section; encoding-name case folding | Gap | Wired (sbc-daemon) | `a=rtpmap` / `a=crypto` are not scoped to the chosen m-section. An `a=crypto` under a rejected `m=audio 0` can still be credited. Encoding names keep the received case (RFC-5, NIST POA&M-23) |
+| RFC 3551 Table 4 static payload types | Partial | Wired (sbc-daemon) | Only PT 0/8/9/18 are named without `a=rtpmap` (RFC-7, NIST POA&M-23) |
+| RFC 5424 message format (PRI, VERSION, TIMESTAMP, MSGID, SD, §6.4 BOM) | Complete | Wired (sbc-daemon, opt-in) | PRI = facility * 8 + 6, VERSION 1, UTC timestamp with `Z`, MSGID `CDR`, NILVALUE SD, UTF-8 BOM before the JSON MSG. Header tokens are limited to PRINTUSASCII. Hand-formatted in `uc-cdr`, not via `uc-syslog`. Tests `syslog_octet_counted_rfc5424`, `syslog_sink_octet_counted_frames_via_fake_connector` |
+| RFC 6587 §3.4.1 octet-counting framing | Complete | Wired (sbc-daemon, opt-in) | The count is the MSG byte length including the 3 BOM octets. Same tests |
+| RFC 5425 TLS transport | Partial | Wired (sbc-daemon, opt-in) | TLS 1.3 only (`uc_transport::tls::create_client_config`; suites and key-exchange groups are not restricted to CNSA 2.0, POA&M-26). The server is authenticated against `cdr.syslog.ca_path` or `security.tls_ca_path`. **Gap:** §4.2 mutual authentication is absent because no client certificate is sent (NIST-06, POA&M-15). No test performs a TLS handshake |
+| SIP transport recorded in the CDR | Gap | Wired (sbc-daemon) | SCTP (RFC 4168) A-legs are recorded as `tcp`: schema v1 has no `sctp` value (POA&M-20) |
+
 ---
 
 ## proto-transaction (RFC 3261 §17 + RFC 3262)
@@ -406,7 +421,9 @@ This is **by design** for security compliance.
 
 ## Document Maintenance
 
-Last Updated: 2026-10-11
+Last Updated: 2026-11-04
+
+2026-11-04: added the sbc-daemon CDR section (RFC 3326, RFC 3264 §6, RFC 5424/5425/6587).
 
 2026-10-11: sbc-daemon now drives the proto-transaction state machines and relays re-INVITE/UPDATE with RFC 4028 session-timer headers; wiring column added.
 

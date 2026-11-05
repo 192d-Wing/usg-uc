@@ -13,7 +13,7 @@ use sbc_config_store::{
     PostgresTrunkGroupStore,
 };
 use sbc_grpc_api::prelude::{
-    CallServiceClient, DialPlanSyncServiceClient, DidMappingSyncServiceClient,
+    CallServiceClient, CdrServiceClient, DialPlanSyncServiceClient, DidMappingSyncServiceClient,
     RegistrationServiceClient, SbcSyncServiceClient, SystemServiceClient, TrunkHealthServiceClient,
     TrunkSyncServiceClient,
 };
@@ -79,6 +79,9 @@ pub struct AppState {
     /// "I changed partition / CSS / route-pattern / route-list X,
     /// please re-apply from Postgres to the live `SbcRouter`".
     pub sbc_sync: SbcSyncServiceClient<Channel>,
+    /// Read-only CDR ring queries (`/cdrs`). Replaces the HTTP-proxy
+    /// fallback to the daemon's former `/cdrs` stub.
+    pub cdrs: CdrServiceClient<Channel>,
 
     /// HTTP client + base URL used by the reverse-proxy fallback for
     /// endpoints sbc-api doesn't own.
@@ -168,10 +171,34 @@ impl AppState {
         // until the first RPC, which is what we want — sbc-api should
         // come up even if the daemon is briefly unavailable (e.g.,
         // mid-restart) and recover when the daemon comes back.
-        let endpoint = Endpoint::from_shared(cfg.daemon_grpc_url.clone())
+        let mut endpoint = Endpoint::from_shared(cfg.daemon_grpc_url.clone())
             .map_err(|e| StateError::Grpc(e.to_string()))?
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5));
+        if let Some(tls) = &cfg.daemon_grpc_tls {
+            // mTLS to the daemon (required for CdrService off loopback).
+            // NIST 800-53 Rev5: IA-3, SC-8
+            // POAM: tonic's rustls defaults are used (TLS 1.2+1.3, default
+            // suites) on both ends of this channel, not the uc-transport CNSA
+            // 2.0 config; the chart's certificates are ECDSA P-384.
+            async fn read(p: &std::path::Path) -> Result<String, StateError> {
+                tokio::fs::read_to_string(p)
+                    .await
+                    .map_err(|e| StateError::Grpc(format!("{}: {e}", p.display())))
+            }
+            let tls_cfg = tonic::transport::ClientTlsConfig::new()
+                .ca_certificate(tonic::transport::Certificate::from_pem(
+                    read(&tls.ca).await?,
+                ))
+                .identity(tonic::transport::Identity::from_pem(
+                    read(&tls.cert).await?,
+                    read(&tls.key).await?,
+                ));
+            endpoint = endpoint
+                .tls_config(tls_cfg)
+                .map_err(|e| StateError::Grpc(e.to_string()))?;
+            info!("daemon gRPC uses mTLS");
+        }
         let channel = endpoint.connect_lazy();
         let trunk_sync = TrunkSyncServiceClient::new(channel.clone());
         let dial_plan_sync = DialPlanSyncServiceClient::new(channel.clone());
@@ -180,6 +207,7 @@ impl AppState {
         let registrations = RegistrationServiceClient::new(channel.clone());
         let system = SystemServiceClient::new(channel.clone());
         let trunk_health = TrunkHealthServiceClient::new(channel.clone());
+        let cdrs = CdrServiceClient::new(channel.clone());
         let sbc_sync = SbcSyncServiceClient::new(channel);
 
         let http_client = reqwest::Client::builder()
@@ -269,6 +297,7 @@ impl AppState {
             system,
             trunk_health,
             sbc_sync,
+            cdrs,
             http_client,
             daemon_http_base: cfg.daemon_http_url.trim_end_matches('/').to_string(),
             daemon_api_token: std::env::var("SBC_API_TOKEN")

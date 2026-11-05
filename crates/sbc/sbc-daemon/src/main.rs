@@ -57,6 +57,7 @@
 mod announcement_client;
 mod api_server;
 mod args;
+mod cdr;
 #[cfg(feature = "cluster")]
 mod cluster;
 #[cfg(feature = "grpc")]

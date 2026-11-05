@@ -26,6 +26,9 @@ tonic = { version = "0.14", features = ["gzip", "tls-aws-lc"] }
 tonic-prost = "0.14"
 # Optional reflection support
 tonic-reflection = { version = "0.14", optional = true }
+# CDR schema v1 <-> CdrRecord conversion (`cdr` module).
+uc-cdr.workspace = true
+serde_json.workspace = true
 
 [build-dependencies]
 tonic-prost-build = "0.14"

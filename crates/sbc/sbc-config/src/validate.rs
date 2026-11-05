@@ -80,7 +80,49 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_routing(config)?;
     validate_header_manipulation(config)?;
     validate_topology_hiding(config)?;
+    validate_cdr(&config.cdr)?;
+    if let Some(grpc) = &config.grpc {
+        validate_grpc(grpc)?;
+    }
 
+    Ok(())
+}
+
+/// Most entries accepted in `grpc.allowed_client_names`.
+pub const MAX_GRPC_ALLOWED_CLIENT_NAMES: usize = 64;
+
+/// Longest entry in `grpc.allowed_client_names` (DNS name limit; URIs and
+/// CNs are capped the same).
+pub const MAX_GRPC_CLIENT_NAME_LEN: usize = 253;
+
+/// `grpc.allowed_client_names` is only enforced under `require_mtls`, so a
+/// list without it is rejected rather than silently ignored.
+///
+/// ## NIST 800-53 Rev5: CM-6, AC-3, IA-3
+fn validate_grpc(config: &crate::schema::GrpcConfig) -> ConfigResult<()> {
+    let err = |message: String| Err(ConfigError::Validation { message });
+    if config.allowed_client_names.is_empty() {
+        return Ok(());
+    }
+    if !config.require_mtls {
+        return err(
+            "grpc.allowed_client_names is only enforced with grpc.require_mtls = true".to_string(),
+        );
+    }
+    if config.allowed_client_names.len() > MAX_GRPC_ALLOWED_CLIENT_NAMES {
+        return err(format!(
+            "grpc.allowed_client_names has more than {MAX_GRPC_ALLOWED_CLIENT_NAMES} entries"
+        ));
+    }
+    for name in &config.allowed_client_names {
+        let printable = name.bytes().all(|b| (0x21..=0x7e).contains(&b));
+        if name.is_empty() || name.len() > MAX_GRPC_CLIENT_NAME_LEN || !printable {
+            return err(format!(
+                "grpc.allowed_client_names entry {name:?} must be 1..={MAX_GRPC_CLIENT_NAME_LEN} \
+                 printable ASCII characters without spaces"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -776,6 +818,125 @@ fn validate_topology_hiding(config: &SbcConfig) -> ConfigResult<()> {
 
 /// Returns `true` if `s` is a non-empty RFC 3261 token
 /// (alphanumeric plus ``-.!%*_+`'~``).
+/// Validates `[cdr]`.
+///
+/// ## NIST 800-53 Rev5: AU-4 (Audit Log Storage Capacity), AU-5, SI-12, SC-5
+fn validate_cdr(config: &crate::schema::CdrConfig) -> ConfigResult<()> {
+    use crate::schema::CdrPiiMode;
+    let err = |message: String| Err(ConfigError::Validation { message });
+    if !config.enabled {
+        return Ok(());
+    }
+    if !config.directory.is_absolute() {
+        return err(format!(
+            "cdr.directory must be an absolute path (got {})",
+            config.directory.display()
+        ));
+    }
+    if let Some(id) = &config.node_id {
+        let ok = !id.is_empty()
+            && id.len() <= 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !ok {
+            return err("cdr.node_id must be 1-64 characters of [A-Za-z0-9._-]".to_string());
+        }
+    }
+    if !(1..=4096).contains(&config.rotate_size_mb) {
+        return err(format!(
+            "cdr.rotate_size_mb must be 1..=4096 (got {})",
+            config.rotate_size_mb
+        ));
+    }
+    match config.rotate_interval_secs() {
+        Some(0) => {}
+        Some(s) if (300..=86_400).contains(&s) => {}
+        _ => {
+            return err(format!(
+                "cdr.rotate_interval must be \"0\" or 5m..=24h (got {:?})",
+                config.rotate_interval
+            ));
+        }
+    }
+    if config.fsync_interval_ms > 60_000 {
+        return err(format!(
+            "cdr.fsync_interval_ms must be 0..=60000 (got {})",
+            config.fsync_interval_ms
+        ));
+    }
+    if !(64..=1_000_000).contains(&config.queue_capacity) {
+        return err(format!(
+            "cdr.queue_capacity must be 64..=1000000 (got {})",
+            config.queue_capacity
+        ));
+    }
+    if config.ring_capacity > 200_000 {
+        return err(format!(
+            "cdr.ring_capacity must be 0..=200000 (got {})",
+            config.ring_capacity
+        ));
+    }
+    match (config.pii, &config.pii_hash_key_file) {
+        (CdrPiiMode::Hash, None) => {
+            return err("cdr.pii = \"hash\" requires cdr.pii_hash_key_file".to_string());
+        }
+        (CdrPiiMode::Hash, Some(p)) if !p.is_absolute() => {
+            return err("cdr.pii_hash_key_file must be an absolute path".to_string());
+        }
+        (CdrPiiMode::Full | CdrPiiMode::MaskCaller, Some(_)) => {
+            // Accepted keys must be enforced or rejected, never ignored.
+            return err("cdr.pii_hash_key_file is only valid with cdr.pii = \"hash\"".to_string());
+        }
+        _ => {}
+    }
+    if config.retention_files == 0 && config.retention_days == 0 {
+        // AU-4/AU-11: one bound is required so CDRs cannot fill the volume
+        // unchecked (STIG: retention >= 1).
+        return err(
+            "cdr.retention_files and cdr.retention_days cannot both be 0 (unlimited); \
+             size retention_files * rotate_size_mb to the CDR volume"
+                .to_string(),
+        );
+    }
+    validate_cdr_syslog(&config.syslog)
+}
+
+/// `[cdr.syslog]` keys are validated even when syslog is disabled: accepted
+/// keys must be enforced or rejected, never silently ignored.
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings)
+fn validate_cdr_syslog(syslog: &crate::schema::CdrSyslogConfig) -> ConfigResult<()> {
+    let err = |message: String| Err(ConfigError::Validation { message });
+    let config = syslog;
+    {
+        let Some(rest) = config.target.strip_prefix("tls://") else {
+            // RFC 5425: CDRs carry PII; TLS is mandatory off-host.
+            return err("cdr.syslog.target must be tls://host:port (RFC 5425)".to_string());
+        };
+        let valid = rest.rsplit_once(':').is_some_and(|(host, port)| {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            !host.is_empty()
+                && !has_ascii_control(host)
+                && !host.contains('/')
+                && port.parse::<u16>().is_ok_and(|p| p != 0)
+        });
+        if !valid {
+            return err(format!(
+                "cdr.syslog.target must be tls://host:port (got {:?})",
+                config.target
+            ));
+        }
+        if config.facility > 23 {
+            return err("cdr.syslog.facility must be 0..=23".to_string());
+        }
+        if config.ca_path.as_ref().is_some_and(|p| !p.is_absolute()) {
+            return err("cdr.syslog.ca_path must be an absolute path".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn is_rfc3261_token(s: &str) -> bool {
     !s.is_empty()
         && s.bytes().all(|b| {
@@ -1578,6 +1739,110 @@ mod tests {
         config.trunk_groups = vec![group];
         validate_config(&config).expect("interval ignored when disabled");
     }
+
+    #[test]
+    fn cdr_defaults_valid() {
+        let config = SbcConfig::default();
+        assert!(config.cdr.enabled);
+        assert!(validate_config(&config).is_ok());
+        assert_eq!(config.cdr.rotate_interval_secs(), Some(3600));
+    }
+
+    #[test]
+    fn cdr_relative_directory_rejected() {
+        let mut config = SbcConfig::default();
+        config.cdr.directory = "cdr".into();
+        assert_rejected(&config, "cdr.directory");
+        config.cdr.enabled = false;
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn cdr_pii_hash_requires_key_file() {
+        use crate::schema::CdrPiiMode;
+        let mut config = SbcConfig::default();
+        config.cdr.pii = CdrPiiMode::Hash;
+        assert_rejected(&config, "pii_hash_key_file");
+        config.cdr.pii_hash_key_file = Some("key".into());
+        assert_rejected(&config, "absolute");
+        config.cdr.pii_hash_key_file = Some("/etc/usg-sbc/cdr.key".into());
+        assert!(validate_config(&config).is_ok());
+        config.cdr.pii = CdrPiiMode::Full;
+        assert_rejected(&config, "only valid with");
+    }
+
+    #[test]
+    fn cdr_unlimited_retention_rejected() {
+        let mut c = SbcConfig::default();
+        c.cdr.retention_files = 0;
+        c.cdr.retention_days = 0;
+        assert_rejected(&c, "cannot both be 0");
+        c.cdr.retention_days = 1;
+        assert!(validate_config(&c).is_ok());
+    }
+
+    #[test]
+    fn cdr_syslog_keys_validated_while_disabled() {
+        let base = SbcConfig::default();
+        assert!(!base.cdr.syslog.enabled);
+        let mut c = base.clone();
+        c.cdr.syslog.target = "udp://collector:514".to_string();
+        assert_rejected(&c, "cdr.syslog.target");
+        let mut c = base.clone();
+        c.cdr.syslog.facility = 24;
+        assert_rejected(&c, "facility");
+        let mut c = base;
+        c.cdr.syslog.ca_path = Some("ca.pem".into());
+        assert_rejected(&c, "ca_path");
+    }
+
+    #[test]
+    fn cdr_ranges_enforced() {
+        let base = SbcConfig::default();
+        let mut c = base.clone();
+        c.cdr.rotate_size_mb = 0;
+        assert_rejected(&c, "rotate_size_mb");
+        let mut c = base.clone();
+        c.cdr.rotate_size_mb = 5000;
+        assert_rejected(&c, "rotate_size_mb");
+        for bad in ["1m", "25h", "abc", "", "-5m", "1d"] {
+            let mut c = base.clone();
+            c.cdr.rotate_interval = bad.to_string();
+            assert_rejected(&c, "rotate_interval");
+        }
+        for good in ["0", "5m", "300", "24h", "3600s"] {
+            let mut c = base.clone();
+            c.cdr.rotate_interval = good.to_string();
+            assert!(validate_config(&c).is_ok(), "{good}");
+        }
+        let mut c = base.clone();
+        c.cdr.queue_capacity = 10;
+        assert_rejected(&c, "queue_capacity");
+        let mut c = base.clone();
+        c.cdr.ring_capacity = 200_001;
+        assert_rejected(&c, "ring_capacity");
+        let mut c = base.clone();
+        c.cdr.fsync_interval_ms = 60_001;
+        assert_rejected(&c, "fsync_interval_ms");
+        let mut c = base;
+        c.cdr.node_id = Some("../etc".into());
+        assert_rejected(&c, "node_id");
+    }
+
+    #[test]
+    fn cdr_syslog_requires_tls() {
+        let mut config = SbcConfig::default();
+        config.cdr.syslog.enabled = true;
+        assert!(validate_config(&config).is_ok());
+        config.cdr.syslog.target = "udp://collector:514".into();
+        assert_rejected(&config, "tls://");
+        config.cdr.syslog.target = "tls://collector".into();
+        assert_rejected(&config, "tls://");
+        config.cdr.syslog.target = "tls://[2001:db8::1]:6514".into();
+        assert!(validate_config(&config).is_ok());
+        config.cdr.syslog.facility = 24;
+        assert_rejected(&config, "facility");
+    }
 }
 
 /// Tests that the shipped deploy configurations still validate.
@@ -1642,6 +1907,28 @@ level = "info"
 format = "json"
 output = "stdout"
 audit_enabled = true
+
+[cdr]
+enabled = true
+format = "jsonl"
+directory = "/var/lib/usg-sbc/cdr"
+rotate_size_mb = 100
+rotate_interval = "1h"
+retention_files = 168
+retention_days = 90
+fsync_interval_ms = 1000
+queue_capacity = 8192
+ring_capacity = 10000
+hash_chain = true
+record_unanswered = "all"
+record_auth_challenges = false
+pii = "full"
+on_failure = "continue"
+
+[cdr.syslog]
+enabled = false
+target = "tls://collector.example.net:6514"
+facility = 16
 "#;
 
     #[test]

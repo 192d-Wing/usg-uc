@@ -222,10 +222,79 @@ fn qa_repo_deploy_configs_validate() {
     }
 }
 
+/// SEC-2/NIST-05: the chart's CDR retention fits the dedicated CDR volume
+/// (retentionFiles * rotateSizeMb <= cdr.persistence.size), and the chart
+/// mounts that volume at the CDR directory.
+/// SEC-8: with grpcMtls the chart allow-lists its own sbc-api client
+/// certificate CN by default, so another certificate from the same issuer
+/// cannot call the daemon.
+#[test]
+fn qa_helm_grpc_allow_list_defaults_to_sbc_api_cert() {
+    let helpers =
+        std::fs::read_to_string(repo_path("deploy/helm/sbc/templates/_helpers.tpl")).unwrap();
+    let mtls =
+        std::fs::read_to_string(repo_path("deploy/helm/sbc/templates/26-sbc-grpc-mtls.yaml"))
+            .unwrap();
+    let cn = r#"printf "%s-sbc-api" (include "sbc.fullname" .)"#;
+    assert!(
+        mtls.contains(&format!("commonName: {{{{ {cn} }}}}")),
+        "client cert CN"
+    );
+    let define = helpers
+        .split("{{- define \"sbc.grpcAllowedClientNames\" -}}")
+        .nth(1)
+        .expect("allow-list helper");
+    assert!(define.contains(&format!("default (list ({cn}))")));
+    let grpc = helpers.split("[grpc]").nth(1).expect("[grpc] block");
+    let block = &grpc[..grpc.find("{{- end }}").expect("grpcMtls if")];
+    assert!(
+        block.contains(r#"allowed_client_names = {{ include "sbc.grpcAllowedClientNames" . }}"#)
+    );
+}
+
+#[test]
+fn qa_helm_cdr_retention_fits_its_volume() {
+    let values = std::fs::read_to_string(repo_path("deploy/helm/sbc/values.yaml")).unwrap();
+    let start = values.find("\n  cdr:\n").expect("sbcDaemon.cdr block");
+    let block = &values[start..];
+    let num = |key: &str| -> u64 {
+        let line = block
+            .lines()
+            .find(|l| l.trim_start().starts_with(key))
+            .unwrap_or_else(|| panic!("{key}"));
+        let v = line.split(':').nth(1).unwrap().split('#').next().unwrap();
+        v.trim()
+            .trim_end_matches("Gi")
+            .trim_end_matches("Mi")
+            .parse()
+            .unwrap()
+    };
+    let size_line = block
+        .lines()
+        .find(|l| l.trim_start().starts_with("size:"))
+        .unwrap();
+    let size_mib = if size_line.contains("Gi") {
+        num("size:") * 1024
+    } else {
+        num("size:")
+    };
+    let total = num("retentionFiles:") * num("rotateSizeMb:");
+    assert!(
+        total <= size_mib,
+        "{total} MiB of CDRs on a {size_mib} MiB volume"
+    );
+    let deploy = std::fs::read_to_string(repo_path(
+        "deploy/helm/sbc/templates/12-sbc-deployment.yaml",
+    ))
+    .unwrap();
+    assert!(deploy.contains("claimName: {{ include \"sbc.fullname\" . }}-cdr"));
+}
+
 /// Minimal render of the Helm `sbc.config` helper (no `helm` binary in CI
 /// images): substitutes the chart default values and evaluates every
 /// `{{- if }}` block both ways, then validates the result.
 #[test]
+#[allow(clippy::too_many_lines)] // flat value table
 fn qa_helm_rendered_sbc_config_validates() {
     let tpl = std::fs::read_to_string(repo_path("deploy/helm/sbc/templates/_helpers.tpl")).unwrap();
     let start = tpl
@@ -278,6 +347,21 @@ fn qa_helm_rendered_sbc_config_validates() {
             "false",
         ),
         ("{{ .Values.sbcDaemon.sipTls.secretName }}", "sip-tls"),
+        // values.yaml sbcDaemon.cdr defaults.
+        ("{{ .Values.sbcDaemon.cdr.enabled }}", "true"),
+        (
+            "{{ .Values.sbcDaemon.cdr.directory | quote }}",
+            "\"/var/lib/sbc/cdr\"",
+        ),
+        ("{{ .Values.sbcDaemon.cdr.format | quote }}", "\"jsonl\""),
+        ("{{ .Values.sbcDaemon.cdr.rotateSizeMb }}", "16"),
+        ("{{ .Values.sbcDaemon.cdr.retentionDays }}", "90"),
+        ("{{ .Values.sbcDaemon.cdr.retentionFiles }}", "48"),
+        ("{{ .Values.sbcDaemon.grpcMtls.enabled }}", "false"),
+        (
+            "{{ include \"sbc.grpcAllowedClientNames\" . }}",
+            "[\"sbc-sbc-api\"]",
+        ),
     ];
     for keep_if_bodies in [false, true] {
         let mut out = String::new();

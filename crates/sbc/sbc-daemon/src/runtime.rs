@@ -422,6 +422,23 @@ impl Runtime {
         // the trunk monitor exists (below).
         let config_trunk_groups = config.trunk_groups.clone();
 
+        // CDR pipeline (`[cdr]`). An unwritable directory stops startup
+        // (fail closed) with an error naming the directory and keys.
+        //
+        // ## NIST 800-53 Rev5: AU-5, AU-12
+        let cdr = crate::cdr::start_from_config(
+            &config.cdr,
+            &instance_name,
+            config.security.tls_ca_path.as_deref(),
+        )
+        .map_err(|reason| {
+            error!(error = %reason, "CDR pipeline failed to start — SBC cannot start");
+            RuntimeError::InitFailed {
+                component: "cdr".to_string(),
+                reason,
+            }
+        })?;
+
         // Pass cluster manager to server if available
         #[cfg(feature = "cluster")]
         let mut server = Server::new_with_cluster(config, signal.clone(), self.cluster.clone());
@@ -431,6 +448,15 @@ impl Runtime {
         // Set zone registry on server (and its SipStack) before starting
         if let Some(ref registry) = zone_registry {
             server.set_zone_registry(Arc::clone(registry));
+        }
+
+        if let Some(ref c) = cdr
+            && !server.set_cdr(Arc::clone(c))
+        {
+            return Err(RuntimeError::InitFailed {
+                component: "cdr".to_string(),
+                reason: "SIP stack already shared; CDR pipeline not attached".to_string(),
+            });
         }
 
         // Attach the out-of-process media plane if configured
@@ -1089,8 +1115,10 @@ impl Runtime {
         let args = self.args.clone();
         let reload_interval = self.reload_check_interval;
 
+        let reload_cdr = cdr.clone();
         let reload_handle = tokio::spawn(async move {
-            Self::config_reload_loop(reload_signal, config_ref, args, reload_interval).await;
+            Self::config_reload_loop(reload_signal, config_ref, args, reload_interval, reload_cdr)
+                .await;
         });
 
         // Run main SIP server loop
@@ -1114,6 +1142,27 @@ impl Runtime {
         // Perform graceful shutdown with connection draining
         info!("Initiating graceful shutdown with connection draining");
         let drain_result = self.shutdown.shutdown_gracefully().await;
+
+        // Calls still up get a `shutdown` CDR, then the CDR writer drains
+        // and closes its file (sidecar digest) before the audit flush, so
+        // the rotation audit event is flushed too (plan §5).
+        //
+        // ## NIST 800-53 Rev5: AU-12, AU-9
+        if let Some(ref c) = cdr {
+            let ended = server.sip_stack().end_remaining_calls_for_shutdown().await;
+            if ended > 0 {
+                info!(calls = ended, "Ended remaining calls with shutdown CDRs");
+            }
+            let emitter = Arc::clone(c.emitter());
+            if !tokio::task::spawn_blocking(move || {
+                emitter.shutdown(crate::cdr::SHUTDOWN_FLUSH_TIMEOUT)
+            })
+            .await
+            .unwrap_or(false)
+            {
+                warn!("CDR queue not drained before shutdown");
+            }
+        }
 
         uc_audit::log_event(uc_audit::AuditEvent::SystemShutdown(
             uc_audit::event::SystemShutdown {
@@ -1179,6 +1228,7 @@ impl Runtime {
         config: Arc<RwLock<SbcConfig>>,
         args: Args,
         poll_interval: Duration,
+        cdr: Option<Arc<crate::cdr::CdrContext>>,
     ) {
         let mut interval = tokio::time::interval(poll_interval);
 
@@ -1194,6 +1244,12 @@ impl Runtime {
                         if Path::new(&config_path).exists() {
                             match load_from_file(&config_path) {
                                 Ok(new_config) => {
+                                    if let Some(ref c) = cdr {
+                                        let old = config.read().await.cdr.clone();
+                                        if old != new_config.cdr {
+                                            crate::cdr::reload(c, &old, &new_config.cdr);
+                                        }
+                                    }
                                     *config.write().await = new_config;
                                     info!("Configuration reloaded successfully");
                                     warn!("Note: running Server and SipStack retain their original config snapshots; a full restart is required for all settings to take effect");

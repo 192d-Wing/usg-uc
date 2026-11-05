@@ -4,8 +4,8 @@
 //! sbc-api owns config entities (phones, DIDs, trunk groups, dial-plan
 //! writes), users (PR10), SBC routing CRUD (PR11), SIP-state reads
 //! (PR7), and trunk runtime state (PR9). What's left for the proxy is
-//! the read-only `/cdrs` and `/dialplans` views, which still live on
-//! the daemon — they're cheap to expose locally there and have no
+//! the read-only `/dialplans` views, which still live on
+//! the daemon (`/cdrs` moved to the gRPC `CdrService`) — they're cheap to expose locally there and have no
 //! Postgres or gRPC equivalent yet. The dashboard hits sbc-api as the
 //! single front door, so the catch-all forwards anything it doesn't
 //! own.

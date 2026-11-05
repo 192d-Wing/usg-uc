@@ -368,167 +368,122 @@ DELETE /api/v1/routes/:id
 
 ## Call Detail Records (CDR)
 
-**NIST 800-53 Rev5 Controls:** AU-2, AU-3, AU-9
+**NIST 800-53 Rev5 Controls:** AU-3, AU-6, AC-3, AC-6, SI-12 (see `docs/NIST-800-53-CONTROLS.md`, Call Detail Records)
+
+Served by `sbc-api-server` (`crates/sbc/sbc-api-server/src/handlers/cdrs.rs`). Each request is forwarded to the daemon's gRPC `CdrService` and reads that node's in-memory ring of recent CDRs (at most `cdr.ring_capacity`). The rotated files on the daemon are the durable record. There is no search, correlation, delete or purge endpoint, and no `cdr:admin` permission.
+
+The daemon mounts `CdrService` only on an mTLS listener (`grpc.require_mtls = true`, with sbc-api given `SBC_DAEMON_GRPC_TLS_{CA,CERT,KEY}_FILE`) or a loopback listener. Otherwise every endpoint below returns `503` with an explanation. With the default Helm chart (`sbcDaemon.grpcMtls.enabled = false`) these endpoints return `503`.
+
+Errors use the body `{"error": "<message>"}`. Status mapping: `400` for invalid parameters or an invalid argument from the daemon; `403` without the permission; `404` when the CDR is not found; `429` when an export is already running; `502` when the daemon is unreachable or returned an invalid CDR; `503` when the daemon does not expose CdrService or CDRs are disabled.
+
+Records use schema v1, the JSON form of `uc_cdr::CallRecord`. Times are UTC epoch milliseconds (`setup_ms`, `ring_ms`, `answer_ms`, `end_ms`). Caller and callee fields are stored after the daemon's `cdr.pii` policy, so they may be masked or HMAC-hashed.
 
 ### List CDRs
 
-List call detail records with filtering.
-
-```
+```text
 GET /api/v1/cdrs
 ```
 
 **Permission:** `cdr:read`
 
-**Query Parameters:**
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `start_time` | ISO 8601 | Filter by start time (from) |
-| `end_time` | ISO 8601 | Filter by end time (to) |
-| `caller` | string | Filter by caller URI |
-| `callee` | string | Filter by callee URI |
-| `status` | string | Filter by status (completed, failed, etc.) |
-| `trunk_id` | string | Filter by trunk |
-| `direction` | string | Filter by direction (inbound, outbound) |
-| `min_duration` | integer | Minimum duration in seconds |
-| `max_duration` | integer | Maximum duration in seconds |
-| `source_ip` | string | Filter by source IP |
-| `dest_ip` | string | Filter by destination IP |
+**Query Parameters** (unknown parameters are rejected with 400; values are limited to 256 bytes):
 
-**Response:**
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `start` | integer | Inclusive lower bound on `setup_ms` (epoch ms) |
+| `end` | integer | Exclusive upper bound on `setup_ms` (epoch ms); must be after `start` |
+| `caller` | string | Exact match on `caller` (as stored) |
+| `callee` | string | Exact match on `callee_dialed` or `callee_translated` |
+| `disposition` | string | `answered`, `failed`, `cancelled`, `rejected`, `busy`, `no_answer`, `media_failure` or `operator_terminated` |
+| `trunk` | string | Matches `final_trunk` or any `trunks_tried` entry |
+| `page_token` | string | Opaque (digits) token from a previous response |
+| `page_size` | integer | Default 100, capped at 500 |
+
+**Response:** newest first.
+
 ```json
 {
-  "items": [
-    {
-      "call_id": "abc123@sbc.example.com",
-      "caller": "sip:alice@example.com",
-      "callee": "sip:bob@example.com",
-      "status": "completed",
-      "start_time": "2024-01-15T10:30:00Z",
-      "end_time": "2024-01-15T10:35:00Z",
-      "duration_seconds": 300,
-      "trunk_id": "trunk-01",
-      "direction": "outbound"
-    }
-  ],
-  "total": 100
+  "cdrs": [ { "schema_version": 1, "record_id": "sbc-a-42", "a_call_id": "...", "disposition": "answered", "...": "..." } ],
+  "next_page_token": "41",
+  "total": 10000,
+  "node_id": "sbc-a"
 }
 ```
 
+`next_page_token` is `null` on the last page. `total` is the number of records in the node's ring.
+
 ### Get CDR
 
-Get a specific CDR by call ID.
-
-```
-GET /api/v1/cdrs/:call_id
+```text
+GET /api/v1/cdrs/{record_id}
 ```
 
 **Permission:** `cdr:read`
 
+Returns one record (`{node_id}-{sequence}`), or 404.
+
 ### Export CDRs
 
-Export CDRs in JSON or CSV format.
-
-```
+```text
 GET /api/v1/cdrs/export
 ```
 
 **Permission:** `cdr:export`
 
-**Query Parameters:**
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `format` | string | Export format: `json` or `csv` |
-| `include_headers` | boolean | Include column headers (CSV) |
-| `fields` | string | Comma-separated field list |
-| `limit` | integer | Maximum records to export |
+**Query Parameters:** `format` = `jsonl` (default) or `csv`, plus the List CDRs filters.
 
-Plus all filtering parameters from List CDRs.
+Response: `200` with `Content-Type: application/x-ndjson` (jsonl) or `text/csv; charset=utf-8` (csv), `Content-Disposition: attachment; filename="cdrs.<ext>"`, and `x-cdr-truncated: true|false`. An export returns at most 50 000 records. Each sbc-api replica runs one export at a time and answers `429` to a concurrent export. The body is built in memory before it is sent (POA&M-21). CSV cells that start with `= + - @`, TAB or CR are prefixed with `'`. Every export after the permission check is audited as a `CdrExport` event with `outcome` `success`, `truncated`, `failed` or `busy`; `caller` and `callee` filter values are recorded as `<redacted>`.
 
 ### CDR Statistics
 
-Get CDR statistics and summary metrics.
-
-```
+```text
 GET /api/v1/cdrs/stats
 ```
 
 **Permission:** `cdr:read`
 
-**Response:**
+**Response** (pipeline counters of the node, not call statistics):
+
 ```json
 {
-  "total_records": 10000,
-  "completed_calls": 9500,
-  "failed_calls": 500,
-  "total_duration_seconds": 1500000,
-  "average_duration_seconds": 157.89,
-  "answer_seizure_ratio": 0.95,
-  "failure_rate": 0.05,
-  "calls_by_status": {
-    "completed": 9500,
-    "failed": 300,
-    "busy": 200
-  },
-  "calls_by_cause": {
-    "normal_clearing": 9500,
-    "user_busy": 200,
-    "no_answer": 300
-  },
-  "calls_by_trunk": {
-    "trunk-01": 5000,
-    "trunk-02": 5000
-  }
+  "emitted": 10000,
+  "dropped": 0,
+  "write_errors": 0,
+  "queue_depth": 0,
+  "ring_size": 10000,
+  "last_write_ms": 1762261200000,
+  "chain_ok": true,
+  "writer_alive": true,
+  "rotations": 12,
+  "health": "healthy",
+  "node_id": "sbc-a"
 }
 ```
 
-### Search CDRs
+### Authorization for CDR endpoints
 
-Search CDRs by various criteria.
+| Credential | `cdr:read` | `cdr:export` |
+| --- | --- | --- |
+| Legacy admin credential | yes | yes |
+| OIDC role `cdr-reader` or `auditor` | yes | no |
+| OIDC role `cdr-exporter` or `fleet-admin` | yes | yes |
+| OIDC scope `cdr:read` | yes | no |
+| OIDC scope `cdr:export` | yes | yes |
+| `config-admin` only | no | no |
 
-```
-GET /api/v1/cdrs/search
-```
+A refused request gets `403 {"error": "permission cdr:read required"}` (or `cdr:export`). It is audited as an `AuthorizationDecision` deny with policy `cdr-rbac` and the user, or `anonymous`.
 
-**Permission:** `cdr:read`
+### gRPC CdrService (daemon)
 
-### Get Correlated CDRs
+Defined in `crates/sbc/sbc-grpc-api/proto/cdr.proto` (package `sbc.api.v1`) and served by `sbc-daemon/src/grpc_server/cdr_service.rs`. It is mounted only under `grpc.require_mtls` or on a loopback `grpc.listen_addr`.
 
-Get all CDRs with the same correlation ID (related calls).
+| RPC | Request | Response |
+| --- | --- | --- |
+| `ListCdrs` | `ListCdrsRequest{start_ms, end_ms, caller, callee, disposition, trunk, page_token, page_size}` (page size 0 means 100, capped at 500) | `ListCdrsResponse{cdrs, next_page_token, total_in_ring, node_id}` |
+| `GetCdr` | `GetCdrRequest{record_id}` | `GetCdrResponse{cdr}` (`NOT_FOUND` if absent) |
+| `GetCdrStats` | `GetCdrStatsRequest{}` | `GetCdrStatsResponse{emitted, dropped, write_errors, queue_depth, ring_size, last_write_ms, chain_ok, writer_alive, rotations, health, node_id}` |
 
-```
-GET /api/v1/cdrs/correlation/:correlation_id
-```
-
-**Permission:** `cdr:read`
-
-### Purge CDRs
-
-Delete CDRs older than a specified date.
-
-```
-DELETE /api/v1/cdrs/purge
-```
-
-**Permission:** `cdr:admin`
-
-**Request Body:**
-```json
-{
-  "before_time": "2023-01-01T00:00:00Z",
-  "status_filter": ["completed", "failed"],
-  "dry_run": false
-}
-```
-
-**Response:**
-```json
-{
-  "records_deleted": 5000,
-  "dry_run": false,
-  "cutoff_time": "2023-01-01T00:00:00Z"
-}
-```
+Invalid input returns `INVALID_ARGUMENT`. Disabled CDRs return `FAILED_PRECONDITION`. Under mTLS, every gRPC call (all services) must present a client certificate whose SAN DNS, SAN URI or subject CN is in `grpc.allowed_client_names` (when the list is non-empty), or it gets `PERMISSION_DENIED`. The daemon does no per-user permission check; sbc-api enforces `cdr:read` / `cdr:export`. `ListCdrs` and `GetCdr` are audited as `CdrExport`. The `user` is `cert:<name>@<peer>` under mTLS, or `unauthenticated@<peer>` on loopback. The optional `x-sbc-user` metadata (sbc-api sends `api:<user>`, sbc-cli sends `cli:<user>`) is recorded only as `on_behalf_of`. Loopback access is unauthenticated (POA&M-22). The channel uses tonic's default TLS suites, not CNSA 2.0 (POA&M-16).
 
 ---
 
@@ -763,9 +718,8 @@ GET /readyz
 | `routes:read` | View routing configuration |
 | `routes:write` | Create/update routes |
 | `routes:admin` | Delete routes |
-| `cdr:read` | View call detail records |
-| `cdr:export` | Export CDRs |
-| `cdr:admin` | Purge CDRs |
+| `cdr:read` | View call detail records (`/api/v1/cdrs`, `/cdrs/{record_id}`, `/cdrs/stats`); see [Authorization for CDR endpoints](#authorization-for-cdr-endpoints) |
+| `cdr:export` | Export CDRs (`/api/v1/cdrs/export`); implies `cdr:read` |
 | `cluster:read` | View cluster status |
 | `cluster:admin` | Manage cluster (failover, drain) |
 | `config:read` | View configuration |

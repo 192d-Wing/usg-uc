@@ -53,7 +53,17 @@ spec:
             - name: SBC_DAEMON_HTTP_URL
               value: "http://{{ include "sbc.fullname" . }}-api.{{ .Release.Namespace }}.svc.cluster.local:80"
             - name: SBC_DAEMON_GRPC_URL
-              value: "http://{{ include "sbc.fullname" . }}-grpc.{{ .Release.Namespace }}.svc.cluster.local:9091"
+              value: {{ include "sbc.daemonGrpcUrl" . | quote }}
+            {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+            # mTLS client identity for the daemon gRPC listener; needed for
+            # the CDR API (CdrService is mTLS/loopback only). NIST: IA-3, SC-8
+            - name: SBC_DAEMON_GRPC_TLS_CA_FILE
+              value: /etc/sbc/grpc-tls/ca.crt
+            - name: SBC_DAEMON_GRPC_TLS_CERT_FILE
+              value: /etc/sbc/grpc-tls/tls.crt
+            - name: SBC_DAEMON_GRPC_TLS_KEY_FILE
+              value: /etc/sbc/grpc-tls/tls.key
+            {{- end }}
             # Postgres DSN — same Secret the daemon reads. sbc-api owns
             # the write side of the four config-entity tables; the
             # daemon still reads the same tables for SIP-router replay.
@@ -126,15 +136,29 @@ spec:
             capabilities:
               drop: [ALL]
               add: [NET_BIND_SERVICE]
-          {{- if and .Values.sbcApi.oidc.issuer .Values.sbcClientConfig.extraCaCert }}
+          {{- $extraCa := and .Values.sbcApi.oidc.issuer .Values.sbcClientConfig.extraCaCert }}
+          {{- if or $extraCa .Values.sbcDaemon.grpcMtls.enabled }}
           volumeMounts:
+            {{- if $extraCa }}
             - { name: extra-ca, mountPath: /etc/ssl/extra-ca, readOnly: true }
+            {{- end }}
+            {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+            - { name: grpc-tls, mountPath: /etc/sbc/grpc-tls, readOnly: true }
+            {{- end }}
           {{- end }}
-      {{- if and .Values.sbcApi.oidc.issuer .Values.sbcClientConfig.extraCaCert }}
+      {{- if or $extraCa .Values.sbcDaemon.grpcMtls.enabled }}
       volumes:
+        {{- if $extraCa }}
         - name: extra-ca
           configMap:
             name: {{ include "sbc.fullname" . }}-client-config-ca
+        {{- end }}
+        {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+        - name: grpc-tls
+          secret:
+            secretName: {{ include "sbc.grpcClientTlsSecret" . }}
+            defaultMode: 0440
+        {{- end }}
       {{- end }}
 ---
 apiVersion: v1

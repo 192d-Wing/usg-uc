@@ -172,6 +172,25 @@ impl Server {
         }
     }
 
+    /// Attaches the CDR pipeline to the SIP stack. Must run while the stack
+    /// `Arc` is still uniquely held (before `start`).
+    ///
+    /// ## NIST 800-53 Rev5: AU-12 (Audit Record Generation)
+    pub fn set_cdr(&mut self, cdr: Arc<crate::cdr::CdrContext>) -> bool {
+        Arc::get_mut(&mut self.sip_stack).map_or_else(
+            || {
+                tracing::error!(
+                    "Cannot set CDR pipeline on SIP stack — Arc has multiple references"
+                );
+                false
+            },
+            |stack| {
+                stack.set_cdr(cdr);
+                true
+            },
+        )
+    }
+
     /// Determines which zone a transport belongs to based on its local bind address.
     fn zone_for_transport(&self, transport: &UdpTransport) -> Option<String> {
         self.zone_for_local_ip(transport.local_addr().ip())
