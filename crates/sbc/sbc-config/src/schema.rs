@@ -148,6 +148,196 @@ pub struct SbcConfig {
     /// vendor-specific provisioning fields (e.g. TEO `update_server`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning: Option<ProvisioningConfig>,
+
+    /// Call Detail Record pipeline settings.
+    ///
+    /// ## NIST 800-53 Rev5: AU-2 (Event Logging), AU-12 (Audit Record Generation)
+    pub cdr: CdrConfig,
+}
+
+/// CDR file format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdrFormatConfig {
+    /// JSON lines (carries the hash chain).
+    #[default]
+    Jsonl,
+    /// Fixed-column CSV (RFC 4180).
+    Csv,
+}
+
+/// Which unanswered call attempts produce a CDR.
+///
+/// ## NIST 800-53 Rev5: AU-2 (organisation-defined event set)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdrRecordUnanswered {
+    /// Every INVITE that reaches admission, including admission, policy and
+    /// no-route rejects and trunk 4xx/5xx/6xx.
+    #[default]
+    All,
+    /// Only attempts that were routed to a B-leg.
+    Routed,
+    /// Answered calls only.
+    None,
+}
+
+/// How caller/callee numbers are stored in CDRs.
+///
+/// ## NIST 800-53 Rev5: SI-12 (Information Management and Retention)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdrPiiMode {
+    /// Store numbers as received.
+    #[default]
+    Full,
+    /// Mask caller numbers except the last four characters.
+    MaskCaller,
+    /// Replace numbers with HMAC-SHA-384 (key from `pii_hash_key_file`).
+    Hash,
+}
+
+/// Call handling when the CDR writer has failed.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures), AU-5(4)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdrOnFailure {
+    /// Keep admitting calls; drop and count CDRs, report health degraded.
+    #[default]
+    Continue,
+    /// Reject new non-emergency INVITEs while the writer is dead.
+    /// Emergency calls are always admitted.
+    RejectNewCalls,
+}
+
+/// CDR syslog forwarding (RFC 5424 over TLS, RFC 5425).
+///
+/// ## NIST 800-53 Rev5: AU-9(2) (Store on Separate Physical Systems), SC-8
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CdrSyslogConfig {
+    /// Forward CDRs to a syslog collector.
+    pub enabled: bool,
+    /// Collector as `tls://host:port`. Only TLS is accepted.
+    pub target: String,
+    /// PEM CA bundle that issues the collector's certificate. Empty uses the
+    /// daemon's configured trust store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_path: Option<PathBuf>,
+    /// Syslog facility, 0..=23 (16 = local0).
+    pub facility: u8,
+}
+
+impl Default for CdrSyslogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target: "tls://collector:6514".to_string(),
+            ca_path: None,
+            facility: 16,
+        }
+    }
+}
+
+/// Call Detail Record settings (`[cdr]`).
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-4 (Storage Capacity), AU-9, AU-11 (Retention), SI-12
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CdrConfig {
+    /// Produce CDRs.
+    pub enabled: bool,
+    /// File format.
+    pub format: CdrFormatConfig,
+    /// Absolute directory for CDR files (created 0750 if missing).
+    pub directory: PathBuf,
+    /// Node id stamped on records and file names. Unset uses
+    /// `general.instance_name` (when it is a valid node id), then `$HOSTNAME`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Rotate a file at this size, 1..=4096 MiB.
+    pub rotate_size_mb: u32,
+    /// Rotate a non-empty file after this long (`"0"` = size only;
+    /// otherwise 5m..=24h). Units: s, m, h.
+    pub rotate_interval: String,
+    /// Closed files to keep (0 = unlimited).
+    pub retention_files: u32,
+    /// Days to keep closed files (0 = unlimited).
+    pub retention_days: u32,
+    /// fsync at most this often (0 = after every record), 0..=60000 ms.
+    pub fsync_interval_ms: u32,
+    /// Writer queue capacity, `64..=1_000_000`.
+    pub queue_capacity: usize,
+    /// Recent CDRs held in memory for the API, `0..=200_000`.
+    pub ring_capacity: usize,
+    /// SHA-384 hash chain over records.
+    pub hash_chain: bool,
+    /// Which unanswered attempts produce a CDR.
+    pub record_unanswered: CdrRecordUnanswered,
+    /// Produce CDRs for INVITEs answered with a 401/407 challenge.
+    pub record_auth_challenges: bool,
+    /// Number storage policy.
+    pub pii: CdrPiiMode,
+    /// HMAC-SHA-384 key file (at least 48 bytes); required when `pii = "hash"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pii_hash_key_file: Option<PathBuf>,
+    /// Call handling when the CDR writer fails.
+    pub on_failure: CdrOnFailure,
+    /// Syslog forwarding.
+    pub syslog: CdrSyslogConfig,
+}
+
+impl Default for CdrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            format: CdrFormatConfig::Jsonl,
+            directory: PathBuf::from("/var/lib/usg-sbc/cdr"),
+            node_id: None,
+            rotate_size_mb: 100,
+            rotate_interval: "1h".to_string(),
+            retention_files: 168,
+            retention_days: 90,
+            fsync_interval_ms: 1000,
+            queue_capacity: 8192,
+            ring_capacity: 10_000,
+            hash_chain: true,
+            record_unanswered: CdrRecordUnanswered::All,
+            record_auth_challenges: false,
+            pii: CdrPiiMode::Full,
+            pii_hash_key_file: None,
+            on_failure: CdrOnFailure::Continue,
+            syslog: CdrSyslogConfig::default(),
+        }
+    }
+}
+
+impl CdrConfig {
+    /// Parses `rotate_interval` into seconds (`0` = size-only rotation).
+    /// Accepts a bare number of seconds or a number with an `s`, `m` or `h`
+    /// suffix. `None` when malformed.
+    #[must_use]
+    pub fn rotate_interval_secs(&self) -> Option<u64> {
+        parse_duration_secs(&self.rotate_interval)
+    }
+}
+
+/// Parses `"90"`, `"30s"`, `"5m"`, `"1h"` into seconds.
+#[must_use]
+pub fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = match s.as_bytes().last()? {
+        b's' => (s.get(..s.len() - 1)?, 1),
+        b'm' => (s.get(..s.len() - 1)?, 60),
+        b'h' => (s.get(..s.len() - 1)?, 3600),
+        b'0'..=b'9' => (s, 1),
+        _ => return None,
+    };
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num.parse::<u64>().ok()?.checked_mul(mult)
 }
 
 /// Phone provisioning settings.
@@ -714,6 +904,15 @@ pub struct GrpcConfig {
     /// Require mutual TLS (client certificate authentication).
     pub require_mtls: bool,
 
+    /// Client certificate names allowed to call the gRPC API when
+    /// `require_mtls` is set. Each entry is matched exactly (DNS names
+    /// ASCII case-insensitively) against the client certificate's SAN DNS
+    /// names, SAN URIs and subject CN. Empty = any certificate that chains
+    /// to `tls_ca_path` (a startup warning is logged).
+    ///
+    /// ## NIST 800-53 Rev5: AC-3 (Access Enforcement), IA-3
+    pub allowed_client_names: Vec<String>,
+
     /// Maximum concurrent gRPC connections.
     pub max_connections: u32,
 
@@ -737,6 +936,7 @@ impl Default for GrpcConfig {
             tls_key_path: None,
             tls_ca_path: None,
             require_mtls: false,
+            allowed_client_names: Vec::new(),
             max_connections: 1000,
             request_timeout_secs: 30,
             enable_reflection: true,

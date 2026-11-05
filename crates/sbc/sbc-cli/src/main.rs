@@ -12,6 +12,7 @@
 //!     status          Show SBC status
 //!     config          Configuration management
 //!     calls           Call management
+//!     cdrs            Call Detail Records (list, show, export, verify)
 //!     health          Health check operations
 //!     metrics         Metrics display
 //!     version         Show version information
@@ -49,6 +50,7 @@ fn main() {
         Command::Config(cmd) => commands::config::run(&args, cmd.clone()),
         Command::Calls(cmd) => commands::calls::run(&args, cmd.clone()),
         Command::Trunk(cmd) => commands::trunk::run(&args, cmd.clone()),
+        Command::Cdrs(cmd) => commands::cdrs::run(&args, cmd.clone()),
         Command::Health => {
             commands::health::run(&args);
             Ok(())

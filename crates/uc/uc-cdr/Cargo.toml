@@ -13,4 +13,21 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-uc-types.workspace = true
+uc-crypto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW / O_NONBLOCK for the PII key open (no unsafe in this crate).
+nix = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "cdr_emit"
+harness = false

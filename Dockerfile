@@ -124,8 +124,12 @@ RUN groupadd --gid 1000 sbc \
     && useradd --uid 1000 --gid sbc --shell /bin/bash --create-home sbc
 
 # Create directories
-RUN mkdir -p /etc/sbc /var/lib/sbc /var/log/sbc \
-    && chown -R sbc:sbc /etc/sbc /var/lib/sbc /var/log/sbc
+# /var/lib/usg-sbc/cdr is the default `cdr.directory` (CDRs are on by
+# default, NIST 800-53 AU-12; the daemon will not start if it cannot write
+# there). Mount a volume on it to keep CDRs across container restarts.
+RUN mkdir -p /etc/sbc /var/lib/sbc /var/log/sbc /var/lib/usg-sbc/cdr \
+    && chown -R sbc:sbc /etc/sbc /var/lib/sbc /var/log/sbc /var/lib/usg-sbc \
+    && chmod 0750 /var/lib/usg-sbc/cdr
 
 # Copy binaries from builder (we cp'd them out of the cache-mounted target dir
 # in the builder stage so this COPY survives cache misses).

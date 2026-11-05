@@ -29,6 +29,8 @@ uc-health.workspace = true
 uc-metrics.workspace = true
 uc-transport = { workspace = true, features = ["websocket"] }
 uc-audit.workspace = true
+# Call Detail Records (schema v1, file/syslog sinks, ring).
+uc-cdr.workspace = true
 chrono.workspace = true
 uc-telemetry.workspace = true
 proto-sip = { workspace = true, features = ["digest-auth"] }
@@ -75,6 +77,9 @@ thiserror.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
+# Client-certificate name parsing for grpc.allowed_client_names (already in
+# the tree via rustls; parsing only, no crypto provider features).
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"] }
 # Self-signed P-384 cert generation for the SBC's DTLS-SRTP identity. aws_lc_rs
 # backend matches the workspace crypto provider (rustls aws-lc-rs); no `ring`.
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
@@ -101,3 +106,4 @@ path = "src/main.rs"
 [dev-dependencies]
 # Thread-local audit capture for tests asserting audit records.
 uc-audit = { workspace = true, features = ["test-capture"] }
+tempfile.workspace = true

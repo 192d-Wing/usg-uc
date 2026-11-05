@@ -17,6 +17,7 @@ use crate::state::AppState;
 
 mod auth;
 mod calls;
+mod cdrs;
 mod dial_plans;
 mod directory;
 mod phones;
@@ -83,6 +84,29 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/calls", get(calls::list))
         .route("/calls/{call_id}/ladder", get(calls::ladder))
         .route("/calls/{call_id}/terminate", post(calls::terminate))
+        // CDRs (PII): gRPC CdrService on the daemon. `cdr:read` for
+        // list/show/stats, `cdr:export` for export; no purge endpoint
+        // (retention is config-driven, AU-9).
+        //
+        // ## NIST 800-53 Rev5: AC-3, AC-6
+        .route(
+            "/cdrs",
+            get(cdrs::list).route_layer(axum::middleware::from_fn(crate::authmw::require_cdr_read)),
+        )
+        .route(
+            "/cdrs/stats",
+            get(cdrs::stats)
+                .route_layer(axum::middleware::from_fn(crate::authmw::require_cdr_read)),
+        )
+        .route(
+            "/cdrs/export",
+            get(cdrs::export)
+                .route_layer(axum::middleware::from_fn(crate::authmw::require_cdr_export)),
+        )
+        .route(
+            "/cdrs/{record_id}",
+            get(cdrs::get).route_layer(axum::middleware::from_fn(crate::authmw::require_cdr_read)),
+        )
         .route("/registrations", get(registrations::list))
         .route("/registrations/{aor}", delete(registrations::delete))
         // Users CRUD — Postgres-backed via uc-user-mgmt as of PR10.

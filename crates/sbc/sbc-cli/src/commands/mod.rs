@@ -1,6 +1,7 @@
 //! CLI command implementations.
 
 pub mod calls;
+pub mod cdrs;
 pub mod config;
 pub mod health;
 pub mod metrics;

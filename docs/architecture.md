@@ -91,6 +91,42 @@ flowchart LR
 exactly one replica (a second agent would double-REGISTER to carriers);
 the daemon must then run with `SBC_TRUNK_SERVICES=external`.
 
+### CDR data flow
+
+``` mermaid
+flowchart LR
+    sip["sip_stack.rs<br>call end / reject"]
+    emit["CdrEmitter<br>(uc-cdr, bounded queue,<br>try_send)"]
+    writer["writer thread<br>PII policy, sequence,<br>SHA-384 chain"]
+    file[("rotated JSONL/CSV files<br>+ .sha384 sidecars<br>(cdr.directory)")]
+    ring["in-memory ring<br>(ring_capacity)"]
+    sys["syslog sink thread<br>RFC 5424 over RFC 5425 TLS<br>(optional)"]
+    audit["uc-audit<br>CdrFileRotated, CdrSinkFailure"]
+    svc["gRPC CdrService<br>(mTLS or loopback only)"]
+    api["sbc-api-server<br>/api/v1/cdrs* (cdr:read / cdr:export)"]
+    cli["sbc-cli cdrs<br>list/show/export (gRPC)<br>verify (offline, files)"]
+    dash["sbc-dashboard Cdrs page"]
+    sip --> emit --> writer
+    writer --> file
+    writer --> ring
+    writer -->|"own queue"| sys
+    writer --> audit
+    ring --> svc
+    svc -->|"mTLS, client-cert allow-list"| api
+    svc -->|"loopback"| cli
+    api --> dash
+    file --> cli
+```
+
+Each daemon node writes its own CDRs; `node_id` and `sequence` identify the
+source. The files are the durable record. The API, CLI and dashboard read
+only the node's in-memory ring. The chain and sidecars are tamper-evident
+only; they are anchored by uc-audit or syslog, not signed. The daemon has
+no dialog-takeover path, so a call lost in a node crash produces no CDR.
+Configuration and limits are in the
+[Administrator Guide](SBC-ADMIN-GUIDE.md#call-detail-records) and the
+POA&M in the [NIST control matrix](NIST-800-53-CONTROLS.md).
+
 A further decomposition of the daemon itself (signaling pod + N media
 relay pods) is explored in
 [Signaling / Media Split](SIGNALING-MEDIA-SPLIT.md).
@@ -115,9 +151,12 @@ direction of travel is described in the
 
 ## Security posture
 
-Cryptography is CNSA 2.0 compliant: all TLS and SRTP key material flows
-through `uc-crypto` backed by the AWS-LC FIPS module, and rustls is built
-with its FIPS posture enabled. See
+Cryptography targets CNSA 2.0: TLS and SRTP use the AWS-LC FIPS module
+(`uc-crypto`, rustls with its FIPS posture enabled). Not every TLS channel
+restricts its suites to CNSA 2.0. The daemon gRPC / sbc-api channel uses
+tonic's default suites, and the SIP-TLS and CDR syslog configs pin the TLS
+version but not the suites. These gaps are tracked in the CNSA and NIST
+documents. See
 [CNSA 2.0 Compliance](CNSA-2-COMPLIANCE.md) and the
 [NIST 800-53 control matrix](NIST-800-53-CONTROLS.md) for the full
 mapping, and the RFC compliance pages for protocol conformance status.

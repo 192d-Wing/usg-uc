@@ -1,0 +1,161 @@
+// SBC Call Detail Record Service
+//
+// Read-only access to the daemon's in-memory ring of recent CDRs (schema v1).
+// The durable record of truth is the daemon's rotated CDR file sink; export
+// and offline verification work from those files, not this service.
+//
+// NIST 800-53 Rev5 Controls:
+// - AU-3: Content of Audit Records
+// - AU-6: Audit Record Review, Analysis, and Reporting
+// - AU-9: Protection of Audit Information (read-only; no delete/purge RPC)
+// - AC-3: Access Enforcement (callers need cdr:read)
+// - SI-12: Information Management and Retention (CDRs contain PII)
+
+syntax = "proto3";
+
+package sbc.api.v1;
+
+// CdrService exposes recent Call Detail Records held by one SBC node.
+service CdrService {
+    // ListCdrs returns recent CDRs, newest first, matching the filter.
+    rpc ListCdrs(ListCdrsRequest) returns (ListCdrsResponse);
+
+    // GetCdr returns one CDR by record_id.
+    rpc GetCdr(GetCdrRequest) returns (GetCdrResponse);
+
+    // GetCdrStats returns CDR pipeline counters and health.
+    rpc GetCdrStats(GetCdrStatsRequest) returns (GetCdrStatsResponse);
+}
+
+// Outcome of one B-leg (trunk) attempt.
+message TrunkAttempt {
+    string trunk_id = 1;
+    // Final SIP status from the trunk; 0 when outcome is not "status".
+    uint32 status = 2;
+    // "status", "timeout" or "transport_error".
+    string outcome = 3;
+    // Epoch milliseconds (UTC) when the attempt ended.
+    uint64 at_ms = 4;
+}
+
+// One Call Detail Record, schema v1. Field meanings match uc_cdr::CallRecord.
+// Enumerations are carried as their snake_case schema strings so the proto
+// does not have to change when the record schema adds a value.
+message CdrRecord {
+    uint32 schema_version = 1;
+    string record_id = 2;
+    string node_id = 3;
+    uint64 sequence = 4;
+    string a_call_id = 5;
+    repeated string b_call_ids = 6;
+    string internal_call_id = 7;
+    // inbound | outbound | internal
+    string direction = 8;
+    string caller = 9;
+    string callee_dialed = 10;
+    optional string callee_translated = 11;
+    optional string caller_translated = 12;
+    string source_ip = 13;
+    uint32 source_port = 14;
+    // udp | tcp | tls | ws | wss
+    string transport = 15;
+    optional string ingress_zone = 16;
+    optional string egress_zone = 17;
+    optional string trunk_group = 18;
+    repeated TrunkAttempt trunks_tried = 19;
+    optional string final_trunk = 20;
+    uint32 failover_count = 21;
+    uint64 setup_ms = 22;
+    optional uint64 ring_ms = 23;
+    optional uint64 answer_ms = 24;
+    uint64 end_ms = 25;
+    uint64 duration_ms = 26;
+    optional uint64 pdd_ms = 27;
+    // answered | failed | cancelled | rejected | busy | no_answer |
+    // media_failure | operator_terminated
+    string disposition = 28;
+    uint32 final_sip_status = 29;
+    // caller | callee | sbc
+    string release_side = 30;
+    // normal | cancel | timer_b | transport_error | trunk_error |
+    // admission_max_calls | draining | policy_denied | no_route |
+    // media_failure | operator | shutdown
+    string release_cause = 31;
+    optional uint32 q850_cause = 32;
+    optional string media_node = 33;
+    bool media_anchored = 34;
+    optional string codec = 35;
+    optional string srtp = 36;
+    bool emergency = 37;
+    // Placeholder; always unset in schema v1.
+    optional string stir_attestation = 38;
+    // Set when this node took the dialog over from a failed peer; timing is partial.
+    bool failover_takeover = 39;
+    // Hex SHA-384 chain values; empty when the hash chain is disabled.
+    string prev_hash = 40;
+    string hash = 41;
+}
+
+// Filter for ListCdrs. Unset/empty fields match everything.
+message ListCdrsRequest {
+    // Inclusive lower bound on setup_ms (epoch ms). 0 = unbounded.
+    uint64 start_ms = 1;
+    // Exclusive upper bound on setup_ms (epoch ms). 0 = unbounded.
+    uint64 end_ms = 2;
+    // Exact match on caller (as stored, i.e. after PII policy).
+    string caller = 3;
+    // Exact match on callee_dialed or callee_translated.
+    string callee = 4;
+    // Disposition string (see CdrRecord.disposition).
+    string disposition = 5;
+    // Matches final_trunk or any trunks_tried entry.
+    string trunk = 6;
+    // Opaque token from a previous ListCdrsResponse.
+    string page_token = 7;
+    // Page size; 0 = server default (100). Capped at 500.
+    uint32 page_size = 8;
+}
+
+message ListCdrsResponse {
+    repeated CdrRecord cdrs = 1;
+    // Empty when there are no more pages.
+    string next_page_token = 2;
+    // Number of records currently held in the node's ring.
+    uint64 total_in_ring = 3;
+    // Node that served the request.
+    string node_id = 4;
+}
+
+message GetCdrRequest {
+    string record_id = 1;
+}
+
+message GetCdrResponse {
+    CdrRecord cdr = 1;
+}
+
+message GetCdrStatsRequest {}
+
+message GetCdrStatsResponse {
+    // Records accepted onto the writer queue.
+    uint64 emitted = 1;
+    // Records dropped (queue full or writer dead).
+    uint64 dropped = 2;
+    // Sink write failures.
+    uint64 write_errors = 3;
+    // Records waiting on the writer queue.
+    uint64 queue_depth = 4;
+    // Records currently held in the ring.
+    uint64 ring_size = 5;
+    // Epoch ms of the last successful file write; 0 = never.
+    uint64 last_write_ms = 6;
+    // False when the writer could not continue the hash chain.
+    bool chain_ok = 7;
+    // Whether the writer thread is running.
+    bool writer_alive = 8;
+    // File rotations since start.
+    uint64 rotations = 9;
+    // "healthy", "degraded" or "unhealthy".
+    string health = 10;
+    string node_id = 11;
+}

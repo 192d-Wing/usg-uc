@@ -275,6 +275,17 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 | `crates/client/client-sip-ua/src/media_session.rs` | ICE/DTLS SDP attributes |
 | `crates/client/client-sip-ua/src/call_agent.rs` | SIP INVITE/re-INVITE |
 
+### sbc-daemon CDR SDP reader (bypasses proto-sdp)
+
+| File | Purpose |
+|------|---------|
+| `crates/sbc/sbc-daemon/src/cdr.rs` (`media_facts`) | Reads the codec and SRTP suite for Call Detail Records. This is a second SDP consumer, separate from proto-sdp and the client parsers |
+
+`media_facts` is called only on the 2xx answer body (`CdrDraft::record_answer`). It reads at most `MAX_SDP_SCAN` (16 KiB), never modifies the SDP and does not affect relaying. It takes the first payload type of the first accepted `m=audio` line. It skips port `0` and `0/n` per RFC 3264 §6 (test `media_facts_skips_rejected_audio_stream`), and names the codec from `a=rtpmap` and the SRTP suite from `a=crypto`, or reports `DTLS-SRTP` for a `UDP/TLS/RTP/SAVP` profile (test `media_facts_reads_codec_and_srtp`). Known limitations, tracked as NIST POA&M-23:
+
+- RFC-5: attributes are not scoped to the chosen m-section, so an `a=crypto` under a rejected `m=audio 0` can still be credited. Encoding names keep the received case (RFC 8866 §5.14).
+- RFC-7: only static PTs 0/8/9/18 are named when there is no `a=rtpmap` (RFC 3551 Table 4 defines more).
+
 ### Proto-SDP Library Files
 
 | File | Purpose |

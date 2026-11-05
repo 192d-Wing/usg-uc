@@ -30,7 +30,16 @@ pub async fn liveness() -> impl IntoResponse {
 /// Readiness checks Postgres reachability via a cheap `is_empty()` call
 /// against an arbitrary store. If Postgres is down, sbc-api is useless
 /// and should be pulled from the LB rotation.
+///
+/// Also not ready when the audit writer has died: CDR exports and
+/// permission denials would go unrecorded (NIST 800-53 Rev5: AU-5).
 pub async fn readiness(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if !uc_audit::writer_alive() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "not_ready", "error": "audit writer not running"})),
+        );
+    }
     match state.phones.is_empty().await {
         Ok(_) => (
             axum::http::StatusCode::OK,

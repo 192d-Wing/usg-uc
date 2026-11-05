@@ -87,3 +87,31 @@ format = "json"
 output = "stdout"
 audit_enabled = true
 # audit_path = "/var/log/sbc/audit.log"
+
+# Call Detail Records (schema v1). One record per INVITE that reaches
+# admission. See docs/SBC-ADMIN-GUIDE.md "Call Detail Records".
+[cdr]
+enabled = true
+format = "jsonl"                    # jsonl | csv
+directory = "/var/lib/usg-sbc/cdr"  # absolute; created 0750, files 0640. Must be
+                                    # writable by the daemon user or startup fails.
+# node_id = "sbc-a"                 # default: general.instance_name, then $HOSTNAME
+rotate_size_mb = 100                # 1..=4096
+rotate_interval = "1h"              # "0" = size only; 5m..=24h
+retention_files = 168               # 0 = unlimited
+retention_days = 90                 # 0 = unlimited
+fsync_interval_ms = 1000            # 0 = fsync every record
+queue_capacity = 8192               # 64..=1000000
+ring_capacity = 10000               # recent CDRs kept for the API, 0..=200000
+hash_chain = true                   # SHA-384 chain + per-file .sha384 sidecar
+record_unanswered = "all"           # all | routed | none
+record_auth_challenges = false
+pii = "full"                        # full | mask_caller | hash
+# pii_hash_key_file = "/etc/usg-sbc/cdr-hmac.key"   # required for pii = "hash" (>= 48 bytes)
+on_failure = "continue"             # continue | reject_new_calls (emergency calls always admitted)
+
+[cdr.syslog]
+enabled = false
+target = "tls://collector.example.net:6514"   # RFC 5425; TLS only
+# ca_path = "/etc/usg-sbc/syslog-ca.pem"
+facility = 16                       # local0
