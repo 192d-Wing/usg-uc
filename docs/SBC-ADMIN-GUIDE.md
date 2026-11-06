@@ -218,13 +218,22 @@ use_dial_plan = true
 # Maximum trunk failover attempts per call
 max_failover_attempts = 3
 
-# Default trunk group when no dial plan entry matches
+# Default trunk group when no dial plan entry matches (outbound calls only)
 default_trunk_group = "us-domestic"
+
+# Trunk group that emergency calls are force-routed to (optional)
+emergency_trunk_group = "psap"
 ```
+
+- `default_trunk_group` applies only to calls whose direction is not inbound. A call arriving from a configured trunk (inbound) that matches no dial-plan entry gets no default fallback and is answered as no route. **Behaviour change (2026-11-06):** earlier builds used the default group for inbound misses too. Test: `uc-routing/src/router.rs::qa_default_trunk_group_is_outbound_only_and_both_matches_inbound`.
+- `emergency_trunk_group` must name a `[[trunk_groups]]` id, or config load fails (`sbc-config/src/validate.rs`, test `emergency_trunk_group_must_exist`). When set, a call whose canonical dialled number is an emergency number (for example `911`, `9-1-1`, `%39%311`) is sent to this group with the canonical number in the R-URI user, ignoring route-pattern blocks. If the group cannot take the call, normal routing runs. An emergency call with no route at all gets **503 without Retry-After**, an `error!` log, an `emergency_unrouted` audit event and `sbc_emergency_unrouted_total`. At startup the daemon logs and audits each emergency number that has no route (`SipStack::check_emergency_routability`). This check runs at startup only, not on each gRPC router sync. Tests: `sip_stack.rs::emergency_call_force_routed_to_emergency_trunk_group`, `unroutable_emergency_call_gets_503_without_retry_after`.
+- Dialled numbers are canonicalised before routing, blocking and VPS screening (`uc-types::DialedNumber`). An R-URI user that looks numeric but is malformed (for example `+19005551234x`), empty, or over 256 bytes is not routed (404).
 
 ### Dial Plans
 
-Dial plans contain entries that match call destinations by pattern, direction, domain, and source trunk.
+Dial plans contain entries that match call destinations by pattern, direction, domain, and source trunk. All four filters are enforced on live calls (`Router::route_call` with `DialPlan::match_extended`; test `sip_stack.rs::dial_plan_direction_source_trunk_and_domain_are_enforced`). A call is inbound when its source is a configured trunk, and outbound otherwise. `pattern_type` must be `exact`, `prefix`, `wildcard` or `any`; any other value fails config load.
+
+Dial plans pushed through the REST API (JSON) carry the pattern and kind only; direction, domain and source trunk are not applied to them.
 
 ```toml
 [[dial_plans]]
@@ -345,8 +354,9 @@ priority = 1
 
 The `domain_pattern` field matches the host part of the Request-URI:
 
-- `"uc.mil"` — matches `uc.mil` and `sip.uc.mil` (suffix match)
-- `"*.mil"` — matches any `.mil` domain
+- `"uc.mil"` — matches `uc.mil` and `sip.uc.mil`, not `evil-uc.mil` (suffix match on a label boundary)
+- `"*.mil"` — matches `mil` and any `.mil` domain, not `evilmil`
+- Comparison is ASCII case-insensitive
 - Omitted — matches any domain
 
 #### Source Trunk Filtering
@@ -354,8 +364,10 @@ The `domain_pattern` field matches the host part of the Request-URI:
 The `source_trunk` field restricts an entry to calls arriving from a specific trunk:
 
 ```toml
-source_trunk = "bulkvs-1"  # only match calls from this trunk ID
+source_trunk = "bulkvs-1"  # a trunk id or a trunk group id
 ```
+
+The value may be a trunk group id or a trunk id; a trunk id is resolved to its trunk group at load, and the entry matches calls whose inbound trunk belongs to that group (so all trunks in the same group match). An unknown id produces a load-time warning and the entry never matches. An entry with `source_trunk` set never matches a call that did not come from a trunk.
 
 This enables different routing for the same number pattern based on which carrier delivered the call.
 
@@ -694,6 +706,14 @@ burst_multiplier = 2.0          # Allow short bursts
 - **Throttle**: Suggested delay (logged at debug level, message still processed)
 - **Reject**: Message silently dropped (`rate_limited` stat incremented)
 - **Block**: Message dropped and the source remains blocked for the limiter's block duration
+
+`per_user_rps` is enforced in `sbc-daemon` (`sip_stack.rs::user_rate_limit`, `user_limiter.rs`):
+
+- **Keying.** A request on a flow bound by an authenticated REGISTER whose AOR user equals the From user is keyed on that AOR. Otherwise it is keyed on the source network (IPv4 /32, IPv6 /64) plus the canonical From user (at most 64 bytes), so a spoofed `From` from another network does not drain the victim's bucket.
+- **Burst** is fixed at `per_user_rps × 2.0`; `burst_multiplier` is not applied to this limiter (POA&M-101).
+- **Capacity.** At most 65,536 buckets, of which unauthenticated keys may use 49,152 (75%). One network may hold 64 unauthenticated users; further From users from that network share one bucket. When the table is full, new keys are allowed untracked, `sbc_user_limiter_overflow_total` is incremented and a warning is logged at most every 10 s.
+- **Exemptions.** Requests from configured trunks are not per-user limited (they are bounded by trunk `max_calls` and VPS caps). An INVITE whose R-URI user is an emergency number is never limited and increments `sbc_user_limiter_emergency_bypass_total`; alert on this counter (POA&M-103). ACK is never limited. A request whose From URI has no user part is not per-user limited (POA&M-102).
+- The audit `RateLimitTriggered` `limit_name` is `per_user_rps:auth:<aor>` or `per_user_rps:unauth:<net>` (no raw user).
 
 ---
 

@@ -24,6 +24,7 @@ mod phones;
 mod proxy;
 mod redact;
 mod registrations;
+mod route_pattern_rules;
 mod sbc;
 mod system;
 mod trunk_groups;

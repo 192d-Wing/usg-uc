@@ -861,42 +861,32 @@ impl Runtime {
                         info!(count = csses.len(), "Seeded calling search spaces");
                     }
                     if let Some(rps) = seed.get("route_patterns").and_then(|v| v.as_array()) {
+                        let mut installed = 0usize;
                         for rp in rps {
-                            let id = rp.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-                            let partition = rp
-                                .get("partition_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default();
-                            let pattern_value =
-                                rp.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-                            let pattern_type = rp
-                                .get("pattern_type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("prefix");
-                            let pattern = match pattern_type {
-                                "exact" => uc_routing::DialPattern::exact(pattern_value),
-                                "wildcard" => uc_routing::DialPattern::wildcard(pattern_value),
-                                "any" => uc_routing::DialPattern::Any,
-                                _ => uc_routing::DialPattern::prefix(pattern_value),
-                            };
-                            let mut route_pattern =
-                                uc_routing::RoutePattern::new(id, pattern, partition);
-                            if let Some(desc) = rp.get("description").and_then(|v| v.as_str()) {
-                                route_pattern = route_pattern.with_description(desc);
+                            match seed_route_pattern(rp) {
+                                Ok(route_pattern) => {
+                                    sbc_w.add_route_pattern(route_pattern);
+                                    installed += 1;
+                                }
+                                Err(e) => {
+                                    // NIST 800-53 Rev5: CM-6, SI-10 — a mistyped
+                                    // (possibly blocking) pattern is reported, not
+                                    // silently turned into a prefix route.
+                                    crate::sip_stack::ROUTE_PATTERN_REJECTED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::error!(
+                                        id = rp.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                                        error = %e,
+                                        "Seed route pattern rejected; not installed"
+                                    );
+                                }
                             }
-                            if let Some(rg) = rp.get("route_group_id").and_then(|v| v.as_str())
-                                && !rg.is_empty()
-                            {
-                                route_pattern = route_pattern.with_route_group(rg);
-                            }
-                            if let Some(rl) = rp.get("route_list_id").and_then(|v| v.as_str())
-                                && !rl.is_empty()
-                            {
-                                route_pattern = route_pattern.with_route_list(rl);
-                            }
-                            sbc_w.add_route_pattern(route_pattern);
                         }
-                        info!(count = rps.len(), "Seeded route patterns");
+                        info!(
+                            count = installed,
+                            rejected = rps.len() - installed,
+                            "Seeded route patterns"
+                        );
                     }
                 }
             }
@@ -947,6 +937,12 @@ impl Runtime {
         }
 
         let app_state = Arc::new(app_state);
+
+        // 47 CFR 9.16; NIST 800-53 Rev5: CP-8, CM-6 — warn loudly when an
+        // emergency number would not route.
+        if let Some(ref sip_stack) = app_state.sip_stack {
+            sip_stack.check_emergency_routability().await;
+        }
 
         // Postgres path: replay DIDs from the directory store. Done here
         // (after the Arc::new cut-over) for symmetry with the JSON path's
@@ -1629,5 +1625,72 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(result.changes.len(), 2);
+    }
+}
+
+/// Builds a route pattern from a seed-file JSON row. Honours `blocked` and
+/// `priority` like the API sync path.
+///
+/// ## NIST 800-53 Rev5: SI-10, CM-6
+///
+/// # Errors
+/// An unknown `pattern_type` (`uc_routing::DialPattern::from_kind`).
+fn seed_route_pattern(
+    rp: &serde_json::Value,
+) -> uc_routing::RoutingResult<uc_routing::RoutePattern> {
+    let id = rp.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    let partition = rp
+        .get("partition_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let pattern_value = rp.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+    let pattern_type = rp
+        .get("pattern_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("prefix");
+    let pattern = uc_routing::DialPattern::from_kind(pattern_type, pattern_value)?;
+    let mut route_pattern = uc_routing::RoutePattern::new(id, pattern, partition);
+    if let Some(desc) = rp.get("description").and_then(|v| v.as_str()) {
+        route_pattern = route_pattern.with_description(desc);
+    }
+    if let Some(rg) = rp.get("route_group_id").and_then(|v| v.as_str())
+        && !rg.is_empty()
+    {
+        route_pattern = route_pattern.with_route_group(rg);
+    }
+    if let Some(rl) = rp.get("route_list_id").and_then(|v| v.as_str())
+        && !rl.is_empty()
+    {
+        route_pattern = route_pattern.with_route_list(rl);
+    }
+    if let Some(p) = rp
+        .get("priority")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|p| u32::try_from(p).ok())
+    {
+        route_pattern = route_pattern.with_priority(p);
+    }
+    if rp
+        .get("blocked")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        route_pattern = route_pattern.with_block(true);
+    }
+    Ok(route_pattern)
+}
+
+#[cfg(test)]
+mod seed_route_pattern_tests {
+    use super::seed_route_pattern;
+    use serde_json::json;
+
+    #[test]
+    fn unknown_pattern_type_is_rejected_not_prefix() {
+        let rp = json!({"id": "b", "partition_id": "p", "pattern": "1900",
+                        "pattern_type": "regex", "blocked": true});
+        assert!(seed_route_pattern(&rp).is_err());
+        let rp = json!({"id": "b", "partition_id": "p", "pattern": "1900", "blocked": true});
+        assert!(matches!(seed_route_pattern(&rp), Ok(ref p) if p.is_blocked()));
     }
 }

@@ -26,6 +26,42 @@ pub struct SbcRoutingResult {
     pub transforms_applied: Vec<String>,
 }
 
+/// Outcome of [`SbcRouter::route`].
+///
+/// Tri-state so that a blocked pattern can never be mistaken for "no
+/// match" and fall through to the dial plan / default trunk group.
+///
+/// ## NIST 800-53 Rev5: AC-3 (Access Enforcement)
+#[derive(Debug, Clone)]
+pub enum SbcRouteOutcome {
+    /// A pattern matched and resolved to route groups.
+    Routed(SbcRoutingResult),
+    /// A blocked pattern matched: the call must be refused (no fallback).
+    Blocked {
+        /// ID of the blocking route pattern.
+        pattern_id: String,
+        /// Partition the blocking pattern belongs to.
+        partition_id: String,
+    },
+    /// No CSS, or no pattern in any CSS partition matched.
+    NoMatch,
+}
+
+impl SbcRouteOutcome {
+    /// The routing result when [`Self::Routed`], else `None`.
+    pub fn routed(self) -> Option<SbcRoutingResult> {
+        match self {
+            Self::Routed(r) => Some(r),
+            Self::Blocked { .. } | Self::NoMatch => None,
+        }
+    }
+
+    /// Whether a blocked pattern matched.
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, Self::Blocked { .. })
+    }
+}
+
 /// A SBC-compatible routing engine.
 ///
 /// Combines Partitions, Calling Search Spaces, Route Patterns, Route Lists,
@@ -176,10 +212,20 @@ impl SbcRouter {
     /// 3. For each partition, find enabled, non-blocked patterns that match.
     /// 4. Among matches, prefer the longest prefix, then lowest priority value.
     /// 5. Resolve route list or route group, apply transforms.
-    pub fn route(&self, dialed_digits: &str, css_id: Option<&str>) -> Option<SbcRoutingResult> {
+    ///
+    /// A blocked pattern matching in a partition walked before any routable
+    /// match returns [`SbcRouteOutcome::Blocked`]; the caller must refuse
+    /// the call (RFC 3261 §21.4.4 403) rather than try other routing.
+    ///
+    /// ## NIST 800-53 Rev5: AC-3 (Access Enforcement)
+    pub fn route(&self, dialed_digits: &str, css_id: Option<&str>) -> SbcRouteOutcome {
         // 1. Resolve CSS
-        let css_key = css_id.or(self.default_css.as_deref())?;
-        let css = self.css_list.get(css_key)?;
+        let Some(css) = css_id
+            .or(self.default_css.as_deref())
+            .and_then(|key| self.css_list.get(key))
+        else {
+            return SbcRouteOutcome::NoMatch;
+        };
 
         // 2-3. Walk partitions in order and collect best match
         let mut best: Option<&RoutePattern> = None;
@@ -187,8 +233,11 @@ impl SbcRouter {
 
         for partition_id in css.partitions() {
             // Blocked patterns reject the call outright — check first.
-            if self.is_blocked_in_partition(partition_id, dialed_digits) {
-                return None;
+            if let Some(rp) = self.blocked_in_partition(partition_id, dialed_digits) {
+                return SbcRouteOutcome::Blocked {
+                    pattern_id: rp.id().to_string(),
+                    partition_id: rp.partition_id().to_string(),
+                };
             }
 
             let candidates = self.matching_patterns_in_partition(partition_id, dialed_digits);
@@ -216,7 +265,9 @@ impl SbcRouter {
             }
         }
 
-        let matched = best?;
+        let Some(matched) = best else {
+            return SbcRouteOutcome::NoMatch;
+        };
 
         // 4. Build result
         let mut transforms_applied = Vec::new();
@@ -232,7 +283,7 @@ impl SbcRouter {
         let route_group_ids =
             self.resolve_route_groups(matched, &mut transformed, &mut transforms_applied);
 
-        Some(SbcRoutingResult {
+        SbcRouteOutcome::Routed(SbcRoutingResult {
             pattern_id: matched.id().to_string(),
             partition_id: matched.partition_id().to_string(),
             transformed_number: transformed,
@@ -241,11 +292,20 @@ impl SbcRouter {
         })
     }
 
-    /// Returns `true` if any blocked pattern in `partition_id` matches `digits`.
-    fn is_blocked_in_partition(&self, partition_id: &str, digits: &str) -> bool {
-        self.route_patterns
-            .iter()
-            .any(|rp| rp.partition_id() == partition_id && rp.is_blocked() && rp.matches(digits))
+    /// The first blocked pattern in `partition_id` that matches `digits`.
+    ///
+    /// Fail-closed for global numbers: `+19005551212` is also tested
+    /// without its `+`, so a block written `1900` catches it (the routing
+    /// key keeps the `+`, see `uc_types::DialedNumber`).
+    ///
+    /// ## NIST 800-53 Rev5: AC-3 (Access Enforcement)
+    fn blocked_in_partition(&self, partition_id: &str, digits: &str) -> Option<&RoutePattern> {
+        let national = digits.strip_prefix('+');
+        self.route_patterns.iter().find(|rp| {
+            rp.partition_id() == partition_id
+                && rp.is_blocked()
+                && (rp.matches(digits) || national.is_some_and(|n| rp.matches(n)))
+        })
     }
 
     /// Returns enabled, non-blocked patterns in the given partition that match `digits`.
@@ -407,7 +467,7 @@ mod tests {
     #[test]
     fn test_route_emergency() {
         let router = setup_sbc_router();
-        let result = router.route("911", Some("css-phone"));
+        let result = router.route("911", Some("css-phone")).routed();
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.pattern_id, "rp-911");
@@ -418,7 +478,7 @@ mod tests {
     #[test]
     fn test_route_us_long_distance() {
         let router = setup_sbc_router();
-        let result = router.route("+15551234567", Some("css-phone"));
+        let result = router.route("+15551234567", Some("css-phone")).routed();
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.pattern_id, "rp-us-ld");
@@ -434,7 +494,107 @@ mod tests {
         let router = setup_sbc_router();
         // +1900 is blocked — the call must be rejected outright.
         let result = router.route("+19005551234", Some("css-phone"));
-        assert!(result.is_none(), "blocked pattern should reject the call");
+        assert!(
+            matches!(
+                result,
+                SbcRouteOutcome::Blocked { ref pattern_id, ref partition_id }
+                    if pattern_id == "rp-900-block" && partition_id == "pt-ld"
+            ),
+            "blocked pattern should reject the call: {result:?}"
+        );
+    }
+
+    fn qa_router(order: &[&str]) -> SbcRouter {
+        let mut router = SbcRouter::new();
+        router.add_partition(Partition::new("pt-block", "Block"));
+        router.add_partition(Partition::new("pt-route", "Route"));
+        router.add_partition(Partition::new("pt-outside", "Outside"));
+        router.add_route_pattern(
+            RoutePattern::new("rp-block", DialPattern::prefix("1900"), "pt-block").with_block(true),
+        );
+        router.add_route_pattern(
+            RoutePattern::new("rp-900-route", DialPattern::prefix("19005"), "pt-route")
+                .with_route_group("tg"),
+        );
+        router.add_route_pattern(
+            RoutePattern::new("rp-outside", DialPattern::prefix("1"), "pt-outside")
+                .with_block(true),
+        );
+        let mut css = CallingSearchSpace::new("css", "css");
+        for p in order {
+            css.add_partition(*p);
+        }
+        router.add_css(css);
+        router
+    }
+
+    #[test]
+    fn qa_blocked_vs_routed_vs_nomatch_tristate() {
+        // Block partition first: Blocked, carrying ids, even though a more
+        // specific routable pattern exists in a later partition.
+        let r = qa_router(&["pt-block", "pt-route"]);
+        let out = r.route("19005551212", Some("css"));
+        assert!(out.is_blocked());
+        assert!(
+            matches!(out, SbcRouteOutcome::Blocked { ref pattern_id, ref partition_id }
+            if pattern_id == "rp-block" && partition_id == "pt-block")
+        );
+        assert!(r.route("19005551212", Some("css")).routed().is_none());
+        // Block in a partition not in the CSS never applies.
+        assert!(matches!(
+            r.route("12025551212", Some("css")),
+            SbcRouteOutcome::NoMatch
+        ));
+        // Routable partition first: first-partition-wins, Routed.
+        let r = qa_router(&["pt-route", "pt-block"]);
+        let routed = r.route("19005551212", Some("css")).routed();
+        assert_eq!(
+            routed.map(|x| x.pattern_id),
+            Some("rp-900-route".to_string())
+        );
+        // Non-matching number in the routable partition then the block one.
+        assert!(r.route("19001111111", Some("css")).is_blocked());
+        // Global form via `+` strip, but an opaque user never matches digits.
+        assert!(r.route("+19001111111", Some("css")).is_blocked());
+        assert!(matches!(
+            r.route("alice", Some("css")),
+            SbcRouteOutcome::NoMatch
+        ));
+    }
+
+    #[test]
+    fn blocked_wins_over_later_partition_match() {
+        let mut router = SbcRouter::new();
+        router.add_partition(Partition::new("pt-block", "Block"));
+        router.add_partition(Partition::new("pt-any", "Any"));
+        router.add_route_pattern(
+            RoutePattern::new("rp-block", DialPattern::prefix("1900"), "pt-block").with_block(true),
+        );
+        router.add_route_pattern(
+            RoutePattern::new("rp-any", DialPattern::Any, "pt-any").with_route_group("tg"),
+        );
+        let mut css = CallingSearchSpace::new("css", "css");
+        css.add_partition("pt-block");
+        css.add_partition("pt-any");
+        router.add_css(css);
+        assert!(matches!(
+            router.route("19005551212", Some("css")),
+            SbcRouteOutcome::Blocked { .. }
+        ));
+        assert!(matches!(
+            router.route("12025551212", Some("css")),
+            SbcRouteOutcome::Routed(ref r) if r.pattern_id == "rp-any"
+        ));
+        assert!(matches!(
+            router.route("12025551212", Some("missing")),
+            SbcRouteOutcome::NoMatch
+        ));
+        assert!(matches!(router.route("1", None), SbcRouteOutcome::NoMatch));
+        // A `1900` block also catches the global form.
+        assert!(matches!(
+            router.route("+19005551212", Some("css")),
+            SbcRouteOutcome::Blocked { .. }
+        ));
     }
 
     #[test]
@@ -442,7 +602,7 @@ mod tests {
         let router = setup_sbc_router();
         // Lobby CSS only has emergency + internal.
         // Long distance +1 should NOT match.
-        let result = router.route("+15551234567", Some("css-lobby"));
+        let result = router.route("+15551234567", Some("css-lobby")).routed();
         assert!(result.is_none());
     }
 
@@ -450,7 +610,7 @@ mod tests {
     fn test_css_filtering_lobby_911() {
         let router = setup_sbc_router();
         // Lobby can still reach 911.
-        let result = router.route("911", Some("css-lobby"));
+        let result = router.route("911", Some("css-lobby")).routed();
         assert!(result.is_some());
         assert_eq!(result.unwrap().pattern_id, "rp-911");
     }
@@ -459,7 +619,7 @@ mod tests {
     fn test_default_css() {
         let router = setup_sbc_router();
         // No explicit CSS — uses default (css-phone).
-        let result = router.route("911", None);
+        let result = router.route("911", None).routed();
         assert!(result.is_some());
     }
 
@@ -467,12 +627,12 @@ mod tests {
     fn test_no_css_no_default() {
         let mut router = SbcRouter::new();
         // No CSS at all.
-        let result = router.route("911", None);
+        let result = router.route("911", None).routed();
         assert!(result.is_none());
 
         // Even with a CSS ID that doesn't exist:
         router.set_default_css("nonexistent");
-        let result = router.route("911", None);
+        let result = router.route("911", None).routed();
         assert!(result.is_none());
     }
 
@@ -524,7 +684,7 @@ mod tests {
     #[test]
     fn test_internal_extension() {
         let router = setup_sbc_router();
-        let result = router.route("1234", Some("css-phone"));
+        let result = router.route("1234", Some("css-phone")).routed();
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.pattern_id, "rp-ext");
@@ -534,7 +694,7 @@ mod tests {
     #[test]
     fn test_local_seven_digit() {
         let router = setup_sbc_router();
-        let result = router.route("5551234", Some("css-phone"));
+        let result = router.route("5551234", Some("css-phone")).routed();
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.pattern_id, "rp-local-7d");
@@ -568,7 +728,7 @@ mod tests {
         css.add_partition("pt-b");
         router.add_css(css);
 
-        let result = router.route("+15551234567", Some("css-ab"));
+        let result = router.route("+15551234567", Some("css-ab")).routed();
         assert!(result.is_some());
         // pt-a is checked first; it has a match, so pt-b is never considered.
         assert_eq!(result.unwrap().partition_id, "pt-a");

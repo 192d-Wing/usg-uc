@@ -47,9 +47,9 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uc_routing::{
-    Admission, DestinationType, DialPattern, DialPlan, DialPlanEntry, Direction, NumberTransform,
-    Router, RouterConfig, RoutingError, SelectionStrategy, Trunk, TrunkConfig, TrunkGroup,
-    TrunkOutcome, TrunkProtocol,
+    Admission, CallRouteContext, DestinationType, DialPattern, DialPlan, DialPlanEntry, Direction,
+    NumberTransform, Router, RouterConfig, RoutingError, SbcRouteOutcome, SelectionStrategy, Trunk,
+    TrunkConfig, TrunkGroup, TrunkOutcome, TrunkProtocol,
 };
 use uc_types::address::SbcSocketAddr;
 use uc_types::address::TransportType as AddrTransport;
@@ -147,13 +147,44 @@ pub struct SipStack {
     /// ACKed (RFC 3261 §13.3.1.4). Keyed by the SIP Call-ID of that leg.
     pending_2xx: RwLock<HashMap<String, Pending2xx>>,
     /// Per-user request limiter (`rate_limit.per_user_rps`), keyed by the
-    /// From user. `None` when disabled.
-    user_limiter: Option<tokio::sync::Mutex<uc_dos_protection::KeyedRateLimiter>>,
+    /// authenticated identity or source network + From user (see
+    /// `crate::user_limiter`). `None` when disabled.
+    user_limiter: Option<std::sync::Mutex<crate::user_limiter::UserLimiter>>,
+    /// `routing.emergency_trunk_group`: emergency calls are force-routed
+    /// here (47 CFR 9.16).
+    emergency_trunk_group: Option<String>,
+    /// Call-path routing counters (exported as gauges).
+    routing_counters: RoutingCounters,
     /// CDR pipeline (`[cdr]`). `None` when CDRs are disabled.
     ///
     /// ## NIST 800-53 Rev5: AU-12 (Audit Record Generation)
     cdr: Option<Arc<crate::cdr::CdrContext>>,
 }
+
+/// Call-path routing counters (monotonic; exported as gauges).
+///
+/// ## NIST 800-53 Rev5: SI-4 (System Monitoring), AU-2
+#[derive(Debug, Default)]
+pub struct RoutingCounters {
+    /// INVITEs refused (403) by a blocked route pattern.
+    pub route_blocked: AtomicU64,
+    /// Emergency calls force-routed to `routing.emergency_trunk_group`.
+    pub emergency_force_routed_trunk: AtomicU64,
+    /// Emergency calls routed past a blocked route pattern.
+    pub emergency_force_routed_blocked_ignored: AtomicU64,
+    /// Emergency calls with no route at all (503).
+    pub emergency_unrouted: AtomicU64,
+    /// Per-user limiter keys allowed untracked because the map was full.
+    pub user_limiter_overflow: AtomicU64,
+    /// Emergency INVITEs that bypassed the per-user limiter.
+    pub user_limiter_emergency_bypass: AtomicU64,
+}
+
+/// Route patterns rejected (unknown `pattern_type`) at seed or sync time.
+/// Process-wide: the seed and API sync paths run outside the SIP stack.
+///
+/// ## NIST 800-53 Rev5: CM-6, SI-4
+pub static ROUTE_PATTERN_REJECTED: AtomicU64 = AtomicU64::new(0);
 
 /// SIP stack configuration.
 #[derive(Debug, Clone)]
@@ -679,6 +710,31 @@ struct TrunkRoute {
     translated: String,
 }
 
+/// Inputs to [`SipStack::route_to_trunk`] for one INVITE.
+struct TrunkCall<'a> {
+    /// The INVITE (for audit identity only).
+    req: &'a SipRequest,
+    /// Where it came from (audit).
+    source: SbcSocketAddr,
+    /// Arrival transport and connection (audit subject lookup).
+    transport: AddrTransport,
+    conn: Option<crate::stir_binding::ConnId>,
+    /// Canonical dialled number: the routing key.
+    dialed: &'a uc_types::DialedNumber,
+    /// Raw Request-URI user, sent on the B-leg when no transform applies.
+    raw_user: &'a str,
+    /// Request-URI host (dial-plan `domain_pattern`).
+    domain: &'a str,
+    /// Trunk group the call arrived on (`Inbound` direction), if any.
+    inbound_trunk_group: Option<&'a str>,
+    /// CSS for the SBC router.
+    css: Option<&'a str>,
+    admission: Admission,
+    tls_only: bool,
+    /// Emergency-classified (47 CFR 9.16).
+    emergency: bool,
+}
+
 /// Outcome of trunk routing for an INVITE no registered user answers.
 enum TrunkRouting {
     Routed(Box<TrunkRoute>),
@@ -692,6 +748,12 @@ enum TrunkRouting {
     },
     /// The transformed number is unsafe to put in a Request-URI.
     InvalidTranslation,
+    /// A blocked route pattern matched: refuse with 403, no dial-plan or
+    /// default-trunk-group fallback (NIST 800-53 Rev5: AC-3).
+    Blocked {
+        pattern_id: String,
+        partition_id: String,
+    },
 }
 
 /// `Retry-After` (seconds) on the 503 sent when every trunk of the matched
@@ -1070,6 +1132,42 @@ fn audit_emergency_bypass(req: &SipRequest, source: SbcSocketAddr) {
     ));
 }
 
+/// `AuthorizationDecision` for an emergency call routed outside normal
+/// policy (`route:blocked-ignored`) or refused for lack of any route
+/// (`emergency_unrouted`, denied).
+///
+/// ## 47 CFR 9.16; NIST 800-53 Rev5: AU-2, AU-3, AU-12
+fn audit_emergency_route(req: &SipRequest, source: SbcSocketAddr, subject: String, policy: &str) {
+    audit(uc_audit::AuditEvent::AuthorizationDecision(
+        uc_audit::event::AuthorizationDecision {
+            identity: subject,
+            resource: req.uri.to_string(),
+            action: "INVITE".to_string(),
+            granted: policy != "emergency_unrouted",
+            policy: policy.to_string(),
+            source_ip: Some(source.ip()),
+        },
+    ));
+}
+
+/// `AuthorizationDecision` (denied, `route:blocked`) for an INVITE refused
+/// by a blocked route pattern. The pattern id is recorded on the audit
+/// trail only, never in the SIP response (SI-11).
+///
+/// ## NIST 800-53 Rev5: AC-3, AU-2, AU-3
+fn audit_route_blocked(req: &SipRequest, source: SbcSocketAddr, subject: String, pattern_id: &str) {
+    audit(uc_audit::AuditEvent::AuthorizationDecision(
+        uc_audit::event::AuthorizationDecision {
+            identity: subject,
+            resource: format!("{} pattern={}", req.uri, pattern_id.escape_default()),
+            action: "INVITE".to_string(),
+            granted: false,
+            policy: "route:blocked".to_string(),
+            source_ip: Some(source.ip()),
+        },
+    ));
+}
+
 /// `AuthenticationAttempt` for a REGISTER outcome.
 fn audit_register_auth(
     aor: &str,
@@ -1227,6 +1325,8 @@ impl SipStack {
             in_flight_invites: RwLock::new(HashSet::new()),
             pending_2xx: RwLock::new(HashMap::new()),
             user_limiter: None,
+            emergency_trunk_group: None,
+            routing_counters: RoutingCounters::default(),
             cdr: None,
             config,
             zone_registry: None,
@@ -1292,6 +1392,8 @@ impl SipStack {
             in_flight_invites: RwLock::new(HashSet::new()),
             pending_2xx: RwLock::new(HashMap::new()),
             user_limiter: None,
+            emergency_trunk_group: None,
+            routing_counters: RoutingCounters::default(),
             cdr: None,
             config,
             zone_registry: None,
@@ -2831,32 +2933,114 @@ impl SipStack {
 
     /// Routes a number no registered user answers to a trunk: the SBC
     /// router's route groups (CSS / partition / route pattern / route list)
-    /// first, then the dial plan. Reserves a `max_calls` slot on the chosen
-    /// trunk; a trunk whose URI does not resolve counts as failed and the
-    /// next failover target is tried.
-    async fn route_to_trunk(
-        &self,
-        dest_user: &str,
-        css: Option<&str>,
-        admission: Admission,
-        tls_only: bool,
-    ) -> TrunkRouting {
+    /// first, then the dial plan (direction, source trunk group and
+    /// Request-URI host enforced), then `default_trunk_group` for outbound
+    /// calls. Reserves a `max_calls` slot on the chosen trunk; a trunk whose
+    /// URI does not resolve counts as failed and the next failover target
+    /// is tried.
+    ///
+    /// A blocked route pattern ends routing ([`TrunkRouting::Blocked`])
+    /// before the router write lock is taken: no dial-plan or default-group
+    /// fallback (NIST 800-53 Rev5: AC-3).
+    ///
+    /// Emergency calls (47 CFR 9.16): with `routing.emergency_trunk_group`
+    /// set they go straight to that group with no transform; if it is
+    /// unavailable, or unset, normal routing runs with route-pattern blocks
+    /// ignored (audited `route:blocked-ignored`).
+    ///
+    /// ## NIST 800-53 Rev5: AC-3, AC-4, CP-8
+    async fn route_to_trunk(&self, call: &TrunkCall<'_>) -> TrunkRouting {
+        let admission = call.admission;
+        let tls_only = call.tls_only;
+        let dest_user = call.dialed.as_str();
+        let css = call.css;
+        // A user that looks like a telephone number but did not canonicalise
+        // (`+19005551234x`), or is empty / oversize, is never matched against
+        // route patterns, the dial plan or the default trunk group: deny
+        // screening could not see the number a carrier would dial (CWE-180).
+        //
+        // ## NIST 800-53 Rev5: AC-3, SI-10
+        if !call.dialed.is_routable() {
+            debug!("Dialled user is not a routable number; no trunk route");
+            return TrunkRouting::NoRoute;
+        }
         let Some(router_lock) = self.router.as_ref() else {
             warn!("No router configured on SIP stack");
             return TrunkRouting::NoRoute;
         };
 
-        let sbc_match = if let Some(ref sbc) = self.sbc_router {
-            sbc.read().await.route(dest_user, css)
+        let mut matched_trunks = false;
+        let mut tls_required = false;
+        let mut force_routed = false;
+
+        // 47 CFR 9.16: emergency force-route. Fixed operator group, no
+        // CSS / pattern / dial-plan transform, so the wire number is the
+        // classified emergency number.
+        let mut decision = None;
+        if call.emergency
+            && let Some(eg) = self.emergency_trunk_group.as_deref()
+        {
+            let groups = [eg.to_string()];
+            let forced = router_lock
+                .write()
+                .await
+                .route_to_groups_for_tls(dest_user, &groups, admission, tls_only);
+            match forced {
+                Ok(d) => {
+                    force_routed = true;
+                    self.routing_counters
+                        .emergency_force_routed_trunk
+                        .fetch_add(1, Ordering::Relaxed);
+                    info!(trunk_group = %eg, "Emergency call force-routed to emergency trunk group");
+                    decision = Some(d);
+                }
+                Err(e) => {
+                    error!(trunk_group = %eg, error = %e, "Emergency trunk group unavailable; trying normal routing");
+                }
+            }
+        }
+
+        let sbc_match = if decision.is_some() {
+            None
+        } else if let Some(ref sbc) = self.sbc_router {
+            let outcome = sbc.read().await.route(dest_user, css);
+            match outcome {
+                SbcRouteOutcome::Routed(r) => Some(r),
+                SbcRouteOutcome::NoMatch => None,
+                SbcRouteOutcome::Blocked {
+                    pattern_id,
+                    partition_id,
+                } if !call.emergency => {
+                    return TrunkRouting::Blocked {
+                        pattern_id,
+                        partition_id,
+                    };
+                }
+                SbcRouteOutcome::Blocked { pattern_id, .. } => {
+                    // 47 CFR 9.16: a block never stops an emergency call.
+                    warn!(pattern = %pattern_id, "Emergency call matched a blocked route pattern; block ignored");
+                    self.routing_counters
+                        .emergency_force_routed_blocked_ignored
+                        .fetch_add(1, Ordering::Relaxed);
+                    let subject = self
+                        .invite_audit_subject(
+                            call.req,
+                            call.source,
+                            call.transport,
+                            call.conn,
+                            call.inbound_trunk_group,
+                        )
+                        .await;
+                    audit_emergency_route(call.req, call.source, subject, "route:blocked-ignored");
+                    None
+                }
+            }
         } else {
             None
         };
 
-        let mut matched_trunks = false;
-        let mut tls_required = false;
         let decision = {
             let mut router = router_lock.write().await;
-            let mut decision = None;
             if let Some(ref result) = sbc_match {
                 info!(
                     pattern = %result.pattern_id,
@@ -2888,7 +3072,20 @@ impl SipStack {
             }
             if decision.is_none() && !matched_trunks {
                 debug!(dest = %dest_user, "Attempting dial plan routing");
-                match router.route_for_tls(dest_user, admission, tls_only) {
+                // NIST 800-53 Rev5: AC-4 — entry direction / source trunk
+                // group / domain filters are enforced; the default trunk
+                // group serves outbound calls only.
+                let ctx = CallRouteContext {
+                    destination: dest_user,
+                    domain: call.domain,
+                    direction: if call.inbound_trunk_group.is_some() {
+                        Direction::Inbound
+                    } else {
+                        Direction::Outbound
+                    },
+                    source_trunk_group: call.inbound_trunk_group,
+                };
+                match router.route_call(&ctx, admission, tls_only) {
                     Ok(d) => decision = Some(d),
                     Err(RoutingError::AllTrunksFailed {
                         trunks_tried,
@@ -2918,8 +3115,17 @@ impl SipStack {
             admission,
             tls_only,
         };
-        let translated = decision.destination;
         let mut failover = decision.failover_targets;
+        // Routing ran on the canonical number; when no transform changed
+        // it, the B-leg keeps the raw dialled user (no wire change for
+        // trunks). An emergency force-route sends the canonical emergency
+        // number (47 CFR 9.16).
+        let dest_user = call.raw_user;
+        let translated = if decision.destination == call.dialed.as_str() && !force_routed {
+            dest_user.to_string()
+        } else {
+            decision.destination
+        };
 
         // The transformed number goes on the wire; the dialed number keeps
         // driving routing, VPS and audit (no partition bypass by dialing a
@@ -3252,36 +3458,118 @@ impl SipStack {
     }
 
     /// Enables per-user request limiting (`rate_limit.per_user_rps`).
+    ///
+    /// Only the configured rate is taken from `limiter`: buckets are kept
+    /// by [`crate::user_limiter::UserLimiter`], which keys on identity and
+    /// never rejects on map overflow. Burst is `rps` x the default
+    /// `burst_multiplier` (2.0).
+    // POAM: POA&M-101 — `rate_limit.burst_multiplier` other than 2.0 is not
+    // applied to the per-user limiter until server.rs passes it through.
     pub fn set_user_rate_limiter(&mut self, limiter: uc_dos_protection::KeyedRateLimiter) {
-        self.user_limiter = Some(tokio::sync::Mutex::new(limiter));
+        let rps = limiter.rps();
+        drop(limiter);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let burst = (f64::from(rps) * crate::user_limiter::DEFAULT_BURST_MULTIPLIER) as u32;
+        self.user_limiter = Some(std::sync::Mutex::new(
+            crate::user_limiter::UserLimiter::new(rps, burst.max(1)),
+        ));
     }
 
-    /// Applies the per-user limiter to a request: `Some(503)` when the From
-    /// user is over its rate (RFC 3261 §21.5.4 with `Retry-After`), `None`
-    /// to proceed. ACK is never limited (it completes a transaction already
-    /// admitted). Requests without a From user are not keyed.
+    /// Applies the per-user limiter to a request: `Some(503)` when its key
+    /// is over its rate (RFC 3261 §21.5.4 with `Retry-After`), `None` to
+    /// proceed. ACK is never limited (it completes a transaction already
+    /// admitted); requests from configured trunks are not per-user limited
+    /// (trunk `max_calls` and VPS cover them); requests without a From user
+    /// are not keyed.
+    ///
+    /// The key is the registered AOR when the request arrives on a flow
+    /// bound to that AOR by an authenticated REGISTER, else the source
+    /// network (/32, /64) plus the canonical From user, so a spoofed
+    /// `From: victim` from elsewhere never drains the victim's bucket.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection). The
+    /// authenticated key depends on IA-2 (REGISTER authentication binding
+    /// the flow) but this function is not itself an IA-2 control.
     async fn user_rate_limit(
         &self,
         req: &SipRequest,
         source: SbcSocketAddr,
+        transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
     ) -> Option<ProcessResult> {
+        use crate::user_limiter::{UserKey, UserLimit};
         let limiter = self.user_limiter.as_ref()?;
         if req.method == Method::Ack {
             return None;
         }
-        let user = req.headers.from_parsed().and_then(|f| f.uri.user)?;
-        let (action, threshold) = {
-            let mut l = limiter.lock().await;
-            (l.check(&user), l.rps())
-        };
-        if action.is_allowed() {
+        // RFC 6881 §5, 47 CFR 9.16: an emergency INVITE is never refused by
+        // the per-user limiter. Classified with the same canonicaliser as
+        // `handle_invite`, so `9-1-1` / `%39%311` cannot slip past either.
+        if req.method == Method::Invite
+            && self
+                .config
+                .emergency_numbers
+                .matches_number(&uc_types::DialedNumber::parse(
+                    req.uri.user.as_deref().unwrap_or(""),
+                ))
+        {
+            self.routing_counters
+                .user_limiter_emergency_bypass
+                .fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        warn!(%user, source = %source, method = %req.method, "Per-user rate limit exceeded, 503");
+        // Trunk sources are exempt from the per-user limiter: they carry
+        // many users on one peering, and are bounded instead by the trunk
+        // `max_calls` admission cap and VPS call limits (SC-5).
+        if self
+            .inbound_trunk_map
+            .read()
+            .await
+            .contains_key(&source.ip().to_canonical())
+        {
+            return None;
+        }
+        let user = req.headers.from_parsed().and_then(|f| f.uri.user)?;
+        // Binding lookup first; its locks are released before the limiter's
+        // (the returned AOR is owned).
+        let key = self
+            .flow_bound_aor(source, transport, conn, &user)
+            .await
+            .map_or_else(|| UserKey::unauth(source.ip(), &user), UserKey::Auth);
+        let (outcome, warn_overflow, threshold) = {
+            // Synchronous critical section, no `.await` under the guard.
+            let mut l = limiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (outcome, warn_overflow) = l.check(&key);
+            (outcome, warn_overflow, l.rps())
+        };
+        match outcome {
+            UserLimit::Allow => return None,
+            UserLimit::AllowUntracked => {
+                self.routing_counters
+                    .user_limiter_overflow
+                    .fetch_add(1, Ordering::Relaxed);
+                if warn_overflow {
+                    warn!(
+                        max_keys = crate::user_limiter::MAX_KEYS,
+                        "Per-user limiter full; new keys allowed untracked"
+                    );
+                }
+                return None;
+            }
+            UserLimit::Reject => {}
+        }
+        let limit_name = key.limit_name();
+        warn!(limit = %limit_name, source = %source, method = %req.method, "Per-user rate limit exceeded, 503");
         uc_audit::log_event(uc_audit::AuditEvent::RateLimitTriggered(
             uc_audit::event::RateLimitTriggered {
                 source_ip: source.ip(),
-                limit_name: format!("per_user_rps:{user}"),
+                limit_name,
                 request_count: u64::from(threshold),
                 threshold: u64::from(threshold),
             },
@@ -3293,6 +3581,132 @@ impl SipStack {
             destination: source,
             flow: Flow::Reply,
         })
+    }
+
+    /// The registered AOR whose user is `from_user` and whose binding is on
+    /// this request's flow (authenticated REGISTER), if any. `None` when
+    /// REGISTER is not authenticated (a binding then proves nothing).
+    ///
+    /// ## NIST 800-53 Rev5: IA-2, IA-3
+    async fn flow_bound_aor(
+        &self,
+        source: SbcSocketAddr,
+        transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
+        from_user: &str,
+    ) -> Option<String> {
+        if !self.register_auth_enabled() {
+            return None;
+        }
+        let key = crate::stir_binding::flow_key(source.ip(), source.port(), transport);
+        // Lock order matches REGISTER (location, then flows) so the two
+        // guards can be held together without deadlock and the candidate
+        // list need not be cloned. No `.await` inside the search.
+        let loc = self.location_service.read().await;
+        let flows = self.stir_flows.read().await;
+        let candidates = flows.get(&key, conn)?;
+        candidates
+            .iter()
+            .find(|aor| {
+                aor.parse::<SipUri>()
+                    .ok()
+                    .and_then(|u| u.user)
+                    .is_some_and(|u| u == from_user)
+                    && Self::flow_has_binding(&loc, aor, &key)
+            })
+            .cloned()
+    }
+
+    /// Audit subject for an INVITE routing decision: the trunk group it
+    /// arrived on, else the AOR bound to its flow by an authenticated
+    /// REGISTER, else `unverified:<From URI>` (the From header alone is
+    /// attacker-chosen). Only called on rare audit paths.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records), IA-2
+    async fn invite_audit_subject(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+        transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
+        trunk_group: Option<&str>,
+    ) -> String {
+        if let Some(tg) = trunk_group {
+            return format!("trunk_group:{tg}");
+        }
+        let from = req.headers.get_value(&HeaderName::From);
+        if let Some(user) = req.headers.from_parsed().and_then(|f| f.uri.user)
+            && let Some(aor) = self.flow_bound_aor(source, transport, conn, &user).await
+        {
+            return aor;
+        }
+        format!(
+            "unverified:{}",
+            from.map_or_else(|| source.to_string(), extract_uri_from_header)
+        )
+    }
+
+    /// Call-path routing counters.
+    pub fn routing_counters(&self) -> &RoutingCounters {
+        &self.routing_counters
+    }
+
+    /// Checks that every configured emergency number would route: with no
+    /// `routing.emergency_trunk_group`, a number the SBC router blocks or
+    /// does not match and that neither the dial plan nor the default trunk
+    /// group carries is logged at `error!` and audited (startup is not
+    /// refused: that would take down all calling). Returns the number of
+    /// unroutable emergency numbers. No trunk slot is reserved.
+    ///
+    /// ## 47 CFR 9.16; NIST 800-53 Rev5: CP-8 (Telecommunications Services), CM-6 (Configuration Settings)
+    pub async fn check_emergency_routability(&self) -> usize {
+        if self.emergency_trunk_group.is_some() {
+            return 0;
+        }
+        let Some(router_lock) = self.router.as_ref() else {
+            return 0;
+        };
+        let mut unroutable = Vec::new();
+        for number in self.config.emergency_numbers.numbers() {
+            let sbc_routed = match self.sbc_router.as_ref() {
+                Some(sbc) => matches!(
+                    sbc.read().await.route(number, None),
+                    SbcRouteOutcome::Routed(_)
+                ),
+                None => false,
+            };
+            if sbc_routed {
+                continue;
+            }
+            let router = router_lock.read().await;
+            let dial_plan = router.config().use_dial_plan
+                && router.active_dial_plan().is_some_and(|p| {
+                    p.match_extended(number, "", Direction::Outbound, None)
+                        .is_some()
+                });
+            let default = router
+                .config()
+                .default_trunk_group
+                .as_deref()
+                .is_some_and(|g| router.get_trunk_group(g).is_some());
+            if !dial_plan && !default {
+                unroutable.push(number.clone());
+            }
+        }
+        for number in &unroutable {
+            error!(number = %number, "Emergency number has no route and no routing.emergency_trunk_group is set");
+            audit(uc_audit::AuditEvent::AuthorizationDecision(
+                uc_audit::event::AuthorizationDecision {
+                    identity: self.config.instance_name.clone(),
+                    resource: format!("emergency_number={number}"),
+                    action: "ROUTE_CHECK".to_string(),
+                    granted: false,
+                    policy: "emergency_unrouted".to_string(),
+                    source_ip: None,
+                },
+            ));
+        }
+        unroutable.len()
     }
 
     /// Sets the STIR/SHAKEN service.
@@ -3535,6 +3949,9 @@ impl SipStack {
             max_failover_attempts: routing_config.max_failover_attempts as usize,
             default_trunk_group: Some(routing_config.default_trunk_group.clone()),
         };
+        // 47 CFR 9.16: validated by sbc-config to name a trunk group.
+        self.emergency_trunk_group
+            .clone_from(&routing_config.emergency_trunk_group);
 
         let mut router = Router::new(router_config);
         self.prepare_router(&mut router);
@@ -3608,11 +4025,17 @@ impl SipStack {
             let mut plan = DialPlan::new(&dp_config.id, &dp_config.name);
 
             for (idx, entry_config) in dp_config.entries.iter().enumerate() {
-                let pattern = match entry_config.pattern_type.as_str() {
-                    "exact" => DialPattern::exact(&entry_config.pattern_value),
-                    "wildcard" => DialPattern::wildcard(&entry_config.pattern_value),
-                    "any" => DialPattern::Any,
-                    _ => DialPattern::prefix(&entry_config.pattern_value),
+                // NIST 800-53 Rev5: SI-10, CM-6 — sbc-config validation
+                // already rejects unknown kinds; never fall back to prefix.
+                let pattern = match DialPattern::from_kind(
+                    &entry_config.pattern_type,
+                    &entry_config.pattern_value,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!(plan = %dp_config.id, entry = idx, error = %e, "Dial plan entry skipped");
+                        continue;
+                    }
                 };
 
                 let direction = match entry_config.direction.as_str() {
@@ -3655,8 +4078,24 @@ impl SipStack {
                 if let Some(ref domain) = entry_config.domain_pattern {
                     entry = entry.with_domain_pattern(domain);
                 }
+                // `source_trunk` matches the trunk group a call arrived on;
+                // a trunk id is resolved to its group here.
+                //
+                // ## NIST 800-53 Rev5: AC-4 (Information Flow Enforcement)
                 if let Some(ref trunk) = entry_config.source_trunk {
-                    entry = entry.with_source_trunk(trunk);
+                    let group = trunk_group_configs
+                        .iter()
+                        .find(|g| g.id == *trunk)
+                        .or_else(|| {
+                            trunk_group_configs
+                                .iter()
+                                .find(|g| g.trunks.iter().any(|t| t.id == *trunk))
+                        })
+                        .map(|g| g.id.as_str());
+                    if group.is_none() {
+                        warn!(plan = %dp_config.id, source_trunk = %trunk, "Dial plan source_trunk matches no trunk group or trunk; entry will never match");
+                    }
+                    entry = entry.with_source_trunk(group.unwrap_or(trunk));
                 }
                 if let Some(ref dest) = entry_config.static_destination {
                     entry = entry.with_static_destination(dest);
@@ -3886,7 +4325,7 @@ impl SipStack {
             if let Some(answer) = self.answer_request_retransmit(req, source).await {
                 return answer;
             }
-            if let Some(rejected) = self.user_rate_limit(req, source).await {
+            if let Some(rejected) = self.user_rate_limit(req, source, transport, conn).await {
                 return rejected;
             }
             self.open_server_transaction(req, source, transport).await;
@@ -4884,12 +5323,16 @@ impl SipStack {
             return self.handle_in_dialog_request(req, source).await;
         }
 
+        // One canonical dialled number (separators, %xx, `+` and
+        // ;phone-context handled once), fed to emergency classification,
+        // VPS screening and routing so they cannot disagree.
+        //
+        // ## NIST 800-53 Rev5: SI-10, AC-3; RFC 3966 §5.1.1, RFC 3261 §19.1.2
+        let dialed = uc_types::DialedNumber::parse(req.uri.user.as_deref().unwrap_or(""));
+
         // Emergency calls (dialed Request-URI user, before any translation);
         // see the admission bypass below.
-        let emergency = self
-            .config
-            .emergency_numbers
-            .matches(req.uri.user.as_deref().unwrap_or(""));
+        let emergency = self.config.emergency_numbers.matches_number(&dialed);
 
         // CDR for an INVITE refused before the call is stored (plan §0
         // reject sites). Rejections the RFC answers with a challenge
@@ -5154,7 +5597,7 @@ impl SipStack {
                 uc_vps::CallDirection::Unknown
             };
             let mut attempt = uc_vps::CallAttempt::new(source.ip())
-                .with_callee(dest_user.clone())
+                .with_callee(dialed.screening_key())
                 .with_request_uri(req.uri.to_string())
                 .with_direction(direction)
                 .with_stir_shaken(stir_in.vps_status);
@@ -5244,7 +5687,11 @@ impl SipStack {
         let b_leg_flow: LegFlow;
         let b_leg_destination = {
             // Check DID → user mapping first (e.g., +12139160002 → jwillman)
-            let mapped_user = self.lookup_did(&dest_user).await;
+            let mapped_user = match self.lookup_did(&dest_user).await {
+                Some(u) => Some(u),
+                None if dialed.as_str() != dest_user => self.lookup_did(dialed.as_str()).await,
+                None => None,
+            };
 
             // Build AOR candidates for location service lookup
             let loc = self.location_service.read().await;
@@ -5324,15 +5771,55 @@ impl SipStack {
                     );
                 }
 
-                match self
-                    .route_to_trunk(
-                        &dest_user,
-                        css_id_owned.as_deref(),
-                        admission,
-                        req.uri.scheme.requires_tls(),
-                    )
-                    .await
-                {
+                let domain = req.uri.host.to_ascii_lowercase();
+                let trunk_call = TrunkCall {
+                    req,
+                    source,
+                    transport,
+                    conn,
+                    dialed: &dialed,
+                    raw_user: &dest_user,
+                    domain: &domain,
+                    inbound_trunk_group: inbound_trunk.as_ref().map(|(tg, _)| tg.as_str()),
+                    css: css_id_owned.as_deref(),
+                    admission,
+                    tls_only: req.uri.scheme.requires_tls(),
+                    emergency,
+                };
+                let routing = self.route_to_trunk(&trunk_call).await;
+                // 47 CFR 9.16: an emergency call nothing can carry is
+                // refused with 503 and no Retry-After, loudly.
+                let routing = match routing {
+                    TrunkRouting::NoRoute | TrunkRouting::Unavailable { .. } if emergency => {
+                        error!(call_id = %a_leg_call_id, dest = %dialed, "Emergency call has no usable route; rejecting with 503");
+                        self.routing_counters
+                            .emergency_unrouted
+                            .fetch_add(1, Ordering::Relaxed);
+                        let subject = self
+                            .invite_audit_subject(
+                                req,
+                                source,
+                                transport,
+                                conn,
+                                trunk_call.inbound_trunk_group,
+                            )
+                            .await;
+                        audit_emergency_route(req, source, subject, "emergency_unrouted");
+                        self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                        reject_cdr(503, uc_cdr::ReleaseCause::NoRoute);
+                        self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
+                            .await;
+                        let unavailable =
+                            create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+                        return ProcessResult::Response {
+                            message: SipMessage::Response(unavailable),
+                            destination: source,
+                            flow: Flow::Reply,
+                        };
+                    }
+                    other => other,
+                };
+                match routing {
                     TrunkRouting::Routed(route) => {
                         // Routed to a trunk/carrier — this outbound leg faces
                         // an untrusted zone, so topology hiding (if enabled)
@@ -5396,6 +5883,40 @@ impl SipStack {
                         }
                         return ProcessResult::Response {
                             message: SipMessage::Response(unavailable),
+                            destination: source,
+                            flow: Flow::Reply,
+                        };
+                    }
+                    TrunkRouting::Blocked {
+                        pattern_id,
+                        partition_id,
+                    } => {
+                        // RFC 3261 §21.4.4: understood but refused; no
+                        // fallback routing. The pattern id stays on the
+                        // audit trail (SI-11).
+                        //
+                        // ## NIST 800-53 Rev5: AC-3, AU-2, SI-11
+                        warn!(call_id = %a_leg_call_id, pattern = %pattern_id, partition = %partition_id, "Blocked route pattern; rejecting INVITE with 403");
+                        self.routing_counters
+                            .route_blocked
+                            .fetch_add(1, Ordering::Relaxed);
+                        let subject = self
+                            .invite_audit_subject(
+                                req,
+                                source,
+                                transport,
+                                conn,
+                                trunk_call.inbound_trunk_group,
+                            )
+                            .await;
+                        audit_route_blocked(req, source, subject, &pattern_id);
+                        self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                        reject_cdr(403, uc_cdr::ReleaseCause::PolicyDenied);
+                        self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
+                            .await;
+                        let forbidden = create_response_from_request(req, StatusCode::FORBIDDEN);
+                        return ProcessResult::Response {
+                            message: SipMessage::Response(forbidden),
                             destination: source,
                             flow: Flow::Reply,
                         };
@@ -8751,6 +9272,7 @@ pub(crate) mod tests {
             use_dial_plan: true,
             max_failover_attempts: 2,
             default_trunk_group: "default".to_string(),
+            emergency_trunk_group: None,
         };
 
         let dial_plans = vec![sbc_config::DialPlanConfig {
@@ -9943,6 +10465,55 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn emergency_invite_bypasses_per_user_limiter() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.set_user_rate_limiter(uc_dos_protection::KeyedRateLimiter::new(1, 1));
+        let invite = |user: &str, n: u32| {
+            Bytes::from(format!(
+                "INVITE sip:{user}@sbc.local SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-erl-{n}\r\n\
+                 From: <sip:alice@example.com>;tag={n}\r\n\
+                 To: <sip:{user}@sbc.local>\r\n\
+                 Call-ID: erl-{n}@test\r\n\
+                 CSeq: 1 INVITE\r\n\
+                 Content-Length: 0\r\n\r\n"
+            ))
+        };
+        // Drain alice's bucket (burst 2) with ordinary INVITEs.
+        for n in 1..=2 {
+            let r = flatten(
+                stack
+                    .process_message(&invite("2025550100", n), alice(), None)
+                    .await,
+            );
+            assert!(responded(&r, 503).is_none(), "within burst");
+        }
+        let limited = flatten(
+            stack
+                .process_message(&invite("2025550100", 3), alice(), None)
+                .await,
+        );
+        let (resp, _) = responded(&limited, 503).expect("over the per-user rate");
+        assert_eq!(resp.headers.get_value(&HeaderName::RetryAfter), Some("1"));
+        // An emergency INVITE from the same key is not refused by the
+        // limiter, in any textual form.
+        for (n, user) in [(4, "911"), (5, "9-1-1"), (6, "%39%311")] {
+            let r = flatten(stack.process_message(&invite(user, n), alice(), None).await);
+            let rate_limited = responded(&r, 503).is_some_and(|(resp, _)| {
+                resp.headers.get_value(&HeaderName::RetryAfter) == Some("1")
+            });
+            assert!(!rate_limited, "{user}: not per-user limited");
+        }
+        assert_eq!(
+            stack
+                .routing_counters()
+                .user_limiter_emergency_bypass
+                .load(Ordering::Relaxed),
+            3
+        );
+    }
+
+    #[tokio::test]
     async fn per_user_rate_limit_answers_503_with_retry_after() {
         let mut stack = SipStack::new(SipStackConfig::default());
         stack.set_user_rate_limiter(uc_dos_protection::KeyedRateLimiter::new(1, 1));
@@ -9963,9 +10534,16 @@ pub(crate) mod tests {
                 .await,
         );
         assert!(responded(&first, 200).is_some());
+        // Burst is rps x 2 (default burst_multiplier).
         let second = flatten(
             stack
                 .process_message(&options("alice", 2), alice(), None)
+                .await,
+        );
+        assert!(responded(&second, 200).is_some());
+        let second = flatten(
+            stack
+                .process_message(&options("alice", 3), alice(), None)
                 .await,
         );
         let (resp, dest) = responded(&second, 503).expect("over the per-user rate");
@@ -9978,6 +10556,34 @@ pub(crate) mod tests {
                 .await,
         );
         assert!(responded(&other, 200).is_some());
+        // The same From user from another network has its own bucket: a
+        // spoofed `From: alice` elsewhere cannot lock alice out.
+        let elsewhere = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 7), 5060);
+        let spoofed = flatten(
+            stack
+                .process_message(&options("alice", 4), elsewhere, None)
+                .await,
+        );
+        assert!(responded(&spoofed, 200).is_some());
+        // ACK is never limited.
+        let ack = flatten(
+            stack
+                .process_message(
+                    &Bytes::from(
+                        "ACK sip:sbc.local SIP/2.0\r\n\
+                         Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-rl-ack\r\n\
+                         From: <sip:alice@example.com>;tag=9\r\n\
+                         To: <sip:sbc.local>;tag=x\r\n\
+                         Call-ID: rl-ack@test\r\n\
+                         CSeq: 1 ACK\r\n\
+                         Content-Length: 0\r\n\r\n",
+                    ),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&ack, 503).is_none());
     }
 
     #[tokio::test]
@@ -10098,6 +10704,7 @@ pub(crate) mod tests {
             use_dial_plan: true,
             max_failover_attempts: 3,
             default_trunk_group: "carriers".to_string(),
+            emergency_trunk_group: None,
         };
         let dial_plans = vec![sbc_config::DialPlanConfig {
             id: "plan".to_string(),
@@ -10268,6 +10875,347 @@ pub(crate) mod tests {
             ..uc_vps::VpsConfig::default()
         })
         .expect("valid VPS config")
+    }
+
+    // ── Call-path routing: blocked patterns, emergency, dial-plan context ──
+
+    /// SBC router whose default CSS walks one partition holding the given
+    /// blocked prefixes.
+    fn blocking_sbc_router(blocked: &[&str]) -> Arc<RwLock<uc_routing::SbcRouter>> {
+        let mut sbc = uc_routing::SbcRouter::new();
+        sbc.add_partition(uc_routing::Partition::new("pt", "Pt"));
+        for (i, prefix) in blocked.iter().enumerate() {
+            sbc.add_route_pattern(
+                uc_routing::RoutePattern::new(
+                    format!("rp-block-{i}"),
+                    DialPattern::prefix(*prefix),
+                    "pt",
+                )
+                .with_block(true),
+            );
+        }
+        let mut css = uc_routing::CallingSearchSpace::new("css", "Css");
+        css.add_partition("pt");
+        sbc.add_css(css);
+        sbc.set_default_css("css");
+        Arc::new(RwLock::new(sbc))
+    }
+
+    /// Carrier routing plus a catch-all (`any`) dial-plan entry, the
+    /// default trunk group, a VPS callee cap and the given SBC blocks.
+    async fn blocking_stack(blocked: &[&str], emergency_group: bool, catch_all: bool) -> SipStack {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        let (mut routing, mut dial_plans, mut groups) =
+            carrier_routing(10, ("none", ""), ["udp", "udp"]);
+        if catch_all {
+            dial_plans[0].entries.push(sbc_config::DialPlanEntryConfig {
+                direction: "both".to_string(),
+                pattern_type: "any".to_string(),
+                trunk_group: "carriers".to_string(),
+                priority: 100,
+                ..Default::default()
+            });
+        } else {
+            // Only `+1…` routes; inbound calls get no default group.
+            dial_plans[0].entries.truncate(1);
+        }
+        if emergency_group {
+            groups.push(sbc_config::TrunkGroupConfig {
+                id: "e911".to_string(),
+                name: "E911".to_string(),
+                strategy: "priority".to_string(),
+                trunks: vec![sbc_config::TrunkConfigSchema {
+                    id: "psap".to_string(),
+                    host: "127.0.0.4".to_string(),
+                    port: 5060,
+                    protocol: "udp".to_string(),
+                    priority: 1,
+                    max_calls: 10,
+                    max_failures: 3,
+                    ..Default::default()
+                }],
+                zone: None,
+                require_tls: false,
+            });
+            routing.emergency_trunk_group = Some("e911".to_string());
+        }
+        stack.init_router_from_config(&routing, &dial_plans, &groups);
+        stack.set_vps_engine(vps_with_callee_cap(5));
+        stack.set_sbc_router(blocking_sbc_router(blocked));
+        stack
+            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        stack
+    }
+
+    async fn invite_user(stack: &SipStack, user: &str, call_id: &str) -> Vec<ProcessResult> {
+        flatten(
+            stack
+                .process_message(
+                    &caller_request("INVITE", user, call_id, 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        )
+    }
+
+    #[tokio::test]
+    async fn blocked_route_pattern_answers_403_without_dial_plan_or_default_fallback() {
+        // Catch-all dial plan entry and default_trunk_group would both
+        // carry the call if the block fell through.
+        let stack = blocking_stack(&["1900"], false, true).await;
+        for (i, user) in ["19005551212", "+1-900-555-1212", "%2B19005551212"]
+            .iter()
+            .enumerate()
+        {
+            let results = invite_user(&stack, user, &format!("blocked-{i}@test")).await;
+            let n403 = results
+                .iter()
+                .filter(|r| matches!(r, ProcessResult::Response { message: SipMessage::Response(resp), .. } if resp.status.code() == 403))
+                .count();
+            assert_eq!(n403, 1, "{user}: one 403");
+            assert!(
+                forwarded(&results, &Method::Invite).is_none(),
+                "{user}: no B-leg"
+            );
+            assert_eq!(active(&stack, "t1").await, 0);
+            assert_eq!(active(&stack, "t2").await, 0);
+            assert_eq!(
+                stack.vps_callee_concurrent_calls(user).await,
+                Some(0),
+                "{user}"
+            );
+        }
+        assert_eq!(
+            stack
+                .routing_counters()
+                .route_blocked
+                .load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(stack.admitted_call_slots(), 0);
+
+        // An unblocked number still routes through the catch-all.
+        let results = invite_user(&stack, "12025550100", "unblocked@test").await;
+        assert!(forwarded(&results, &Method::Invite).is_some());
+    }
+
+    #[tokio::test]
+    async fn emergency_call_force_routed_to_emergency_trunk_group() {
+        let stack = blocking_stack(&["9"], true, true).await;
+        let results = invite_user(&stack, "9-1-1", "e911-forced@test").await;
+        let (b_invite, dest) = forwarded(&results, &Method::Invite).expect("INVITE to PSAP trunk");
+        assert_eq!(
+            dest,
+            SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(127, 0, 0, 4), 5060)
+        );
+        assert_eq!(b_invite.uri.user.as_deref(), Some("911"));
+        assert_eq!(
+            stack
+                .routing_counters()
+                .emergency_force_routed_trunk
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(stack.emergency_admissions(), 1);
+    }
+
+    #[tokio::test]
+    async fn emergency_call_ignores_block_and_uses_dial_plan() {
+        let stack = blocking_stack(&["9"], false, true).await;
+        let results = invite_user(&stack, "911", "e911-dp@test").await;
+        let (b_invite, dest) = forwarded(&results, &Method::Invite).expect("INVITE to carrier");
+        assert_eq!(dest, t1());
+        assert_eq!(b_invite.uri.user.as_deref(), Some("911"));
+        assert_eq!(
+            stack
+                .routing_counters()
+                .emergency_force_routed_blocked_ignored
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unroutable_emergency_call_gets_503_without_retry_after() {
+        let stack = blocking_stack(&["9"], false, false).await;
+        // Outbound (registered endpoint) emergency calls still have the
+        // default trunk group; the caller here is a trunk (inbound).
+        assert_eq!(stack.check_emergency_routability().await, 0);
+        let mut bare = SipStack::new(SipStackConfig::default());
+        let (mut routing, _, groups) = carrier_routing(10, ("none", ""), ["udp", "udp"]);
+        routing.default_trunk_group = "missing".to_string();
+        bare.init_router_from_config(&routing, &[], &groups);
+        assert_eq!(bare.check_emergency_routability().await, 3, "911, 112, 933");
+        let results = invite_user(&stack, "911", "e911-none@test").await;
+        let (resp, _) = responded(&results, 503).expect("503");
+        assert!(resp.headers.get_value(&HeaderName::RetryAfter).is_none());
+        assert!(forwarded(&results, &Method::Invite).is_none());
+        assert_eq!(
+            stack
+                .routing_counters()
+                .emergency_unrouted
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(stack.admitted_call_slots(), 0);
+    }
+
+    #[tokio::test]
+    async fn qa_emergency_textual_forms_all_force_route_with_canonical_user() {
+        let stack = blocking_stack(&["9"], true, true).await;
+        for (i, user) in ["(911)", "+911", "%39%31%31", "9.1.1"].iter().enumerate() {
+            let results = invite_user(&stack, user, &format!("e911-form-{i}@test")).await;
+            let (b_invite, dest) =
+                forwarded(&results, &Method::Invite).unwrap_or_else(|| panic!("{user}: PSAP"));
+            assert_eq!(
+                dest,
+                SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(127, 0, 0, 4), 5060),
+                "{user}"
+            );
+            assert!(responded(&results, 403).is_none(), "{user}");
+            assert!(
+                matches!(b_invite.uri.user.as_deref(), Some("911" | "+911")),
+                "{user}: {:?}",
+                b_invite.uri.user
+            );
+        }
+        assert_eq!(stack.emergency_admissions(), 4);
+    }
+
+    #[tokio::test]
+    async fn qa_block_not_evaded_by_dot_or_paren_separators() {
+        let stack = blocking_stack(&["1900"], false, true).await;
+        for (i, user) in ["1.900.555.1212", "(1900)5551212"].iter().enumerate() {
+            let results = invite_user(&stack, user, &format!("evade-{i}@test")).await;
+            assert!(responded(&results, 403).is_some(), "{user}");
+            assert!(forwarded(&results, &Method::Invite).is_none(), "{user}");
+        }
+        assert_eq!(stack.admitted_call_slots(), 0);
+    }
+
+    #[tokio::test]
+    async fn sec001_numeric_looking_opaque_user_is_not_routed() {
+        // `1900` block plus a catch-all and `+1` route: an opaque number
+        // that dodges the block must not reach a carrier through them.
+        let stack = blocking_stack(&["1900"], false, true).await;
+        for (i, user) in ["+19005551234x", "1-900-555-1234_"].iter().enumerate() {
+            let results = invite_user(&stack, user, &format!("opaque-{i}@test")).await;
+            assert!(forwarded(&results, &Method::Invite).is_none(), "{user}");
+            assert_eq!(active(&stack, "t1").await, 0, "{user}");
+            assert_eq!(active(&stack, "t2").await, 0, "{user}");
+        }
+        assert_eq!(stack.admitted_call_slots(), 0);
+    }
+
+    #[tokio::test]
+    async fn sec004_oversize_user_does_not_match_catch_all() {
+        let stack = blocking_stack(&[], false, true).await;
+        let user = "a".repeat(uc_types::dialed_number::MAX_RAW_LEN + 1);
+        let results = invite_user(&stack, &user, "oversize@test").await;
+        assert!(forwarded(&results, &Method::Invite).is_none());
+        assert_eq!(active(&stack, "t1").await, 0);
+        assert_eq!(stack.admitted_call_slots(), 0);
+    }
+
+    #[tokio::test]
+    async fn near_emergency_number_is_not_exempt_from_blocks() {
+        let stack = blocking_stack(&["1"], false, true).await;
+        let results = invite_user(&stack, "+1911", "not-e911@test").await;
+        assert!(responded(&results, 403).is_some());
+        assert_eq!(stack.emergency_admissions(), 0);
+    }
+
+    /// Dial plan with one entry built by `entry`, group "carriers" and the
+    /// caller (alice) admitted as trunk group "pbx".
+    async fn context_stack(entry: sbc_config::DialPlanEntryConfig) -> SipStack {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        let (routing, mut dial_plans, mut groups) =
+            carrier_routing(10, ("none", ""), ["udp", "udp"]);
+        dial_plans[0].entries = vec![entry];
+        groups.push(sbc_config::TrunkGroupConfig {
+            id: "pbx".to_string(),
+            name: "PBX".to_string(),
+            strategy: "priority".to_string(),
+            trunks: vec![sbc_config::TrunkConfigSchema {
+                id: "pbx-1".to_string(),
+                host: "192.168.1.1".to_string(),
+                port: 5060,
+                protocol: "udp".to_string(),
+                ..Default::default()
+            }],
+            zone: None,
+            require_tls: false,
+        });
+        stack.init_router_from_config(&routing, &dial_plans, &groups);
+        stack
+            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        stack
+    }
+
+    fn carrier_entry(direction: &str) -> sbc_config::DialPlanEntryConfig {
+        sbc_config::DialPlanEntryConfig {
+            direction: direction.to_string(),
+            pattern_type: "prefix".to_string(),
+            pattern_value: "+1".to_string(),
+            trunk_group: "carriers".to_string(),
+            priority: 1,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_plan_direction_source_trunk_and_domain_are_enforced() {
+        // Inbound call (from trunk group "pbx"), outbound-only entry: no
+        // route, and default_trunk_group does not apply inbound.
+        let stack = context_stack(carrier_entry("outbound")).await;
+        let results = place_call(&stack, "dir-out@test").await;
+        assert!(forwarded(&results, &Method::Invite).is_none());
+
+        // Inbound entry restricted to source trunk "pbx-1" (a trunk id,
+        // resolved to its group "pbx" at load): routed.
+        let stack = context_stack(sbc_config::DialPlanEntryConfig {
+            source_trunk: Some("pbx-1".to_string()),
+            ..carrier_entry("inbound")
+        })
+        .await;
+        let results = place_call(&stack, "dir-in@test").await;
+        assert_eq!(
+            forwarded(&results, &Method::Invite).map(|(_, d)| d),
+            Some(t1())
+        );
+
+        // Another source trunk group: skipped.
+        let stack = context_stack(sbc_config::DialPlanEntryConfig {
+            source_trunk: Some("carriers".to_string()),
+            ..carrier_entry("inbound")
+        })
+        .await;
+        assert!(forwarded(&place_call(&stack, "src@test").await, &Method::Invite).is_none());
+
+        // Domain filter: the Request-URI host is sbc.local.
+        let stack = context_stack(sbc_config::DialPlanEntryConfig {
+            domain_pattern: Some("other.example".to_string()),
+            ..carrier_entry("both")
+        })
+        .await;
+        assert!(forwarded(&place_call(&stack, "dom-miss@test").await, &Method::Invite).is_none());
+        let stack = context_stack(sbc_config::DialPlanEntryConfig {
+            domain_pattern: Some("SBC.LOCAL".to_string()),
+            ..carrier_entry("both")
+        })
+        .await;
+        assert!(forwarded(&place_call(&stack, "dom-hit@test").await, &Method::Invite).is_some());
+    }
+
+    #[tokio::test]
+    async fn b_leg_keeps_raw_dialled_user_without_transform() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = invite_user(&stack, "+1-555-123-4567", "raw@test").await;
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("routed");
+        assert_eq!(b_invite.uri.user.as_deref(), Some("+1-555-123-4567"));
     }
 
     #[tokio::test]
@@ -12363,6 +13311,7 @@ pub(crate) mod tests {
             use_dial_plan: true,
             max_failover_attempts: 3,
             default_trunk_group: "carriers".to_string(),
+            emergency_trunk_group: None,
         };
         let entry = |prefix: &str, priority: u32| sbc_config::DialPlanEntryConfig {
             direction: "both".to_string(),

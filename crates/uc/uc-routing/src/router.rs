@@ -1,12 +1,28 @@
 //! Call router.
 
-use crate::dialplan::{DialPlan, DialPlanResult};
+use crate::dialplan::{DialPlan, DialPlanResult, Direction};
 use crate::error::{RoutingError, RoutingResult};
 use crate::trunk::{Admission, Trunk, TrunkGroup, TrunkOutcome};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Per-call routing context for [`Router::route_call`].
+#[derive(Debug, Clone, Copy)]
+pub struct CallRouteContext<'a> {
+    /// Canonical dialled number (routing key).
+    pub destination: &'a str,
+    /// Request-URI host, matched against entry `domain_pattern`
+    /// (case-insensitive, RFC 3261 §19.1.4).
+    pub domain: &'a str,
+    /// Call direction: [`Direction::Inbound`] when the call came from a
+    /// configured trunk, else [`Direction::Outbound`].
+    pub direction: Direction,
+    /// Trunk-group id the call arrived on, matched against entry
+    /// `source_trunk`.
+    pub source_trunk_group: Option<&'a str>,
+}
 
 /// Routing decision.
 #[derive(Debug, Clone)]
@@ -277,7 +293,50 @@ impl Router {
         self.trunk_groups.get_mut(id)
     }
 
+    /// Routes a call with its full context: the active dial plan is
+    /// matched with [`DialPlan::match_extended`] (direction, source trunk
+    /// group and Request-URI host filters enforced), then
+    /// `default_trunk_group` — for [`Direction::Outbound`] calls only, so a
+    /// trunk-originated call cannot be relayed out another trunk by the
+    /// default group.
+    ///
+    /// ## NIST 800-53 Rev5: AC-4 (Information Flow Enforcement), SC-8
+    ///
+    /// # Errors
+    /// As [`Self::route_for_tls`].
+    pub fn route_call(
+        &mut self,
+        ctx: &CallRouteContext<'_>,
+        admission: Admission,
+        tls_only: bool,
+    ) -> RoutingResult<RoutingDecision> {
+        let dial_plan_result = if self.config.use_dial_plan {
+            self.active_dial_plan().and_then(|plan| {
+                plan.match_extended(
+                    ctx.destination,
+                    ctx.domain,
+                    ctx.direction,
+                    ctx.source_trunk_group,
+                )
+            })
+        } else {
+            None
+        };
+        let allow_default = ctx.direction != Direction::Inbound;
+        self.route_with_dial_plan_result(
+            ctx.destination,
+            dial_plan_result,
+            allow_default,
+            admission,
+            tls_only,
+        )
+    }
+
     /// Routes a call to the given destination.
+    ///
+    /// Legacy library entry point: the dial plan is matched on the number
+    /// only (`DialPlan::match_number`, entry direction / source trunk /
+    /// domain filters ignored). The SBC daemon uses [`Self::route_call`].
     ///
     /// # Errors
     /// Returns an error if the operation fails.
@@ -310,15 +369,27 @@ impl Router {
         admission: Admission,
         tls_only: bool,
     ) -> RoutingResult<RoutingDecision> {
-        self.stats.requests += 1;
-
         let dial_plan_result = if self.config.use_dial_plan {
             self.match_dial_plan(destination)
         } else {
             None
         };
+        self.route_with_dial_plan_result(destination, dial_plan_result, true, admission, tls_only)
+    }
 
-        let trunk_group_id = self.resolve_trunk_group(dial_plan_result.as_ref(), destination)?;
+    /// Shared tail of [`Self::route_for_tls`] / [`Self::route_call`].
+    fn route_with_dial_plan_result(
+        &mut self,
+        destination: &str,
+        dial_plan_result: Option<DialPlanResult>,
+        allow_default: bool,
+        admission: Admission,
+        tls_only: bool,
+    ) -> RoutingResult<RoutingDecision> {
+        self.stats.requests += 1;
+
+        let trunk_group_id =
+            self.resolve_trunk_group(dial_plan_result.as_ref(), destination, allow_default)?;
         let (trunk_id, trunk_uri, failover_trunks) =
             self.select_trunk_from_group(&trunk_group_id, admission, tls_only)?;
         let failover_targets = failover_trunks
@@ -351,10 +422,16 @@ impl Router {
         &self,
         dial_plan_result: Option<&DialPlanResult>,
         destination: &str,
+        allow_default: bool,
     ) -> RoutingResult<String> {
         dial_plan_result
             .map(|r| r.trunk_group.as_str())
-            .or(self.config.default_trunk_group.as_deref())
+            .or_else(|| {
+                self.config
+                    .default_trunk_group
+                    .as_deref()
+                    .filter(|_| allow_default)
+            })
             .ok_or_else(|| RoutingError::NoRoute {
                 destination: destination.to_string(),
             })
@@ -1439,5 +1516,168 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn ctx_router() -> Router {
+        let config = RouterConfig::default().with_default_trunk_group("default-tg");
+        let mut router = Router::new(config);
+        let mut plan = DialPlan::new("p", "P");
+        plan.add_entry(
+            DialPlanEntry::new("out", DialPattern::prefix("1"), "out-tg")
+                .with_direction(Direction::Outbound)
+                .with_priority(10),
+        );
+        plan.add_entry(
+            DialPlanEntry::new("in-a", DialPattern::prefix("1"), "in-tg")
+                .with_direction(Direction::Inbound)
+                .with_source_trunk("carrier-a")
+                .with_priority(20),
+        );
+        plan.add_entry(
+            DialPlanEntry::new("dom", DialPattern::prefix("2"), "dom-tg")
+                .with_direction(Direction::Both)
+                .with_domain_pattern("*.mil")
+                .with_priority(30),
+        );
+        router.add_dial_plan(plan);
+        for id in ["default-tg", "out-tg", "in-tg", "dom-tg"] {
+            let mut g = TrunkGroup::new(id, id);
+            g.add_trunk(Trunk::new(TrunkConfig::new(
+                format!("{id}-t"),
+                "example.com",
+            )));
+            router.add_trunk_group(g);
+        }
+        router
+    }
+
+    fn ctx<'a>(
+        destination: &'a str,
+        domain: &'a str,
+        direction: Direction,
+        source: Option<&'a str>,
+    ) -> CallRouteContext<'a> {
+        CallRouteContext {
+            destination,
+            domain,
+            direction,
+            source_trunk_group: source,
+        }
+    }
+
+    #[test]
+    fn route_call_enforces_direction_source_trunk_and_domain() {
+        let mut r = ctx_router();
+        let d = r
+            .route_call(
+                &ctx("1555", "h", Direction::Outbound, None),
+                Admission::Normal,
+                false,
+            )
+            .unwrap();
+        assert_eq!(d.trunk_group_id, "out-tg");
+
+        // Inbound from carrier-a: the outbound entry is skipped.
+        let d = r
+            .route_call(
+                &ctx("1555", "h", Direction::Inbound, Some("carrier-a")),
+                Admission::Normal,
+                false,
+            )
+            .unwrap();
+        assert_eq!(d.trunk_group_id, "in-tg");
+
+        // Inbound from another trunk: no entry and no default group.
+        assert!(
+            r.route_call(
+                &ctx("1555", "h", Direction::Inbound, Some("carrier-b")),
+                Admission::Normal,
+                false,
+            )
+            .is_err()
+        );
+
+        // Domain filter, label boundary and case.
+        let d = r
+            .route_call(
+                &ctx("2000", "SIP.Army.MIL", Direction::Outbound, None),
+                Admission::Normal,
+                false,
+            )
+            .unwrap();
+        assert_eq!(d.trunk_group_id, "dom-tg");
+        let d = r
+            .route_call(
+                &ctx("2000", "evilmil", Direction::Outbound, None),
+                Admission::Normal,
+                false,
+            )
+            .unwrap();
+        assert_eq!(d.trunk_group_id, "default-tg");
+    }
+
+    #[test]
+    fn qa_default_trunk_group_is_outbound_only_and_both_matches_inbound() {
+        let mut r = ctx_router();
+        // Outbound miss falls to the default group.
+        let d = r
+            .route_call(
+                &ctx("9999", "h", Direction::Outbound, None),
+                Admission::Normal,
+                false,
+            )
+            .unwrap();
+        assert_eq!(d.trunk_group_id, "default-tg");
+        // Inbound miss: no default fallback, with or without a source group.
+        for src in [None, Some("carrier-a"), Some("default-tg")] {
+            assert!(
+                r.route_call(
+                    &ctx("9999", "h", Direction::Inbound, src),
+                    Admission::Normal,
+                    false
+                )
+                .is_err(),
+                "{src:?}"
+            );
+        }
+        // Inbound without a source group does not satisfy a source_trunk filter.
+        assert!(
+            r.route_call(
+                &ctx("1555", "h", Direction::Inbound, None),
+                Admission::Normal,
+                false
+            )
+            .is_err()
+        );
+        // Direction::Both entry matches inbound when the domain matches.
+        let d = r
+            .route_call(
+                &ctx("2000", "uc.army.mil", Direction::Inbound, Some("x")),
+                Admission::Normal,
+                false,
+            )
+            .unwrap();
+        assert_eq!(d.trunk_group_id, "dom-tg");
+        // Label boundary for inbound too: evilmil / mil.evil.com miss and
+        // there is no default fallback.
+        for dom in ["evilmil", "army.mil.evil.com", "xmil", ""] {
+            assert!(
+                r.route_call(
+                    &ctx("2000", dom, Direction::Inbound, None),
+                    Admission::Normal,
+                    false
+                )
+                .is_err(),
+                "{dom}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_route_ignores_entry_filters() {
+        let mut r = ctx_router();
+        // match_number semantics: first enabled entry by priority wins.
+        assert_eq!(r.route("1555").unwrap().trunk_group_id, "out-tg");
+        assert_eq!(r.route("2000").unwrap().trunk_group_id, "dom-tg");
     }
 }

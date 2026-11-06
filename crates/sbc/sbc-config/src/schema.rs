@@ -1329,8 +1329,21 @@ pub struct RoutingConfig {
     pub use_dial_plan: bool,
     /// Maximum failover attempts per call.
     pub max_failover_attempts: u32,
-    /// Default trunk group for unmatched calls.
+    /// Default trunk group for unmatched calls. Applies to outbound calls
+    /// only (calls not arriving from a configured trunk), so a
+    /// trunk-originated call is never relayed out another trunk by default.
+    ///
+    /// ## NIST 800-53 Rev5: AC-4 (Information Flow Enforcement)
     pub default_trunk_group: String,
+    /// Trunk group that emergency-classified calls (`[vps]
+    /// emergency_numbers`) are force-routed to, bypassing CSS, route
+    /// patterns, the dial plan and every number transform. When unset, an
+    /// emergency call follows normal routing with route-pattern blocks
+    /// ignored. Must name a `[[trunk_groups]]` id.
+    ///
+    /// ## 47 CFR 9.16; NIST 800-53 Rev5: CP-8 (Telecommunications Services)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emergency_trunk_group: Option<String>,
 }
 
 impl Default for RoutingConfig {
@@ -1339,6 +1352,7 @@ impl Default for RoutingConfig {
             use_dial_plan: true,
             max_failover_attempts: 3,
             default_trunk_group: "default".to_string(),
+            emergency_trunk_group: None,
         }
     }
 }
@@ -1372,7 +1386,9 @@ pub struct DialPlanEntryConfig {
     /// Domain pattern to match (e.g., "uc.mil", "*.mil").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain_pattern: Option<String>,
-    /// Source trunk filter (only match calls from this trunk ID).
+    /// Source trunk filter: only match calls arriving on this trunk group.
+    /// A trunk id is accepted and resolved to its trunk group at load
+    /// (`validate::resolve_source_trunk`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_trunk: Option<String>,
     /// Trunk group to route to.
