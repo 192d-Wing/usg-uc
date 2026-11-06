@@ -5414,9 +5414,11 @@ name = "proto-stir-shaken"
 version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
+ "criterion",
  "proptest",
  "serde",
  "serde_json",
+ "uc-crypto",
  "uc-types",
 ]
 
@@ -8614,6 +8616,7 @@ version = "0.10.0"
 dependencies = [
  "arc-swap",
  "bytes",
+ "criterion",
  "http",
  "http-body-util",
  "hyper",
@@ -8630,6 +8633,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uc-crypto",
+ "uc-transport",
  "uc-types",
  "uuid",
  "zeroize",
@@ -8701,8 +8705,10 @@ dependencies = [
  "arc-swap",
  "bytes",
  "crc32c",
+ "criterion",
  "futures-util",
  "rand 0.9.5",
+ "rcgen",
  "rustls",
  "rustls-pki-types",
  "socket2",

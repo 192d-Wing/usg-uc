@@ -412,7 +412,7 @@ strategy = "least_connections"   # selection strategy
 >   tls_client_cert = false              # true: present security.tls_cert_path (mTLS)
 > ```
 >
-> `tls_server_name` and `tls_client_cert` are accepted only on `tls` trunks. `tls_server_name` must be a DNS name or IP address without a port. `tls_client_cert = true` needs `security.tls_cert_path` / `tls_key_path`. `security.min_tls_version` applies to trunk connections too. Cipher suites are not restricted. A TLS handshake or verify failure is logged as a warning and counted in `sip_egress_connect_failures_total`; it does not produce its own audit event. Trunk connects time out after 5 s, and the SBC holds at most 1024 trunk connections.
+> `tls_server_name` and `tls_client_cert` are accepted only on `tls` trunks. `tls_server_name` must be a DNS name or IP address without a port. `tls_client_cert = true` needs `security.tls_cert_path` / `tls_key_path`. `security.min_tls_version` applies to trunk connections too. Cipher suites and key exchange are limited to CNSA 2.0 (TLS 1.3 `TLS_AES_256_GCM_SHA384`, ML-KEM-1024 or P-384). A TLS handshake or verify failure is logged as a warning and counted in `sip_egress_connect_failures_total`; it does not produce its own audit event. Trunk connects time out after 5 s, and the SBC holds at most 1024 trunk connections.
 >
 > A group may mix `tls` and `udp`/`tcp` trunks. Without `require_tls`, failover from a TLS trunk to a UDP trunk is allowed and sends that attempt in clear. Set `require_tls` (below) if plaintext failover is not acceptable.
 
@@ -447,7 +447,7 @@ require_tls = true              # default false
 - **central-config-api exit codes:** 0 clean shutdown, 2 configuration error, 3 state (store) init failure, 4 listener bind failure, 5 server error while running, 6 audit logger init failure (the service refuses to start without its audit trail).
 - **Per group only (POA&M-57).** A route (route list or dial plan) that names a TLS-only group and then a plain group can still fail over to the plain group's UDP trunks for a `sip:` call. Set `require_tls` on every group in the route, or use `security.require_tls_trunks`.
 - Turning `security.require_tls_trunks` off does not clear the flag on groups already loaded (fails safe); restart to apply.
-- **Signaling only:** `require_tls` does not require SRTP on the B-leg. Configure media security separately. Cipher suites are still unrestricted (POA&M-26).
+- **Signaling only:** `require_tls` does not require SRTP on the B-leg. Configure media security separately. Trunk TLS is limited to CNSA 2.0 suites (POA&M-26 closed).
 - **Clusters:** upgrade every node before enabling the flag. Older nodes ignore it and also send API trunks over UDP.
 
 ### Trunk transport: breaking changes (POA&M-5)
@@ -673,7 +673,7 @@ require_mtls = false             # SIP-TLS clients must present a certificate (n
 Notes on what the daemon actually does with these keys:
 
 - `tls_cert_path` / `tls_key_path` (wired): used for SIP-over-TLS listeners (`transport.tls_listen`) and REST HTTPS. Must be set together.
-- `min_tls_version` (wired): SIP-TLS listeners accept TLS 1.3 only by default; `"1.2"` also admits TLS 1.2 clients. Cipher suites are not restricted beyond the protocol version. The REST HTTPS listener uses rustls defaults (TLS 1.2 permitted) and is not affected by this key.
+- `min_tls_version` (wired): SIP-TLS listeners accept TLS 1.3 only by default; `"1.2"` also admits TLS 1.2 clients (`ECDHE-ECDSA-AES256-GCM-SHA384` only). Cipher suites and key exchange are limited to CNSA 2.0. The REST HTTPS listener uses rustls defaults (TLS 1.2 permitted) and is not affected by this key.
 - `curve` only constrains the configuration enum; the key type of the loaded certificate is not checked (P-256/RSA certificates are accepted by rustls).
 - `trunk_tls_ca_path` (wired): PEM bundle of the CAs that issue trunk server certificates. Required when any trunk uses `protocol = "tls"`; separate from `tls_ca_path` (client CA for the listener). See Trunk Groups.
 - `require_mtls` (wired for SIP-TLS and gRPC): the SIP-TLS listener requires a client certificate chaining to `tls_ca_path`; `validate_config` rejects `require_mtls = true` without `tls_cert_path` and `tls_ca_path`. The gRPC listener has its own `[grpc] require_mtls` / `tls_ca_path`.

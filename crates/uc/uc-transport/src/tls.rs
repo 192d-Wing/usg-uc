@@ -5,8 +5,12 @@
 //! TLS is configured with CNSA 2.0 compliant settings only:
 //! - **TLS 1.3** required (no TLS 1.2 or earlier)
 //! - **Cipher Suite**: `TLS_AES_256_GCM_SHA384` only
-//! - **Key Exchange**: P-384 ECDHE
+//! - **Key Exchange**: ML-KEM-1024 (preferred) or P-384 ECDHE
 //! - **Certificates**: P-384 ECDSA
+//!
+//! Every config built here uses [`cnsa_provider`]. Where a deployment sets
+//! `min_tls_version = "1.2"`, TLS 1.2 is limited to
+//! `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` over P-384.
 //!
 //! ## NIST 800-53 Rev5
 //!
@@ -37,6 +41,45 @@ use tokio::sync::Mutex;
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use tracing::{debug, instrument, trace};
 use uc_types::address::{SbcSocketAddr, TransportType};
+
+/// The CNSA 2.0 rustls crypto provider shared by every TLS client and
+/// server in the SBC (SIP-TLS listeners, trunk TLS, RFC 5425 CDR syslog,
+/// STIR/SHAKEN `x5u` fetch).
+///
+/// It is the aws-lc-rs (FIPS) provider with its algorithm lists cut down:
+///
+/// - **Cipher suites**: `TLS13_AES_256_GCM_SHA384` and, for TLS 1.2 only when
+///   a caller enables it, `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`. No
+///   AES-128, no ChaCha20-Poly1305, no RSA key transport or RSA-signed
+///   ECDHE suites.
+/// - **Key exchange**: `MLKEM1024` first, then `secp384r1`. No X25519,
+///   no P-256, no X25519/P-256 + ML-KEM-768 hybrids.
+///
+/// ML-KEM-1024 is the CNSA 2.0 key-establishment algorithm (category 5),
+/// and the aws-lc FIPS module reports it as FIPS-approved. It is offered
+/// first so two up-to-date peers agree a quantum-resistant key. P-384
+/// ECDHE stays as the fallback for CNSA 1.0 peers: a peer that only
+/// supports P-384 answers with a `HelloRetryRequest` (one extra round trip).
+/// TLS 1.2 cannot use ML-KEM, so 1.2 handshakes always use P-384.
+///
+/// Signature verification algorithms are left at the provider defaults,
+/// so certificate chains signed with RSA or P-256 by a peer's CA still
+/// verify; the TLS 1.2 suite does require the peer's own certificate key
+/// to be ECDSA.
+///
+/// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection), SC-8, SC-12
+#[must_use]
+pub fn cnsa_provider() -> rustls::crypto::CryptoProvider {
+    use rustls::crypto::aws_lc_rs::{cipher_suite, kx_group};
+    rustls::crypto::CryptoProvider {
+        cipher_suites: vec![
+            cipher_suite::TLS13_AES_256_GCM_SHA384,
+            cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        ],
+        kx_groups: vec![kx_group::MLKEM1024, kx_group::SECP384R1],
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    }
+}
 
 /// Creates a CNSA 2.0 compliant TLS server configuration.
 ///
@@ -91,7 +134,7 @@ pub struct TlsServerOptions {
 
 /// Creates a TLS server configuration with an explicit policy.
 ///
-/// Uses the aws-lc-rs (FIPS) provider. With `client_ca` set, the handshake
+/// Uses [`cnsa_provider`] (CNSA 2.0 suites and groups only). With `client_ca` set, the handshake
 /// requires and verifies a client certificate (`WebPKI` rules against the
 /// given roots), which is how `security.require_mtls` is enforced for SIP.
 ///
@@ -104,7 +147,7 @@ pub fn create_server_config_with(
     private_key: PrivateKeyDer<'static>,
     options: TlsServerOptions,
 ) -> TransportResult<ServerConfig> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(cnsa_provider());
     let versions: &[&'static rustls::SupportedProtocolVersion] = match options.min_version {
         MinTlsVersion::V1_3 => &[&rustls::version::TLS13],
         MinTlsVersion::V1_2 => &[&rustls::version::TLS12, &rustls::version::TLS13],
@@ -168,19 +211,13 @@ pub fn load_root_store(path: &std::path::Path) -> TransportResult<rustls::RootCe
 ///
 /// - TLS 1.3 only
 /// - `TLS_AES_256_GCM_SHA384` cipher suite
-/// - P-384 key exchange
+/// - ML-KEM-1024 or P-384 key exchange (see [`cnsa_provider`])
 ///
 /// ## Errors
 ///
 /// Returns an error if the configuration cannot be created.
-///
-/// # Errors
-/// Returns an error if the operation fails.
-///
-/// # Errors
-/// Returns an error if the operation fails.
 pub fn create_client_config(root_certs: rustls::RootCertStore) -> TransportResult<ClientConfig> {
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = cnsa_provider();
 
     let config = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -223,18 +260,17 @@ impl std::fmt::Debug for TlsClientOptions {
 
 /// Creates a TLS client configuration with an explicit policy.
 ///
-/// Uses the same aws-lc-rs provider as [`create_client_config`].
-/// `min_version` selects TLS 1.3 only or TLS 1.2 + 1.3. The provider's
-/// default cipher suites and key-exchange groups are offered unchanged:
-/// this function does not restrict them, so it makes no CNSA 2.0 claim of
-/// its own (suite selection is up to the provider and the peer).
+/// Uses [`cnsa_provider`], like [`create_client_config`]. `min_version`
+/// selects TLS 1.3 only or TLS 1.2 + 1.3; either way only the CNSA 2.0
+/// suites and groups are offered, so a peer that supports only AES-128,
+/// `ChaCha20`, X25519 or P-256 fails the handshake.
 ///
 /// ## Errors
 ///
 /// Returns an error if the protocol versions or client certificate cannot
 /// be configured.
 pub fn create_client_config_with(options: TlsClientOptions) -> TransportResult<ClientConfig> {
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = cnsa_provider();
     let versions: &[&'static rustls::SupportedProtocolVersion] = match options.min_version {
         MinTlsVersion::V1_3 => &[&rustls::version::TLS13],
         MinTlsVersion::V1_2 => &[&rustls::version::TLS12, &rustls::version::TLS13],
@@ -310,10 +346,11 @@ pub fn load_private_key(path: &Path) -> TransportResult<PrivateKeyDer<'static>> 
 ///
 /// ## CNSA 2.0 Compliance
 ///
-/// This transport is configured with CNSA 2.0 compliant TLS settings:
-/// - TLS 1.3 only
-/// - `TLS_AES_256_GCM_SHA384` cipher suite
-/// - P-384 ECDHE key exchange
+/// Connections use the `ClientConfig` passed to [`TlsTransport::connect`].
+/// Configs from [`create_client_config`] / [`create_client_config_with`]
+/// are CNSA 2.0: `TLS_AES_256_GCM_SHA384` (plus
+/// `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` when TLS 1.2 is allowed) and
+/// ML-KEM-1024 or P-384 key exchange, via [`cnsa_provider`].
 ///
 /// ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality and Integrity)
 pub struct TlsTransport {
@@ -552,8 +589,9 @@ impl std::fmt::Debug for TlsTransport {
 ///
 /// Connections use the suites, groups and versions of the `ServerConfig`
 /// passed to [`TlsListener::bind`]; the listener itself enforces none, so
-/// CNSA 2.0 compliance depends on that config (see
-/// `create_server_config`).
+/// CNSA 2.0 compliance depends on that config. Configs from
+/// [`create_server_config`] / [`create_server_config_with`] use
+/// [`cnsa_provider`].
 ///
 /// ## NIST 800-53 Rev5: SC-8
 pub struct TlsListener {
@@ -803,6 +841,270 @@ mod tests {
         assert!(config.alpn_protocols.is_empty()); // No ALPN by default
     }
 
-    // Note: Full TLS tests require generating P-384 test certificates
-    // which would be done in integration tests.
+    // ---- CNSA 2.0 handshake tests (POA&M-26 / POA&M-40) ----
+    //
+    // Handshakes run in memory between a `ClientConnection` and a
+    // `ServerConnection`, so no sockets are needed.
+
+    use rustls::crypto::CryptoProvider;
+    use rustls::crypto::aws_lc_rs::{cipher_suite, kx_group};
+    use rustls::{ClientConnection, ServerConnection};
+
+    struct Pki {
+        ca: CertificateDer<'static>,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    }
+
+    /// A P-384 CA and a P-384 leaf for `localhost`.
+    fn pki() -> Pki {
+        let alg = &rcgen::PKCS_ECDSA_P384_SHA384;
+        let ca_key = rcgen::KeyPair::generate_for(alg).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate_for(alg).unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .unwrap();
+        Pki {
+            ca: ca.der().clone(),
+            chain: vec![leaf.der().clone()],
+            key: PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+        }
+    }
+
+    fn roots(pki: &Pki) -> rustls::RootCertStore {
+        let mut r = rustls::RootCertStore::empty();
+        r.add(pki.ca.clone()).unwrap();
+        r
+    }
+
+    /// A non-CNSA peer: AES-128-GCM (+ `ChaCha20` on 1.2) and X25519 / P-256.
+    fn weak_provider() -> CryptoProvider {
+        CryptoProvider {
+            cipher_suites: vec![
+                cipher_suite::TLS13_AES_128_GCM_SHA256,
+                cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+                cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            ],
+            kx_groups: vec![kx_group::X25519, kx_group::SECP256R1],
+            ..rustls::crypto::aws_lc_rs::default_provider()
+        }
+    }
+
+    /// A non-CNSA peer that does use AES-256, but only over X25519.
+    fn x25519_only_provider() -> CryptoProvider {
+        CryptoProvider {
+            kx_groups: vec![kx_group::X25519],
+            ..rustls::crypto::aws_lc_rs::default_provider()
+        }
+    }
+
+    /// A CNSA 1.0 peer: AES-256-GCM over P-384 only (no ML-KEM).
+    fn p384_only_provider() -> CryptoProvider {
+        CryptoProvider {
+            kx_groups: vec![kx_group::SECP384R1],
+            ..cnsa_provider()
+        }
+    }
+
+    fn client_with(provider: CryptoProvider, pki: &Pki, v12: bool) -> ClientConfig {
+        let versions: &[&'static rustls::SupportedProtocolVersion] = if v12 {
+            &[&rustls::version::TLS12]
+        } else {
+            &[&rustls::version::TLS13]
+        };
+        ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(versions)
+            .unwrap()
+            .with_root_certificates(roots(pki))
+            .with_no_client_auth()
+    }
+
+    fn server_with(provider: CryptoProvider, pki: &Pki) -> ServerConfig {
+        ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(pki.chain.clone(), pki.key.clone_key())
+            .unwrap()
+    }
+
+    /// Outcome of a successful handshake.
+    #[derive(Debug)]
+    struct Negotiated {
+        suite: rustls::CipherSuite,
+        group: Option<rustls::NamedGroup>,
+    }
+
+    /// Drives a handshake to completion in memory.
+    fn handshake(client: ClientConfig, server: ServerConfig) -> Result<Negotiated, rustls::Error> {
+        let mut c = ClientConnection::new(Arc::new(client), "localhost".try_into().unwrap())?;
+        let mut s = ServerConnection::new(Arc::new(server))?;
+        for _ in 0..16 {
+            if !c.is_handshaking() && !s.is_handshaking() {
+                break;
+            }
+            let mut buf = Vec::new();
+            while c.wants_write() {
+                c.write_tls(&mut buf).unwrap();
+            }
+            if !buf.is_empty() {
+                s.read_tls(&mut &buf[..]).unwrap();
+                s.process_new_packets()?;
+            }
+            let mut buf = Vec::new();
+            while s.wants_write() {
+                s.write_tls(&mut buf).unwrap();
+            }
+            if !buf.is_empty() {
+                c.read_tls(&mut &buf[..]).unwrap();
+                c.process_new_packets()?;
+            }
+        }
+        assert!(!c.is_handshaking(), "handshake did not finish");
+        Ok(Negotiated {
+            suite: c.negotiated_cipher_suite().unwrap().suite(),
+            group: c
+                .negotiated_key_exchange_group()
+                .map(rustls::crypto::SupportedKxGroup::name),
+        })
+    }
+
+    #[test]
+    fn cnsa_provider_lists_only_cnsa_algorithms() {
+        let p = cnsa_provider();
+        let suites: Vec<_> = p
+            .cipher_suites
+            .iter()
+            .map(rustls::SupportedCipherSuite::suite)
+            .collect();
+        assert_eq!(
+            suites,
+            [
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            ]
+        );
+        let groups: Vec<_> = p.kx_groups.iter().map(|g| g.name()).collect();
+        assert_eq!(
+            groups,
+            [rustls::NamedGroup::MLKEM1024, rustls::NamedGroup::secp384r1]
+        );
+    }
+
+    #[test]
+    fn cnsa_configs_are_fips() {
+        let pki = pki();
+        assert!(create_client_config(roots(&pki)).unwrap().fips());
+        let server = create_server_config(pki.chain.clone(), pki.key.clone_key()).unwrap();
+        assert!(server.fips());
+    }
+
+    #[test]
+    fn cnsa_client_and_server_agree_ml_kem_1024() {
+        let pki = pki();
+        let client = create_client_config(roots(&pki)).unwrap();
+        let server = create_server_config(pki.chain.clone(), pki.key.clone_key()).unwrap();
+        let n = handshake(client, server).unwrap();
+        assert_eq!(n.suite, rustls::CipherSuite::TLS13_AES_256_GCM_SHA384);
+        assert_eq!(n.group, Some(rustls::NamedGroup::MLKEM1024));
+    }
+
+    #[test]
+    fn cnsa_client_falls_back_to_p384_with_cnsa1_server() {
+        let pki = pki();
+        let client = create_client_config(roots(&pki)).unwrap();
+        let n = handshake(client, server_with(p384_only_provider(), &pki)).unwrap();
+        assert_eq!(n.suite, rustls::CipherSuite::TLS13_AES_256_GCM_SHA384);
+        assert_eq!(n.group, Some(rustls::NamedGroup::secp384r1));
+    }
+
+    #[test]
+    fn cnsa_server_accepts_cnsa1_client() {
+        let pki = pki();
+        let server = create_server_config(pki.chain.clone(), pki.key.clone_key()).unwrap();
+        let n = handshake(client_with(p384_only_provider(), &pki, false), server).unwrap();
+        assert_eq!(n.group, Some(rustls::NamedGroup::secp384r1));
+    }
+
+    #[test]
+    fn cnsa_client_rejects_aes128_x25519_server() {
+        let pki = pki();
+        let client = create_client_config(roots(&pki)).unwrap();
+        assert!(handshake(client, server_with(weak_provider(), &pki)).is_err());
+    }
+
+    #[test]
+    fn cnsa_client_rejects_x25519_only_server() {
+        let pki = pki();
+        let client = create_client_config(roots(&pki)).unwrap();
+        assert!(handshake(client, server_with(x25519_only_provider(), &pki)).is_err());
+    }
+
+    #[test]
+    fn cnsa_server_rejects_aes128_x25519_client() {
+        let pki = pki();
+        for v12 in [false, true] {
+            let server = create_server_config_with(
+                pki.chain.clone(),
+                pki.key.clone_key(),
+                TlsServerOptions {
+                    min_version: MinTlsVersion::V1_2,
+                    client_ca: None,
+                },
+            )
+            .unwrap();
+            let client = client_with(weak_provider(), &pki, v12);
+            assert!(handshake(client, server).is_err(), "v12={v12}");
+        }
+    }
+
+    #[test]
+    fn cnsa_server_rejects_x25519_only_client() {
+        let pki = pki();
+        let server = create_server_config(pki.chain.clone(), pki.key.clone_key()).unwrap();
+        let client = client_with(x25519_only_provider(), &pki, false);
+        assert!(handshake(client, server).is_err());
+    }
+
+    #[test]
+    fn tls12_is_limited_to_ecdhe_ecdsa_aes256_over_p384() {
+        let pki = pki();
+        let client = create_client_config_with(TlsClientOptions {
+            roots: roots(&pki),
+            min_version: MinTlsVersion::V1_2,
+            client_auth: None,
+        })
+        .unwrap();
+        // A TLS 1.2-only server with the default (non-CNSA) provider.
+        let server = ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(pki.chain.clone(), pki.key.clone_key())
+        .unwrap();
+        let n = handshake(client, server).unwrap();
+        assert_eq!(
+            n.suite,
+            rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        );
+        assert_eq!(n.group, Some(rustls::NamedGroup::secp384r1));
+    }
+
+    #[test]
+    fn client_config_with_rejects_weak_server_on_tls12() {
+        let pki = pki();
+        let client = create_client_config_with(TlsClientOptions {
+            roots: roots(&pki),
+            min_version: MinTlsVersion::V1_2,
+            client_auth: None,
+        })
+        .unwrap();
+        assert!(handshake(client, server_with(weak_provider(), &pki)).is_err());
+    }
 }
