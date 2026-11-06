@@ -46,14 +46,24 @@ The **Wiring** column says which shipped binary calls the code: `sbc-daemon` (SI
 |------|--------|-------|
 | §7 / §25.1 CRLF line ends, token names, no CTL in values | Complete | Bare CR/LF rejected; CTLs except HTAB rejected, including escaped CTLs in quoted-pairs (deliberate deviation, RFC 4475 `intmeth`) |
 | §7.5 leading CRLF | Complete | Up to 32 skipped |
-| §18.3 Content-Length framing | Partial | `Framing::Datagram` truncates / rejects; `Framing::Stream` (TCP/TLS) requires an exact C-L; `Framing::Message` (WS/WSS per RFC 7118 §5, SCTP per RFC 4168) makes C-L optional but exact if present. The soft client uses `Stream` on TCP/TLS; sbc-daemon still uses datagram rules everywhere (POA&M-64) |
+| §18.3 Content-Length framing | Partial | `Framing::Datagram` truncates / rejects; `Framing::Stream` (TCP/TLS) requires an exact C-L; `Framing::Message` (WS/WSS per RFC 7118 §5, SCTP per RFC 4168) makes C-L optional but exact if present. The soft client uses `Stream` on TCP/TLS. sbc-daemon's stream framer (`next_sip_frame`) now applies the same C-L rules via `SipMessage::stream_message_len`: on TCP/TLS a missing, duplicate, conflicting or malformed C-L (§20.14) gets a 400 and the connection closes; the subsequent parse still uses datagram rules (POA&M-64). Tests `duplicate_cl_gets_400_and_close`, `duplicate_content_length_rejected`, `malformed_content_length_rejected`, `reframing_any_split_is_identical` |
 | §8.1.1.5 CSeq < 2^31, CSeq method = request method | Complete | Exact, case-sensitive comparison (§7.1) |
 | §20.22 Max-Forwards 0-255 | Complete (stricter than grammar) | §20.22 grammar is `1*DIGIT`; values above 255 (the §16.6 cap) are rejected as 400-class. Tests `max_forwards_range`, `max_forwards_bounds` |
 | Duplicate single-valued headers (RFC 4475 §3.3.8/§3.3.9) | Complete | Call-ID, To, From, CSeq, Max-Forwards, Content-Length |
-| §8.2.2 / §16.3 400 for malformed requests | Missing | Daemon logs and drops (POA&M-63) |
+| §8.2.2 / §16.3 400 for malformed requests | Partial | sbc-daemon sends a sanitized 400 for stream framing errors only (`framing_error_response`, test `framing_error_response_is_minimal_400`); other malformed requests are logged and dropped (POA&M-63) |
 | §22 digest verifier | Partial | Not reviewed in Phase 1 (POA&M-65); empty input and parameter caps fixed |
 | RFC 3323 topology hiding | Partial | Not reviewed in Phase 1 (POA&M-65) |
 | RFC 3327 Path | Partial | Only list splitting fixed (`path_values` splits combined values) |
+
+### sbc-daemon stream and WebSocket transport (RFC 7118, RFC 6455, RFC 3261 §18.3, RFC 5626 §4.4.1)
+
+| Item | Status | Wiring | Notes |
+|------|--------|--------|-------|
+| RFC 7118 §4 `sip` subprotocol | Complete | Wired (sbc-daemon, plain WS) | `sip` echoed when offered; an upgrade without it gets HTTP 400 (`uc-transport/src/websocket.rs`). Tests `ws_handshake_accepts_sip_subprotocol_and_echoes_it`, `ws_handshake_rejects_missing_subprotocol`, `qa_ws_handshake_selects_sip_from_offer_list`, integration `ws_upgrade_without_sip_subprotocol_is_refused`. `transport.ws_require_sip_subprotocol = false` admits a missing header and is non-conformant (an offer of only other protocols is still refused, `ws_handshake_rejects_non_sip_subprotocol_even_when_not_required`) |
+| RFC 7118 §5 one SIP message per WS message | Complete | Wired (sbc-daemon) | C-L optional but exact if present; a WS message without a header terminator is discarded and not joined to the next one (test `ws_partial_message_is_not_spliced`) |
+| RFC 6455 §10.4 size limits | Complete | Wired (sbc-daemon) | Message and frame caps 65,535 bytes (`MAX_WS_MESSAGE_SIZE`, `sip_ws_config`). Tests `ws_rejects_message_over_64k`, `qa_ws_message_at_limit_is_delivered`, `qa_ws_fragmented_message_over_limit_rejected`, `ws_message_limit_fits_sip_stream_limit` |
+| RFC 3261 §18.3 / §20.14 stream C-L | Complete (framing) | Wired (sbc-daemon) | Missing, duplicate, conflicting or malformed C-L on TCP/TLS: 400 (Via/From/To/Call-ID/CSeq) then close; bad responses are discarded silently. See the §18.3 row above |
+| RFC 5626 §4.4.1 CRLF keep-alive pong | Complete | Wired (sbc-daemon, TCP/TLS) | Each CRLFCRLF ping is counted, including one split across reads; one CRLF pong is written per batch of pings read together, not one per ping. Keepalives count only after the first accepted message. Tests `crlf_ping_gets_single_crlf_pong`, `keepalive_counts_pings_and_waits_on_a_lone_crlf`, `crlf_after_first_message_keeps_flow_alive` |
 
 #### RFC 4475 results (`crates/proto/proto-sip/tests/rfc4475.rs`)
 
@@ -219,6 +229,7 @@ RFC 3261 §17 is wired into sbc-daemon and the soft client. RFC 3262 (PRACK/100r
 | §4.2 | Instance-ID | Complete | Wired (sbc-daemon) | Daemon parses `+sip.instance` into the binding |
 | §4.3 | Reg-ID | Complete | Wired (sbc-daemon) | Daemon parses `reg-id` into the binding |
 | §4.4 | Flow Token | Partial | Library-only | Generation only |
+| §4.4.1 | CRLF keep-alive (server pong) | Complete | Wired (sbc-daemon, TCP/TLS) | One CRLF pong per batch of pings; see sbc-daemon stream transport section |
 | §5.1 | Outbound Proxy Discovery | Partial | Library-only | Basic support |
 | §5.2 | Registrar Flow Maintenance | Complete | Library-only | `outbound.rs` FlowManager; no caller |
 | §5.3 | Edge Proxy Routing | Complete | Library-only | Flow token routing; no caller |

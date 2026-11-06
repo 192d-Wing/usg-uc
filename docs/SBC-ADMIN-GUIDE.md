@@ -167,8 +167,42 @@ If no listeners are configured, the SBC binds to `[::]:5060` (IPv6 with IPv4 fal
 
 Stream transports (TCP/TLS) frame messages by `Content-Length`
 (RFC 3261 §18.3) and return responses over the connection the request
-arrived on. Failed TLS handshakes are logged and do not stop the
-listener.
+arrived on. A missing, duplicate (even if equal), malformed or oversized
+`Content-Length` on TCP/TLS closes the connection; a request gets a
+minimal `400 Bad Request` first (counted in `framing_errors`). WebSocket
+messages may omit `Content-Length` (RFC 7118 §5). Failed TLS handshakes
+are logged and do not stop the listener.
+
+Stream connection limits (NIST SC-5, SC-10):
+
+```toml
+[transport]
+max_connections_per_listener = 10000  # pool per TCP/TLS/WS listener (1..=1000000)
+max_connections_total = 20000         # node-wide ceiling, all listeners (1..=4000000)
+max_connections_per_source = 128      # per IPv4 address / IPv6 prefix, all listeners
+                                      # (1..=max_connections_per_listener); raise for
+                                      # NATs or PBXs that funnel many phones
+handshake_timeout_secs = 10           # TLS and WebSocket handshake deadline (1..=60)
+first_message_timeout_secs = 30       # a new connection must send an accepted SIP
+                                      # message within this (1..=tcp_idle_timeout_secs)
+tcp_idle_timeout_secs = 300           # idle limit afterwards (30..=3600)
+ws_require_sip_subprotocol = true     # refuse WS upgrades without `sip` (RFC 7118 §4)
+```
+
+Before a connection's first accepted message (one that parses as SIP),
+bare CRLF keep-alives, partial-message drips and unparseable frames do
+not count as activity; afterwards CRLF keep-alives keep an RFC 5626 flow
+alive. On TCP/TLS a double-CRLF ping is answered with a single-CRLF pong
+(RFC 5626 §4.4.1). WebSocket upgrades run off the accept loop under
+`handshake_timeout_secs`, the reply echoes `Sec-WebSocket-Protocol: sip`,
+and WS messages and frames are capped at 65,535 bytes. Each WS message
+must hold one complete SIP message (RFC 7118 §5); an incomplete one is
+discarded (counted as a framing error) and never joined to the next.
+
+> **Note:** `ws_require_sip_subprotocol = false` admits WebSocket upgrades
+> that offer no subprotocol. This is **not conformant with RFC 7118 §4**
+> (the client MUST offer `sip`) and exists only for legacy clients; an
+> offer that lists only other subprotocols is still refused.
 
 > **Note:** setting `security.tls_cert_path` also activates HTTPS on the
 > REST API. Unless `transport.api_tls_listen` is set, the API server
@@ -687,7 +721,31 @@ global_rps = 10000              # Global requests per second
 per_ip_rps = 100                # Per source IP
 per_user_rps = 50               # Per From user (after parsing); 0 disables. Over the rate → 503 + Retry-After: 1
 burst_multiplier = 2.0          # Allow short bursts
+ipv6_prefix_len = 64            # IPv6 sources keyed per /64 (32..=128); v4-mapped = IPv4
+max_tracked_sources = 65536     # per-source buckets (1024..=4194304)
+max_blocked_sources = 16384     # blocked-source cap (1..=max_tracked_sources)
+overflow_rps = 0                # shared bucket for new sources past the cap;
+                                # 0 = auto (1000 clamped to per_ip_rps..=global_rps)
+block_duration_secs = 60        # block after exceeding 2x per_ip_rps (1..=86400)
+sweep_interval_secs = 10        # expired blocks / idle buckets sweep (1..=300)
+audit_interval_secs = 60        # rejection audit aggregation interval (1..=3600)
+audit_max_records_per_interval = 1024  # per-interval audit record cap (1..=65536)
 ```
+
+The per-source limiter runs first; the global limiter is consulted only
+for messages the per-source limiter allowed, and it never blocks a source.
+Rate-limit audit records (`RateLimitTriggered`) are aggregated, not per
+packet. `limit_name` values: `per_ip_rps` (rejections per source per
+interval), `global_rps` (source `0.0.0.0`), `overflow_rps` (source `::`),
+`per_ip_blocked_drops` (messages dropped while the source was blocked),
+`per_ip_conn` (connection-cap rejections), `listener_conn` / `total_conn`
+(accepts dropped on a full listener or node-wide pool; source `0.0.0.0`,
+one warning logged per interval), `framing` (stream Content-Length
+framing rejections and discarded partial WS messages, per source),
+`per_ip_block:/<prefix>:<secs>s` (immediate; source is the blocked
+address or IPv6 prefix, `request_count` 0), `per_ip_unblock` (immediate)
+and `per_ip_rps_suppressed` (sum beyond the per-interval cap; `threshold`
+= number of suppressed entries).
 
 `global_rps` and `per_ip_rps` feed two `uc-dos-protection` token-bucket limiters in `sbc-daemon/src/server.rs`. `general.max_calls` additionally rejects INVITEs with 503 once the concurrent-call limit is reached. When rate limits are exceeded:
 

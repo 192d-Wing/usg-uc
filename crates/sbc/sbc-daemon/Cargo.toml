@@ -113,3 +113,5 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 # Thread-local audit capture for tests asserting audit records.
 uc-audit = { workspace = true, features = ["test-capture"] }
 tempfile.workspace = true
+# Paused-clock tests for stream idle / first-message deadlines.
+tokio = { workspace = true, features = ["test-util"] }
