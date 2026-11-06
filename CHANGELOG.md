@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-11-06
+
+SBC release with three operator-breaking changes: call detail records,
+STIR/SHAKEN, and SIP transport on every leg (POA&M-5). The client is not
+released with this version; client crates share the workspace version
+number only.
+
+### Upgrade checklist (operators)
+
+1. **CDRs are on by default.** Make sure the CDR directory is writable (Helm
+   gives it its own PVC). The daemon refuses to start if it isn't, or if none
+   of the newest CDR files holds a complete record.
+2. **CDR access moved.** OIDC `config-admin` alone no longer reads CDRs; grant
+   `cdr:read` / `cdr:export`. In Helm, `/api/v1/cdrs` returns 503 until
+   `sbcDaemon.grpcMtls` is configured. sbc-api exits with code 5 if audit
+   logging can't start.
+3. **CDR schema is v2** (STIR fields added). Readers must accept v1 and v2;
+   a file mixing both is rejected by `sbc-cli cdrs verify`.
+4. **STIR/SHAKEN config is nested.** `[stir_shaken]` now has
+   `signing` / `attestation` / `verification` tables and rejects unknown keys;
+   the old flat keys still parse for this release with a warning.
+   `verification_enabled` now defaults to false and the default attestation
+   is C. Helm: `sbcDaemon.stirShaken`.
+5. **TLS trunks need trust anchors and a listener.** Set
+   `security.trunk_tls_ca_path` (Helm: `sbcDaemon.trunkTls.caConfigMap` or
+   `caSecretName`) and `tls_listen`; TCP trunks need `tcp_listen`. Without the
+   CA a TLS trunk fails closed.
+6. **Trunk Request-URI uses the trunk host:port**, not the dialled host; the
+   CDR destination host can change accordingly.
+7. **Registered phones are reached only on the connection they registered
+   on.** A phone registered over TLS whose connection is gone gets 503, never
+   UDP.
+
+### Changed (release)
+
+- Workspace version 0.9.0 → 0.10.0; Helm chart version and appVersion
+  0.8.0 → 0.10.0.
+- tokio 1.53.2 → 1.54.1, fixing RUSTSEC-2026-0386 (`AsyncFd` I/O-safety
+  unsoundness).
+- New `deny.toml`: `cargo deny check` (licenses, advisories, bans, sources)
+  now passes. Licenses are an explicit permissive allow-list; git sources are
+  limited to the first-party RADIUS crate (NIST 800-53 SR-3, SR-4, CM-10).
+- `client-gui-tauri` now inherits the workspace license (Apache-2.0).
+- `security.trunk_tls_ca_path` is accepted with no TLS trunk in the config
+  file, so TLS trunks synced over the API (as in Helm) can connect.
+
+### Added (deploy)
+
+- Helm `sbcDaemon.trunkTls` (trunk CA bundle from a ConfigMap or Secret,
+  mounted at `/etc/sbc/trunk-ca`).
+- Helm `sbcDaemon.stirShaken`: verification with an STI-CR anchors ConfigMap,
+  and signing with a Secret. The init container copies the signing key to a
+  memory-backed volume owned by the daemon uid at mode 0400, as the signer
+  requires. Per-trunk sign/verify still come only from `[[trunk_groups]]` in
+  the config file (POA&M-34).
+
 ### Fixed (SBC, Security, POA&M-5 / SC-8)
 
 - **Requests go out on the target leg's transport.** Before this fix, a B-leg INVITE, BYE or CANCEL triggered by a TCP/TLS caller was written back down the *caller's* connection. That was a misroute, and it leaked trunk routing and the STIR Identity to the caller. Timer-driven sends (retransmissions, failover INVITEs, BYEs, 408s) all went out on the UDP socket. Now every message carries an explicit flow: the caller's transport for the A-leg, and the trunk's `protocol` for the B-leg. The daemon opens outbound TCP/TLS connections to trunks, reuses them, and reads trunk responses from them (`sbc-daemon`)
@@ -18,14 +74,14 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added (SBC, config)
 
-- `security.trunk_tls_ca_path` sets the trust anchors for trunk server certificates. It is required when any trunk uses `protocol = "tls"` and rejected when no trunk does. Per-trunk `tls_server_name` and `tls_client_cert` (mTLS to the trunk, default off) are TLS-only (`sbc-config`, `uc-routing`)
+- `security.trunk_tls_ca_path` sets the trust anchors for trunk server certificates. It is required when any trunk in the config file uses `protocol = "tls"`, and may also be set with no TLS trunk in the file so that TLS trunks synced over the API can connect. Per-trunk `tls_server_name` and `tls_client_cert` (mTLS to the trunk, default off) are TLS-only (`sbc-config`, `uc-routing`)
 - Flow metrics on `/metrics`: `sip_egress_connections`, `sip_egress_connect_failures_total`, `sip_egress_dial_backoff_total`, `sip_send_no_connection_total`, `sip_stream_write_timeouts_total`, `sip_send_lane_dropped_total`, `sip_send_lane_overflow_total` (`sbc-daemon`)
 - Via `rport` (RFC 3581) on SBC-originated UDP requests (`sbc-daemon`)
 - `uc_transport::tls::create_client_config_with(TlsClientOptions)` takes extra roots, a minimum TLS version and an optional client certificate (`uc-transport`)
 
 ### Changed (BREAKING, SBC config)
 
-- A config with a `protocol = "tls"` trunk now fails validation unless `security.trunk_tls_ca_path` is set. Operators must mount the trunk CA bundle (Helm/Ansible) before upgrading
+- A config with a `protocol = "tls"` trunk now fails validation unless `security.trunk_tls_ca_path` is set. Operators must mount the trunk CA bundle before upgrading (Helm: `sbcDaemon.trunkTls`)
 - A `protocol = "tcp"` or `"tls"` trunk now requires a matching listener of that transport; configs without one fail validation
 - B-leg INVITEs to trunks now use the trunk's host and port in the Request-URI instead of the dialled host. Trunks or downstream parsers matching on the dialled host must be updated
 - Registered phones are reached only on their registration flow. A UDP caller calling a TLS-registered phone whose connection has closed gets 503 (no UDP fallback, SC-8)

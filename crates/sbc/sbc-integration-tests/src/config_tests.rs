@@ -347,6 +347,17 @@ fn qa_helm_rendered_sbc_config_validates() {
             "false",
         ),
         ("{{ .Values.sbcDaemon.sipTls.secretName }}", "sip-tls"),
+        // values.yaml sbcDaemon.trunkTls / stirShaken (rendered with the
+        // optional blocks on in the keep_if_bodies pass).
+        (
+            "{{ .Values.sbcDaemon.stirShaken.verificationEnabled }}",
+            "true",
+        ),
+        ("{{ .Values.sbcDaemon.stirShaken.signingEnabled }}", "true"),
+        (
+            "{{ .Values.sbcDaemon.stirShaken.certificateUrl | quote }}",
+            "\"https://certs.example.net/sti.pem\"",
+        ),
         // values.yaml sbcDaemon.cdr defaults.
         ("{{ .Values.sbcDaemon.cdr.enabled }}", "true"),
         (

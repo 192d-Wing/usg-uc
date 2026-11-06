@@ -211,6 +211,29 @@ require_mtls = false
 tls_cert_path = "/etc/sbc/sip-tls/tls.crt"
 tls_key_path = "/etc/sbc/sip-tls/tls.key"
 {{- end }}
+{{- if or .Values.sbcDaemon.trunkTls.caConfigMap .Values.sbcDaemon.trunkTls.caSecretName }}
+# Trust anchors for TLS SIP trunks (never the client-issuing CA).
+trunk_tls_ca_path = "/etc/sbc/trunk-ca/ca.pem"
+{{- end }}
+{{- if or .Values.sbcDaemon.stirShaken.verificationEnabled .Values.sbcDaemon.stirShaken.signingEnabled }}
+
+[stir_shaken]
+verification_enabled = {{ .Values.sbcDaemon.stirShaken.verificationEnabled }}
+signing_enabled = {{ .Values.sbcDaemon.stirShaken.signingEnabled }}
+{{- if .Values.sbcDaemon.stirShaken.verificationEnabled }}
+
+[stir_shaken.verification]
+trust_anchors_path = "/etc/sbc/sti-cr/sti-cr.pem"
+{{- end }}
+{{- if .Values.sbcDaemon.stirShaken.signingEnabled }}
+
+[stir_shaken.signing]
+certificate_path = "/etc/sbc/sti/tls.crt"
+private_key_path = "/etc/sbc/sti/tls.key"
+certificate_url = {{ .Values.sbcDaemon.stirShaken.certificateUrl | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
 
 [monitoring]
 metrics_bind = {{ .Values.sbcDaemon.config.metrics_listen | quote }}

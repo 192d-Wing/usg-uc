@@ -469,6 +469,35 @@ sbcDaemon:
   # logs a warning for the configured tls_listen.
   sipTls:
     secretName: ""
+  # Trust anchors for TLS SIP trunks (security.trunk_tls_ca_path). Name of a
+  # ConfigMap or Secret (key below) holding a PEM bundle of the CAs that issue
+  # trunk server certificates, mounted at /etc/sbc/trunk-ca. Required before
+  # any trunk with protocol = "tls" can connect: without it the daemon has no
+  # trunk TLS client and TLS trunks fail closed (never downgrade). Kept apart
+  # from the client-issuing CA used for mTLS.
+  trunkTls:
+    caConfigMap: ""
+    caSecretName: ""
+    caKey: "ca.crt"
+  # STIR/SHAKEN (RFC 8224/8225/8588). Off by default. Note: per-trunk
+  # sign/verify switches come only from [[trunk_groups]] in the config file
+  # (POA&M-34); trunks synced over the API get neither.
+  stirShaken:
+    # Inbound verification. Needs the STI-CR trust-anchor bundle.
+    verificationEnabled: false
+    # ConfigMap holding the STI-CR anchors PEM (key below), mounted at
+    # /etc/sbc/sti-cr.
+    trustAnchorsConfigMap: ""
+    trustAnchorsKey: "sti-cr.pem"
+    # Outbound signing (ES256, documented CNSA 2.0 exception).
+    signingEnabled: false
+    # Secret with the STI certificate chain (tls.crt) and PKCS#8 key (tls.key).
+    # The init container copies them to a memory-backed /etc/sbc/sti owned by
+    # the daemon uid with the key at mode 0400 (the signer rejects anything
+    # group/other-readable or owned by another uid).
+    signingSecretName: ""
+    # Public HTTPS URL where the STI certificate is published (x5u).
+    certificateUrl: ""
   # RFC 8898 Bearer-token REGISTER authorization. When enabled, the daemon
   # rejects REGISTERs that don't carry a valid OIDC access token whose `dn`
   # claim equals the AOR user part — the server-side half of the soft

@@ -1,0 +1,66 @@
+# cargo-deny policy (licenses, advisories, bans, sources).
+#
+# NIST 800-53 Rev5: SR-3 (Supply Chain Controls), SR-4 (Provenance),
+# CM-10 (Software Usage Restrictions), RA-5 (Vulnerability Monitoring)
+#
+# Run: `cargo deny check`. The license allow-list is the set of permissive
+# licenses the dependency tree actually uses (as of 0.10.0); adding a crate
+# under any other license fails the check until it is reviewed here.
+
+[graph]
+all-features = true
+
+[advisories]
+# Unmaintained crates fail only when a workspace crate depends on them
+# directly; transitive ones (askama -> basic-toml, serde_yaml_ng ->
+# unsafe-libyaml) are reported by cargo-audit as warnings and tracked there.
+unmaintained = "workspace"
+# Keep in step with .cargo/audit.toml; each ignore is justified there.
+ignore = [
+    "RUSTSEC-2024-0429",
+    "RUSTSEC-2024-0370",
+    "RUSTSEC-2023-0071",
+]
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    # File-level copyleft; used unmodified as a dependency, so no source
+    # disclosure obligation for this codebase.
+    "MPL-2.0",
+    # aws-lc / ring legacy OpenSSL-derived code.
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[licenses.private]
+# Crates marked `publish = false` are not license-checked. Every workspace
+# crate also inherits the workspace `license` (Apache-2.0).
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+# Workspace crates use versionless `path` dependencies and none is
+# published to crates.io, so path wildcards are expected; registry
+# dependencies in this tree all carry versions.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# First-party RADIUS protocol crate (uc-aaa `radius` feature).
+allow-git = ["https://github.com/192d-Wing/usg-radius.git"]

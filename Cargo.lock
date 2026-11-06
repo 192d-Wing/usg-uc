@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "central-config-api"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "central-config-import"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "central-config-store",
  "sbc-config-store",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "central-config-store"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "serde",
@@ -997,7 +997,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "client-audio"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "client-types",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "client-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "client-ffi"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "client-audio",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "client-integration-tests"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "client-audio",
  "client-core",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "client-provisioning"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "client-sip-ua"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "client-types"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1521,7 +1521,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote 1.0.47",
- "syn 3.0.7",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1768,7 +1768,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2000,7 +2000,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3947,7 +3947,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4057,7 +4057,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4686,7 +4686,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.45.0",
 ]
 
 [[package]]
@@ -5292,14 +5292,14 @@ dependencies = [
 
 [[package]]
 name = "proto-b2bua"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "proto-dialog"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "proto-sip",
  "thiserror 2.0.21",
@@ -5307,7 +5307,7 @@ dependencies = [
 
 [[package]]
 name = "proto-dtls"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5320,7 +5320,7 @@ dependencies = [
 
 [[package]]
 name = "proto-ice"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-stun",
@@ -5334,7 +5334,7 @@ dependencies = [
 
 [[package]]
 name = "proto-jwt"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -5349,7 +5349,7 @@ dependencies = [
 
 [[package]]
 name = "proto-registrar"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -5366,7 +5366,7 @@ dependencies = [
 
 [[package]]
 name = "proto-rtp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.21",
@@ -5376,7 +5376,7 @@ dependencies = [
 
 [[package]]
 name = "proto-sdp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -5387,7 +5387,7 @@ dependencies = [
 
 [[package]]
 name = "proto-sip"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -5397,7 +5397,7 @@ dependencies = [
 
 [[package]]
 name = "proto-srtp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-rtp",
@@ -5410,7 +5410,7 @@ dependencies = [
 
 [[package]]
 name = "proto-stir-shaken"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "proptest",
@@ -5421,7 +5421,7 @@ dependencies = [
 
 [[package]]
 name = "proto-stun"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.21",
@@ -5433,7 +5433,7 @@ dependencies = [
 
 [[package]]
 name = "proto-transaction"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "proto-sip",
  "thiserror 2.0.21",
@@ -5441,7 +5441,7 @@ dependencies = [
 
 [[package]]
 name = "proto-turn"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-stun",
@@ -5543,7 +5543,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5992,7 +5992,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6068,7 +6068,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-announcement"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "include_dir",
@@ -6080,7 +6080,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-announcement-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "rand 0.8.8",
  "sbc-announcement",
@@ -6094,7 +6094,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-api-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "hyper",
@@ -6123,7 +6123,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-cli"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "sbc-config",
  "sbc-grpc-api",
@@ -6139,7 +6139,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-client-config-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
@@ -6160,7 +6160,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-config"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "nix 0.31.3",
  "rustls-pki-types",
@@ -6183,7 +6183,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-config-store"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6197,7 +6197,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-config-sync"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "central-config-store",
@@ -6218,7 +6218,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-daemon"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -6290,7 +6290,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-grpc-api"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -6304,7 +6304,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-http-util"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "http",
  "ipnet",
@@ -6312,7 +6312,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-integration-tests"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -6336,7 +6336,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-media"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "sbc-grpc-api",
  "sbc-media-core",
@@ -6350,7 +6350,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-media-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6373,7 +6373,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-provision-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "hex",
@@ -6395,7 +6395,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-trunk-agent"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "sbc-config-store",
  "sbc-grpc-api",
@@ -6410,7 +6410,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-trunk-services"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-sip",
@@ -6983,7 +6983,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7261,7 +7261,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7750,7 +7750,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7879,9 +7879,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -8326,7 +8326,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8366,7 +8366,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "uc-aaa"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "diameter",
@@ -8381,21 +8381,21 @@ dependencies = [
 
 [[package]]
 name = "uc-acl"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-api"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-audit"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "serde",
@@ -8408,7 +8408,7 @@ dependencies = [
 
 [[package]]
 name = "uc-auth"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "argon2",
  "axum",
@@ -8426,7 +8426,7 @@ dependencies = [
 
 [[package]]
 name = "uc-cdr"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -8441,7 +8441,7 @@ dependencies = [
 
 [[package]]
 name = "uc-cluster"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -8456,7 +8456,7 @@ dependencies = [
 
 [[package]]
 name = "uc-codecs"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -8467,7 +8467,7 @@ dependencies = [
 
 [[package]]
 name = "uc-crypto"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "rustls-pki-types",
@@ -8479,7 +8479,7 @@ dependencies = [
 
 [[package]]
 name = "uc-discovery"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "k8s-openapi",
@@ -8508,21 +8508,21 @@ dependencies = [
 
 [[package]]
 name = "uc-dos-protection"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-health"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-media-engine"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-rtp",
@@ -8536,14 +8536,14 @@ dependencies = [
 
 [[package]]
 name = "uc-metrics"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-phone-mgmt"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8554,7 +8554,7 @@ dependencies = [
 
 [[package]]
 name = "uc-policy"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "tracing",
  "uc-types",
@@ -8562,7 +8562,7 @@ dependencies = [
 
 [[package]]
 name = "uc-routing"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "regex",
  "serde",
@@ -8571,7 +8571,7 @@ dependencies = [
 
 [[package]]
 name = "uc-siprec"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "proto-sdp",
  "proto-sip",
@@ -8582,7 +8582,7 @@ dependencies = [
 
 [[package]]
 name = "uc-snmp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "serde",
@@ -8593,7 +8593,7 @@ dependencies = [
 
 [[package]]
 name = "uc-state-sync"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -8609,7 +8609,7 @@ dependencies = [
 
 [[package]]
 name = "uc-sti"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -8636,7 +8636,7 @@ dependencies = [
 
 [[package]]
 name = "uc-storage"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bb8",
  "bb8-redis",
@@ -8654,7 +8654,7 @@ dependencies = [
 
 [[package]]
 name = "uc-syslog"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "serde",
@@ -8678,7 +8678,7 @@ dependencies = [
 
 [[package]]
 name = "uc-telemetry"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "opentelemetry",
@@ -8695,7 +8695,7 @@ dependencies = [
 
 [[package]]
 name = "uc-transport"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -8718,7 +8718,7 @@ dependencies = [
 
 [[package]]
 name = "uc-types"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -8726,7 +8726,7 @@ dependencies = [
 
 [[package]]
 name = "uc-user-mgmt"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -8745,7 +8745,7 @@ dependencies = [
 
 [[package]]
 name = "uc-vps"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "serde",
@@ -8758,7 +8758,7 @@ dependencies = [
 
 [[package]]
 name = "uc-webrtc"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-dtls",
@@ -8787,7 +8787,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9384,7 +9384,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -9405,7 +9405,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
  "raw-window-handle",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "windows-version",
 ]
 
@@ -9870,7 +9870,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
