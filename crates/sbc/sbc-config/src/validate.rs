@@ -645,6 +645,25 @@ fn validate_trunk_groups(config: &SbcConfig) -> ConfigResult<()> {
         }
 
         validate_trunks(group)?;
+
+        // NIST 800-53 Rev5: SC-8, CM-6 — a TLS-only group (its own flag or the
+        // global `security.require_tls_trunks`) without a TLS trunk would
+        // reject every call; refuse the config instead (POA&M-48).
+        if (group.require_tls || config.security.require_tls_trunks)
+            && !group.trunks.iter().any(|t| t.protocol == "tls")
+        {
+            let why = if group.require_tls {
+                "require_tls = true"
+            } else {
+                "security.require_tls_trunks = true"
+            };
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "trunk group '{}': {why} but the group has no trunk with protocol = \"tls\"",
+                    group.id
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -1244,6 +1263,7 @@ mod tests {
             strategy: "priority".to_string(),
             trunks: vec![trunk("t1")],
             zone: None,
+            require_tls: false,
         }
     }
 
@@ -1458,6 +1478,7 @@ mod tests {
                 ..Default::default()
             }],
             zone: None,
+            require_tls: false,
         });
         assert_rejected(&c, "signing_enabled");
     }
@@ -2499,6 +2520,7 @@ mod qa_trunk_tls_edges {
                 ..TrunkConfigSchema::default()
             }],
             zone: None,
+            require_tls: false,
         }
     }
 
@@ -2513,6 +2535,43 @@ mod qa_trunk_tls_edges {
 
     fn err(c: &SbcConfig) -> String {
         super::validate_config(c).unwrap_err().to_string()
+    }
+
+    // POA&M-48 (SC-8): require_tls validation.
+    #[test]
+    fn require_tls_group_needs_a_tls_trunk() {
+        let ca = Some("/etc/sbc/trunk-ca.pem");
+        let mut g = group("a", "udp");
+        g.require_tls = true;
+        assert!(err(&cfg(vec![g.clone()], ca)).contains("require_tls"));
+        g.trunks.clear();
+        assert!(err(&cfg(vec![g.clone()], ca)).contains("require_tls"));
+        // Mixed group is fine.
+        let mut g = group("a", "udp");
+        g.require_tls = true;
+        g.trunks.extend(group("b", "tls").trunks);
+        super::validate_config(&cfg(vec![g], ca)).unwrap();
+    }
+
+    #[test]
+    fn global_require_tls_trunks_applies_to_every_group() {
+        let ca = Some("/etc/sbc/trunk-ca.pem");
+        let mut c = cfg(vec![group("a", "tls"), group("b", "tcp")], ca);
+        super::validate_config(&c).unwrap();
+        c.security.require_tls_trunks = true;
+        assert!(err(&c).contains("security.require_tls_trunks"));
+        c.trunk_groups.truncate(1);
+        super::validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn require_tls_absent_key_defaults_false() {
+        let c = crate::load_from_str(
+            "[[trunk_groups]]\nid = \"g\"\n[[trunk_groups.trunks]]\nid = \"t\"\nhost = \"sip.example.net\"\n",
+        )
+        .unwrap();
+        assert!(!c.trunk_groups[0].require_tls);
+        assert!(!c.security.require_tls_trunks);
     }
 
     #[test]

@@ -32,6 +32,14 @@ async fn main() -> ExitCode {
         "central-config-api starting"
     );
 
+    // Config-change audit records (trunk-group transport policy) go to the
+    // tracing output, target "audit". Fail closed, as sbc-api-server.
+    // NIST 800-53 Rev5: AU-2, AU-5, AU-12, CM-3
+    if let Err(e) = uc_audit::init() {
+        error!(error = %e, "audit logger init failed; refusing to start");
+        return ExitCode::from(6);
+    }
+
     let cfg = match config::Config::from_env() {
         Ok(c) => c,
         Err(e) => {

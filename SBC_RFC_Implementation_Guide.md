@@ -65,7 +65,7 @@ This document provides a comprehensive summary of RFCs required for implementing
 - **Deterministic Ordering:** For stateless proxies, must define deterministic ordering for equal-priority SRV records
 - **SIPS URI Handling:** Must enforce TLS-only transport for SIPS URIs
 
-**Current implementation (sbc-daemon):** no NAPTR/SRV; trunk hosts are resolved with A/AAAA only. Failover is across configured trunks in the selected route groups, not SRV targets: 408, Timer B and 503 (RFC 3263 §4.3) plus 500/502/504 (local policy) move the call to the next trunk; transport send errors do not. A 503 puts the trunk into `cooldown_secs` cooldown; the trunk's `Retry-After` is ignored. See `docs/RFC_COMPLIANCE_GAPS.md`.
+**Current implementation (sbc-daemon):** no NAPTR/SRV; trunk hosts are resolved with A/AAAA only. Failover is across configured trunks in the selected route groups, not SRV targets: 408, Timer B and 503 (RFC 3263 §4.3) plus 500/502/504 (local policy) move the call to the next trunk, and a transport error on the first send of a B-leg INVITE also fails over. A trunk's 503 `Retry-After` sets the trunk cooldown, clamped to `general.trunk_retry_after_max_secs`. A `sips:` Request-URI makes only TLS trunks eligible in every routed group (RFC 3261 §26.2.2); with none eligible the SBC answers 503 with `Reason: Q.850;cause=79` (RFC 6432) and no `Retry-After`. Trunks without a port default to 5061 for TLS and 5060 otherwise. Open: the last trunk's 503 is relayed unchanged when failover is exhausted (RFC-004). See `docs/RFC_COMPLIANCE_GAPS.md`.
 
 **CNSA 2.0 Notes:**
 - DNSSEC validation SHOULD be implemented for DNS security

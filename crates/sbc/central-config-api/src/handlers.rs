@@ -662,12 +662,35 @@ async fn upsert_trunk_group(
     if let Err(msg) = validate_trunk_group_fields(&cfg) {
         return bad_request(msg);
     }
+    // NIST 800-53 Rev5: SC-8, CM-6 (POA&M-48) — same `require_tls` /
+    // `protocol`|`transport` reading as the daemon's TrunkSync path. A
+    // central body is a whole group, so a TLS-only group without a TLS trunk
+    // is refused outright (422), as in a config file.
+    if let Some(resp) = trunk_group_policy_rejection(&body) {
+        return resp;
+    }
+    // Prior version, for the transport-policy audit record. A failed read
+    // only weakens the diff (treated as absent); it never blocks the write.
+    let old = match state
+        .store
+        .get_row(ConfigTable::TrunkGroups, &site, &cfg.id)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(site, group_id = %cfg.id, error = %e, "trunk group prior-version read failed");
+            None
+        }
+    };
     match state
         .store
         .upsert_json(ConfigTable::TrunkGroups, &site, &cfg.id, &body, &actor)
         .await
     {
-        Ok(epoch) => ok_epoch(epoch),
+        Ok(epoch) => {
+            audit_trunk_group_change(&actor, &site, &cfg.id, old.as_ref(), Some(&body));
+            ok_epoch(epoch)
+        }
         Err(e) => write_error(&e),
     }
 }
@@ -684,12 +707,28 @@ async fn delete_trunk_group(
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
+    // Prior version, for the transport-policy audit record (SEC-005). A
+    // failed read only drops the record; it never blocks the delete.
+    let old = match state
+        .store
+        .get_row(ConfigTable::TrunkGroups, &site, &id)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(site, group_id = %id, error = %e, "trunk group prior-version read failed");
+            None
+        }
+    };
     match state
         .store
         .delete(ConfigTable::TrunkGroups, &site, &id, &actor)
         .await
     {
-        Ok(epoch) => ok_epoch(epoch),
+        Ok(epoch) => {
+            audit_trunk_group_change(&actor, &site, &id, old.as_ref(), None);
+            ok_epoch(epoch)
+        }
         Err(e) => write_error(&e),
     }
 }
@@ -795,6 +834,56 @@ fn validate_trunk_group_fields(cfg: &sbc_config::schema::TrunkGroupConfig) -> Re
         return Err("id or name contains control characters".to_string());
     }
     Ok(())
+}
+
+/// `require_tls` transport policy on a trunk-group body: malformed -> 400,
+/// a `require_tls` group without a TLS trunk -> 422.
+fn trunk_group_policy_rejection(body: &Value) -> Option<Response> {
+    use sbc_config_store::TrunkPolicyError;
+    match sbc_config_store::validate_trunk_group_json(body) {
+        Ok(warnings) if warnings.is_empty() => None,
+        Ok(warnings) => Some(unprocessable(warnings.join("; "))),
+        Err(TrunkPolicyError::Invalid(m)) => Some(bad_request(m)),
+        Err(TrunkPolicyError::Policy(m)) => Some(unprocessable(m)),
+    }
+}
+
+/// `ConfigurationChange` audit record for a stored trunk-group upsert or
+/// delete (`new` is `None`) that changed `require_tls` or a trunk's
+/// transport (who, site, group, old/new, outcome). Nothing is written for
+/// other edits.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-3, CM-3 (Configuration Change Control), SC-8
+fn audit_trunk_group_change(
+    actor: &str,
+    site: &str,
+    group_id: &str,
+    old: Option<&Value>,
+    new: Option<&Value>,
+) {
+    let Some(diff) = sbc_config_store::trunk_policy::transport_policy_diff(old, new) else {
+        return;
+    };
+    uc_audit::log_event(uc_audit::AuditEvent::ConfigurationChange(
+        uc_audit::event::ConfigurationChange {
+            admin: actor.to_string(),
+            change_type: uc_audit::event::ConfigChangeType::Modified,
+            description: format!(
+                "site={} trunk_group={} {diff} outcome=success",
+                site.escape_default(),
+                group_id.escape_default()
+            ),
+        },
+    ));
+}
+
+/// 422 for a well-formed body that violates a policy.
+fn unprocessable(detail: impl Into<String>) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({ "error": "unprocessable", "detail": detail.into() })),
+    )
+        .into_response()
 }
 
 /// Valid dial plan directions.
@@ -1979,5 +2068,86 @@ mod tests {
         let (s, b) = send_req(&app, "GET", "/v1/sites/MUHJ/phones", Some(&no_scope), None).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
         assert_eq!(b["error"], "insufficient_scope");
+    }
+}
+
+#[cfg(test)]
+mod trunk_policy_tests {
+    use super::{audit_trunk_group_change, trunk_group_policy_rejection};
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    // POA&M-48 (SC-8): central bodies get the same require_tls checks.
+    #[test]
+    fn require_tls_policy_status_codes() {
+        let status = |b: serde_json::Value| trunk_group_policy_rejection(&b).map(|r| r.status());
+        assert_eq!(status(json!({"id": "g", "trunks": []})), None);
+        assert_eq!(
+            status(json!({"id": "g", "require_tls": "yes"})),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            status(json!({"id": "g", "require_tls": true, "trunks": []})),
+            Some(StatusCode::UNPROCESSABLE_ENTITY)
+        );
+        assert_eq!(
+            status(json!({"id": "g", "require_tls": true,
+                "trunks": [{"id": "t", "host": "h", "protocol": "udp"}]})),
+            Some(StatusCode::UNPROCESSABLE_ENTITY)
+        );
+        assert_eq!(
+            status(json!({"id": "g", "require_tls": true,
+                "trunks": [{"id": "t", "host": "h", "protocol": "tls"}]})),
+            None
+        );
+    }
+
+    // SEC-003 / NIST-001: require_tls / protocol changes are audited.
+    #[test]
+    fn transport_change_is_audited() {
+        let capture = uc_audit::capture::start();
+        let new = json!({"id": "g", "require_tls": true,
+            "trunks": [{"id": "t", "host": "h", "protocol": "tls"}]});
+        audit_trunk_group_change("op1", "SITE", "g", None, Some(&new));
+        audit_trunk_group_change("op1", "SITE", "g", Some(&new), Some(&new));
+        let changes: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::ConfigurationChange(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].admin, "op1");
+        assert_eq!(
+            changes[0].description,
+            "site=SITE trunk_group=g require_tls=false->true trunk_protocols=[t:-->tls] outcome=success"
+        );
+    }
+
+    // SEC-005: deleting a group is audited with new = None.
+    #[test]
+    fn trunk_group_delete_is_audited() {
+        let capture = uc_audit::capture::start();
+        let old = json!({"id": "g", "require_tls": true,
+            "trunks": [{"id": "t", "host": "h", "protocol": "tls"}]});
+        audit_trunk_group_change("op2", "SITE", "g", Some(&old), None);
+        // Deleting an absent group has nothing to report.
+        audit_trunk_group_change("op2", "SITE", "g", None, None);
+        let changes: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::ConfigurationChange(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].admin, "op2");
+        assert_eq!(
+            changes[0].description,
+            "site=SITE trunk_group=g require_tls=true->false trunk_protocols=[t:tls->-] outcome=success"
+        );
     }
 }

@@ -87,6 +87,14 @@ pub struct SipStack {
     dtls_fingerprint_source: Option<Arc<sbc_media_core::dtls_identity::DtlsFingerprintSource>>,
     /// Call router for dial plan matching and trunk selection.
     router: Option<RwLock<Router>>,
+    /// Global `security.require_tls_trunks`, applied to every router built
+    /// (NIST 800-53 Rev5: SC-8, POA&M-48).
+    require_tls_trunks: bool,
+    /// `security.trunk_tls_ca_path` is set (egress TLS to trunks possible).
+    trunk_tls_ca_configured: bool,
+    /// `require_tls` policy counters shared with every router built, read by
+    /// the metrics endpoint without the router lock (SI-4).
+    tls_policy_counters: Arc<uc_routing::TlsPolicyCounters>,
     /// SBC-compatible router for CSS/Partition-based routing.
     sbc_router: Option<Arc<RwLock<uc_routing::SbcRouter>>>,
     /// SIP header manipulator for per-trunk/global header rules.
@@ -646,6 +654,10 @@ struct TrunkLease {
     started: Instant,
     /// Emergency calls take slots past `max_calls`, failover included.
     admission: Admission,
+    /// The caller's Request-URI was `sips:`: every attempt of this call,
+    /// failover included, is TLS-only (RFC 3261 §26.2.2; NIST 800-53 Rev5:
+    /// SC-8).
+    tls_only: bool,
 }
 
 /// A call routed to a trunk: the reserved slot, where to send the INVITE,
@@ -666,8 +678,11 @@ enum TrunkRouting {
     /// No pattern / dial plan entry / trunk group matches the number.
     NoRoute,
     /// A route matched but every trunk is down, cooling down or at
-    /// `max_calls`.
-    Unavailable,
+    /// `max_calls`. `tls_required`: a `require_tls` group refused its only
+    /// usable (non-TLS) trunks (NIST 800-53 Rev5: SC-8, POA&M-48).
+    Unavailable {
+        tls_required: bool,
+    },
     /// The transformed number is unsafe to put in a Request-URI.
     InvalidTranslation,
 }
@@ -942,18 +957,20 @@ fn acquire_next_target(
     router: &mut Router,
     targets: &mut Vec<(String, String)>,
     admission: Admission,
+    tls_only: bool,
 ) -> Option<(TrunkLease, String)> {
     let mut consumed = 0;
     let mut found = None;
     for (group_id, trunk_id) in targets.iter() {
         consumed += 1;
-        if let Some(uri) = router.acquire_trunk_for(group_id, trunk_id, admission) {
+        if let Some(uri) = router.acquire_trunk_for_tls(group_id, trunk_id, admission, tls_only) {
             found = Some((
                 TrunkLease {
                     group_id: group_id.clone(),
                     trunk_id: trunk_id.clone(),
                     started: Instant::now(),
                     admission,
+                    tls_only,
                 },
                 uri,
             ));
@@ -1187,6 +1204,9 @@ impl SipStack {
             media_pipeline: None,
             dtls_fingerprint_source: None,
             router: None,
+            require_tls_trunks: false,
+            trunk_tls_ca_configured: false,
+            tls_policy_counters: Arc::default(),
             sbc_router: None,
             header_manipulator: None,
             topology_hider: None,
@@ -1249,6 +1269,9 @@ impl SipStack {
             media_pipeline: None,
             dtls_fingerprint_source: None,
             router: None,
+            require_tls_trunks: false,
+            trunk_tls_ca_configured: false,
+            tls_policy_counters: Arc::default(),
             sbc_router: None,
             header_manipulator: None,
             topology_hider: None,
@@ -2809,6 +2832,7 @@ impl SipStack {
         dest_user: &str,
         css: Option<&str>,
         admission: Admission,
+        tls_only: bool,
     ) -> TrunkRouting {
         let Some(router_lock) = self.router.as_ref() else {
             warn!("No router configured on SIP stack");
@@ -2822,6 +2846,7 @@ impl SipStack {
         };
 
         let mut matched_trunks = false;
+        let mut tls_required = false;
         let decision = {
             let mut router = router_lock.write().await;
             let mut decision = None;
@@ -2833,14 +2858,21 @@ impl SipStack {
                     css = ?css,
                     "Routed via SBC CSS/Partition"
                 );
-                match router.route_to_groups_for(
+                // RFC 3261 §26.2.2: a `sips:` call is TLS-only in every
+                // group (NIST 800-53 Rev5: SC-8).
+                match router.route_to_groups_for_tls(
                     &result.transformed_number,
                     &result.route_group_ids,
                     admission,
+                    tls_only,
                 ) {
                     Ok(d) => decision = Some(d),
-                    Err(RoutingError::AllTrunksFailed { trunks_tried }) if trunks_tried > 0 => {
+                    Err(RoutingError::AllTrunksFailed {
+                        trunks_tried,
+                        tls_required: tls,
+                    }) if trunks_tried > 0 || tls => {
                         matched_trunks = true;
+                        tls_required |= tls;
                     }
                     Err(e) => {
                         warn!(error = %e, "SBC route groups match no trunk group; trying dial plan");
@@ -2849,10 +2881,14 @@ impl SipStack {
             }
             if decision.is_none() && !matched_trunks {
                 debug!(dest = %dest_user, "Attempting dial plan routing");
-                match router.route_for(dest_user, admission) {
+                match router.route_for_tls(dest_user, admission, tls_only) {
                     Ok(d) => decision = Some(d),
-                    Err(RoutingError::AllTrunksFailed { trunks_tried }) if trunks_tried > 0 => {
+                    Err(RoutingError::AllTrunksFailed {
+                        trunks_tried,
+                        tls_required: tls,
+                    }) if trunks_tried > 0 || tls => {
                         matched_trunks = true;
+                        tls_required |= tls;
                     }
                     Err(e) => warn!(dest = %dest_user, error = %e, "Dial plan routing failed"),
                 }
@@ -2862,7 +2898,7 @@ impl SipStack {
 
         let Some(decision) = decision else {
             return if matched_trunks {
-                TrunkRouting::Unavailable
+                TrunkRouting::Unavailable { tls_required }
             } else {
                 TrunkRouting::NoRoute
             };
@@ -2873,6 +2909,7 @@ impl SipStack {
             trunk_id: decision.trunk_id,
             started: Instant::now(),
             admission,
+            tls_only,
         };
         let translated = decision.destination;
         let mut failover = decision.failover_targets;
@@ -2922,14 +2959,18 @@ impl SipStack {
             let next = {
                 let mut router = router_lock.write().await;
                 router.release_trunk(&lease.group_id, &lease.trunk_id, TrunkOutcome::Failed);
-                acquire_next_target(&mut router, &mut failover, admission)
+                acquire_next_target(&mut router, &mut failover, admission, tls_only)
             };
             match next {
                 Some((l, u)) => {
                     lease = l;
                     uri = u;
                 }
-                None => return TrunkRouting::Unavailable,
+                None => {
+                    return TrunkRouting::Unavailable {
+                        tls_required: false,
+                    };
+                }
             }
         }
     }
@@ -2954,7 +2995,13 @@ impl SipStack {
     ///
     /// The retried INVITE is addressed and sent per the next trunk's
     /// configured protocol (`sips:`/TLS, TCP, UDP), never downgraded to the
-    /// failed attempt's transport (POA&M-5 closed).
+    /// failed attempt's transport (POA&M-5 closed). In a `require_tls`
+    /// group the next target is only ever a TLS trunk: non-TLS trunks are
+    /// left out of the failover order and refused again by
+    /// `Router::acquire_trunk_for_tls`, so with no TLS trunk left the call
+    /// fails rather than downgrading (POA&M-48 closed). The same holds in any
+    /// group when the caller's Request-URI was `sips:` (lease `tls_only`):
+    /// RFC 3261 §26.2.2 requires TLS on every hop to the target domain.
     ///
     /// ## NIST 800-53 Rev5: SC-8; RFC 3261 §18.1.1, §26.2; RFC 3263 §4.3
     async fn try_failover(
@@ -2977,7 +3024,12 @@ impl SipStack {
         let (lease, new_dest, endpoint) = loop {
             let (next, endpoint) = {
                 let mut router = router_lock.write().await;
-                let next = acquire_next_target(&mut router, &mut remaining, old_lease.admission)?;
+                let next = acquire_next_target(
+                    &mut router,
+                    &mut remaining,
+                    old_lease.admission,
+                    old_lease.tls_only,
+                )?;
                 let endpoint = TrunkEndpoint::of(&router, &next.0.group_id, &next.0.trunk_id);
                 (next, endpoint)
             };
@@ -3258,6 +3310,40 @@ impl SipStack {
         self.emergency_admissions.load(Ordering::Relaxed)
     }
 
+    /// `require_tls` policy counters (`routing_tls_required_*`).
+    pub fn tls_policy_counters(&self) -> &uc_routing::TlsPolicyCounters {
+        &self.tls_policy_counters
+    }
+
+    /// Sets the global TLS-only trunk policy (`security.require_tls_trunks`).
+    /// Call before [`Self::init_router_from_config`]; also applied to a router
+    /// that already exists.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8 (POA&M-48)
+    pub fn set_require_tls_trunks(&mut self, on: bool) {
+        self.require_tls_trunks = on;
+        if let Some(router) = self.router.as_mut() {
+            router.get_mut().set_require_tls_default(on);
+        }
+    }
+
+    /// Records whether `security.trunk_tls_ca_path` is set, so trunk syncs
+    /// can flag TLS trunks that will fail closed (NIST 800-53 Rev5: SI-4).
+    pub fn set_trunk_tls_ca_configured(&mut self, configured: bool) {
+        self.trunk_tls_ca_configured = configured;
+    }
+
+    /// Whether `security.trunk_tls_ca_path` is set.
+    pub fn trunk_tls_ca_configured(&self) -> bool {
+        self.trunk_tls_ca_configured
+    }
+
+    /// Applies the stack-wide TLS policy and shared counters to a new router.
+    fn prepare_router(&self, router: &mut Router) {
+        router.set_tls_policy_counters(Arc::clone(&self.tls_policy_counters));
+        router.set_require_tls_default(self.require_tls_trunks);
+    }
+
     /// Attaches the CDR pipeline. Call before the stack is shared.
     pub fn set_cdr(&mut self, cdr: Arc<crate::cdr::CdrContext>) {
         self.cdr = Some(cdr);
@@ -3444,6 +3530,7 @@ impl SipStack {
         };
 
         let mut router = Router::new(router_config);
+        self.prepare_router(&mut router);
 
         // Load trunk groups first (dial plan entries reference them)
         for tg_config in trunk_group_configs {
@@ -3455,7 +3542,11 @@ impl SipStack {
                 _ => SelectionStrategy::Priority,
             };
 
-            let mut group = TrunkGroup::new(&tg_config.id, &tg_config.name).with_strategy(strategy);
+            // NIST 800-53 Rev5: SC-8 — TLS-only egress for this group
+            // (POA&M-48); the router ORs in `security.require_tls_trunks`.
+            let mut group = TrunkGroup::new(&tg_config.id, &tg_config.name)
+                .with_strategy(strategy)
+                .with_require_tls(tg_config.require_tls);
 
             for t_config in &tg_config.trunks {
                 let protocol = match t_config.protocol.as_str() {
@@ -5197,7 +5288,12 @@ impl SipStack {
                 }
 
                 match self
-                    .route_to_trunk(&dest_user, css_id_owned.as_deref(), admission)
+                    .route_to_trunk(
+                        &dest_user,
+                        css_id_owned.as_deref(),
+                        admission,
+                        req.uri.scheme.requires_tls(),
+                    )
                     .await
                 {
                     TrunkRouting::Routed(route) => {
@@ -5225,24 +5321,42 @@ impl SipStack {
                         reject_cdr(final_status(&result), uc_cdr::ReleaseCause::NoRoute);
                         return result;
                     }
-                    TrunkRouting::Unavailable => {
+                    TrunkRouting::Unavailable { tls_required } => {
                         // Every trunk of the matched route is down, cooling
                         // down or at max_calls: 503 + Retry-After (RFC 3261
-                        // §21.5.4), no queuing.
+                        // §21.5.4), no queuing. A `require_tls` group whose
+                        // only usable trunks are UDP/TCP takes the same path:
+                        // the call is refused, never sent in clear.
                         //
-                        // ## NIST 800-53 Rev5: SC-5, SI-17 (Fail-Safe Procedures)
-                        warn!(call_id = %a_leg_call_id, dest = %dest_user, "No usable trunk (all down or at capacity), rejecting INVITE with 503");
-                        audit_invite_denied(req, source, "no-usable-trunk");
+                        // ## NIST 800-53 Rev5: SC-5, SI-17 (Fail-Safe Procedures),
+                        // SC-8 (POA&M-48), AU-2/AU-3 ("no-tls-trunk" reason)
+                        if tls_required {
+                            warn!(call_id = %a_leg_call_id, dest = %dest_user, "require_tls: no usable TLS trunk; rejecting INVITE with 503");
+                            audit_invite_denied(req, source, "no-tls-trunk");
+                        } else {
+                            warn!(call_id = %a_leg_call_id, dest = %dest_user, "No usable trunk (all down or at capacity), rejecting INVITE with 503");
+                            audit_invite_denied(req, source, "no-usable-trunk");
+                        }
                         self.in_flight_invites.write().await.remove(&a_leg_call_id);
                         reject_cdr(503, uc_cdr::ReleaseCause::NoRoute);
                         self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
                             .await;
                         let mut unavailable =
                             create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
-                        unavailable.headers.set(
-                            HeaderName::RetryAfter,
-                            TRUNK_UNAVAILABLE_RETRY_AFTER_SECS.to_string(),
-                        );
+                        if tls_required {
+                            // RFC 3261 §21.5.4: a lasting policy refusal
+                            // carries no Retry-After (retrying cannot help).
+                            // RFC 3326 §2, RFC 6432: a Q.850 Reason (79, service
+                            // not implemented) states the cause.
+                            unavailable
+                                .headers
+                                .set(HeaderName::Reason, "Q.850;cause=79;text=\"no TLS trunk\"");
+                        } else {
+                            unavailable.headers.set(
+                                HeaderName::RetryAfter,
+                                TRUNK_UNAVAILABLE_RETRY_AFTER_SECS.to_string(),
+                            );
+                        }
                         return ProcessResult::Response {
                             message: SipMessage::Response(unavailable),
                             destination: source,
@@ -6439,7 +6553,9 @@ impl SipStack {
                 max_failover_attempts: 3,
                 default_trunk_group: None,
             };
-            self.router = Some(RwLock::new(Router::new(config)));
+            let mut router = Router::new(config);
+            self.prepare_router(&mut router);
+            self.router = Some(RwLock::new(router));
         }
     }
 
@@ -8586,6 +8702,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 }],
                 zone: None,
+                require_tls: false,
             },
             sbc_config::TrunkGroupConfig {
                 id: "emergency".to_string(),
@@ -8599,6 +8716,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 }],
                 zone: None,
+                require_tls: false,
             },
         ];
 
@@ -9938,6 +10056,7 @@ pub(crate) mod tests {
                 trunk("t2", "127.0.0.3", 2, protos[1]),
             ],
             zone: None,
+            require_tls: false,
         }];
         (routing, dial_plans, groups)
     }
@@ -11258,6 +11377,7 @@ pub(crate) mod tests {
                 ..Default::default()
             }],
             zone: None,
+            require_tls: false,
         }];
         stack.init_router_from_config(&sbc_config::RoutingConfig::default(), &[], &groups);
         let router = stack.router().expect("router").read().await;
@@ -12098,6 +12218,7 @@ pub(crate) mod tests {
             strategy: "priority".to_string(),
             trunks: vec![trunk("t1", "127.0.0.2", 1), trunk("t2", "127.0.0.3", 2)],
             zone: None,
+            require_tls: false,
         }];
         stack.init_router_from_config(&routing, &dial_plans, &groups);
         if let Some(engine) = vps {
@@ -13017,6 +13138,7 @@ pub(crate) mod tests {
                 ),
             ],
             zone: None,
+            require_tls: false,
         });
         stack.set_stir(Arc::new(crate::stir::test_support::service(&c)));
         (stack, f)
@@ -13225,6 +13347,7 @@ pub(crate) mod tests {
                 ),
             ],
             zone: None,
+            require_tls: false,
         });
         tweak(&mut c);
         let source = Arc::new(crate::stir::test_support::FakeSource {
@@ -14794,5 +14917,449 @@ pub(crate) mod tests {
         assert!(flows[0].dial.is_none(), "caller leg is never dialled");
         assert_eq!(flows[1].transport, AddrTransport::Tls);
         assert_eq!(flows[1].dial.as_deref(), Some("127.0.0.2"));
+    }
+
+    // ------------------------------------------------------------------
+    // POA&M-48 (SC-8): require_tls trunk groups never egress in clear.
+    // ------------------------------------------------------------------
+
+    async fn set_group_require_tls(stack: &SipStack, on: bool) {
+        stack
+            .router()
+            .unwrap()
+            .write()
+            .await
+            .get_trunk_group_mut("carriers")
+            .unwrap()
+            .set_require_tls(on);
+    }
+
+    fn no_invite_forwarded(results: &[ProcessResult]) -> bool {
+        forwarded(results, &Method::Invite).is_none()
+    }
+
+    // NIST 800-53 Rev5: SC-8; RFC 3261 §26.2.
+    #[tokio::test]
+    async fn require_tls_group_skips_udp_tcp_on_primary() {
+        for low in ["udp", "tcp"] {
+            let stack = trunk_stack_protos([low, "tls"]).await;
+            set_group_require_tls(&stack, true).await;
+            let results = place_call(&stack, &format!("rt-{low}@test")).await;
+            let (inv, dest) = forwarded(&results, &Method::Invite).expect("TLS trunk");
+            assert_eq!(dest.port(), 5061, "{low}");
+            assert!(inv.uri.to_string().starts_with("sips:"), "{}", inv.uri);
+            assert_eq!(
+                flow_of(&results, &Method::Invite).transport,
+                AddrTransport::Tls
+            );
+            assert_eq!(stack.tls_policy_counters().skips(), 1);
+        }
+    }
+
+    // NIST 800-53 Rev5: SC-8, CP-8; RFC 3263 §4.3; RFC 5630 §3.1.3.
+    #[tokio::test]
+    async fn require_tls_failover_skips_udp_tcp() {
+        // Only TLS trunk fails: no failover to the UDP trunk, error relayed.
+        let stack = trunk_stack_protos(["udp", "tls"]).await;
+        set_group_require_tls(&stack, true).await;
+        let results = place_call(&stack, "rt-fo1@test").await;
+        let first = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let out = flatten(
+            stack
+                .process_message(&response_to(&first, 503, Some("x"), None), t2(), None)
+                .await,
+        );
+        assert!(no_invite_forwarded(&out), "{out:?}");
+        assert!(responded(&out, 503).is_some());
+
+        // A second TLS trunk is the next hop; UDP/TCP never are.
+        let stack = trunk_stack_protos(["udp", "tls"]).await;
+        {
+            let mut router = stack.router().unwrap().write().await;
+            let g = router.get_trunk_group_mut("carriers").unwrap();
+            g.set_require_tls(true);
+            g.add_trunk(Trunk::new(
+                TrunkConfig::new("t3", "127.0.0.4")
+                    .with_port(5061)
+                    .with_protocol(TrunkProtocol::Tls)
+                    .with_priority(3),
+            ));
+            g.add_trunk(Trunk::new(
+                TrunkConfig::new("t4", "127.0.0.5")
+                    .with_protocol(TrunkProtocol::Tcp)
+                    .with_priority(2),
+            ));
+        }
+        let results = place_call(&stack, "rt-fo2@test").await;
+        let first = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        assert!(first.uri.to_string().contains("127.0.0.3"));
+        let out = flatten(
+            stack
+                .process_message(&response_to(&first, 503, Some("x"), None), t2(), None)
+                .await,
+        );
+        let (retry, _) = forwarded(&out, &Method::Invite).expect("failover to t3");
+        assert_eq!(
+            retry.uri.to_string(),
+            format!("sips:{DIALED}@127.0.0.4:5061")
+        );
+        assert_eq!(flow_of(&out, &Method::Invite).transport, AddrTransport::Tls);
+    }
+
+    // Defence in depth: the policy turned on after routing still blocks a
+    // clear-text failover target (Router::acquire_trunk_for re-check).
+    #[tokio::test]
+    async fn require_tls_turned_on_mid_call_blocks_clear_failover() {
+        let stack = trunk_stack_protos(["tls", "udp"]).await;
+        let results = place_call(&stack, "rt-mid@test").await;
+        let first = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        set_group_require_tls(&stack, true).await;
+        let skips = stack.tls_policy_counters().skips();
+        let out = flatten(ProcessResult::Multiple(
+            stack
+                .on_invite_sent(&SipMessage::Request(first), false)
+                .await,
+        ));
+        assert!(no_invite_forwarded(&out), "{out:?}");
+        assert_eq!(stack.tls_policy_counters().skips(), skips + 1);
+    }
+
+    // NIST 800-53 Rev5: SC-8, SI-17, AU-2; RFC 3261 §21.5.4.
+    #[tokio::test]
+    async fn require_tls_all_non_tls_gives_503_no_udp_datagram() {
+        let stack = trunk_stack_protos(["udp", "tcp"]).await;
+        set_group_require_tls(&stack, true).await;
+        let capture = uc_audit::capture::start();
+        let results = place_call(&stack, "rt-none@test").await;
+        assert!(no_invite_forwarded(&results), "{results:?}");
+        assert!(
+            !results
+                .iter()
+                .any(|r| matches!(r, ProcessResult::Forward { .. })),
+            "nothing leaves the SBC towards a trunk"
+        );
+        let (resp, dest) = responded(&results, 503).expect("503");
+        assert_eq!(dest, alice());
+        // RFC-003/RFC-005: lasting policy refusal, no Retry-After; Reason set.
+        assert!(resp.headers.get_value(&HeaderName::RetryAfter).is_none());
+        assert_eq!(
+            resp.headers.get_value(&HeaderName::Reason),
+            Some("Q.850;cause=79;text=\"no TLS trunk\"")
+        );
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1);
+        assert_eq!(authz[0].policy, "no-tls-trunk");
+        drop(capture);
+        assert_eq!(stack.tls_policy_counters().rejects(), 1);
+        assert_eq!(stack.tls_policy_counters().skips(), 2);
+        assert_all_released(&stack).await;
+    }
+
+    #[tokio::test]
+    async fn require_tls_tls_trunks_down_keeps_no_usable_trunk_reason() {
+        let stack = trunk_stack_protos(["tls", "tls"]).await;
+        set_group_require_tls(&stack, true).await;
+        stack.set_trunk_reachable("t1", false).await;
+        stack.set_trunk_reachable("t2", false).await;
+        let capture = uc_audit::capture::start();
+        let results = place_call(&stack, "rt-down@test").await;
+        assert!(responded(&results, 503).is_some());
+        assert_eq!(authz_events(&capture.events())[0].policy, "no-usable-trunk");
+        assert_eq!(stack.tls_policy_counters().rejects(), 0);
+    }
+
+    #[tokio::test]
+    async fn require_tls_false_unchanged() {
+        let stack = trunk_stack_protos(["udp", "tls"]).await;
+        let results = place_call(&stack, "rt-off@test").await;
+        let (_, dest) = forwarded(&results, &Method::Invite).unwrap();
+        assert_eq!(dest, t1());
+        assert_eq!(flow_of(&results, &Method::Invite), &LegFlow::UDP);
+        assert_eq!(stack.tls_policy_counters().skips(), 0);
+    }
+
+    // `security.require_tls_trunks`: every group, no opt-out.
+    #[tokio::test]
+    async fn global_require_tls_trunks_applies_to_config_groups() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.set_require_tls_trunks(true);
+        let (routing, dial_plans, groups) = carrier_routing(10, ("none", ""), ["udp", "tls"]);
+        stack.init_router_from_config(&routing, &dial_plans, &groups);
+        stack
+            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        let results = place_call(&stack, "rt-global@test").await;
+        let (_, dest) = forwarded(&results, &Method::Invite).unwrap();
+        assert_eq!(dest.port(), 5061);
+    }
+
+    // API / TrunkSync / config-store groups: protocol honoured, flag read.
+    #[tokio::test]
+    async fn api_synced_group_honours_require_tls() {
+        let stack = trunk_stack_protos(["udp", "udp"]).await;
+        let body = serde_json::json!({
+            "id": "carriers",
+            "name": "Carriers",
+            "require_tls": true,
+            "trunks": [
+                {"id": "t1", "host": "127.0.0.2", "port": 5060, "transport": "udp", "priority": 1},
+                {"id": "t2", "host": "127.0.0.3", "port": 5061, "transport": "tls", "priority": 2},
+            ],
+        });
+        let group = crate::api_server::trunk_group_from_json(&body).unwrap();
+        assert!(group.require_tls());
+        stack.add_trunk_group_to_router(group).await;
+        let results = place_call(&stack, "rt-api@test").await;
+        let (inv, dest) = forwarded(&results, &Method::Invite).unwrap();
+        assert_eq!(dest.port(), 5061);
+        assert!(inv.uri.to_string().starts_with("sips:"));
+    }
+
+    #[test]
+    fn api_synced_group_malformed_policy_fails_closed() {
+        // Non-bool flag: treated as true.
+        let g = crate::api_server::trunk_group_from_json(&serde_json::json!({
+            "id": "g", "require_tls": "true", "trunks": []
+        }))
+        .unwrap();
+        assert!(g.require_tls());
+        // Unknown protocol (trailing space): trunk skipped, never UDP.
+        let g = crate::api_server::trunk_group_from_json(&serde_json::json!({
+            "id": "g",
+            "trunks": [
+                {"id": "a", "host": "192.0.2.1", "protocol": "TLS "},
+                {"id": "b", "host": "192.0.2.2", "protocol": "TLS"},
+                {"id": "c", "host": "192.0.2.3"},
+            ],
+        }))
+        .unwrap();
+        assert!(g.get_trunk("a").is_none());
+        assert_eq!(
+            g.get_trunk("b").unwrap().config().protocol,
+            TrunkProtocol::Tls
+        );
+        assert_eq!(
+            g.get_trunk("c").unwrap().config().protocol,
+            TrunkProtocol::Udp
+        );
+        assert!(!g.require_tls());
+    }
+
+    // ------------------------------------------------------------------
+    // QA (POA&M-48): CDR, metrics export, API trunk edge cases.
+    // ------------------------------------------------------------------
+
+    // The policy 503 writes one rejected CDR: 503 / NoRoute.
+    #[tokio::test]
+    async fn qa_require_tls_policy_503_cdr_is_no_route_reject() {
+        let mut stack = trunk_stack_protos(["udp", "tcp"]).await;
+        let em = cdr_emitter();
+        stack.set_cdr(Arc::new(crate::cdr::CdrContext::new(
+            Arc::clone(&em),
+            &sbc_config::schema::CdrConfig::default(),
+        )));
+        set_group_require_tls(&stack, true).await;
+        let r = place_call(&stack, "rt-cdr@test").await;
+        assert!(responded(&r, 503).is_some());
+        let c = one_cdr(&em);
+        assert_eq!(c.disposition, uc_cdr::Disposition::Rejected);
+        assert_eq!(c.release_cause, uc_cdr::ReleaseCause::NoRoute);
+        assert_eq!(c.final_sip_status, 503);
+        assert!(c.trunks_tried.is_empty(), "no trunk attempted: {c:#?}");
+    }
+
+    // Both counters reach the /metrics export.
+    #[tokio::test]
+    async fn qa_require_tls_counters_exported_in_metrics() {
+        let stack = trunk_stack_protos(["udp", "tcp"]).await;
+        set_group_require_tls(&stack, true).await;
+        assert!(responded(&place_call(&stack, "rt-m@test").await, 503).is_some());
+        let mut state = crate::api_server::AppState::new(
+            uc_metrics::SbcMetrics::standard(),
+            Arc::new(crate::server::ServerStats::default()),
+        );
+        state.sip_stack = Some(Arc::new(stack));
+        state.refresh_daemon_metrics();
+        let text = state.metrics.export();
+        assert!(text.contains("routing_tls_required_skips 2"), "{text}");
+        assert!(text.contains("routing_tls_required_rejects 1"), "{text}");
+    }
+
+    // API trunk transport "tls" with no trunk TLS client (no
+    // security.trunk_tls_ca_path): the INVITE is routed on a TLS flow, the
+    // flow layer refuses it (NoTlsClient), nothing goes out on UDP, and the
+    // send failure does not fail over to a clear trunk in a require_tls group.
+    #[tokio::test]
+    async fn qa_api_tls_trunk_without_ca_fails_closed_no_udp() {
+        use uc_transport::Transport as _;
+        let stack = trunk_stack_protos(["udp", "udp"]).await;
+        let body = serde_json::json!({
+            "id": "carriers", "require_tls": true,
+            "trunks": [
+                {"id": "t1", "host": "127.0.0.2", "port": 5060, "transport": "udp", "priority": 1},
+                {"id": "t2", "host": "127.0.0.3", "port": 5061, "transport": "tls", "priority": 2},
+            ],
+        });
+        stack
+            .add_trunk_group_to_router(crate::api_server::trunk_group_from_json(&body).unwrap())
+            .await;
+        let results = place_call(&stack, "rt-noca@test").await;
+        let (inv, dest) = forwarded(&results, &Method::Invite).unwrap();
+        let inv = inv.clone();
+        let flow = flow_of(&results, &Method::Invite).clone();
+        assert_eq!(flow.transport, AddrTransport::Tls);
+
+        let bind = || {
+            uc_transport::udp::UdpTransport::bind(SbcSocketAddr::new_v4(
+                std::net::Ipv4Addr::LOCALHOST,
+                0,
+            ))
+        };
+        let sbc_udp = Arc::new(bind().await.unwrap());
+        let watcher = bind().await.unwrap();
+        let table = crate::flows::FlowTable::new(4);
+        table.set_default_udp(Arc::clone(&sbc_udp));
+        let err = table
+            .send(&flow, &dest, b"INVITE", Some(&sbc_udp))
+            .await
+            .unwrap_err();
+        assert_eq!(err, crate::flows::FlowError::NoTlsClient);
+        let none =
+            tokio::time::timeout(std::time::Duration::from_millis(100), watcher.recv()).await;
+        assert!(none.is_err(), "no UDP datagram");
+
+        // Send failure: no clear-text failover.
+        let out = flatten(ProcessResult::Multiple(
+            stack.on_invite_sent(&SipMessage::Request(inv), false).await,
+        ));
+        assert!(no_invite_forwarded(&out), "{out:?}");
+    }
+
+    // An unknown protocol string skips the trunk end to end: the call goes to
+    // the next trunk, never to the skipped one as UDP. With require_tls and
+    // only a bad "TLS " trunk, the group is empty and the call is refused.
+    #[tokio::test]
+    async fn qa_api_unknown_protocol_trunk_is_skipped_end_to_end() {
+        let stack = trunk_stack_protos(["udp", "udp"]).await;
+        let body = serde_json::json!({
+            "id": "carriers",
+            "trunks": [
+                {"id": "t1", "host": "127.0.0.2", "port": 5060, "protocol": "sctp", "priority": 1},
+                {"id": "t2", "host": "127.0.0.3", "port": 5060, "protocol": "udp", "priority": 2},
+            ],
+        });
+        stack
+            .add_trunk_group_to_router(crate::api_server::trunk_group_from_json(&body).unwrap())
+            .await;
+        let r = place_call(&stack, "rt-unk@test").await;
+        let (_, dest) = forwarded(&r, &Method::Invite).unwrap();
+        assert_eq!(dest, t2());
+
+        let stack = trunk_stack_protos(["udp", "udp"]).await;
+        let body = serde_json::json!({
+            "id": "carriers", "require_tls": true,
+            "trunks": [
+                {"id": "t1", "host": "127.0.0.2", "port": 5061, "protocol": "TLS ", "priority": 1},
+            ],
+        });
+        stack
+            .add_trunk_group_to_router(crate::api_server::trunk_group_from_json(&body).unwrap())
+            .await;
+        let r = place_call(&stack, "rt-unk2@test").await;
+        assert!(no_invite_forwarded(&r), "{r:?}");
+        // QA-4: the require_tls group is empty after the skip; the call
+        // still takes the policy 503 (no-tls-trunk), not the no-route path.
+        let (resp, _) = responded(&r, 503).expect("policy 503");
+        assert_eq!(
+            resp.headers.get_value(&HeaderName::Reason),
+            Some("Q.850;cause=79;text=\"no TLS trunk\"")
+        );
+    }
+
+    // security.require_tls_trunks on a live stack (before it is shared):
+    // existing config groups flip to TLS-only.
+    // NOTE: RuntimeManager::reload_config (SIGHUP) only swaps the stored
+    // SbcConfig and never calls set_require_tls_trunks, so a reload does
+    // not change the policy; a restart is required (see qa-report gaps).
+    #[tokio::test]
+    async fn qa_global_require_tls_trunks_toggled_after_router_init() {
+        let mut stack = trunk_stack_protos(["udp", "tls"]).await;
+        let (_, dest) = forwarded(&place_call(&stack, "rt-g1@test").await, &Method::Invite)
+            .map(|(m, d)| (m.clone(), d))
+            .unwrap();
+        assert_eq!(dest, t1());
+        stack.set_require_tls_trunks(true);
+        let r = place_call(&stack, "rt-g2@test").await;
+        let (_, dest) = forwarded(&r, &Method::Invite).unwrap();
+        assert_eq!(dest.port(), 5061);
+        // An API group synced later inherits the global policy.
+        let body = serde_json::json!({
+            "id": "carriers",
+            "trunks": [{"id": "t1", "host": "127.0.0.2", "transport": "udp"}],
+        });
+        stack
+            .add_trunk_group_to_router(crate::api_server::trunk_group_from_json(&body).unwrap())
+            .await;
+        let r = place_call(&stack, "rt-g3@test").await;
+        assert!(no_invite_forwarded(&r));
+        assert!(responded(&r, 503).is_some());
+    }
+
+    async fn place_sips_call(stack: &SipStack, call_id: &str) -> Vec<ProcessResult> {
+        let req = caller_request("INVITE", DIALED, call_id, 1, None, Some(ALICE_SDP));
+        let text = String::from_utf8_lossy(&req).replacen("INVITE sip:", "INVITE sips:", 1);
+        flatten(
+            stack
+                .process_message_on(&Bytes::from(text), alice(), None, AddrTransport::Tls)
+                .await,
+        )
+    }
+
+    // RFC 3261 §26.2.2 (RFC-002): a sips: Request-URI makes the call
+    // TLS-only even in a group without require_tls; failover never picks
+    // the UDP trunk. NIST 800-53 Rev5: SC-8.
+    #[tokio::test]
+    async fn sips_invite_to_mixed_group_never_egresses_clear() {
+        let stack = trunk_stack_protos(["udp", "tls"]).await;
+        let results = place_sips_call(&stack, "sips-mixed@test").await;
+        let (inv, dest) = forwarded(&results, &Method::Invite).expect("TLS trunk");
+        assert_eq!(dest.port(), 5061);
+        assert!(inv.uri.scheme.requires_tls(), "{}", inv.uri);
+        assert_eq!(
+            flow_of(&results, &Method::Invite).transport,
+            AddrTransport::Tls
+        );
+        let first = inv.clone();
+        let out = flatten(
+            stack
+                .process_message(&response_to(&first, 503, Some("x"), None), t2(), None)
+                .await,
+        );
+        assert!(no_invite_forwarded(&out), "no failover to UDP: {out:?}");
+
+        // sip: to the same group is unchanged (priority-1 UDP trunk).
+        let stack = trunk_stack_protos(["udp", "tls"]).await;
+        let results = place_call(&stack, "sip-mixed@test").await;
+        assert_eq!(
+            flow_of(&results, &Method::Invite).transport,
+            AddrTransport::Udp
+        );
+    }
+
+    // sips: call, only clear trunks: policy 503, nothing sent to a trunk.
+    #[tokio::test]
+    async fn sips_invite_only_clear_trunks_gets_policy_503() {
+        let stack = trunk_stack_protos(["udp", "tcp"]).await;
+        let capture = uc_audit::capture::start();
+        let results = place_sips_call(&stack, "sips-none@test").await;
+        assert!(no_invite_forwarded(&results), "{results:?}");
+        let (resp, _) = responded(&results, 503).expect("503");
+        assert!(resp.headers.get_value(&HeaderName::RetryAfter).is_none());
+        assert!(resp.headers.get_value(&HeaderName::Reason).is_some());
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1);
+        assert_eq!(authz[0].policy, "no-tls-trunk");
+        drop(capture);
+        assert_all_released(&stack).await;
     }
 }

@@ -531,6 +531,13 @@ impl Server {
         sip_stack: &mut SipStack,
         config: &SbcConfig,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<String>> {
+        // NIST 800-53 Rev5: SC-8 — global TLS-only trunk policy (POA&M-48),
+        // set before any router is built so every group inherits it.
+        sip_stack.set_require_tls_trunks(config.security.require_tls_trunks);
+        // NIST 800-53 Rev5: SC-8, SI-4 — lets the API/TrunkSync path flag a
+        // TLS trunk that cannot connect (no trust anchors configured).
+        sip_stack.set_trunk_tls_ca_configured(config.security.trunk_tls_ca_path.is_some());
+
         // Initialize router from config (if routing section present)
         if let Some(ref routing) = config.routing {
             sip_stack.init_router_from_config(routing, &config.dial_plans, &config.trunk_groups);
