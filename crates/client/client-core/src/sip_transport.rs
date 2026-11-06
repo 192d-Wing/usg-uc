@@ -25,7 +25,7 @@
 
 use crate::{AppError, AppResult};
 use bytes::BytesMut;
-use proto_sip::message::{SipMessage, SipRequest, SipResponse};
+use proto_sip::message::{Framing, SipMessage, SipRequest, SipResponse};
 // Only the debug-only `InsecureCertVerifier` needs these; gating them keeps
 // release builds warning-free.
 #[cfg(debug_assertions)]
@@ -527,20 +527,21 @@ impl TlsReader {
             return Ok(None); // Need more data
         };
 
-        // Parse headers to find Content-Length
-        let headers_str = std::str::from_utf8(&data[..header_end + 4])
-            .map_err(|e| AppError::Sip(format!("Invalid UTF-8 in SIP headers: {e}")))?;
-
-        let content_length = extract_content_length(headers_str).unwrap_or(0);
+        // Frame with the same strict rules the parser applies (name case,
+        // compact `l`, LWS before the colon, duplicates, 1*DIGIT), so the
+        // framer cannot cut at an offset the parser disagrees with. Any
+        // framing error is fatal for the connection: the stream cannot be
+        // resynchronised.
+        // RFC 3261 §18.3. NIST 800-53 Rev5: SI-10 (no stream desync).
+        let total_length = SipMessage::stream_message_len(&data[..header_end + 4])
+            .map_err(|e| AppError::Sip(format!("SIP stream framing error: {e}")))?;
 
         // Reject oversized messages to prevent OOM attacks
-        if content_length > MAX_SIP_MESSAGE_SIZE {
+        if total_length > MAX_SIP_MESSAGE_SIZE {
             return Err(AppError::Sip(format!(
-                "SIP Content-Length {content_length} exceeds maximum {MAX_SIP_MESSAGE_SIZE}"
+                "SIP message length {total_length} exceeds maximum {MAX_SIP_MESSAGE_SIZE}"
             )));
         }
-
-        let total_length = header_end + 4 + content_length;
 
         if self.read_buffer.len() < total_length {
             return Ok(None); // Need more data for body
@@ -549,8 +550,11 @@ impl TlsReader {
         // Extract the complete message
         let message_bytes = self.read_buffer.split_to(total_length);
 
-        // Parse the SIP message
-        match SipMessage::parse(&message_bytes) {
+        // Parse the SIP message.
+        // RFC 3261 §18.3: stream transport - Content-Length is mandatory and
+        // must match the framed body exactly.
+        // NIST 800-53 Rev5: SI-10 (strict framing prevents desync/smuggling).
+        match SipMessage::parse_with(&message_bytes, Framing::Stream) {
             Ok(msg) => {
                 trace!(peer = %self.peer_addr, "\n{msg}");
                 Ok(Some(msg))
@@ -1262,18 +1266,6 @@ fn find_header_end(data: &[u8]) -> Option<usize> {
     None
 }
 
-/// Extracts Content-Length from SIP headers.
-fn extract_content_length(headers: &str) -> Option<usize> {
-    for line in headers.lines() {
-        let line_lower = line.to_lowercase();
-        if line_lower.starts_with("content-length:") || line_lower.starts_with("l:") {
-            let value = line.split(':').nth(1)?.trim();
-            return value.parse().ok();
-        }
-    }
-    None
-}
-
 /// Loads the system's trusted root CA certificates.
 ///
 /// Uses rustls-native-certs to load platform-specific trusted CAs:
@@ -1472,34 +1464,65 @@ mod tests {
         assert_eq!(find_header_end(data), Some(33));
     }
 
+    /// Body length the stream framer would use for `head`, or `None` on a
+    /// framing error.
+    fn framed_body_len(head: &str) -> Option<usize> {
+        SipMessage::stream_message_len(head.as_bytes())
+            .ok()
+            .map(|total| total - head.len())
+    }
+
     #[test]
     fn test_extract_content_length() {
         let headers = "SIP/2.0 200 OK\r\nContent-Length: 123\r\n\r\n";
-        assert_eq!(extract_content_length(headers), Some(123));
+        assert_eq!(framed_body_len(headers), Some(123));
     }
 
     #[test]
     fn test_extract_content_length_compact() {
         let headers = "SIP/2.0 200 OK\r\nl: 456\r\n\r\n";
-        assert_eq!(extract_content_length(headers), Some(456));
+        assert_eq!(framed_body_len(headers), Some(456));
+        let headers = "SIP/2.0 200 OK\r\nL: 7\r\n\r\n";
+        assert_eq!(framed_body_len(headers), Some(7));
     }
 
     #[test]
     fn test_extract_content_length_missing() {
+        // RFC 3261 §18.3: mandatory on streams; an error, not 0.
         let headers = "SIP/2.0 200 OK\r\n\r\n";
-        assert_eq!(extract_content_length(headers), None);
+        assert_eq!(framed_body_len(headers), None);
     }
 
     #[test]
     fn test_extract_content_length_case_insensitive() {
         let headers = "SIP/2.0 200 OK\r\nCONTENT-LENGTH: 789\r\n\r\n";
-        assert_eq!(extract_content_length(headers), Some(789));
+        assert_eq!(framed_body_len(headers), Some(789));
     }
 
     #[test]
     fn test_extract_content_length_with_spaces() {
         let headers = "SIP/2.0 200 OK\r\nContent-Length:   42  \r\n\r\n";
-        assert_eq!(extract_content_length(headers), Some(42));
+        assert_eq!(framed_body_len(headers), Some(42));
+    }
+
+    #[test]
+    fn test_extract_content_length_lws_before_colon() {
+        let headers = "SIP/2.0 200 OK\r\nContent-Length \t: 9\r\n\r\n";
+        assert_eq!(framed_body_len(headers), Some(9));
+    }
+
+    #[test]
+    fn test_extract_content_length_rejects_duplicates_and_garbage() {
+        for head in [
+            "SIP/2.0 200 OK\r\nContent-Length: 1\r\nl: 2\r\n\r\n",
+            "SIP/2.0 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
+            "SIP/2.0 200 OK\r\nContent-Length: abc\r\n\r\n",
+            "SIP/2.0 200 OK\r\nContent-Length: -1\r\n\r\n",
+            "SIP/2.0 200 OK\r\nContent-Length: 1 2\r\n\r\n",
+            "SIP/2.0 200 OK\r\nContent-Length:\r\n\r\n",
+        ] {
+            assert_eq!(framed_body_len(head), None, "{head:?}");
+        }
     }
 
     #[tokio::test]
@@ -1666,8 +1689,8 @@ mod tests {
         let tag2 = generate_tag();
 
         // Tags should be non-empty
-        assert!(!tag1.is_empty());
-        assert!(!tag2.is_empty());
+        assert_ne!(tag1, "");
+        assert_ne!(tag2, "");
 
         // Tags should contain hyphen (from our format)
         assert!(tag1.contains('-'));

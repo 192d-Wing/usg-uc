@@ -3,15 +3,16 @@
 //! This crate handles Session Initiation Protocol (SIP) message parsing,
 //! validation, and construction for `VoIP` signaling.
 //!
-//! ## RFC 3261 Compliance: 100%
+//! ## RFC 3261 Compliance
 //!
-//! This crate provides complete RFC 3261 message layer compliance:
+//! Message layer coverage (see `PROTO_RFC_COMPLIANCE.md` and
+//! `docs/RFC_COMPLIANCE_GAPS.md` for known gaps, e.g. the §25 URI grammar):
 //!
 //! - **§7**: SIP Messages - Complete message parsing and generation
 //! - **§8**: General User Agent Behavior - Request/response construction
 //! - **§10**: Registrations - REGISTER method and Contact handling
 //! - **§11**: Querying for Capabilities - OPTIONS request/response processing
-//! - **§19**: SIP Uniform Resource Indicators - Full URI parsing
+//! - **§19**: SIP Uniform Resource Indicators - URI parsing (partial §25 grammar)
 //! - **§20**: Header Fields - All 44 standard headers implemented
 //! - **§22**: Usage of HTTP Authentication - Digest auth (MD5, SHA-256, SHA-512-256)
 //!
@@ -25,7 +26,9 @@
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-8**: Transmission Confidentiality and Integrity
+//! - **SC-8**: Transmission Confidentiality and Integrity (bodies serialized verbatim)
+//! - **SI-10**: Information Input Validation (strict byte-based parser)
+//! - **SC-5**: Denial-of-Service Protection (`MAX_*` parser limits)
 //! - **IA-2**: Identification and Authentication
 
 //! ## Safety-Critical Code Compliance
@@ -56,6 +59,7 @@ pub mod builder;
 pub mod error;
 pub mod header;
 pub mod header_params;
+pub mod list;
 pub mod manipulation;
 pub mod message;
 pub mod method;
@@ -83,7 +87,8 @@ pub use header::{Header, HeaderName, Headers};
 pub use header_params::{
     CSeqHeader, MaxForwardsHeader, NameAddr, VIA_BRANCH_MAGIC_COOKIE, ViaHeader,
 };
-pub use message::{SipMessage, SipRequest, SipResponse};
+pub use list::{ListSplit, split_list, split_list_bounded};
+pub use message::{Framing, SipMessage, SipRequest, SipResponse};
 pub use method::Method;
 pub use redirect::{
     DEFAULT_MAX_REDIRECT_DEPTH, RedirectContact, RedirectHandler, RedirectHeaders, RedirectResult,
@@ -120,6 +125,31 @@ pub use options::{
 
 /// Maximum SIP message size per RFC 3261.
 pub const MAX_MESSAGE_SIZE: usize = 65535;
+
+// NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection) - per-message
+// parser limits bound CPU and memory spent on any single message.
+
+/// Maximum number of header fields in one message (folded lines count once).
+pub const MAX_HEADERS: usize = 256;
+
+/// Maximum length of one unfolded header field (name + value).
+pub const MAX_HEADER_LEN: usize = 8192;
+
+/// Maximum length of the start line (Request-Line / Status-Line).
+pub const MAX_START_LINE_LEN: usize = 8192;
+
+/// Maximum length of a URI string.
+pub const MAX_URI_LEN: usize = 4096;
+
+/// Maximum parameters per URI / Via / name-addr parameter list.
+pub const MAX_PARAMS: usize = 64;
+
+/// Maximum list elements per header field after comma splitting.
+pub const MAX_LIST_ELEMENTS: usize = 64;
+
+/// Maximum leading CRLF pairs skipped before the start line
+/// (RFC 3261 §7.5; RFC 5626 §3.5.1 keep-alives).
+pub const MAX_LEADING_CRLF: usize = 32;
 
 /// Default SIP port (UDP/TCP).
 pub const DEFAULT_SIP_PORT: u16 = 5060;

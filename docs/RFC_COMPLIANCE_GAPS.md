@@ -20,7 +20,7 @@ The **Wiring** column says which shipped binary calls the code: `sbc-daemon` (SI
 
 | Section | Title | Status | Wiring | Notes |
 |---------|-------|--------|--------|-------|
-| §7.1 | Requests | Complete | Wired (sbc-daemon, soft client) | All methods defined in `method.rs`; daemon dispatches REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE (`sip_stack.rs`) |
+| §7.1 | Requests | Complete | Wired (sbc-daemon, soft client) | All methods defined in `method.rs`; matched case-sensitively, extension methods kept as received; daemon dispatches REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE (`sip_stack.rs`) |
 | §7.2 | Responses | Complete | Wired (sbc-daemon, soft client) | All status codes in `response.rs` |
 | §8.1 | UAC Behavior | Partial | Wired (sbc-daemon, soft client) | Daemon acts as UAC on the B-leg with client transactions and non-2xx ACKs (`sip_stack.rs`); soft client is a full UAC. No redirect following |
 | §8.2 | UAS Behavior | Partial | Wired (sbc-daemon, soft client) | Daemon acts as UAS on the A-leg with server transactions (`sip_stack.rs`) |
@@ -31,14 +31,41 @@ The **Wiring** column says which shipped binary calls the code: `sbc-daemon` (SI
 | §13.2.2.4 | 3xx Redirect Responses | Complete | Library-only | `redirect.rs`; no caller. Daemon relays 3xx as a non-2xx final; soft client rejects redirects |
 | §14 | Modifying an Existing Session | Partial | Wired (sbc-daemon, soft client) | Daemon relays re-INVITE/UPDATE across legs, 491 on glare, 481 for unmatched in-dialog requests (`sip_stack.rs` `handle_in_dialog_request`); soft client sends hold/resume re-INVITE |
 | §15 | Terminating a Session | Partial | Wired (sbc-daemon, soft client) | Daemon relays BYE/CANCEL to the other leg (`sip_stack.rs` `handle_bye`, `handle_cancel`) |
-| §16.4 | Route Information Preprocessing | Complete | Library-only | `routing.rs`; the daemon is a B2BUA, not a proxy |
-| §16.6 | Request Forwarding | Complete | Library-only | `proxy.rs`; no caller |
-| §16.12.1 | Loose Routing | Complete | Library-only | `routing.rs`; no caller |
+| §16.4 | Route Information Preprocessing | Partial | Library-only | `routing.rs`; the daemon is a B2BUA, not a proxy. Route lists now use the shared byte-indexed splitter (`list.rs`); module otherwise not reviewed (POA&M-65) |
+| §16.6 | Request Forwarding | Partial | Library-only | `proxy.rs`; no caller. Via insert/pop is O(n) and order-preserving; combined Via values handled. Module otherwise not reviewed (POA&M-65) |
+| §16.12.1 | Loose Routing | Partial | Library-only | `routing.rs`; no caller. Only the list splitter was reviewed in Phase 1 (POA&M-65) |
 | §17 | Transactions | Partial | Wired (sbc-daemon, soft client) | Daemon drives proto-transaction client/server FSMs and timers (`sip_stack.rs` `poll_timers`); soft client drives client FSMs |
 | §18 | Transport | Partial | Library-only | `Transport` enum has no caller; sockets are provided by uc-transport |
-| §19 | SIP URI | Complete | Wired (sbc-daemon, soft client) | `uri.rs` |
-| §20 | Header Fields | Complete | Wired (sbc-daemon, soft client) | 56 `HeaderName` variants in `header.rs` |
-| §22 | Authentication | Complete | Wired (soft client) | `auth.rs` (RFC 2617) used by the soft client as UAC. The daemon's REGISTER digest challenge/verification is proto-registrar's own code (`authentication.rs`), not `proto_sip::auth` |
+| §19 | SIP URI | Partial | Wired (sbc-daemon, soft client) | `uri.rs`. Length/parameter caps and host/bracket validation added; no §25 grammar, %-escape handling (§19.1.4), absoluteURI or 416 for unknown schemes (POA&M-62) |
+| §20 | Header Fields | Partial | Wired (sbc-daemon, soft client) | 59 `HeaderName` variants in `header.rs`; names are case-insensitive (`Custom` normalised), compact forms incl. e/x/b/y/a/j/d. Only Via, CSeq, Max-Forwards, Content-Length are grammar-checked at parse time; other headers are checked when a caller parses them |
+| §22 | Authentication | Partial | Wired (soft client) | `auth.rs` (RFC 2617) used by the soft client as UAC. The daemon's REGISTER digest challenge/verification is proto-registrar's own code (`authentication.rs`), not `proto_sip::auth` |
+
+### proto-sip message layer hardening (Phase 1)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| §7 / §25.1 CRLF line ends, token names, no CTL in values | Complete | Bare CR/LF rejected; CTLs except HTAB rejected, including escaped CTLs in quoted-pairs (deliberate deviation, RFC 4475 `intmeth`) |
+| §7.5 leading CRLF | Complete | Up to 32 skipped |
+| §18.3 Content-Length framing | Partial | `Framing::Datagram` truncates / rejects; `Framing::Stream` (TCP/TLS) requires an exact C-L; `Framing::Message` (WS/WSS per RFC 7118 §5, SCTP per RFC 4168) makes C-L optional but exact if present. The soft client uses `Stream` on TCP/TLS; sbc-daemon still uses datagram rules everywhere (POA&M-64) |
+| §8.1.1.5 CSeq < 2^31, CSeq method = request method | Complete | Exact, case-sensitive comparison (§7.1) |
+| §20.22 Max-Forwards 0-255 | Complete (stricter than grammar) | §20.22 grammar is `1*DIGIT`; values above 255 (the §16.6 cap) are rejected as 400-class. Tests `max_forwards_range`, `max_forwards_bounds` |
+| Duplicate single-valued headers (RFC 4475 §3.3.8/§3.3.9) | Complete | Call-ID, To, From, CSeq, Max-Forwards, Content-Length |
+| §8.2.2 / §16.3 400 for malformed requests | Missing | Daemon logs and drops (POA&M-63) |
+| §22 digest verifier | Partial | Not reviewed in Phase 1 (POA&M-65); empty input and parameter caps fixed |
+| RFC 3323 topology hiding | Partial | Not reviewed in Phase 1 (POA&M-65) |
+| RFC 3327 Path | Partial | Only list splitting fixed (`path_values` splits combined values) |
+
+#### RFC 4475 results (`crates/proto/proto-sip/tests/rfc4475.rs`)
+
+| Result | Vectors | Notes |
+|--------|---------|-------|
+| Pass: valid, accepted | `wsinv`, `esc01`, `escnull`, `esc02`, `lwsdisp`, `longreq`, `dblreq`, `semiuri`, `transports`, `mpart01`, `unreason`, `noreason`, `badbranch`, `unksm2`, `bext01`, `invut`, `regaut01`, `bcast`, `zeromf`, `cparam01`, `cparam02`, `regescrt`, `sdp01` | Round-trip idempotent. `dblreq` with Stream framing is rejected (`dblreq_stream_framing_rejects_trailing_request`) |
+| Pass: parse, then 400 | `insuf`, `inv2543` | Rejected by `validate_request_headers`, not the parser |
+| Pass: invalid, rejected | `clerr`, `ncl`, `scalar02`, `scalarlg`, `ltgtruri`, `lwsruri`, `lwsstart`, `trws`, `badvers`, `mismatch01`, `mismatch02`, `bigcode`, `multi01`, `mcl01`, `baddn` | `baddn` passes only because the archive copy lacks the final CRLF; with it restored it is accepted (`baddn_with_terminating_crlf_is_known_gap`) |
+| Gap (deviation): valid, rejected | `intmeth` | Escaped CTLs in a quoted-pair are rejected on purpose |
+| Gap: should parse then 416, rejected | `unkscm`, `novelsc` | URI parser rejects unknown schemes (POA&M-62) |
+| Gap: invalid, accepted | `badinv01`, `quotbal`, `escruri`, `baddate`, `regbadct`, `badaspec` | Via/Contact params, To structure, URI grammar, Date, addr-spec not checked at parse time |
+| RFC 4475 torture vectors | Partial | All 49 vectors in `crates/proto/proto-sip/tests/rfc4475.rs` (Datagram framing); see the table below |
 
 ### sbc-daemon B2BUA trunk routing (RFC 3263 §4.3, RFC 3261 §8.1.1, §21.5.4)
 

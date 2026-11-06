@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
-SBC only (planned SBC 0.11.0). The client is not affected.
+Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Security
 
@@ -96,6 +96,38 @@ SBC only (planned SBC 0.11.0). The client is not affected.
   Check a peer with
   `openssl s_client -connect host:port -tls1_3 -ciphersuites TLS_AES_256_GCM_SHA384 -groups secp384r1`.
   The REST HTTPS listener, daemon gRPC and the soft client are unchanged.
+
+### Changed (SBC and client, proto-sip message-layer hardening, Phase 1)
+
+- **SIP parsing is strict.** Messages with bare CR or LF line ends, header
+  names that are not tokens, control characters (other than HTAB) in header
+  values, malformed or duplicate Content-Length (`+5`, `-1`, `l:` plus
+  `Content-Length:`), duplicate Call-ID/To/From/CSeq/Max-Forwards, CSeq of
+  2^31 or more, a CSeq method that differs from the request method, or
+  Max-Forwards above 255 are now rejected, as is a header section without
+  its terminating empty line (missing final CRLF). Peers that send LF-only
+  messages no longer interoperate; there is no compatibility switch.
+- Over UDP, bytes after Content-Length are discarded (RFC 3261 §18.3). The
+  soft client requires Content-Length on TCP/TLS, and its stream framer now
+  applies the parser's Content-Length rules: a missing, duplicate or
+  non-numeric Content-Length closes the connection instead of framing as 0.
+  WS/WSS/SCTP use a new `Framing::Message` mode: Content-Length optional,
+  exact if present (RFC 7118 §5, RFC 4168).
+- **SIP methods are case-sensitive** (RFC 3261 §7.1). `invite` is now an
+  extension method, not INVITE, and extension methods keep the case they
+  were received in. `CSeq: 1 invite` on an INVITE is rejected.
+- Binary message bodies are no longer dropped on re-serialization.
+- Header names compare case-insensitively everywhere (custom spellings of
+  known headers such as `Min-Expires` and `Accept` now match). New compact
+  forms: `e`, `x`, `b`, `y`, `a`, `j`, `d`.
+- Per-message limits: 256 header fields, 8 KiB per header and start line,
+  4 KiB URIs, 64 parameters, 64 list elements.
+- Fixed a panic in Route/Contact list splitting with non-ASCII display names.
+- Known gap (SBC): sbc-daemon still frames TCP/TLS with datagram rules and
+  does not yet use the stream framer (POA&M-64, deferred).
+- Dev only: proptest and criterion dev-dependencies and a standalone
+  cargo-fuzz crate (`crates/proto/proto-sip/fuzz`, excluded from the
+  workspace). No runtime dependency or config/CDR/audit schema change.
 
 ## [0.10.0] — 2026-11-06
 

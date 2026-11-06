@@ -10,8 +10,10 @@
 //! - **Loose Routing**: Modern routing (;lr parameter) - request target unchanged
 //! - **Strict Routing**: Legacy routing - request target modified (deprecated)
 
+use crate::MAX_LIST_ELEMENTS;
 use crate::error::{SipError, SipResult};
 use crate::header_params::NameAddr;
+use crate::list::split_list_bounded;
 use crate::uri::SipUri;
 
 /// A Route entry (parsed Route or Record-Route header value).
@@ -132,7 +134,7 @@ impl RouteSet {
 
         for header in headers {
             // Route headers can contain multiple comma-separated entries
-            for entry in split_header_list(header) {
+            for entry in split_list_bounded(header, MAX_LIST_ELEMENTS)? {
                 let route: RouteEntry = entry.parse()?;
                 routes.push(route);
             }
@@ -156,7 +158,10 @@ impl RouteSet {
 
         // Process in reverse order
         for header in headers.iter().rev() {
-            for entry in split_header_list(header).into_iter().rev() {
+            for entry in split_list_bounded(header, MAX_LIST_ELEMENTS)?
+                .into_iter()
+                .rev()
+            {
                 let route: RouteEntry = entry.parse()?;
                 routes.push(route);
             }
@@ -324,7 +329,7 @@ pub fn process_record_route_for_uac(record_routes: &[String]) -> SipResult<Route
     let mut routes = Vec::new();
 
     for header in record_routes {
-        for entry in split_header_list(header) {
+        for entry in split_list_bounded(header, MAX_LIST_ELEMENTS)? {
             let route: RouteEntry = entry.parse()?;
             routes.push(route);
         }
@@ -355,42 +360,6 @@ pub fn create_record_route(proxy_uri: SipUri, loose_route: bool) -> RouteEntry {
 /// Returns an error if the operation fails.
 pub fn parse_route_name_addr(value: &str) -> SipResult<NameAddr> {
     value.parse()
-}
-
-/// Splits a comma-separated header list.
-///
-/// Handles quoted strings properly (commas inside quotes are not separators).
-fn split_header_list(header: &str) -> Vec<&str> {
-    let mut result = Vec::new();
-    let mut start = 0;
-    let mut in_quotes = false;
-    let mut in_angle = false;
-
-    let chars: Vec<char> = header.chars().collect();
-
-    for (i, &c) in chars.iter().enumerate() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            '<' if !in_quotes => in_angle = true,
-            '>' if !in_quotes => in_angle = false,
-            ',' if !in_quotes && !in_angle => {
-                let entry = header[start..i].trim();
-                if !entry.is_empty() {
-                    result.push(entry);
-                }
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-
-    // Add last entry
-    let entry = header[start..].trim();
-    if !entry.is_empty() {
-        result.push(entry);
-    }
-
-    result
 }
 
 #[cfg(test)]
@@ -481,7 +450,7 @@ mod tests {
     #[test]
     fn test_split_header_list() {
         let header = "<sip:p1.example.com;lr>, <sip:p2.example.com;lr>";
-        let parts = split_header_list(header);
+        let parts = split_list_bounded(header, MAX_LIST_ELEMENTS).unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0], "<sip:p1.example.com;lr>");
         assert_eq!(parts[1], "<sip:p2.example.com;lr>");
@@ -490,9 +459,20 @@ mod tests {
     #[test]
     fn test_split_header_list_with_quotes() {
         let header = "\"Name, Jr.\" <sip:p1.example.com;lr>, <sip:p2.example.com>";
-        let parts = split_header_list(header);
+        let parts = split_list_bounded(header, MAX_LIST_ELEMENTS).unwrap();
         assert_eq!(parts.len(), 2);
         assert!(parts[0].contains("Name, Jr."));
+    }
+
+    #[test]
+    fn test_route_set_multibyte_display_name_regression() {
+        // Used to panic: char index used to slice by byte.
+        // (Route display names are not supported by RouteEntry; must not panic.)
+        let header = "\"Ünïcödé\" <sip:p1.example.com;lr>, <sip:p2.example.com;lr>".to_string();
+        let _ = RouteSet::from_route_headers(&[header]);
+        let header = "<sip:p1.example.com;lr;n=Ünïcödé>, <sip:p2.example.com;lr>".to_string();
+        let set = RouteSet::from_route_headers(&[header]).unwrap();
+        assert_eq!(set.len(), 2);
     }
 
     #[test]

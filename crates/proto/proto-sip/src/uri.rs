@@ -273,28 +273,50 @@ fn parse_user_info(user_host_port: &str) -> (Option<String>, Option<String>, &st
 }
 
 /// Parses host and port, handling IPv6 addresses.
+///
+/// RFC 3261 §25.1: `hostport = host [ ":" port ]`, IPv6 references are
+/// bracketed. A host that is empty, contains a stray `[`/`]`/`:`, or
+/// trailing garbage after `]` is rejected so the URI re-serializes
+/// identically (found by the `roundtrip` fuzz target).
+///
+/// NIST 800-53 Rev5: SI-10 (Information Input Validation).
+// POAM: POA&M-62 - full RFC 3261 §25 URI grammar (host charset, %-escapes,
+// §19.1.4 comparison) is out of scope for Phase 1.
 fn parse_host_port(host_port: &str) -> SipResult<(String, Option<u16>)> {
-    if host_port.starts_with('[') {
+    let invalid = |reason: &str| SipError::InvalidUri {
+        reason: reason.to_string(),
+    };
+    if let Some(inner) = host_port.strip_prefix('[') {
         // IPv6
-        if let Some((h, p)) = host_port.split_once(']') {
-            let host = h.trim_start_matches('[');
-            let port = p.strip_prefix(':').and_then(|p| p.parse().ok());
-            Ok((host.to_string(), port))
-        } else {
-            Err(SipError::InvalidUri {
-                reason: "invalid IPv6 address".to_string(),
-            })
+        let (h, p) = inner
+            .split_once(']')
+            .ok_or_else(|| invalid("invalid IPv6 address"))?;
+        if h.is_empty() || h.contains(['[', ']']) {
+            return Err(invalid("invalid IPv6 address"));
         }
-    } else if let Some((h, p)) = host_port.rsplit_once(':') {
-        // IPv4 or hostname with port
-        if let Ok(port) = p.parse() {
-            Ok((h.to_string(), Some(port)))
-        } else {
-            Ok((host_port.to_string(), None))
-        }
-    } else {
-        Ok((host_port.to_string(), None))
+        let port = match p {
+            "" => None,
+            _ => Some(
+                p.strip_prefix(':')
+                    .and_then(|p| p.parse().ok())
+                    .ok_or_else(|| invalid("invalid port"))?,
+            ),
+        };
+        return Ok((h.to_string(), port));
     }
+
+    let (host, port) = match host_port.rsplit_once(':') {
+        // IPv4 or hostname with port
+        Some((h, p)) => match p.parse() {
+            Ok(port) => (h, Some(port)),
+            Err(_) => (host_port, None),
+        },
+        None => (host_port, None),
+    };
+    if host.is_empty() || host.contains([':', '[', ']']) {
+        return Err(invalid("invalid host"));
+    }
+    Ok((host.to_string(), port))
 }
 
 /// Parses URI headers from a header string.
@@ -315,7 +337,19 @@ impl FromStr for SipUri {
     type Err = SipError;
 
     fn from_str(s: &str) -> SipResult<Self> {
-        debug_assert!(!s.is_empty(), "empty URI string");
+        // NIST 800-53 Rev5: SI-10 / SC-5 - untrusted input: empty and
+        // oversized URIs are real errors (was a debug_assert).
+        if s.is_empty() {
+            return Err(SipError::InvalidUri {
+                reason: "empty URI".to_string(),
+            });
+        }
+        if s.len() > crate::MAX_URI_LEN {
+            return Err(SipError::LimitExceeded {
+                what: "URI length",
+                limit: crate::MAX_URI_LEN,
+            });
+        }
 
         let (scheme_str, rest) = s.split_once(':').ok_or_else(|| SipError::InvalidUri {
             reason: "missing scheme separator".to_string(),
@@ -326,6 +360,13 @@ impl FromStr for SipUri {
             .split_once('?')
             .map_or((rest, None), |(r, h)| (r, Some(h)));
         let parts: Vec<&str> = rest.split(';').collect();
+        // NIST 800-53 Rev5: SC-5 - bound uri-parameters.
+        if parts.len() > crate::MAX_PARAMS + 1 {
+            return Err(SipError::LimitExceeded {
+                what: "URI parameters",
+                limit: crate::MAX_PARAMS,
+            });
+        }
 
         let user_host_port = parts.first().ok_or_else(|| SipError::InvalidUri {
             reason: "missing host".to_string(),
@@ -411,5 +452,34 @@ mod tests {
         let uri: SipUri = original.parse().unwrap();
         let formatted = format!("{uri}");
         assert_eq!(formatted, original);
+    }
+
+    #[test]
+    fn uri_untrusted_input_errors_in_release() {
+        assert!("".parse::<SipUri>().is_err());
+        let long = format!("sip:{}@example.com", "a".repeat(crate::MAX_URI_LEN));
+        assert!(long.parse::<SipUri>().is_err());
+        let many = (0..=crate::MAX_PARAMS).fold(String::new(), |mut acc, i| {
+            let _ = std::fmt::Write::write_fmt(&mut acc, format_args!(";p{i}"));
+            acc
+        });
+        assert!(
+            format!("sip:a@example.com{many}")
+                .parse::<SipUri>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn fuzz_regression_stray_bracket_host_roundtrip() {
+        // roundtrip fuzz crash: host ":adch]nparam" re-serialized as
+        // "[:adch]nparam]" and re-parsed differently.
+        assert!("sip:vivekg@:adch]nparam".parse::<SipUri>().is_err());
+        assert!("sip:[::1]junk".parse::<SipUri>().is_err());
+        assert!("sip:a@".parse::<SipUri>().is_err());
+        let u: SipUri = "sip:a@[2001:db8::1]:5060".parse().unwrap();
+        assert_eq!(u.port, Some(5060));
+        let again: SipUri = u.to_string().parse().unwrap();
+        assert_eq!(again.to_string(), u.to_string());
     }
 }

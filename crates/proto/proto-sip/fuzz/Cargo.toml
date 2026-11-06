@@ -1,0 +1,44 @@
+[package]
+name = "proto-sip-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+proto-sip = { path = "..", features = ["digest-auth"] }
+
+# Standalone workspace: keeps nightly-only fuzz code out of the main
+# workspace build (the root Cargo.toml also lists this dir in `exclude`).
+[workspace]
+
+[[bin]]
+name = "parse_message"
+path = "fuzz_targets/parse_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "split_list"
+path = "fuzz_targets/split_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_values"
+path = "fuzz_targets/header_values.rs"
+test = false
+doc = false
+bench = false
