@@ -51,7 +51,8 @@ pub struct CallLimiter {
     invite_limiter: Option<RateLimiter>,
     /// Per-source REGISTER token buckets (None when disabled).
     register_limiter: Option<RateLimiter>,
-    /// Concurrent call count per callee number.
+    /// Concurrent call count per callee number. Keys are canonical
+    /// screening keys (`uc_types::DialedNumber`), supplied by the engine.
     concurrent_by_callee: HashMap<String, u32>,
 }
 

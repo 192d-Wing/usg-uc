@@ -97,10 +97,16 @@ impl VpsEngine {
     fn compile_rule(rule: &VpsRuleConfig) -> PolicyRule {
         let mut conditions = Vec::new();
         if let Some(ref prefix) = rule.caller_prefix {
-            conditions.push(Condition::CallerId(StringMatch::Prefix(prefix.clone())));
+            // NIST 800-53 Rev5: AC-3, SI-10 — prefixes are canonicalised at
+            // load and compared against the canonical caller/callee.
+            conditions.push(Condition::CallerId(StringMatch::Prefix(
+                uc_types::canonical_prefix(prefix),
+            )));
         }
         if let Some(ref prefix) = rule.callee_prefix {
-            conditions.push(Condition::CalledNumber(StringMatch::Prefix(prefix.clone())));
+            conditions.push(Condition::CalledNumber(StringMatch::Prefix(
+                uc_types::canonical_prefix(prefix),
+            )));
         }
         if let Some(ref source) = rule.source_ip {
             conditions.push(Condition::SourceIp(source.clone()));
@@ -153,8 +159,34 @@ impl VpsEngine {
         self.emergency.matches(dialed)
     }
 
+    /// Canonicalises the attempt's caller and callee once
+    /// (`uc_types::DialedNumber` screening keys), so the blocklist, policy
+    /// prefixes, emergency check and per-callee cap all compare the same
+    /// form. Idempotent on already-canonical input.
+    ///
+    /// ## NIST 800-53 Rev5: SI-10 (Information Input Validation), AC-3
+    fn canonical_attempt(attempt: &CallAttempt) -> CallAttempt {
+        let mut canon = attempt.clone();
+        canon.callee = attempt
+            .callee
+            .as_deref()
+            .map(crate::emergency::screening_key);
+        canon.caller = attempt
+            .caller
+            .as_deref()
+            .map(crate::emergency::screening_key);
+        canon
+    }
+
     /// Screens a call attempt. See the crate docs for evaluation order.
+    /// Caller and callee are compared in canonical form.
     pub fn screen_call(&mut self, attempt: &CallAttempt) -> VpsVerdict {
+        let canon = Self::canonical_attempt(attempt);
+        self.screen_canonical(&canon)
+    }
+
+    /// [`Self::screen_call`] on an attempt already canonicalised.
+    fn screen_canonical(&mut self, attempt: &CallAttempt) -> VpsVerdict {
         if !self.config.enabled {
             return VpsVerdict::allow(VerdictSource::Disabled);
         }
@@ -341,8 +373,12 @@ impl VpsEngine {
     /// key to [`Self::call_ended`] exactly once when the call goes away.
     ///
     /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+    ///
+    /// The reserved key is the canonical screening key of the callee, so
+    /// `+15551234567` and `1 (555) 123-4567` share one slot.
     pub fn screen_and_reserve(&mut self, attempt: &CallAttempt) -> (VpsVerdict, Option<String>) {
-        let verdict = self.screen_call(attempt);
+        let attempt = &Self::canonical_attempt(attempt);
+        let verdict = self.screen_canonical(attempt);
         // An emergency call takes no slot, so held emergency calls never
         // fill the cap against further ones.
         if !verdict.is_allowed()
@@ -363,18 +399,25 @@ impl VpsEngine {
     }
 
     /// Current concurrent call count for a callee.
+    /// `callee` is canonicalised (idempotent on a reserved key).
     pub fn callee_concurrent_calls(&self, callee: &str) -> u32 {
-        self.limiter.concurrent_calls(callee)
+        self.limiter
+            .concurrent_calls(&crate::emergency::screening_key(callee))
     }
 
     /// Records a screened call becoming active (concurrency accounting).
+    /// `callee` is canonicalised.
     pub fn call_started(&mut self, callee: &str) {
-        self.limiter.call_started(callee);
+        self.limiter
+            .call_started(&crate::emergency::screening_key(callee));
     }
 
-    /// Records a call ending (concurrency accounting).
+    /// Records a call ending (concurrency accounting). `callee` is
+    /// canonicalised, so the key returned by [`Self::screen_and_reserve`]
+    /// and the dialed form release the same slot.
     pub fn call_ended(&mut self, callee: &str) {
-        self.limiter.call_ended(callee);
+        self.limiter
+            .call_ended(&crate::emergency::screening_key(callee));
     }
 
     /// Installs a timed (or permanent) source block. The surface the
@@ -521,7 +564,7 @@ mod tests {
         let mut engine = VpsEngine::new(&config).unwrap();
         let verdict = engine.screen_call(&attempt(ip(1)).with_caller("+19005551234"));
         assert!(!verdict.is_allowed());
-        assert_eq!(verdict.matched_rule(), Some("blocklist:+1900"));
+        assert_eq!(verdict.matched_rule(), Some("blocklist:1900"));
     }
 
     #[test]
@@ -580,7 +623,7 @@ mod tests {
         let (v1, k1) = engine.screen_and_reserve(&attempt(ip(1)));
         let (v2, k2) = engine.screen_and_reserve(&attempt(ip(2)));
         assert!(v1.is_allowed() && v2.is_allowed());
-        assert_eq!(k1.as_deref(), Some("+12135552000"));
+        assert_eq!(k1.as_deref(), Some("12135552000"));
         assert!(k2.is_some());
         assert_eq!(engine.callee_concurrent_calls("+12135552000"), 2);
 
@@ -608,6 +651,153 @@ mod tests {
         let (verdict, key) = disabled.screen_and_reserve(&attempt(ip(1)));
         assert!(verdict.is_allowed());
         assert!(key.is_none());
+    }
+
+    #[test]
+    fn canonical_callee_deny_catches_formatting_variants() {
+        let config = VpsConfig {
+            rules: vec![VpsRuleConfig {
+                id: "block-premium".to_string(),
+                callee_prefix: Some("1900".to_string()),
+                ..VpsRuleConfig::default()
+            }],
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        for callee in [
+            "+19005551234",
+            "1-900-555-1234",
+            "%2B19005551234",
+            "sip:1(900)5551234@h",
+        ] {
+            let v = engine.screen_call(&attempt(ip(1)).with_callee(callee));
+            assert!(!v.is_allowed(), "{callee}");
+        }
+        assert!(
+            engine
+                .screen_call(&attempt(ip(1)).with_callee("+12135551234"))
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn canonical_caller_blocklist_and_runtime_block() {
+        let config = VpsConfig {
+            blocked_caller_prefixes: vec!["+1555".to_string()],
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        for caller in ["15551234567", "1-555-123-4567"] {
+            let v = engine.screen_call(&attempt(ip(1)).with_caller(caller));
+            assert_eq!(v.source(), VerdictSource::Blocklist, "{caller}");
+        }
+        engine.block_caller_prefix("+1-900", None);
+        let v = engine.screen_call(&attempt(ip(1)).with_caller("19005550000"));
+        assert_eq!(v.source(), VerdictSource::Blocklist);
+    }
+
+    #[test]
+    fn qa_deny_emergency_and_cap_alternate_forms() {
+        let config = VpsConfig {
+            rules: vec![VpsRuleConfig {
+                id: "deny-9".to_string(),
+                callee_prefix: Some("9".to_string()),
+                ..VpsRuleConfig::default()
+            }],
+            tdos: TdosConfig {
+                per_source_cps: 0,
+                per_callee_max_concurrent: 1,
+                ..TdosConfig::default()
+            },
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        // Emergency forms bypass the deny rule.
+        for callee in [
+            "911",
+            "9-1-1",
+            "(911)",
+            "+911",
+            "%39%31%31",
+            "sip:911;phone-context=+1@h",
+        ] {
+            let v = engine.screen_call(&attempt(ip(1)).with_callee(callee));
+            assert_eq!(v.source(), VerdictSource::EmergencyBypass, "{callee}");
+        }
+        // Near-emergency and phone-context variants are denied.
+        for callee in ["9111", "9-1-1-1", "95551234;phone-context=+1", "%2B9 555"] {
+            let v = engine.screen_call(&attempt(ip(1)).with_callee(callee));
+            assert!(!v.is_allowed(), "{callee}");
+        }
+        // Opaque callee: screening key is the raw user, compared as a
+        // string prefix (fails closed for a deny rule).
+        assert!(
+            !engine
+                .screen_call(&attempt(ip(1)).with_callee("9alice"))
+                .is_allowed()
+        );
+        assert!(
+            engine
+                .screen_call(&attempt(ip(1)).with_callee("alice9"))
+                .is_allowed()
+        );
+        // Per-callee cap: escaped and URI forms share one key.
+        let (v1, k1) = engine.screen_and_reserve(&attempt(ip(1)).with_callee("%2B15551234567"));
+        assert!(v1.is_allowed());
+        assert_eq!(k1.as_deref(), Some("15551234567"));
+        for other in [
+            "sip:+1-555-123-4567@h;user=phone",
+            "1.555.123.4567",
+            "15551234567;x=1",
+        ] {
+            let (v, k) = engine.screen_and_reserve(&attempt(ip(2)).with_callee(other));
+            assert_eq!(v.source(), VerdictSource::ConcurrencyCap, "{other}");
+            assert!(k.is_none(), "{other}");
+        }
+        assert_eq!(engine.callee_concurrent_calls("(555) 123-4567"), 0);
+        assert_eq!(engine.callee_concurrent_calls("1 555 123 4567"), 1);
+        engine.call_ended("+1 (555) 123-4567");
+        assert_eq!(engine.callee_concurrent_calls("15551234567"), 0);
+    }
+
+    #[test]
+    fn qa_caller_blocklist_unblock_is_canonical() {
+        let mut engine = VpsEngine::new(&enabled_config()).unwrap();
+        engine.block_caller_prefix("%2B1 (555)", None);
+        for caller in ["+15550001111", "1-555-000-1111", "sip:15550001111@h"] {
+            let v = engine.screen_call(&attempt(ip(1)).with_caller(caller));
+            assert_eq!(v.source(), VerdictSource::Blocklist, "{caller}");
+        }
+        assert!(
+            engine
+                .screen_call(&attempt(ip(1)).with_caller("+12025550100"))
+                .is_allowed()
+        );
+        engine.unblock_caller_prefix("+1-555");
+        assert!(
+            engine
+                .screen_call(&attempt(ip(1)).with_caller("+15550001111"))
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn canonical_callee_cap_shares_one_slot() {
+        let config = VpsConfig {
+            tdos: TdosConfig {
+                per_source_cps: 0,
+                per_callee_max_concurrent: 1,
+                ..TdosConfig::default()
+            },
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        let (v1, k1) = engine.screen_and_reserve(&attempt(ip(1)).with_callee("+15551234567"));
+        assert!(v1.is_allowed());
+        let (v2, _) = engine.screen_and_reserve(&attempt(ip(2)).with_callee("1 (555) 123-4567"));
+        assert_eq!(v2.source(), VerdictSource::ConcurrencyCap);
+        engine.call_ended(k1.as_deref().unwrap());
+        assert_eq!(engine.callee_concurrent_calls("+1-555-123-4567"), 0);
     }
 
     #[test]

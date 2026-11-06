@@ -45,6 +45,17 @@ This document provides a comprehensive summary of RFCs required for implementing
 - Certificate validation must use SHA-384 or SHA-512 for fingerprints
 - RSA and ECDSA certificates will need migration to ML-DSA-87 by 2035
 
+**Current implementation (sbc-daemon), call-path responses:**
+
+| Condition | Response | Notes |
+|-----------|----------|-------|
+| Route pattern `blocked` matched | 403 Forbidden | No dial-plan or default-group fallback; audited `route:blocked` |
+| Emergency number with no route | 503, no `Retry-After` | Audited `emergency_unrouted` |
+| Numeric-looking malformed, empty or >256-byte R-URI user | 404 | Number Not In Service announcement, then the final response |
+| Per-user rate exceeded | 503, `Retry-After: 1` | Keyed on the authenticated AOR, else source /32 or /64 plus canonical From user; trunk sources, ACK and emergency INVITEs are exempt |
+
+Open: RFC 3966 `;phone-context` is dropped (POA&M-100) and `urn:service:sos` is not classified as emergency; see `docs/RFC_COMPLIANCE_GAPS.md`.
+
 ---
 
 ### RFC 3263 - Locating SIP Servers

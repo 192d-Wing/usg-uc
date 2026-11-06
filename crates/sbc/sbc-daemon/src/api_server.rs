@@ -347,6 +347,39 @@ pub const METRIC_AUDIT_RECORDS_DROPPED: &str = "audit_records_dropped";
 pub const METRIC_AUDIT_WRITER_ALIVE: &str = "audit_writer_alive";
 /// Gauge: emergency INVITEs admitted through the emergency bypass.
 pub const METRIC_EMERGENCY_ADMISSIONS: &str = "emergency_calls_admitted";
+/// Call-path routing gauges mirroring monotonic counters (no labels).
+///
+/// ## NIST 800-53 Rev5: SI-4 (System Monitoring), AU-2
+pub const ROUTING_METRICS: &[(&str, &str)] = &[
+    (
+        "sbc_route_blocked_total",
+        "INVITEs refused with 403 by a blocked route pattern",
+    ),
+    (
+        "sbc_emergency_force_routed_emergency_trunk_total",
+        "Emergency calls force-routed to routing.emergency_trunk_group",
+    ),
+    (
+        "sbc_emergency_force_routed_blocked_ignored_total",
+        "Emergency calls routed past a blocked route pattern",
+    ),
+    (
+        "sbc_emergency_unrouted_total",
+        "Emergency calls refused with 503 because nothing could route them",
+    ),
+    (
+        "sbc_user_limiter_overflow_total",
+        "Per-user limiter keys allowed untracked because the key map was full",
+    ),
+    (
+        "sbc_user_limiter_emergency_bypass_total",
+        "Emergency INVITEs exempted from the per-user limiter",
+    ),
+    (
+        "sbc_route_pattern_rejected_total",
+        "Route patterns rejected for an unknown pattern_type (seed or sync)",
+    ),
+];
 /// Gauge: CDRs accepted onto the writer queue.
 pub const METRIC_CDR_EMITTED: &str = "cdr_emitted_total";
 /// Gauge: CDRs dropped because the queue was full.
@@ -481,6 +514,9 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
         METRIC_EMERGENCY_ADMISSIONS,
         "Emergency INVITEs admitted through the emergency bypass (47 CFR 9.16)",
     );
+    for &(name, help) in ROUTING_METRICS {
+        metrics.register_gauge(name, help);
+    }
     // NIST 800-53 Rev5: AU-5 (CDR pipeline failure visibility)
     for (name, help) in [
         (METRIC_CDR_EMITTED, "CDRs accepted onto the writer queue"),
@@ -620,6 +656,25 @@ impl AppState {
             self.sip_stack.as_ref(),
         ) {
             g.set(as_gauge(stack.emergency_admissions()));
+        }
+        if let Some(stack) = self.sip_stack.as_ref() {
+            let c = stack.routing_counters();
+            let load =
+                |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+            let values = [
+                load(&c.route_blocked),
+                load(&c.emergency_force_routed_trunk),
+                load(&c.emergency_force_routed_blocked_ignored),
+                load(&c.emergency_unrouted),
+                load(&c.user_limiter_overflow),
+                load(&c.user_limiter_emergency_bypass),
+                load(&crate::sip_stack::ROUTE_PATTERN_REJECTED),
+            ];
+            for (&(name, _), v) in ROUTING_METRICS.iter().zip(values) {
+                if let Some(g) = self.metrics.gauge(name) {
+                    g.set(as_gauge(v));
+                }
+            }
         }
         if let Some(cdr) = self.sip_stack.as_ref().and_then(|s| s.cdr()) {
             let s = cdr.emitter().stats();
@@ -1595,12 +1650,17 @@ fn dial_plan_from_entries(plan_id: &str, entries: &[serde_json::Value]) -> uc_ro
 
         // Same pattern_type vocabulary as config dial plans and route patterns.
         // An absent pattern or the legacy ".*" default stays a catch-all.
-        let pattern = match pattern_type {
-            "any" => uc_routing::DialPattern::Any,
-            _ if matches!(pattern_value, ".*" | "*" | "") => uc_routing::DialPattern::Any,
-            "exact" => uc_routing::DialPattern::exact(pattern_value),
-            "wildcard" => uc_routing::DialPattern::wildcard(pattern_value),
-            _ => uc_routing::DialPattern::prefix(pattern_value),
+        let pattern = if matches!(pattern_value, ".*" | "*" | "") {
+            uc_routing::DialPattern::Any
+        } else {
+            match uc_routing::DialPattern::from_kind(pattern_type, pattern_value) {
+                Ok(p) => p,
+                Err(e) => {
+                    // NIST 800-53 Rev5: SI-10 — skip, never a silent prefix.
+                    tracing::warn!(plan = plan_id, entry = idx, error = %e, "Dial plan entry skipped");
+                    continue;
+                }
+            }
         };
         let entry_id = format!("{plan_id}-{idx}");
         let dp_entry =
@@ -1680,8 +1740,8 @@ pub async fn apply_css_to_router(state: &Arc<AppState>, body: &serde_json::Value
 }
 
 /// Apply a JSON route-pattern body. `pattern_type` chooses the
-/// `DialPattern` variant; unknown values fall back to `prefix` to match
-/// the legacy REST handler.
+/// `DialPattern` variant (absent = `prefix`); an unknown value is
+/// rejected and the previous pattern kept.
 pub async fn apply_route_pattern_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
     let Some(ref router) = state.sbc_router else {
         return;
@@ -1701,11 +1761,16 @@ pub async fn apply_route_pattern_to_router(state: &Arc<AppState>, body: &serde_j
         .get("pattern_type")
         .and_then(|v| v.as_str())
         .unwrap_or("prefix");
-    let pattern = match pattern_type {
-        "exact" => uc_routing::DialPattern::exact(pattern_value),
-        "wildcard" => uc_routing::DialPattern::wildcard(pattern_value),
-        "any" => uc_routing::DialPattern::Any,
-        _ => uc_routing::DialPattern::prefix(pattern_value),
+    // NIST 800-53 Rev5: SI-10, CM-6 — an unknown kind keeps the previous
+    // pattern instead of installing a silent prefix route.
+    let pattern = match uc_routing::DialPattern::from_kind(pattern_type, pattern_value) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::sip_stack::ROUTE_PATTERN_REJECTED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(id, error = %e, "Route pattern sync rejected; previous pattern kept");
+            return;
+        }
     };
     let mut rp = uc_routing::RoutePattern::new(id, pattern, partition);
     if let Some(rl) = body.get("route_list_id").and_then(|v| v.as_str())
@@ -2232,5 +2297,29 @@ mod tests {
         assert!(!tls_trunk_without_ca(&g, true));
         let g = trunk_group_from_json(&udp).expect("group");
         assert!(!tls_trunk_without_ca(&g, false));
+    }
+
+    #[tokio::test]
+    async fn route_pattern_sync_rejects_unknown_pattern_type_and_keeps_previous() {
+        let mut state = AppState::new(SbcMetrics::standard(), Arc::new(ServerStats::default()));
+        let router = Arc::new(tokio::sync::RwLock::new(uc_routing::SbcRouter::new()));
+        state.sbc_router = Some(Arc::clone(&router));
+        let state = Arc::new(state);
+        let good = serde_json::json!({"id": "rp", "partition_id": "pt", "pattern": "1900",
+                                      "pattern_type": "prefix", "blocked": true});
+        apply_route_pattern_to_router(&state, &good).await;
+        let before =
+            crate::sip_stack::ROUTE_PATTERN_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        let bogus = serde_json::json!({"id": "rp", "partition_id": "pt", "pattern": "1900",
+                                       "pattern_type": "bogus"});
+        apply_route_pattern_to_router(&state, &bogus).await;
+        let r = router.read().await;
+        let pats = r.list_route_patterns();
+        assert_eq!(pats.len(), 1);
+        assert!(pats[0].is_blocked(), "previous (blocked) pattern kept");
+        assert!(
+            crate::sip_stack::ROUTE_PATTERN_REJECTED.load(std::sync::atomic::Ordering::Relaxed)
+                > before
+        );
     }
 }

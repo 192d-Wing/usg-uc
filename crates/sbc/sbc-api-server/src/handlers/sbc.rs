@@ -296,6 +296,13 @@ pub async fn create_route_pattern(
             );
         }
     };
+    // NIST 800-53 Rev5: SI-10 — unknown pattern_type is a 400, never a prefix.
+    if let Err(e) = super::route_pattern_rules::validate_pattern_type(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"success": false, "error": e})),
+        );
+    }
     if body
         .get("pattern")
         .and_then(|v| v.as_str())
@@ -326,6 +333,13 @@ pub async fn update_route_pattern(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // NIST 800-53 Rev5: SI-10 — unknown pattern_type is a 400, never a prefix.
+    if let Err(e) = super::route_pattern_rules::validate_pattern_type(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"success": false, "error": e})),
+        );
+    }
     let mut doc = body;
     if let serde_json::Value::Object(ref mut obj) = doc {
         obj.insert("id".to_string(), serde_json::Value::String(id.clone()));

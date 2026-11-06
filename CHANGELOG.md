@@ -215,6 +215,84 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   rate-limited to once per second. Before, it ran under the location write
   lock on every new-flow REGISTER (POA&M-35).
 
+### Security (SBC, call-path routing and number normalisation)
+
+- **SBC: blocked route patterns fail closed (behaviour change).** A call that
+  matches a `blocked` route pattern now gets `403 Forbidden` and does not fall
+  back to a later partition, the dial plan or `default_trunk_group`. A block is
+  also tested against the dialled number with `+` stripped, so a `1900` block
+  catches `+1-900-…`. A block written as `+1900` does not catch the national
+  form `1900…`, so write blocks without `+`. Audited as `route:blocked`; new
+  metric `sbc_route_blocked_total`. (AC-3, AC-4)
+- **SBC: `routing.default_trunk_group` is outbound-only (behaviour change).**
+  Inbound calls that match nothing get 404 and are no longer sent to the
+  default group. Deployments that relied on inbound catch-all through the
+  default group need an explicit dial-plan entry with `direction = "inbound"`
+  or `"both"`. (AC-4)
+- **SBC: dial-plan `direction`, `source_trunk` and `domain_pattern` are
+  enforced (behaviour change).** They were parsed but ignored before.
+  `domain_pattern` now matches on a label boundary and ignores ASCII case
+  (`*.mil` no longer matches `evilmil`). API/JSON dial plans still carry only
+  the pattern kind. (AC-4)
+- **SBC: unknown `pattern_type` is rejected (behaviour change).** Only
+  `exact|prefix|wildcard|any` (case-sensitive) are accepted. Config load fails
+  validation. Daemon seed and gRPC sync skip the row with a warning
+  (`sbc_route_pattern_rejected_total`). REST POST/PUT `/route-patterns`
+  returns 400 for an unknown or non-string value. Seeded `blocked` and
+  `priority` are now honoured. (SI-10, CM-6)
+- **SBC: canonical dialled-number handling (behaviour change).** R-URI users
+  are canonicalised once (`uc_types::DialedNumber`: separators, percent
+  decoding, `tel:`/`sip:` forms) before routing, VPS screening, blocklist and
+  emergency matching. A numeric-looking user that is not canonical (for
+  example `+19005551234x`), an empty user or a user over 256 bytes is never
+  routed and gets 404, including against `any` catch-alls and the default
+  group. Alias users such as `alice` still route. `;phone-context` is dropped,
+  not applied (POA&M-100). (SI-10)
+- **SBC: per-user INVITE/REGISTER limiter rekeyed (behaviour change).**
+  Buckets are keyed on the authenticated AOR when the request arrives on a
+  flow bound by an authenticated REGISTER, and otherwise on
+  `(source /32 or /64, From user)`, so a spoofed `From` from another network
+  cannot drain a victim's bucket. More than 64 unauthenticated users per
+  network share one bucket. Trunk sources are exempt (bounded by trunk
+  `max_calls` and VPS caps). Emergency INVITEs bypass the limiter. Overflow of
+  the key table is allowed, not rejected. Burst is fixed at `rps x 2` and
+  `rate_limit.burst_multiplier` is ignored for this limiter (POA&M-101).
+  Audit `limit_name` is now `per_user_rps:auth:…` or
+  `per_user_rps:unauth:<net>`, which affects SIEM parsers. New metrics
+  `sbc_user_limiter_overflow_total` and
+  `sbc_user_limiter_emergency_bypass_total`. (SC-5)
+- **SBC: emergency calls (behaviour change).** Emergency numbers are
+  canonicalised (`9-1-1` and `%39%311` match `911`). They are force-routed to
+  the new optional `routing.emergency_trunk_group` when it is set, and a
+  matching block is ignored and audited (`route:blocked-ignored`). An emergency
+  call with no route gets 503 without `Retry-After` and is audited as
+  `emergency_unrouted`. Routability is checked at startup only. New metrics
+  `sbc_emergency_force_routed_emergency_trunk_total`,
+  `sbc_emergency_force_routed_blocked_ignored_total` and
+  `sbc_emergency_unrouted_total`. Route audit subjects are now
+  `trunk_group:<tg>`, the flow-bound AOR, or `unverified:<From URI>`.
+  (CP-8, CM-6, AU-3; 47 CFR 9.16)
+- POA&M-100 to POA&M-103 record the deferred items from this work, including
+  phone-context-aware normalisation (POA&M-100) and `burst_multiplier` for
+  the per-user limiter (POA&M-101). See `docs/NIST-800-53-CONTROLS.md`.
+
+### Changed (SBC, call-path routing)
+
+- **Breaking API (library): `uc_routing::SbcRouter::route` now returns
+  `SbcRouteOutcome { Routed, Blocked { pattern_id, partition_id }, NoMatch }`**
+  instead of an `Option`. Use `routed()` and `is_blocked()` for the old shape.
+  `Router::route_call` takes a `CallRouteContext` and uses
+  `DialPlan::match_extended`. `route`/`route_for`/`route_for_tls` keep their
+  old semantics and are documented as legacy.
+- **VPS: canonical comparisons.** Blocklist rule names are canonical
+  (`blocklist:1900`, was `blocklist:+1900`) and the reserved callee key is
+  canonical (`12135552000`). Update any SIEM rules that match these strings.
+  CDR causes are unchanged: a blocked route records `PolicyDenied` and an
+  unrouted emergency call records `NoRoute`.
+- `uc-vps` now depends on `uc-types` (workspace crate). `uc-types` gains
+  `proptest` as a dev-dependency only. No new third-party runtime
+  dependencies.
+
 ### Changed (SBC and client, proto-sip message-layer hardening, Phase 1)
 
 - **SIP parsing is strict.** Messages with bare CR or LF line ends, header

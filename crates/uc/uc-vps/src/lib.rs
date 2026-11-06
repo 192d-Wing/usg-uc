@@ -61,7 +61,7 @@ pub use config::{
     VpsDefaultAction, VpsRuleAction, VpsRuleConfig, default_emergency_numbers,
 };
 pub use context::{CallAttempt, CallDirection, StirShakenStatus, uri_user};
-pub use emergency::EmergencyNumbers;
+pub use emergency::{EmergencyNumbers, screening_key};
 pub use engine::{VpsEngine, VpsStats};
 pub use error::{VpsError, VpsResult};
 pub use verdict::{VerdictSource, VpsAction, VpsVerdict};

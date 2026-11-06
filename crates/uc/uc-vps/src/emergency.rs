@@ -3,31 +3,23 @@
 //! One predicate shared by VPS screening and the SIP stack's own capacity
 //! limits, so both agree on what counts as an emergency call.
 
-/// RFC 3966 §5.1.1 visual separators plus the `+` of a global number,
-/// ignored when matching an emergency number.
-const fn is_dial_separator(b: u8) -> bool {
-    matches!(b, b'+' | b'-' | b'.' | b'(' | b')' | b' ')
-}
+use uc_types::DialedNumber;
 
 /// The user part of a dialed callee: the URI user when `dialed` is a SIP
 /// or tel URI, else `dialed` itself; URI parameters dropped.
-fn dialed_user(dialed: &str) -> &str {
+pub(crate) fn dialed_user(dialed: &str) -> &str {
     let user = crate::context::uri_user(dialed).unwrap_or(dialed);
     user.split(';').next().unwrap_or(user)
 }
 
-/// Exact match of `dialed` against `entry`, ignoring separators on both
-/// sides. No prefix match: `9111` is not `911`.
-fn dial_matches(dialed: &str, entry: &str) -> bool {
-    let mut d = dialed.bytes().filter(|b| !is_dial_separator(*b));
-    let mut e = entry.bytes().filter(|b| !is_dial_separator(*b));
-    loop {
-        match (d.next(), e.next()) {
-            (None, None) => return true,
-            (Some(x), Some(y)) if x == y => {}
-            _ => return false,
-        }
-    }
+/// Canonical screening key of a number or URI (`uc_types::DialedNumber`
+/// rules: separators, `%xx`, `+` and URI parameters removed).
+///
+/// ## NIST 800-53 Rev5: SI-10 (Information Input Validation)
+pub fn screening_key(dialed: &str) -> String {
+    DialedNumber::parse(dialed_user(dialed))
+        .screening_key()
+        .to_string()
 }
 
 /// The configured emergency numbers (`[vps] emergency_numbers`).
@@ -39,19 +31,35 @@ pub struct EmergencyNumbers {
 }
 
 impl EmergencyNumbers {
-    /// Builds the classifier from a validated list.
+    /// Builds the classifier from a validated list. Entries are stored in
+    /// canonical digit form so matching is one string compare per entry.
     pub fn new(numbers: &[String]) -> Self {
         Self {
-            numbers: numbers.to_vec(),
+            numbers: numbers
+                .iter()
+                .map(|n| DialedNumber::parse(n))
+                .filter_map(|n| n.digits().map(str::to_string))
+                .collect(),
         }
     }
 
     /// Whether `dialed` (a Request-URI, or its user part) is an emergency
-    /// number: exact match after stripping `+`, visual separators and URI
-    /// parameters. Allocation-free.
+    /// number: exact match of the canonical digits (`+`, visual separators,
+    /// `%xx` escapes and URI parameters removed). No prefix match.
     pub fn matches(&self, dialed: &str) -> bool {
-        let user = dialed_user(dialed);
-        !user.is_empty() && self.numbers.iter().any(|entry| dial_matches(user, entry))
+        self.matches_number(&DialedNumber::parse(dialed_user(dialed)))
+    }
+
+    /// [`Self::matches`] for an already canonicalised number (no reparse).
+    pub fn matches_number(&self, dialed: &DialedNumber) -> bool {
+        dialed
+            .digits()
+            .is_some_and(|d| self.numbers.iter().any(|entry| entry == d))
+    }
+
+    /// The canonical emergency numbers (digits, no `+`).
+    pub fn numbers(&self) -> &[String] {
+        &self.numbers
     }
 
     /// Whether the list is empty (no emergency bypass).
@@ -70,6 +78,9 @@ mod tests {
         assert!(e.matches("911") && e.matches("+1-1-2") && e.matches("tel:933"));
         assert!(!e.matches("9111") && !e.matches("+1911") && !e.matches(""));
         assert!(!e.matches(";911"));
+        assert!(e.matches("9-1-1") && e.matches("%39%31%31") && e.matches("911;phone-context=+1"));
+        assert!(e.matches_number(&DialedNumber::parse("(911)")));
+        assert!(!e.matches_number(&DialedNumber::parse("+1911")));
         assert!(EmergencyNumbers::default().is_empty());
         assert!(!EmergencyNumbers::default().matches("911"));
     }

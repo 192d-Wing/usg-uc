@@ -68,6 +68,9 @@
 - sbc-daemon stream framing (RFC 3261 §18.3/§20.14): on TCP/TLS a missing, duplicate, conflicting or malformed Content-Length gets a 400 and the connection closes; the framer shares `SipMessage::stream_message_len` with the parser. Post-framing parse still uses datagram rules (POA&M-64)
 - sbc-daemon RFC 5626 §4.4.1: CRLFCRLF pings on TCP/TLS are answered with a CRLF pong, one per batch of pings read together
 - The `general.max_calls` admission-ceiling 503 carries no `Retry-After`
+- sbc-daemon call-path responses: a blocked route pattern gets 403 with no fallback (RFC 3261 §21.4.4); an emergency call with no route gets 503 without `Retry-After` (`emergency_unrouted`); a numeric-looking malformed, empty or >256-byte R-URI user gets 404
+- sbc-daemon per-user limiter: 503 `Retry-After: 1`, keyed on the authenticated AOR or on source /32 or /64 plus canonical From user; trunk sources, ACK and emergency INVITEs are exempt (RFC 6881 §5)
+- Open: RFC 3966 `;phone-context` dropped (POA&M-100), translated local numbers lose their context, `urn:service:sos` not classified as emergency (RFC 5031, RFC 6881 §6.2); see `docs/RFC_COMPLIANCE_GAPS.md`
 - sbc-daemon trunk TLS policy: a `sips:` Request-URI restricts trunk egress to TLS trunks in every routed group (RFC 3261 §26.2.2); `require_tls` groups / `security.require_tls_trunks` do the same per group (cross-group fallback for `sip:` calls remains, NIST POA&M-57). With no eligible TLS trunk the SBC answers 503 with `Reason: Q.850;cause=79` (RFC 6432) and no `Retry-After`. API trunks without a port default to 5061 for TLS, 5060 otherwise (RFC 3261 §19.1.2 / RFC 3263). Open: the last trunk's 503 is relayed unchanged when failover is exhausted (RFC-004). See `docs/RFC_COMPLIANCE_GAPS.md`
 
 ---

@@ -8801,6 +8801,7 @@ dependencies = [
 name = "uc-types"
 version = "0.10.0"
 dependencies = [
+ "proptest",
  "serde",
  "thiserror 2.0.21",
 ]
@@ -8837,6 +8838,7 @@ dependencies = [
  "tracing",
  "uc-dos-protection",
  "uc-policy",
+ "uc-types",
 ]
 
 [[package]]
