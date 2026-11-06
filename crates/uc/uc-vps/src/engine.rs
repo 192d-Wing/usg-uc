@@ -352,9 +352,9 @@ impl VpsEngine {
         {
             return (verdict, None);
         }
-        // POAM: the per-callee concurrency (`per_callee_max_concurrent`) is counted per node only; in a cluster of N nodes the
-        // effective limit is N x the configured cap. Cluster-wide accounting is a
-        // follow-up via uc-state-sync.
+        // POAM: POA&M-81 — `per_callee_max_concurrent` is counted per node and is NOT
+        // divided by `cluster.admission` (a cap of 1 cannot be split); an
+        // N-node cluster admits up to N x cap per callee. Accepted risk.
         let reserved = attempt.callee.clone();
         if let Some(ref callee) = reserved {
             self.limiter.call_started(callee);

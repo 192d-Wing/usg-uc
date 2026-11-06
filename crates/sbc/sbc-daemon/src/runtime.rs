@@ -939,7 +939,14 @@ impl Runtime {
             match ts.list().await {
                 Ok(groups) => {
                     for group_json in &groups {
-                        crate::api_server::sync_trunk_group_to_router(&app_state, group_json).await;
+                        if let Err(e) =
+                            crate::api_server::sync_trunk_group_to_router(&app_state, group_json)
+                                .await
+                        {
+                            // NIST 800-53 Rev5: SC-5 — rejected, not installed.
+                            warn!(error = %e, "Trunk group rejected during replay");
+                            continue;
+                        }
                         if let Some(trunks) = group_json.get("trunks").and_then(|v| v.as_array()) {
                             for trunk in trunks {
                                 crate::api_server::start_trunk_services(&app_state, trunk);
@@ -1065,7 +1072,13 @@ impl Runtime {
             drop(store);
 
             for group_json in &groups {
-                crate::api_server::sync_trunk_group_to_router(&app_state, group_json).await;
+                if let Err(e) =
+                    crate::api_server::sync_trunk_group_to_router(&app_state, group_json).await
+                {
+                    // NIST 800-53 Rev5: SC-5 — rejected, not installed.
+                    warn!(error = %e, "Trunk group rejected during replay");
+                    continue;
+                }
                 if let Some(trunks) = group_json.get("trunks").and_then(|v| v.as_array()) {
                     for trunk in trunks {
                         crate::api_server::start_trunk_services(&app_state, trunk);

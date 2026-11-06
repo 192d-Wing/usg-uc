@@ -13,7 +13,8 @@ use uc_types::protocol::{CnsaCurve, CnsaHash, CnsaSrtpProfile};
 // Re-export cluster config types (feature-gated)
 #[cfg(feature = "cluster")]
 pub use uc_cluster::{
-    ClusterConfig, FailoverConfig, FailoverStrategy, HeartbeatConfig, NodeRole, ReplicationConfig,
+    AdmissionSplit, ClusterAdmissionConfig, ClusterConfig, FailoverConfig, FailoverStrategy,
+    HeartbeatConfig, NodeRole, ReplicationConfig,
 };
 #[cfg(feature = "cluster")]
 pub use uc_discovery::{
@@ -394,6 +395,53 @@ pub const MAX_TRUNK_RETRY_AFTER_SECS: u32 = 3600;
 pub const fn default_emergency_reserve(max_calls: u32) -> u32 {
     let tenth = max_calls / 10;
     if tenth == 0 { 1 } else { tenth }
+}
+
+/// One node's share of a cluster-wide cap: `cap / divisor`, rounded
+/// down, at least 1 (a divisor of 0 or 1 returns `cap`).
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+#[must_use]
+pub const fn cluster_share(cap: u32, divisor: u32) -> u32 {
+    if divisor <= 1 {
+        return cap;
+    }
+    let share = cap / divisor;
+    if share == 0 { 1 } else { share }
+}
+
+impl SbcConfig {
+    /// Divisor this node applies to cluster-divided caps
+    /// (`cluster.admission`): `expected_nodes` under `split = "divide"`,
+    /// otherwise 1.
+    ///
+    /// The emergency reserve, VPS `per_callee_max_concurrent` and rate
+    /// limits are never divided.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, CP-2(2) (Capacity Planning)
+    #[must_use]
+    pub fn admission_divisor(&self) -> u32 {
+        #[cfg(feature = "cluster")]
+        {
+            self.cluster.as_ref().map_or(1, |c| c.admission.divisor())
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            1
+        }
+    }
+
+    /// `general.max_calls` enforced on this node (cluster share).
+    #[must_use]
+    pub fn effective_max_calls(&self) -> u32 {
+        cluster_share(self.general.max_calls, self.admission_divisor())
+    }
+
+    /// `general.max_registrations` enforced on this node (cluster share).
+    #[must_use]
+    pub fn effective_max_registrations(&self) -> u32 {
+        cluster_share(self.general.max_registrations, self.admission_divisor())
+    }
 }
 
 /// General SBC settings.

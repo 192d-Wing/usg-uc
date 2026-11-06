@@ -176,6 +176,12 @@ pub struct SipStackConfig {
     /// may use (`general.emergency_reserve_calls`). Emergency INVITEs past
     /// `max_calls + emergency_reserve_calls` get 503 (SC-5).
     pub emergency_reserve_calls: u32,
+    /// Divisor applied to trunk `max_calls` (`cluster.admission`,
+    /// `expected_nodes` under `split = "divide"`, else 1). `max_calls` and
+    /// `max_registrations` above already hold this node's share.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+    pub admission_divisor: u32,
     /// Emergency numbers (`[vps] emergency_numbers`): may use the
     /// emergency reserve above `max_calls` and trunk `max_calls`, and skip
     /// VPS number/caller screening (47 CFR 9.16).
@@ -207,6 +213,7 @@ impl Default for SipStackConfig {
             max_calls: 1000,
             emergency_reserve_calls: sbc_config::schema::default_emergency_reserve(1000),
             max_registrations: 50_000,
+            admission_divisor: 1,
             emergency_numbers: uc_vps::EmergencyNumbers::new(&uc_vps::default_emergency_numbers()),
             trunk_retry_after_max_secs: sbc_config::schema::DEFAULT_TRUNK_RETRY_AFTER_MAX_SECS,
             udp_port: 5060,
@@ -3469,7 +3476,12 @@ impl SipStack {
                     .with_protocol(protocol)
                     .with_priority(t_config.priority)
                     .with_weight(t_config.weight)
-                    .with_max_calls(t_config.max_calls)
+                    // NIST 800-53 Rev5: SC-5 — this node's share of the
+                    // trunk cap; the emergency reserve stays undivided.
+                    .with_max_calls(sbc_config::schema::cluster_share(
+                        t_config.max_calls,
+                        self.config.admission_divisor,
+                    ))
                     .with_emergency_reserve_calls(t_config.effective_emergency_reserve_calls())
                     .with_cooldown_secs(u64::from(t_config.cooldown_secs))
                     .with_max_failures(t_config.max_failures)
@@ -6443,7 +6455,30 @@ impl SipStack {
         }
     }
 
+    /// This node's enforced share of an API-provisioned trunk `max_calls`
+    /// (`cluster.admission`). Rejects 0, values above `u32::MAX`, and caps
+    /// below `expected_nodes` under `split = "divide"` — the same rules
+    /// `validate_config` applies to config-file trunks.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection), CM-6
+    pub fn api_trunk_max_calls(&self, trunk_id: &str, raw: u64) -> Result<u32, String> {
+        let n = self.config.admission_divisor.max(1);
+        let cap = u32::try_from(raw)
+            .ok()
+            .filter(|c| *c > 0)
+            .ok_or_else(|| format!("trunk '{trunk_id}' max_calls must be 1-{}", u32::MAX))?;
+        if cap < n {
+            return Err(format!(
+                "trunk '{trunk_id}' max_calls ({cap}) is below cluster.admission.expected_nodes ({n}) with split = \"divide\""
+            ));
+        }
+        Ok(sbc_config::schema::cluster_share(cap, n))
+    }
+
     /// Adds or replaces a trunk group in the router.
+    ///
+    /// Trunk `max_calls` must already be this node's share
+    /// ([`Self::api_trunk_max_calls`]).
     pub async fn add_trunk_group_to_router(&self, group: TrunkGroup) {
         if let Some(ref router_lock) = self.router {
             let mut router = router_lock.write().await;
@@ -11240,6 +11275,40 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn cluster_divide_share_reaches_trunk_router() {
+        // NIST 800-53 Rev5: SC-5 — POA&M-1 phase 1: trunk cap is this
+        // node's share; the emergency reserve is not divided.
+        let mut stack = SipStack::new(SipStackConfig {
+            admission_divisor: 3,
+            ..SipStackConfig::default()
+        });
+        let groups = vec![sbc_config::TrunkGroupConfig {
+            id: "g".to_string(),
+            name: "G".to_string(),
+            strategy: "priority".to_string(),
+            trunks: vec![sbc_config::TrunkConfigSchema {
+                id: "tx".to_string(),
+                host: "127.0.0.9".to_string(),
+                max_calls: 100,
+                emergency_reserve_calls: Some(7),
+                ..Default::default()
+            }],
+            zone: None,
+        }];
+        stack.init_router_from_config(&sbc_config::RoutingConfig::default(), &[], &groups);
+        let router = stack.router().expect("router").read().await;
+        let cfg = router
+            .get_trunk_group("g")
+            .and_then(|g| g.get_trunk("tx"))
+            .expect("trunk")
+            .config()
+            .clone();
+        drop(router);
+        assert_eq!(cfg.max_calls, 33);
+        assert_eq!(cfg.emergency_reserve_calls, Some(7));
+    }
+
+    #[tokio::test]
     async fn qa_config_cooldown_and_max_failures_reach_router() {
         let mut stack = SipStack::new(SipStackConfig::default());
         let groups = vec![sbc_config::TrunkGroupConfig {
@@ -11572,6 +11641,59 @@ pub(crate) mod tests {
         // Still no room for a normal call.
         let n4 = place_call(&stack, "t-n4@em").await;
         assert!(responded(&n4, 503).is_some());
+    }
+
+    #[tokio::test]
+    async fn qa_cluster_divide_emergency_reserve_admitted_past_trunk_share() {
+        // NIST 800-53 Rev5: SC-5 / 47 CFR 9.16 — POA&M-1 phase 1. Trunk
+        // max_calls=3 divided across 3 nodes gives a share of 1 per trunk;
+        // the default reserve (1) is sized from the undivided cap.
+        let config = SipStackConfig {
+            admission_divisor: 3,
+            ..SipStackConfig::default()
+        };
+        let stack = trunk_stack_cfg(config, 3, ("none", ""), None).await;
+        let n1 = place_call(&stack, "cd-n1@em").await;
+        assert_eq!(forwarded(&n1, &Method::Invite).unwrap().1, t1());
+        let n2 = place_call(&stack, "cd-n2@em").await;
+        assert_eq!(forwarded(&n2, &Method::Invite).unwrap().1, t2());
+        // Share exhausted on both trunks: normal call rejected.
+        let n3 = place_call(&stack, "cd-n3@em").await;
+        assert!(responded(&n3, 503).is_some(), "share must be 1 per trunk");
+        // Emergency still admitted via the undivided reserve.
+        let e1 = place_call_to(&stack, "911", "cd-e1@em").await;
+        assert_eq!(forwarded(&e1, &Method::Invite).unwrap().1, t1());
+        let e2 = place_call_to(&stack, "911", "cd-e2@em").await;
+        assert_eq!(forwarded(&e2, &Method::Invite).unwrap().1, t2());
+        let e3 = place_call_to(&stack, "911", "cd-e3@em").await;
+        assert!(responded(&e3, 503).is_some());
+        assert_eq!(active(&stack, "t1").await, 2);
+        assert_eq!(active(&stack, "t2").await, 2);
+    }
+
+    #[tokio::test]
+    async fn qa_cluster_divide_global_share_exhausted_emergency_admitted() {
+        // Global cap 6 / 3 nodes = 2; reserve from the undivided cap (1).
+        let config = SipStackConfig {
+            max_calls: sbc_config::schema::cluster_share(6, 3),
+            emergency_reserve_calls: sbc_config::schema::default_emergency_reserve(6),
+            admission_divisor: 3,
+            ..SipStackConfig::default()
+        };
+        let stack = trunk_stack_cfg(config, 100, ("none", ""), None).await;
+        for i in 0..2 {
+            let n = place_call(&stack, &format!("cg-n{i}@em")).await;
+            assert!(forwarded(&n, &Method::Invite).is_some(), "share slot {i}");
+        }
+        let over = place_call(&stack, "cg-over@em").await;
+        assert!(responded(&over, 503).is_some());
+        let e = place_call_to(&stack, "911", "cg-e@em").await;
+        assert!(
+            forwarded(&e, &Method::Invite).is_some(),
+            "reserve admits 911"
+        );
+        let e2 = place_call_to(&stack, "911", "cg-e2@em").await;
+        assert!(responded(&e2, 503).is_some());
     }
 
     #[tokio::test]

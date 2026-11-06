@@ -324,12 +324,49 @@ impl Server {
                 "vps.emergency_numbers is empty: emergency calls are subject to every call limit"
             );
         }
+        #[cfg(feature = "cluster")]
+        if config.cluster.as_ref().is_some_and(|c| {
+            c.admission.split == sbc_config::schema::AdmissionSplit::Divide
+                && c.admission.expected_nodes == 1
+        }) {
+            // CM-6 / CP-2(2): divide by 1 is per-node; likely a missed resize.
+            warn!(
+                "cluster.admission split = \"divide\" with expected_nodes = 1: caps are not divided"
+            );
+        }
+        let divisor = config.admission_divisor();
+        if divisor > 1 {
+            // CP-2(2): a remainder is capacity no node can use.
+            if !config.general.max_calls.is_multiple_of(divisor)
+                || !config.general.max_registrations.is_multiple_of(divisor)
+                || config
+                    .trunk_groups
+                    .iter()
+                    .flat_map(|g| &g.trunks)
+                    .any(|t| !t.max_calls.is_multiple_of(divisor))
+            {
+                warn!(
+                    expected_nodes = divisor,
+                    "cluster.admission divide: general or trunk caps are not multiples of expected_nodes; the remainder is unused"
+                );
+            }
+            info!(
+                expected_nodes = divisor,
+                max_calls = config.effective_max_calls(),
+                max_registrations = config.effective_max_registrations(),
+                "cluster.admission divide: enforcing this node's share of cluster caps"
+            );
+        }
         SipStackConfig {
             instance_name: config.general.instance_name.clone(),
             domain: config.general.instance_name.clone(),
-            max_calls: config.general.max_calls,
+            // NIST 800-53 Rev5: SC-5 — `cluster.admission.split = "divide"`
+            // enforces this node's share of the cluster-wide caps. The
+            // emergency reserve is per node and undivided (47 CFR 9.16).
+            max_calls: config.effective_max_calls(),
             emergency_reserve_calls: config.general.effective_emergency_reserve_calls(),
-            max_registrations: config.general.max_registrations,
+            max_registrations: config.effective_max_registrations(),
+            admission_divisor: config.admission_divisor(),
             emergency_numbers: uc_vps::EmergencyNumbers::new(
                 &config
                     .vps
@@ -873,10 +910,14 @@ impl Server {
             instance = %self.config.general.instance_name,
             "Starting SBC daemon"
         );
+        // AU-3: log the caps this node enforces (cluster share under divide).
         info!(
-            max_calls = self.config.general.max_calls,
-            max_registrations = self.config.general.max_registrations,
-            "Call limits configured"
+            max_calls = self.config.effective_max_calls(),
+            max_registrations = self.config.effective_max_registrations(),
+            configured_max_calls = self.config.general.max_calls,
+            configured_max_registrations = self.config.general.max_registrations,
+            admission_divisor = self.config.admission_divisor(),
+            "Call limits configured (per-node enforced)"
         );
         info!(
             media_mode = ?self.config.media.default_mode,
@@ -2708,5 +2749,31 @@ mod tests {
         }
         assert!(got.starts_with(b"FIRST"), "{got:?}");
         assert!(got[5..].starts_with(b"SIP/2.0 200 OK"), "{got:?}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cluster_divide_sets_node_share_and_keeps_emergency_reserve() {
+        let config = sbc_config::load_from_str(
+            "[general]\nmax_calls = 1000\nmax_registrations = 3000\n\
+             [cluster]\nenabled = true\n\
+             [cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 3\n",
+        )
+        .expect("config");
+        let sip = Server::build_sip_config(&config);
+        assert_eq!(sip.max_calls, 333);
+        assert_eq!(sip.max_registrations, 1000);
+        assert_eq!(sip.admission_divisor, 3);
+        // 47 CFR 9.16: per-node reserve from the configured (undivided) cap.
+        assert_eq!(sip.emergency_reserve_calls, 100);
+    }
+
+    #[test]
+    fn default_admission_is_per_node() {
+        let config = SbcConfig::default();
+        let sip = Server::build_sip_config(&config);
+        assert_eq!(sip.max_calls, config.general.max_calls);
+        assert_eq!(sip.max_registrations, config.general.max_registrations);
+        assert_eq!(sip.admission_divisor, 1);
     }
 }
