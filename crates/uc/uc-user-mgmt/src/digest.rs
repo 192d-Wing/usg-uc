@@ -4,7 +4,15 @@ use sha2::{Digest, Sha256};
 
 /// Compute the HA1 component of SIP digest authentication.
 ///
-/// `HA1 = SHA-256(username:realm:password)`
+/// `HA1 = SHA-256(username:realm:password)` (RFC 7616 §3.4.2). The result
+/// is password-equivalent; store it only sealed (RFC 7616 §5.2 Storing
+/// Passwords; see `encrypt`).
+///
+/// CNSA-EXCEPTION: SHA-256 digest is mandated by RFC 7616 / RFC 8760 for
+/// SIP interop; SHA-384 is not a registered digest algorithm. Authentication
+/// only, never confidentiality.
+// POAM: POA&M-110 SHA-256 SIP digest (CNSA 2.0 deviation) until a CNSA
+// digest algorithm is registered or bearer auth (RFC 8898) replaces digest.
 #[must_use]
 pub fn compute_ha1(username: &str, realm: &str, password: &str) -> String {
     let input = format!("{username}:{realm}:{password}");
@@ -16,6 +24,9 @@ pub fn compute_ha1(username: &str, realm: &str, password: &str) -> String {
 ///
 /// Computes `HA2 = SHA-256(method:uri)` and
 /// `expected = SHA-256(ha1:nonce:ha2)`, then compares with the client response.
+///
+/// CNSA-EXCEPTION: SHA-256 per RFC 7616 / RFC 8760 (see [`compute_ha1`]).
+// POAM: POA&M-110 SHA-256 SIP digest (CNSA 2.0 deviation).
 #[must_use]
 pub fn verify_digest_response(
     ha1: &str,

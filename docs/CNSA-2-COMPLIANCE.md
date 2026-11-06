@@ -16,7 +16,7 @@ CNSA 2.0 defines cryptographic algorithms approved for protecting classified inf
 
 | Function | Algorithm | Minimum Size | Implementation | Status |
 |----------|-----------|--------------|----------------|--------|
-| Symmetric Encryption | AES-256-GCM | 256-bit | `uc-crypto::aead::Aes256GcmKey`; SRTP via `proto-srtp` | Wired (sbc-media-core SRTP relay) |
+| Symmetric Encryption | AES-256-GCM | 256-bit | `uc-crypto::aead::Aes256GcmKey`; SRTP via `proto-srtp`; HA1 at rest via `uc-user-mgmt` | Wired (sbc-media-core SRTP relay; sbc-api-server `users.digest_ha1`) |
 | Hash Functions | SHA-384, SHA-512 | 384-bit | `uc-crypto::hash::{sha384, sha512}` | Wired (sbc-media-core DTLS fingerprints via `proto-dtls`) |
 | Digital Signatures | ECDSA P-384 | P-384 | `uc-crypto::ecdsa::P384KeyPair` | Library-only (no shipped caller; TLS/DTLS signatures are done by rustls / the DTLS sidecar) |
 | Key Exchange | ECDH P-384 | P-384 | `uc-crypto::ecdh::P384EphemeralKeyPair` | Library-only (no shipped caller) |
@@ -130,6 +130,7 @@ Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_ver
 ### STIR/SHAKEN
 
 - **CNSA exception (documented, POA&M-27):** SHAKEN mandates ES256 (ECDSA P-256 / SHA-256; RFC 8225 §5.2, ATIS-1000074), and every STI-CA issues P-256 certificates. ES256 lives only in `uc_crypto::interop::ecdsa_p256`, compiled with the `stir-shaken-es256` feature, not re-exported from the CNSA surface. **The feature is not optional for the SBC:** `uc-sti` depends on `uc-crypto` with `stir-shaken-es256` enabled unconditionally (`crates/uc/uc-sti/Cargo.toml`) and `sbc-daemon` always depends on `uc-sti`, so every `sbc-daemon` binary contains the ES256 code, whether or not `[stir_shaken]` is enabled (POA&M-39). At runtime it is reached only when signing or verification is configured; the using modules carry a `CNSA-EXCEPTION` tag (`uc-crypto/src/x509.rs`, `uc-sti/src/cache.rs`, `proto-stir-shaken/src/passport.rs`, `sbc-daemon/src/stir.rs`, `sbc-config`), though `uc-sti/src/signer.rs` does not. It is used for caller-identity signatures only, never for confidentiality. The CNSA `uc_crypto::ecdsa` module still exposes P-384 only.
+- **CNSA exception (documented, POA&M-110): SIP digest HA1.** HA1 and digest responses use SHA-256 (RFC 7616, RFC 8760) because SIP phones support nothing CNSA-approved (SHA-512-256 is not CNSA either). Code: `uc-user-mgmt/src/digest.rs` `compute_ha1`, `verify_digest_response`, tagged `CNSA-EXCEPTION` and `// POAM: POA&M-110`. Authentication only, never confidentiality. Stored HA1 values are sealed with AES-256-GCM (see NIST SC-28). Milestone: a CNSA digest algorithm for SIP, or RFC 8898 Bearer replacing digest. The provisioning-token HMAC-SHA256 (`sbc-provision-server`) is a separate, still-open item.
 - **Algorithm confusion:** `ppt=shaken` PASSporTs with any `alg` other than ES256 (including `none` and ES384) are rejected (`proto-stir-shaken/src/passport.rs`).
 - **ES384:** reserved for bilateral profiles; `stir_shaken.algorithm = "ES384"` is rejected by validation in this release (POA&M-32).
 - **STI certificate chains:** validated with rustls-webpki (aws-lc FIPS provider) to the STI-CR anchors, ECDSA P-256/P-384 signatures only (`uc_crypto::x509`).

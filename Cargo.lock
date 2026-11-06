@@ -6169,6 +6169,7 @@ dependencies = [
  "axum",
  "hyper",
  "ipnet",
+ "nix 0.31.3",
  "proto-jwt",
  "reqwest 0.12.28",
  "sbc-config-store",
@@ -6176,6 +6177,7 @@ dependencies = [
  "sbc-http-util",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tonic",
@@ -6186,9 +6188,11 @@ dependencies = [
  "uc-audit",
  "uc-auth",
  "uc-cdr",
+ "uc-crypto",
  "uc-phone-mgmt",
  "uc-user-mgmt",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -8805,6 +8809,7 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "ldap3",
+ "proptest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -8815,6 +8820,7 @@ dependencies = [
  "tracing",
  "uc-crypto",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

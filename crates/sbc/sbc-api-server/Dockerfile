@@ -81,6 +81,9 @@ COPY --from=builder /tmp/sbc-api-server /usr/local/bin/sbc-api-server
 RUN chown sbc:sbc /usr/local/bin/sbc-api-server \
     && setcap 'cap_net_bind_service=+ep' /usr/local/bin/sbc-api-server
 
+# No secrets are baked in. SBC_USER_HA1_KEY_FILE (required) must point at a
+# mounted 64-hex-char key file, mode 0400, owned by uid 1000, e.g.
+#   -v ./ha1-key:/run/secrets/sbc-ha1-key:ro -e SBC_USER_HA1_KEY_FILE=/run/secrets/sbc-ha1-key
 USER sbc
 
 EXPOSE 80/tcp

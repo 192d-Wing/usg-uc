@@ -294,18 +294,23 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   `x</displayName><proxy>evil.example</proxy>…` re-points every phone on the
   template. Shared XML/attribute escaping, field validation in sbc-config-store,
   per-vendor injection tests.
-- [ ] **MAJOR, LIVE — digest HA1 stored in plaintext** in `users.digest_ha1`;
+- [x] **MAJOR, LIVE — digest HA1 stored in plaintext** in `users.digest_ha1`;
   sbc-api-server uses `PostgresUserStore` and never wraps it in
   `EncryptedUserStore` (`sbc-api-server/src/state.rs:144`). `decrypt_ha1`
   also passes plaintext through, so DB write access can plant a known HA1
   (`uc-user-mgmt/src/encrypt.rs:89`). Wrap with a file/secret key, fail closed,
-  drop the pass-through, re-encrypt existing rows.
-- [ ] **MAJOR, LIVE — `/users` create/update/delete need only authentication**,
+  drop the pass-through, re-encrypt existing rows. Fixed 2026-11-06 (ha1-users-authz): `EncryptedUserStore`
+  with `SBC_USER_HA1_KEY_FILE`, no pass-through, startup re-encrypt (NIST SC-28,
+  SC-12; POA&M-111).
+- [x] **MAJOR, LIVE — `/users` create/update/delete need only authentication**,
   no permission (an `auditor` token can create accounts) and no audit event
   (`sbc-api-server/src/handlers/mod.rs:114`, `handlers/users.rs`). Add
   `users:admin`/`users:read` and AC-2 audit records; 403 tests. Resolve the
   contradiction between `state.rs:45-47` (daemon uses this table for digest) and
-  the IA-2 row (never populated).
+  the IA-2 row (never populated). Fixed 2026-11-06 (ha1-users-authz): `users:read`/`users:admin`,
+  `AccountManagement` audit (NIST AC-2, AC-3, AC-6). Contradiction: the IA-2 row
+  was correct (the daemon does not read this table); the `state.rs` comment was
+  wrong and is fixed.
 - [ ] **MAJOR, LIVE — uc-audit sink write failures are silent**
   (`uc-audit/src/sink.rs:77`): ENOSPC loses every later record while `audit`
   health stays Healthy and `sbc_audit_records_dropped` stays 0. Make `write`
@@ -315,19 +320,25 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   (`uc-audit/src/lib.rs:75`, `sink.rs:57`). Resume from the file tail like
   uc-cdr, 0600/0640 file and 0750 dir, `sbc-cli audit verify`; POA&M for a keyed
   chain (HMAC-SHA-384 or ML-DSA-87).
-- [ ] **MAJOR, LIVE — SHA-256 HA1 and HMAC-SHA256 provisioning tokens are not
-  listed as CNSA exceptions** (`uc-user-mgmt/src/digest.rs`,
-  `sbc-provision-server/src/main.rs:314`). Record as exceptions with POA&M, or
-  move the HMAC to SHA-384.
+- [x] **MAJOR, LIVE — SHA-256 HA1 not listed as a CNSA exception**
+  (`uc-user-mgmt/src/digest.rs`). Fixed 2026-11-06 (ha1-users-authz): POA&M-110,
+  `CNSA-EXCEPTION` marker, CNSA-2-COMPLIANCE.md.
+- [ ] **MAJOR, LIVE — HMAC-SHA256 provisioning tokens not listed as a CNSA
+  exception** (`sbc-provision-server/src/main.rs:314`; split from the HA1 item
+  above). Record as an exception with POA&M, or move the HMAC to SHA-384.
 - [ ] **MINOR, LIVE — dropped audit records leave no trace in the chain**
   (sequence assigned in the writer). Emit an `AuditRecordsDropped{count}` record.
 - [ ] **MINOR, LIVE — sbc-api-server and central-config-api audit only to
   tracing** (no FileSink option). Add an audit path or document log shipping.
-- [ ] **MINOR, LIVE — raw DB/user-mgmt errors returned to clients**, including on
+- [x] **MINOR, LIVE — raw DB/user-mgmt errors returned to clients**, including on
   unauthenticated `/readyz` (`handlers/users.rs`, `handlers/system.rs:50`).
-- [ ] **MINOR, LIVE — `User` `Debug` prints `digest_ha1`** (`uc-user-mgmt/src/model.rs`).
-- [ ] **MINOR, LIVE — `list_users` binds LIMIT/OFFSET as text** (Postgres rejects
-  it) and `GET /users` is unbounded (`postgres.rs:279`).
+  Fixed 2026-11-06 (ha1-users-authz): fixed messages (NIST SI-11).
+- [x] **MINOR, LIVE — `User` `Debug` prints `digest_ha1`** (`uc-user-mgmt/src/model.rs`).
+  Fixed 2026-11-06 (ha1-users-authz): redacting `Debug`.
+- [x] **MINOR, LIVE — `list_users` binds LIMIT/OFFSET as text** (Postgres rejects
+  it) and `GET /users` is unbounded (`postgres.rs:279`). Fixed 2026-11-06 (ha1-users-authz): i64 binds,
+  default 100 / max 1000 (NIST SC-5). The Postgres bind test is `#[ignore]` and
+  not run.
 - [ ] **MINOR, LIVE — provisioning device token is a static HMAC(secret, MAC)**
   in the URL query: never expires, can't be revoked per device, lands in access
   logs (`sbc-provision-server/src/main.rs:309`).

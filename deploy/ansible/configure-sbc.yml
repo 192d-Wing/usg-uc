@@ -16,6 +16,11 @@
 # Trunk credentials are read from the environment, never committed:
 #   SBC_TRUNK_SIP_USERNAME, SBC_TRUNK_SIP_PASSWORD
 #   ansible-playbook -i inventory.yml configure-sbc.yml --tags users
+#
+# User creation requires a principal with `users:admin` (legacy admin
+# credential, or an OIDC token with role users-admin/fleet-admin). Existing
+# users return 409 and are left unchanged. The HA1-at-rest key
+# (SBC_USER_HA1_KEY_FILE) is provisioned by the Helm chart, not here.
 
 - name: Configure USG SBC
   hosts: sbc
@@ -204,7 +209,7 @@
         method: POST
         body_format: json
         body: "{{ item }}"
-        status_code: [200, 201]
+        status_code: [200, 201, 409]
       loop: "{{ users }}"
       loop_control:
         label: "{{ item.username }}"

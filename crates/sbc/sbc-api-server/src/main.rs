@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 
 mod authmw;
 mod config;
+mod ha1_key;
 mod handlers;
 mod state;
 

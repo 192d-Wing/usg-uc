@@ -121,6 +121,10 @@ pub enum AuditEvent {
     /// STIR failure audit events were dropped because an aggregation table
     /// was full (AU-5 capacity alert).
     StirAuditEventsDropped(StirAuditEventsDropped),
+
+    /// A managed user account was created, modified or removed (or the
+    /// attempt failed).
+    AccountManagement(AccountManagement),
 }
 
 impl AuditEvent {
@@ -133,7 +137,6 @@ impl AuditEvent {
             }
             Self::AuthenticationAttempt(_) => AuditEventType::Authentication,
             Self::AuthorizationDecision(_) | Self::CdrExport(_) => AuditEventType::Authorization,
-            Self::ConfigurationChange(_) => AuditEventType::Configuration,
             Self::CryptoKeyOperation(_) | Self::StirSignFailure(_) | Self::StirKeyLoaded(_) => {
                 AuditEventType::Cryptographic
             }
@@ -142,9 +145,10 @@ impl AuditEvent {
             | Self::RateLimitTriggered(_)
             | Self::StirVerifyFailure(_)
             | Self::StirAuditEventsDropped(_) => AuditEventType::Security,
-            Self::StirTrustAnchorsReloaded(_) | Self::StirTrustAnchorReloadFailed(_) => {
-                AuditEventType::Configuration
-            }
+            Self::ConfigurationChange(_)
+            | Self::StirTrustAnchorsReloaded(_)
+            | Self::StirTrustAnchorReloadFailed(_)
+            | Self::AccountManagement(_) => AuditEventType::Configuration,
             Self::SystemStartup(_)
             | Self::SystemShutdown(_)
             | Self::TrunkFailover(_)
@@ -460,6 +464,56 @@ pub struct CdrFileRotated {
     pub sha384: String,
 }
 
+/// Account-management action.
+///
+/// ## NIST 800-53 Rev5: AC-2 (Account Management)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAction {
+    /// Account created.
+    Create,
+    /// Account modified (attributes, credential or enabled flag).
+    Update,
+    /// Account removed.
+    Delete,
+}
+
+/// A management-plane change to a managed (SIP) user account.
+///
+/// Never carries the password, HA1 or any other authenticator.
+///
+/// ## NIST 800-53 Rev5: AC-2 (Account Management), AC-2(4) (Automated Audit
+/// Actions), AU-3 (Content of Audit Records)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountManagement {
+    /// Authenticated principal that requested the change.
+    pub actor: String,
+    /// Issuer that authenticated `actor` (OIDC `iss`), when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_issuer: Option<String>,
+    /// Target account identifier (empty when not yet assigned/unknown).
+    pub target_user_id: String,
+    /// Target account username, when known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target_username: String,
+    /// What was attempted.
+    pub action: AccountAction,
+    /// Whether the change was applied.
+    pub success: bool,
+    /// Fixed failure token (`not_found`, `already_exists`, `invalid`,
+    /// `storage`); `None` on success. Never contains backend error text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    /// Source IP address of the request, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ip: Option<IpAddr>,
+    /// Which attribute groups an update touched (`password`, `enabled`,
+    /// `username`, `profile`), so credential resets and enable/disable are
+    /// distinguishable from edits. Names only, never values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<String>,
+}
+
 /// Bulk CDR read (export) by a management user. CDRs carry PII.
 ///
 /// ## NIST 800-53 Rev5: AU-2, AC-3, SI-12
@@ -700,5 +754,29 @@ mod tests {
         assert!(json.contains(r#""source":"options""#));
         let back: AuditEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, AuditEvent::TrunkReachabilityChanged(r) if !r.reachable));
+    }
+
+    #[test]
+    fn account_management_serializes_without_secrets() {
+        let ev = AuditEvent::AccountManagement(AccountManagement {
+            actor: "op1".to_string(),
+            actor_issuer: Some("https://idp.example.invalid".to_string()),
+            target_user_id: "u-1".to_string(),
+            target_username: "alice".to_string(),
+            action: AccountAction::Create,
+            success: false,
+            failure_reason: Some("already_exists".to_string()),
+            source_ip: None,
+            changed: vec!["password".to_string()],
+        });
+        assert_eq!(ev.event_type(), AuditEventType::Configuration);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"account_management""#), "{json}");
+        assert!(json.contains(r#""action":"create""#), "{json}");
+        assert!(!json.contains("source_ip"), "{json}");
+        assert!(json.contains(r#""changed":["password"]"#), "{json}");
+        assert!(json.contains(r#""actor_issuer""#), "{json}");
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, AuditEvent::AccountManagement(a) if !a.success));
     }
 }

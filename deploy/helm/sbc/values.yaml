@@ -184,6 +184,19 @@ sbcApi:
   oidc:
     issuer: ""
     audience: "usg-uc-config"
+  # AES-256-GCM key sealing SIP digest HA1 at rest (required; the pod will
+  # not start without it). Set existingSecret to a Secret you manage
+  # (key `ha1-key`, 64 hex chars, e.g. `openssl rand -hex 32`); rendering
+  # fails without it. Back it up with the database: losing it means
+  # re-provisioning every SIP user's password.
+  # generate: LAB ONLY. Chart generates the key via `lookup`; unsafe with
+  # helm template / --dry-run / Argo CD / Flux (would emit a new key) and
+  # stores the key in Helm release records. Fails on upgrade if the
+  # existing Secret cannot be read.
+  ha1Key:
+    existingSecret: ""
+    generate: false
+    key: ha1-key
 
 # sbc-provision-server — stand-alone phone-provisioning pod (PR6).
 # Owns /provision/<MAC>.{cfg,xml}: reads the phone record from Postgres

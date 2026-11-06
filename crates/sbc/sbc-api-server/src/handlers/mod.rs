@@ -109,13 +109,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/registrations", get(registrations::list))
         .route("/registrations/{aor}", delete(registrations::delete))
-        // Users CRUD — Postgres-backed via uc-user-mgmt as of PR10.
-        // Replaces the daemon's REST /users handlers.
-        .route("/users", get(users::list).post(users::create))
-        .route(
-            "/users/{id}",
-            get(users::get).put(users::update).delete(users::delete),
-        )
+        // Users CRUD — Postgres-backed via uc-user-mgmt (HA1 encrypted
+        // at rest). Reads need `users:read`, writes `users:admin`; every
+        // account change is audited.
+        //
+        // ## NIST 800-53 Rev5: AC-2, AC-3, AC-6
+        .merge(users::routes(users::UsersState {
+            store: Arc::clone(&state.users),
+            trusted_proxies: Arc::clone(&state.trusted_proxies),
+        }))
         // SBC routing CRUD — Postgres-backed as of PR11. Each write
         // notifies the daemon via SbcSyncService so the live router
         // catches up without a daemon restart. Replaces the daemon's

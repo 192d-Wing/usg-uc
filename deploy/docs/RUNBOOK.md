@@ -88,6 +88,42 @@ helm uninstall sbc -n sbc-system
 
 ---
 
+### SIP User HA1 Key (sbc-api)
+
+sbc-api requires `SBC_USER_HA1_KEY_FILE`: a file with exactly 64 hex
+characters (32-byte AES-256-GCM key; one trailing newline allowed), mode
+0400/0600, owned by the sbc-api uid, not a symlink. Missing or invalid key:
+the process exits with code 3 (`state init failed`) and logs the reason.
+
+- **Rollout of the first encrypting version:** roll *all* sbc-api replicas;
+  do not run old and new versions side by side. Old binaries write plaintext
+  HA1, which new replicas reject (users fail with 500 until the next new
+  replica restart re-runs the startup re-encrypt job).
+- **Startup re-encrypt job:** runs on every start under a Postgres advisory
+  lock, seals plaintext rows, and refuses to start if a row holds an
+  unrecognized HA1 value (`HA1 re-encryption failed`). It waits at most
+  60 s for a peer replica holding the lock, then exits non-zero (the pod is
+  restarted). Rows it could not seal because they changed concurrently are
+  logged (`HA1 changed during re-encrypt`) and sealed on the next start.
+- **Malformed HA1 row (e.g. a 32-hex MD5 HA1 from an old import) blocks
+  startup on every replica.** Recovery:
+  1. Find the id(s) in the sbc-api log: `stored HA1 is not a recognized
+     format` with `user_id=<id>`.
+  2. Clear only that row's credential:
+     `UPDATE users SET digest_ha1 = NULL WHERE id = '<id>';`
+  3. Restart sbc-api; it now starts (the user has no SIP digest credential).
+  4. Re-provision the password: `PUT /users/<id>` with `{"password": ...}`.
+- **All replicas must share one key.** A mismatch shows up as 500s on
+  `/users` with `user store error ... HA1 decryption failed` in the log.
+- **One undecryptable row fails the whole `GET /users` page** (500, fail
+  closed). The log names it: `stored HA1 failed to decrypt` with
+  `user_id=<id>`. If the key is correct, the row is corrupt or was copied
+  from another row/database: apply the malformed-row recovery above to
+  that id.
+- **Backup:** store the key with (but separately from) database backups.
+  Key loss = every SIP user's password must be re-set via `PUT /users/{id}`.
+- **Rotation:** not supported yet (POA&M-111).
+
 ## Operations
 
 ### Configuration Hot-Reload
