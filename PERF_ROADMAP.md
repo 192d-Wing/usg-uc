@@ -127,3 +127,78 @@ The following components lack criterion benchmarks in `crates/client/client-audi
 - [ ] Full I/O thread frame cycle (capture + encode + send)
 
 Adding these enables before/after measurement for each optimization above.
+
+---
+
+## SBC 0.10.0 baseline: STIR/SHAKEN and SIP transport
+
+Added for POA&M-38 and POA&M-50. Machine: Apple M2 Max (12 cores, 32 GB),
+macOS 27.0.1, rustc 1.99.1, `bench` profile, with
+other work running on the machine. Numbers are the criterion point estimate from
+`-- --quick` runs on 2026-11-06 (main at 861c23a). Treat them as a reference
+for regressions on the same machine, not as absolute capacity.
+
+```bash
+cargo bench -p proto-stir-shaken --bench passport -- --quick
+cargo bench -p uc-sti --bench sti_cache -- --quick
+cargo bench -p uc-transport --bench transport_rtt -- --quick
+```
+
+### `proto-stir-shaken` (`benches/passport.rs`)
+
+Real ES256 via `uc-crypto::interop::ecdsa_p256` (aws-lc).
+
+| Bench | Time |
+|---|---|
+| `passport_sign_es256` (sign + encode, one dest) | 17.6 µs |
+| `passport_encode_noop_signer` (JSON + base64 only) | 0.52 µs |
+| `identity_header_parse` (full-form token, info/alg/ppt) | 0.79 µs |
+| `verifier_prepare` (parse + decode) | 1.88 µs |
+| `verifier_verify_es256_warm_key` (ECDSA verify + claim checks) | 43.0 µs |
+| `verifier_prepare_plus_verify` | 45.0 µs |
+| `reject_oversize_identity` (8 KiB value, length cap) | 4 ns |
+| `reject_malformed_max_token` (~4 KB token, bad base64 at end) | 5.1 µs |
+
+### `uc-sti` (`benches/sti_cache.rs`)
+
+| Bench | Time |
+|---|---|
+| `cache_hit_key_resolver_cached` (`KeyResolver::cached`) | 62 ns |
+| `cache_hit_get_or_fetch_block_on` (warm path, includes `block_on`) | 150 ns |
+| `cache_miss_fill_evict_at_cap16` (fake source; chain validation + insert + evict + task spawn) | 62 µs |
+| `aggregator_record_hit` (`FailureAggregator::record`, same key in window) | 33 ns |
+| `lru_insert_evict_at_cap256` (one full shard) | 117 ns |
+| `lru_get_hit_cap256` (256 gets) | 5.9 µs (23 ns/get) |
+
+### `uc-transport` (`benches/transport_rtt.rs`)
+
+One iteration = client send, server recv, server send, client recv on
+127.0.0.1 (single-threaded runtime). TCP/TLS use the split read/write halves.
+
+| Bench | 600 B | 4 KB |
+|---|---|---|
+| TCP round trip | 18.9 µs | 16.6 µs |
+| TLS 1.3 round trip (P-384 cert, AES-256-GCM) | 20.1 µs | 26.2 µs |
+| UDP round trip | 26.2 µs | n/a (`MAX_UDP_MESSAGE_SIZE` = 1300) |
+
+### Reading the numbers
+
+- Verifying one inbound SHAKEN Identity costs about 45 µs of CPU, almost all
+  of it the ECDSA P-256 verify; signing one costs about 18 µs. The cache hit
+  (62 ns) and aggregator (33 ns) are negligible next to that.
+- Rejecting a malformed token costs at most ~5 µs, about a ninth of a valid
+  verify; oversize values are rejected by the length cap at once.
+- The 3-8% INVITE throughput estimate for STIR is not confirmed or refuted
+  here: that needs the INVITE-to-180 daemon bench, which is still missing.
+- Loopback round trips are dominated by syscalls and the runtime, not TLS:
+  TLS adds ~1 µs at 600 B and ~10 µs at 4 KB over TCP. The UDP path was not
+  changed in 0.10.0; its number is for comparison only. Quick-mode loopback
+  numbers vary between runs (TCP 600 B measured 12.5 µs and 18.9 µs in two
+  runs); compare with a full, non-`--quick` run before calling a regression.
+
+### Still missing
+
+- [ ] End-to-end INVITE-to-180 through `sbc-daemon`, with and without STIR
+  (open under POA&M-38 / POA&M-50).
+- [ ] `sbc-daemon` flow table and per-destination lane enqueue/dispatch
+  (`flows.rs`, `FlowTable::lane_busy`; open under POA&M-50, see POA&M-55).

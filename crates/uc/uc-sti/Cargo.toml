@@ -41,3 +41,8 @@ nix = { workspace = true, features = ["fs", "user"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile.workspace = true
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+criterion.workspace = true
+
+[[bench]]
+name = "sti_cache"
+harness = false
