@@ -39,6 +39,10 @@ sbcApi:
     repository: ghcr.io/192d-wing/sbc-api-server
     tag: "0.7.0"
     pullPolicy: IfNotPresent
+  # SIP digest HA1 at-rest key (SC-28, SC-12). Create this Secret before the
+  # upgrade (`openssl rand -hex 32`); see deploy/helm/sbc/DEPLOYING.md.
+  ha1Key:
+    existingSecret: sbc-ha1-key
 
 sbcProvision:
   image:

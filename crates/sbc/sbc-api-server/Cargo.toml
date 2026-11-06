@@ -33,7 +33,10 @@ uc-phone-mgmt.workspace = true
 # Direct path dep (instead of workspace=true) so we can disable the
 # default `sqlite` feature; cargo doesn't allow overriding inherited
 # default-features.
-uc-user-mgmt = { path = "../../uc/uc-user-mgmt", default-features = false, features = ["postgres"] }
+uc-user-mgmt = { path = "../../uc/uc-user-mgmt", default-features = false, features = ["postgres", "encryption"] }
+# HA1-at-rest key (AES-256-GCM via uc-crypto, CNSA 2.0).
+uc-crypto.workspace = true
+zeroize.workspace = true
 
 # Runtime
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
@@ -68,5 +71,10 @@ uuid = { version = "1", features = ["v4"] }
 thiserror.workspace = true
 ipnet.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs", "user"] }
+
 [dev-dependencies]
+tempfile.workspace = true
+uc-user-mgmt = { path = "../../uc/uc-user-mgmt", default-features = false, features = ["postgres", "encryption", "sqlite"] }
 uc-audit = { workspace = true, features = ["test-capture"] }

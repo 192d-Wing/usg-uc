@@ -20,7 +20,17 @@ use sbc_grpc_api::prelude::{
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
 use tracing::info;
+use uc_user_mgmt::encrypt::EncryptedUserStore;
 use uc_user_mgmt::postgres::PostgresUserStore;
+
+/// The users store: Postgres with HA1 sealed at rest.
+pub type UserStoreImpl = EncryptedUserStore<PostgresUserStore>;
+
+/// Advisory-lock name serializing the HA1 re-encrypt job across replicas.
+const HA1_REENCRYPT_LOCK: &str = "uc_user_mgmt.ha1_reencrypt";
+/// Give up waiting for a peer replica's re-encrypt lock after this long and
+/// exit non-zero (the orchestrator restarts us). NIST 800-53 Rev5: CP-10
+const HA1_REENCRYPT_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 use crate::config::Config;
 
@@ -34,6 +44,10 @@ pub enum StateError {
     Http(String),
     #[error("authentication setup failed: {0}")]
     Auth(String),
+    #[error("HA1 encryption key: {0}")]
+    Ha1Key(String),
+    #[error("HA1 re-encryption failed: {0}")]
+    Ha1Reencrypt(String),
 }
 
 #[derive(Clone)]
@@ -42,10 +56,14 @@ pub struct AppState {
     pub directory: Arc<PostgresDirectoryNumberStore>,
     pub trunk_groups: Arc<PostgresTrunkGroupStore>,
     pub dial_plans: Arc<PostgresDialPlanStore>,
-    /// Postgres-backed user store. Moves /users CRUD off the daemon as
-    /// of PR10. SIP digest auth still happens in the daemon, but it
-    /// reads through the same `users` table via its own pool.
-    pub users: Arc<PostgresUserStore>,
+    /// Postgres-backed user store with `digest_ha1` AES-256-GCM sealed at
+    /// rest. sbc-api is the only consumer of the `users` table: sbc-daemon
+    /// SIP digest auth does not read it today. If it ever does, the daemon
+    /// must also load `SBC_USER_HA1_KEY_FILE` and wrap its store in
+    /// `EncryptedUserStore`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-28(1), IA-5(1)(c)
+    pub users: Arc<UserStoreImpl>,
     /// Postgres-backed SBC-routing stores (PR11). sbc-api owns CRUD;
     /// after each write it notifies the daemon via `sbc_sync` so the
     /// live router catches up without a daemon restart.
@@ -140,10 +158,40 @@ impl AppState {
                 .await
                 .map_err(|e| StateError::Postgres(e.to_string()))?,
         );
-        let users = Arc::new(
+        // HA1 at rest: key is mandatory (fail closed), then seal any
+        // legacy plaintext rows before serving. A startup job, not a SQL
+        // migration, because the key never enters the database. Serialized
+        // across replicas by a Postgres advisory lock; idempotent.
+        // NIST 800-53 Rev5: SC-28(1), SC-12, IA-5(1)(c)
+        let ha1_key = crate::ha1_key::load_ha1_key(&cfg.user_ha1_key_file)?;
+        uc_audit::log_event(uc_audit::AuditEvent::CryptoKeyOperation(
+            uc_audit::event::CryptoKeyOperation {
+                key_id: "sbc-user-ha1".to_string(),
+                operation: uc_audit::event::KeyOperationType::Loaded,
+                algorithm: "AES-256-GCM".to_string(),
+            },
+        ));
+        let users = Arc::new(EncryptedUserStore::new(
             PostgresUserStore::new(&cfg.database_url)
                 .await
                 .map_err(|e| StateError::Postgres(e.to_string()))?,
+            ha1_key,
+        ));
+        let report = users
+            .inner()
+            .with_advisory_lock(
+                HA1_REENCRYPT_LOCK,
+                HA1_REENCRYPT_LOCK_TIMEOUT,
+                users.reencrypt_plaintext_rows(),
+            )
+            .await
+            .map_err(|e| StateError::Ha1Reencrypt(e.to_string()))?;
+        info!(
+            scanned = report.scanned,
+            encrypted = report.encrypted,
+            already = report.already,
+            raced = report.raced,
+            "HA1 at-rest re-encryption check complete"
         );
         let partitions = Arc::new(
             PostgresPartitionStore::new(&cfg.database_url)

@@ -61,6 +61,13 @@ pub struct Config {
     ///
     /// ## NIST 800-53 Rev5: IA-3 (Device Identification and Authentication), SC-8
     pub daemon_grpc_tls: Option<GrpcClientTls>,
+
+    /// File holding the AES-256-GCM key (64 hex chars) that seals SIP
+    /// digest HA1 values at rest (`SBC_USER_HA1_KEY_FILE`, required).
+    /// Must be owner-only and owned by the sbc-api uid.
+    ///
+    /// ## NIST 800-53 Rev5: SC-28(1), SC-12
+    pub user_ha1_key_file: std::path::PathBuf,
 }
 
 /// PEM file paths for the daemon gRPC mTLS client.
@@ -135,6 +142,12 @@ impl Config {
             }
         };
 
+        let user_ha1_key_file = std::env::var("SBC_USER_HA1_KEY_FILE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or(ConfigError::Missing("SBC_USER_HA1_KEY_FILE"))?
+            .into();
+
         Ok(Self {
             listen_addr,
             database_url,
@@ -144,6 +157,7 @@ impl Config {
             oidc_audience,
             trusted_proxies,
             daemon_grpc_tls,
+            user_ha1_key_file,
         })
     }
 }

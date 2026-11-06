@@ -133,6 +133,14 @@ runtime surface still gates on `config-admin`; a granular central-only
 operator without it can manage central config but not the per-site runtime
 endpoints.)
 
+**Per-site SIP user accounts.** `config-admin` alone no longer grants
+`/users`: reads need realm role `users-reader`, `users-admin`, `auditor` or
+`fleet-admin` (or scope `users:read`); create/update/delete need
+`users-admin` or `fleet-admin` (or scope `users:admin`). Create the
+`users-admin` and `users-reader` realm roles and include them in the `roles`
+mapper. Denials are audited (`AuthorizationDecision`, policy `users-rbac`);
+every account change is audited (`AccountManagement`).
+
 ```jsonc
 {
   "clientId": "usg-uc-config-admin",

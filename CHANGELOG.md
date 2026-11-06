@@ -11,6 +11,35 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Security
 
+- **SBC: user HA1 digests encrypted at rest; key required (BREAKING, fail closed).**
+  `sbc-api-server` now refuses to start without `SBC_USER_HA1_KEY_FILE`
+  (64 hex chars, mode 0400, owned by uid 1000). On first start it re-encrypts
+  existing plaintext `digest_ha1` rows once (Postgres advisory lock, 60 s
+  timeout; a lost row race is retried next start). Helm now requires
+  `sbcApi.ha1Key.existingSecret`; default values fail to render.
+  `sbcApi.ha1Key.generate=true` is for disposable labs only. No mixed-version
+  rollout: stop every old sbc-api replica before starting the new one, because
+  old binaries cannot read encrypted rows. Recovery for malformed rows is in
+  RUNBOOK.md. (NIST 800-53 Rev5: IA-5(1), SC-28, SC-12)
+- **SBC: `/users` requires `users:read` / `users:admin` (BREAKING).** New
+  Keycloak roles `users-reader` and `users-admin`. Existing API clients need the
+  new roles before upgrade (see deploy/keycloak/central-config-clients.md).
+  (AC-3, AC-6)
+- **SBC: new `AccountManagement` audit event (SIEM schema addition).** It records
+  user create/update/delete and rejected request bodies, with `actor_issuer` and
+  `changed` (field-group names only). SIEM parsers must accept the new event
+  type. (AC-2(4), AU-2, AU-3)
+
+### Changed
+
+- **SBC: `/users` API semantics (BREAKING for API clients).** PUT/DELETE
+  return real status codes (404 etc.) instead of blanket success. A duplicate
+  POST returns 409. `GET /users` is paged (`limit` default 100, max 1000;
+  `offset`), and the response includes `limit` and `offset`. Ansible
+  `configure-sbc.yml` treats 409 as already-present.
+
+### Security
+
 - **SBC: transport-level DoS hardening for TCP/TLS/WebSocket (SC-5, SC-7, SC-10).**
   Each stream listener now has its own connection pool. There is also a
   node-wide ceiling and a per-source cap; a source is one IPv4 address or one

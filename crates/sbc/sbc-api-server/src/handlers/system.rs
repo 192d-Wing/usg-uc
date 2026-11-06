@@ -34,21 +34,36 @@ pub async fn liveness() -> impl IntoResponse {
 /// Also not ready when the audit writer has died: CDR exports and
 /// permission denials would go unrecorded (NIST 800-53 Rev5: AU-5).
 pub async fn readiness(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if !uc_audit::writer_alive() {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"status": "not_ready", "error": "audit writer not running"})),
-        );
+    let audit_ok = uc_audit::writer_alive();
+    if !audit_ok {
+        warn!("readiness: audit writer not running");
+        return readiness_response::<()>(false, &Ok(()));
     }
-    match state.phones.is_empty().await {
-        Ok(_) => (
+    let db = state.phones.is_empty().await.map(|_| ());
+    if let Err(e) = &db {
+        warn!(error = %e, "readiness: postgres check failed");
+    }
+    readiness_response(audit_ok, &db)
+}
+
+/// Status + body for `/readyz`. Unauthenticated endpoint: the backend error
+/// never reaches the body, only the log (done by the caller).
+///
+/// NIST 800-53 Rev5: SI-11 (Error Handling)
+fn readiness_response<E>(
+    audit_ok: bool,
+    db: &Result<(), E>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    if audit_ok && db.is_ok() {
+        (
             axum::http::StatusCode::OK,
             Json(serde_json::json!({"status": "ready"})),
-        ),
-        Err(e) => (
+        )
+    } else {
+        (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"status": "not_ready", "error": e.to_string()})),
-        ),
+            Json(serde_json::json!({"status": "not_ready"})),
+        )
     }
 }
 
@@ -211,5 +226,24 @@ pub async fn tls_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "error": status.message(),
             }))
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn not_ready_body_carries_no_backend_detail() {
+        let secret = "connection to 10.0.0.5:5432 refused for user sbc password=hunter2";
+        for (audit_ok, db) in [(true, Err(secret)), (false, Ok(())), (false, Err(secret))] {
+            let (code, Json(body)) = readiness_response(audit_ok, &db);
+            assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body, serde_json::json!({"status": "not_ready"}));
+        }
+        let (code, Json(body)) = readiness_response::<&str>(true, &Ok(()));
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"status": "ready"}));
     }
 }

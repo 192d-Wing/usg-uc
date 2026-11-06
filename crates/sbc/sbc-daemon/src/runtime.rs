@@ -607,11 +607,11 @@ impl Runtime {
         app_state.zone_registry = zone_registry.clone();
 
         // User store init moved to sbc-api as of PR10 — sbc-api owns
-        // /users CRUD via PostgresUserStore. The daemon no longer holds
-        // a UserStore handle here. (SIP digest auth will read the same
-        // Postgres `users` table directly once that wiring lands; until
-        // then, the daemon's auth path still relies on whatever is in
-        // its in-memory state.)
+        // /users CRUD via PostgresUserStore. The daemon holds no
+        // UserStore and SIP digest auth does not read the Postgres
+        // `users` table. If that is ever wired, the daemon must also load
+        // SBC_USER_HA1_KEY_FILE and read through EncryptedUserStore
+        // (digest_ha1 is AES-256-GCM ciphertext at rest).
 
         // Initialize Postgres-backed config stores when a DSN is
         // configured. Same `SBC_POSTGRES_URL` env var the user store

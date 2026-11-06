@@ -14,6 +14,9 @@ use crate::error::UserMgmtError;
 use crate::model::{AuthType, User, UserFilter};
 use crate::store::{Result, UserStore};
 
+/// Poll interval while waiting for an advisory lock held by a peer.
+const ADVISORY_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// PostgreSQL-backed user store.
 ///
 /// Uses a connection pool for concurrent access across async tasks.
@@ -48,6 +51,66 @@ impl PostgresUserStore {
         let store = Self { pool };
         store.create_tables().await?;
         Ok(store)
+    }
+
+    /// Run `fut` while holding a session-level Postgres advisory lock keyed
+    /// by `hashtext(name)`, so replicas sharing the database serialize the
+    /// work (used for the startup HA1 re-encrypt job).
+    ///
+    /// The lock lives on one pooled connection; if unlocking fails that
+    /// connection is detached and closed, which releases the lock.
+    ///
+    /// Polls `pg_try_advisory_lock` until `timeout` elapses, then returns
+    /// `StorageError` without running `fut`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UserMgmtError::StorageError` on a database error or if the
+    /// lock is not acquired within `timeout`; otherwise `fut`'s result.
+    pub async fn with_advisory_lock<T, F>(
+        &self,
+        name: &str,
+        timeout: std::time::Duration,
+        fut: F,
+    ) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
+        // NIST 800-53 Rev5: CP-10 — never wait forever on a lock held by a
+        // wedged peer; fail so the process exits non-zero and is restarted.
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+                .bind(name)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
+            if got {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(UserMgmtError::StorageError(format!(
+                    "timed out after {}s waiting for advisory lock {name}",
+                    timeout.as_secs()
+                )));
+            }
+            tokio::time::sleep(ADVISORY_LOCK_POLL).await;
+        }
+        let out = fut.await;
+        if sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
+            .bind(name)
+            .execute(&mut *conn)
+            .await
+            .is_err()
+        {
+            drop(conn.detach());
+        }
+        out
     }
 
     async fn create_tables(&self) -> Result<()> {
@@ -276,21 +339,20 @@ impl UserStore for PostgresUserStore {
 
         sql.push_str(" ORDER BY username");
 
-        if let Some(limit) = filter.limit {
-            let _ = write!(sql, " LIMIT ${bind_idx}");
-            binds.push(limit.to_string());
-            bind_idx += 1;
-        }
-
-        if let Some(offset) = filter.offset {
-            let _ = write!(sql, " OFFSET ${bind_idx}");
-            binds.push(offset.to_string());
-        }
+        // LIMIT/OFFSET are bound as BIGINT (binding text
+        // here fails at the server). Always bounded.
+        // NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+        let _ = write!(sql, " LIMIT ${bind_idx}");
+        bind_idx += 1;
+        let _ = write!(sql, " OFFSET ${bind_idx}");
 
         let mut query = sqlx::query(&sql);
         for val in &binds {
             query = query.bind(val);
         }
+        query = query
+            .bind(filter.effective_limit())
+            .bind(filter.effective_offset());
 
         let rows = query
             .fetch_all(&self.pool)
@@ -350,6 +412,20 @@ impl UserStore for PostgresUserStore {
         }
 
         Ok(user)
+    }
+
+    async fn replace_digest_ha1(&self, id: &str, expected: &str, new: &str) -> Result<bool> {
+        // Column-only CAS: never clobbers a concurrent password/enable edit
+        // from another (possibly older) replica.
+        let result =
+            sqlx::query("UPDATE users SET digest_ha1 = $3 WHERE id = $1 AND digest_ha1 = $2")
+                .bind(id)
+                .bind(expected)
+                .bind(new)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn delete_user(&self, id: &str) -> Result<()> {
@@ -423,5 +499,62 @@ impl UserStore for PostgresUserStore {
 
         // COUNT(*) is never negative; fall back to 0 defensively.
         Ok(usize::try_from(count).unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn database_url() -> String {
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/sbc_test".to_owned())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL server"]
+    async fn advisory_lock_times_out_then_succeeds() {
+        let a = PostgresUserStore::new(&database_url()).await.unwrap();
+        let b = PostgresUserStore::new(&database_url()).await.unwrap();
+        let name = format!("uc_user_mgmt.test.{}", uuid::Uuid::new_v4());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let holder = a.with_advisory_lock(&name, Duration::from_secs(5), async {
+            rx.await.ok();
+            Ok(())
+        });
+        let waiter = async {
+            // Let the holder acquire first.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let err = b
+                .with_advisory_lock(&name, Duration::from_secs(1), async { Ok(()) })
+                .await;
+            assert!(err.is_err(), "lock must time out while held");
+            tx.send(()).unwrap();
+        };
+        let (held, ()) = tokio::join!(holder, waiter);
+        held.unwrap();
+
+        // Released: a second caller now gets it immediately.
+        b.with_advisory_lock(&name, Duration::from_secs(1), async { Ok(7) })
+            .await
+            .map(|v| assert_eq!(v, 7))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL server"]
+    async fn list_binds_integer_limit_offset() {
+        let s = PostgresUserStore::new(&database_url()).await.unwrap();
+        let page = s
+            .list_users(&UserFilter {
+                limit: Some(5),
+                offset: Some(0),
+                ..UserFilter::default()
+            })
+            .await
+            .unwrap();
+        assert!(page.len() <= 5);
     }
 }

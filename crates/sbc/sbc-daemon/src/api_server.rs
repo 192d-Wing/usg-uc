@@ -1865,8 +1865,9 @@ pub async fn apply_route_list_to_router(state: &Arc<AppState>, body: &serde_json
 // ============================================================================
 
 // ============================================================================
-// (User Management handlers removed in PR10 — sbc-api owns /users CRUD,
-// reading and writing PostgresUserStore directly.)
+// (User Management handlers removed in PR10 — sbc-api owns /users CRUD
+// through EncryptedUserStore<PostgresUserStore>; the daemon does not read
+// the users table.)
 // (Phone Management + Phone Provisioning handlers removed in PR8 —
 // sbc-api owns phone CRUD; sbc-provision owns /provision/<MAC>.{cfg,xml}.)
 // ============================================================================

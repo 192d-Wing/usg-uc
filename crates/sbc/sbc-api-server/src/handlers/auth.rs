@@ -82,12 +82,15 @@ pub async fn login(
                 .login_rate_limiter
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entry = limiter.entry(client_ip).or_insert((0, Instant::now()));
+            let entry = limiter
+                .entry(client_ip)
+                .or_insert_with(|| (0, Instant::now()));
             if entry.1.elapsed() >= RATE_LIMIT_WINDOW {
                 *entry = (1, Instant::now());
             } else {
                 entry.0 += 1;
             }
+            drop(limiter);
         }
         return (
             StatusCode::UNAUTHORIZED,

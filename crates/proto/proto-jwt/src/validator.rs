@@ -143,6 +143,12 @@ impl Validator {
         Self { jwks, cfg }
     }
 
+    /// The issuer this validator enforces (every accepted token's `iss`).
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.cfg.issuer
+    }
+
     /// Shared JWKS cache, for readiness probing.
     #[must_use]
     pub const fn jwks(&self) -> &Arc<JwksCache> {
