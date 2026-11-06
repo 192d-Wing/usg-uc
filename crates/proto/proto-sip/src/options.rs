@@ -354,7 +354,7 @@ mod tests {
     fn test_options_capabilities_default() {
         let caps = OptionsCapabilities::default();
 
-        assert!(!caps.methods.is_empty());
+        assert_ne!(caps.methods.len(), 0);
         assert!(caps.methods.contains(&Method::Invite));
         assert!(caps.methods.contains(&Method::Options));
         assert!(caps.accept_types.contains(&"application/sdp".to_string()));
@@ -509,10 +509,10 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert!(!DEFAULT_SUPPORTED_METHODS.is_empty());
+        assert_ne!(DEFAULT_SUPPORTED_METHODS.len(), 0);
         assert!(DEFAULT_SUPPORTED_METHODS.contains(&Method::Options));
-        assert!(!DEFAULT_ACCEPT_TYPES.is_empty());
-        assert!(!DEFAULT_ACCEPT_ENCODINGS.is_empty());
-        assert!(!DEFAULT_ACCEPT_LANGUAGES.is_empty());
+        assert_ne!(DEFAULT_ACCEPT_TYPES.len(), 0);
+        assert_ne!(DEFAULT_ACCEPT_ENCODINGS.len(), 0);
+        assert_ne!(DEFAULT_ACCEPT_LANGUAGES.len(), 0);
     }
 }

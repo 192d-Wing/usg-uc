@@ -8,7 +8,9 @@
 //! - Functions include debug assertions for invariant checking
 //! - No recursion is used
 
+use crate::MAX_PARAMS;
 use crate::error::{SipError, SipResult};
+use crate::header::is_token_byte;
 use crate::method::Method;
 use crate::uri::SipUri;
 use std::collections::HashMap;
@@ -183,93 +185,78 @@ impl fmt::Display for ViaHeader {
 impl FromStr for ViaHeader {
     type Err = SipError;
 
-    /// Parses a Via header string.
+    /// Parses a single Via field value (one `via-parm`).
+    ///
+    /// RFC 3261 §20.42 / §25.1: LWS is allowed around `/` (SLASH), `;`
+    /// (SEMI), `=` (EQUAL) and `:` (COLON) and between sent-protocol and
+    /// sent-by (RFC 4475 §3.1.1.1). A combined value (`a, b`) is rejected
+    /// here; use [`crate::Headers::via_all_parsed`] to split it.
+    ///
+    /// NIST 800-53 Rev5: SI-10 (input validation), SC-5 (parameter cap).
     ///
     /// # Loop Bounds (Power of 10 Rule 2)
     ///
-    /// - `splitn(2, ' ')` produces at most 2 elements
-    /// - `split('/')` bounded by input length
-    /// - Parameter parsing bounded by input length
+    /// - Parameter loop bounded by [`MAX_PARAMS`]
     fn from_str(s: &str) -> SipResult<Self> {
-        // Power of 10 Rule 5: Assert precondition
-        debug_assert!(!s.is_empty(), "empty Via header string");
+        let s = trim_lws(s);
+        if s.is_empty() {
+            return Err(via_err("empty value"));
+        }
+        // Exactly one list element; counted without allocating.
+        let mut elems = crate::list::split_list(s);
+        match (elems.next(), elems.next()) {
+            (Some(Ok(_)), None) => {}
+            (Some(Err(_)) | None, _) | (_, Some(Err(_))) => {
+                return Err(via_err("multiple or malformed Via values"));
+            }
+            (_, Some(Ok(_))) => return Err(via_err("multiple Via values in one field")),
+        }
 
-        // Split into protocol part and rest (no Vec allocation)
-        let (proto_part, rest) = s.split_once(' ').ok_or_else(|| SipError::InvalidHeader {
-            name: "Via".to_string(),
-            reason: "missing sent-by".to_string(),
-        })?;
-
-        // Parse SIP/2.0/transport via chained split_once (no Vec allocation)
-        let (protocol_str, remainder) =
-            proto_part
-                .split_once('/')
-                .ok_or_else(|| SipError::InvalidHeader {
-                    name: "Via".to_string(),
-                    reason: "invalid protocol format".to_string(),
-                })?;
-        let (version_str, transport_str) =
-            remainder
-                .split_once('/')
-                .ok_or_else(|| SipError::InvalidHeader {
-                    name: "Via".to_string(),
-                    reason: "invalid protocol format".to_string(),
-                })?;
+        // sent-protocol = protocol-name SLASH protocol-version SLASH transport
+        let (protocol_str, rest) = s
+            .split_once('/')
+            .ok_or_else(|| via_err("invalid protocol format"))?;
+        let (version_str, rest) = rest
+            .split_once('/')
+            .ok_or_else(|| via_err("invalid protocol format"))?;
+        let protocol_str = trim_lws(protocol_str);
+        let version_str = trim_lws(version_str);
+        let rest = trim_lws_start(rest);
+        let transport_end = rest
+            .bytes()
+            .position(|b| !is_token_byte(b))
+            .unwrap_or(rest.len());
+        let (transport_str, rest) = rest.split_at(transport_end);
+        if !is_token(protocol_str) || !is_token(version_str) || transport_str.is_empty() {
+            return Err(via_err("invalid protocol format"));
+        }
+        if !rest.starts_with([' ', '\t']) {
+            return Err(via_err("missing sent-by"));
+        }
 
         let protocol = protocol_str.to_string();
         let version = version_str.to_string();
         let transport = transport_str.to_uppercase();
 
         // Split sent-by from params (no Vec allocation)
-        let (sent_by, params_str) = if let Some((sb, ps)) = rest.split_once(';') {
-            (sb, Some(ps))
-        } else {
-            (rest, None)
+        let (sent_by, params_str) = match rest.split_once(';') {
+            Some((sb, ps)) => (trim_lws(sb), Some(ps)),
+            None => (trim_lws(rest), None),
         };
 
-        // Parse host:port
-        let (host, port) = if let Some((h, p)) = sent_by.rsplit_once(':') {
-            if let Ok(port) = p.parse() {
-                (h.to_string(), Some(port))
-            } else {
-                (sent_by.to_string(), None)
-            }
-        } else {
-            (sent_by.to_string(), None)
+        // Parse host [COLON port]
+        let (host, port) = match sent_by.rsplit_once(':') {
+            Some((h, p)) if !h.ends_with(':') => match trim_lws(p).parse() {
+                Ok(port) => (trim_lws(h).to_string(), Some(port)),
+                Err(_) => (sent_by.to_string(), None),
+            },
+            _ => (sent_by.to_string(), None),
         };
-
-        // Parse parameters
-        let mut branch = None;
-        let mut received = None;
-        let mut rport = None;
-        let mut ttl = None;
-        let mut maddr = None;
-        let mut params = HashMap::new();
-
-        for param in params_str.into_iter().flat_map(|ps| ps.split(';')) {
-            // Split name=value without allocating; only allocate for the
-            // matched field or for unknown params that go into the HashMap.
-            let (raw_name, raw_value) = if let Some((n, v)) = param.split_once('=') {
-                (n.trim(), Some(v.trim()))
-            } else {
-                (param.trim(), None::<&str>)
-            };
-
-            if raw_name.eq_ignore_ascii_case("branch") {
-                branch = raw_value.map(String::from);
-            } else if raw_name.eq_ignore_ascii_case("received") {
-                received = raw_value.map(String::from);
-            } else if raw_name.eq_ignore_ascii_case("rport") {
-                rport = Some(raw_value.and_then(|v| v.parse().ok()));
-            } else if raw_name.eq_ignore_ascii_case("ttl") {
-                ttl = raw_value.and_then(|v| v.parse().ok());
-            } else if raw_name.eq_ignore_ascii_case("maddr") {
-                maddr = raw_value.map(String::from);
-            } else {
-                // Only allocate for unknown params
-                params.insert(raw_name.to_lowercase(), raw_value.map(String::from));
-            }
+        if host.is_empty() || host.bytes().any(|b| b == b' ' || b == b'\t') {
+            return Err(via_err("invalid sent-by"));
         }
+
+        let p = parse_via_params(params_str)?;
 
         Ok(Self {
             protocol,
@@ -277,14 +264,101 @@ impl FromStr for ViaHeader {
             transport,
             host,
             port,
-            branch,
-            received,
-            rport,
-            ttl,
-            maddr,
-            params,
+            branch: p.branch,
+            received: p.received,
+            rport: p.rport_present.then_some(p.rport),
+            ttl: p.ttl,
+            maddr: p.maddr,
+            params: p.params,
         })
     }
+}
+
+/// Parsed Via parameters.
+#[derive(Default)]
+struct ViaParams {
+    branch: Option<String>,
+    received: Option<String>,
+    /// `;rport` present (with or without a value).
+    rport_present: bool,
+    rport: Option<u16>,
+    ttl: Option<u8>,
+    maddr: Option<String>,
+    params: HashMap<String, Option<String>>,
+}
+
+/// Parses `*( SEMI via-params )` (RFC 3261 §20.42), LWS-tolerant.
+///
+/// NIST 800-53 Rev5: SC-5 - at most [`MAX_PARAMS`] parameters.
+fn parse_via_params(params_str: Option<&str>) -> SipResult<ViaParams> {
+    let mut p = ViaParams::default();
+    let mut count = 0usize;
+
+    for param in params_str.into_iter().flat_map(|ps| ps.split(';')) {
+        let (raw_name, raw_value) = match param.split_once('=') {
+            Some((n, v)) => (trim_lws(n), Some(trim_lws(v))),
+            None => (trim_lws(param), None::<&str>),
+        };
+        if raw_name.is_empty() && raw_value.is_none() {
+            continue;
+        }
+        count += 1;
+        if count > MAX_PARAMS {
+            return Err(SipError::LimitExceeded {
+                what: "Via parameters",
+                limit: MAX_PARAMS,
+            });
+        }
+        if !is_token(raw_name) {
+            return Err(via_err("parameter name is not a token"));
+        }
+
+        if raw_name.eq_ignore_ascii_case("branch") {
+            // RFC 3261 §20.42: via-branch = "branch" EQUAL token
+            match raw_value {
+                Some(v) if !v.is_empty() => p.branch = Some(v.to_string()),
+                _ => return Err(via_err("empty branch parameter")),
+            }
+        } else if raw_name.eq_ignore_ascii_case("received") {
+            p.received = raw_value.map(String::from);
+        } else if raw_name.eq_ignore_ascii_case("rport") {
+            p.rport_present = true;
+            p.rport = raw_value.and_then(|v| v.parse().ok());
+        } else if raw_name.eq_ignore_ascii_case("ttl") {
+            p.ttl = raw_value.and_then(|v| v.parse().ok());
+        } else if raw_name.eq_ignore_ascii_case("maddr") {
+            p.maddr = raw_value.map(String::from);
+        } else {
+            // Only allocate for unknown params
+            p.params
+                .insert(raw_name.to_lowercase(), raw_value.map(String::from));
+        }
+    }
+
+    Ok(p)
+}
+
+/// Builds a Via parse error.
+fn via_err(reason: &str) -> SipError {
+    SipError::InvalidHeader {
+        name: "Via".to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+/// Trims SP / HTAB (RFC 3261 §25.1 LWS after unfolding).
+fn trim_lws(s: &str) -> &str {
+    s.trim_matches([' ', '\t'])
+}
+
+/// Trims leading SP / HTAB.
+fn trim_lws_start(s: &str) -> &str {
+    s.trim_start_matches([' ', '\t'])
+}
+
+/// Returns true if `s` is a non-empty `token` (RFC 3261 §25.1).
+fn is_token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(is_token_byte)
 }
 
 /// Parsed From/To header per RFC 3261 Section 20.20/20.39.
@@ -433,12 +507,27 @@ fn extract_uri_and_params(rest: &str) -> SipResult<(&str, &str)> {
     }
 }
 
+/// Parsed name-addr parameters: tag and the remaining params.
+type NameAddrParams = (Option<String>, HashMap<String, Option<String>>);
+
 /// Parses name-addr parameters into tag and other params.
-fn parse_nameaddr_params(params_str: &str) -> (Option<String>, HashMap<String, Option<String>>) {
+///
+/// NIST 800-53 Rev5: SC-5 - at most [`MAX_PARAMS`] parameters.
+fn parse_nameaddr_params(params_str: &str) -> SipResult<NameAddrParams> {
     let mut tag = None;
     let mut params = HashMap::new();
 
-    for param in params_str.split(';').filter(|p| !p.is_empty()) {
+    for (i, param) in params_str
+        .split(';')
+        .filter(|p| !trim_lws(p).is_empty())
+        .enumerate()
+    {
+        if i >= MAX_PARAMS {
+            return Err(SipError::LimitExceeded {
+                what: "name-addr parameters",
+                limit: MAX_PARAMS,
+            });
+        }
         let (raw_name, raw_value) = if let Some((n, v)) = param.split_once('=') {
             (n.trim(), Some(v.trim()))
         } else {
@@ -453,7 +542,7 @@ fn parse_nameaddr_params(params_str: &str) -> (Option<String>, HashMap<String, O
         }
     }
 
-    (tag, params)
+    Ok((tag, params))
 }
 
 impl FromStr for NameAddr {
@@ -461,13 +550,19 @@ impl FromStr for NameAddr {
 
     fn from_str(s: &str) -> SipResult<Self> {
         let s = s.trim();
-        debug_assert!(!s.is_empty(), "empty name-addr string");
+        // NIST 800-53 Rev5: SI-10 - untrusted input, real error (was debug_assert).
+        if s.is_empty() {
+            return Err(SipError::InvalidHeader {
+                name: "From/To".to_string(),
+                reason: "empty name-addr".to_string(),
+            });
+        }
 
         let (display_name, rest) = extract_display_name(s)?;
         let rest = rest.trim();
         let (uri_str, params_str) = extract_uri_and_params(rest)?;
         let uri: SipUri = uri_str.parse()?;
-        let (tag, params) = parse_nameaddr_params(params_str);
+        let (tag, params) = parse_nameaddr_params(params_str)?;
 
         Ok(Self {
             display_name,
@@ -512,8 +607,13 @@ impl FromStr for CSeqHeader {
     ///
     /// - `split_whitespace()` bounded by input length
     fn from_str(s: &str) -> SipResult<Self> {
-        // Power of 10 Rule 5: Assert precondition
-        debug_assert!(!s.is_empty(), "empty CSeq header string");
+        // NIST 800-53 Rev5: SI-10 - untrusted input, real error (was debug_assert).
+        if s.trim().is_empty() {
+            return Err(SipError::InvalidHeader {
+                name: "CSeq".to_string(),
+                reason: "empty value".to_string(),
+            });
+        }
 
         // Split into sequence and method (no Vec allocation)
         let (seq_str, method_str) =
@@ -525,17 +625,33 @@ impl FromStr for CSeqHeader {
                 })?;
 
         let method_str = method_str.trim_start();
+        if !is_token(method_str) {
+            return Err(SipError::InvalidHeader {
+                name: "CSeq".to_string(),
+                reason: "method is not a token".to_string(),
+            });
+        }
 
+        // RFC 3261 §25.1: CSeq = 1*DIGIT LWS Method (no sign).
+        if seq_str.len() > 10 || !seq_str.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(SipError::InvalidHeader {
+                name: "CSeq".to_string(),
+                reason: "invalid sequence number".to_string(),
+            });
+        }
         let sequence: u32 = seq_str.parse().map_err(|_| SipError::InvalidHeader {
             name: "CSeq".to_string(),
             reason: "invalid sequence number".to_string(),
         })?;
 
-        // Power of 10 Rule 5: Assert sequence range (RFC 3261: 0 to 2^31-1)
-        debug_assert!(
-            sequence <= 0x7FFF_FFFF,
-            "CSeq sequence exceeds RFC 3261 max"
-        );
+        // RFC 3261 §8.1.1.5: sequence number MUST be less than 2^31.
+        // NIST 800-53 Rev5: SI-10 - enforced in release builds (was debug_assert).
+        if sequence > 0x7FFF_FFFF {
+            return Err(SipError::InvalidHeader {
+                name: "CSeq".to_string(),
+                reason: "sequence number must be < 2^31".to_string(),
+            });
+        }
 
         // Method parsing is infallible - unknown methods become Extension variants
         let method: Method = method_str
@@ -710,5 +826,51 @@ mod tests {
         assert_eq!(mf.value, 0);
         assert!(mf.is_zero());
         assert!(mf.decrement().is_none());
+    }
+
+    #[test]
+    fn via_lws_tolerant() {
+        let via: ViaHeader = "SIP / 2.0 / UDP host.example.com ; branch = z9hG4bK1"
+            .parse()
+            .unwrap();
+        assert_eq!(via.transport, "UDP");
+        assert_eq!(via.host, "host.example.com");
+        assert_eq!(via.branch.as_deref(), Some("z9hG4bK1"));
+        let via: ViaHeader = "SIP/2.0/TCP h.example.com : 5070;rport".parse().unwrap();
+        assert_eq!(via.port, Some(5070));
+    }
+
+    #[test]
+    fn via_rejects_bad_input() {
+        assert!("".parse::<ViaHeader>().is_err());
+        assert!("SIP/2.0/UDP h;branch=".parse::<ViaHeader>().is_err());
+        assert!("SIP/2.0/UDP h;branch".parse::<ViaHeader>().is_err());
+        assert!("SIP/2.0/UDPh".parse::<ViaHeader>().is_err());
+        assert!("SIP/2.0/UDP a, SIP/2.0/UDP b".parse::<ViaHeader>().is_err());
+        let many = (0..=crate::MAX_PARAMS).fold(String::new(), |mut acc, i| {
+            let _ = std::fmt::Write::write_fmt(&mut acc, format_args!(";p{i}"));
+            acc
+        });
+        assert!(format!("SIP/2.0/UDP h{many}").parse::<ViaHeader>().is_err());
+    }
+
+    #[test]
+    fn cseq_errors_in_release() {
+        assert!("".parse::<CSeqHeader>().is_err());
+        assert!("2147483648 INVITE".parse::<CSeqHeader>().is_err());
+        assert!("2147483647 INVITE".parse::<CSeqHeader>().is_ok());
+        assert!("+1 INVITE".parse::<CSeqHeader>().is_err());
+        assert!("1 IN VITE".parse::<CSeqHeader>().is_err());
+    }
+
+    #[test]
+    fn name_addr_errors_in_release() {
+        assert!("".parse::<NameAddr>().is_err());
+        assert!("   ".parse::<NameAddr>().is_err());
+        let many = (0..=crate::MAX_PARAMS).fold(String::new(), |mut acc, i| {
+            let _ = std::fmt::Write::write_fmt(&mut acc, format_args!(";p{i}"));
+            acc
+        });
+        assert!(format!("<sip:a@b>{many}").parse::<NameAddr>().is_err());
     }
 }

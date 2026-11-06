@@ -264,15 +264,20 @@ impl FromStr for DigestChallenge {
     type Err = SipError;
 
     fn from_str(s: &str) -> SipResult<Self> {
-        debug_assert!(!s.is_empty(), "empty challenge string");
-
         let s = s.trim();
+        // NIST 800-53 Rev5: SI-10 - untrusted input, real error (was debug_assert).
+        if s.is_empty() {
+            return Err(SipError::InvalidHeader {
+                name: "WWW-Authenticate".to_string(),
+                reason: "empty challenge".to_string(),
+            });
+        }
         let params_str = s
             .strip_prefix("Digest ")
             .or_else(|| s.strip_prefix("digest "))
             .unwrap_or(s);
 
-        let params = parse_auth_params(params_str);
+        let params = parse_auth_params(params_str)?;
 
         let realm = get_required_param(&params, "realm", "WWW-Authenticate")?;
         let nonce = get_required_param(&params, "nonce", "WWW-Authenticate")?;
@@ -434,15 +439,20 @@ impl FromStr for DigestCredentials {
     type Err = SipError;
 
     fn from_str(s: &str) -> SipResult<Self> {
-        debug_assert!(!s.is_empty(), "empty credentials string");
-
         let s = s.trim();
+        // NIST 800-53 Rev5: SI-10 - untrusted input, real error (was debug_assert).
+        if s.is_empty() {
+            return Err(SipError::InvalidHeader {
+                name: "Authorization".to_string(),
+                reason: "empty credentials".to_string(),
+            });
+        }
         let params_str = s
             .strip_prefix("Digest ")
             .or_else(|| s.strip_prefix("digest "))
             .unwrap_or(s);
 
-        let params = parse_auth_params(params_str);
+        let params = parse_auth_params(params_str)?;
 
         let username = get_required_param(&params, "username", "Authorization")?;
         let realm = get_required_param(&params, "realm", "Authorization")?;
@@ -498,7 +508,7 @@ impl FromStr for DigestCredentials {
 ///
 /// - Outer loop bounded by number of commas in input
 /// - Inner quote scanning bounded by parameter length
-fn parse_auth_params(s: &str) -> HashMap<String, String> {
+fn parse_auth_params(s: &str) -> SipResult<HashMap<String, String>> {
     let mut params = HashMap::new();
 
     // Simple state machine for parsing
@@ -524,6 +534,13 @@ fn parse_auth_params(s: &str) -> HashMap<String, String> {
             // End of parameter
             if let Some((name, value)) = parse_single_param(&current) {
                 params.insert(name, value);
+                // NIST 800-53 Rev5: SC-5 - bound auth-params.
+                if params.len() > crate::MAX_PARAMS {
+                    return Err(SipError::LimitExceeded {
+                        what: "auth parameters",
+                        limit: crate::MAX_PARAMS,
+                    });
+                }
             }
             current.clear();
         } else {
@@ -533,9 +550,6 @@ fn parse_auth_params(s: &str) -> HashMap<String, String> {
         i += 1;
     }
 
-    // Power of 10 Rule 5: Assert loop completed
-    debug_assert_eq!(i, chars.len(), "parse loop should consume all chars");
-
     // Handle last parameter
     if !current.is_empty()
         && let Some((name, value)) = parse_single_param(&current)
@@ -543,7 +557,7 @@ fn parse_auth_params(s: &str) -> HashMap<String, String> {
         params.insert(name, value);
     }
 
-    params
+    Ok(params)
 }
 
 /// Parses a single `name=value` or `name="value"` parameter.
@@ -1084,7 +1098,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!ha2.is_empty());
+        assert_ne!(ha2, "");
     }
 
     #[test]
@@ -1127,7 +1141,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!response.is_empty());
+        assert_ne!(response, "");
     }
 
     #[test]
@@ -1144,7 +1158,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!response.is_empty());
+        assert_ne!(response, "");
     }
 
     #[test]
@@ -1188,7 +1202,7 @@ mod tests {
         assert_eq!(creds.nonce, "servernonce123");
         assert_eq!(creds.qop, Some(Qop::Auth));
         assert_eq!(creds.algorithm, DigestAlgorithm::Sha256);
-        assert!(!creds.response.is_empty());
+        assert_ne!(creds.response, "");
     }
 
     #[test]
@@ -1225,5 +1239,20 @@ mod tests {
         assert!(!constant_time_eq("test", "Test"));
         assert!(!constant_time_eq("test", "testing"));
         assert!(!constant_time_eq("", "x"));
+    }
+
+    #[test]
+    fn auth_untrusted_input_errors_in_release() {
+        assert!("".parse::<DigestChallenge>().is_err());
+        assert!("  ".parse::<DigestCredentials>().is_err());
+        let many = (0..=crate::MAX_PARAMS + 1).fold(String::new(), |mut acc, i| {
+            let _ = write!(acc, "p{i}=v,");
+            acc
+        });
+        assert!(
+            format!("Digest realm=\"r\", nonce=\"n\", {many}")
+                .parse::<DigestChallenge>()
+                .is_err()
+        );
     }
 }

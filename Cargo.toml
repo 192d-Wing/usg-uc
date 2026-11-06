@@ -102,6 +102,8 @@ members = [
     "crates/client/client-gui-tauri",
     "crates/client/client-integration-tests",
 ]
+# Nightly-only cargo-fuzz crate; its own workspace (see its Cargo.toml).
+exclude = ["crates/proto/proto-sip/fuzz"]
 resolver = "2"
 
 [workspace.package]
@@ -278,6 +280,7 @@ windows = { version = "0.62", features = [
 uuid = { version = "1.28", features = ["v4"] }
 tempfile = "3.27"
 criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1"
 
 [workspace.lints.rust]
 # Use deny instead of forbid to allow platform-specific unsafe code with explicit #[allow(unsafe_code)]

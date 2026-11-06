@@ -6,7 +6,11 @@ use thiserror::Error;
 pub type SipResult<T> = Result<T, SipError>;
 
 /// SIP errors.
+///
+/// Marked `#[non_exhaustive]`: new variants are added as the parser is
+/// hardened, and callers must keep a catch-all arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SipError {
     /// Failed to parse SIP message.
     #[error("failed to parse SIP message: {reason}")]
@@ -76,4 +80,72 @@ pub enum SipError {
         /// Error description.
         reason: String,
     },
+
+    /// A single-valued header appeared more than once (RFC 3261 §7.3.1,
+    /// §20; RFC 4475 §3.1.2.x).
+    #[error("duplicate single-valued header: {name}")]
+    DuplicateHeader {
+        /// Header name (canonical form).
+        name: String,
+    },
+
+    /// A parser resource limit was exceeded.
+    ///
+    /// NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection).
+    #[error("{what} exceeds limit {limit}")]
+    LimitExceeded {
+        /// What was limited (static, never attacker data).
+        what: &'static str,
+        /// The configured limit.
+        limit: usize,
+    },
+
+    /// Content-Length header value is malformed (RFC 3261 §20.14).
+    #[error("invalid Content-Length: {reason}")]
+    InvalidContentLength {
+        /// Static reason (never attacker data).
+        reason: &'static str,
+    },
+}
+
+impl SipError {
+    /// Returns true if this error was caused by a malformed or abusive
+    /// message from the peer, i.e. a case where RFC 3261 §8.2.2 / §16.3
+    /// permit a 400 (Bad Request) response.
+    ///
+    /// NIST 800-53 Rev5: SI-10 (Information Input Validation), SI-11
+    /// (Error Handling).
+    #[must_use]
+    pub fn is_client_error(&self) -> bool {
+        matches!(
+            self,
+            Self::ParseError { .. }
+                | Self::InvalidMethod { .. }
+                | Self::InvalidUri { .. }
+                | Self::InvalidHeader { .. }
+                | Self::MissingHeader { .. }
+                | Self::InvalidStatusCode { .. }
+                | Self::MessageTooLarge { .. }
+                | Self::ContentLengthMismatch { .. }
+                | Self::DuplicateHeader { .. }
+                | Self::LimitExceeded { .. }
+                | Self::InvalidContentLength { .. }
+        )
+    }
+}
+
+/// Truncates attacker-controlled text before it is placed in an error
+/// reason (reasons reach logs).
+///
+/// NIST 800-53 Rev5: SI-11 (Error Handling) - bound echoed input.
+pub(crate) fn truncate_for_log(s: &str) -> String {
+    const MAX: usize = 64;
+    if s.len() <= MAX {
+        return s.escape_debug().to_string();
+    }
+    let mut end = MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", s[..end].escape_debug())
 }
