@@ -108,6 +108,8 @@ name = "sbc-daemon"
 path = "src/main.rs"
 
 [dev-dependencies]
+# PEM output for the CNSA syslog TLS handshake test CA.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 # Thread-local audit capture for tests asserting audit records.
 uc-audit = { workspace = true, features = ["test-capture"] }
 tempfile.workspace = true
