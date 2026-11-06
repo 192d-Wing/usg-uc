@@ -233,7 +233,6 @@ private_key_path = "/etc/sbc/sti/tls.key"
 certificate_url = {{ .Values.sbcDaemon.stirShaken.certificateUrl | quote }}
 {{- end }}
 {{- end }}
-{{- end }}
 
 [monitoring]
 metrics_bind = {{ .Values.sbcDaemon.config.metrics_listen | quote }}
