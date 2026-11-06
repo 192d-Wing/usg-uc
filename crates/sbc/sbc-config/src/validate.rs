@@ -721,13 +721,13 @@ fn validate_trunk_tls(config: &SbcConfig) -> ConfigResult<()> {
                       (PEM bundle of CAs that issue trunk server certificates)"
                 .to_string(),
         }),
-        (Some(p), true) if !p.is_absolute() => Err(ConfigError::Validation {
+        (Some(p), _) if !p.is_absolute() => Err(ConfigError::Validation {
             message: "security.trunk_tls_ca_path must be an absolute path".to_string(),
         }),
-        (Some(_), false) => Err(ConfigError::Validation {
-            message: "security.trunk_tls_ca_path is set but no trunk uses protocol = \"tls\""
-                .to_string(),
-        }),
+        // A CA with no TLS trunk in this file is allowed: trunks also arrive
+        // through the gRPC TrunkSync / management API (the Helm deployment
+        // defines none in the config file), and a TLS trunk added that way
+        // needs these anchors to connect at all.
         _ => Ok(()),
     }
 }
@@ -2476,7 +2476,8 @@ max_passport_age_secs = 120
         assert!(super::validate_config(&c).is_err());
         c.trunk_groups[0].trunks[0].tls_client_cert = false;
         c.security.trunk_tls_ca_path = Some("/etc/sbc/trunk-ca.pem".into());
-        assert!(super::validate_config(&c).is_err());
+        // An unused CA is allowed (trunks may arrive via TrunkSync).
+        super::validate_config(&c).unwrap();
     }
 }
 
@@ -2534,9 +2535,15 @@ mod qa_trunk_tls_edges {
     }
 
     #[test]
-    fn unused_trunk_ca_rejected_for_tcp_only() {
+    fn trunk_ca_without_tls_trunk_in_file_is_allowed() {
+        // TLS trunks may arrive later via TrunkSync; the CA must be loadable
+        // up front. It must still be absolute.
         let c = cfg(vec![group("a", "tcp")], Some("/etc/sbc/trunk-ca.pem"));
-        assert!(err(&c).contains("no trunk uses"));
+        super::validate_config(&c).unwrap();
+        let c = cfg(Vec::new(), Some("/etc/sbc/trunk-ca.pem"));
+        super::validate_config(&c).unwrap();
+        let c = cfg(Vec::new(), Some("trunk-ca.pem"));
+        assert!(err(&c).contains("absolute"));
     }
 
     #[test]
