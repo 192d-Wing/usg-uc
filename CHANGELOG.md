@@ -97,6 +97,25 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   `openssl s_client -connect host:port -tls1_3 -ciphersuites TLS_AES_256_GCM_SHA384 -groups secp384r1`.
   The REST HTTPS listener, daemon gRPC and the soft client are unchanged.
 
+- **SBC, STIR/SHAKEN (behaviour change):** attestation A for a registered
+  endpoint is now tied to the TCP/TLS connection that carried its REGISTER,
+  not to the source `ip:port`. When that connection closes, the binding is
+  dropped. A new connection from the same address (CGNAT port reuse) no
+  longer gets A (POA&M-36). What operators will see:
+  - Phones that reconnect get B until they re-REGISTER on the new connection.
+  - A de-REGISTER only removes the binding when it arrives on the connection
+    that owns it.
+  - UDP is unchanged and stays at B.
+
+  There are no config or schema changes. TLS peer-certificate binding is
+  still open as POA&M-70.
+
+### Fixed
+
+- **SBC:** at registration capacity, the full STIR flow-table sweep is now
+  rate-limited to once per second. Before, it ran under the location write
+  lock on every new-flow REGISTER (POA&M-35).
+
 ### Changed (SBC and client, proto-sip message-layer hardening, Phase 1)
 
 - **SIP parsing is strict.** Messages with bare CR or LF line ends, header
