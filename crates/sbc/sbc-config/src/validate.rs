@@ -271,7 +271,62 @@ fn validate_transport(config: &crate::schema::TransportConfig) -> ConfigResult<(
         });
     }
 
+    validate_stream_limits(config)
+}
+
+/// Range check helper for numeric settings.
+fn check_range<T>(name: &str, value: T, min: T, max: T) -> ConfigResult<()>
+where
+    T: PartialOrd + std::fmt::Display + Copy,
+{
+    if value < min || value > max {
+        return Err(ConfigError::Validation {
+            message: format!("{name} must be in {min}..={max} (got {value})"),
+        });
+    }
     Ok(())
+}
+
+/// Stream connection limits and timeouts.
+///
+/// ## NIST 800-53 Rev5: SC-5, SC-10, CM-6
+fn validate_stream_limits(config: &crate::schema::TransportConfig) -> ConfigResult<()> {
+    check_range(
+        "transport.tcp_idle_timeout_secs",
+        config.tcp_idle_timeout_secs,
+        30,
+        3600,
+    )?;
+    check_range(
+        "transport.max_connections_per_listener",
+        config.max_connections_per_listener,
+        1,
+        1_000_000,
+    )?;
+    check_range(
+        "transport.max_connections_total",
+        config.max_connections_total,
+        1,
+        4_000_000,
+    )?;
+    check_range(
+        "transport.max_connections_per_source",
+        config.max_connections_per_source,
+        1,
+        config.max_connections_per_listener,
+    )?;
+    check_range(
+        "transport.handshake_timeout_secs",
+        config.handshake_timeout_secs,
+        1,
+        60,
+    )?;
+    check_range(
+        "transport.first_message_timeout_secs",
+        config.first_message_timeout_secs,
+        1,
+        config.tcp_idle_timeout_secs,
+    )
 }
 
 fn validate_media(config: &crate::schema::MediaConfig) -> ConfigResult<()> {
@@ -630,7 +685,63 @@ fn validate_rate_limit(config: &crate::schema::RateLimitConfig) -> ConfigResult<
                 message: "burst_multiplier must be a finite number >= 1.0".to_string(),
             });
         }
+
+        // NIST 800-53 Rev5: SC-5 — the overflow share sits between one
+        // source's and the whole node's budget.
+        if config.overflow_rps != 0 {
+            check_range(
+                "rate_limit.overflow_rps",
+                config.overflow_rps,
+                config.per_ip_rps,
+                config.global_rps.max(config.per_ip_rps),
+            )?;
+        }
     }
+
+    // Checked even when disabled: the keying prefix also feeds the
+    // per-source connection cap.
+    check_range(
+        "rate_limit.ipv6_prefix_len",
+        config.ipv6_prefix_len,
+        32,
+        128,
+    )?;
+    check_range(
+        "rate_limit.max_tracked_sources",
+        config.max_tracked_sources,
+        1024,
+        4_194_304,
+    )?;
+    check_range(
+        "rate_limit.max_blocked_sources",
+        config.max_blocked_sources,
+        1,
+        config.max_tracked_sources,
+    )?;
+    check_range(
+        "rate_limit.block_duration_secs",
+        config.block_duration_secs,
+        1,
+        86_400,
+    )?;
+    check_range(
+        "rate_limit.sweep_interval_secs",
+        config.sweep_interval_secs,
+        1,
+        300,
+    )?;
+    check_range(
+        "rate_limit.audit_interval_secs",
+        config.audit_interval_secs,
+        1,
+        3600,
+    )?;
+    check_range(
+        "rate_limit.audit_max_records_per_interval",
+        config.audit_max_records_per_interval,
+        1,
+        65_536,
+    )?;
 
     Ok(())
 }
@@ -3083,6 +3194,81 @@ mod cluster_admission_tests {
             "[general]\nmax_registrations = 3\n[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 4\n",
         ] {
             assert!(crate::load_from_str(bad).is_err(), "accepted: {bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
+mod transport_dos_limits {
+    use super::validate_config;
+    use crate::schema::SbcConfig;
+
+    #[test]
+    fn defaults_validate() {
+        let c = SbcConfig::default();
+        assert_eq!(c.rate_limit.ipv6_prefix_len, 64);
+        assert_eq!(c.rate_limit.max_blocked_sources, 16_384);
+        assert_eq!(c.rate_limit.block_duration_secs, 60);
+        assert_eq!(c.transport.max_connections_per_source, 128);
+        assert_eq!(c.transport.max_connections_total, 20_000);
+        assert_eq!(c.rate_limit.effective_overflow_rps(), 1_000);
+        let mut hi = c.rate_limit.clone();
+        hi.per_ip_rps = 10_000;
+        hi.global_rps = 50_000;
+        assert_eq!(hi.effective_overflow_rps(), 10_000);
+        assert!(c.transport.ws_require_sip_subprotocol);
+        validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn old_config_without_new_keys_loads() {
+        let c: SbcConfig = toml::from_str(
+            "[rate_limit]\nenabled = true\nglobal_rps = 10000\nper_ip_rps = 100\n\
+             [transport]\nudp_listen = [\"0.0.0.0:5060\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.rate_limit.audit_interval_secs, 60);
+        assert_eq!(c.transport.first_message_timeout_secs, 30);
+    }
+
+    #[test]
+    fn serde_round_trip_keeps_new_keys() {
+        let mut c = SbcConfig::default();
+        c.rate_limit.ipv6_prefix_len = 48;
+        c.transport.max_connections_per_source = 7;
+        let text = toml::to_string(&c).unwrap();
+        let back: SbcConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.rate_limit.ipv6_prefix_len, 48);
+        assert_eq!(back.transport.max_connections_per_source, 7);
+    }
+
+    #[test]
+    fn out_of_range_values_rejected() {
+        let cases: Vec<fn(&mut SbcConfig)> = vec![
+            |c| c.rate_limit.ipv6_prefix_len = 16,
+            |c| c.rate_limit.max_tracked_sources = 10,
+            |c| c.rate_limit.max_blocked_sources = 0,
+            |c| c.rate_limit.overflow_rps = 1,
+            |c| c.rate_limit.overflow_rps = 1_000_000,
+            |c| c.rate_limit.block_duration_secs = 0,
+            |c| c.rate_limit.sweep_interval_secs = 0,
+            |c| c.rate_limit.audit_interval_secs = 0,
+            |c| c.rate_limit.audit_max_records_per_interval = 0,
+            |c| c.transport.max_connections_per_source = 0,
+            |c| c.transport.max_connections_per_source = 20_000,
+            |c| c.transport.max_connections_per_listener = 0,
+            |c| c.transport.max_connections_total = 0,
+            |c| c.transport.handshake_timeout_secs = 0,
+            |c| c.transport.handshake_timeout_secs = 61,
+            |c| c.transport.first_message_timeout_secs = 0,
+            |c| c.transport.first_message_timeout_secs = 301,
+            |c| c.transport.tcp_idle_timeout_secs = 5,
+        ];
+        for (i, mutate) in cases.into_iter().enumerate() {
+            let mut c = SbcConfig::default();
+            mutate(&mut c);
+            assert!(validate_config(&c).is_err(), "case {i} should fail");
         }
     }
 }

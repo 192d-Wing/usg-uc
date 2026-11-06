@@ -209,7 +209,7 @@ uc-transport TCP/TLS/WS, uc-dos-protection and uc-crypto are LIVE; uc-dns is
 LIVE in the client only; uc-transport SCTP, cert hot-reload, uc-discovery and
 uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
 
-- [ ] **BLOCKER, LIVE — global rate limiter blacklists innocent sources
+- [x] **BLOCKER, LIVE — global rate limiter blacklists innocent sources
   (confirmed).** `rate_limit_allows` (`sbc-daemon/src/server.rs:1591`) checks
   the shared global limiter first; past 2× `global_rps` it calls
   `block(source)` on whoever sent the current packet
@@ -218,30 +218,36 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
   chance. The `blocked` map is uncapped and never swept (`cleanup()` unused),
   so spoofed sources grow it without bound. Fix: per-IP first, never `block`
   from a global limiter, cap and sweep `blocked`.
-- [ ] **BLOCKER, LIVE (when `ws_listen` set) — WebSocket upgrade runs inline in
+  fixed: per-IP checked first, global limiter never blocks, `blocked` capped (`max_blocked_sources`) and swept (fix/transport-dos-audit).
+- [x] **BLOCKER, LIVE (when `ws_listen` set) — WebSocket upgrade runs inline in
   the accept loop with no timeout** (`uc-transport/src/websocket.rs:412`,
   `server.rs:1687`). One TCP connect that never sends a request stops the WS
   listener for everyone. Split accept/handshake like `TlsListener`, 10 s timeout
   after taking the connection permit.
-- [ ] **MAJOR, LIVE — WebSocket uses tungstenite defaults (64 MiB messages,
+  fixed: WS handshake spawned off the accept loop under `handshake_timeout_secs`, after admission (fix/transport-dos-audit).
+- [x] **MAJOR, LIVE — WebSocket uses tungstenite defaults (64 MiB messages,
   16 MiB frames)** (`websocket.rs:142`); the 64 KiB SIP limit is checked only
   after a full message arrives. Set `WebSocketConfig` limits; require the `sip`
   subprotocol (RFC 7118 §4).
-- [ ] **MAJOR, LIVE — one 10,000-connection pool shared by TCP/TLS/WS, no
+  fixed: messages/frames capped at 65,535 bytes; `sip` subprotocol required, HTTP 400 otherwise (fix/transport-dos-audit).
+- [x] **MAJOR, LIVE — one 10,000-connection pool shared by TCP/TLS/WS, no
   per-source cap or accept rate limit; a bare CRLF resets the 300 s idle timer**
   (`server.rs:1348,1786`). One IP can hold every slot, blocking trunk mTLS.
   Per-IP cap, per-listener pools, CRLF doesn't count as activity.
-- [ ] **MAJOR, LIVE — rate limiter keys IPv6 per /128 and rejects every new
+  fixed: per-source cap, per-listener pools plus `max_connections_total`, first-message deadline, wall-clock idle, CRLF counts only after a first accepted message (residual POA&M-94) (fix/transport-dos-audit).
+- [x] **MAJOR, LIVE — rate limiter keys IPv6 per /128 and rejects every new
   source when the 65,536-entry table is full** (`limiter.rs`). A /64 gets 2^64
   buckets; a spoofed or rotated flood locks out all untracked legitimate
   sources. Key IPv6 by /64, unmap v4-mapped, overflow bucket instead of reject.
+  fixed: IPv6 keyed per `ipv6_prefix_len` (default /64), v4-mapped unmapped, shared overflow bucket past the cap (fix/transport-dos-audit).
 - [ ] **MAJOR, LIVE — per-user rate limiter keyed on the unauthenticated From
   user, before auth, and rejects past 65,536 keys** (`sip_stack.rs:3256`).
   Targeted lockout via spoofed `From: victim`, or 503 for every new user after a
   spray. Key on authenticated identity (or source /64 + user) after auth.
-- [ ] **MAJOR, LIVE — every rate-limited packet writes an audit record**
+- [x] **MAJOR, LIVE — every rate-limited packet writes an audit record**
   (`server.rs:41,1607,1627`), so a flood fills the audit queue and drops
   security records. Aggregate per (source, limit) and emit on state change.
+  fixed: rate-limit audit aggregated per (source, limit) per interval, block/unblock on transition, per-interval cap (fix/transport-dos-audit).
 - [ ] **MAJOR, LIVE — REST API TLS is not CNSA and cert hot-reload is dead code**
   (`sbc-daemon/src/api_server.rs:1174` uses the default provider;
   `ReloadableTlsAcceptor` never installed, `runtime.rs:564`). No TLS handshake
@@ -259,9 +265,10 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
 - [ ] **MINOR, LIVE (client) — uc-dns resolver built without a DNS backend**
   (`uc-dns/src/resolver.rs:163`, `client-sip-ua/src/call_agent.rs:3144`), so
   NAPTR/SRV are never queried; RFC 3263 isn't actually done.
-- [ ] **NIT, LIVE — stream framer `parse_content_length`: first CL wins,
+- [x] **NIT, LIVE — stream framer `parse_content_length`: first CL wins,
   malformed becomes 0, duplicates not rejected** (`server.rs:2303`); can disagree
   with proto-sip on message boundaries.
+  fixed: framer uses `SipMessage::stream_message_len`; bad CL gets 400 and close on TCP/TLS (fix/transport-dos-audit).
 - [ ] **NIT, LIVE (client) — uc-dns cache eviction is an O(n) scan per insert;
   SRV weighting always picks the median** (`cache.rs:139`, `srv.rs:160`).
 - [ ] **MAJOR, DORMANT — SCTP `Chunk::decode` panics on a padded last chunk**

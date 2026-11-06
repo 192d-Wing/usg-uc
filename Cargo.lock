@@ -6400,11 +6400,13 @@ dependencies = [
  "uc-cdr",
  "uc-cluster",
  "uc-discovery",
+ "uc-dos-protection",
  "uc-health",
  "uc-metrics",
  "uc-policy",
  "uc-routing",
  "uc-storage",
+ "uc-transport",
  "uc-types",
 ]
 
@@ -8584,6 +8586,7 @@ dependencies = [
 name = "uc-dos-protection"
 version = "0.10.0"
 dependencies = [
+ "criterion",
  "uc-types",
 ]
 
