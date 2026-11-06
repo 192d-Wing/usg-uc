@@ -530,3 +530,72 @@ strategy = "priority"
     let udp = ok.replace("protocol = \"tls\"", "protocol = \"udp\"");
     assert!(load_from_str(&udp).is_err(), "TLS-only keys on a UDP trunk");
 }
+
+// NIST 800-53 Rev5: SC-8, CM-6 (POA&M-48) — `require_tls` trunk groups load
+// only with a TLS trunk, and route only to TLS trunks.
+#[test]
+fn test_require_tls_trunk_group_config() {
+    use uc_routing::{Router, RouterConfig, Trunk, TrunkConfig, TrunkGroup, TrunkProtocol};
+
+    let mixed = r#"
+[security]
+trunk_tls_ca_path = "/etc/sbc/trunk-ca.pem"
+
+[[trunk_groups]]
+id = "g1"
+name = "g1"
+strategy = "priority"
+require_tls = true
+  [[trunk_groups.trunks]]
+  id = "udp1"
+  host = "192.0.2.10"
+  port = 5060
+  protocol = "udp"
+  priority = 1
+  [[trunk_groups.trunks]]
+  id = "tls1"
+  host = "sip.example.net"
+  port = 5061
+  protocol = "tls"
+  priority = 2
+"#;
+    let config = load_from_str(mixed).unwrap();
+    assert!(config.trunk_groups[0].require_tls);
+    assert!(!config.security.require_tls_trunks);
+
+    // Same group without its TLS trunk is a config error.
+    let no_tls = mixed
+        .split("  [[trunk_groups.trunks]]\n  id = \"tls1\"")
+        .next()
+        .unwrap();
+    let err = load_from_str(no_tls).unwrap_err().to_string();
+    assert!(err.contains("require_tls"), "{err}");
+
+    // Global key: a plain UDP group fails to load.
+    let global = trunk_toml("").replace(
+        "[[trunk_groups]]",
+        "[security]\nrequire_tls_trunks = true\n\n[[trunk_groups]]",
+    );
+    rejected_naming(&global, "require_tls_trunks");
+
+    // Routing over the loaded group never picks the UDP trunk.
+    let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+    let g = &config.trunk_groups[0];
+    let mut group = TrunkGroup::new(&g.id, &g.name).with_require_tls(g.require_tls);
+    for t in &g.trunks {
+        let proto = if t.protocol == "tls" {
+            TrunkProtocol::Tls
+        } else {
+            TrunkProtocol::Udp
+        };
+        group.add_trunk(Trunk::new(
+            TrunkConfig::new(&t.id, &t.host)
+                .with_protocol(proto)
+                .with_priority(t.priority),
+        ));
+    }
+    router.add_trunk_group(group);
+    let d = router.route_to_group("1", "g1").unwrap();
+    assert_eq!(d.trunk_id, "tls1");
+    assert_eq!(d.failover_targets, Vec::<(String, String)>::new());
+}

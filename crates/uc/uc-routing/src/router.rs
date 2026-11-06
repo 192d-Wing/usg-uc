@@ -4,6 +4,8 @@ use crate::dialplan::{DialPlan, DialPlanResult};
 use crate::error::{RoutingError, RoutingResult};
 use crate::trunk::{Admission, Trunk, TrunkGroup, TrunkOutcome};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Routing decision.
@@ -93,6 +95,32 @@ pub struct RouterStats {
     pub failovers: u64,
 }
 
+/// `require_tls` policy counters (NIST 800-53 Rev5: SI-4, SC-8).
+///
+/// Shared through an [`Arc`] so a metrics scrape never takes the router lock.
+/// Unlabelled counters: no cardinality from attacker-controlled data (SC-5).
+#[derive(Debug, Default)]
+pub struct TlsPolicyCounters {
+    /// Non-TLS trunks excluded by policy (summed per routing decision and per
+    /// refused failover acquisition).
+    skips: AtomicU64,
+    /// Calls refused because a `require_tls` group had no usable TLS trunk
+    /// while a usable non-TLS trunk existed.
+    rejects: AtomicU64,
+}
+
+impl TlsPolicyCounters {
+    /// `routing_tls_required_skips`.
+    pub fn skips(&self) -> u64 {
+        self.skips.load(Ordering::Relaxed)
+    }
+
+    /// `routing_tls_required_rejects`.
+    pub fn rejects(&self) -> u64 {
+        self.rejects.load(Ordering::Relaxed)
+    }
+}
+
 /// Call router.
 #[derive(Debug)]
 pub struct Router {
@@ -106,6 +134,10 @@ pub struct Router {
     trunk_groups: HashMap<String, TrunkGroup>,
     /// Statistics.
     stats: RouterStats,
+    /// Global `security.require_tls_trunks`: ORed into every group added.
+    require_tls_default: bool,
+    /// `require_tls` policy counters.
+    tls_counters: Arc<TlsPolicyCounters>,
 }
 
 impl Router {
@@ -117,6 +149,8 @@ impl Router {
             active_dial_plan: None,
             trunk_groups: HashMap::new(),
             stats: RouterStats::default(),
+            require_tls_default: false,
+            tls_counters: Arc::new(TlsPolicyCounters::default()),
         }
     }
 
@@ -185,8 +219,46 @@ impl Router {
             .and_then(|id| self.dial_plans.get(id))
     }
 
-    /// Adds a trunk group.
-    pub fn add_trunk_group(&mut self, group: TrunkGroup) {
+    /// Sets the global TLS-only default (`security.require_tls_trunks`).
+    ///
+    /// NIST 800-53 Rev5: SC-8 — applies to groups added after the call and to
+    /// groups already present. A group cannot opt out while it is set.
+    pub fn set_require_tls_default(&mut self, require_tls: bool) {
+        self.require_tls_default = require_tls;
+        if require_tls {
+            for group in self.trunk_groups.values_mut() {
+                group.set_require_tls(true);
+            }
+        }
+    }
+
+    /// Returns the global TLS-only default.
+    pub fn require_tls_default(&self) -> bool {
+        self.require_tls_default
+    }
+
+    /// `(skips, rejects)` snapshot of the `require_tls` policy counters.
+    pub fn tls_policy_counters(&self) -> (u64, u64) {
+        (self.tls_counters.skips(), self.tls_counters.rejects())
+    }
+
+    /// Replaces the counter handle so a router rebuilt by its owner keeps
+    /// counting into the same (already exported) counters.
+    pub fn set_tls_policy_counters(&mut self, counters: Arc<TlsPolicyCounters>) {
+        self.tls_counters = counters;
+    }
+
+    /// Shared handle to the `require_tls` counters (for lock-free scrapes).
+    pub fn tls_policy_counters_handle(&self) -> Arc<TlsPolicyCounters> {
+        Arc::clone(&self.tls_counters)
+    }
+
+    /// Adds a trunk group. The effective `require_tls` policy is the group's
+    /// own flag ORed with the global default.
+    pub fn add_trunk_group(&mut self, mut group: TrunkGroup) {
+        if self.require_tls_default {
+            group.set_require_tls(true);
+        }
         self.trunk_groups.insert(group.id().to_string(), group);
     }
 
@@ -222,6 +294,22 @@ impl Router {
         destination: &str,
         admission: Admission,
     ) -> RoutingResult<RoutingDecision> {
+        self.route_for_tls(destination, admission, false)
+    }
+
+    /// [`Self::route_for`] for a call that itself requires TLS egress when
+    /// `tls_only` (RFC 3261 §26.2.2: `sips:` Request-URI). The group's
+    /// `require_tls` predicate is applied as if the group had it set.
+    ///
+    /// # Errors
+    /// As [`Self::route_for`]; `tls_required` is set when the TLS
+    /// requirement is what refused the call.
+    pub fn route_for_tls(
+        &mut self,
+        destination: &str,
+        admission: Admission,
+        tls_only: bool,
+    ) -> RoutingResult<RoutingDecision> {
         self.stats.requests += 1;
 
         let dial_plan_result = if self.config.use_dial_plan {
@@ -232,7 +320,7 @@ impl Router {
 
         let trunk_group_id = self.resolve_trunk_group(dial_plan_result.as_ref(), destination)?;
         let (trunk_id, trunk_uri, failover_trunks) =
-            self.select_trunk_from_group(&trunk_group_id, admission)?;
+            self.select_trunk_from_group(&trunk_group_id, admission, tls_only)?;
         let failover_targets = failover_trunks
             .iter()
             .map(|t| (trunk_group_id.clone(), t.clone()))
@@ -279,6 +367,7 @@ impl Router {
         &mut self,
         trunk_group_id: &str,
         admission: Admission,
+        tls_only: bool,
     ) -> RoutingResult<(String, String, Vec<String>)> {
         let trunk_count = self
             .trunk_groups
@@ -291,15 +380,33 @@ impl Router {
             }
         })?;
 
-        let trunk_id = trunk_group
-            .select_trunk_for(admission)
+        // NIST 800-53 Rev5: SC-8 — the group's `require_tls` predicate is
+        // applied inside selection and failover ordering (POA&M-48).
+        let Some(trunk_id) = trunk_group
+            .select_trunk_with(admission, tls_only)
             .map(String::from)
-            .ok_or(RoutingError::AllTrunksFailed {
+        else {
+            // Failure path only: tell a policy refusal from "all down".
+            let tls_required = trunk_group.tls_blocked_with(admission, tls_only);
+            if tls_required {
+                self.tls_counters.rejects.fetch_add(1, Ordering::Relaxed);
+                self.tls_counters
+                    .skips
+                    .fetch_add(u64::from(trunk_group.non_tls_count()), Ordering::Relaxed);
+            }
+            return Err(RoutingError::AllTrunksFailed {
                 trunks_tried: trunk_count,
-            })?;
+                tls_required,
+            });
+        };
+        if (trunk_group.require_tls() || tls_only) && trunk_group.non_tls_count() > 0 {
+            self.tls_counters
+                .skips
+                .fetch_add(u64::from(trunk_group.non_tls_count()), Ordering::Relaxed);
+        }
 
         let failover_trunks: Vec<String> = trunk_group
-            .failover_order_for(admission)
+            .failover_order_with(admission, tls_only)
             .into_iter()
             .filter(|id| *id != trunk_id)
             .take(self.config.max_failover_attempts)
@@ -350,10 +457,24 @@ impl Router {
         group_id: &str,
         admission: Admission,
     ) -> RoutingResult<RoutingDecision> {
+        self.route_to_group_for_tls(destination, group_id, admission, false)
+    }
+
+    /// [`Self::route_to_group_for`]; `tls_only` as in [`Self::route_for_tls`].
+    ///
+    /// # Errors
+    /// As [`Self::route_to_group_for`].
+    pub fn route_to_group_for_tls(
+        &mut self,
+        destination: &str,
+        group_id: &str,
+        admission: Admission,
+        tls_only: bool,
+    ) -> RoutingResult<RoutingDecision> {
         self.stats.requests += 1;
 
         let (trunk_id, trunk_uri, failover_trunks) =
-            self.select_trunk_from_group(group_id, admission)?;
+            self.select_trunk_from_group(group_id, admission, tls_only)?;
         let failover_targets = failover_trunks
             .iter()
             .map(|t| (group_id.to_string(), t.clone()))
@@ -398,20 +519,49 @@ impl Router {
         group_ids: &[String],
         admission: Admission,
     ) -> RoutingResult<RoutingDecision> {
+        self.route_to_groups_for_tls(destination, group_ids, admission, false)
+    }
+
+    /// [`Self::route_to_groups_for`]; `tls_only` as in [`Self::route_for_tls`].
+    /// The call's TLS requirement applies to every group in the list,
+    /// including cross-group failover targets.
+    ///
+    /// # Errors
+    /// As [`Self::route_to_groups`].
+    // POAM: POA&M-57 — `require_tls` is per group: a route list naming a
+    // TLS-only group then a plain group can fall back to the plain group's
+    // UDP/TCP trunks (accepted scope; mitigated by
+    // `security.require_tls_trunks` and by `tls_only` for `sips:` calls).
+    pub fn route_to_groups_for_tls(
+        &mut self,
+        destination: &str,
+        group_ids: &[String],
+        admission: Admission,
+        tls_only: bool,
+    ) -> RoutingResult<RoutingDecision> {
         if group_ids.is_empty() {
             return Err(RoutingError::NoRoute {
                 destination: destination.to_string(),
             });
         }
         let mut tried = 0usize;
+        let mut tls_required = false;
         for (idx, group_id) in group_ids.iter().enumerate() {
             tried += self
                 .trunk_groups
                 .get(group_id.as_str())
                 .map_or(0, TrunkGroup::trunk_count);
-            let Ok(mut decision) = self.route_to_group_for(destination, group_id, admission) else {
-                continue;
-            };
+            let mut decision =
+                match self.route_to_group_for_tls(destination, group_id, admission, tls_only) {
+                    Ok(d) => d,
+                    Err(RoutingError::AllTrunksFailed {
+                        tls_required: tls, ..
+                    }) => {
+                        tls_required |= tls;
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
             let max = self.config.max_failover_attempts;
             for later in group_ids.iter().skip(idx + 1) {
                 if decision.failover_targets.len() >= max {
@@ -421,7 +571,7 @@ impl Router {
                     continue;
                 }
                 if let Some(group) = self.trunk_groups.get(later.as_str()) {
-                    for t in group.failover_order_for(admission) {
+                    for t in group.failover_order_with(admission, tls_only) {
                         if decision.failover_targets.len() >= max {
                             break;
                         }
@@ -435,6 +585,7 @@ impl Router {
         }
         Err(RoutingError::AllTrunksFailed {
             trunks_tried: tried,
+            tls_required,
         })
     }
 
@@ -452,10 +603,30 @@ impl Router {
         trunk_id: &str,
         admission: Admission,
     ) -> Option<String> {
-        let trunk = self
-            .trunk_groups
-            .get_mut(group_id)
-            .and_then(|g| g.get_trunk_mut(trunk_id))?;
+        self.acquire_trunk_for_tls(group_id, trunk_id, admission, false)
+    }
+
+    /// [`Self::acquire_trunk_for`]; `tls_only` refuses a non-TLS trunk for a
+    /// call that requires TLS (`sips:` Request-URI) in any group.
+    pub fn acquire_trunk_for_tls(
+        &mut self,
+        group_id: &str,
+        trunk_id: &str,
+        admission: Admission,
+        tls_only: bool,
+    ) -> Option<String> {
+        let group = self.trunk_groups.get_mut(group_id)?;
+        // NIST 800-53 Rev5: SC-8 — defence in depth: a failover target list
+        // built before a re-sync that turned `require_tls` on must not reach a
+        // clear-text trunk (RFC 5630 §3.1.3: no TLS-to-clear downgrade).
+        let allowed = group
+            .get_trunk(trunk_id)
+            .map(|t| group.transport_allowed_with(t, tls_only))?;
+        if !allowed {
+            self.tls_counters.skips.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let trunk = group.get_trunk_mut(trunk_id)?;
         if !trunk.is_usable_for(admission) {
             return None;
         }
@@ -954,6 +1125,319 @@ mod tests {
         assert!(matches!(
             router.route_for("911", Admission::Emergency),
             Err(RoutingError::AllTrunksFailed { .. })
+        ));
+    }
+
+    // --- POA&M-48 (SC-8): require_tls ---
+
+    use crate::trunk::{SelectionStrategy, TrunkProtocol};
+
+    fn mixed_group(id: &str, require_tls: bool) -> TrunkGroup {
+        let mut g = TrunkGroup::new(id, id).with_require_tls(require_tls);
+        g.add_trunk(Trunk::new(
+            TrunkConfig::new("udp", "udp.example.com")
+                .with_protocol(TrunkProtocol::Udp)
+                .with_priority(1),
+        ));
+        g.add_trunk(Trunk::new(
+            TrunkConfig::new("tcp", "tcp.example.com")
+                .with_protocol(TrunkProtocol::Tcp)
+                .with_priority(2),
+        ));
+        g.add_trunk(Trunk::new(
+            TrunkConfig::new("tls1", "tls1.example.com")
+                .with_protocol(TrunkProtocol::Tls)
+                .with_priority(3),
+        ));
+        g.add_trunk(Trunk::new(
+            TrunkConfig::new("tls2", "tls2.example.com")
+                .with_protocol(TrunkProtocol::Tls)
+                .with_priority(4),
+        ));
+        g
+    }
+
+    #[test]
+    fn require_tls_skips_non_tls_on_primary_and_failover() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        router.add_trunk_group(mixed_group("g", true));
+        let d = router.route_to_group("1", "g").unwrap();
+        assert_eq!(d.trunk_id, "tls1");
+        assert_eq!(d.failover_trunks, vec!["tls2".to_string()]);
+        assert!(d.failover_targets.iter().all(|(_, t)| t.starts_with("tls")));
+        assert_eq!(router.tls_policy_counters(), (2, 0));
+    }
+
+    #[test]
+    fn require_tls_false_is_unchanged() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        router.add_trunk_group(mixed_group("g", false));
+        let d = router.route_to_group("1", "g").unwrap();
+        assert_eq!(d.trunk_id, "udp");
+        assert_eq!(
+            d.failover_trunks,
+            vec!["tcp".to_string(), "tls1".to_string(), "tls2".to_string()]
+        );
+        assert_eq!(router.tls_policy_counters(), (0, 0));
+    }
+
+    #[test]
+    fn require_tls_all_non_tls_reports_tls_required() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        let mut g = mixed_group("g", true);
+        g.remove_trunk("tls1");
+        g.remove_trunk("tls2");
+        assert_eq!(g.non_tls_count(), 2);
+        router.add_trunk_group(g);
+        assert!(matches!(
+            router.route_to_group("1", "g"),
+            Err(RoutingError::AllTrunksFailed {
+                trunks_tried: 2,
+                tls_required: true
+            })
+        ));
+        assert!(matches!(
+            router.route_to_groups("1", &["g".to_string()]),
+            Err(RoutingError::AllTrunksFailed {
+                tls_required: true,
+                ..
+            })
+        ));
+        assert_eq!(router.tls_policy_counters().1, 2);
+    }
+
+    #[test]
+    fn require_tls_tls_down_is_not_a_policy_reject() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        let mut g = mixed_group("g", true);
+        for id in ["udp", "tcp", "tls1", "tls2"] {
+            g.get_trunk_mut(id).unwrap().disable();
+        }
+        router.add_trunk_group(g);
+        assert!(matches!(
+            router.route_to_group("1", "g"),
+            Err(RoutingError::AllTrunksFailed {
+                tls_required: false,
+                ..
+            })
+        ));
+        assert_eq!(router.tls_policy_counters(), (0, 0));
+    }
+
+    #[test]
+    fn acquire_refuses_non_tls_after_policy_turned_on() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        router.add_trunk_group(mixed_group("g", false));
+        let d = router.route_to_group("1", "g").unwrap();
+        assert!(d.failover_targets.iter().any(|(_, t)| t == "tcp"));
+        router
+            .get_trunk_group_mut("g")
+            .unwrap()
+            .set_require_tls(true);
+        assert!(router.acquire_trunk("g", "tcp").is_none());
+        assert_eq!(router.tls_policy_counters().0, 1);
+        assert!(router.acquire_trunk("g", "tls2").is_some());
+    }
+
+    #[test]
+    fn global_require_tls_default_applies_and_cannot_be_opted_out() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        router.add_trunk_group(mixed_group("early", false));
+        router.set_require_tls_default(true);
+        router.add_trunk_group(mixed_group("late", false));
+        assert!(router.get_trunk_group("early").unwrap().require_tls());
+        assert!(router.get_trunk_group("late").unwrap().require_tls());
+        assert_eq!(router.route_to_group("1", "late").unwrap().trunk_id, "tls1");
+    }
+
+    #[test]
+    fn require_tls_every_strategy_selects_only_tls() {
+        for strategy in [
+            SelectionStrategy::Priority,
+            SelectionStrategy::RoundRobin,
+            SelectionStrategy::WeightedRandom,
+            SelectionStrategy::LeastConnections,
+            SelectionStrategy::BestSuccessRate,
+        ] {
+            let mut g = mixed_group("g", true).with_strategy(strategy);
+            for _ in 0..8 {
+                let id = g.select_trunk().unwrap().to_string();
+                assert!(id.starts_with("tls"), "{strategy:?} picked {id}");
+            }
+            assert!(g.failover_order().iter().all(|t| t.starts_with("tls")));
+            assert_eq!(g.usable_trunk_count(), 2);
+        }
+    }
+
+    // --- QA (POA&M-48): cross-group fallback and global toggle ---
+
+    fn plain_udp_group(id: &str) -> TrunkGroup {
+        let mut g = TrunkGroup::new(id, id);
+        g.add_trunk(Trunk::new(
+            TrunkConfig::new("b-udp", "b-udp.example.com")
+                .with_protocol(TrunkProtocol::Udp)
+                .with_priority(1),
+        ));
+        g
+    }
+
+    // Documents current behaviour (plan Q4, user decision: policy is per
+    // group). A route listing a require_tls group A then a plain group B
+    // appends B's clear-text trunks to the failover targets after A's TLS
+    // trunks. Operators must set require_tls on every group of the route or
+    // use security.require_tls_trunks.
+    #[test]
+    fn qa_cross_group_failover_reaches_plain_group_after_tls_group() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        router.add_trunk_group(mixed_group("a", true));
+        router.add_trunk_group(plain_udp_group("b"));
+        let d = router
+            .route_to_groups("1", &["a".to_string(), "b".to_string()])
+            .unwrap();
+        assert_eq!(d.trunk_id, "tls1");
+        assert_eq!(
+            d.failover_targets,
+            vec![
+                ("a".to_string(), "tls2".to_string()),
+                ("b".to_string(), "b-udp".to_string()),
+            ],
+            "A's non-TLS trunks are skipped; B's UDP trunk is still a target"
+        );
+        // Acquiring B's UDP trunk is allowed: B has no policy.
+        assert!(
+            router
+                .acquire_trunk_for("b", "b-udp", Admission::Normal)
+                .is_some()
+        );
+        // Acquiring A's UDP trunk is refused.
+        assert!(
+            router
+                .acquire_trunk_for("a", "udp", Admission::Normal)
+                .is_none()
+        );
+    }
+
+    // Current behaviour: a require_tls group with no TLS trunk at all is
+    // skipped and the call routes to the next (plain) group in clear.
+    #[test]
+    fn qa_cross_group_primary_falls_through_to_plain_group() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        let mut a = mixed_group("a", true);
+        a.remove_trunk("tls1");
+        a.remove_trunk("tls2");
+        router.add_trunk_group(a);
+        router.add_trunk_group(plain_udp_group("b"));
+        let d = router
+            .route_to_groups("1", &["a".to_string(), "b".to_string()])
+            .unwrap();
+        assert_eq!(d.trunk_id, "b-udp");
+        let (_, rejects) = router.tls_policy_counters();
+        // Recorded: the reject counter counts group-level refusals, even
+        // when a later group carried the call (no 503 sent).
+        assert_eq!(rejects, 1);
+    }
+
+    // With the global default on, the cross-group fallback is closed.
+    #[test]
+    fn qa_global_default_closes_cross_group_fallback() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        router.set_require_tls_default(true);
+        router.add_trunk_group(mixed_group("a", false));
+        router.add_trunk_group(plain_udp_group("b"));
+        let d = router
+            .route_to_groups("1", &["a".to_string(), "b".to_string()])
+            .unwrap();
+        assert!(d.failover_targets.iter().all(|(_, t)| t.starts_with("tls")));
+        assert!(
+            router
+                .acquire_trunk_for("b", "b-udp", Admission::Normal)
+                .is_none()
+        );
+    }
+
+    // Runtime toggle: turning the global default on flips loaded groups.
+    // Turning it off again does NOT restore their own flag (stays strict
+    // until the group is re-added); groups added later use their own flag.
+    #[test]
+    fn qa_global_default_toggle_at_runtime() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        router.add_trunk_group(mixed_group("a", false));
+        assert_eq!(router.route_to_group("1", "a").unwrap().trunk_id, "udp");
+        router.set_require_tls_default(true);
+        assert_eq!(router.route_to_group("1", "a").unwrap().trunk_id, "tls1");
+        router.set_require_tls_default(false);
+        assert!(!router.require_tls_default());
+        assert!(router.get_trunk_group("a").unwrap().require_tls());
+        router.add_trunk_group(plain_udp_group("b"));
+        assert!(!router.get_trunk_group("b").unwrap().require_tls());
+        router.add_trunk_group(mixed_group("a", false));
+        assert_eq!(router.route_to_group("1", "a").unwrap().trunk_id, "udp");
+    }
+
+    // RFC 3261 §26.2.2 (RFC-002): a sips: call is TLS-only in every group,
+    // including cross-group failover, even without `require_tls`.
+    #[test]
+    fn tls_only_call_skips_non_tls_without_group_flag() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        router.add_trunk_group(mixed_group("a", false));
+        router.add_trunk_group(plain_udp_group("b"));
+        let d = router
+            .route_to_groups_for_tls(
+                "1",
+                &["a".to_string(), "b".to_string()],
+                Admission::Normal,
+                true,
+            )
+            .unwrap();
+        assert_eq!(d.trunk_id, "tls1");
+        assert!(d.failover_targets.iter().all(|(_, t)| t.starts_with("tls")));
+        assert!(
+            router
+                .acquire_trunk_for_tls("a", "udp", Admission::Normal, true)
+                .is_none()
+        );
+        assert!(
+            router
+                .acquire_trunk_for_tls("a", "udp", Admission::Normal, false)
+                .is_some()
+        );
+        // Only clear trunks: the call is refused as a TLS policy failure.
+        assert!(matches!(
+            router.route_to_group_for_tls("1", "b", Admission::Normal, true),
+            Err(RoutingError::AllTrunksFailed {
+                tls_required: true,
+                ..
+            })
+        ));
+        // Same group, sip: call: unchanged.
+        assert_eq!(
+            router
+                .route_to_group_for_tls("1", "a", Admission::Normal, false)
+                .unwrap()
+                .trunk_id,
+            "udp"
+        );
+    }
+
+    // QA-4: a require_tls group with no trunk left is a policy refusal.
+    #[test]
+    fn empty_require_tls_group_reports_tls_required() {
+        let mut router = Router::new(RouterConfig::default().with_dial_plan(false));
+        router.add_trunk_group(TrunkGroup::new("e", "e").with_require_tls(true));
+        router.add_trunk_group(TrunkGroup::new("p", "p"));
+        assert!(matches!(
+            router.route_to_groups("1", &["e".to_string()]),
+            Err(RoutingError::AllTrunksFailed {
+                trunks_tried: 0,
+                tls_required: true
+            })
+        ));
+        assert!(matches!(
+            router.route_to_group("1", "p"),
+            Err(RoutingError::AllTrunksFailed {
+                tls_required: false,
+                ..
+            })
         ));
     }
 }

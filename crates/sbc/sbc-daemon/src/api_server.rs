@@ -400,6 +400,24 @@ pub const FLOW_METRICS: &[(&str, &str)] = &[
     ),
 ];
 
+/// `require_tls` trunk-group policy counters (POA&M-48; no labels).
+///
+/// Exported as gauges mirroring monotonic router counters: `MetricRegistry`
+/// counters have no `set`, and a scrape-time delta would double count under
+/// concurrent scrapes, so the names carry no `_total` suffix.
+///
+/// ## NIST 800-53 Rev5: SC-8, SI-4
+pub const TLS_POLICY_METRICS: &[(&str, &str)] = &[
+    (
+        "routing_tls_required_skips",
+        "Non-TLS trunks excluded, counted per routing decision",
+    ),
+    (
+        "routing_tls_required_rejects",
+        "require_tls group-level refusals (a later group may still carry the call)",
+    ),
+];
+
 /// STIR/SHAKEN gauges (bounded names; no per-host or per-number labels).
 ///
 /// ## NIST 800-53 Rev5: SI-4 (System Monitoring), IA-9
@@ -496,6 +514,9 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
         metrics.register_gauge(*name, *help);
     }
     for (name, help) in FLOW_METRICS {
+        metrics.register_gauge(*name, *help);
+    }
+    for (name, help) in TLS_POLICY_METRICS {
         metrics.register_gauge(*name, *help);
     }
 }
@@ -647,6 +668,18 @@ impl AppState {
                     "sip_send_lane_overflow_total",
                     f.lane_overflow.load(Relaxed),
                 ),
+            ] {
+                if let Some(g) = self.metrics.gauge(name) {
+                    g.set(as_gauge(v));
+                }
+            }
+        }
+        // NIST 800-53 Rev5: SI-4 — lock-free read; never takes the router lock.
+        if let Some(stack) = self.sip_stack.as_ref() {
+            let c = stack.tls_policy_counters();
+            for (name, v) in [
+                ("routing_tls_required_skips", c.skips()),
+                ("routing_tls_required_rejects", c.rejects()),
             ] {
                 if let Some(g) = self.metrics.gauge(name) {
                     g.set(as_gauge(v));
@@ -1236,14 +1269,17 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
         .get("host")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let port = trunk
-        .get("port")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(5060) as u16;
 
     if trunk_id.is_empty() || host.is_empty() {
         return;
     }
+    let Some(port) = trunk_json_port(trunk) else {
+        tracing::warn!(
+            trunk_id,
+            "Not starting trunk services: invalid protocol or port"
+        );
+        return;
+    };
 
     // Resolve zone IPs for binding and Contact header.
     // The trunk's "zone" field specifies which interface to bind to.
@@ -1331,11 +1367,32 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
     }
 }
 
-/// Syncs a trunk group from MemStore JSON to the SipStack router.
-pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serde_json::Value) {
-    let Some(ref sip_stack) = state.sip_stack else {
-        return;
-    };
+/// Port of a trunk JSON body: the `port` field, else the transport's
+/// default (5061 for TLS, 5060 otherwise; RFC 3261 §19.1.2). `None` for an
+/// unknown protocol or a port outside `1..=65535` (never truncated).
+///
+/// ## NIST 800-53 Rev5: SI-10 (Information Input Validation)
+fn trunk_json_port(trunk: &serde_json::Value) -> Option<u16> {
+    use sbc_config_store::trunk_policy::{trunk_port, trunk_transport};
+    let transport = trunk_transport(trunk).ok()?;
+    trunk_port(trunk, transport).ok()
+}
+
+/// Builds a router trunk group from a MemStore / config-store JSON body
+/// (API, TrunkSync, central config). `None` when the body has no `id`.
+///
+/// ## NIST 800-53 Rev5: SC-8 (POA&M-48)
+///
+/// - `require_tls`: a JSON bool is used as-is, absent means `false`, any
+///   other type means `true` (fail closed) plus a warning.
+/// - Trunk `protocol` (falling back to `transport`) is honoured: `udp`,
+///   `tcp`, `tls`; absent means `udp`. An unknown value skips the trunk with
+///   a warning; it never silently becomes UDP.
+/// - Trunk `port`: absent means 5061 for TLS, 5060 otherwise; outside
+///   `1..=65535` skips the trunk with a warning.
+pub fn trunk_group_from_json(group_json: &serde_json::Value) -> Option<uc_routing::TrunkGroup> {
+    use sbc_config_store::trunk_policy::{TrunkTransport, group_require_tls, trunk_transport};
+
     let id = group_json
         .get("id")
         .and_then(|v| v.as_str())
@@ -1345,29 +1402,62 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
         .and_then(|v| v.as_str())
         .unwrap_or(id);
     if id.is_empty() {
-        return;
+        return None;
     }
 
-    let mut group = uc_routing::TrunkGroup::new(id, name);
+    let require_tls = group_require_tls(group_json).unwrap_or_else(|e| {
+        tracing::warn!(trunk_group = id, error = %e, "require_tls is not a boolean; enforcing TLS-only (fail closed)");
+        true
+    });
+    let mut group = uc_routing::TrunkGroup::new(id, name).with_require_tls(require_tls);
 
     if let Some(trunks) = group_json.get("trunks").and_then(|v| v.as_array()) {
         for t in trunks {
             let trunk_id = t.get("id").and_then(|v| v.as_str()).unwrap_or_default();
             let host = t.get("host").and_then(|v| v.as_str()).unwrap_or_default();
-            let port = t
-                .get("port")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(5060) as u16;
             if trunk_id.is_empty() || host.is_empty() {
                 continue;
             }
+            // NIST 800-53 Rev5: SC-8 — the trunk's own transport, never a
+            // hard-coded UDP (RFC 3261 §26.2: TLS where configured).
+            let protocol = match trunk_transport(t) {
+                Ok(TrunkTransport::Udp) => uc_routing::TrunkProtocol::Udp,
+                Ok(TrunkTransport::Tcp) => uc_routing::TrunkProtocol::Tcp,
+                Ok(TrunkTransport::Tls) => uc_routing::TrunkProtocol::Tls,
+                Err(e) => {
+                    tracing::warn!(trunk_group = id, trunk_id, error = %e, "Skipping trunk with invalid protocol");
+                    continue;
+                }
+            };
+            // RFC 3261 §19.1.2: default port follows the transport (5061 for
+            // TLS); an out-of-range port skips the trunk, never truncated.
+            let Some(port) = trunk_json_port(t) else {
+                tracing::warn!(
+                    trunk_group = id,
+                    trunk_id,
+                    "Skipping trunk with invalid port"
+                );
+                continue;
+            };
+            let is_tls = protocol == uc_routing::TrunkProtocol::Tls;
+            // NIST 800-53 Rev5: SC-23; RFC 5922 §7 — TLS settings apply to TLS
+            // trunks only. An empty name verifies against `host`.
+            let tls_server_name = t
+                .get("tls_server_name")
+                .and_then(|v| v.as_str())
+                .filter(|n| is_tls && !n.is_empty())
+                .map(String::from);
+            let tls_client_cert = is_tls
+                && t.get("tls_client_cert")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
 
             let trunk_config = uc_routing::TrunkConfig {
                 id: trunk_id.to_string(),
                 name: trunk_id.to_string(),
                 host: host.to_string(),
                 port,
-                protocol: uc_routing::TrunkProtocol::Udp,
+                protocol,
                 priority: t
                     .get("priority")
                     .and_then(serde_json::Value::as_u64)
@@ -1392,12 +1482,37 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
                     .unwrap_or(5) as u32,
                 outbound_enabled: true,
                 inbound_enabled: true,
-                // API trunks are UDP-only (above); no TLS settings apply.
-                tls_server_name: None,
-                tls_client_cert: false,
+                tls_server_name,
+                tls_client_cert,
             };
             group.add_trunk(uc_routing::Trunk::new(trunk_config));
         }
+    }
+    Some(group)
+}
+
+/// True when `group` has a TLS trunk but no trunk CA bundle is configured.
+fn tls_trunk_without_ca(group: &uc_routing::TrunkGroup, ca_configured: bool) -> bool {
+    !ca_configured && group.non_tls_count() as usize != group.trunk_count()
+}
+
+/// Syncs a trunk group from MemStore JSON to the SipStack router.
+pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serde_json::Value) {
+    let Some(ref sip_stack) = state.sip_stack else {
+        return;
+    };
+    let Some(group) = trunk_group_from_json(group_json) else {
+        return;
+    };
+    let id = group.id().to_string();
+    let id = id.as_str();
+    if tls_trunk_without_ca(&group, sip_stack.trunk_tls_ca_configured()) {
+        // NIST 800-53 Rev5: SC-8, SI-4 — the TLS trunk fails closed (no
+        // trust anchors), so calls on it are refused; flag it loudly.
+        tracing::error!(
+            trunk_group = id,
+            "TLS trunk synced but security.trunk_tls_ca_path is not set; TLS connections to it will fail"
+        );
     }
 
     sip_stack.add_trunk_group_to_router(group).await;
@@ -1412,10 +1527,7 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
                 .iter()
                 .filter_map(|t| {
                     let h = t.get("host").and_then(|v| v.as_str())?;
-                    let p = t
-                        .get("port")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(5060) as u16;
+                    let p = trunk_json_port(t)?;
                     Some((h.to_string(), p))
                 })
                 .collect()
@@ -1982,5 +2094,41 @@ mod tests {
         assert_eq!(config.listen_addr.port(), 8080);
         assert!(!config.enable_cors);
         assert_eq!(config.api_version, "v1");
+    }
+
+    // RFC 3261 §19.1.2 (RFC-001/SEC-002): synced trunk port defaults follow
+    // the transport; an out-of-range port skips the trunk, never truncates.
+    #[test]
+    fn synced_trunk_port_follows_transport() {
+        let body = serde_json::json!({
+            "id": "g",
+            "trunks": [
+                {"id": "tls", "host": "tls.example.com", "protocol": "tls"},
+                {"id": "udp", "host": "udp.example.com"},
+                {"id": "big", "host": "big.example.com", "port": 70_000},
+                {"id": "set", "host": "set.example.com", "protocol": "tls", "port": 5080},
+            ],
+        });
+        let g = trunk_group_from_json(&body).expect("group");
+        let port = |id: &str| g.get_trunk(id).map(|t| t.config().port);
+        assert_eq!(port("tls"), Some(5061));
+        assert_eq!(port("udp"), Some(5060));
+        assert_eq!(port("big"), None);
+        assert_eq!(port("set"), Some(5080));
+        assert_eq!(g.trunk_count(), 3);
+    }
+
+    // NIST-004: TLS trunk + no trunk CA bundle is detected.
+    #[test]
+    fn tls_trunk_without_ca_detected() {
+        let tls = serde_json::json!({"id": "g", "trunks": [
+            {"id": "a", "host": "a.example.com", "protocol": "tls"}]});
+        let udp = serde_json::json!({"id": "g", "trunks": [
+            {"id": "a", "host": "a.example.com"}]});
+        let g = trunk_group_from_json(&tls).expect("group");
+        assert!(tls_trunk_without_ca(&g, false));
+        assert!(!tls_trunk_without_ca(&g, true));
+        let g = trunk_group_from_json(&udp).expect("group");
+        assert!(!tls_trunk_without_ca(&g, false));
     }
 }

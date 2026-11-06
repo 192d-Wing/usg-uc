@@ -1129,6 +1129,7 @@ mod tests {
                 },
             ],
             zone: None,
+            require_tls: false,
         });
         let svc = test_support::service(&c);
         let ctx = |trunk| SignCtx {
@@ -1201,6 +1202,7 @@ mod tests {
                 ..Default::default()
             }],
             zone: None,
+            require_tls: false,
         });
         c
     }
