@@ -185,6 +185,10 @@ The SBC acts as a B2BUA registrar, storing user bindings in an in-memory locatio
 
 Registration is automatic — any SIP UA that sends a REGISTER request will have its bindings stored. The only authentication mode that can be enabled on a running daemon is OIDC Bearer tokens (RFC 8898, `SBC_AUTH_MODE=bearer` plus `SBC_OIDC_ISSUER` — the mode used by the soft client's sign-in flow). Without it the daemon logs `REGISTER is UNAUTHENTICATED: any peer can register any user` at startup.
 
+### Transport to registered phones
+
+A REGISTER records the source address and the transport it actually arrived on (not the `Via` or the Contact `transport=`). Calls to that phone go back on the same flow: UDP to the source address, or the phone's own accepted TCP/TLS connection. The SBC never dials a phone and never falls back to UDP. If a TCP/TLS-registered phone's connection has closed, the INVITE is not sent and the caller gets a 503 until the phone reconnects and registers again. Before this change such calls went out over UDP. A binding with a TCP/TLS Contact but no recorded flow (for example one created by the API or replicated from another node) is not routed.
+
 ### Authentication
 
 - **Bearer (wired)**: set `SBC_AUTH_MODE=bearer` and `SBC_OIDC_ISSUER` (optionally an extra CA for the internal IdP). Tokens are validated via `proto-jwt` (JWKS cache). Note: the validator currently accepts `RS256`, `PS256`, `ES256` and `ES384` tokens.
@@ -391,12 +395,34 @@ strategy = "least_connections"   # selection strategy
   id = "telnyx-backup"
   host = "sip.telnyx.com"
   port = 5060
-  protocol = "tls"
+  protocol = "tls"               # needs security.trunk_tls_ca_path and transport.tls_listen
   priority = 2                   # lower priority = used for failover
   max_calls = 100
 ```
 
-> **Trunk `protocol`**: `tcp`/`tls` currently only change the trunk URI scheme (`sip:` vs `sips:`) in the router. Forwarded requests are transmitted on the transport the A-leg arrived on (`server.rs`, `transport.send`); the daemon does not open outbound TCP/TLS client connections to trunks (planned).
+> **Trunk `protocol`**: every request toward a trunk (INVITE, failover INVITE, ACK, CANCEL, BYE, re-INVITE, retransmissions) is sent over the trunk's own protocol. For `tcp` and `tls` the SBC opens and reuses an outbound connection and reads the trunk's responses from it. A `tls` trunk gets a `sips:` Request-URI and a `SIP/2.0/TLS` Via with the `tls_listen` port. A `tls` trunk needs `transport.tls_listen`, and a `tcp` trunk needs `transport.tcp_listen`; otherwise the config is rejected. A trunk that stops reading has its connection closed after a 2 s write deadline, and the INVITE fails over. A failed dial is remembered for 2 s, and sends to that trunk inside that window fail at once. Its certificate is always verified against `security.trunk_tls_ca_path` (required once any trunk uses TLS) and against `tls_server_name`, or against `host` when that is unset. An IP-literal host is matched against an IP SAN. If the handshake or verification fails, the call fails over to the next trunk on that trunk's protocol, or the caller gets a 503. The SBC never retries over plaintext.
+>
+> ```toml
+> [security]
+> trunk_tls_ca_path = "/etc/sbc/trunk-ca.pem"   # CAs for trunk server certs (not tls_ca_path)
+>
+>   [[trunk_groups.trunks]]
+>   protocol = "tls"
+>   tls_server_name = "sip.telnyx.com"   # optional; defaults to host
+>   tls_client_cert = false              # true: present security.tls_cert_path (mTLS)
+> ```
+>
+> `tls_server_name` and `tls_client_cert` are accepted only on `tls` trunks. `tls_server_name` must be a DNS name or IP address without a port. `tls_client_cert = true` needs `security.tls_cert_path` / `tls_key_path`. `security.min_tls_version` applies to trunk connections too. Cipher suites are not restricted. A TLS handshake or verify failure is logged as a warning and counted in `sip_egress_connect_failures_total`; it does not produce its own audit event. Trunk connects time out after 5 s, and the SBC holds at most 1024 trunk connections.
+>
+> A group may mix `tls` and `udp`/`tcp` trunks. Failover from a TLS trunk to a UDP trunk is allowed and sends that attempt in clear; there is no `require_tls` policy yet (NIST POA&M-48). Keep TLS-only groups if plaintext failover is not acceptable.
+
+### Trunk transport: breaking changes (POA&M-5)
+
+- A config with any `protocol = "tls"` trunk is rejected unless `security.trunk_tls_ca_path` is set to an absolute path. Setting it with no TLS trunk is also rejected. The public web PKI is not trusted for trunks.
+- A `tls` trunk without `transport.tls_listen`, or a `tcp` trunk without `transport.tcp_listen`, is rejected.
+- The B-leg Request-URI host and port are now the trunk's `host` and `port` (`sips:` for TLS, `;transport=tcp` for TCP) instead of the dialled host. Trunks that expected the SBC domain in the Request-URI need a header-manipulation rule or a config change.
+- B-leg transaction timers follow the trunk's protocol, not the caller's: a TCP caller to a UDP trunk now gets UDP retransmissions on the B-leg.
+- Calls to registered phones use the transport the phone registered on (see SIP Registration).
 
 ### Selection Strategies
 
@@ -615,6 +641,7 @@ Notes on what the daemon actually does with these keys:
 - `tls_cert_path` / `tls_key_path` (wired): used for SIP-over-TLS listeners (`transport.tls_listen`) and REST HTTPS. Must be set together.
 - `min_tls_version` (wired): SIP-TLS listeners accept TLS 1.3 only by default; `"1.2"` also admits TLS 1.2 clients. Cipher suites are not restricted beyond the protocol version. The REST HTTPS listener uses rustls defaults (TLS 1.2 permitted) and is not affected by this key.
 - `curve` only constrains the configuration enum; the key type of the loaded certificate is not checked (P-256/RSA certificates are accepted by rustls).
+- `trunk_tls_ca_path` (wired): PEM bundle of the CAs that issue trunk server certificates. Required when any trunk uses `protocol = "tls"`; separate from `tls_ca_path` (client CA for the listener). See Trunk Groups.
 - `require_mtls` (wired for SIP-TLS and gRPC): the SIP-TLS listener requires a client certificate chaining to `tls_ca_path`; `validate_config` rejects `require_mtls = true` without `tls_cert_path` and `tls_ca_path`. The gRPC listener has its own `[grpc] require_mtls` / `tls_ca_path`.
 
 ### Rate Limiting

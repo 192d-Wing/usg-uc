@@ -31,7 +31,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
@@ -193,6 +193,68 @@ pub fn create_client_config(root_certs: rustls::RootCertStore) -> TransportResul
     Ok(config)
 }
 
+/// Client-side TLS policy for outbound connections (SIP trunks).
+///
+/// Certificate verification is always on: there is no option to disable
+/// it. The server name (or IP SAN) is checked against the name passed to
+/// [`TlsTransport::connect`].
+///
+/// ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality and Integrity),
+/// SC-23 (Session Authenticity), IA-3 (Device Identification)
+pub struct TlsClientOptions {
+    /// Trust anchors the server certificate must chain to.
+    pub roots: rustls::RootCertStore,
+    /// Lowest protocol version offered.
+    pub min_version: MinTlsVersion,
+    /// Certificate chain and key presented when the server requests a
+    /// client certificate (mutual TLS). `None` means no client auth.
+    pub client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+}
+
+impl std::fmt::Debug for TlsClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsClientOptions")
+            .field("roots", &self.roots.len())
+            .field("min_version", &self.min_version)
+            .field("client_auth", &self.client_auth.is_some())
+            .finish()
+    }
+}
+
+/// Creates a TLS client configuration with an explicit policy.
+///
+/// Uses the same aws-lc-rs provider as [`create_client_config`].
+/// `min_version` selects TLS 1.3 only or TLS 1.2 + 1.3. The provider's
+/// default cipher suites and key-exchange groups are offered unchanged:
+/// this function does not restrict them, so it makes no CNSA 2.0 claim of
+/// its own (suite selection is up to the provider and the peer).
+///
+/// ## Errors
+///
+/// Returns an error if the protocol versions or client certificate cannot
+/// be configured.
+pub fn create_client_config_with(options: TlsClientOptions) -> TransportResult<ClientConfig> {
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let versions: &[&'static rustls::SupportedProtocolVersion] = match options.min_version {
+        MinTlsVersion::V1_3 => &[&rustls::version::TLS13],
+        MinTlsVersion::V1_2 => &[&rustls::version::TLS12, &rustls::version::TLS13],
+    };
+    let builder = ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(versions)
+        .map_err(|e| TransportError::TlsHandshakeFailed {
+            reason: format!("failed to set TLS protocol versions: {e}"),
+        })?
+        .with_root_certificates(options.roots);
+    match options.client_auth {
+        Some((chain, key)) => builder.with_client_auth_cert(chain, key).map_err(|e| {
+            TransportError::TlsCertificateError {
+                reason: format!("client certificate rejected: {e}"),
+            }
+        }),
+        None => Ok(builder.with_no_client_auth()),
+    }
+}
+
 /// Loads a certificate chain from a PEM file.
 ///
 /// ## Errors
@@ -255,7 +317,10 @@ pub fn load_private_key(path: &Path) -> TransportResult<PrivateKeyDer<'static>> 
 ///
 /// ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality and Integrity)
 pub struct TlsTransport {
-    stream: Arc<Mutex<TlsStream<TcpStream>>>,
+    /// Read and write halves are locked separately so a send from another
+    /// task never waits behind a pending `recv` on the reader task.
+    reader: Mutex<ReadHalf<TlsStream<TcpStream>>>,
+    writer: Mutex<WriteHalf<TlsStream<TcpStream>>>,
     local_addr: SbcSocketAddr,
     peer_addr: SbcSocketAddr,
     read_buffer: Mutex<BytesMut>,
@@ -281,8 +346,10 @@ impl TlsTransport {
             "TLS transport created"
         );
 
+        let (reader, writer) = tokio::io::split(stream);
         Ok(Self {
-            stream: Arc::new(Mutex::new(stream)),
+            reader: Mutex::new(reader),
+            writer: Mutex::new(writer),
             local_addr: local_addr.into(),
             peer_addr: peer_addr.into(),
             read_buffer: Mutex::new(BytesMut::with_capacity(MAX_STREAM_MESSAGE_SIZE)),
@@ -314,6 +381,7 @@ impl TlsTransport {
                     address: dest,
                     reason: e.to_string(),
                 })?;
+        let _ = tcp_stream.set_nodelay(true);
 
         let server_name: rustls::pki_types::ServerName<'static> = server_name
             .to_string()
@@ -343,6 +411,10 @@ impl TlsTransport {
 }
 
 impl Transport for TlsTransport {
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     fn send<'a>(
         &'a self,
         data: &'a [u8],
@@ -363,7 +435,7 @@ impl Transport for TlsTransport {
             trace!(size = data.len(), "sending TLS data");
 
             {
-                let mut stream = self.stream.lock().await;
+                let mut stream = self.writer.lock().await;
                 stream
                     .write_all(data)
                     .await
@@ -394,7 +466,7 @@ impl Transport for TlsTransport {
 
             let data = {
                 let mut read_buffer = self.read_buffer.lock().await;
-                let mut stream = self.stream.lock().await;
+                let mut stream = self.reader.lock().await;
 
                 let mut temp_buffer = [0u8; 4096];
                 let n = stream.read(&mut temp_buffer).await.map_err(|e| {
@@ -442,7 +514,7 @@ impl Transport for TlsTransport {
             }
 
             {
-                let mut stream = self.stream.lock().await;
+                let mut stream = self.writer.lock().await;
                 let _ = stream.shutdown().await;
                 drop(stream);
             }
@@ -466,7 +538,8 @@ impl StreamTransport for TlsTransport {
 impl std::fmt::Debug for TlsTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsTransport")
-            .field("stream", &"<mutex>")
+            .field("reader", &"<mutex>")
+            .field("writer", &"<mutex>")
             .field("local_addr", &self.local_addr)
             .field("peer_addr", &self.peer_addr)
             .field("read_buffer", &"<mutex>")
@@ -477,9 +550,10 @@ impl std::fmt::Debug for TlsTransport {
 
 /// TLS listener for accepting incoming secure connections.
 ///
-/// ## CNSA 2.0 Compliance
-///
-/// All connections are established using CNSA 2.0 compliant TLS settings.
+/// Connections use the suites, groups and versions of the `ServerConfig`
+/// passed to [`TlsListener::bind`]; the listener itself enforces none, so
+/// CNSA 2.0 compliance depends on that config (see
+/// `create_server_config`).
 ///
 /// ## NIST 800-53 Rev5: SC-8
 pub struct TlsListener {

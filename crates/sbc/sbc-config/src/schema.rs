@@ -707,6 +707,16 @@ pub struct SecurityConfig {
     /// PEM bundle of CA certificates trusted for client certificates.
     /// Required when `require_mtls` is set.
     pub tls_ca_path: Option<PathBuf>,
+
+    /// PEM bundle of CA certificates trusted for SIP trunk **server**
+    /// certificates (outbound TLS to `protocol = "tls"` trunks). Kept
+    /// separate from `tls_ca_path` so a client-issuing CA cannot
+    /// impersonate a trunk. Required when any trunk uses TLS; there is no
+    /// implicit public-root fallback.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-23 (Session Authenticity)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trunk_tls_ca_path: Option<PathBuf>,
 }
 
 impl Default for SecurityConfig {
@@ -718,6 +728,7 @@ impl Default for SecurityConfig {
             min_tls_version: "1.3".to_string(),
             require_mtls: false,
             tls_ca_path: None,
+            trunk_tls_ca_path: None,
         }
     }
 }
@@ -1407,6 +1418,19 @@ pub struct TrunkConfigSchema {
     pub options_ping_interval_secs: u32,
     /// STIR/SHAKEN per-trunk behaviour.
     pub stir_shaken: TrunkStirConfig,
+    /// TLS server name the trunk certificate is verified against
+    /// (`protocol = "tls"` only). Unset: `host` is verified (a DNS name,
+    /// or an IP SAN when `host` is an IP literal). Verification is never
+    /// skipped.
+    ///
+    /// ## NIST 800-53 Rev5: SC-23; RFC 5922 §7
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_server_name: Option<String>,
+    /// Present `security.tls_cert_path` / `tls_key_path` to this trunk as
+    /// the TLS client certificate (mutual TLS). `protocol = "tls"` only.
+    ///
+    /// ## NIST 800-53 Rev5: IA-3
+    pub tls_client_cert: bool,
 }
 
 impl TrunkConfigSchema {
@@ -1435,6 +1459,8 @@ impl Default for TrunkConfigSchema {
             options_ping_enabled: false,
             options_ping_interval_secs: 30,
             stir_shaken: TrunkStirConfig::default(),
+            tls_server_name: None,
+            tls_client_cert: false,
         }
     }
 }

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+### Fixed (SBC, Security, POA&M-5 / SC-8)
+
+- **Requests go out on the target leg's transport.** Before this fix, a B-leg INVITE, BYE or CANCEL triggered by a TCP/TLS caller was written back down the *caller's* connection. That was a misroute, and it leaked trunk routing and the STIR Identity to the caller. Timer-driven sends (retransmissions, failover INVITEs, BYEs, 408s) all went out on the UDP socket. Now every message carries an explicit flow: the caller's transport for the A-leg, and the trunk's `protocol` for the B-leg. The daemon opens outbound TCP/TLS connections to trunks, reuses them, and reads trunk responses from them (`sbc-daemon`)
+- **Failover follows the next trunk.** The retried INVITE gets that trunk's Request-URI (`sips:` for TLS, `;transport=tcp` for TCP), a Via with the matching transport and listener port, a matching Contact, and a transaction with that transport's timers. STIR re-signing on failover is unchanged (`sbc-daemon`)
+- **No plaintext fallback.** Trunk TLS always verifies the server certificate. A connect, handshake or verification failure fails the attempt over to the next trunk, or returns 503 (`sbc-daemon`)
+- **CANCEL uses the B-leg INVITE's Request-URI** (RFC 3261 §9.1) and goes out on the B-leg flow, not the dialled R-URI over UDP (`sbc-daemon`)
+- **Phones registered over TLS/TCP were reached over UDP.** Requests to a registered contact now go on the flow the REGISTER arrived on (`sbc-daemon`, `proto-registrar`)
+- **TCP/TLS transports split read and write halves**, so a send no longer waits behind a pending receive on the same connection (`uc-transport`)
+
+### Added (SBC, config)
+
+- `security.trunk_tls_ca_path` sets the trust anchors for trunk server certificates. It is required when any trunk uses `protocol = "tls"` and rejected when no trunk does. Per-trunk `tls_server_name` and `tls_client_cert` (mTLS to the trunk, default off) are TLS-only (`sbc-config`, `uc-routing`)
+- Flow metrics on `/metrics`: `sip_egress_connections`, `sip_egress_connect_failures_total`, `sip_egress_dial_backoff_total`, `sip_send_no_connection_total`, `sip_stream_write_timeouts_total`, `sip_send_lane_dropped_total`, `sip_send_lane_overflow_total` (`sbc-daemon`)
+- Via `rport` (RFC 3581) on SBC-originated UDP requests (`sbc-daemon`)
+- `uc_transport::tls::create_client_config_with(TlsClientOptions)` takes extra roots, a minimum TLS version and an optional client certificate (`uc-transport`)
+
+### Changed (BREAKING, SBC config)
+
+- A config with a `protocol = "tls"` trunk now fails validation unless `security.trunk_tls_ca_path` is set. Operators must mount the trunk CA bundle (Helm/Ansible) before upgrading
+- A `protocol = "tcp"` or `"tls"` trunk now requires a matching listener of that transport; configs without one fail validation
+- B-leg INVITEs to trunks now use the trunk's host and port in the Request-URI instead of the dialled host. Trunks or downstream parsers matching on the dialled host must be updated
+- Registered phones are reached only on their registration flow. A UDP caller calling a TLS-registered phone whose connection has closed gets 503 (no UDP fallback, SC-8)
+- B-leg transaction timers follow the trunk transport (Timer A not used on TCP/TLS, RFC 3261 §17.1.2.2), changing retransmission and failover timing on stream trunks
+- `proto_registrar::Binding` gains a `source_transport` field; struct-literal constructors must set it (`proto-registrar`, internal API)
+
 ### Added (SBC, STIR/SHAKEN)
 
 - **STIR/SHAKEN verification and signing in the call path** — inbound INVITEs are verified (RFC 8224/8225/8588, ATIS-1000074) after Max-Forwards and before VPS. The verstat result is written into From/P-Asserted-Identity and fed to VPS enforcement. Outbound INVITEs to trunks with `sign = true` are signed at egress after manipulation and topology hiding, and any inbound Identity is stripped unless the trunk is trusted. Failures follow `verification.failure_policy` (`pass-through` | `mark` | `reject`). Rejects carry a `Reason: SIP;cause=N` header and produce a PolicyDenied CDR (`sbc-daemon`, `proto-sip`)

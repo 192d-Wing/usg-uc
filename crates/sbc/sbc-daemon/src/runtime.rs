@@ -522,6 +522,7 @@ impl Runtime {
 
         let mut app_state = AppState::new(metrics, stats);
         app_state.sip_stack = Some(Arc::clone(server.sip_stack()));
+        app_state.flows = Some(Arc::clone(server.flows()));
 
         // Initialize phone provisioning server when [provisioning] is set in
         // config.toml. Without this, /provision/{file} returns 503 because

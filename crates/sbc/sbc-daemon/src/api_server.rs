@@ -273,6 +273,8 @@ pub struct AppState {
     pub ready: AtomicU64,
     /// SIP stack for call/registration queries.
     pub sip_stack: Option<Arc<crate::sip_stack::SipStack>>,
+    /// Egress flow table, for its counters on the metrics endpoint.
+    pub flows: Option<Arc<crate::flows::FlowTable>>,
     /// Phone provisioning server.
     pub provisioning: Option<Arc<uc_phone_mgmt::provisioning::ProvisioningServer>>,
     /// SBC router for CSS/partition-based routing.
@@ -363,6 +365,40 @@ pub const METRIC_CDR_ROTATIONS: &str = "cdr_rotations_total";
 pub const METRIC_CDR_WRITER_ALIVE: &str = "cdr_writer_alive";
 /// Gauge: epoch seconds of the last CDR file write (0 = never).
 pub const METRIC_CDR_LAST_WRITE: &str = "cdr_last_write_timestamp_seconds";
+
+/// Egress flow-layer gauges (POA&M-5; bounded names, no per-peer labels).
+///
+/// ## NIST 800-53 Rev5: SC-5, SI-4
+pub const FLOW_METRICS: &[(&str, &str)] = &[
+    (
+        "sip_egress_connections",
+        "SBC-dialled TCP/TLS trunk connections currently open",
+    ),
+    (
+        "sip_egress_connect_failures_total",
+        "Egress trunk connect, handshake/verification, timeout or cap failures",
+    ),
+    (
+        "sip_egress_dial_backoff_total",
+        "Egress sends failed at once inside a dial-failure backoff window",
+    ),
+    (
+        "sip_send_no_connection_total",
+        "Sends to an accepted connection that had already closed",
+    ),
+    (
+        "sip_stream_write_timeouts_total",
+        "Stream writes that missed the write deadline (connection closed)",
+    ),
+    (
+        "sip_send_lane_dropped_total",
+        "Stream sends dropped because their per-destination queue was full",
+    ),
+    (
+        "sip_send_lane_overflow_total",
+        "Stream sends run unordered because the lane table was full",
+    ),
+];
 
 /// STIR/SHAKEN gauges (bounded names; no per-host or per-number labels).
 ///
@@ -457,6 +493,9 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
         metrics.register_gauge(name, help);
     }
     for (name, help) in STIR_METRICS {
+        metrics.register_gauge(*name, *help);
+    }
+    for (name, help) in FLOW_METRICS {
         metrics.register_gauge(*name, *help);
     }
 }
@@ -579,6 +618,41 @@ impl AppState {
                 }
             }
         }
+        if let Some(flows) = self.flows.as_ref() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let f = &flows.stats;
+            for (name, v) in [
+                (
+                    "sip_egress_connections",
+                    u64::try_from(f.egress_connections.load(Relaxed)).unwrap_or(u64::MAX),
+                ),
+                (
+                    "sip_egress_connect_failures_total",
+                    f.egress_connect_failures.load(Relaxed),
+                ),
+                (
+                    "sip_egress_dial_backoff_total",
+                    f.egress_dial_backoff.load(Relaxed),
+                ),
+                (
+                    "sip_send_no_connection_total",
+                    f.send_no_connection.load(Relaxed),
+                ),
+                (
+                    "sip_stream_write_timeouts_total",
+                    f.stream_write_timeouts.load(Relaxed),
+                ),
+                ("sip_send_lane_dropped_total", f.lane_dropped.load(Relaxed)),
+                (
+                    "sip_send_lane_overflow_total",
+                    f.lane_overflow.load(Relaxed),
+                ),
+            ] {
+                if let Some(g) = self.metrics.gauge(name) {
+                    g.set(as_gauge(v));
+                }
+            }
+        }
         if let Some(stir) = self.sip_stack.as_ref().and_then(|s| s.stir()) {
             use std::sync::atomic::Ordering::Relaxed;
             let m = &stir.metrics;
@@ -635,6 +709,7 @@ impl AppState {
             start_time: Instant::now(),
             ready: AtomicU64::new(1), // Start as ready
             sip_stack: None,
+            flows: None,
             provisioning: None,
             sbc_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
@@ -670,6 +745,7 @@ impl AppState {
             start_time: Instant::now(),
             ready: AtomicU64::new(1),
             sip_stack: None,
+            flows: None,
             provisioning: None,
             sbc_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
@@ -1316,6 +1392,9 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
                     .unwrap_or(5) as u32,
                 outbound_enabled: true,
                 inbound_enabled: true,
+                // API trunks are UDP-only (above); no TLS settings apply.
+                tls_server_name: None,
+                tls_client_cert: false,
             };
             group.add_trunk(uc_routing::Trunk::new(trunk_config));
         }
