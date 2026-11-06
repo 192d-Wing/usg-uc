@@ -29,6 +29,10 @@ pub struct ClusterConfig {
     pub failover: FailoverConfig,
     /// Replication configuration.
     pub replication: ReplicationConfig,
+    /// Cluster semantics of the per-node admission caps.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection), CP-2(2) (Capacity Planning)
+    pub admission: ClusterAdmissionConfig,
 }
 
 impl Default for ClusterConfig {
@@ -46,6 +50,69 @@ impl Default for ClusterConfig {
             heartbeat: HeartbeatConfig::default(),
             failover: FailoverConfig::default(),
             replication: ReplicationConfig::default(),
+            admission: ClusterAdmissionConfig::default(),
+        }
+    }
+}
+
+/// How configured admission caps (`max_calls`, `max_registrations`, trunk
+/// `max_calls`) apply across a cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionSplit {
+    /// Every node enforces the full configured cap (an N-node cluster
+    /// admits up to N x cap). Backward-compatible default.
+    #[default]
+    PerNode,
+    /// Every node enforces `cap / expected_nodes` (rounded down, at least
+    /// 1), so the cluster total never exceeds the configured cap.
+    Divide,
+}
+
+/// Most nodes `cluster.admission.expected_nodes` may name.
+pub const MAX_EXPECTED_NODES: u32 = 64;
+
+/// Static cluster-wide admission split (POA&M-1 phase 1).
+///
+/// The share is computed once at config load from `expected_nodes`, not
+/// from live membership, so a partition cannot raise it (fails closed).
+///
+/// ## NIST 800-53 Rev5: SC-5, SC-24 (Fail in Known State), CM-6
+// POAM: POA&M-80 — phase 2 of POA&M-1 (lease borrowing over uc-storage so survivors can
+// use a dead node's share) is not implemented; a node's share is static and
+// operators must update `expected_nodes` when the cluster is resized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// CM-6: a misspelled key must not silently fall back to `expected_nodes = 1`.
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterAdmissionConfig {
+    /// Whether caps are per node or divided across `expected_nodes`.
+    pub split: AdmissionSplit,
+    /// Number of nodes the caps are divided across (1..=64).
+    pub expected_nodes: u32,
+}
+
+impl Default for ClusterAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            split: AdmissionSplit::PerNode,
+            expected_nodes: 1,
+        }
+    }
+}
+
+impl ClusterAdmissionConfig {
+    /// Divisor applied to divided caps on this node (1 under `per_node`).
+    #[must_use]
+    pub const fn divisor(&self) -> u32 {
+        match self.split {
+            AdmissionSplit::PerNode => 1,
+            AdmissionSplit::Divide => {
+                if self.expected_nodes == 0 {
+                    1
+                } else {
+                    self.expected_nodes
+                }
+            }
         }
     }
 }
@@ -382,7 +449,7 @@ mod tests {
 
         let config_no_id = ClusterConfig::default();
         let generated_id = config_no_id.effective_node_id();
-        assert!(!generated_id.as_str().is_empty());
+        assert_ne!(generated_id.as_str(), "");
         assert!(generated_id.as_str().starts_with("node-"));
     }
 
@@ -400,5 +467,43 @@ mod tests {
         assert_eq!(config.replication_interval(), Duration::from_millis(100));
         assert_eq!(config.snapshot_interval(), Duration::from_mins(5));
         assert_eq!(config.max_lag(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn qa_admission_divisor() {
+        let mut a = ClusterAdmissionConfig::default();
+        assert_eq!(a.split, AdmissionSplit::PerNode);
+        assert_eq!(a.expected_nodes, 1);
+        assert_eq!(a.divisor(), 1);
+        a.expected_nodes = 5;
+        assert_eq!(a.divisor(), 1, "per_node ignores expected_nodes");
+        a.split = AdmissionSplit::Divide;
+        assert_eq!(a.divisor(), 5);
+        a.expected_nodes = 0;
+        assert_eq!(a.divisor(), 1, "0 never divides by zero");
+        a.expected_nodes = MAX_EXPECTED_NODES;
+        assert_eq!(a.divisor(), 64);
+    }
+
+    #[test]
+    fn qa_admission_serde_default_and_names() {
+        let c: ClusterConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.admission, ClusterAdmissionConfig::default());
+        let a: ClusterAdmissionConfig =
+            serde_json::from_str(r#"{"split":"divide","expected_nodes":3}"#).unwrap();
+        assert_eq!(a.split, AdmissionSplit::Divide);
+        assert_eq!(a.divisor(), 3);
+        assert_eq!(
+            serde_json::to_string(&AdmissionSplit::PerNode).unwrap(),
+            r#""per_node""#
+        );
+        assert!(serde_json::from_str::<ClusterAdmissionConfig>(r#"{"split":"Divide"}"#).is_err());
+        // NIST-001: typo in a key is rejected, not ignored.
+        assert!(
+            serde_json::from_str::<ClusterAdmissionConfig>(
+                r#"{"split":"divide","expected_node":3}"#
+            )
+            .is_err()
+        );
     }
 }

@@ -1391,6 +1391,23 @@ fn trunk_json_port(trunk: &serde_json::Value) -> Option<u16> {
 /// - Trunk `port`: absent means 5061 for TLS, 5060 otherwise; outside
 ///   `1..=65535` skips the trunk with a warning.
 pub fn trunk_group_from_json(group_json: &serde_json::Value) -> Option<uc_routing::TrunkGroup> {
+    trunk_group_from_json_admitted(group_json, |_, raw| {
+        Ok(u32::try_from(raw).unwrap_or(u32::MAX))
+    })
+    .ok()
+    .flatten()
+}
+
+/// [`trunk_group_from_json`] with each trunk's `max_calls` mapped through
+/// `max_calls` (this node's `cluster.admission` share). `Err` when any
+/// trunk's cap is rejected; nothing is built.
+///
+/// ## NIST 800-53 Rev5: SC-5, CM-6 — API trunks get the same per-node
+/// share as config-file trunks (POA&M-1).
+fn trunk_group_from_json_admitted(
+    group_json: &serde_json::Value,
+    max_calls: impl Fn(&str, u64) -> Result<u32, String>,
+) -> Result<Option<uc_routing::TrunkGroup>, String> {
     use sbc_config_store::trunk_policy::{TrunkTransport, group_require_tls, trunk_transport};
 
     let id = group_json
@@ -1402,7 +1419,7 @@ pub fn trunk_group_from_json(group_json: &serde_json::Value) -> Option<uc_routin
         .and_then(|v| v.as_str())
         .unwrap_or(id);
     if id.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let require_tls = group_require_tls(group_json).unwrap_or_else(|e| {
@@ -1452,6 +1469,13 @@ pub fn trunk_group_from_json(group_json: &serde_json::Value) -> Option<uc_routin
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
 
+            // NIST 800-53 Rev5: SC-5 — this node's share of the trunk cap.
+            let max_calls = max_calls(
+                trunk_id,
+                t.get("max_calls")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(100),
+            )?;
             let trunk_config = uc_routing::TrunkConfig {
                 id: trunk_id.to_string(),
                 name: trunk_id.to_string(),
@@ -1466,10 +1490,7 @@ pub fn trunk_group_from_json(group_json: &serde_json::Value) -> Option<uc_routin
                     .get("weight")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(100) as u32,
-                max_calls: t
-                    .get("max_calls")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(100) as u32,
+                max_calls,
                 // Default emergency headroom (10% of max_calls, min 1).
                 emergency_reserve_calls: None,
                 cooldown_secs: t
@@ -1488,7 +1509,7 @@ pub fn trunk_group_from_json(group_json: &serde_json::Value) -> Option<uc_routin
             group.add_trunk(uc_routing::Trunk::new(trunk_config));
         }
     }
-    Some(group)
+    Ok(Some(group))
 }
 
 /// True when `group` has a TLS trunk but no trunk CA bundle is configured.
@@ -1497,12 +1518,21 @@ fn tls_trunk_without_ca(group: &uc_routing::TrunkGroup, ca_configured: bool) -> 
 }
 
 /// Syncs a trunk group from MemStore JSON to the SipStack router.
-pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serde_json::Value) {
+///
+/// Returns `Err` (nothing is installed) when a trunk `max_calls` is
+/// invalid for this node's `cluster.admission` split.
+pub async fn sync_trunk_group_to_router(
+    state: &Arc<AppState>,
+    group_json: &serde_json::Value,
+) -> Result<(), String> {
     let Some(ref sip_stack) = state.sip_stack else {
-        return;
+        return Ok(());
     };
-    let Some(group) = trunk_group_from_json(group_json) else {
-        return;
+    let Some(group) = trunk_group_from_json_admitted(group_json, |id, raw| {
+        sip_stack.api_trunk_max_calls(id, raw)
+    })?
+    else {
+        return Ok(());
     };
     let id = group.id().to_string();
     let id = id.as_str();
@@ -1538,6 +1568,7 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
     }
 
     tracing::info!(trunk_group = id, css = ?css_id, "Synced trunk group to SIP stack router");
+    Ok(())
 }
 
 /// Builds a router `DialPlan` from the JSON entries of an API dial plan.
@@ -1880,6 +1911,76 @@ mod tests {
         let metrics = SbcMetrics::standard();
         let stats = Arc::new(ServerStats::default());
         Arc::new(AppState::new(metrics, stats))
+    }
+
+    async fn divided_state(n: u32) -> Arc<AppState> {
+        let mut stack = crate::sip_stack::SipStack::new(crate::sip_stack::SipStackConfig {
+            admission_divisor: n,
+            ..crate::sip_stack::SipStackConfig::default()
+        });
+        stack.ensure_router().await;
+        let mut state = AppState::new(SbcMetrics::standard(), Arc::new(ServerStats::default()));
+        state.sip_stack = Some(Arc::new(stack));
+        Arc::new(state)
+    }
+
+    async fn api_trunk_cap(state: &Arc<AppState>, group: &str, trunk: &str) -> Option<u32> {
+        let stack = state.sip_stack.as_ref()?;
+        let router = stack.router()?.read().await;
+        router
+            .get_trunk_group(group)
+            .and_then(|g| g.get_trunk(trunk))
+            .map(|t| t.config().max_calls)
+    }
+
+    #[tokio::test]
+    async fn api_trunk_gets_cluster_share() {
+        // NIST 800-53 Rev5: SC-5 — SEC-001: API trunks are divided too.
+        let state = divided_state(3).await;
+        let g = serde_json::json!({"id": "g", "trunks": [
+            {"id": "a", "host": "127.0.0.9", "max_calls": 30},
+            {"id": "b", "host": "127.0.0.10"}
+        ]});
+        sync_trunk_group_to_router(&state, &g)
+            .await
+            .expect("accepted");
+        assert_eq!(api_trunk_cap(&state, "g", "a").await, Some(10));
+        assert_eq!(api_trunk_cap(&state, "g", "b").await, Some(33));
+        // per_node: unchanged.
+        let state = divided_state(1).await;
+        sync_trunk_group_to_router(&state, &g)
+            .await
+            .expect("accepted");
+        assert_eq!(api_trunk_cap(&state, "g", "a").await, Some(30));
+    }
+
+    #[tokio::test]
+    async fn api_trunk_bad_max_calls_rejected_and_not_installed() {
+        let state = divided_state(3).await;
+        for (cap, needle) in [
+            (serde_json::json!(0), "must be 1-"),
+            (
+                serde_json::json!(2),
+                "below cluster.admission.expected_nodes (3)",
+            ),
+            (serde_json::json!(u64::from(u32::MAX) + 1), "must be 1-"),
+        ] {
+            let g = serde_json::json!({"id": "g", "trunks": [
+                {"id": "ok", "host": "127.0.0.9", "max_calls": 30},
+                {"id": "bad", "host": "127.0.0.10", "max_calls": cap}
+            ]});
+            let err = sync_trunk_group_to_router(&state, &g)
+                .await
+                .expect_err("rejected");
+            assert!(err.contains(needle), "{err}");
+            assert_eq!(api_trunk_cap(&state, "g", "ok").await, None);
+        }
+        // max_calls = 0 is rejected under per_node as well.
+        let state = divided_state(1).await;
+        let g = serde_json::json!({"id": "g", "trunks": [
+            {"id": "z", "host": "127.0.0.9", "max_calls": 0}
+        ]});
+        assert!(sync_trunk_group_to_router(&state, &g).await.is_err());
     }
 
     #[test]

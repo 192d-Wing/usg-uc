@@ -424,9 +424,9 @@ impl Router {
 
         // Reserve the slot in the same `&mut self` as the selection so two
         // concurrent routes cannot both take the last slot (SC-5).
-        // POAM: the trunk `max_calls` reservation is counted per node only; in a cluster of N nodes the
-        // effective limit is N x the configured cap. Cluster-wide accounting is a
-        // follow-up via uc-state-sync.
+        // POAM: POA&M-1 — `max_calls` here is per node. sbc-daemon passes this node's
+        // share under `cluster.admission.split = "divide"` (static); dynamic
+        // cluster-wide leasing is POA&M-80.
         if let Some(t) = trunk_group.get_trunk_mut(&trunk_id) {
             t.start_call();
         }
@@ -630,9 +630,9 @@ impl Router {
         if !trunk.is_usable_for(admission) {
             return None;
         }
-        // POAM: the trunk `max_calls` reservation is counted per node only; in a cluster of N nodes the
-        // effective limit is N x the configured cap. Cluster-wide accounting is a
-        // follow-up via uc-state-sync.
+        // POAM: POA&M-1 — `max_calls` here is per node. sbc-daemon passes this node's
+        // share under `cluster.admission.split = "divide"` (static); dynamic
+        // cluster-wide leasing is POA&M-80.
         trunk.start_call();
         Some(trunk.sip_uri())
     }

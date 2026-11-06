@@ -59,7 +59,14 @@ impl TrunkSyncService for TrunkSyncServiceImpl {
 
         match store.get(&group_id).await {
             Ok(group_json) => {
-                crate::api_server::sync_trunk_group_to_router(&self.state, &group_json).await;
+                // NIST 800-53 Rev5: SC-5, CM-6 — invalid trunk caps are
+                // rejected (gRPC INVALID_ARGUMENT, HTTP 400 equivalent).
+                if let Err(e) =
+                    crate::api_server::sync_trunk_group_to_router(&self.state, &group_json).await
+                {
+                    warn!(group_id, error = %e, "trunk group rejected");
+                    return Err(Status::invalid_argument(e));
+                }
                 Ok(Response::new(SyncTrunkGroupResponse {
                     synced: true,
                     message: "synced to SIP router".to_string(),

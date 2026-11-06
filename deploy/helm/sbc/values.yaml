@@ -395,6 +395,13 @@ sbcConfigSync:
     key: token
 
 sbcDaemon:
+  # The chart renders no [cluster] section, so every replica enforces the
+  # full max_calls / max_registrations / trunk max_calls (per-node caps;
+  # N replicas admit N x cap). To keep the cluster total at the configured
+  # caps, build the daemon with the `cluster` feature and set
+  #   [cluster.admission] split = "divide", expected_nodes = <replicas>
+  # in config.toml, and update expected_nodes whenever replicas changes
+  # (NIST 800-53 SC-5, POA&M-1; see docs/CLUSTERING.md).
   replicas: 1
   # PVC for /var/lib/sbc — holds the file-backed SQLite (users / HA1s) and
   # JSON-persisted phones, directory_numbers, trunk_groups. Survives pod

@@ -82,10 +82,74 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_header_manipulation(config)?;
     validate_topology_hiding(config)?;
     validate_cdr(&config.cdr)?;
+    #[cfg(feature = "cluster")]
+    validate_cluster_admission(config)?;
     if let Some(grpc) = &config.grpc {
         validate_grpc(grpc)?;
     }
 
+    Ok(())
+}
+
+/// `cluster.admission`: under `split = "divide"` every divided cap must
+/// give each of `expected_nodes` at least one slot, and `expected_nodes`
+/// is only accepted where it is enforced.
+///
+/// ## NIST 800-53 Rev5: CM-6, SC-5, CP-2(2)
+#[cfg(feature = "cluster")]
+fn validate_cluster_admission(config: &SbcConfig) -> ConfigResult<()> {
+    use crate::schema::AdmissionSplit;
+    let Some(cluster) = &config.cluster else {
+        return Ok(());
+    };
+    let adm = &cluster.admission;
+    match adm.split {
+        AdmissionSplit::PerNode => {
+            if adm.expected_nodes != 1 {
+                return Err(ConfigError::Validation {
+                    message:
+                        "cluster.admission.expected_nodes is only used with split = \"divide\""
+                            .to_string(),
+                });
+            }
+            return Ok(());
+        }
+        AdmissionSplit::Divide => {}
+    }
+    if !cluster.enabled {
+        return Err(ConfigError::Validation {
+            message: "cluster.admission.split = \"divide\" requires cluster.enabled".to_string(),
+        });
+    }
+    let n = adm.expected_nodes;
+    if !(1..=uc_cluster::MAX_EXPECTED_NODES).contains(&n) {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "cluster.admission.expected_nodes must be 1-{}",
+                uc_cluster::MAX_EXPECTED_NODES
+            ),
+        });
+    }
+    let too_small = |what: &str, cap: u32| -> ConfigResult<()> {
+        if cap < n {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "{what} ({cap}) is below cluster.admission.expected_nodes ({n}) with split = \"divide\""
+                ),
+            });
+        }
+        Ok(())
+    };
+    too_small("general.max_calls", config.general.max_calls)?;
+    too_small(
+        "general.max_registrations",
+        config.general.max_registrations,
+    )?;
+    for group in &config.trunk_groups {
+        for trunk in &group.trunks {
+            too_small(&format!("trunk '{}' max_calls", trunk.id), trunk.max_calls)?;
+        }
+    }
     Ok(())
 }
 
@@ -2783,5 +2847,242 @@ facility = 16
         bad.vps.as_mut().unwrap().emergency_numbers = vec!["9-1-1".to_string()];
         assert!(super::validate_config(&bad).is_err());
         assert!(crate::load_from_str("[general]\ntrunk_retry_after_max_secs = 0\n").is_err());
+    }
+}
+
+#[cfg(all(test, feature = "cluster"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod cluster_admission_tests {
+    use super::*;
+    use crate::schema::{
+        AdmissionSplit, ClusterConfig, TrunkConfigSchema, TrunkGroupConfig, cluster_share,
+    };
+
+    fn divided(n: u32) -> SbcConfig {
+        let mut config = SbcConfig::default();
+        let mut cluster = ClusterConfig {
+            enabled: true,
+            ..ClusterConfig::default()
+        };
+        cluster.admission.split = AdmissionSplit::Divide;
+        cluster.admission.expected_nodes = n;
+        config.cluster = Some(cluster);
+        config
+    }
+
+    fn rejected(config: &SbcConfig, needle: &str) {
+        let msg = validate_config(config).expect_err("rejected").to_string();
+        assert!(msg.contains(needle), "'{msg}' should mention '{needle}'");
+    }
+
+    #[test]
+    fn share_arithmetic() {
+        assert_eq!(cluster_share(100, 0), 100);
+        assert_eq!(cluster_share(100, 1), 100);
+        assert_eq!(cluster_share(100, 3), 33);
+        assert_eq!(cluster_share(2, 3), 1);
+        assert_eq!(cluster_share(u32::MAX, 64), u32::MAX / 64);
+    }
+
+    #[test]
+    fn per_node_default_keeps_configured_caps() {
+        let config = SbcConfig::default();
+        validate_config(&config).unwrap();
+        assert_eq!(config.admission_divisor(), 1);
+        assert_eq!(config.effective_max_calls(), config.general.max_calls);
+        assert_eq!(
+            config.effective_max_registrations(),
+            config.general.max_registrations
+        );
+        let mut c = divided(1);
+        c.cluster.as_mut().unwrap().admission.split = AdmissionSplit::PerNode;
+        validate_config(&c).unwrap();
+        assert_eq!(c.admission_divisor(), 1);
+    }
+
+    #[test]
+    fn divide_splits_caps_but_not_emergency_reserve() {
+        let mut config = divided(3);
+        config.general.max_calls = 1000;
+        config.general.max_registrations = 3000;
+        validate_config(&config).unwrap();
+        assert_eq!(config.effective_max_calls(), 333);
+        assert_eq!(config.effective_max_registrations(), 1000);
+        // 47 CFR 9.16: the reserve stays per node, sized from the configured cap.
+        assert_eq!(config.general.effective_emergency_reserve_calls(), 100);
+    }
+
+    #[test]
+    fn divide_rejects_bad_values() {
+        rejected(&divided(0), "expected_nodes must be 1-64");
+        rejected(&divided(65), "expected_nodes must be 1-64");
+        let mut c = divided(3);
+        c.general.max_calls = 2;
+        rejected(&c, "general.max_calls");
+        let mut c = divided(3);
+        c.general.max_registrations = 2;
+        rejected(&c, "general.max_registrations");
+        let mut c = divided(3);
+        c.trunk_groups.push(TrunkGroupConfig {
+            id: "g".to_string(),
+            require_tls: false,
+            name: "g".to_string(),
+            strategy: "priority".to_string(),
+            trunks: vec![TrunkConfigSchema {
+                id: "t1".to_string(),
+                host: "sip.example.com".to_string(),
+                max_calls: 2,
+                ..Default::default()
+            }],
+            zone: None,
+        });
+        rejected(&c, "trunk 't1' max_calls");
+        let mut c = divided(3);
+        c.cluster.as_mut().unwrap().enabled = false;
+        rejected(&c, "requires cluster.enabled");
+        let mut c = divided(3);
+        c.cluster.as_mut().unwrap().admission.split = AdmissionSplit::PerNode;
+        rejected(&c, "only used with split");
+    }
+
+    #[test]
+    fn toml_round_trip() {
+        let parsed = crate::load_from_str(
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 4\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.admission_divisor(), 4);
+        assert_eq!(parsed.effective_max_calls(), 2500);
+    }
+
+    #[test]
+    fn qa_share_boundaries() {
+        // N = 1 identity, exact and uneven division, cap == N gives 1.
+        for cap in [0, 1, 7, 1000, u32::MAX] {
+            assert_eq!(cluster_share(cap, 1), cap);
+        }
+        assert_eq!(cluster_share(1000, 4), 250);
+        assert_eq!(cluster_share(1001, 4), 250);
+        assert_eq!(cluster_share(1003, 4), 250);
+        assert_eq!(cluster_share(64, 64), 1);
+        assert_eq!(cluster_share(127, 64), 1);
+        assert_eq!(cluster_share(128, 64), 2);
+        // Floor never exceeds the cluster total.
+        for n in 1..=64u32 {
+            for cap in [n, n + 1, 2 * n - 1, 999, 50_000] {
+                let s = cluster_share(cap, n);
+                assert!(s >= 1 && u64::from(s) * u64::from(n) <= u64::from(cap.max(n)));
+            }
+        }
+    }
+
+    #[test]
+    fn misspelled_admission_key_rejected() {
+        // NIST 800-53 Rev5: CM-6 — NIST-001.
+        let err = crate::load_from_str(
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_node = 3\n",
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn qa_divide_one_node_is_identity_and_accepted() {
+        let config = divided(1);
+        validate_config(&config).unwrap();
+        assert_eq!(config.admission_divisor(), 1);
+        assert_eq!(config.effective_max_calls(), config.general.max_calls);
+        assert_eq!(
+            config.effective_max_registrations(),
+            config.general.max_registrations
+        );
+    }
+
+    #[test]
+    fn qa_divide_cap_equal_to_n_accepted_below_rejected() {
+        let mut c = divided(64);
+        c.general.max_calls = 64;
+        c.general.max_registrations = 64;
+        validate_config(&c).unwrap();
+        assert_eq!(c.effective_max_calls(), 1);
+        assert_eq!(c.effective_max_registrations(), 1);
+        c.general.max_calls = 63;
+        rejected(&c, "general.max_calls (63)");
+        let mut c = divided(4);
+        c.general.max_registrations = 3;
+        rejected(&c, "general.max_registrations (3)");
+    }
+
+    #[test]
+    fn qa_divide_trunk_cap_equal_to_n_accepted() {
+        let mut c = divided(3);
+        c.trunk_groups.push(TrunkGroupConfig {
+            id: "g".to_string(),
+            require_tls: false,
+            name: "g".to_string(),
+            strategy: "priority".to_string(),
+            trunks: vec![
+                TrunkConfigSchema {
+                    id: "ok".to_string(),
+                    host: "sip.example.com".to_string(),
+                    max_calls: 3,
+                    ..Default::default()
+                },
+                TrunkConfigSchema {
+                    id: "small".to_string(),
+                    host: "sip2.example.com".to_string(),
+                    max_calls: 2,
+                    ..Default::default()
+                },
+            ],
+            zone: None,
+        });
+        rejected(&c, "trunk 'small' max_calls");
+        c.trunk_groups[0].trunks.pop();
+        validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn qa_per_node_caps_below_n_irrelevant() {
+        // per_node with expected_nodes = 1 does not apply the cap >= N rule.
+        let mut c = divided(1);
+        c.cluster.as_mut().unwrap().admission.split = AdmissionSplit::PerNode;
+        c.general.max_calls = 1;
+        c.general.max_registrations = 1;
+        validate_config(&c).unwrap();
+        // per_node under a disabled cluster is fine too.
+        c.cluster.as_mut().unwrap().enabled = false;
+        validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn qa_toml_backward_compat_and_rejections() {
+        // Existing [cluster] without an admission table: per_node, divisor 1.
+        let parsed = crate::load_from_str("[cluster]\nenabled = true\n").unwrap();
+        let adm = &parsed.cluster.as_ref().unwrap().admission;
+        assert_eq!(adm.split, AdmissionSplit::PerNode);
+        assert_eq!(adm.expected_nodes, 1);
+        assert_eq!(parsed.admission_divisor(), 1);
+        assert_eq!(parsed.effective_max_calls(), parsed.general.max_calls);
+        // No [cluster] at all.
+        let parsed = crate::load_from_str("").unwrap();
+        assert_eq!(parsed.admission_divisor(), 1);
+        // Explicit per_node.
+        let parsed = crate::load_from_str(
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"per_node\"\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.admission_divisor(), 1);
+        // Rejections through the loader.
+        for bad in [
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"bogus\"\n",
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 0\n",
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 65\n",
+            "[cluster]\nenabled = true\n[cluster.admission]\nexpected_nodes = 3\n",
+            "[cluster]\nenabled = false\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 2\n",
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = -1\n",
+            "[general]\nmax_registrations = 3\n[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 4\n",
+        ] {
+            assert!(crate::load_from_str(bad).is_err(), "accepted: {bad}");
+        }
     }
 }

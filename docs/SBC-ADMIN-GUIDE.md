@@ -1028,6 +1028,10 @@ failure_detection_timeout_ms = 5000
 drain_timeout_ms = 30000
 strategy = "prefer_same_zone"    # prefer_same_zone, prefer_same_region, least_loaded, priority
 
+[cluster.admission]              # wired (POA&M-1 phase 1)
+split = "per_node"               # per_node (default: each node enforces the full cap) | divide
+expected_nodes = 1               # 1-64; only with split = "divide"
+
 [storage]                        # wired
 backend = "redis"                # memory, redis, postgres
 key_prefix = "sbc:"
