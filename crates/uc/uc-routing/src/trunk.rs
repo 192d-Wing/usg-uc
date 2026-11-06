@@ -562,6 +562,13 @@ pub struct TrunkGroup {
     strategy: SelectionStrategy,
     /// Round-robin index.
     round_robin_idx: usize,
+    /// Only TLS trunks are eligible for selection and failover.
+    ///
+    /// NIST 800-53 Rev5: SC-8 (no clear-text egress for this group)
+    require_tls: bool,
+    /// Number of non-TLS trunks in the group, kept current by
+    /// `add_trunk`/`remove_trunk` so the skip metric costs no scan.
+    non_tls_count: u32,
 }
 
 impl TrunkGroup {
@@ -573,7 +580,73 @@ impl TrunkGroup {
             trunks: HashMap::new(),
             strategy: SelectionStrategy::Priority,
             round_robin_idx: 0,
+            require_tls: false,
+            non_tls_count: 0,
         }
+    }
+
+    /// Sets the `require_tls` policy (builder form).
+    ///
+    /// NIST 800-53 Rev5: SC-8 — when set, only trunks whose protocol is TLS
+    /// are selected, ordered for failover or acquired. A group with no usable
+    /// TLS trunk fails the call instead of falling back to UDP/TCP.
+    #[must_use]
+    pub fn with_require_tls(mut self, require_tls: bool) -> Self {
+        self.require_tls = require_tls;
+        self
+    }
+
+    /// Returns whether this group only admits TLS trunks.
+    pub fn require_tls(&self) -> bool {
+        self.require_tls
+    }
+
+    /// Sets the `require_tls` policy.
+    pub fn set_require_tls(&mut self, require_tls: bool) {
+        self.require_tls = require_tls;
+    }
+
+    /// Number of non-TLS trunks in the group.
+    pub fn non_tls_count(&self) -> u32 {
+        self.non_tls_count
+    }
+
+    /// Whether `trunk` passes the group's transport policy.
+    #[inline]
+    pub fn transport_allowed(&self, trunk: &Trunk) -> bool {
+        self.transport_allowed_with(trunk, false)
+    }
+
+    /// [`Self::transport_allowed`] for a call that itself requires TLS
+    /// (`tls_only`, e.g. a `sips:` Request-URI, RFC 3261 §26.2.2): the
+    /// group's `require_tls` ORed with the call's requirement.
+    #[inline]
+    pub fn transport_allowed_with(&self, trunk: &Trunk, tls_only: bool) -> bool {
+        !(self.require_tls || tls_only) || trunk.config().protocol == TrunkProtocol::Tls
+    }
+
+    /// Eligibility predicate shared by selection, failover and counting.
+    #[inline]
+    fn eligible(&self, trunk: &Trunk, admission: Admission, tls_only: bool) -> bool {
+        trunk.is_usable_for(admission) && self.transport_allowed_with(trunk, tls_only)
+    }
+
+    /// Failure-path only: true when the `require_tls` policy is what left the
+    /// group without a usable trunk (some non-TLS trunk would have been
+    /// usable). Not called on the success path.
+    pub fn tls_blocked(&self, admission: Admission) -> bool {
+        self.tls_blocked_with(admission, false)
+    }
+
+    /// [`Self::tls_blocked`] with the call's own TLS requirement ORed in.
+    /// A `require_tls` group with no trunk at all (e.g. every synced trunk
+    /// skipped for an unknown protocol) also counts as a policy refusal.
+    pub fn tls_blocked_with(&self, admission: Admission, tls_only: bool) -> bool {
+        (self.require_tls && self.trunks.is_empty())
+            || ((self.require_tls || tls_only)
+                && self.trunks.values().any(|t| {
+                    t.config().protocol != TrunkProtocol::Tls && t.is_usable_for(admission)
+                }))
     }
 
     /// Returns the group ID.
@@ -595,12 +668,26 @@ impl TrunkGroup {
 
     /// Adds a trunk to the group.
     pub fn add_trunk(&mut self, trunk: Trunk) {
-        self.trunks.insert(trunk.id().to_string(), trunk);
+        let is_tls = trunk.config().protocol == TrunkProtocol::Tls;
+        if let Some(old) = self.trunks.insert(trunk.id().to_string(), trunk)
+            && old.config().protocol != TrunkProtocol::Tls
+        {
+            self.non_tls_count = self.non_tls_count.saturating_sub(1);
+        }
+        if !is_tls {
+            self.non_tls_count = self.non_tls_count.saturating_add(1);
+        }
     }
 
     /// Removes a trunk from the group.
     pub fn remove_trunk(&mut self, id: &str) -> Option<Trunk> {
-        self.trunks.remove(id)
+        let removed = self.trunks.remove(id);
+        if let Some(t) = &removed
+            && t.config().protocol != TrunkProtocol::Tls
+        {
+            self.non_tls_count = self.non_tls_count.saturating_sub(1);
+        }
+        removed
     }
 
     /// Gets a trunk by ID.
@@ -618,9 +705,12 @@ impl TrunkGroup {
         self.trunks.len()
     }
 
-    /// Returns the number of usable trunks.
+    /// Returns the number of usable trunks (honouring `require_tls`).
     pub fn usable_trunk_count(&self) -> usize {
-        self.trunks.values().filter(|t| t.is_usable()).count()
+        self.trunks
+            .values()
+            .filter(|t| self.eligible(t, Admission::Normal, false))
+            .count()
     }
 
     /// Selects a trunk for routing.
@@ -630,10 +720,18 @@ impl TrunkGroup {
 
     /// Selects a trunk for a call admitted as `admission`.
     pub fn select_trunk_for(&mut self, admission: Admission) -> Option<&str> {
+        self.select_trunk_with(admission, false)
+    }
+
+    /// [`Self::select_trunk_for`]; `tls_only` restricts selection to TLS
+    /// trunks for this call (RFC 3261 §26.2.2 `sips:` Request-URI).
+    pub fn select_trunk_with(&mut self, admission: Admission, tls_only: bool) -> Option<&str> {
+        // NIST 800-53 Rev5: SC-8 — `eligible` drops non-TLS trunks when
+        // the group requires TLS (POA&M-48).
         let usable: Vec<_> = self
             .trunks
             .iter()
-            .filter(|(_, t)| t.is_usable_for(admission))
+            .filter(|(_, t)| self.eligible(t, admission, tls_only))
             .collect();
 
         if usable.is_empty() {
@@ -691,10 +789,17 @@ impl TrunkGroup {
 
     /// Failover order for a call admitted as `admission`.
     pub fn failover_order_for(&self, admission: Admission) -> Vec<&str> {
+        self.failover_order_with(admission, false)
+    }
+
+    /// [`Self::failover_order_for`]; `tls_only` as in [`Self::select_trunk_with`].
+    pub fn failover_order_with(&self, admission: Admission, tls_only: bool) -> Vec<&str> {
+        // NIST 800-53 Rev5: SC-8 — failover never lists a non-TLS trunk in a
+        // `require_tls` group (RFC 5630 §3.1.3: no TLS-to-clear downgrade).
         let mut usable: Vec<_> = self
             .trunks
             .iter()
-            .filter(|(_, t)| t.is_usable_for(admission))
+            .filter(|(_, t)| self.eligible(t, admission, tls_only))
             .collect();
 
         usable.sort_by_key(|(_, t)| t.priority());
@@ -949,6 +1054,25 @@ mod tests {
 
         let order = group.failover_order();
         assert_eq!(order, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn non_tls_count_tracks_add_replace_remove() {
+        let mut g = TrunkGroup::new("g", "g");
+        g.add_trunk(Trunk::new(
+            TrunkConfig::new("a", "a.example.com").with_protocol(TrunkProtocol::Udp),
+        ));
+        assert_eq!(g.non_tls_count(), 1);
+        g.add_trunk(Trunk::new(
+            TrunkConfig::new("a", "a.example.com").with_protocol(TrunkProtocol::Tls),
+        ));
+        assert_eq!(g.non_tls_count(), 0);
+        g.add_trunk(Trunk::new(
+            TrunkConfig::new("b", "b.example.com").with_protocol(TrunkProtocol::Tcp),
+        ));
+        assert_eq!(g.non_tls_count(), 1);
+        g.remove_trunk("b");
+        assert_eq!(g.non_tls_count(), 0);
     }
 
     #[test]

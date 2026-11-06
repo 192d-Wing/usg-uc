@@ -717,6 +717,13 @@ pub struct SecurityConfig {
     /// ## NIST 800-53 Rev5: SC-8, SC-23 (Session Authenticity)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trunk_tls_ca_path: Option<PathBuf>,
+
+    /// Global TLS-only egress: every trunk group behaves as if it had
+    /// `require_tls = true` (a group cannot opt out). Applies to config-file
+    /// and API-synced groups alike. Signaling only; does not imply SRTP.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8 (POA&M-48)
+    pub require_tls_trunks: bool,
 }
 
 impl Default for SecurityConfig {
@@ -729,6 +736,7 @@ impl Default for SecurityConfig {
             require_mtls: false,
             tls_ca_path: None,
             trunk_tls_ca_path: None,
+            require_tls_trunks: false,
         }
     }
 }
@@ -1375,6 +1383,15 @@ pub struct TrunkGroupConfig {
     /// Zone this trunk group is bound to (must match a `[[zones]]` name).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone: Option<String>,
+    /// Only trunks with `protocol = "tls"` are used for this group, on the
+    /// primary selection and on every failover hop. With no usable TLS
+    /// trunk the call is rejected with 503; it never falls back to UDP/TCP.
+    /// Validation rejects a `require_tls` group without a TLS trunk.
+    /// Signaling only; does not imply SRTP.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8 (POA&M-48); RFC 5630 §3.1.3
+    #[serde(default)]
+    pub require_tls: bool,
 }
 
 /// Individual trunk configuration.

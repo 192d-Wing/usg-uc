@@ -215,6 +215,10 @@ tls_key_path = "/etc/sbc/sip-tls/tls.key"
 # Trust anchors for TLS SIP trunks (never the client-issuing CA).
 trunk_tls_ca_path = "/etc/sbc/trunk-ca/ca.pem"
 {{- end }}
+{{- if .Values.sbcDaemon.trunkTls.requireTlsTrunks }}
+# NIST 800-53 Rev5: SC-8 — every trunk group is TLS-only (POA&M-48).
+require_tls_trunks = true
+{{- end }}
 {{- if or .Values.sbcDaemon.stirShaken.verificationEnabled .Values.sbcDaemon.stirShaken.signingEnabled }}
 
 [stir_shaken]

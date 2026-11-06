@@ -7,8 +7,77 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+SBC only (planned SBC 0.11.0). The client is not affected.
+
+### Security
+
+- **SBC: API-synced trunks now use their configured transport (behaviour change).**
+  Trunk groups created over the REST API, TrunkSync, the config store or
+  central config used to be sent over UDP whatever the trunk said. The daemon
+  now reads the trunk's `protocol`, or `transport` if `protocol` is absent
+  (`udp`/`tcp`/`tls`, case-insensitive; absent = `udp`). A row that already
+  says `"transport": "tls"` switches to TLS on upgrade and needs
+  `security.trunk_tls_ca_path`; without it the trunk fails closed. An unknown
+  value now skips the trunk with a warning instead of falling back to UDP.
+  `tls_server_name` and `tls_client_cert` are read for TLS trunks.
+  (NIST 800-53 Rev5: SC-8)
+- **SBC: API/synced trunk ports follow the transport (behaviour change).** A
+  TLS trunk with no `port` now dials 5061 (was 5060). A port of 0, above
+  65535 or non-integer is rejected with 400 by sbc-api-server and
+  central-config-api, and skipped with a warning by the daemon; it is never
+  truncated.
+
+### Added
+
+- **SBC: `require_tls` trunk-group policy (POA&M-48, SC-8).** `require_tls = true`
+  on a `[[trunk_groups]]` entry (or `"require_tls": true` in the API/central
+  body) limits primary selection and every failover hop to TLS trunks. If no
+  TLS trunk is usable the INVITE gets 503 and is never sent over UDP/TCP (a
+  policy refusal carries `Reason: Q.850;cause=79;text="no TLS trunk"` and no
+  Retry-After). A `sips:` Request-URI makes the call TLS-only in every group
+  on its route, failover included. `security.require_tls_trunks = true` (Helm
+  `sbcDaemon.trunkTls.requireTlsTrunks`) applies this to every group, and
+  groups cannot opt out. Refusals are audited as `InviteDenied` with reason
+  `no-tls-trunk` and counted in `routing_tls_required_skips` and
+  `routing_tls_required_rejects`.
+  - Validation: a config file with a TLS-only group that has no TLS trunk
+    fails to load.
+  - REST API: a non-bool `require_tls` or an unknown protocol returns 400. A
+    TLS-only group that has trunks but none of them TLS returns 422; nothing
+    is stored. An empty TLS-only group is accepted with a `warnings` entry.
+  - Central config returns 422 for any TLS-only group without a TLS trunk.
+    Trunk-group upserts and deletes that change transport policy write a
+    `ConfigurationChange` audit record. `central-config-api` now exits with
+    code 6 if audit init fails (server errors keep code 5).
+  - The dashboard has a "Require TLS" checkbox and a "TLS only" badge.
+  - Policy is per group. A route that lists a TLS-only group and then a plain
+    group can still fail over to the plain group: set the flag on every
+    group in the route, or use the global key.
+  - Covers signaling only; it does not require SRTP.
+  - Takes effect on restart only; a reload reports it as `restart_required`.
+  - `require_tls` and trunk-protocol changes made through sbc-api-server or
+    central config are audited as `ConfigurationChange`.
+  - API/synced trunks without a `port` default to 5061 for TLS (was 5060);
+    an out-of-range port is rejected (400) or skipped, never truncated.
+  - **Upgrade all nodes before enabling it.** Older nodes ignore the flag.
+
 ### Changed
 
+- **BREAKING (SBC operators): `central-config-api` audit init is fail-closed.**
+  It now depends on `sbc-config-store` and `uc-audit` at runtime and exits
+  with code 6 if audit logging cannot start (server errors keep code 5).
+  Supervisors and alerting that match exit codes must know code 6.
+- **SBC: config reload reports `require_tls` changes as `restart_required`.**
+  `security.require_tls_trunks`, `trunk_groups.require_tls` and
+  `trunk_groups` changes are logged and returned as needing a restart.
+- **SBC: new audit records.** Trunk-group transport-policy changes emit the
+  existing `ConfigurationChange` event (change type `Modified`, also for a
+  central delete). The audit schema is unchanged; SIEM parsers see more
+  records of an existing type. The CDR schema is unchanged.
+- **SBC: mixed-version cluster rollout.** Nodes older than this release ignore
+  `require_tls` and keep sending API trunks over UDP. Upgrade every node
+  (and central-config-api) before setting the flag or the global key, or
+  calls routed by old nodes still leave in clear text.
 - **BREAKING (trunk TLS, CDR syslog, STIR/SHAKEN x5u fetch, SIP-TLS listeners):**
   TLS is now limited to CNSA 2.0 algorithms through the new shared
   `uc_transport::tls::cnsa_provider()` (POA&M-26, POA&M-40). TLS 1.3 offers

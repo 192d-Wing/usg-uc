@@ -63,6 +63,9 @@ fingerprint_hash = "Sha384"
 curve = "P384"
 min_tls_version = "1.3"
 require_mtls = false
+# NIST 800-53 Rev5: SC-8 — every trunk group sends only on TLS trunks (no
+# UDP/TCP fallback; 503 when none is usable). Per group: `require_tls = true`.
+# require_tls_trunks = false
 
 [stir_shaken]
 # Verification is off until STI-CR trust anchors are configured (it was on by

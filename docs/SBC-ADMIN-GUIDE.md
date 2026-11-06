@@ -412,9 +412,43 @@ strategy = "least_connections"   # selection strategy
 >   tls_client_cert = false              # true: present security.tls_cert_path (mTLS)
 > ```
 >
-> `tls_server_name` and `tls_client_cert` are accepted only on `tls` trunks. `tls_server_name` must be a DNS name or IP address without a port. `tls_client_cert = true` needs `security.tls_cert_path` / `tls_key_path`. `security.min_tls_version` applies to trunk connections too. Cipher suites are not restricted. A TLS handshake or verify failure is logged as a warning and counted in `sip_egress_connect_failures_total`; it does not produce its own audit event. Trunk connects time out after 5 s, and the SBC holds at most 1024 trunk connections.
+> `tls_server_name` and `tls_client_cert` are accepted only on `tls` trunks. `tls_server_name` must be a DNS name or IP address without a port. `tls_client_cert = true` needs `security.tls_cert_path` / `tls_key_path`. `security.min_tls_version` applies to trunk connections too. Cipher suites and key exchange are limited to CNSA 2.0 (TLS 1.3 `TLS_AES_256_GCM_SHA384`, ML-KEM-1024 or P-384). A TLS handshake or verify failure is logged as a warning and counted in `sip_egress_connect_failures_total`; it does not produce its own audit event. Trunk connects time out after 5 s, and the SBC holds at most 1024 trunk connections.
 >
-> A group may mix `tls` and `udp`/`tcp` trunks. Failover from a TLS trunk to a UDP trunk is allowed and sends that attempt in clear; there is no `require_tls` policy yet (NIST POA&M-48). Keep TLS-only groups if plaintext failover is not acceptable.
+> A group may mix `tls` and `udp`/`tcp` trunks. Without `require_tls`, failover from a TLS trunk to a UDP trunk is allowed and sends that attempt in clear. Set `require_tls` (below) if plaintext failover is not acceptable.
+
+### TLS-only trunk groups (`require_tls`)
+
+NIST 800-53 Rev5 SC-8 (POA&M-48 closed). Set `require_tls = true` on a group to keep every call routed to it off clear-text transports:
+
+```toml
+[security]
+trunk_tls_ca_path = "/etc/sbc/trunk-ca.pem"
+require_tls_trunks = false      # true: every trunk group is TLS-only; groups cannot opt out
+
+[[trunk_groups]]
+id = "pstn"
+require_tls = true              # default false
+```
+
+- Primary selection and every failover hop consider only trunks with `protocol = "tls"`, whatever the selection strategy. UDP/TCP trunks in the group stay configured, health-checked and visible. They are just never selected for this group.
+- If no TLS trunk is usable, the INVITE gets **503** and is never tried over UDP/TCP. When the policy is the cause (only UDP/TCP trunks could have taken the call, or the group has no trunk at all), the 503 carries `Reason: Q.850;cause=79;text="no TLS trunk"` and **no Retry-After** (retrying cannot help). When the TLS trunks are down, cooling down or at `max_calls`, the 503 carries Retry-After as for "no usable trunk".
+- **`sips:` calls:** an INVITE whose Request-URI is `sips:` is TLS-only in every group on its route, with or without `require_tls`, including failover and the next group in a route list (RFC 3261 §26.2.2). A `sip:` INVITE is unaffected.
+- **Audit:** when the policy causes the refusal (a UDP/TCP trunk would otherwise have taken the call), the record is `InviteDenied` with reason `no-tls-trunk`. When the TLS trunks are simply down or full, the reason stays `no-usable-trunk`. The CDR is 503 / `NoRoute` in both cases.
+- **Metrics** (unlabelled, monotonic): `routing_tls_required_skips` counts non-TLS trunks excluded, per routing decision. `routing_tls_required_rejects` counts group-level refusals; a later group in the route may still carry the call, so it is not a count of failed calls.
+- **Reload:** `require_tls`, `security.require_tls_trunks` and any `[[trunk_groups]]` edit take effect only after a **restart**. A SIGHUP reload stores them but reports them under `restart_required` and logs a warning.
+- **CA check:** a TLS trunk arriving through the API/TrunkSync while `security.trunk_tls_ca_path` is unset logs an error at startup replay and on every sync; such a trunk cannot connect (calls fail closed).
+- **Audit of changes:** sbc-api-server trunk-group/trunk create, update and delete, and central-config trunk-group upserts and deletes, write a `ConfigurationChange` record (who, group, old -> new `require_tls`, changed trunk protocols, outcome) when `require_tls` or a trunk protocol changes.
+- **Validation:**
+  - Config file: a group with `require_tls` (or any group, when `security.require_tls_trunks` is set) must contain a `tls` trunk, otherwise the config is rejected. An empty group is also rejected.
+  - REST API (`/api/v1/trunkgroups` group create/update and the `/trunks` add, update and delete calls): a non-bool `require_tls` or a protocol outside `udp`/`tcp`/`tls` returns **400**. A `require_tls` group that has trunks but no TLS trunk returns **422** and nothing is stored. This also applies to deleting the last TLS trunk. An empty `require_tls` group is accepted with `"warnings": ["require_tls group has no TLS trunk; calls will be rejected"]`, so a group can be created first and its trunks added after.
+  - Central config: the same checks apply, except that an empty `require_tls` group also returns 422.
+  - The sbc-api server cannot see the daemon's `security.require_tls_trunks`. With the global key on, a TLS-less API group is refused at call time (503 plus the metric and audit record above).
+- **API/synced trunk transport:** API, TrunkSync, config-store and central trunks use `protocol` or, if that is absent, `transport` (the dashboard field). Values are `udp`, `tcp` or `tls`, case-insensitive. An absent value means `udp`. An unknown value causes the daemon to skip that trunk with a warning. An absent `port` means 5061 for TLS and 5060 otherwise; a port outside 1-65535 is rejected by the APIs (400) and skipped by the daemon. A non-bool `require_tls` reaching the daemon is treated as `true` (fail closed). `tls_server_name` and `tls_client_cert` are read for TLS trunks.
+- **central-config-api exit codes:** 0 clean shutdown, 2 configuration error, 3 state (store) init failure, 4 listener bind failure, 5 server error while running, 6 audit logger init failure (the service refuses to start without its audit trail).
+- **Per group only (POA&M-57).** A route (route list or dial plan) that names a TLS-only group and then a plain group can still fail over to the plain group's UDP trunks for a `sip:` call. Set `require_tls` on every group in the route, or use `security.require_tls_trunks`.
+- Turning `security.require_tls_trunks` off does not clear the flag on groups already loaded (fails safe); restart to apply.
+- **Signaling only:** `require_tls` does not require SRTP on the B-leg. Configure media security separately. Trunk TLS is limited to CNSA 2.0 suites (POA&M-26 closed).
+- **Clusters:** upgrade every node before enabling the flag. Older nodes ignore it and also send API trunks over UDP.
 
 ### Trunk transport: breaking changes (POA&M-5)
 
@@ -639,7 +673,7 @@ require_mtls = false             # SIP-TLS clients must present a certificate (n
 Notes on what the daemon actually does with these keys:
 
 - `tls_cert_path` / `tls_key_path` (wired): used for SIP-over-TLS listeners (`transport.tls_listen`) and REST HTTPS. Must be set together.
-- `min_tls_version` (wired): SIP-TLS listeners accept TLS 1.3 only by default; `"1.2"` also admits TLS 1.2 clients. Cipher suites are not restricted beyond the protocol version. The REST HTTPS listener uses rustls defaults (TLS 1.2 permitted) and is not affected by this key.
+- `min_tls_version` (wired): SIP-TLS listeners accept TLS 1.3 only by default; `"1.2"` also admits TLS 1.2 clients (`ECDHE-ECDSA-AES256-GCM-SHA384` only). Cipher suites and key exchange are limited to CNSA 2.0. The REST HTTPS listener uses rustls defaults (TLS 1.2 permitted) and is not affected by this key.
 - `curve` only constrains the configuration enum; the key type of the loaded certificate is not checked (P-256/RSA certificates are accepted by rustls).
 - `trunk_tls_ca_path` (wired): PEM bundle of the CAs that issue trunk server certificates. Required when any trunk uses `protocol = "tls"`; separate from `tls_ca_path` (client CA for the listener). See Trunk Groups.
 - `require_mtls` (wired for SIP-TLS and gRPC): the SIP-TLS listener requires a client certificate chaining to `tls_ca_path`; `validate_config` rejects `require_mtls = true` without `tls_cert_path` and `tls_ca_path`. The gRPC listener has its own `[grpc] require_mtls` / `tls_ca_path`.

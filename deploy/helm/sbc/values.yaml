@@ -479,6 +479,10 @@ sbcDaemon:
     caConfigMap: ""
     caSecretName: ""
     caKey: "ca.crt"
+    # security.require_tls_trunks (NIST 800-53 Rev5: SC-8): every trunk group
+    # sends only on TLS trunks; with none usable the call gets 503, never
+    # UDP/TCP. Groups cannot opt out. Needs caConfigMap/caSecretName.
+    requireTlsTrunks: false
   # STIR/SHAKEN (RFC 8224/8225/8588). Off by default. Note: per-trunk
   # sign/verify switches come only from [[trunk_groups]] in the config file
   # (POA&M-34); trunks synced over the API get neither.

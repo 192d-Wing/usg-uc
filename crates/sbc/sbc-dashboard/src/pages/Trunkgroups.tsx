@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
+import Badge from '@cloudscape-design/components/badge';
 import Button from '@cloudscape-design/components/button';
+import Checkbox from '@cloudscape-design/components/checkbox';
 import ContentLayout from '@cloudscape-design/components/content-layout';
 import FormField from '@cloudscape-design/components/form-field';
 import Header from '@cloudscape-design/components/header';
@@ -15,14 +17,21 @@ import { centralApi } from '../centralApi';
 import { useSite } from '../SiteContext';
 import { DeleteConfirmModal, FormModal } from '../components/CrudModal';
 
-type Trunk = { id?: string; host?: string; port?: number; transport?: string };
+type Trunk = { id?: string; host?: string; port?: number; transport?: string; protocol?: string };
 
 type TrunkGroup = {
   id?: string;
   name?: string;
   description?: string;
+  /** NIST 800-53 Rev5: SC-8 (POA&M-48) — route only over TLS trunks. */
+  require_tls?: boolean;
   trunks?: Trunk[];
 };
+
+function hasTlsTrunk(g: TrunkGroup | undefined): boolean {
+  // Same precedence as the server: `protocol`, then `transport`.
+  return (g?.trunks ?? []).some((t) => (t.protocol ?? t.transport ?? '').toLowerCase() === 'tls');
+}
 
 export function Trunkgroups() {
   const [items, setItems] = useState<TrunkGroup[]>([]);
@@ -35,6 +44,7 @@ export function Trunkgroups() {
   const [formId, setFormId] = useState('');
   const [formName, setFormName] = useState('');
   const [formDesc, setFormDesc] = useState('');
+  const [formRequireTls, setFormRequireTls] = useState(false);
   const [busy, setBusy] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -78,6 +88,7 @@ export function Trunkgroups() {
     setFormId('');
     setFormName('');
     setFormDesc('');
+    setFormRequireTls(false);
     setModalError(null);
     setModalMode('create');
   };
@@ -86,6 +97,7 @@ export function Trunkgroups() {
     setFormId(target.id ?? '');
     setFormName(target.name ?? '');
     setFormDesc(target.description ?? '');
+    setFormRequireTls(target.require_tls === true);
     setModalError(null);
     setModalMode('edit');
   };
@@ -113,6 +125,7 @@ export function Trunkgroups() {
       id,
       name: formName.trim(),
       description: formDesc.trim() || undefined,
+      require_tls: formRequireTls,
       // Preserve existing trunks on update (central validates the full doc).
       trunks: modalMode === 'edit' ? (target?.trunks ?? []) : [],
     };
@@ -190,6 +203,11 @@ export function Trunkgroups() {
           { id: 'name', header: 'Name', cell: (g) => g.name ?? '—', isRowHeader: true, sortingField: 'name' },
           { id: 'description', header: 'Description', cell: (g) => g.description ?? '—' },
           {
+            id: 'require_tls',
+            header: 'Transport policy',
+            cell: (g) => (g.require_tls ? <Badge color="green">TLS only</Badge> : '—'),
+          },
+          {
             id: 'trunks',
             header: 'Trunks',
             cell: (g) =>
@@ -245,6 +263,19 @@ export function Trunkgroups() {
         </FormField>
         <FormField label="Description (optional)">
           <Textarea value={formDesc} onChange={({ detail }) => setFormDesc(detail.value)} />
+        </FormField>
+        <FormField
+          label="Transport policy"
+          description="Calls routed to this group use TLS trunks only, on the first attempt and on every failover. With no usable TLS trunk the call is rejected (503); it never falls back to UDP/TCP. The group must contain at least one TLS trunk, or the save is rejected."
+          warningText={
+            formRequireTls && !hasTlsTrunk(modalMode === 'edit' ? target : undefined)
+              ? 'This group has no TLS trunk; the server will reject the change.'
+              : undefined
+          }
+        >
+          <Checkbox checked={formRequireTls} onChange={({ detail }) => setFormRequireTls(detail.checked)}>
+            Require TLS
+          </Checkbox>
         </FormField>
       </FormModal>
 

@@ -66,6 +66,7 @@
 - sbc-daemon trunk failover (RFC 3263 §4.3): 408/Timer B/503 plus local-policy 500/502/504; a transport error on the first send of a B-leg INVITE also fails over immediately; a trunk's 503 `Retry-After` (§21.5.4, §20.33) sets the trunk cooldown, clamped to `general.trunk_retry_after_max_secs` (RFC-001 resolved). See `docs/RFC_COMPLIANCE_GAPS.md`
 - sbc-daemon transaction timers follow the receive transport (reliable on TCP/TLS/WS/WSS/SCTP, so no Timer A/E/G there; RFC 3261 §17.1.1.2/§17.1.2.2/§17.2.1/§17.2.2). Timer-loop sends (failover INVITEs, BYEs) still go out on UDP (POA&M-5); the stream-loop wiring has no end-to-end test. See `docs/RFC_COMPLIANCE_GAPS.md`
 - The `general.max_calls` admission-ceiling 503 carries no `Retry-After`
+- sbc-daemon trunk TLS policy: a `sips:` Request-URI restricts trunk egress to TLS trunks in every routed group (RFC 3261 §26.2.2); `require_tls` groups / `security.require_tls_trunks` do the same per group (cross-group fallback for `sip:` calls remains, NIST POA&M-57). With no eligible TLS trunk the SBC answers 503 with `Reason: Q.850;cause=79` (RFC 6432) and no `Retry-After`. API trunks without a port default to 5061 for TLS, 5060 otherwise (RFC 3261 §19.1.2 / RFC 3263). Open: the last trunk's 503 is relayed unchanged when failover is exhausted (RFC-004). See `docs/RFC_COMPLIANCE_GAPS.md`
 
 ---
 
