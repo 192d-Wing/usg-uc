@@ -24,13 +24,101 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_async, connect_async};
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Callback, ErrorResponse, Request, Response,
+};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, accept_hdr_async_with_config, connect_async,
+};
 use tracing::{debug, info, warn};
 use uc_types::address::{SbcSocketAddr, TransportType};
 
 /// SIP WebSocket subprotocol per RFC 7118.
 pub const SIP_SUBPROTOCOL: &str = "sip";
+
+/// Maximum WebSocket message and frame size. One WS message carries one SIP
+/// message (RFC 7118 §5), so the SIP stream limit applies. tungstenite would
+/// otherwise accept 64 MiB messages and 16 MiB frames.
+///
+/// ## NIST 800-53 Rev5: SC-5, SI-10; RFC 6455 §10.4
+pub const MAX_WS_MESSAGE_SIZE: usize = MAX_STREAM_MESSAGE_SIZE;
+
+/// WebSocket protocol limits for SIP-over-WebSocket.
+fn sip_ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_WS_MESSAGE_SIZE))
+}
+
+/// Whether a `Sec-WebSocket-Protocol` value offers the exact `sip` token
+/// (comma-separated list, RFC 6455 §4.2.2; tokens are case-sensitive).
+fn offers_sip(value: &[u8]) -> bool {
+    value
+        .split(|&b| b == b',')
+        .any(|token| token.trim_ascii() == SIP_SUBPROTOCOL.as_bytes())
+}
+
+/// Builds an HTTP 400 handshake rejection.
+fn reject_upgrade(reason: &str) -> ErrorResponse {
+    let mut resp = ErrorResponse::new(Some(reason.to_string()));
+    *resp.status_mut() = StatusCode::BAD_REQUEST;
+    resp
+}
+
+/// Upgrade-request check for RFC 7118 §4: the client MUST offer `sip`, and
+/// the server MUST echo it or fail the handshake. With `require_sip` false
+/// a request carrying no `Sec-WebSocket-Protocol` header is admitted without
+/// a subprotocol (legacy gateways); one that offers only other protocols is
+/// still refused.
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
+#[derive(Debug, Clone, Copy)]
+struct SubprotocolCheck {
+    require_sip: bool,
+}
+
+impl Callback for SubprotocolCheck {
+    fn on_request(self, req: &Request, mut resp: Response) -> Result<Response, ErrorResponse> {
+        let mut offered_any = false;
+        let mut offered_sip = false;
+        for value in req.headers().get_all("sec-websocket-protocol") {
+            offered_any = true;
+            if offers_sip(value.as_bytes()) {
+                offered_sip = true;
+            }
+        }
+        if offered_sip {
+            resp.headers_mut().insert(
+                "sec-websocket-protocol",
+                HeaderValue::from_static(SIP_SUBPROTOCOL),
+            );
+            return Ok(resp);
+        }
+        if !offered_any && !self.require_sip {
+            return Ok(resp);
+        }
+        Err(reject_upgrade(
+            "the 'sip' WebSocket subprotocol is required",
+        ))
+    }
+}
+
+/// Options for [`WebSocketListener`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebSocketListenerOptions {
+    /// Refuse upgrades that do not offer the `sip` subprotocol (RFC 7118 §4).
+    pub require_sip_subprotocol: bool,
+}
+
+impl Default for WebSocketListenerOptions {
+    fn default() -> Self {
+        Self {
+            require_sip_subprotocol: true,
+        }
+    }
+}
 
 /// WebSocket transport state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,12 +227,42 @@ impl WebSocketTransport {
         peer_addr: SbcSocketAddr,
         secure: bool,
     ) -> TransportResult<Self> {
-        let stream = accept_async(MaybeTlsStream::Plain(tcp_stream))
-            .await
-            .map_err(|e| TransportError::ConnectFailed {
-                address: peer_addr,
-                reason: format!("WebSocket accept failed: {e}"),
-            })?;
+        Self::accept_with_options(
+            tcp_stream,
+            local_addr,
+            peer_addr,
+            secure,
+            WebSocketListenerOptions::default(),
+        )
+        .await
+    }
+
+    /// Accepts a WebSocket connection with explicit options: negotiates the
+    /// `sip` subprotocol and applies the SIP message/frame size limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WebSocket handshake fails or is refused.
+    pub async fn accept_with_options(
+        tcp_stream: TcpStream,
+        local_addr: SbcSocketAddr,
+        peer_addr: SbcSocketAddr,
+        secure: bool,
+        options: WebSocketListenerOptions,
+    ) -> TransportResult<Self> {
+        let callback = SubprotocolCheck {
+            require_sip: options.require_sip_subprotocol,
+        };
+        let stream = accept_hdr_async_with_config(
+            MaybeTlsStream::Plain(tcp_stream),
+            callback,
+            Some(sip_ws_config()),
+        )
+        .await
+        .map_err(|e| TransportError::ConnectFailed {
+            address: peer_addr,
+            reason: format!("WebSocket accept failed: {e}"),
+        })?;
 
         info!(
             local = %local_addr,
@@ -370,6 +488,8 @@ pub struct WebSocketListener {
     listener: tokio::net::TcpListener,
     /// Whether to use TLS (WSS).
     secure: bool,
+    /// Handshake options.
+    options: WebSocketListenerOptions,
 }
 
 impl WebSocketListener {
@@ -401,15 +521,25 @@ impl WebSocketListener {
             local_addr: *addr,
             listener,
             secure,
+            options: WebSocketListenerOptions::default(),
         })
     }
 
-    /// Accepts the next WebSocket connection.
+    /// Replaces the handshake options.
+    #[must_use]
+    pub const fn with_options(mut self, options: WebSocketListenerOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Accepts the raw TCP connection only (no HTTP upgrade). Pair with
+    /// [`Self::complete_handshake`] inside a spawned task under a timeout,
+    /// so one slow client cannot stall the accept loop (SC-5).
     ///
     /// # Errors
     ///
     /// Returns an error if accepting fails.
-    pub async fn accept(&self) -> TransportResult<WebSocketTransport> {
+    pub async fn accept_tcp(&self) -> TransportResult<(TcpStream, SbcSocketAddr)> {
         let (tcp_stream, peer_addr) =
             self.listener
                 .accept()
@@ -417,16 +547,54 @@ impl WebSocketListener {
                 .map_err(|e| TransportError::Io {
                     reason: format!("Accept failed: {e}"),
                 })?;
+        Ok((tcp_stream, SbcSocketAddr::from(peer_addr)))
+    }
 
-        let peer = SbcSocketAddr::from(peer_addr);
+    /// Completes the WebSocket upgrade on a stream from [`Self::accept_tcp`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the handshake fails or is refused.
+    pub async fn complete_handshake(
+        &self,
+        tcp_stream: TcpStream,
+        peer: SbcSocketAddr,
+    ) -> TransportResult<WebSocketTransport> {
+        WebSocketTransport::accept_with_options(
+            tcp_stream,
+            self.local_addr,
+            peer,
+            self.secure,
+            self.options,
+        )
+        .await
+    }
 
-        WebSocketTransport::accept(tcp_stream, self.local_addr, peer, self.secure).await
+    /// Accepts the next WebSocket connection (TCP accept and handshake
+    /// inline; prefer [`Self::accept_tcp`] + [`Self::complete_handshake`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if accepting fails.
+    pub async fn accept(&self) -> TransportResult<WebSocketTransport> {
+        let (tcp_stream, peer) = self.accept_tcp().await?;
+        self.complete_handshake(tcp_stream, peer).await
     }
 
     /// Returns the local address.
     #[must_use]
     pub const fn local_addr(&self) -> &SbcSocketAddr {
         &self.local_addr
+    }
+
+    /// Returns the address the socket is actually bound to (resolves a
+    /// port-0 bind).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket address cannot be read.
+    pub fn bound_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.listener.local_addr()
     }
 }
 
@@ -444,5 +612,232 @@ mod tests {
     #[test]
     fn test_sip_subprotocol() {
         assert_eq!(SIP_SUBPROTOCOL, "sip");
+    }
+
+    #[test]
+    fn ws_message_limit_fits_sip_stream_limit() {
+        const _: () = assert!(MAX_WS_MESSAGE_SIZE <= MAX_STREAM_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn offers_sip_matches_exact_token_only() {
+        assert!(offers_sip(b"sip"));
+        assert!(offers_sip(b"chat, sip"));
+        assert!(offers_sip(b" sip ,x"));
+        assert!(!offers_sip(b"sips"));
+        assert!(!offers_sip(b"SIP"));
+        assert!(!offers_sip(b""));
+    }
+
+    async fn listener(require: bool) -> Arc<WebSocketListener> {
+        let addr = SbcSocketAddr::from("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap());
+        let l = WebSocketListener::bind(&addr, false)
+            .await
+            .unwrap()
+            .with_options(WebSocketListenerOptions {
+                require_sip_subprotocol: require,
+            });
+        Arc::new(l)
+    }
+
+    fn local(l: &WebSocketListener) -> std::net::SocketAddr {
+        l.bound_addr().unwrap()
+    }
+
+    /// Spawns one accept + handshake; returns its result.
+    fn serve_one(
+        l: &Arc<WebSocketListener>,
+    ) -> tokio::task::JoinHandle<TransportResult<WebSocketTransport>> {
+        let l = Arc::clone(l);
+        tokio::spawn(async move {
+            let (tcp, peer) = l.accept_tcp().await?;
+            l.complete_handshake(tcp, peer).await
+        })
+    }
+
+    fn request(addr: std::net::SocketAddr, protocol: Option<&str>) -> Request {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}/").into_client_request().unwrap();
+        if let Some(p) = protocol {
+            req.headers_mut()
+                .insert("sec-websocket-protocol", HeaderValue::from_str(p).unwrap());
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_accepts_sip_subprotocol_and_echoes_it() {
+        let l = listener(true).await;
+        let server = serve_one(&l);
+        let (_ws, resp) = tokio_tungstenite::connect_async(request(local(&l), Some("sip")))
+            .await
+            .unwrap();
+        assert_eq!(resp.headers().get("sec-websocket-protocol").unwrap(), "sip");
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_rejects_missing_subprotocol() {
+        let l = listener(true).await;
+        let server = serve_one(&l);
+        let err = tokio_tungstenite::connect_async(request(local(&l), None))
+            .await
+            .unwrap_err();
+        let status = match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => Some(resp.status()),
+            _ => None,
+        };
+        assert_eq!(status, Some(StatusCode::BAD_REQUEST));
+        assert!(server.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_rejects_non_sip_subprotocol_even_when_not_required() {
+        let l = listener(false).await;
+        let server = serve_one(&l);
+        assert!(
+            tokio_tungstenite::connect_async(request(local(&l), Some("chat")))
+                .await
+                .is_err()
+        );
+        assert!(server.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_allows_missing_when_not_required() {
+        let l = listener(false).await;
+        let server = serve_one(&l);
+        let (_ws, resp) = tokio_tungstenite::connect_async(request(local(&l), None))
+            .await
+            .unwrap();
+        assert!(resp.headers().get("sec-websocket-protocol").is_none());
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ws_rejects_message_over_64k() {
+        use futures_util::SinkExt;
+        let l = listener(true).await;
+        let server = serve_one(&l);
+        let (mut ws, _) = tokio_tungstenite::connect_async(request(local(&l), Some("sip")))
+            .await
+            .unwrap();
+        let transport = server.await.unwrap().unwrap();
+        let big = vec![b'a'; MAX_WS_MESSAGE_SIZE + 1];
+        let _ = ws.send(Message::Binary(big.into())).await;
+        assert!(transport.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ws_accept_tcp_does_not_block_on_handshake() {
+        let l = listener(true).await;
+        let addr = local(&l);
+        // A silent client: TCP connected, never sends the upgrade.
+        let _silent = TcpStream::connect(addr).await.unwrap();
+        let (silent_tcp, _) = l.accept_tcp().await.unwrap();
+        let l2 = Arc::clone(&l);
+        let stalled = tokio::spawn(async move {
+            let peer = SbcSocketAddr::from(addr);
+            l2.complete_handshake(silent_tcp, peer).await
+        });
+        // A second client still completes its handshake.
+        let server = serve_one(&l);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio_tungstenite::connect_async(request(addr, Some("sip"))),
+        )
+        .await
+        .unwrap();
+        assert!(res.is_ok());
+        assert!(server.await.unwrap().is_ok());
+        stalled.abort();
+    }
+
+    // QA: a message exactly at the 64 KiB SIP limit is still delivered.
+    #[tokio::test]
+    async fn qa_ws_message_at_limit_is_delivered() {
+        use futures_util::SinkExt;
+        let l = listener(true).await;
+        let server = serve_one(&l);
+        let (mut ws, _) = tokio_tungstenite::connect_async(request(local(&l), Some("sip")))
+            .await
+            .unwrap();
+        let transport = server.await.unwrap().unwrap();
+        let exact = vec![b'a'; MAX_WS_MESSAGE_SIZE];
+        ws.send(Message::Binary(exact.into())).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), transport.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.data.len(), MAX_WS_MESSAGE_SIZE);
+    }
+
+    // QA: frames each under the cap but reassembling past the 64 KiB
+    // message cap are refused (message cap, not only frame cap).
+    #[tokio::test]
+    async fn qa_ws_fragmented_message_over_limit_rejected() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+        let l = listener(true).await;
+        let server = serve_one(&l);
+        let (mut ws, _) = tokio_tungstenite::connect_async(request(local(&l), Some("sip")))
+            .await
+            .unwrap();
+        let transport = server.await.unwrap().unwrap();
+        let half = vec![b'a'; MAX_WS_MESSAGE_SIZE / 2 + 1];
+        let _ = ws
+            .send(Message::Frame(Frame::message(
+                half.clone(),
+                OpCode::Data(Data::Binary),
+                false,
+            )))
+            .await;
+        let _ = ws
+            .send(Message::Frame(Frame::message(
+                half.clone(),
+                OpCode::Data(Data::Continue),
+                false,
+            )))
+            .await;
+        let _ = ws
+            .send(Message::Frame(Frame::message(
+                half,
+                OpCode::Data(Data::Continue),
+                true,
+            )))
+            .await;
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), transport.recv())
+            .await
+            .unwrap();
+        assert!(r.is_err());
+    }
+
+    // QA: `sip` offered among other tokens is selected and echoed alone.
+    #[tokio::test]
+    async fn qa_ws_handshake_selects_sip_from_offer_list() {
+        let l = listener(true).await;
+        let server = serve_one(&l);
+        let (_ws, resp) = tokio_tungstenite::connect_async(request(local(&l), Some("chat, sip")))
+            .await
+            .unwrap();
+        assert_eq!(resp.headers().get("sec-websocket-protocol").unwrap(), "sip");
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    // QA: with the requirement on, an offer of only other protocols is a 400.
+    #[tokio::test]
+    async fn qa_ws_handshake_rejects_other_subprotocol_when_required() {
+        let l = listener(true).await;
+        let server = serve_one(&l);
+        let err = tokio_tungstenite::connect_async(request(local(&l), Some("sips, chat")))
+            .await
+            .unwrap_err();
+        let status = match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => Some(resp.status()),
+            _ => None,
+        };
+        assert_eq!(status, Some(StatusCode::BAD_REQUEST));
+        assert!(server.await.unwrap().is_err());
     }
 }

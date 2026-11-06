@@ -60,6 +60,7 @@ mod args;
 mod cdr;
 #[cfg(feature = "cluster")]
 mod cluster;
+mod conn_limit;
 mod flow;
 mod flows;
 #[cfg(feature = "grpc")]

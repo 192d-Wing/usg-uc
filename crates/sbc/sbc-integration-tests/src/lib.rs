@@ -43,6 +43,9 @@ mod policy_tests;
 #[cfg(test)]
 mod routing_tests;
 
+#[cfg(test)]
+mod transport_dos_tests;
+
 #[cfg(all(test, feature = "cluster"))]
 mod cluster_tests;
 

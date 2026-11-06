@@ -36,11 +36,15 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic))]
 
 pub mod error;
+pub mod key;
 pub mod limiter;
 pub mod tracker;
 
 pub use error::{DosError, DosResult};
-pub use limiter::{KeyedRateLimiter, RateLimitAction, RateLimiter, RateLimiterConfig};
+pub use key::{DEFAULT_IPV6_PREFIX_LEN, source_key};
+pub use limiter::{
+    CheckOutcome, KeyedRateLimiter, RateLimitAction, RateLimiter, RateLimiterConfig, SweepEvent,
+};
 pub use tracker::{RequestTracker, SourceStats};
 
 /// Default rate limit (requests per second).

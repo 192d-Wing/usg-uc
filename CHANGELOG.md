@@ -11,6 +11,27 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Security
 
+- **SBC: transport-level DoS hardening for TCP/TLS/WebSocket (SC-5, SC-7, SC-10).**
+  Each stream listener now has its own connection pool. There is also a
+  node-wide ceiling and a per-source cap; a source is one IPv4 address or one
+  IPv6 prefix (`rate_limit.ipv6_prefix_len`). Admission checks the per-source
+  cap first, then the listener pool, then the total. TLS and WebSocket
+  handshakes run under `handshake_timeout_secs`. A new connection must send an
+  accepted SIP message within `first_message_timeout_secs`; CRLF keep-alives
+  and frames the parser rejects do not count. After that, idle time is
+  measured by the wall clock, so dripping one byte at a time no longer keeps
+  a connection open. Stream framing uses the same Content-Length rules as the
+  parser (#167). A bad frame gets a sanitized 400 and the connection closes.
+  On TCP/TLS, RFC 5626 CRLFCRLF pings get a single CRLF pong. WebSocket
+  messages are capped at 65,535 bytes, and a truncated WS message is
+  discarded instead of being joined to the next one.
+- **SBC: per-source rate-limiter state is bounded (SC-5).** In global mode the
+  limiter never blocks. Per-source buckets are capped at
+  `max_tracked_sources`. Once the cap is reached, new sources share an
+  overflow bucket. Blocked sources are capped at `max_blocked_sources`.
+  Expired state is cleared by a periodic sweep. Known gaps: blocks are not
+  replicated across the cluster (POA&M-90), and rotating through /48
+  prefixes is bounded only by the overflow bucket (POA&M-91).
 - **SBC: API-synced trunks now use their configured transport (behaviour change).**
   Trunk groups created over the REST API, TrunkSync, the config store or
   central config used to be sent over UDP whatever the trunk said. The daemon
@@ -29,6 +50,24 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Added
 
+- **SBC: new `[transport]` keys** (defaults; valid range):
+  `max_connections_per_listener` (10000; 1..=1,000,000),
+  `max_connections_total` (20000; 1..=4,000,000),
+  `max_connections_per_source` (128; 1..=`max_connections_per_listener`;
+  raise it for large enterprise NATs with many TLS phones),
+  `handshake_timeout_secs` (10; 1..=60),
+  `first_message_timeout_secs` (30; 1..=`tcp_idle_timeout_secs`),
+  `ws_require_sip_subprotocol` (true).
+- **SBC: new `[rate_limit]` keys** (defaults; valid range):
+  `ipv6_prefix_len` (64; 32..=128, checked even when rate limiting is
+  disabled), `max_tracked_sources` (65536; 1024..=4,194,304),
+  `max_blocked_sources` (16384; 1..=`max_tracked_sources`),
+  `overflow_rps` (0 = auto, which is 1000 clamped into
+  `per_ip_rps..=global_rps`; a non-zero value must be in that range),
+  `block_duration_secs` (60; 1..=86400), `sweep_interval_secs` (10; 1..=300),
+  `audit_interval_secs` (60; 1..=3600),
+  `audit_max_records_per_interval` (1024; 1..=65536).
+  Existing configs that omit these keys still load and get the defaults.
 - **SBC: `require_tls` trunk-group policy (POA&M-48, SC-8).** `require_tls = true`
   on a `[[trunk_groups]]` entry (or `"require_tls": true` in the API/central
   body) limits primary selection and every failover hop to TLS trunks. If no
@@ -63,6 +102,37 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Changed
 
+- **SBC: `transport.tcp_idle_timeout_secs` is now enforced (behaviour
+  change).** The key used to be accepted and ignored. It is now the idle
+  timeout for TCP, TLS and WS connections after their first message, and it
+  must be 30..=3600. A config outside that range now fails to load. The
+  default of 300 is unchanged.
+- **SBC: WebSocket upgrades must offer the `sip` subprotocol (behaviour
+  change, RFC 7118 §4).** An upgrade that does not offer `sip` is refused
+  with 400. Setting `transport.ws_require_sip_subprotocol = false` admits
+  upgrades that send no `Sec-WebSocket-Protocol` header, but that is
+  non-conformant with RFC 7118. An offer that lists only other subprotocols
+  is refused either way.
+- **SBC: rate-limit audit records changed (SIEM parsers: action needed).**
+  - Rate-limit rejections are no longer logged one record per packet. They
+    are summed per source and per `limit_name` every
+    `audit_interval_secs`, with at most `audit_max_records_per_interval`
+    records per interval. Anything over that cap goes into one
+    `per_ip_rps_suppressed` record.
+  - New `limit_name` values: `per_ip_rps_suppressed`,
+    `per_ip_blocked_drops`, `listener_conn`, `total_conn` and `framing`.
+    Global, overflow and pool records use the placeholder source `0.0.0.0`
+    (POA&M-92).
+  - `per_ip_block` is written once, when the block starts. Its `limit_name`
+    is now `per_ip_block:/<prefix>:<secs>s` (for example
+    `per_ip_block:/32:60s`). Its source is the blocked address or IPv6
+    network, `request_count` is 0, and the threshold is `per_ip_rps`.
+  - **SIEM rules that match `limit_name == "per_ip_block"` exactly must
+    switch to a prefix match on `per_ip_block:`.**
+  - The audit control tag is now `AU-4, AU-12, SC-5`.
+  - The new server counters (`framing_errors`, `conn_rejected_per_source`,
+    `ws_handshake_failures`, `handshake_timeouts`) are not yet exported by
+    the API (POA&M-93).
 - **BREAKING (SBC operators): `central-config-api` audit init is fail-closed.**
   It now depends on `sbc-config-store` and `uc-audit` at runtime and exits
   with code 6 if audit logging cannot start (server errors keep code 5).

@@ -540,8 +540,44 @@ pub struct TransportConfig {
     /// TCP connection timeout in seconds.
     pub tcp_timeout_secs: u64,
 
-    /// TCP idle timeout in seconds.
+    /// Idle timeout in seconds for accepted stream connections (TCP, TLS,
+    /// WebSocket) once they have delivered a SIP message. Valid 30..=3600.
+    ///
+    /// ## NIST 800-53 Rev5: SC-10 (Network Disconnect)
     pub tcp_idle_timeout_secs: u64,
+
+    /// Connection pool size of each stream listener (TCP, TLS, WS), so a
+    /// flood on one listener cannot starve another. Valid 1..=1,000,000.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub max_connections_per_listener: u32,
+
+    /// Ceiling on accepted stream connections across all listeners (fd
+    /// budget). Valid 1..=4,000,000.
+    pub max_connections_total: u32,
+
+    /// Concurrent stream connections allowed from one source (IPv4 address
+    /// or IPv6 `rate_limit.ipv6_prefix_len` prefix), across all listeners.
+    /// An enterprise NAT funnelling many TLS phones may need more. Valid
+    /// 1..=`max_connections_per_listener`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    pub max_connections_per_source: u32,
+
+    /// TLS / WebSocket handshake deadline in seconds. Valid 1..=60.
+    pub handshake_timeout_secs: u64,
+
+    /// Deadline in seconds for a new stream connection to deliver its first
+    /// accepted SIP message; until then CRLF keep-alives do not count as
+    /// activity. Valid 1..=`tcp_idle_timeout_secs`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-10
+    pub first_message_timeout_secs: u64,
+
+    /// Refuse WebSocket upgrades that do not offer the `sip` subprotocol
+    /// (RFC 7118 §4 MUST). When false, an upgrade with no
+    /// `Sec-WebSocket-Protocol` header is admitted.
+    pub ws_require_sip_subprotocol: bool,
 
     /// External/public IP address for SIP Contact and SDP.
     /// Used when behind NAT. If unset, auto-detected from outgoing socket.
@@ -586,6 +622,12 @@ impl Default for TransportConfig {
             wss_listen: Vec::new(),
             tcp_timeout_secs: 30,
             tcp_idle_timeout_secs: 300,
+            max_connections_per_listener: 10_000,
+            max_connections_total: 20_000,
+            max_connections_per_source: 128,
+            handshake_timeout_secs: 10,
+            first_message_timeout_secs: 30,
+            ws_require_sip_subprotocol: true,
             external_ip: None,
             signaling_ip: None,
             media_ip: None,
@@ -1163,6 +1205,53 @@ pub struct RateLimitConfig {
 
     /// Burst allowance multiplier.
     pub burst_multiplier: f32,
+
+    /// IPv6 prefix length per-source limiter and connection state is keyed
+    /// on (one /64 is one source). Valid 32..=128.
+    pub ipv6_prefix_len: u8,
+
+    /// Cap on per-source token buckets. Valid 1024..=4,194,304.
+    pub max_tracked_sources: u32,
+
+    /// Cap on simultaneously blocked sources. Valid
+    /// 1..=`max_tracked_sources`.
+    pub max_blocked_sources: u32,
+
+    /// Rate of the shared bucket that new sources use once
+    /// `max_tracked_sources` is reached. `0` (default) means automatic:
+    /// 1000 clamped into `per_ip_rps`..=`global_rps`. A non-zero value must
+    /// lie in `per_ip_rps`..=`global_rps`.
+    pub overflow_rps: u32,
+
+    /// How long a source over 2x `per_ip_rps` stays blocked. Valid 1..=86400.
+    pub block_duration_secs: u64,
+
+    /// Interval of the limiter maintenance sweep (expired blocks, idle
+    /// buckets). Valid 1..=300.
+    pub sweep_interval_secs: u64,
+
+    /// Interval at which rate-limit rejections are aggregated into audit
+    /// records. Valid 1..=3600.
+    ///
+    /// ## NIST 800-53 Rev5: AU-4, AU-12
+    pub audit_interval_secs: u64,
+
+    /// Cap on aggregated rate-limit audit records per interval; the rest
+    /// are summed into one `per_ip_rps_suppressed` record. Valid 1..=65536.
+    pub audit_max_records_per_interval: u32,
+}
+
+impl RateLimitConfig {
+    /// The overflow bucket rate in effect (resolves the `0` = automatic
+    /// setting of `overflow_rps`).
+    #[must_use]
+    pub fn effective_overflow_rps(&self) -> u32 {
+        if self.overflow_rps != 0 {
+            return self.overflow_rps;
+        }
+        let ceiling = self.global_rps.max(self.per_ip_rps);
+        1_000u32.clamp(self.per_ip_rps.min(ceiling), ceiling)
+    }
 }
 
 impl Default for RateLimitConfig {
@@ -1173,6 +1262,14 @@ impl Default for RateLimitConfig {
             per_ip_rps: 100,
             per_user_rps: 50,
             burst_multiplier: 2.0,
+            ipv6_prefix_len: 64,
+            max_tracked_sources: 65_536,
+            max_blocked_sources: 16_384,
+            overflow_rps: 0,
+            block_duration_secs: 60,
+            sweep_interval_secs: 10,
+            audit_interval_secs: 60,
+            audit_max_records_per_interval: 1_024,
         }
     }
 }
