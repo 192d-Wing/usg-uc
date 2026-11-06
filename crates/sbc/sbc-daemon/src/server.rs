@@ -1788,6 +1788,15 @@ impl Server {
                 .register_accepted(transport.transport_type(), peer, Arc::clone(&transport));
             (transport.transport_type(), peer, None, false)
         });
+        // NIST 800-53 Rev5: IA-3, SC-23 — a process-unique id for this
+        // connection binds STIR endpoint attestation to it, not to the
+        // (reusable, CGNAT) peer address (RFC 5626 §3.1, §5.2).
+        let conn_id = crate::stir_binding::ConnId::next();
+        // Releases the STIR binding even if this task panics or is aborted.
+        let stir_guard = StirConnGuard {
+            stack: Some(Arc::clone(&ctx.sip_stack)),
+            conn: conn_id,
+        };
         let send_ctx = SendCtx {
             flows: Arc::clone(&ctx.flows),
             stats: Arc::clone(&ctx.stats),
@@ -1860,11 +1869,12 @@ impl Server {
                             .sip_stack
                             // RFC 3261 §17: responses and forwards ride this
                             // stream, so its transactions use reliable timers.
-                            .process_message_on(
+                            .process_message_conn(
                                 &frame,
                                 peer,
                                 ctx.zone_name.as_deref(),
                                 transport.transport_type(),
+                                Some(conn_id),
                             )
                             .await;
                         // NIST 800-53 Rev5: SC-5 — only a reply back on this
@@ -1887,6 +1897,11 @@ impl Server {
             }
         }
 
+        // NIST 800-53 Rev5: SC-23, IA-3 — frames are processed inline, so
+        // every REGISTER from this connection has finished; release its STIR
+        // binding (before the flow is removed) so a later connection on the
+        // same address cannot inherit it.
+        stir_guard.release().await;
         ctx.flows.remove(&key, &transport);
         let _ = transport.close().await;
     }
@@ -2343,6 +2358,35 @@ fn build_dtls_fingerprint_source(
             {
                 panic!("DTLS-SRTP termination configured but identity unavailable: {e}");
             }
+        }
+    }
+}
+
+/// Releases a stream connection's STIR flow binding when its receive loop
+/// ends. Normal exit awaits [`Self::release`] (ordered before the flow-table
+/// removal); on panic or task abort, `Drop` spawns the release instead.
+///
+/// NIST 800-53 Rev5: SC-23 (Session Authenticity), IA-3
+struct StirConnGuard {
+    stack: Option<Arc<SipStack>>,
+    conn: crate::stir_binding::ConnId,
+}
+
+impl StirConnGuard {
+    async fn release(mut self) {
+        if let Some(stack) = self.stack.take() {
+            stack.connection_closed(self.conn).await;
+        }
+    }
+}
+
+impl Drop for StirConnGuard {
+    fn drop(&mut self) {
+        if let Some(stack) = self.stack.take()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            let conn = self.conn;
+            drop(rt.spawn(async move { stack.connection_closed(conn).await }));
         }
     }
 }

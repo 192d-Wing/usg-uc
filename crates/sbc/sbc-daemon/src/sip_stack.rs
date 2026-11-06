@@ -3694,6 +3694,24 @@ impl SipStack {
         receiving_zone: Option<&str>,
         transport: AddrTransport,
     ) -> ProcessResult {
+        self.process_message_conn(data, source, receiving_zone, transport, None)
+            .await
+    }
+
+    /// [`Self::process_message_on`] for a message read from stream
+    /// connection `conn` (`None` for UDP). The id binds STIR endpoint
+    /// attestation to the connection a REGISTER arrived on, not to its
+    /// address (RFC 5626 §3.1, §5.2).
+    ///
+    /// ## NIST 800-53 Rev5: IA-3, SC-23 (Session Authenticity)
+    pub async fn process_message_conn(
+        &self,
+        data: &Bytes,
+        source: SbcSocketAddr,
+        receiving_zone: Option<&str>,
+        transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
+    ) -> ProcessResult {
         // Parse the SIP message
         let message = match SipMessage::parse(data) {
             Ok(msg) => msg,
@@ -3717,7 +3735,7 @@ impl SipStack {
 
         let mut result = match message {
             SipMessage::Request(_) => {
-                self.process_request(message, source, receiving_zone, transport)
+                self.process_request(message, source, receiving_zone, transport, conn)
                     .await
             }
             SipMessage::Response(_) => self.process_response(message, source).await,
@@ -3740,6 +3758,7 @@ impl SipStack {
         source: SbcSocketAddr,
         receiving_zone: Option<&str>,
         transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
     ) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -3771,9 +3790,9 @@ impl SipStack {
         }
 
         match method {
-            Method::Register => self.handle_register(message, source, transport).await,
+            Method::Register => self.handle_register(message, source, transport, conn).await,
             Method::Invite => {
-                self.handle_invite(message, source, receiving_zone, transport)
+                self.handle_invite(message, source, receiving_zone, transport, conn)
                     .await
             }
             Method::Ack => self.handle_ack(message).await,
@@ -4330,6 +4349,7 @@ impl SipStack {
         message: SipMessage,
         source: SbcSocketAddr,
         transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
     ) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -4640,7 +4660,10 @@ impl SipStack {
                     // STIR flow index (SEC-008/SEC-009): the flow this
                     // REGISTER actually arrived on (received source and
                     // transport, not the declared Contact) now binds the
-                    // AOR, or no longer does after a de-registration.
+                    // AOR, or no longer does after a de-registration. For
+                    // TCP/TLS the entry is also bound to the connection id,
+                    // so a later connection on a reused address does not
+                    // inherit it (RFC 5626 §3.1, §5.2; IA-3, SC-23).
                     {
                         let key = crate::stir_binding::flow_key(source.ip(), src_port, transport);
                         let this_bound =
@@ -4648,13 +4671,14 @@ impl SipStack {
                         let mut flows = self.stir_flows.write().await;
                         if this_bound {
                             let cap = self.config.max_registrations as usize;
-                            let indexed = flows
-                                .bind(key, &aor, cap, |k, a| Self::flow_has_binding(&loc, a, k));
+                            let indexed = flows.bind(key, conn, &aor, cap, |k, a| {
+                                Self::flow_has_binding(&loc, a, k)
+                            });
                             if !indexed {
                                 debug!(aor = %aor, "STIR flow index full; flow not indexed");
                             }
                         } else {
-                            flows.unbind(&key, &aor);
+                            flows.unbind(&key, conn, &aor);
                         }
                     }
                     // Update active count while holding the loc lock.
@@ -4737,6 +4761,7 @@ impl SipStack {
         source: SbcSocketAddr,
         receiving_zone: Option<&str>,
         transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
     ) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -5545,7 +5570,7 @@ impl SipStack {
                 .is_some_and(|l| stir.signs(&l.trunk_id))
                 || failover_targets.iter().any(|(_, t)| stir.signs(t));
             let binding = if may_sign && source_trunk.is_none() && self.register_auth_enabled() {
-                self.stir_endpoint_binding(source, transport, &from_uri)
+                self.stir_endpoint_binding(source, transport, conn, &from_uri)
                     .await
             } else {
                 None
@@ -6534,20 +6559,49 @@ impl SipStack {
     /// Records that `aor` registered from `source` over `transport` in the
     /// STIR flow index (tests that seed the location service directly).
     #[cfg(test)]
-    async fn index_stir_flow(&self, aor: &str, source: SbcSocketAddr, transport: AddrTransport) {
+    async fn index_stir_flow(
+        &self,
+        aor: &str,
+        source: SbcSocketAddr,
+        transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
+    ) {
         let key = crate::stir_binding::flow_key(source.ip(), source.port(), transport);
         let cap = self.config.max_registrations as usize;
         let _ = self
             .stir_flows
             .write()
             .await
-            .bind(key, aor, cap, |_, _| true);
+            .bind(key, conn, aor, cap, |_, _| true);
+    }
+
+    /// Releases the STIR flow binding of stream connection `conn` when it
+    /// closes, so a new connection that reuses the address (CGNAT) cannot
+    /// inherit attestation A. Takes only the `stir_flows` lock (never the
+    /// location lock), so it cannot invert the REGISTER lock order. A
+    /// connection that never bound (the common case) costs only a read
+    /// lock.
+    ///
+    /// ## NIST 800-53 Rev5: SC-23 (Session Authenticity), IA-3
+    pub async fn connection_closed(&self, conn: crate::stir_binding::ConnId) {
+        if !self.stir_flows.read().await.has_conn(conn) {
+            return;
+        }
+        self.stir_flows.write().await.unbind_conn(conn);
     }
 
     /// STIR caller binding for an endpoint INVITE (RFC 8588 §4 attestation
     /// inputs). `None`: the INVITE is not bound to a registration from this
     /// flow (received IP, port and transport of the REGISTER, re-checked
-    /// against the AOR's live binding), so the caller is not authenticated.
+    /// against the AOR's live binding, and for TCP/TLS the same connection
+    /// `conn` the REGISTER arrived on), so the caller is not authenticated.
+    /// A TCP/TLS connection-id mismatch is fail-secure: unauthenticated,
+    /// never capped-at-B (local policy; ATIS-1000074 does not define
+    /// connection binding).
+    ///
+    /// POAM: POA&M-70 TLS peer-certificate fingerprint is not bound to the entry;
+    /// `Transport` does not expose peer certificates to the SIP stack. The
+    /// unique connection id covers a single TLS session.
     /// `Some(tn)`: bound to a registered AOR; `tn` is the number provisioned
     /// for that AOR (the AOR user when it is a TN, else a DID mapped to it),
     /// or `None` when it has none.
@@ -6570,11 +6624,12 @@ impl SipStack {
         &self,
         source: SbcSocketAddr,
         transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
         from_uri: &str,
     ) -> Option<Option<String>> {
         let from_user = from_uri.parse::<SipUri>().ok()?.user?;
         let key = crate::stir_binding::flow_key(source.ip(), source.port(), transport);
-        let candidates: Vec<String> = self.stir_flows.read().await.get(&key)?.to_vec();
+        let candidates: Vec<String> = self.stir_flows.read().await.get(&key, conn)?.to_vec();
         let bound_users: Vec<String> = {
             let loc = self.location_service.read().await;
             candidates
@@ -13694,7 +13749,12 @@ pub(crate) mod tests {
         send_on(stack, call_id, src, from, pai, AddrTransport::Tcp).await
     }
 
-    /// [`send`] over `transport`.
+    /// The stream connection the STIR tests' endpoint REGISTERs and sends
+    /// INVITEs on (one per test process; ids are never reused).
+    static TEST_CONN: std::sync::LazyLock<crate::stir_binding::ConnId> =
+        std::sync::LazyLock::new(crate::stir_binding::ConnId::next);
+
+    /// [`send`] over `transport` (on [`TEST_CONN`]; ignored for UDP).
     async fn send_on(
         stack: &SipStack,
         call_id: &str,
@@ -13703,13 +13763,27 @@ pub(crate) mod tests {
         pai: Option<&str>,
         transport: AddrTransport,
     ) -> Vec<ProcessResult> {
+        send_conn(stack, call_id, src, from, transport, Some(*TEST_CONN), pai).await
+    }
+
+    /// [`send`] over `transport` on stream connection `conn`.
+    async fn send_conn(
+        stack: &SipStack,
+        call_id: &str,
+        src: SbcSocketAddr,
+        from: &str,
+        transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
+        pai: Option<&str>,
+    ) -> Vec<ProcessResult> {
         flatten(
             stack
-                .process_message_on(
+                .process_message_conn(
                     &endpoint_invite(call_id, src, from, pai),
                     src,
                     None,
                     transport,
+                    conn,
                 )
                 .await,
         )
@@ -13747,7 +13821,9 @@ pub(crate) mod tests {
                     1,
                 ))
                 .unwrap();
-            q.stack.index_stir_flow(aor, src, AddrTransport::Tcp).await;
+            q.stack
+                .index_stir_flow(aor, src, AddrTransport::Tcp, Some(*TEST_CONN))
+                .await;
         }
         q.stack.add_did_mapping("+12025550142", "bob").await;
 
@@ -13855,7 +13931,9 @@ pub(crate) mod tests {
         assert_eq!(a, None);
 
         // Indexed UDP flow: B with the caller's own TN, never A.
-        q.stack.index_stir_flow(aor, src, AddrTransport::Udp).await;
+        q.stack
+            .index_stir_flow(aor, src, AddrTransport::Udp, None)
+            .await;
         let (a, orig) = forwarded_attest(&udp("sec9-udp@test").await);
         assert_eq!(a, Some(proto_stir_shaken::Attestation::Partial));
         assert_eq!(orig.as_deref(), Some("12025550100"));
@@ -13896,12 +13974,13 @@ pub(crate) mod tests {
              Expires: 300\r\n\
              Content-Length: 0\r\n\r\n"
         ));
+        let conn = Some(crate::stir_binding::ConnId::next());
         let _ = stack
-            .process_message_on(&reg, src, None, AddrTransport::Tls)
+            .process_message_conn(&reg, src, None, AddrTransport::Tls, conn)
             .await;
         assert_eq!(
             stack
-                .stir_endpoint_binding(src, AddrTransport::Tls, "sip:+12025550100@sbc.local")
+                .stir_endpoint_binding(src, AddrTransport::Tls, conn, "sip:+12025550100@sbc.local")
                 .await,
             Some(Some("+12025550100".to_owned()))
         );
@@ -13929,12 +14008,13 @@ pub(crate) mod tests {
                 if expires == 0 { 2 } else { 1 }
             ))
         };
+        let conn = Some(crate::stir_binding::ConnId::next());
         let _ = stack
-            .process_message_on(&reg(300), src, None, AddrTransport::Tcp)
+            .process_message_conn(&reg(300), src, None, AddrTransport::Tcp, conn)
             .await;
         let key = crate::stir_binding::flow_key(src.ip(), src.port(), AddrTransport::Tcp);
         assert_eq!(
-            stack.stir_flows.read().await.get(&key),
+            stack.stir_flows.read().await.get(&key, conn),
             Some(&["sip:alice@sbc.local".to_owned()][..])
         );
         // The declared (private) Contact is not the flow: the latched
@@ -13945,11 +14025,314 @@ pub(crate) mod tests {
             &key
         ));
         let other = crate::stir_binding::flow_key(src.ip(), src.port(), AddrTransport::Udp);
-        assert!(stack.stir_flows.read().await.get(&other).is_none());
+        assert!(stack.stir_flows.read().await.get(&other, None).is_none());
         let _ = stack
-            .process_message_on(&reg(0), src, None, AddrTransport::Tcp)
+            .process_message_conn(&reg(0), src, None, AddrTransport::Tcp, conn)
             .await;
-        assert!(stack.stir_flows.read().await.get(&key).is_none());
+        assert!(stack.stir_flows.read().await.get(&key, conn).is_none());
+    }
+
+    /// REGISTER over TLS from `src` on connection `conn` (connection-binding tests).
+    async fn poam36_register(
+        stack: &SipStack,
+        src: SbcSocketAddr,
+        conn: Option<crate::stir_binding::ConnId>,
+        transport: AddrTransport,
+    ) {
+        let t = if transport == AddrTransport::Udp {
+            "udp"
+        } else {
+            "tls"
+        };
+        let reg = Bytes::from(format!(
+            "REGISTER sip:sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/{} {src};branch=z9hG4bK-p36-{}\r\n\
+             From: <sip:+12025550100@sbc.local>;tag=r\r\n\
+             To: <sip:+12025550100@sbc.local>\r\n\
+             Call-ID: reg-p36-{}@test\r\n\
+             CSeq: 1 REGISTER\r\n\
+             Contact: <sip:+12025550100@10.0.0.7:5061;transport={t}>\r\n\
+             Expires: 300\r\n\
+             Content-Length: 0\r\n\r\n",
+            t.to_ascii_uppercase(),
+            conn.map_or(0, |_| 1),
+            src.port(),
+        ));
+        let _ = stack
+            .process_message_conn(&reg, src, None, transport, conn)
+            .await;
+    }
+
+    /// A signing stack with REGISTER auth required (digest itself is not
+    /// exercised: the registrar accepts the test REGISTER as is).
+    async fn poam36_stack() -> QaStir {
+        let mut q = qa_stir_stack_with(
+            sbc_config::StirFailurePolicy::Mark,
+            0,
+            500,
+            false,
+            false,
+            |c| c.stir_shaken.attestation.owned_numbers = vec!["+1202555*".into()],
+        )
+        .await;
+        q.stack.config.require_auth = true;
+        q
+    }
+
+    /// Connection binding (a): a new TLS connection on the same CGNAT address does
+    /// not inherit attestation A, whether or not the old one closed.
+    #[tokio::test]
+    async fn poam36_new_connection_same_address_not_a() {
+        use crate::stir_binding::ConnId;
+        let q = poam36_stack().await;
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 20), 40_100);
+        let (c1, c2) = (Some(ConnId::next()), Some(ConnId::next()));
+        poam36_register(&q.stack, src, c1, AddrTransport::Tls).await;
+        let from = "sip:+12025550100@sbc.local";
+        // c1 still open, c2 reuses the address: unauthenticated.
+        assert_eq!(
+            q.stack
+                .stir_endpoint_binding(src, AddrTransport::Tls, c2, from)
+                .await,
+            None
+        );
+        let (a, _) = forwarded_attest(
+            &send_conn(
+                &q.stack,
+                "p36-open@test",
+                src,
+                "+12025550100",
+                AddrTransport::Tls,
+                c2,
+                None,
+            )
+            .await,
+        );
+        assert_ne!(a, Some(proto_stir_shaken::Attestation::Full));
+        // c1 closes, c2 still has not registered: unauthenticated.
+        if let Some(c) = c1 {
+            q.stack.connection_closed(c).await;
+        }
+        assert_eq!(
+            q.stack
+                .stir_endpoint_binding(src, AddrTransport::Tls, c2, from)
+                .await,
+            None
+        );
+        let (a, _) = forwarded_attest(
+            &send_conn(
+                &q.stack,
+                "p36-closed@test",
+                src,
+                "+12025550100",
+                AddrTransport::Tls,
+                c2,
+                None,
+            )
+            .await,
+        );
+        assert_ne!(a, Some(proto_stir_shaken::Attestation::Full));
+    }
+
+    /// Connection binding (b): REGISTER and INVITE on the same connection attest A.
+    #[tokio::test]
+    async fn poam36_same_connection_attests_a() {
+        let q = poam36_stack().await;
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 21), 40_101);
+        let c1 = Some(crate::stir_binding::ConnId::next());
+        poam36_register(&q.stack, src, c1, AddrTransport::Tls).await;
+        let (a, orig) = forwarded_attest(
+            &send_conn(
+                &q.stack,
+                "p36-same@test",
+                src,
+                "+12025550100",
+                AddrTransport::Tls,
+                c1,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(a, Some(proto_stir_shaken::Attestation::Full));
+        assert_eq!(orig.as_deref(), Some("12025550100"));
+    }
+
+    /// Connection binding (c): closing the connection drops its flow entry.
+    #[tokio::test]
+    async fn poam36_entry_removed_on_close() {
+        let q = poam36_stack().await;
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 22), 40_102);
+        let c1 = crate::stir_binding::ConnId::next();
+        poam36_register(&q.stack, src, Some(c1), AddrTransport::Tls).await;
+        assert_eq!(q.stack.stir_flows.read().await.len(), 1);
+        q.stack.connection_closed(c1).await;
+        assert_eq!(q.stack.stir_flows.read().await.len(), 0);
+    }
+
+    /// Connection binding (d): UDP keeps address matching (no connection id) and
+    /// stays capped at B.
+    #[tokio::test]
+    async fn poam36_udp_unchanged() {
+        let q = poam36_stack().await;
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 23), 40_103);
+        poam36_register(&q.stack, src, None, AddrTransport::Udp).await;
+        let (a, orig) = forwarded_attest(
+            &send_conn(
+                &q.stack,
+                "p36-udp@test",
+                src,
+                "+12025550100",
+                AddrTransport::Udp,
+                None,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(a, Some(proto_stir_shaken::Attestation::Partial));
+        assert_eq!(orig.as_deref(), Some("12025550100"));
+    }
+
+    /// QA: REGISTER from `src` on `conn` with an explicit CSeq/Expires (refresh,
+    /// de-register) over TCP or TLS.
+    async fn poam36_register_ex(
+        stack: &SipStack,
+        src: SbcSocketAddr,
+        conn: Option<crate::stir_binding::ConnId>,
+        transport: AddrTransport,
+        cseq: u32,
+        expires: u32,
+    ) {
+        let t = if transport == AddrTransport::Tcp {
+            "tcp"
+        } else {
+            "tls"
+        };
+        let reg = Bytes::from(format!(
+            "REGISTER sip:sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/{} {src};branch=z9hG4bK-p36x-{cseq}-{}\r\n\
+             From: <sip:+12025550100@sbc.local>;tag=r\r\n\
+             To: <sip:+12025550100@sbc.local>\r\n\
+             Call-ID: reg-p36x-{}@test\r\n\
+             CSeq: {cseq} REGISTER\r\n\
+             Contact: <sip:+12025550100@10.0.0.7:5061;transport={t}>\r\n\
+             Expires: {expires}\r\n\
+             Content-Length: 0\r\n\r\n",
+            t.to_ascii_uppercase(),
+            src.port(),
+            src.port(),
+        ));
+        let _ = stack
+            .process_message_conn(&reg, src, None, transport, conn)
+            .await;
+    }
+
+    /// QA (POA&M-36): a REGISTER refresh on the same connection keeps one entry
+    /// and attestation A.
+    #[tokio::test]
+    async fn poam36_qa_refresh_same_conn_keeps_a() {
+        let q = poam36_stack().await;
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 30), 40_130);
+        let c1 = Some(crate::stir_binding::ConnId::next());
+        poam36_register_ex(&q.stack, src, c1, AddrTransport::Tls, 1, 300).await;
+        poam36_register_ex(&q.stack, src, c1, AddrTransport::Tls, 2, 300).await;
+        assert_eq!(q.stack.stir_flows.read().await.len(), 1);
+        let (a, _) = forwarded_attest(
+            &send_conn(
+                &q.stack,
+                "p36-refresh@test",
+                src,
+                "+12025550100",
+                AddrTransport::Tls,
+                c1,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(a, Some(proto_stir_shaken::Attestation::Full));
+    }
+
+    /// QA (POA&M-36): after de-REGISTER (Expires: 0) on the connection, an
+    /// INVITE on that same connection is no longer bound (live recheck).
+    #[tokio::test]
+    async fn poam36_qa_deregister_drops_a() {
+        let q = poam36_stack().await;
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 31), 40_131);
+        let c1 = Some(crate::stir_binding::ConnId::next());
+        poam36_register_ex(&q.stack, src, c1, AddrTransport::Tls, 1, 300).await;
+        poam36_register_ex(&q.stack, src, c1, AddrTransport::Tls, 2, 0).await;
+        assert_eq!(
+            q.stack
+                .stir_endpoint_binding(src, AddrTransport::Tls, c1, "sip:+12025550100@sbc.local")
+                .await,
+            None
+        );
+    }
+
+    /// QA (POA&M-36): the binding moves to a new connection on the same address;
+    /// the old connection's late close does not remove it, and the old
+    /// connection no longer matches.
+    #[tokio::test]
+    async fn poam36_qa_binding_moves_old_close_keeps_new() {
+        use crate::stir_binding::ConnId;
+        let q = poam36_stack().await;
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 32), 40_132);
+        let (c1, c2) = (ConnId::next(), ConnId::next());
+        let from = "sip:+12025550100@sbc.local";
+        poam36_register_ex(&q.stack, src, Some(c1), AddrTransport::Tls, 1, 300).await;
+        poam36_register_ex(&q.stack, src, Some(c2), AddrTransport::Tls, 2, 300).await;
+        assert_eq!(
+            q.stack
+                .stir_endpoint_binding(src, AddrTransport::Tls, Some(c1), from)
+                .await,
+            None
+        );
+        q.stack.connection_closed(c1).await;
+        assert_eq!(q.stack.stir_flows.read().await.len(), 1);
+        let (a, _) = forwarded_attest(
+            &send_conn(
+                &q.stack,
+                "p36-moved@test",
+                src,
+                "+12025550100",
+                AddrTransport::Tls,
+                Some(c2),
+                None,
+            )
+            .await,
+        );
+        assert_eq!(a, Some(proto_stir_shaken::Attestation::Full));
+        q.stack.connection_closed(c2).await;
+        assert_eq!(q.stack.stir_flows.read().await.len(), 0);
+    }
+
+    /// QA (POA&M-36): plain TCP behaves like TLS: same conn A, other conn not A.
+    #[tokio::test]
+    async fn poam36_qa_tcp_variant() {
+        use crate::stir_binding::ConnId;
+        let q = poam36_stack().await;
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 33), 40_133);
+        let (c1, c2) = (Some(ConnId::next()), Some(ConnId::next()));
+        poam36_register_ex(&q.stack, src, c1, AddrTransport::Tcp, 1, 300).await;
+        let from = "sip:+12025550100@sbc.local";
+        assert!(
+            q.stack
+                .stir_endpoint_binding(src, AddrTransport::Tcp, c1, from)
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            q.stack
+                .stir_endpoint_binding(src, AddrTransport::Tcp, c2, from)
+                .await,
+            None
+        );
+        // TLS lookup on the same address does not match a TCP entry.
+        assert_eq!(
+            q.stack
+                .stir_endpoint_binding(src, AddrTransport::Tls, c1, from)
+                .await,
+            None
+        );
     }
 
     /// NIST-009: verification failures are audited once per (trunk, reason)
