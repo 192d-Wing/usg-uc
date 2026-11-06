@@ -270,6 +270,7 @@ impl Runtime {
             return Ok(ConfigReloadResult {
                 success: false,
                 changes: Vec::new(),
+                restart_required: Vec::new(),
                 message: "Config file not found".to_string(),
             });
         }
@@ -282,6 +283,7 @@ impl Runtime {
         // Compare with current config to identify changes
         let current = self.config.read().await;
         let changes = Self::detect_config_changes(&current, &new_config);
+        let restart_required = Self::detect_restart_required(&current, &new_config);
 
         // Log what changed
         if changes.is_empty() {
@@ -289,6 +291,7 @@ impl Runtime {
             return Ok(ConfigReloadResult {
                 success: true,
                 changes: Vec::new(),
+                restart_required: Vec::new(),
                 message: "No changes detected".to_string(),
             });
         }
@@ -303,11 +306,49 @@ impl Runtime {
             "Configuration reloaded successfully"
         );
 
+        // NIST 800-53 Rev5: CM-6, SC-8 — the running router keeps its
+        // trunk groups and `require_tls` policy until restart; say so rather
+        // than claim the change is applied (POA&M-48).
+        let message = if restart_required.is_empty() {
+            "Configuration reloaded".to_string()
+        } else {
+            warn!(
+                keys = ?restart_required,
+                "Configuration reloaded, but these settings take effect only after a restart"
+            );
+            format!(
+                "Configuration reloaded; restart required for: {}",
+                restart_required.join(", ")
+            )
+        };
+
         Ok(ConfigReloadResult {
             success: true,
             changes,
-            message: "Configuration reloaded".to_string(),
+            restart_required,
+            message,
         })
+    }
+
+    /// Changed settings a reload does not apply to the running SIP stack.
+    fn detect_restart_required(old: &SbcConfig, new: &SbcConfig) -> Vec<String> {
+        let mut keys = Vec::new();
+        if old.security.require_tls_trunks != new.security.require_tls_trunks {
+            keys.push("security.require_tls_trunks".to_string());
+        }
+        if old.trunk_groups != new.trunk_groups {
+            let tls_changed = old.trunk_groups.len() != new.trunk_groups.len()
+                || old
+                    .trunk_groups
+                    .iter()
+                    .zip(&new.trunk_groups)
+                    .any(|(a, b)| a.id != b.id || a.require_tls != b.require_tls);
+            if tls_changed {
+                keys.push("trunk_groups.require_tls".to_string());
+            }
+            keys.push("trunk_groups".to_string());
+        }
+        keys
     }
 
     /// Detects which configuration sections changed.
@@ -1380,6 +1421,9 @@ pub struct ConfigReloadResult {
     pub success: bool,
     /// List of changed configuration sections.
     pub changes: Vec<String>,
+    /// Changed settings that are stored but only take effect after a
+    /// restart (e.g. `security.require_tls_trunks`, `trunk_groups`).
+    pub restart_required: Vec<String>,
     /// Human-readable message.
     pub message: String,
 }
@@ -1546,11 +1590,40 @@ mod tests {
         assert!(changes.contains(&"general".to_string()));
     }
 
+    // SEC-001 / QA-1: require_tls and trunk-group edits are restart-only.
+    #[test]
+    fn reload_reports_require_tls_as_restart_required() {
+        let old = SbcConfig::default();
+        let mut new = old.clone();
+        assert_eq!(
+            Runtime::detect_restart_required(&old, &new),
+            Vec::<String>::new()
+        );
+        new.security.require_tls_trunks = true;
+        assert_eq!(
+            Runtime::detect_restart_required(&old, &new),
+            vec!["security.require_tls_trunks".to_string()]
+        );
+        let mut new = old.clone();
+        new.trunk_groups.push(sbc_config::TrunkGroupConfig {
+            id: "g".to_string(),
+            name: "g".to_string(),
+            strategy: "priority".to_string(),
+            trunks: Vec::new(),
+            zone: None,
+            require_tls: true,
+        });
+        let keys = Runtime::detect_restart_required(&old, &new);
+        assert!(keys.contains(&"trunk_groups".to_string()), "{keys:?}");
+        assert!(keys.contains(&"trunk_groups.require_tls".to_string()));
+    }
+
     #[test]
     fn test_config_reload_result() {
         let result = ConfigReloadResult {
             success: true,
             changes: vec!["general".to_string(), "logging".to_string()],
+            restart_required: Vec::new(),
             message: "Configuration reloaded".to_string(),
         };
 

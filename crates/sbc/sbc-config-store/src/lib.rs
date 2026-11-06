@@ -26,6 +26,7 @@ pub mod phones;
 pub mod sbc;
 pub mod schema;
 pub mod trunk_groups;
+pub mod trunk_policy;
 
 pub use dial_plans::PostgresDialPlanStore;
 pub use directory::PostgresDirectoryNumberStore;
@@ -42,3 +43,4 @@ pub use sbc::{
 };
 pub use schema::ensure_schema;
 pub use trunk_groups::PostgresTrunkGroupStore;
+pub use trunk_policy::{TrunkPolicyError, TrunkTransport, validate_trunk_group_json};
