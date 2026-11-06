@@ -54,8 +54,8 @@ pub use error::{RoutingError, RoutingResult};
 pub use partition::Partition;
 pub use route_list::{RouteList, RouteListMember};
 pub use route_pattern::RoutePattern;
-pub use router::{Router, RouterConfig, RoutingDecision, TlsPolicyCounters};
-pub use sbc_router::{SbcRouter, SbcRoutingResult};
+pub use router::{CallRouteContext, Router, RouterConfig, RoutingDecision, TlsPolicyCounters};
+pub use sbc_router::{SbcRouteOutcome, SbcRouter, SbcRoutingResult};
 pub use trunk::{
     Admission, SelectionStrategy, Trunk, TrunkConfig, TrunkGroup, TrunkOutcome, TrunkProtocol,
     TrunkState, default_emergency_reserve,

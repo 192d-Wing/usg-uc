@@ -82,19 +82,25 @@ DORMANT items before anyone wires them in.
 
 ### Call path: routing, VPS, auth (uc-routing, uc-vps, uc-policy, uc-auth, uc-aaa)
 
-- [ ] **MAJOR, LIVE — blocked route pattern falls through to the dial plan
+- [x] **MAJOR, LIVE — blocked route pattern falls through to the dial plan
   (confirmed).** `SbcRouter::route` returns `None` for a blocked match
   (`uc-routing/src/sbc_router.rs:186`), and `sip_stack.rs` (~2842-2884) treats
   that as "no match" and tries the dial plan and default trunk group. A blocked
   `1900` prefix still reaches PSTN. Fix: tri-state `Routed`/`Blocked`/`NoMatch`,
   403 on `Blocked`, no fallback; daemon test. `docs/route-patterns.md:67,97`
   overclaims.
-- [ ] **MAJOR, LIVE — dial-plan `direction` / `source_trunk` / `domain_pattern`
+  Fixed 2026-11-06 (PR 172):
+  `SbcRouteOutcome`, 403, docs corrected. Residual: a `+1900` block
+  does not catch national `1900…` (write blocks without `+`).
+- [x] **MAJOR, LIVE — dial-plan `direction` / `source_trunk` / `domain_pattern`
   ignored.** Config sets them but the router only calls `DialPlan::match_number`
   (`router.rs:698`); `match_extended` has no callers. Trunk-to-trunk relay into
   outbound-only entries. Fix: pass direction, source trunk and R-URI host into
   `route_for_tls` and use `match_extended`. Admin guide (~227, 243-264) overclaims.
-- [ ] **MAJOR, LIVE — emergency classification and routing normalise numbers
+  Fixed 2026-11-06 (PR 172):
+  `Router::route_call`; `default_trunk_group` now outbound-only.
+  Residual: REST JSON dial plans still carry no filters.
+- [x] **MAJOR, LIVE — emergency classification and routing normalise numbers
   differently.** VPS `emergency.rs` strips `+ - . ( )` and spaces; routing uses
   the raw R-URI user. `9-1-1` / `+911` gets `EmergencyBypass` (skips blocklist,
   rate limit, per-callee cap, STIR screening, deny rules, uses the emergency
@@ -102,17 +108,24 @@ DORMANT items before anyone wires them in.
   (separators, `%xx`, `;phone-context`, E.164 rule) and feed VPS and routing the
   same string; reject or force-route emergency-classified calls that don't hit
   an emergency pattern.
-- [ ] **MAJOR, LIVE — VPS prefix rules, caller blocklist and per-callee cap
+  Fixed 2026-11-06 (PR 172):
+  `uc-types::DialedNumber`, `routing.emergency_trunk_group`, 503 on
+  unrouted emergency. Residuals: phone-context dropped (POA&M-100),
+  `urn:service:sos` not classified, emergency INVITE flood (POA&M-103).
+- [x] **MAJOR, LIVE — VPS prefix rules, caller blocklist and per-callee cap
   compare raw strings** (`uc-vps/src/engine.rs:97`, `blocklist.rs:68`,
   `call_limiter`). `+1900…` / `1-900…` evade a `1900` deny; alternate textual
   forms evade the per-callee cap. Fix: same canonicaliser as above, applied to
   configured prefixes at load.
+  Fixed 2026-11-06 (PR 172).
 - [ ] **MAJOR, LIVE — management-API HMAC signing key has no minimum length**
   (`uc-auth/src/lib.rs` `from_env`). Fix: reject < 32 bytes (prefer 48), zeroize,
   bound `SBC_AUTH_TOKEN_TTL_SECS`; consider `iat`/`nbf`, audience, revocation.
-- [ ] **MINOR, LIVE — unknown `pattern_type` silently becomes a prefix**
+- [x] **MINOR, LIVE — unknown `pattern_type` silently becomes a prefix**
   (`runtime.rs:876`, `sip_stack.rs:3600`), so a mistyped block does nothing.
   Reject at config load and in the API (400).
+  Fixed 2026-11-06 (PR 172):
+  `DialPattern::from_kind`, API 400, sync/seed skip.
 - [ ] **MINOR, LIVE — STI fetch pool can be starved** when
   `stir_shaken.verification.allow_hosts` is empty (`uc-sti/src/cache.rs:368`).
   Require or loudly warn on empty `allow_hosts`; per-source fetch budget.
@@ -240,10 +253,14 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
   buckets; a spoofed or rotated flood locks out all untracked legitimate
   sources. Key IPv6 by /64, unmap v4-mapped, overflow bucket instead of reject.
   fixed: IPv6 keyed per `ipv6_prefix_len` (default /64), v4-mapped unmapped, shared overflow bucket past the cap (fix/transport-dos-audit).
-- [ ] **MAJOR, LIVE — per-user rate limiter keyed on the unauthenticated From
+- [x] **MAJOR, LIVE — per-user rate limiter keyed on the unauthenticated From
   user, before auth, and rejects past 65,536 keys** (`sip_stack.rs:3256`).
   Targeted lockout via spoofed `From: victim`, or 503 for every new user after a
   spray. Key on authenticated identity (or source /64 + user) after auth.
+  Fixed 2026-11-06 (PR 172):
+  `user_limiter.rs`, AOR or /32,/64 + user keying, overflow
+  allowed untracked. Residuals: POA&M-101 (burst fixed 2.0), POA&M-102 (no From
+  user skips limiter), POA&M-103 (emergency bypass, no per-source alarm).
 - [x] **MAJOR, LIVE — every rate-limited packet writes an audit record**
   (`server.rs:41,1607,1627`), so a flood fills the audit queue and drops
   security records. Aggregate per (source, limit) and emit on state change.

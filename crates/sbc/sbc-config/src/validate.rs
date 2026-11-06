@@ -1059,6 +1059,21 @@ fn validate_routing(config: &SbcConfig) -> ConfigResult<()> {
         });
     }
 
+    // 47 CFR 9.16; NIST 800-53 Rev5: CM-6 — the emergency trunk group
+    // must exist, or every emergency call would be refused by routing.
+    if let Some(eg) = config
+        .routing
+        .as_ref()
+        .and_then(|r| r.emergency_trunk_group.as_deref())
+        && !group_ids.contains(eg)
+    {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "routing.emergency_trunk_group '{eg}' does not match any [[trunk_groups]] id"
+            ),
+        });
+    }
+
     for plan in &config.dial_plans {
         for entry in &plan.entries {
             validate_dial_plan_entry(&plan.id, entry, &group_ids, have_groups)?;
@@ -1066,6 +1081,50 @@ fn validate_routing(config: &SbcConfig) -> ConfigResult<()> {
     }
 
     Ok(())
+}
+
+/// Resolves a dial-plan `source_trunk` to a trunk-group id: a trunk-group
+/// id is returned as is; a trunk id resolves to the group containing it.
+/// `None` when it names neither (see [`routing_warnings`]).
+///
+/// ## NIST 800-53 Rev5: AC-4 (Information Flow Enforcement)
+#[must_use]
+pub fn resolve_source_trunk<'a>(config: &'a SbcConfig, id: &str) -> Option<&'a str> {
+    config
+        .trunk_groups
+        .iter()
+        .find(|g| g.id == id)
+        .or_else(|| {
+            config
+                .trunk_groups
+                .iter()
+                .find(|g| g.trunks.iter().any(|t| t.id == id))
+        })
+        .map(|g| g.id.as_str())
+}
+
+/// Non-fatal routing configuration problems, for the daemon to log at
+/// load: a dial-plan `source_trunk` naming no trunk group or trunk (the
+/// entry can then never match).
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings)
+#[must_use]
+pub fn routing_warnings(config: &SbcConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for plan in &config.dial_plans {
+        for entry in &plan.entries {
+            if let Some(st) = entry.source_trunk.as_deref()
+                && resolve_source_trunk(config, st).is_none()
+            {
+                out.push(format!(
+                    "dial plan '{}': source_trunk '{st}' matches no trunk group or trunk id; \
+                     the entry will never match",
+                    plan.id
+                ));
+            }
+        }
+    }
+    out
 }
 
 fn validate_dial_plan_entry(
@@ -2147,6 +2206,43 @@ max_passport_age_secs = 120
             entries: vec![entry],
         }];
         config
+    }
+
+    #[test]
+    fn emergency_trunk_group_must_exist() {
+        let mut config = SbcConfig::default();
+        config.trunk_groups = vec![trunk_group("default"), trunk_group("e911")];
+        config.routing = Some(crate::schema::RoutingConfig {
+            emergency_trunk_group: Some("e911".to_string()),
+            ..Default::default()
+        });
+        assert!(validate_config(&config).is_ok());
+        if let Some(r) = config.routing.as_mut() {
+            r.emergency_trunk_group = Some("nope".to_string());
+        }
+        assert_rejected(&config, "routing.emergency_trunk_group 'nope'");
+    }
+
+    #[test]
+    fn source_trunk_resolves_group_or_trunk_and_warns_on_unknown() {
+        let mut config = SbcConfig::default();
+        config.trunk_groups = vec![trunk_group("carriers")];
+        assert_eq!(resolve_source_trunk(&config, "carriers"), Some("carriers"));
+        assert_eq!(resolve_source_trunk(&config, "t1"), Some("carriers"));
+        assert_eq!(resolve_source_trunk(&config, "x"), None);
+        config.dial_plans = vec![DialPlanConfig {
+            id: "main".to_string(),
+            name: "Main".to_string(),
+            active: true,
+            entries: vec![DialPlanEntryConfig {
+                source_trunk: Some("ghost".to_string()),
+                trunk_group: "carriers".to_string(),
+                ..Default::default()
+            }],
+        }];
+        let w = routing_warnings(&config);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("ghost"));
     }
 
     #[test]

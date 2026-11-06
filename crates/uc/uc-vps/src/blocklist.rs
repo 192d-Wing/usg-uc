@@ -44,8 +44,13 @@ impl Blocklist {
 
     /// Blocks a caller-number prefix. `duration` of `None` blocks
     /// permanently. Re-blocking an existing prefix replaces its expiry.
+    ///
+    /// The prefix is stored canonical (`uc_types::canonical_prefix`), so
+    /// `+1-900` and `1900` are the same block.
+    ///
+    /// ## NIST 800-53 Rev5: AC-3, SI-10
     pub fn block_caller_prefix(&mut self, prefix: impl Into<String>, duration: Option<Duration>) {
-        let prefix = prefix.into();
+        let prefix = uc_types::canonical_prefix(&prefix.into());
         let expiry = duration.map(|d| Instant::now() + d);
         if let Some(entry) = self.caller_prefixes.iter_mut().find(|(p, _)| *p == prefix) {
             entry.1 = expiry;
@@ -56,7 +61,8 @@ impl Blocklist {
 
     /// Unblocks a caller-number prefix.
     pub fn unblock_caller_prefix(&mut self, prefix: &str) {
-        self.caller_prefixes.retain(|(p, _)| p != prefix);
+        let prefix = uc_types::canonical_prefix(prefix);
+        self.caller_prefixes.retain(|(p, _)| *p != prefix);
     }
 
     /// Whether a source IP is currently blocked.
@@ -64,8 +70,10 @@ impl Blocklist {
         self.sources.get(&source).is_some_and(is_active)
     }
 
-    /// Returns the blocking prefix if the caller number is blocked.
+    /// Returns the blocking prefix (canonical form) if the caller number
+    /// is blocked. `caller` is canonicalised before comparison.
     pub fn caller_block_match(&self, caller: &str) -> Option<&str> {
+        let caller = crate::emergency::screening_key(caller);
         self.caller_prefixes
             .iter()
             .find(|(prefix, expiry)| is_active(expiry) && caller.starts_with(prefix.as_str()))
@@ -129,7 +137,7 @@ mod tests {
         let mut bl = Blocklist::new();
         bl.block_caller_prefix("+1900", None);
 
-        assert_eq!(bl.caller_block_match("+19005551234"), Some("+1900"));
+        assert_eq!(bl.caller_block_match("+19005551234"), Some("1900"));
         assert_eq!(bl.caller_block_match("+12135551234"), None);
 
         bl.unblock_caller_prefix("+1900");
@@ -141,7 +149,19 @@ mod tests {
         let mut bl = Blocklist::new();
         bl.block_caller_prefix("+1900", Some(Duration::ZERO));
         bl.block_caller_prefix("+1900", None);
-        assert_eq!(bl.caller_block_match("+19005551234"), Some("+1900"));
+        assert_eq!(bl.caller_block_match("+19005551234"), Some("1900"));
         assert_eq!(bl.blocked_prefix_count(), 1);
+    }
+
+    #[test]
+    fn caller_prefix_is_canonical() {
+        let mut bl = Blocklist::new();
+        bl.block_caller_prefix("+1555", None);
+        assert!(bl.caller_block_match("15551234567").is_some());
+        assert!(bl.caller_block_match("1-555-123-4567").is_some());
+        assert!(bl.caller_block_match("%2B15551234567").is_some());
+        bl.block_caller_prefix("+1-900", None);
+        assert_eq!(bl.blocked_prefix_count(), 2);
+        assert_eq!(bl.caller_block_match("1 (900) 555 1212"), Some("1900"));
     }
 }
