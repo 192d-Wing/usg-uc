@@ -17,6 +17,8 @@ proto-stir-shaken.workspace = true
 # CNSA-EXCEPTION: ATIS-1000074 mandates ES256 (P-256) for SHAKEN PASSporTs.
 uc-crypto = { workspace = true, features = ["stir-shaken-es256"] }
 uc-types.workspace = true
+# CNSA 2.0 rustls provider for the x5u fetch client (POA&M-40).
+uc-transport = { workspace = true, features = ["tls"] }
 tokio = { workspace = true, features = ["net", "time", "sync", "rt", "fs"] }
 tokio-rustls.workspace = true
 rustls.workspace = true

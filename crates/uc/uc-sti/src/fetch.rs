@@ -112,16 +112,22 @@ impl HttpsFetcher {
         Self::tls_config(roots)
     }
 
-    /// TLS 1.2/1.3 client config on the aws-lc (FIPS) provider, explicitly
-    /// selected so a process with several rustls providers compiled in does
-    /// not fall back to ambiguity. TLS 1.2 stays enabled because public STI
-    /// certificate repositories are not all TLS 1.3; the cert chain itself is
+    /// TLS 1.2/1.3 client config on the CNSA 2.0 provider
+    /// (`uc_transport::tls::cnsa_provider`: aws-lc FIPS, AES-256-GCM only,
+    /// ML-KEM-1024 or P-384 only), explicitly selected so a process with
+    /// several rustls providers compiled in does not fall back to
+    /// ambiguity. TLS 1.2 stays enabled because public STI certificate
+    /// repositories are not all TLS 1.3; on 1.2 only
+    /// `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` is offered, so the
+    /// repository needs an ECDSA certificate. The cert chain itself is
     /// validated against the STI-CR anchors regardless.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-13
     ///
     /// # Errors
     /// If the provider rejects the protocol versions.
     pub fn tls_config(roots: rustls::RootCertStore) -> Result<Arc<rustls::ClientConfig>, String> {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = Arc::new(uc_transport::tls::cnsa_provider());
         Ok(Arc::new(
             rustls::ClientConfig::builder_with_provider(provider)
                 .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])

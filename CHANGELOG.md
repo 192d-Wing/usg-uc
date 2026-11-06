@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (trunk TLS, CDR syslog, STIR/SHAKEN x5u fetch, SIP-TLS listeners):**
+  TLS is now limited to CNSA 2.0 algorithms through the new shared
+  `uc_transport::tls::cnsa_provider()` (POA&M-26, POA&M-40). TLS 1.3 offers
+  only `TLS_AES_256_GCM_SHA384`; where TLS 1.2 is allowed
+  (`security.min_tls_version = "1.2"`, and always for x5u fetches) only
+  `ECDHE-ECDSA-AES256-GCM-SHA384`. Key exchange is ML-KEM-1024 (preferred)
+  or P-384; X25519, P-256 and the ML-KEM-768 hybrids are gone. Peers that
+  will stop connecting:
+  - SIP trunks and SIP-TLS clients (phones) that support only AES-128-GCM,
+    ChaCha20-Poly1305, X25519 or P-256, or that use TLS 1.2 with an RSA
+    certificate.
+  - RFC 5425 syslog collectors (`cdr.syslog`) with the same limits.
+  - STIR/SHAKEN certificate repositories (`x5u` hosts) with the same limits;
+    calls signed with their certificates then fail verification.
+
+  Check a peer with
+  `openssl s_client -connect host:port -tls1_3 -ciphersuites TLS_AES_256_GCM_SHA384 -groups secp384r1`.
+  The REST HTTPS listener, daemon gRPC and the soft client are unchanged.
+
 ## [0.10.0] — 2026-11-06
 
 SBC release with three operator-breaking changes: call detail records,

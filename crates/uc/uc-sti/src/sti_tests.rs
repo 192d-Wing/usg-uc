@@ -381,6 +381,16 @@ impl Resolve for LoopbackResolver {
 /// with `response` (raw HTTP/1.1 bytes). Returns the address and the TLS
 /// client config trusting its CA.
 async fn https_server(response: Vec<u8>) -> (std::net::SocketAddr, Arc<rustls::ClientConfig>) {
+    https_server_with(response, rustls::crypto::aws_lc_rs::default_provider()).await
+}
+
+/// As [`https_server`], with the server's crypto provider chosen by the
+/// test. The returned client config is the production x5u config
+/// ([`HttpsFetcher::tls_config`], CNSA 2.0).
+async fn https_server_with(
+    response: Vec<u8>,
+    server_provider: rustls::crypto::CryptoProvider,
+) -> (std::net::SocketAddr, Arc<rustls::ClientConfig>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -391,17 +401,15 @@ async fn https_server(response: Vec<u8>) -> (std::net::SocketAddr, Arc<rustls::C
         .unwrap()
         .signed_by(&srv_key, &ca_cert, &ca_key)
         .unwrap();
-    let server_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("tls versions")
-    .with_no_client_auth()
-    .with_single_cert(
-        vec![srv.der().clone()],
-        rustls_pki_types::PrivateKeyDer::Pkcs8(srv_key.serialize_der().into()),
-    )
-    .unwrap();
+    let server_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(server_provider))
+        .with_safe_default_protocol_versions()
+        .expect("tls versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![srv.der().clone()],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(srv_key.serialize_der().into()),
+        )
+        .unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -424,14 +432,42 @@ async fn https_server(response: Vec<u8>) -> (std::net::SocketAddr, Arc<rustls::C
     });
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca_cert.der().clone()).unwrap();
-    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("tls versions")
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    (addr, Arc::new(client))
+    (addr, HttpsFetcher::tls_config(roots).unwrap())
+}
+
+/// POA&M-40: the x5u client offers only CNSA 2.0 suites and groups.
+#[tokio::test]
+async fn x5u_tls_is_cnsa_only() {
+    use rustls::crypto::aws_lc_rs::{cipher_suite, kx_group};
+    let url = X5uUrl::parse("https://cert.example.com/sti.pem", &[]).unwrap();
+    let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
+
+    // A CNSA 2.0 repository (TLS 1.3, AES-256-GCM, ML-KEM-1024/P-384).
+    let (addr, tls) = https_server_with(ok.clone(), uc_transport::tls::cnsa_provider()).await;
+    let got = fetcher(addr, tls, 16384)
+        .fetch(&url, Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(got.body.as_ref(), b"ok");
+
+    // A repository offering only AES-128-GCM / ChaCha20 over X25519/P-256.
+    let weak = rustls::crypto::CryptoProvider {
+        cipher_suites: vec![
+            cipher_suite::TLS13_AES_128_GCM_SHA256,
+            cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        ],
+        kx_groups: vec![kx_group::X25519, kx_group::SECP256R1],
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    };
+    let (addr, tls) = https_server_with(ok, weak).await;
+    assert!(matches!(
+        fetcher(addr, tls, 16384)
+            .fetch(&url, Duration::from_secs(2))
+            .await
+            .unwrap_err(),
+        FetchError::Transport(_)
+    ));
 }
 
 fn fetcher(addr: std::net::SocketAddr, tls: Arc<rustls::ClientConfig>, max: usize) -> HttpsFetcher {

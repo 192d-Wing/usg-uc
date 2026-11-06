@@ -8632,6 +8632,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uc-crypto",
+ "uc-transport",
  "uc-types",
  "uuid",
  "zeroize",
