@@ -768,15 +768,13 @@ impl CdrObserver for AuditObserver {
 // POAM: NIST-06 (IA-3) no client certificate is presented, so the collector
 // cannot authenticate the SBC; add optional client identity (security.tls
 // cert/key) for mutually authenticated RFC 5425.
-// POAM: POA&M-26 (SC-13) `create_client_config` forces TLS 1.3 but does not
-// restrict cipher suites or key-exchange groups to the CNSA 2.0 set
-// (AES-256-GCM / P-384); restrict them before claiming SC-13 here.
-/// RFC 5425 TLS connector for the CDR syslog sink: TLS 1.3 only (via
-/// `uc_transport::tls::create_client_config`), with connect and I/O timeouts.
-/// Cipher suites are not yet limited to CNSA 2.0, and the SBC presents no
-/// client certificate (see the POA&M notes above).
+/// RFC 5425 TLS connector for the CDR syslog sink: TLS 1.3 only, CNSA 2.0
+/// suite and groups (`TLS_AES_256_GCM_SHA384`, ML-KEM-1024 or P-384, via
+/// `uc_transport::tls::create_client_config` / `cnsa_provider`), with
+/// connect and I/O timeouts. The SBC presents no client certificate (see
+/// the POA&M note above).
 ///
-/// ## NIST 800-53 Rev5: SC-8, AU-9(2)
+/// ## NIST 800-53 Rev5: SC-8, SC-13, AU-9(2)
 pub struct TlsSyslogConnector {
     host: String,
     port: u16,
@@ -1146,6 +1144,72 @@ mod tests {
             (Some("PCMU".into()), Some("DTLS-SRTP".into()))
         );
         assert_eq!(media_facts(b"\xff\x00garbage"), (None, None));
+    }
+
+    /// Starts a one-connection TLS collector on 127.0.0.1 with `provider`,
+    /// returning its port, the CA PEM file, and the server thread (which
+    /// yields whether the handshake completed).
+    #[allow(clippy::unwrap_used)]
+    fn tls_collector(
+        provider: rustls::crypto::CryptoProvider,
+    ) -> (u16, tempfile::NamedTempFile, std::thread::JoinHandle<bool>) {
+        let alg = &rcgen::PKCS_ECDSA_P384_SHA384;
+        let ca_key = rcgen::KeyPair::generate_for(alg).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let key = rcgen::KeyPair::generate_for(alg).unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .unwrap()
+            .signed_by(&key, &ca, &ca_key)
+            .unwrap();
+        let mut ca_file = tempfile::NamedTempFile::new().unwrap();
+        ca_file.write_all(ca.pem().as_bytes()).unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut conn = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+            while conn.is_handshaking() {
+                if conn.complete_io(&mut tcp).is_err() {
+                    return false;
+                }
+            }
+            true
+        });
+        (port, ca_file, handle)
+    }
+
+    /// POA&M-26: the RFC 5425 connector completes a handshake with a CNSA
+    /// 2.0 collector and refuses one offering only AES-128 / X25519.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn syslog_tls_is_cnsa_only() {
+        use rustls::crypto::aws_lc_rs::{cipher_suite, kx_group};
+        let (port, ca, server) = tls_collector(uc_transport::tls::cnsa_provider());
+        let mut c = TlsSyslogConnector::new(&format!("tls://127.0.0.1:{port}"), ca.path()).unwrap();
+        assert!(c.connect().is_ok());
+        assert!(server.join().unwrap());
+
+        let weak = rustls::crypto::CryptoProvider {
+            cipher_suites: vec![cipher_suite::TLS13_AES_128_GCM_SHA256],
+            kx_groups: vec![kx_group::X25519],
+            ..rustls::crypto::aws_lc_rs::default_provider()
+        };
+        let (port, ca, server) = tls_collector(weak);
+        let mut c = TlsSyslogConnector::new(&format!("tls://127.0.0.1:{port}"), ca.path()).unwrap();
+        assert!(c.connect().is_err());
+        assert!(!server.join().unwrap());
     }
 
     #[test]

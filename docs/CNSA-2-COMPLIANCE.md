@@ -21,7 +21,7 @@ CNSA 2.0 defines cryptographic algorithms approved for protecting classified inf
 | Digital Signatures | ECDSA P-384 | P-384 | `uc-crypto::ecdsa::P384KeyPair` | Library-only (no shipped caller; TLS/DTLS signatures are done by rustls / the DTLS sidecar) |
 | Key Exchange | ECDH P-384 | P-384 | `uc-crypto::ecdh::P384EphemeralKeyPair` | Library-only (no shipped caller) |
 | Key Derivation | HKDF-SHA384 | - | `uc-crypto::hkdf::hkdf_sha384` | Library-only (no shipped caller; SRTP uses the RFC 3711 KDF, see below) |
-| TLS | TLS 1.3 | - | rustls with aws-lc-rs (`uc-transport::tls`) | Wired (sbc-daemon SIP-TLS listeners, soft client). Protocol version is 1.3 only unless `security.min_tls_version = "1.2"`; cipher suites are **not** restricted (see SIP/TLS). |
+| TLS | TLS 1.3 | - | rustls with aws-lc-rs (`uc-transport::tls`) | Wired (sbc-daemon SIP-TLS listeners, soft client). Protocol version is 1.3 only unless `security.min_tls_version = "1.2"`. SBC configs use `uc_transport::tls::cnsa_provider()`: `TLS_AES_256_GCM_SHA384` (plus `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` on 1.2), ML-KEM-1024 or P-384 (see SIP/TLS). The soft client (`client-core/src/sip_transport.rs`) builds its own config and is not restricted. |
 
 ### Forbidden Algorithms
 
@@ -99,11 +99,14 @@ Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_ver
 ### SIP/TLS
 
 - **TLS Version**: Wired (sbc-daemon). SIP-over-TLS listeners are built with `uc_transport::tls::create_server_config_with` — TLS 1.3 only by default, TLS 1.2+1.3 when `security.min_tls_version = "1.2"`. Listeners are skipped (with a warning) when `security.tls_cert_path`/`tls_key_path` are unset.
-- **Cipher Suite**: **Not restricted** beyond the protocol version. `create_server_config`/`create_client_config` use `aws_lc_rs::default_provider()` without a `cipher_suites` or `kx_groups` filter, so `TLS_AES_128_GCM_SHA256`, `TLS_CHACHA20_POLY1305_SHA256`, X25519 and P-256 remain negotiable alongside `TLS_AES_256_GCM_SHA384`/P-384. Restricting to the CNSA suite is Planned.
+- **Cipher Suite**: Wired (uc-transport). `create_server_config`, `create_server_config_with`, `create_client_config` and `create_client_config_with` all build on `uc_transport::tls::cnsa_provider()`, the aws-lc-rs FIPS provider cut down to `TLS13_AES_256_GCM_SHA384` and, only when TLS 1.2 is enabled, `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`. AES-128, ChaCha20-Poly1305 and RSA suites are not offered or accepted.
+- **Key Exchange**: `MLKEM1024` (preferred), then `secp384r1`. X25519, P-256 and the X25519/P-256 + ML-KEM-768 hybrids are not offered or accepted. ML-KEM-1024 is the CNSA 2.0 key-establishment algorithm and is FIPS-approved in the aws-lc FIPS module (the configs report `fips() == true`). P-384 is kept so CNSA 1.0 peers still connect (one HelloRetryRequest round trip). The ML-KEM-768 hybrids are excluded because ML-KEM-768 is below CNSA 2.0's category 5 and X25519/P-256 are not CNSA algorithms. TLS 1.2 handshakes use P-384 (ML-KEM is TLS 1.3 only).
+- **Signature algorithms**: verification schemes are the provider defaults, so peers whose CA signs with RSA or P-256 still verify. On TLS 1.2 the peer's own certificate must be ECDSA.
+- Tests (`uc-transport/src/tls.rs`): `cnsa_provider_lists_only_cnsa_algorithms`, `cnsa_configs_are_fips`, `cnsa_client_and_server_agree_ml_kem_1024`, `cnsa_client_falls_back_to_p384_with_cnsa1_server`, `cnsa_server_accepts_cnsa1_client`, `cnsa_client_rejects_aes128_x25519_server`, `cnsa_client_rejects_x25519_only_server`, `cnsa_server_rejects_aes128_x25519_client`, `cnsa_server_rejects_x25519_only_client`, `tls12_is_limited_to_ecdhe_ecdsa_aes256_over_p384`, `client_config_with_rejects_weak_server_on_tls12`.
 - **REST HTTPS** (`sbc-daemon/src/api_server.rs`): uses `rustls::ServerConfig::builder()` with the process default provider — TLS 1.2 is permitted (workspace `rustls` enables the `tls12` feature) and suites are unrestricted. Planned: route through `uc-transport::tls`.
 - **Daemon gRPC / sbc-api channel** (`sbc-daemon/src/grpc_server/mod.rs` `configure_tls`, `sbc-api-server/src/state.rs`): tonic `ServerTlsConfig` / `ClientTlsConfig` with tonic's default rustls suites, so TLS 1.2 and 1.3, AES-128 and X25519 are allowed. This is not the uc-transport config. The Helm `grpcMtls` certificates are ECDSA P-384 (cert-manager), but the negotiated suite is not CNSA-restricted. NIST POA&M-16.
-- **CDR syslog (RFC 5425)** (`sbc-daemon/src/cdr.rs` `TlsSyslogConnector`): `uc_transport::tls::create_client_config`, so TLS 1.3 only, with the same unrestricted suites and groups as above. No client certificate is sent. NIST POA&M-15 and POA&M-26.
-- **Egress SIP trunk TLS** (`sbc-daemon/src/flows.rs`, `server.rs`; `uc_transport::tls::create_client_config_with`): Wired (sbc-daemon). Server certificates are always verified against `security.trunk_tls_ca_path` (required when any trunk is `tls`) for `tls_server_name` or the trunk host / IP SAN; verification cannot be disabled. `security.min_tls_version` applies (TLS 1.3 only by default). With per-trunk `tls_client_cert = true` the SBC presents `security.tls_cert_path` (optional mTLS). Suites and key-exchange groups are the aws-lc provider defaults, **not restricted** to CNSA (NIST POA&M-26). Tests: `flows::tests::tls_flow_dials_verified_trunk`, `tls_flow_never_downgrades_on_verify_failure`, `mtls_and_plain_flows_to_same_trunk_do_not_share_a_connection` (rcgen P-384 test CA; the negotiated suite is not asserted).
+- **CDR syslog (RFC 5425)** (`sbc-daemon/src/cdr.rs` `TlsSyslogConnector`): `uc_transport::tls::create_client_config`, so TLS 1.3 only, `TLS_AES_256_GCM_SHA384`, ML-KEM-1024 or P-384 (POA&M-26 closed; test `cdr::tests::syslog_tls_is_cnsa_only` handshakes with a CNSA collector and fails against an AES-128/X25519 one). No client certificate is sent (NIST POA&M-15).
+- **Egress SIP trunk TLS** (`sbc-daemon/src/flows.rs`, `server.rs`; `uc_transport::tls::create_client_config_with`): Wired (sbc-daemon). Server certificates are always verified against `security.trunk_tls_ca_path` (required when any trunk is `tls`) for `tls_server_name` or the trunk host / IP SAN; verification cannot be disabled. `security.min_tls_version` applies (TLS 1.3 only by default). With per-trunk `tls_client_cert = true` the SBC presents `security.tls_cert_path` (optional mTLS). Suites and key-exchange groups are the CNSA set from `uc_transport::tls::cnsa_provider()` (POA&M-26 closed); with `min_tls_version = "1.2"` a 1.2 trunk must offer `ECDHE-ECDSA-AES256-GCM-SHA384`, so it needs an ECDSA certificate. Tests: `flows::tests::tls_flow_dials_verified_trunk`, `tls_flow_never_downgrades_on_verify_failure`, `mtls_and_plain_flows_to_same_trunk_do_not_share_a_connection` (rcgen P-384 test CA; the negotiated suite is not asserted).
 - **Certificates**: P-384 ECDSA is the operational requirement, but it is **not enforced**; rustls accepts any certificate/key it can parse (P-256, RSA).
 - **Client mTLS**: Wired (sbc-daemon). `security.require_mtls` makes the SIP-TLS listener require a client certificate chaining to `security.tls_ca_path` (WebPKI verifier); `validate_config` rejects the flag without a CA bundle. The gRPC listener enforces its own `[grpc] require_mtls`.
 - **Implementation**: rustls with aws-lc-rs backend (`uc-transport`). The soft client (`client-core/src/sip_transport.rs`) also pins TLS 1.3 only.
@@ -130,7 +133,7 @@ Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_ver
 - **Algorithm confusion:** `ppt=shaken` PASSporTs with any `alg` other than ES256 (including `none` and ES384) are rejected (`proto-stir-shaken/src/passport.rs`).
 - **ES384:** reserved for bilateral profiles; `stir_shaken.algorithm = "ES384"` is rejected by validation in this release (POA&M-32).
 - **STI certificate chains:** validated with rustls-webpki (aws-lc FIPS provider) to the STI-CR anchors, ECDSA P-256/P-384 signatures only (`uc_crypto::x509`).
-- **x5u fetch TLS:** TLS 1.2/1.3 on the aws-lc provider (`uc-sti/src/fetch.rs` `tls_config`) against the system web PKI. Suites and key-exchange groups are the provider defaults: CNSA suites are neither required nor preferred (POA&M-40; same class of gap as POA&M-26). Public STI repositories do not all offer the CNSA suite; the fetched chain's trust comes from the STI-CR anchors, not the transport.
+- **x5u fetch TLS:** TLS 1.2/1.3 on `uc_transport::tls::cnsa_provider()` (`uc-sti/src/fetch.rs` `tls_config`) against the system web PKI: AES-256-GCM only, ML-KEM-1024 or P-384 only, and on TLS 1.2 `ECDHE-ECDSA-AES256-GCM-SHA384` only (POA&M-40 closed; test `sti_tests::x5u_tls_is_cnsa_only`). A certificate repository that offers only AES-128/ChaCha20, only X25519/P-256, or (on TLS 1.2) only an RSA certificate can no longer be fetched from, and calls signed with its certificates fail verification. The fetched chain's trust still comes from the STI-CR anchors.
 - **Implementation**: `proto-stir-shaken` (pure protocol), `uc-sti` (fetch/cache/anchors/signer), `sbc-daemon/src/stir.rs` (call path).
 
 ### JWT (OIDC Bearer REGISTER and Management API)
@@ -165,13 +168,13 @@ CNSA 2.0 mandates migration to post-quantum algorithms by 2033:
 
 | Function | Current | Future (2033) | Status |
 |----------|---------|---------------|--------|
-| Key Exchange | ECDH P-384 | ML-KEM-1024 | Planned |
+| Key Exchange | ECDH P-384 | ML-KEM-1024 | Wired for SBC TLS (preferred; P-384 fallback). Not for DTLS-SRTP or the soft client. |
 | Signatures | ECDSA P-384 | ML-DSA-87 | Planned |
 
 Current state of the migration path:
 
 - `uc-crypto` declares a `pqc` feature flag, but it is **empty** (`pqc = []`, no code behind it).
-- aws-lc-rs includes ML-KEM support; nothing in the workspace calls it yet.
+- SBC TLS (SIP-TLS, trunk TLS, CDR syslog, x5u fetch) offers ML-KEM-1024 first through `uc_transport::tls::cnsa_provider()`. DTLS-SRTP and `uc-crypto` do not use ML-KEM yet.
 - Key exchange abstractions in `uc-crypto` support algorithm agility (Library-only).
 
 ## Verification
