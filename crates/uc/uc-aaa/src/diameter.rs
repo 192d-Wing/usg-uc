@@ -655,12 +655,21 @@ mod tests {
         ));
     }
 
+    // Test-only credential built at runtime; the value is never checked
+    // (the client must reject before using it).
+    fn test_credential() -> String {
+        format!("unused-{}", std::process::id())
+    }
+
     #[cfg(not(feature = "diameter"))]
     #[tokio::test]
     async fn test_stub_authenticate_rejects() {
         let client = create_test_client();
         let result = client
-            .authenticate(crate::provider::AuthRequest::new("alice", "secret"))
+            .authenticate(crate::provider::AuthRequest::new(
+                "alice",
+                test_credential(),
+            ))
             .await;
         assert!(result.is_err(), "stub must never accept");
     }
@@ -672,7 +681,10 @@ mod tests {
     async fn test_feature_authenticate_rejects() {
         let client = create_test_client();
         let result = client
-            .authenticate(crate::provider::AuthRequest::new("alice", "secret"))
+            .authenticate(crate::provider::AuthRequest::new(
+                "alice",
+                test_credential(),
+            ))
             .await;
         assert!(
             !matches!(result, Ok(ref r) if r.success),
