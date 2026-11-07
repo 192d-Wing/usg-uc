@@ -329,6 +329,36 @@ helm uninstall sbc-<site-id> -n sbc-system
 > site's config/registration state. The SBC daemon runs a single replica per
 > site (`ReadWriteOnce`); upgrades are a brief restart, not a rolling handover.
 
+### Upgrading to the management-API hardening release (fix/mgmt-api-hardening)
+
+This upgrade has breaking changes. Check each point before you upgrade.
+
+- **Everyone must log in again.** Management API tokens are now `v2.`
+  (HMAC-SHA-384, with `aud` and `iat` claims). `v1.` tokens are rejected and
+  there is no fallback.
+- **`SBC_AUTH_SIGNING_KEY`** must be hex and decode to at least 32 bytes; 48
+  bytes is recommended (`openssl rand -hex 48`). A key that is set but empty,
+  is not hex, or is shorter than 32 bytes stops startup. Keys of 32 to 47 bytes
+  load with a warning. The chart generates a 48-byte key for new installs and
+  keeps an existing key on upgrade.
+- **`SBC_AUTH_TOKEN_TTL_SECS`** must be between 60 and 86400. Values outside
+  that range stop startup.
+- **`SBC_PROVISION_SECRET`** (only if set) must be hex and decode to at least
+  32 bytes (`openssl rand -hex 48`). Provisioning tokens are now HMAC-SHA-384,
+  so old 64-character `?token=` values return 403. Re-mint every phone's
+  provisioning URL token with `sbc-provision-server --mint-token <MAC>` (reads
+  `SBC_PROVISION_SECRET`, prints the token, exits 2 on error). Deployments that
+  use only CIDR allow-lists are not affected.
+- **Daemon REST API over HTTPS** is now TLS 1.3 only with the CNSA suite set,
+  whatever `security.min_tls_version` says. The key must match
+  `security.curve`, or the daemon will not start. It serves HTTP/1.1 only (no
+  HTTP/2) and limits connections: 256 concurrent, a 10 s handshake timeout, a
+  10 s header-read/idle timeout, and a 300 s maximum connection age.
+- **Certificate hot reload:** the daemon polls the REST API certificate and key
+  files every 30 s and reloads them when they change, so cert-manager renewals
+  apply without a restart. A failed reload keeps the old certificate in use;
+  watch `sbc_api_tls_cert_reload_failures_total`.
+
 ---
 
 ## 9. Multi-site rollout

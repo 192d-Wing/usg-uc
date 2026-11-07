@@ -92,6 +92,8 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hyper.workspace = true
 hyper-util.workspace = true
+# Constant-time SBC_API_TOKEN comparison (already in the tree via uc-auth).
+subtle = "2.6"
 
 # gRPC dependencies (optional)
 sbc-grpc-api = { workspace = true, optional = true }

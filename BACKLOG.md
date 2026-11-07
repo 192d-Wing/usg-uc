@@ -118,9 +118,12 @@ DORMANT items before anyone wires them in.
   forms evade the per-callee cap. Fix: same canonicaliser as above, applied to
   configured prefixes at load.
   Fixed 2026-11-06 (PR 172).
-- [ ] **MAJOR, LIVE — management-API HMAC signing key has no minimum length**
+- [x] **MAJOR, LIVE — management-API HMAC signing key has no minimum length**
   (`uc-auth/src/lib.rs` `from_env`). Fix: reject < 32 bytes (prefer 48), zeroize,
   bound `SBC_AUTH_TOKEN_TTL_SECS`; consider `iat`/`nbf`, audience, revocation.
+  Fixed 2026-11-07 (fix/mgmt-api-hardening): key at least 32 bytes (warn under
+  48), zeroized; TTL 60-86400; HMAC-SHA-384 `v2.` tokens with `aud`/`iat`.
+  Residuals: no revocation (POA&M-210), SHA-256 API-key digests (POA&M-211).
 - [x] **MINOR, LIVE — unknown `pattern_type` silently becomes a prefix**
   (`runtime.rs:876`, `sip_stack.rs:3600`), so a mistyped block does nothing.
   Reject at config load and in the API (400).
@@ -309,11 +312,16 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
   (`server.rs:41,1607,1627`), so a flood fills the audit queue and drops
   security records. Aggregate per (source, limit) and emit on state change.
   fixed: rate-limit audit aggregated per (source, limit) per interval, block/unblock on transition, per-interval cap (fix/transport-dos-audit).
-- [ ] **MAJOR, LIVE — REST API TLS is not CNSA and cert hot-reload is dead code**
+- [x] **MAJOR, LIVE — REST API TLS is not CNSA and cert hot-reload is dead code**
   (`sbc-daemon/src/api_server.rs:1174` uses the default provider;
   `ReloadableTlsAcceptor` never installed, `runtime.rs:564`). No TLS handshake
   timeout or connection cap on the API port either. Install the reloadable CNSA
   acceptor, timeout + semaphore; POA&M row (CNSA doc :106 discloses the gap).
+  Fixed 2026-11-07 (fix/mgmt-api-hardening): reloadable `cnsa_provider` TLS 1.3
+  acceptor with `security.curve`, 30 s file-poll reload, connection cap,
+  handshake/idle/age timeouts, HTTP/1.1 only. Residuals: plain-HTTP listener
+  unbounded (POA&M-212), unauthenticated without `SBC_API_TOKEN` (POA&M-213),
+  reloads not audited (POA&M-214).
 - [x] **MAJOR, LIVE (client) — soft client TLS uses the default aws-lc provider,
   not `cnsa_provider()`** (`client-core/src/sip_transport.rs:722`).
   Fixed: SIP-TLS and provisioning HTTPS use `cnsa_provider()` (debug-only provisioning Insecure mode excepted); verifier builders tracked as POA&M-173 (fix/client-cnsa-tls-dns).
@@ -416,9 +424,12 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
 - [x] **MAJOR, LIVE — SHA-256 HA1 not listed as a CNSA exception**
   (`uc-user-mgmt/src/digest.rs`). Fixed 2026-11-06 (ha1-users-authz): POA&M-110,
   `CNSA-EXCEPTION` marker, CNSA-2-COMPLIANCE.md.
-- [ ] **MAJOR, LIVE — HMAC-SHA256 provisioning tokens not listed as a CNSA
+- [x] **MAJOR, LIVE — HMAC-SHA256 provisioning tokens not listed as a CNSA
   exception** (`sbc-provision-server/src/main.rs:314`; split from the HA1 item
   above). Record as an exception with POA&M, or move the HMAC to SHA-384.
+  Fixed 2026-11-07 (fix/mgmt-api-hardening): moved to HMAC-SHA-384 with a hex
+  secret of at least 32 bytes and `--mint-token`; no exception needed.
+  Expiry/revocation remain POA&M-120.
 - [x] **MINOR, LIVE — dropped audit records leave no trace in the chain**
   (sequence assigned in the writer). Emit an `AuditRecordsDropped{count}` record.
   Fixed 2026-11-06 (uc-audit-integrity): markers for queue-full, sink-write

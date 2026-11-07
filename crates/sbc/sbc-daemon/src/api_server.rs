@@ -36,20 +36,20 @@ use axum::{Json, Router, extract::State, http::StatusCode, response::IntoRespons
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use hyper_util::service::TowerToHyperService;
-use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uc_health::{ComponentStatus, SystemHealth};
 use uc_metrics::MetricRegistry;
 use uc_transport::cert_reload::ReloadableTlsAcceptor;
+use uc_transport::tls::RequiredKeyCurve;
+use uc_types::protocol::CnsaCurve;
 
 use crate::server::ServerStats;
 use crate::shutdown::ShutdownSignal;
@@ -60,19 +60,23 @@ use crate::shutdown::ShutdownSignal;
 /// warning is logged at startup).
 static API_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
-fn expected_api_token() -> &'static Option<String> {
-    API_TOKEN.get_or_init(|| {
-        let tok = std::env::var("SBC_API_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty());
-        if tok.is_none() {
-            warn!(
-                "SBC_API_TOKEN not set — daemon REST API is unauthenticated. \
+// POAM: POA&M-213 — when SBC_API_TOKEN is unset the daemon REST data
+// endpoints are unauthenticated (warn only); IA-2 / AC-3.
+fn expected_api_token() -> Option<&'static str> {
+    API_TOKEN
+        .get_or_init(|| {
+            let tok = std::env::var("SBC_API_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty());
+            if tok.is_none() {
+                warn!(
+                    "SBC_API_TOKEN not set — daemon REST API is unauthenticated. \
                    Set SBC_API_TOKEN to require bearer-token auth on data endpoints."
-            );
-        }
-        tok
-    })
+                );
+            }
+            tok
+        })
+        .as_deref()
 }
 
 async fn api_auth_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
@@ -82,7 +86,7 @@ async fn api_auth_middleware(req: Request<axum::body::Body>, next: Next) -> Resp
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .is_some_and(|t| t == expected);
+            .is_some_and(|t| api_token_matches(t, expected));
         if !authorized {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -93,6 +97,52 @@ async fn api_auth_middleware(req: Request<axum::body::Body>, next: Next) -> Resp
     }
     next.run(req).await
 }
+
+/// Constant-time bearer-token comparison (length is not secret).
+///
+/// NIST 800-53 Rev5: IA-2 / IA-5 — no early-exit timing oracle.
+fn api_token_matches(presented: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    presented.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1
+}
+
+/// TLS handshake deadline on the REST HTTPS listener.
+///
+/// NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection).
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum concurrent REST HTTPS connections (handshake + serving).
+///
+/// NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection).
+pub const MAX_API_TLS_CONNECTIONS: usize = 256;
+/// HTTP/1 request-header read deadline after the handshake (slowloris).
+///
+/// hyper arms this timer whenever the connection waits for a request head,
+/// including the keep-alive gap between requests, so it is also the idle
+/// timeout for an established REST HTTPS connection.
+///
+/// NIST 800-53 Rev5: SC-5, SC-10 (Network Disconnect).
+pub const API_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum lifetime of one REST HTTPS connection. On expiry the connection
+/// is shut down gracefully (in-flight request finishes, keep-alive ends) and
+/// is force-closed after [`API_CONN_DRAIN_GRACE`], releasing its cap permit.
+///
+/// NIST 800-53 Rev5: SC-5, SC-10 (Network Disconnect).
+pub const MAX_API_CONNECTION_AGE: Duration = Duration::from_secs(300);
+/// Grace period after [`MAX_API_CONNECTION_AGE`] before a force close.
+pub const API_CONN_DRAIN_GRACE: Duration = Duration::from_secs(10);
+/// Poll interval for REST TLS certificate/key file changes.
+///
+/// NIST 800-53 Rev5: SC-17 (Public Key Infrastructure Certificates).
+pub const TLS_RELOAD_POLL: Duration = Duration::from_secs(30);
+
+/// Counter: REST TLS handshakes that exceeded [`TLS_HANDSHAKE_TIMEOUT`].
+pub const METRIC_API_TLS_HANDSHAKE_TIMEOUTS: &str = "api_tls_handshake_timeouts_total";
+/// Counter: REST TLS connections shed because the connection cap was full.
+pub const METRIC_API_TLS_CONN_REJECTED: &str = "api_tls_connections_rejected_total";
+/// Counter: successful REST TLS certificate reloads.
+pub const METRIC_API_TLS_RELOADS: &str = "api_tls_cert_reloads_total";
+/// Counter: failed REST TLS certificate reloads (old certificate kept).
+pub const METRIC_API_TLS_RELOAD_FAILURES: &str = "api_tls_cert_reload_failures_total";
 
 /// API server configuration.
 #[derive(Debug, Clone)]
@@ -111,6 +161,17 @@ pub struct ApiServerConfig {
     pub api_version: String,
     /// TLS configuration (cert + key paths). Required for HTTPS.
     pub tls: Option<TlsConfig>,
+    /// TLS handshake deadline (default [`TLS_HANDSHAKE_TIMEOUT`]).
+    pub tls_handshake_timeout: Duration,
+    /// Concurrent HTTPS connection cap (default [`MAX_API_TLS_CONNECTIONS`]).
+    pub max_tls_connections: usize,
+    /// Certificate change poll interval (default [`TLS_RELOAD_POLL`]).
+    pub tls_reload_poll: Duration,
+    /// Request-head / keep-alive idle deadline (default
+    /// [`API_HEADER_READ_TIMEOUT`]).
+    pub tls_idle_timeout: Duration,
+    /// Maximum HTTPS connection lifetime (default [`MAX_API_CONNECTION_AGE`]).
+    pub max_tls_connection_age: Duration,
 }
 
 /// TLS configuration for the API server.
@@ -132,6 +193,11 @@ impl Default for ApiServerConfig {
             enable_cors: false,
             api_version: "v1".to_string(),
             tls: None,
+            tls_handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
+            max_tls_connections: MAX_API_TLS_CONNECTIONS,
+            tls_reload_poll: TLS_RELOAD_POLL,
+            tls_idle_timeout: API_HEADER_READ_TIMEOUT,
+            max_tls_connection_age: MAX_API_CONNECTION_AGE,
         }
     }
 }
@@ -506,6 +572,22 @@ pub const STIR_METRICS: &[(&str, &str)] = &[
 ///
 /// ## NIST 800-53 Rev5: AU-5, SI-4 (System Monitoring)
 fn register_daemon_metrics(metrics: &mut MetricRegistry) {
+    metrics.register_counter(
+        METRIC_API_TLS_HANDSHAKE_TIMEOUTS,
+        "REST HTTPS handshakes abandoned after the handshake deadline",
+    );
+    metrics.register_counter(
+        METRIC_API_TLS_CONN_REJECTED,
+        "REST HTTPS connections shed because the connection cap was reached",
+    );
+    metrics.register_counter(
+        METRIC_API_TLS_RELOADS,
+        "Successful REST HTTPS certificate reloads",
+    );
+    metrics.register_counter(
+        METRIC_API_TLS_RELOAD_FAILURES,
+        "Failed REST HTTPS certificate reloads (previous certificate kept)",
+    );
     metrics.register_gauge(
         METRIC_AUDIT_RECORDS_DROPPED,
         "Audit records lost: audit queue full, writer exited, or sink write failed",
@@ -832,42 +914,6 @@ impl AppState {
         }
     }
 
-    /// Creates new application state with TLS acceptor for certificate reload support.
-    pub fn with_tls(
-        mut metrics: MetricRegistry,
-        stats: Arc<ServerStats>,
-        tls_acceptor: Arc<ReloadableTlsAcceptor>,
-    ) -> Self {
-        register_daemon_metrics(&mut metrics);
-        Self {
-            metrics,
-            stats,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            start_time: Instant::now(),
-            ready: AtomicU64::new(1),
-            sip_stack: None,
-            flows: None,
-            provisioning: None,
-            sbc_router: None,
-            mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
-            directory_store: None,
-            phone_store: None,
-            trunk_group_store: None,
-            dial_plan_store: None,
-            partition_store: None,
-            css_store: None,
-            route_pattern_store: None,
-            route_list_store: None,
-            trunk_monitor: None,
-            trunk_registrar: None,
-            remote_trunk_status: Arc::new(tokio::sync::RwLock::new(RemoteTrunkStatus::default())),
-            zone_registry: None,
-            tls_acceptor: Some(tls_acceptor),
-            #[cfg(feature = "cluster")]
-            cluster_health_fn: None,
-        }
-    }
-
     /// Sets the cluster health check function.
     #[cfg(feature = "cluster")]
     pub fn set_cluster_health_fn<F, Fut>(&mut self, f: F)
@@ -1077,6 +1123,9 @@ impl ApiServer {
     }
 
     /// Runs the API server with plain HTTP on `addr`.
+    // POAM: POA&M-212 — the plain-HTTP listener (axum::serve) has no
+    // connection cap or header-read timeout (SC-5); bound to the pod network
+    // behind NetworkPolicy in k8s.
     async fn run_http(&self, addr: SocketAddr) -> Result<(), ApiServerError> {
         let router = self.router();
 
@@ -1106,28 +1155,33 @@ impl ApiServer {
     }
 
     /// Runs the API server with HTTPS (TLS) on `addr`.
+    ///
+    /// Always serves through the [`ReloadableTlsAcceptor`] installed in
+    /// [`AppState::tls_acceptor`] (CNSA 2.0 provider, TLS 1.3 only, PR 177
+    /// fail-closed key-file checks); there is no static fallback.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality), SC-13, SC-5
     async fn run_https(
         &self,
         tls_config: &TlsConfig,
         addr: SocketAddr,
     ) -> Result<(), ApiServerError> {
+        // Fail closed: TLS was configured, so never serve without the
+        // CNSA acceptor built at startup.
+        let Some(reloadable) = self.state.tls_acceptor.clone() else {
+            return Err(ApiServerError::TlsError {
+                reason: "HTTPS configured but no TLS acceptor installed".to_string(),
+            });
+        };
         let router = self.router();
 
         info!(
             address = %addr,
             cert = %tls_config.cert_path.display(),
             tls = true,
+            max_connections = self.config.max_tls_connections,
             "Starting API server (HTTPS)"
         );
-
-        // Use the reloadable TLS acceptor from state if available (preferred for hot-reload),
-        // otherwise fall back to creating a static one at startup.
-        let reloadable_acceptor = self.state.tls_acceptor.clone();
-        let static_acceptor = if reloadable_acceptor.is_none() {
-            Some(Arc::new(Self::create_tls_acceptor(tls_config)?))
-        } else {
-            None
-        };
 
         let listener =
             tokio::net::TcpListener::bind(addr)
@@ -1137,55 +1191,108 @@ impl ApiServer {
                     reason: e.to_string(),
                 })?;
 
-        let shutdown = self.shutdown.clone();
+        Self::spawn_tls_reload_watcher(
+            Arc::clone(&reloadable),
+            Arc::clone(&self.state),
+            self.shutdown.clone(),
+            self.config.tls_reload_poll,
+        );
 
-        // Run HTTPS server with graceful shutdown
+        let shutdown = self.shutdown.clone();
+        let permits = Arc::new(tokio::sync::Semaphore::new(self.config.max_tls_connections));
+        let handshake_timeout = self.config.tls_handshake_timeout;
+        let idle_timeout = self.config.tls_idle_timeout;
+        let max_age = self.config.max_tls_connection_age;
+        // Resolved once; the shed path does no per-connection lookup.
+        let rejected_counter = self.state.metrics.counter(METRIC_API_TLS_CONN_REJECTED);
+
         loop {
             tokio::select! {
                 result = listener.accept() => {
-                    match result {
-                        Ok((stream, _peer_addr)) => {
-                            // Get the current acceptor (supports hot-reload if reloadable)
-                            let acceptor = match (&reloadable_acceptor, &static_acceptor) {
-                                (Some(r), _) => r.acceptor_arc(),
-                                (None, Some(s)) => Arc::clone(s),
-                                (None, None) => {
-                                    warn!("No TLS acceptor available");
-                                    continue;
-                                }
-                            };
-                            let mut service = router.clone().into_make_service();
-
-                            tokio::spawn(async move {
-                                match acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        let io = TokioIo::new(tls_stream);
-                                        let svc = match service.call(()).await {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                warn!(error = ?e, "Failed to create service");
-                                                return;
-                                            }
-                                        };
-
-                                        let hyper_svc = TowerToHyperService::new(svc);
-                                        if let Err(e) = ServerBuilder::new(hyper_util::rt::TokioExecutor::new())
-                                            .serve_connection(io, hyper_svc)
-                                            .await
-                                        {
-                                            warn!(error = %e, "Error serving HTTPS connection");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "TLS handshake failed");
-                                    }
-                                }
-                            });
-                        }
+                    let stream = match result {
+                        Ok((stream, _peer_addr)) => stream,
                         Err(e) => {
                             warn!(error = %e, "Failed to accept connection");
+                            continue;
                         }
-                    }
+                    };
+                    // NIST 800-53 Rev5: SC-5 — shed immediately when full;
+                    // never await a permit so the accept loop cannot stall.
+                    let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                        drop(stream);
+                        if let Some(c) = rejected_counter {
+                            c.inc();
+                        }
+                        debug!("REST HTTPS connection cap reached; connection dropped");
+                        continue;
+                    };
+                    let acceptor = reloadable.acceptor_arc();
+                    let mut service = router.clone().into_make_service();
+                    let state = Arc::clone(&self.state);
+
+                    tokio::spawn(async move {
+                        // Held for the whole connection (handshake + serving).
+                        let _permit = permit;
+                        let tls_stream = match tokio::time::timeout(
+                            handshake_timeout,
+                            acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                debug!(error = %e, "TLS handshake failed");
+                                return;
+                            }
+                            Err(_) => {
+                                if let Some(c) =
+                                    state.metrics.counter(METRIC_API_TLS_HANDSHAKE_TIMEOUTS)
+                                {
+                                    c.inc();
+                                }
+                                debug!("TLS handshake timed out");
+                                return;
+                            }
+                        };
+                        let io = TokioIo::new(tls_stream);
+                        let svc = match service.call(()).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!(error = ?e, "Failed to create service");
+                                return;
+                            }
+                        };
+                        let hyper_svc = TowerToHyperService::new(svc);
+                        // NIST 800-53 Rev5: SC-5 — HTTP/1 only. h2 (prior
+                        // knowledge; no ALPN is offered) would let an idle
+                        // client hold a permit with no header-read deadline.
+                        let mut builder =
+                            ServerBuilder::new(hyper_util::rt::TokioExecutor::new())
+                                .http1_only();
+                        builder
+                            .http1()
+                            .timer(hyper_util::rt::TokioTimer::new())
+                            .header_read_timeout(idle_timeout);
+                        let conn = builder.serve_connection(io, hyper_svc);
+                        tokio::pin!(conn);
+                        // NIST 800-53 Rev5: SC-10 — bound connection lifetime
+                        // so slow bodies / slow readers cannot pin a permit.
+                        let result = tokio::select! {
+                            r = conn.as_mut() => r,
+                            () = tokio::time::sleep(max_age) => {
+                                conn.as_mut().graceful_shutdown();
+                                tokio::time::timeout(API_CONN_DRAIN_GRACE, conn)
+                                    .await
+                                    .unwrap_or_else(|_| {
+                                        debug!("HTTPS connection force-closed after max age");
+                                        Ok(())
+                                    })
+                            }
+                        };
+                        if let Err(e) = result {
+                            debug!(error = %e, "Error serving HTTPS connection");
+                        }
+                    });
                 }
                 () = shutdown.wait_for_shutdown() => {
                     info!("API server (HTTPS) shutting down");
@@ -1197,57 +1304,96 @@ impl ApiServer {
         Ok(())
     }
 
-    /// Creates a reloadable TLS acceptor for hot certificate rotation.
+    /// Builds the REST HTTPS acceptor at startup (fail closed).
     ///
-    /// ## NIST 800-53 Rev5: SC-12 (Cryptographic Key Establishment and Management)
-    pub fn create_reloadable_tls_acceptor(
+    /// Reuses `uc_transport` cert loading: `load_private_key_checked`
+    /// (PR 177 mode/owner/symlink checks), the `security.curve` key-curve
+    /// match, and `create_server_config` (CNSA 2.0 provider, TLS 1.3 only).
+    /// The REST plane is TLS 1.3 only regardless of `security.min_tls_version`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-12, SC-13, SC-28
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiServerError::TlsError`] if the certificate or key cannot be
+    /// loaded or fails a check.
+    pub fn build_tls_acceptor(
         tls_config: &TlsConfig,
-    ) -> Result<ReloadableTlsAcceptor, ApiServerError> {
-        ReloadableTlsAcceptor::new(tls_config.cert_path.clone(), tls_config.key_path.clone())
-            .map_err(|e| ApiServerError::TlsError {
-                reason: format!("Failed to create TLS acceptor: {e}"),
-            })
+        curve: CnsaCurve,
+    ) -> Result<Arc<ReloadableTlsAcceptor>, ApiServerError> {
+        let required = match curve {
+            CnsaCurve::P384 => RequiredKeyCurve::P384,
+            CnsaCurve::P521 => RequiredKeyCurve::P521,
+        };
+        ReloadableTlsAcceptor::new_with_curve(
+            tls_config.cert_path.clone(),
+            tls_config.key_path.clone(),
+            Some(required),
+        )
+        .map(Arc::new)
+        .map_err(|e| ApiServerError::TlsError {
+            reason: format!("Failed to create TLS acceptor: {e}"),
+        })
     }
 
-    /// Creates a TLS acceptor with CNSA 2.0 compliant configuration.
-    fn create_tls_acceptor(tls_config: &TlsConfig) -> Result<TlsAcceptor, ApiServerError> {
-        use rustls::pki_types::PrivateKeyDer;
-        use rustls::pki_types::pem::PemObject;
-
-        // Load certificate chain
-        let certs: Vec<CertificateDer<'static>> =
-            CertificateDer::pem_file_iter(&tls_config.cert_path)
-                .map_err(|e| ApiServerError::TlsError {
-                    reason: format!("Failed to open certificate file: {e}"),
-                })?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| ApiServerError::TlsError {
-                    reason: format!("Failed to parse certificates: {e}"),
-                })?;
-
-        if certs.is_empty() {
-            return Err(ApiServerError::TlsError {
-                reason: "No certificates found in certificate file".to_string(),
-            });
-        }
-
-        // Load private key
-        let key = PrivateKeyDer::from_pem_file(&tls_config.key_path).map_err(|e| {
-            ApiServerError::TlsError {
-                reason: format!("Failed to load private key: {e}"),
+    /// Spawns a watcher that reloads the REST certificate when the cert or
+    /// key file changes (mtime/length), e.g. cert-manager or Secret-volume
+    /// rotation. A failed reload keeps the previous certificate in service.
+    ///
+    /// ## NIST 800-53 Rev5: SC-17 (Public Key Infrastructure Certificates)
+    // POAM: POA&M-214 — REST TLS reloads are logged via tracing only; no
+    // uc-audit record is emitted yet (AU-12).
+    pub fn spawn_tls_reload_watcher(
+        acceptor: Arc<ReloadableTlsAcceptor>,
+        state: Arc<AppState>,
+        shutdown: ShutdownSignal,
+        poll: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut last = tls_files_fingerprint(&acceptor).await;
+            let mut ticker = tokio::time::interval(poll);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    () = shutdown.wait_for_shutdown() => break,
+                }
+                let current = tls_files_fingerprint(&acceptor).await;
+                if current == last {
+                    continue;
+                }
+                last = current;
+                // File I/O + key parsing: keep it off the runtime workers.
+                let reloader = Arc::clone(&acceptor);
+                let ok = tokio::task::spawn_blocking(move || reloader.try_reload())
+                    .await
+                    .unwrap_or(false);
+                let name = if ok {
+                    METRIC_API_TLS_RELOADS
+                } else {
+                    METRIC_API_TLS_RELOAD_FAILURES
+                };
+                if let Some(c) = state.metrics.counter(name) {
+                    c.inc();
+                }
             }
-        })?;
-
-        // Create TLS config with CNSA 2.0 compliant settings
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| ApiServerError::TlsError {
-                reason: format!("Failed to create TLS config: {e}"),
-            })?;
-
-        Ok(TlsAcceptor::from(Arc::new(config)))
+        })
     }
+}
+
+/// `(mtime, len)` of the cert and key files; `None` entries on stat failure.
+type TlsFileFingerprint = [Option<(std::time::SystemTime, u64)>; 2];
+
+async fn tls_files_fingerprint(acceptor: &ReloadableTlsAcceptor) -> TlsFileFingerprint {
+    async fn stat(p: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+        let m = tokio::fs::metadata(p).await.ok()?;
+        Some((m.modified().ok()?, m.len()))
+    }
+    [
+        stat(acceptor.cert_path()).await,
+        stat(acceptor.key_path()).await,
+    ]
 }
 
 // ============================================================================
@@ -2529,5 +2675,429 @@ mod tests {
             crate::sip_stack::ROUTE_PATTERN_REJECTED.load(std::sync::atomic::Ordering::Relaxed)
                 > before
         );
+    }
+}
+
+/// REST HTTPS listener tests: CNSA provider, reload, SC-5 limits.
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod rest_tls_tests {
+    use super::*;
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use std::io::Write as _;
+    use tokio::io::AsyncReadExt;
+    use uc_metrics::SbcMetrics;
+
+    struct Pki {
+        _dir: tempfile::TempDir,
+        cert: PathBuf,
+        key: PathBuf,
+    }
+
+    fn write_secret(path: &std::path::Path, data: &str) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .expect("open");
+        f.write_all(data.as_bytes()).expect("write");
+    }
+
+    /// Writes a self-signed `localhost` cert + key using `alg`.
+    fn write_pki(pki: &Pki, alg: &'static rcgen::SignatureAlgorithm) -> CertificateDer<'static> {
+        let key = rcgen::KeyPair::generate_for(alg).expect("key");
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
+        let cert = params.self_signed(&key).expect("cert");
+        write_secret(&pki.cert, &cert.pem());
+        write_secret(&pki.key, &key.serialize_pem());
+        cert.der().clone()
+    }
+
+    fn new_pki() -> (Pki, CertificateDer<'static>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pki = Pki {
+            cert: dir.path().join("cert.pem"),
+            key: dir.path().join("key.pem"),
+            _dir: dir,
+        };
+        let der = write_pki(&pki, &rcgen::PKCS_ECDSA_P384_SHA384);
+        (pki, der)
+    }
+
+    fn free_addr() -> SocketAddr {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr")
+    }
+
+    struct Running {
+        addr: SocketAddr,
+        state: Arc<AppState>,
+        shutdown: ShutdownSignal,
+    }
+
+    async fn start(pki: &Pki, tweak: impl FnOnce(&mut ApiServerConfig)) -> Running {
+        let tls = TlsConfig {
+            cert_path: pki.cert.clone(),
+            key_path: pki.key.clone(),
+        };
+        let acceptor = ApiServer::build_tls_acceptor(&tls, CnsaCurve::P384).expect("acceptor");
+        let mut state = AppState::new(SbcMetrics::standard(), Arc::new(ServerStats::default()));
+        state.tls_acceptor = Some(acceptor);
+        let state = Arc::new(state);
+        let addr = free_addr();
+        let mut config = ApiServerConfig {
+            listen_addr: addr,
+            tls: Some(tls),
+            ..ApiServerConfig::default()
+        };
+        tweak(&mut config);
+        let shutdown = ShutdownSignal::new();
+        let server = ApiServer::new(config, Arc::clone(&state), shutdown.clone());
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Running {
+            addr,
+            state,
+            shutdown,
+        }
+    }
+
+    fn client_config(
+        provider: rustls::crypto::CryptoProvider,
+        trust: &CertificateDer<'static>,
+    ) -> Arc<rustls::ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(trust.clone()).expect("root");
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .expect("versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    }
+
+    async fn connect(
+        addr: SocketAddr,
+        cfg: Arc<rustls::ClientConfig>,
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let name = ServerName::try_from("localhost").expect("name");
+        tokio_rustls::TlsConnector::from(cfg)
+            .connect(name, tcp)
+            .await
+    }
+
+    fn counter(state: &AppState, name: &str) -> u64 {
+        state
+            .metrics
+            .counter(name)
+            .map_or(0, uc_metrics::Counter::get)
+    }
+
+    #[tokio::test]
+    async fn rest_tls_negotiates_cnsa_suite() {
+        let (pki, der) = new_pki();
+        let srv = start(&pki, |_| {}).await;
+        let tls = connect(
+            srv.addr,
+            client_config(uc_transport::tls::cnsa_provider(), &der),
+        )
+        .await
+        .expect("handshake");
+        let (_, conn) = tls.get_ref();
+        assert_eq!(
+            conn.negotiated_cipher_suite().map(|s| s.suite()),
+            Some(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384)
+        );
+        assert_eq!(
+            conn.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3)
+        );
+        srv.shutdown.request_shutdown();
+    }
+
+    #[tokio::test]
+    async fn rest_tls_rejects_non_cnsa_client() {
+        use rustls::crypto::aws_lc_rs::{cipher_suite, default_provider, kx_group};
+        let (pki, der) = new_pki();
+        let srv = start(&pki, |_| {}).await;
+        let weak = rustls::crypto::CryptoProvider {
+            cipher_suites: vec![cipher_suite::TLS13_AES_128_GCM_SHA256],
+            kx_groups: vec![kx_group::X25519],
+            ..default_provider()
+        };
+        assert!(connect(srv.addr, client_config(weak, &der)).await.is_err());
+        srv.shutdown.request_shutdown();
+    }
+
+    #[tokio::test]
+    async fn rest_tls_reload_swaps_cert() {
+        let (pki, der_a) = new_pki();
+        let srv = start(&pki, |c| c.tls_reload_poll = Duration::from_millis(50)).await;
+        let provider = uc_transport::tls::cnsa_provider;
+        connect(srv.addr, client_config(provider(), &der_a))
+            .await
+            .expect("cert A");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let der_b = write_pki(&pki, &rcgen::PKCS_ECDSA_P384_SHA384);
+        // The watcher picks the change up without any signal.
+        let mut swapped = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if counter(&srv.state, METRIC_API_TLS_RELOADS) >= 1 {
+                swapped = true;
+                break;
+            }
+        }
+        assert!(swapped, "watcher reloaded");
+        let tls = connect(srv.addr, client_config(provider(), &der_b))
+            .await
+            .expect("cert B");
+        let peer = tls.get_ref().1.peer_certificates().expect("peer");
+        assert_eq!(peer.first(), Some(&der_b));
+        assert!(
+            connect(srv.addr, client_config(provider(), &der_a))
+                .await
+                .is_err()
+        );
+        srv.shutdown.request_shutdown();
+    }
+
+    #[tokio::test]
+    async fn rest_tls_reload_failure_keeps_old_cert() {
+        let (pki, der_a) = new_pki();
+        let srv = start(&pki, |_| {}).await;
+        // P-256 is not CNSA and not `security.curve`: reload fails closed.
+        write_pki(&pki, &rcgen::PKCS_ECDSA_P256_SHA256);
+        assert!(srv.state.reload_tls_certificates().is_err());
+        let tls = connect(
+            srv.addr,
+            client_config(uc_transport::tls::cnsa_provider(), &der_a),
+        )
+        .await
+        .expect("still cert A");
+        assert_eq!(
+            tls.get_ref().1.peer_certificates().and_then(<[_]>::first),
+            Some(&der_a)
+        );
+        srv.shutdown.request_shutdown();
+    }
+
+    #[tokio::test]
+    async fn rest_tls_handshake_timeout() {
+        let (pki, _) = new_pki();
+        let srv = start(&pki, |c| {
+            c.tls_handshake_timeout = Duration::from_millis(200);
+        })
+        .await;
+        let mut tcp = tokio::net::TcpStream::connect(srv.addr).await.expect("tcp");
+        let started = Instant::now();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf))
+            .await
+            .expect("server closed the idle connection")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(counter(&srv.state, METRIC_API_TLS_HANDSHAKE_TIMEOUTS) >= 1);
+        srv.shutdown.request_shutdown();
+    }
+
+    #[tokio::test]
+    async fn rest_tls_connection_cap() {
+        let (pki, _) = new_pki();
+        let srv = start(&pki, |c| c.max_tls_connections = 2).await;
+        // `start` probed the port with a connection that has since closed;
+        // let its permit drain (handshake EOF) before filling the cap.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _a = tokio::net::TcpStream::connect(srv.addr).await.expect("a");
+        let _b = tokio::net::TcpStream::connect(srv.addr).await.expect("b");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut c = tokio::net::TcpStream::connect(srv.addr).await.expect("c");
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(2), c.read(&mut buf))
+            .await
+            .expect("third connection shed immediately")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        assert_eq!(counter(&srv.state, METRIC_API_TLS_CONN_REJECTED), 1);
+        srv.shutdown.request_shutdown();
+    }
+
+    /// Opens `n` TLS sessions that never send a request.
+    async fn idle_sessions(
+        srv: &Running,
+        der: &CertificateDer<'static>,
+        n: usize,
+    ) -> Vec<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(
+                connect(
+                    srv.addr,
+                    client_config(uc_transport::tls::cnsa_provider(), der),
+                )
+                .await
+                .expect("idle session"),
+            );
+        }
+        v
+    }
+
+    /// Sends `GET /healthz` on a fresh TLS session; returns the status line.
+    async fn get_health(srv: &Running, der: &CertificateDer<'static>) -> Option<String> {
+        use tokio::io::AsyncWriteExt;
+        let mut tls = connect(
+            srv.addr,
+            client_config(uc_transport::tls::cnsa_provider(), der),
+        )
+        .await
+        .ok()?;
+        tls.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .ok()?;
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), tls.read_to_end(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        let text = String::from_utf8_lossy(&buf);
+        text.lines().next().map(str::to_string)
+    }
+
+    async fn served_after_bound(srv: &Running, der: &CertificateDer<'static>) -> bool {
+        for _ in 0..100 {
+            if get_health(srv, der).await.is_some() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn rest_tls_idle_connections_release_cap_permits() {
+        let (pki, der) = new_pki();
+        let srv = start(&pki, |c| {
+            c.max_tls_connections = 2;
+            c.tls_idle_timeout = Duration::from_millis(300);
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let held = idle_sessions(&srv, &der, 2).await;
+        // At the cap: a new connection is shed.
+        assert!(get_health(&srv, &der).await.is_none());
+        assert!(counter(&srv.state, METRIC_API_TLS_CONN_REJECTED) >= 1);
+        // Idle sessions are closed by the keep-alive/header deadline.
+        assert!(
+            served_after_bound(&srv, &der).await,
+            "new connection served once the bound expired"
+        );
+        drop(held);
+        srv.shutdown.request_shutdown();
+    }
+
+    #[tokio::test]
+    async fn rest_tls_max_connection_age_releases_cap_permits() {
+        let (pki, der) = new_pki();
+        let srv = start(&pki, |c| {
+            c.max_tls_connections = 2;
+            c.tls_idle_timeout = Duration::from_secs(60);
+            c.max_tls_connection_age = Duration::from_millis(300);
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let held = idle_sessions(&srv, &der, 2).await;
+        assert!(get_health(&srv, &der).await.is_none());
+        assert!(
+            served_after_bound(&srv, &der).await,
+            "new connection served once the bound expired"
+        );
+        drop(held);
+        srv.shutdown.request_shutdown();
+    }
+
+    #[tokio::test]
+    async fn rest_tls_h2_prior_knowledge_not_served() {
+        use tokio::io::AsyncWriteExt;
+        let (pki, der) = new_pki();
+        let srv = start(&pki, |_| {}).await;
+        let mut tls = connect(
+            srv.addr,
+            client_config(uc_transport::tls::cnsa_provider(), &der),
+        )
+        .await
+        .expect("handshake");
+        tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .expect("preface");
+        // Empty SETTINGS frame.
+        tls.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+            .await
+            .expect("settings");
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut buf))
+            .await
+            .expect("server closed the h2 connection");
+        // An h2 server would answer with a SETTINGS frame (type 0x4).
+        assert!(!(buf.len() >= 9 && buf[3] == 4), "server spoke HTTP/2");
+        srv.shutdown.request_shutdown();
+    }
+
+    #[test]
+    fn startup_fails_closed_on_bad_api_key_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (pki, _) = new_pki();
+        let tls = TlsConfig {
+            cert_path: pki.cert.clone(),
+            key_path: pki.key.clone(),
+        };
+        // Wrong curve for `security.curve`.
+        assert!(ApiServer::build_tls_acceptor(&tls, CnsaCurve::P521).is_err());
+        // World-readable key file (PR 177 checks).
+        std::fs::set_permissions(&pki.key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(ApiServer::build_tls_acceptor(&tls, CnsaCurve::P384).is_err());
+    }
+
+    #[tokio::test]
+    async fn https_without_acceptor_fails_closed() {
+        let (pki, _) = new_pki();
+        let state = Arc::new(AppState::new(
+            SbcMetrics::standard(),
+            Arc::new(ServerStats::default()),
+        ));
+        let config = ApiServerConfig {
+            listen_addr: free_addr(),
+            tls: Some(TlsConfig {
+                cert_path: pki.cert.clone(),
+                key_path: pki.key.clone(),
+            }),
+            ..ApiServerConfig::default()
+        };
+        let server = ApiServer::new(config, state, ShutdownSignal::new());
+        assert!(matches!(
+            server.run().await,
+            Err(ApiServerError::TlsError { .. })
+        ));
+    }
+
+    #[test]
+    fn api_token_compare_constant_time() {
+        assert!(api_token_matches("s3cret-token", "s3cret-token"));
+        assert!(!api_token_matches("s3cret-tokex", "s3cret-token"));
+        assert!(!api_token_matches("s3cret", "s3cret-token"));
+        assert!(!api_token_matches("", "s3cret-token"));
     }
 }

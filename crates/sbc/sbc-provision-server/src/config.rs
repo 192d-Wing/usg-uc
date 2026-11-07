@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 
 use thiserror::Error;
 
+use crate::token::ProvisionSecret;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("missing required env var: {0}")]
@@ -52,10 +54,10 @@ pub struct Config {
 
     /// Shared secret for HMAC-based device authentication. When set,
     /// provisioning requests must carry `?token=<hex-hmac>` where the HMAC
-    /// is `HMAC-SHA256(secret, mac_address)`. Parsed from
-    /// `SBC_PROVISION_SECRET`. When absent, provisioning is unauthenticated
-    /// (a warning is logged at startup).
-    pub provision_secret: Option<String>,
+    /// is `HMAC-SHA-384(secret, mac_address)` (96 hex chars). Parsed from
+    /// `SBC_PROVISION_SECRET`; at least 32 bytes. When absent, provisioning
+    /// is unauthenticated (a warning is logged at startup).
+    pub provision_secret: Option<ProvisionSecret>,
 }
 
 impl Config {
@@ -99,14 +101,12 @@ impl Config {
             reason,
         })?;
 
-        let provision_secret = std::env::var("SBC_PROVISION_SECRET")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let provision_secret = parse_provision_secret(std::env::var("SBC_PROVISION_SECRET").ok())?;
 
         let allow_unauthenticated = std::env::var("SBC_PROVISION_ALLOW_UNAUTHENTICATED")
             .is_ok_and(|v| v.eq_ignore_ascii_case("true"));
         check_guards(
-            provision_secret.as_deref(),
+            provision_secret.is_some(),
             &allowed_cidrs,
             allow_unauthenticated,
         )?;
@@ -137,15 +137,33 @@ fn validate_provision_host(host: &str) -> Result<(), ConfigError> {
     }
 }
 
+/// Parses `SBC_PROVISION_SECRET`: unset/empty = `None`; otherwise hex that
+/// decodes to at least [`crate::token::MIN_PROVISION_SECRET_BYTES`] bytes
+/// (fail closed).
+///
+/// NIST 800-53 Rev5: IA-5 (Authenticator Management), CM-6
+pub fn parse_provision_secret(raw: Option<String>) -> Result<Option<ProvisionSecret>, ConfigError> {
+    match raw {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) => ProvisionSecret::new(s)
+            .map(Some)
+            .map_err(|reason| ConfigError::Invalid {
+                var: "SBC_PROVISION_SECRET",
+                reason,
+            }),
+    }
+}
+
 /// Refuses a configuration under which phone configs (which carry SIP and
 /// directory credentials) would be served to anyone who can reach the
 /// port, unless the operator opted into that explicitly.
 const fn check_guards(
-    secret: Option<&str>,
+    has_secret: bool,
     allowed_cidrs: &[ipnet::IpNet],
     allow_unauthenticated: bool,
 ) -> Result<(), ConfigError> {
-    if secret.is_none() && allowed_cidrs.is_empty() && !allow_unauthenticated {
+    if !has_secret && allowed_cidrs.is_empty() && !allow_unauthenticated {
         return Err(ConfigError::Unguarded);
     }
     Ok(())
@@ -159,10 +177,10 @@ mod tests {
     #[test]
     fn unguarded_config_is_rejected_unless_opted_in() {
         assert!(matches!(
-            check_guards(None, &[], false),
+            check_guards(false, &[], false),
             Err(ConfigError::Unguarded)
         ));
-        assert!(check_guards(None, &[], true).is_ok());
+        assert!(check_guards(false, &[], true).is_ok());
     }
 
     #[test]
@@ -184,7 +202,32 @@ mod tests {
     #[test]
     fn either_guard_is_sufficient() {
         let lan: ipnet::IpNet = "10.0.100.0/24".parse().unwrap();
-        assert!(check_guards(Some("s3cret"), &[], false).is_ok());
-        assert!(check_guards(None, &[lan], false).is_ok());
+        assert!(check_guards(true, &[], false).is_ok());
+        assert!(check_guards(false, &[lan], false).is_ok());
+    }
+
+    #[test]
+    fn short_provision_secret_rejected() {
+        assert!(matches!(
+            parse_provision_secret(Some("s3cret".to_string())),
+            Err(ConfigError::Invalid {
+                var: "SBC_PROVISION_SECRET",
+                ..
+            })
+        ));
+        assert!(
+            parse_provision_secret(Some(String::new()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_provision_secret(None).unwrap().is_none());
+        // 32 non-hex chars: rejected (floor is on decoded bytes).
+        assert!(parse_provision_secret(Some("k".repeat(32))).is_err());
+        assert!(parse_provision_secret(Some("ab".repeat(31))).is_err());
+        assert!(
+            parse_provision_secret(Some("ab".repeat(32)))
+                .unwrap()
+                .is_some()
+        );
     }
 }
