@@ -70,8 +70,11 @@ impl PostgresPhoneStore {
     /// Returns `ConfigStoreError::Storage` for DB errors (including the
     /// unique-MAC violation when another phone already owns this MAC) or
     /// `ConfigStoreError::Serialization` if the `Phone` cannot be
-    /// JSON-encoded.
+    /// JSON-encoded, or `ConfigStoreError::Invalid` if a field fails
+    /// [`crate::validate::validate_phone`].
     pub async fn upsert(&self, phone: &Phone) -> ConfigStoreResult<()> {
+        // NIST 800-53 Rev5: SI-10 -- reject malformed fields before any write.
+        crate::validate::validate_phone(phone)?;
         let mac_normalized = Self::normalize_mac(&phone.mac_address);
         let data = serde_json::to_value(phone)?;
         sqlx::query(

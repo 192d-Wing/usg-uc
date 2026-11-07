@@ -16,6 +16,7 @@
 pub mod cisco_9800;
 pub mod cisco_mpp;
 pub mod error;
+pub mod escape;
 pub mod firmware;
 pub mod model;
 pub mod poly_edge;

@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn test_phone_new() {
         let phone = Phone::new("aa:bb:cc:dd:ee:ff", PhoneModel::PolyEdgeE450, "Lobby Phone");
-        assert!(!phone.id.is_empty());
+        assert_ne!(phone.id, "");
         assert_eq!(phone.mac_address, "aa:bb:cc:dd:ee:ff");
         assert_eq!(phone.model, PhoneModel::PolyEdgeE450);
         assert_eq!(phone.name, "Lobby Phone");
