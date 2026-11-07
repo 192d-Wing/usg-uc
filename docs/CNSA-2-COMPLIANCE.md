@@ -21,7 +21,7 @@ CNSA 2.0 defines cryptographic algorithms approved for protecting classified inf
 | Digital Signatures | ECDSA P-384 | P-384 | `uc-crypto::ecdsa::P384KeyPair` | Library-only (no shipped caller; TLS/DTLS signatures are done by rustls / the DTLS sidecar) |
 | Key Exchange | ECDH P-384 | P-384 | `uc-crypto::ecdh::P384EphemeralKeyPair` | Library-only (no shipped caller) |
 | Key Derivation | HKDF-SHA384 | - | `uc-crypto::hkdf::hkdf_sha384` | Library-only (no shipped caller; SRTP uses the RFC 3711 KDF, see below) |
-| TLS | TLS 1.3 | - | rustls with aws-lc-rs (`uc-transport::tls`) | Wired (sbc-daemon SIP-TLS listeners, soft client). Protocol version is 1.3 only unless `security.min_tls_version = "1.2"`. SBC configs use `uc_transport::tls::cnsa_provider()`: `TLS_AES_256_GCM_SHA384` (plus `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` on 1.2), ML-KEM-1024 or P-384 (see SIP/TLS). The soft client (`client-core/src/sip_transport.rs`) builds its own config and is not restricted. |
+| TLS | TLS 1.3 | - | rustls with aws-lc-rs (`uc-transport::tls`) | Wired (sbc-daemon SIP-TLS listeners, soft client). Protocol version is 1.3 only unless `security.min_tls_version = "1.2"`. SBC configs use `uc_transport::tls::cnsa_provider()`: `TLS_AES_256_GCM_SHA384` (plus `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` on 1.2), ML-KEM-1024 or P-384 (see SIP/TLS). The soft client SIP-TLS (`client-core/src/sip_transport.rs` `create_tls_config`, TLS 1.3 only) and provisioning HTTPS (`client-provisioning/src/http.rs` `build_tls_config`, TLS 1.3 only, via reqwest `use_preconfigured_tls`) also use `cnsa_provider()` (tests `test_tls_config_uses_cnsa_provider`, `tls_config_uses_cnsa_provider`). Exception: the debug-build-only provisioning `CaTrust::Insecure` mode uses reqwest's default rustls provider (not compiled into release builds). The client verifier modes do not use the shared `uc_transport::tls` builders (POA&M-173). |
 
 ### Forbidden Algorithms
 
@@ -109,7 +109,7 @@ Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_ver
 - **Egress SIP trunk TLS** (`sbc-daemon/src/flows.rs`, `server.rs`; `uc_transport::tls::create_client_config_with`): Wired (sbc-daemon). Server certificates are always verified against `security.trunk_tls_ca_path` (required when any trunk is `tls`) for `tls_server_name` or the trunk host / IP SAN; verification cannot be disabled. `security.min_tls_version` applies (TLS 1.3 only by default). With per-trunk `tls_client_cert = true` the SBC presents `security.tls_cert_path` (optional mTLS). Suites and key-exchange groups are the CNSA set from `uc_transport::tls::cnsa_provider()` (POA&M-26 closed); with `min_tls_version = "1.2"` a 1.2 trunk must offer `ECDHE-ECDSA-AES256-GCM-SHA384`, so it needs an ECDSA certificate. Tests: `flows::tests::tls_flow_dials_verified_trunk`, `tls_flow_never_downgrades_on_verify_failure`, `mtls_and_plain_flows_to_same_trunk_do_not_share_a_connection` (rcgen P-384 test CA; the negotiated suite is not asserted).
 - **Certificates**: P-384 ECDSA is the operational requirement, but it is **not enforced**; rustls accepts any certificate/key it can parse (P-256, RSA).
 - **Client mTLS**: Wired (sbc-daemon). `security.require_mtls` makes the SIP-TLS listener require a client certificate chaining to `security.tls_ca_path` (WebPKI verifier); `validate_config` rejects the flag without a CA bundle. The gRPC listener enforces its own `[grpc] require_mtls`.
-- **Implementation**: rustls with aws-lc-rs backend (`uc-transport`). The soft client (`client-core/src/sip_transport.rs`) also pins TLS 1.3 only.
+- **Implementation**: rustls with aws-lc-rs backend (`uc-transport`). The soft client (`client-core/src/sip_transport.rs`) also pins TLS 1.3 only and uses `cnsa_provider()`; so does client provisioning HTTPS (`client-provisioning/src/http.rs`), except the debug-only `CaTrust::Insecure` mode.
 
 ### SRTP
 
@@ -169,7 +169,7 @@ CNSA 2.0 mandates migration to post-quantum algorithms by 2033:
 
 | Function | Current | Future (2033) | Status |
 |----------|---------|---------------|--------|
-| Key Exchange | ECDH P-384 | ML-KEM-1024 | Wired for SBC TLS (preferred; P-384 fallback). Not for DTLS-SRTP or the soft client. |
+| Key Exchange | ECDH P-384 | ML-KEM-1024 | Wired for SBC TLS and soft client SIP-TLS / provisioning HTTPS (preferred; P-384 fallback). Not for DTLS-SRTP. |
 | Signatures | ECDSA P-384 | ML-DSA-87 | Planned |
 
 Current state of the migration path:

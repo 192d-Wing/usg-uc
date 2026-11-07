@@ -288,8 +288,9 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
   `ReloadableTlsAcceptor` never installed, `runtime.rs:564`). No TLS handshake
   timeout or connection cap on the API port either. Install the reloadable CNSA
   acceptor, timeout + semaphore; POA&M row (CNSA doc :106 discloses the gap).
-- [ ] **MAJOR, LIVE (client) — soft client TLS uses the default aws-lc provider,
+- [x] **MAJOR, LIVE (client) — soft client TLS uses the default aws-lc provider,
   not `cnsa_provider()`** (`client-core/src/sip_transport.rs:722`).
+  Fixed: SIP-TLS and provisioning HTTPS use `cnsa_provider()` (debug-only provisioning Insecure mode excepted); verifier builders tracked as POA&M-173 (fix/client-cnsa-tls-dns).
 - [x] **MAJOR, LIVE — `Aes256GcmKey` and `P384KeyPair` don't zeroize their
   secrets** (`uc-crypto/src/aead.rs:33`, `ecdsa.rs:23`: `ZeroizeOnDrop` with the
   only secret field `#[zeroize(skip)]`); `open()` leaves an unwiped plaintext
@@ -309,15 +310,17 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
   P-521 key (and vice versa). Also emit a `CryptoKeyOperation` audit event
   (AU-2, AU-12) with outcome on TLS key load and on every cert reload,
   pass or fail (uc-transport has no audit sink).
-- [ ] **MINOR, LIVE (client) — uc-dns resolver built without a DNS backend**
+- [x] **MINOR, LIVE (client) — uc-dns resolver built without a DNS backend**
   (`uc-dns/src/resolver.rs:163`, `client-sip-ua/src/call_agent.rs:3144`), so
   NAPTR/SRV are never queried; RFC 3263 isn't actually done.
+  Fixed: system-conf hickory backend, no-backend fail-safe instead of public resolvers; no DNSSEC (POA&M-172); public `new` kept for uc-discovery (POA&M-174) (fix/client-cnsa-tls-dns).
 - [x] **NIT, LIVE — stream framer `parse_content_length`: first CL wins,
   malformed becomes 0, duplicates not rejected** (`server.rs:2303`); can disagree
   with proto-sip on message boundaries.
   fixed: framer uses `SipMessage::stream_message_len`; bad CL gets 400 and close on TCP/TLS (fix/transport-dos-audit).
-- [ ] **NIT, LIVE (client) — uc-dns cache eviction is an O(n) scan per insert;
+- [x] **NIT, LIVE (client) — uc-dns cache eviction is an O(n) scan per insert;
   SRV weighting always picks the median** (`cache.rs:139`, `srv.rs:160`).
+  Fixed: O(log n) indexed eviction; RFC 2782 weighted random SRV order (fix/client-cnsa-tls-dns).
 - [ ] **MAJOR, DORMANT — SCTP `Chunk::decode` panics on a padded last chunk**
   (`uc-transport/src/sctp/chunk.rs:311`, `split_to(padded_length)` past the
   buffer). Clamp and fuzz before enabling the `sctp` feature.
@@ -337,6 +340,7 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
   row presents the limiters without caveats; CNSA doc :113 (client) reads as
   compliant. No fuzz targets anywhere in the repo for the stream framer, SCTP,
   NAPTR/SRV or ACL parsing.
+  Partly fixed (fix/client-cnsa-tls-dns): PROTO_RFC_COMPLIANCE.md :26/:508 client SRV and the CNSA :113 client TLS text now match the code; the rest remains.
 
 ### Data and operations (uc-cdr, uc-storage, uc-audit, uc-syslog, uc-cluster, uc-state-sync, uc-api, uc-phone-mgmt, uc-user-mgmt, uc-metrics, uc-health, uc-telemetry, uc-snmp)
 

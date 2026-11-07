@@ -1088,6 +1088,7 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "uc-crypto",
+ "uc-transport",
  "whoami",
  "windows",
  "zeroize",
@@ -1156,11 +1157,14 @@ dependencies = [
  "chrono",
  "client-types",
  "reqwest 0.12.28",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "uc-transport",
  "url",
  "zeroize",
 ]
@@ -8581,6 +8585,7 @@ name = "uc-dns"
 version = "0.1.0"
 dependencies = [
  "hickory-resolver",
+ "rand 0.9.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

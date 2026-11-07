@@ -535,6 +535,9 @@ impl ClientApp {
         // TLS connections are made to resolved socket addresses, so tell the
         // transport which DNS name to present as SNI and verify the server
         // certificate against (IP-literal registrars keep the IP fallback).
+        // RFC 3263 §4.4 / RFC 5922 §4: this is the SIP domain from the AoR's
+        // registrar URI, never the NAPTR/SRV target (resolution returns only a
+        // socket address), so spoofed SRV cannot redirect identity checks.
         if let Some(ref transport) = self.sip_transport {
             let host = account
                 .registrar_uri
@@ -1370,13 +1373,14 @@ fn ice_config_from_settings(network: &crate::settings::NetworkSettings) -> proto
             format!("{host_port}:3478")
         };
         match target.to_socket_addrs() {
-            Ok(mut addrs) => match addrs.next() {
-                Some(addr) => {
+            Ok(mut addrs) => {
+                if let Some(addr) = addrs.next() {
                     info!(server = %uri, resolved = %addr, "STUN server configured for ICE");
                     config.stun_servers.push(addr);
+                } else {
+                    warn!(server = %uri, "STUN server resolved to no addresses; ignored");
                 }
-                None => warn!(server = %uri, "STUN server resolved to no addresses; ignored"),
-            },
+            }
             Err(e) => warn!(server = %uri, error = %e, "STUN server did not resolve; ignored"),
         }
     }
@@ -1405,10 +1409,9 @@ mod tests {
 
         // ICE disabled: no servers regardless of the setting.
         network.enable_ice = false;
-        assert!(
-            super::ice_config_from_settings(&network)
-                .stun_servers
-                .is_empty()
+        assert_eq!(
+            super::ice_config_from_settings(&network).stun_servers,
+            Vec::<std::net::SocketAddr>::new()
         );
     }
 
