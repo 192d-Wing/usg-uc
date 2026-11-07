@@ -7,6 +7,7 @@ This document describes the CNSA 2.0 compliance status for the USG SIP Soft Clie
 | Requirement | Implementation Status |
 |-------------|----------------------|
 | TLS 1.3 only | ✅ Enforced via `TransportPreference::TlsOnly` |
+| CNSA TLS suites/groups | ✅ SIP-TLS (`client-core/src/sip_transport.rs` `create_tls_config`) and provisioning HTTPS (`client-provisioning/src/http.rs` `build_tls_config`) use `uc_transport::tls::cnsa_provider()`: `TLS_AES_256_GCM_SHA384`, ML-KEM-1024 / P-384; no AES-128, no X25519. Tests `test_tls_config_uses_cnsa_provider`, `tls_config_uses_cnsa_provider`. Exception: debug-build-only provisioning `CaTrust::Insecure` uses reqwest's default provider. Open: POA&M-173 (verifier modes not on the shared builders) |
 | AES-256-GCM | ✅ SRTP uses AES-256-GCM via proto-srtp |
 | P-384/P-521 curves | ✅ Certificate store prefers P-384 |
 | SHA-384+ hashing | ✅ Certificate thumbprints use SHA-256+, DTLS uses SHA-384 |
@@ -102,7 +103,7 @@ All security-relevant events are logged:
 ## Testing
 
 CNSA 2.0 compliance can be verified by:
-1. Checking that only TLS 1.3 connections are established
+1. Checking that only TLS 1.3 connections are established with CNSA suites and groups (`test_tls_config_uses_cnsa_provider`, `tls_config_uses_cnsa_provider`; config-level assertion, no handshake test)
 2. Verifying SRTP uses AEAD_AES_256_GCM
 3. Confirming certificate algorithms are P-384/P-521 ECDSA
 4. Testing that password authentication is rejected

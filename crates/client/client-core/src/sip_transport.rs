@@ -723,9 +723,12 @@ impl SipTransport {
 
     /// Creates CNSA 2.0 compliant TLS configuration.
     fn create_tls_config(config: &TransportConfig) -> AppResult<ClientConfig> {
-        use rustls::crypto::aws_lc_rs::default_provider;
-
-        let provider = default_provider();
+        // NIST 800-53 Rev5: SC-8(1), SC-13 (CNSA 2.0 suites/groups only:
+        // TLS_AES_256_GCM_SHA384, ML-KEM-1024 / P-384) — the shared provider,
+        // not aws-lc-rs' default set (which includes AES-128 and X25519).
+        // POAM: POA&M-173 - client verifier modes still use their own builder
+        // rather than the shared uc_transport::tls client config builders (CM-2).
+        let provider = uc_transport::tls::cnsa_provider();
 
         // Build the config based on verification mode
         let builder = ClientConfig::builder_with_provider(Arc::new(provider))
@@ -1439,6 +1442,29 @@ fn parse_pem_certificates(pem_data: &str) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NIST 800-53 Rev5: SC-13 — the soft-client TLS config must carry exactly
+    /// the shared CNSA 2.0 provider (no AES-128, no X25519).
+    #[test]
+    fn test_tls_config_uses_cnsa_provider() -> AppResult<()> {
+        let tls = SipTransport::create_tls_config(&TransportConfig::new())?;
+        let got = tls.crypto_provider();
+        let want = uc_transport::tls::cnsa_provider();
+        let suites = |p: &rustls::crypto::CryptoProvider| {
+            p.cipher_suites
+                .iter()
+                .map(rustls::SupportedCipherSuite::suite)
+                .collect::<Vec<_>>()
+        };
+        let groups = |p: &rustls::crypto::CryptoProvider| {
+            p.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>()
+        };
+        assert_eq!(suites(got), suites(&want));
+        assert_eq!(groups(got), groups(&want));
+        assert!(!suites(got).contains(&rustls::CipherSuite::TLS13_AES_128_GCM_SHA256));
+        assert!(!groups(got).contains(&rustls::NamedGroup::X25519));
+        Ok(())
+    }
 
     #[test]
     fn test_find_header_end() {

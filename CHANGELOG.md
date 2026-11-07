@@ -11,6 +11,15 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Security
 
+- **Client: SIP-TLS and provisioning HTTPS use the CNSA 2.0 provider.** The
+  soft client's SIP-TLS transport (client-core) and the provisioning HTTPS client
+  (client-provisioning, which gets a preconfigured rustls config passed to
+  reqwest) now build rustls from `uc_transport::tls::cnsa_provider()`, which
+  allows TLS 1.3 only with the CNSA suites and key-exchange groups. Before this
+  they used the default aws-lc provider. Servers that only offer TLS 1.2 or
+  non-CNSA suites now fail the handshake. (NIST 800-53 Rev5: SC-8, SC-13;
+  POA&M-173 tracks the residual CM-2 item)
+
 - **SBC: audit trail integrity (uc-audit) (BREAKING for SIEM parsers and
   alerting).** (NIST 800-53 Rev5: AU-5, AU-9, AU-10, AU-8, SI-10)
   - Audit sink writes can now fail and are counted. A write error (for
@@ -79,6 +88,25 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   type. (AC-2(4), AU-2, AU-3)
 
 ### Changed
+
+- **SBC + client: uc-dns uses the system DNS configuration and has no public
+  fallback (behaviour change).** `SipResolver::new` and the client call agent
+  now build a hickory resolver from the host config (`/etc/resolv.conf` or the
+  OS equivalent). The resolver no longer falls back to public resolvers. All
+  `SipResolver::new` callers are affected, including the SBC: hosts with no
+  usable system DNS config get a resolver-init error. `DnsConfig::default()`
+  now has an empty `servers` list, which means "use system config". Set
+  `servers` explicitly if you relied on the old defaults. (CM-7; POA&M-172 and
+  POA&M-174 track the residual items)
+- **SBC + client: real RFC 3263 NAPTR/SRV resolution.** NAPTR and SRV are now
+  queried. SRV targets are chosen by RFC 2782 weighted-random selection; before
+  this the median was always picked. "." targets are filtered out, and
+  unresolvable targets are skipped. A `sips` lookup never downgrades to a
+  non-TLS target.
+- **uc-dns: cache eviction is O(log n).** Eviction no longer does an O(n) scan
+  on every insert. Each `put` evicts at most 32 expired entries.
+- **Client:** the call agent initializes its resolver lazily (OnceCell built
+  on a blocking task).
 
 - **SBC: config-store write validation (operator-visible).** Phone and
   directory-number upserts are validated first and fail with the new

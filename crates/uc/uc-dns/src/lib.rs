@@ -8,9 +8,10 @@
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-20**: Secure Name/Address Resolution Service
-//! - **SC-21**: Secure Name/Address Resolution Service (Authoritative Source)
-//! - **SC-22**: Architecture and Provisioning for Name/Address Resolution Service
+//! - **CM-7**: the resolver uses the host system DNS configuration, never
+//!   hickory's public-resolver defaults (`SipResolver::new`).
+//! - **SC-20 / SC-21 / SC-22**: NOT implemented. Responses are not
+//!   DNSSEC-validated and no DoT/DoH is used (POA&M-172).
 //!
 //! ## Architecture
 //!

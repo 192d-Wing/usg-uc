@@ -3,11 +3,16 @@
 //! Provides TTL-aware caching for DNS records to reduce query load
 //! and improve resolution performance.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, trace};
+
+/// Maximum expired entries evicted by a single `put` at capacity.
+///
+/// NIST 800-53 Rev5: SC-5 (bounded work under the cache write lock).
+const PUT_EVICT_BATCH: usize = 32;
 
 /// A cached DNS record with expiration tracking.
 #[derive(Debug, Clone)]
@@ -68,11 +73,98 @@ pub enum CacheEntry {
     Negative,
 }
 
+/// Cache storage plus ordered indexes for O(log n) eviction.
+///
+/// NIST 800-53 Rev5: SC-5 — the cache is hard-bounded by `max_entries`; the
+/// indexes keep eviction at capacity O(log n) so an insertion flood cannot
+/// degrade into an O(n) scan per insert (O(n^2) CPU overall).
+#[derive(Debug, Default)]
+struct CacheInner {
+    /// Key -> (record, insertion sequence number).
+    entries: HashMap<String, (CachedRecord<CacheEntry>, u64)>,
+    /// Insertion order index (oldest first): seq -> key.
+    by_insert: BTreeMap<u64, String>,
+    /// Expiry index (soonest first): (expires_at, seq) -> key.
+    by_expiry: BTreeMap<(Instant, u64), String>,
+    /// Next insertion sequence number.
+    next_seq: u64,
+}
+
+impl CacheInner {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Removes `key` and its index entries. O(log n).
+    fn remove(&mut self, key: &str) -> bool {
+        if let Some((record, seq)) = self.entries.remove(key) {
+            self.by_insert.remove(&seq);
+            self.by_expiry.remove(&(record.expires_at, seq));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Inserts (or replaces) `key`, keeping both indexes consistent.
+    fn insert(&mut self, key: String, record: CachedRecord<CacheEntry>) {
+        self.remove(&key);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.by_insert.insert(seq, key.clone());
+        self.by_expiry.insert((record.expires_at, seq), key.clone());
+        self.entries.insert(key, (record, seq));
+    }
+
+    /// Evicts every entry whose expiry is at or before `now`, soonest first.
+    fn evict_expired(&mut self, now: Instant, limit: usize) -> usize {
+        let mut evicted = 0;
+        while evicted < limit
+            && let Some((&(expires_at, _), _)) = self.by_expiry.first_key_value()
+        {
+            if expires_at > now {
+                break;
+            }
+            if let Some((_, key)) = self.by_expiry.pop_first() {
+                if let Some((_, seq)) = self.entries.remove(&key) {
+                    self.by_insert.remove(&seq);
+                }
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    /// Evicts the oldest-inserted entry. O(log n).
+    fn evict_oldest(&mut self) -> bool {
+        self.by_insert
+            .first_key_value()
+            .map(|(_, key)| key.clone())
+            .is_some_and(|key| self.remove(&key))
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.by_insert.clear();
+        self.by_expiry.clear();
+    }
+
+    #[cfg(test)]
+    fn indexes_consistent(&self) -> bool {
+        self.entries.len() == self.by_insert.len()
+            && self.entries.len() == self.by_expiry.len()
+            && self.entries.iter().all(|(k, (r, seq))| {
+                self.by_insert.get(seq) == Some(k)
+                    && self.by_expiry.get(&(r.expires_at, *seq)) == Some(k)
+            })
+    }
+}
+
 /// DNS cache with TTL-based expiration.
 #[derive(Debug)]
 pub struct DnsCache {
-    /// Cache storage.
-    entries: Arc<RwLock<HashMap<String, CachedRecord<CacheEntry>>>>,
+    /// Cache storage and eviction indexes.
+    inner: Arc<RwLock<CacheInner>>,
     /// Maximum number of entries.
     max_entries: usize,
     /// Minimum TTL (overrides shorter TTLs).
@@ -93,7 +185,7 @@ impl DnsCache {
         negative_ttl: Duration,
     ) -> Self {
         Self {
-            entries: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(CacheInner::default())),
             max_entries,
             min_ttl,
             max_ttl,
@@ -114,44 +206,52 @@ impl DnsCache {
     /// Gets a cached entry.
     pub async fn get(&self, name: &str, record_type: &str) -> Option<CacheEntry> {
         let key = Self::cache_key(name, record_type);
-        let entries = self.entries.read().await;
+        let inner = self.inner.read().await;
 
-        if let Some(record) = entries.get(&key)
+        if let Some((record, _)) = inner.entries.get(&key)
             && !record.is_expired()
         {
             trace!(key = %key, ttl = ?record.remaining_ttl(), "Cache hit");
             return Some(record.data.clone());
         }
-        drop(entries);
+        drop(inner);
 
         trace!(key = %key, "Cache miss");
         None
     }
 
     /// Puts an entry in the cache.
+    ///
+    /// At capacity, expired entries are evicted first (soonest expiry
+    /// first), then the oldest-inserted live entries; each eviction is
+    /// O(log n).
     pub async fn put(&self, name: &str, record_type: &str, entry: CacheEntry, ttl: Duration) {
         let key = Self::cache_key(name, record_type);
         let normalized_ttl = self.normalize_ttl(ttl);
 
-        let mut entries = self.entries.write().await;
+        let mut inner = self.inner.write().await;
 
-        // Evict expired entries if at capacity
-        if entries.len() >= self.max_entries {
-            Self::evict_expired_locked(&mut entries);
+        // Overwriting an existing key never needs to evict another entry.
+        inner.remove(&key);
+
+        if inner.len() >= self.max_entries {
+            // Bounded per put so one insert never drains the whole table under
+            // the write lock; bulk cleanup is left to `evict_expired()`.
+            let evicted = inner.evict_expired(Instant::now(), PUT_EVICT_BATCH);
+            if evicted > 0 {
+                debug!(count = evicted, "Evicted expired cache entries");
+            }
         }
 
-        // If still at capacity, evict oldest entries
-        while entries.len() >= self.max_entries {
-            if let Some(oldest_key) = Self::find_oldest_locked(&entries) {
-                entries.remove(&oldest_key);
-            } else {
+        while inner.len() >= self.max_entries {
+            if !inner.evict_oldest() {
                 break;
             }
         }
 
         let record = CachedRecord::new(entry, normalized_ttl);
         debug!(key = %key, ttl = ?normalized_ttl, "Cached DNS record");
-        entries.insert(key, record);
+        inner.insert(key, record);
     }
 
     /// Puts a negative cache entry.
@@ -163,63 +263,54 @@ impl DnsCache {
     /// Removes an entry from the cache.
     pub async fn remove(&self, name: &str, record_type: &str) {
         let key = Self::cache_key(name, record_type);
-        let mut entries = self.entries.write().await;
-        entries.remove(&key);
+        let mut inner = self.inner.write().await;
+        inner.remove(&key);
     }
 
     /// Clears all cached entries.
     pub async fn clear(&self) {
-        let mut entries = self.entries.write().await;
-        entries.clear();
+        let mut inner = self.inner.write().await;
+        inner.clear();
     }
 
     /// Returns the number of cached entries.
     pub async fn len(&self) -> usize {
-        let entries = self.entries.read().await;
-        entries.len()
+        let inner = self.inner.read().await;
+        inner.len()
     }
 
     /// Returns true if the cache is empty.
     pub async fn is_empty(&self) -> bool {
-        let entries = self.entries.read().await;
-        entries.is_empty()
+        let inner = self.inner.read().await;
+        inner.entries.is_empty()
     }
 
     /// Evicts expired entries.
     pub async fn evict_expired(&self) -> usize {
-        let mut entries = self.entries.write().await;
-        Self::evict_expired_locked(&mut entries)
-    }
-
-    /// Evicts expired entries (requires write lock).
-    fn evict_expired_locked(entries: &mut HashMap<String, CachedRecord<CacheEntry>>) -> usize {
-        let before = entries.len();
-        entries.retain(|_, record| !record.is_expired());
-        let evicted = before - entries.len();
+        let mut inner = self.inner.write().await;
+        let evicted = inner.evict_expired(Instant::now(), usize::MAX);
+        drop(inner);
         if evicted > 0 {
             debug!(count = evicted, "Evicted expired cache entries");
         }
         evicted
     }
 
-    /// Finds the oldest entry key.
-    fn find_oldest_locked(entries: &HashMap<String, CachedRecord<CacheEntry>>) -> Option<String> {
-        entries
-            .iter()
-            .max_by_key(|(_, record)| record.age())
-            .map(|(key, _)| key.clone())
-    }
-
     /// Returns cache statistics.
     pub async fn stats(&self) -> CacheStats {
-        let entries = self.entries.read().await;
-        let total = entries.len();
-        let expired = entries.values().filter(|r| r.is_expired()).count();
-        let negative = entries
+        let inner = self.inner.read().await;
+        let total = inner.len();
+        let expired = inner
+            .entries
             .values()
-            .filter(|r| matches!(r.data, CacheEntry::Negative))
+            .filter(|(r, _)| r.is_expired())
             .count();
-        drop(entries);
+        let negative = inner
+            .entries
+            .values()
+            .filter(|(r, _)| matches!(r.data, CacheEntry::Negative))
+            .count();
+        drop(inner);
 
         CacheStats {
             total_entries: total,
@@ -359,5 +450,116 @@ mod tests {
         assert_eq!(stats.total_entries, 2);
         assert_eq!(stats.negative_entries, 1);
         assert!(stats.utilization() > 0.0);
+    }
+
+    fn small_cache(max: usize) -> DnsCache {
+        DnsCache::new(
+            max,
+            Duration::ZERO,
+            Duration::from_hours(1),
+            Duration::from_mins(1),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_capacity_evicts_oldest_first() {
+        let cache = small_cache(3);
+        for i in 0..5 {
+            cache
+                .put(
+                    &format!("h{i}.test"),
+                    "A",
+                    CacheEntry::Negative,
+                    Duration::from_mins(5),
+                )
+                .await;
+        }
+        assert_eq!(cache.len().await, 3);
+        assert!(cache.get("h0.test", "A").await.is_none());
+        assert!(cache.get("h1.test", "A").await.is_none());
+        for i in 2..5 {
+            assert!(cache.get(&format!("h{i}.test"), "A").await.is_some());
+        }
+        assert!(cache.inner.read().await.indexes_consistent());
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_keeps_index_consistent() {
+        let cache = small_cache(2);
+        cache
+            .put("a.test", "A", CacheEntry::Negative, Duration::from_mins(5))
+            .await;
+        cache
+            .put("b.test", "A", CacheEntry::Negative, Duration::from_mins(5))
+            .await;
+        // Overwrite at capacity must not evict b.
+        cache
+            .put("a.test", "A", CacheEntry::Negative, Duration::from_mins(9))
+            .await;
+        assert_eq!(cache.len().await, 2);
+        assert!(cache.get("b.test", "A").await.is_some());
+        assert!(cache.inner.read().await.indexes_consistent());
+        // a is now the newest; next insert evicts b.
+        cache
+            .put("c.test", "A", CacheEntry::Negative, Duration::from_mins(5))
+            .await;
+        assert!(cache.get("b.test", "A").await.is_none());
+        assert!(cache.get("a.test", "A").await.is_some());
+        assert!(cache.inner.read().await.indexes_consistent());
+    }
+
+    #[tokio::test]
+    async fn test_expired_evicted_before_live() {
+        let cache = small_cache(2);
+        cache
+            .put(
+                "live.test",
+                "A",
+                CacheEntry::Negative,
+                Duration::from_mins(5),
+            )
+            .await;
+        cache
+            .put("dead.test", "A", CacheEntry::Negative, Duration::ZERO)
+            .await;
+        cache
+            .put(
+                "new.test",
+                "A",
+                CacheEntry::Negative,
+                Duration::from_mins(5),
+            )
+            .await;
+        assert!(cache.get("live.test", "A").await.is_some());
+        assert!(cache.get("new.test", "A").await.is_some());
+        assert_eq!(cache.len().await, 2);
+        assert!(cache.inner.read().await.indexes_consistent());
+    }
+
+    #[tokio::test]
+    async fn test_random_ops_keep_indexes_consistent() {
+        let cache = small_cache(16);
+        // Deterministic LCG; no RNG dependency needed for the property.
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        for _ in 0..2000 {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let name = format!("n{}.test", (x >> 33) % 40);
+            match (x >> 20) % 4 {
+                0 => cache.remove(&name, "A").await,
+                1 => {
+                    cache
+                        .put(&name, "A", CacheEntry::Negative, Duration::ZERO)
+                        .await;
+                }
+                _ => {
+                    cache
+                        .put(&name, "A", CacheEntry::Negative, Duration::from_mins(5))
+                        .await;
+                }
+            }
+            assert!(cache.len().await <= 16);
+        }
+        cache.evict_expired().await;
+        assert!(cache.inner.read().await.indexes_consistent());
     }
 }
