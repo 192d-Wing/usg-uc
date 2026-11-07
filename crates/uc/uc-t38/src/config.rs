@@ -63,7 +63,7 @@ impl Default for T38Config {
     }
 }
 
-/// Error correction mode per ITU-T T.38.
+/// Error correction mode, modelled on ITU-T T.38 (non-interoperable encoding, POA&M-204).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCorrectionMode {

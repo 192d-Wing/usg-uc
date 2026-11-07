@@ -3,10 +3,17 @@
 //! This crate implements T.38 real-time fax relay for the USG Session Border Controller,
 //! enabling fax transmission over IP networks with error correction.
 //!
+//! ## WARNING: not interoperable (POA&M-204)
+//!
+//! The UDPTL and IFP wire encodings in this crate are **project-specific**.
+//! They are NOT the ITU-T T.38 ASN.1 PER encoding and will not interoperate
+//! with standards-conformant T.38 gateways or endpoints. RFC 4612 covers only
+//! the MIME registration. This crate is not a dependency of any shipped binary.
+//!
 //! ## Features
 //!
-//! - **UDPTL Transport**: UDP Transport Layer for T.38 with redundancy
-//! - **Error Correction**: FEC and redundancy modes per ITU-T T.38
+//! - **UDPTL Transport**: UDPTL-style transport with redundancy (non-standard encoding)
+//! - **Error Correction**: redundancy modelled on ITU-T T.38 (FEC is a stub; non-interoperable encoding, POA&M-204)
 //! - **Audio-to-T.38 Gateway**: Transition from audio fax to T.38
 //! - **T.30 Signal Handling**: Fax signal detection and processing
 //!
@@ -30,6 +37,8 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_const_for_fn)]
 #![allow(clippy::unused_async)]
+
+// POAM: POA&M-204 -- UDPTL/IFP wire encoding is not ITU-T T.38 ASN.1 PER; not interoperable
 
 pub mod config;
 pub mod error;

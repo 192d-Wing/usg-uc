@@ -118,9 +118,12 @@ DORMANT items before anyone wires them in.
   forms evade the per-callee cap. Fix: same canonicaliser as above, applied to
   configured prefixes at load.
   Fixed 2026-11-06 (PR 172).
-- [ ] **MAJOR, LIVE — management-API HMAC signing key has no minimum length**
+- [x] **MAJOR, LIVE — management-API HMAC signing key has no minimum length**
   (`uc-auth/src/lib.rs` `from_env`). Fix: reject < 32 bytes (prefer 48), zeroize,
   bound `SBC_AUTH_TOKEN_TTL_SECS`; consider `iat`/`nbf`, audience, revocation.
+  Fixed 2026-11-07 (fix/mgmt-api-hardening): key at least 32 bytes (warn under
+  48), zeroized; TTL 60-86400; HMAC-SHA-384 `v2.` tokens with `aud`/`iat`.
+  Residuals: no revocation (POA&M-210), SHA-256 API-key digests (POA&M-211).
 - [x] **MINOR, LIVE — unknown `pattern_type` silently becomes a prefix**
   (`runtime.rs:876`, `sip_stack.rs:3600`), so a mistyped block does nothing.
   Reject at config load and in the API (400).
@@ -138,18 +141,24 @@ DORMANT items before anyone wires them in.
   call.** Index patterns by partition.
   Fixed 2026-11-07 (fix/live-batch-190): POA&M-192, `by_partition` index,
   test `partition_index_matches_linear_reference`. No bench (perf unmeasured).
-- [ ] **BLOCKER if wired, DORMANT — Diameter accepts everyone**
+- [x] **BLOCKER if wired, DORMANT — Diameter accepts everyone** (POA&M-200)
   (`uc-aaa/src/diameter.rs:223-360`, `send_mar` returns accept). Return an error
   or remove; POA&M so nobody enables the `aaa` feature.
+  Fixed: UAR/MAR/SAR and the stub `authenticate`/`account` return
+  `DiameterError` in both cfgs (fail closed). Real Cx remains unimplemented.
 - [ ] **MAJOR, DORMANT — RADIUS:** Message-Authenticator not required on
   responses (BlastRADIUS, CVE-2024-3596); non-constant-time compare despite the
   comment (`radius.rs:563`); 8-bit identifier wraps; shared secret not zeroized;
   UDP+MD5 not CNSA (RadSec only).
-- [ ] **BLOCKER if used, DORMANT — policy `StringMatch::Regex` always returns
-  true** (`uc-policy/src/condition.rs:46`). Implement with compiled `regex` or
+- [x] **BLOCKER if used, DORMANT — policy `StringMatch::Regex` always returns
+  true** (POA&M-201) (`uc-policy/src/condition.rs:46`). Implement with compiled `regex` or
   remove the variant.
-- [ ] **MINOR, DORMANT — routing `DialPattern::Regex` recompiles per match and
-  fails open on a bad pattern** (`dialplan.rs:119`). Compile once, reject invalid.
+  Fixed: `BoundedRegex` (compiled once, 1 KiB pattern cap, 1 MiB size limits);
+  an invalid pattern cannot be constructed.
+- [x] **MINOR, DORMANT — routing `DialPattern::Regex` recompiles per match and
+  fails open on a bad pattern** (POA&M-205) (`dialplan.rs:119`). Compile once, reject invalid.
+  Fixed: `DialPlanEntry` caches a bounded compiled regex; invalid never matches;
+  `DialPattern::validate` and `DialPlan::try_add_entry` reject it.
 
 ### SIP message layer (proto-sip)
 
@@ -298,8 +307,12 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   corrected (`uc-media-engine/src/lib.rs`).
 - [ ] **BLOCKER, DORMANT — T.38 UDPTL/IFP use a home-made wire format**, not
   ASN.1 PER (`uc-t38/src/udptl.rs`, `ifp.rs`); no real gateway interoperates.
-- [ ] **BLOCKER, DORMANT — T.38 decode panics on a 5-byte datagram**
-  (`udptl.rs` ~118-137, unchecked `get_u8`). Bounds checks + fuzz target (cheap).
+  POA&M-204: documented as non-interoperable in crate docs and ROADMAP; the
+  ASN.1 PER encoding is still open.
+- [x] **BLOCKER, DORMANT — T.38 decode panics on a 5-byte datagram**
+  (POA&M-202/203) (`udptl.rs` ~118-137, unchecked `get_u8`). Bounds checks + fuzz target (cheap).
+  Fixed: bounds-checked UDPTL/IFP decode, truncation tests for every prefix,
+  `uc-t38/fuzz` targets `udptl_decode` and `ifp_decode`.
 - [ ] **MAJOR, DORMANT — T.38 redundancy recovery is dead code, FEC a stub, no
   SDP (RFC 4612/6913 attributes), fixed 512-byte buffer.**
 - [ ] **MAJOR, DORMANT — SIPREC metadata doesn't follow the RFC 7865 schema**,
@@ -316,6 +329,11 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
 - [ ] **Docs:** ROADMAP marks T.38, SIPREC and trickle ICE as implemented;
   `docs/SDP_RFC_Compliance.md` says uc-webrtc/uc-siprec use proto-sdp; RFC 3551
   "Full" and RFC 7587 "FEC support" overclaim.
+  Partial (POA&M-204/206): ROADMAP T.38, SIPREC and trickle ICE marks changed
+  to ⚠️ partial; `docs/architecture.md` caveats added; `SDP_RFC_Compliance.md`
+  no longer says uc-webrtc/uc-siprec use proto-sdp. RFC 7587 is already
+  ⚠️ Partial there (POA&M-141/142) and no RFC 3551 "Full" claim remains in
+  `docs/`. Still open: historical CHANGELOG entries (T.38, RFC 6733, RFC 7865).
 
 ### Transport, crypto, DNS, ACL (uc-transport, uc-crypto, uc-dns, uc-discovery, uc-dos-protection, uc-acl)
 
@@ -366,11 +384,16 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
   (`server.rs:41,1607,1627`), so a flood fills the audit queue and drops
   security records. Aggregate per (source, limit) and emit on state change.
   fixed: rate-limit audit aggregated per (source, limit) per interval, block/unblock on transition, per-interval cap (fix/transport-dos-audit).
-- [ ] **MAJOR, LIVE — REST API TLS is not CNSA and cert hot-reload is dead code**
+- [x] **MAJOR, LIVE — REST API TLS is not CNSA and cert hot-reload is dead code**
   (`sbc-daemon/src/api_server.rs:1174` uses the default provider;
   `ReloadableTlsAcceptor` never installed, `runtime.rs:564`). No TLS handshake
   timeout or connection cap on the API port either. Install the reloadable CNSA
   acceptor, timeout + semaphore; POA&M row (CNSA doc :106 discloses the gap).
+  Fixed 2026-11-07 (fix/mgmt-api-hardening): reloadable `cnsa_provider` TLS 1.3
+  acceptor with `security.curve`, 30 s file-poll reload, connection cap,
+  handshake/idle/age timeouts, HTTP/1.1 only. Residuals: plain-HTTP listener
+  unbounded (POA&M-212), unauthenticated without `SBC_API_TOKEN` (POA&M-213),
+  reloads not audited (POA&M-214).
 - [x] **MAJOR, LIVE (client) — soft client TLS uses the default aws-lc provider,
   not `cnsa_provider()`** (`client-core/src/sip_transport.rs:722`).
   Fixed: SIP-TLS and provisioning HTTPS use `cnsa_provider()` (debug-only provisioning Insecure mode excepted); verifier builders tracked as POA&M-173 (fix/client-cnsa-tls-dns).
@@ -398,6 +421,8 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
   `CryptoKeyOperation` (outcome, sanitized reason); gRPC `ReloadTls` audited.
   The REST/API acceptor and REST reload path are NOT covered (SEC-003):
   no curve pin, no audit (POA&M-193). SIP TLS not hot-reloadable (POA&M-194).
+  Curve pin for the REST acceptor added 2026-11-07 (fix/mgmt-api-hardening);
+  REST reload audit still open (POA&M-193, POA&M-214).
 - [x] **MINOR, LIVE (client) — uc-dns resolver built without a DNS backend**
   (`uc-dns/src/resolver.rs:163`, `client-sip-ua/src/call_agent.rs:3144`), so
   NAPTR/SRV are never queried; RFC 3263 isn't actually done.
@@ -478,9 +503,12 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
 - [x] **MAJOR, LIVE — SHA-256 HA1 not listed as a CNSA exception**
   (`uc-user-mgmt/src/digest.rs`). Fixed 2026-11-06 (ha1-users-authz): POA&M-110,
   `CNSA-EXCEPTION` marker, CNSA-2-COMPLIANCE.md.
-- [ ] **MAJOR, LIVE — HMAC-SHA256 provisioning tokens not listed as a CNSA
+- [x] **MAJOR, LIVE — HMAC-SHA256 provisioning tokens not listed as a CNSA
   exception** (`sbc-provision-server/src/main.rs:314`; split from the HA1 item
   above). Record as an exception with POA&M, or move the HMAC to SHA-384.
+  Fixed 2026-11-07 (fix/mgmt-api-hardening): moved to HMAC-SHA-384 with a hex
+  secret of at least 32 bytes and `--mint-token`; no exception needed.
+  Expiry/revocation remain POA&M-120.
 - [x] **MINOR, LIVE — dropped audit records leave no trace in the chain**
   (sequence assigned in the writer). Emit an `AuditRecordsDropped{count}` record.
   Fixed 2026-11-06 (uc-audit-integrity): markers for queue-full, sink-write

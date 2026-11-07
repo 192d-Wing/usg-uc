@@ -103,7 +103,7 @@ members = [
     "crates/client/client-integration-tests",
 ]
 # Nightly-only cargo-fuzz crate; its own workspace (see its Cargo.toml).
-exclude = ["crates/proto/proto-sip/fuzz"]
+exclude = ["crates/proto/proto-sip/fuzz", "crates/uc/uc-t38/fuzz"]
 resolver = "2"
 
 [workspace.package]

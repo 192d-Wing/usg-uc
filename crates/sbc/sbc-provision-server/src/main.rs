@@ -19,17 +19,17 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use hmac::{Hmac, Mac};
 use sbc_config_store::PostgresPhoneStore;
-use sha2::Sha256;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use uc_phone_mgmt::provisioning::ProvisioningServer;
 
 mod config;
+mod token;
 
 use config::Config;
+use token::ProvisionSecret;
 
 #[derive(Clone)]
 struct AppState {
@@ -37,11 +37,17 @@ struct AppState {
     provisioning: Arc<ProvisioningServer>,
     start_time: std::time::Instant,
     /// Shared secret for HMAC device auth. `None` = unauthenticated.
-    provision_secret: Option<Arc<String>>,
+    provision_secret: Option<ProvisionSecret>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
+    // `--mint-token <MAC>`: print the device token for a MAC and exit.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--mint-token") {
+        return mint_token_cli(args.get(1).map(String::as_str));
+    }
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sbc_provision_server=debug"));
     tracing_subscriber::fmt()
@@ -87,7 +93,7 @@ async fn main() -> ExitCode {
         phones,
         provisioning,
         start_time: std::time::Instant::now(),
-        provision_secret: cfg.provision_secret.clone().map(Arc::new),
+        provision_secret: cfg.provision_secret.clone(),
     };
 
     let restriction = source_restriction(&cfg);
@@ -259,7 +265,7 @@ async fn serve_teo_global() -> impl IntoResponse {
 /// Query parameters for provisioning requests.
 #[derive(Debug, serde::Deserialize)]
 struct ProvisionQuery {
-    /// HMAC-SHA256 token for device authentication.
+    /// HMAC-SHA-384 token (96 hex chars) for device authentication.
     #[serde(default)]
     token: Option<String>,
 }
@@ -293,7 +299,7 @@ async fn serve_phone_config(
     let filename = path.rsplit('/').next().unwrap_or(&path);
     let stem = filename.split('.').next().unwrap_or(filename);
     let mac_token = stem.split('-').next().unwrap_or(stem);
-    let mac_key = mac_token.replace([':', '-'], "").to_lowercase();
+    let mac_key = token::normalize_mac(mac_token);
 
     // Verify HMAC device token when a provision secret is configured.
     // POAM: POA&M-120 -- the token is a static HMAC(secret, mac) in the
@@ -303,16 +309,12 @@ async fn serve_phone_config(
     // per-phone `provision_epoch` for revocation, keyed rotation, and the
     // token carried in the generated resync URLs (IA-3, IA-5(1), AC-2(3)).
     if let Some(ref secret) = state.provision_secret {
-        let valid = query.token.as_deref().is_some_and(|token| {
-            let Ok(token_bytes) = hex::decode(token) else {
-                return false;
-            };
-            let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
-                return false;
-            };
-            mac.update(mac_key.as_bytes());
-            mac.verify_slice(&token_bytes).is_ok()
-        });
+        // NIST 800-53 Rev5: SC-13 — HMAC-SHA-384 (CNSA 2.0); legacy
+        // HMAC-SHA-256 tokens are rejected (re-mint with --mint-token).
+        let valid = query
+            .token
+            .as_deref()
+            .is_some_and(|t| token::verify_device_token(secret, &mac_key, t));
         if !valid {
             warn!(mac = %mac_key, "provisioning request with invalid or missing device token");
             return Response::builder()
@@ -392,6 +394,34 @@ fn source_restriction(cfg: &Config) -> SourceRestriction {
     restriction
 }
 
+/// Output of `--mint-token`: the token, or an error message (never the
+/// secret).
+fn mint_token_output(secret: Option<String>, mac: Option<&str>) -> Result<String, String> {
+    let mac = mac
+        .map(token::normalize_mac)
+        .filter(|m| m.len() == 12 && m.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| "usage: sbc-provision-server --mint-token <MAC>".to_string())?;
+    let secret = config::parse_provision_secret(secret)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "SBC_PROVISION_SECRET is not set".to_string())?;
+    Ok(token::mint_device_token(&secret, &mac))
+}
+
+/// `--mint-token <MAC>` CLI: reads `SBC_PROVISION_SECRET` from env, prints
+/// the hex token for `?token=` and exits.
+fn mint_token_cli(mac: Option<&str>) -> ExitCode {
+    match mint_token_output(std::env::var("SBC_PROVISION_SECRET").ok(), mac) {
+        Ok(t) => {
+            println!("{t}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod span_tests {
@@ -405,5 +435,39 @@ mod span_tests {
         assert_eq!(span_path(&uri), "/provision/aabbccddeeff.cfg");
         let req = axum::http::Request::get(uri).body(()).unwrap();
         let _span = http_span(&req);
+    }
+
+    #[test]
+    fn mint_token_cli_matches_verifier() {
+        let secret = "5a".repeat(48);
+        let t = mint_token_output(Some(secret.clone()), Some("AA:BB:CC:DD:EE:FF")).unwrap();
+        let s = ProvisionSecret::new(secret.clone()).unwrap();
+        assert!(token::verify_device_token(&s, "aabbccddeeff", &t));
+        assert!(mint_token_output(Some(secret), Some("not-a-mac")).is_err());
+        assert!(mint_token_output(None, Some("aabbccddeeff")).is_err());
+        assert!(mint_token_output(Some("short".into()), Some("aabbccddeeff")).is_err());
+    }
+
+    #[test]
+    fn mint_token_cli_rejects_bad_mac_and_secret_boundaries() {
+        let secret = "5a".repeat(32);
+        // Exactly the secret floor (32 decoded bytes) is accepted.
+        assert!(mint_token_output(Some(secret.clone()), Some("aabbccddeeff")).is_ok());
+        assert!(mint_token_output(Some("5a".repeat(31)), Some("aabbccddeeff")).is_err());
+        // Non-hex secret of sufficient length is rejected.
+        assert!(mint_token_output(Some("s".repeat(64)), Some("aabbccddeeff")).is_err());
+        assert!(mint_token_output(Some(String::new()), Some("aabbccddeeff")).is_err());
+        // MAC argument missing, wrong length, or non-hex.
+        assert!(mint_token_output(Some(secret.clone()), None).is_err());
+        assert!(mint_token_output(Some(secret.clone()), Some("")).is_err());
+        assert!(mint_token_output(Some(secret.clone()), Some("aabbccddeef")).is_err());
+        assert!(mint_token_output(Some(secret.clone()), Some("aabbccddeeff0")).is_err());
+        assert!(mint_token_output(Some(secret), Some("gghhiijjkkll")).is_err());
+        // Error text never echoes the secret.
+        let err =
+            mint_token_output(Some("hunter2hunter2".into()), Some("aabbccddeeff")).unwrap_err();
+        assert!(!err.contains("hunter2"));
+        let err = mint_token_output(Some("5a".repeat(20)), Some("aabbccddeeff")).unwrap_err();
+        assert!(!err.contains("5a5a"));
     }
 }
