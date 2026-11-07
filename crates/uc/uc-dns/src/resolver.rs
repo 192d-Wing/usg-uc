@@ -143,10 +143,26 @@ pub struct SipResolver {
 
 impl SipResolver {
     /// Creates a new SIP resolver.
+    ///
+    /// With the `resolver` feature, DNS queries use the host's system DNS
+    /// configuration. If that cannot be read the resolver runs with no DNS
+    /// backend (numeric/cached targets only) — it never falls back to
+    /// hickory's public default resolvers.
+    ///
+    /// NIST 800-53 Rev5: CM-7 (enterprise resolver, fail-safe).
     #[must_use]
     pub fn new(config: SipResolverConfig, cache: Arc<DnsCache>) -> Self {
         #[cfg(feature = "resolver")]
-        let dns_resolver = HickoryDnsResolver::new(Arc::clone(&cache)).ok();
+        let dns_resolver = match HickoryDnsResolver::from_system_conf(Arc::clone(&cache)) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "system DNS configuration unavailable; SIP resolver running without DNS backend"
+                );
+                None
+            }
+        };
 
         Self {
             config,
@@ -330,12 +346,11 @@ impl SipResolver {
             targets = self.resolve_fallback(host, transport).await?;
         }
 
-        // Sort by priority then weight
-        targets.sort_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then_with(|| b.weight.cmp(&a.weight))
-        });
+        // RFC 2782 / RFC 3263 §4.4: targets are already in RFC 2782 order
+        // (priority, then weighted-random within a priority). Only a stable
+        // priority sort is safe here; sorting by weight would discard the
+        // weighted-random draw.
+        targets.sort_by_key(|t| t.priority);
 
         if targets.is_empty() {
             return Err(DnsError::NoRecords {
@@ -397,8 +412,10 @@ impl SipResolver {
         resolver.add_records(records.to_vec());
 
         // Select appropriate NAPTR record based on transport preference
+        // RFC 3263 §4.1: discard records whose service is not a supported
+        // SIP/SIPS service.
         let selected = transport.to_transport_pref().map_or_else(
-            || resolver.select_best(),
+            || resolver.select_best_sip(),
             |pref| {
                 let matching = resolver.select_for_transport(pref);
                 matching.into_iter().next()
@@ -421,25 +438,10 @@ impl SipResolver {
             return Ok(None);
         }
 
-        let mut targets = Vec::new();
-        for srv in srv_records {
-            let addresses = self.resolve_addresses(&srv.target).await?;
-            for ip in addresses {
-                targets.push(SipTarget::with_details(
-                    SocketAddr::new(ip, srv.port),
-                    naptr_transport,
-                    Some(host.to_string()),
-                    srv.priority,
-                    srv.weight,
-                ));
-            }
-        }
-
-        if targets.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(targets))
-        }
+        // RFC 3263 §4.1: the replacement is an SRV name processed per
+        // RFC 2782 (weighted order, "." targets dropped).
+        self.process_srv_records(host, &srv_records, naptr_transport)
+            .await
     }
 
     /// Resolves using SRV records directly.
@@ -497,10 +499,21 @@ impl SipResolver {
 
         let mut targets = Vec::new();
 
-        for srv in records {
+        // RFC 2782 / RFC 3263 §4.4: try targets in priority order with
+        // weighted-random ordering within each priority.
+        for srv in &SrvResolver::order_rfc2782(records) {
             // Use cached addresses if available
             let addresses = if srv.addresses.is_empty() {
-                self.resolve_addresses(&srv.target).await?
+                // RFC 3263 §4.4 / RFC 2782: a target that does not resolve
+                // is skipped and the next one tried; only if every target
+                // fails does the caller fall back.
+                match self.resolve_addresses(&srv.target).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        debug!(target = %srv.target, error = %e, "SRV target unresolvable; trying next");
+                        continue;
+                    }
+                }
             } else {
                 srv.addresses.clone()
             };
@@ -683,6 +696,17 @@ mod tests {
         assert!(target.is_secure());
     }
 
+    /// NIST 800-53 Rev5: CM-7 — with the `resolver` feature the default
+    /// constructor wires the system-configured DNS backend (when the host has
+    /// one), so RFC 3263 NAPTR/SRV queries are actually issued.
+    #[cfg(feature = "resolver")]
+    #[test]
+    fn test_with_defaults_has_system_dns_backend_outside_runtime() {
+        let resolver = SipResolver::with_defaults();
+        let system_ok = HickoryDnsResolver::from_system_conf(Arc::new(DnsCache::default())).is_ok();
+        assert_eq!(resolver.has_dns_resolver(), system_ok);
+    }
+
     #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_resolve_numeric_ip() {
@@ -767,5 +791,301 @@ mod tests {
         assert_eq!(target.priority, 10);
         assert_eq!(target.weight, 100);
         assert_eq!(target.hostname, Some("sip.example.com".to_string()));
+    }
+
+    /// Fail-safe path (plan Q3): a resolver with no DNS backend must still
+    /// serve numeric and cached targets, and must not issue network queries
+    /// for uncached names (returns promptly, no panic).
+    #[cfg(feature = "resolver")]
+    fn no_backend_resolver(cache: Arc<DnsCache>) -> SipResolver {
+        SipResolver {
+            config: SipResolverConfig::default(),
+            cache,
+            naptr_resolver: NaptrResolver::new(),
+            srv_resolver: SrvResolver::new(),
+            dns_resolver: None,
+        }
+    }
+
+    #[cfg(feature = "resolver")]
+    #[allow(clippy::unwrap_used)]
+    #[tokio::test]
+    async fn test_no_backend_fallback_serves_numeric_and_cached() {
+        let cache = Arc::new(DnsCache::default());
+        let resolver = no_backend_resolver(Arc::clone(&cache));
+        assert!(!resolver.has_dns_resolver());
+
+        let t = resolver
+            .resolve("192.0.2.7", None, TransportPreference::Tls)
+            .await
+            .unwrap();
+        assert_eq!(t.len(), 1);
+        assert!(t[0].is_secure());
+
+        cache
+            .put(
+                "sip:cached.example:Any",
+                "SIP",
+                CacheEntry::Address(vec!["192.0.2.8".parse().unwrap()]),
+                Duration::from_mins(5),
+            )
+            .await;
+        let t = resolver
+            .resolve("cached.example", None, TransportPreference::Any)
+            .await
+            .unwrap();
+        assert_eq!(t.len(), 1);
+    }
+
+    #[cfg(feature = "resolver")]
+    #[tokio::test]
+    async fn test_no_backend_uncached_name_does_not_hang() {
+        let resolver = no_backend_resolver(Arc::new(DnsCache::default()));
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            resolver.resolve("uncached.invalid", None, TransportPreference::Any),
+        )
+        .await;
+        assert!(res.is_ok(), "no-backend resolve must not block on network");
+        if let Ok(Ok(targets)) = res {
+            assert!(targets.is_empty() || targets.iter().all(|t| t.address.ip().is_loopback()));
+        }
+    }
+
+    /// Resolver with no network backend in either feature configuration.
+    fn offline_resolver(cache: Arc<DnsCache>) -> SipResolver {
+        SipResolver {
+            config: SipResolverConfig::default(),
+            cache,
+            naptr_resolver: NaptrResolver::new(),
+            srv_resolver: SrvResolver::new(),
+            #[cfg(feature = "resolver")]
+            dns_resolver: None,
+        }
+    }
+
+    #[allow(clippy::unwrap_used)]
+    fn srv_with_addr(prio: u16, weight: u16, target: &str, ip: &str) -> SrvRecord {
+        let mut r = SrvRecord::new("_sip._udp.example.com", prio, weight, 5060, target, 300);
+        r.add_address(ip.parse().unwrap());
+        r
+    }
+
+    /// RFC-001: resolve_full must preserve the RFC 2782 weighted-random
+    /// order within a priority. With weights 0 and 1 each record comes
+    /// first with probability 1/2, so over 200 runs both orders appear
+    /// (failure probability 2^-199). A weight-desc re-sort would always put
+    /// the weight-1 target first.
+    #[allow(clippy::unwrap_used)]
+    #[tokio::test]
+    async fn test_resolve_preserves_weighted_order() {
+        let cache = Arc::new(DnsCache::default());
+        let resolver = offline_resolver(Arc::clone(&cache));
+        let srv_name = SrvResolver::sip_srv_name("example.com", &TransportPref::Udp.to_string());
+        resolver
+            .cache_srv(
+                &srv_name,
+                vec![
+                    srv_with_addr(10, 1, "heavy.example.com", "192.0.2.1"),
+                    srv_with_addr(10, 0, "light.example.com", "192.0.2.2"),
+                    srv_with_addr(20, 100, "backup.example.com", "192.0.2.3"),
+                ],
+                Duration::from_mins(5),
+            )
+            .await;
+
+        let (mut heavy_first, mut light_first) = (0, 0);
+        for _ in 0..200 {
+            let t = resolver
+                .resolve("example.com", None, TransportPreference::Udp)
+                .await
+                .unwrap();
+            assert_eq!(t.len(), 3);
+            // Priority order is always respected.
+            assert_eq!(t[2].address.ip().to_string(), "192.0.2.3");
+            match t[0].address.ip().to_string().as_str() {
+                "192.0.2.1" => heavy_first += 1,
+                "192.0.2.2" => light_first += 1,
+                other => unreachable!("unexpected first target {other}"),
+            }
+        }
+        assert!(
+            heavy_first > 0 && light_first > 0,
+            "{heavy_first}/{light_first}"
+        );
+    }
+
+    /// RFC-003: an unresolvable SRV target is skipped, not fatal.
+    #[allow(clippy::unwrap_used)]
+    #[tokio::test]
+    async fn test_unresolvable_srv_target_is_skipped() {
+        let cache = Arc::new(DnsCache::default());
+        let resolver = offline_resolver(Arc::clone(&cache));
+        let srv_name = SrvResolver::sip_srv_name("example.com", &TransportPref::Udp.to_string());
+        resolver
+            .cache_srv(
+                &srv_name,
+                vec![
+                    SrvRecord::new(&srv_name, 10, 0, 5060, "dead.invalid", 300),
+                    srv_with_addr(20, 0, "alive.example.com", "192.0.2.9"),
+                ],
+                Duration::from_mins(5),
+            )
+            .await;
+
+        let t = resolver
+            .resolve("example.com", None, TransportPreference::Udp)
+            .await
+            .unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].address, "192.0.2.9:5060".parse().unwrap());
+        assert_eq!(t[0].priority, 20);
+    }
+
+    /// RFC-002: NAPTR→SRV drops "." targets and resolves through RFC 2782.
+    #[allow(clippy::unwrap_used)]
+    #[tokio::test]
+    async fn test_naptr_srv_filters_null_target() {
+        let cache = Arc::new(DnsCache::default());
+        let resolver = offline_resolver(Arc::clone(&cache));
+        resolver
+            .cache_naptr(
+                "example.com",
+                vec![NaptrRecord::new(
+                    "example.com",
+                    10,
+                    10,
+                    "s",
+                    "SIP+D2U",
+                    "",
+                    "_sip._udp.example.com",
+                    300,
+                )],
+                Duration::from_mins(5),
+            )
+            .await;
+        resolver
+            .cache_srv(
+                "_sip._udp.example.com",
+                vec![
+                    SrvRecord::new("_sip._udp.example.com", 0, 0, 5060, ".", 300),
+                    srv_with_addr(10, 0, "ok.example.com", "192.0.2.4"),
+                ],
+                Duration::from_mins(5),
+            )
+            .await;
+        let t = resolver
+            .resolve("example.com", None, TransportPreference::Any)
+            .await
+            .unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].address, "192.0.2.4:5060".parse().unwrap());
+        assert_eq!(t[0].transport, TransportPref::Udp);
+    }
+
+    /// RFC-005: with no preference, a non-SIP NAPTR record ordered first is
+    /// skipped in favour of the first SIP service.
+    #[allow(clippy::unwrap_used)]
+    #[tokio::test]
+    async fn test_naptr_any_skips_non_sip_service() {
+        let cache = Arc::new(DnsCache::default());
+        let resolver = offline_resolver(Arc::clone(&cache));
+        resolver
+            .cache_naptr(
+                "example.com",
+                vec![
+                    NaptrRecord::new(
+                        "example.com",
+                        1,
+                        1,
+                        "s",
+                        "E2U+email",
+                        "",
+                        "_x._tcp.example.com",
+                        300,
+                    ),
+                    NaptrRecord::new(
+                        "example.com",
+                        10,
+                        10,
+                        "s",
+                        "SIPS+D2T",
+                        "",
+                        "_sips._tcp.example.com",
+                        300,
+                    ),
+                ],
+                Duration::from_mins(5),
+            )
+            .await;
+        let mut r = srv_with_addr(10, 0, "tls.example.com", "192.0.2.5");
+        r.port = 5061;
+        resolver
+            .cache_srv("_sips._tcp.example.com", vec![r], Duration::from_mins(5))
+            .await;
+        let t = resolver
+            .resolve("example.com", None, TransportPreference::Any)
+            .await
+            .unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].transport, TransportPref::Tls);
+    }
+
+    /// SEC-1 / RFC 3263 §4.1: a sips: URI (TLS preference) never yields a
+    /// non-TLS target, even when NAPTR prefers UDP and an insecure SRV set
+    /// exists for the domain.
+    #[allow(clippy::unwrap_used)]
+    #[tokio::test]
+    async fn test_sips_never_downgrades_via_naptr_or_srv() {
+        let cache = Arc::new(DnsCache::default());
+        let resolver = offline_resolver(Arc::clone(&cache));
+        resolver
+            .cache_naptr(
+                "example.com",
+                vec![NaptrRecord::new(
+                    "example.com",
+                    1,
+                    1,
+                    "s",
+                    "SIP+D2U",
+                    "",
+                    "_sip._udp.example.com",
+                    300,
+                )],
+                Duration::from_mins(5),
+            )
+            .await;
+        resolver
+            .cache_srv(
+                "_sip._udp.example.com",
+                vec![srv_with_addr(0, 0, "udp.example.com", "192.0.2.6")],
+                Duration::from_mins(5),
+            )
+            .await;
+
+        // No TLS records at all: must fail (or fall back to A with TLS),
+        // never return the UDP target.
+        if let Ok(t) = resolver
+            .resolve("example.com", None, TransportPreference::Tls)
+            .await
+        {
+            assert!(t.iter().all(SipTarget::is_secure));
+        }
+
+        // With a TLS SRV set present via the direct SRV step, only TLS
+        // targets come back.
+        let tls_srv = SrvResolver::sip_srv_name("example.com", &TransportPref::Tls.to_string());
+        let mut r = srv_with_addr(10, 0, "tls.example.com", "192.0.2.7");
+        r.port = 5061;
+        resolver
+            .cache_srv(&tls_srv, vec![r], Duration::from_mins(5))
+            .await;
+        let t = resolver
+            .resolve("example.com", None, TransportPreference::Tls)
+            .await
+            .unwrap();
+        assert!(!t.is_empty());
+        assert!(t.iter().all(SipTarget::is_secure));
+        assert!(t.iter().all(|t| t.address.ip().to_string() == "192.0.2.7"));
     }
 }

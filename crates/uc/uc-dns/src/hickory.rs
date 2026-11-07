@@ -29,11 +29,48 @@ pub struct HickoryDnsResolver {
 }
 
 impl HickoryDnsResolver {
-    /// Creates a new resolver with system configuration.
+    /// Creates a resolver from the operating system's DNS configuration
+    /// (`/etc/resolv.conf` on Unix, SystemConfiguration on Apple, the
+    /// registry on Windows).
+    ///
+    /// NIST 800-53 Rev5: CM-7 — queries go to the enterprise resolver the
+    /// host is configured for, never a hard-coded public one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DnsError::ResolverInit`] if the system configuration cannot be
+    /// read or the resolver cannot be built. Callers must not fall back to
+    /// [`Self::new`] (public resolvers) on error.
+    // POAM: POA&M-172 - DNS responses are not DNSSEC-validated and are not
+    // carried over DoT (SC-20, SC-21, SC-22).
+    pub fn from_system_conf(cache: Arc<DnsCache>) -> DnsResult<Self> {
+        let resolver = TokioResolver::builder(TokioRuntimeProvider::default())
+            .map_err(|e| DnsError::ResolverInit {
+                reason: format!("system DNS configuration unavailable: {e}"),
+            })?
+            .build()
+            .map_err(|e| DnsError::ResolverInit {
+                reason: e.to_string(),
+            })?;
+
+        Ok(Self {
+            resolver,
+            cache,
+            default_ttl: Duration::from_mins(5),
+        })
+    }
+
+    /// Creates a new resolver with hickory's default configuration.
+    ///
+    /// Note: hickory's default [`ResolverConfig`] points at public resolvers;
+    /// production callers should use [`Self::from_system_conf`].
     ///
     /// # Errors
     ///
     /// Returns an error if the resolver cannot be created.
+    // POAM: POA&M-174 - public-resolver constructor kept `pub` because
+    // uc-discovery (dns.rs) still calls it; migrate to `from_system_conf`
+    // and restrict to `pub(crate)` (CM-7).
     pub fn new(cache: Arc<DnsCache>) -> DnsResult<Self> {
         let resolver = TokioResolver::builder_with_config(
             ResolverConfig::default(),
@@ -360,6 +397,21 @@ mod tests {
         let cache = Arc::new(DnsCache::default());
         let resolver = HickoryDnsResolver::new(cache);
         assert!(resolver.is_ok());
+    }
+
+    #[test]
+    fn test_from_system_conf_uses_host_config_or_resolver_init() {
+        let result = HickoryDnsResolver::from_system_conf(Arc::new(DnsCache::default()));
+        let host_has_nameserver = std::fs::read_to_string("/etc/resolv.conf")
+            .is_ok_and(|c| c.lines().any(|l| l.trim_start().starts_with("nameserver")));
+        if host_has_nameserver {
+            // A configured host must yield a backend built from its config.
+            assert!(result.is_ok(), "system conf present but init failed");
+        } else {
+            // Otherwise the only acceptable outcome is a ResolverInit error,
+            // never a silent fallback to hickory's public resolvers.
+            assert!(matches!(result, Err(DnsError::ResolverInit { .. })));
+        }
     }
 
     #[allow(clippy::unwrap_used)]

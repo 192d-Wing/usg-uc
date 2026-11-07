@@ -71,5 +71,5 @@ wave 2 = b79893b0.
 2. ✅ **Route-set handling (#2)** — prerequisite for the client working against our own SBC.
 3. ✅ **Registration robustness (#5, #11)** and **NAT (#6)** — small, high value.
 4. ✅ **RTP DTX timestamp + marker (#8, #9)** — small fixes in io_thread/rtp_handler.
-5. ✅ **RFC 3263 DNS (#4)** — resolved via `uc-dns` (NAPTR/SRV, `resolver` feature).
+5. ✅ **RFC 3263 DNS (#4)** — resolved via `uc-dns` (NAPTR/SRV, `resolver` feature). Before fix/client-cnsa-tls-dns the resolver had no DNS backend, so NAPTR/SRV were never queried. It now uses the system DNS configuration, with RFC 2782 weighted SRV order. No DNSSEC (NIST POA&M-172).
 6. ✅ All findings are now fixed or accepted as documented limitations (SRTP ROC across DTLS rekey, early-media start, ICE trickling).

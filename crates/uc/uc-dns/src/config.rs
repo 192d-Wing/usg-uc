@@ -1,6 +1,6 @@
 //! DNS configuration.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 /// DNS resolver configuration.
@@ -40,10 +40,9 @@ pub struct DnsConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
-            servers: vec![
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 53),
-            ],
+            // Empty = use the host's system resolver configuration; no
+            // hard-coded public resolvers. NIST 800-53 Rev5: CM-7.
+            servers: Vec::new(),
             timeout: Duration::from_secs(5),
             retries: 2,
             cache_enabled: true,
@@ -227,7 +226,7 @@ mod tests {
         let config = DnsConfig::default();
         assert!(config.cache_enabled);
         assert_eq!(config.retries, 2);
-        assert!(!config.servers.is_empty());
+        assert_eq!(config.servers, Vec::<SocketAddr>::new());
     }
 
     #[test]
