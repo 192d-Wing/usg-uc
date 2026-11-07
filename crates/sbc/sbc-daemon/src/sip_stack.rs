@@ -178,6 +178,16 @@ pub struct RoutingCounters {
     pub user_limiter_overflow: AtomicU64,
     /// Emergency INVITEs that bypassed the per-user limiter.
     pub user_limiter_emergency_bypass: AtomicU64,
+    /// Egress messages that failed topology hiding and were not sent raw
+    /// (`sbc_topology_hiding_failures_total`, POA&M-156).
+    ///
+    /// POAM: POA&M-180 - counted but not yet exported by the metrics
+    /// endpoint (`api_server.rs` `ROUTING_METRICS`).
+    pub topology_hiding_failures: AtomicU64,
+    /// Header-manipulation rule failures that rejected a request
+    /// (`sbc_header_manipulation_failures_total`, POA&M-156). Export: see
+    /// `topology_hiding_failures`.
+    pub header_manipulation_failures: AtomicU64,
 }
 
 /// Route patterns rejected (unknown `pattern_type`) at seed or sync time.
@@ -556,6 +566,11 @@ struct CallAddresses {
     a_leg_sip_call_id: String,
     /// B-leg SIP Call-ID.
     b_leg_sip_call_id: String,
+    /// Per-leg topology-hiding decision (POA&M-155). Node-local:
+    /// `CallAddresses` is not replicated.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7
+    hidden: HiddenLegs,
     /// SBC's local SIP address (`host:port` of the B-leg transport's
     /// listener) for B-leg Via/Contact headers.
     local_addr: String,
@@ -651,6 +666,17 @@ struct CallAddresses {
     ///
     /// ## NIST 800-53 Rev5: AU-3, AU-12
     cdr: crate::cdr::CdrDraft,
+}
+
+/// Which legs of a call get topology-hidden egress.
+#[derive(Debug, Clone, Copy, Default)]
+struct HiddenLegs {
+    /// Toward the caller: a trunk, or outside
+    /// `topology_hiding.internal_networks`.
+    a_leg: bool,
+    /// Toward the callee: the B-leg faces a trunk (`b_leg_external`) or a
+    /// destination outside `topology_hiding.internal_networks`.
+    b_leg: bool,
 }
 
 impl CallAddresses {
@@ -1110,14 +1136,324 @@ fn manipulation_failure(e: &proto_sip::SipError) -> (StatusCode, String) {
 /// Status and audit policy for a B-leg topology-hiding failure: 400, as the
 /// unparseable element came from the peer (NIST 800-53 Rev5: SC-7).
 fn topology_failure(e: &proto_sip::SipError) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, topology_policy(e))
+}
+
+/// Audit policy for a topology-hiding failure on any egress path:
+/// `sip.topology_hiding.failed:<Header>` (no header value, SI-11).
+fn topology_policy(e: &proto_sip::SipError) -> String {
     let header = match e {
         proto_sip::SipError::TopologyHiding { header, .. } => header.as_str(),
         _ => "unknown",
     };
-    (
-        StatusCode::BAD_REQUEST,
-        format!("sip.topology_hiding.failed:{header}"),
-    )
+    format!("sip.topology_hiding.failed:{header}")
+}
+
+/// Per-call topology-hiding decision, captured before a handler runs (the
+/// handler may already have removed the call record, e.g. on BYE).
+#[derive(Debug, Clone)]
+struct LegHiding {
+    a_call_id: String,
+    b_call_id: String,
+    a_hidden: bool,
+    b_hidden: bool,
+}
+
+impl LegHiding {
+    fn of(addrs: &CallAddresses) -> Self {
+        Self {
+            a_call_id: addrs.a_leg_sip_call_id.clone(),
+            b_call_id: addrs.b_leg_sip_call_id.clone(),
+            a_hidden: addrs.hidden.a_leg,
+            b_hidden: addrs.hidden.b_leg,
+        }
+    }
+
+    fn for_call_id(&self, call_id: &str) -> Option<bool> {
+        if call_id == self.a_call_id {
+            Some(self.a_hidden)
+        } else if call_id == self.b_call_id {
+            Some(self.b_hidden)
+        } else {
+            None
+        }
+    }
+}
+
+/// What a dropped egress message was, for the fail-closed follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HideFailureKind {
+    /// A request (relayed or SBC-originated) that was dropped.
+    Request,
+    /// An initial (to-tag-less) INVITE: a failover attempt; the call fails.
+    InitialInvite,
+    /// A 2xx to INVITE replaced by a 500: the dialog is torn down.
+    Invite2xx,
+    /// A reliable 1xx (`Require: 100rel`, RFC 3262 §3) to INVITE, replaced
+    /// by a 500 like a final response; an unanswered call is torn down
+    /// (CANCEL to the callee) instead of waiting 64*T1 for the UAS.
+    ReliableProvisional,
+    /// Any other response (final replaced by 500, unreliable 1xx dropped).
+    Response,
+}
+
+/// CANCEL for the B-leg's current INVITE attempt.
+fn build_b_leg_cancel(addrs: &CallAddresses) -> SipRequest {
+    // CANCEL to B-leg. RFC 3261 §9.1: a CANCEL must mirror the INVITE
+    // it cancels — same Via branch, From, To (no tag), and CSeq number
+    // with method CANCEL. A fresh branch made it unmatchable.
+    // RFC 3261 §9.1: the Request-URI is the current attempt's INVITE
+    // Request-URI (updated on failover); the socket-address form is only
+    // a fallback for records that predate it.
+    let b_uri = addrs.b_leg_ruri.clone().unwrap_or_else(|| {
+        leg_request_uri(
+            None,
+            &addrs.b_leg_destination.ip().to_string(),
+            addrs.b_leg_destination.port(),
+            &addrs.b_leg_flow,
+        )
+    });
+    let mut b_cancel = proto_sip::message::SipRequest::new(Method::Cancel, b_uri);
+    b_cancel
+        .headers
+        .set(HeaderName::CallId, &addrs.b_leg_sip_call_id);
+    b_cancel.headers.set(HeaderName::CSeq, "1 CANCEL");
+    b_cancel.headers.set(HeaderName::From, &addrs.b_leg_from);
+    b_cancel.headers.set(HeaderName::To, &addrs.b_leg_to);
+    b_cancel.headers.set(HeaderName::MaxForwards, "70");
+    b_cancel.headers.add(Header::new(
+        HeaderName::Via,
+        crate::flow::via_for(&addrs.b_leg_flow, &addrs.local_addr, &addrs.b_leg_branch),
+    ));
+    b_cancel.headers.set(HeaderName::ContentLength, "0");
+    b_cancel
+}
+
+/// Whether a response requires reliable provisional delivery (RFC 3262 §3).
+fn requires_100rel(resp: &SipResponse) -> bool {
+    resp.headers.get_all(&HeaderName::Require).any(|h| {
+        h.value
+            .split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("100rel"))
+    })
+}
+
+/// One egress message that failed topology hiding (never sent raw).
+#[derive(Debug)]
+struct HideFailure {
+    kind: HideFailureKind,
+    policy: String,
+    method: String,
+    call_id: Option<String>,
+    cseq: Option<String>,
+    destination: SbcSocketAddr,
+    /// Peer whose message failed hiding (the relayed trigger's source);
+    /// `None` for SBC-originated messages (AU-3).
+    source: Option<SbcSocketAddr>,
+}
+
+/// Visits every wire message (`Response` / `Forward`) of a result in
+/// depth-first order.
+fn for_each_wire_mut(result: &mut ProcessResult, f: &mut impl FnMut(&mut ProcessResult)) {
+    match result {
+        ProcessResult::Multiple(v) => {
+            for r in v {
+                for_each_wire_mut(r, f);
+            }
+        }
+        ProcessResult::Response { .. } | ProcessResult::Forward { .. } => f(result),
+        ProcessResult::NoAction | ProcessResult::Error { .. } => {}
+    }
+}
+
+/// Bare response of `status` carrying only the dialog/transaction headers of
+/// `resp` (Via, From, To, Call-ID, CSeq): no Contact or Record-Route, so it
+/// cannot leak topology or fail hiding itself.
+fn bare_response_like(resp: &SipResponse, status: StatusCode) -> SipResponse {
+    let mut out = SipResponse::new(status);
+    for via in resp.headers.get_all(&HeaderName::Via) {
+        out.headers.add(Header::new(HeaderName::Via, &via.value));
+    }
+    for name in [
+        HeaderName::From,
+        HeaderName::To,
+        HeaderName::CallId,
+        HeaderName::CSeq,
+    ] {
+        if let Some(v) = resp.headers.get_value(&name) {
+            out.headers.set(name, v);
+        }
+    }
+    out.headers.set(HeaderName::ContentLength, "0");
+    out
+}
+
+/// Hides one wire message in place. On failure the message is never sent
+/// raw: a request is dropped, a final response is replaced by a bare 500
+/// and a 1xx is dropped (RFC 3261 §8.2.6.2: a response's Via is copied, not
+/// rewritten).
+///
+/// ## NIST 800-53 Rev5: SC-7, SI-17
+fn hide_wire(hider: &TopologyHider, element: &mut ProcessResult) -> Option<HideFailure> {
+    let (ProcessResult::Response { message, .. } | ProcessResult::Forward { message, .. }) =
+        element
+    else {
+        return None;
+    };
+    let res = match message {
+        SipMessage::Request(req) => hider.hide_b2bua_request(&mut req.headers),
+        // RFC 3261 §8.1.3.4 / §21.3: 3xx Contacts are redirect targets; only
+        // internal ones are rewritten.
+        SipMessage::Response(resp) => {
+            hider.hide_b2bua_response_for_status(&mut resp.headers, resp.status.code())
+        }
+    };
+    let e = res.err()?;
+    // Never forward the unhidden message: take it out of the result.
+    let (ProcessResult::Response {
+        message,
+        destination,
+        flow,
+    }
+    | ProcessResult::Forward {
+        message,
+        destination,
+        flow,
+    }) = std::mem::replace(element, ProcessResult::NoAction)
+    else {
+        return None;
+    };
+    let headers = message.headers();
+    let cseq = headers.cseq().map(str::to_string);
+    let call_id = headers.call_id().map(str::to_string);
+    let (kind, method) = match &message {
+        SipMessage::Request(req) => {
+            let initial_invite = req.method == Method::Invite
+                && req
+                    .headers
+                    .get_value(&HeaderName::To)
+                    .is_some_and(|t| extract_param(t, "tag").is_none());
+            let kind = if initial_invite {
+                HideFailureKind::InitialInvite
+            } else {
+                HideFailureKind::Request
+            };
+            (kind, req.method.to_string())
+        }
+        SipMessage::Response(resp) => {
+            let code = resp.status.code();
+            let is_invite = cseq
+                .as_deref()
+                .and_then(|c| c.split_whitespace().nth(1))
+                .is_some_and(|m| m.eq_ignore_ascii_case("INVITE"));
+            let reliable_1xx = code < 200 && is_invite && requires_100rel(resp);
+            let kind = if (200..300).contains(&code) && is_invite {
+                HideFailureKind::Invite2xx
+            } else if reliable_1xx {
+                HideFailureKind::ReliableProvisional
+            } else {
+                HideFailureKind::Response
+            };
+            // RFC-2: a reliable 1xx is not silently dropped (the UAS would
+            // retransmit for 64*T1); it fails like a final response.
+            if code >= 200 || reliable_1xx {
+                *element = ProcessResult::Response {
+                    message: SipMessage::Response(bare_response_like(
+                        resp,
+                        StatusCode::SERVER_INTERNAL_ERROR,
+                    )),
+                    destination,
+                    flow,
+                };
+            }
+            (kind, format!("response:{code}"))
+        }
+    };
+    Some(HideFailure {
+        kind,
+        policy: topology_policy(&e),
+        method,
+        call_id,
+        cseq,
+        destination,
+        source: None,
+    })
+}
+
+/// Message and destination of a wire element.
+fn wire_parts(el: &ProcessResult) -> Option<(&SipMessage, SbcSocketAddr)> {
+    match el {
+        ProcessResult::Response {
+            message,
+            destination,
+            ..
+        }
+        | ProcessResult::Forward {
+            message,
+            destination,
+            ..
+        } => Some((message, *destination)),
+        _ => None,
+    }
+}
+
+/// Appends `extra` to `result`, turning it into `Multiple` if needed.
+fn append_results(result: &mut ProcessResult, extra: Vec<ProcessResult>) {
+    if extra.is_empty() {
+        return;
+    }
+    if let ProcessResult::Multiple(v) = result {
+        v.extend(extra);
+        return;
+    }
+    let prev = std::mem::replace(result, ProcessResult::NoAction);
+    let mut v = Vec::with_capacity(extra.len() + 1);
+    v.push(prev);
+    v.extend(extra);
+    *result = ProcessResult::Multiple(v);
+}
+
+/// Whether `result` already holds a final response for the request with
+/// this Call-ID and CSeq.
+fn has_final_response(result: &ProcessResult, call_id: Option<&str>, cseq: Option<&str>) -> bool {
+    match result {
+        ProcessResult::Multiple(v) => v.iter().any(|r| has_final_response(r, call_id, cseq)),
+        ProcessResult::Response {
+            message: SipMessage::Response(resp),
+            ..
+        } => {
+            resp.status.code() >= 200
+                && resp.headers.call_id() == call_id
+                && resp.headers.cseq() == cseq
+        }
+        _ => false,
+    }
+}
+
+/// `AuthorizationDecision` (denied) for a message not sent because topology
+/// hiding failed. Carries no header value (SI-11).
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-12, SC-7
+/// NIST-002 (AU-3): `identity` / `source_ip` name the peer whose message
+/// failed (`"sbc"` / `None` for SBC-originated messages); the egress peer is
+/// recorded in `resource` as `<call-id>;dest=<addr>`.
+fn audit_topology_failure(f: &HideFailure) {
+    audit(uc_audit::AuditEvent::AuthorizationDecision(
+        uc_audit::event::AuthorizationDecision {
+            identity: f
+                .source
+                .map_or_else(|| "sbc".to_string(), |s| s.to_string()),
+            resource: format!(
+                "{};dest={}",
+                f.call_id.as_deref().unwrap_or_default(),
+                f.destination
+            ),
+            action: f.method.clone(),
+            granted: false,
+            policy: f.policy.clone(),
+            source_ip: f.source.map(|s| s.ip()),
+        },
+    ));
 }
 
 /// `AuthorizationDecision` for a rejected INVITE (admission or VPS policy).
@@ -2097,7 +2433,18 @@ impl SipStack {
 
         let mut timeouts = Vec::new();
         for (branch, call) in timed_out {
-            timeouts.extend(self.fail_timed_out_request(&branch, &call).await);
+            // C2 (POA&M-155): snapshot first, the failure releases the call.
+            let snapshot = if self.topology_hider.is_some() {
+                self.leg_hiding_of(&call).await
+            } else {
+                None
+            };
+            let mut failed = self.fail_timed_out_request(&branch, &call).await;
+            for r in &mut failed {
+                self.apply_egress_topology(r, None, snapshot.as_slice())
+                    .await;
+            }
+            timeouts.extend(failed);
         }
         // The 408s ride their server transactions; the BYEs get client ones
         // on the leg's own flow (RFC 3261 §17.1.2.2: reliable timers on
@@ -2191,6 +2538,349 @@ impl SipStack {
         Vec::new()
     }
 
+    /// Hiding decision for the call an inbound SIP Call-ID belongs to,
+    /// captured before its handler may remove the record (BYE, CANCEL).
+    async fn leg_hiding_for(&self, sip_call_id: &str) -> Option<LegHiding> {
+        let corr = self.call_correlation.read().await;
+        let id = corr
+            .a_leg
+            .get(sip_call_id)
+            .or_else(|| corr.b_leg.get(sip_call_id))?;
+        corr.addresses.get(id).map(LegHiding::of)
+    }
+
+    /// Hiding decision for an internal call id (timer paths).
+    async fn leg_hiding_of(&self, call: &CallId) -> Option<LegHiding> {
+        self.call_correlation
+            .read()
+            .await
+            .addresses
+            .get(call)
+            .map(LegHiding::of)
+    }
+
+    /// Hiding decision for traffic with no call record (out-of-dialog
+    /// responses, the announcement BYE): hide toward a trunk or any address
+    /// outside `topology_hiding.internal_networks`.
+    async fn destination_hidden(&self, dest: SbcSocketAddr) -> bool {
+        let Some(ref hider) = self.topology_hider else {
+            return false;
+        };
+        if self.inbound_trunk_map.read().await.contains_key(&dest.ip()) {
+            return true;
+        }
+        !hider.read().await.config().is_internal_ip(dest.ip())
+    }
+
+    /// Counts, logs and audits one topology-hiding failure. The header value
+    /// is never echoed (NIST 800-53 Rev5: SI-11; SI-4, AU-12).
+    fn record_topology_failure(&self, f: &HideFailure) {
+        let prev = self
+            .routing_counters
+            .topology_hiding_failures
+            .fetch_add(1, Ordering::Relaxed);
+        // PERF-004: a peer can trigger failures in a loop; the log line is
+        // sampled (first 10, then every 1000th). Counter and audit are not.
+        if prev < 10 || prev.is_multiple_of(1000) {
+            warn!(
+                method = %f.method,
+                policy = %f.policy,
+                destination = %f.destination,
+                total = prev + 1,
+                "Topology hiding failed; message not sent unhidden"
+            );
+        }
+        audit_topology_failure(f);
+    }
+
+    /// POA&M-155 egress chokepoint: topology-hides every wire message of
+    /// `result` that goes toward a hidden leg, before it is tracked (so
+    /// Timer A/E/G and 2xx retransmissions resend the hidden bytes).
+    ///
+    /// Requests get [`TopologyHider::hide_b2bua_request`] (Via, Contact,
+    /// Record-Route); responses get [`TopologyHider::hide_b2bua_response`]
+    /// (Contact, Record-Route; RFC 3261 §8.2.6.2 / §18.2.2: the Via stack
+    /// is the recipient's and is copied unchanged).
+    ///
+    /// Fail closed, never forward raw: a request is dropped (the inbound
+    /// `trigger` request gets a 500 unless already answered finally); a
+    /// final response becomes a bare 500, a 1xx is dropped; a dropped
+    /// failover INVITE fails the call (503 to the caller); a dropped 2xx to
+    /// INVITE tears the dialog down (BYE). Returns the failure count.
+    ///
+    /// Disabled hider: one `Option` check.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7, AC-4, SI-17, AU-12
+    // POAM-181: residual leaks not covered here: Warning / Server /
+    // User-Agent / Reason headers, SDP `o=` / `c=` lines, and the missing
+    // Contact on the relayed 2xx (RFC 3261 §12.1.1). SC-7 is partial until
+    // POA&M-181 closes. POAM-180: failure counters are not yet exported.
+    async fn apply_egress_topology(
+        &self,
+        result: &mut ProcessResult,
+        trigger: Option<(&Bytes, SbcSocketAddr)>,
+        snapshots: &[LegHiding],
+    ) -> usize {
+        let Some(ref hider_lock) = self.topology_hider else {
+            return 0;
+        };
+        let mut failures = self.hide_pass(hider_lock, result, snapshots).await;
+        if failures.is_empty() {
+            return 0;
+        }
+        // NIST-002: these came from relaying the trigger's message.
+        if let Some((_, src)) = trigger {
+            for f in &mut failures {
+                f.source = Some(src);
+            }
+        }
+        let (extra, extra_snapshots) = self.topology_followups(&failures, result, trigger).await;
+        if !extra.is_empty() {
+            let mut extra = ProcessResult::Multiple(extra);
+            // Follow-ups are SBC-built; a failure here only drops them (no
+            // further follow-ups, bounded).
+            failures.extend(
+                self.hide_pass(hider_lock, &mut extra, &extra_snapshots)
+                    .await,
+            );
+            let ProcessResult::Multiple(extra) = extra else {
+                return failures.len();
+            };
+            append_results(result, extra);
+        }
+        for f in &failures {
+            self.record_topology_failure(f);
+        }
+        failures.len()
+    }
+
+    /// Decides per wire message whether it goes to a hidden leg, then hides
+    /// it. Lock order: `call_correlation` → `inbound_trunk_map` →
+    /// `topology_hider`, never nested.
+    async fn hide_pass(
+        &self,
+        hider_lock: &RwLock<TopologyHider>,
+        result: &mut ProcessResult,
+        snapshots: &[LegHiding],
+    ) -> Vec<HideFailure> {
+        // Pass 1: the call's leg flag, or `None` (no call record) to fall
+        // back to the destination.
+        let mut decisions: Vec<Option<bool>> = Vec::new();
+        {
+            let corr = self.call_correlation.read().await;
+            for_each_wire_mut(result, &mut |el| {
+                let d = wire_parts(el)
+                    .and_then(|(m, _)| m.call_id())
+                    .and_then(|id| {
+                        snapshots
+                            .iter()
+                            .find_map(|s| s.for_call_id(id))
+                            .or_else(|| {
+                                corr.a_leg.get(id).map_or_else(
+                                    || {
+                                        corr.b_leg
+                                            .get(id)
+                                            .and_then(|c| corr.addresses.get(c))
+                                            .map(|a| a.hidden.b_leg)
+                                    },
+                                    |c| corr.addresses.get(c).map(|a| a.hidden.a_leg),
+                                )
+                            })
+                    });
+                decisions.push(d);
+            });
+        }
+        let mut trunk_dest = vec![false; decisions.len()];
+        if decisions.iter().any(Option::is_none) {
+            let map = self.inbound_trunk_map.read().await;
+            let mut i = 0;
+            for_each_wire_mut(result, &mut |el| {
+                if decisions.get(i).is_some_and(Option::is_none)
+                    && let Some((_, dest)) = wire_parts(el)
+                    && let Some(slot) = trunk_dest.get_mut(i)
+                {
+                    *slot = map.contains_key(&dest.ip());
+                }
+                i += 1;
+            });
+        }
+        // Pass 2: hide.
+        let hider = hider_lock.read().await;
+        let mut failures = Vec::new();
+        let mut i = 0;
+        for_each_wire_mut(result, &mut |el| {
+            let hide = decisions.get(i).copied().flatten().unwrap_or_else(|| {
+                trunk_dest.get(i).copied().unwrap_or(false)
+                    || wire_parts(el)
+                        .is_some_and(|(_, dest)| !hider.config().is_internal_ip(dest.ip()))
+            });
+            i += 1;
+            if hide && let Some(f) = hide_wire(&hider, el) {
+                failures.push(f);
+            }
+        });
+        failures
+    }
+
+    /// Fail-closed follow-ups for dropped messages (see
+    /// [`Self::apply_egress_topology`]), with the hiding snapshots of the
+    /// calls they release (their records are gone afterwards).
+    async fn topology_followups(
+        &self,
+        failures: &[HideFailure],
+        result: &ProcessResult,
+        trigger: Option<(&Bytes, SbcSocketAddr)>,
+    ) -> (Vec<ProcessResult>, Vec<LegHiding>) {
+        let mut out = Vec::new();
+        let mut snapshots = Vec::new();
+        // A relayed request was dropped: its originator gets a 500 (the
+        // fault is ours), unless the handler already answered finally.
+        // Re-parsed from the wire bytes only on this failure path.
+        if let Some((data, source)) = trigger
+            && failures.iter().any(|f| f.kind == HideFailureKind::Request)
+            && let Ok(SipMessage::Request(req)) = SipMessage::parse(data)
+            && req.method != Method::Ack
+            && !has_final_response(result, req.headers.call_id(), req.headers.cseq())
+        {
+            out.push(ProcessResult::Response {
+                message: SipMessage::Response(create_response_from_request(
+                    &req,
+                    StatusCode::SERVER_INTERNAL_ERROR,
+                )),
+                destination: source,
+                flow: Flow::Reply,
+            });
+        }
+        for f in failures {
+            if !matches!(
+                f.kind,
+                HideFailureKind::InitialInvite
+                    | HideFailureKind::Invite2xx
+                    | HideFailureKind::ReliableProvisional
+            ) {
+                continue;
+            }
+            let Some(id) = f.call_id.as_deref() else {
+                continue;
+            };
+            let found = {
+                let corr = self.call_correlation.read().await;
+                corr.a_leg
+                    .get(id)
+                    .or_else(|| corr.b_leg.get(id))
+                    .and_then(|c| corr.addresses.get(c).map(|a| (c.clone(), a.clone())))
+            };
+            let Some((internal, addrs)) = found else {
+                continue;
+            };
+            let unanswered_initial = id == addrs.a_leg_sip_call_id
+                && !addrs.b_leg_answered
+                && f.cseq.as_deref() == Some(addrs.a_leg_cseq.as_str());
+            if f.kind == HideFailureKind::ReliableProvisional && !unanswered_initial {
+                // RFC-6: a reliable 1xx of a re-INVITE (or any INVITE other
+                // than the unanswered initial one) got a 500, but the other
+                // leg's INVITE is still pending. RFC 3261 §17.2.1: no second
+                // final may follow on the server transaction that sent the
+                // 500, and RFC 5057 §5.1: a re-INVITE's 500 leaves the dialog
+                // up. Tear the dialog down like a failed re-INVITE 2xx: BYE
+                // both legs (the UAS answers its pending re-INVITE 487,
+                // RFC 3261 §15.1.2) and release the call, so a late final from
+                // the other leg finds no call and is never relayed.
+                if addrs.dialog_to_tag.is_none() {
+                    continue;
+                }
+            }
+            if f.kind == HideFailureKind::ReliableProvisional && unanswered_initial {
+                snapshots.push(LegHiding::of(&addrs));
+                {
+                    let mut calls = self.calls.write().await;
+                    if let Some(c) = calls.get_mut(&internal) {
+                        let failed = StatusCode::SERVER_INTERNAL_ERROR;
+                        c.fail(failed.code(), failed.reason_phrase());
+                    }
+                }
+                out.push(ProcessResult::Forward {
+                    message: SipMessage::Request(build_b_leg_cancel(&addrs)),
+                    destination: addrs.b_leg_destination,
+                    flow: addrs.b_leg_flow.clone().into(),
+                });
+                // SEC-2: the callee's own message forced the teardown.
+                audit_call_terminated(&addrs, uc_audit::event::TerminationReason::PolicyTerminated);
+                self.cleanup_terminated_call(
+                    &internal,
+                    false,
+                    crate::cdr::CdrEnd::dialog_lost(false, 500),
+                )
+                .await;
+                continue;
+            }
+            snapshots.push(LegHiding::of(&addrs));
+            if f.kind == HideFailureKind::InitialInvite {
+                // A failover INVITE could not be sent hidden: the call fails
+                // as if no trunk were left (503, as on Timer B / send failure).
+                if addrs.b_leg_answered {
+                    continue;
+                }
+                let unavailable = StatusCode::SERVICE_UNAVAILABLE;
+                {
+                    let mut calls = self.calls.write().await;
+                    if let Some(c) = calls.get_mut(&internal) {
+                        c.fail(unavailable.code(), unavailable.reason_phrase());
+                    }
+                }
+                out.push(ProcessResult::Response {
+                    message: SipMessage::Response(build_a_leg_response(unavailable, &addrs)),
+                    destination: addrs.a_leg_source,
+                    flow: addrs.a_leg_flow.clone().into(),
+                });
+            } else {
+                // The 2xx was replaced by a 500. The other leg holds a
+                // confirmed dialog: BYE it. A re-INVITE's 500 leaves the
+                // dialog up at the recipient too (RFC 5057 §5.1), so BYE that
+                // leg as well.
+                let to_a = id == addrs.a_leg_sip_call_id;
+                let initial = f.kind == HideFailureKind::Invite2xx
+                    && to_a
+                    && f.cseq.as_deref() == Some(addrs.a_leg_cseq.as_str());
+                if addrs.dialog_to_tag.is_some() {
+                    let mut legs = vec![to_a];
+                    if !initial {
+                        legs.push(!to_a);
+                    }
+                    for target_b in legs {
+                        let (dest, flow) = addrs.leg_target(target_b);
+                        out.push(ProcessResult::Forward {
+                            message: SipMessage::Request(Self::build_leg_bye(&addrs, target_b)),
+                            destination: dest,
+                            flow: flow.into(),
+                        });
+                    }
+                }
+            }
+            // SEC-2 (AU-3): a 2xx (or reliable 1xx) the peer sent with unhideable Contact /
+            // Record-Route is a peer-induced, policy-enforced teardown; a
+            // failover INVITE built by the SBC is an SBC failure.
+            let reason = if f.kind == HideFailureKind::InitialInvite {
+                uc_audit::event::TerminationReason::Failed
+            } else {
+                uc_audit::event::TerminationReason::PolicyTerminated
+            };
+            audit_call_terminated(&addrs, reason);
+            let status = if f.kind == HideFailureKind::InitialInvite {
+                503
+            } else {
+                500
+            };
+            self.cleanup_terminated_call(
+                &internal,
+                false,
+                crate::cdr::CdrEnd::dialog_lost(addrs.b_leg_answered, status),
+            )
+            .await;
+        }
+        (out, snapshots)
+    }
+
     /// Reports the outcome of putting a forwarded request on the wire.
     /// Only the first send of a call's initial B-leg INVITE matters: if it
     /// failed (UDP send error, TCP/TLS connect, handshake or write failure,
@@ -2282,6 +2972,13 @@ impl SipStack {
                 flow: addrs.a_leg_flow.clone().into(),
             }]
         };
+        // C3 (POA&M-155): hide before tracking.
+        let mut out = out;
+        let snapshot = LegHiding::of(&addrs);
+        for r in &mut out {
+            self.apply_egress_topology(r, None, std::slice::from_ref(&snapshot))
+                .await;
+        }
         // Each result carries its leg's flow: the failover INVITE the next
         // trunk's, the 503 the caller's (RFC 3261 §18.1.1, §18.2.2).
         for r in &out {
@@ -2331,13 +3028,19 @@ impl SipStack {
             );
             audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Failed);
             if addrs.dialog_to_tag.is_some() {
+                let snapshot = LegHiding::of(&addrs);
                 for target_b_leg in [false, true] {
                     let (destination, flow) = addrs.leg_target(target_b_leg);
-                    out.push(ProcessResult::Forward {
+                    let mut bye = ProcessResult::Forward {
                         message: SipMessage::Request(Self::build_leg_bye(&addrs, target_b_leg)),
                         destination,
                         flow: flow.into(),
-                    });
+                    };
+                    // POA&M-155: SBC-originated teardown BYE, hidden like
+                    // every other egress message.
+                    self.apply_egress_topology(&mut bye, None, std::slice::from_ref(&snapshot))
+                        .await;
+                    out.push(bye);
                 }
             }
             self.cleanup_terminated_call(&call, false, crate::cdr::CdrEnd::dialog_lost(true, 200))
@@ -3465,7 +4168,7 @@ impl SipStack {
         audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Failed);
 
         // Each BYE on its own leg's flow (NIST 800-53 Rev5: SC-8).
-        vec![
+        let mut out = vec![
             ProcessResult::Forward {
                 message: SipMessage::Request(a_bye),
                 destination: addrs.a_leg_source,
@@ -3476,7 +4179,14 @@ impl SipStack {
                 destination: addrs.b_leg_destination,
                 flow: addrs.b_leg_flow.clone().into(),
             },
-        ]
+        ];
+        // C4 (POA&M-155): server.rs sends these directly; hide here.
+        let snapshot = LegHiding::of(&addrs);
+        for r in &mut out {
+            self.apply_egress_topology(r, None, std::slice::from_ref(&snapshot))
+                .await;
+        }
+        out
     }
 
     /// Enables RFC 8898 Bearer-token REGISTER authorization. When set,
@@ -4377,6 +5087,14 @@ impl SipStack {
             "Processing SIP message"
         );
 
+        // POA&M-155: the call's hiding decision is captured before the
+        // handler runs (BYE/CANCEL remove the record). Skipped entirely when
+        // topology hiding is off.
+        let hiding_snapshot = match (&self.topology_hider, message.call_id()) {
+            (Some(_), Some(id)) => self.leg_hiding_for(id).await,
+            _ => None,
+        };
+        let is_request = message.is_request();
         let mut result = match message {
             SipMessage::Request(_) => {
                 self.process_request(message, source, receiving_zone, transport, conn)
@@ -4384,6 +5102,14 @@ impl SipStack {
             }
             SipMessage::Response(_) => self.process_response(message, source).await,
         };
+        // C1: egress chokepoint, before tracking so retransmissions resend
+        // hidden bytes (NIST 800-53 Rev5: SC-7).
+        self.apply_egress_topology(
+            &mut result,
+            is_request.then_some((data, source)),
+            hiding_snapshot.as_slice(),
+        )
+        .await;
         // Everything a handler puts on the wire rides a transaction: responses
         // are recorded for retransmission, forwarded requests get a client
         // transaction that retransmits and times them out (RFC 3261 §17).
@@ -6254,6 +6980,18 @@ impl SipStack {
             }
         };
 
+        // RFC 3581 §3 / RFC 3261 §9.1: on UDP the B-leg Via carries an empty
+        // `rport`, the same Via `via_for` gives the CANCEL, non-2xx ACK and
+        // failover INVITE, so the CANCEL's top Via equals this INVITE's.
+        if b_leg_flow.transport == AddrTransport::Udp
+            && let Some(via) = b_leg_request.headers.get_value(&HeaderName::Via)
+            && extract_param(via, "rport").is_none()
+            && !via.contains(";rport")
+        {
+            let via = format!("{via};rport");
+            b_leg_request.headers.set(HeaderName::Via, via);
+        }
+
         // RFC 4028 session timers negotiate end to end through the B2BUA:
         // carry the caller's timer support and Session-Expires/Min-SE so the
         // callee can pick the refresher; the SBC relays the refreshes.
@@ -6280,6 +7018,9 @@ impl SipStack {
                 Ok(_) => {}
                 Err(e) => {
                     warn!(error = %e, "Header manipulation failed; rejecting INVITE");
+                    self.routing_counters
+                        .header_manipulation_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     th_failure = Some(manipulation_failure(&e));
                 }
             }
@@ -6297,15 +7038,19 @@ impl SipStack {
         // Record-Route element is rewritten; an element that cannot be
         // parsed fails closed with 400 instead of being forwarded verbatim
         // (NIST 800-53 Rev5: SC-7, SI-17).
-        // POAM: POA&M-155 - this is the only call site of the hider:
-        // responses relayed toward the caller (Contact/Record-Route of the
-        // far side) and in-dialog / out-of-dialog non-INVITE requests are
-        // not topology-hidden.
-        // POAM: POA&M-156 - no `sbc_topology_hiding_failures_total` /
-        // manipulation-failure metric; failures are visible only in the
-        // audit trail (SI-4, AU-6).
+        // POA&M-155: every other message (responses, in-dialog and
+        // out-of-dialog requests, timer/failover/teardown requests) is
+        // hidden at the egress chokepoint (`apply_egress_topology`); this
+        // site stays because it owns the slot/port/media release. The
+        // chokepoint pass over this INVITE is an idempotent no-op.
+        // POA&M-156: failures count `topology_hiding_failures` (SI-4, AU-6).
+        // SEC-1: the callee-facing leg is hidden toward a trunk and toward
+        // any destination outside `internal_networks` (e.g. a registered
+        // remote endpoint), the same address rule as the A-leg.
+        let b_leg_hidden = b_leg_external
+            || (self.topology_hider.is_some() && self.destination_hidden(b_leg_destination).await);
         if th_failure.is_none()
-            && b_leg_external
+            && b_leg_hidden
             && let Some(ref hider) = self.topology_hider
             && let Err(e) = hider
                 .read()
@@ -6313,6 +7058,9 @@ impl SipStack {
                 .hide_b2bua_request(&mut b_leg_request.headers)
         {
             warn!(error = %e, "Topology hiding failed; rejecting INVITE");
+            self.routing_counters
+                .topology_hiding_failures
+                .fetch_add(1, Ordering::Relaxed);
             th_failure = Some(topology_failure(&e));
         }
 
@@ -6464,6 +7212,18 @@ impl SipStack {
             crate::cdr::CdrDraft::default()
         };
 
+        // POA&M-155: per-leg topology-hiding flags. Each leg is hidden when
+        // its peer is a trunk or outside the internal networks
+        // (NIST 800-53 Rev5: SC-7, AC-4).
+        let hidden = if self.topology_hider.is_some() {
+            HiddenLegs {
+                a_leg: self.destination_hidden(source).await,
+                b_leg: b_leg_hidden,
+            }
+        } else {
+            HiddenLegs::default()
+        };
+
         // 8. Store call state and correlation
         {
             let mut calls = self.calls.write().await;
@@ -6522,6 +7282,7 @@ impl SipStack {
                     a_leg_local_addr,
                     a_leg_sip_call_id: a_leg_call_id.clone(),
                     b_leg_sip_call_id: b_leg_sip_call_id.clone(),
+                    hidden,
                     local_addr: local_sip_addr,
                     failover_targets,
                     trunk_lease,
@@ -6917,33 +7678,7 @@ impl SipStack {
         terminated.headers.set(HeaderName::CSeq, &addrs.a_leg_cseq);
         terminated.headers.set(HeaderName::ContentLength, "0");
 
-        // CANCEL to B-leg. RFC 3261 §9.1: a CANCEL must mirror the INVITE
-        // it cancels — same Via branch, From, To (no tag), and CSeq number
-        // with method CANCEL. A fresh branch made it unmatchable.
-        // RFC 3261 §9.1: the Request-URI is the current attempt's INVITE
-        // Request-URI (updated on failover); the socket-address form is only
-        // a fallback for records that predate it.
-        let b_uri = addrs.b_leg_ruri.clone().unwrap_or_else(|| {
-            leg_request_uri(
-                None,
-                &addrs.b_leg_destination.ip().to_string(),
-                addrs.b_leg_destination.port(),
-                &addrs.b_leg_flow,
-            )
-        });
-        let mut b_cancel = proto_sip::message::SipRequest::new(Method::Cancel, b_uri);
-        b_cancel
-            .headers
-            .set(HeaderName::CallId, &addrs.b_leg_sip_call_id);
-        b_cancel.headers.set(HeaderName::CSeq, "1 CANCEL");
-        b_cancel.headers.set(HeaderName::From, &addrs.b_leg_from);
-        b_cancel.headers.set(HeaderName::To, &addrs.b_leg_to);
-        b_cancel.headers.set(HeaderName::MaxForwards, "70");
-        b_cancel.headers.add(Header::new(
-            HeaderName::Via,
-            crate::flow::via_for(&addrs.b_leg_flow, &addrs.local_addr, &addrs.b_leg_branch),
-        ));
-        b_cancel.headers.set(HeaderName::ContentLength, "0");
+        let b_cancel = build_b_leg_cancel(&addrs);
 
         // Clean up; RTP ports (C12) and the trunk / VPS slots are released
         // with the correlation record, exactly once.
@@ -7694,11 +8429,46 @@ impl SipStack {
             .unwrap_or_default()
             .to_string();
 
-        let source_port = source.port();
         // local_ip = macvlan IP for binding sockets; daemon_ip = the
         // daemon's external/public IP (sdp_ip may be the announcement
         // pod's address and must not be used for the BYE)
         let local_ip = rtp_bind_ip.map_or_else(|| daemon_ip.clone(), |ip| ip.to_string());
+
+        // The BYE is built (and topology-hidden) up front: the hider and
+        // counters are not reachable from the playback task. C5 of
+        // POA&M-155: it is sent raw on a socket, bypassing the egress
+        // chokepoint, so it is hidden here and dropped if hiding fails
+        // (NIST 800-53 Rev5: SC-7, SI-17).
+        // POAM-184: this BYE is always sent as plain UDP from :5060 whatever
+        // the caller's transport (cleartext toward TLS callers, SC-8) and is
+        // logged in full at info.
+        let bye_bytes =
+            match build_announcement_bye(&local_ip, source, &call_id, &ok_to, &invite_from) {
+                Ok(mut bye_req) => {
+                    if self.destination_hidden(source).await
+                        && let Some(ref hider) = self.topology_hider
+                        && let Err(e) = hider.read().await.hide_b2bua_request(&mut bye_req.headers)
+                    {
+                        let failure = HideFailure {
+                            kind: HideFailureKind::Request,
+                            policy: topology_policy(&e),
+                            method: Method::Bye.to_string(),
+                            call_id: Some(call_id.clone()),
+                            cseq: None,
+                            destination: source,
+                            source: None,
+                        };
+                        self.record_topology_failure(&failure);
+                        None
+                    } else {
+                        Some(SipMessage::Request(bye_req).to_bytes())
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to build BYE after announcement");
+                    None
+                }
+            };
 
         // Spawn background task to play announcement then BYE
         tokio::spawn(async move {
@@ -7737,57 +8507,32 @@ impl SipStack {
             // Send BYE after announcement
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            // Build BYE using the exact dialog headers from the INVITE/200 exchange.
-            // From UAS perspective: our From = the To from 200 OK, our To = the From from INVITE
-            let caller_ip = source.ip().to_string();
-            let bye_uri = SipUri::new(&caller_ip).with_port(source_port);
-            let bye = RequestBuilder::new(Method::Bye, bye_uri)
-                .via_auto("UDP", &local_ip, Some(5060))
-                .from_auto(SipUri::new(&local_ip), None)
-                .to_uri(SipUri::new(&caller_ip), None)
-                .call_id(&call_id)
-                .cseq(2)
-                .max_forwards(70)
-                .build_with_defaults()
-                .map(|mut r| {
-                    // Overwrite From/To with exact dialog headers (swapped for UAS BYE)
-                    r.headers.set(HeaderName::From, &ok_to);
-                    r.headers.set(HeaderName::To, &invite_from);
-                    r
-                });
-
-            match bye {
-                Ok(bye_req) => {
-                    let bye_bytes = SipMessage::Request(bye_req).to_bytes();
-                    info!("Sending BYE:\n{}", String::from_utf8_lossy(&bye_bytes));
-                    // Bind to the outside zone IP on port 5060 so the BYE comes
-                    // from the same address the call was established on
-                    let bind_addr: std::net::SocketAddr = format!("{local_ip}:5060")
-                        .parse()
-                        .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-                    let sock2 = socket2::Socket::new(
-                        socket2::Domain::IPV4,
-                        socket2::Type::DGRAM,
-                        Some(socket2::Protocol::UDP),
-                    );
-                    if let Ok(s) = sock2 {
-                        s.set_reuse_address(true).ok();
-                        #[cfg(target_os = "linux")]
-                        s.set_reuse_port(true).ok();
-                        s.set_nonblocking(true).ok();
-                        if s.bind(&bind_addr.into()).is_ok()
-                            && let Ok(sock) = tokio::net::UdpSocket::from_std(s.into())
-                        {
-                            if let Err(e) = sock.send_to(&bye_bytes, source.as_std()).await {
-                                warn!(error = %e, "Failed to send BYE after announcement");
-                            } else {
-                                info!(call_id = %call_id, destination = %source, "Sent BYE after announcement");
-                            }
+            if let Some(bye_bytes) = bye_bytes {
+                info!("Sending BYE:\n{}", String::from_utf8_lossy(&bye_bytes));
+                // Bind to the outside zone IP on port 5060 so the BYE comes
+                // from the same address the call was established on
+                let bind_addr: std::net::SocketAddr = format!("{local_ip}:5060")
+                    .parse()
+                    .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                let sock2 = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
+                );
+                if let Ok(s) = sock2 {
+                    s.set_reuse_address(true).ok();
+                    #[cfg(target_os = "linux")]
+                    s.set_reuse_port(true).ok();
+                    s.set_nonblocking(true).ok();
+                    if s.bind(&bind_addr.into()).is_ok()
+                        && let Ok(sock) = tokio::net::UdpSocket::from_std(s.into())
+                    {
+                        if let Err(e) = sock.send_to(&bye_bytes, source.as_std()).await {
+                            warn!(error = %e, "Failed to send BYE after announcement");
+                        } else {
+                            info!(call_id = %call_id, destination = %source, "Sent BYE after announcement");
                         }
                     }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to build BYE after announcement");
                 }
             }
 
@@ -7939,6 +8684,33 @@ fn unsupported_scheme_response(data: &[u8]) -> Option<proto_sip::message::SipRes
         )),
         SipMessage::Response(_) => None,
     }
+}
+
+/// BYE the SBC (as UAS) sends after an announcement: From/To are the
+/// dialog's exact headers, swapped (From = our 200 OK To, To = the caller's
+/// INVITE From).
+fn build_announcement_bye(
+    local_ip: &str,
+    source: SbcSocketAddr,
+    call_id: &str,
+    ok_to: &str,
+    invite_from: &str,
+) -> proto_sip::SipResult<SipRequest> {
+    let caller_ip = source.ip().to_string();
+    let bye_uri = SipUri::new(&caller_ip).with_port(source.port());
+    RequestBuilder::new(Method::Bye, bye_uri)
+        .via_auto("UDP", local_ip, Some(5060))
+        .from_auto(SipUri::new(local_ip), None)
+        .to_uri(SipUri::new(&caller_ip), None)
+        .call_id(call_id)
+        .cseq(2)
+        .max_forwards(70)
+        .build_with_defaults()
+        .map(|mut r| {
+            r.headers.set(HeaderName::From, ok_to);
+            r.headers.set(HeaderName::To, invite_from);
+            r
+        })
 }
 
 fn create_response_from_request(
@@ -9711,6 +10483,7 @@ pub mod tests {
             a_leg_local_addr: "10.0.0.9:5060".to_string(),
             a_leg_sip_call_id: "aleg-callid".to_string(),
             b_leg_sip_call_id: "bleg-callid".to_string(),
+            hidden: HiddenLegs::default(),
             local_addr: "10.0.0.9:5060".to_string(),
             failover_targets: vec![],
             trunk_lease: None,
@@ -17187,5 +17960,1094 @@ pub mod tests {
         });
         assert_eq!(status, StatusCode::SERVER_INTERNAL_ERROR);
         assert_eq!(policy, "sip.header_manipulation.failed:r1");
+    }
+
+    // ── POA&M-155 / POA&M-156: topology hiding on every egress path ──
+
+    const TH_EXTERNAL: &str = "sbc.example.com";
+
+    async fn enable_hider(stack: &mut SipStack) {
+        stack
+            .init_topology_hider_from_config(&sbc_config::TopologyHidingConfig {
+                enabled: true,
+                mode: "signaling_only".to_string(),
+                external_host: TH_EXTERNAL.to_string(),
+                external_port: 5060,
+                ..Default::default()
+            })
+            .expect("valid topology config");
+    }
+
+    /// Trunk B-leg (t1/t2, external) and inbound-trunk caller (alice):
+    /// both legs hidden.
+    async fn th_trunk_stack() -> SipStack {
+        let mut stack = trunk_stack(10, ("none", ""), None).await;
+        enable_hider(&mut stack).await;
+        stack
+    }
+
+    /// Internal hosts the SBC or the test peers use.
+    fn leaks_internal(v: &str) -> bool {
+        ["127.", "192.168.", "10.0.", "localhost"]
+            .iter()
+            .any(|p| v.contains(p))
+    }
+
+    /// Every Contact / Record-Route (and Via of requests) of every wire
+    /// message in `results` is free of internal addresses. Response Vias
+    /// are the recipient's own and must stay byte-exact (RFC 3261 §8.2.6.2).
+    fn assert_no_internal(results: &[ProcessResult]) {
+        for r in results {
+            let Some((msg, dest)) = wire_parts(r) else {
+                continue;
+            };
+            let mut names = vec![HeaderName::Contact, HeaderName::RecordRoute];
+            if msg.is_request() {
+                names.push(HeaderName::Via);
+            }
+            for n in &names {
+                for h in msg.headers().get_all(n) {
+                    assert!(
+                        !leaks_internal(&h.value),
+                        "{n:?} leaks internal address toward {dest}: {}",
+                        h.value
+                    );
+                }
+            }
+        }
+    }
+
+    fn th_failures(stack: &SipStack) -> u64 {
+        stack
+            .routing_counters
+            .topology_hiding_failures
+            .load(Ordering::Relaxed)
+    }
+
+    /// Places a trunk call (alice → t1), answers it and ACKs it; returns the
+    /// B-leg INVITE. Every message on the way is checked for leaks.
+    async fn th_established(stack: &SipStack, call_id: &str) -> proto_sip::message::SipRequest {
+        let results = place_call(stack, call_id).await;
+        assert_no_internal(&results);
+        let (b_invite, dest) = forwarded(&results, &Method::Invite).expect("INVITE to t1");
+        assert_eq!(dest, t1());
+        let b_invite = b_invite.clone();
+        assert!(
+            b_invite
+                .headers
+                .get_value(&HeaderName::Contact)
+                .is_some_and(|c| c.contains(TH_EXTERNAL))
+        );
+
+        // Provisional relay (B→A 180/183).
+        for status in [180, 183] {
+            let body = (status == 183).then_some(BOB_SDP);
+            let results = flatten(
+                stack
+                    .process_message(
+                        &response_to(&b_invite, status, Some("bobtag"), body),
+                        t1(),
+                        None,
+                    )
+                    .await,
+            );
+            assert_no_internal(&results);
+        }
+        // 2xx relay to alice and the ACK to t1.
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 200, Some("bobtag"), Some(BOB_SDP)),
+                    t1(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+        let (ok, dest) = responded(&results, 200).expect("200 to alice");
+        assert_eq!(dest, alice());
+        // The relayed 2xx carries no Contact today; if one is added it must
+        // be hidden (inbound trunk caller).
+        assert!(
+            ok.headers
+                .get_value(&HeaderName::Contact)
+                .is_none_or(|c| c.contains(TH_EXTERNAL)),
+            "caller-facing Contact hidden: {:?}",
+            ok.headers
+        );
+        // RFC 3261 §8.2.6.2: alice's Via stack is copied byte-exact.
+        assert_eq!(
+            ok.headers.get_value(&HeaderName::Via),
+            Some(format!("SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-{call_id}-1").as_str())
+        );
+        assert!(forwarded(&results, &Method::Ack).is_some());
+        let ack = caller_request("ACK", DIALED, call_id, 1, Some("bobtag"), None);
+        stack.process_message(&ack, alice(), None).await;
+        b_invite
+    }
+
+    // POA&M-155: INVITE/1xx/2xx/ACK, re-INVITE both ways, UPDATE, INFO,
+    // BYE: nothing internal reaches either (external) leg.
+    #[tokio::test]
+    async fn th_full_dialog_hides_every_message_both_directions() {
+        let stack = th_trunk_stack().await;
+        let b_invite = th_established(&stack, "th-full@test").await;
+
+        // re-INVITE A→B and its 200 relayed back.
+        let results = flatten(
+            stack
+                .process_message(
+                    &caller_request(
+                        "INVITE",
+                        DIALED,
+                        "th-full@test",
+                        2,
+                        Some("bobtag"),
+                        Some(ALICE_SDP),
+                    ),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+        let (reinv, _) = forwarded(&results, &Method::Invite).expect("re-INVITE to t1");
+        let reinv = reinv.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&reinv, 200, None, Some(BOB_SDP)), t1(), None)
+                .await,
+        );
+        assert_no_internal(&results);
+        assert!(responded(&results, 200).is_some());
+        let ack = caller_request("ACK", DIALED, "th-full@test", 2, Some("bobtag"), None);
+        assert_no_internal(&flatten(stack.process_message(&ack, alice(), None).await));
+
+        // re-INVITE B→A and its 200.
+        let results = flatten(
+            stack
+                .process_message(
+                    &bob_request(&b_invite, "INVITE", 10, Some(BOB_SDP)),
+                    t1(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+        let (reinv_a, dest) = forwarded(&results, &Method::Invite).expect("re-INVITE to alice");
+        assert_eq!(dest, alice());
+        let reinv_a = reinv_a.clone();
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&reinv_a, 200, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+        let ack = bob_request(&b_invite, "ACK", 10, None);
+        assert_no_internal(&flatten(stack.process_message(&ack, t1(), None).await));
+
+        // UPDATE from the callee: relayed to alice (asserted) and its 200
+        // relayed back.
+        let results = flatten(
+            stack
+                .process_message(
+                    &bob_request(&b_invite, "UPDATE", 11, Some(BOB_SDP)),
+                    t1(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+        let (upd, dest) = forwarded(&results, &Method::Update).expect("UPDATE to alice");
+        assert_eq!(dest, alice());
+        let upd = upd.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&upd, 200, None, None), alice(), None)
+                .await,
+        );
+        assert_no_internal(&results);
+
+        // In-dialog INFO is NOT relayed today (POA&M-182: answered 405
+        // locally). This only checks that the local answer leaks nothing; it
+        // is not evidence of INFO relay hiding.
+        let results = flatten(
+            stack
+                .process_message(&bob_request(&b_invite, "INFO", 12, None), t1(), None)
+                .await,
+        );
+        assert_no_internal(&results);
+        assert!(forwarded(&results, &Method::Info).is_none(), "POA&M-182");
+
+        // BYE from the caller: BYE to t1 + 200 to alice.
+        let results = flatten(
+            stack
+                .process_message(
+                    &caller_request("BYE", DIALED, "th-full@test", 3, Some("bobtag"), None),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+        let (bye, dest) = forwarded(&results, &Method::Bye).expect("BYE to t1");
+        assert_eq!(dest, t1());
+        assert!(
+            bye.headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .contains(TH_EXTERNAL)
+        );
+        assert_eq!(th_failures(&stack), 0);
+    }
+
+    // POA&M-155: BYE from the trunk side, and CANCEL + 487.
+    #[tokio::test]
+    async fn th_bye_from_callee_and_cancel_are_hidden() {
+        let stack = th_trunk_stack().await;
+        let b_invite = th_established(&stack, "th-bye@test").await;
+        let results = flatten(
+            stack
+                .process_message(&bob_request(&b_invite, "BYE", 20, None), t1(), None)
+                .await,
+        );
+        assert_no_internal(&results);
+        let (bye, dest) = forwarded(&results, &Method::Bye).expect("BYE to alice");
+        assert_eq!(dest, alice());
+        assert!(
+            bye.headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .contains(TH_EXTERNAL)
+        );
+
+        let results = place_call(&stack, "th-cancel@test").await;
+        assert_no_internal(&results);
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
+        let b_invite = b_invite.clone();
+        let results = flatten(
+            stack
+                .process_message(
+                    &caller_request("CANCEL", DIALED, "th-cancel@test", 1, None, None),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+        let (cancel, _) = forwarded(&results, &Method::Cancel).expect("CANCEL to t1");
+        // RFC 3261 §9.1: CANCEL Via (branch) and Request-URI match the INVITE.
+        assert_eq!(cancel.headers.via_branch(), b_invite.headers.via_branch());
+        assert_eq!(
+            cancel.headers.get_value(&HeaderName::Via),
+            b_invite.headers.get_value(&HeaderName::Via)
+        );
+        assert_eq!(cancel.uri, b_invite.uri);
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 487, Some("bobtag"), None),
+                    t1(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+    }
+
+    // POA&M-155: error-response relay (486/503) to the caller, failover
+    // INVITE to the next trunk.
+    #[tokio::test]
+    async fn th_error_relay_and_failover_invite_are_hidden() {
+        let stack = th_trunk_stack().await;
+        let results = place_call(&stack, "th-fo@test").await;
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
+        let b_invite = b_invite.clone();
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 503, Some("t1tag"), None),
+                    t1(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+        let (retry, dest) = forwarded(&results, &Method::Invite).expect("failover INVITE");
+        assert_eq!(dest, t2());
+        let retry = retry.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&retry, 486, Some("t2tag"), None), t2(), None)
+                .await,
+        );
+        assert_no_internal(&results);
+        assert!(responded(&results, 486).is_some());
+        assert_eq!(th_failures(&stack), 0);
+    }
+
+    // POA&M-155: out-of-dialog responses to an external source.
+    #[tokio::test]
+    async fn th_out_of_dialog_responses_are_hidden() {
+        let stack = th_trunk_stack().await;
+        let ext = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(203, 0, 113, 9), 5060);
+        for method in ["OPTIONS", "SUBSCRIBE", "BYE"] {
+            let to_tag = (method == "BYE").then_some("x");
+            let msg = caller_request(
+                method,
+                "nobody",
+                &format!("ood-{method}@test"),
+                1,
+                to_tag,
+                None,
+            );
+            let results = flatten(stack.process_message(&msg, ext, None).await);
+            assert!(!results.is_empty(), "{method} answered");
+            assert_no_internal(&results);
+        }
+    }
+
+    // POA&M-155 C4: media-failure BYEs are hidden on hidden legs.
+    #[tokio::test]
+    async fn th_media_failure_byes_are_hidden() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        enable_hider(&mut stack).await;
+        let internal = CallId::new("call-1");
+        let mut addrs = confirmed_call_addresses();
+        addrs.hidden = HiddenLegs {
+            a_leg: true,
+            b_leg: true,
+        };
+        {
+            let mut corr = stack.call_correlation.write().await;
+            corr.a_leg
+                .insert(addrs.a_leg_sip_call_id.clone(), internal.clone());
+            corr.b_leg
+                .insert(addrs.b_leg_sip_call_id.clone(), internal.clone());
+            corr.addresses.insert(internal.clone(), addrs.clone());
+        }
+        let byes = stack.terminate_call_on_media_failure("call-1").await;
+        assert_eq!(byes.len(), 2);
+        assert_no_internal(&byes);
+    }
+
+    // POA&M-155: an inside-facing B-leg (registered user) is not rewritten,
+    // while the caller-facing leg (inbound trunk) is.
+    #[tokio::test]
+    async fn th_inside_leg_is_not_rewritten() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        enable_hider(&mut stack).await;
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\
+            From: <sip:bob@sbc.local>;tag=r1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: reg-bob@relay\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:bob@127.0.0.1:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        stack
+            .process_message(&Bytes::from_static(register), bob(), None)
+            .await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE to bob");
+        let b_invite = b_invite.clone();
+        assert!(
+            !b_invite
+                .headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .contains(TH_EXTERNAL),
+            "inside-facing Via untouched"
+        );
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 200, Some("bobtag"), Some(BOB_SDP)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let (ok, _) = responded(&results, 200).expect("200 to alice");
+        assert!(
+            ok.headers
+                .get_value(&HeaderName::Contact)
+                .is_none_or(|c| c.contains(TH_EXTERNAL))
+        );
+        let (ack, _) = forwarded(&results, &Method::Ack).expect("ACK to bob");
+        assert!(
+            !ack.headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .contains(TH_EXTERNAL)
+        );
+    }
+
+    // POA&M-155 C7: the retransmitted 2xx is the stored, hidden one.
+    #[tokio::test]
+    async fn th_retransmitted_2xx_is_hidden() {
+        let stack = th_trunk_stack().await;
+        let results = place_call(&stack, "th-rtx@test").await;
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
+        let b_invite = b_invite.clone();
+        stack
+            .process_message(
+                &response_to(&b_invite, 200, Some("bobtag"), Some(BOB_SDP)),
+                t1(),
+                None,
+            )
+            .await;
+        for p in stack.pending_2xx.write().await.values_mut() {
+            p.next_at = Instant::now();
+        }
+        let rtx = stack.retransmit_pending_2xx().await;
+        assert!(!rtx.is_empty(), "2xx retransmitted");
+        assert_no_internal(&rtx);
+    }
+
+    // POA&M-155 fail closed: a relayed in-dialog request that cannot be
+    // hidden is not forwarded; its originator gets a 500; counted and
+    // audited without the header value.
+    #[tokio::test]
+    async fn th_request_hide_failure_drops_and_answers_500() {
+        let stack = th_trunk_stack().await;
+        let b_invite = th_established(&stack, "th-fail@test").await;
+        let info = caller_request("INFO", DIALED, "th-fail@test", 5, Some("bobtag"), None);
+        let mut bad = SipRequest::new(Method::Info, b_invite.uri.clone());
+        bad.headers
+            .set(HeaderName::CallId, b_invite.headers.call_id().unwrap());
+        bad.headers.set(HeaderName::CSeq, "3 INFO");
+        bad.headers.set(HeaderName::Contact, "<garbage-10.0.0.7");
+        let mut result = ProcessResult::Forward {
+            message: SipMessage::Request(bad),
+            destination: t1(),
+            flow: LegFlow::UDP.into(),
+        };
+        let capture = uc_audit::capture::start();
+        let n = stack
+            .apply_egress_topology(&mut result, Some((&info, alice())), &[])
+            .await;
+        assert_eq!(n, 1);
+        let results = flatten(result);
+        assert!(
+            forwarded(&results, &Method::Info).is_none(),
+            "never forwarded raw"
+        );
+        let (resp, dest) = responded(&results, 500).expect("500 to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(resp.headers.cseq(), Some("5 INFO"));
+        assert_eq!(th_failures(&stack), 1);
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1, "{authz:?}");
+        assert_eq!(authz[0].policy, "sip.topology_hiding.failed:Contact");
+        assert_eq!(authz[0].action, "INFO");
+        // NIST-002 (AU-3): the record names the peer whose message failed.
+        assert_eq!(authz[0].source_ip, Some(alice().ip()));
+        assert_eq!(authz[0].identity, alice().to_string());
+        assert!(authz[0].resource.contains(&t1().to_string()));
+        assert!(!authz[0].granted);
+        assert!(!format!("{authz:?}").contains("garbage"), "SI-11");
+    }
+
+    // POA&M-155 fail closed: a 2xx to INVITE that cannot be hidden becomes a
+    // 500 to the caller and the callee is BYEd; a 1xx is dropped.
+    #[tokio::test]
+    async fn th_response_hide_failure_never_forwards_raw() {
+        let stack = th_trunk_stack().await;
+        th_established(&stack, "th-rfail@test").await;
+        let bad_resp = |status: StatusCode| {
+            let mut r = SipResponse::new(status);
+            r.headers.add(Header::new(
+                HeaderName::Via,
+                "SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-x",
+            ));
+            r.headers.set(HeaderName::CallId, "th-rfail@test");
+            r.headers.set(HeaderName::CSeq, "1 INVITE");
+            r.headers
+                .set(HeaderName::To, "<sip:x@sbc.local>;tag=bobtag");
+            r.headers.set(HeaderName::Contact, "<garbage");
+            ProcessResult::Response {
+                message: SipMessage::Response(r),
+                destination: alice(),
+                flow: LegFlow::UDP.into(),
+            }
+        };
+        let mut ringing = bad_resp(StatusCode::RINGING);
+        assert_eq!(
+            stack.apply_egress_topology(&mut ringing, None, &[]).await,
+            1
+        );
+        assert!(flatten(ringing).is_empty(), "1xx dropped");
+
+        let mut ok = bad_resp(StatusCode::OK);
+        assert_eq!(stack.apply_egress_topology(&mut ok, None, &[]).await, 1);
+        let results = flatten(ok);
+        assert!(responded(&results, 200).is_none(), "2xx not forwarded raw");
+        let (resp, dest) = responded(&results, 500).expect("500 instead");
+        assert_eq!(dest, alice());
+        assert!(resp.headers.get_value(&HeaderName::Contact).is_none());
+        // RFC 3261 §8.2.6.2 (RFC-5): the bare final 500 keeps the To tag.
+        assert!(
+            resp.headers
+                .get_value(&HeaderName::To)
+                .is_some_and(|t| t.contains("tag=bobtag")),
+            "{:?}",
+            resp.headers
+        );
+        let (_, dest) = forwarded(&results, &Method::Bye).expect("BYE to callee");
+        assert_eq!(dest, t1());
+        assert_no_internal(&results);
+        assert_eq!(th_failures(&stack), 2);
+        assert!(
+            stack.call_correlation.read().await.addresses.is_empty(),
+            "call released"
+        );
+        assert_all_released(&stack).await;
+    }
+
+    // POA&M-155 fail closed (C1/C3): a failover INVITE that cannot be
+    // hidden is not sent; the call fails with 503 to the caller.
+    #[tokio::test]
+    async fn th_failover_invite_hide_failure_fails_call() {
+        let stack = th_trunk_stack().await;
+        let results = place_call(&stack, "th-fofail@test").await;
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
+        let b_invite = b_invite.clone();
+        {
+            let mut corr = stack.call_correlation.write().await;
+            let addrs = corr.addresses.values_mut().next().expect("call");
+            let mut tpl = SipRequest::clone(addrs.b_leg_invite.as_ref().expect("template"));
+            tpl.headers
+                .add(Header::new(HeaderName::RecordRoute, "<garbage"));
+            addrs.b_leg_invite = Some(Arc::new(tpl));
+        }
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 503, Some("t1tag"), None),
+                    t1(),
+                    None,
+                )
+                .await,
+        );
+        assert!(
+            forwarded(&results, &Method::Invite).is_none(),
+            "{results:?}"
+        );
+        let (_, dest) = responded(&results, 503).expect("503 to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(th_failures(&stack), 1);
+        assert_all_released(&stack).await;
+    }
+
+    // SEC-1: a registered callee outside `internal_networks` gets a hidden
+    // B-leg too (not only trunks).
+    #[tokio::test]
+    async fn th_external_registered_callee_leg_is_hidden() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        enable_hider(&mut stack).await;
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        let remote = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(203, 0, 113, 20), 5060);
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 203.0.113.20:5060;branch=z9hG4bK-reg-ext\r\n\
+            From: <sip:bob@sbc.local>;tag=r1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: reg-bob-ext@relay\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:bob@203.0.113.20:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        stack
+            .process_message(&Bytes::from_static(register), remote, None)
+            .await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (b_invite, dest) =
+            forwarded(&results, &Method::Invite).unwrap_or_else(|| panic!("{results:?}"));
+        assert_eq!(dest, remote);
+        assert_no_internal(&results[..]);
+        let b_invite = b_invite.clone();
+        assert!(
+            b_invite
+                .headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .contains(TH_EXTERNAL),
+            "remote-facing Via hidden"
+        );
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 200, Some("bobtag"), Some(BOB_SDP)),
+                    remote,
+                    None,
+                )
+                .await,
+        );
+        let (ack, dest) = forwarded(&results, &Method::Ack).expect("ACK to bob");
+        assert_eq!(dest, remote);
+        assert!(
+            ack.headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .contains(TH_EXTERNAL)
+        );
+        assert_eq!(th_failures(&stack), 0);
+    }
+
+    // RFC-1: a 3xx toward a hidden peer keeps external redirect targets and
+    // hides only internal ones (RFC 3261 §8.1.3.4, §21.3).
+    #[tokio::test]
+    async fn th_redirect_contacts_keep_external_targets() {
+        let stack = th_trunk_stack().await;
+        let ext = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(203, 0, 113, 9), 5060);
+        let mut r = SipResponse::new(StatusCode::new(302).expect("302"));
+        r.headers.add(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bK-302",
+        ));
+        r.headers.set(HeaderName::CallId, "th-302@test");
+        r.headers.set(HeaderName::CSeq, "1 INVITE");
+        r.headers.set(HeaderName::To, "<sip:x@sbc.local>;tag=r");
+        r.headers.add(Header::new(
+            HeaderName::Contact,
+            "<sip:bob@198.51.100.7:5060>",
+        ));
+        r.headers
+            .add(Header::new(HeaderName::Contact, "<sip:bob@10.0.0.9:5060>"));
+        let mut res = ProcessResult::Response {
+            message: SipMessage::Response(r),
+            destination: ext,
+            flow: LegFlow::UDP.into(),
+        };
+        assert_eq!(stack.apply_egress_topology(&mut res, None, &[]).await, 0);
+        let results = flatten(res);
+        let (resp, _) = responded(&results, 302).expect("302 relayed");
+        let contacts: Vec<_> = resp
+            .headers
+            .get_all(&HeaderName::Contact)
+            .map(|h| h.value.clone())
+            .collect();
+        let joined = contacts.join(",");
+        assert!(
+            joined.contains("198.51.100.7:5060"),
+            "external kept: {joined}"
+        );
+        assert!(!joined.contains("10.0.0.9"), "internal hidden: {joined}");
+        assert!(joined.contains(TH_EXTERNAL), "{joined}");
+    }
+
+    // RFC-2: a reliable 1xx (Require: 100rel) that cannot be hidden fails
+    // the call like a final response: 500 to the caller, CANCEL to the
+    // callee, resources released (not a silent drop for 64*T1).
+    #[tokio::test]
+    async fn th_reliable_1xx_hide_failure_fails_call() {
+        let stack = th_trunk_stack().await;
+        let results = place_call(&stack, "th-rel@test").await;
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
+        let b_invite = b_invite.clone();
+        let a_cseq = stack
+            .call_correlation
+            .read()
+            .await
+            .addresses
+            .values()
+            .next()
+            .expect("call")
+            .a_leg_cseq
+            .clone();
+        let mut r = SipResponse::new(StatusCode::RINGING);
+        r.headers.add(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-th-rel",
+        ));
+        r.headers.set(HeaderName::CallId, "th-rel@test");
+        r.headers.set(HeaderName::CSeq, &a_cseq);
+        r.headers
+            .set(HeaderName::To, "<sip:x@sbc.local>;tag=bobtag");
+        r.headers.set(HeaderName::Require, "100rel");
+        r.headers.set(HeaderName::Contact, "<garbage");
+        let mut res = ProcessResult::Response {
+            message: SipMessage::Response(r),
+            destination: alice(),
+            flow: LegFlow::UDP.into(),
+        };
+        let capture = uc_audit::capture::start();
+        assert_eq!(stack.apply_egress_topology(&mut res, None, &[]).await, 1);
+        let results = flatten(res);
+        assert!(responded(&results, 180).is_none(), "1xx not forwarded raw");
+        let (resp, dest) = responded(&results, 500).expect("500 to alice");
+        assert_eq!(dest, alice());
+        assert!(resp.headers.get_value(&HeaderName::Contact).is_none());
+        let (cancel, dest) = forwarded(&results, &Method::Cancel).expect("CANCEL to t1");
+        assert_eq!(dest, t1());
+        // RFC 3261 §9.1: the CANCEL's top Via is the INVITE's.
+        assert_eq!(
+            cancel.headers.get_value(&HeaderName::Via),
+            b_invite.headers.get_value(&HeaderName::Via)
+        );
+        assert_no_internal(&results);
+        assert_eq!(th_failures(&stack), 1);
+        // SEC-2: audited as a peer-induced, policy-enforced teardown.
+        assert!(
+            capture.events().iter().any(|e| matches!(
+                e,
+                uc_audit::AuditEvent::CallTerminated(t)
+                    if matches!(t.reason, uc_audit::event::TerminationReason::PolicyTerminated)
+            )),
+            "{:?}",
+            capture.events()
+        );
+        assert_all_released(&stack).await;
+    }
+
+    // RFC-6: a reliable 1xx of a re-INVITE that cannot be hidden gets a
+    // 500; the dialog is torn down (BYE both legs) and the callee's late 2xx
+    // to the pending re-INVITE is never relayed as a second final
+    // (RFC 3261 §17.2.1, RFC 5057 §5.1).
+    #[tokio::test]
+    async fn th_reliable_1xx_reinvite_hide_failure_tears_down() {
+        let stack = th_trunk_stack().await;
+        th_established(&stack, "th-rel-re@test").await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &caller_request(
+                        "INVITE",
+                        DIALED,
+                        "th-rel-re@test",
+                        20,
+                        Some("bobtag"),
+                        Some(ALICE_SDP),
+                    ),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (b_reinvite, dest) = forwarded(&results, &Method::Invite).expect("re-INVITE to t1");
+        assert_eq!(dest, t1());
+        let b_reinvite = b_reinvite.clone();
+        let mut r = SipResponse::new(StatusCode::new(183).expect("183"));
+        r.headers.add(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-th-rel-re",
+        ));
+        r.headers.set(HeaderName::CallId, "th-rel-re@test");
+        r.headers.set(HeaderName::CSeq, "20 INVITE");
+        r.headers
+            .set(HeaderName::To, "<sip:x@sbc.local>;tag=bobtag");
+        r.headers.set(HeaderName::Require, "100rel");
+        r.headers.set(HeaderName::Contact, "<garbage");
+        let mut res = ProcessResult::Response {
+            message: SipMessage::Response(r),
+            destination: alice(),
+            flow: LegFlow::UDP.into(),
+        };
+        let capture = uc_audit::capture::start();
+        assert_eq!(stack.apply_egress_topology(&mut res, None, &[]).await, 1);
+        let results = flatten(res);
+        assert!(responded(&results, 183).is_none(), "1xx not forwarded raw");
+        let (_, dest) = responded(&results, 500).expect("500 to alice");
+        assert_eq!(dest, alice());
+        let byes: Vec<_> = results
+            .iter()
+            .filter_map(|r| match r {
+                ProcessResult::Forward {
+                    message: SipMessage::Request(req),
+                    destination,
+                    ..
+                } if req.method == Method::Bye => Some(*destination),
+                _ => None,
+            })
+            .collect();
+        assert!(byes.contains(&alice()), "BYE to alice: {results:?}");
+        assert!(byes.contains(&t1()), "BYE to t1: {results:?}");
+        assert!(forwarded(&results, &Method::Cancel).is_none());
+        assert_no_internal(&results);
+        assert!(
+            capture.events().iter().any(|e| matches!(
+                e,
+                uc_audit::AuditEvent::CallTerminated(t)
+                    if matches!(t.reason, uc_audit::event::TerminationReason::PolicyTerminated)
+            )),
+            "{:?}",
+            capture.events()
+        );
+        assert_all_released(&stack).await;
+        // The callee's late 2xx to the re-INVITE: no second final to alice.
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_reinvite, 200, None, Some(BOB_SDP)),
+                    t1(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 200).is_none(), "{results:?}");
+    }
+
+    // RFC-4: the non-2xx ACK toward a hidden trunk carries the hidden
+    // INVITE's top Via (RFC 3261 §17.1.1.3).
+    #[tokio::test]
+    async fn th_non2xx_ack_via_matches_invite() {
+        let stack = th_trunk_stack().await;
+        let results = place_call(&stack, "th-ack@test").await;
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
+        let b_invite = b_invite.clone();
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 486, Some("t1tag"), None),
+                    t1(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+        let (ack, dest) = forwarded(&results, &Method::Ack).expect("non-2xx ACK to t1");
+        assert_eq!(dest, t1());
+        assert_eq!(
+            ack.headers.get_value(&HeaderName::Via),
+            b_invite.headers.get_value(&HeaderName::Via)
+        );
+    }
+
+    // POA&M-156: header-manipulation failures are counted.
+    #[tokio::test]
+    async fn manipulation_failure_is_counted() {
+        let mut stack = trunk_stack(10, ("none", ""), None).await;
+        let mut policy = ManipulationPolicy::new("p");
+        policy.add_rule(ManipulationRule::new(
+            "inject",
+            proto_sip::manipulation::ManipulationCondition::always(),
+            ManipulationAction::add(HeaderName::Custom("X-Bad".to_string()), "a\r\nX-Evil: 1"),
+        ));
+        let mut manipulator = HeaderManipulator::new();
+        manipulator.add_global_policy(policy);
+        stack.header_manipulator = Some(manipulator);
+        let results = place_call(&stack, "manip-count@test").await;
+        assert!(responded(&results, 500).is_some());
+        assert_eq!(
+            stack
+                .routing_counters
+                .header_manipulation_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    // QA (POA&M-155): mid-dialog non-INVITE requests in both directions.
+    // UPDATE is relayed (asserted, not vacuous). INFO/PRACK/MESSAGE/NOTIFY
+    // are NOT relayed today: `handle_other_request` answers 405 locally
+    // (pre-existing gap, see qa-report). That local answer must still leak
+    // nothing toward the trunk peer.
+    #[tokio::test]
+    async fn qa_th_mid_dialog_methods_both_directions() {
+        let stack = th_trunk_stack().await;
+        let b_invite = th_established(&stack, "qa-mid@test").await;
+
+        // UPDATE A→B relayed, 200 back.
+        let results = flatten(
+            stack
+                .process_message(
+                    &caller_request(
+                        "UPDATE",
+                        DIALED,
+                        "qa-mid@test",
+                        10,
+                        Some("bobtag"),
+                        Some(ALICE_SDP),
+                    ),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+        let (req, dest) = forwarded(&results, &Method::Update).expect("UPDATE relayed to t1");
+        assert_eq!(dest, t1());
+        assert!(
+            req.headers
+                .get_value(&HeaderName::Via)
+                .is_some_and(|v| v.contains(TH_EXTERNAL))
+        );
+        let req = req.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&req, 200, None, Some(BOB_SDP)), t1(), None)
+                .await,
+        );
+        assert_no_internal(&results);
+        let (_, dest) = responded(&results, 200).expect("200 to UPDATE relayed");
+        assert_eq!(dest, alice());
+
+        // UPDATE B→A relayed.
+        let results = flatten(
+            stack
+                .process_message(
+                    &bob_request(&b_invite, "UPDATE", 30, Some(BOB_SDP)),
+                    t1(),
+                    None,
+                )
+                .await,
+        );
+        assert_no_internal(&results);
+        let (_, dest) = forwarded(&results, &Method::Update).expect("UPDATE relayed to alice");
+        assert_eq!(dest, alice());
+
+        // Other in-dialog methods: answered locally, hidden, both directions.
+        for (i, method) in ["INFO", "PRACK", "MESSAGE", "NOTIFY"]
+            .into_iter()
+            .enumerate()
+        {
+            let cseq = 40 + u32::try_from(i).unwrap();
+            for from_callee in [false, true] {
+                let (msg, src) = if from_callee {
+                    (bob_request(&b_invite, method, cseq, None), t1())
+                } else {
+                    (
+                        caller_request(method, DIALED, "qa-mid@test", cseq, Some("bobtag"), None),
+                        alice(),
+                    )
+                };
+                let results = flatten(stack.process_message(&msg, src, None).await);
+                assert!(!results.is_empty(), "{method} answered");
+                assert_no_internal(&results);
+            }
+        }
+        assert_eq!(th_failures(&stack), 0, "clean dialog has no failures");
+    }
+
+    // QA (POA&M-155): a final non-2xx on a re-INVITE (491) and 4xx on an
+    // in-dialog request are relayed hidden; Via of the recipient untouched.
+    #[tokio::test]
+    async fn qa_th_in_dialog_error_responses_hidden() {
+        let stack = th_trunk_stack().await;
+        th_established(&stack, "qa-err@test").await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &caller_request(
+                        "INVITE",
+                        DIALED,
+                        "qa-err@test",
+                        2,
+                        Some("bobtag"),
+                        Some(ALICE_SDP),
+                    ),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (reinv, _) = forwarded(&results, &Method::Invite).expect("re-INVITE");
+        let reinv = reinv.clone();
+        let mut resp = String::from_utf8(response_to(&reinv, 491, None, None).to_vec()).unwrap();
+        resp = resp.replacen(
+            "Content-Length",
+            "Contact: <sip:bob@10.0.0.7:5060>\r\nRecord-Route: <sip:10.0.0.8;lr>\r\nContent-Length",
+            1,
+        );
+        let results = flatten(stack.process_message(&Bytes::from(resp), t1(), None).await);
+        assert_no_internal(&results);
+        let (r, dest) = responded(&results, 491).expect("491 relayed to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(
+            r.headers.get_value(&HeaderName::Via),
+            Some("SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-qa-err@test-2")
+        );
+        assert_eq!(th_failures(&stack), 0);
+    }
+
+    // QA (POA&M-155 fail closed): malformed Record-Route on a relayed
+    // request is audited as Record-Route and never forwarded.
+    #[tokio::test]
+    async fn qa_th_request_bad_record_route_fails_closed() {
+        let stack = th_trunk_stack().await;
+        let b_invite = th_established(&stack, "qa-rr@test").await;
+        let upd = caller_request("UPDATE", DIALED, "qa-rr@test", 7, Some("bobtag"), None);
+        let mut bad = SipRequest::new(Method::Update, b_invite.uri.clone());
+        bad.headers
+            .set(HeaderName::CallId, b_invite.headers.call_id().unwrap());
+        bad.headers.set(HeaderName::CSeq, "3 UPDATE");
+        bad.headers.set(HeaderName::RecordRoute, "<sip:10.0.0.9;lr");
+        let mut result = ProcessResult::Forward {
+            message: SipMessage::Request(bad),
+            destination: t1(),
+            flow: LegFlow::UDP.into(),
+        };
+        let capture = uc_audit::capture::start();
+        let before = th_failures(&stack);
+        let n = stack
+            .apply_egress_topology(&mut result, Some((&upd, alice())), &[])
+            .await;
+        assert_eq!(n, 1);
+        let results = flatten(result);
+        assert!(forwarded(&results, &Method::Update).is_none());
+        let (resp, dest) = responded(&results, 500).expect("500 to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(resp.headers.cseq(), Some("7 UPDATE"));
+        assert_no_internal(&results);
+        assert_eq!(th_failures(&stack), before + 1);
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1, "{authz:?}");
+        assert_eq!(authz[0].policy, "sip.topology_hiding.failed:Record-Route");
+        assert_eq!(authz[0].action, "UPDATE");
+        assert!(!format!("{authz:?}").contains("10.0.0.9"), "SI-11");
+    }
+
+    // QA (POA&M-155 fail closed): a non-2xx final response that cannot be
+    // hidden becomes a 500 (never raw), with no BYE; counter +1 per failure.
+    #[tokio::test]
+    async fn qa_th_final_error_response_hide_failure_becomes_500() {
+        let stack = th_trunk_stack().await;
+        let mut r = SipResponse::new(StatusCode::BUSY_HERE);
+        r.headers.add(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-y",
+        ));
+        r.headers.set(HeaderName::CallId, "qa-486@test");
+        r.headers.set(HeaderName::CSeq, "1 INVITE");
+        r.headers.set(HeaderName::RecordRoute, "<garbage");
+        let mut res = ProcessResult::Response {
+            message: SipMessage::Response(r),
+            destination: SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(203, 0, 113, 9), 5060),
+            flow: LegFlow::UDP.into(),
+        };
+        assert_eq!(stack.apply_egress_topology(&mut res, None, &[]).await, 1);
+        let results = flatten(res);
+        assert!(responded(&results, 486).is_none(), "never raw");
+        assert!(responded(&results, 500).is_some(), "{results:?}");
+        assert!(forwarded(&results, &Method::Bye).is_none());
+        assert_eq!(th_failures(&stack), 1);
     }
 }

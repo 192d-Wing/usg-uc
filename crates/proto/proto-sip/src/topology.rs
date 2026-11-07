@@ -13,7 +13,11 @@
 //!
 //! ## RFC Compliance
 //!
-//! - **RFC 3261**: SIP Core (§16.6 - Request Forwarding)
+//! - **RFC 3261**: SIP Core (§16.6 - Request Forwarding; §8.2.6.2 / §18.2.2 -
+//!   response Via copied unchanged by `hide_b2bua_response`; §8.1.3.4 - 3xx
+//!   redirect targets)
+//! - **RFC 3581**: `rport` (bare flag kept on the rewritten B2BUA Via)
+//! - **RFC 7092**: B2BUA taxonomy (signaling-only B2BUA model)
 //! - **RFC 3323**: A Privacy Mechanism for SIP
 //! - **RFC 3325**: Private Extensions to SIP for Asserted Identity
 //!
@@ -239,8 +243,7 @@ impl TopologyHidingConfig {
     pub fn is_internal_address(&self, host: &str) -> bool {
         let h = bare_host(host);
         if let Ok(ip) = h.parse::<IpAddr>() {
-            let ip = normalize(ip);
-            return self.internal_cidrs.iter().any(|c| c.contains(ip));
+            return self.is_internal_ip(ip);
         }
         let h = h.strip_suffix('.').unwrap_or(h);
         self.internal_domains.iter().any(|d| {
@@ -252,6 +255,14 @@ impl TopologyHidingConfig {
                         && h.as_bytes()[h.len() - d.len() - 1] == b'.'
                         && h[h.len() - d.len()..].eq_ignore_ascii_case(d)))
         })
+    }
+
+    /// [`Self::is_internal_address`] for an already-parsed IP (no string
+    /// round trip; PERF-003).
+    #[must_use]
+    pub fn is_internal_ip(&self, ip: IpAddr) -> bool {
+        let ip = normalize(ip);
+        self.internal_cidrs.iter().any(|c| c.contains(ip))
     }
 
     /// Returns true if `host` must be hidden under the current mode.
@@ -274,6 +285,9 @@ impl TopologyHidingConfig {
         }
     }
 }
+
+/// Replacement elements for one header; `None` means unchanged.
+type Rewrite = Option<Vec<String>>;
 
 fn topo_err(header: &HeaderName, reason: &'static str) -> SipError {
     SipError::TopologyHiding {
@@ -517,20 +531,45 @@ impl TopologyHider {
         anonymized
     }
 
-    fn rewritten_contacts(&self, headers: &Headers) -> SipResult<Vec<String>> {
-        elements(headers, &HeaderName::Contact)?
-            .into_iter()
-            .map(|e| {
-                // RFC 3261 §10.2.2: REGISTER wildcard passes through.
-                if e.trim() == "*" {
-                    return Ok(e);
-                }
-                let na: NameAddr = e
-                    .parse()
-                    .map_err(|_| topo_err(&HeaderName::Contact, "unparseable element"))?;
-                Ok(self.anonymize_contact(&na).to_string())
-            })
-            .collect()
+    /// Computes the rewritten Contact elements without mutating `headers`.
+    /// `Ok(None)` when no element changes (no rewrite needed).
+    ///
+    /// With `redirect` (a 3xx response), Contact elements are redirect
+    /// targets (RFC 3261 §8.1.3.4, §21.3): only targets whose host (or
+    /// `maddr`) is internal are rewritten; external targets are left alone so
+    /// the recipient is not redirected back to the SBC.
+    fn rewritten_contacts(
+        &self,
+        headers: &Headers,
+        redirect: bool,
+    ) -> SipResult<Option<Vec<String>>> {
+        let elems = elements(headers, &HeaderName::Contact)?;
+        let mut changed = false;
+        let mut out = Vec::with_capacity(elems.len());
+        for e in elems {
+            // RFC 3261 §10.2.2: REGISTER wildcard passes through.
+            if e.trim() == "*" {
+                out.push(e);
+                continue;
+            }
+            let na: NameAddr = e
+                .parse()
+                .map_err(|_| topo_err(&HeaderName::Contact, "unparseable element"))?;
+            if redirect
+                && !self.config.is_internal_address(&na.uri.host)
+                && !na
+                    .uri
+                    .maddr()
+                    .is_some_and(|m| self.config.is_internal_address(m))
+            {
+                out.push(e);
+                continue;
+            }
+            let rewritten = self.anonymize_contact(&na).to_string();
+            changed |= rewritten != e;
+            out.push(rewritten);
+        }
+        Ok(changed.then_some(out))
     }
 
     /// Rewrites every Contact element (all instances, comma-folded values).
@@ -542,8 +581,9 @@ impl TopologyHider {
         if self.config.mode == TopologyHidingMode::None || !headers.contains(&HeaderName::Contact) {
             return Ok(());
         }
-        let out = self.rewritten_contacts(headers)?;
-        headers.replace_instances(&HeaderName::Contact, out);
+        if let Some(out) = self.rewritten_contacts(headers, false)? {
+            headers.replace_instances(&HeaderName::Contact, out);
+        }
         Ok(())
     }
 
@@ -588,28 +628,42 @@ impl TopologyHider {
         {
             return Ok(());
         }
-        let out = elements(headers, &HeaderName::RecordRoute)?
-            .into_iter()
-            .map(|e| {
-                let na: NameAddr = e
-                    .parse()
-                    .map_err(|_| topo_err(&HeaderName::RecordRoute, "unparseable element"))?;
-                let hide = self.config.should_hide(&na.uri.host)
-                    || na.uri.maddr().is_some_and(|m| self.config.should_hide(m));
-                if !hide {
-                    return Ok(e);
-                }
-                let t = na.uri.transport().or(transport);
-                let t = if na.uri.scheme == UriScheme::Sips {
-                    Some("tls")
-                } else {
-                    t
-                };
-                Ok(self.create_anonymized_record_route(t))
-            })
-            .collect::<SipResult<Vec<_>>>()?;
-        headers.replace_instances(&HeaderName::RecordRoute, out);
+        if let Some(out) = self.rewritten_record_routes(headers, transport)? {
+            headers.replace_instances(&HeaderName::RecordRoute, out);
+        }
         Ok(())
+    }
+
+    /// Computes the rewritten Record-Route elements without mutating
+    /// `headers`. `Ok(None)` when no element needs hiding.
+    fn rewritten_record_routes(
+        &self,
+        headers: &Headers,
+        transport: Option<&str>,
+    ) -> SipResult<Option<Vec<String>>> {
+        let elems = elements(headers, &HeaderName::RecordRoute)?;
+        let mut changed = false;
+        let mut out = Vec::with_capacity(elems.len());
+        for e in elems {
+            let na: NameAddr = e
+                .parse()
+                .map_err(|_| topo_err(&HeaderName::RecordRoute, "unparseable element"))?;
+            let hide = self.config.should_hide(&na.uri.host)
+                || na.uri.maddr().is_some_and(|m| self.config.should_hide(m));
+            if !hide {
+                out.push(e);
+                continue;
+            }
+            let t = na.uri.transport().or(transport);
+            let t = if na.uri.scheme == UriScheme::Sips {
+                Some("tls")
+            } else {
+                t
+            };
+            changed = true;
+            out.push(self.create_anonymized_record_route(t));
+        }
+        Ok(changed.then_some(out))
     }
 
     // =========================================================================
@@ -766,27 +820,118 @@ impl TopologyHider {
         if self.config.mode == TopologyHidingMode::None {
             return Ok(());
         }
-        let mut work = headers.clone();
-        if work.contains(&HeaderName::Via) {
-            let out = parse_vias(&work)?
-                .into_iter()
-                .map(|via| {
-                    let hide = self.config.should_hide(&via.host);
-                    let mut anonymized = via.clone();
-                    if hide {
-                        anonymized.host.clone_from(&self.config.external_host);
-                        anonymized.port = self.config.port_for(via_is_tls(&via));
-                    }
-                    self.scrub_via_params(&mut anonymized, hide);
-                    anonymized.to_string()
-                })
-                .collect();
-            work.replace_instances(&HeaderName::Via, out);
+        // PERF-001: two-phase (compute every replacement, then apply) keeps
+        // the rewrite atomic without cloning the whole header map.
+        let vias = if headers.contains(&HeaderName::Via) {
+            self.rewritten_b2bua_vias(headers)?
+        } else {
+            None
+        };
+        let (contacts, rrs) = self.rewritten_contact_rr(headers, false)?;
+        if let Some(out) = vias {
+            headers.replace_instances(&HeaderName::Via, out);
         }
-        self.rewrite_contacts(&mut work)?;
-        self.rewrite_record_routes(&mut work, None)?;
-        *headers = work;
+        Self::apply_contact_rr(headers, contacts, rrs);
         Ok(())
+    }
+
+    /// Applies topology hiding to a **B2BUA-originated** response sent toward
+    /// an untrusted leg: rewrites every Contact and Record-Route element that
+    /// must be hidden and leaves Via untouched.
+    ///
+    /// RFC 3261 §8.2.6.2 / §18.2.2: a response's Via stack belongs to the
+    /// recipient and MUST be copied unchanged; rewriting it would misroute the
+    /// response or break transaction matching (§17.1.3).
+    ///
+    /// NIST 800-53 Rev5: SC-7 (Boundary Protection), SI-17 (fail closed).
+    ///
+    /// # Errors
+    /// [`SipError::TopologyHiding`] if any Contact/Record-Route element cannot
+    /// be parsed; `headers` is left unchanged (never forward unhidden).
+    pub fn hide_b2bua_response(&self, headers: &mut Headers) -> SipResult<()> {
+        self.hide_b2bua_response_for_status(headers, 200)
+    }
+
+    /// [`Self::hide_b2bua_response`] aware of the status code: in a 3xx
+    /// response only Contacts with an internal host are rewritten (RFC 3261
+    /// §8.1.3.4 / §21.3 redirect targets); external targets pass unchanged.
+    ///
+    /// # Errors
+    /// As [`Self::hide_b2bua_response`]; `headers` is left unchanged.
+    pub fn hide_b2bua_response_for_status(
+        &self,
+        headers: &mut Headers,
+        status_code: u16,
+    ) -> SipResult<()> {
+        if self.config.mode == TopologyHidingMode::None {
+            return Ok(());
+        }
+        let redirect = (300..400).contains(&status_code);
+        let (contacts, rrs) = self.rewritten_contact_rr(headers, redirect)?;
+        Self::apply_contact_rr(headers, contacts, rrs);
+        Ok(())
+    }
+
+    /// Phase 1 for the B2BUA Via: anonymize in place, never strip.
+    fn rewritten_b2bua_vias(&self, headers: &Headers) -> SipResult<Option<Vec<String>>> {
+        let elems = elements(headers, &HeaderName::Via)?;
+        let mut changed = false;
+        let mut out = Vec::with_capacity(elems.len());
+        for e in elems {
+            let mut via = e
+                .parse::<ViaHeader>()
+                .map_err(|_| topo_err(&HeaderName::Via, "unparseable element"))?;
+            let hide = self.config.should_hide(&via.host);
+            if hide {
+                let tls = via_is_tls(&via);
+                via.host.clone_from(&self.config.external_host);
+                via.port = self.config.port_for(tls);
+            }
+            let had_rport = via.rport.is_some();
+            self.scrub_via_params(&mut via, hide);
+            // RFC 3581 §3: keep a bare `rport` flag (no address disclosed) so
+            // responses still follow the source port behind NAT/LB.
+            if had_rport && via.rport.is_none() {
+                via.rport = Some(None);
+            }
+            let rewritten = via.to_string();
+            changed |= rewritten != e;
+            out.push(rewritten);
+        }
+        Ok(changed.then_some(out))
+    }
+
+    /// Phase 1 for Contact and Record-Route (no mutation).
+    fn rewritten_contact_rr(
+        &self,
+        headers: &Headers,
+        redirect: bool,
+    ) -> SipResult<(Rewrite, Rewrite)> {
+        let contacts = if headers.contains(&HeaderName::Contact) {
+            self.rewritten_contacts(headers, redirect)?
+        } else {
+            None
+        };
+        let rrs = if headers.contains(&HeaderName::RecordRoute) {
+            self.rewritten_record_routes(headers, None)?
+        } else {
+            None
+        };
+        Ok((contacts, rrs))
+    }
+
+    /// Phase 2 for Contact and Record-Route (infallible).
+    fn apply_contact_rr(
+        headers: &mut Headers,
+        contacts: Option<Vec<String>>,
+        rrs: Option<Vec<String>>,
+    ) {
+        if let Some(out) = contacts {
+            headers.replace_instances(&HeaderName::Contact, out);
+        }
+        if let Some(out) = rrs {
+            headers.replace_instances(&HeaderName::RecordRoute, out);
+        }
     }
 
     /// Applies all topology hiding transformations to inbound response
@@ -1405,5 +1550,289 @@ mod tests {
         assert!(!tok.contains(&legacy));
         assert!(!tok.contains("10.0.0.1") && !tok.contains("secret"));
         assert!(tok[..32].bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    // POAM-155: response hiding rewrites Contact / Record-Route, Via byte-exact.
+    #[test]
+    fn b2bua_response_keeps_via_hides_contact_rr() {
+        let via = "SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bKcaller;received=10.0.0.9";
+        let mut h = hdrs(&[
+            (HeaderName::Via, via),
+            (
+                HeaderName::RecordRoute,
+                "<sip:10.0.0.1;lr>, <sip:p.example.com;lr>",
+            ),
+            (HeaderName::Contact, "<sip:sbc@10.0.0.1:5060>"),
+        ]);
+        basic().hide_b2bua_response(&mut h).unwrap();
+        assert_eq!(values(&h, &HeaderName::Via), vec![via]);
+        assert_eq!(
+            values(&h, &HeaderName::Contact),
+            vec!["<sip:sbc@sbc.example.com>"]
+        );
+        assert_eq!(
+            values(&h, &HeaderName::RecordRoute),
+            vec!["<sip:sbc.example.com;lr>", "<sip:p.example.com;lr>"]
+        );
+    }
+
+    // POAM-155: response hiding is atomic and names the failing header.
+    #[test]
+    fn b2bua_response_fail_closed_atomic() {
+        for (bad, name) in [
+            (HeaderName::Contact, "Contact"),
+            (HeaderName::RecordRoute, "Record-Route"),
+        ] {
+            let orig = hdrs(&[
+                (HeaderName::Contact, "<sip:a@10.0.0.1>"),
+                (HeaderName::RecordRoute, "<sip:10.0.0.1;lr>"),
+                (bad, "<garbage"),
+            ]);
+            let mut h = orig.clone();
+            let e = basic().hide_b2bua_response(&mut h).unwrap_err();
+            assert!(
+                matches!(&e, SipError::TopologyHiding { header, .. } if header == name),
+                "{e:?}"
+            );
+            for n in [HeaderName::Contact, HeaderName::RecordRoute] {
+                assert_eq!(values(&h, &n), values(&orig, &n));
+            }
+        }
+    }
+
+    // POAM-155 / PERF-001: nothing to hide leaves headers unchanged.
+    #[test]
+    fn b2bua_noop_when_nothing_internal() {
+        let orig = hdrs(&[
+            (
+                HeaderName::Via,
+                "SIP/2.0/UDP sbc.example.com;branch=z9hG4bKa",
+            ),
+            (HeaderName::Contact, "<sip:a@sbc.example.com>"),
+            (HeaderName::RecordRoute, "<sip:p.example.com;lr>"),
+        ]);
+        let mut h = orig.clone();
+        basic().hide_b2bua_request(&mut h).unwrap();
+        for n in [
+            HeaderName::Via,
+            HeaderName::Contact,
+            HeaderName::RecordRoute,
+        ] {
+            assert_eq!(values(&h, &n), values(&orig, &n));
+        }
+        basic().hide_b2bua_response(&mut h).unwrap();
+        assert_eq!(
+            values(&h, &HeaderName::Contact),
+            values(&orig, &HeaderName::Contact)
+        );
+    }
+
+    // QA POAM-155: request hiding is atomic when only Record-Route is bad;
+    // the error names Record-Route and Via/Contact are untouched.
+    #[test]
+    fn qa_request_bad_record_route_atomic() {
+        let orig = hdrs(&[
+            (HeaderName::Via, "SIP/2.0/UDP 10.0.0.1;branch=z9hG4bKa"),
+            (HeaderName::Contact, "<sip:a@10.0.0.1>"),
+            (HeaderName::RecordRoute, "<sip:10.0.0.2;lr"),
+        ]);
+        let mut h = orig.clone();
+        let e = basic().hide_b2bua_request(&mut h).unwrap_err();
+        assert!(
+            matches!(&e, SipError::TopologyHiding { header, .. } if header == "Record-Route"),
+            "{e:?}"
+        );
+        for n in [
+            HeaderName::Via,
+            HeaderName::Contact,
+            HeaderName::RecordRoute,
+        ] {
+            assert_eq!(values(&h, &n), values(&orig, &n));
+        }
+    }
+
+    // QA POAM-155: response hiding never parses Via, so a Via it cannot
+    // parse is passed through byte-exact (RFC 3261 §18.2.2).
+    #[test]
+    fn qa_response_ignores_unparseable_via() {
+        let mut h = hdrs(&[
+            (HeaderName::Via, "not a via at all"),
+            (HeaderName::Contact, "<sip:a@10.0.0.1>"),
+        ]);
+        basic().hide_b2bua_response(&mut h).unwrap();
+        assert_eq!(values(&h, &HeaderName::Via), vec!["not a via at all"]);
+        assert_eq!(
+            values(&h, &HeaderName::Contact),
+            vec!["<sip:a@sbc.example.com>"]
+        );
+    }
+
+    // QA POAM-155: no topology headers at all is Ok and a no-op.
+    #[test]
+    fn qa_empty_headers_ok() {
+        let mut h = Headers::new();
+        basic().hide_b2bua_request(&mut h).unwrap();
+        basic().hide_b2bua_response(&mut h).unwrap();
+        assert!(h.is_empty());
+    }
+
+    // QA POAM-155: CRLF smuggled into a Contact value never yields a
+    // header line break in the output (rejected or sanitised).
+    #[test]
+    fn qa_contact_crlf_injection_never_emitted() {
+        for hide_resp in [false, true] {
+            let mut h = hdrs(&[(HeaderName::Contact, "<sip:a@10.0.0.1>\r\nX-Evil: 1")]);
+            let r = if hide_resp {
+                basic().hide_b2bua_response(&mut h)
+            } else {
+                basic().hide_b2bua_request(&mut h)
+            };
+            if r.is_ok() {
+                for v in values(&h, &HeaderName::Contact) {
+                    assert!(!v.contains('\r') && !v.contains('\n'), "{v:?}");
+                    assert!(!v.contains("10.0.0.1"), "{v:?}");
+                }
+            }
+        }
+    }
+
+    // QA POAM-155 threat sketch: an internal IP disguised in a quoted
+    // display-name or inside angle brackets with a comma must not survive
+    // as the URI host.
+    #[test]
+    fn qa_contact_tricky_display_name_and_comma() {
+        let mut h = hdrs(&[(
+            HeaderName::Contact,
+            "\"x, y\" <sip:a@10.0.0.1;transport=udp>, <sip:b@192.168.1.5>",
+        )]);
+        basic().hide_b2bua_response(&mut h).unwrap();
+        let v = values(&h, &HeaderName::Contact);
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(
+            v.iter()
+                .all(|c| !c.contains("10.0.0.1") && !c.contains("192.168.1.5")),
+            "{v:?}"
+        );
+    }
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn host() -> impl Strategy<Value = (String, bool)> {
+            prop_oneof![
+                (0u8..=255, 0u8..=255).prop_map(|(a, b)| (format!("10.{a}.{b}.1"), true)),
+                (0u8..=255).prop_map(|a| (format!("192.168.{a}.7"), true)),
+                "[a-z]{1,8}".prop_map(|n| (format!("{n}.local"), true)),
+                "[a-z]{1,8}".prop_map(|n| (format!("{n}.example.com"), false)),
+            ]
+        }
+
+        proptest! {
+            // POAM-155: hidden output never carries an internal host; branch
+            // preserved; idempotent.
+            #[test]
+            fn hidden_never_leaks_internal(
+                hosts in proptest::collection::vec((host(), 1024u16..65535), 1..4),
+                response in any::<bool>(),
+            ) {
+                let mut h = Headers::new();
+                for (i, ((hst, _), port)) in hosts.iter().enumerate() {
+                    h.add(Header::new(
+                        HeaderName::Via,
+                        format!("SIP/2.0/UDP {hst}:{port};branch=z9hG4bK{i}"),
+                    ));
+                    h.add(Header::new(HeaderName::Contact, format!("<sip:u@{hst}:{port}>")));
+                    h.add(Header::new(HeaderName::RecordRoute, format!("<sip:{hst};lr>")));
+                }
+                let orig_via = values(&h, &HeaderName::Via);
+                let hider = basic();
+                if response {
+                    hider.hide_b2bua_response(&mut h).unwrap();
+                } else {
+                    hider.hide_b2bua_request(&mut h).unwrap();
+                }
+                let once = h.clone();
+                let mut names = vec![HeaderName::Contact, HeaderName::RecordRoute];
+                if !response {
+                    names.push(HeaderName::Via);
+                }
+                for ((hst, internal), _) in &hosts {
+                    if !internal {
+                        continue;
+                    }
+                    for n in &names {
+                        for v in values(&h, n) {
+                            prop_assert!(!v.contains(hst.as_str()), "{} leaked in {}", hst, v);
+                        }
+                    }
+                }
+                if response {
+                    prop_assert_eq!(values(&h, &HeaderName::Via), orig_via);
+                }
+                for (i, v) in values(&h, &HeaderName::Via).iter().enumerate() {
+                    let branch = format!("branch=z9hG4bK{i}");
+                    prop_assert!(v.contains(&branch));
+                }
+                if response {
+                    hider.hide_b2bua_response(&mut h).unwrap();
+                } else {
+                    hider.hide_b2bua_request(&mut h).unwrap();
+                }
+                for n in [HeaderName::Via, HeaderName::Contact, HeaderName::RecordRoute] {
+                    prop_assert_eq!(values(&h, &n), values(&once, &n));
+                }
+            }
+        }
+    }
+    // RFC-1: 3xx Contacts are redirect targets; only internal ones are hidden.
+    #[test]
+    fn redirect_contacts_only_internal_rewritten() {
+        let mut h = hdrs(&[(
+            HeaderName::Contact,
+            "<sip:bob@198.51.100.7:5060>, <sip:bob@10.0.0.9:5060>",
+        )]);
+        basic().hide_b2bua_response_for_status(&mut h, 302).unwrap();
+        let v: Vec<_> = h
+            .get_all(&HeaderName::Contact)
+            .map(|x| x.value.clone())
+            .collect();
+        let joined = v.join(",");
+        assert!(joined.contains("198.51.100.7:5060"), "{joined}");
+        assert!(!joined.contains("10.0.0.9"), "{joined}");
+
+        // Aggressive mode must not rewrite an external redirect target either.
+        let mut h = hdrs(&[(HeaderName::Contact, "<sip:bob@198.51.100.7:5060>")]);
+        aggressive()
+            .hide_b2bua_response_for_status(&mut h, 301)
+            .unwrap();
+        assert_eq!(
+            h.get_value(&HeaderName::Contact).unwrap(),
+            "<sip:bob@198.51.100.7:5060>"
+        );
+        // Non-3xx in aggressive mode still rewrites it.
+        aggressive()
+            .hide_b2bua_response_for_status(&mut h, 200)
+            .unwrap();
+        assert!(
+            !h.get_value(&HeaderName::Contact)
+                .unwrap()
+                .contains("198.51.100.7")
+        );
+    }
+
+    // RFC-3: the SBC's rewritten Via keeps a bare rport flag (RFC 3581).
+    #[test]
+    fn b2bua_request_keeps_bare_rport() {
+        let mut h = hdrs(&[(
+            HeaderName::Via,
+            "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-r1;rport=5070",
+        )]);
+        basic().hide_b2bua_request(&mut h).unwrap();
+        let v = h.get_value(&HeaderName::Via).unwrap();
+        assert!(!v.contains("10.0.0.1"), "{v}");
+        assert!(!v.contains("5070"), "{v}");
+        assert!(v.contains(";rport"), "{v}");
+        assert!(v.contains("branch=z9hG4bK-r1"), "{v}");
     }
 }

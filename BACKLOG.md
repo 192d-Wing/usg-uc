@@ -189,15 +189,65 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
 - [ ] **MINOR — URI comparisons not yet on §19.1.4** (POA&M-154): registrar /
   dialog / ACL matching in sbc-trunk-services and uc-acl compare fields or
   strings; switch to `SipUri::equivalent`.
-- [ ] **MAJOR, LIVE — topology hiding covers only the B-leg initial INVITE**
+- [x] **MAJOR, LIVE — topology hiding covers only the B-leg initial INVITE**
   (POA&M-155): responses relayed toward the caller (e.g. 200 OK
   `Contact: <sip:10.x>` / Record-Route of the far side) and in-dialog
   (BYE, re-INVITE, UPDATE) or out-of-dialog non-INVITE requests do not call
   the hider (`sip_stack.rs`, `hide_b2bua_request` only call site).
-- [ ] **MINOR — no topology-hiding / header-manipulation failure metrics**
+  Fixed (fix/topology-hiding-full-dialog): one egress chokepoint
+  (`SipStack::apply_egress_topology`) hides every request and response
+  before transaction tracking, on handler, timer, failover, media-failure,
+  2xx-expiry and announcement-BYE paths; per-leg flags (caller is a trunk or
+  outside `internal_networks`; callee leg toward a trunk or outside
+  `internal_networks`, e.g. a remote registered endpoint). New
+  `TopologyHider::hide_b2bua_response` leaves Via untouched (RFC 3261
+  §8.2.6.2); in 3xx only internal redirect targets are rewritten; the SBC's
+  own Via keeps a bare `rport` (RFC 3581). Fail closed: dropped request +
+  500 to the originator, final response or reliable (100rel) 1xx replaced
+  by 500, unreliable 1xx dropped, 2xx-to-INVITE or reliable 1xx tears the
+  call down, failover INVITE fails the call with 503. Residual leaks:
+  POA&M-181; in-dialog INFO/PRACK/MESSAGE/NOTIFY are not relayed:
+  POA&M-182.
+- [x] **MINOR — no topology-hiding / header-manipulation failure metrics**
   (POA&M-156): planned `sbc_topology_hiding_failures_total` (and the
   manipulation equivalent) were dropped; failures are only in the audit
   trail (SI-4, AU-6).
+  Partially fixed (fix/topology-hiding-full-dialog): `RoutingCounters`
+  `topology_hiding_failures` / `header_manipulation_failures` are counted;
+  export deferred to POA&M-180 (not yet observable by operators).
+- [ ] **MINOR — topology/manipulation failure counters not exported**
+  (POA&M-180): `sbc_topology_hiding_failures_total` and
+  `sbc_header_manipulation_failures_total` are counted in
+  `RoutingCounters` but need two rows in `api_server.rs`
+  `ROUTING_METRICS` and its `load()` list to reach `/metrics` (SI-4,
+  AU-6).
+- [ ] **MINOR, LIVE — residual topology leaks outside Via/Contact/
+  Record-Route** (POA&M-181): `Warning`, `Server`, `User-Agent` and
+  `Reason` text and the SDP `o=` username may still name internal hosts or
+  products toward a hidden leg (SC-7). Also: relayed 2xx to the caller
+  carries no Contact at all (RFC 3261 §12.1.1 target), so there is nothing
+  to hide but the dialog has no remote target. Marker: `// POAM-181:` at
+  `SipStack::apply_egress_topology`.
+- [ ] **MINOR, LIVE — in-dialog PRACK/INFO/MESSAGE/NOTIFY answered 405, not
+  relayed** (POA&M-182): `handle_other_request` answers these locally with
+  405 instead of relaying them to the other leg (RFC 3262 PRACK, RFC 6086
+  INFO, RFC 3428 MESSAGE, RFC 6665 NOTIFY). Not a topology leak (the local
+  405 is hidden), but the topology-hiding tests do not and cannot evidence
+  hiding of their relay until it exists.
+- [ ] **MINOR, LIVE — `topology_hiding.mode = "basic"` silently disables
+  hiding** (POA&M-183): `topology_config_from` enables the hider only for
+  `signaling_only` / `full`; an accepted `basic` value is not enforced and
+  not rejected (CM-6, CM-7, SC-7). Fix in sbc-config validation (reject or
+  map it).
+- [ ] **MINOR, LIVE — post-announcement BYE always plain UDP from :5060 and
+  logged in full** (POA&M-184): the BYE after an announcement is sent on an
+  ad-hoc UDP socket bound to `:5060` whatever the caller's transport
+  (cleartext toward TLS callers, SC-8) and logged in full at `info`.
+  Marker: `// POAM-184:` in `sip_stack.rs`.
+- [ ] **NIT, LIVE — late INVITE 2xx on a released call is not ACKed**
+  (POA&M-185): a 2xx that crosses the SBC's BYE (or arrives after any call
+  release) is dropped without ACK+BYE (RFC 3261 §13.2.2.4). Bounded by the
+  UAS's 64*T1 retransmit timeout; needs a short-lived released-call record.
 - [ ] **MINOR, DORMANT — proxy-model topology hiding has no Via restore**
   (POA&M-157): `TopologyHider::hide_outbound_request` strips/rewrites Vias
   without storing them, so responses could not reach internal hops

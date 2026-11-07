@@ -98,6 +98,48 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   bytes are now wiped on drop, and the `open()` buffer is wiped when the
   tag check fails (POA&M-160..164).
 
+- **SBC: topology hiding covers the whole dialog, both directions
+  (peer-visible).** (NIST 800-53 Rev5: SC-7, AC-4, SI-17, SI-11, AU-12, SI-4;
+  RFC 3261 §8.2.6.2, §18.2.2; POA&M-155, POA&M-156) With
+  `topology_hiding.enabled`, every request and response the SBC sends toward
+  a hidden leg is rewritten, not only the B-leg initial INVITE: 1xx/2xx and
+  error relays, ACK, re-INVITE, UPDATE, BYE, CANCEL, the local 405 to
+  in-dialog PRACK/INFO/MESSAGE/NOTIFY (not relayed yet, POA&M-182),
+  out-of-dialog responses (OPTIONS, REGISTER, 405, 481),
+  timer 408/BYE, failover INVITEs, media-failure BYEs and the
+  post-announcement BYE. Retransmissions resend the hidden bytes.
+  - **Upgrade note:** the caller-facing leg is now hidden when the caller is
+    an inbound trunk or outside `topology_hiding.internal_networks`, so
+    inbound trunk calls see `external_host` in the SBC's Via/Contact/
+    Record-Route. `external_host` must route back to the SBC. The callee
+    leg is likewise hidden toward a trunk or any destination outside
+    `internal_networks` (e.g. a remote registered endpoint).
+  - **3xx Contacts:** in redirect responses only Contacts with an internal
+    host are rewritten to `external_host`; external redirect targets pass
+    unchanged (RFC 3261 §8.1.3.4, §21.3).
+  - **rport:** the SBC's own (rewritten) Via keeps a bare `;rport` flag
+    (RFC 3581) instead of dropping it; the B-leg initial INVITE on UDP now
+    carries `;rport` too, so CANCEL and non-2xx ACK Vias equal the INVITE's
+    (RFC 3261 §9.1, §17.1.1.3).
+  - Response Via stacks are never rewritten (new
+    `TopologyHider::hide_b2bua_response`); the hider no longer clones the
+    header map per call.
+  - Fail closed: a message that cannot be hidden is never sent raw. A
+    relayed request is dropped and its sender gets 500; a final response
+    becomes a bare 500 and an unreliable 1xx is dropped; a reliable
+    (`Require: 100rel`) 1xx becomes 500 and the unanswered call is
+    CANCELed (on a re-INVITE both legs are BYEd, so no late final is
+    relayed after the 500); a 2xx to INVITE becomes 500 and the other leg is BYEd
+    (peer-induced teardowns audited as `PolicyTerminated`); a failover
+    INVITE fails the call with 503. Each failure is audited as
+    `sip.topology_hiding.failed:<Header>`, naming the peer whose message
+    failed; the warning log is sampled, the counter and audit are not.
+  - New counters `topology_hiding_failures` and
+    `header_manipulation_failures` (to be exported as
+    `sbc_topology_hiding_failures_total` /
+    `sbc_header_manipulation_failures_total`; counted, export deferred to
+    POA&M-180).
+
 - **proto-sip / SBC: SIP URI parser, topology hiding and header manipulation
   (BREAKING for some configs and malformed peers).** (NIST 800-53 Rev5: SI-10,
   SC-7, SC-8, SC-5, SC-30, AC-4, CM-6, SI-17; POA&M-150..152)
@@ -117,7 +159,7 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
     element is rewritten, and an element that cannot be parsed rejects the
     call (400 plus audit record `sip.topology_hiding.failed:<header>`)
     instead of being forwarded. Responses relayed back to the caller and
-    in-dialog requests are still not hidden (POA&M-155, open). An invalid
+    in-dialog requests were not hidden by this change (POA&M-155, since closed; see above). An invalid
     `internal_networks`/`internal_domains` entry now stops the SBC at
     startup instead of being skipped. Contact rewrites keep
     `transport=tls` / `sips:` and use the new
@@ -142,7 +184,7 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
     `AuthorizationDecision` event (granted=false). The schema is unchanged.
     The new policy values are `sip.header_manipulation.failed:<rule>` and
     `sip.topology_hiding.failed:<header>`. No Prometheus failure metrics yet
-    (POA&M-156, open), so alert from audit records.
+    (counters added under POA&M-156; export is POA&M-180), so alert from audit records.
   - **proto-sip API (client/library consumers):** `obfuscate_call_id`
     returns `SipResult<String>`. `with_internal_network` was removed (use
     `try_with_internal_network`). `SipError` gains `UnsupportedUriScheme`,
