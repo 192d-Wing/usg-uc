@@ -54,6 +54,8 @@ rustls.workspace = true
 tokio-rustls = "0.26"
 rustls-pki-types.workspace = true
 rustls-native-certs.workspace = true
+# Shared CNSA 2.0 rustls CryptoProvider (uc_transport::tls::cnsa_provider).
+uc-transport.workspace = true
 
 # Utilities
 base64 = "0.22"
