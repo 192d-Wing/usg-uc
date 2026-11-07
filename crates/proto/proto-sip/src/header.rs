@@ -150,6 +150,10 @@ pub enum HeaderName {
     /// P-Preferred-Identity header.
     PPreferredIdentity,
 
+    // Privacy (RFC 3323)
+    /// Privacy header (RFC 3323 §4.2).
+    Privacy,
+
     // Reason header (RFC 3326)
     /// Reason header.
     Reason,
@@ -234,6 +238,7 @@ impl HeaderName {
             Self::Identity => "Identity",
             Self::PAssertedIdentity => "P-Asserted-Identity",
             Self::PPreferredIdentity => "P-Preferred-Identity",
+            Self::Privacy => "Privacy",
             Self::Reason => "Reason",
             Self::ReferTo => "Refer-To",
             Self::ReferredBy => "Referred-By",
@@ -466,6 +471,7 @@ const HEADER_NAME_TABLE: &[(&str, HeaderName)] = &[
     ("identity", HeaderName::Identity),
     ("p-asserted-identity", HeaderName::PAssertedIdentity),
     ("p-preferred-identity", HeaderName::PPreferredIdentity),
+    ("privacy", HeaderName::Privacy),
     ("reason", HeaderName::Reason),
     ("refer-to", HeaderName::ReferTo),
     ("referred-by", HeaderName::ReferredBy),

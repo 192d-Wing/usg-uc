@@ -12,8 +12,10 @@
 
 use crate::MAX_LIST_ELEMENTS;
 use crate::error::{SipError, SipResult};
+use crate::header::HeaderName;
 use crate::header_params::NameAddr;
 use crate::list::split_list_bounded;
+use crate::message::SipRequest;
 use crate::uri::SipUri;
 
 /// A Route entry (parsed Route or Record-Route header value).
@@ -125,10 +127,7 @@ impl RouteSet {
     /// Creates a route set from Route header values.
     ///
     /// # Errors
-    /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
+    /// Returns an error if a value cannot be split or parsed.
     pub fn from_route_headers(headers: &[String]) -> SipResult<Self> {
         let mut routes = Vec::new();
 
@@ -143,16 +142,15 @@ impl RouteSet {
         Ok(Self { routes })
     }
 
-    /// Creates a route set from Record-Route header values.
+    /// Creates a route set from Record-Route header values in **reverse**
+    /// order, including elements inside a comma-joined header.
     ///
-    /// Per RFC 3261 Section 12.1.1, the route set is constructed by
-    /// copying the Record-Route headers in reverse order.
+    /// This is the UAC rule: RFC 3261 §12.1.2 - "the route set MUST be set to
+    /// the list of URIs in the Record-Route header field from the response,
+    /// taken in reverse order".
     ///
     /// # Errors
-    /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
+    /// Returns an error if a value cannot be split or parsed.
     pub fn from_record_route_headers(headers: &[String]) -> SipResult<Self> {
         let mut routes = Vec::new();
 
@@ -168,6 +166,18 @@ impl RouteSet {
         }
 
         Ok(Self { routes })
+    }
+
+    /// Creates a route set from Record-Route header values **in order**.
+    ///
+    /// This is the UAS rule: RFC 3261 §12.1.1 - "the route set MUST be set to
+    /// the list of URIs in the Record-Route header field from the request,
+    /// taken in order".
+    ///
+    /// # Errors
+    /// Returns an error if a value cannot be split or parsed.
+    pub fn from_record_route_headers_in_order(headers: &[String]) -> SipResult<Self> {
+        Self::from_route_headers(headers)
     }
 
     /// Adds a route entry.
@@ -301,41 +311,139 @@ pub fn compute_request_target(
     }
 }
 
-/// Processes incoming Record-Route headers for a UAS.
+/// Builds the UAS route set from the Record-Route headers of a
+/// dialog-creating request.
 ///
-/// Per RFC 3261 Section 12.1.1, the UAS copies Record-Route headers
-/// in reverse order to form its route set.
-///
-/// # Errors
-/// Returns an error if the operation fails.
+/// RFC 3261 §12.1.1: the UAS route set is the Record-Route URIs **in order**.
+/// (POA&M-231: this previously reversed them.)
 ///
 /// # Errors
-/// Returns an error if the operation fails.
+/// Returns an error if a value cannot be split or parsed.
 pub fn process_record_route_for_uas(record_routes: &[String]) -> SipResult<RouteSet> {
+    RouteSet::from_record_route_headers_in_order(record_routes)
+}
+
+/// Builds the UAC route set from the Record-Route headers of a
+/// dialog-creating response.
+///
+/// RFC 3261 §12.1.2: the UAC route set is the Record-Route URIs in
+/// **reverse** order, including elements inside one comma-joined header.
+/// (POA&M-231: this previously kept them in order.)
+///
+/// # Errors
+/// Returns an error if a value cannot be split or parsed.
+pub fn process_record_route_for_uac(record_routes: &[String]) -> SipResult<RouteSet> {
     RouteSet::from_record_route_headers(record_routes)
 }
 
-/// Processes incoming Record-Route headers for a UAC.
-///
-/// Per RFC 3261 Section 12.1.2, the UAC copies Record-Route headers
-/// in order to form its route set (already in correct order from response).
-///
-/// # Errors
-/// Returns an error if the operation fails.
-///
-/// # Errors
-/// Returns an error if the operation fails.
-pub fn process_record_route_for_uac(record_routes: &[String]) -> SipResult<RouteSet> {
-    let mut routes = Vec::new();
+/// Outcome of RFC 3261 §16.4 route information preprocessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutePreprocess {
+    /// Preprocessing completed.
+    Done {
+        /// The Request-URI was ours (previous hop was a strict router) and
+        /// was replaced by the last Route value, which was removed.
+        restored_from_strict_route: bool,
+        /// The topmost Route value was ours and was removed.
+        popped_own_route: bool,
+    },
+    /// The Request-URI is one of our Record-Route URIs but the request has
+    /// no Route header to restore it from. Nothing was changed; the caller
+    /// decides (typically 404 or 416).
+    NoRouteForOwnUri,
+}
 
-    for header in record_routes {
-        for entry in split_list_bounded(header, MAX_LIST_ELEMENTS)? {
-            let route: RouteEntry = entry.parse()?;
-            routes.push(route);
+/// Collects every Route element across all Route headers.
+///
+/// NIST 800-53 Rev5: SC-5 - fails instead of truncating, so a rewrite can
+/// never silently drop routes.
+fn route_elements(request: &SipRequest) -> SipResult<Vec<String>> {
+    let mut out = Vec::new();
+    for h in request.headers.get_all(&HeaderName::Route) {
+        for e in split_list_bounded(&h.value, MAX_LIST_ELEMENTS)? {
+            if out.len() >= MAX_LIST_ELEMENTS {
+                return Err(SipError::LimitExceeded {
+                    what: "Route elements",
+                    limit: MAX_LIST_ELEMENTS,
+                });
+            }
+            out.push(e.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// RFC 3261 §16.4 route information preprocessing for a proxy.
+///
+/// Runs before target selection (§16.5). `is_own` must recognise the URIs
+/// this proxy places in Record-Route (see `ProxyContext::is_own`):
+///
+/// 1. If the Request-URI is ours, the previous hop was a strict router:
+///    the Request-URI MUST be replaced by the **last** Route value, and that
+///    value removed (also when it is part of a comma-joined header).
+/// 2. Then, if the **topmost** Route value is ours, it MUST be removed.
+///
+/// Only values `is_own` recognises are consumed, so an attacker-supplied
+/// last Route can become the Request-URI only when the Request-URI was one
+/// of our own Record-Route URIs (RFC-mandated); routing policy still applies
+/// afterwards. NIST 800-53 Rev5: SC-7 (Boundary Protection), SI-10.
+///
+/// # Security
+///
+/// When the Request-URI is one of our Record-Route URIs (strict-route
+/// restore), the **last Route value, supplied by the sender**, becomes the
+/// new Request-URI. Access control, dial-plan and routing policy MUST be
+/// evaluated on the Request-URI *after* this function runs, never on the
+/// value as received, or a sender can steer the request past them.
+/// NIST 800-53 Rev5: AC-4, SC-7.
+///
+/// POAM: §16.4 paragraph 3 (`maddr` naming this proxy) is not implemented;
+/// a Request-URI with such a `maddr` is forwarded unchanged.
+///
+/// # Errors
+/// Returns an error if a Route value cannot be split or parsed, or there are
+/// more than [`MAX_LIST_ELEMENTS`] Route values. The request is not modified
+/// on error.
+pub fn preprocess_route_information(
+    request: &mut SipRequest,
+    is_own: &dyn Fn(&SipUri) -> bool,
+) -> SipResult<RoutePreprocess> {
+    let mut routes = route_elements(request)?;
+    let mut new_uri = None;
+    let mut changed = false;
+
+    if is_own(&request.uri) {
+        let Some(last) = routes.pop() else {
+            return Ok(RoutePreprocess::NoRouteForOwnUri);
+        };
+        let entry: RouteEntry = last.parse()?;
+        new_uri = Some(entry.uri);
+        changed = true;
+    }
+
+    let mut popped_own_route = false;
+    if let Some(top) = routes.first() {
+        let entry: RouteEntry = top.parse()?;
+        if is_own(entry.uri()) {
+            routes.remove(0);
+            popped_own_route = true;
+            changed = true;
         }
     }
 
-    Ok(RouteSet { routes })
+    let restored_from_strict_route = new_uri.is_some();
+    if let Some(uri) = new_uri {
+        request.uri = uri;
+    }
+    if changed {
+        request
+            .headers
+            .replace_instances(&HeaderName::Route, routes);
+    }
+    Ok(RoutePreprocess::Done {
+        restored_from_strict_route,
+        popped_own_route,
+    })
 }
 
 /// Constructs Record-Route header for a proxy.
@@ -354,10 +462,7 @@ pub fn create_record_route(proxy_uri: SipUri, loose_route: bool) -> RouteEntry {
 /// Parses a `NameAddr` from a Route/Record-Route header value.
 ///
 /// # Errors
-/// Returns an error if the operation fails.
-///
-/// # Errors
-/// Returns an error if the operation fails.
+/// Returns an error if the value is not a valid name-addr.
 pub fn parse_route_name_addr(value: &str) -> SipResult<NameAddr> {
     value.parse()
 }
@@ -514,5 +619,141 @@ mod tests {
         let headers = route_set.to_route_headers();
         assert_eq!(headers.len(), 1);
         assert!(headers[0].contains("proxy.example.com"));
+    }
+
+    fn hosts(set: &RouteSet) -> Vec<String> {
+        set.iter().map(|e| e.host().to_string()).collect()
+    }
+
+    /// RFC 3261 §12.1.1 / §12.1.2 with a 3-hop Record-Route, as separate
+    /// headers and as one comma list.
+    #[test]
+    fn route_set_order_uas_in_order_uac_reversed() {
+        let separate = vec![
+            "<sip:p1.example.com;lr>".to_string(),
+            "<sip:p2.example.com;lr>".to_string(),
+            "<sip:p3.example.com;lr>".to_string(),
+        ];
+        let joined = vec![
+            "<sip:p1.example.com;lr>, <sip:p2.example.com;lr>, <sip:p3.example.com;lr>".to_string(),
+        ];
+        let mixed = vec![
+            "<sip:p1.example.com;lr>, <sip:p2.example.com;lr>".to_string(),
+            "<sip:p3.example.com;lr>".to_string(),
+        ];
+        for rr in [&separate, &joined, &mixed] {
+            assert_eq!(
+                hosts(&process_record_route_for_uas(rr).unwrap()),
+                ["p1.example.com", "p2.example.com", "p3.example.com"]
+            );
+            assert_eq!(
+                hosts(&process_record_route_for_uac(rr).unwrap()),
+                ["p3.example.com", "p2.example.com", "p1.example.com"]
+            );
+        }
+    }
+
+    fn own(uri: &SipUri) -> bool {
+        uri.user.is_none() && uri.host.eq_ignore_ascii_case("me.example.com")
+    }
+
+    fn req_with_routes(ruri: &str, routes: &[&str]) -> SipRequest {
+        let mut req = SipRequest::new(crate::method::Method::Invite, ruri.parse().unwrap());
+        for r in routes {
+            req.headers.add_route(*r);
+        }
+        req
+    }
+
+    #[test]
+    fn preprocess_strict_router_restores_last_route() {
+        let mut req = req_with_routes(
+            "sip:me.example.com",
+            &["<sip:next.example.com;lr>", "<sip:bob@target.example.com>"],
+        );
+        let out = preprocess_route_information(&mut req, &own).unwrap();
+        assert_eq!(
+            out,
+            RoutePreprocess::Done {
+                restored_from_strict_route: true,
+                popped_own_route: false
+            }
+        );
+        assert_eq!(req.uri.host, "target.example.com");
+        assert_eq!(req.headers.route_values(), ["<sip:next.example.com;lr>"]);
+    }
+
+    #[test]
+    fn preprocess_strict_router_last_route_in_comma_list() {
+        let mut req = req_with_routes(
+            "sip:me.example.com",
+            &["<sip:next.example.com;lr>, <sip:bob@target.example.com>"],
+        );
+        preprocess_route_information(&mut req, &own).unwrap();
+        assert_eq!(req.uri.host, "target.example.com");
+        assert_eq!(req.headers.route_values(), ["<sip:next.example.com;lr>"]);
+    }
+
+    #[test]
+    fn preprocess_pops_own_top_route() {
+        let mut req = req_with_routes(
+            "sip:bob@target.example.com",
+            &["<sip:me.example.com;lr>", "<sip:next.example.com;lr>"],
+        );
+        let out = preprocess_route_information(&mut req, &own).unwrap();
+        assert_eq!(
+            out,
+            RoutePreprocess::Done {
+                restored_from_strict_route: false,
+                popped_own_route: true
+            }
+        );
+        assert_eq!(req.uri.host, "target.example.com");
+        assert_eq!(req.headers.route_values(), ["<sip:next.example.com;lr>"]);
+    }
+
+    #[test]
+    fn preprocess_pops_own_top_route_inside_comma_list() {
+        let mut req = req_with_routes(
+            "sip:bob@target.example.com",
+            &["<sip:me.example.com;lr>, <sip:next.example.com;lr>"],
+        );
+        preprocess_route_information(&mut req, &own).unwrap();
+        assert_eq!(req.headers.route_values(), ["<sip:next.example.com;lr>"]);
+    }
+
+    #[test]
+    fn preprocess_foreign_top_route_untouched() {
+        let mut req = req_with_routes(
+            "sip:bob@target.example.com",
+            &["<sip:next.example.com;lr>, <sip:me.example.com;lr>"],
+        );
+        let out = preprocess_route_information(&mut req, &own).unwrap();
+        assert_eq!(
+            out,
+            RoutePreprocess::Done {
+                restored_from_strict_route: false,
+                popped_own_route: false
+            }
+        );
+        assert_eq!(req.headers.route_values().len(), 2);
+    }
+
+    #[test]
+    fn preprocess_own_ruri_without_route() {
+        let mut req = req_with_routes("sip:me.example.com", &[]);
+        assert_eq!(
+            preprocess_route_information(&mut req, &own).unwrap(),
+            RoutePreprocess::NoRouteForOwnUri
+        );
+        assert_eq!(req.uri.host, "me.example.com");
+    }
+
+    #[test]
+    fn preprocess_bad_route_is_error_and_request_unchanged() {
+        let mut req = req_with_routes("sip:me.example.com", &["<sip:a.example.com;lr>", "<bad"]);
+        assert!(preprocess_route_information(&mut req, &own).is_err());
+        assert_eq!(req.uri.host, "me.example.com");
+        assert_eq!(req.headers.count(&HeaderName::Route), 2);
     }
 }

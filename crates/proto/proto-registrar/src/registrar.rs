@@ -127,6 +127,10 @@ pub struct RegisterRequest {
     pub authorization: Option<String>,
     /// Request method (typically REGISTER).
     pub method: String,
+    /// Request-URI as received; digest credentials must be bound to it
+    /// (RFC 7616 §3.4.6). `None` skips that check (POAM: POA&M-230 caller
+    /// follow-up, see `Authenticator::authenticate`).
+    pub request_uri: Option<String>,
 }
 
 impl RegisterRequest {
@@ -142,7 +146,15 @@ impl RegisterRequest {
             source_address: None,
             authorization: None,
             method: "REGISTER".to_string(),
+            request_uri: None,
         }
+    }
+
+    /// Sets the Request-URI the digest credentials must match.
+    #[must_use]
+    pub fn with_request_uri(mut self, uri: impl Into<String>) -> Self {
+        self.request_uri = Some(uri.into());
+        self
     }
 
     /// Sets the contacts.
@@ -770,6 +782,7 @@ impl AuthenticatedRegistrar {
                 credentials.as_ref(),
                 &config.realm,
                 &request.method,
+                request.request_uri.as_deref(),
                 None, // No entity body for REGISTER
             );
 
@@ -872,6 +885,7 @@ mod tests {
             source_address: None,
             authorization: None,
             method: "REGISTER".to_string(),
+            request_uri: None,
         }
     }
 
@@ -883,7 +897,7 @@ mod tests {
             let start = challenge.find(&key).unwrap() + key.len();
             challenge[start..].split('"').next().unwrap().to_string()
         };
-        let (realm, nonce) = (field("realm"), field("nonce"));
+        let (realm, nonce, opaque) = (field("realm"), field("nonce"), field("opaque"));
         let response =
             crate::authentication::compute_digest_response(&crate::authentication::DigestParams {
                 username,
@@ -901,7 +915,7 @@ mod tests {
         format!(
             "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", \
              uri=\"sip:example.com\", response=\"{response}\", algorithm=SHA-256, \
-             qop=auth, nc=00000001, cnonce=\"cnonce1\""
+             qop=auth, nc=00000001, cnonce=\"cnonce1\", opaque=\"{opaque}\""
         )
     }
 
@@ -986,6 +1000,7 @@ mod tests {
             source_address: None,
             authorization: None,
             method: "REGISTER".to_string(),
+            request_uri: None,
         };
 
         let response = registrar.process_register(&request).unwrap();
@@ -1013,6 +1028,7 @@ mod tests {
             source_address: None,
             authorization: None,
             method: "REGISTER".to_string(),
+            request_uri: None,
         };
 
         let response = registrar.process_register(&fetch_request).unwrap();
@@ -1040,6 +1056,7 @@ mod tests {
             source_address: None,
             authorization: None,
             method: "REGISTER".to_string(),
+            request_uri: None,
         };
 
         let response = registrar.process_register(&remove_request).unwrap();
@@ -1067,6 +1084,7 @@ mod tests {
             source_address: None,
             authorization: None,
             method: "REGISTER".to_string(),
+            request_uri: None,
         };
 
         let response = registrar.process_register(&remove_request).unwrap();
@@ -1089,6 +1107,7 @@ mod tests {
             source_address: None,
             authorization: None,
             method: "REGISTER".to_string(),
+            request_uri: None,
         };
 
         let response = registrar.process_register(&request).unwrap();
@@ -1112,6 +1131,7 @@ mod tests {
             source_address: None,
             authorization: None,
             method: "REGISTER".to_string(),
+            request_uri: None,
         };
         registrar.process_register(&request1).unwrap();
 
@@ -1126,6 +1146,7 @@ mod tests {
             source_address: None,
             authorization: None,
             method: "REGISTER".to_string(),
+            request_uri: None,
         };
         let response = registrar.process_register(&request2).unwrap();
 
@@ -1181,6 +1202,7 @@ mod tests {
             source_address: None,
             authorization: None,
             method: "REGISTER".to_string(),
+            request_uri: None,
         };
 
         let response = registrar.process_register(&request).unwrap();

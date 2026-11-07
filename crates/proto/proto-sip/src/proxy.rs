@@ -22,7 +22,24 @@
 //!
 //! ### §16.4 Route Information Preprocessing
 //!
-//! Handled by [`crate::routing`] module.
+//! [`crate::routing::preprocess_route_information`] with
+//! [`ProxyContext::is_own`]. It is a separate step; the caller runs, in order:
+//!
+//! 1. [`compute_loop_hash`] on the request **as received**;
+//! 2. [`RequestForwarder::validate_request`] (§16.3, loop/spiral check);
+//! 3. `preprocess_route_information` (§16.4);
+//! 4. target selection (§16.5), including ACL and dial-plan checks;
+//! 5. [`RequestForwarder::forward_request_with_loop_hash`] /
+//!    [`RequestForwarder::fork_request_with_loop_hash`] with the hash from
+//!    step 1, so the branch reflects the request before translation
+//!    (§16.6 step 8).
+//!
+//! # Security
+//!
+//! Step 3 can replace the Request-URI with the sender-supplied last Route
+//! value (§16.4 strict-route restore). ACL, dial-plan and routing policy
+//! MUST therefore run on the post-preprocessing Request-URI (step 4), never
+//! on the Request-URI as received. NIST 800-53 Rev5: AC-4, SC-7.
 //!
 //! ### §16.5 Determining Request Targets
 //!
@@ -110,8 +127,12 @@ pub struct ProxyContext {
     pub record_route: bool,
     /// Whether to use loose routing.
     pub loose_routing: bool,
-    /// Trusted domains for loop detection.
+    /// Trusted peer domains. Used only to accept a topmost Via on responses;
+    /// it is **not** consulted for loop detection ("trusted" is not "me").
     pub trusted_domains: HashSet<String>,
+    /// Additional URIs this proxy places in Record-Route (aliases, other
+    /// listeners). `proxy_uri` is always treated as ours.
+    pub own_uris: Vec<SipUri>,
 }
 
 impl ProxyContext {
@@ -126,7 +147,29 @@ impl ProxyContext {
             record_route: true,
             loose_routing: true,
             trusted_domains: HashSet::new(),
+            own_uris: Vec::new(),
         }
+    }
+
+    /// Adds a URI this proxy places in Record-Route (RFC 3261 §16.4).
+    #[must_use]
+    pub fn with_own_uri(mut self, uri: SipUri) -> Self {
+        self.own_uris.push(uri);
+        self
+    }
+
+    /// Returns true if `uri` is one this proxy placed in Record-Route
+    /// (RFC 3261 §16.4).
+    ///
+    /// Matches `proxy_uri` or any `own_uris` entry on: equal user part (so
+    /// `sip:bob@<our-host>` is not ours), case-insensitive host, effective
+    /// port (5060, or 5061 for `sips:`/`transport=tls`), and `transport` when
+    /// both URIs carry one.
+    #[must_use]
+    pub fn is_own(&self, uri: &SipUri) -> bool {
+        std::iter::once(&self.proxy_uri)
+            .chain(self.own_uris.iter())
+            .any(|own| uri_matches_own(uri, own))
     }
 
     /// Sets the port.
@@ -147,6 +190,101 @@ impl ProxyContext {
     pub fn add_trusted_domain(&mut self, domain: &str) {
         self.trusted_domains.insert(domain.to_lowercase());
     }
+}
+
+/// Effective port of a URI for "is this us" checks.
+fn effective_port(uri: &SipUri) -> u16 {
+    uri.port.unwrap_or_else(|| {
+        if uri.scheme == crate::uri::UriScheme::Sips
+            || uri
+                .transport()
+                .is_some_and(|t| t.eq_ignore_ascii_case("tls"))
+        {
+            crate::DEFAULT_SIPS_PORT
+        } else {
+            crate::DEFAULT_SIP_PORT
+        }
+    })
+}
+
+/// See [`ProxyContext::is_own`].
+fn uri_matches_own(uri: &SipUri, own: &SipUri) -> bool {
+    uri.user == own.user
+        && uri.host.eq_ignore_ascii_case(&own.host)
+        && effective_port(uri) == effective_port(own)
+        && match (uri.transport(), own.transport()) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => true,
+        }
+}
+
+/// Separator for the loop-hash suffix in branches this proxy emits:
+/// `z9hG4bK{rand16hex}.{loophash16hex}`.
+const LOOP_HASH_SEP: char = '.';
+
+/// Computes the RFC 3261 §16.6 step 8 loop hash of a request **as received**
+/// (before §16.4 preprocessing or Request-URI translation).
+///
+/// Input fields, NUL-separated, in this order: Request-URI, To tag, From tag,
+/// Call-ID, `CSeq` sequence number, every Route value, every Proxy-Require
+/// value, every Proxy-Authorization value. If one of them changes when the
+/// request comes back, that is a spiral, not a loop (§16.3 item 4).
+///
+/// The topmost Via suggested by §16.6 step 8 is deliberately **not** hashed:
+/// on a real loop the topmost Via is the previous hop's, never the one first
+/// received, so hashing it would classify every loop as a spiral.
+///
+/// FNV-1a 64 is deterministic across nodes and builds. It is not a security
+/// boundary: a collision only misclassifies a loop as a spiral, which
+/// Max-Forwards (483) still bounds. NIST 800-53 Rev5: SC-5.
+#[must_use]
+pub fn compute_loop_hash(request: &SipRequest) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for b in bytes.iter().chain(std::iter::once(&0u8)) {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(PRIME);
+        }
+    };
+    feed(request.uri.to_string().as_bytes());
+    feed(request.headers.to_tag().unwrap_or_default().as_bytes());
+    feed(request.headers.from_tag().unwrap_or_default().as_bytes());
+    feed(
+        request
+            .headers
+            .call_id()
+            .unwrap_or_default()
+            .trim()
+            .as_bytes(),
+    );
+    let cseq_num = request
+        .headers
+        .cseq_parsed()
+        .map(|c| c.sequence.to_string())
+        .unwrap_or_default();
+    feed(cseq_num.as_bytes());
+    for name in [
+        HeaderName::Route,
+        HeaderName::ProxyRequire,
+        HeaderName::ProxyAuthorization,
+    ] {
+        for hdr in request.headers.get_all(&name) {
+            feed(hdr.value.trim().as_bytes());
+        }
+    }
+    h
+}
+
+/// Extracts the loop hash from a branch emitted by [`RequestForwarder`].
+fn branch_loop_hash(branch: &str) -> Option<u64> {
+    let rest = branch.strip_prefix(crate::header_params::VIA_BRANCH_MAGIC_COOKIE)?;
+    let (_, suffix) = rest.rsplit_once(LOOP_HASH_SEP)?;
+    if suffix.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(suffix, 16).ok()
 }
 
 /// Forwarding target for a request.
@@ -282,41 +420,47 @@ impl RequestForwarder {
         request.headers.get_all(&HeaderName::Via).count()
     }
 
-    /// Detects loops by checking Via headers.
+    /// Returns true if a Via sent-by is this proxy's (host + port).
+    fn is_our_via(&self, via: &ViaHeader) -> bool {
+        let port_match = match (via.port, self.context.port) {
+            (Some(vp), Some(op)) => vp == op,
+            (None | Some(crate::DEFAULT_SIP_PORT), None | Some(crate::DEFAULT_SIP_PORT)) => true,
+            _ => false,
+        };
+        port_match && via.host.eq_ignore_ascii_case(&self.context.host)
+    }
+
+    /// RFC 3261 §16.3 item 4: loop detection that allows spirals.
     ///
-    /// Per RFC 3261 §16.3, a loop is detected if a Via header
-    /// contains our own address with a branch we've seen before.
+    /// For every Via value (all header instances, comma lists split) whose
+    /// sent-by is ours, the loop hash in its branch is compared with the
+    /// hash of the incoming request. Equal means a loop (482); different
+    /// means a spiral (allowed; Max-Forwards still bounds it). A Via of ours
+    /// whose branch carries no loop hash is treated as a loop (fail closed).
+    /// `trusted_domains` is not consulted: a trusted peer is not this proxy.
     fn detect_loop(&self, request: &SipRequest) -> Option<String> {
-        let our_host = self.context.host.to_lowercase();
-        let our_port = self.context.port;
-
-        for via_header in request.headers.get_all(&HeaderName::Via) {
-            if let Ok(via) = via_header.value.parse::<ViaHeader>() {
-                let via_host = via.host.to_lowercase();
-
-                // Check if this Via is from us
-                let host_match =
-                    via_host == our_host || self.context.trusted_domains.contains(&via_host);
-
-                let port_match = match (via.port, our_port) {
-                    (Some(vp), Some(op)) => vp == op,
-                    (None | Some(5060), None | Some(5060)) => true, // Default port
-                    _ => false,
-                };
-
-                if host_match && port_match {
-                    // Check for RFC 3261 branch magic cookie
-                    if via.has_rfc3261_branch() {
-                        return Some(format!(
-                            "Loop detected: Via from {} with branch {}",
-                            via.host,
-                            via.branch.as_deref().unwrap_or("none")
-                        ));
-                    }
+        let mut current: Option<u64> = None;
+        for via in request.headers.via_all_parsed() {
+            if !self.is_our_via(&via) {
+                continue;
+            }
+            let hash = *current.get_or_insert_with(|| compute_loop_hash(request));
+            match via.branch.as_deref().and_then(branch_loop_hash) {
+                Some(h) if h != hash => {}
+                Some(_) => {
+                    return Some(format!(
+                        "Loop detected: request returned unchanged via {}",
+                        via.host
+                    ));
+                }
+                None => {
+                    return Some(format!(
+                        "Loop detected: own Via from {} without loop hash",
+                        via.host
+                    ));
                 }
             }
         }
-
         None
     }
 
@@ -339,6 +483,22 @@ impl RequestForwarder {
         request: &SipRequest,
         target: &ForwardingTarget,
     ) -> SipResult<SipRequest> {
+        self.forward_request_with_loop_hash(request, target, compute_loop_hash(request))
+    }
+
+    /// Like [`Self::forward_request`], with the loop hash computed by the
+    /// caller from the request as received (before §16.4 preprocessing).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Max-Forwards cannot be decremented or the CSPRNG
+    /// fails.
+    pub fn forward_request_with_loop_hash(
+        &self,
+        request: &SipRequest,
+        target: &ForwardingTarget,
+        loop_hash: u64,
+    ) -> SipResult<SipRequest> {
         // Step 1: Make a copy
         let mut forwarded = request.clone();
 
@@ -354,7 +514,7 @@ impl RequestForwarder {
         }
 
         // Step 8: Add Via header
-        self.add_via_header(&mut forwarded);
+        self.add_via_header(&mut forwarded, loop_hash)?;
 
         // Apply transport override if specified
         if let Some(ref transport) = target.transport {
@@ -399,18 +559,32 @@ impl RequestForwarder {
     }
 
     /// Adds a Via header for this proxy.
-    fn add_via_header(&self, request: &mut SipRequest) {
+    ///
+    /// RFC 3261 §16.6 step 8: branch = `z9hG4bK{rand16hex}.{loophash16hex}`.
+    /// The random part keeps each fork unique; the loop hash lets §16.3
+    /// tell a spiral from a loop.
+    fn add_via_header(&self, request: &mut SipRequest, loop_hash: u64) -> SipResult<()> {
         let mut via = ViaHeader::new(&self.context.transport, &self.context.host);
 
         if let Some(port) = self.context.port {
             via = via.with_port(port);
         }
 
-        // Generate unique branch for this transaction
-        via = via.with_branch(ViaHeader::generate_branch());
+        let mut rand = [0u8; 8];
+        getrandom::fill(&mut rand).map_err(|e| SipError::InvalidHeader {
+            name: "Via".to_string(),
+            reason: format!("CSPRNG failure: {e}"),
+        })?;
+        let branch = format!(
+            "{}{:016x}{LOOP_HASH_SEP}{loop_hash:016x}",
+            crate::header_params::VIA_BRANCH_MAGIC_COOKIE,
+            u64::from_be_bytes(rand)
+        );
+        via = via.with_branch(branch);
 
         // Insert at the beginning of Via headers (Via must be first)
         self.prepend_via_header(request, via.to_string());
+        Ok(())
     }
 
     /// Prepends a Via header to the beginning of the Via headers list.
@@ -443,6 +617,21 @@ impl RequestForwarder {
         request: &SipRequest,
         targets: &[ForwardingTarget],
     ) -> SipResult<Vec<SipRequest>> {
+        self.fork_request_with_loop_hash(request, targets, compute_loop_hash(request))
+    }
+
+    /// Like [`Self::fork_request`], with a caller-supplied loop hash. Every
+    /// branch gets a unique random part and the same loop hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are no targets or forwarding fails.
+    pub fn fork_request_with_loop_hash(
+        &self,
+        request: &SipRequest,
+        targets: &[ForwardingTarget],
+        loop_hash: u64,
+    ) -> SipResult<Vec<SipRequest>> {
         if targets.is_empty() {
             return Err(SipError::InvalidUri {
                 reason: "no targets for forking".to_string(),
@@ -462,7 +651,7 @@ impl RequestForwarder {
         let mut requests = Vec::with_capacity(sorted_targets.len());
 
         for target in sorted_targets {
-            let forwarded = self.forward_request(request, target)?;
+            let forwarded = self.forward_request_with_loop_hash(request, target, loop_hash)?;
             requests.push(forwarded);
         }
 
@@ -611,31 +800,22 @@ impl ResponseProcessor {
 
 /// Creates a 100 Trying response for proxies.
 ///
-/// Per RFC 3261 §16.2, a proxy SHOULD send 100 Trying immediately
-/// after receiving an INVITE to suppress retransmissions.
+/// RFC 3261 §16.2 / §8.2.6.2: copies **all** Via header fields in order
+/// (combined lists preserved), From, To (no tag is added), Call-ID and `CSeq`.
+/// RFC 3261 §8.2.6.1: a Timestamp in the request MUST be copied (no delay
+/// value is added). `Content-Length: 0` is set.
 #[must_use]
 pub fn create_trying_response(request: &SipRequest) -> SipResponse {
     use crate::response::StatusCode;
 
     let mut response = SipResponse::new(StatusCode::TRYING);
-
-    // Copy required headers from request
-    if let Some(via) = request.headers.get(&HeaderName::Via) {
-        response.headers.add(via.clone());
+    copy_required_headers(request, &mut response);
+    if let Some(ts) = request.headers.get(&HeaderName::Timestamp) {
+        response.headers.add(ts.clone());
     }
-    if let Some(from) = request.headers.get(&HeaderName::From) {
-        response.headers.add(from.clone());
-    }
-    if let Some(to) = request.headers.get(&HeaderName::To) {
-        response.headers.add(to.clone());
-    }
-    if let Some(call_id) = request.headers.get(&HeaderName::CallId) {
-        response.headers.add(call_id.clone());
-    }
-    if let Some(cseq) = request.headers.get(&HeaderName::CSeq) {
-        response.headers.add(cseq.clone());
-    }
-
+    response
+        .headers
+        .add(Header::new(HeaderName::ContentLength, "0"));
     response
 }
 
@@ -929,9 +1109,252 @@ mod tests {
             .headers
             .add(Header::new(HeaderName::CSeq, "1 INVITE"));
 
+        // Our Via with a legacy branch (no loop hash): fail closed, 482.
         let validation = forwarder.validate_request(&request);
         assert!(!validation.valid);
         assert_eq!(validation.response_code, Some(482)); // Loop Detected
+    }
+
+    /// Simulates the request coming back to us after `forwarded` went out
+    /// via another proxy.
+    fn returned(forwarded: &SipRequest) -> SipRequest {
+        let mut back = forwarded.clone();
+        let idx = back.headers.position(&HeaderName::Via).unwrap();
+        back.headers.insert(
+            idx,
+            Header::new(
+                HeaderName::Via,
+                "SIP/2.0/UDP other.example.net;branch=z9hG4bKother",
+            ),
+        );
+        back
+    }
+
+    #[test]
+    fn same_request_back_is_loop() {
+        let forwarder = RequestForwarder::new(create_proxy_context());
+        let request = create_test_request();
+        let target = ForwardingTarget::new(request.uri.clone());
+        let fwd = forwarder.forward_request(&request, &target).unwrap();
+        let v = forwarder.validate_request(&returned(&fwd));
+        assert_eq!(v.response_code, Some(482), "{v:?}");
+    }
+
+    #[test]
+    fn spiral_with_changed_ruri_allowed() {
+        let forwarder = RequestForwarder::new(create_proxy_context());
+        let request = create_test_request();
+        let target = ForwardingTarget::new(SipUri::new("biloxi.example.com").with_user("bob2"));
+        let fwd = forwarder.forward_request(&request, &target).unwrap();
+        let v = forwarder.validate_request(&returned(&fwd));
+        assert!(v.valid, "{v:?}");
+    }
+
+    #[test]
+    fn spiral_with_changed_cseq_allowed() {
+        let forwarder = RequestForwarder::new(create_proxy_context());
+        let request = create_test_request();
+        let target = ForwardingTarget::new(request.uri.clone());
+        let fwd = forwarder.forward_request(&request, &target).unwrap();
+        let mut back = returned(&fwd);
+        back.headers.set(HeaderName::CSeq, "2 INVITE");
+        assert!(forwarder.validate_request(&back).valid);
+    }
+
+    #[test]
+    fn own_via_inside_comma_list_detected() {
+        let forwarder = RequestForwarder::new(create_proxy_context());
+        let request = create_test_request();
+        let target = ForwardingTarget::new(request.uri.clone());
+        let fwd = forwarder.forward_request(&request, &target).unwrap();
+        let mut back = fwd.clone();
+        let vias: Vec<String> = back
+            .headers
+            .get_all(&HeaderName::Via)
+            .map(|h| h.value.clone())
+            .collect();
+        back.headers.replace_instances(
+            &HeaderName::Via,
+            vec![format!(
+                "SIP/2.0/UDP other.example.net;branch=z9hG4bKx, {}",
+                vias.join(", ")
+            )],
+        );
+        assert_eq!(forwarder.validate_request(&back).response_code, Some(482));
+    }
+
+    #[test]
+    fn foreign_via_with_same_branch_ignored() {
+        let forwarder = RequestForwarder::new(create_proxy_context());
+        let request = create_test_request();
+        let target = ForwardingTarget::new(request.uri.clone());
+        let fwd = forwarder.forward_request(&request, &target).unwrap();
+        let branch = fwd.headers.via_branch().unwrap();
+        let mut back = request.clone();
+        back.headers.insert(
+            0,
+            Header::new(
+                HeaderName::Via,
+                format!("SIP/2.0/UDP elsewhere.example.net;branch={branch}"),
+            ),
+        );
+        assert!(forwarder.validate_request(&back).valid);
+    }
+
+    #[test]
+    fn trusted_domain_via_is_not_us() {
+        let mut ctx = create_proxy_context();
+        ctx.add_trusted_domain("pc33.atlanta.example.com");
+        let forwarder = RequestForwarder::new(ctx);
+        // pc33's legacy branch would be a "loop" if trusted meant "us".
+        assert!(forwarder.validate_request(&create_test_request()).valid);
+    }
+
+    #[test]
+    fn fork_branches_unique_with_shared_loop_hash() {
+        let forwarder = RequestForwarder::new(create_proxy_context());
+        let request = create_test_request();
+        let targets = vec![
+            ForwardingTarget::new(SipUri::new("t1.example.com")),
+            ForwardingTarget::new(SipUri::new("t2.example.com")),
+        ];
+        let forks = forwarder.fork_request(&request, &targets).unwrap();
+        let branches: Vec<String> = forks
+            .iter()
+            .map(|r| r.headers.via_branch().unwrap())
+            .collect();
+        assert_ne!(branches[0], branches[1]);
+        let hashes: Vec<u64> = branches
+            .iter()
+            .map(|b| branch_loop_hash(b).unwrap())
+            .collect();
+        assert_eq!(hashes[0], hashes[1]);
+        assert_eq!(hashes[0], compute_loop_hash(&request));
+    }
+
+    #[test]
+    fn trying_from_parsed_wire_with_separate_via_lines() {
+        let raw = "INVITE sip:bob@biloxi.example.com SIP/2.0\r\n\
+            Via: SIP/2.0/UDP p1.example.com;branch=z9hG4bK1\r\n\
+            Via: SIP/2.0/TCP p2.example.com;branch=z9hG4bK2;received=192.0.2.2\r\n\
+            Via: SIP/2.0/UDP pc33.atlanta.example.com;branch=z9hG4bK3\r\n\
+            Max-Forwards: 70\r\n\
+            From: Alice <sip:alice@atlanta.example.com>;tag=1234\r\n\
+            To: Bob <sip:bob@biloxi.example.com>\r\n\
+            Call-ID: abc123@atlanta\r\n\
+            CSeq: 7 INVITE\r\n\
+            Timestamp: 1.5 0.25\r\n\
+            Content-Length: 0\r\n\r\n";
+        let request = match crate::message::SipMessage::parse(raw.as_bytes()).unwrap() {
+            crate::message::SipMessage::Request(r) => r,
+            crate::message::SipMessage::Response(_) => unreachable!(),
+        };
+        let response = create_trying_response(&request);
+        let vias: Vec<&str> = response
+            .headers
+            .get_all(&HeaderName::Via)
+            .map(|h| h.value.as_str())
+            .collect();
+        assert_eq!(vias.len(), 3);
+        assert!(vias[0].contains("p1.example.com"));
+        assert!(vias[1].contains("received=192.0.2.2"));
+        assert!(vias[2].contains("pc33.atlanta"));
+        assert_eq!(
+            response.headers.get_value(&HeaderName::Timestamp),
+            Some("1.5 0.25")
+        );
+        assert_eq!(
+            response.headers.get_value(&HeaderName::CSeq),
+            Some("7 INVITE")
+        );
+        assert_eq!(
+            response.headers.get_value(&HeaderName::CallId),
+            Some("abc123@atlanta")
+        );
+        assert_eq!(response.headers.to_tag(), None);
+        assert_eq!(
+            response.headers.get_value(&HeaderName::ContentLength),
+            Some("0")
+        );
+
+        // No Timestamp in the request means none in the 100.
+        let mut no_ts = request.clone();
+        no_ts.headers.remove(&HeaderName::Timestamp);
+        assert_eq!(
+            create_trying_response(&no_ts)
+                .headers
+                .get_value(&HeaderName::Timestamp),
+            None
+        );
+    }
+
+    #[test]
+    fn trying_copies_all_vias_and_timestamp() {
+        let mut request = create_test_request();
+        request.headers.insert(
+            0,
+            Header::new(HeaderName::Via, "SIP/2.0/UDP a.example.com;branch=z9hG4bKa"),
+        );
+        request.headers.add(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/UDP b.example.com;branch=z9hG4bKb, SIP/2.0/UDP c.example.com;branch=z9hG4bKc",
+        ));
+        request
+            .headers
+            .add(Header::new(HeaderName::Timestamp, "54.21"));
+        let response = create_trying_response(&request);
+        let req_vias: Vec<&str> = request
+            .headers
+            .get_all(&HeaderName::Via)
+            .map(|h| h.value.as_str())
+            .collect();
+        let resp_vias: Vec<&str> = response
+            .headers
+            .get_all(&HeaderName::Via)
+            .map(|h| h.value.as_str())
+            .collect();
+        assert_eq!(req_vias, resp_vias);
+        assert_eq!(resp_vias.len(), 3);
+        assert_eq!(
+            response.headers.get_value(&HeaderName::Timestamp),
+            Some("54.21")
+        );
+        assert_eq!(response.headers.to_tag(), None);
+        assert_eq!(
+            response.headers.get_value(&HeaderName::ContentLength),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn is_own_matching() {
+        let ctx = ProxyContext::new(
+            "sip:ss1.atlanta.example.com;lr".parse().unwrap(),
+            "UDP",
+            "ss1.atlanta.example.com",
+        )
+        .with_own_uri("sips:alias.example.com".parse().unwrap());
+        assert!(ctx.is_own(&"sip:SS1.atlanta.example.com:5060".parse().unwrap()));
+        assert!(ctx.is_own(&"sip:alias.example.com:5061;transport=tls".parse().unwrap()));
+        assert!(!ctx.is_own(&"sip:bob@ss1.atlanta.example.com".parse().unwrap()));
+        assert!(!ctx.is_own(&"sip:ss1.atlanta.example.com:5070".parse().unwrap()));
+        assert!(!ctx.is_own(&"sip:alias.example.com".parse().unwrap()));
+    }
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn loop_hash_deterministic(user in "[a-z]{1,10}", call_id in "[a-z0-9]{1,20}", seq in 1u32..) {
+                let mut r = create_test_request();
+                r.uri = SipUri::new("example.com").with_user(user);
+                r.headers.set(HeaderName::CallId, call_id);
+                r.headers.set(HeaderName::CSeq, format!("{seq} INVITE"));
+                prop_assert_eq!(compute_loop_hash(&r), compute_loop_hash(&r.clone()));
+            }
+        }
     }
 
     #[test]

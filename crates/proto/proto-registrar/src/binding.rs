@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn test_path() {
         let mut binding = test_binding();
-        assert!(binding.path().is_empty());
+        assert_eq!(binding.path(), &[] as &[String]);
 
         let path = vec![
             "<sip:edge.example.com;lr>".to_string(),

@@ -20,9 +20,13 @@
 //!
 //! - **RFC 2617**: HTTP Authentication (Digest authentication)
 //! - **RFC 3263**: SIP: Locating SIP Servers
+//! - **RFC 3323 / RFC 3325**: Privacy header and P-Asserted-Identity
+//!   privacy service helpers (`privacy` module; library-only)
 //! - **RFC 3264**: An Offer/Answer Model with SDP
 //! - **RFC 4566**: SDP: Session Description Protocol
 //! - **RFC 7118**: WebSocket Transport for SIP
+//! - **RFC 7616**: HTTP Digest (SHA-256 / SHA-512-256; server-side
+//!   `DigestVerifier` with feature `digest-auth`)
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
@@ -57,6 +61,8 @@
 pub mod auth;
 pub mod builder;
 pub mod cidr;
+#[cfg(feature = "digest-auth")]
+pub mod digest_verifier;
 pub mod error;
 pub mod header;
 pub mod header_params;
@@ -65,6 +71,7 @@ pub mod manipulation;
 pub mod message;
 pub mod method;
 pub mod options;
+pub mod privacy;
 pub mod proxy;
 pub mod redirect;
 pub mod response;
@@ -74,7 +81,7 @@ pub mod transport;
 pub mod uri;
 
 #[cfg(feature = "digest-auth")]
-pub use auth::Md5DigestHasher;
+pub use auth::{AlgorithmHasher, Md5DigestHasher, Sha256DigestHasher, Sha512_256DigestHasher};
 pub use auth::{
     DigestAlgorithm, DigestChallenge, DigestCredentials, DigestHasher, Qop,
     compute_digest_response, compute_ha1, compute_ha2, compute_response, create_credentials,
@@ -84,6 +91,11 @@ pub use builder::{
     RequestBuilder, ResponseBuilder, generate_branch, generate_call_id, generate_tag,
 };
 pub use cidr::IpCidr;
+#[cfg(feature = "digest-auth")]
+pub use digest_verifier::{
+    DigestPolicy, DigestReject, DigestRequestView, DigestSecret, DigestVerdict, DigestVerifier,
+    NonceCheck, NonceIssuer,
+};
 pub use error::{SipError, SipResult};
 pub use header::{Header, HeaderName, Headers};
 pub use header_params::{
@@ -92,14 +104,18 @@ pub use header_params::{
 pub use list::{ListSplit, split_list, split_list_bounded};
 pub use message::{Framing, SipMessage, SipRequest, SipResponse};
 pub use method::Method;
+pub use privacy::{
+    PrivacyCapabilities, PrivacyError, PrivacyHeader, PrivacyOutcome, PrivacyValue, apply_privacy,
+    sanitize_inbound_identity,
+};
 pub use redirect::{
     DEFAULT_MAX_REDIRECT_DEPTH, RedirectContact, RedirectHandler, RedirectHeaders, RedirectResult,
     parse_redirect_response,
 };
 pub use response::StatusCode;
 pub use routing::{
-    RouteEntry, RouteSet, compute_request_target, create_record_route,
-    process_record_route_for_uac, process_record_route_for_uas,
+    RouteEntry, RoutePreprocess, RouteSet, compute_request_target, create_record_route,
+    preprocess_route_information, process_record_route_for_uac, process_record_route_for_uas,
 };
 pub use topology::{TopologyHider, TopologyHidingConfig, TopologyHidingMode};
 pub use transport::Transport;
@@ -108,8 +124,8 @@ pub use uri::{AbsoluteUri, SipUri, TelUri, Uri, UriScheme};
 // RFC 3261 §16.6 Proxy forwarding
 pub use proxy::{
     ForkingMode, ForwardingTarget, ProxyContext, ProxyValidation, RequestForwarder,
-    ResponseProcessor, create_loop_detected_response, create_too_many_hops_response,
-    create_trying_response,
+    ResponseProcessor, compute_loop_hash, create_loop_detected_response,
+    create_too_many_hops_response, create_trying_response,
 };
 
 // Header Manipulation Engine (Enterprise SBC feature)

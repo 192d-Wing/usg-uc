@@ -710,7 +710,7 @@ mod tests {
         let token = FlowToken::from_flow_id(&flow_id);
 
         assert!(token.as_str().starts_with("f-"));
-        assert!(!token.as_str().is_empty());
+        assert_ne!(token.as_str(), "");
     }
 
     #[test]
@@ -871,7 +871,7 @@ mod tests {
 
         // Tick should not generate actions immediately (flow just created)
         let actions = manager.tick();
-        assert!(actions.is_empty());
+        assert_eq!(actions.len(), 0, "{actions:?}");
 
         // Verify flow is tracked
         assert_eq!(manager.flow_count(), 1);
@@ -891,7 +891,7 @@ mod tests {
 
         // Tick should not generate actions immediately (flow just created)
         let actions = manager.tick();
-        assert!(actions.is_empty());
+        assert_eq!(actions.len(), 0, "{actions:?}");
 
         // Verify flow is tracked with correct transport
         let flow = manager.get_flow(&flow_id).unwrap();

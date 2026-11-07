@@ -227,7 +227,9 @@ impl Dialog {
         self.remote_target = Some(target.into());
     }
 
-    /// Sets the route set.
+    /// Sets the route set, already in sending order: Record-Route in order
+    /// for a UAS (RFC 3261 §12.1.1), reversed for a UAC (§12.1.2). See
+    /// `proto_sip::process_record_route_for_uas` / `_for_uac`.
     pub fn set_route_set(&mut self, routes: Vec<String>) {
         self.route_set = routes;
     }

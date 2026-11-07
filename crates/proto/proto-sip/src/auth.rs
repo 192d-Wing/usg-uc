@@ -208,9 +208,9 @@ impl fmt::Display for DigestChallenge {
             self.realm, self.nonce
         )?;
 
-        if self.algorithm != DigestAlgorithm::Md5 {
-            write!(f, ", algorithm={}", self.algorithm)?;
-        }
+        // RFC 7616 §3.3: always name the algorithm, including MD5, so the
+        // client never has to infer it.
+        write!(f, ", algorithm={}", self.algorithm)?;
 
         if let Some(ref opaque) = self.opaque {
             write!(f, ", opaque=\"{opaque}\"")?;
@@ -574,13 +574,36 @@ fn parse_single_param(s: &str) -> Option<(String, String)> {
 /// This trait abstracts the hash algorithm, allowing the protocol library
 /// to remain independent of specific crypto implementations.
 ///
-/// Implementations should use:
+/// Implementations must use:
 /// - MD5 for `DigestAlgorithm::Md5` and `Md5Sess`
 /// - SHA-256 for `DigestAlgorithm::Sha256` and `Sha256Sess`
 /// - SHA-512/256 for `DigestAlgorithm::Sha512_256` and `Sha512_256Sess`
+///
+/// RFC 7616 §3.4.1: the hash is selected by the `algorithm` parameter. The
+/// digest functions refuse a hasher whose [`DigestHasher::handles`] returns
+/// false for the algorithm in use, so an MD5 hasher can never answer or verify
+/// a SHA-256 challenge (POA&M-230; NIST 800-53 Rev5: SC-13, SC-24 fail closed).
 pub trait DigestHasher {
     /// Computes the hash of the input and returns it as a lowercase hex string.
     fn hash(&self, input: &[u8]) -> String;
+
+    /// Returns true if this hasher implements the hash function named by
+    /// `algorithm` (session and non-session variants share one hash).
+    ///
+    /// There is deliberately no default: an implementor must state which
+    /// algorithms it computes, or every digest computation fails closed.
+    fn handles(&self, algorithm: DigestAlgorithm) -> bool;
+}
+
+/// Lowercase hex encoding of a digest output.
+#[cfg(feature = "digest-auth")]
+fn to_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// MD5 hasher for digest authentication (legacy compatibility).
@@ -588,12 +611,119 @@ pub trait DigestHasher {
 /// WARNING: MD5 is cryptographically weak. Only use for
 /// interoperability with systems that don't support SHA-256.
 #[cfg(feature = "digest-auth")]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Md5DigestHasher;
 
 #[cfg(feature = "digest-auth")]
 impl DigestHasher for Md5DigestHasher {
     fn hash(&self, input: &[u8]) -> String {
         format!("{:x}", md5::compute(input))
+    }
+
+    fn handles(&self, algorithm: DigestAlgorithm) -> bool {
+        matches!(algorithm, DigestAlgorithm::Md5 | DigestAlgorithm::Md5Sess)
+    }
+}
+
+/// SHA-256 hasher for digest authentication (RFC 7616 §3.2).
+///
+/// NIST 800-53 Rev5: SC-13 (Cryptographic Protection) - computed by
+/// aws-lc-rs (the FIPS 140-3 validated module only when the build enables
+/// the `aws-lc-rs/fips` feature, e.g. via the workspace `fips` feature). Not a CNSA 2.0 hash; SIP digest stays under the
+/// existing CNSA exception (POA&M-110) because RFC 7616 defines no SHA-384.
+#[cfg(feature = "digest-auth")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sha256DigestHasher;
+
+#[cfg(feature = "digest-auth")]
+impl DigestHasher for Sha256DigestHasher {
+    fn hash(&self, input: &[u8]) -> String {
+        to_hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, input).as_ref())
+    }
+
+    fn handles(&self, algorithm: DigestAlgorithm) -> bool {
+        matches!(
+            algorithm,
+            DigestAlgorithm::Sha256 | DigestAlgorithm::Sha256Sess
+        )
+    }
+}
+
+/// SHA-512/256 hasher for digest authentication (RFC 7616 §3.2).
+///
+/// This is the FIPS 180-4 SHA-512/256 function (its own initial hash
+/// values), not SHA-512 truncated to 256 bits.
+#[cfg(feature = "digest-auth")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sha512_256DigestHasher;
+
+#[cfg(feature = "digest-auth")]
+impl DigestHasher for Sha512_256DigestHasher {
+    fn hash(&self, input: &[u8]) -> String {
+        to_hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA512_256, input).as_ref())
+    }
+
+    fn handles(&self, algorithm: DigestAlgorithm) -> bool {
+        matches!(
+            algorithm,
+            DigestAlgorithm::Sha512_256 | DigestAlgorithm::Sha512_256Sess
+        )
+    }
+}
+
+/// Hasher selected from the `algorithm` of a challenge or policy.
+///
+/// Enum dispatch (no boxing). Use [`AlgorithmHasher::for_algorithm`] with the
+/// challenge's algorithm on the UAC side and with the configured policy
+/// algorithm on the server side.
+#[cfg(feature = "digest-auth")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlgorithmHasher {
+    /// MD5 / MD5-sess.
+    Md5,
+    /// SHA-256 / SHA-256-sess.
+    Sha256,
+    /// SHA-512-256 / SHA-512-256-sess.
+    Sha512_256,
+}
+
+#[cfg(feature = "digest-auth")]
+impl AlgorithmHasher {
+    /// Returns the hasher that implements `algorithm`.
+    #[must_use]
+    pub fn for_algorithm(algorithm: DigestAlgorithm) -> Self {
+        match algorithm {
+            DigestAlgorithm::Md5 | DigestAlgorithm::Md5Sess => Self::Md5,
+            DigestAlgorithm::Sha256 | DigestAlgorithm::Sha256Sess => Self::Sha256,
+            DigestAlgorithm::Sha512_256 | DigestAlgorithm::Sha512_256Sess => Self::Sha512_256,
+        }
+    }
+}
+
+#[cfg(feature = "digest-auth")]
+impl DigestHasher for AlgorithmHasher {
+    fn hash(&self, input: &[u8]) -> String {
+        match self {
+            Self::Md5 => Md5DigestHasher.hash(input),
+            Self::Sha256 => Sha256DigestHasher.hash(input),
+            Self::Sha512_256 => Sha512_256DigestHasher.hash(input),
+        }
+    }
+
+    fn handles(&self, algorithm: DigestAlgorithm) -> bool {
+        Self::for_algorithm(algorithm) == *self
+    }
+}
+
+/// Rejects a hasher that does not implement `algorithm` (fail closed).
+fn ensure_hasher(hasher: &impl DigestHasher, algorithm: DigestAlgorithm) -> SipResult<()> {
+    if hasher.handles(algorithm) {
+        Ok(())
+    } else {
+        Err(SipError::InvalidHeader {
+            name: "algorithm".to_string(),
+            reason: format!("hasher does not implement digest algorithm {algorithm}"),
+        })
     }
 }
 
@@ -635,7 +765,8 @@ pub fn generate_cnonce() -> String {
 ///
 /// # Errors
 ///
-/// Returns an error if HA1 computation fails.
+/// Returns an error if `hasher` does not implement `algorithm`, or if a
+/// session algorithm is used without `nonce`/`cnonce`.
 pub fn compute_ha1(
     hasher: &impl DigestHasher,
     username: &str,
@@ -645,6 +776,8 @@ pub fn compute_ha1(
     nonce: Option<&str>,
     cnonce: Option<&str>,
 ) -> SipResult<String> {
+    // RFC 7616 §3.4.2: A1 is hashed with the negotiated algorithm.
+    ensure_hasher(hasher, algorithm)?;
     let mut a1 = String::with_capacity(username.len() + realm.len() + password.len() + 2);
 
     let _ = write!(a1, "{username}:{realm}:{password}");
@@ -814,6 +947,15 @@ pub fn compute_digest_response(
 }
 
 /// Verifies digest credentials against a known password.
+///
+/// Low-level response check only: it trusts the credential's `algorithm`,
+/// `qop`, `uri`, `nonce` and `nc`. Server-side authentication must use
+/// [`crate::digest_verifier::DigestVerifier`] (feature `digest-auth`), which
+/// enforces the configured algorithm/qop, the Request-URI binding, nonce
+/// validity and nc replay (RFC 7616 §3.4.5, §3.4.6, §3.7).
+///
+/// The hasher must implement `credentials.algorithm`; otherwise this returns
+/// `Err` instead of comparing a digest computed with the wrong hash.
 ///
 /// # Arguments
 ///
@@ -1055,6 +1197,10 @@ mod tests {
             let hash2 = hash.wrapping_mul(0x517cc1b727220a95);
             format!("{hash:016x}{hash2:016x}")
         }
+
+        fn handles(&self, _algorithm: DigestAlgorithm) -> bool {
+            true
+        }
     }
 
     #[test]
@@ -1254,5 +1400,132 @@ mod tests {
                 .parse::<DigestChallenge>()
                 .is_err()
         );
+    }
+
+    // RFC 7616 §3.9.1 inputs. Expected values were recomputed independently
+    // with Python hashlib (md5 / sha256 / sha512_256), not copied from text.
+    #[cfg(feature = "digest-auth")]
+    mod rfc7616 {
+        use super::*;
+
+        const USER: &str = "Mufasa";
+        const REALM: &str = "http-auth@example.org";
+        const PASS: &str = "Circle of Life";
+        const URI: &str = "/dir/index.html";
+        const NONCE: &str = "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v";
+        const CNONCE: &str = "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ";
+
+        fn response(alg: DigestAlgorithm) -> String {
+            compute_digest_response(
+                &AlgorithmHasher::for_algorithm(alg),
+                USER,
+                REALM,
+                PASS,
+                "GET",
+                URI,
+                NONCE,
+                alg,
+                Some(Qop::Auth),
+                Some(1),
+                Some(CNONCE),
+                None,
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn md5_vector() {
+            assert_eq!(
+                response(DigestAlgorithm::Md5),
+                "8ca523f5e9506fed4657c9700eebdbec"
+            );
+        }
+
+        #[test]
+        fn sha256_vector() {
+            assert_eq!(
+                response(DigestAlgorithm::Sha256),
+                "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1"
+            );
+        }
+
+        #[test]
+        fn sha512_256_response() {
+            assert_eq!(
+                response(DigestAlgorithm::Sha512_256),
+                "430d05014cecc49cab6fbe03176d41a1da86cbfe24a16580e22aaad928d960d0"
+            );
+        }
+
+        #[test]
+        fn session_variants() {
+            assert_eq!(
+                response(DigestAlgorithm::Md5Sess),
+                "e783283f46242139c486a698fec7211d"
+            );
+            assert_eq!(
+                response(DigestAlgorithm::Sha256Sess),
+                "2fd51b3a77ad75bad6afad6003e818d767133c46d9e2749e7f5232ae1ea3efd7"
+            );
+            assert_eq!(
+                response(DigestAlgorithm::Sha512_256Sess),
+                "3f2a34f923c38b0fb26dce2fdfc2ce326c23cecf86fbb1444f3e51fbbc2cb92e"
+            );
+        }
+
+        /// FIPS 180-4 "abc" vector; SHA-512/256 is not truncated SHA-512.
+        #[test]
+        fn sha512_256_is_not_truncated_sha512() {
+            let h = Sha512_256DigestHasher.hash(b"abc");
+            assert_eq!(
+                h,
+                "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23"
+            );
+            assert_ne!(
+                h,
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+            );
+        }
+
+        #[test]
+        fn algorithm_hasher_dispatch() {
+            for (alg, hasher) in [
+                (DigestAlgorithm::Md5, AlgorithmHasher::Md5),
+                (DigestAlgorithm::Md5Sess, AlgorithmHasher::Md5),
+                (DigestAlgorithm::Sha256, AlgorithmHasher::Sha256),
+                (DigestAlgorithm::Sha256Sess, AlgorithmHasher::Sha256),
+                (DigestAlgorithm::Sha512_256, AlgorithmHasher::Sha512_256),
+                (DigestAlgorithm::Sha512_256Sess, AlgorithmHasher::Sha512_256),
+            ] {
+                assert_eq!(AlgorithmHasher::for_algorithm(alg), hasher);
+                assert!(hasher.handles(alg));
+            }
+            assert!(!AlgorithmHasher::Md5.handles(DigestAlgorithm::Sha256));
+            assert!(!Sha256DigestHasher.handles(DigestAlgorithm::Md5));
+        }
+
+        /// POA&M-230 regression: an MD5 hasher must not answer a SHA-256
+        /// challenge with an MD5 digest.
+        #[test]
+        fn md5_hasher_with_sha256_challenge_fails_closed() {
+            let challenge = DigestChallenge::new(REALM, NONCE)
+                .with_algorithm(DigestAlgorithm::Sha256)
+                .with_qop(Qop::Auth);
+            let result = create_credentials(
+                &Md5DigestHasher,
+                &challenge,
+                USER,
+                PASS,
+                "GET",
+                URI,
+                Some(CNONCE),
+                Some(1),
+                None,
+            );
+            assert!(result.is_err());
+            let creds = DigestCredentials::new(USER, REALM, NONCE, URI, "00")
+                .with_algorithm(DigestAlgorithm::Sha256);
+            assert!(verify_credentials(&Md5DigestHasher, &creds, PASS, "GET", None).is_err());
+        }
     }
 }
