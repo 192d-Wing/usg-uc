@@ -386,6 +386,64 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   cargo-fuzz crate (`crates/proto/proto-sip/fuzz`, excluded from the
   workspace). No runtime dependency or config/CDR/audit schema change.
 
+### Fixed (client, media audit 2026-11-06)
+
+- **Client: Opus FEC/PLC no longer drifts 60 ms per lost 20 ms frame.**
+  A lost frame used to be concealed into a 2880-sample (60 ms) buffer, so
+  playout drifted on every loss. Now each lost frame produces exactly one
+  ptime: in-band FEC from packet N+1 (when its TOC can carry LBRR), then
+  Opus native PLC, then WSOLA. `fec_recovered` / `fec_recovered_frames`
+  count FEC-path decodes only. They do not confirm that LBRR was present
+  (POA&M-141). The hot path does not allocate on loss.
+
+### Fixed (SBC / uc-codecs, media audit 2026-11-06)
+
+- **G.722 level fix.** Input at -3 dBFS used to clip at -6 dBFS (-1.8 dB
+  gain, rail hits). The QMF scaling now follows the ITU-T G.191 STL / spandsp
+  16-bit convention, and the -3 and -10 dBFS level tests both show 0.00 dB.
+  Transcoded G.722 audio is louder near full scale than before. Only a
+  self-generated regression vector is used, not the official ITU vectors
+  (POA&M-140).
+- **G.722 encode/decode return errors instead of `Ok(0)`.** Odd PCM length
+  gives `CodecError::InvalidInput` and a short output buffer gives
+  `CodecError::BufferTooSmall`. sbc-media-core transcoder callers map these
+  to the existing `DecryptionFailed`/`EncryptionFailed`. (SI-10)
+- **Codec negotiation hardened (library only, NOT wired in sbc-daemon).**
+  `CodecRegistry::negotiate` now matches channel count. Opus is exempt per
+  RFC 7587 §7. It adopts the remote PT for any non-reserved PT and rejects
+  reserved PTs (72-76, >127) and conflicting PT bindings. It caps remote
+  entries at 64. The answer gives local Opus fmtp (minptime is reconciled)
+  and keeps the peer's parsed fmtp in `CodecCapability::remote_fmtp`.
+  telephone-event events are intersected (RFC 4733). Remote fmtp that is
+  oversize or contains control characters is rejected. telephone-event at
+  8 kHz (PT 101) and 48 kHz (PT 110) is in the default registry. The
+  transcoder refuses telephone-event/CN legs. `MediaSession::negotiate_codecs`
+  now delegates to the registry. **These code paths are reached only from
+  tests today. The live sbc-daemon SDP answer path does not use them, so this
+  gives no production protection yet (POA&M-142).** PTs 64-95 are still adopted
+  under rtcp-mux (POA&M-143).
+
+### Changed (BREAKING, uc-codecs / uc-media-engine library API)
+
+- `AudioCodec::decode_fec` now takes `(next_packet, output)` and sizes the
+  output to the lost frame. New trait methods `conceal(output)` and
+  `supports_plc()` have defaults. External `AudioCodec` implementors must
+  update.
+- New `CodecError` variants: `InvalidInput { reason }` and
+  `LossRecoveryFailed { reason: &'static str }`. Exhaustive matches must
+  handle them. `G722Encoder::encode`/`G722Decoder::decode` return
+  `CodecResult<usize>`. `PayloadType::is_dynamic` now uses the RFC 3551
+  ranges, so `Dynamic(72)` returns false.
+- New public field `CodecCapability::remote_fmtp` and new modules `fmtp` and
+  `opus_toc`.
+- uc-media-engine: removed `StreamStats::{packets_lost, jitter_ms, rtt_ms}`
+  (they were always 0). Crate docs no longer claim RTP/RTCP/SRTP/transcoding.
+- Client: `AudioError::LossRecovery` variant and
+  `JitterBufferResult::Lost { fec_source }` field added.
+- No config, CDR, audit or gRPC schema change. Dev only: `criterion`
+  (workspace 0.8) dev-dependency and `benches/codecs.rs` in uc-codecs. No new
+  runtime or crypto dependency.
+
 ## [0.10.0] — 2026-11-06
 
 SBC release with three operator-breaking changes: call detail records,

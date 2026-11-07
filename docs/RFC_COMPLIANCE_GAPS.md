@@ -489,11 +489,20 @@ This is **by design** for security compliance.
 | proto-rtp | RFC 3550 | §7 | Translators/mixers | Done | Library-only |
 | proto-sip | RFC 3261 | §16.6 | Full proxy forwarding | Done | Library-only |
 
+## uc-codecs / media (2026-11-06 media audit)
+
+| Item | Status | Wired | Notes |
+|------|--------|-------|-------|
+| ITU-T G.722 conformance vectors (G.191 / App. II) | Gap | uc-codecs (soft client) | Only a self-generated regression vector (`g722_adpcm.rs` `test_self_generated_regression_vector`) and level tests (`test_level_1khz`, `test_level_lower_and_upper_band`). Official vectors not run (POA&M-140) |
+| RFC 5761 §4 PT range under rtcp-mux | Deviation | Library-only (negotiation not wired, POA&M-142) | `payload_types::is_dynamic` adopts PTs 64-71/77-95 even with rtcp-mux; only 72-76 are rejected (tests `test_is_dynamic_ranges`, `test_negotiate_rejects_rtcp_colliding_pt`). POA&M-143 |
+
 ---
 
 ## Document Maintenance
 
-Last Updated: 2026-11-04
+Last Updated: 2026-11-06
+
+2026-11-06: added the uc-codecs media section (G.722 vectors, RFC 5761 deviation).
 
 2026-11-04: added the sbc-daemon CDR section (RFC 3326, RFC 3264 §6, RFC 5424/5425/6587).
 

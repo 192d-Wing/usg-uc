@@ -182,19 +182,37 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
 
 ### Media (uc-codecs, uc-media-engine, uc-webrtc, uc-t38, uc-siprec)
 
-- [ ] **MAJOR, LIVE (client) — Opus "FEC" is plain PLC and over-sized**
+- [x] **MAJOR, LIVE (client) — Opus "FEC" is plain PLC and over-sized**
   (`uc-codecs/src/opus_ffi.rs:273`, `client-audio/src/decode_thread.rs:969`):
   each lost 20 ms frame is concealed as 60 ms; in-band FEC advertised but never
   used. Decode the next packet with fec=1 sized to the lost frame.
-- [ ] **MINOR, LIVE (SBC) — codec negotiation** (`uc-codecs/src/lib.rs:274`)
+  *Done 2026-11-06 (media audit):* `FfiOpusDecoder::decode_fec` decodes packet
+  N+1 with fec=1 sized to the lost frame; CELT-only/too-short sources go to PLC
+  (tests `test_decode_fec_returns_exactly_lost_frame`,
+  `test_lost_frame_opus_with_next_packet_uses_fec`). Open: POA&M-141 (LBRR flag
+  not checked; `fec_recovered` counts FEC-path decodes, not confirmed LBRR).
+- [x] **MINOR, LIVE (SBC) — codec negotiation** (`uc-codecs/src/lib.rs:274`)
   ignores channels and remote fmtp, adopts the remote PT only for 96-127 (not
   35-71/77-95), no `telephone-event` default; duplicate
   `MediaSession::negotiate_codecs` keeps the local PT. Delegate to one impl.
-- [ ] **MINOR, LIVE — G.722 levels unverified** (`g722_adpcm.rs:401,540`):
+  *Done 2026-11-06 in the library:* channels and fmtp intersection
+  (`fmtp.rs`), remote non-reserved PT adopted, telephone-event 8k and 48k
+  defaults, `MediaSession` delegates (tests `test_negotiate_adopts_unassigned_pt`,
+  `test_negotiate_telephone_event_48k`, `test_negotiate_opus_fmtp_intersection`).
+  **Not wired**: sbc-daemon does not call either `negotiate_codecs`
+  (POA&M-142). PTs 64-71/77-95 accepted under rtcp-mux (POA&M-143).
+- [x] **MINOR, LIVE — G.722 levels unverified** (`g722_adpcm.rs:401,540`):
   14-bit clamp with no rescale may clip or lose 6 dB; run ITU-T G.191 vectors.
   Encode/decode return `Ok(0)` on a short buffer and drop an odd last sample.
-- [ ] **NIT, LIVE — media-engine stats hard-coded** (`packets_lost`, `jitter_ms`,
+  *Done 2026-11-06:* level tests (`test_level_1khz`,
+  `test_level_lower_and_upper_band`), short buffer and odd length now error
+  (`test_buffer_too_small`, `test_odd_length_rejected`), self-generated
+  regression vector. Open: official ITU-T G.191 vectors not run (POA&M-140).
+- [x] **NIT, LIVE — media-engine stats hard-coded** (`packets_lost`, `jitter_ms`,
   `rtt_ms` = 0); crate docs claim RTP/RTCP/SRTP/transcoding it doesn't do.
+  *Done 2026-11-06:* the hard-coded `packets_lost`/`jitter_ms`/`rtt_ms` fields
+  were removed from `stream.rs` stats (the crate never sees RTP); crate docs
+  corrected (`uc-media-engine/src/lib.rs`).
 - [ ] **BLOCKER, DORMANT — T.38 UDPTL/IFP use a home-made wire format**, not
   ASN.1 PER (`uc-t38/src/udptl.rs`, `ifp.rs`); no real gateway interoperates.
 - [ ] **BLOCKER, DORMANT — T.38 decode panics on a 5-byte datagram**

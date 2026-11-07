@@ -5,7 +5,7 @@ use crate::error::{MediaError, MediaResult};
 use crate::stream::{MediaStream, StreamConfig, StreamDirection, StreamState};
 use std::collections::HashMap;
 use std::time::Instant;
-use uc_codecs::CodecCapability;
+use uc_codecs::{CodecCapability, CodecRegistry};
 
 /// Media handling mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -213,6 +213,8 @@ impl MediaSession {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
+    // POAM: POA&M-142 -- sbc-daemon's live SDP answer path does not call
+    // this yet; the hardened negotiation is reachable only from tests.
     pub fn negotiate_codecs(&mut self, remote_codecs: &[CodecCapability]) -> MediaResult<()> {
         if self.state != SessionState::Created && self.state != SessionState::Negotiating {
             return Err(MediaError::InvalidStateTransition {
@@ -223,20 +225,17 @@ impl MediaSession {
 
         self.state = SessionState::Negotiating;
 
-        // Find intersection of codecs
-        let mut negotiated = Vec::new();
-        for local in &self.config.local_codecs {
-            for remote in remote_codecs {
-                if local.name.eq_ignore_ascii_case(&remote.name)
-                    && local.clock_rate == remote.clock_rate
-                {
-                    negotiated.push(local.clone());
-                    break;
-                }
-            }
+        // Single negotiation implementation: delegate to uc-codecs so PT
+        // adoption, channel matching and fmtp intersection stay consistent.
+        // RFC 3264 §6.1, RFC 7587 §6.1, RFC 4733 §2.4.1
+        let mut registry = CodecRegistry::new();
+        for codec in &self.config.local_codecs {
+            registry.register(codec.clone());
         }
+        let negotiated = registry.negotiate(remote_codecs);
 
-        if negotiated.is_empty() {
+        // telephone-event / CN alone cannot carry a call.
+        if !negotiated.iter().any(CodecCapability::is_audio_payload) {
             return Err(MediaError::CodecNegotiationFailed {
                 reason: "no common codecs".to_string(),
             });
@@ -490,6 +489,48 @@ mod tests {
         // Only PCMU should be negotiated (we didn't add Opus locally)
         assert_eq!(session.negotiated_codecs().len(), 1);
         assert_eq!(session.negotiated_codecs()[0].name, "PCMU");
+    }
+
+    #[test]
+    fn test_codec_negotiation_matches_registry() {
+        let local = vec![
+            CodecCapability::opus(111),
+            CodecCapability::pcmu(),
+            CodecCapability::telephone_event(101),
+        ];
+        let mut config = test_session_config();
+        for c in &local {
+            config = config.with_codec(c.clone());
+        }
+        let mut session = MediaSession::new(config);
+        let mut registry = CodecRegistry::new();
+        for c in session.config.local_codecs.clone() {
+            registry.register(c);
+        }
+
+        let remote = vec![
+            CodecCapability::opus(96).with_fmtp("useinbandfec=0"),
+            CodecCapability::telephone_event(100),
+        ];
+        session.negotiate_codecs(&remote).unwrap();
+        assert_eq!(session.negotiated_codecs(), registry.negotiate(&remote));
+        let opus = session
+            .negotiated_codecs()
+            .iter()
+            .find(|c| c.name == "opus")
+            .unwrap();
+        assert_eq!(opus.payload_type, 96, "remote dynamic PT adopted");
+    }
+
+    #[test]
+    fn test_codec_negotiation_dtmf_only_fails() {
+        let config = test_session_config().with_codec(CodecCapability::telephone_event(101));
+        let mut session = MediaSession::new(config);
+        assert!(
+            session
+                .negotiate_codecs(&[CodecCapability::telephone_event(101)])
+                .is_err()
+        );
     }
 
     #[test]

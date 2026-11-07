@@ -101,6 +101,12 @@ pub enum JitterBufferResult {
         expected_sequence: u16,
         /// Expected timestamp.
         expected_timestamp: u32,
+        /// Payload of the packet that follows the lost one, if buffered.
+        ///
+        /// Lets the decoder rebuild the lost frame from in-band FEC
+        /// (RFC 7587 §3.4). Cloning `Bytes` is a refcount bump, not a heap
+        /// allocation.
+        fec_source: Option<Bytes>,
     },
     /// Buffer is not yet ready (still filling).
     NotReady,
@@ -417,9 +423,16 @@ impl JitterBuffer {
                 self.packets.len()
             );
 
+            // RFC 7587 §3.4: packet N+1 carries the LBRR copy of lost packet N.
+            let fec_source = self
+                .packets
+                .get(&expected_seq.wrapping_add(1))
+                .map(|p| p.payload.clone());
+
             return JitterBufferResult::Lost {
                 expected_sequence: expected_seq,
                 expected_timestamp,
+                fec_source,
             };
         }
 
@@ -876,6 +889,43 @@ mod tests {
         }
 
         assert!(jb.stats().packets_lost > 0);
+    }
+
+    #[test]
+    fn test_lost_carries_next_payload_for_fec() {
+        let mut jb = JitterBuffer::new(8000, 160, 20);
+        jb.push(make_packet(0, 0));
+        jb.push(make_packet(2, 320));
+        jb.next_playout_sequence = Some(0);
+        jb.is_primed = true;
+        let _ = jb.pop();
+        match jb.pop() {
+            JitterBufferResult::Lost { fec_source, .. } => {
+                assert_eq!(fec_source, Some(make_packet(2, 320).payload));
+            }
+            other => panic!("Expected loss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lost_without_adjacent_next_has_no_fec_source() {
+        let mut jb = JitterBuffer::new(8000, 160, 20);
+        jb.push(make_packet(0, 0));
+        jb.push(make_packet(3, 480)); // 1 and 2 both missing
+        jb.next_playout_sequence = Some(0);
+        jb.is_primed = true;
+        let _ = jb.pop();
+        match jb.pop() {
+            JitterBufferResult::Lost {
+                expected_sequence,
+                fec_source,
+                ..
+            } => {
+                assert_eq!(expected_sequence, 1);
+                assert!(fec_source.is_none(), "seq 2 is not buffered");
+            }
+            other => panic!("Expected loss, got {other:?}"),
+        }
     }
 
     #[test]
