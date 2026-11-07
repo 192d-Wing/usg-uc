@@ -782,6 +782,10 @@ impl MediaPipeline {
     /// codec matched: telephone-event/CN alone cannot carry a call.
     // POAM: POA&M-142 -- sbc-daemon does not call this yet; the live SDP
     // answer path does not run uc-codecs negotiation.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     pub async fn negotiate_codecs(
         &self,
         call_id: &str,

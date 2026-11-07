@@ -63,7 +63,6 @@ use sbc_grpc_api::sbc::registration_service_server::RegistrationServiceServer;
 use sbc_grpc_api::sbc::sbc_sync_service_server::SbcSyncServiceServer;
 use sbc_grpc_api::sbc::system_service_server::SystemServiceServer;
 use sbc_grpc_api::sbc::trunk_health_service_server::TrunkHealthServiceServer;
-use sbc_grpc_api::sbc::trunk_status_publish_service_server::TrunkStatusPublishServiceServer;
 use sbc_grpc_api::sbc::trunk_sync_service_server::TrunkSyncServiceServer;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -198,7 +197,7 @@ impl GrpcServer {
         let trunk_health_svc = TrunkHealthServiceImpl::new(Arc::clone(&self.state));
         // Write-side: the sbc-trunk-agent pod pushes trunk status
         // snapshots here when trunk services run externally.
-        let trunk_status_publish_svc = TrunkStatusPublishServiceImpl::new(Arc::clone(&self.state));
+        let _trunk_status_publish_svc = TrunkStatusPublishServiceImpl::new(Arc::clone(&self.state));
         let sbc_sync_svc = SbcSyncServiceImpl::new(Arc::clone(&self.state));
         // Read-only CDR ring queries. CDRs carry PII and this listener has
         // no per-RPC authorization, so the service is mounted only when

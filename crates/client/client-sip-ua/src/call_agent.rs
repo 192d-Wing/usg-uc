@@ -3229,6 +3229,10 @@ impl CallAgent {
     /// to the destination. This ensures the Via/Contact headers contain a
     /// routable IP address.
     #[allow(clippy::unused_async)]
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     async fn get_local_addr_for_destination(
         destination: SocketAddr,
         configured_addr: SocketAddr,

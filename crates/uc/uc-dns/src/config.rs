@@ -227,7 +227,7 @@ mod tests {
         let config = DnsConfig::default();
         assert!(config.cache_enabled);
         assert_eq!(config.retries, 2);
-        assert!(!config.servers.is_empty());
+        assert_ne!(config.servers, [] as [std::net::SocketAddr; 0]);
     }
 
     #[test]

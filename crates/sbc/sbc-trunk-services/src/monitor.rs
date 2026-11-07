@@ -305,6 +305,10 @@ impl TrunkMonitor {
     }
 
     /// Sends a single OPTIONS ping and returns response time in ms.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear request/response exchange; splitting it would scatter the socket handling"
+    )]
     async fn send_options_ping(
         trunk_id: &str,
         host: &str,
@@ -416,11 +420,8 @@ impl TrunkMonitor {
             // CSeq method must match OPTIONS.
             let cseq_ok = text.lines().any(|line| {
                 let line = line.trim();
-                if let Some(rest) = line.strip_prefix("CSeq:") {
-                    rest.trim().ends_with("OPTIONS")
-                } else {
-                    false
-                }
+                line.strip_prefix("CSeq:")
+                    .is_some_and(|rest| rest.trim().ends_with("OPTIONS"))
             });
             if !cseq_ok {
                 debug!(

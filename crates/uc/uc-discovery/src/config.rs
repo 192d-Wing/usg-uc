@@ -288,7 +288,7 @@ mod tests {
         let config = DiscoveryConfig::default();
         assert_eq!(config.method, DiscoveryMethod::Static);
         assert_eq!(config.refresh_interval_ms, 30000);
-        assert!(config.static_peers.is_empty());
+        assert_eq!(config.static_peers, [] as [std::net::SocketAddr; 0]);
     }
 
     #[test]

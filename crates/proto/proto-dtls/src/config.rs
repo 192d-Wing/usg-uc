@@ -412,7 +412,7 @@ V29ybGQ=
     fn test_parse_pem_certificates_empty() {
         let pem = b"no certificates here";
         let certs = parse_pem_certificates(pem).unwrap();
-        assert!(certs.is_empty());
+        assert_eq!(certs, [] as [std::vec::Vec<u8>; 0]);
     }
 
     #[test]
@@ -471,7 +471,7 @@ VGVzdA==
     #[test]
     fn test_base64_decode_empty() {
         let decoded = base64_decode("").unwrap();
-        assert!(decoded.is_empty());
+        assert_eq!(decoded, [] as [u8; 0]);
     }
 
     #[test]

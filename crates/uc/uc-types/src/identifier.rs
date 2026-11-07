@@ -256,6 +256,6 @@ mod tests {
     #[test]
     fn test_media_session_id() {
         let session_id = MediaSessionId::generate();
-        assert!(!session_id.as_str().is_empty());
+        assert_ne!(session_id.as_str(), "");
     }
 }

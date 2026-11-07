@@ -409,7 +409,7 @@ mod tests {
         };
         let ns = KubernetesDiscovery::resolve_namespace(&config);
         // Will be "default" unless running in a pod
-        assert!(!ns.is_empty());
+        assert_ne!(ns, "");
     }
 
     #[test]
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn test_default_kubernetes_config() {
         let config = KubernetesConfig::default();
-        assert!(config.namespace.is_empty());
+        assert_eq!(config.namespace, "");
         assert_eq!(config.service_name, "sbc");
         assert!(config.in_cluster);
         assert!(config.kubeconfig_path.is_none());

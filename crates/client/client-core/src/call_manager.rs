@@ -4159,6 +4159,6 @@ m=audio 5004 RTP/AVP 0\r\n\
 a=rtpmap:0 PCMU/8000\r\n";
 
         let exts = parse_extmap_attributes(sdp);
-        assert!(exts.is_empty());
+        assert_eq!(exts, [] as [(u8, std::string::String); 0]);
     }
 }

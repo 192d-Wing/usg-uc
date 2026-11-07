@@ -359,7 +359,7 @@ mod tests {
             if i >= window - 1 {
                 #[allow(clippy::cast_precision_loss)]
                 let avg = sum / window as f64;
-                power += avg * avg;
+                power = avg.mul_add(avg, power);
                 count += 1;
             }
         }

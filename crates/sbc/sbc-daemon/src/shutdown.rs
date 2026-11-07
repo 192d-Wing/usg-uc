@@ -93,6 +93,10 @@ impl ShutdownSignal {
     ///
     /// On Unix, this installs handlers for SIGTERM, SIGINT, and SIGHUP.
     /// On other platforms, only Ctrl+C is handled.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     pub async fn install_handlers(&self) -> Result<(), ShutdownError> {
         let shutdown = self.clone();
 

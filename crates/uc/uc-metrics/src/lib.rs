@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn test_latency_buckets() {
-        assert!(!DEFAULT_LATENCY_BUCKETS.is_empty());
+        assert_ne!(DEFAULT_LATENCY_BUCKETS, []);
         // Should be in ascending order
         for i in 1..DEFAULT_LATENCY_BUCKETS.len() {
             assert!(DEFAULT_LATENCY_BUCKETS[i] > DEFAULT_LATENCY_BUCKETS[i - 1]);
@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn test_duration_buckets() {
-        assert!(!DEFAULT_DURATION_BUCKETS.is_empty());
+        assert_ne!(DEFAULT_DURATION_BUCKETS, []);
         for i in 1..DEFAULT_DURATION_BUCKETS.len() {
             assert!(DEFAULT_DURATION_BUCKETS[i] > DEFAULT_DURATION_BUCKETS[i - 1]);
         }

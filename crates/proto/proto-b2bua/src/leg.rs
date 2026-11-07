@@ -474,8 +474,8 @@ mod tests {
         let leg = test_leg();
         assert_eq!(leg.role(), LegRole::ALeg);
         assert_eq!(leg.state(), LegState::Created);
-        assert!(!leg.call_id().is_empty());
-        assert!(!leg.local_tag().is_empty());
+        assert_ne!(leg.call_id(), "");
+        assert_ne!(leg.local_tag(), "");
     }
 
     #[test]

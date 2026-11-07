@@ -32,6 +32,10 @@ struct RecordingRefresher {
 }
 
 impl Refresher for RecordingRefresher {
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     async fn refresh(&self, items: &[RefreshItem]) {
         let mut g = self.seen.lock().expect("lock");
         for i in items {
