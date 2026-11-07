@@ -1,13 +1,19 @@
 //! REST API for SBC management and configuration.
 //!
-//! This crate provides the HTTP API for runtime configuration,
-//! monitoring, and management of the SBC.
+//! This crate provides route and permission metadata plus request/response
+//! types for the SBC management API. It is a library only: it runs no HTTP
+//! server and emits no audit events.
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **AC-3**: Access Enforcement
-//! - **CM-6**: Configuration Settings
-//! - **AU-2**: Event Logging
+//! - **AC-3**: Access Enforcement — library-only. Routes are default-deny and
+//!   [`Route::authorize`] / [`Router::authorize`] enforce declared
+//!   permissions, but enforcement depends on the serving caller invoking
+//!   them (POA&M-234: sbc-daemon does not yet call `authorize`).
+//! - **CM-6**: Configuration Settings — metadata only (`config:read` /
+//!   `config:admin` permissions on the `/config` routes).
+//!
+//! No AU-2 event logging is performed by this crate.
 //!
 //! ## Features
 //!

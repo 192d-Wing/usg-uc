@@ -5,21 +5,197 @@
 //! atomic operations, and bulk operations.
 
 use crate::backend::StorageBackend;
-use crate::config::RedisConfig;
+use crate::config::{RedisConfig, RedisTlsConfig, redact_error, redact_url};
 use crate::error::{StorageError, StorageResult};
 use bb8::Pool;
-use bb8_redis::RedisConnectionManager;
 use bytes::Bytes;
 use redis::AsyncCommands;
+use redis::aio::MultiplexedConnection;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 use tracing::{debug, trace, warn};
 
+/// Upper bound on keys returned by [`StorageBackend::keys`] (SC-5).
+pub const MAX_KEYS_RESULT: usize = 100_000;
+
+/// SCAN `COUNT` hint per round trip.
+const SCAN_COUNT: usize = 1000;
+
+/// bb8 connection manager over a pre-built [`redis::Client`].
+///
+/// Replaces `bb8_redis::RedisConnectionManager`, which can only be built
+/// from a URL and so cannot carry a custom CA or client certificate.
+#[derive(Clone)]
+pub struct RedisClientManager {
+    client: redis::Client,
+}
+
+impl std::fmt::Debug for RedisClientManager {
+    // redis::Client's Debug prints the connection info, password included.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisClientManager").finish_non_exhaustive()
+    }
+}
+
+/// Pooled Redis connection that remembers transport failures.
+///
+/// bb8's `test_on_check_out` is disabled (it costs a PING round trip per
+/// command), so a dead multiplexed connection is detected here instead: any
+/// command that fails with a dropped-connection or unrecoverable error marks
+/// the connection broken, and [`bb8::ManageConnection::has_broken`] makes the
+/// pool discard it on return.
+pub struct TrackedConnection {
+    inner: MultiplexedConnection,
+    broken: bool,
+}
+
+impl TrackedConnection {
+    fn track<T>(&mut self, result: redis::RedisResult<T>) -> redis::RedisResult<T> {
+        if let Err(e) = &result {
+            if is_fatal(e) {
+                self.broken = true;
+            }
+        }
+        result
+    }
+}
+
+/// Whether `e` means the connection itself can no longer be used.
+fn is_fatal(e: &redis::RedisError) -> bool {
+    e.is_connection_dropped() || e.is_unrecoverable_error() || e.is_io_error()
+}
+
+impl redis::aio::ConnectionLike for TrackedConnection {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        Box::pin(async move {
+            let r = self.inner.req_packed_command(cmd).await;
+            self.track(r)
+        })
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        Box::pin(async move {
+            let r = self
+                .inner
+                .req_packed_commands(pipeline, offset, count)
+                .await;
+            self.track(r)
+        })
+    }
+
+    fn get_db(&self) -> i64 {
+        self.inner.get_db()
+    }
+}
+
+impl bb8::ManageConnection for RedisClientManager {
+    type Connection = TrackedConnection;
+    type Error = redis::RedisError;
+
+    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        Ok(TrackedConnection {
+            inner: self.client.get_multiplexed_async_connection().await?,
+            broken: false,
+        })
+    }
+
+    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        let pong: String = redis::cmd("PING").query_async(conn).await?;
+        if pong == "PONG" {
+            Ok(())
+        } else {
+            Err(redis::RedisError::from((
+                redis::ErrorKind::Extension,
+                "unexpected PING reply",
+            )))
+        }
+    }
+
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        conn.broken
+    }
+}
+
+/// Reads a PEM file named in the TLS config.
+async fn read_pem(path: &str, what: &str) -> StorageResult<Vec<u8>> {
+    tokio::fs::read(path)
+        .await
+        .map_err(|e| StorageError::ConfigError {
+            reason: format!("redis tls {what} '{path}': {e}"),
+        })
+}
+
+/// Builds the Redis client, applying the TLS block when present.
+///
+/// NIST 800-53 Rev5: SC-8 (Transmission Confidentiality and Integrity),
+/// IA-3 (Device Identification and Authentication)
+// POAM: POA&M-230 rustls here uses the process-default provider (aws-lc-rs
+// FIPS); cipher suites are not pinned to the CNSA 2.0 set.
+async fn build_client(config: &RedisConfig) -> StorageResult<redis::Client> {
+    let map_err = |e: redis::RedisError| StorageError::ConnectionFailed {
+        reason: format!(
+            "invalid Redis configuration: {}",
+            redact_error(&e.to_string(), &config.url)
+        ),
+    };
+    match &config.tls {
+        None => redis::Client::open(config.url.as_str()).map_err(map_err),
+        Some(tls) => {
+            let certs = load_tls_certificates(tls).await?;
+            redis::Client::build_with_tls(config.url.as_str(), certs).map_err(map_err)
+        }
+    }
+}
+
+/// Loads CA and client certificate material for [`redis::Client::build_with_tls`].
+async fn load_tls_certificates(tls: &RedisTlsConfig) -> StorageResult<redis::TlsCertificates> {
+    let root_cert = match &tls.ca_cert_path {
+        Some(p) => Some(read_pem(p, "ca_cert_path").await?),
+        None => None,
+    };
+    let client_tls = match (&tls.client_cert_path, &tls.client_key_path) {
+        (Some(cert), Some(key)) => Some(redis::ClientTlsConfig {
+            client_cert: read_pem(cert, "client_cert_path").await?,
+            client_key: read_pem(key, "client_key_path").await?,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(StorageError::ConfigError {
+                reason: "redis tls client_cert_path and client_key_path must be set together"
+                    .to_string(),
+            });
+        }
+    };
+    Ok(redis::TlsCertificates {
+        client_tls,
+        root_cert,
+    })
+}
+
+/// Appends a SCAN result, failing once more than `cap` keys are collected.
+fn push_capped(out: &mut Vec<String>, key: String, cap: usize) -> StorageResult<()> {
+    if out.len() >= cap {
+        return Err(StorageError::RedisError {
+            reason: format!("key pattern matched more than {cap} keys"),
+        });
+    }
+    out.push(key);
+    Ok(())
+}
+
 /// Redis storage backend with connection pooling.
 pub struct RedisBackend {
     /// Connection pool.
-    pool: Pool<RedisConnectionManager>,
+    pool: Pool<RedisClientManager>,
     /// Configuration.
     config: RedisConfig,
 }
@@ -30,21 +206,32 @@ impl RedisBackend {
     /// # Errors
     /// Returns an error if connection pool creation fails.
     pub async fn new(config: RedisConfig) -> StorageResult<Self> {
-        debug!(url = %config.url, pool_size = config.pool_size, "Creating Redis backend");
+        // NIST 800-53 Rev5: SC-8 (fail closed on plaintext / unverified TLS)
+        if config.validate_transport_security()? {
+            warn!(
+                url = %redact_url(&config.url),
+                "Redis allow_insecure_transport is set: connection is not TLS-protected"
+            );
+        }
+        debug!(url = %redact_url(&config.url), pool_size = config.pool_size, "Creating Redis backend");
 
-        let manager = RedisConnectionManager::new(config.url.clone()).map_err(|e| {
-            StorageError::ConnectionFailed {
-                reason: format!("Failed to create Redis connection manager: {e}"),
-            }
-        })?;
+        let manager = RedisClientManager {
+            client: build_client(&config).await?,
+        };
 
         let pool = Pool::builder()
             .max_size(config.pool_size)
             .connection_timeout(config.connection_timeout())
+            // A PING per checkout doubles every command's round trips;
+            // TrackedConnection + has_broken evict dead connections instead.
+            .test_on_check_out(false)
             .build(manager)
             .await
             .map_err(|e| StorageError::ConnectionFailed {
-                reason: format!("Failed to create connection pool: {e}"),
+                reason: format!(
+                    "Failed to create connection pool: {}",
+                    redact_error(&e.to_string(), &config.url)
+                ),
             })?;
 
         // Test the connection
@@ -53,14 +240,20 @@ impl RedisBackend {
                 .get()
                 .await
                 .map_err(|e| StorageError::ConnectionFailed {
-                    reason: format!("Failed to get connection from pool: {e}"),
+                    reason: format!(
+                        "Failed to get connection from pool: {}",
+                        redact_error(&e.to_string(), &config.url)
+                    ),
                 })?;
 
             redis::cmd("PING")
                 .query_async::<String>(&mut *conn)
                 .await
                 .map_err(|e| StorageError::ConnectionFailed {
-                    reason: format!("Redis PING failed: {e}"),
+                    reason: format!(
+                        "Redis PING failed: {}",
+                        redact_error(&e.to_string(), &config.url)
+                    ),
                 })?;
         }
 
@@ -70,7 +263,7 @@ impl RedisBackend {
     }
 
     /// Gets a connection from the pool.
-    async fn get_conn(&self) -> StorageResult<bb8::PooledConnection<'_, RedisConnectionManager>> {
+    async fn get_conn(&self) -> StorageResult<bb8::PooledConnection<'_, RedisClientManager>> {
         self.pool.get().await.map_err(|e| {
             warn!(error = %e, "Failed to get Redis connection");
             StorageError::PoolExhausted
@@ -156,9 +349,21 @@ impl StorageBackend for RedisBackend {
     ) -> Pin<Box<dyn Future<Output = StorageResult<Vec<String>>> + Send + '_>> {
         let pattern = pattern.to_string();
         Box::pin(async move {
-            trace!(pattern = %pattern, "Redis KEYS");
+            // SCAN, not KEYS: KEYS blocks the Redis server for O(N).
+            trace!(pattern = %pattern, "Redis SCAN MATCH");
             let mut conn = self.get_conn().await?;
-            let keys: Vec<String> = conn.keys(&pattern).await?;
+            // COUNT 1000: the server default of 10 costs ~N/10 round trips.
+            let opts = redis::ScanOptions::default()
+                .with_pattern(pattern.as_str())
+                .with_count(SCAN_COUNT);
+            let mut iter = conn.scan_options::<String>(opts).await?;
+            let mut keys = Vec::new();
+            while let Some(item) = iter.next_item().await {
+                push_capped(&mut keys, item?, MAX_KEYS_RESULT)?;
+            }
+            // SCAN may return a key more than once.
+            keys.sort_unstable();
+            keys.dedup();
             Ok(keys)
         })
     }
@@ -386,7 +591,7 @@ impl std::fmt::Debug for RedisBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let stats = self.pool_stats();
         f.debug_struct("RedisBackend")
-            .field("url", &self.config.url)
+            .field("url", &redact_url(&self.config.url))
             .field("pool_connections", &stats.connections)
             .field("pool_idle", &stats.idle_connections)
             .finish()
@@ -398,6 +603,17 @@ impl std::fmt::Debug for RedisBackend {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fatal_errors_mark_connection_broken() {
+        let io = redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(is_fatal(&io));
+        let app = redis::RedisError::from((redis::ErrorKind::Extension, "WRONGTYPE"));
+        assert!(!is_fatal(&app));
+    }
+
     // These tests require a running Redis instance.
     // Run with: cargo test --features redis -- --ignored
 
@@ -406,8 +622,39 @@ mod tests {
             url: std::env::var("REDIS_URL")
                 .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
             pool_size: 5,
+            allow_insecure_transport: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn push_capped_enforces_limit() {
+        let mut out = Vec::new();
+        for i in 0..3 {
+            push_capped(&mut out, format!("k{i}"), 3).unwrap();
+        }
+        let err = push_capped(&mut out, "k3".to_string(), 3).unwrap_err();
+        assert!(err.to_string().contains("more than 3"));
+        assert_eq!(out.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn plain_url_rejected_before_connect() {
+        let cfg = RedisConfig::new("redis://user:hunter2@127.0.0.1:1");
+        let err = RedisBackend::new(cfg).await.unwrap_err();
+        assert!(matches!(err, StorageError::InsecureTransport { .. }));
+        assert!(!err.to_string().contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn missing_ca_file_is_config_error() {
+        let mut cfg = RedisConfig::new("rediss://127.0.0.1:1");
+        cfg.tls = Some(RedisTlsConfig {
+            ca_cert_path: Some("/nonexistent/uc-storage-ca.pem".to_string()),
+            ..Default::default()
+        });
+        let err = RedisBackend::new(cfg).await.unwrap_err();
+        assert!(matches!(err, StorageError::ConfigError { .. }));
     }
 
     #[tokio::test]

@@ -123,6 +123,16 @@ Call Detail Records read SIP and SDP facts and ship records to syslog. This code
 | RFC 5425 TLS transport | Partial | Wired (sbc-daemon, opt-in) | TLS 1.3 only, CNSA 2.0 suite and groups (`uc_transport::tls::create_client_config` / `cnsa_provider`; POA&M-26 closed). The server is authenticated against `cdr.syslog.ca_path` or `security.tls_ca_path`. **Gap:** §4.2 mutual authentication is absent because no client certificate is sent (NIST-06, POA&M-15). Handshake test: `syslog_tls_is_cnsa_only` |
 | SIP transport recorded in the CDR | Gap | Wired (sbc-daemon) | SCTP (RFC 4168) A-legs are recorded as `tcp`: schema v1 has no `sctp` value (POA&M-20) |
 
+### uc-syslog (RFC 5424 / 5425 / 6587; library-only)
+
+Not called by any shipped binary (NIST POA&M-235). Added 2026-11-07.
+
+| Behaviour | Status | Wiring | Notes |
+|-----------|--------|--------|-------|
+| RFC 5424 message format | Partial | Library-only | HOSTNAME, APP-NAME, PROCID and MSGID are inserted verbatim (`uc-syslog/src/formatter.rs`); §6.2 PRINTUSASCII, length limits and NILVALUE for empty fields are not enforced. TLS with RFC 3164 format is refused (`tls_with_bsd_format_rejected`) |
+| RFC 6587 / RFC 5425 §4.3 octet counting | Complete | Library-only | TLS frames are `MSG-LEN SP SYSLOG-MSG` (`octet_counted_frame`). Plain TCP keeps LF framing. Tests `tls_octet_counted_framing`, `tls_delivers_octet_counted_frames` |
+| RFC 5425 TLS transport | Partial | Library-only | CNSA `cnsa_provider()` client config, TLS 1.3 by default; server path validation against `ca_file` + `server_name`; optional client certificate (§4.2); close_notify via `close()`; port 6514 default. **Gaps:** §5.2.2 end-entity fingerprint matching absent (SHA-1 mandatory-to-implement conflicts with CNSA 2.0; workaround: self-signed cert in `ca_file`); at-least-once delivery on reconnect; no buffering when the collector is down. Tests `untrusted_server_cert_rejected`, `wrong_server_name_rejected`, `half_client_auth_rejected`, `drop_without_close_is_truncation` |
+
 ### sbc-daemon STIR/SHAKEN (RFC 8224, 8225, 8226, 8588, ATIS-1000074)
 
 Off by default; enabled per trunk (`stir_shaken.sign` / `verify`). Code: `proto-stir-shaken`, `uc-sti`, `uc-crypto` (`interop::ecdsa_p256`, `x509`), `sbc-daemon/src/stir.rs`, `stir_binding.rs`, `sip_stack.rs`.

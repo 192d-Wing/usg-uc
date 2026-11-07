@@ -498,7 +498,11 @@
 
 ### CDR syslog sink (not a proto-* crate)
 
-`uc-cdr` hand-formats the CDR syslog output. It does not use `uc-syslog`, which has no TLS support. The format is RFC 5424: PRI = facility * 8 + 6 (informational), VERSION `1`, an RFC 3339 UTC timestamp with milliseconds and `Z`, the sanitised hostname (`node_id`), APP-NAME `usg-sbc`, PROCID `-`, MSGID `CDR`, STRUCTURED-DATA as NILVALUE `-`, and MSG as the UTF-8 BOM (§6.4) followed by the record's canonical JSON. Framing is RFC 6587 octet counting; the count includes the 3 BOM octets. The transport is RFC 5425 over TLS 1.3 only (`uc_transport::tls::create_client_config`). Cipher suites and key-exchange groups are not restricted, so the suite is not CNSA 2.0 enforced (NIST POA&M-26). Gap: RFC 5425 §4.2 mutual authentication is absent because no client certificate is sent (NIST POA&M-15). Tests: `syslog_octet_counted_rfc5424`, `syslog_sink_octet_counted_frames_via_fake_connector`. No test performs a TLS handshake.
+`uc-cdr` hand-formats the CDR syslog output. It does not use `uc-syslog` (see below). The format is RFC 5424: PRI = facility * 8 + 6 (informational), VERSION `1`, an RFC 3339 UTC timestamp with milliseconds and `Z`, the sanitised hostname (`node_id`), APP-NAME `usg-sbc`, PROCID `-`, MSGID `CDR`, STRUCTURED-DATA as NILVALUE `-`, and MSG as the UTF-8 BOM (§6.4) followed by the record's canonical JSON. Framing is RFC 6587 octet counting; the count includes the 3 BOM octets. The transport is RFC 5425 over TLS 1.3 only (`uc_transport::tls::create_client_config`). Cipher suites and key-exchange groups are not restricted, so the suite is not CNSA 2.0 enforced (NIST POA&M-26). Gap: RFC 5425 §4.2 mutual authentication is absent because no client certificate is sent (NIST POA&M-15). Tests: `syslog_octet_counted_rfc5424`, `syslog_sink_octet_counted_frames_via_fake_connector`. No test performs a TLS handshake.
+
+### uc-syslog (library-only, not a proto-* crate)
+
+`uc-syslog` is not called by any shipped binary (NIST POA&M-235). Since 2026-11-07 it has an RFC 5425 transport (`SyslogTransport::Tls`): CNSA client config (`cnsa_provider()`, TLS 1.3 by default), server authenticated against `ca_file` and `server_name`, optional client certificate (§4.2), RFC 6587 / RFC 5425 §4.3 octet counting, close_notify via `SyslogForwarder::close()`, default port 6514, TLS with BSD (RFC 3164) format refused. Status: **Partial**. Gaps: no §5.2.2 end-entity fingerprint matching (SHA-1 mandatory-to-implement conflicts with CNSA 2.0; workaround: put the self-signed collector certificate in `ca_file`); RFC 5424 §6.2 header fields (HOSTNAME, APP-NAME, PROCID, MSGID) are not checked for PRINTUSASCII, length or NILVALUE; at-least-once delivery on reconnect; no buffering when the collector is down. UDP and plain TCP (LF framing) remain. Tests: `tls_delivers_octet_counted_frames`, `untrusted_server_cert_rejected`, `wrong_server_name_rejected`, `tls_with_bsd_format_rejected`, `drop_without_close_is_truncation`, `tls_octet_counted_framing`.
 
 ### Complete RFC Index
 
@@ -551,8 +555,8 @@
 | RFC 5359 | Line Event Package | proto-dialog | library |
 | RFC 5362 | Resource Lists Event Package | proto-dialog | library |
 | RFC 5373 | Call Completion | proto-dialog | library |
-| RFC 5424 | The Syslog Protocol | uc-cdr (`sink.rs` `SyslogSink`, hand-formatted; not uc-syslog) | sbc-daemon (CDR syslog sink, opt-in) |
-| RFC 5425 | TLS Transport for Syslog | uc-cdr, sbc-daemon `cdr.rs` `TlsSyslogConnector` | sbc-daemon (CDR syslog sink, TLS 1.3 only, server-auth only: no client certificate) |
+| RFC 5424 | The Syslog Protocol | uc-cdr (`sink.rs` `SyslogSink`, hand-formatted; not uc-syslog); uc-syslog (formatter, Partial: header fields not sanitised) | sbc-daemon (CDR syslog sink, opt-in); uc-syslog: library |
+| RFC 5425 | TLS Transport for Syslog | uc-cdr, sbc-daemon `cdr.rs` `TlsSyslogConnector`; uc-syslog `SyslogTransport::Tls` (Partial: no §5.2.2 fingerprints, POA&M-235) | sbc-daemon (CDR syslog sink, TLS 1.3 only, server-auth only: no client certificate); uc-syslog: library |
 | RFC 5389 | STUN | proto-stun | sbc-daemon (zone external-IP discovery), soft client (ICE checks); long-term credentials: library |
 | RFC 5626 | SIP Outbound | proto-registrar | sbc-daemon (instance-id/reg-id, CRLF ping); flow manager: library |
 | RFC 5627 | GRUU | proto-registrar | library |
@@ -570,7 +574,7 @@
 | RFC 6188 | AES-256-CM | proto-sdp | library |
 | RFC 6347 | DTLS 1.2 | proto-dtls | soft client (SBC uses Go sidecar) |
 | RFC 6446 | Session Recording | proto-dialog | library |
-| RFC 6587 | Syslog over TCP (octet-counting framing) | uc-cdr | sbc-daemon (CDR syslog sink; octet counting only) |
+| RFC 6587 | Syslog over TCP (octet-counting framing) | uc-cdr; uc-syslog (octet counting on TLS, LF on plain TCP) | sbc-daemon (CDR syslog sink; octet counting only); uc-syslog: library |
 | RFC 6665 | SIP Events | proto-sip, proto-dialog | library |
 | RFC 6910 | Auto-Configuration | proto-dialog | library |
 | RFC 7092 | B2BUA Taxonomy | proto-b2bua | sbc-daemon |

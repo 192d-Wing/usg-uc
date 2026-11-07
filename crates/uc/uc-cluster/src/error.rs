@@ -100,6 +100,12 @@ pub enum ClusterError {
     #[error("cluster not initialized")]
     NotInitialized,
 
+    /// Peer message authentication failed.
+    ///
+    /// NIST 800-53 Rev5: IA-3, SC-23
+    #[error("peer authentication failed: {0}")]
+    AuthenticationFailed(#[from] crate::auth::AuthError),
+
     /// Operation timed out.
     #[error("operation timed out after {duration_ms}ms")]
     Timeout {

@@ -1,5 +1,6 @@
 //! API routing.
 
+use crate::error::{ApiError, ApiResult};
 use crate::request::HttpMethod;
 use std::collections::HashMap;
 
@@ -16,8 +17,11 @@ pub struct Route {
     pub description: Option<String>,
     /// Whether authentication is required.
     pub auth_required: bool,
-    /// Required permissions.
+    /// Required permissions (all must be granted).
     pub permissions: Vec<String>,
+    /// Whether the route is intentionally reachable without any permission
+    /// (for example liveness checks). Routes are default-deny otherwise.
+    pub public: bool,
 }
 
 impl Route {
@@ -30,6 +34,7 @@ impl Route {
             description: None,
             auth_required: true,
             permissions: Vec::new(),
+            public: false,
         }
     }
 
@@ -72,6 +77,50 @@ impl Route {
     pub fn with_permission(mut self, permission: impl Into<String>) -> Self {
         self.permissions.push(permission.into());
         self
+    }
+
+    /// Marks the route as public: no authentication or permission needed.
+    #[must_use]
+    pub fn public(mut self) -> Self {
+        self.public = true;
+        self.auth_required = false;
+        self
+    }
+
+    /// Checks whether a caller holding `granted` permissions may invoke the
+    /// route.
+    ///
+    /// Default deny: a non-public route with no declared permission is
+    /// refused, and every declared permission must be granted. The caller
+    /// is responsible for authenticating the principal before calling this
+    /// for routes with `auth_required`; this crate only holds metadata and
+    /// enforces nothing unless the server invokes it.
+    ///
+    /// NIST 800-53 Rev5: AC-3 (Access Enforcement), AC-6 (Least Privilege)
+    ///
+    /// # Errors
+    /// Returns a 403 [`ApiError`] when access is denied.
+    pub fn authorize<S: AsRef<str>>(&self, granted: &[S]) -> ApiResult<()> {
+        if self.public {
+            return Ok(());
+        }
+        if self.permissions.is_empty() {
+            return Err(ApiError::forbidden(format!(
+                "route {} declares no permission",
+                self.name
+            )));
+        }
+        let missing = self
+            .permissions
+            .iter()
+            .any(|required| !granted.iter().any(|g| g.as_ref() == required));
+        if missing {
+            return Err(ApiError::forbidden(format!(
+                "missing permission for route {}",
+                self.name
+            )));
+        }
+        Ok(())
     }
 
     /// Returns whether this route matches the given method and path.
@@ -182,6 +231,26 @@ impl Router {
         None
     }
 
+    /// Finds the route for `method`/`path` and authorizes the caller.
+    ///
+    /// NIST 800-53 Rev5: AC-3 (Access Enforcement)
+    ///
+    /// # Errors
+    /// Returns 404 when no route matches and 403 when [`Route::authorize`]
+    /// denies access.
+    pub fn authorize<S: AsRef<str>>(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        granted: &[S],
+    ) -> ApiResult<(&Route, HashMap<String, String>)> {
+        let (route, params) = self
+            .find(method, path)
+            .ok_or_else(|| ApiError::not_found("route"))?;
+        route.authorize(granted)?;
+        Ok((route, params))
+    }
+
     /// Returns the number of routes.
     pub fn route_count(&self) -> usize {
         self.routes.len()
@@ -204,11 +273,11 @@ impl SbcRoutes {
     pub fn trunks() -> Router {
         let mut router = Router::with_prefix("/api/v1/trunks");
         router
-            .get("", "list_trunks")
-            .get("/:id", "get_trunk")
-            .post("", "create_trunk")
-            .put("/:id", "update_trunk")
-            .delete("/:id", "delete_trunk");
+            .route(Route::get("", "list_trunks").with_permission("trunk:read"))
+            .route(Route::get("/:id", "get_trunk").with_permission("trunk:read"))
+            .route(Route::post("", "create_trunk").with_permission("trunk:admin"))
+            .route(Route::put("/:id", "update_trunk").with_permission("trunk:admin"))
+            .route(Route::delete("/:id", "delete_trunk").with_permission("trunk:admin"));
         router
     }
 
@@ -216,11 +285,11 @@ impl SbcRoutes {
     pub fn routes() -> Router {
         let mut router = Router::with_prefix("/api/v1/routes");
         router
-            .get("", "list_routes")
-            .get("/:id", "get_route")
-            .post("", "create_route")
-            .put("/:id", "update_route")
-            .delete("/:id", "delete_route");
+            .route(Route::get("", "list_routes").with_permission("route:read"))
+            .route(Route::get("/:id", "get_route").with_permission("route:read"))
+            .route(Route::post("", "create_route").with_permission("route:admin"))
+            .route(Route::put("/:id", "update_route").with_permission("route:admin"))
+            .route(Route::delete("/:id", "delete_route").with_permission("route:admin"));
         router
     }
 
@@ -228,20 +297,22 @@ impl SbcRoutes {
     pub fn calls() -> Router {
         let mut router = Router::with_prefix("/api/v1/calls");
         router
-            .get("", "list_calls")
-            .get("/:id", "get_call")
-            .delete("/:id", "hangup_call");
+            .route(Route::get("", "list_calls").with_permission("call:read"))
+            .route(Route::get("/:id", "get_call").with_permission("call:read"))
+            .route(Route::delete("/:id", "hangup_call").with_permission("call:admin"));
         router
     }
 
     /// Creates system management routes.
+    ///
+    /// ## NIST 800-53 Rev5: AC-3, CM-5 (configuration changes need `config:admin`)
     pub fn system() -> Router {
         let mut router = Router::with_prefix("/api/v1/system");
         router
-            .get("/health", "health_check")
-            .get("/metrics", "get_metrics")
-            .get("/config", "get_config")
-            .put("/config", "update_config");
+            .route(Route::get("/health", "health_check").public())
+            .route(Route::get("/metrics", "get_metrics").with_permission("system:read"))
+            .route(Route::get("/config", "get_config").with_permission("config:read"))
+            .route(Route::put("/config", "update_config").with_permission("config:admin"));
         router
     }
 
@@ -658,5 +729,128 @@ mod tests {
     fn test_sbc_routes_cdrs_count() {
         let router = SbcRoutes::cdrs();
         assert_eq!(router.route_count(), 7);
+    }
+
+    #[test]
+    fn missing_permission_forbidden() {
+        let route = Route::get("/x", "x")
+            .with_permission("a")
+            .with_permission("b");
+        let err = route.authorize(&["a"]).unwrap_err();
+        assert_eq!(err.status, crate::error::StatusCode::FORBIDDEN);
+        assert!(route.authorize::<&str>(&[]).is_err());
+        assert!(route.authorize(&["a", "b"]).is_ok());
+        // Prefix or case variants do not count.
+        assert!(route.authorize(&["a", "B", "b:extra"]).is_err());
+    }
+
+    #[test]
+    fn empty_permission_route_denied_unless_public() {
+        let route = Route::get("/x", "x");
+        assert!(route.authorize(&["admin", "config:admin"]).is_err());
+        // Disabling auth alone does not open a route.
+        assert!(
+            route
+                .clone()
+                .with_auth(false)
+                .authorize::<&str>(&[])
+                .is_err()
+        );
+        assert!(route.public().authorize::<&str>(&[]).is_ok());
+    }
+
+    #[test]
+    fn config_routes_require_permission() {
+        let router = SbcRoutes::all();
+        assert!(
+            router
+                .authorize::<&str>(HttpMethod::Put, "/api/v1/system/config", &[])
+                .is_err()
+        );
+        assert!(
+            router
+                .authorize(HttpMethod::Put, "/api/v1/system/config", &["config:read"])
+                .is_err()
+        );
+        assert!(
+            router
+                .authorize(HttpMethod::Put, "/api/v1/system/config", &["config:admin"])
+                .is_ok()
+        );
+        assert!(
+            router
+                .authorize::<&str>(HttpMethod::Get, "/api/v1/system/config", &[])
+                .is_err()
+        );
+        assert!(
+            router
+                .authorize(HttpMethod::Get, "/api/v1/system/config", &["config:read"])
+                .is_ok()
+        );
+        assert!(
+            router
+                .authorize::<&str>(HttpMethod::Get, "/api/v1/system/health", &[])
+                .is_ok()
+        );
+        let err = router
+            .authorize::<&str>(HttpMethod::Get, "/api/v1/nope", &[])
+            .unwrap_err();
+        assert_eq!(err.status, crate::error::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn every_sbc_route_has_permission_or_public() {
+        let router = SbcRoutes::all();
+        for route in router.routes() {
+            assert!(
+                route.public || !route.permissions.is_empty(),
+                "route {} has no permission",
+                route.name
+            );
+            if !route.public {
+                assert!(route.auth_required, "route {} skips auth", route.name);
+                assert!(route.authorize::<&str>(&[]).is_err(), "{}", route.name);
+            }
+        }
+        let public: Vec<_> = router
+            .routes()
+            .iter()
+            .filter(|r| r.public)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(public, ["health_check"]);
+    }
+
+    #[test]
+    fn router_authorize_unknown_route_not_found() {
+        let router = SbcRoutes::all();
+        let err = router
+            .authorize(HttpMethod::Get, "/no/such/route", &["config:admin"])
+            .unwrap_err();
+        assert_eq!(err.status, crate::error::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn router_authorize_config_put_requires_admin() {
+        let router = SbcRoutes::all();
+        let full = router
+            .routes()
+            .iter()
+            .find(|r| r.name == "update_config")
+            .map(|r| r.path.clone())
+            .unwrap_or_default();
+        assert!(
+            full.ends_with("/config"),
+            "config PUT route present: {full}"
+        );
+        let denied = router
+            .authorize(HttpMethod::Put, &full, &["config:read"])
+            .unwrap_err();
+        assert_eq!(denied.status, crate::error::StatusCode::FORBIDDEN);
+        assert!(
+            router
+                .authorize(HttpMethod::Put, &full, &["config:admin"])
+                .is_ok()
+        );
     }
 }

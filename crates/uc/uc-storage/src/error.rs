@@ -15,6 +15,15 @@ pub enum StorageError {
         reason: String,
     },
 
+    /// Transport security policy violated (plaintext or unverified TLS).
+    ///
+    /// NIST 800-53 Rev5: SC-8
+    #[error("insecure transport rejected: {reason}")]
+    InsecureTransport {
+        /// Why the transport was rejected.
+        reason: String,
+    },
+
     /// Connection failed.
     #[error("connection failed: {reason}")]
     ConnectionFailed {

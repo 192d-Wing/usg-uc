@@ -521,16 +521,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bb8-redis"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc1063effc7f6cf848bcbcc6e31b5962be75215835587d3109607c643d616f66"
-dependencies = [
- "bb8",
- "redis",
-]
-
-[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3005,7 +2995,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -5804,10 +5794,13 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "rand 0.10.3",
+ "rustls",
+ "rustls-native-certs",
  "ryu",
  "sha1_smol",
  "socket2",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "url",
  "xxhash-rust",
@@ -5926,7 +5919,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -7174,6 +7167,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -7183,6 +7177,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -8538,7 +8533,9 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uc-crypto",
  "uc-types",
+ "zeroize",
 ]
 
 [[package]]
@@ -8732,7 +8729,6 @@ name = "uc-storage"
 version = "0.10.0"
 dependencies = [
  "bb8",
- "bb8-redis",
  "bytes",
  "chrono",
  "redis",
@@ -8750,10 +8746,15 @@ name = "uc-syslog"
 version = "0.10.0"
 dependencies = [
  "chrono",
+ "rcgen",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "uc-transport",
 ]
 
 [[package]]
@@ -9401,6 +9402,15 @@ dependencies = [
  "pkg-config",
  "soup3-sys",
  "system-deps",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
