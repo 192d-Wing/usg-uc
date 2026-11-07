@@ -312,12 +312,14 @@ The shipped image builds `sbc-daemon` with `grpc` only, so uc-cluster,
 uc-storage and uc-state-sync (behind `cluster`) are DORMANT; uc-api, uc-syslog
 and uc-snmp have no callers. uc-cdr was checked and found clean.
 
-- [ ] **MAJOR, LIVE — phone-config generators don't escape interpolated values**
+- [x] **MAJOR, LIVE — phone-config generators don't escape interpolated values**
   (`uc-phone-mgmt/src/cisco_9800.rs`, `polycom_vvx.rs`, `cisco_mpp.rs`,
   `poly_edge.rs`; only `teo.rs` escapes). A display name like
   `x</displayName><proxy>evil.example</proxy>…` re-points every phone on the
   template. Shared XML/attribute escaping, field validation in sbc-config-store,
-  per-vendor injection tests.
+  per-vendor injection tests. Fixed 2026-11-06 (phone-cfg-escape): `escape.rs`
+  in all generators, store validation on phone/DN upsert (NIST SI-15, SI-10;
+  open POA&M-121, POA&M-122, POA&M-123).
 - [x] **MAJOR, LIVE — digest HA1 stored in plaintext** in `users.digest_ha1`;
   sbc-api-server uses `PostgresUserStore` and never wraps it in
   `EncryptedUserStore` (`sbc-api-server/src/state.rs:144`). `decrypt_ha1`
@@ -372,9 +374,11 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   it) and `GET /users` is unbounded (`postgres.rs:279`). Fixed 2026-11-06 (ha1-users-authz): i64 binds,
   default 100 / max 1000 (NIST SC-5). The Postgres bind test is `#[ignore]` and
   not run.
-- [ ] **MINOR, LIVE — provisioning device token is a static HMAC(secret, MAC)**
+- [x] **MINOR, LIVE — provisioning device token is a static HMAC(secret, MAC)**
   in the URL query: never expires, can't be revoked per device, lands in access
   logs (`sbc-provision-server/src/main.rs:309`).
+  Log exposure fixed 2026-11-06 (phone-cfg-escape): span drops the query.
+  Expiry, revocation and token-in-URL remain as POA&M-120.
 - [ ] **MINOR, LIVE — `[telemetry.otlp]` accepted but ignored** (feature off),
   and `tls`/`headers` never applied even with it on. Reject or require https.
 - [ ] **MINOR, LIVE — unenforced config keys accepted** (`monitoring.snmp`,

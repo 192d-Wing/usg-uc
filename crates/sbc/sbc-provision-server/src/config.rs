@@ -73,6 +73,7 @@ impl Config {
 
         let provision_host = std::env::var("SBC_PROVISION_HOST")
             .map_err(|_| ConfigError::Missing("SBC_PROVISION_HOST"))?;
+        validate_provision_host(&provision_host)?;
 
         let provision_port = std::env::var("SBC_PROVISION_PORT")
             .unwrap_or_else(|_| "80".to_string())
@@ -122,6 +123,20 @@ impl Config {
     }
 }
 
+/// `SBC_PROVISION_HOST` is interpolated into every rendered phone config,
+/// so it must be a plain `host[:port]` (DNS name, IPv4 or `[IPv6]`).
+/// NIST 800-53 Rev5: CM-6 (Configuration Settings), SI-10
+fn validate_provision_host(host: &str) -> Result<(), ConfigError> {
+    if sbc_config_store::validate::is_valid_host_port(host) && host.len() <= 253 {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid {
+            var: "SBC_PROVISION_HOST",
+            reason: "must be host[:port]".to_string(),
+        })
+    }
+}
+
 /// Refuses a configuration under which phone configs (which carry SIP and
 /// directory credentials) would be served to anyone who can reach the
 /// port, unless the operator opted into that explicitly.
@@ -148,6 +163,22 @@ mod tests {
             Err(ConfigError::Unguarded)
         ));
         assert!(check_guards(None, &[], true).is_ok());
+    }
+
+    #[test]
+    fn provision_host_must_be_host_port() {
+        for ok in ["sbc.example.com", "10.0.0.1:8080", "[::1]:80"] {
+            assert!(validate_provision_host(ok).is_ok(), "{ok}");
+        }
+        for bad in ["evil</x>", "a b", "", "h/p", "h\n"] {
+            assert!(matches!(
+                validate_provision_host(bad),
+                Err(ConfigError::Invalid {
+                    var: "SBC_PROVISION_HOST",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

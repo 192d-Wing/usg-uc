@@ -61,8 +61,11 @@ impl PostgresDirectoryNumberStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for any DB error or
     /// `ConfigStoreError::Serialization` if the `extra` map cannot be
-    /// JSON-encoded.
+    /// JSON-encoded, or `ConfigStoreError::Invalid` if a field fails
+    /// [`crate::validate::validate_directory_number`].
     pub async fn upsert(&self, dn: &DirectoryNumber) -> ConfigStoreResult<()> {
+        // NIST 800-53 Rev5: SI-10 -- reject malformed fields before any write.
+        crate::validate::validate_directory_number(dn)?;
         let extra_json = serde_json::to_value(&dn.extra)?;
         sqlx::query(
             "INSERT INTO directory_numbers (did, sip_user, partition, description, extra)

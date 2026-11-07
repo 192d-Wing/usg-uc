@@ -17,7 +17,10 @@ use std::str::FromStr;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
-use sbc_config_store::{PostgresPhoneStore, ensure_schema};
+use sbc_config_store::{
+    ConfigStoreError, DirectoryNumber, PostgresDirectoryNumberStore, PostgresPhoneStore,
+    ensure_schema,
+};
 use uc_phone_mgmt::model::{Phone, PhoneModel};
 
 fn admin_dsn() -> Option<String> {
@@ -292,4 +295,39 @@ async fn central_and_local_schemas_agree() {
             "schema drift between site-local and central definitions of {table}"
         );
     }
+}
+
+/// NIST 800-53 Rev5: SI-10 -- invalid records are rejected before any row
+/// is written, for both phone and directory stores.
+#[tokio::test]
+async fn upsert_rejects_invalid_and_writes_nothing() {
+    let Some(admin) = admin_dsn() else { return };
+    let pool = scratch_db(&admin, "csmt_validate").await;
+
+    let phones = PostgresPhoneStore::from_pool(pool.clone())
+        .await
+        .expect("phone store");
+    let mut phone = Phone::new("aa:bb:cc:dd:ee:01", PhoneModel::PolycomVVX450, "bad\nname");
+    phone.name = "bad\nname".to_string();
+    match phones.upsert(&phone).await {
+        Err(ConfigStoreError::Invalid { field, .. }) => assert_eq!(field, "name"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(phones.list().await.expect("list phones").len(), 0);
+
+    let dirs = PostgresDirectoryNumberStore::from_pool(pool)
+        .await
+        .expect("directory store");
+    let dn = DirectoryNumber {
+        did: "1001\r\n".to_string(),
+        user: None,
+        partition: None,
+        description: None,
+        extra: std::collections::HashMap::new(),
+    };
+    match dirs.upsert(&dn).await {
+        Err(ConfigStoreError::Invalid { field, .. }) => assert_eq!(field, "did"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(dirs.list().await.expect("list dids").len(), 0);
 }

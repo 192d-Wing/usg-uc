@@ -49,6 +49,16 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   - Open items: POA&M-130 (keyed chain, HMAC-SHA-384 or ML-DSA-87),
     POA&M-131 (residual O_NOFOLLOW open race), POA&M-133 (audit file rotation and retention; capacity is the platform's job).
 
+- **SBC: phone-config output escaping for all vendors.** `uc-phone-mgmt`
+  now escapes every operator-supplied string in Polycom VVX, Poly Edge,
+  Cisco MPP, Cisco 9800 and Teo configs (XML text, attribute, comment and
+  MPP key/value contexts). Benign output is byte-identical. (SI-15, SI-10;
+  POA&M-122: Cisco MPP `$VAR` macros are not escaped yet, pending firmware
+  confirmation)
+- **SBC: provisioning token no longer in request logs.**
+  `sbc-provision-server` request spans record only method and path, so the
+  `?token=` query string is never logged. The token design itself is still
+  open as POA&M-120. (IA-5, AU-9)
 - **SBC: user HA1 digests encrypted at rest; key required (BREAKING, fail closed).**
   `sbc-api-server` now refuses to start without `SBC_USER_HA1_KEY_FILE`
   (64 hex chars, mode 0400, owned by uid 1000). On first start it re-encrypts
@@ -70,6 +80,19 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Changed
 
+- **SBC: config-store write validation (operator-visible).** Phone and
+  directory-number upserts are validated first and fail with the new
+  `ConfigStoreError::Invalid { field, reason }`. Rows that used to be accepted
+  are now rejected: control characters, oversize fields, bad charsets. Dial
+  strings must be ASCII alphanumerics plus `*#+,.-_`. Re-check existing
+  provisioning data before upgrade. Known gaps: sbc-api-server still returns
+  500 for `Invalid` instead of 400 and emits no audit event for the reject (POA&M-123), and `sbc-config-sync` apply bypasses
+  validation (POA&M-121). (SI-10)
+- **SBC: transport is case-insensitive on Cisco MPP/9800 and Teo.** A stored
+  `"TLS"`/`"TCP"` used to render `UDP` on MPP/9800. It now renders TLS/TCP,
+  so affected phones change transport on their next resync.
+- **SBC: `SBC_PROVISION_HOST` must be `host[:port]`.** Any other value makes
+  `sbc-provision-server` refuse to start. (CM-6)
 - **SBC: `/users` API semantics (BREAKING for API clients).** PUT/DELETE
   return real status codes (404 etc.) instead of blanket success. A duplicate
   POST returns 409. `GET /users` is paged (`limit` default 100, max 1000;
