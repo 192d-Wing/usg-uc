@@ -96,7 +96,7 @@ impl std::fmt::Display for StorageBackendType {
 /// Redis configuration.
 ///
 /// `Debug` redacts the password in `url`. `Serialize` does not: serialized
-/// configs still carry the secret (POA&M-237).
+/// configs still carry the secret (POA&M-247).
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RedisConfig {
@@ -265,7 +265,7 @@ impl Default for RedisTlsConfig {
 /// PostgreSQL configuration.
 ///
 /// `Debug` redacts the password in `url`. `Serialize` does not: serialized
-/// configs still carry the secret (POA&M-237).
+/// configs still carry the secret (POA&M-247).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PostgresConfig {

@@ -26,7 +26,7 @@ pub struct PkiIdentity {
 /// Validator for DoD PKI certificates.
 ///
 /// Holds the CA bundle path. Identity extraction currently fails closed
-/// (POA&M-233); no chain validation is performed.
+/// (POA&M-243); no chain validation is performed.
 pub struct PkiValidator {
     /// Path to the CA bundle PEM file.
     ca_bundle_path: String,
@@ -70,7 +70,7 @@ impl PkiValidator {
     /// NIST 800-53 Rev5: IA-2(12) (PIV acceptance), IA-5(2) (PKI-based
     /// authentication), SC-24 (fail in known state)
     ///
-    /// POAM: POA&M-233 - implement RFC 5280 §6 path validation with
+    /// POAM: POA&M-243 - implement RFC 5280 §6 path validation with
     /// rustls-webpki `EndEntityCert::verify_for_usage` (CNSA signature
     /// algorithms, client-auth EKU, `RevocationOptionsBuilder` with CRLs and
     /// `UnknownStatusPolicy::Deny`), plus a DER subject/SAN parser for
@@ -82,7 +82,7 @@ impl PkiValidator {
     pub fn extract_identity(&self, cert_der: &[u8]) -> Result<PkiIdentity, UserMgmtError> {
         let _ = cert_der;
         Err(UserMgmtError::CertificateValidationFailed(
-            "PKI certificate validation not implemented (POA&M-233)".to_owned(),
+            "PKI certificate validation not implemented (POA&M-243)".to_owned(),
         ))
     }
 }

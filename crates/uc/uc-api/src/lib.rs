@@ -9,7 +9,7 @@
 //! - **AC-3**: Access Enforcement — library-only. Routes are default-deny and
 //!   [`Route::authorize`] / [`Router::authorize`] enforce declared
 //!   permissions, but enforcement depends on the serving caller invoking
-//!   them (POA&M-234: sbc-daemon does not yet call `authorize`).
+//!   them (POA&M-244: sbc-daemon does not yet call `authorize`).
 //! - **CM-6**: Configuration Settings — metadata only (`config:read` /
 //!   `config:admin` permissions on the `/config` routes).
 //!

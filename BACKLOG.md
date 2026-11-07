@@ -598,7 +598,7 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   Fixed 2026-11-07 (branch pr/data-plane-dormant-security-271dfc): default `verify-full`; `disable`/`prefer`/`require`
   and `redis://` refused unless `allow_insecure_transport`; Redis `tls`
   applied; passwords redacted in logs, Debug and errors. Open: CNSA-pinned
-  suites (POA&M-230), `Serialize` still emits the password (POA&M-237).
+  suites (POA&M-240), `Serialize` still emits the password (POA&M-247).
   **Caller change needed (sbc-config/sbc-daemon):** document and pass
   `storage.postgres.ssl_root_cert`, `allow_insecure_transport` and Redis
   `tls`; existing non-TLS deployments now fail at startup.
@@ -612,7 +612,7 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   window; only authenticated heartbeat/replication entry points are public;
   `add_chunk` rejects duplicate, out-of-range, changed-total and oversize
   input. Open: no transport or key rotation, first-contact replay after
-  restart (POA&M-231); no fencing/epoch (POA&M-232); rejections not audited.
+  restart (POA&M-241); no fencing/epoch (POA&M-242); rejections not audited.
   **Caller change needed:** sbc-config `cluster.auth { key_file, key_id }`,
   required (fail closed) when `cluster.enabled`; sbc-daemon loads
   `ClusterAuthKey::from_file`, builds `PeerAuthenticator` with a per-boot
@@ -623,21 +623,21 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   cert authenticates. Replace with webpki chain validation or delete; POA&M.
   Fail-closed half done 2026-11-07 (branch pr/data-plane-dormant-security-271dfc): `extract_identity` always
   errors; substring parser removed. Open: full RFC 5280 validator (webpki,
-  client-auth EKU, CRL deny-on-unknown, SAN/EDIPI parser) (POA&M-233).
+  client-auth EKU, CRL deny-on-unknown, SAN/EDIPI parser) (POA&M-243).
 - [ ] **MAJOR, DORMANT — uc-api claims AC-3/CM-6/AU-2** but `with_permission` is
   unenforced metadata and `/config` has no permission. Mark library-only or delete.
   Library half fixed 2026-11-07 (branch pr/data-plane-dormant-security-271dfc): default-deny `Route::authorize` /
   `Router::authorize`; every route has a permission (`/config` read/admin);
   claims now library-only. **Caller change needed:** sbc-daemon must call
-  `Router::authorize` (POA&M-234).
+  `Router::authorize` (POA&M-244).
 - [ ] **MINOR, DORMANT — uc-syslog is UDP/plain TCP only** (claims AU-9);
   **uc-snmp is v2c with default `public` and malformed BER**. Remove or fix
   (v3 authPriv only; uc-cdr `SyslogSink` is the live RFC 5425 path).
   Syslog half fixed 2026-11-07 (branch pr/data-plane-dormant-security-271dfc): RFC 5425 TLS with `cnsa_provider()`
   and octet counting (library-only). Open: §5.2.2 fingerprints, RFC 5424
-  header sanitising, buffering (POA&M-235). **Caller change needed:** a
+  header sanitising, buffering (POA&M-245). **Caller change needed:** a
   daemon `tls` syslog config if uc-syslog is ever wired. uc-snmp half open
-  (POA&M-236).
+  (POA&M-246).
 - [ ] **MINOR, DORMANT — audit hex deserialiser panics on odd-length/multibyte
   input** (`uc-audit/src/record.rs:128`); **digest verify not constant-time,
   ignores qop/cnonce/nc and realm** (`uc-user-mgmt/src/digest.rs`).
@@ -653,7 +653,7 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   Crate-level annotations with no backing code: uc-api, uc-syslog, uc-storage,
   uc-cluster, uc-state-sync, uc-snmp, uc-telemetry — mark library-only.
   uc-api, uc-syslog, uc-storage, uc-cluster, uc-state-sync and uc-user-mgmt PKI
-  headers and register rows done 2026-11-07 (branch pr/data-plane-dormant-security-271dfc) (POA&M-230..237).
+  headers and register rows done 2026-11-07 (branch pr/data-plane-dormant-security-271dfc) (POA&M-240..247).
   uc-snmp and uc-telemetry headers, SC-13/IA-5/SI-11/AC-2 parts stay open.
 
 ## RFC compliance — accepted limitations

@@ -41,7 +41,7 @@ bb8 = { version = "0.9", optional = true }
 
 # PostgreSQL (optional)
 # `tls-rustls-aws-lc-rs`: sqlx builds its own rustls ClientConfig with the
-# aws-lc-rs default provider (suites not CNSA-pinned; POA&M-230).
+# aws-lc-rs default provider (suites not CNSA-pinned; POA&M-240).
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "tls-rustls-aws-lc-rs"], optional = true }
 chrono = { version = "0.4", optional = true }
 

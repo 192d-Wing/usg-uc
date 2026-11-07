@@ -24,16 +24,16 @@
 //! ## NIST 800-53 Rev5 Controls
 //!
 //! Library-only: these hold when a caller uses the crate as configured;
-//! the daemon does not yet pass CA / opt-in settings through (POA&M-230).
+//! the daemon does not yet pass CA / opt-in settings through (POA&M-240).
 //!
 //! - **SC-8**: Redis (`rediss://`) and PostgreSQL (`verify-full` default)
 //!   connections are TLS with server authentication. Plaintext, `prefer`,
 //!   `require` and unverified TLS fail closed unless
 //!   `allow_insecure_transport` is set. Suites are the aws-lc-rs defaults,
-//!   not CNSA-pinned (POA&M-230).
+//!   not CNSA-pinned (POA&M-240).
 //! - **SI-11 / IA-5(1)**: connection-URL passwords are redacted in `Debug`,
 //!   logs and error reasons ([`redact_url`]). `Serialize` still emits them
-//!   (POA&M-237).
+//!   (POA&M-247).
 //! - **SC-28** is *not* provided: there is no at-rest encryption.
 //!
 //! ## Architecture

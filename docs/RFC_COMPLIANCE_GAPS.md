@@ -128,7 +128,7 @@ Call Detail Records read SIP and SDP facts and ship records to syslog. This code
 
 ### uc-syslog (RFC 5424 / 5425 / 6587; library-only)
 
-Not called by any shipped binary (NIST POA&M-235). Added 2026-11-07.
+Not called by any shipped binary (NIST POA&M-245). Added 2026-11-07.
 
 | Behaviour | Status | Wiring | Notes |
 |-----------|--------|--------|-------|

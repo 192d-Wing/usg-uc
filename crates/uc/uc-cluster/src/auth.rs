@@ -8,7 +8,7 @@
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! Library-only (no transport; POA&M-231): the controls below are provided
+//! Library-only (no transport; POA&M-241): the controls below are provided
 //! by this module but no wire path uses it yet.
 //!
 //! - **IA-3**: Device Identification and Authentication (peer nodes are
@@ -19,7 +19,7 @@
 //! - **SC-23**: Session Authenticity (sequence window, timestamp window and
 //!   generation reject replayed or stale messages)
 //!
-//! POAM: POA&M-231 no transport exists yet, so nothing on the wire uses
+//! POAM: POA&M-241 no transport exists yet, so nothing on the wire uses
 //! this envelope; sbc-config must require `cluster.auth` when the cluster
 //! is enabled; key distribution and rotation (multiple `key_id`s) are not
 //! implemented. First contact after a verifier restart accepts any
@@ -27,7 +27,7 @@
 //! (30 s default) can be replayed once and becomes the baseline; the
 //! transport must add a fresh handshake/nonce on first contact.
 //!
-//! POAM: POA&M-232 fencing / epoch-based split-brain protection is not
+//! POAM: POA&M-242 fencing / epoch-based split-brain protection is not
 //! provided; `generation` is the intended carrier for a fencing token.
 
 use crate::error::{ClusterError, ClusterResult};
@@ -392,7 +392,7 @@ impl PeerAuthenticator {
         // Peer may have been removed between the checks above.
         let slot = peers.get_mut(&env.sender).ok_or(AuthError::UnknownSender)?;
         let next = match slot {
-            // POAM: POA&M-231 first-contact replay within the window (see
+            // POAM: POA&M-241 first-contact replay within the window (see
             // module docs).
             None => ReplayState::first(env.generation, env.sequence),
             Some(state) => state.check(env.generation, env.sequence)?,
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn restart_replay_bounded_by_timestamp_window() {
-        // SEC-3 / POA&M-231: a fresh verifier (restart) accepts a captured
+        // SEC-3 / POA&M-241: a fresh verifier (restart) accepts a captured
         // envelope once if it is inside the timestamp window, never twice,
         // and never once the window has passed.
         let (a, _) = pair();

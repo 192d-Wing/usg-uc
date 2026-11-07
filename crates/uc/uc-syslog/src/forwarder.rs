@@ -113,7 +113,7 @@ impl TlsSink {
     /// The lock is held across the reconnect (up to
     /// [`TLS_CONNECT_TIMEOUT`]), so while the collector is down concurrent
     /// callers queue behind it.
-    /// POAM: POA&M-235 when wired into sbc-daemon, signaling and media must
+    /// POAM: POA&M-245 when wired into sbc-daemon, signaling and media must
     /// reach the forwarder through a bounded, drop-counting channel, and
     /// reconnects need a backoff (PERF-2).
     async fn send(&self, frame: &[u8]) -> SyslogResult<()> {

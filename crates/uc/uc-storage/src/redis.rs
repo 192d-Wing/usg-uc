@@ -138,7 +138,7 @@ async fn read_pem(path: &str, what: &str) -> StorageResult<Vec<u8>> {
 ///
 /// NIST 800-53 Rev5: SC-8 (Transmission Confidentiality and Integrity),
 /// IA-3 (Device Identification and Authentication)
-// POAM: POA&M-230 rustls here uses the process-default provider (aws-lc-rs
+// POAM: POA&M-240 rustls here uses the process-default provider (aws-lc-rs
 // FIPS); cipher suites are not pinned to the CNSA 2.0 set.
 async fn build_client(config: &RedisConfig) -> StorageResult<redis::Client> {
     let map_err = |e: redis::RedisError| StorageError::ConnectionFailed {

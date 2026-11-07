@@ -235,7 +235,7 @@ impl ClusterMembership {
     /// Nothing is applied on failure.
     ///
     /// NIST 800-53 Rev5: IA-3 (peer authentication), SC-23 (anti-replay),
-    /// SI-10 (input validation). Library-only (no transport; POA&M-231).
+    /// SI-10 (input validation). Library-only (no transport; POA&M-241).
     ///
     /// # Errors
     /// Returns [`ClusterError::AuthenticationFailed`] or

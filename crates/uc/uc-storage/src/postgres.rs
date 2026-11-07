@@ -591,7 +591,7 @@ const fn pg_ssl_mode(mode: PostgresSslMode) -> PgSslMode {
 /// downgrade the validated policy.
 ///
 /// NIST 800-53 Rev5: SC-8, CM-6
-// POAM: POA&M-230 sqlx builds its own rustls ClientConfig with the aws-lc-rs
+// POAM: POA&M-240 sqlx builds its own rustls ClientConfig with the aws-lc-rs
 // default provider; suites are not pinned to the CNSA 2.0 set.
 fn connect_options(config: &PostgresConfig) -> StorageResult<PgConnectOptions> {
     let mut options =

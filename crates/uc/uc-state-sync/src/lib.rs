@@ -35,7 +35,7 @@
 //! - **CP-10**: System Recovery and Reconstitution
 //! - **IA-3 / SC-8(1) / SC-23**: replication messages are sealed and
 //!   verified with `uc_cluster::auth` (library-only; no transport,
-//!   POA&M-231)
+//!   POA&M-241)
 //!
 //! ## Architecture
 //!
