@@ -464,6 +464,11 @@ fn run_writer(mut state: WriterState, rx: Receiver<Job>) {
             Ok(Job::Reload(r)) => state.reload(*r),
             Ok(Job::Shutdown(done)) => {
                 state.close();
+                // Close the queue and clear `writer_alive` before acknowledging, so
+                // an `emit` or health check after `shutdown` returns sees the
+                // writer as gone instead of racing the thread exit.
+                drop(rx);
+                state.shared.writer_alive.store(false, Ordering::Relaxed);
                 let _ = done.try_send(());
                 return;
             }
