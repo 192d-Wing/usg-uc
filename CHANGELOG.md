@@ -57,6 +57,34 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Security
 
+- **SBC: management-API hardening (BREAKING for admin sessions,
+  provisioning URLs and REST TLS).** (NIST 800-53 Rev5: IA-2, IA-5, SC-8,
+  SC-12, SC-13, SC-5, SC-23; POA&M-210..214) **Upgrade notes:**
+  - Admin tokens are now `v2.` HMAC-SHA-384 with `aud=sbc-api`. v1 tokens
+    are rejected with no fallback; operators must log in again after
+    upgrade.
+  - `SBC_AUTH_SIGNING_KEY` (if set) must be hex and decode to at least 32
+    bytes (48 recommended; shorter keys log a warning). Empty, non-hex or
+    short keys stop startup. `SBC_AUTH_TOKEN_TTL_SECS` must be within 60..=86400.
+    New Helm installs generate a 48-byte hex key; existing 32-byte keys are
+    kept and still load.
+  - Provisioning tokens are now HMAC-SHA-384 (96 hex chars). When
+    `SBC_PROVISION_SECRET` is set it must be hex and decode to at least 32
+    bytes (`openssl rand -hex 48`). Existing `?token=` URLs return 403 until
+    re-minted with `sbc-provision-server --mint-token <MAC>`. Deployments
+    that rely only on `allowedSourceCidrs` are unaffected.
+  - The REST HTTPS listener uses the CNSA provider, TLS 1.3 only (whatever
+    `security.min_tls_version` says) and HTTP/1.1 only. It applies the
+    checked key load and curve enforcement, fails closed when no acceptor
+    is configured, caps connections at 256, and sets a 10 s handshake
+    timeout, a 10 s idle/header timeout and a 300 s maximum connection age.
+    The cert and key are reloaded within 30 s of changing on disk.
+  - `SBC_API_TOKEN` is compared in constant time.
+  - New metrics: `sbc_api_tls_handshake_timeouts_total`,
+    `sbc_api_tls_connections_rejected_total`,
+    `sbc_api_tls_cert_reloads_total`,
+    `sbc_api_tls_cert_reload_failures_total`.
+
 - **SBC: TLS private key files are checked at load and the key curve is
   enforced (BREAKING, SEC-001).** (NIST 800-53 Rev5: SC-12, SC-13, SC-28,
   SC-4) **Upgrade note:** the SIP-TLS listeners, the trunk client key and

@@ -227,6 +227,8 @@ sbcProvision:
   # The server refuses to start when neither allowedSourceCidrs nor
   # SBC_PROVISION_SECRET is set, because rendered phone configs carry SIP
   # and directory credentials. Set this to true only to run it open anyway.
+  # SBC_PROVISION_SECRET (not set by this chart) must be hex decoding to
+  # >= 32 bytes (`openssl rand -hex 48`); see DEPLOYING.md upgrade notes.
   allowUnauthenticated: false
 
 # sbc-client-config-server — soft-client discovery + provisioning pod

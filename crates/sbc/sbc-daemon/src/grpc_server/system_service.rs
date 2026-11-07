@@ -18,15 +18,15 @@ use tracing::info;
 /// success on `Ok(true)`, failure on `Err`, nothing on `Ok(false)` (TLS not
 /// configured, no key touched).
 ///
-/// The API acceptor accepts P-384 or P-521 keys (its curve is not pinned to
-/// `security.curve`; POA&M-193), so the algorithm label is the family.
+/// The API acceptor is pinned to `security.curve` (fix/mgmt-api-hardening),
+/// but the algorithm label is still the family (ECDSA P-384/P-521).
 /// Filesystem paths in the failure reason (uc-transport cert-load errors
 /// embed them) are reduced to the file name before auditing.
 ///
 /// ## NIST 800-53 Rev5: AU-2, AU-3, AU-12, SC-12, SI-11 (POA&M-166)
-// POAM: POA&M-193, the API TLS acceptor (sbc-api-server api_server.rs) does
-// not pin its key curve to `security.curve`, and REST-triggered TLS reloads
-// are not audited; only this gRPC ReloadTls path emits a key event.
+// POAM: POA&M-193, REST-triggered TLS reloads (`POST /api/v1/system/tls/reload`
+// and the api_server.rs file watcher, POA&M-214) are not audited; only this
+// gRPC ReloadTls path emits a key event.
 fn audit_tls_reload(result: &Result<bool, String>, key_path: Option<&std::path::Path>) {
     use uc_audit::event::{CryptoKeyOperation, KeyOperationType};
     const ROLE: &str = "api-tls";

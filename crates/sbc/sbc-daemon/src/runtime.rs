@@ -472,6 +472,7 @@ impl Runtime {
             .tls_cert_path
             .clone()
             .zip(config.security.tls_key_path.clone());
+        let api_tls_curve = config.security.curve;
         let provisioning_config = config.provisioning.clone();
         // Config-file trunks with `options_ping_enabled` are monitored once
         // the trunk monitor exists (below).
@@ -576,6 +577,21 @@ impl Runtime {
         let stats = Arc::clone(server.stats());
 
         let mut app_state = AppState::new(metrics, stats);
+        // REST HTTPS: build the CNSA reloadable acceptor now and fail closed
+        // (no plain-HTTP fallback). Key file must pass the uc-transport
+        // checks and be on `security.curve` (REST half of POA&M-166).
+        //
+        // ## NIST 800-53 Rev5: SC-8, SC-13, SC-12
+        if let Some(ref tls) = api_config.tls {
+            app_state.tls_acceptor = Some(
+                ApiServer::build_tls_acceptor(tls, api_tls_curve).map_err(|e| {
+                    RuntimeError::InitFailed {
+                        component: "api-tls".to_string(),
+                        reason: e.to_string(),
+                    }
+                })?,
+            );
+        }
         app_state.sip_stack = Some(Arc::clone(server.sip_stack()));
         app_state.flows = Some(Arc::clone(server.flows()));
 
