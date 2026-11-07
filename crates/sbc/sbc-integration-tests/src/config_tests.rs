@@ -332,7 +332,7 @@ fn qa_helm_rendered_sbc_config_validates() {
         ),
         (
             "{{ .Values.sbcDaemon.topologyHiding.mode | quote }}",
-            "\"Basic\"",
+            "\"signaling_only\"",
         ),
         (
             "{{ .Values.sbcDaemon.topologyHiding.externalHost | default (printf \"sbc.%s\" .Values.site.fqdn_base) | quote }}",

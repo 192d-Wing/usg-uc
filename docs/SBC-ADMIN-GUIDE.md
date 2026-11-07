@@ -696,7 +696,7 @@ Topology hiding prevents internal network information from leaking to external n
 ```toml
 [topology_hiding]
 enabled = true
-mode = "full"                    # none, signaling_only, or full
+mode = "full"                    # required when enabled: "signaling_only" or "full"
 external_host = "sbc.uc.mil"    # hostname to present externally
 external_port = 5060
 obfuscate_call_id = true         # replace internal Call-IDs
@@ -714,19 +714,29 @@ matched as IP addresses or DNS labels, not by string prefix, so
 the daemon will not start. All three keys are optional. Older configurations
 that omit them load with the defaults shown.
 
-Scope: topology hiding is applied only to the B-leg initial INVITE. It is
-not applied to responses relayed back to the caller, to in-dialog requests
-(BYE, re-INVITE, UPDATE) or to other out-of-dialog requests (POA&M-155).
-If a Via, Contact or Record-Route value cannot be parsed for rewriting, the
-INVITE is rejected with 400 and an audit record with policy
-`sip.topology_hiding.failed:<header>` is written. The request is never
-forwarded partly rewritten.
+Scope: topology hiding is applied to every request and response sent
+toward a hidden leg (POA&M-155). Toward a hidden leg the SBC also removes
+`Server`, `User-Agent` and `Warning`, reduces `Reason` to
+`protocol;cause=N`, and rewrites the SDP `o=` line to username `-` and
+address `external_host` (POA&M-181). SDP `c=` lines are not rewritten by
+topology hiding; without a media relay the peer's media address passes
+through (accepted residual, POA&M-215). If a Via, Contact, Record-Route or
+SDP `o=` value cannot be rewritten, the message is not forwarded partly
+rewritten: it fails closed, an audit record with policy
+`sip.topology_hiding.failed:<header>` (or `:sdp-o`) is written, and the
+failure is counted in `sbc_topology_hiding_failures_total`.
 
 ### Modes
 
+When `enabled = true`, `mode` must be exactly `signaling_only` or `full`
+(case-sensitive). `none`, `basic`, any other value, or a missing `mode` key
+(its default is `none`) is a validation error and the SBC refuses to start
+or reload (POA&M-183). To turn topology hiding off, set `enabled = false`;
+`mode` is then not checked. BREAKING: an enabled section that relied on the
+default `mode` or used `basic` must be changed to `signaling_only` or `full`.
+
 | Mode | Behavior |
-|------|----------|
-| `none` | No topology hiding |
+| ---- | -------- |
 | `signaling_only` | Anonymize Via headers, replace internal IPs |
 | `full` | Anonymize Via, Contact, Record-Route, and optionally Call-ID |
 
