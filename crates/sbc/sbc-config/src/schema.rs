@@ -1708,6 +1708,17 @@ pub struct TopologyHidingConfig {
     pub external_port: u16,
     /// Whether to obfuscate SIP Call-ID headers.
     pub obfuscate_call_id: bool,
+    /// External port presented for TLS elements (`transport=tls`, `sips:`),
+    /// so the return path is not downgraded to a cleartext port
+    /// (RFC 3261 §26.2; NIST 800-53 Rev5: SC-8). POA&M-151.
+    pub external_tls_port: u16,
+    /// Extra internal networks (CIDR, e.g. `"10.20.0.0/16"`), added to the
+    /// built-in RFC 1918 / RFC 6598 / loopback / link-local / ULA defaults.
+    pub internal_networks: Vec<String>,
+    /// Extra internal DNS domains (a host matches `d` or `*.d`), added to
+    /// the built-in defaults (`localhost`, `local`, `internal`, `lan`,
+    /// `home.arpa`).
+    pub internal_domains: Vec<String>,
 }
 
 impl Default for TopologyHidingConfig {
@@ -1718,6 +1729,9 @@ impl Default for TopologyHidingConfig {
             external_host: String::new(),
             external_port: 5060,
             obfuscate_call_id: false,
+            external_tls_port: 5061,
+            internal_networks: Vec::new(),
+            internal_domains: Vec::new(),
         }
     }
 }
@@ -1942,5 +1956,28 @@ mod tests {
         assert_eq!(topo.mode, "full");
         assert_eq!(topo.external_host, "sbc.uc.mil");
         assert!(topo.obfuscate_call_id);
+    }
+
+    // POAM-151 (QA): pre-POA&M-151 TOML without the new topology keys loads
+    // with safe defaults; new keys round-trip when present.
+    #[test]
+    fn qa_topology_hiding_new_keys_default_and_parse() {
+        let old: SbcConfig = toml::from_str(
+            "[topology_hiding]\nenabled = true\nmode = \"basic\"\nexternal_host = \"sbc.example.com\"\n",
+        )
+        .expect("old TOML loads");
+        let t = old.topology_hiding.unwrap();
+        assert_eq!(t.external_tls_port, 5061);
+        assert_eq!(t.internal_networks, Vec::<String>::new());
+        assert_eq!(t.internal_domains, Vec::<String>::new());
+
+        let new: SbcConfig = toml::from_str(
+            "[topology_hiding]\nenabled = true\nexternal_host = \"sbc.example.com\"\nexternal_tls_port = 15061\ninternal_networks = [\"10.20.0.0/16\"]\ninternal_domains = [\"corp.example\"]\n",
+        )
+        .expect("new TOML loads");
+        let t = new.topology_hiding.unwrap();
+        assert_eq!(t.external_tls_port, 15061);
+        assert_eq!(t.internal_networks, vec!["10.20.0.0/16".to_string()]);
+        assert_eq!(t.internal_domains, vec!["corp.example".to_string()]);
     }
 }

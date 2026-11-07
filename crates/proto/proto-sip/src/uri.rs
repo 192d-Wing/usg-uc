@@ -1,6 +1,7 @@
 //! SIP URI handling per RFC 3261.
 
 use crate::error::{SipError, SipResult};
+use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -244,138 +245,491 @@ impl fmt::Display for SipUri {
     }
 }
 
-/// Parses URI parameters from a list of parameter strings.
-fn parse_uri_params(parts: &[&str]) -> Vec<(String, Option<String>)> {
-    parts
-        .iter()
-        .map(|p| {
-            if let Some((name, value)) = p.split_once('=') {
-                (name.to_string(), Some(value.to_string()))
-            } else {
-                (p.to_string(), None)
-            }
-        })
-        .collect()
+// ---------------------------------------------------------------------------
+// RFC 3261 §25.1 character classes.
+//
+// POAM: POA&M-150 - the URI parser is a single-pass scanner over the RFC 3261
+// §25.1 ABNF. The previous splitter cut `;`/`?` before locating userinfo and
+// took the first `@`, so `sip:victim;x=@evil.com` resolved to host `victim`.
+// NIST 800-53 Rev5: SI-10 (Information Input Validation).
+// ---------------------------------------------------------------------------
+
+/// `unreserved = alphanum / mark` (RFC 3261 §25.1).
+fn is_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+        )
 }
 
-/// Parses user info from a URI (user:password@host).
-fn parse_user_info(user_host_port: &str) -> (Option<String>, Option<String>, &str) {
-    if let Some((userinfo, hp)) = user_host_port.split_once('@') {
-        let (user, password) = if let Some((u, p)) = userinfo.split_once(':') {
-            (Some(u.to_string()), Some(p.to_string()))
-        } else {
-            (Some(userinfo.to_string()), None)
-        };
-        (user, password, hp)
-    } else {
-        (None, None, user_host_port)
+/// `user-unreserved = "&" / "=" / "+" / "$" / "," / ";" / "?" / "/"`.
+fn is_user_char(b: u8) -> bool {
+    is_unreserved(b) || matches!(b, b'&' | b'=' | b'+' | b'$' | b',' | b';' | b'?' | b'/')
+}
+
+/// `password = *( unreserved / escaped / "&" / "=" / "+" / "$" / "," )`.
+fn is_password_char(b: u8) -> bool {
+    is_unreserved(b) || matches!(b, b'&' | b'=' | b'+' | b'$' | b',')
+}
+
+/// `paramchar = param-unreserved / unreserved / escaped`,
+/// `param-unreserved = "[" / "]" / "/" / ":" / "&" / "+" / "$"`.
+fn is_param_char(b: u8) -> bool {
+    is_unreserved(b) || matches!(b, b'[' | b']' | b'/' | b':' | b'&' | b'+' | b'$')
+}
+
+/// `hnv-unreserved = "[" / "]" / "/" / "?" / ":" / "+" / "$"`.
+fn is_hnv_char(b: u8) -> bool {
+    is_unreserved(b) || matches!(b, b'[' | b']' | b'/' | b'?' | b':' | b'+' | b'$')
+}
+
+fn invalid(reason: &str) -> SipError {
+    SipError::InvalidUri {
+        reason: reason.to_string(),
     }
 }
 
-/// Parses host and port, handling IPv6 addresses.
-///
-/// RFC 3261 §25.1: `hostport = host [ ":" port ]`, IPv6 references are
-/// bracketed. A host that is empty, contains a stray `[`/`]`/`:`, or
-/// trailing garbage after `]` is rejected so the URI re-serializes
-/// identically (found by the `roundtrip` fuzz target).
-///
-/// NIST 800-53 Rev5: SI-10 (Information Input Validation).
-// POAM: POA&M-62 - full RFC 3261 §25 URI grammar (host charset, %-escapes,
-// §19.1.4 comparison) is out of scope for Phase 1.
-fn parse_host_port(host_port: &str) -> SipResult<(String, Option<u16>)> {
-    let invalid = |reason: &str| SipError::InvalidUri {
-        reason: reason.to_string(),
-    };
-    if let Some(inner) = host_port.strip_prefix('[') {
-        // IPv6
-        let (h, p) = inner
-            .split_once(']')
-            .ok_or_else(|| invalid("invalid IPv6 address"))?;
-        if h.is_empty() || h.contains(['[', ']']) {
-            return Err(invalid("invalid IPv6 address"));
+/// Validates `s` as `*( allowed / escaped )` where `escaped = "%" HEXDIG HEXDIG`.
+fn validate_escaped(s: &str, allowed: fn(u8) -> bool, what: &str) -> SipResult<()> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'%' {
+            let ok = b
+                .get(i + 1..i + 3)
+                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit));
+            if !ok {
+                return Err(invalid(&format!("bad %-escape in {what}")));
+            }
+            i += 3;
+        } else if allowed(c) {
+            i += 1;
+        } else {
+            return Err(invalid(&format!("illegal character in {what}")));
         }
-        let port = match p {
+    }
+    Ok(())
+}
+
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
+/// Decodes `%HH` escapes (RFC 3261 §19.1.2). Input must already have passed
+/// [`validate_escaped`]; malformed escapes are kept verbatim. Decoded bytes
+/// that are not UTF-8 are replaced (U+FFFD) - callers comparing identities
+/// should use [`SipUri::equivalent`], which compares raw octets.
+fn percent_decode(s: &str) -> Cow<'_, str> {
+    if !s.contains('%') {
+        return Cow::Borrowed(s);
+    }
+    match String::from_utf8(percent_decode_bytes(s)) {
+        Ok(v) => Cow::Owned(v),
+        Err(e) => Cow::Owned(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    }
+}
+
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(h) = b.get(i + 1..i + 3)
+            && h.iter().all(u8::is_ascii_hexdigit)
+        {
+            out.push(hex_val(h[0]) << 4 | hex_val(h[1]));
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// `reserved = ";" / "/" / "?" / ":" / "@" / "&" / "=" / "+" / "$" / ","`
+/// (RFC 3261 §25.1).
+const fn is_reserved(b: u8) -> bool {
+    matches!(
+        b,
+        b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b','
+    )
+}
+
+/// Canonical form for §19.1.4 comparison: `%HH` of an unreserved octet is
+/// decoded; `%HH` of a reserved octet stays escaped (hex upper-cased), so it
+/// never equals the literal reserved character.
+fn canonical_escaped(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(h) = b.get(i + 1..i + 3)
+            && h.iter().all(u8::is_ascii_hexdigit)
+        {
+            let v = hex_val(h[0]) << 4 | hex_val(h[1]);
+            if is_reserved(v) {
+                out.push(b'%');
+                out.push(h[0].to_ascii_uppercase());
+                out.push(h[1].to_ascii_uppercase());
+            } else {
+                out.push(v);
+            }
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Compares two escaped strings per RFC 3261 §19.1.4: "characters other
+/// than those in the reserved set are equivalent to their %HEX HEX
+/// encoding" - an escaped reserved character is NOT equal to its literal
+/// form. `ci` selects ASCII case-insensitive comparison.
+fn escaped_eq(a: &str, b: &str, ci: bool) -> bool {
+    let (a, b) = (canonical_escaped(a), canonical_escaped(b));
+    if ci {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
+    }
+}
+
+/// `hostname = *( domainlabel "." ) toplabel [ "." ]` (RFC 3261 §25.1).
+fn is_valid_hostname(h: &str) -> bool {
+    let h = h.strip_suffix('.').unwrap_or(h);
+    if h.is_empty() {
+        return false;
+    }
+    let labels: Vec<&str> = h.split('.').collect();
+    for l in &labels {
+        let b = l.as_bytes();
+        let (Some(first), Some(last)) = (b.first(), b.last()) else {
+            return false;
+        };
+        if !first.is_ascii_alphanumeric()
+            || !last.is_ascii_alphanumeric()
+            || !b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+        {
+            return false;
+        }
+    }
+    // toplabel = ALPHA / ALPHA *( alphanum / "-" ) alphanum
+    labels
+        .last()
+        .and_then(|l| l.as_bytes().first())
+        .is_some_and(u8::is_ascii_alphabetic)
+}
+
+/// Parses `host [ ":" port ]` (RFC 3261 §25.1). Ports must be `1*DIGIT`,
+/// non-zero and fit in `u16`; anything else is rejected instead of being
+/// silently dropped (POA&M-150).
+fn parse_host_port(host_port: &str) -> SipResult<(String, Option<u16>)> {
+    let (host, port_str) = if let Some(inner) = host_port.strip_prefix('[') {
+        let (h, after) = inner
+            .split_once(']')
+            .ok_or_else(|| invalid("invalid IPv6 reference"))?;
+        if h.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(invalid("invalid IPv6 reference"));
+        }
+        let port = match after {
             "" => None,
-            _ => Some(
+            p => Some(
                 p.strip_prefix(':')
-                    .and_then(|p| p.parse().ok())
-                    .ok_or_else(|| invalid("invalid port"))?,
+                    .ok_or_else(|| invalid("trailing data after IPv6 reference"))?,
             ),
         };
-        return Ok((h.to_string(), port));
-    }
-
-    let (host, port) = match host_port.rsplit_once(':') {
-        // IPv4 or hostname with port
-        Some((h, p)) => match p.parse() {
-            Ok(port) => (h, Some(port)),
-            Err(_) => (host_port, None),
-        },
-        None => (host_port, None),
+        (h, port)
+    } else {
+        let (h, p) = match host_port.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (host_port, None),
+        };
+        if h.parse::<std::net::Ipv4Addr>().is_err() && !is_valid_hostname(h) {
+            return Err(invalid("invalid host"));
+        }
+        (h, p)
     };
-    if host.is_empty() || host.contains([':', '[', ']']) {
-        return Err(invalid("invalid host"));
-    }
+    let port = match port_str {
+        None => None,
+        Some(p) => {
+            if p.is_empty() || p.len() > 5 || !p.bytes().all(|c| c.is_ascii_digit()) {
+                return Err(invalid("invalid port"));
+            }
+            match p.parse::<u16>() {
+                Ok(0) | Err(_) => return Err(invalid("invalid port")),
+                Ok(v) => Some(v),
+            }
+        }
+    };
     Ok((host.to_string(), port))
 }
 
-/// Parses URI headers from a header string.
-fn parse_uri_headers(headers_str: Option<&str>) -> Vec<(String, String)> {
-    headers_str
-        .map(|h| {
-            h.split('&')
-                .filter_map(|pair| {
-                    pair.split_once('=')
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// uri-parameters that RFC 3261 §19.1.4 gives comparison semantics to; a
+/// duplicate would let two components disagree on the effective value.
+/// uri-parameters that must match if present in either URI (RFC 3261
+/// §19.1.4).
+const EQ_MUST_MATCH_PARAMS: [&str; 5] = ["user", "ttl", "method", "maddr", "transport"];
+
+const UNIQUE_PARAMS: [&str; 6] = ["transport", "user", "ttl", "method", "maddr", "lr"];
+
+/// Parses `*( ";" uri-parameter )` (without the leading `;`).
+fn parse_uri_params(s: &str) -> SipResult<Vec<(String, Option<String>)>> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for p in s.split(';') {
+        if out.len() >= crate::MAX_PARAMS {
+            // NIST 800-53 Rev5: SC-5 - bound uri-parameters.
+            return Err(SipError::LimitExceeded {
+                what: "URI parameters",
+                limit: crate::MAX_PARAMS,
+            });
+        }
+        let (name, value) = match p.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (p, None),
+        };
+        if name.is_empty() || value.is_some_and(str::is_empty) {
+            return Err(invalid("empty uri-parameter"));
+        }
+        validate_escaped(name, is_param_char, "uri-parameter")?;
+        if let Some(v) = value {
+            validate_escaped(v, is_param_char, "uri-parameter")?;
+        }
+        if UNIQUE_PARAMS.iter().any(|u| u.eq_ignore_ascii_case(name))
+            && out.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
+            return Err(invalid("duplicate uri-parameter"));
+        }
+        out.push((name.to_string(), value.map(str::to_string)));
+    }
+    Ok(out)
+}
+
+/// Parses `hname "=" hvalue *( "&" header )` (without the leading `?`).
+fn parse_uri_headers(s: &str) -> SipResult<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for pair in s.split('&') {
+        if out.len() >= crate::MAX_PARAMS {
+            return Err(SipError::LimitExceeded {
+                what: "URI headers",
+                limit: crate::MAX_PARAMS,
+            });
+        }
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or_else(|| invalid("URI header without '='"))?;
+        if k.is_empty() {
+            return Err(invalid("empty URI header name"));
+        }
+        validate_escaped(k, is_hnv_char, "URI header")?;
+        validate_escaped(v, is_hnv_char, "URI header")?;
+        out.push((k.to_string(), v.to_string()));
+    }
+    Ok(out)
+}
+
+/// Shared length / emptiness checks for untrusted URI text.
+fn check_len(s: &str) -> SipResult<()> {
+    // NIST 800-53 Rev5: SI-10 / SC-5 - untrusted input.
+    if s.is_empty() {
+        return Err(invalid("empty URI"));
+    }
+    if s.len() > crate::MAX_URI_LEN {
+        return Err(SipError::LimitExceeded {
+            what: "URI length",
+            limit: crate::MAX_URI_LEN,
+        });
+    }
+    Ok(())
+}
+
+/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` (RFC 3986 §3.1).
+fn is_valid_scheme(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.first().is_some_and(u8::is_ascii_alphabetic)
+        && b.iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'))
+}
+
+impl SipUri {
+    /// Returns the user part with `%HH` escapes decoded.
+    #[must_use]
+    pub fn user_decoded(&self) -> Option<Cow<'_, str>> {
+        self.user.as_deref().map(percent_decode)
+    }
+
+    /// Returns the password with `%HH` escapes decoded.
+    #[must_use]
+    pub fn password_decoded(&self) -> Option<Cow<'_, str>> {
+        self.password.as_deref().map(percent_decode)
+    }
+
+    /// Returns a URI parameter value with `%HH` escapes decoded.
+    #[must_use]
+    pub fn get_param_decoded(&self, name: &str) -> Option<Cow<'_, str>> {
+        self.get_param(name).map(percent_decode)
+    }
+
+    /// URI equivalence per RFC 3261 §19.1.4.
+    ///
+    /// - scheme must match; userinfo is case-sensitive after unescaping;
+    /// - host is case-insensitive, IP literals compared as addresses;
+    /// - a port present on one side only makes the URIs unequal;
+    /// - `user`, `ttl`, `method`, `maddr`, `transport` must match if present
+    ///   in either URI; other parameters are compared only if in both;
+    /// - URI headers must all match (case-insensitive names).
+    ///
+    /// POAM: POA&M-154 - not yet used by registrar/dialog/auth comparisons
+    /// (IA-2, AC-3); add the control claim once those callers migrate.
+    #[must_use]
+    pub fn equivalent(&self, other: &SipUri) -> bool {
+        if self.scheme != other.scheme || self.port != other.port {
+            return false;
+        }
+        let opt_eq = |a: &Option<String>, b: &Option<String>| match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => escaped_eq(a, b, false),
+            _ => false,
+        };
+        if !opt_eq(&self.user, &other.user) || !opt_eq(&self.password, &other.password) {
+            return false;
+        }
+        let host_eq = match (
+            self.host.parse::<std::net::IpAddr>(),
+            other.host.parse::<std::net::IpAddr>(),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            (Err(_), Err(_)) => escaped_eq(&self.host, &other.host, true),
+            _ => false,
+        };
+        if !host_eq {
+            return false;
+        }
+        let param_eq = |a: &Option<String>, b: &Option<String>| match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => escaped_eq(a, b, true),
+            _ => false,
+        };
+        for (name, value) in &self.params {
+            match other.params.iter().find(|(n, _)| escaped_eq(n, name, true)) {
+                Some((_, ov)) => {
+                    if !param_eq(value, ov) {
+                        return false;
+                    }
+                }
+                None if EQ_MUST_MATCH_PARAMS
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(name)) =>
+                {
+                    return false;
+                }
+                None => {}
+            }
+        }
+        for (name, _) in &other.params {
+            if EQ_MUST_MATCH_PARAMS
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(name))
+                && !self.params.iter().any(|(n, _)| escaped_eq(n, name, true))
+            {
+                return false;
+            }
+        }
+        // Headers: every header in either URI must be present in the other
+        // with an equal value.
+        let hdr_sub = |a: &[(String, String)], b: &[(String, String)]| {
+            a.iter().all(|(n, v)| {
+                b.iter()
+                    .any(|(on, ov)| escaped_eq(n, on, true) && escaped_eq(v, ov, false))
+            })
+        };
+        hdr_sub(&self.headers, &other.headers) && hdr_sub(&other.headers, &self.headers)
+    }
 }
 
 impl FromStr for SipUri {
     type Err = SipError;
 
     fn from_str(s: &str) -> SipResult<Self> {
-        // NIST 800-53 Rev5: SI-10 / SC-5 - untrusted input: empty and
-        // oversized URIs are real errors (was a debug_assert).
-        if s.is_empty() {
-            return Err(SipError::InvalidUri {
-                reason: "empty URI".to_string(),
+        check_len(s)?;
+        let (scheme_str, rest) = s
+            .split_once(':')
+            .ok_or_else(|| invalid("missing scheme separator"))?;
+        // RFC 3261 §8.2.2.1: a non-SIP scheme is "unsupported" (416 on the
+        // Request-URI), not malformed.
+        let scheme = if scheme_str.eq_ignore_ascii_case("sip") {
+            UriScheme::Sip
+        } else if scheme_str.eq_ignore_ascii_case("sips") {
+            UriScheme::Sips
+        } else if is_valid_scheme(scheme_str) {
+            return Err(SipError::UnsupportedUriScheme {
+                scheme: crate::error::truncate_for_log(scheme_str),
             });
-        }
-        if s.len() > crate::MAX_URI_LEN {
-            return Err(SipError::LimitExceeded {
-                what: "URI length",
-                limit: crate::MAX_URI_LEN,
-            });
-        }
+        } else {
+            return Err(invalid("invalid scheme"));
+        };
 
-        let (scheme_str, rest) = s.split_once(':').ok_or_else(|| SipError::InvalidUri {
-            reason: "missing scheme separator".to_string(),
-        })?;
+        // RFC 3261 §25.1: `@` is not allowed unescaped in hostport,
+        // uri-parameters or headers, so the userinfo delimiter is the LAST
+        // `@`. Everything before it is userinfo (which may legally contain
+        // `;`, `?`, `/`, ...).
+        let (userinfo, after) = match rest.rfind('@') {
+            Some(at) => (Some(&rest[..at]), &rest[at + 1..]),
+            None => (None, rest),
+        };
+        let (user, password) = match userinfo {
+            None => (None, None),
+            Some(ui) => {
+                let (u, p) = match ui.split_once(':') {
+                    Some((u, p)) => (u, Some(p)),
+                    None => (ui, None),
+                };
+                if u.is_empty() {
+                    return Err(invalid("empty user"));
+                }
+                validate_escaped(u, is_user_char, "user")?;
+                if let Some(p) = p {
+                    validate_escaped(p, is_password_char, "password")?;
+                }
+                (Some(u.to_string()), p.map(str::to_string))
+            }
+        };
 
-        let scheme: UriScheme = scheme_str.parse()?;
-        let (rest, headers_str) = rest
-            .split_once('?')
-            .map_or((rest, None), |(r, h)| (r, Some(h)));
-        let parts: Vec<&str> = rest.split(';').collect();
-        // NIST 800-53 Rev5: SC-5 - bound uri-parameters.
-        if parts.len() > crate::MAX_PARAMS + 1 {
-            return Err(SipError::LimitExceeded {
-                what: "URI parameters",
-                limit: crate::MAX_PARAMS,
-            });
-        }
-
-        let user_host_port = parts.first().ok_or_else(|| SipError::InvalidUri {
-            reason: "missing host".to_string(),
-        })?;
-
-        let params = parse_uri_params(&parts[1..]);
-        let (user, password, host_port) = parse_user_info(user_host_port);
-        let (host, port) = parse_host_port(host_port)?;
-        let headers = parse_uri_headers(headers_str);
+        // hostport ends at the first `;` or `?` (after any IPv6 reference).
+        let search_from = if after.starts_with('[') {
+            after.find(']').unwrap_or(0)
+        } else {
+            0
+        };
+        let hp_end = after[search_from..]
+            .find([';', '?'])
+            .map_or(after.len(), |i| i + search_from);
+        let (host, port) = parse_host_port(&after[..hp_end])?;
+        let tail = &after[hp_end..];
+        let (params_str, headers_str) = match tail.split_once('?') {
+            Some((p, h)) => (p, Some(h)),
+            None => (tail, None),
+        };
+        let params = match params_str.strip_prefix(';') {
+            Some(p) => parse_uri_params(p)?,
+            None if params_str.is_empty() => Vec::new(),
+            None => return Err(invalid("trailing data after host")),
+        };
+        let headers = match headers_str {
+            Some(h) => parse_uri_headers(h)?,
+            None => Vec::new(),
+        };
 
         Ok(SipUri {
             scheme,
@@ -386,6 +740,219 @@ impl FromStr for SipUri {
             params,
             headers,
         })
+    }
+}
+
+/// `tel:` URI (RFC 3966), minimally validated.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TelUri {
+    /// The subscriber number, without visual separators removed.
+    pub number: String,
+    /// True for a global number (`+` prefix).
+    pub global: bool,
+    /// Parameters (`;name[=value]`), raw.
+    pub params: Vec<(String, Option<String>)>,
+}
+
+/// RFC 3966 `phonedigit-hex` plus visual separators.
+fn is_tel_number_char(b: u8, global: bool) -> bool {
+    b.is_ascii_digit()
+        || matches!(b, b'-' | b'.' | b'(' | b')')
+        || (!global && (b.is_ascii_hexdigit() || matches!(b, b'*' | b'#')))
+}
+
+/// RFC 3966 `paramchar = param-unreserved / unreserved / pct-encoded`.
+fn is_tel_param_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'_'
+                | b'.'
+                | b'~'
+                | b'['
+                | b']'
+                | b'/'
+                | b':'
+                | b'&'
+                | b'+'
+                | b'$'
+                | b'!'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+        )
+}
+
+impl FromStr for TelUri {
+    type Err = SipError;
+
+    fn from_str(s: &str) -> SipResult<Self> {
+        check_len(s)?;
+        let (scheme, rest) = s
+            .split_once(':')
+            .ok_or_else(|| invalid("missing scheme separator"))?;
+        if !scheme.eq_ignore_ascii_case("tel") {
+            return Err(invalid("not a tel URI"));
+        }
+        let (number, params_str) = match rest.split_once(';') {
+            Some((n, p)) => (n, Some(p)),
+            None => (rest, None),
+        };
+        let global = number.starts_with('+');
+        let digits = number.strip_prefix('+').unwrap_or(number);
+        if digits.is_empty() || !digits.bytes().all(|b| is_tel_number_char(b, global)) {
+            return Err(invalid("invalid telephone-subscriber"));
+        }
+        let mut params = Vec::new();
+        if let Some(ps) = params_str {
+            for p in ps.split(';') {
+                if params.len() >= crate::MAX_PARAMS {
+                    return Err(SipError::LimitExceeded {
+                        what: "URI parameters",
+                        limit: crate::MAX_PARAMS,
+                    });
+                }
+                let (n, v) = match p.split_once('=') {
+                    Some((n, v)) => (n, Some(v)),
+                    None => (p, None),
+                };
+                if n.is_empty() || v.is_some_and(str::is_empty) {
+                    return Err(invalid("empty tel parameter"));
+                }
+                validate_escaped(n, is_tel_param_char, "tel parameter")?;
+                if let Some(v) = v {
+                    validate_escaped(v, is_tel_param_char, "tel parameter")?;
+                }
+                params.push((n.to_string(), v.map(str::to_string)));
+            }
+        }
+        Ok(Self {
+            number: number.to_string(),
+            global,
+            params,
+        })
+    }
+}
+
+impl fmt::Display for TelUri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "tel:{}", self.number)?;
+        for (n, v) in &self.params {
+            write!(f, ";{n}")?;
+            if let Some(v) = v {
+                write!(f, "={v}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Any other `absoluteURI` (RFC 3261 §25.1 / RFC 3986 §3), kept opaque.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AbsoluteUri {
+    /// Scheme (as received).
+    pub scheme: String,
+    /// Everything after the first `:`.
+    pub rest: String,
+}
+
+/// RFC 3986 `reserved / unreserved` (printable ASCII except SP `"` `<` `>`
+/// `\` `^` `` ` `` `{` `|` `}` and `%`, which must be an escape).
+fn is_uric(b: u8) -> bool {
+    b.is_ascii_graphic()
+        && !matches!(
+            b,
+            b'"' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}' | b'%'
+        )
+}
+
+impl FromStr for AbsoluteUri {
+    type Err = SipError;
+
+    fn from_str(s: &str) -> SipResult<Self> {
+        check_len(s)?;
+        let (scheme, rest) = s
+            .split_once(':')
+            .ok_or_else(|| invalid("missing scheme separator"))?;
+        if !is_valid_scheme(scheme) || rest.is_empty() {
+            return Err(invalid("invalid absoluteURI"));
+        }
+        validate_escaped(rest, is_uric, "absoluteURI")?;
+        Ok(Self {
+            scheme: scheme.to_string(),
+            rest: rest.to_string(),
+        })
+    }
+}
+
+impl fmt::Display for AbsoluteUri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.scheme, self.rest)
+    }
+}
+
+/// A Request-URI / addr-spec of any scheme (RFC 3261 §25.1
+/// `SIP-URI / SIPS-URI / absoluteURI`).
+///
+/// POAM: POA&M-153 - `NameAddr.uri` and `RequestLine.uri` still hold
+/// [`SipUri`]; this type exists so the migration is mechanical.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Uri {
+    /// `sip:` / `sips:`.
+    Sip(SipUri),
+    /// `tel:` (RFC 3966).
+    Tel(TelUri),
+    /// Any other scheme, opaque.
+    Absolute(AbsoluteUri),
+}
+
+impl Uri {
+    /// Returns the scheme as written (lower-case for sip/sips/tel).
+    #[must_use]
+    pub fn scheme(&self) -> &str {
+        match self {
+            Self::Sip(u) => u.scheme.as_str(),
+            Self::Tel(_) => "tel",
+            Self::Absolute(a) => &a.scheme,
+        }
+    }
+
+    /// Returns the SIP URI if this is `sip:`/`sips:`.
+    #[must_use]
+    pub fn as_sip(&self) -> Option<&SipUri> {
+        match self {
+            Self::Sip(u) => Some(u),
+            _ => None,
+        }
+    }
+}
+
+impl FromStr for Uri {
+    type Err = SipError;
+
+    fn from_str(s: &str) -> SipResult<Self> {
+        check_len(s)?;
+        let (scheme, _) = s
+            .split_once(':')
+            .ok_or_else(|| invalid("missing scheme separator"))?;
+        if scheme.eq_ignore_ascii_case("sip") || scheme.eq_ignore_ascii_case("sips") {
+            s.parse().map(Self::Sip)
+        } else if scheme.eq_ignore_ascii_case("tel") {
+            s.parse().map(Self::Tel)
+        } else {
+            s.parse().map(Self::Absolute)
+        }
+    }
+}
+
+impl fmt::Display for Uri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sip(u) => u.fmt(f),
+            Self::Tel(u) => u.fmt(f),
+            Self::Absolute(u) => u.fmt(f),
+        }
     }
 }
 

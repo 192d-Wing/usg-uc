@@ -65,6 +65,8 @@ impl StatusCode {
     pub const REQUEST_URI_TOO_LONG: Self = Self(414);
     /// 415 Unsupported Media Type.
     pub const UNSUPPORTED_MEDIA_TYPE: Self = Self(415);
+    /// 416 Unsupported URI Scheme (RFC 3261 §21.4.17).
+    pub const UNSUPPORTED_URI_SCHEME: Self = Self(416);
     /// 420 Bad Extension.
     pub const BAD_EXTENSION: Self = Self(420);
     /// 421 Extension Required.
@@ -218,6 +220,7 @@ impl StatusCode {
             413 => "Request Entity Too Large",
             414 => "Request-URI Too Long",
             415 => "Unsupported Media Type",
+            416 => "Unsupported URI Scheme",
             420 => "Bad Extension",
             421 => "Extension Required",
             423 => "Interval Too Brief",

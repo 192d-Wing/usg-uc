@@ -150,21 +150,43 @@ Phase 1 (byte-based parsing, strict header grammar, Content-Length, limits,
 semantic 400s, case-insensitive names, compact forms, comma-list splitter,
 fuzzing, RFC 4475 tests) is in PR #167. Remaining:
 
-- [ ] **BLOCKER, LIVE — URI parser picks the wrong host.** Splits on `;`/`?`
+- [x] **BLOCKER, LIVE — URI parser picks the wrong host.** (POA&M-150) Splits on `;`/`?`
   before finding userinfo, first `@` not last: `sip:victim;x=@evil.com` and
   `sip:+1555;phone-context=…@gw` parse with the wrong host. No %-escaping, no
   RFC 3261 §19.1.4 comparison, bad ports dropped silently, `tel:`/absoluteURI
   fail the whole parse (no 416). Rewrite to the §25 ABNF with a generic `Uri`.
-- [ ] **MAJOR, LIVE — topology hiding leaks.** String-prefix internal match
+- [x] **MAJOR, LIVE — topology hiding leaks.** (POA&M-151) String-prefix internal match
   (`10.` matches `10.example.com`; no IPv6 ULA/link-local, 127/8, 169.254/16,
   100.64/10); comma-folded Via/Contact/Record-Route only partly rewritten;
   unparseable entries kept or Vias dropped; Contact rewrite drops
   `transport=tls`; Call-ID map unbounded with unkeyed hash
   (`topology.rs`). CIDR matching, per-value handling, fail closed, bounded map.
-- [ ] **MAJOR, LIVE — header manipulation collapses multi-instance headers and
+  Fixed for the B-leg initial INVITE only (the sole hider call site); see
+  POA&M-155.
+- [x] **MAJOR, LIVE — header manipulation collapses multi-instance headers and
   checks only the first instance** (`manipulation.rs:635-712`,
   `Headers::set`); a harmless first copy hides a spoofed second one. Apply
-  per instance, validate output.
+  per instance, validate output. (POA&M-152)
+- [ ] **MINOR — `NameAddr.uri` / `RequestLine.uri` still `SipUri`** (POA&M-153):
+  `tel:`/absoluteURI inside To/From/Contact/Route still fail to parse. Migrate
+  to `proto_sip::Uri` (needs client-core / client-sip-ua changes).
+- [ ] **MINOR — URI comparisons not yet on §19.1.4** (POA&M-154): registrar /
+  dialog / ACL matching in sbc-trunk-services and uc-acl compare fields or
+  strings; switch to `SipUri::equivalent`.
+- [ ] **MAJOR, LIVE — topology hiding covers only the B-leg initial INVITE**
+  (POA&M-155): responses relayed toward the caller (e.g. 200 OK
+  `Contact: <sip:10.x>` / Record-Route of the far side) and in-dialog
+  (BYE, re-INVITE, UPDATE) or out-of-dialog non-INVITE requests do not call
+  the hider (`sip_stack.rs`, `hide_b2bua_request` only call site).
+- [ ] **MINOR — no topology-hiding / header-manipulation failure metrics**
+  (POA&M-156): planned `sbc_topology_hiding_failures_total` (and the
+  manipulation equivalent) were dropped; failures are only in the audit
+  trail (SI-4, AU-6).
+- [ ] **MINOR, DORMANT — proxy-model topology hiding has no Via restore**
+  (POA&M-157): `TopologyHider::hide_outbound_request` strips/rewrites Vias
+  without storing them, so responses could not reach internal hops
+  (RFC 3261 §16.7, §18.2.2). No daemon caller today; needs branch-keyed
+  Via restoration before proxy use.
 - [ ] **MAJOR, DORMANT — RFC 3261 §12.1.1/§12.1.2 route-set order swapped**
   (`routing.rs:309,323`); §16.4 route preprocessing missing; loop detection
   rejects spirals and ignores branch hash; 100 Trying copies only the first Via

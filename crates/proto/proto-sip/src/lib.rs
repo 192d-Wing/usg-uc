@@ -56,6 +56,7 @@
 
 pub mod auth;
 pub mod builder;
+pub mod cidr;
 pub mod error;
 pub mod header;
 pub mod header_params;
@@ -82,6 +83,7 @@ pub use auth::{
 pub use builder::{
     RequestBuilder, ResponseBuilder, generate_branch, generate_call_id, generate_tag,
 };
+pub use cidr::IpCidr;
 pub use error::{SipError, SipResult};
 pub use header::{Header, HeaderName, Headers};
 pub use header_params::{
@@ -101,7 +103,7 @@ pub use routing::{
 };
 pub use topology::{TopologyHider, TopologyHidingConfig, TopologyHidingMode};
 pub use transport::Transport;
-pub use uri::{SipUri, UriScheme};
+pub use uri::{AbsoluteUri, SipUri, TelUri, Uri, UriScheme};
 
 // RFC 3261 §16.6 Proxy forwarding
 pub use proxy::{

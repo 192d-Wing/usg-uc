@@ -471,6 +471,10 @@ mod tests {
         let header = "\"Ünïcödé\" <sip:p1.example.com;lr>, <sip:p2.example.com;lr>".to_string();
         let _ = RouteSet::from_route_headers(&[header]);
         let header = "<sip:p1.example.com;lr;n=Ünïcödé>, <sip:p2.example.com;lr>".to_string();
+        // POAM-150: non-ASCII is not a legal paramchar (RFC 3261 §25.1);
+        // rejected without panicking.
+        assert!(RouteSet::from_route_headers(&[header]).is_err());
+        let header = "<sip:p1.example.com;lr;n=%C3%9C>, <sip:p2.example.com;lr>".to_string();
         let set = RouteSet::from_route_headers(&[header]).unwrap();
         assert_eq!(set.len(), 2);
     }

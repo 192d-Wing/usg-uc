@@ -33,10 +33,11 @@ The **Wiring** column says which shipped binary calls the code: `sbc-daemon` (SI
 | §15 | Terminating a Session | Partial | Wired (sbc-daemon, soft client) | Daemon relays BYE/CANCEL to the other leg (`sip_stack.rs` `handle_bye`, `handle_cancel`) |
 | §16.4 | Route Information Preprocessing | Partial | Library-only | `routing.rs`; the daemon is a B2BUA, not a proxy. Route lists now use the shared byte-indexed splitter (`list.rs`); module otherwise not reviewed (POA&M-65) |
 | §16.6 | Request Forwarding | Partial | Library-only | `proxy.rs`; no caller. Via insert/pop is O(n) and order-preserving; combined Via values handled. Module otherwise not reviewed (POA&M-65) |
+| §16.7 / §18.2.2 | Response routing under proxy-model topology hiding (RFC-003) | Gap | Library-only | `TopologyHider::hide_outbound_request` (proxy model) strips (aggressive) or rewrites (basic) Vias with no stored copy, so responses could not be routed back to internal hops. No daemon caller; the daemon uses only `hide_b2bua_request`, which never strips a Via. Not RFC-conformant for proxy use until branch-keyed Via restoration exists (POA&M-157) |
 | §16.12.1 | Loose Routing | Partial | Library-only | `routing.rs`; no caller. Only the list splitter was reviewed in Phase 1 (POA&M-65) |
 | §17 | Transactions | Partial | Wired (sbc-daemon, soft client) | Daemon drives proto-transaction client/server FSMs and timers (`sip_stack.rs` `poll_timers`); soft client drives client FSMs |
 | §18 | Transport | Partial | Library-only | `Transport` enum has no caller; sockets are provided by uc-transport |
-| §19 | SIP URI | Partial | Wired (sbc-daemon, soft client) | `uri.rs`. Length/parameter caps and host/bracket validation added; no §25 grammar, %-escape handling (§19.1.4), absoluteURI or 416 for unknown schemes (POA&M-62) |
+| §19 | SIP URI | Partial | Wired (sbc-daemon, soft client) | `uri.rs`. §25 grammar, %-escape validation, strict ports, §19.1.4 `SipUri::equivalent`, generic `Uri` and 416 for non-SIP Request-URIs (POA&M-150). `tel:`/absoluteURI in To/From/Contact/Route still fail to parse, because `NameAddr.uri` is `SipUri`; a topology Contact rewrite of such a value would fail closed with 400 (RFC-002, POA&M-153). Callers not yet on `equivalent` (POA&M-154). Advisory (RFC-005, dormant until POA&M-154): `equivalent` decodes `%25` to `%`, so `%253B` and `%3B` compare equal; keep `%25` escaped when comparing |
 | §20 | Header Fields | Partial | Wired (sbc-daemon, soft client) | 59 `HeaderName` variants in `header.rs`; names are case-insensitive (`Custom` normalised), compact forms incl. e/x/b/y/a/j/d. Only Via, CSeq, Max-Forwards, Content-Length are grammar-checked at parse time; other headers are checked when a caller parses them |
 | §22 | Authentication | Partial | Wired (soft client) | `auth.rs` (RFC 2617) used by the soft client as UAC. The daemon's REGISTER digest challenge/verification is proto-registrar's own code (`authentication.rs`), not `proto_sip::auth` |
 
@@ -52,7 +53,7 @@ The **Wiring** column says which shipped binary calls the code: `sbc-daemon` (SI
 | Duplicate single-valued headers (RFC 4475 §3.3.8/§3.3.9) | Complete | Call-ID, To, From, CSeq, Max-Forwards, Content-Length |
 | §8.2.2 / §16.3 400 for malformed requests | Partial | sbc-daemon sends a sanitized 400 for stream framing errors only (`framing_error_response`, test `framing_error_response_is_minimal_400`); other malformed requests are logged and dropped (POA&M-63) |
 | §22 digest verifier | Partial | Not reviewed in Phase 1 (POA&M-65); empty input and parameter caps fixed |
-| RFC 3323 topology hiding | Partial | Not reviewed in Phase 1 (POA&M-65) |
+| RFC 3323 topology hiding | Partial | Reviewed and fixed under POA&M-151 for the B-leg initial INVITE (CIDR matching, per-element rewrite, fail closed); other message paths not hidden (POA&M-155); proxy-model Via restore missing (POA&M-157) |
 | RFC 3327 Path | Partial | Only list splitting fixed (`path_values` splits combined values) |
 
 ### sbc-daemon stream and WebSocket transport (RFC 7118, RFC 6455, RFC 3261 §18.3, RFC 5626 §4.4.1)
@@ -73,8 +74,8 @@ The **Wiring** column says which shipped binary calls the code: `sbc-daemon` (SI
 | Pass: parse, then 400 | `insuf`, `inv2543` | Rejected by `validate_request_headers`, not the parser |
 | Pass: invalid, rejected | `clerr`, `ncl`, `scalar02`, `scalarlg`, `ltgtruri`, `lwsruri`, `lwsstart`, `trws`, `badvers`, `mismatch01`, `mismatch02`, `bigcode`, `multi01`, `mcl01`, `baddn` | `baddn` passes only because the archive copy lacks the final CRLF; with it restored it is accepted (`baddn_with_terminating_crlf_is_known_gap`) |
 | Gap (deviation): valid, rejected | `intmeth` | Escaped CTLs in a quoted-pair are rejected on purpose |
-| Gap: should parse then 416, rejected | `unkscm`, `novelsc` | URI parser rejects unknown schemes (POA&M-62) |
-| Gap: invalid, accepted | `badinv01`, `quotbal`, `escruri`, `baddate`, `regbadct`, `badaspec` | Via/Contact params, To structure, URI grammar, Date, addr-spec not checked at parse time |
+| Rejected with 416 (`UnsupportedUriScheme`) | `unkscm`, `novelsc` | parse fails with a 416-mapped error; the SBC answers 416 (POA&M-150) |
+| Gap: invalid, accepted | `badinv01`, `quotbal`, `baddate`, `regbadct`, `badaspec` | Via/Contact params, To structure, URI grammar, Date, addr-spec not checked at parse time |
 | RFC 4475 torture vectors | Partial | All 49 vectors in `crates/proto/proto-sip/tests/rfc4475.rs` (Datagram framing); see the table below |
 
 ### sbc-daemon B2BUA trunk routing (RFC 3263 §4.3, RFC 3261 §8.1.1, §21.5.4)
