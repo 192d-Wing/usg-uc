@@ -10,6 +10,10 @@
 //! - At most `max_concurrent_fetches` fetches run at once, and at most
 //!   [`MAX_FETCHES_PER_HOST`] per `x5u` host; beyond either a caller fails
 //!   fast with [`FetchError::Busy`] (never queues).
+//! - At most `max_fetches_per_source` new fetches started on behalf of one
+//!   SIP source (IPv4 address or IPv6 /64), so one peer presenting `x5u`
+//!   URLs on many hosts it controls cannot hold every fetch permit
+//!   (POA&M-190). Joining an in-flight fetch for the same URL is free.
 //! - The fetch runs on its own task: a caller that stops waiting (deadline,
 //!   CANCEL) does not cancel it, and its result still fills the cache,
 //!   unless the trust anchors changed meanwhile ([`StiCertCache::invalidate`]
@@ -28,6 +32,7 @@ use crate::ssrf::X5uUrl;
 use proto_stir_shaken::{Alg, KeyResolver, TnAuthEntry, TnAuthScope, VerifiedKey, VerifyingKey};
 use std::collections::HashMap;
 use std::hash::BuildHasher;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,6 +43,9 @@ const MAX_CHAIN_CERTS: usize = 8;
 /// Most concurrent fetches to one `x5u` host (on top of the global cap), so
 /// one slow or hostile host cannot take every fetch permit.
 pub const MAX_FETCHES_PER_HOST: usize = 4;
+/// Default most concurrent fetches started for one SIP source
+/// ([`CacheConfig::max_fetches_per_source`]).
+pub const DEFAULT_MAX_FETCHES_PER_SOURCE: usize = 4;
 /// Most lock shards per store.
 const MAX_SHARDS: usize = 16;
 
@@ -56,6 +64,11 @@ pub struct CacheConfig {
     pub max_concurrent_fetches: usize,
     /// Optional `x5u` host allow-list.
     pub allow_hosts: Vec<String>,
+    /// Most concurrent fetches started for one SIP source ([`SourceKey`]);
+    /// clamped to `1..=max_concurrent_fetches`.
+    ///
+    /// NIST 800-53 Rev5: SC-5 (POA&M-190)
+    pub max_fetches_per_source: usize,
 }
 
 impl Default for CacheConfig {
@@ -67,6 +80,38 @@ impl Default for CacheConfig {
             fetch_timeout: Duration::from_millis(1500),
             max_concurrent_fetches: 32,
             allow_hosts: Vec::new(),
+            max_fetches_per_source: DEFAULT_MAX_FETCHES_PER_SOURCE,
+        }
+    }
+}
+
+/// The SIP source a fetch is charged to.
+///
+/// An IPv4 address, an IPv6 /64 (one subscriber allocation, so address rotation within it does not
+/// multiply the budget), or `Unspecified` for callers without a source
+/// (budgeted like any other source, never exempt).
+// POAM: POA&M-196, carriers sharing one source IP share one budget; a peer
+// holding a /48 (or shorter) IPv6 prefix can present up to 65536 /64 keys,
+// and spoofed UDP sources are charged to the spoofed key. Both remain
+// bounded by `max_concurrent_fetches`; per-trunk charging is the follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourceKey {
+    /// IPv4 source address.
+    V4(std::net::Ipv4Addr),
+    /// Upper 64 bits of an IPv6 source address.
+    V6Prefix64(u64),
+    /// No source known.
+    Unspecified,
+}
+
+impl From<IpAddr> for SourceKey {
+    fn from(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(v4) => Self::V4(v4),
+            // IPv4-mapped IPv6 is the same peer as its IPv4 form.
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or_else(|| Self::V6Prefix64((v6.to_bits() >> 64) as u64), Self::V4),
         }
     }
 }
@@ -162,6 +207,9 @@ pub struct CacheStats {
     pub fetches: AtomicU64,
     /// Fetches refused (busy).
     pub busy: AtomicU64,
+    /// Fetches refused because the source's budget was spent (also
+    /// counted in `busy`).
+    pub busy_source: AtomicU64,
     /// Fetch results dropped because the anchors changed meanwhile.
     pub stale_results: AtomicU64,
 }
@@ -175,6 +223,48 @@ struct Inflight {
     urls: HashMap<String, watch::Receiver<Option<Outcome>>>,
     /// Running fetches by host (bounded by the global permit count).
     hosts: HashMap<String, usize>,
+    /// Running fetches by source (bounded by the global permit count;
+    /// entries removed at zero).
+    sources: HashMap<SourceKey, usize>,
+}
+
+impl Inflight {
+    fn release(&mut self, host: &str, source: SourceKey) {
+        if let Some(n) = self.hosts.get_mut(host) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.hosts.remove(host);
+            }
+        }
+        if let Some(n) = self.sources.get_mut(&source) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.sources.remove(&source);
+            }
+        }
+    }
+}
+
+/// Releases a running fetch's URL/host/source slots when the fetch task
+/// ends, including by panic or runtime shutdown, so counters cannot leak.
+struct FetchSlot {
+    cache: Arc<StiCertCache>,
+    key: String,
+    host: String,
+    source: SourceKey,
+    generation: u64,
+}
+
+impl Drop for FetchSlot {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.cache.inflight.lock() {
+            // A newer generation may own this URL's slot now.
+            if self.cache.generation() == self.generation {
+                m.urls.remove(&self.key);
+            }
+            m.release(&self.host, self.source);
+        }
+    }
 }
 
 /// The STI certificate cache.
@@ -263,6 +353,23 @@ impl StiCertCache {
         self.len() == 0
     }
 
+    /// Running fetches charged to `source` (0 when idle).
+    #[must_use]
+    pub fn inflight_for_source(&self, source: IpAddr) -> usize {
+        self.inflight.lock().map_or(0, |m| {
+            m.sources
+                .get(&SourceKey::from(source))
+                .copied()
+                .unwrap_or(0)
+        })
+    }
+
+    /// Distinct sources with a running fetch.
+    #[must_use]
+    pub fn inflight_sources(&self) -> usize {
+        self.inflight.lock().map_or(0, |m| m.sources.len())
+    }
+
     /// Fetches in flight.
     #[must_use]
     pub fn inflight(&self) -> usize {
@@ -335,13 +442,52 @@ impl StiCertCache {
         true
     }
 
-    /// Returns the validated key for `x5u`, fetching it if needed. Waits at
-    /// most `deadline`; on expiry returns [`FetchError::Timeout`] while the
-    /// fetch continues in the background.
+    /// [`Self::get_or_fetch_from`] for a caller without a SIP source; such
+    /// fetches share the [`SourceKey::Unspecified`] budget, so all callers
+    /// of this method together get at most `max_fetches_per_source`
+    /// concurrent new fetches (default 4), not `max_concurrent_fetches`;
+    /// excess callers get `Busy`. Bulk callers (warm-up, prefetch) should
+    /// use [`Self::get_or_fetch_from`] with a distinct source.
+    ///
+    /// # Errors
+    /// See [`Self::get_or_fetch_from`].
+    pub async fn get_or_fetch(self: &Arc<Self>, x5u: &str, deadline: Duration) -> Outcome {
+        self.get_or_fetch_keyed(SourceKey::Unspecified, x5u, deadline)
+            .await
+    }
+
+    /// Returns the validated key for `x5u`, fetching it if needed. A new
+    /// fetch is charged to `source` (see [`SourceKey`]); past
+    /// `max_fetches_per_source` it fails fast with [`FetchError::Busy`].
+    /// Waits at most `deadline`; on expiry returns [`FetchError::Timeout`]
+    /// while the fetch continues in the background.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (POA&M-190)
     ///
     /// # Errors
     /// The (possibly negative-cached) fetch/validation failure.
-    pub async fn get_or_fetch(self: &Arc<Self>, x5u: &str, deadline: Duration) -> Outcome {
+    pub async fn get_or_fetch_from(
+        self: &Arc<Self>,
+        source: IpAddr,
+        x5u: &str,
+        deadline: Duration,
+    ) -> Outcome {
+        self.get_or_fetch_keyed(SourceKey::from(source), x5u, deadline)
+            .await
+    }
+
+    fn per_source_limit(&self) -> usize {
+        self.cfg
+            .max_fetches_per_source
+            .clamp(1, self.cfg.max_concurrent_fetches.max(1))
+    }
+
+    async fn get_or_fetch_keyed(
+        self: &Arc<Self>,
+        source: SourceKey,
+        x5u: &str,
+        deadline: Duration,
+    ) -> Outcome {
         if let Some(o) = self.lookup(x5u) {
             let counter = if o.is_ok() {
                 &self.stats.hits
@@ -370,6 +516,12 @@ impl StiCertCache {
                     self.stats.busy.fetch_add(1, Ordering::Relaxed);
                     return Err(FetchError::Busy);
                 }
+                let per_source = inflight.sources.get(&source).copied().unwrap_or(0);
+                if per_source >= self.per_source_limit() {
+                    self.stats.busy.fetch_add(1, Ordering::Relaxed);
+                    self.stats.busy_source.fetch_add(1, Ordering::Relaxed);
+                    return Err(FetchError::Busy);
+                }
                 let Ok(permit) = Arc::clone(&self.sem).try_acquire_owned() else {
                     self.stats.busy.fetch_add(1, Ordering::Relaxed);
                     return Err(FetchError::Busy);
@@ -377,31 +529,28 @@ impl StiCertCache {
                 let (tx, rx) = watch::channel(None);
                 inflight.urls.insert(x5u.to_owned(), rx.clone());
                 *inflight.hosts.entry(url.host.clone()).or_insert(0) += 1;
+                *inflight.sources.entry(source).or_insert(0) += 1;
                 self.stats.fetches.fetch_add(1, Ordering::Relaxed);
                 let generation = self.generation();
-                let this = Arc::clone(self);
-                let key = x5u.to_owned();
+                let slot = FetchSlot {
+                    cache: Arc::clone(self),
+                    key: x5u.to_owned(),
+                    host: url.host.clone(),
+                    source,
+                    generation,
+                };
                 tokio::spawn(async move {
+                    let this = &slot.cache;
                     let (outcome, ttl) = this.fetch_and_validate(&url).await;
                     // Waiters on a fetch that straddled an anchor change get
                     // a failure, never a key validated under the old set.
-                    let outcome = if this.store(&key, &outcome, ttl, generation) {
+                    let outcome = if this.store(&slot.key, &outcome, ttl, generation) {
                         outcome
                     } else {
                         Err(FetchError::Untrusted("anchors-changed"))
                     };
-                    if let Ok(mut m) = this.inflight.lock() {
-                        // A newer generation may own this URL's slot now.
-                        if this.generation() == generation {
-                            m.urls.remove(&key);
-                        }
-                        if let Some(n) = m.hosts.get_mut(&url.host) {
-                            *n = n.saturating_sub(1);
-                            if *n == 0 {
-                                m.hosts.remove(&url.host);
-                            }
-                        }
-                    }
+                    // Release slots before waking waiters (they may retry).
+                    drop(slot);
                     let _ = tx.send(Some(outcome));
                     drop(permit);
                 });
@@ -522,5 +671,28 @@ mod tests {
         assert_eq!(s.get("a", 0), None);
         assert!(s.insert_if("a", 1, 100, || true));
         assert_eq!(s.get("a", 0), Some(1));
+    }
+
+    /// QA (POA&M-190): source keying. Same IPv6 /64 shares a key, a
+    /// different /64 does not; IPv4-mapped IPv6 equals its IPv4 form;
+    /// Unspecified never collides with a real address.
+    #[test]
+    fn qa_source_key_mapping() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let k = |s: &str| SourceKey::from(s.parse::<IpAddr>().unwrap());
+        assert_eq!(k("2001:db8:1:2::1"), k("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_ne!(k("2001:db8:1:2::1"), k("2001:db8:1:3::1"));
+        assert_eq!(k("::ffff:192.0.2.7"), k("192.0.2.7"));
+        assert_eq!(
+            k("::ffff:192.0.2.7"),
+            SourceKey::V4(Ipv4Addr::new(192, 0, 2, 7))
+        );
+        assert_ne!(k("192.0.2.7"), k("192.0.2.8"));
+        assert_eq!(
+            SourceKey::from(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+            SourceKey::V6Prefix64(0x2001_0db8_0000_0000)
+        );
+        assert_ne!(k("0.0.0.0"), SourceKey::Unspecified);
+        assert_ne!(k("::"), SourceKey::Unspecified);
     }
 }

@@ -112,8 +112,14 @@ fn bench(c: &mut Criterion) {
             let i = n.fetch_add(1, Ordering::Relaxed);
             let url = format!("https://cert.example.com/sti-{i}.pem");
             black_box(
-                rt.block_on(small.get_or_fetch(&url, Duration::from_secs(2)))
-                    .unwrap(),
+                // Distinct source per iteration: measures fetch + validate +
+                // evict, not the shared `Unspecified` per-source budget.
+                rt.block_on(small.get_or_fetch_from(
+                    std::net::IpAddr::from(std::net::Ipv6Addr::from(u128::from(i) << 64)),
+                    &url,
+                    Duration::from_secs(2),
+                ))
+                .unwrap(),
             )
         });
     });

@@ -238,17 +238,15 @@ certificate_url = {{ .Values.sbcDaemon.stirShaken.certificateUrl | quote }}
 {{- end }}
 {{- end }}
 
-[monitoring]
-metrics_bind = {{ .Values.sbcDaemon.config.metrics_listen | quote }}
-per_call_metrics = false
-scrape_interval_secs = 15
+# No [monitoring] table: it is not implemented and the daemon rejects it
+# at config load (POA&M-191; exporter work tracked as POA&M-195).
 
 [grpc]
 # gRPC admin API. Used by sbc-api-server (when sbcApi.enabled) to call
 # TrunkSync / DialPlanSync / DidMappingSync after operator writes, so
 # the SIP router stays in sync without sbc-api going through the
-# daemon's REST endpoint. Distinct port from `[monitoring]` above —
-# both default to 9090 in the Rust schema, which would collide.
+# daemon's REST endpoint. Kept off 9090 (sbcDaemon.config.metrics_listen,
+# reserved for a future metrics exporter).
 # `enabled` defaults to false in the schema, so it MUST be set true
 # here or the gRPC server never starts and sbc-api's writes silently
 # skip the SIP-router refresh step.

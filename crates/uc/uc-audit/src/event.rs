@@ -322,6 +322,90 @@ pub struct CryptoKeyOperation {
     pub operation: KeyOperationType,
     /// Algorithm associated with the key.
     pub algorithm: String,
+    /// Outcome of the operation. Omitted from the serialized form on
+    /// success so records written before this field existed re-serialize
+    /// byte-identically (canonical form, see `record::parse_canonical`).
+    ///
+    /// NIST 800-53 Rev5: AU-3 (outcome of the event)
+    #[serde(default, skip_serializing_if = "KeyOperationOutcome::is_success")]
+    pub outcome: KeyOperationOutcome,
+    /// Failure reason (sanitized: no CR/LF, bounded length). Must never
+    /// contain key material or full file paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Maximum length (bytes) of [`CryptoKeyOperation::reason`].
+pub const MAX_KEY_OPERATION_REASON_LEN: usize = 256;
+
+impl CryptoKeyOperation {
+    /// Successful key operation.
+    #[must_use]
+    pub fn success(
+        key_id: impl Into<String>,
+        operation: KeyOperationType,
+        algorithm: impl Into<String>,
+    ) -> Self {
+        Self {
+            key_id: key_id.into(),
+            operation,
+            algorithm: algorithm.into(),
+            outcome: KeyOperationOutcome::Success,
+            reason: None,
+        }
+    }
+
+    /// Failed key operation. `reason` is sanitized: control characters
+    /// (including CR/LF) are replaced and it is truncated to
+    /// [`MAX_KEY_OPERATION_REASON_LEN`] bytes on a char boundary.
+    ///
+    /// NIST 800-53 Rev5: AU-3, SI-10 (no log injection via reason)
+    #[must_use]
+    pub fn failure(
+        key_id: impl Into<String>,
+        operation: KeyOperationType,
+        algorithm: impl Into<String>,
+        reason: &str,
+    ) -> Self {
+        Self {
+            key_id: key_id.into(),
+            operation,
+            algorithm: algorithm.into(),
+            outcome: KeyOperationOutcome::Failure,
+            reason: Some(sanitize_reason(reason)),
+        }
+    }
+}
+
+fn sanitize_reason(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len().min(MAX_KEY_OPERATION_REASON_LEN));
+    for c in reason.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if out.len() + c.len_utf8() > MAX_KEY_OPERATION_REASON_LEN {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Outcome of a [`CryptoKeyOperation`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyOperationOutcome {
+    /// Operation succeeded.
+    #[default]
+    Success,
+    /// Operation failed.
+    Failure,
+}
+
+impl KeyOperationOutcome {
+    /// `true` for [`KeyOperationOutcome::Success`].
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
 }
 
 /// `DoS` attack type.
@@ -694,6 +778,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn crypto_key_operation_success_is_byte_compatible() {
+        // Golden: pre-outcome-field serialization must be unchanged.
+        let e = AuditEvent::CryptoKeyOperation(CryptoKeyOperation::success(
+            "k",
+            KeyOperationType::Loaded,
+            "ECDSA-P384",
+        ));
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"crypto_key_operation","key_id":"k","operation":"Loaded","algorithm":"ECDSA-P384"}"#
+        );
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        let op = match back {
+            AuditEvent::CryptoKeyOperation(op) => Some(op),
+            _ => None,
+        }
+        .unwrap();
+        assert_eq!(op.outcome, KeyOperationOutcome::Success);
+        assert!(op.reason.is_none());
+    }
+
+    #[test]
+    fn crypto_key_operation_failure_round_trips_and_sanitizes() {
+        let long = format!("bad\r\nINJECT {}", "x".repeat(400));
+        let op = CryptoKeyOperation::failure("k", KeyOperationType::Loaded, "ECDSA-P384", &long);
+        let r = op.reason.clone().unwrap();
+        assert!(!r.contains('\n') && !r.contains('\r'));
+        assert!(r.len() <= MAX_KEY_OPERATION_REASON_LEN);
+        let e = AuditEvent::CryptoKeyOperation(op);
+        assert_eq!(e.event_type(), AuditEventType::Cryptographic);
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""outcome":"failure""#), "{json}");
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        let op = match back {
+            AuditEvent::CryptoKeyOperation(op) => Some(op),
+            _ => None,
+        }
+        .unwrap();
+        assert_eq!(op.outcome, KeyOperationOutcome::Failure);
+    }
+
+    #[test]
     fn audit_records_dropped_serializes_snake_case_and_is_security() {
         let d = AuditEvent::AuditRecordsDropped(AuditRecordsDropped {
             count: 3,
@@ -831,5 +958,30 @@ mod tests {
         assert!(json.contains(r#""actor_issuer""#), "{json}");
         let back: AuditEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, AuditEvent::AccountManagement(a) if !a.success));
+    }
+
+    /// QA (POA&M-166, SI-10): every control char is replaced, the cap is
+    /// exact, and truncation never splits a multi-byte char.
+    #[test]
+    fn qa_key_operation_reason_sanitization_edges() {
+        let f = |r: &str| {
+            CryptoKeyOperation::failure("k", KeyOperationType::Loaded, "ECDSA-P384", r)
+                .reason
+                .unwrap()
+        };
+        let r = f("a\tb\0c\x1bd\x7fe\u{85}f");
+        assert!(!r.chars().any(char::is_control), "{r:?}");
+        assert_eq!(r, "a b c d e f");
+        let exact = "x".repeat(MAX_KEY_OPERATION_REASON_LEN);
+        assert_eq!(f(&exact), exact);
+        let r = f(&format!(
+            "{}\u{20ac}",
+            "x".repeat(MAX_KEY_OPERATION_REASON_LEN - 1)
+        ));
+        assert_eq!(r.len(), MAX_KEY_OPERATION_REASON_LEN - 1);
+        let r = f(&"\u{20ac}".repeat(200));
+        assert!(r.len() <= MAX_KEY_OPERATION_REASON_LEN);
+        assert_eq!(r.len() % 3, 0);
+        assert_eq!(f(""), "");
     }
 }

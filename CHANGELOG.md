@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC config, live batch POA&M-190..192, 166)
+
+- **SBC: `[monitoring]` and `[telemetry.otlp]` are now rejected at config
+  load.** (CM-6, CM-7, SI-10; POA&M-191) Before, both tables were parsed and
+  silently ignored: no metrics exporter, SNMP, syslog or OTLP exporter
+  read them. This covers every `[monitoring]` key, including
+  `[monitoring.snmp]` and `[monitoring.syslog]` (`[cdr.syslog]` is a
+  different table, still supported, and not affected). **We chose to reject
+  rather than warn.** A setting that loads and is then ignored makes
+  operators and assessors think monitoring or OTLP export is running when it
+  is not. A log warning is easy to miss, and a failed start is not.
+  **Upgrade:** remove these tables from `sbc.toml` before upgrading. In a
+  mixed-version cluster, old nodes still accept the tables and new nodes
+  refuse them, so remove them from the shared config first.
+- **SBC: the TLS private key must match `security.curve`.** (SC-12, SC-13;
+  POA&M-166) The SIP-TLS listener key and the trunk mTLS client key are
+  loaded pinned to the configured curve. A P-521 key with
+  `curve = "P-384"` (or the reverse) now stops startup.
+- **SBC: new `stir_shaken.verification.max_fetches_per_source` key
+  (default 4; must be in `1..=max_concurrent_fetches`).** (SC-5; POA&M-190)
+  This caps concurrent x5u certificate fetches per source (IPv4 address or
+  IPv6 /64). Sources that can't be identified share one budget. **Upgrade:**
+  if you set `max_concurrent_fetches` below 4, also set
+  `max_fetches_per_source` to that value or lower, or config load fails.
+  When verification is on and `x5u_allow_hosts` is empty, startup logs a
+  warning.
+- **Helm (`deploy/helm/sbc`): `[monitoring]` is no longer rendered into
+  `sbc.toml`.** `sbcDaemon.config.metrics_listen` is kept but reserved.
+  `services.metrics.enabled` now defaults to `false`, because the
+  `<release>-metrics` Service pointed at port 9090 and nothing listens
+  there. Before re-enabling it, check whether anything scrapes it.
+
+### Added
+
+- **SBC audit schema (additive):** `CryptoKeyOperation` events gain
+  `outcome` (`failure`) and `reason` (sanitised, at most 256 bytes, file
+  names only). Both fields are omitted on success, so success records are
+  byte-identical to before. SIEM parsers should treat both as optional. TLS
+  key load at startup and gRPC `ReloadTls` now emit these events (AU-2,
+  AU-3, SC-12; POA&M-166).
+
+### Changed
+
+- **SBC routing:** partition-scoped route lookups use a per-partition index.
+  Results and ordering are unchanged (POA&M-192).
+
 ### Security
 
 - **SBC: TLS private key files are checked at load and the key curve is

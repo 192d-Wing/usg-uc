@@ -82,12 +82,41 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_header_manipulation(config)?;
     validate_topology_hiding(config)?;
     validate_cdr(&config.cdr)?;
+    validate_unimplemented(config)?;
     #[cfg(feature = "cluster")]
     validate_cluster_admission(config)?;
     if let Some(grpc) = &config.grpc {
         validate_grpc(grpc)?;
     }
 
+    Ok(())
+}
+
+/// Rejects config tables that are parsed but not implemented, so an
+/// operator is never told by a clean config load that SNMP, syslog,
+/// Prometheus or OTLP export (with its TLS and auth headers) is active.
+/// The `[telemetry.otlp]` rejection only exists when sbc-config is built
+/// with the `telemetry` feature (the daemon enables it); without it the
+/// table is dropped as an unknown key, not rejected.
+///
+/// ## NIST 800-53 Rev5: CM-6, CM-7, SA-8 (POA&M-191)
+fn validate_unimplemented(config: &SbcConfig) -> ConfigResult<()> {
+    if config.monitoring.is_some() {
+        return Err(ConfigError::Validation {
+            message: "[monitoring] (metrics_bind, per_call_metrics, scrape_interval_secs, \
+                      snmp, syslog) is not implemented; remove it. Prometheus/SNMP/syslog \
+                      export is not available; use [cdr.syslog] for CDR forwarding"
+                .to_string(),
+        });
+    }
+    #[cfg(feature = "telemetry")]
+    if config.telemetry.as_ref().is_some_and(|t| t.otlp.is_some()) {
+        return Err(ConfigError::Validation {
+            message: "[telemetry.otlp] is not implemented (export, tls and headers are not \
+                      applied); remove it"
+                .to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -609,6 +638,12 @@ fn validate_stir_verification(ss: &crate::schema::StirShakenConfig) -> ConfigRes
         v.max_concurrent_fetches as u64,
         1,
         1024,
+    )?;
+    bounded(
+        "max_fetches_per_source",
+        v.max_fetches_per_source as u64,
+        1,
+        v.max_concurrent_fetches as u64,
     )?;
     bounded(
         "trust_anchor_refresh_secs",
@@ -1874,7 +1909,10 @@ max_passport_age_secs = 30
             ),
             (
                 "max_concurrent_fetches",
-                |v, x| v.max_concurrent_fetches = usize::try_from(x).unwrap(),
+                |v, x| {
+                    v.max_concurrent_fetches = usize::try_from(x).unwrap();
+                    v.max_fetches_per_source = 1;
+                },
                 1,
                 1024,
             ),
@@ -1907,6 +1945,54 @@ max_passport_age_secs = 30
         let mut c = SbcConfig::default();
         c.stir_shaken.verification.cert_fetch_timeout_ms = 0;
         assert_rejected(&c, "cert_fetch_timeout_ms");
+    }
+
+    /// POA&M-190: per-source fetch budget is `1..=max_concurrent_fetches`.
+    #[test]
+    fn stir_max_fetches_per_source_bounds() {
+        let mut c = stir_verify_ok();
+        assert_eq!(c.stir_shaken.verification.max_fetches_per_source, 4);
+        for bad in [0, c.stir_shaken.verification.max_concurrent_fetches + 1] {
+            c.stir_shaken.verification.max_fetches_per_source = bad;
+            assert_rejected(&c, "max_fetches_per_source");
+        }
+        c.stir_shaken.verification.max_fetches_per_source =
+            c.stir_shaken.verification.max_concurrent_fetches;
+        assert!(validate_config(&c).is_ok());
+        c.stir_shaken.verification.max_concurrent_fetches = 2;
+        c.stir_shaken.verification.max_fetches_per_source = 3;
+        assert_rejected(&c, "max_fetches_per_source");
+    }
+
+    /// POA&M-191: unimplemented `[monitoring]` keys are rejected at load,
+    /// each on its own; `[cdr.syslog]` (implemented) is unaffected.
+    #[test]
+    fn monitoring_table_rejected_at_load() {
+        for body in [
+            "[monitoring]\n",
+            "[monitoring]\nmetrics_bind = \"127.0.0.1:9090\"\n",
+            "[monitoring]\nper_call_metrics = true\n",
+            "[monitoring]\nscrape_interval_secs = 30\n",
+            "[monitoring.snmp]\n",
+            "[monitoring.syslog]\n",
+        ] {
+            let e = crate::load_from_str(body).unwrap_err().to_string();
+            assert!(e.contains("monitoring"), "{body}: {e}");
+        }
+        assert!(crate::load_from_str("").is_ok(), "default config loads");
+    }
+
+    /// POA&M-191: `[telemetry.otlp]` is rejected; `[telemetry]` alone loads.
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn telemetry_otlp_rejected_at_load() {
+        let e = crate::load_from_str(
+            "[telemetry.otlp]\nendpoint = \"https://otel.example.com:4317\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("telemetry.otlp"), "{e}");
+        assert!(crate::load_from_str("[telemetry]\n").is_ok());
     }
 
     #[test]
