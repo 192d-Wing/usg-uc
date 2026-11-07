@@ -53,13 +53,9 @@ impl NumberTransform {
                 }
             }
             Self::AddPrefix { prefix } => format!("{prefix}{number}"),
-            Self::ReplacePrefix { from, to } => {
-                if let Some(rest) = number.strip_prefix(from.as_str()) {
-                    format!("{to}{rest}")
-                } else {
-                    number.to_string()
-                }
-            }
+            Self::ReplacePrefix { from, to } => number
+                .strip_prefix(from.as_str())
+                .map_or_else(|| number.to_string(), |rest| format!("{to}{rest}")),
             Self::Replace {
                 number: replacement,
             } => replacement.clone(),

@@ -36,7 +36,7 @@
 //! | lwsruri | 3.1.2.8 | invalid | Reject | |
 //! | lwsstart | 3.1.2.9 | invalid | Reject | multiple SP |
 //! | trws | 3.1.2.10 | invalid | Reject | trailing SP |
-//! | escruri | 3.1.2.11 | invalid | KnownGap: Accept | URI grammar rewrite out of scope |
+//! | escruri | 3.1.2.11 | invalid | Reject | URI headers not allowed in Request-URI (POA&M-150) |
 //! | baddate | 3.1.2.12 | invalid | KnownGap: Accept | Date semantics outside message layer |
 //! | regbadct | 3.1.2.13 | invalid | KnownGap: Accept | name-addr vs addr-spec `?` not checked |
 //! | badaspec | 3.1.2.14 | invalid | KnownGap: Accept | addr-spec LWS not checked |
@@ -47,8 +47,8 @@
 //! | bigcode | 3.1.2.19 | invalid | Reject | 3DIGIT status code |
 //! | badbranch | 3.2.1 | valid | Accept | |
 //! | insuf | 3.3.1 | parse ok, 400 | AcceptInsufficient | |
-//! | unkscm | 3.3.2 | parse ok, 416 | KnownGap: Reject | URI parser rejects unknown schemes |
-//! | novelsc | 3.3.3 | parse ok, 416 | KnownGap: Reject | as unkscm |
+//! | unkscm | 3.3.2 | parse ok, 416 | Reject416 | parse fails with `UnsupportedUriScheme`, `status_code() == 416` (POA&M-150) |
+//! | novelsc | 3.3.3 | parse ok, 416 | Reject416 | as unkscm |
 //! | unksm2 | 3.3.4 | valid | Accept | |
 //! | bext01 | 3.3.5 | valid | Accept | |
 //! | invut | 3.3.6 | valid | Accept | |
@@ -76,6 +76,9 @@ enum Expect {
     GapAccept(&'static str),
     /// Current behaviour is reject, RFC says accept (reason documented).
     GapReject(&'static str),
+    /// Rejected with `UnsupportedUriScheme` mapping to 416 (RFC 3261
+    /// §8.2.2.1).
+    Reject416,
 }
 
 fn check(name: &str, data: &[u8], expect: Expect) {
@@ -106,6 +109,14 @@ fn check(name: &str, data: &[u8], expect: Expect) {
                 "{name}: expected missing mandatory header"
             );
         }
+        Expect::Reject416 => {
+            let e: SipError = r.err().unwrap_or_else(|| panic!("{name}: expected 416"));
+            assert!(
+                matches!(e, SipError::UnsupportedUriScheme { .. }),
+                "{name}: {e}"
+            );
+            assert_eq!(e.status_code(), 416, "{name}");
+        }
         Expect::Reject | Expect::GapReject(_) => {
             let e: SipError = r
                 .err()
@@ -128,7 +139,7 @@ macro_rules! vector {
     };
 }
 
-use Expect::{Accept, AcceptInsufficient, GapAccept, GapReject, Reject};
+use Expect::{Accept, AcceptInsufficient, GapAccept, GapReject, Reject, Reject416};
 
 // 3.1.1 Valid messages
 vector!(wsinv, Accept);
@@ -159,7 +170,7 @@ vector!(ltgtruri, Reject);
 vector!(lwsruri, Reject);
 vector!(lwsstart, Reject);
 vector!(trws, Reject);
-vector!(escruri, GapAccept("URI rewrite out of scope"));
+vector!(escruri, Reject);
 vector!(baddate, GapAccept("Date semantics"));
 vector!(regbadct, GapAccept("addr-spec ? not checked"));
 vector!(badaspec, GapAccept("addr-spec LWS not checked"));
@@ -174,8 +185,8 @@ vector!(badbranch, Accept);
 
 // 3.3 Application layer
 vector!(insuf, AcceptInsufficient);
-vector!(unkscm, GapReject("unknown URI scheme rejected"));
-vector!(novelsc, GapReject("unknown URI scheme rejected"));
+vector!(unkscm, Reject416);
+vector!(novelsc, Reject416);
 vector!(unksm2, Accept);
 vector!(bext01, Accept);
 vector!(invut, Accept);

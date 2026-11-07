@@ -126,7 +126,7 @@ async fn test_association_handle_4way_handshake() {
 
     // Step 2: Server processes INIT and generates INIT-ACK
     let init_ack_chunks = server.process_packet(&init_packet).await.unwrap();
-    assert!(!init_ack_chunks.is_empty());
+    assert_ne!(init_ack_chunks, [] as [uc_transport::sctp::Chunk; 0]);
     assert!(init_ack_chunks.iter().any(is_init_ack));
 
     // Step 3: Client processes INIT-ACK and generates COOKIE-ECHO
@@ -140,7 +140,7 @@ async fn test_association_handle_4way_handshake() {
     }
 
     let cookie_echo_chunks = client.process_packet(&init_ack_packet).await.unwrap();
-    assert!(!cookie_echo_chunks.is_empty());
+    assert_ne!(cookie_echo_chunks, [] as [uc_transport::sctp::Chunk; 0]);
     assert!(cookie_echo_chunks.iter().any(is_cookie_echo));
 
     // Step 4: Server processes COOKIE-ECHO and generates COOKIE-ACK
@@ -154,7 +154,7 @@ async fn test_association_handle_4way_handshake() {
     }
 
     let cookie_ack_chunks = server.process_packet(&cookie_echo_packet).await.unwrap();
-    assert!(!cookie_ack_chunks.is_empty());
+    assert_ne!(cookie_ack_chunks, [] as [uc_transport::sctp::Chunk; 0]);
     assert!(cookie_ack_chunks.iter().any(is_cookie_ack));
 
     // Server should now be established
@@ -329,7 +329,7 @@ async fn test_association_handle_abort() {
 
     // Abort the association
     let abort_actions = client.abort().await;
-    assert!(!abort_actions.is_empty());
+    assert_ne!(abort_actions, [] as [uc_transport::sctp::StateAction; 0]);
 
     // Client should be closed
     assert_eq!(client.state().await, AssociationState::Closed);
@@ -427,6 +427,6 @@ async fn test_heartbeat_handling() {
 
     // Server should respond with heartbeat ack
     let response = server.process_packet(&hb_packet).await.unwrap();
-    assert!(!response.is_empty());
+    assert_ne!(response, [] as [uc_transport::sctp::Chunk; 0]);
     assert!(response.iter().any(is_heartbeat_ack));
 }

@@ -571,17 +571,26 @@ sbcDaemon:
     grpc_listen: "0.0.0.0:9091"
 
   # Topology hiding (NIST SC-7): anonymize the SBC's internal signaling host
-  # in the Via/Contact of outbound trunk-facing INVITEs so internal topology
+  # in the Via/Contact/Record-Route of outbound trunk-facing initial INVITEs
+  # (B-leg only; responses/in-dialog not yet hidden, POA&M-155) so internal topology
   # is not disclosed to carriers. Opt-in; applies only to outside-facing legs
   # (inside-facing legs are never rewritten). Default disabled = no change.
   topologyHiding:
     enabled: false
-    # none | signaling_only (anonymize host) | full (also drops display names)
+    # none | signaling_only (best effort: hides internal hosts, leaves public
+    # hostnames) | full (recommended: hides every host except externalHost)
     mode: signaling_only
     # Public host presented in the anonymized Via/Contact. Empty defaults to
     # sbc.<site.fqdn_base>.
     externalHost: ""
     externalPort: 5060
+    # Port presented for TLS elements (transport=tls / sips:). Default 5061.
+    externalTlsPort: 5061
+    # Extra internal CIDRs / DNS domains, added to the built-in defaults
+    # (RFC1918, 100.64/10, loopback, link-local, ULA; localhost, local,
+    # internal, lan, home.arpa). An invalid entry stops the SBC at startup.
+    internalNetworks: []
+    internalDomains: []
     # The B2BUA already emits a fresh per-leg Call-ID, so Call-ID obfuscation
     # is not applied to B2BUA legs; kept for config-schema completeness.
     obfuscateCallId: false

@@ -407,7 +407,7 @@ mod tests {
             .process_sip_offer(&session_id, sip_sdp)
             .await
             .unwrap();
-        assert!(!response.sdp.is_empty());
+        assert_ne!(response.sdp, "");
     }
 
     #[tokio::test]

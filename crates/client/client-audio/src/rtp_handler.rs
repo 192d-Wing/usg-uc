@@ -1407,7 +1407,7 @@ mod tests {
         assert_eq!(pt, 0);
         assert_eq!(primary_data.len(), 80);
         assert!(primary_data.iter().all(|&b| b == 0xCC));
-        assert!(redundant.is_empty());
+        assert_eq!(redundant, [] as [(u8, u32, &[u8]); 0]);
     }
 
     #[test]
@@ -1758,7 +1758,7 @@ mod tests {
         let jb = SharedJitterBuffer::new(8000, 160, 60);
         let mut rx = RtpReceiver::new(Arc::new(socket), jb);
 
-        assert!(rx.extension_map().is_empty());
+        assert_eq!(rx.extension_map(), []);
         rx.set_extension_map(vec![(
             1,
             "urn:ietf:params:rtp-hdrext:ssrc-audio-level".to_string(),

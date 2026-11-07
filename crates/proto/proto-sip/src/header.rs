@@ -630,6 +630,43 @@ impl Headers {
         self.headers.iter().filter(move |h| h.name == *name)
     }
 
+    /// Gets all headers with the given name, mutably, in message order.
+    ///
+    /// POAM: POA&M-152 - lets callers apply an edit to every instance.
+    pub fn get_all_mut<'a>(
+        &'a mut self,
+        name: &'a HeaderName,
+    ) -> impl Iterator<Item = &'a mut Header> + 'a {
+        self.headers.iter_mut().filter(move |h| h.name == *name)
+    }
+
+    /// Keeps only the headers for which `f` returns true (order preserved).
+    pub fn retain(&mut self, f: impl FnMut(&Header) -> bool) {
+        self.headers.retain(f);
+    }
+
+    /// Renames every instance of `from` to `to` in place (order preserved).
+    pub fn rename_all(&mut self, from: &HeaderName, to: &HeaderName) {
+        for h in self.headers.iter_mut().filter(|h| h.name == *from) {
+            h.name = to.clone();
+        }
+    }
+
+    /// Replaces every instance of `name` with one header per value in
+    /// `values`, positioned where the first original instance was (or
+    /// appended if there was none). An empty `values` removes the header.
+    ///
+    /// POAM: POA&M-151 - per-element rewrite of comma-folded lists.
+    pub fn replace_instances(&mut self, name: &HeaderName, values: Vec<String>) {
+        let idx = self.position(name).unwrap_or(self.headers.len());
+        self.remove(name);
+        let idx = idx.min(self.headers.len());
+        self.headers.splice(
+            idx..idx,
+            values.into_iter().map(|v| Header::new(name.clone(), v)),
+        );
+    }
+
     /// Gets the first header value with the given name.
     #[must_use]
     pub fn get_value(&self, name: &HeaderName) -> Option<&str> {

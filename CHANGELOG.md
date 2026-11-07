@@ -24,6 +24,57 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   bytes are now wiped on drop, and the `open()` buffer is wiped when the
   tag check fails (POA&M-160..164).
 
+- **proto-sip / SBC: SIP URI parser, topology hiding and header manipulation
+  (BREAKING for some configs and malformed peers).** (NIST 800-53 Rev5: SI-10,
+  SC-7, SC-8, SC-5, SC-30, AC-4, CM-6, SI-17; POA&M-150..152)
+  - URIs are parsed per the RFC 3261 §25 grammar. The userinfo delimiter is
+    the last `@`, so `sip:victim;x=@evil.com` now resolves to host
+    `evil.com`. Illegal characters, bad `%` escapes, invalid ports (`:0`,
+    `:70000`, `:abc`) and duplicate `transport`/`user`/`ttl`/`method`/
+    `maddr`/`lr` parameters are rejected instead of being dropped or
+    accepted. URI headers in a Request-URI are rejected. New
+    `SipUri::equivalent` (§19.1.4) and generic `Uri` (`sip`/`tel`/other).
+  - A Request-URI with a non-SIP scheme (`tel:`, `urn:` ...) is answered
+    **416 Unsupported URI Scheme** instead of being dropped.
+  - Topology hiding matches internal hosts by CIDR / DNS label, not string
+    prefix, and covers 100.64/10, 127/8, 169.254/16, IPv6 ULA, link-local
+    and IPv4-mapped IPv6. On the B-leg initial INVITE toward an external
+    (trunk) zone, every Via/Contact/Record-Route instance and comma-folded
+    element is rewritten, and an element that cannot be parsed rejects the
+    call (400 plus audit record `sip.topology_hiding.failed:<header>`)
+    instead of being forwarded. Responses relayed back to the caller and
+    in-dialog requests are still not hidden (POA&M-155, open). An invalid
+    `internal_networks`/`internal_domains` entry now stops the SBC at
+    startup instead of being skipped. Contact rewrites keep
+    `transport=tls` / `sips:` and use the new
+    `topology_hiding.external_tls_port` (default 5061). New keys
+    `topology_hiding.internal_networks` and `internal_domains` add to the
+    built-in list. `full` mode is the recommended mode: it hides every host
+    that is not `external_host`. `signaling_only` (basic) is best effort and
+    leaves public hostnames alone. Call-ID obfuscation uses random tokens in
+    a bounded map.
+  - Replace/regex-replace/prepend/append results longer than the 8 KiB
+    header bound are refused before the value is built (SC-5).
+  - Header manipulation now acts on every instance of a header, and
+    conditions match if any instance matches. `set` still collapses to one
+    instance. Output is validated (no CR/LF/CTL, From/To/Contact/Route/CSeq
+    grammar, single From/To/Call-ID/CSeq). An invalid result leaves the
+    headers untouched and the SBC rejects the INVITE with 500 and an audit
+    record (`sip.header_manipulation.failed:<rule>`).
+  - **Config break:** `header_manipulation` rules that target `Via`,
+    `Content-Length`, `CSeq` or `Call-ID` (including compact forms) are
+    refused at load.
+  - **SIEM/alerting:** these failures are written as the existing
+    `AuthorizationDecision` event (granted=false). The schema is unchanged.
+    The new policy values are `sip.header_manipulation.failed:<rule>` and
+    `sip.topology_hiding.failed:<header>`. No Prometheus failure metrics yet
+    (POA&M-156, open), so alert from audit records.
+  - **proto-sip API (client/library consumers):** `obfuscate_call_id`
+    returns `SipResult<String>`. `with_internal_network` was removed (use
+    `try_with_internal_network`). `SipError` gains `UnsupportedUriScheme`,
+    `TopologyHiding` and `ManipulationInvalid`, which breaks exhaustive matches.
+  - Helm: `sbcDaemon.topologyHiding.externalTlsPort`, `internalNetworks`
+    and `internalDomains` are exposed.
 - **Client: SIP-TLS and provisioning HTTPS use the CNSA 2.0 provider.** The
   soft client's SIP-TLS transport (client-core) and the provisioning HTTPS client
   (client-provisioning, which gets a preconfigured rustls config passed to

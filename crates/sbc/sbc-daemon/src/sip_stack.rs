@@ -1094,21 +1094,56 @@ fn audit_call_terminated(addrs: &CallAddresses, reason: uc_audit::event::Termina
     ));
 }
 
+/// Status and audit policy for a B-leg header-manipulation failure: bare
+/// 500 toward the A-leg (no detail echoed, NIST 800-53 Rev5: SI-11).
+fn manipulation_failure(e: &proto_sip::SipError) -> (StatusCode, String) {
+    let rule = match e {
+        proto_sip::SipError::ManipulationInvalid { rule, .. } => rule.as_str(),
+        _ => "unknown",
+    };
+    (
+        StatusCode::SERVER_INTERNAL_ERROR,
+        format!("sip.header_manipulation.failed:{rule}"),
+    )
+}
+
+/// Status and audit policy for a B-leg topology-hiding failure: 400, as the
+/// unparseable element came from the peer (NIST 800-53 Rev5: SC-7).
+fn topology_failure(e: &proto_sip::SipError) -> (StatusCode, String) {
+    let header = match e {
+        proto_sip::SipError::TopologyHiding { header, .. } => header.as_str(),
+        _ => "unknown",
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        format!("sip.topology_hiding.failed:{header}"),
+    )
+}
+
 /// `AuthorizationDecision` for a rejected INVITE (admission or VPS policy).
 fn audit_invite_denied(req: &SipRequest, source: SbcSocketAddr, policy: &str) {
-    audit(uc_audit::AuditEvent::AuthorizationDecision(
-        uc_audit::event::AuthorizationDecision {
-            identity: req
-                .headers
-                .get_value(&HeaderName::From)
-                .map_or_else(|| source.to_string(), extract_uri_from_header),
-            resource: req.uri.to_string(),
-            action: "INVITE".to_string(),
-            granted: false,
-            policy: policy.to_string(),
-            source_ip: Some(source.ip()),
-        },
-    ));
+    audit(invite_denied_event(req, source, policy));
+}
+
+/// Builds the denial record emitted by [`audit_invite_denied`].
+///
+/// ## NIST 800-53 Rev5: AU-3, AU-12
+fn invite_denied_event(
+    req: &SipRequest,
+    source: SbcSocketAddr,
+    policy: &str,
+) -> uc_audit::AuditEvent {
+    uc_audit::AuditEvent::AuthorizationDecision(uc_audit::event::AuthorizationDecision {
+        identity: req
+            .headers
+            .get_value(&HeaderName::From)
+            .map_or_else(|| source.to_string(), extract_uri_from_header),
+        resource: req.uri.to_string(),
+        action: "INVITE".to_string(),
+        granted: false,
+        policy: policy.to_string(),
+        source_ip: Some(source.ip()),
+    })
 }
 
 /// `AuthorizationDecision` (granted) for an emergency call admitted past
@@ -4176,22 +4211,73 @@ impl SipStack {
         self.header_manipulator = Some(manipulator);
     }
 
-    /// Initializes the topology hider from config.
-    pub fn init_topology_hider_from_config(&mut self, config: &sbc_config::TopologyHidingConfig) {
+    /// Builds the topology-hiding config, refusing any `internal_networks`
+    /// or `internal_domains` entry that does not parse. Returns `Ok(None)`
+    /// when hiding is disabled.
+    ///
+    /// NIST 800-53 Rev5: CM-6, SC-7 - a bad entry must not silently shrink
+    /// the set of hidden hosts (fail closed; SEC-001/NIST-002). The config
+    /// loader already rejects these values; this re-check covers paths that
+    /// bypass `validate_config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the offending entry.
+    pub fn topology_config_from(
+        config: &sbc_config::TopologyHidingConfig,
+    ) -> Result<Option<SipTopologyConfig>, String> {
         if !config.enabled {
-            return;
+            return Ok(None);
         }
 
         let mode = match config.mode.as_str() {
             "signaling_only" => TopologyHidingMode::Basic,
             "full" => TopologyHidingMode::Aggressive,
-            _ => return, // "none"
+            _ => return Ok(None), // "none"
         };
 
-        let topo_config = SipTopologyConfig::new(&config.external_host)
+        let mut topo_config = SipTopologyConfig::new(&config.external_host)
             .with_port(config.external_port)
+            .with_tls_port(config.external_tls_port)
             .with_mode(mode)
             .with_call_id_obfuscation(config.obfuscate_call_id);
+        // POA&M-151: operator networks/domains are added to the built-in
+        // defaults.
+        for cidr in &config.internal_networks {
+            let c = cidr.parse::<proto_sip::IpCidr>().map_err(|e| {
+                format!(
+                    "topology_hiding.internal_networks: '{}' is invalid: {e}",
+                    cidr.escape_default()
+                )
+            })?;
+            topo_config = topo_config.with_internal_cidr(c);
+        }
+        for domain in &config.internal_domains {
+            if !sbc_config::validate::is_valid_domain(domain) {
+                return Err(format!(
+                    "topology_hiding.internal_domains: '{}' is not a valid DNS name",
+                    domain.escape_default()
+                ));
+            }
+            topo_config = topo_config.with_internal_domain(domain.clone());
+        }
+        Ok(Some(topo_config))
+    }
+
+    /// Initializes the topology hider from config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error (and leaves the hider unset) if any configured
+    /// internal network or domain is invalid; the server refuses to start
+    /// in that case (see `Server::start`).
+    pub fn init_topology_hider_from_config(
+        &mut self,
+        config: &sbc_config::TopologyHidingConfig,
+    ) -> Result<(), String> {
+        let Some(topo_config) = Self::topology_config_from(config)? else {
+            return Ok(());
+        };
 
         let hider = TopologyHider::new(topo_config);
 
@@ -4203,6 +4289,7 @@ impl SipStack {
         );
 
         self.topology_hider = Some(RwLock::new(hider));
+        Ok(())
     }
 
     /// Returns whether the stack has a storage-backed location service.
@@ -4257,6 +4344,21 @@ impl SipStack {
         // Parse the SIP message
         let message = match SipMessage::parse(data) {
             Ok(msg) => msg,
+            Err(e @ proto_sip::SipError::UnsupportedUriScheme { .. }) => {
+                // RFC 3261 §8.2.2.1: a non-SIP Request-URI (tel:, urn:, ...)
+                // SHOULD be answered 416. POAM: POA&M-150.
+                warn!(error = %e, "Unsupported Request-URI scheme");
+                return unsupported_scheme_response(data).map_or_else(
+                    || ProcessResult::Error {
+                        reason: format!("Parse error: {e}"),
+                    },
+                    |resp| ProcessResult::Response {
+                        message: SipMessage::Response(resp),
+                        destination: source,
+                        flow: Flow::Reply,
+                    },
+                );
+            }
             Err(e) => {
                 warn!(error = %e, "Failed to parse SIP message");
                 return ProcessResult::Error {
@@ -6157,17 +6259,29 @@ impl SipStack {
         // callee can pick the refresher; the SBC relays the refreshes.
         relay_session_timer_request_headers(&req.headers, &mut b_leg_request.headers);
 
-        // 7b. Apply header manipulation to B-leg INVITE
+        // 7b. Apply header manipulation to B-leg INVITE.
+        //
+        // POAM: POA&M-152 - fail closed: a rule that produced invalid output
+        // (or did not run) must not let the unmanipulated headers through, as
+        // a strip rule that did not run is a policy bypass. The A-leg gets a
+        // bare 500 (no detail echoed, NIST 800-53 Rev5: SI-11) and the
+        // denial is audited (AU-12, AC-4).
+        let mut th_failure: Option<(StatusCode, String)> = None;
         if let Some(ref manipulator) = self.header_manipulator {
             let context =
                 ManipulationContext::for_request("INVITE", ManipulationDirection::Outbound);
-            if let Ok(count) = manipulator.apply(&mut b_leg_request.headers, &context)
-                && count > 0
-            {
-                debug!(
-                    rules_applied = count,
-                    "Header manipulation applied to B-leg INVITE"
-                );
+            match manipulator.apply(&mut b_leg_request.headers, &context) {
+                Ok(count) if count > 0 => {
+                    debug!(
+                        rules_applied = count,
+                        "Header manipulation applied to B-leg INVITE"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, "Header manipulation failed; rejecting INVITE");
+                    th_failure = Some(manipulation_failure(&e));
+                }
             }
         }
 
@@ -6178,11 +6292,48 @@ impl SipStack {
         // scoped to outside-facing legs so inside routing is unaffected. The
         // B2BUA already emits a fresh per-leg Call-ID, so no Call-ID rewrite is
         // needed (and it must not change — it is the correlation key).
-        if b_leg_external && let Some(ref hider) = self.topology_hider {
-            hider
+        //
+        // POA&M-151: on this B-leg initial INVITE every Via/Contact/
+        // Record-Route element is rewritten; an element that cannot be
+        // parsed fails closed with 400 instead of being forwarded verbatim
+        // (NIST 800-53 Rev5: SC-7, SI-17).
+        // POAM: POA&M-155 - this is the only call site of the hider:
+        // responses relayed toward the caller (Contact/Record-Route of the
+        // far side) and in-dialog / out-of-dialog non-INVITE requests are
+        // not topology-hidden.
+        // POAM: POA&M-156 - no `sbc_topology_hiding_failures_total` /
+        // manipulation-failure metric; failures are visible only in the
+        // audit trail (SI-4, AU-6).
+        if th_failure.is_none()
+            && b_leg_external
+            && let Some(ref hider) = self.topology_hider
+            && let Err(e) = hider
                 .read()
                 .await
-                .hide_b2bua_request(&mut b_leg_request.headers);
+                .hide_b2bua_request(&mut b_leg_request.headers)
+        {
+            warn!(error = %e, "Topology hiding failed; rejecting INVITE");
+            th_failure = Some(topology_failure(&e));
+        }
+
+        if let Some((status, policy)) = th_failure {
+            audit_invite_denied(req, source, &policy);
+            self.in_flight_invites.write().await.remove(&a_leg_call_id);
+            self.release_slots(
+                trunk_lease.as_ref(),
+                vps_callee.as_deref(),
+                TrunkOutcome::Abandoned,
+            )
+            .await;
+            self.release_rtp_port(b_leg_rtp_port);
+            if let Some(ref pipeline) = self.media_pipeline {
+                let _ = pipeline.remove_session(&session_key).await;
+            }
+            return ProcessResult::Response {
+                message: SipMessage::Response(create_response_from_request(req, status)),
+                destination: source,
+                flow: Flow::Reply,
+            };
         }
 
         // Failover re-sends this INVITE (fresh Call-ID/branch/tag), so keep
@@ -6830,6 +6981,10 @@ impl SipStack {
     }
 
     /// Handles OPTIONS request (keepalive/capability query).
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     async fn handle_options(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -6902,6 +7057,10 @@ impl SipStack {
     }
 
     /// Matches a response to its client transaction.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     async fn match_response_to_transaction(&self) -> ProcessResult {
         // In B2BUA mode, would forward response to appropriate leg
         // For now, just log it
@@ -7104,6 +7263,10 @@ impl SipStack {
     }
 
     /// Ensures a Router exists on the SipStack, creating a default one if needed.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     pub async fn ensure_router(&mut self) {
         if self.router.is_none() {
             let config = RouterConfig {
@@ -7748,6 +7911,36 @@ pub struct ContactSummary {
 }
 
 /// Creates a response from a request, copying required headers.
+/// Builds a 416 (Unsupported URI Scheme) for a request whose Request-URI
+/// has a well-formed non-SIP scheme. The start line's URI is replaced by a
+/// placeholder so the rest of the message can be parsed with the normal
+/// (bounded) parser; only the headers `create_response_from_request` copies
+/// are echoed. Returns `None` if the message still does not parse.
+///
+/// RFC 3261 §8.2.2.1, §21.4.17. NIST 800-53 Rev5: SI-10, SI-11.
+fn unsupported_scheme_response(data: &[u8]) -> Option<proto_sip::message::SipResponse> {
+    let eol = data.windows(2).position(|w| w == b"\r\n")?;
+    let start = std::str::from_utf8(data.get(..eol)?).ok()?;
+    let mut parts = start.splitn(3, ' ');
+    let (method, _uri, version) = (parts.next()?, parts.next()?, parts.next()?);
+    // RFC 3261 §17.1.1.3: ACK is never answered.
+    if method == "ACK" {
+        return None;
+    }
+    let mut patched = Vec::with_capacity(data.len());
+    patched.extend_from_slice(method.as_bytes());
+    patched.extend_from_slice(b" sip:invalid.invalid ");
+    patched.extend_from_slice(version.as_bytes());
+    patched.extend_from_slice(data.get(eol..)?);
+    match SipMessage::parse(&Bytes::from(patched)).ok()? {
+        SipMessage::Request(req) => Some(create_response_from_request(
+            &req,
+            StatusCode::UNSUPPORTED_URI_SCHEME,
+        )),
+        SipMessage::Response(_) => None,
+    }
+}
+
 fn create_response_from_request(
     req: &proto_sip::message::SipRequest,
     status: StatusCode,
@@ -8326,13 +8519,13 @@ fn extract_param<'a>(header_value: &'a str, name: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-pub(crate) mod tests {
+pub mod tests {
     use super::*;
 
     /// For server tests: a stack with trunks t1 (127.0.0.2:5061) and t2
     /// (127.0.0.3:5061), both TLS, and a placed call's primary B-leg INVITE
     /// result (to t1).
-    pub(crate) async fn tls_failover_call(call_id: &str) -> (SipStack, ProcessResult) {
+    pub async fn tls_failover_call(call_id: &str) -> (SipStack, ProcessResult) {
         let stack = trunk_stack_protos(["tls", "tls"]).await;
         let primary = place_call(&stack, call_id)
             .await
@@ -8346,7 +8539,7 @@ pub(crate) mod tests {
     }
 
     /// Active calls on carrier trunk `trunk` (server tests).
-    pub(crate) async fn carrier_active(stack: &SipStack, trunk: &str) -> u32 {
+    pub async fn carrier_active(stack: &SipStack, trunk: &str) -> u32 {
         active(stack, trunk).await
     }
 
@@ -8908,8 +9101,8 @@ pub(crate) mod tests {
         let tag1 = generate_tag();
         let tag2 = generate_tag();
 
-        assert!(!tag1.is_empty());
-        assert!(!tag2.is_empty());
+        assert_ne!(tag1, "");
+        assert_ne!(tag2, "");
         assert!(tag1.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(tag2.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -9392,10 +9585,43 @@ pub(crate) mod tests {
             external_host: "sbc.uc.mil".to_string(),
             external_port: 5060,
             obfuscate_call_id: true,
+            internal_networks: vec!["203.0.113.0/24".to_string()],
+            internal_domains: vec!["corp.test".to_string()],
+            ..Default::default()
         };
 
-        stack.init_topology_hider_from_config(&topo_config);
-        assert!(stack.topology_hider.is_some());
+        stack
+            .init_topology_hider_from_config(&topo_config)
+            .expect("valid topology config");
+        let hider = stack.topology_hider.as_ref().expect("hider").read().await;
+        // POAM-151: configured networks/domains are added to the defaults.
+        assert!(hider.config().is_internal_address("203.0.113.7"));
+        assert!(hider.config().is_internal_address("pbx.corp.test"));
+        assert!(hider.config().is_internal_address("10.0.0.1"));
+        assert!(!hider.config().is_internal_address("10.example.com"));
+    }
+
+    // SEC-001/NIST-002: an unparseable internal network or domain refuses
+    // to enable the hider (and `Server::start` fails) instead of skipping it.
+    #[tokio::test]
+    async fn invalid_internal_network_fails_closed() {
+        for (nets, doms) in [
+            (vec!["10.20.0.0/33".to_string()], vec![]),
+            (vec![], vec!["-bad.example".to_string()]),
+        ] {
+            let mut stack = SipStack::new(SipStackConfig::default());
+            let topo = sbc_config::TopologyHidingConfig {
+                enabled: true,
+                mode: "full".to_string(),
+                external_host: "sbc.example".to_string(),
+                internal_networks: nets,
+                internal_domains: doms,
+                ..Default::default()
+            };
+            assert!(SipStack::topology_config_from(&topo).is_err());
+            assert!(stack.init_topology_hider_from_config(&topo).is_err());
+            assert!(stack.topology_hider.is_none());
+        }
     }
 
     #[tokio::test]
@@ -9411,7 +9637,9 @@ pub(crate) mod tests {
             ..Default::default()
         };
 
-        stack.init_topology_hider_from_config(&topo_config);
+        stack
+            .init_topology_hider_from_config(&topo_config)
+            .expect("disabled config is valid");
         assert!(
             stack.topology_hider.is_none(),
             "Disabled topology hider should be None"
@@ -13790,6 +14018,47 @@ pub(crate) mod tests {
         assert_ne!(c.caller, "+12025550100");
     }
 
+    /// POAM-152: a manipulation rule whose output is invalid fails closed:
+    /// the caller gets a bare 500 and no B-leg INVITE is sent.
+    #[tokio::test]
+    async fn manipulation_invalid_output_fails_closed() {
+        let (mut stack, _em) = cdr_stack().await;
+        stack.init_manipulator_from_config(&sbc_config::HeaderManipulationConfig {
+            global_rules: vec![sbc_config::ManipulationRuleConfig {
+                name: "broken-from".to_string(),
+                direction: "both".to_string(),
+                action: "set".to_string(),
+                header: "From".to_string(),
+                value: "<garbage".to_string(),
+            }],
+            trunk_rules: Vec::new(),
+        });
+        let r = place_call(&stack, "manip-bad@cdr").await;
+        assert!(forwarded(&r, &Method::Invite).is_none(), "no B-leg INVITE");
+        assert_eq!(response_status(&r).map(|(c, _)| c), Some(500));
+    }
+
+    /// POAM-150: a non-SIP Request-URI is answered 416 (RFC 3261 §8.2.2.1).
+    #[tokio::test]
+    async fn tel_request_uri_answered_416() {
+        let (stack, _em) = cdr_stack().await;
+        let req = String::from_utf8(
+            caller_request("OPTIONS", DIALED, "tel416@cdr", 1, None, None).to_vec(),
+        )
+        .unwrap();
+        let (start, rest) = req.split_once("\r\n").unwrap();
+        let mut parts = start.splitn(3, ' ');
+        let method = parts.next().unwrap();
+        let _ = parts.next();
+        let version = parts.next().unwrap();
+        let tel = Bytes::from(format!("{method} tel:+15551234567 {version}\r\n{rest}"));
+        let r = flatten(stack.process_message(&tel, alice(), None).await);
+        assert_eq!(response_status(&r).map(|(c, _)| c), Some(416));
+
+        let ack = Bytes::from(format!("ACK tel:+15551234567 {version}\r\n{rest}"));
+        assert!(unsupported_scheme_response(&ack).is_none());
+    }
+
     /// QA: an answered 911 call is flagged emergency and keeps the dialed
     /// number.
     #[tokio::test]
@@ -16816,5 +17085,107 @@ pub(crate) mod tests {
         assert_eq!(authz[0].policy, "no-tls-trunk");
         drop(capture);
         assert_all_released(&stack).await;
+    }
+
+    // SEC-004 / POA&M-152: a manipulation rule whose output is invalid
+    // fails the INVITE closed: bare 500 to the caller, nothing forwarded,
+    // the denial audited with the rule name, and every slot, RTP port and
+    // in-flight entry released.
+    #[tokio::test]
+    async fn manipulation_failure_rejects_audits_and_releases() {
+        use proto_sip::manipulation::ManipulationCondition;
+        let mut stack = trunk_stack_protos(["udp", "tcp"]).await;
+        let mut policy = ManipulationPolicy::new("egress");
+        policy.add_rule(ManipulationRule::new(
+            "inject",
+            ManipulationCondition::always(),
+            ManipulationAction::add(HeaderName::Custom("X-Bad".to_string()), "a\r\nX-Evil: 1"),
+        ));
+        let mut manipulator = HeaderManipulator::new();
+        manipulator.add_global_policy(policy);
+        stack.header_manipulator = Some(manipulator);
+
+        let capture = uc_audit::capture::start();
+        let results = place_call(&stack, "manip-fail@test").await;
+        assert!(no_invite_forwarded(&results), "{results:?}");
+        let (resp, dest) = responded(&results, 500).expect("500");
+        assert_eq!(dest, alice());
+        assert!(resp.body.is_none(), "no detail echoed (SI-11)");
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1, "{authz:?}");
+        assert_eq!(authz[0].policy, "sip.header_manipulation.failed:inject");
+        assert_eq!(authz[0].action, "INVITE");
+        assert!(!authz[0].granted);
+        assert_eq!(authz[0].source_ip, Some(alice().ip()));
+        drop(capture);
+        assert_all_released(&stack).await;
+        assert!(stack.in_flight_invites.read().await.is_empty());
+        assert!(
+            stack
+                .allocated_ports
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "RTP port released"
+        );
+    }
+
+    // SEC-004 / POA&M-151: the topology-hiding failure seam. The B2BUA
+    // builds its own Via/Contact and manipulation validates them, so an
+    // unparseable element cannot reach the hider end to end; this pins the
+    // hider error, the 400 status, the audit policy string and the record
+    // fields used by the fail-closed block.
+    #[test]
+    fn topology_failure_maps_to_400_and_audit_record() {
+        let hider = TopologyHider::new(
+            SipTopologyConfig::new("sbc.example").with_mode(TopologyHidingMode::Basic),
+        );
+        let raw = "INVITE sip:+15550100@203.0.113.9 SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 10.0.0.5:5060;branch=z9hG4bKth1\r\n\
+            From: <sip:alice@sbc.example>;tag=a1\r\n\
+            To: <sip:+15550100@203.0.113.9>\r\n\
+            Call-ID: th-fail@test\r\n\
+            CSeq: 1 INVITE\r\n\
+            Contact: <tel:+15550199>\r\n\
+            Content-Length: 0\r\n\r\n";
+        let Ok(SipMessage::Request(req)) = SipMessage::parse(&Bytes::from(raw)) else {
+            panic!("test INVITE must parse");
+        };
+        let mut headers = req.headers.clone();
+        let e = hider.hide_b2bua_request(&mut headers).unwrap_err();
+        for name in [HeaderName::Via, HeaderName::Contact] {
+            assert_eq!(
+                headers.get_value(&name),
+                req.headers.get_value(&name),
+                "hider is atomic on failure"
+            );
+        }
+        let (status, policy) = topology_failure(&e);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(policy, "sip.topology_hiding.failed:Contact");
+        assert_eq!(
+            create_response_from_request(&req, status).status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 0, 2, 10), 5060);
+        let uc_audit::AuditEvent::AuthorizationDecision(d) =
+            invite_denied_event(&req, source, &policy)
+        else {
+            panic!("denial must be an AuthorizationDecision");
+        };
+        assert_eq!(d.policy, "sip.topology_hiding.failed:Contact");
+        assert_eq!(d.action, "INVITE");
+        assert!(!d.granted);
+        assert_eq!(d.source_ip, Some(source.ip()));
+        assert_eq!(d.resource, req.uri.to_string());
+        assert!(d.identity.contains("alice@sbc.example"), "{}", d.identity);
+
+        let (status, policy) = manipulation_failure(&proto_sip::SipError::ManipulationInvalid {
+            rule: "r1".to_string(),
+            header: "To".to_string(),
+        });
+        assert_eq!(status, StatusCode::SERVER_INTERNAL_ERROR);
+        assert_eq!(policy, "sip.header_manipulation.failed:r1");
     }
 }

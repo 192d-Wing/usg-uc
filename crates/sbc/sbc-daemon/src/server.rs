@@ -661,7 +661,11 @@ impl Server {
 
         // Initialize topology hiding (if configured)
         if let Some(ref topo) = config.topology_hiding {
-            sip_stack.init_topology_hider_from_config(topo);
+            // CM-6/SC-7: an invalid entry leaves the hider unset and
+            // `start` refuses to run (fail closed, never warn-and-skip).
+            if let Err(e) = sip_stack.init_topology_hider_from_config(topo) {
+                error!(error = %e, "Invalid topology hiding config");
+            }
         }
 
         // Media plane. When SBC_MEDIA_CONTROLLER_URL is set (grpc builds), the
@@ -978,6 +982,13 @@ impl Server {
 
     /// Starts the server and binds to transport addresses.
     pub async fn start(&mut self) -> Result<(), ServerError> {
+        // NIST 800-53 Rev5: CM-6, SC-7 - refuse to start with an internal
+        // network/domain entry that does not parse, even when the config
+        // bypassed `validate_config` (SEC-001/NIST-002).
+        if let Some(ref topo) = self.config.topology_hiding {
+            SipStack::topology_config_from(topo)
+                .map_err(|message| ServerError::ConfigError { message })?;
+        }
         info!(
             version = env!("CARGO_PKG_VERSION"),
             instance = %self.config.general.instance_name,

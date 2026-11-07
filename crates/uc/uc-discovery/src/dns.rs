@@ -227,16 +227,14 @@ pub fn select_weighted_peer(peers: &[DiscoveredPeer]) -> Option<&DiscoveredPeer>
         // If all weights are 0, pick randomly
         let random = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as usize)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos() as usize);
         return Some(same_priority[random % same_priority.len()]);
     }
 
     // Weighted random selection
     let random = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| (d.as_nanos() % u128::from(total_weight)) as u32)
-        .unwrap_or(0);
+        .map_or(0, |d| (d.as_nanos() % u128::from(total_weight)) as u32);
 
     let mut cumulative = 0u32;
     for peer in &same_priority {

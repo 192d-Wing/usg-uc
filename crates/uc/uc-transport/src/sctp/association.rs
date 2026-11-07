@@ -1244,8 +1244,7 @@ impl AssociationInner {
         // Include timestamp in heartbeat info for RTT measurement
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis() as u64);
 
         HeartbeatChunk::new(Bytes::copy_from_slice(&now.to_be_bytes()))
     }
@@ -1257,8 +1256,7 @@ impl AssociationInner {
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_millis() as u64);
 
             let rtt = Duration::from_millis(now.saturating_sub(sent_time));
 
@@ -2614,8 +2612,7 @@ impl AssociationHandle {
         // Include timestamp for RTT measurement
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis() as u64);
 
         // Encode path ID info: timestamp (8 bytes) + local addr + remote addr
         // This allows us to identify the path when HEARTBEAT-ACK returns

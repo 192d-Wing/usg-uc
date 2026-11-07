@@ -1646,7 +1646,7 @@ mod tests {
 
         // No changes
         let changes = Runtime::detect_config_changes(&config1, &config2);
-        assert!(changes.is_empty());
+        assert_eq!(changes, [] as [std::string::String; 0]);
 
         // Change general section
         config2.general.instance_name = "changed-sbc".to_string();

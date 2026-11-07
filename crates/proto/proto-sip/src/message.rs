@@ -699,7 +699,24 @@ impl SipRequest {
         let method: Method = m
             .parse()
             .unwrap_or_else(|e: std::convert::Infallible| match e {});
-        let uri: SipUri = u.parse()?;
+        // POAM: POA&M-150 - parse the generic absoluteURI first so a
+        // well-formed non-SIP scheme (tel:, urn:, ...) is reported as
+        // UnsupportedUriScheme (416, RFC 3261 §8.2.2.1) instead of 400.
+        let uri: SipUri = match u.parse::<crate::uri::Uri>()? {
+            crate::uri::Uri::Sip(uri) => uri,
+            other => {
+                return Err(SipError::UnsupportedUriScheme {
+                    scheme: truncate_for_log(other.scheme()),
+                });
+            }
+        };
+        // RFC 3261 §19.1.1 (table 1): URI headers are not allowed in a
+        // Request-URI (RFC 4475 §3.1.2.11 escruri).
+        if !uri.headers.is_empty() {
+            return Err(SipError::ParseError {
+                reason: "headers not allowed in Request-URI".to_string(),
+            });
+        }
 
         Ok(Self {
             method,

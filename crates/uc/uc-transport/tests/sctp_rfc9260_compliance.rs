@@ -858,7 +858,7 @@ mod section5_association_init {
 
         // Step 2: Server receives INIT, sends INIT-ACK
         let init_ack_chunks = server.process_packet(&init_packet).await.unwrap();
-        assert!(!init_ack_chunks.is_empty());
+        assert_ne!(init_ack_chunks, [] as [uc_transport::sctp::Chunk; 0]);
         assert!(
             init_ack_chunks
                 .iter()
@@ -1447,7 +1447,7 @@ mod section9_termination {
         let actions = assoc.abort().await;
 
         assert_eq!(assoc.state().await, AssociationState::Closed);
-        assert!(!actions.is_empty());
+        assert_ne!(actions, [] as [uc_transport::sctp::StateAction; 0]);
     }
 
     /// RFC 9260 Section 9.1: ABORT chunk format with error causes.
