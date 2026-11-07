@@ -566,6 +566,8 @@ sbcDaemon:
     media_mode: Relay
     srtp_required: true
     api_listen: "0.0.0.0:80"
+    # Reserved: not rendered into sbc.toml. The daemon has no metrics
+    # exporter yet and rejects a [monitoring] table (POA&M-191/195).
     metrics_listen: "0.0.0.0:9090"
     # gRPC admin API — must be distinct from metrics_listen (both default
     # to 9090 in the Rust schema, which collides). sbc-api dials this
@@ -619,4 +621,6 @@ mediaSplit:
 services:
   sip:     { enabled: true }
   api:     { enabled: true }
-  metrics: { enabled: true }
+  # Off: the daemon has no metrics exporter on 9090 yet (POA&M-195);
+  # enabling this creates a Service with no listener behind it.
+  metrics: { enabled: false }

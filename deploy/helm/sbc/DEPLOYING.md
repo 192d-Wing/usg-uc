@@ -171,7 +171,7 @@ sbcDaemon:
 | `image` + `<component>.image` | Image refs | Model A: `localhost/*:local` + `Never`; Model B: `ghcr.io/192d-wing/*:<tag>` + `IfNotPresent` |
 | `auth` | Mgmt-plane admin | Fail-closed: `sbc-api`/`sbc-provision` won't start without a credential. Prefer `adminPasswordHash` (argon2 PHC) to keep plaintext out of values |
 | `sbcPostgres` | Config store | `enabled: true` for the in-chart StatefulSet (set `password`), or `enabled: false` + `existingSecret.name` (key `dsn`) for managed Postgres |
-| `sbcDaemon.config` | SIP tuning | `max_calls`, `max_registrations`, `media_mode`, `srtp_required`, listen addrs (`grpc_listen` must differ from `metrics_listen`) |
+| `sbcDaemon.config` | SIP tuning | `max_calls`, `max_registrations`, `media_mode`, `srtp_required`, listen addrs (`metrics_listen` is reserved and not rendered; the daemon rejects a `[monitoring]` table). The `-metrics` Service (`services.metrics`, port 9090) is off by default and has no listener behind it: no metrics exporter exists (POA&M-195) |
 | `sbcDaemon.sipTls` | SIP-over-TLS | `secretName` of a `kubernetes.io/tls` Secret covering the registrar domain; empty = UDP/TCP only |
 | `sbcDaemon.oidc` | REGISTER authz | RFC 8898 bearer-token REGISTER; requires an IdP (see `sbcClientConfig.oidc`) |
 | `gateway` | Edge HTTPS | Opt-in Gateway API + cert-manager termination; needs the Gateway API CRDs + cert-manager |

@@ -62,6 +62,79 @@ fn audit_rate_limit(
     ));
 }
 
+/// Maps the configured `security.curve` to the curve TLS private keys must
+/// be on.
+///
+/// ## NIST 800-53 Rev5: SC-12, SC-13 (CNSA 2.0 curve consistency)
+pub const fn required_key_curve(
+    curve: uc_types::protocol::CnsaCurve,
+) -> uc_transport::tls::RequiredKeyCurve {
+    match curve {
+        uc_types::protocol::CnsaCurve::P384 => uc_transport::tls::RequiredKeyCurve::P384,
+        uc_types::protocol::CnsaCurve::P521 => uc_transport::tls::RequiredKeyCurve::P521,
+    }
+}
+
+/// Audit algorithm label for `security.curve`.
+pub const fn key_algorithm(curve: uc_types::protocol::CnsaCurve) -> &'static str {
+    match curve {
+        uc_types::protocol::CnsaCurve::P384 => "ECDSA-P384",
+        uc_types::protocol::CnsaCurve::P521 => "ECDSA-P521",
+    }
+}
+
+/// Audit key id: a fixed role plus the key file name only (never the full
+/// path, never file contents).
+pub fn tls_key_id(role: &str, path: &std::path::Path) -> String {
+    path.file_name().map_or_else(
+        || role.to_string(),
+        |n| format!("{role}:{}", n.to_string_lossy()),
+    )
+}
+
+/// Records a TLS key operation (pass or fail) on the audit trail. The
+/// failure reason is the loader's error text, which carries no key
+/// material or path; `CryptoKeyOperation::failure` strips CR/LF and caps it.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-3, AU-12, SC-12
+pub fn audit_tls_key<T, E: std::fmt::Display>(
+    key_id: String,
+    operation: uc_audit::event::KeyOperationType,
+    curve: uc_types::protocol::CnsaCurve,
+    result: &Result<T, E>,
+) {
+    let algorithm = key_algorithm(curve);
+    let event = match result {
+        Ok(_) => uc_audit::event::CryptoKeyOperation::success(key_id, operation, algorithm),
+        Err(e) => uc_audit::event::CryptoKeyOperation::failure(
+            key_id,
+            operation,
+            algorithm,
+            &e.to_string(),
+        ),
+    };
+    uc_audit::log_event(uc_audit::AuditEvent::CryptoKeyOperation(event));
+}
+
+/// Loads a TLS private key that must be on `security.curve`, auditing the
+/// outcome either way.
+///
+/// ## NIST 800-53 Rev5: SC-12, SC-13, AU-12
+fn load_tls_key_audited(
+    role: &str,
+    path: &std::path::Path,
+    curve: uc_types::protocol::CnsaCurve,
+) -> uc_transport::TransportResult<rustls_pki_types::PrivateKeyDer<'static>> {
+    let result = uc_transport::tls::load_private_key_with(path, required_key_curve(curve));
+    audit_tls_key(
+        tls_key_id(role, path),
+        uc_audit::event::KeyOperationType::Loaded,
+        curve,
+        &result,
+    );
+    result
+}
+
 /// Stream connection deadlines from `[transport]`.
 #[derive(Clone, Copy, Debug)]
 struct StreamTimeouts {
@@ -1170,7 +1243,8 @@ impl Server {
             (true, Some(cert), Some(key)) => {
                 let chain = uc_transport::tls::load_certs(cert)
                     .map_err(|e| tls_error(format!("loading {}: {e}", cert.display())))?;
-                let key = uc_transport::tls::load_private_key(key)
+                // POA&M-166: key must be on security.curve; outcome audited.
+                let key = load_tls_key_audited("trunk-mtls-client", key, sec.curve)
                     .map_err(|e| tls_error(format!("loading {}: {e}", key.display())))?;
                 Some(Arc::new(
                     uc_transport::tls::create_client_config_with(
@@ -1309,10 +1383,14 @@ impl Server {
             address: "tls".to_string(),
             reason,
         };
+        // POAM: POA&M-194, the SIP TLS cert/key are loaded once at bind;
+        // they are not hot-reloadable (ReloadTls covers the API acceptor only).
         let cert_chain = uc_transport::tls::load_certs(cert_path)
             .map_err(|e| tls_error(format!("loading {}: {e}", cert_path.display())))?;
-        let private_key = uc_transport::tls::load_private_key(key_path)
-            .map_err(|e| tls_error(format!("loading {}: {e}", key_path.display())))?;
+        // POA&M-166: key must be on security.curve; outcome audited.
+        let private_key =
+            load_tls_key_audited("sip-tls-listener", key_path, self.config.security.curve)
+                .map_err(|e| tls_error(format!("loading {}: {e}", key_path.display())))?;
         // security.min_tls_version and security.require_mtls (with
         // security.tls_ca_path) are enforced here; validate_config already
         // guaranteed the combinations are coherent.
@@ -3095,6 +3173,123 @@ impl Drop for StirConnGuard {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
+    /// Writes a fresh PKCS#8 EC key with mode 0600 into `dir`.
+    #[cfg(unix)]
+    fn write_ec_key(
+        dir: &std::path::Path,
+        name: &str,
+        alg: &'static rcgen::SignatureAlgorithm,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let kp = rcgen::KeyPair::generate_for(alg).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, kp.serialize_pem()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    fn key_ops(events: &[uc_audit::AuditEvent]) -> Vec<uc_audit::event::CryptoKeyOperation> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::CryptoKeyOperation(k) => Some(k.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// POA&M-166: the daemon TLS key loader enforces `security.curve` and
+    /// audits success and failure.
+    #[cfg(unix)]
+    #[test]
+    fn tls_key_load_enforces_curve_and_audits_outcome() {
+        use uc_audit::event::{KeyOperationOutcome, KeyOperationType};
+        use uc_types::protocol::CnsaCurve;
+        let dir = tempfile::tempdir().unwrap();
+        let p384 = write_ec_key(dir.path(), "p384.key", &rcgen::PKCS_ECDSA_P384_SHA384);
+        let capture = uc_audit::capture::start();
+
+        assert!(load_tls_key_audited("sip-tls-listener", &p384, CnsaCurve::P384).is_ok());
+        let err = load_tls_key_audited("trunk-mtls-client", &p384, CnsaCurve::P521);
+        assert!(
+            err.is_err(),
+            "P-384 key must be rejected under P-521 config"
+        );
+
+        let ops = key_ops(&capture.events());
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].key_id, "sip-tls-listener:p384.key");
+        assert_eq!(ops[0].operation, KeyOperationType::Loaded);
+        assert_eq!(ops[0].outcome, KeyOperationOutcome::Success);
+        assert_eq!(ops[0].algorithm, "ECDSA-P384");
+        assert_eq!(ops[1].key_id, "trunk-mtls-client:p384.key");
+        assert_eq!(ops[1].outcome, KeyOperationOutcome::Failure);
+        assert_eq!(ops[1].algorithm, "ECDSA-P521");
+        let reason = ops[1].reason.as_deref().unwrap();
+        assert!(reason.contains("curve"), "{reason}");
+        assert!(
+            !reason.contains(dir.path().to_string_lossy().as_ref()),
+            "reason must not carry the key path"
+        );
+    }
+
+    /// QA: reverse curve mismatch (P-521 key under P-384 baseline) also
+    /// fails closed; P-521 key under P-521 config succeeds. One event each.
+    #[test]
+    fn qa_tls_key_load_p521_key_curve_matrix() {
+        use uc_audit::event::KeyOperationOutcome;
+        use uc_types::protocol::CnsaCurve;
+        let dir = tempfile::tempdir().unwrap();
+        let p521 = write_ec_key(dir.path(), "p521.key", &rcgen::PKCS_ECDSA_P521_SHA512);
+        let capture = uc_audit::capture::start();
+        assert!(load_tls_key_audited("sip-tls-listener", &p521, CnsaCurve::P384).is_err());
+        assert!(load_tls_key_audited("sip-tls-listener", &p521, CnsaCurve::P521).is_ok());
+        let ops = key_ops(&capture.events());
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].outcome, KeyOperationOutcome::Failure);
+        assert_eq!(ops[0].algorithm, "ECDSA-P384");
+        assert_eq!(ops[1].outcome, KeyOperationOutcome::Success);
+        assert_eq!(ops[1].algorithm, "ECDSA-P521");
+        assert!(ops[1].reason.is_none());
+    }
+
+    /// QA: missing-file failure reason carries neither the directory path
+    /// nor CR/LF.
+    #[test]
+    fn qa_tls_key_load_missing_file_reason_sanitized() {
+        let capture = uc_audit::capture::start();
+        let r = load_tls_key_audited(
+            "trunk-mtls-client",
+            std::path::Path::new("/qa-secret-dir/sub/client.key"),
+            uc_types::protocol::CnsaCurve::P384,
+        );
+        assert!(r.is_err());
+        let ops = key_ops(&capture.events());
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].key_id, "trunk-mtls-client:client.key");
+        let reason = ops[0].reason.as_deref().unwrap_or("");
+        assert!(!reason.contains('\n') && !reason.contains('\r'));
+        assert!(!reason.contains("/qa-secret-dir"), "{reason}");
+    }
+
+    /// A missing key file is a failure event too (fail closed, audited).
+    #[test]
+    fn tls_key_load_missing_file_audits_failure() {
+        let capture = uc_audit::capture::start();
+        let r = load_tls_key_audited(
+            "sip-tls-listener",
+            std::path::Path::new("/nonexistent/sbc-test.key"),
+            uc_types::protocol::CnsaCurve::P384,
+        );
+        assert!(r.is_err());
+        let ops = key_ops(&capture.events());
+        assert_eq!(ops.len(), 1);
+        assert_eq!(
+            ops[0].outcome,
+            uc_audit::event::KeyOperationOutcome::Failure
+        );
+    }
     use super::*;
 
     #[test]

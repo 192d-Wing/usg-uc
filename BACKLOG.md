@@ -129,11 +129,18 @@ DORMANT items before anyone wires them in.
   Reject at config load and in the API (400).
   Fixed 2026-11-06 (PR 172):
   `DialPattern::from_kind`, API 400, sync/seed skip.
-- [ ] **MINOR, LIVE — STI fetch pool can be starved** when
+- [x] **MINOR, LIVE — STI fetch pool can be starved** when
   `stir_shaken.verification.allow_hosts` is empty (`uc-sti/src/cache.rs:368`).
   Require or loudly warn on empty `allow_hosts`; per-source fetch budget.
-- [ ] **NIT, LIVE — `SbcRouter::route` scans every pattern per partition per
+  Fixed 2026-11-07 (fix/live-batch-190): POA&M-190, per-source budget
+  `stir_shaken.verification.max_fetches_per_source` (default 4, IPv6 per /64,
+  `get_or_fetch_from`), startup `warn!` on empty `x5u_allow_hosts` (warn, not
+  error). Residual: shared carrier IP, /48 holders, spoofed UDP (POA&M-196);
+  `busy_source` not exported as a metric.
+- [x] **NIT, LIVE — `SbcRouter::route` scans every pattern per partition per
   call.** Index patterns by partition.
+  Fixed 2026-11-07 (fix/live-batch-190): POA&M-192, `by_partition` index,
+  test `partition_index_matches_linear_reference`. No bench (perf unmeasured).
 - [ ] **BLOCKER if wired, DORMANT — Diameter accepts everyone**
   (`uc-aaa/src/diameter.rs:223-360`, `send_mar` returns accept). Return an error
   or remove; POA&M so nobody enables the `aaa` feature.
@@ -337,13 +344,20 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
   RSA/P-256 keys rejected, `load_private_key_with` gives an exact curve match
   (POA&M-164, fix/crypto-key-zeroize). Residual: symlinked parent dirs and
   copies inside rustls/aws-lc not wiped (POA&M-165). Non-unix builds refuse key loading (fail closed).
-- [ ] **MINOR, LIVE — `security.curve` isn't passed to TLS key loading**
+- [x] **MINOR, LIVE — `security.curve` isn't passed to TLS key loading**
   (POA&M-166). `sbc-daemon/src/server.rs:1162,1303` call `load_private_key`,
   which accepts P-384 or P-521; switch to
   `load_private_key_with(path, security.curve)` so a P-384 config rejects a
   P-521 key (and vice versa). Also emit a `CryptoKeyOperation` audit event
   (AU-2, AU-12) with outcome on TLS key load and on every cert reload,
   pass or fail (uc-transport has no audit sink).
+  Fixed 2026-11-07 (fix/live-batch-190): daemon SIP-TLS listener and trunk
+  mTLS keys use `load_private_key_with(security.curve)` and emit
+  `CryptoKeyOperation` (outcome, sanitized reason); gRPC `ReloadTls` audited.
+  The REST/API acceptor and REST reload path are NOT covered (SEC-003):
+  no curve pin, no audit (POA&M-193). SIP TLS not hot-reloadable (POA&M-194).
+  Curve pin for the REST acceptor added 2026-11-07 (fix/mgmt-api-hardening);
+  REST reload audit still open (POA&M-193, POA&M-214).
 - [x] **MINOR, LIVE (client) — uc-dns resolver built without a DNS backend**
   (`uc-dns/src/resolver.rs:163`, `client-sip-ua/src/call_agent.rs:3144`), so
   NAPTR/SRV are never queried; RFC 3263 isn't actually done.
@@ -452,13 +466,23 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   logs (`sbc-provision-server/src/main.rs:309`).
   Log exposure fixed 2026-11-06 (phone-cfg-escape): span drops the query.
   Expiry, revocation and token-in-URL remain as POA&M-120.
-- [ ] **MINOR, LIVE — `[telemetry.otlp]` accepted but ignored** (feature off),
+- [x] **MINOR, LIVE — `[telemetry.otlp]` accepted but ignored** (feature off),
   and `tls`/`headers` never applied even with it on. Reject or require https.
-- [ ] **MINOR, LIVE — unenforced config keys accepted** (`monitoring.snmp`,
+  Fixed 2026-11-07 (fix/live-batch-190): POA&M-191, rejected at config load
+  (requires sbc-config `telemetry` feature, which the daemon enables). No
+  exporter exists (POA&M-195).
+- [x] **MINOR, LIVE — unenforced config keys accepted** (`monitoring.snmp`,
   `monitoring.syslog`, possibly `metrics_bind`, `per_call_metrics`,
   `scrape_interval_secs`; `sbc-config/src/schema.rs:1173`). Verify and reject.
+  Fixed 2026-11-07 (fix/live-batch-190): POA&M-191, every key verified
+  unread; whole `[monitoring]` table rejected at load, `deny_unknown_fields`;
+  Helm no longer renders it. Residual: Helm `-metrics` Service on 9090 has no
+  listener (docs note only); POA&M-195.
 - [ ] **NIT, LIVE — audit timestamp taken on caller thread, sequence in writer**
   (order can differ); **metric label map unbounded** (no labelled series yet).
+  Timestamp half fixed by #174 (writer assigns both); regression test
+  `timestamps_non_decreasing_in_sequence_order` added 2026-11-07
+  (fix/live-batch-190). Metric label map half still open.
 - [ ] **MAJOR, DORMANT — uc-storage ignores `ssl_mode` and Redis `tls`**
   (default `Prefer`), and logs/Debug-prints URLs with embedded passwords
   (`uc-storage/src/config.rs`, `postgres.rs:37`, `redis.rs:33`). Apply TLS,
