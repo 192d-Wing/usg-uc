@@ -168,6 +168,10 @@ sbcPostgres:
 # daemon's API ClusterIP to sbc-api's, so operator/dashboard traffic
 # stops sharing a process lifecycle with SIP.
 sbcApi:
+  # Absolute path for the hash-chained audit file (SBC_API_AUDIT_PATH).
+  # Unset = audit to tracing only. When set, startup fails closed if the file
+  # cannot be opened; mount a writable volume (dir 0750, not group/world-writable).
+  auditPath: ""
   enabled: true
   replicas: 2                            # rolling update needs >1
   image:

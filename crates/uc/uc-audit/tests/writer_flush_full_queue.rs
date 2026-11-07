@@ -22,4 +22,5 @@ fn flush_with_full_queue_waits_for_drain() {
     // Shutdown flush with a generous timeout must wait for the drain.
     assert!(uc_audit::flush(Duration::from_secs(10)));
     assert_eq!(mem.records().len(), AUDIT_QUEUE_CAPACITY + 1);
+    assert_eq!(uc_audit::dropped_records(), 0);
 }

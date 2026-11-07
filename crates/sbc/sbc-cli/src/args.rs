@@ -48,6 +48,8 @@ pub enum Command {
     Trunk(TrunkCommand),
     /// Call Detail Records.
     Cdrs(CdrsCommand),
+    /// Audit trail tools.
+    Audit(AuditCommand),
     /// Health check.
     Health,
     /// Show metrics.
@@ -110,6 +112,18 @@ pub enum CdrsCommand {
     Export { filter: CdrsFilter, format: String },
     /// Verify CDR files offline (hash chain, sidecar digest).
     Verify { files: Vec<String> },
+}
+
+/// `audit` subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditCommand {
+    /// Verify uc-audit files offline (hash chain, sequence continuity).
+    /// `require_anchor` fails when the first file does not start at
+    /// sequence 0 (its head may have been deleted).
+    Verify {
+        files: Vec<String>,
+        require_anchor: bool,
+    },
 }
 
 /// Configuration subcommands.
@@ -200,6 +214,7 @@ impl Args {
                 "calls" => Self::parse_calls_command(&mut iter),
                 "trunk" => Self::parse_trunk_command(&mut iter),
                 "cdrs" => Self::parse_cdrs_command(&mut iter, &mut args),
+                "audit" => Self::parse_audit_command(&mut iter),
                 "health" => Command::Health,
                 "metrics" => Command::Metrics,
                 "version" => Command::Version,
@@ -331,6 +346,32 @@ impl Args {
         Command::Cdrs(cmd)
     }
 
+    /// Parses `audit` subcommand. Every remaining argument is a file,
+    /// except `--require-anchor`.
+    fn parse_audit_command(iter: &mut impl Iterator<Item = String>) -> Command {
+        match iter.next().as_deref() {
+            Some("verify") => {
+                let mut require_anchor = false;
+                let files = iter
+                    .filter(|a| {
+                        let flag = a == "--require-anchor";
+                        require_anchor |= flag;
+                        !flag
+                    })
+                    .collect();
+                Command::Audit(AuditCommand::Verify {
+                    files,
+                    require_anchor,
+                })
+            }
+            Some(other) => {
+                eprintln!("Unknown audit subcommand: {other}");
+                Command::Help
+            }
+            None => Command::Help,
+        }
+    }
+
     /// Prints help information.
     pub fn print_help() {
         println!(
@@ -361,6 +402,9 @@ COMMANDS:
         verify <FILE>.. Verify CDR files offline (hash chain, .sha384 sidecar)
         FILTERS: --since 1h --caller X --callee X --disposition D
                  --trunk T --limit N
+    audit               Audit trail
+        verify [--require-anchor] <FILE>..
+                        Verify audit files offline (hash chain, sequence)
     health              Perform health check
     metrics             Show Prometheus metrics
     version             Show version information
@@ -386,6 +430,7 @@ EXAMPLES:
     sbc-cli cdrs list --since 1h --disposition failed
     sbc-cli cdrs export --format csv > cdrs.csv
     sbc-cli cdrs verify /var/lib/usg-sbc/cdr/*.jsonl
+    sbc-cli audit verify /var/log/sbc/audit.log
     sbc-cli --grpc-url http://sbc-daemon:9091 trunk registrations
 
 For more information, see the documentation at https://github.com/usg/usg-uc-sbc"
@@ -443,6 +488,29 @@ mod tests {
             cmd_files(cmd),
             vec!["a.jsonl".to_string(), "b.jsonl".to_string()]
         );
+    }
+
+    #[test]
+    fn audit_verify_parses_files() {
+        let it = ["verify", "a.log", "b.log"].map(String::from);
+        let cmd = Args::parse_audit_command(&mut it.into_iter());
+        assert!(
+            matches!(&cmd, Command::Audit(AuditCommand::Verify { files, require_anchor: false })
+                if files == &["a.log".to_string(), "b.log".to_string()]),
+            "{cmd:?}"
+        );
+        let it = ["verify", "--require-anchor", "a.log"].map(String::from);
+        let cmd = Args::parse_audit_command(&mut it.into_iter());
+        assert!(
+            matches!(&cmd, Command::Audit(AuditCommand::Verify { files, require_anchor: true })
+                if files == &["a.log".to_string()]),
+            "{cmd:?}"
+        );
+        let it = ["bogus"].map(String::from);
+        assert!(matches!(
+            Args::parse_audit_command(&mut it.into_iter()),
+            Command::Help
+        ));
     }
 
     fn cmd_files(cmd: Command) -> Vec<String> {

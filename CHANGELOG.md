@@ -11,6 +11,44 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Security
 
+- **SBC: audit trail integrity (uc-audit) (BREAKING for SIEM parsers and
+  alerting).** (NIST 800-53 Rev5: AU-5, AU-9, AU-10, AU-8, SI-10)
+  - Audit sink writes can now fail and are counted. A write error (for
+    example ENOSPC) no longer drops records silently. New gauge
+    `sbc_audit_write_failures`, and the `audit` health component reports
+    Unhealthy while the sink is failing. **Alert change:**
+    `sbc_audit_records_dropped` now counts queue drops plus sink write
+    failures, so existing thresholds may fire more often.
+  - The hash chain resumes from the last complete record on restart instead
+    of starting again at sequence 0. An unterminated tail is truncated and a
+    marker is chained. A file that holds only a torn fragment, or that has no
+    parsable record, is refused and left untouched.
+  - Audit files are created with mode 0640 (existing looser files are
+    tightened) and missing directories with 0750. Symlinks, non-regular files
+    and group- or world-writable parent directories are refused.
+  - New event type `audit_records_dropped` (`count`, `total`, `reason`:
+    queue full, sink write failed, torn tail). SIEM parsers must accept it.
+  - The record timestamp is now taken on the writer thread.
+  - New `sbc-cli audit verify <FILE>... [--require-anchor]`. It checks the
+    chain against canonical record bytes, so reordered, extra or re-encoded
+    fields count as tampering. Unanchored first files give a warning, or exit 1
+    with `--require-anchor`.
+  - `sbc-api-server` (`SBC_API_AUDIT_PATH`) and `central-config-api`
+    (`CENTRAL_API_AUDIT_PATH`) can write a hash-chained audit file (absolute
+    path; unset or empty means tracing only). When it is set, startup fails
+    closed (exit 5 / exit 6) if the file cannot be opened, and `/readyz`
+    reports not-ready while the sink is failing. Helm: optional
+    `sbcApi.auditPath` / `api.auditPath`, unset by default, and the path must
+    be on a writable volume. **BREAKING for deployments with an unwritable
+    `logging.audit_path`:** sbc-daemon now fails closed and exits with code 3
+    when `logging.audit_path` is set but the file cannot be opened or resumed
+    (including refused files); the tracing fallback is removed. Unset
+    `audit_path` is unchanged (tracing only).
+  - Dependency: workspace `hex = "0.4"` (already in the lock tree, 0.4.3; not
+    a crypto dependency). Replaces hand-written hex decoding that could panic.
+  - Open items: POA&M-130 (keyed chain, HMAC-SHA-384 or ML-DSA-87),
+    POA&M-131 (residual O_NOFOLLOW open race), POA&M-133 (audit file rotation and retention; capacity is the platform's job).
+
 - **SBC: phone-config output escaping for all vendors.** `uc-phone-mgmt`
   now escapes every operator-supplied string in Polycom VVX, Poly Edge,
   Cisco MPP, Cisco 9800 and Teo configs (XML text, attribute, comment and

@@ -341,8 +341,12 @@ pub struct AppState {
     >,
 }
 
-/// Gauge: audit records dropped (queue full or writer thread dead).
+/// Gauge: audit records lost (queue full, writer thread dead, or sink
+/// write failed).
 pub const METRIC_AUDIT_RECORDS_DROPPED: &str = "audit_records_dropped";
+/// Gauge: audit records the sink failed to persist (e.g. ENOSPC); included
+/// in [`METRIC_AUDIT_RECORDS_DROPPED`].
+pub const METRIC_AUDIT_WRITE_FAILURES: &str = "audit_write_failures";
 /// Gauge: 1 while the audit writer thread runs, 0 once it has exited.
 pub const METRIC_AUDIT_WRITER_ALIVE: &str = "audit_writer_alive";
 /// Gauge: emergency INVITEs admitted through the emergency bypass.
@@ -504,7 +508,11 @@ pub const STIR_METRICS: &[(&str, &str)] = &[
 fn register_daemon_metrics(metrics: &mut MetricRegistry) {
     metrics.register_gauge(
         METRIC_AUDIT_RECORDS_DROPPED,
-        "Audit records dropped because the audit queue was full or its writer had exited",
+        "Audit records lost: audit queue full, writer exited, or sink write failed",
+    );
+    metrics.register_gauge(
+        METRIC_AUDIT_WRITE_FAILURES,
+        "Audit records the audit sink failed to persist (included in audit_records_dropped)",
     );
     metrics.register_gauge(
         METRIC_AUDIT_WRITER_ALIVE,
@@ -598,35 +606,37 @@ fn cdr_component_status(cdr: Option<&crate::cdr::CdrContext>) -> ComponentStatus
 pub const AUDIT_DROP_DEGRADED_WINDOW: Duration = Duration::from_secs(60);
 
 /// Health of the audit pipeline: unhealthy once the writer thread has
-/// exited (every record is dropped), degraded while records were dropped
-/// within [`AUDIT_DROP_DEGRADED_WINDOW`], healthy otherwise.
+/// exited (every record is dropped) or while the sink is failing writes
+/// (an unopenable `logging.audit_path` stops startup instead); degraded while records were lost within [`AUDIT_DROP_DEGRADED_WINDOW`];
+/// healthy otherwise.
 ///
 /// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
 fn audit_component_status() -> ComponentStatus {
-    audit_status_from(
-        uc_audit::writer_alive(),
-        uc_audit::dropped_records(),
-        uc_audit::last_drop_elapsed(),
-        AUDIT_DROP_DEGRADED_WINDOW,
-    )
+    audit_status_from(&uc_audit::stats(), AUDIT_DROP_DEGRADED_WINDOW)
 }
 
 /// Pure decision behind [`audit_component_status`].
 ///
 /// ## NIST 800-53 Rev5: AU-5, SI-4 (System Monitoring)
-fn audit_status_from(
-    writer_alive: bool,
-    dropped: u64,
-    last_drop: Option<Duration>,
-    window: Duration,
-) -> ComponentStatus {
-    if !writer_alive {
+fn audit_status_from(stats: &uc_audit::AuditStats, window: Duration) -> ComponentStatus {
+    let dropped = stats.dropped;
+    if !stats.writer_alive {
         return ComponentStatus::unhealthy(
             "audit",
             format!("audit writer thread exited; {dropped} records dropped"),
         );
     }
-    match last_drop {
+    if stats.sink_failing {
+        return ComponentStatus::unhealthy(
+            "audit",
+            format!("audit sink write failing ({} errors)", stats.write_failures),
+        );
+    }
+    let recent = [stats.last_drop, stats.last_write_failure]
+        .into_iter()
+        .flatten()
+        .min();
+    match recent {
         Some(ago) if ago < window => ComponentStatus::degraded(
             "audit",
             format!(
@@ -650,6 +660,9 @@ impl AppState {
         }
         if let Some(g) = self.metrics.gauge(METRIC_AUDIT_WRITER_ALIVE) {
             g.set(i64::from(uc_audit::writer_alive()));
+        }
+        if let Some(g) = self.metrics.gauge(METRIC_AUDIT_WRITE_FAILURES) {
+            g.set(as_gauge(uc_audit::write_failures()));
         }
         if let (Some(g), Some(stack)) = (
             self.metrics.gauge(METRIC_EMERGENCY_ADMISSIONS),
@@ -2067,6 +2080,7 @@ mod tests {
         let text = state.metrics.export();
         assert!(text.contains("sbc_audit_records_dropped 0"), "{text}");
         assert!(text.contains("sbc_audit_writer_alive 1"), "{text}");
+        assert!(text.contains("sbc_audit_write_failures 0"), "{text}");
         assert!(text.contains("sbc_emergency_calls_admitted 0"), "{text}");
     }
 
@@ -2123,32 +2137,42 @@ mod tests {
         );
     }
 
+    /// Stats with the writer alive and the given loss.
+    fn audit_stats(
+        writer_alive: bool,
+        dropped: u64,
+        last_drop: Option<Duration>,
+    ) -> uc_audit::AuditStats {
+        uc_audit::AuditStats {
+            writer_alive,
+            dropped,
+            queue_drops: dropped,
+            last_drop,
+            ..uc_audit::AuditStats::default()
+        }
+    }
+
     #[test]
     fn audit_status_recovers_after_drop_window() {
         use uc_health::HealthStatus;
         let w = AUDIT_DROP_DEGRADED_WINDOW;
-        let dead = audit_status_from(false, 7, None, w);
+        let st = |alive, dropped, last| audit_status_from(&audit_stats(alive, dropped, last), w);
+        let dead = st(false, 7, None);
         assert_eq!(dead.status, HealthStatus::Unhealthy);
         assert_eq!(
-            audit_status_from(false, 7, Some(Duration::from_secs(1)), w).status,
+            st(false, 7, Some(Duration::from_secs(1))).status,
             HealthStatus::Unhealthy
         );
-        let recent = audit_status_from(true, 7, Some(Duration::from_secs(5)), w);
+        let recent = st(true, 7, Some(Duration::from_secs(5)));
         assert_eq!(recent.status, HealthStatus::Degraded);
         assert_eq!(
             recent.message.as_deref(),
             Some("7 audit records dropped, last 5s ago")
         );
-        let old = audit_status_from(true, 7, Some(Duration::from_secs(61)), w);
+        let old = st(true, 7, Some(Duration::from_secs(61)));
         assert_eq!(old.status, HealthStatus::Healthy);
-        assert_eq!(
-            audit_status_from(true, 7, Some(w), w).status,
-            HealthStatus::Healthy
-        );
-        assert_eq!(
-            audit_status_from(true, 0, None, w).status,
-            HealthStatus::Healthy
-        );
+        assert_eq!(st(true, 7, Some(w)).status, HealthStatus::Healthy);
+        assert_eq!(st(true, 0, None).status, HealthStatus::Healthy);
     }
 
     #[test]
@@ -2157,27 +2181,83 @@ mod tests {
         let w = AUDIT_DROP_DEGRADED_WINDOW;
         assert_eq!(w, Duration::from_secs(60));
         let just_under = Duration::from_millis(59_999);
-        let s = audit_status_from(true, 2, Some(just_under), w);
+        let s = audit_status_from(&audit_stats(true, 2, Some(just_under)), w);
         assert_eq!(s.status, HealthStatus::Degraded);
         assert_eq!(
             s.message.as_deref(),
             Some("2 audit records dropped, last 59s ago")
         );
-        let s = audit_status_from(true, 1, Some(Duration::ZERO), w);
+        let s = audit_status_from(&audit_stats(true, 1, Some(Duration::ZERO)), w);
         assert_eq!(s.status, HealthStatus::Degraded);
         assert_eq!(
             s.message.as_deref(),
             Some("1 audit records dropped, last 0s ago")
         );
         assert_eq!(
-            audit_status_from(true, 1, Some(w + Duration::from_millis(1)), w).status,
+            audit_status_from(&audit_stats(true, 1, Some(w + Duration::from_millis(1))), w).status,
             HealthStatus::Healthy
         );
         // A zero window never reports degraded.
         assert_eq!(
-            audit_status_from(true, 1, Some(Duration::ZERO), Duration::ZERO).status,
+            audit_status_from(&audit_stats(true, 1, Some(Duration::ZERO)), Duration::ZERO).status,
             HealthStatus::Healthy
         );
+    }
+
+    #[test]
+    fn audit_status_unhealthy_when_sink_failing() {
+        use uc_health::HealthStatus;
+        let stats = uc_audit::AuditStats {
+            writer_alive: true,
+            dropped: 4,
+            write_failures: 4,
+            sink_failing: true,
+            last_drop: Some(Duration::ZERO),
+            last_write_failure: Some(Duration::ZERO),
+            ..uc_audit::AuditStats::default()
+        };
+        let s = audit_status_from(&stats, AUDIT_DROP_DEGRADED_WINDOW);
+        assert_eq!(s.status, HealthStatus::Unhealthy);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("audit sink write failing (4 errors)")
+        );
+        // A dead writer still takes precedence.
+        let dead = uc_audit::AuditStats {
+            writer_alive: false,
+            ..stats
+        };
+        assert!(
+            audit_status_from(&dead, AUDIT_DROP_DEGRADED_WINDOW)
+                .message
+                .is_some_and(|m| m.contains("writer thread exited"))
+        );
+    }
+
+    #[test]
+    fn audit_status_degraded_after_recent_write_failure() {
+        use uc_health::HealthStatus;
+        let w = AUDIT_DROP_DEGRADED_WINDOW;
+        let stats = uc_audit::AuditStats {
+            writer_alive: true,
+            dropped: 1,
+            write_failures: 1,
+            sink_failing: false,
+            last_drop: Some(Duration::from_secs(120)),
+            last_write_failure: Some(Duration::from_secs(10)),
+            ..uc_audit::AuditStats::default()
+        };
+        let s = audit_status_from(&stats, w);
+        assert_eq!(s.status, HealthStatus::Degraded);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("1 audit records dropped, last 10s ago")
+        );
+        let old = uc_audit::AuditStats {
+            last_write_failure: Some(Duration::from_secs(120)),
+            ..stats
+        };
+        assert_eq!(audit_status_from(&old, w).status, HealthStatus::Healthy);
     }
 
     #[test]

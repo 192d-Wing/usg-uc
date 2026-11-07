@@ -6199,12 +6199,14 @@ dependencies = [
 name = "sbc-cli"
 version = "0.10.0"
 dependencies = [
+ "chrono",
  "sbc-config",
  "sbc-grpc-api",
  "serde_json",
  "tempfile",
  "tokio",
  "tonic",
+ "uc-audit",
  "uc-cdr",
  "uc-health",
  "uc-metrics",
@@ -8474,8 +8476,10 @@ name = "uc-audit"
 version = "0.10.0"
 dependencies = [
  "chrono",
+ "hex",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
  "uc-crypto",

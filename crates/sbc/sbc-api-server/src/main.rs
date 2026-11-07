@@ -37,15 +37,8 @@ async fn main() -> ExitCode {
         "sbc-api-server starting"
     );
 
-    // Management-plane audit events (e.g. CdrExport, CDR permission
-    // denials) go to the tracing output, target "audit". Fail closed: a
-    // management API that serves PII must not run unaudited.
-    // NIST 800-53 Rev5: AU-2, AU-5, AU-12
-    if let Err(e) = uc_audit::init() {
-        error!(error = %e, "audit logger init failed; refusing to start");
-        return ExitCode::from(5);
-    }
-
+    // Config before audit: the audit sink comes from config. A config error
+    // exits before any audit-relevant action.
     let cfg = match config::Config::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -53,6 +46,17 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Management-plane audit events (e.g. CdrExport, CDR permission
+    // denials) go to the hash-chained file at `SBC_API_AUDIT_PATH`, or the
+    // tracing output (target "audit") when unset. Fail closed: a management
+    // API that serves PII must not run unaudited, and a configured file
+    // that cannot be opened must not silently downgrade to tracing.
+    // NIST 800-53 Rev5: AU-2, AU-5, AU-9, AU-12
+    if let Err(e) = init_audit(cfg.audit_path.as_deref()) {
+        error!(error = %e, "audit logger init failed; refusing to start");
+        return ExitCode::from(5);
+    }
 
     let app_state = match state::AppState::build(&cfg).await {
         Ok(s) => s,
@@ -106,4 +110,39 @@ async fn main() -> ExitCode {
     }
     info!("clean shutdown");
     ExitCode::SUCCESS
+}
+
+/// Starts the audit logger on the configured file (chain resumed, 0640 in
+/// a 0750 directory) or the tracing output.
+///
+/// ## NIST 800-53 Rev5: AU-5, AU-9, AU-12
+fn init_audit(path: Option<&std::path::Path>) -> Result<(), String> {
+    match path {
+        Some(p) => {
+            let sink = uc_audit::sink::FileSink::open(p)
+                .map_err(|e| format!("cannot open audit file {}: {e}", p.display()))?;
+            uc_audit::init_with_sink(Box::new(sink)).map_err(|e| e.to_string())?;
+            info!(path = %p.display(), "audit log enabled");
+            Ok(())
+        }
+        None => uc_audit::init().map_err(|e| e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod audit_init_tests {
+    use super::init_audit;
+
+    /// A configured audit path that cannot be opened must be an error
+    /// (main maps it to a refusal to start), never a silent tracing fallback.
+    #[cfg(unix)]
+    #[test]
+    fn init_audit_bad_path_is_error() {
+        let bad = std::path::Path::new("/dev/null/audit/audit.log");
+        let r = init_audit(Some(bad));
+        assert!(
+            matches!(&r, Err(e) if e.contains("cannot open audit file")),
+            "{r:?}"
+        );
+    }
 }

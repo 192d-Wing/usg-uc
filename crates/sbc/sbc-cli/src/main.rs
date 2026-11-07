@@ -51,6 +51,7 @@ fn main() {
         Command::Calls(cmd) => commands::calls::run(&args, cmd.clone()),
         Command::Trunk(cmd) => commands::trunk::run(&args, cmd.clone()),
         Command::Cdrs(cmd) => commands::cdrs::run(&args, cmd.clone()),
+        Command::Audit(cmd) => commands::audit::run(cmd.clone()),
         Command::Health => {
             commands::health::run(&args);
             Ok(())

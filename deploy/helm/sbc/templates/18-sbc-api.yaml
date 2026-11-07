@@ -117,6 +117,13 @@ spec:
               value: "/etc/ssl/extra-ca/oopl-ca.pem"
             {{- end }}
             {{- end }}
+            {{- with .Values.sbcApi.auditPath }}
+            # Optional hash-chained audit file (fail-closed when set: the pod
+            # exits if it cannot be opened). Must be on a writable volume
+            # mounted via extraVolumes. NIST: AU-9
+            - name: SBC_API_AUDIT_PATH
+              value: {{ . | quote }}
+            {{- end }}
             # HA1-at-rest key (required, fail-closed). NIST: SC-28(1)
             - name: SBC_USER_HA1_KEY_FILE
               value: /run/secrets/sbc-ha1/ha1-key
