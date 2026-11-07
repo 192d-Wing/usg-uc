@@ -108,6 +108,37 @@ impl TrunkHealthStatus {
     }
 }
 
+impl TrunkHealthStatus {
+    /// Records one ping result. Returns the new reachability when it
+    /// differs from what was last reported: on the first result (the
+    /// initial `reachable = false` is "unknown", not "down") and on every
+    /// up/down flip. Steady state returns `None`.
+    fn apply_ping(&mut self, result: &Result<u64, String>) -> Option<bool> {
+        let first = self.total_pings == 0;
+        let was = self.reachable;
+        match result {
+            Ok(response_ms) => self.record_success(*response_ms),
+            Err(_) => self.record_failure(),
+        }
+        (first || was != self.reachable).then_some(self.reachable)
+    }
+}
+
+/// A trunk's OPTIONS reachability changed (or was learned for the first
+/// time). Consumers feed this into trunk selection so a down trunk is
+/// skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrunkReachability {
+    /// Trunk ID.
+    pub trunk_id: String,
+    /// Whether the trunk now answers OPTIONS with 2xx.
+    pub reachable: bool,
+}
+
+/// Capacity of the reachability broadcast channel. Events are transitions
+/// only, so this is ample; a lagging consumer resyncs from [`TrunkMonitor::health`].
+const REACHABILITY_CHANNEL_CAPACITY: usize = 256;
+
 /// Configuration for a trunk to monitor.
 #[derive(Debug, Clone)]
 pub struct MonitoredTrunk {
@@ -134,6 +165,8 @@ pub struct TrunkMonitor {
     tasks: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// SBC's local domain for From/Via headers.
     local_domain: String,
+    /// Reachability transitions, for routing to skip down trunks.
+    events: tokio::sync::broadcast::Sender<TrunkReachability>,
 }
 
 impl TrunkMonitor {
@@ -144,7 +177,14 @@ impl TrunkMonitor {
             health: Arc::new(RwLock::new(HashMap::new())),
             tasks: std::sync::Mutex::new(HashMap::new()),
             local_domain: local_domain.to_string(),
+            events: tokio::sync::broadcast::channel(REACHABILITY_CHANNEL_CAPACITY).0,
         }
+    }
+
+    /// Subscribes to reachability transitions. On
+    /// `RecvError::Lagged`, re-read [`Self::health`] to resync.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<TrunkReachability> {
+        self.events.subscribe()
     }
 
     /// Stops monitoring a trunk and removes its health entry.
@@ -181,6 +221,7 @@ impl TrunkMonitor {
         let health = Arc::clone(&self.health);
         let domain = self.local_domain.clone();
         let registry_id = trunk.trunk_id.clone();
+        let events = self.events.clone();
 
         let interval = Duration::from_secs(u64::from(trunk.interval_secs.max(5)));
 
@@ -217,18 +258,22 @@ impl TrunkMonitor {
                 .await;
 
                 // Update under the lock, then release it before logging.
-                let (uptime_pct, consecutive_failures) = {
+                let (uptime_pct, consecutive_failures, changed) = {
                     let mut h = health.write().await;
                     let status = h
                         .entry(trunk.trunk_id.clone())
                         .or_insert_with(|| TrunkHealthStatus::new(&trunk.trunk_id));
 
-                    match &result {
-                        Ok(response_ms) => status.record_success(*response_ms),
-                        Err(_) => status.record_failure(),
-                    }
-                    (status.uptime_pct, status.consecutive_failures)
+                    let changed = status.apply_ping(&result);
+                    (status.uptime_pct, status.consecutive_failures, changed)
                 };
+                if let Some(reachable) = changed {
+                    // No receivers is fine (nothing routes on health yet).
+                    let _ = events.send(TrunkReachability {
+                        trunk_id: trunk.trunk_id.clone(),
+                        reachable,
+                    });
+                }
 
                 match result {
                     Ok(response_ms) => {
@@ -260,6 +305,10 @@ impl TrunkMonitor {
     }
 
     /// Sends a single OPTIONS ping and returns response time in ms.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear request/response exchange; splitting it would scatter the socket handling"
+    )]
     async fn send_options_ping(
         trunk_id: &str,
         host: &str,
@@ -371,11 +420,8 @@ impl TrunkMonitor {
             // CSeq method must match OPTIONS.
             let cseq_ok = text.lines().any(|line| {
                 let line = line.trim();
-                if let Some(rest) = line.strip_prefix("CSeq:") {
-                    rest.trim().ends_with("OPTIONS")
-                } else {
-                    false
-                }
+                line.strip_prefix("CSeq:")
+                    .is_some_and(|rest| rest.trim().ends_with("OPTIONS"))
             });
             if !cseq_ok {
                 debug!(
@@ -454,6 +500,38 @@ mod tests {
         assert_eq!(status.total_pings, 2);
         assert_eq!(status.total_success, 1);
         assert!((status.uptime_pct - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_ping_reports_first_result_and_transitions_only() {
+        let mut status = TrunkHealthStatus::new("t");
+        // First result is always reported, even "down" (initial state is unknown).
+        assert_eq!(status.apply_ping(&Err("timeout".to_string())), Some(false));
+        assert_eq!(status.apply_ping(&Err("timeout".to_string())), None);
+        assert_eq!(status.apply_ping(&Ok(5)), Some(true));
+        assert_eq!(status.apply_ping(&Ok(5)), None);
+        assert_eq!(status.apply_ping(&Ok(7)), None);
+        assert_eq!(status.apply_ping(&Err("503".to_string())), Some(false));
+
+        let mut up_first = TrunkHealthStatus::new("u");
+        assert_eq!(up_first.apply_ping(&Ok(1)), Some(true));
+        assert_eq!(up_first.apply_ping(&Ok(1)), None);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_receives_sent_events() {
+        let monitor = TrunkMonitor::new("sbc.example.com");
+        let mut rx = monitor.subscribe();
+        monitor
+            .events
+            .send(TrunkReachability {
+                trunk_id: "t".to_string(),
+                reachable: false,
+            })
+            .unwrap();
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.trunk_id, "t");
+        assert!(!ev.reachable);
     }
 
     #[test]

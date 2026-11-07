@@ -149,7 +149,14 @@ async fn set_session_error(app: &AppHandle, ctx: &SigninCtx, message: String) {
             .general
             .allow_untrusted_cert_warning;
         let already_accepted = ctx.session.read().await.accept_untrusted_ca;
-        if warn_enabled && !already_accepted && is_untrusted_cert_error(&message) {
+        // Release builds never offer the override (CaTrust::Insecure does not
+        // exist there); the user must install the CA via
+        // [provisioning] extra_ca_cert_file instead.
+        if cfg!(debug_assertions)
+            && warn_enabled
+            && !already_accepted
+            && is_untrusted_cert_error(&message)
+        {
             format!("UNTRUSTED_CA:{message}")
         } else {
             message
@@ -168,6 +175,7 @@ async fn set_session_error(app: &AppHandle, ctx: &SigninCtx, message: String) {
 /// acceptance wins, then the persisted extra-CA path, then the system
 /// store.
 async fn ca_trust(ctx: &SigninCtx) -> CaTrust {
+    #[cfg(debug_assertions)]
     if ctx.session.read().await.accept_untrusted_ca {
         return CaTrust::Insecure;
     }
@@ -252,6 +260,13 @@ pub async fn start_signin(
     // HTTP for this app run skips server-cert verification. Only honored
     // when the warning flow is enabled in settings.
     if accept_untrusted == Some(true) {
+        if !cfg!(debug_assertions) {
+            return Err(
+                "Untrusted certificates cannot be accepted in release builds; \
+                 add the CA to [provisioning] extra_ca_cert_file instead"
+                    .to_string(),
+            );
+        }
         let allowed = state
             .settings_manager
             .read()

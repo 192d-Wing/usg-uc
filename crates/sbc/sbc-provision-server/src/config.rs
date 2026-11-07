@@ -5,12 +5,19 @@ use std::net::SocketAddr;
 
 use thiserror::Error;
 
+use crate::token::ProvisionSecret;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("missing required env var: {0}")]
     Missing(&'static str),
     #[error("invalid {var}: {reason}")]
     Invalid { var: &'static str, reason: String },
+    #[error(
+        "provisioning would be unauthenticated: set SBC_PROVISION_SECRET or \
+         SBC_PROVISION_ALLOWED_CIDRS, or SBC_PROVISION_ALLOW_UNAUTHENTICATED=true to accept that"
+    )]
+    Unguarded,
 }
 
 #[derive(Debug, Clone)]
@@ -47,10 +54,10 @@ pub struct Config {
 
     /// Shared secret for HMAC-based device authentication. When set,
     /// provisioning requests must carry `?token=<hex-hmac>` where the HMAC
-    /// is `HMAC-SHA256(secret, mac_address)`. Parsed from
-    /// `SBC_PROVISION_SECRET`. When absent, provisioning is unauthenticated
-    /// (a warning is logged at startup).
-    pub provision_secret: Option<String>,
+    /// is `HMAC-SHA-384(secret, mac_address)` (96 hex chars). Parsed from
+    /// `SBC_PROVISION_SECRET`; at least 32 bytes. When absent, provisioning
+    /// is unauthenticated (a warning is logged at startup).
+    pub provision_secret: Option<ProvisionSecret>,
 }
 
 impl Config {
@@ -68,6 +75,7 @@ impl Config {
 
         let provision_host = std::env::var("SBC_PROVISION_HOST")
             .map_err(|_| ConfigError::Missing("SBC_PROVISION_HOST"))?;
+        validate_provision_host(&provision_host)?;
 
         let provision_port = std::env::var("SBC_PROVISION_PORT")
             .unwrap_or_else(|_| "80".to_string())
@@ -93,9 +101,15 @@ impl Config {
             reason,
         })?;
 
-        let provision_secret = std::env::var("SBC_PROVISION_SECRET")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let provision_secret = parse_provision_secret(std::env::var("SBC_PROVISION_SECRET").ok())?;
+
+        let allow_unauthenticated = std::env::var("SBC_PROVISION_ALLOW_UNAUTHENTICATED")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("true"));
+        check_guards(
+            provision_secret.is_some(),
+            &allowed_cidrs,
+            allow_unauthenticated,
+        )?;
 
         Ok(Self {
             listen_addr,
@@ -106,5 +120,114 @@ impl Config {
             trusted_proxies,
             provision_secret,
         })
+    }
+}
+
+/// `SBC_PROVISION_HOST` is interpolated into every rendered phone config,
+/// so it must be a plain `host[:port]` (DNS name, IPv4 or `[IPv6]`).
+/// NIST 800-53 Rev5: CM-6 (Configuration Settings), SI-10
+fn validate_provision_host(host: &str) -> Result<(), ConfigError> {
+    if sbc_config_store::validate::is_valid_host_port(host) && host.len() <= 253 {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid {
+            var: "SBC_PROVISION_HOST",
+            reason: "must be host[:port]".to_string(),
+        })
+    }
+}
+
+/// Parses `SBC_PROVISION_SECRET`: unset/empty = `None`; otherwise hex that
+/// decodes to at least [`crate::token::MIN_PROVISION_SECRET_BYTES`] bytes
+/// (fail closed).
+///
+/// NIST 800-53 Rev5: IA-5 (Authenticator Management), CM-6
+pub fn parse_provision_secret(raw: Option<String>) -> Result<Option<ProvisionSecret>, ConfigError> {
+    match raw {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) => ProvisionSecret::new(s)
+            .map(Some)
+            .map_err(|reason| ConfigError::Invalid {
+                var: "SBC_PROVISION_SECRET",
+                reason,
+            }),
+    }
+}
+
+/// Refuses a configuration under which phone configs (which carry SIP and
+/// directory credentials) would be served to anyone who can reach the
+/// port, unless the operator opted into that explicitly.
+const fn check_guards(
+    has_secret: bool,
+    allowed_cidrs: &[ipnet::IpNet],
+    allow_unauthenticated: bool,
+) -> Result<(), ConfigError> {
+    if !has_secret && allowed_cidrs.is_empty() && !allow_unauthenticated {
+        return Err(ConfigError::Unguarded);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unguarded_config_is_rejected_unless_opted_in() {
+        assert!(matches!(
+            check_guards(false, &[], false),
+            Err(ConfigError::Unguarded)
+        ));
+        assert!(check_guards(false, &[], true).is_ok());
+    }
+
+    #[test]
+    fn provision_host_must_be_host_port() {
+        for ok in ["sbc.example.com", "10.0.0.1:8080", "[::1]:80"] {
+            assert!(validate_provision_host(ok).is_ok(), "{ok}");
+        }
+        for bad in ["evil</x>", "a b", "", "h/p", "h\n"] {
+            assert!(matches!(
+                validate_provision_host(bad),
+                Err(ConfigError::Invalid {
+                    var: "SBC_PROVISION_HOST",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn either_guard_is_sufficient() {
+        let lan: ipnet::IpNet = "10.0.100.0/24".parse().unwrap();
+        assert!(check_guards(true, &[], false).is_ok());
+        assert!(check_guards(false, &[lan], false).is_ok());
+    }
+
+    #[test]
+    fn short_provision_secret_rejected() {
+        assert!(matches!(
+            parse_provision_secret(Some("s3cret".to_string())),
+            Err(ConfigError::Invalid {
+                var: "SBC_PROVISION_SECRET",
+                ..
+            })
+        ));
+        assert!(
+            parse_provision_secret(Some(String::new()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_provision_secret(None).unwrap().is_none());
+        // 32 non-hex chars: rejected (floor is on decoded bytes).
+        assert!(parse_provision_secret(Some("k".repeat(32))).is_err());
+        assert!(parse_provision_secret(Some("ab".repeat(31))).is_err());
+        assert!(
+            parse_provision_secret(Some("ab".repeat(32)))
+                .unwrap()
+                .is_some()
+        );
     }
 }

@@ -1,6 +1,10 @@
 //! Cisco 9800 series provisioning configuration generator.
 
+use crate::escape::{transport_token, xml_attr, xml_text};
 use crate::model::Phone;
+
+// NIST 800-53 Rev5: SI-15 (Information Output Filtering) -- every operator
+// string goes through `crate::escape`; numerics and static strs are type-safe.
 
 /// Generate a Cisco 9800 series provisioning XML configuration.
 ///
@@ -8,6 +12,7 @@ use crate::model::Phone;
 /// features for 9800 hardware including Wi-Fi, USB headset, and presence.
 #[must_use]
 pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
+    let sbc_host = xml_text(sbc_host);
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <device>
@@ -15,10 +20,13 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
     );
 
     // Device info
-    xml.push_str(&format!("  <deviceName>{}</deviceName>\n", phone.name));
+    xml.push_str(&format!(
+        "  <deviceName>{}</deviceName>\n",
+        xml_text(&phone.name)
+    ));
     xml.push_str(&format!(
         "  <macAddress>{}</macAddress>\n",
-        phone.mac_address
+        xml_text(&phone.mac_address)
     ));
     xml.push_str(&format!(
         "  <model>{}</model>\n\n",
@@ -31,28 +39,41 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
         xml.push_str(&format!("  <line index=\"{i}\">\n"));
         xml.push_str(&format!("    <proxy>{sbc_host}</proxy>\n"));
         xml.push_str(&format!("    <port>{}</port>\n", line.sip_port));
-        xml.push_str(&format!("    <userId>{}</userId>\n", line.sip_username));
-        xml.push_str(&format!("    <password>{}</password>\n", line.sip_password));
+        xml.push_str(&format!(
+            "    <userId>{}</userId>\n",
+            xml_text(&line.sip_username)
+        ));
+        xml.push_str(&format!(
+            "    <password>{}</password>\n",
+            xml_text(&line.sip_password)
+        ));
         xml.push_str(&format!(
             "    <displayName>{}</displayName>\n",
-            line.display_name
+            xml_text(&line.display_name)
         ));
-        xml.push_str(&format!("    <authId>{}</authId>\n", line.sip_username));
+        xml.push_str(&format!(
+            "    <authId>{}</authId>\n",
+            xml_text(&line.sip_username)
+        ));
         xml.push_str("    <enabled>true</enabled>\n");
 
         if let Some(vm) = &line.voicemail_uri {
+            let vm = xml_text(vm);
             xml.push_str(&format!("    <voiceMail>{vm}</voiceMail>\n"));
         }
 
         if let Some(cf) = &line.call_forward {
             xml.push_str("    <callForward>\n");
             if let Some(all) = &cf.all {
+                let all = xml_text(all);
                 xml.push_str(&format!("      <all>{all}</all>\n"));
             }
             if let Some(busy) = &cf.busy {
+                let busy = xml_text(busy);
                 xml.push_str(&format!("      <busy>{busy}</busy>\n"));
             }
             if let Some(na) = &cf.no_answer {
+                let na = xml_text(na);
                 xml.push_str(&format!("      <noAnswer>{na}</noAnswer>\n"));
                 xml.push_str(&format!(
                     "      <noAnswerTimeout>{}</noAnswerTimeout>\n",
@@ -72,7 +93,9 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
         for sd in &phone.speed_dials {
             xml.push_str(&format!(
                 "    <speedDial index=\"{}\" label=\"{}\" number=\"{}\" />\n",
-                sd.index, sd.label, sd.number
+                sd.index,
+                xml_attr(&sd.label),
+                xml_attr(&sd.number)
             ));
         }
         xml.push_str("  </speedDials>\n\n");
@@ -84,7 +107,9 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
         for blf in &phone.blf_entries {
             xml.push_str(&format!(
                 "    <blf index=\"{}\" label=\"{}\" address=\"{}\" />\n",
-                blf.index, blf.label, blf.address
+                blf.index,
+                xml_attr(&blf.label),
+                xml_attr(&blf.address)
             ));
         }
         xml.push_str("  </blfEntries>\n\n");
@@ -134,9 +159,11 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
     if phone.display.timezone.is_some() || phone.display.ntp_server.is_some() {
         xml.push_str("  <time>\n");
         if let Some(tz) = &phone.display.timezone {
+            let tz = xml_text(tz);
             xml.push_str(&format!("    <timezone>{tz}</timezone>\n"));
         }
         if let Some(ntp) = &phone.display.ntp_server {
+            let ntp = xml_text(ntp);
             xml.push_str(&format!("    <ntpServer>{ntp}</ntpServer>\n"));
         }
         xml.push_str(&format!(
@@ -156,9 +183,11 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
             xml.push_str(&format!("    <brightness>{brightness}</brightness>\n"));
         }
         if let Some(lang) = &phone.display.language {
+            let lang = xml_text(lang);
             xml.push_str(&format!("    <language>{lang}</language>\n"));
         }
         if let Some(ringtone) = &phone.display.ringtone {
+            let ringtone = xml_text(ringtone);
             xml.push_str(&format!("    <ringtone>{ringtone}</ringtone>\n"));
         }
         xml.push_str("  </display>\n\n");
@@ -168,15 +197,18 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
     if phone.directory.enabled {
         xml.push_str("  <directory>\n");
         if let Some(server) = &phone.directory.ldap_server {
+            let server = xml_text(server);
             xml.push_str(&format!("    <ldapServer>{server}</ldapServer>\n"));
         }
         if let Some(port) = phone.directory.ldap_port {
             xml.push_str(&format!("    <ldapPort>{port}</ldapPort>\n"));
         }
         if let Some(base_dn) = &phone.directory.ldap_base_dn {
+            let base_dn = xml_text(base_dn);
             xml.push_str(&format!("    <ldapBaseDN>{base_dn}</ldapBaseDN>\n"));
         }
         if let Some(bind_dn) = &phone.directory.ldap_bind_dn {
+            let bind_dn = xml_text(bind_dn);
             xml.push_str(&format!("    <ldapBindDN>{bind_dn}</ldapBindDN>\n"));
         }
         if phone.directory.ldap_tls {
@@ -189,12 +221,15 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
     if phone.emergency.emergency_number.is_some() {
         xml.push_str("  <emergency>\n");
         if let Some(num) = &phone.emergency.emergency_number {
+            let num = xml_text(num);
             xml.push_str(&format!("    <number>{num}</number>\n"));
         }
         if let Some(loc) = &phone.emergency.location_id {
+            let loc = xml_text(loc);
             xml.push_str(&format!("    <locationId>{loc}</locationId>\n"));
         }
         if let Some(elin) = &phone.emergency.elin {
+            let elin = xml_text(elin);
             xml.push_str(&format!("    <elin>{elin}</elin>\n"));
         }
         xml.push_str("  </emergency>\n\n");
@@ -204,11 +239,7 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
     let transport = phone
         .lines
         .first()
-        .map_or("UDP", |l| match l.transport.as_str() {
-            "tls" => "TLS",
-            "tcp" => "TCP",
-            _ => "UDP",
-        });
+        .map_or("UDP", |l| transport_token(&l.transport));
 
     xml.push_str("  <sipSettings>\n");
     xml.push_str(&format!("    <transport>{transport}</transport>\n"));

@@ -330,14 +330,7 @@ impl MediaController for MediaPipeline {
         b_leg_media_ip: Option<std::net::IpAddr>,
     ) -> Result<AllocatedPorts, MediaPipelineError> {
         // Inherent method (method resolution prefers it over this trait method).
-        MediaPipeline::create_session_with_zones(
-            self,
-            call_id,
-            mode,
-            a_leg_media_ip,
-            b_leg_media_ip,
-        )
-        .await
+        Self::create_session_with_zones(self, call_id, mode, a_leg_media_ip, b_leg_media_ip).await
     }
 
     async fn set_remote_address(
@@ -346,11 +339,11 @@ impl MediaController for MediaPipeline {
         is_a_leg: bool,
         address: SbcSocketAddr,
     ) -> Result<(), MediaPipelineError> {
-        MediaPipeline::set_remote_address(self, call_id, is_a_leg, address).await
+        Self::set_remote_address(self, call_id, is_a_leg, address).await
     }
 
     async fn start_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
-        MediaPipeline::start_relay(self, call_id).await
+        Self::start_relay(self, call_id).await
     }
 
     async fn start_relay_terminate(
@@ -359,15 +352,15 @@ impl MediaController for MediaPipeline {
         a_leg: LegDtlsParams,
         b_leg: LegDtlsParams,
     ) -> Result<(), MediaPipelineError> {
-        MediaPipeline::start_relay_terminate(self, call_id, a_leg, b_leg).await
+        Self::start_relay_terminate(self, call_id, a_leg, b_leg).await
     }
 
     async fn stop_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
-        MediaPipeline::stop_relay(self, call_id).await
+        Self::stop_relay(self, call_id).await
     }
 
     async fn remove_session(&self, call_id: &str) -> Result<(), MediaPipelineError> {
-        MediaPipeline::remove_session(self, call_id).await
+        Self::remove_session(self, call_id).await
     }
 
     async fn allocate_ports(&self) -> Result<(u16, u16), MediaPipelineError> {
@@ -384,6 +377,11 @@ pub struct NegotiatedCodec {
     pub payload_type: u8,
     /// Clock rate in Hz.
     pub clock_rate: u32,
+}
+
+/// Returns false for payload formats that carry no audio samples.
+fn is_audio_codec_name(name: &str) -> bool {
+    !(name.eq_ignore_ascii_case("telephone-event") || name.eq_ignore_ascii_case("CN"))
 }
 
 /// Transcoder for converting between different codecs in the relay path.
@@ -526,7 +524,11 @@ impl Transcoder {
                             "G.722 decoder not initialized".into(),
                         ))
                     },
-                    |dec| Ok(dec.decode(payload, output)),
+                    |dec| {
+                        dec.decode(payload, output).map_err(|e| {
+                            MediaPipelineError::DecryptionFailed(format!("G.722 decode: {e}"))
+                        })
+                    },
                 )
             }
             _ => Err(MediaPipelineError::DecryptionFailed(format!(
@@ -570,7 +572,11 @@ impl Transcoder {
                             "G.722 encoder not initialized".into(),
                         ))
                     },
-                    |enc| Ok(enc.encode(pcm, output)),
+                    |enc| {
+                        enc.encode(pcm, output).map_err(|e| {
+                            MediaPipelineError::EncryptionFailed(format!("G.722 encode: {e}"))
+                        })
+                    },
                 )
             }
             _ => Err(MediaPipelineError::EncryptionFailed(format!(
@@ -770,6 +776,16 @@ impl MediaPipeline {
     }
 
     /// Negotiates codecs with remote offer.
+    ///
+    /// Delegates to `uc_codecs::CodecRegistry::negotiate` (PT adoption,
+    /// channel match, fmtp intersection). Fails unless at least one audio
+    /// codec matched: telephone-event/CN alone cannot carry a call.
+    // POAM: POA&M-142 -- sbc-daemon does not call this yet; the live SDP
+    // answer path does not run uc-codecs negotiation.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     pub async fn negotiate_codecs(
         &self,
         call_id: &str,
@@ -777,7 +793,7 @@ impl MediaPipeline {
     ) -> Result<Vec<CodecCapability>, MediaPipelineError> {
         let negotiated = self.codec_registry.negotiate(remote_codecs);
 
-        if negotiated.is_empty() {
+        if !negotiated.iter().any(CodecCapability::is_audio_payload) {
             warn!(call_id = %call_id, "Codec negotiation failed - no common codecs");
             return Err(MediaPipelineError::CodecNegotiationFailed);
         }
@@ -1226,6 +1242,21 @@ impl MediaPipeline {
             .ok_or(MediaPipelineError::SessionNotFound)?;
 
         let needs_transcoding = a_codec.name != b_codec.name;
+
+        // RFC 4733 events and comfort noise are not audio samples: they must
+        // never reach the transcoder factory.
+        // NIST 800-53 Rev5: SI-10
+        if needs_transcoding
+            && (!is_audio_codec_name(&a_codec.name) || !is_audio_codec_name(&b_codec.name))
+        {
+            warn!(
+                call_id = %call_id,
+                a_codec = %a_codec.name,
+                b_codec = %b_codec.name,
+                "Refusing to transcode a non-audio payload format"
+            );
+            return Err(MediaPipelineError::CodecNegotiationFailed);
+        }
 
         if needs_transcoding {
             info!(
@@ -1812,12 +1843,12 @@ async fn terminate_supervisor(s: TerminateSetup) {
         SrtpContext::new(&b_in, SrtpDirection::Inbound, s.b_ssrc),
         SrtpContext::new(&b_out, SrtpDirection::Outbound, s.b_ssrc),
     );
-    let (a_ingress, a_egress, b_ingress, b_egress) = match ctxs {
-        (Ok(ai), Ok(ae), Ok(bi), Ok(be)) => (ai, ae, bi, be),
-        _ => {
-            warn!(call_id = %s.call_id, "SRTP context creation failed; media not relayed");
-            return;
-        }
+    let (a_ingress, a_egress, b_ingress, b_egress) = if let (Ok(ai), Ok(ae), Ok(bi), Ok(be)) = ctxs
+    {
+        (ai, ae, bi, be)
+    } else {
+        warn!(call_id = %s.call_id, "SRTP context creation failed; media not relayed");
+        return;
     };
 
     // Peer→sidecar DTLS (post-handshake rekey) demuxed by each relay leg.
@@ -2460,6 +2491,61 @@ mod tests {
             result,
             Err(MediaPipelineError::CodecNegotiationFailed)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_codec_negotiation_with_telephone_event() {
+        let mut config = MediaPipelineConfig::default();
+        config
+            .local_codecs
+            .push(CodecCapability::telephone_event(101));
+        let pipeline = MediaPipeline::new(config);
+
+        let remote = vec![
+            CodecCapability::telephone_event(96),
+            CodecCapability::pcmu(),
+        ];
+        let negotiated = pipeline.negotiate_codecs("call", &remote).await.unwrap();
+        assert!(
+            negotiated
+                .iter()
+                .any(|c| c.name == "telephone-event" && c.payload_type == 96)
+        );
+        // The first audio codec is what a transcoder would be built from.
+        let audio = negotiated.iter().find(|c| c.is_audio_payload()).unwrap();
+        assert_eq!(audio.name, "PCMU");
+
+        // DTMF-only overlap is a negotiation failure.
+        let result = pipeline
+            .negotiate_codecs("call", &[CodecCapability::telephone_event(96)])
+            .await;
+        assert!(matches!(
+            result,
+            Err(MediaPipelineError::CodecNegotiationFailed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_telephone_event_never_reaches_transcoder() {
+        let pipeline = MediaPipeline::new(MediaPipelineConfig::default());
+        pipeline.create_session("te-call", None).await.unwrap();
+        let a = NegotiatedCodec {
+            name: "telephone-event".to_string(),
+            payload_type: 101,
+            clock_rate: 8000,
+        };
+        let b = NegotiatedCodec {
+            name: "PCMU".to_string(),
+            payload_type: 0,
+            clock_rate: 8000,
+        };
+        let result = pipeline.set_negotiated_codecs("te-call", a, b).await;
+        assert!(matches!(
+            result,
+            Err(MediaPipelineError::CodecNegotiationFailed)
+        ));
+        let sessions = pipeline.sessions.read().await;
+        assert!(sessions.get("te-call").unwrap().transcoder.is_none());
     }
 
     #[tokio::test]

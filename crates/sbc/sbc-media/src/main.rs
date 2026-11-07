@@ -14,7 +14,9 @@
 //! - `SBC_MEDIA_GRPC_LISTEN` — gRPC listen address (default `0.0.0.0:9096`).
 //! - `SBC_MEDIA_RTP_PORT_MIN` / `SBC_MEDIA_RTP_PORT_MAX` — inclusive RTP port
 //!   range (defaults 16384 / 32768, the pipeline defaults).
-//! - `SBC_MEDIA_DEFAULT_MODE` — `relay` (default) or `pass-through`.
+//! - `SBC_MEDIA_DEFAULT_MODE` — only `relay` (the default) is accepted; any
+//!   other value (including `pass-through`) is rejected at startup, matching
+//!   the daemon's `media.default_mode` validation.
 //! - `SBC_MEDIA_SRTP_REQUIRED` — `true` (default) / `false`.
 //! - `SBC_MEDIA_ADVERTISED_IP` — this node's media IP, returned per session so
 //!   the signaling daemon steers SDP to it (standalone media-node pool). Unset
@@ -81,6 +83,21 @@ fn env_port(key: &str, default: u16) -> Result<u16, String> {
     })
 }
 
+/// Parses `SBC_MEDIA_DEFAULT_MODE`. Only `relay` is accepted.
+///
+/// NIST 800-53 Rev5: CM-6 (Configuration Settings) — the daemon rejects a
+/// non-Relay `media.default_mode`; the media pod must not silently run a
+/// mode the daemon refuses.
+fn parse_default_mode(value: &str) -> Result<MediaMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "relay" => Ok(MediaMode::Relay),
+        other => Err(format!(
+            "SBC_MEDIA_DEFAULT_MODE {other:?} is not supported: only \"relay\" is \
+             enforced (media.default_mode must be Relay)"
+        )),
+    }
+}
+
 impl Config {
     fn from_env() -> Result<Self, String> {
         let grpc_listen: SocketAddr = std::env::var("SBC_MEDIA_GRPC_LISTEN")
@@ -88,16 +105,9 @@ impl Config {
             .parse()
             .map_err(|e| format!("SBC_MEDIA_GRPC_LISTEN invalid: {e}"))?;
 
-        let default_mode = match std::env::var("SBC_MEDIA_DEFAULT_MODE")
-            .unwrap_or_else(|_| "relay".to_string())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "relay" => MediaMode::Relay,
-            "pass-through" | "passthrough" => MediaMode::PassThrough,
-            other => return Err(format!("SBC_MEDIA_DEFAULT_MODE invalid: {other:?}")),
-        };
+        let default_mode = parse_default_mode(
+            &std::env::var("SBC_MEDIA_DEFAULT_MODE").unwrap_or_else(|_| "relay".to_string()),
+        )?;
 
         let terminate_dtls = env_bool("SBC_MEDIA_TERMINATE_DTLS", false)?;
         let dtls_sidecar_socket = std::env::var("SBC_MEDIA_DTLS_SIDECAR_SOCKET")
@@ -292,6 +302,35 @@ async fn main() -> ExitCode {
         Err(e) => {
             error!(error = %e, "gRPC server error");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_mode_only_accepts_relay() {
+        assert!(matches!(parse_default_mode("relay"), Ok(MediaMode::Relay)));
+        assert!(matches!(
+            parse_default_mode(" Relay "),
+            Ok(MediaMode::Relay)
+        ));
+        for bad in [
+            "pass-through",
+            "passthrough",
+            "PassThrough",
+            "SignalingOnly",
+            "",
+        ] {
+            let result = parse_default_mode(bad);
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.contains("SBC_MEDIA_DEFAULT_MODE")),
+                "{bad:?}: {result:?}"
+            );
         }
     }
 }

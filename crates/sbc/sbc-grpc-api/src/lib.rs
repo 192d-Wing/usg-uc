@@ -10,6 +10,7 @@
 //!
 //! - [`ConfigService`](sbc::config_service_server::ConfigService) - Configuration management
 //! - [`CallService`](sbc::call_service_server::CallService) - Call monitoring and control
+//! - [`CdrService`](sbc::cdr_service_server::CdrService) - Call Detail Record queries
 //! - [`RegistrationService`](sbc::registration_service_server::RegistrationService) - Registration management
 //! - [`SystemService`](sbc::system_service_server::SystemService) - System operations
 //! - [`ClusterService`](sbc::cluster_service_server::ClusterService) - Cluster management (feature-gated)
@@ -144,6 +145,8 @@ pub mod health {
     tonic::include_proto!("grpc.health.v1");
 }
 
+pub mod cdr;
+
 /// Re-export commonly used types for convenience.
 pub mod prelude {
     // Config service
@@ -162,6 +165,14 @@ pub mod prelude {
         CallEvent, CallInfo, CallLegInfo, CallState, GetCallRequest, GetCallResponse,
         GetCallStatsRequest, GetCallStatsResponse, ListCallsRequest, ListCallsResponse,
         TerminateCallRequest, TerminateCallResponse, WatchCallsRequest,
+    };
+
+    // CDR service (read-only view of the daemon's recent-CDR ring)
+    pub use super::sbc::cdr_service_client::CdrServiceClient;
+    pub use super::sbc::cdr_service_server::{CdrService, CdrServiceServer};
+    pub use super::sbc::{
+        CdrRecord, GetCdrRequest, GetCdrResponse, GetCdrStatsRequest, GetCdrStatsResponse,
+        ListCdrsRequest, ListCdrsResponse, TrunkAttempt,
     };
 
     // Registration service

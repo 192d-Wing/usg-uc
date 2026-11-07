@@ -211,6 +211,10 @@ impl SctpAssociation {
     /// # Errors
     ///
     /// Returns an error if association setup fails.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async kept for the transport API; I/O is driven by the association task"
+    )]
     pub async fn connect(&mut self) -> TransportResult<()> {
         // Process the Associate event to start the handshake
         let actions = self.state_machine.process_event(StateEvent::Associate);
@@ -289,6 +293,10 @@ impl SctpAssociation {
     /// # Errors
     ///
     /// Returns an error if not connected or send fails.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async kept for the transport API; I/O is driven by the association task"
+    )]
     pub async fn send_on_stream(
         &self,
         stream: StreamId,
@@ -340,6 +348,10 @@ impl SctpAssociation {
     /// # Errors
     ///
     /// Returns an error if shutdown fails.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async kept for the transport API; I/O is driven by the association task"
+    )]
     pub async fn shutdown(&mut self) -> TransportResult<()> {
         let actions = self.state_machine.process_event(StateEvent::Shutdown);
 

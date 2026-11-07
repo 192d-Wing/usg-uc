@@ -50,9 +50,9 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             (monitor.get_all_status().await, 0u32)
         } else {
             let remote = self.state.remote_trunk_status.read().await;
-            let age = remote
-                .received_at
-                .map_or(0u32, |t| t.elapsed().as_secs().min(u32::MAX as u64) as u32);
+            let age = remote.received_at.map_or(0u32, |t| {
+                t.elapsed().as_secs().min(u64::from(u32::MAX)) as u32
+            });
             (remote.health.clone(), age)
         };
         let trunks: Vec<TrunkHealthInfo> = statuses
@@ -88,9 +88,9 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             (reg.get_all_status().await, 0u32)
         } else {
             let remote = self.state.remote_trunk_status.read().await;
-            let age = remote
-                .received_at
-                .map_or(0u32, |t| t.elapsed().as_secs().min(u32::MAX as u64) as u32);
+            let age = remote.received_at.map_or(0u32, |t| {
+                t.elapsed().as_secs().min(u64::from(u32::MAX)) as u32
+            });
             (remote.registrations.clone(), age)
         };
         let trunks: Vec<TrunkRegistrationInfo> = statuses
@@ -167,7 +167,10 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let port = trunk.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
+        let port = trunk
+            .get("port")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(5060) as u16;
 
         if username.is_empty() || host.is_empty() {
             return Ok(Response::new(RegisterTrunkResponse {

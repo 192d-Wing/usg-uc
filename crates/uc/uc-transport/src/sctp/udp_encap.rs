@@ -200,13 +200,13 @@ impl UdpHeader {
         sum += u32::from(self.length);
 
         // Add payload
-        let mut chunks = payload.chunks_exact(2);
-        for chunk in chunks.by_ref() {
-            sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+        let (words, remainder) = payload.as_chunks::<2>();
+        for word in words {
+            sum += u32::from(u16::from_be_bytes(*word));
         }
 
         // Handle odd byte
-        if let Some(&last_byte) = chunks.remainder().first() {
+        if let Some(&last_byte) = remainder.first() {
             sum += u32::from(u16::from_be_bytes([last_byte, 0]));
         }
 

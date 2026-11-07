@@ -1,7 +1,9 @@
 //! UDPTL (UDP Transport Layer) for T.38.
 //!
-//! Implements the UDPTL transport protocol per ITU-T T.38 Annex D,
-//! providing reliability through redundancy or FEC.
+//! Provides a UDPTL-style transport with redundancy or FEC.
+//!
+//! **Not interoperable** (POA&M-204): the wire format is project-specific and
+//! is NOT the ITU-T T.38 §9 / Annex UDPTL ASN.1 PER encoding.
 
 use crate::config::{ErrorCorrectionMode, UdptlConfig};
 use crate::error::{T38Error, T38Result};
@@ -112,10 +114,11 @@ impl UdptlPacket {
     ///
     /// Returns an error if the packet is malformed.
     pub fn decode(mut data: Bytes) -> T38Result<Self> {
+        // NIST 800-53 Rev5: SI-10, SC-5 -- POA&M-202 fixed: every read below is bounds-checked; truncated or
+        // malformed datagrams are rejected, never a panic.
+        // NIST 800-53 Rev5: SI-10 (input validation), SC-5 (DoS protection)
         if data.len() < 4 {
-            return Err(T38Error::InvalidUdptlPacket {
-                reason: "packet too short".to_string(),
-            });
+            return Err(invalid_udptl("packet too short"));
         }
 
         let seq_num = data.get_u16();
@@ -123,9 +126,7 @@ impl UdptlPacket {
         // Primary IFP packet
         let ifp_len = data.get_u16() as usize;
         if data.len() < ifp_len {
-            return Err(T38Error::InvalidUdptlPacket {
-                reason: "IFP length exceeds packet".to_string(),
-            });
+            return Err(invalid_udptl("IFP length exceeds packet"));
         }
         let ifp_data = data.split_to(ifp_len);
         let primary = IfpPacket::decode(ifp_data)?;
@@ -136,40 +137,26 @@ impl UdptlPacket {
         } else {
             let ec_type = data.get_u8();
             match ec_type {
+                0 => ErrorCorrectionData::None,
                 1 => {
                     // Redundancy
-                    let count = data.get_u8() as usize;
-                    let mut packets = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        if data.len() < 2 {
-                            break;
-                        }
-                        let len = data.get_u16() as usize;
-                        if data.len() < len {
-                            break;
-                        }
-                        packets.push(data.split_to(len));
+                    if data.is_empty() {
+                        return Err(invalid_udptl("missing redundancy count"));
                     }
-                    ErrorCorrectionData::Redundancy(packets)
+                    let count = data.get_u8() as usize;
+                    ErrorCorrectionData::Redundancy(decode_entries(&mut data, count)?)
                 }
                 2 => {
                     // FEC
+                    if data.len() < 2 {
+                        return Err(invalid_udptl("missing FEC span/count"));
+                    }
                     let span = data.get_u8();
                     let count = data.get_u8() as usize;
-                    let mut entries = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        if data.len() < 2 {
-                            break;
-                        }
-                        let len = data.get_u16() as usize;
-                        if data.len() < len {
-                            break;
-                        }
-                        entries.push(data.split_to(len));
-                    }
+                    let entries = decode_entries(&mut data, count)?;
                     ErrorCorrectionData::Fec { span, entries }
                 }
-                _ => ErrorCorrectionData::None,
+                _ => return Err(invalid_udptl("unknown error correction type")),
             }
         };
 
@@ -179,6 +166,34 @@ impl UdptlPacket {
             error_correction,
         })
     }
+}
+
+/// Builds an [`T38Error::InvalidUdptlPacket`] error.
+fn invalid_udptl(reason: &str) -> T38Error {
+    T38Error::InvalidUdptlPacket {
+        reason: reason.to_string(),
+    }
+}
+
+/// Decodes `count` length-prefixed (u16) entries, rejecting truncation.
+///
+/// The preallocation is capped by the bytes actually present (each entry
+/// needs at least its 2-byte length) so an attacker-supplied `count` cannot
+/// amplify allocation.
+// NIST 800-53 Rev5: SC-5 (DoS protection), SI-10 (input validation)
+fn decode_entries(data: &mut Bytes, count: usize) -> T38Result<Vec<Bytes>> {
+    let mut entries = Vec::with_capacity(count.min(data.len() / 2));
+    for _ in 0..count {
+        if data.len() < 2 {
+            return Err(invalid_udptl("truncated error correction entry length"));
+        }
+        let len = data.get_u16() as usize;
+        if data.len() < len {
+            return Err(invalid_udptl("error correction entry exceeds packet"));
+        }
+        entries.push(data.split_to(len));
+    }
+    Ok(entries)
 }
 
 /// UDPTL transport for T.38 sessions.
@@ -418,5 +433,69 @@ mod tests {
         } else {
             panic!("expected redundancy data");
         }
+    }
+
+    /// Decodes every strict prefix of `full`; must never panic and must
+    /// reject every prefix except the one ending exactly after the primary
+    /// IFP (which is a valid packet without error correction).
+    fn assert_truncations_rejected(full: &Bytes, primary_end: usize) {
+        for n in 0..full.len() {
+            let result = UdptlPacket::decode(full.slice(..n));
+            if n == primary_end {
+                assert!(result.is_ok(), "prefix {n} is a valid no-EC packet");
+            } else {
+                assert!(result.is_err(), "prefix {n} of {} accepted", full.len());
+            }
+        }
+    }
+
+    // NIST 800-53 Rev5: SI-10 -- POA&M-202: truncated datagrams are rejected, never panic.
+    #[test]
+    fn test_decode_truncated_redundancy() {
+        let primary = IfpPacket::new(7, DataType::V21, vec![1, 2, 3]);
+        let primary_end = 4 + primary.encode().len();
+        let packet = UdptlPacket::with_redundancy(
+            7,
+            primary,
+            vec![Bytes::from_static(&[9, 9]), Bytes::from_static(&[8, 8, 8])],
+        );
+        let full = packet.encode();
+        assert!(UdptlPacket::decode(full.clone()).is_ok());
+        assert_truncations_rejected(&full, primary_end);
+    }
+
+    #[test]
+    fn test_decode_truncated_fec() {
+        let primary = IfpPacket::new(3, DataType::V21, vec![4, 5]);
+        let primary_end = 4 + primary.encode().len();
+        let packet = UdptlPacket {
+            seq_num: 3,
+            primary,
+            error_correction: ErrorCorrectionData::Fec {
+                span: 3,
+                entries: vec![Bytes::from_static(&[1, 2, 3]), Bytes::from_static(&[4])],
+            },
+        };
+        let full = packet.encode();
+        assert!(UdptlPacket::decode(full.clone()).is_ok());
+        assert_truncations_rejected(&full, primary_end);
+    }
+
+    #[test]
+    fn test_decode_rejects_bad_ec() {
+        let primary = IfpPacket::new(1, DataType::V21, vec![1]).encode();
+        let mut buf = BytesMut::new();
+        buf.put_u16(1);
+        buf.put_u16(u16::try_from(primary.len()).unwrap());
+        buf.put_slice(&primary);
+        // Unknown EC type.
+        let mut unknown = buf.clone();
+        unknown.put_u8(9);
+        assert!(UdptlPacket::decode(unknown.freeze()).is_err());
+        // Redundancy claiming 255 entries with none present.
+        let mut huge = buf;
+        huge.put_u8(1);
+        huge.put_u8(255);
+        assert!(UdptlPacket::decode(huge.freeze()).is_err());
     }
 }

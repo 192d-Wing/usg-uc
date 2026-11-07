@@ -30,6 +30,11 @@ const VALID_STRATEGIES: &[&str] = &[
 /// falls back to `udp`.
 const VALID_TRUNK_PROTOCOLS: &[&str] = &["udp", "tcp", "tls"];
 
+/// Bounds for `trunk_groups[].trunks[].options_ping_interval_secs`. The
+/// monitor never pings faster than every 5 s.
+const MIN_OPTIONS_PING_INTERVAL_SECS: u32 = 5;
+const MAX_OPTIONS_PING_INTERVAL_SECS: u32 = 3600;
+
 /// Call/rule directions accepted by the daemon; anything else silently falls
 /// back to `outbound` (dial plans) or `both` (header manipulation).
 const VALID_DIRECTIONS: &[&str] = &["inbound", "outbound", "both"];
@@ -66,15 +71,152 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_transport(&config.transport)?;
     validate_media(&config.media)?;
     validate_security(&config.security)?;
-    validate_stir_shaken(&config.stir_shaken)?;
+    validate_logging(&config.logging)?;
+    validate_stir_shaken(config)?;
     validate_rate_limit(&config.rate_limit)?;
     validate_vps(config)?;
     validate_zones(&config.zones)?;
     validate_trunk_groups(config)?;
+    validate_trunk_tls(config)?;
     validate_routing(config)?;
     validate_header_manipulation(config)?;
     validate_topology_hiding(config)?;
+    validate_cdr(&config.cdr)?;
+    validate_unimplemented(config)?;
+    #[cfg(feature = "cluster")]
+    validate_cluster_admission(config)?;
+    if let Some(grpc) = &config.grpc {
+        validate_grpc(grpc)?;
+    }
 
+    Ok(())
+}
+
+/// Rejects config tables that are parsed but not implemented, so an
+/// operator is never told by a clean config load that SNMP, syslog,
+/// Prometheus or OTLP export (with its TLS and auth headers) is active.
+/// The `[telemetry.otlp]` rejection only exists when sbc-config is built
+/// with the `telemetry` feature (the daemon enables it); without it the
+/// table is dropped as an unknown key, not rejected.
+///
+/// ## NIST 800-53 Rev5: CM-6, CM-7, SA-8 (POA&M-191)
+fn validate_unimplemented(config: &SbcConfig) -> ConfigResult<()> {
+    if config.monitoring.is_some() {
+        return Err(ConfigError::Validation {
+            message: "[monitoring] (metrics_bind, per_call_metrics, scrape_interval_secs, \
+                      snmp, syslog) is not implemented; remove it. Prometheus/SNMP/syslog \
+                      export is not available; use [cdr.syslog] for CDR forwarding"
+                .to_string(),
+        });
+    }
+    #[cfg(feature = "telemetry")]
+    if config.telemetry.as_ref().is_some_and(|t| t.otlp.is_some()) {
+        return Err(ConfigError::Validation {
+            message: "[telemetry.otlp] is not implemented (export, tls and headers are not \
+                      applied); remove it"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// `cluster.admission`: under `split = "divide"` every divided cap must
+/// give each of `expected_nodes` at least one slot, and `expected_nodes`
+/// is only accepted where it is enforced.
+///
+/// ## NIST 800-53 Rev5: CM-6, SC-5, CP-2(2)
+#[cfg(feature = "cluster")]
+fn validate_cluster_admission(config: &SbcConfig) -> ConfigResult<()> {
+    use crate::schema::AdmissionSplit;
+    let Some(cluster) = &config.cluster else {
+        return Ok(());
+    };
+    let adm = &cluster.admission;
+    match adm.split {
+        AdmissionSplit::PerNode => {
+            if adm.expected_nodes != 1 {
+                return Err(ConfigError::Validation {
+                    message:
+                        "cluster.admission.expected_nodes is only used with split = \"divide\""
+                            .to_string(),
+                });
+            }
+            return Ok(());
+        }
+        AdmissionSplit::Divide => {}
+    }
+    if !cluster.enabled {
+        return Err(ConfigError::Validation {
+            message: "cluster.admission.split = \"divide\" requires cluster.enabled".to_string(),
+        });
+    }
+    let n = adm.expected_nodes;
+    if !(1..=uc_cluster::MAX_EXPECTED_NODES).contains(&n) {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "cluster.admission.expected_nodes must be 1-{}",
+                uc_cluster::MAX_EXPECTED_NODES
+            ),
+        });
+    }
+    let too_small = |what: &str, cap: u32| -> ConfigResult<()> {
+        if cap < n {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "{what} ({cap}) is below cluster.admission.expected_nodes ({n}) with split = \"divide\""
+                ),
+            });
+        }
+        Ok(())
+    };
+    too_small("general.max_calls", config.general.max_calls)?;
+    too_small(
+        "general.max_registrations",
+        config.general.max_registrations,
+    )?;
+    for group in &config.trunk_groups {
+        for trunk in &group.trunks {
+            too_small(&format!("trunk '{}' max_calls", trunk.id), trunk.max_calls)?;
+        }
+    }
+    Ok(())
+}
+
+/// Most entries accepted in `grpc.allowed_client_names`.
+pub const MAX_GRPC_ALLOWED_CLIENT_NAMES: usize = 64;
+
+/// Longest entry in `grpc.allowed_client_names` (DNS name limit; URIs and
+/// CNs are capped the same).
+pub const MAX_GRPC_CLIENT_NAME_LEN: usize = 253;
+
+/// `grpc.allowed_client_names` is only enforced under `require_mtls`, so a
+/// list without it is rejected rather than silently ignored.
+///
+/// ## NIST 800-53 Rev5: CM-6, AC-3, IA-3
+fn validate_grpc(config: &crate::schema::GrpcConfig) -> ConfigResult<()> {
+    let err = |message: String| Err(ConfigError::Validation { message });
+    if config.allowed_client_names.is_empty() {
+        return Ok(());
+    }
+    if !config.require_mtls {
+        return err(
+            "grpc.allowed_client_names is only enforced with grpc.require_mtls = true".to_string(),
+        );
+    }
+    if config.allowed_client_names.len() > MAX_GRPC_ALLOWED_CLIENT_NAMES {
+        return err(format!(
+            "grpc.allowed_client_names has more than {MAX_GRPC_ALLOWED_CLIENT_NAMES} entries"
+        ));
+    }
+    for name in &config.allowed_client_names {
+        let printable = name.bytes().all(|b| (0x21..=0x7e).contains(&b));
+        if name.is_empty() || name.len() > MAX_GRPC_CLIENT_NAME_LEN || !printable {
+            return err(format!(
+                "grpc.allowed_client_names entry {name:?} must be 1..={MAX_GRPC_CLIENT_NAME_LEN} \
+                 printable ASCII characters without spaces"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -91,9 +233,34 @@ fn validate_general(config: &crate::schema::GeneralConfig) -> ConfigResult<()> {
         });
     }
 
+    // The emergency reserve is enforced by admission control; an
+    // out-of-range value is rejected, not ignored.
+    //
+    // ## 47 CFR 9.16; NIST 800-53 Rev5: CM-6, SC-5
+    if let Some(reserve) = config.emergency_reserve_calls
+        && !(1..=config.max_calls).contains(&reserve)
+    {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "emergency_reserve_calls must be 1-{} (max_calls)",
+                config.max_calls
+            ),
+        });
+    }
+
     if config.max_registrations == 0 {
         return Err(ConfigError::Validation {
             message: "max_registrations must be greater than 0".to_string(),
+        });
+    }
+
+    if !(1..=crate::schema::MAX_TRUNK_RETRY_AFTER_SECS).contains(&config.trunk_retry_after_max_secs)
+    {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "trunk_retry_after_max_secs must be 1-{}",
+                crate::schema::MAX_TRUNK_RETRY_AFTER_SECS
+            ),
         });
     }
 
@@ -114,6 +281,18 @@ fn validate_transport(config: &crate::schema::TransportConfig) -> ConfigResult<(
         });
     }
 
+    // The WebSocket transport (RFC 7118) does not terminate TLS itself, so a
+    // `wss_listen` entry would silently be plain WS. Refuse it rather than
+    // advertise security that is not there.
+    if !config.wss_listen.is_empty() {
+        return Err(ConfigError::Validation {
+            message: "transport.wss_listen is not supported by this build: the WebSocket \
+                      transport does not terminate TLS. Terminate TLS at a reverse proxy and \
+                      use transport.ws_listen, or use transport.tls_listen."
+                .to_string(),
+        });
+    }
+
     // Validate timeouts
     if config.tcp_timeout_secs == 0 {
         return Err(ConfigError::Validation {
@@ -121,7 +300,62 @@ fn validate_transport(config: &crate::schema::TransportConfig) -> ConfigResult<(
         });
     }
 
+    validate_stream_limits(config)
+}
+
+/// Range check helper for numeric settings.
+fn check_range<T>(name: &str, value: T, min: T, max: T) -> ConfigResult<()>
+where
+    T: PartialOrd + std::fmt::Display + Copy,
+{
+    if value < min || value > max {
+        return Err(ConfigError::Validation {
+            message: format!("{name} must be in {min}..={max} (got {value})"),
+        });
+    }
     Ok(())
+}
+
+/// Stream connection limits and timeouts.
+///
+/// ## NIST 800-53 Rev5: SC-5, SC-10, CM-6
+fn validate_stream_limits(config: &crate::schema::TransportConfig) -> ConfigResult<()> {
+    check_range(
+        "transport.tcp_idle_timeout_secs",
+        config.tcp_idle_timeout_secs,
+        30,
+        3600,
+    )?;
+    check_range(
+        "transport.max_connections_per_listener",
+        config.max_connections_per_listener,
+        1,
+        1_000_000,
+    )?;
+    check_range(
+        "transport.max_connections_total",
+        config.max_connections_total,
+        1,
+        4_000_000,
+    )?;
+    check_range(
+        "transport.max_connections_per_source",
+        config.max_connections_per_source,
+        1,
+        config.max_connections_per_listener,
+    )?;
+    check_range(
+        "transport.handshake_timeout_secs",
+        config.handshake_timeout_secs,
+        1,
+        60,
+    )?;
+    check_range(
+        "transport.first_message_timeout_secs",
+        config.first_message_timeout_secs,
+        1,
+        config.tcp_idle_timeout_secs,
+    )
 }
 
 fn validate_media(config: &crate::schema::MediaConfig) -> ConfigResult<()> {
@@ -150,11 +384,64 @@ fn validate_media(config: &crate::schema::MediaConfig) -> ConfigResult<()> {
         });
     }
 
+    validate_media_enforced(config)?;
+
     // CNSA 2.0: Validate SRTP profile
     validate_cnsa_srtp(&config.srtp);
 
     // CNSA 2.0: Validate DTLS fingerprint hash
     validate_cnsa_hash(config.dtls.fingerprint_hash);
+
+    Ok(())
+}
+
+/// Rejects media keys this build accepts in the schema but does not act on.
+///
+/// The live call path always anchors media (`Relay`): there is no media
+/// bypass, so `PassThrough`/`SignalingOnly` and per-realm overrides would be
+/// silently ignored. There is no SDP codec filtering or transcoding, so a
+/// non-default codec list would be ignored too.
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings), CM-7 (Least Functionality)
+fn validate_media_enforced(config: &crate::schema::MediaConfig) -> ConfigResult<()> {
+    use uc_types::media::MediaMode;
+
+    if config.default_mode != MediaMode::Relay {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "media.default_mode = {:?} is not supported by this build (media is always \
+                 relayed; there is no media bypass); remove it or set it to \"Relay\"",
+                config.default_mode
+            ),
+        });
+    }
+
+    if !config.realm_modes.is_empty() {
+        let mut realms: Vec<&str> = config.realm_modes.keys().map(String::as_str).collect();
+        realms.sort_unstable();
+        return Err(ConfigError::Validation {
+            message: format!(
+                "media.realm_modes is not supported by this build (per-realm media modes need \
+                 media bypass); remove the entries for: {}",
+                realms.join(", ")
+            ),
+        });
+    }
+
+    // Order-insensitive: the list is not used for SDP negotiation, so only
+    // its contents matter for "is this the default".
+    let mut configured = config.codecs.clone();
+    let mut default = crate::schema::MediaConfig::default().codecs;
+    configured.sort_unstable_by_key(|c| format!("{c:?}"));
+    default.sort_unstable_by_key(|c| format!("{c:?}"));
+    if configured != default {
+        return Err(ConfigError::Validation {
+            message: "media.codecs is not enforced by this build (no SDP codec filtering or \
+                      transcoding); remove it or set it to the default list \
+                      [\"Opus\", \"G722\", \"G711Ulaw\", \"G711Alaw\"]"
+                .to_string(),
+        });
+    }
 
     Ok(())
 }
@@ -183,52 +470,231 @@ fn validate_security(config: &crate::schema::SecurityConfig) -> ConfigResult<()>
 
     // CNSA 2.0: Validate TLS version
     match config.min_tls_version.as_str() {
-        "1.3" => Ok(()),
-        "1.2" => {
-            // TLS 1.2 is allowed but 1.3 is preferred
-            Ok(())
+        "1.3" | "1.2" => {}
+        _ => {
+            return Err(ConfigError::CnsaViolation {
+                message: "minimum TLS version must be 1.2 or 1.3".to_string(),
+            });
         }
-        _ => Err(ConfigError::CnsaViolation {
-            message: "minimum TLS version must be 1.2 or 1.3".to_string(),
-        }),
     }
+
+    // Mutual TLS needs server credentials and a CA to verify clients against.
+    if config.require_mtls {
+        if config.tls_cert_path.is_none() {
+            return Err(ConfigError::Validation {
+                message: "security.require_mtls needs security.tls_cert_path / tls_key_path"
+                    .to_string(),
+            });
+        }
+        if config.tls_ca_path.is_none() {
+            return Err(ConfigError::Validation {
+                message: "security.require_mtls needs security.tls_ca_path (PEM bundle of \
+                          CAs that issue client certificates)"
+                    .to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
-fn validate_stir_shaken(config: &crate::schema::StirShakenConfig) -> ConfigResult<()> {
-    // If signing is enabled, certificate and key must be provided
-    if config.signing_enabled {
-        if config.certificate_path.is_none() {
+fn validate_logging(config: &crate::schema::LoggingConfig) -> ConfigResult<()> {
+    match config.level.to_ascii_lowercase().as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" => {}
+        other => {
             return Err(ConfigError::Validation {
-                message: "STIR/SHAKEN signing requires certificate_path".to_string(),
-            });
-        }
-
-        if config.private_key_path.is_none() {
-            return Err(ConfigError::Validation {
-                message: "STIR/SHAKEN signing requires private_key_path".to_string(),
-            });
-        }
-
-        if config.certificate_url.is_none() {
-            return Err(ConfigError::Validation {
-                message: "STIR/SHAKEN signing requires certificate_url".to_string(),
+                message: format!(
+                    "logging.level must be trace, debug, info, warn or error (got {other:?})"
+                ),
             });
         }
     }
-
-    // NOTE (relaxed rule): `verification_enabled = true` without
-    // `ca_bundle_path` is NOT rejected. The shipped deploy config
-    // (deploy/config/config.toml) explicitly enables verification without a
-    // CA bundle, and the daemon has no verification code path today.
-    // Tighten this once verification is implemented.
-
-    // Validate attestation level
-    match config.default_attestation.as_str() {
-        "A" | "B" | "C" => Ok(()),
-        _ => Err(ConfigError::Validation {
-            message: "default_attestation must be A, B, or C".to_string(),
-        }),
+    match config.format.to_ascii_lowercase().as_str() {
+        "json" | "text" => {}
+        other => {
+            return Err(ConfigError::Validation {
+                message: format!("logging.format must be json or text (got {other:?})"),
+            });
+        }
     }
+    if config.output.trim().is_empty() {
+        return Err(ConfigError::Validation {
+            message: "logging.output must be stdout, stderr or a file path".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// `[stir_shaken]` and per-trunk `stir_shaken` validation.
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings), SC-13, SC-17, IA-9
+fn validate_stir_shaken(config: &SbcConfig) -> ConfigResult<()> {
+    use crate::schema::StirAlgorithm;
+    let err = |message: String| Err(ConfigError::Validation { message });
+    let (ss, _deprecated) = config
+        .stir_shaken
+        .normalized()
+        .map_err(|message| ConfigError::Validation { message })?;
+
+    // CNSA-EXCEPTION: ATIS-1000074 mandates ES256 for ppt=shaken. ES384
+    // (bilateral) is reserved and not implemented, so it is rejected rather
+    // than silently signing with ES256.
+    if ss.algorithm == StirAlgorithm::Es384 {
+        return err(
+            "stir_shaken.algorithm = \"ES384\" is not supported in this release (SHAKEN requires ES256)"
+                .to_string(),
+        );
+    }
+
+    // An accepted-but-unimplemented key source is rejected even with
+    // signing off, so enabling signing later cannot surprise (CM-6).
+    if ss.signing.key_source == crate::schema::StirKeySource::Pkcs11 {
+        return err("stir_shaken.signing.key_source = \"pkcs11\" is not supported yet".into());
+    }
+    if ss.signing_enabled {
+        validate_stir_signing(&ss.signing)?;
+    }
+    validate_stir_verification(&ss)?;
+    validate_stir_attestation(&ss.attestation)?;
+
+    // Per-trunk switches are enforced or rejected, never silently ignored.
+    for g in &config.trunk_groups {
+        for t in &g.trunks {
+            if t.stir_shaken.sign && !ss.signing_enabled {
+                return err(format!(
+                    "trunk {}: stir_shaken.sign requires stir_shaken.signing_enabled",
+                    t.id
+                ));
+            }
+            if t.stir_shaken.verify && !ss.verification_enabled {
+                return err(format!(
+                    "trunk {}: stir_shaken.verify requires stir_shaken.verification_enabled",
+                    t.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_stir_signing(sig: &crate::schema::StirSigningConfig) -> ConfigResult<()> {
+    use crate::schema::StirKeySource;
+    let err = |message: String| Err(ConfigError::Validation { message });
+    {
+        if sig.key_source == StirKeySource::Pkcs11 {
+            return err("stir_shaken.signing.key_source = \"pkcs11\" is not supported yet".into());
+        }
+        if sig.private_key_path.is_none() {
+            return err("STIR/SHAKEN signing requires signing.private_key_path".to_string());
+        }
+        if sig.certificate_path.is_none() {
+            return err("STIR/SHAKEN signing requires signing.certificate_path".to_string());
+        }
+        match sig.certificate_url.as_deref() {
+            None => return err("STIR/SHAKEN signing requires signing.certificate_url".to_string()),
+            Some(u) if !is_https_url(u) => {
+                return err("stir_shaken.signing.certificate_url must be an https:// URL".into());
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_stir_verification(ss: &crate::schema::StirShakenConfig) -> ConfigResult<()> {
+    let err = |message: String| Err(ConfigError::Validation { message });
+    let v = &ss.verification;
+    if ss.verification_enabled && v.trust_anchors_path.is_none() {
+        return err(
+            "stir_shaken.verification_enabled requires verification.trust_anchors_path".to_string(),
+        );
+    }
+    let bounded = |name: &str, val: u64, lo: u64, hi: u64| -> ConfigResult<()> {
+        if (lo..=hi).contains(&val) {
+            Ok(())
+        } else {
+            err(format!(
+                "stir_shaken.verification.{name} must be {lo}..={hi}"
+            ))
+        }
+    };
+    bounded("cert_fetch_timeout_ms", v.cert_fetch_timeout_ms, 100, 5000)?;
+    bounded(
+        "cert_cache_entries",
+        v.cert_cache_entries as u64,
+        1,
+        100_000,
+    )?;
+    bounded("cert_cache_ttl_secs", v.cert_cache_ttl_secs, 60, 86_400)?;
+    bounded(
+        "negative_cache_ttl_secs",
+        v.negative_cache_ttl_secs,
+        1,
+        3600,
+    )?;
+    bounded("max_cert_bytes", v.max_cert_bytes as u64, 1024, 65_536)?;
+    bounded(
+        "max_concurrent_fetches",
+        v.max_concurrent_fetches as u64,
+        1,
+        1024,
+    )?;
+    bounded(
+        "max_fetches_per_source",
+        v.max_fetches_per_source as u64,
+        1,
+        v.max_concurrent_fetches as u64,
+    )?;
+    bounded(
+        "trust_anchor_refresh_secs",
+        v.trust_anchor_refresh_secs,
+        60,
+        604_800,
+    )?;
+    bounded("max_passport_age_secs", v.max_passport_age_secs, 10, 300)?;
+    if v.x5u_allow_hosts.len() > 256
+        || v.x5u_allow_hosts
+            .iter()
+            .any(|h| h.is_empty() || h.len() > 253 || h.contains(['/', ':', '@', ' ']))
+    {
+        return err(
+            "stir_shaken.verification.x5u_allow_hosts entries must be bare host names (max 256)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_stir_attestation(a: &crate::schema::StirAttestationConfig) -> ConfigResult<()> {
+    let err = |message: String| Err(ConfigError::Validation { message });
+    if a.owned_numbers.len() > 10_000 || a.rules.len() > 1024 {
+        return err("stir_shaken.attestation: at most 10000 owned_numbers and 1024 rules".into());
+    }
+    for n in &a.owned_numbers {
+        let digits = n.strip_suffix('*').unwrap_or(n);
+        let digits = digits.strip_prefix('+').unwrap_or(digits);
+        if digits.is_empty() || digits.len() > 32 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return err(format!(
+                "stir_shaken.attestation.owned_numbers entry {n:?} must be digits with an optional trailing *"
+            ));
+        }
+    }
+    for r in &a.rules {
+        if let Some(p) = &r.orig_prefix
+            && (p.is_empty() || p.len() > 32 || !p.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return err("stir_shaken.attestation.rules orig_prefix must be digits".into());
+        }
+    }
+    Ok(())
+}
+
+fn is_https_url(u: &str) -> bool {
+    u.get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        && u.len() > 8
+        && u.len() <= 1024
+        && !u.bytes().any(|b| b.is_ascii_control() || b == b' ')
 }
 
 fn validate_vps(config: &SbcConfig) -> ConfigResult<()> {
@@ -254,7 +720,63 @@ fn validate_rate_limit(config: &crate::schema::RateLimitConfig) -> ConfigResult<
                 message: "burst_multiplier must be a finite number >= 1.0".to_string(),
             });
         }
+
+        // NIST 800-53 Rev5: SC-5 — the overflow share sits between one
+        // source's and the whole node's budget.
+        if config.overflow_rps != 0 {
+            check_range(
+                "rate_limit.overflow_rps",
+                config.overflow_rps,
+                config.per_ip_rps,
+                config.global_rps.max(config.per_ip_rps),
+            )?;
+        }
     }
+
+    // Checked even when disabled: the keying prefix also feeds the
+    // per-source connection cap.
+    check_range(
+        "rate_limit.ipv6_prefix_len",
+        config.ipv6_prefix_len,
+        32,
+        128,
+    )?;
+    check_range(
+        "rate_limit.max_tracked_sources",
+        config.max_tracked_sources,
+        1024,
+        4_194_304,
+    )?;
+    check_range(
+        "rate_limit.max_blocked_sources",
+        config.max_blocked_sources,
+        1,
+        config.max_tracked_sources,
+    )?;
+    check_range(
+        "rate_limit.block_duration_secs",
+        config.block_duration_secs,
+        1,
+        86_400,
+    )?;
+    check_range(
+        "rate_limit.sweep_interval_secs",
+        config.sweep_interval_secs,
+        1,
+        300,
+    )?;
+    check_range(
+        "rate_limit.audit_interval_secs",
+        config.audit_interval_secs,
+        1,
+        3600,
+    )?;
+    check_range(
+        "rate_limit.audit_max_records_per_interval",
+        config.audit_max_records_per_interval,
+        1,
+        65_536,
+    )?;
 
     Ok(())
 }
@@ -333,9 +855,110 @@ fn validate_trunk_groups(config: &SbcConfig) -> ConfigResult<()> {
         }
 
         validate_trunks(group)?;
+
+        // NIST 800-53 Rev5: SC-8, CM-6 — a TLS-only group (its own flag or the
+        // global `security.require_tls_trunks`) without a TLS trunk would
+        // reject every call; refuse the config instead (POA&M-48).
+        if (group.require_tls || config.security.require_tls_trunks)
+            && !group.trunks.iter().any(|t| t.protocol == "tls")
+        {
+            let why = if group.require_tls {
+                "require_tls = true"
+            } else {
+                "security.require_tls_trunks = true"
+            };
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "trunk group '{}': {why} but the group has no trunk with protocol = \"tls\"",
+                    group.id
+                ),
+            });
+        }
     }
 
     Ok(())
+}
+
+/// Outbound TLS to trunks: trust anchors, verified name, client cert.
+/// Every key is enforced by the egress flow layer or rejected here.
+///
+/// ## NIST 800-53 Rev5: SC-8, SC-23 (Session Authenticity), IA-3, CM-6
+fn validate_trunk_tls(config: &SbcConfig) -> ConfigResult<()> {
+    let mut any_tls = false;
+    for group in &config.trunk_groups {
+        for trunk in &group.trunks {
+            let is_tls = trunk.protocol == "tls";
+            any_tls |= is_tls;
+            let what = |key: &str, why: &str| ConfigError::Validation {
+                message: format!("trunk '{}' (group '{}'): {key} {why}", trunk.id, group.id),
+            };
+            // RFC 3261 §8.1.1.8, §18.2.2, §20.42: the Via sent-by and
+            // Contact on a TCP/TLS leg name the SBC's listener of that
+            // transport, where the trunk sends in-dialog requests and
+            // late responses. Without one the SBC would advertise a port
+            // nothing listens on.
+            let listener_missing = match trunk.protocol.as_str() {
+                "tls" => config.transport.tls_listen.is_empty(),
+                "tcp" => config.transport.tcp_listen.is_empty(),
+                _ => false,
+            };
+            if listener_missing {
+                return Err(what(
+                    "protocol",
+                    &format!(
+                        "= \"{}\" needs a transport.{}_listen address",
+                        trunk.protocol, trunk.protocol
+                    ),
+                ));
+            }
+            if let Some(name) = &trunk.tls_server_name {
+                if !is_tls {
+                    return Err(what("tls_server_name", "requires protocol = \"tls\""));
+                }
+                // A DNS name (RFC 6125) or IP literal; never a SIP header value.
+                if name.is_empty()
+                    || name.len() > 253
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
+                    // Must also be what rustls will verify against: rejects
+                    // "host:5061", "::::" and other non-name/non-IP shapes.
+                    || rustls_pki_types::ServerName::try_from(name.as_str()).is_err()
+                {
+                    return Err(what(
+                        "tls_server_name",
+                        "must be a DNS name or IP address (letters, digits, '.', '-', ':')",
+                    ));
+                }
+            }
+            if trunk.tls_client_cert {
+                if !is_tls {
+                    return Err(what("tls_client_cert", "requires protocol = \"tls\""));
+                }
+                if config.security.tls_cert_path.is_none() {
+                    return Err(what(
+                        "tls_client_cert",
+                        "needs security.tls_cert_path / tls_key_path",
+                    ));
+                }
+            }
+        }
+    }
+    match (&config.security.trunk_tls_ca_path, any_tls) {
+        (None, true) => Err(ConfigError::Validation {
+            message: "a trunk uses protocol = \"tls\" but security.trunk_tls_ca_path is not set \
+                      (PEM bundle of CAs that issue trunk server certificates)"
+                .to_string(),
+        }),
+        (Some(p), _) if !p.is_absolute() => Err(ConfigError::Validation {
+            message: "security.trunk_tls_ca_path must be an absolute path".to_string(),
+        }),
+        // A CA with no TLS trunk in this file is allowed: trunks also arrive
+        // through the gRPC TrunkSync / management API (the Helm deployment
+        // defines none in the config file), and a TLS trunk added that way
+        // needs these anchors to connect at all.
+        _ => Ok(()),
+    }
 }
 
 fn validate_trunks(group: &crate::schema::TrunkGroupConfig) -> ConfigResult<()> {
@@ -398,6 +1021,56 @@ fn validate_trunks(group: &crate::schema::TrunkGroupConfig) -> ConfigResult<()> 
                 ),
             });
         }
+
+        // max_calls = 0 would make the trunk permanently "at capacity";
+        // max_failures = 0 would put it into cooldown on every failure.
+        // These keys are enforced by routing, so out-of-range values are
+        // rejected rather than accepted and ignored.
+        //
+        // ## NIST 800-53 Rev5: CM-6 (Configuration Settings), SC-5
+        if trunk.max_calls == 0 {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "trunk '{}' (group '{}'): max_calls must be greater than 0",
+                    trunk.id, group.id
+                ),
+            });
+        }
+        if let Some(reserve) = trunk.emergency_reserve_calls
+            && !(1..=trunk.max_calls).contains(&reserve)
+        {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "trunk '{}' (group '{}'): emergency_reserve_calls must be 1-{} (max_calls)",
+                    trunk.id, group.id, trunk.max_calls
+                ),
+            });
+        }
+        if trunk.max_failures == 0 {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "trunk '{}' (group '{}'): max_failures must be greater than 0",
+                    trunk.id, group.id
+                ),
+            });
+        }
+
+        // The OPTIONS monitor clamps to >= 5 s; reject values it would
+        // silently change rather than ignore them.
+        if trunk.options_ping_enabled
+            && !(MIN_OPTIONS_PING_INTERVAL_SECS..=MAX_OPTIONS_PING_INTERVAL_SECS)
+                .contains(&trunk.options_ping_interval_secs)
+        {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "trunk '{}' (group '{}'): options_ping_interval_secs must be between {} and {}",
+                    trunk.id,
+                    group.id,
+                    MIN_OPTIONS_PING_INTERVAL_SECS,
+                    MAX_OPTIONS_PING_INTERVAL_SECS
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -421,6 +1094,21 @@ fn validate_routing(config: &SbcConfig) -> ConfigResult<()> {
         });
     }
 
+    // 47 CFR 9.16; NIST 800-53 Rev5: CM-6 — the emergency trunk group
+    // must exist, or every emergency call would be refused by routing.
+    if let Some(eg) = config
+        .routing
+        .as_ref()
+        .and_then(|r| r.emergency_trunk_group.as_deref())
+        && !group_ids.contains(eg)
+    {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "routing.emergency_trunk_group '{eg}' does not match any [[trunk_groups]] id"
+            ),
+        });
+    }
+
     for plan in &config.dial_plans {
         for entry in &plan.entries {
             validate_dial_plan_entry(&plan.id, entry, &group_ids, have_groups)?;
@@ -428,6 +1116,50 @@ fn validate_routing(config: &SbcConfig) -> ConfigResult<()> {
     }
 
     Ok(())
+}
+
+/// Resolves a dial-plan `source_trunk` to a trunk-group id: a trunk-group
+/// id is returned as is; a trunk id resolves to the group containing it.
+/// `None` when it names neither (see [`routing_warnings`]).
+///
+/// ## NIST 800-53 Rev5: AC-4 (Information Flow Enforcement)
+#[must_use]
+pub fn resolve_source_trunk<'a>(config: &'a SbcConfig, id: &str) -> Option<&'a str> {
+    config
+        .trunk_groups
+        .iter()
+        .find(|g| g.id == id)
+        .or_else(|| {
+            config
+                .trunk_groups
+                .iter()
+                .find(|g| g.trunks.iter().any(|t| t.id == id))
+        })
+        .map(|g| g.id.as_str())
+}
+
+/// Non-fatal routing configuration problems, for the daemon to log at
+/// load: a dial-plan `source_trunk` naming no trunk group or trunk (the
+/// entry can then never match).
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings)
+#[must_use]
+pub fn routing_warnings(config: &SbcConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for plan in &config.dial_plans {
+        for entry in &plan.entries {
+            if let Some(st) = entry.source_trunk.as_deref()
+                && resolve_source_trunk(config, st).is_none()
+            {
+                out.push(format!(
+                    "dial plan '{}': source_trunk '{st}' matches no trunk group or trunk id; \
+                     the entry will never match",
+                    plan.id
+                ));
+            }
+        }
+    }
+    out
 }
 
 fn validate_dial_plan_entry(
@@ -556,6 +1288,21 @@ fn validate_manipulation_rule(
         });
     }
 
+    // POAM: POA&M-152 - Via, Content-Length, CSeq and Call-ID are owned by
+    // the SBC's transaction layer; editing them breaks transaction matching
+    // and framing. Refused at load (NIST 800-53 Rev5: CM-6, SI-10).
+    if SBC_OWNED_HEADERS
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(header))
+    {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "header manipulation rule '{name}': header '{header}' is owned by the SBC \
+                 (Via, Content-Length, CSeq, Call-ID cannot be manipulated)"
+            ),
+        });
+    }
+
     if has_ascii_control(value) {
         return Err(ConfigError::Validation {
             message: format!(
@@ -569,10 +1316,14 @@ fn validate_manipulation_rule(
     Ok(())
 }
 
+/// Headers (full and compact forms) that header manipulation may not target.
+const SBC_OWNED_HEADERS: [&str; 6] = ["via", "v", "content-length", "l", "cseq", "call-id"];
+
 fn validate_topology_hiding(config: &SbcConfig) -> ConfigResult<()> {
-    if let Some(topo) = &config.topology_hiding
-        && has_ascii_control(&topo.external_host)
-    {
+    let Some(topo) = &config.topology_hiding else {
+        return Ok(());
+    };
+    if has_ascii_control(&topo.external_host) {
         return Err(ConfigError::Validation {
             message: format!(
                 "topology_hiding.external_host '{}' contains ASCII control characters",
@@ -580,12 +1331,195 @@ fn validate_topology_hiding(config: &SbcConfig) -> ConfigResult<()> {
             ),
         });
     }
+    // POAM: POA&M-151 - internal networks/domains are validated at load so
+    // a typo cannot silently weaken topology hiding (NIST 800-53 Rev5: CM-6,
+    // SC-7).
+    if topo.external_tls_port == 0 {
+        return Err(ConfigError::Validation {
+            message: "topology_hiding.external_tls_port must be non-zero".to_string(),
+        });
+    }
+    for cidr in &topo.internal_networks {
+        if !is_valid_cidr(cidr) {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "topology_hiding.internal_networks: '{}' is not a valid CIDR \
+                     (e.g. 10.0.0.0/8, fd00::/8)",
+                    cidr.escape_default()
+                ),
+            });
+        }
+    }
+    for domain in &topo.internal_domains {
+        if !is_valid_domain(domain) {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "topology_hiding.internal_domains: '{}' is not a valid DNS name",
+                    domain.escape_default()
+                ),
+            });
+        }
+    }
 
     Ok(())
 }
 
+/// `addr/prefix` with prefix <= 32 (IPv4) or <= 128 (IPv6), or a bare IP.
+fn is_valid_cidr(s: &str) -> bool {
+    let (a, p) = match s.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (s, None),
+    };
+    let Ok(addr) = a.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    p.is_none_or(|p| {
+        !p.is_empty()
+            && p.len() <= 3
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u8>().is_ok_and(|n| n <= max)
+    })
+}
+
+/// Hostname grammar: dot-separated labels of alnum/`-`, no leading or
+/// trailing `-`, at most 253 octets (RFC 1123 §2.1).
+#[must_use]
+pub fn is_valid_domain(s: &str) -> bool {
+    let s = s.strip_suffix('.').unwrap_or(s);
+    !s.is_empty()
+        && s.len() <= 253
+        && s.split('.').all(|l| {
+            let b = l.as_bytes();
+            !b.is_empty()
+                && b.len() <= 63
+                && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+                && b.first() != Some(&b'-')
+                && b.last() != Some(&b'-')
+        })
+}
+
 /// Returns `true` if `s` is a non-empty RFC 3261 token
 /// (alphanumeric plus ``-.!%*_+`'~``).
+/// Validates `[cdr]`.
+///
+/// ## NIST 800-53 Rev5: AU-4 (Audit Log Storage Capacity), AU-5, SI-12, SC-5
+fn validate_cdr(config: &crate::schema::CdrConfig) -> ConfigResult<()> {
+    use crate::schema::CdrPiiMode;
+    let err = |message: String| Err(ConfigError::Validation { message });
+    if !config.enabled {
+        return Ok(());
+    }
+    if !config.directory.is_absolute() {
+        return err(format!(
+            "cdr.directory must be an absolute path (got {})",
+            config.directory.display()
+        ));
+    }
+    if let Some(id) = &config.node_id {
+        let ok = !id.is_empty()
+            && id.len() <= 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !ok {
+            return err("cdr.node_id must be 1-64 characters of [A-Za-z0-9._-]".to_string());
+        }
+    }
+    if !(1..=4096).contains(&config.rotate_size_mb) {
+        return err(format!(
+            "cdr.rotate_size_mb must be 1..=4096 (got {})",
+            config.rotate_size_mb
+        ));
+    }
+    match config.rotate_interval_secs() {
+        Some(0) => {}
+        Some(s) if (300..=86_400).contains(&s) => {}
+        _ => {
+            return err(format!(
+                "cdr.rotate_interval must be \"0\" or 5m..=24h (got {:?})",
+                config.rotate_interval
+            ));
+        }
+    }
+    if config.fsync_interval_ms > 60_000 {
+        return err(format!(
+            "cdr.fsync_interval_ms must be 0..=60000 (got {})",
+            config.fsync_interval_ms
+        ));
+    }
+    if !(64..=1_000_000).contains(&config.queue_capacity) {
+        return err(format!(
+            "cdr.queue_capacity must be 64..=1000000 (got {})",
+            config.queue_capacity
+        ));
+    }
+    if config.ring_capacity > 200_000 {
+        return err(format!(
+            "cdr.ring_capacity must be 0..=200000 (got {})",
+            config.ring_capacity
+        ));
+    }
+    match (config.pii, &config.pii_hash_key_file) {
+        (CdrPiiMode::Hash, None) => {
+            return err("cdr.pii = \"hash\" requires cdr.pii_hash_key_file".to_string());
+        }
+        (CdrPiiMode::Hash, Some(p)) if !p.is_absolute() => {
+            return err("cdr.pii_hash_key_file must be an absolute path".to_string());
+        }
+        (CdrPiiMode::Full | CdrPiiMode::MaskCaller, Some(_)) => {
+            // Accepted keys must be enforced or rejected, never ignored.
+            return err("cdr.pii_hash_key_file is only valid with cdr.pii = \"hash\"".to_string());
+        }
+        _ => {}
+    }
+    if config.retention_files == 0 && config.retention_days == 0 {
+        // AU-4/AU-11: one bound is required so CDRs cannot fill the volume
+        // unchecked (STIG: retention >= 1).
+        return err(
+            "cdr.retention_files and cdr.retention_days cannot both be 0 (unlimited); \
+             size retention_files * rotate_size_mb to the CDR volume"
+                .to_string(),
+        );
+    }
+    validate_cdr_syslog(&config.syslog)
+}
+
+/// `[cdr.syslog]` keys are validated even when syslog is disabled: accepted
+/// keys must be enforced or rejected, never silently ignored.
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings)
+fn validate_cdr_syslog(syslog: &crate::schema::CdrSyslogConfig) -> ConfigResult<()> {
+    let err = |message: String| Err(ConfigError::Validation { message });
+    let config = syslog;
+    {
+        let Some(rest) = config.target.strip_prefix("tls://") else {
+            // RFC 5425: CDRs carry PII; TLS is mandatory off-host.
+            return err("cdr.syslog.target must be tls://host:port (RFC 5425)".to_string());
+        };
+        let valid = rest.rsplit_once(':').is_some_and(|(host, port)| {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            !host.is_empty()
+                && !has_ascii_control(host)
+                && !host.contains('/')
+                && port.parse::<u16>().is_ok_and(|p| p != 0)
+        });
+        if !valid {
+            return err(format!(
+                "cdr.syslog.target must be tls://host:port (got {:?})",
+                config.target
+            ));
+        }
+        if config.facility > 23 {
+            return err("cdr.syslog.facility must be 0..=23".to_string());
+        }
+        if config.ca_path.as_ref().is_some_and(|p| !p.is_absolute()) {
+            return err("cdr.syslog.ca_path must be an absolute path".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn is_rfc3261_token(s: &str) -> bool {
     !s.is_empty()
         && s.bytes().all(|b| {
@@ -655,6 +1589,7 @@ mod tests {
         RoutingConfig, TopologyHidingConfig, TrunkConfigSchema, TrunkGroupConfig,
         TrunkManipulationRuleConfig, ZoneConfig,
     };
+    use uc_types::media::MediaMode;
 
     fn zone(name: &str) -> ZoneConfig {
         ZoneConfig {
@@ -680,6 +1615,7 @@ mod tests {
             strategy: "priority".to_string(),
             trunks: vec![trunk("t1")],
             zone: None,
+            require_tls: false,
         }
     }
 
@@ -710,6 +1646,72 @@ mod tests {
             msg.contains(needle),
             "error '{msg}' should mention '{needle}'"
         );
+    }
+
+    #[test]
+    fn wss_listen_is_rejected_as_unsupported() {
+        let mut config = SbcConfig::default();
+        config.transport.wss_listen = vec!["0.0.0.0:7443".parse().unwrap()];
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("wss_listen"), "{err}");
+        config.transport.wss_listen.clear();
+        config.transport.ws_listen = vec!["0.0.0.0:7080".parse().unwrap()];
+        assert!(
+            validate_config(&config).is_ok(),
+            "plain ws_listen is supported"
+        );
+    }
+
+    #[test]
+    fn require_mtls_needs_certificate_and_client_ca() {
+        let mut config = SbcConfig::default();
+        config.security.require_mtls = true;
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("tls_cert_path")
+        );
+        config.security.tls_cert_path = Some("/etc/sbc/tls.crt".into());
+        config.security.tls_key_path = Some("/etc/sbc/tls.key".into());
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("tls_ca_path")
+        );
+        config.security.tls_ca_path = Some("/etc/sbc/clients-ca.pem".into());
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn logging_fields_are_validated() {
+        let mut config = SbcConfig::default();
+        config.logging.format = "yaml".to_string();
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("logging.format")
+        );
+        config.logging.format = "text".to_string();
+        config.logging.level = "loud".to_string();
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("logging.level")
+        );
+        config.logging.level = "warn".to_string();
+        config.logging.output = " ".to_string();
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("logging.output")
+        );
+        config.logging.output = "/var/log/sbc/sbc.log".to_string();
+        assert!(validate_config(&config).is_ok());
     }
 
     #[test]
@@ -754,6 +1756,398 @@ mod tests {
         let mut config = SbcConfig::default();
         config.stir_shaken.signing_enabled = true;
         assert!(validate_config(&config).is_err());
+    }
+
+    fn stir_signing_ok() -> SbcConfig {
+        let mut config = SbcConfig::default();
+        let s = &mut config.stir_shaken;
+        s.signing_enabled = true;
+        s.signing.private_key_path = Some("/etc/sbc/sti.key".into());
+        s.signing.certificate_path = Some("/etc/sbc/sti.pem".into());
+        s.signing.certificate_url = Some("https://cert.example.invalid/sti.pem".into());
+        config
+    }
+
+    #[test]
+    fn stir_defaults_are_off_and_valid() {
+        let config = SbcConfig::default();
+        assert!(!config.stir_shaken.verification_enabled);
+        assert!(!config.stir_shaken.signing_enabled);
+        assert_eq!(
+            config.stir_shaken.attestation.default,
+            crate::schema::StirAttestation::C
+        );
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn stir_signing_rules() {
+        validate_config(&stir_signing_ok()).unwrap();
+        let mut c = stir_signing_ok();
+        c.stir_shaken.signing.certificate_url = Some("http://cert.example.invalid/a".into());
+        assert_rejected(&c, "https");
+        let mut c = stir_signing_ok();
+        c.stir_shaken.signing.key_source = crate::schema::StirKeySource::Pkcs11;
+        assert_rejected(&c, "pkcs11");
+        let mut c = stir_signing_ok();
+        c.stir_shaken.algorithm = crate::schema::StirAlgorithm::Es384;
+        assert_rejected(&c, "ES384");
+    }
+
+    #[test]
+    fn stir_verification_rules() {
+        let mut c = SbcConfig::default();
+        c.stir_shaken.verification_enabled = true;
+        assert_rejected(&c, "trust_anchors_path");
+        c.stir_shaken.verification.trust_anchors_path = Some("/etc/sbc/sti-cr".into());
+        validate_config(&c).unwrap();
+        c.stir_shaken.verification.cert_fetch_timeout_ms = 50;
+        assert_rejected(&c, "cert_fetch_timeout_ms");
+        c.stir_shaken.verification.cert_fetch_timeout_ms = 1500;
+        c.stir_shaken.verification.cert_cache_entries = 0;
+        assert_rejected(&c, "cert_cache_entries");
+        c.stir_shaken.verification.cert_cache_entries = 100_001;
+        assert_rejected(&c, "cert_cache_entries");
+        c.stir_shaken.verification.cert_cache_entries = 10;
+        c.stir_shaken.verification.x5u_allow_hosts = vec!["https://x".into()];
+        assert_rejected(&c, "x5u_allow_hosts");
+    }
+
+    #[test]
+    fn stir_trunk_switch_requires_global() {
+        let mut c = SbcConfig::default();
+        c.trunk_groups.push(crate::schema::TrunkGroupConfig {
+            id: "g".into(),
+            name: String::new(),
+            strategy: "priority".into(),
+            trunks: vec![TrunkConfigSchema {
+                id: "t1".into(),
+                host: "192.0.2.1".into(),
+                stir_shaken: crate::schema::TrunkStirConfig {
+                    sign: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            zone: None,
+            require_tls: false,
+        });
+        assert_rejected(&c, "signing_enabled");
+    }
+
+    #[test]
+    fn stir_deprecated_aliases() {
+        let toml_src = r#"
+[stir_shaken]
+signing_enabled = true
+certificate_path = "/etc/sbc/sti.pem"
+private_key_path = "/etc/sbc/sti.key"
+certificate_url = "https://cert.example.invalid/sti.pem"
+default_attestation = "B"
+max_passport_age_secs = 30
+"#;
+        let c: SbcConfig = toml::from_str(toml_src).unwrap();
+        let (n, used) = c.stir_shaken.normalized().unwrap();
+        assert_eq!(used.len(), 5);
+        assert_eq!(
+            n.signing.certificate_path.as_deref(),
+            Some(std::path::Path::new("/etc/sbc/sti.pem"))
+        );
+        assert_eq!(n.attestation.default, crate::schema::StirAttestation::B);
+        assert_eq!(n.verification.max_passport_age_secs, 30);
+        validate_config(&c).unwrap();
+
+        let mut bad = c.clone();
+        bad.stir_shaken.signing.certificate_path = Some("/other".into());
+        assert_rejected(&bad, "conflicts");
+        let mut bad = c;
+        bad.stir_shaken.default_attestation = Some("Z".into());
+        assert_rejected(&bad, "default_attestation");
+    }
+
+    fn stir_verify_ok() -> SbcConfig {
+        let mut c = SbcConfig::default();
+        c.stir_shaken.verification_enabled = true;
+        c.stir_shaken.verification.trust_anchors_path = Some("/etc/sbc/sti-cr".into());
+        c
+    }
+
+    /// QA: every numeric bound, both edges, one key at a time.
+    #[test]
+    fn qa_stir_every_verification_bound() {
+        type Set = fn(&mut crate::schema::StirVerificationConfig, u64);
+        let cases: &[(&str, Set, u64, u64)] = &[
+            (
+                "cert_fetch_timeout_ms",
+                |v, x| v.cert_fetch_timeout_ms = x,
+                100,
+                5000,
+            ),
+            (
+                "cert_cache_entries",
+                |v, x| v.cert_cache_entries = usize::try_from(x).unwrap(),
+                1,
+                100_000,
+            ),
+            (
+                "cert_cache_ttl_secs",
+                |v, x| v.cert_cache_ttl_secs = x,
+                60,
+                86_400,
+            ),
+            (
+                "negative_cache_ttl_secs",
+                |v, x| v.negative_cache_ttl_secs = x,
+                1,
+                3600,
+            ),
+            (
+                "max_cert_bytes",
+                |v, x| v.max_cert_bytes = usize::try_from(x).unwrap(),
+                1024,
+                65_536,
+            ),
+            (
+                "max_concurrent_fetches",
+                |v, x| {
+                    v.max_concurrent_fetches = usize::try_from(x).unwrap();
+                    v.max_fetches_per_source = 1;
+                },
+                1,
+                1024,
+            ),
+            (
+                "trust_anchor_refresh_secs",
+                |v, x| v.trust_anchor_refresh_secs = x,
+                60,
+                604_800,
+            ),
+            (
+                "max_passport_age_secs",
+                |v, x| v.max_passport_age_secs = x,
+                10,
+                300,
+            ),
+        ];
+        for &(name, set, lo, hi) in cases {
+            for ok in [lo, hi] {
+                let mut c = stir_verify_ok();
+                set(&mut c.stir_shaken.verification, ok);
+                assert!(validate_config(&c).is_ok(), "{name}={ok}");
+            }
+            for bad in [lo - 1, hi + 1] {
+                let mut c = stir_verify_ok();
+                set(&mut c.stir_shaken.verification, bad);
+                assert_rejected(&c, name);
+            }
+        }
+        // Bounds apply even when verification is off (no silent acceptance).
+        let mut c = SbcConfig::default();
+        c.stir_shaken.verification.cert_fetch_timeout_ms = 0;
+        assert_rejected(&c, "cert_fetch_timeout_ms");
+    }
+
+    /// POA&M-190: per-source fetch budget is `1..=max_concurrent_fetches`.
+    #[test]
+    fn stir_max_fetches_per_source_bounds() {
+        let mut c = stir_verify_ok();
+        assert_eq!(c.stir_shaken.verification.max_fetches_per_source, 4);
+        for bad in [0, c.stir_shaken.verification.max_concurrent_fetches + 1] {
+            c.stir_shaken.verification.max_fetches_per_source = bad;
+            assert_rejected(&c, "max_fetches_per_source");
+        }
+        c.stir_shaken.verification.max_fetches_per_source =
+            c.stir_shaken.verification.max_concurrent_fetches;
+        assert!(validate_config(&c).is_ok());
+        c.stir_shaken.verification.max_concurrent_fetches = 2;
+        c.stir_shaken.verification.max_fetches_per_source = 3;
+        assert_rejected(&c, "max_fetches_per_source");
+    }
+
+    /// POA&M-191: unimplemented `[monitoring]` keys are rejected at load,
+    /// each on its own; `[cdr.syslog]` (implemented) is unaffected.
+    #[test]
+    fn monitoring_table_rejected_at_load() {
+        for body in [
+            "[monitoring]\n",
+            "[monitoring]\nmetrics_bind = \"127.0.0.1:9090\"\n",
+            "[monitoring]\nper_call_metrics = true\n",
+            "[monitoring]\nscrape_interval_secs = 30\n",
+            "[monitoring.snmp]\n",
+            "[monitoring.syslog]\n",
+        ] {
+            let e = crate::load_from_str(body).unwrap_err().to_string();
+            assert!(e.contains("monitoring"), "{body}: {e}");
+        }
+        assert!(crate::load_from_str("").is_ok(), "default config loads");
+    }
+
+    /// POA&M-191: `[telemetry.otlp]` is rejected; `[telemetry]` alone loads.
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn telemetry_otlp_rejected_at_load() {
+        let e = crate::load_from_str(
+            "[telemetry.otlp]\nendpoint = \"https://otel.example.com:4317\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("telemetry.otlp"), "{e}");
+        assert!(crate::load_from_str("[telemetry]\n").is_ok());
+    }
+
+    #[test]
+    fn qa_stir_allow_hosts_and_attestation_syntax() {
+        for bad in ["", "a b", "h:443", "u@h", "h/p"] {
+            let mut c = stir_verify_ok();
+            c.stir_shaken.verification.x5u_allow_hosts = vec![bad.into()];
+            assert_rejected(&c, "x5u_allow_hosts");
+        }
+        let mut c = stir_verify_ok();
+        c.stir_shaken.verification.x5u_allow_hosts = vec!["cert.example.com".into()];
+        validate_config(&c).unwrap();
+        c.stir_shaken.verification.x5u_allow_hosts = vec!["h".into(); 257];
+        assert_rejected(&c, "x5u_allow_hosts");
+
+        for good in ["+1202555*", "1202555", "1*"] {
+            let mut c = SbcConfig::default();
+            c.stir_shaken.attestation.owned_numbers = vec![good.into()];
+            assert!(validate_config(&c).is_ok(), "{good}");
+        }
+        for bad in ["", "*", "+", "12a", "1*2", &"1".repeat(33)] {
+            let mut c = SbcConfig::default();
+            c.stir_shaken.attestation.owned_numbers = vec![bad.to_string()];
+            assert_rejected(&c, "owned_numbers");
+        }
+        let toml_src = r#"
+[stir_shaken.attestation]
+default = "A"
+[[stir_shaken.attestation.rules]]
+orig_prefix = "12x"
+attest = "A"
+"#;
+        let c: SbcConfig = toml::from_str(toml_src).unwrap();
+        assert_rejected(&c, "orig_prefix");
+        assert!(
+            toml::from_str::<SbcConfig>("[stir_shaken.attestation]\ndefault = \"D\"\n").is_err(),
+            "attestation.default is a typed enum"
+        );
+    }
+
+    #[test]
+    fn qa_stir_trunk_verify_requires_global_and_unknown_trunk_key() {
+        let toml_src = r#"
+[[trunk_groups]]
+id = "g"
+strategy = "priority"
+[[trunk_groups.trunks]]
+id = "t1"
+host = "192.0.2.1"
+stir_shaken = { verify = true }
+"#;
+        let c: SbcConfig = toml::from_str(toml_src).unwrap();
+        assert_rejected(&c, "verification_enabled");
+        // deny_unknown_fields on the per-trunk table.
+        let typo = toml_src.replace("verify = true", "verfy = true");
+        assert!(toml::from_str::<SbcConfig>(&typo).is_err());
+    }
+
+    #[test]
+    fn qa_stir_failure_policy_and_algorithm_strings() {
+        for (s, want) in [
+            (
+                "pass-through",
+                crate::schema::StirFailurePolicy::PassThrough,
+            ),
+            ("mark", crate::schema::StirFailurePolicy::Mark),
+            ("reject", crate::schema::StirFailurePolicy::Reject),
+        ] {
+            let c: SbcConfig = toml::from_str(&format!(
+                "[stir_shaken.verification]\nfailure_policy = \"{s}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(c.stir_shaken.verification.failure_policy, want);
+        }
+        assert!(
+            toml::from_str::<SbcConfig>("[stir_shaken.verification]\nfailure_policy = \"drop\"\n")
+                .is_err()
+        );
+        let c: SbcConfig = toml::from_str("[stir_shaken]\nalgorithm = \"ES384\"\n").unwrap();
+        assert_rejected(&c, "ES384");
+        let c: SbcConfig =
+            toml::from_str("[stir_shaken.signing]\nkey_source = \"pkcs11\"\n").unwrap();
+        // NIST-008: pkcs11 is rejected even with signing off.
+        assert_rejected(&c, "pkcs11");
+    }
+
+    #[test]
+    fn qa_stir_ca_bundle_alias_and_conflicts() {
+        let toml_src = r#"
+[stir_shaken]
+verification_enabled = true
+ca_bundle_path = "/etc/sbc/sti-cr"
+"#;
+        let c: SbcConfig = toml::from_str(toml_src).unwrap();
+        let (n, used) = c.stir_shaken.normalized().unwrap();
+        assert_eq!(used, vec!["ca_bundle_path"]);
+        assert_eq!(
+            n.verification.trust_anchors_path.as_deref(),
+            Some(std::path::Path::new("/etc/sbc/sti-cr"))
+        );
+        validate_config(&c).unwrap();
+        // Same value under both: accepted, not a conflict.
+        let mut same = c.clone();
+        same.stir_shaken.verification.trust_anchors_path = Some("/etc/sbc/sti-cr".into());
+        validate_config(&same).unwrap();
+        let mut bad = c;
+        bad.stir_shaken.verification.trust_anchors_path = Some("/other".into());
+        assert_rejected(&bad, "ca_bundle_path");
+    }
+
+    /// QA: the deprecated top-level `max_passport_age_secs` silently wins
+    /// over a different nested value; every other alias reports a conflict.
+    #[test]
+    fn qa_stir_max_age_alias_conflict_is_reported() {
+        let toml_src = "
+[stir_shaken]
+max_passport_age_secs = 30
+[stir_shaken.verification]
+max_passport_age_secs = 120
+";
+        let c: SbcConfig = toml::from_str(toml_src).unwrap();
+        assert!(c.stir_shaken.normalized().is_err());
+        // Alias alone, or agreeing with the nested key, still folds.
+        let c: SbcConfig = toml::from_str("[stir_shaken]\nmax_passport_age_secs = 30\n").unwrap();
+        let (n, used) = c.stir_shaken.normalized().unwrap();
+        assert_eq!(n.verification.max_passport_age_secs, 30);
+        assert_eq!(used, vec!["max_passport_age_secs"]);
+        let c: SbcConfig = toml::from_str(
+            "[stir_shaken]\nmax_passport_age_secs = 30\n[stir_shaken.verification]\nmax_passport_age_secs = 30\n",
+        )
+        .unwrap();
+        assert!(c.stir_shaken.normalized().is_ok());
+        let c: SbcConfig = toml::from_str(
+            "[stir_shaken]\ndefault_attestation = \"A\"\n[stir_shaken.attestation]\ndefault = \"B\"\n",
+        )
+        .unwrap();
+        assert!(c.stir_shaken.normalized().is_err());
+    }
+
+    /// `[stir_shaken]` and its nested tables reject unknown keys; the
+    /// deprecated flat aliases are still accepted.
+    #[test]
+    fn stir_unknown_keys_rejected() {
+        for src in [
+            "[stir_shaken]\nsigning_enabeld = true\n",
+            "[stir_shaken.signing]\nprivate_key = \"/k\"\n",
+            "[stir_shaken.attestation]\ndefualt = \"A\"\n",
+            "[stir_shaken.verification]\nmax_age = 30\n",
+        ] {
+            assert!(toml::from_str::<SbcConfig>(src).is_err(), "{src}");
+        }
+        let ok = "[stir_shaken]\ncertificate_path = \"/c\"\nprivate_key_path = \"/k\"\n\
+                  certificate_url = \"https://x/c\"\nca_bundle_path = \"/a\"\n\
+                  default_attestation = \"B\"\nmax_passport_age_secs = 30\n";
+        assert!(toml::from_str::<SbcConfig>(ok).is_ok());
     }
 
     #[test]
@@ -935,6 +2329,8 @@ mod tests {
             let mut group = trunk_group("tg1");
             group.trunks[0].protocol = (*protocol).to_string();
             config.trunk_groups = vec![group];
+            config.security.trunk_tls_ca_path =
+                (*protocol == "tls").then(|| "/etc/sbc/trunk-ca.pem".into());
             assert!(validate_config(&config).is_ok(), "protocol {protocol}");
         }
 
@@ -979,6 +2375,43 @@ mod tests {
             entries: vec![entry],
         }];
         config
+    }
+
+    #[test]
+    fn emergency_trunk_group_must_exist() {
+        let mut config = SbcConfig::default();
+        config.trunk_groups = vec![trunk_group("default"), trunk_group("e911")];
+        config.routing = Some(crate::schema::RoutingConfig {
+            emergency_trunk_group: Some("e911".to_string()),
+            ..Default::default()
+        });
+        assert!(validate_config(&config).is_ok());
+        if let Some(r) = config.routing.as_mut() {
+            r.emergency_trunk_group = Some("nope".to_string());
+        }
+        assert_rejected(&config, "routing.emergency_trunk_group 'nope'");
+    }
+
+    #[test]
+    fn source_trunk_resolves_group_or_trunk_and_warns_on_unknown() {
+        let mut config = SbcConfig::default();
+        config.trunk_groups = vec![trunk_group("carriers")];
+        assert_eq!(resolve_source_trunk(&config, "carriers"), Some("carriers"));
+        assert_eq!(resolve_source_trunk(&config, "t1"), Some("carriers"));
+        assert_eq!(resolve_source_trunk(&config, "x"), None);
+        config.dial_plans = vec![DialPlanConfig {
+            id: "main".to_string(),
+            name: "Main".to_string(),
+            active: true,
+            entries: vec![DialPlanEntryConfig {
+                source_trunk: Some("ghost".to_string()),
+                trunk_group: "carriers".to_string(),
+                ..Default::default()
+            }],
+        }];
+        let w = routing_warnings(&config);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("ghost"));
     }
 
     #[test]
@@ -1092,6 +2525,91 @@ mod tests {
 
     // ── Header manipulation ────────────────────────────────────────
 
+    // POAM-152: SBC-owned headers cannot be manipulated.
+    #[test]
+    fn test_header_manipulation_sbc_owned_rejected() {
+        for header in [
+            "Via",
+            "v",
+            "Content-Length",
+            "l",
+            "CSeq",
+            "Call-ID",
+            "call-id",
+        ] {
+            let mut rule = global_rule();
+            rule.header = header.to_string();
+            assert_rejected(&config_with_global_rule(rule), "owned by the SBC");
+        }
+    }
+
+    // POAM-151: internal networks/domains validated.
+    #[test]
+    fn test_topology_hiding_internal_networks() {
+        let mut config = SbcConfig::default();
+        config.topology_hiding = Some(TopologyHidingConfig {
+            enabled: true,
+            mode: "full".to_string(),
+            external_host: "sbc.example.com".to_string(),
+            internal_networks: vec!["10.20.0.0/16".into(), "fd00::/8".into(), "192.0.2.1".into()],
+            internal_domains: vec!["corp.example".into()],
+            ..Default::default()
+        });
+        assert!(validate_config(&config).is_ok());
+        for bad in [
+            "10.0.0.0/33",
+            "::/129",
+            "10.0.0.0/8x",
+            "garbage",
+            "10.0.0.0/",
+        ] {
+            let mut c = config.clone();
+            if let Some(t) = c.topology_hiding.as_mut() {
+                t.internal_networks = vec![bad.to_string()];
+            }
+            assert_rejected(&c, "internal_networks");
+        }
+        for bad in ["", "-bad.example", "a..b", "x y"] {
+            let mut c = config.clone();
+            if let Some(t) = c.topology_hiding.as_mut() {
+                t.internal_domains = vec![bad.to_string()];
+            }
+            assert_rejected(&c, "internal_domains");
+        }
+    }
+
+    // POAM-151 (QA): external_tls_port = 0 refused; boundary prefixes and
+    // trunk-scoped SBC-owned header rules handled.
+    #[test]
+    fn qa_topology_tls_port_and_prefix_boundaries() {
+        let mut config = SbcConfig::default();
+        config.topology_hiding = Some(TopologyHidingConfig {
+            enabled: true,
+            external_host: "sbc.example.com".to_string(),
+            internal_networks: vec!["10.0.0.0/32".into(), "::/128".into(), "0.0.0.0/0".into()],
+            ..Default::default()
+        });
+        assert!(validate_config(&config).is_ok());
+        let mut c = config.clone();
+        if let Some(t) = c.topology_hiding.as_mut() {
+            t.external_tls_port = 0;
+        }
+        assert_rejected(&c, "external_tls_port");
+        for bad in ["10.0.0.0/-1", "10.0.0.0/0032", "10.0.0.0/ 8", "fd00::/8/8"] {
+            let mut c = config.clone();
+            if let Some(t) = c.topology_hiding.as_mut() {
+                t.internal_networks = vec![bad.to_string()];
+            }
+            assert_rejected(&c, "internal_networks");
+        }
+        let mut rule = global_rule();
+        rule.header = "VIA".to_string();
+        assert_rejected(&config_with_global_rule(rule), "owned by the SBC");
+        let mut rule = global_rule();
+        rule.header = "X-Via".to_string();
+        assert!(validate_config(&config_with_global_rule(rule)).is_ok());
+    }
+
     fn config_with_global_rule(rule: ManipulationRuleConfig) -> SbcConfig {
         let mut config = SbcConfig::default();
         config.header_manipulation = Some(HeaderManipulationConfig {
@@ -1185,6 +2703,7 @@ mod tests {
             external_host: "sbc.example.com\r\nVia: evil".to_string(),
             external_port: 5060,
             obfuscate_call_id: false,
+            ..Default::default()
         });
         assert_rejected(&config, "topology_hiding.external_host");
 
@@ -1195,6 +2714,473 @@ mod tests {
     }
 
     // ── STIR/SHAKEN ────────────────────────────────────────────────
+
+    #[test]
+    fn test_repo_deploy_configs_validate() {
+        for rel in ["deploy/config/config.toml", "deploy/test/sbc-test.toml"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../..")
+                .join(rel);
+            let text = std::fs::read_to_string(&path).expect(rel);
+            let config = crate::load_from_str(&text).expect(rel);
+            let result = validate_config(&config);
+            assert!(result.is_ok(), "{rel} must validate: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_media_default_mode_must_be_relay() {
+        for mode in [MediaMode::PassThrough, MediaMode::SignalingOnly] {
+            let mut config = SbcConfig::default();
+            config.media.default_mode = mode;
+            assert_rejected(&config, "media.default_mode");
+        }
+    }
+
+    #[test]
+    fn test_media_realm_modes_rejected() {
+        let mut config = SbcConfig::default();
+        config
+            .media
+            .realm_modes
+            .insert("external".to_string(), MediaMode::Relay);
+        assert_rejected(&config, "media.realm_modes");
+        assert_rejected(&config, "external");
+    }
+
+    #[test]
+    fn test_media_codecs_must_equal_default_set() {
+        use uc_types::codec::CodecId;
+
+        let mut config = SbcConfig::default();
+        config.media.codecs.reverse();
+        validate_config(&config).expect("reordered default codecs are accepted");
+
+        config.media.codecs = vec![CodecId::G711Ulaw, CodecId::G711Alaw, CodecId::G722];
+        assert_rejected(&config, "media.codecs");
+
+        config.media.codecs = vec![
+            CodecId::Opus,
+            CodecId::G722,
+            CodecId::G711Ulaw,
+            CodecId::G711Alaw,
+            CodecId::G711Alaw,
+        ];
+        assert_rejected(&config, "media.codecs");
+    }
+
+    #[test]
+    fn test_trunk_limits_must_be_positive() {
+        let mut config = SbcConfig::default();
+        let mut group = trunk_group("tg");
+        group.trunks[0].max_calls = 0;
+        config.trunk_groups = vec![group];
+        assert_rejected(&config, "max_calls");
+
+        let mut group = trunk_group("tg");
+        group.trunks[0].max_failures = 0;
+        config.trunk_groups = vec![group];
+        assert_rejected(&config, "max_failures");
+    }
+
+    #[test]
+    fn emergency_reserve_calls_default_and_bounds() {
+        let mut config = SbcConfig::default();
+        assert_eq!(config.general.emergency_reserve_calls, None);
+        assert_eq!(config.general.effective_emergency_reserve_calls(), 1000);
+        config.general.max_calls = 5;
+        assert_eq!(config.general.effective_emergency_reserve_calls(), 1);
+        for ok in [1, 5] {
+            config.general.emergency_reserve_calls = Some(ok);
+            assert!(super::validate_config(&config).is_ok(), "{ok}");
+            assert_eq!(config.general.effective_emergency_reserve_calls(), ok);
+        }
+        for bad in [0, 6, u32::MAX] {
+            config.general.emergency_reserve_calls = Some(bad);
+            assert_rejected(&config, "emergency_reserve_calls");
+        }
+        config.general.emergency_reserve_calls = None;
+
+        let mut group = trunk_group("tg");
+        group.trunks[0].max_calls = 20;
+        assert_eq!(group.trunks[0].effective_emergency_reserve_calls(), 2);
+        group.trunks[0].emergency_reserve_calls = Some(20);
+        config.trunk_groups = vec![group.clone()];
+        assert!(super::validate_config(&config).is_ok());
+        for bad in [0, 21] {
+            group.trunks[0].emergency_reserve_calls = Some(bad);
+            config.trunk_groups = vec![group.clone()];
+            assert_rejected(&config, "emergency_reserve_calls");
+        }
+
+        let parsed =
+            crate::load_from_str("[general]\nmax_calls = 100\nemergency_reserve_calls = 7\n")
+                .unwrap();
+        assert_eq!(parsed.general.effective_emergency_reserve_calls(), 7);
+    }
+
+    #[test]
+    fn test_trunk_options_ping_interval_bounds() {
+        let mut config = SbcConfig::default();
+        let mut group = trunk_group("tg");
+        group.trunks[0].options_ping_enabled = true;
+        group.trunks[0].options_ping_interval_secs = 30;
+        config.trunk_groups = vec![group.clone()];
+        validate_config(&config).expect("30 s ping interval is valid");
+
+        for bad in [0, 4, 3601] {
+            group.trunks[0].options_ping_interval_secs = bad;
+            config.trunk_groups = vec![group.clone()];
+            assert_rejected(&config, "options_ping_interval_secs");
+        }
+
+        // Not checked while pinging is off.
+        group.trunks[0].options_ping_enabled = false;
+        group.trunks[0].options_ping_interval_secs = 0;
+        config.trunk_groups = vec![group];
+        validate_config(&config).expect("interval ignored when disabled");
+    }
+
+    #[test]
+    fn cdr_defaults_valid() {
+        let config = SbcConfig::default();
+        assert!(config.cdr.enabled);
+        assert!(validate_config(&config).is_ok());
+        assert_eq!(config.cdr.rotate_interval_secs(), Some(3600));
+    }
+
+    #[test]
+    fn cdr_relative_directory_rejected() {
+        let mut config = SbcConfig::default();
+        config.cdr.directory = "cdr".into();
+        assert_rejected(&config, "cdr.directory");
+        config.cdr.enabled = false;
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn cdr_pii_hash_requires_key_file() {
+        use crate::schema::CdrPiiMode;
+        let mut config = SbcConfig::default();
+        config.cdr.pii = CdrPiiMode::Hash;
+        assert_rejected(&config, "pii_hash_key_file");
+        config.cdr.pii_hash_key_file = Some("key".into());
+        assert_rejected(&config, "absolute");
+        config.cdr.pii_hash_key_file = Some("/etc/usg-sbc/cdr.key".into());
+        assert!(validate_config(&config).is_ok());
+        config.cdr.pii = CdrPiiMode::Full;
+        assert_rejected(&config, "only valid with");
+    }
+
+    #[test]
+    fn cdr_unlimited_retention_rejected() {
+        let mut c = SbcConfig::default();
+        c.cdr.retention_files = 0;
+        c.cdr.retention_days = 0;
+        assert_rejected(&c, "cannot both be 0");
+        c.cdr.retention_days = 1;
+        assert!(validate_config(&c).is_ok());
+    }
+
+    #[test]
+    fn cdr_syslog_keys_validated_while_disabled() {
+        let base = SbcConfig::default();
+        assert!(!base.cdr.syslog.enabled);
+        let mut c = base.clone();
+        c.cdr.syslog.target = "udp://collector:514".to_string();
+        assert_rejected(&c, "cdr.syslog.target");
+        let mut c = base.clone();
+        c.cdr.syslog.facility = 24;
+        assert_rejected(&c, "facility");
+        let mut c = base;
+        c.cdr.syslog.ca_path = Some("ca.pem".into());
+        assert_rejected(&c, "ca_path");
+    }
+
+    #[test]
+    fn cdr_ranges_enforced() {
+        let base = SbcConfig::default();
+        let mut c = base.clone();
+        c.cdr.rotate_size_mb = 0;
+        assert_rejected(&c, "rotate_size_mb");
+        let mut c = base.clone();
+        c.cdr.rotate_size_mb = 5000;
+        assert_rejected(&c, "rotate_size_mb");
+        for bad in ["1m", "25h", "abc", "", "-5m", "1d"] {
+            let mut c = base.clone();
+            c.cdr.rotate_interval = bad.to_string();
+            assert_rejected(&c, "rotate_interval");
+        }
+        for good in ["0", "5m", "300", "24h", "3600s"] {
+            let mut c = base.clone();
+            c.cdr.rotate_interval = good.to_string();
+            assert!(validate_config(&c).is_ok(), "{good}");
+        }
+        let mut c = base.clone();
+        c.cdr.queue_capacity = 10;
+        assert_rejected(&c, "queue_capacity");
+        let mut c = base.clone();
+        c.cdr.ring_capacity = 200_001;
+        assert_rejected(&c, "ring_capacity");
+        let mut c = base.clone();
+        c.cdr.fsync_interval_ms = 60_001;
+        assert_rejected(&c, "fsync_interval_ms");
+        let mut c = base;
+        c.cdr.node_id = Some("../etc".into());
+        assert_rejected(&c, "node_id");
+    }
+
+    #[test]
+    fn cdr_syslog_requires_tls() {
+        let mut config = SbcConfig::default();
+        config.cdr.syslog.enabled = true;
+        assert!(validate_config(&config).is_ok());
+        config.cdr.syslog.target = "udp://collector:514".into();
+        assert_rejected(&config, "tls://");
+        config.cdr.syslog.target = "tls://collector".into();
+        assert_rejected(&config, "tls://");
+        config.cdr.syslog.target = "tls://[2001:db8::1]:6514".into();
+        assert!(validate_config(&config).is_ok());
+        config.cdr.syslog.facility = 24;
+        assert_rejected(&config, "facility");
+    }
+    // NIST 800-53 Rev5: SC-8, SC-23 — outbound trunk TLS keys are enforced
+    // or rejected, never ignored.
+    // RFC-001 (RFC 3261 §18.2.2, §20.42): a TCP/TLS trunk needs a listener
+    // of that transport, or the Via/Contact would name a dead port.
+    #[test]
+    fn stream_trunk_requires_matching_listener() {
+        for (proto, port) in [("tls", 5061), ("tcp", 5060)] {
+            let mut c = SbcConfig::default();
+            let mut g = trunk_group("g1");
+            g.trunks[0].protocol = proto.to_string();
+            g.trunks[0].port = port;
+            c.trunk_groups = vec![g];
+            if proto == "tls" {
+                c.security.trunk_tls_ca_path = Some("/etc/sbc/trunk-ca.pem".into());
+            }
+            super::validate_config(&c).unwrap();
+            if proto == "tls" {
+                c.transport.tls_listen.clear();
+            } else {
+                c.transport.tcp_listen.clear();
+            }
+            let err = super::validate_config(&c).unwrap_err().to_string();
+            assert!(err.contains(&format!("transport.{proto}_listen")), "{err}");
+        }
+        // A UDP trunk needs no stream listener.
+        let mut c = SbcConfig::default();
+        c.transport.tcp_listen.clear();
+        c.transport.tls_listen.clear();
+        c.trunk_groups = vec![trunk_group("g1")];
+        super::validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn trunk_tls_keys_validated() {
+        let tls_cfg = || {
+            let mut c = SbcConfig::default();
+            let mut g = trunk_group("g1");
+            g.trunks[0].protocol = "tls".to_string();
+            g.trunks[0].port = 5061;
+            c.trunk_groups = vec![g];
+            c
+        };
+        // A TLS trunk needs trunk trust anchors.
+        let c = tls_cfg();
+        let err = super::validate_config(&c).unwrap_err().to_string();
+        assert!(err.contains("trunk_tls_ca_path"), "{err}");
+        let mut c = tls_cfg();
+        c.security.trunk_tls_ca_path = Some("trunks.pem".into());
+        assert!(
+            super::validate_config(&c).is_err(),
+            "relative path rejected"
+        );
+        c.security.trunk_tls_ca_path = Some("/etc/sbc/trunk-ca.pem".into());
+        super::validate_config(&c).unwrap();
+
+        // Server name: TLS only, no header metacharacters.
+        c.trunk_groups[0].trunks[0].tls_server_name = Some("sip.example.net".to_string());
+        super::validate_config(&c).unwrap();
+        c.trunk_groups[0].trunks[0].tls_server_name = Some("bad\r\nVia: x".to_string());
+        assert!(super::validate_config(&c).is_err());
+        c.trunk_groups[0].trunks[0].tls_server_name = None;
+
+        // mTLS to the trunk needs the SBC certificate.
+        c.trunk_groups[0].trunks[0].tls_client_cert = true;
+        assert!(super::validate_config(&c).is_err());
+        c.security.tls_cert_path = Some("/etc/sbc/cert.pem".into());
+        c.security.tls_key_path = Some("/etc/sbc/key.pem".into());
+        super::validate_config(&c).unwrap();
+
+        // TLS-only keys on a UDP trunk are rejected, as is an unused CA.
+        let mut c = SbcConfig::default();
+        c.trunk_groups = vec![trunk_group("g1")];
+        c.trunk_groups[0].trunks[0].tls_server_name = Some("sip.example.net".to_string());
+        assert!(super::validate_config(&c).is_err());
+        c.trunk_groups[0].trunks[0].tls_server_name = None;
+        c.trunk_groups[0].trunks[0].tls_client_cert = true;
+        assert!(super::validate_config(&c).is_err());
+        c.trunk_groups[0].trunks[0].tls_client_cert = false;
+        c.security.trunk_tls_ca_path = Some("/etc/sbc/trunk-ca.pem".into());
+        // An unused CA is allowed (trunks may arrive via TrunkSync).
+        super::validate_config(&c).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod qa_trunk_tls_edges {
+    use crate::schema::{SbcConfig, TrunkConfigSchema, TrunkGroupConfig};
+
+    fn group(id: &str, proto: &str) -> TrunkGroupConfig {
+        TrunkGroupConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            strategy: "priority".to_string(),
+            trunks: vec![TrunkConfigSchema {
+                id: format!("{id}-t"),
+                host: "sip.example.net".to_string(),
+                port: if proto == "tls" { 5061 } else { 5060 },
+                protocol: proto.to_string(),
+                ..TrunkConfigSchema::default()
+            }],
+            zone: None,
+            require_tls: false,
+        }
+    }
+
+    fn cfg(groups: Vec<TrunkGroupConfig>, ca: Option<&str>) -> SbcConfig {
+        let mut c = SbcConfig {
+            trunk_groups: groups,
+            ..SbcConfig::default()
+        };
+        c.security.trunk_tls_ca_path = ca.map(Into::into);
+        c
+    }
+
+    fn err(c: &SbcConfig) -> String {
+        super::validate_config(c).unwrap_err().to_string()
+    }
+
+    // POA&M-48 (SC-8): require_tls validation.
+    #[test]
+    fn require_tls_group_needs_a_tls_trunk() {
+        let ca = Some("/etc/sbc/trunk-ca.pem");
+        let mut g = group("a", "udp");
+        g.require_tls = true;
+        assert!(err(&cfg(vec![g.clone()], ca)).contains("require_tls"));
+        g.trunks.clear();
+        assert!(err(&cfg(vec![g.clone()], ca)).contains("require_tls"));
+        // Mixed group is fine.
+        let mut g = group("a", "udp");
+        g.require_tls = true;
+        g.trunks.extend(group("b", "tls").trunks);
+        super::validate_config(&cfg(vec![g], ca)).unwrap();
+    }
+
+    #[test]
+    fn global_require_tls_trunks_applies_to_every_group() {
+        let ca = Some("/etc/sbc/trunk-ca.pem");
+        let mut c = cfg(vec![group("a", "tls"), group("b", "tcp")], ca);
+        super::validate_config(&c).unwrap();
+        c.security.require_tls_trunks = true;
+        assert!(err(&c).contains("security.require_tls_trunks"));
+        c.trunk_groups.truncate(1);
+        super::validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn require_tls_absent_key_defaults_false() {
+        let c = crate::load_from_str(
+            "[[trunk_groups]]\nid = \"g\"\n[[trunk_groups.trunks]]\nid = \"t\"\nhost = \"sip.example.net\"\n",
+        )
+        .unwrap();
+        assert!(!c.trunk_groups[0].require_tls);
+        assert!(!c.security.require_tls_trunks);
+    }
+
+    #[test]
+    fn tls_trunk_in_a_later_group_still_needs_ca() {
+        let c = cfg(vec![group("a", "udp"), group("b", "tls")], None);
+        assert!(err(&c).contains("trunk_tls_ca_path"));
+        let c = cfg(
+            vec![group("a", "udp"), group("b", "tls")],
+            Some("/etc/sbc/trunk-ca.pem"),
+        );
+        super::validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn trunk_ca_path_empty_or_relative_rejected() {
+        for p in ["", "trunk-ca.pem", "./trunk-ca.pem", "../etc/ca.pem"] {
+            let c = cfg(vec![group("a", "tls")], Some(p));
+            assert!(err(&c).contains("absolute"), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn trunk_ca_without_tls_trunk_in_file_is_allowed() {
+        // TLS trunks may arrive later via TrunkSync; the CA must be loadable
+        // up front. It must still be absolute.
+        let c = cfg(vec![group("a", "tcp")], Some("/etc/sbc/trunk-ca.pem"));
+        super::validate_config(&c).unwrap();
+        let c = cfg(Vec::new(), Some("/etc/sbc/trunk-ca.pem"));
+        super::validate_config(&c).unwrap();
+        let c = cfg(Vec::new(), Some("trunk-ca.pem"));
+        assert!(err(&c).contains("absolute"));
+    }
+
+    #[test]
+    fn tls_server_name_shapes() {
+        // 253 octets in labels of at most 63 (RFC 1035 §2.3.4).
+        let max_name = format!("{0}.{0}.{0}.{1}", "a".repeat(63), "a".repeat(61));
+        assert_eq!(max_name.len(), 253);
+        for ok in ["sip.example.net", "192.0.2.10", "2001:db8::1", &max_name] {
+            let mut c = cfg(vec![group("a", "tls")], Some("/etc/sbc/trunk-ca.pem"));
+            c.trunk_groups[0].trunks[0].tls_server_name = Some(ok.to_string());
+            assert!(super::validate_config(&c).is_ok(), "{ok:?} rejected");
+        }
+        for bad in [
+            "",
+            &"a".repeat(254),
+            "sip example.net",
+            "sip_example.net",
+            "sip.example.net\r\n",
+            "sip.example.net;transport=udp",
+            "*.example.net",
+            "sip.example.net/",
+            "host:5061",
+            "::::",
+            "sip..example.net",
+            &"a".repeat(64),
+        ] {
+            let mut c = cfg(vec![group("a", "tls")], Some("/etc/sbc/trunk-ca.pem"));
+            c.trunk_groups[0].trunks[0].tls_server_name = Some(bad.to_string());
+            assert!(super::validate_config(&c).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn tls_keys_rejected_on_tcp_trunk() {
+        let mut c = cfg(vec![group("a", "tcp")], None);
+        c.trunk_groups[0].trunks[0].tls_server_name = Some("sip.example.net".to_string());
+        assert!(err(&c).contains("requires protocol"));
+        let mut c = cfg(vec![group("a", "tcp")], None);
+        c.trunk_groups[0].trunks[0].tls_client_cert = true;
+        assert!(err(&c).contains("requires protocol"));
+    }
+
+    #[test]
+    fn tls_client_cert_needs_cert_and_key_pair() {
+        let mut c = cfg(vec![group("a", "tls")], Some("/etc/sbc/trunk-ca.pem"));
+        c.trunk_groups[0].trunks[0].tls_client_cert = true;
+        c.security.tls_cert_path = Some("/etc/sbc/cert.pem".into());
+        assert!(super::validate_config(&c).is_err(), "cert without key");
+        c.security.tls_cert_path = None;
+        c.security.tls_key_path = Some("/etc/sbc/key.pem".into());
+        assert!(super::validate_config(&c).is_err(), "key without cert");
+    }
 }
 
 /// Tests that the shipped deploy configurations still validate.
@@ -1243,9 +3229,7 @@ require_mtls = false
 
 [stir_shaken]
 signing_enabled = false
-verification_enabled = true
-default_attestation = "B"
-max_passport_age_secs = 60
+verification_enabled = false
 
 [rate_limit]
 enabled = true
@@ -1259,11 +3243,383 @@ level = "info"
 format = "json"
 output = "stdout"
 audit_enabled = true
+
+[cdr]
+enabled = true
+format = "jsonl"
+directory = "/var/lib/usg-sbc/cdr"
+rotate_size_mb = 100
+rotate_interval = "1h"
+retention_files = 168
+retention_days = 90
+fsync_interval_ms = 1000
+queue_capacity = 8192
+ring_capacity = 10000
+hash_chain = true
+record_unanswered = "all"
+record_auth_challenges = false
+pii = "full"
+on_failure = "continue"
+
+[cdr.syslog]
+enabled = false
+target = "tls://collector.example.net:6514"
+facility = 16
 "#;
 
     #[test]
     fn test_deploy_config_toml_validates() {
         let config = crate::load_from_str(DEPLOY_CONFIG_TOML).expect("deploy/config/config.toml");
         assert_eq!(config.general.instance_name, "sbc-01");
+        super::validate_config(&config).expect("deploy/config/config.toml must validate");
+    }
+
+    #[test]
+    fn trunk_retry_after_max_secs_bounds() {
+        let mut config = crate::SbcConfig::default();
+        assert_eq!(config.general.trunk_retry_after_max_secs, 300);
+        for ok in [1, 300, 3600] {
+            config.general.trunk_retry_after_max_secs = ok;
+            assert!(super::validate_config(&config).is_ok(), "{ok}");
+        }
+        for bad in [0, 3601, u32::MAX] {
+            config.general.trunk_retry_after_max_secs = bad;
+            assert!(super::validate_config(&config).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn emergency_numbers_parse_default_and_reject_invalid() {
+        let config = crate::load_from_str("[vps]\nenabled = true\n").unwrap();
+        assert_eq!(
+            config.vps.as_ref().unwrap().emergency_numbers,
+            vec!["911", "933", "112"]
+        );
+        let config = crate::load_from_str(
+            "[general]\ntrunk_retry_after_max_secs = 60\n[vps]\nemergency_numbers = [\"911\", \"+999\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.general.trunk_retry_after_max_secs, 60);
+        assert_eq!(
+            config.vps.as_ref().unwrap().emergency_numbers,
+            vec!["911", "+999"]
+        );
+        assert!(super::validate_config(&config).is_ok());
+        let mut bad = config;
+        bad.vps.as_mut().unwrap().emergency_numbers = vec!["9-1-1".to_string()];
+        assert!(super::validate_config(&bad).is_err());
+        assert!(crate::load_from_str("[general]\ntrunk_retry_after_max_secs = 0\n").is_err());
+    }
+}
+
+#[cfg(all(test, feature = "cluster"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod cluster_admission_tests {
+    use super::*;
+    use crate::schema::{
+        AdmissionSplit, ClusterConfig, TrunkConfigSchema, TrunkGroupConfig, cluster_share,
+    };
+
+    fn divided(n: u32) -> SbcConfig {
+        let mut config = SbcConfig::default();
+        let mut cluster = ClusterConfig {
+            enabled: true,
+            ..ClusterConfig::default()
+        };
+        cluster.admission.split = AdmissionSplit::Divide;
+        cluster.admission.expected_nodes = n;
+        config.cluster = Some(cluster);
+        config
+    }
+
+    fn rejected(config: &SbcConfig, needle: &str) {
+        let msg = validate_config(config).expect_err("rejected").to_string();
+        assert!(msg.contains(needle), "'{msg}' should mention '{needle}'");
+    }
+
+    #[test]
+    fn share_arithmetic() {
+        assert_eq!(cluster_share(100, 0), 100);
+        assert_eq!(cluster_share(100, 1), 100);
+        assert_eq!(cluster_share(100, 3), 33);
+        assert_eq!(cluster_share(2, 3), 1);
+        assert_eq!(cluster_share(u32::MAX, 64), u32::MAX / 64);
+    }
+
+    #[test]
+    fn per_node_default_keeps_configured_caps() {
+        let config = SbcConfig::default();
+        validate_config(&config).unwrap();
+        assert_eq!(config.admission_divisor(), 1);
+        assert_eq!(config.effective_max_calls(), config.general.max_calls);
+        assert_eq!(
+            config.effective_max_registrations(),
+            config.general.max_registrations
+        );
+        let mut c = divided(1);
+        c.cluster.as_mut().unwrap().admission.split = AdmissionSplit::PerNode;
+        validate_config(&c).unwrap();
+        assert_eq!(c.admission_divisor(), 1);
+    }
+
+    #[test]
+    fn divide_splits_caps_but_not_emergency_reserve() {
+        let mut config = divided(3);
+        config.general.max_calls = 1000;
+        config.general.max_registrations = 3000;
+        validate_config(&config).unwrap();
+        assert_eq!(config.effective_max_calls(), 333);
+        assert_eq!(config.effective_max_registrations(), 1000);
+        // 47 CFR 9.16: the reserve stays per node, sized from the configured cap.
+        assert_eq!(config.general.effective_emergency_reserve_calls(), 100);
+    }
+
+    #[test]
+    fn divide_rejects_bad_values() {
+        rejected(&divided(0), "expected_nodes must be 1-64");
+        rejected(&divided(65), "expected_nodes must be 1-64");
+        let mut c = divided(3);
+        c.general.max_calls = 2;
+        rejected(&c, "general.max_calls");
+        let mut c = divided(3);
+        c.general.max_registrations = 2;
+        rejected(&c, "general.max_registrations");
+        let mut c = divided(3);
+        c.trunk_groups.push(TrunkGroupConfig {
+            id: "g".to_string(),
+            require_tls: false,
+            name: "g".to_string(),
+            strategy: "priority".to_string(),
+            trunks: vec![TrunkConfigSchema {
+                id: "t1".to_string(),
+                host: "sip.example.com".to_string(),
+                max_calls: 2,
+                ..Default::default()
+            }],
+            zone: None,
+        });
+        rejected(&c, "trunk 't1' max_calls");
+        let mut c = divided(3);
+        c.cluster.as_mut().unwrap().enabled = false;
+        rejected(&c, "requires cluster.enabled");
+        let mut c = divided(3);
+        c.cluster.as_mut().unwrap().admission.split = AdmissionSplit::PerNode;
+        rejected(&c, "only used with split");
+    }
+
+    #[test]
+    fn toml_round_trip() {
+        let parsed = crate::load_from_str(
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 4\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.admission_divisor(), 4);
+        assert_eq!(parsed.effective_max_calls(), 2500);
+    }
+
+    #[test]
+    fn qa_share_boundaries() {
+        // N = 1 identity, exact and uneven division, cap == N gives 1.
+        for cap in [0, 1, 7, 1000, u32::MAX] {
+            assert_eq!(cluster_share(cap, 1), cap);
+        }
+        assert_eq!(cluster_share(1000, 4), 250);
+        assert_eq!(cluster_share(1001, 4), 250);
+        assert_eq!(cluster_share(1003, 4), 250);
+        assert_eq!(cluster_share(64, 64), 1);
+        assert_eq!(cluster_share(127, 64), 1);
+        assert_eq!(cluster_share(128, 64), 2);
+        // Floor never exceeds the cluster total.
+        for n in 1..=64u32 {
+            for cap in [n, n + 1, 2 * n - 1, 999, 50_000] {
+                let s = cluster_share(cap, n);
+                assert!(s >= 1 && u64::from(s) * u64::from(n) <= u64::from(cap.max(n)));
+            }
+        }
+    }
+
+    #[test]
+    fn misspelled_admission_key_rejected() {
+        // NIST 800-53 Rev5: CM-6 — NIST-001.
+        let err = crate::load_from_str(
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_node = 3\n",
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn qa_divide_one_node_is_identity_and_accepted() {
+        let config = divided(1);
+        validate_config(&config).unwrap();
+        assert_eq!(config.admission_divisor(), 1);
+        assert_eq!(config.effective_max_calls(), config.general.max_calls);
+        assert_eq!(
+            config.effective_max_registrations(),
+            config.general.max_registrations
+        );
+    }
+
+    #[test]
+    fn qa_divide_cap_equal_to_n_accepted_below_rejected() {
+        let mut c = divided(64);
+        c.general.max_calls = 64;
+        c.general.max_registrations = 64;
+        validate_config(&c).unwrap();
+        assert_eq!(c.effective_max_calls(), 1);
+        assert_eq!(c.effective_max_registrations(), 1);
+        c.general.max_calls = 63;
+        rejected(&c, "general.max_calls (63)");
+        let mut c = divided(4);
+        c.general.max_registrations = 3;
+        rejected(&c, "general.max_registrations (3)");
+    }
+
+    #[test]
+    fn qa_divide_trunk_cap_equal_to_n_accepted() {
+        let mut c = divided(3);
+        c.trunk_groups.push(TrunkGroupConfig {
+            id: "g".to_string(),
+            require_tls: false,
+            name: "g".to_string(),
+            strategy: "priority".to_string(),
+            trunks: vec![
+                TrunkConfigSchema {
+                    id: "ok".to_string(),
+                    host: "sip.example.com".to_string(),
+                    max_calls: 3,
+                    ..Default::default()
+                },
+                TrunkConfigSchema {
+                    id: "small".to_string(),
+                    host: "sip2.example.com".to_string(),
+                    max_calls: 2,
+                    ..Default::default()
+                },
+            ],
+            zone: None,
+        });
+        rejected(&c, "trunk 'small' max_calls");
+        c.trunk_groups[0].trunks.pop();
+        validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn qa_per_node_caps_below_n_irrelevant() {
+        // per_node with expected_nodes = 1 does not apply the cap >= N rule.
+        let mut c = divided(1);
+        c.cluster.as_mut().unwrap().admission.split = AdmissionSplit::PerNode;
+        c.general.max_calls = 1;
+        c.general.max_registrations = 1;
+        validate_config(&c).unwrap();
+        // per_node under a disabled cluster is fine too.
+        c.cluster.as_mut().unwrap().enabled = false;
+        validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn qa_toml_backward_compat_and_rejections() {
+        // Existing [cluster] without an admission table: per_node, divisor 1.
+        let parsed = crate::load_from_str("[cluster]\nenabled = true\n").unwrap();
+        let adm = &parsed.cluster.as_ref().unwrap().admission;
+        assert_eq!(adm.split, AdmissionSplit::PerNode);
+        assert_eq!(adm.expected_nodes, 1);
+        assert_eq!(parsed.admission_divisor(), 1);
+        assert_eq!(parsed.effective_max_calls(), parsed.general.max_calls);
+        // No [cluster] at all.
+        let parsed = crate::load_from_str("").unwrap();
+        assert_eq!(parsed.admission_divisor(), 1);
+        // Explicit per_node.
+        let parsed = crate::load_from_str(
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"per_node\"\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.admission_divisor(), 1);
+        // Rejections through the loader.
+        for bad in [
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"bogus\"\n",
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 0\n",
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 65\n",
+            "[cluster]\nenabled = true\n[cluster.admission]\nexpected_nodes = 3\n",
+            "[cluster]\nenabled = false\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 2\n",
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = -1\n",
+            "[general]\nmax_registrations = 3\n[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 4\n",
+        ] {
+            assert!(crate::load_from_str(bad).is_err(), "accepted: {bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
+mod transport_dos_limits {
+    use super::validate_config;
+    use crate::schema::SbcConfig;
+
+    #[test]
+    fn defaults_validate() {
+        let c = SbcConfig::default();
+        assert_eq!(c.rate_limit.ipv6_prefix_len, 64);
+        assert_eq!(c.rate_limit.max_blocked_sources, 16_384);
+        assert_eq!(c.rate_limit.block_duration_secs, 60);
+        assert_eq!(c.transport.max_connections_per_source, 128);
+        assert_eq!(c.transport.max_connections_total, 20_000);
+        assert_eq!(c.rate_limit.effective_overflow_rps(), 1_000);
+        let mut hi = c.rate_limit.clone();
+        hi.per_ip_rps = 10_000;
+        hi.global_rps = 50_000;
+        assert_eq!(hi.effective_overflow_rps(), 10_000);
+        assert!(c.transport.ws_require_sip_subprotocol);
+        validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn old_config_without_new_keys_loads() {
+        let c: SbcConfig = toml::from_str(
+            "[rate_limit]\nenabled = true\nglobal_rps = 10000\nper_ip_rps = 100\n\
+             [transport]\nudp_listen = [\"0.0.0.0:5060\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.rate_limit.audit_interval_secs, 60);
+        assert_eq!(c.transport.first_message_timeout_secs, 30);
+    }
+
+    #[test]
+    fn serde_round_trip_keeps_new_keys() {
+        let mut c = SbcConfig::default();
+        c.rate_limit.ipv6_prefix_len = 48;
+        c.transport.max_connections_per_source = 7;
+        let text = toml::to_string(&c).unwrap();
+        let back: SbcConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.rate_limit.ipv6_prefix_len, 48);
+        assert_eq!(back.transport.max_connections_per_source, 7);
+    }
+
+    #[test]
+    fn out_of_range_values_rejected() {
+        let cases: Vec<fn(&mut SbcConfig)> = vec![
+            |c| c.rate_limit.ipv6_prefix_len = 16,
+            |c| c.rate_limit.max_tracked_sources = 10,
+            |c| c.rate_limit.max_blocked_sources = 0,
+            |c| c.rate_limit.overflow_rps = 1,
+            |c| c.rate_limit.overflow_rps = 1_000_000,
+            |c| c.rate_limit.block_duration_secs = 0,
+            |c| c.rate_limit.sweep_interval_secs = 0,
+            |c| c.rate_limit.audit_interval_secs = 0,
+            |c| c.rate_limit.audit_max_records_per_interval = 0,
+            |c| c.transport.max_connections_per_source = 0,
+            |c| c.transport.max_connections_per_source = 20_000,
+            |c| c.transport.max_connections_per_listener = 0,
+            |c| c.transport.max_connections_total = 0,
+            |c| c.transport.handshake_timeout_secs = 0,
+            |c| c.transport.handshake_timeout_secs = 61,
+            |c| c.transport.first_message_timeout_secs = 0,
+            |c| c.transport.first_message_timeout_secs = 301,
+            |c| c.transport.tcp_idle_timeout_secs = 5,
+        ];
+        for (i, mutate) in cases.into_iter().enumerate() {
+            let mut c = SbcConfig::default();
+            mutate(&mut c);
+            assert!(validate_config(&c).is_err(), "case {i} should fail");
+        }
     }
 }

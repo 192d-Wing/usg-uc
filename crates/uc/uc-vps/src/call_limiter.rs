@@ -51,7 +51,8 @@ pub struct CallLimiter {
     invite_limiter: Option<RateLimiter>,
     /// Per-source REGISTER token buckets (None when disabled).
     register_limiter: Option<RateLimiter>,
-    /// Concurrent call count per callee number.
+    /// Concurrent call count per callee number. Keys are canonical
+    /// screening keys (`uc_types::DialedNumber`), supplied by the engine.
     concurrent_by_callee: HashMap<String, u32>,
 }
 
@@ -92,6 +93,11 @@ impl CallLimiter {
         self.register_limiter
             .as_mut()
             .map_or(RateLimitAction::Allow, |limiter| limiter.check(source))
+    }
+
+    /// Configured per-callee concurrency cap (0 = unlimited).
+    pub fn per_callee_max_concurrent(&self) -> u32 {
+        self.config.per_callee_max_concurrent
     }
 
     /// Whether a new call to `callee` would exceed the concurrency cap.

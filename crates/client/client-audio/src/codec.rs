@@ -170,22 +170,59 @@ impl CodecPipeline {
         trace!("Generated {} samples of PLC", output.len());
     }
 
-    /// Decodes with Forward Error Correction for a lost packet.
+    /// Validates a lost frame of `frame_samples`
+    /// total samples against the decode buffer capacity.
+    const fn check_lost_frame(&self, frame_samples: usize) -> AudioResult<()> {
+        if frame_samples == 0 || frame_samples > self.decode_buffer.len() {
+            return Err(AudioError::LossRecovery("invalid lost-frame size"));
+        }
+        Ok(())
+    }
+
+    /// Rebuilds a lost frame from the in-band FEC carried in the next packet.
     ///
-    /// Only works with codecs that support FEC (e.g., Opus with inband FEC).
-    /// Returns the decoded samples, or an error if FEC is not supported.
-    pub fn decode_fec(&mut self) -> AudioResult<&[i16]> {
+    /// `next_payload` is the RTP payload of the packet after the lost one and
+    /// `frame_samples` is the lost frame's length (ptime x rate x channels).
+    /// The returned slice is exactly `frame_samples` long; no allocation.
+    // RFC 7587 §3.4 / RFC 6716 §2.1.7 (LBRR)
+    pub fn decode_fec(&mut self, next_payload: &[u8], frame_samples: usize) -> AudioResult<&[i16]> {
+        self.check_lost_frame(frame_samples)?;
+        if !self.codec.supports_fec() {
+            return Err(AudioError::LossRecovery("codec has no in-band FEC"));
+        }
+        // The codec validates the buffer size and the N+1 TOC (RFC 6716
+        // §3.1) before touching decoder state, so no pre-check here.
         let decoded_len = self
             .codec
-            .decode_fec(&mut self.decode_buffer)
-            .map_err(|e| AudioError::CodecError(format!("FEC decode failed: {e}")))?;
-
+            .decode_fec(next_payload, &mut self.decode_buffer[..frame_samples])
+            .map_err(|_| AudioError::LossRecovery("FEC decode failed"))?;
         trace!(
             "FEC decoded {} samples ({})",
             decoded_len,
             self.codec.name()
         );
-        Ok(&self.decode_buffer[..decoded_len])
+        Ok(&self.decode_buffer[..decoded_len.min(frame_samples)])
+    }
+
+    /// Generates codec-native packet loss concealment for one lost frame of
+    /// `frame_samples` total samples (RFC 6716 §4.4 for Opus).
+    pub fn conceal(&mut self, frame_samples: usize) -> AudioResult<&[i16]> {
+        self.check_lost_frame(frame_samples)?;
+        let decoded_len = self
+            .codec
+            .conceal(&mut self.decode_buffer[..frame_samples])
+            .map_err(|_| AudioError::LossRecovery("PLC failed"))?;
+        trace!(
+            "PLC generated {} samples ({})",
+            decoded_len,
+            self.codec.name()
+        );
+        Ok(&self.decode_buffer[..decoded_len.min(frame_samples)])
+    }
+
+    /// Returns true if the codec has native packet loss concealment.
+    pub fn supports_plc(&self) -> bool {
+        self.codec.supports_plc()
     }
 
     /// Returns true if this codec supports Forward Error Correction.

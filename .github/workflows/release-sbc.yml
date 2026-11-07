@@ -1,4 +1,4 @@
-name: Release
+name: Release SBC
 
 # Builds the SBC pod images (sbc-daemon, sbc-api-server, sbc-provision-server,
 # sbc-client-config-server, sbc-announcement-server, sbc-trunk-agent,
@@ -16,14 +16,17 @@ name: Release
 # / Platform One project registry.
 #
 # Triggers:
-#   - a semver tag (v1.2.3) cuts released images tagged with the version
-#     (and `latest` on the default branch);
+#   - an `sbc-v<semver>` tag (sbc-v1.2.3) cuts released images tagged with
+#     the version (and `latest` on the default branch). The prefix keeps the
+#     SBC release cadence independent of the soft client
+#     (.github/workflows/release-client.yml, `client-v*`) and the docs site
+#     (`docs-v*`); a bare `v*` tag no longer triggers anything.
 #   - workflow_dispatch builds on-demand images tagged with the short SHA.
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'sbc-v*'
   workflow_dispatch:
     inputs:
       push:
@@ -166,9 +169,12 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ matrix.image }}
+          # `type=match` instead of `type=semver` because the tag carries the
+          # `sbc-` prefix. Group 1 strips it: sbc-v1.2.3 -> 1.2.3 and 1.2;
+          # pre-releases (sbc-v1.2.3-rc.1) get only the full version tag.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=sbc-v(\d+\.\d+\.\d+.*),group=1
+            type=match,pattern=sbc-v(\d+\.\d+)\.\d+$,group=1
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=,enable=${{ github.event_name == 'workflow_dispatch' }}
 

@@ -8,66 +8,99 @@ pub type CdrResult<T> = Result<T, CdrError>;
 /// CDR errors.
 #[derive(Debug)]
 pub enum CdrError {
-    /// Write error.
-    WriteError {
+    /// Invalid emitter or sink configuration.
+    Config {
         /// Message.
         message: String,
     },
-    /// Format error.
+    /// Record could not be serialized.
     FormatError {
         /// Message.
         message: String,
-    },
-    /// Invalid field.
-    InvalidField {
-        /// Field name.
-        field: String,
-        /// Reason.
-        reason: String,
-    },
-    /// Buffer full.
-    BufferFull {
-        /// Current size.
-        size: usize,
     },
     /// IO error.
     IoError {
         /// Message.
         message: String,
     },
+    /// The writer thread could not be started.
+    WriterThread {
+        /// Message.
+        message: String,
+    },
+    /// A CDR file failed integrity verification.
+    ///
+    /// ## NIST 800-53 Rev5: AU-9 (Protection of Audit Information)
+    Verify {
+        /// 1-based line number of the first failure (0 = whole file).
+        line: u64,
+        /// Reason.
+        reason: String,
+    },
+}
+
+impl CdrError {
+    pub(crate) fn config(message: impl Into<String>) -> Self {
+        Self::Config {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn verify(line: u64, reason: impl Into<String>) -> Self {
+        Self::Verify {
+            line,
+            reason: reason.into(),
+        }
+    }
 }
 
 impl fmt::Display for CdrError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::WriteError { message } => write!(f, "Write error: {message}"),
+            Self::Config { message } => write!(f, "CDR config error: {message}"),
             Self::FormatError { message } => write!(f, "Format error: {message}"),
-            Self::InvalidField { field, reason } => {
-                write!(f, "Invalid field '{field}': {reason}")
-            }
-            Self::BufferFull { size } => write!(f, "Buffer full: {size} records"),
             Self::IoError { message } => write!(f, "IO error: {message}"),
+            Self::WriterThread { message } => write!(f, "CDR writer thread: {message}"),
+            Self::Verify { line, reason } => {
+                write!(f, "CDR verification failed at line {line}: {reason}")
+            }
         }
     }
 }
 
 impl std::error::Error for CdrError {}
 
+impl From<std::io::Error> for CdrError {
+    fn from(e: std::io::Error) -> Self {
+        Self::IoError {
+            message: e.to_string(),
+        }
+    }
+}
+
+impl From<serde_json::Error> for CdrError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::FormatError {
+            message: e.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_write_error_display() {
-        let error = CdrError::WriteError {
-            message: "disk full".to_string(),
-        };
-        assert!(error.to_string().contains("disk full"));
+    fn test_verify_error_display() {
+        let error = CdrError::verify(7, "hash mismatch");
+        let s = error.to_string();
+        assert!(s.contains("line 7"));
+        assert!(s.contains("hash mismatch"));
     }
 
     #[test]
-    fn test_buffer_full_display() {
-        let error = CdrError::BufferFull { size: 1000 };
-        assert!(error.to_string().contains("1000"));
+    fn test_io_error_from() {
+        let e: CdrError = std::io::Error::other("disk full").into();
+        assert!(e.to_string().contains("disk full"));
     }
 }

@@ -429,7 +429,7 @@ impl FractionalSincResampler {
                     let win = self.kaiser_lut.evaluate(x_abs * inv_half);
 
                     let coeff = sinc_val * win;
-                    sum += f64::from(self.history[self.hist_pos + k]) * coeff;
+                    sum = f64::mul_add(f64::from(self.history[self.hist_pos + k]), coeff, sum);
                     coeff_sum += coeff;
                 }
 
@@ -485,7 +485,7 @@ impl FractionalSincResampler {
                     let win = self.kaiser_lut.evaluate(x_abs * inv_half);
 
                     let coeff = sinc_val * win;
-                    sum += f64::from(self.history[self.hist_pos + k]) * coeff;
+                    sum = f64::mul_add(f64::from(self.history[self.hist_pos + k]), coeff, sum);
                     coeff_sum += coeff;
                 }
 
@@ -665,7 +665,7 @@ fn kaiser_window(n: usize, length: usize, beta: f64) -> f64 {
     }
     let m = (length - 1) as f64 / 2.0;
     let x = (n as f64 - m) / m;
-    let inner = (1.0 - x * x).max(0.0).sqrt();
+    let inner = x.mul_add(-x, 1.0).max(0.0).sqrt();
     bessel_i0(beta * inner) / bessel_i0(beta)
 }
 

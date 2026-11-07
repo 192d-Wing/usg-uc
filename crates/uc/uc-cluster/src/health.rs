@@ -228,7 +228,7 @@ impl HealthMetrics {
         let mem_score = 1.0 - f64::from(self.memory_percent);
 
         // Weight: 40% CPU, 40% memory, 20% other factors
-        (cpu_score * 0.4 + mem_score * 0.4 + 0.2).clamp(0.0, 1.0)
+        (f64::mul_add(mem_score, 0.4, cpu_score * 0.4) + 0.2).clamp(0.0, 1.0)
     }
 }
 

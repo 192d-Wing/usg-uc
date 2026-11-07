@@ -22,9 +22,17 @@ use crate::media_pipeline::{AllocatedPorts, LegDtlsParams, MediaController, Medi
 use sbc_grpc_api::sbc as pb;
 use sbc_grpc_api::sbc::media_controller_service_client::MediaControllerServiceClient;
 use std::net::IpAddr;
-use tonic::transport::Channel;
+use std::time::Duration;
+use tonic::transport::{Channel, Endpoint};
 use uc_media_engine::MediaMode;
 use uc_types::address::SbcSocketAddr;
+
+/// Time allowed to (re)establish the control connection to a media node.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Deadline for one media-control RPC. Well under the INVITE's Timer B, so a
+/// dead node is marked down and the call placed on another node in time.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A [`MediaController`] backed by a gRPC connection to an out-of-process media
 /// plane. Cheap to clone-per-call: the inner tonic client shares one HTTP/2
@@ -43,10 +51,24 @@ impl GrpcMediaController {
     /// Returns [`MediaPipelineError::Rpc`] if the connection cannot be
     /// established.
     pub async fn connect(url: String) -> Result<Self, MediaPipelineError> {
-        let client = MediaControllerServiceClient::connect(url.clone())
+        let rpc_err = |e: tonic::transport::Error| {
+            MediaPipelineError::Rpc(format!("connect {url} failed: {e}"))
+        };
+        // Without deadlines an RPC to a node that died without closing its
+        // socket hangs instead of failing, so the pool never routes away from
+        // it (NIST 800-53 Rev5: SC-5, CP-10). The request timeout covers a
+        // streaming RPC only until its response headers arrive, so the
+        // long-lived event stream is unaffected.
+        let channel = Endpoint::from_shared(url.clone())
+            .map_err(rpc_err)?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .connect()
             .await
-            .map_err(|e| MediaPipelineError::Rpc(format!("connect {url} failed: {e}")))?;
-        Ok(Self { client })
+            .map_err(rpc_err)?;
+        Ok(Self {
+            client: MediaControllerServiceClient::new(channel),
+        })
     }
 
     /// Wraps an already-connected client (used by tests and by callers that
@@ -171,7 +193,7 @@ impl MediaController for GrpcMediaController {
             media_ip: resp
                 .media_ip
                 .as_deref()
-                .map(|s| s.parse::<IpAddr>())
+                .map(str::parse::<IpAddr>)
                 .transpose()
                 .map_err(|e| {
                     MediaPipelineError::Rpc(format!("invalid media_ip from media node: {e}"))
@@ -405,6 +427,34 @@ mod tests {
         GrpcMediaController::connect(spawn_fake().await)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unresponsive_node_fails_within_deadline() {
+        // A node that accepts TCP but never answers (hung, or its socket left
+        // half-open) must surface as an Rpc error, not hang the call setup.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let result = tokio::time::timeout(
+            CONNECT_TIMEOUT + REQUEST_TIMEOUT + Duration::from_secs(2),
+            async {
+                let mc = GrpcMediaController::connect(url).await?;
+                mc.create_session_with_zones("hang", Some(MediaMode::Relay), None, None)
+                    .await
+            },
+        )
+        .await
+        .expect("bounded by the connect/request deadlines");
+        assert!(
+            matches!(result, Err(MediaPipelineError::Rpc(_))),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

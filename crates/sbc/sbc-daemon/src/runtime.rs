@@ -107,6 +107,7 @@ impl Runtime {
     pub async fn new(args: Args) -> Result<Self, RuntimeError> {
         // Load configuration
         let config = Self::load_config(&args)?;
+        Self::init_audit(&config, &args)?;
 
         // Initialize telemetry provider
         let telemetry = Self::init_telemetry(&config)?;
@@ -187,6 +188,59 @@ impl Runtime {
         Ok(Some(provider))
     }
 
+    /// Starts the audit trail (NIST 800-53 AU-2/AU-3/AU-9) when
+    /// `logging.audit_enabled`: hash-chained JSON-lines at
+    /// `logging.audit_path`, or the tracing output (target `audit`) when no
+    /// path is configured. Records the startup event.
+    ///
+    /// # Errors
+    /// [`RuntimeError::AuditFailed`] when `logging.audit_path` is set but the
+    /// file sink cannot be opened or resumed (including files `FileSink`
+    /// refuses: symlink, group/world-writable directory, torn-only file).
+    fn init_audit(config: &SbcConfig, args: &Args) -> Result<(), RuntimeError> {
+        if !config.logging.audit_enabled {
+            return Ok(());
+        }
+        let result = match config.logging.audit_path.as_deref() {
+            None => {
+                info!("Audit events enabled on the tracing output (target \"audit\")");
+                uc_audit::init()
+            }
+            Some(path) => match uc_audit::sink::FileSink::open(path) {
+                Ok(sink) => {
+                    info!(path = %path.display(), "Audit log enabled");
+                    uc_audit::init_with_sink(Box::new(sink))
+                }
+                Err(e) => {
+                    // NIST 800-53 Rev5: AU-5 (Response to Audit Logging
+                    // Process Failures) -- fail closed: an operator who
+                    // configured a protected audit file never gets a daemon
+                    // running without it. main() exits with
+                    // AUDIT_INIT_FAILED_EXIT_CODE.
+                    error!(
+                        path = %path.display(),
+                        error = %e,
+                        "Cannot open audit log; SBC cannot start"
+                    );
+                    return Err(RuntimeError::AuditFailed {
+                        path: path.display().to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+            },
+        };
+        if let Err(e) = result {
+            debug!(error = %e, "Audit logger already initialised");
+        }
+        uc_audit::log_event(uc_audit::AuditEvent::SystemStartup(
+            uc_audit::event::SystemStartup {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                config_path: args.effective_config_path().display().to_string(),
+            },
+        ));
+        Ok(())
+    }
+
     /// Loads configuration from file or uses defaults.
     fn load_config(args: &Args) -> Result<SbcConfig, RuntimeError> {
         let config_path = args.effective_config_path();
@@ -230,6 +284,7 @@ impl Runtime {
             return Ok(ConfigReloadResult {
                 success: false,
                 changes: Vec::new(),
+                restart_required: Vec::new(),
                 message: "Config file not found".to_string(),
             });
         }
@@ -242,6 +297,7 @@ impl Runtime {
         // Compare with current config to identify changes
         let current = self.config.read().await;
         let changes = Self::detect_config_changes(&current, &new_config);
+        let restart_required = Self::detect_restart_required(&current, &new_config);
 
         // Log what changed
         if changes.is_empty() {
@@ -249,6 +305,7 @@ impl Runtime {
             return Ok(ConfigReloadResult {
                 success: true,
                 changes: Vec::new(),
+                restart_required: Vec::new(),
                 message: "No changes detected".to_string(),
             });
         }
@@ -263,11 +320,49 @@ impl Runtime {
             "Configuration reloaded successfully"
         );
 
+        // NIST 800-53 Rev5: CM-6, SC-8 — the running router keeps its
+        // trunk groups and `require_tls` policy until restart; say so rather
+        // than claim the change is applied (POA&M-48).
+        let message = if restart_required.is_empty() {
+            "Configuration reloaded".to_string()
+        } else {
+            warn!(
+                keys = ?restart_required,
+                "Configuration reloaded, but these settings take effect only after a restart"
+            );
+            format!(
+                "Configuration reloaded; restart required for: {}",
+                restart_required.join(", ")
+            )
+        };
+
         Ok(ConfigReloadResult {
             success: true,
             changes,
-            message: "Configuration reloaded".to_string(),
+            restart_required,
+            message,
         })
+    }
+
+    /// Changed settings a reload does not apply to the running SIP stack.
+    fn detect_restart_required(old: &SbcConfig, new: &SbcConfig) -> Vec<String> {
+        let mut keys = Vec::new();
+        if old.security.require_tls_trunks != new.security.require_tls_trunks {
+            keys.push("security.require_tls_trunks".to_string());
+        }
+        if old.trunk_groups != new.trunk_groups {
+            let tls_changed = old.trunk_groups.len() != new.trunk_groups.len()
+                || old
+                    .trunk_groups
+                    .iter()
+                    .zip(&new.trunk_groups)
+                    .any(|(a, b)| a.id != b.id || a.require_tls != b.require_tls);
+            if tls_changed {
+                keys.push("trunk_groups.require_tls".to_string());
+            }
+            keys.push("trunk_groups".to_string());
+        }
+        keys
     }
 
     /// Detects which configuration sections changed.
@@ -377,7 +472,28 @@ impl Runtime {
             .tls_cert_path
             .clone()
             .zip(config.security.tls_key_path.clone());
+        let api_tls_curve = config.security.curve;
         let provisioning_config = config.provisioning.clone();
+        // Config-file trunks with `options_ping_enabled` are monitored once
+        // the trunk monitor exists (below).
+        let config_trunk_groups = config.trunk_groups.clone();
+
+        // CDR pipeline (`[cdr]`). An unwritable directory stops startup
+        // (fail closed) with an error naming the directory and keys.
+        //
+        // ## NIST 800-53 Rev5: AU-5, AU-12
+        let cdr = crate::cdr::start_from_config(
+            &config.cdr,
+            &instance_name,
+            config.security.tls_ca_path.as_deref(),
+        )
+        .map_err(|reason| {
+            error!(error = %reason, "CDR pipeline failed to start — SBC cannot start");
+            RuntimeError::InitFailed {
+                component: "cdr".to_string(),
+                reason,
+            }
+        })?;
 
         // Pass cluster manager to server if available
         #[cfg(feature = "cluster")]
@@ -388,6 +504,41 @@ impl Runtime {
         // Set zone registry on server (and its SipStack) before starting
         if let Some(ref registry) = zone_registry {
             server.set_zone_registry(Arc::clone(registry));
+        }
+
+        if let Some(ref c) = cdr
+            && !server.set_cdr(Arc::clone(c))
+        {
+            return Err(RuntimeError::InitFailed {
+                component: "cdr".to_string(),
+                reason: "SIP stack already shared; CDR pipeline not attached".to_string(),
+            });
+        }
+
+        // STIR/SHAKEN: signing key, trust anchors, certificate cache. A
+        // configured-but-unloadable setup refuses startup rather than run
+        // with signing/verification silently off.
+        //
+        // ## NIST 800-53 Rev5: CM-6, SC-12, SC-17
+        let stir = {
+            let cfg = self.config.read().await;
+            crate::stir::StirService::from_config(&cfg).map_err(|reason| {
+                RuntimeError::InitFailed {
+                    component: "stir_shaken".to_string(),
+                    reason,
+                }
+            })?
+        }
+        .map(Arc::new);
+        if let Some(ref s) = stir {
+            if !server.set_stir(Arc::clone(s)) {
+                return Err(RuntimeError::InitFailed {
+                    component: "stir_shaken".to_string(),
+                    reason: "SIP stack already shared; STIR/SHAKEN not attached".to_string(),
+                });
+            }
+            s.spawn_anchor_refresh();
+            s.spawn_audit_flush();
         }
 
         // Attach the out-of-process media plane if configured
@@ -426,7 +577,23 @@ impl Runtime {
         let stats = Arc::clone(server.stats());
 
         let mut app_state = AppState::new(metrics, stats);
+        // REST HTTPS: build the CNSA reloadable acceptor now and fail closed
+        // (no plain-HTTP fallback). Key file must pass the uc-transport
+        // checks and be on `security.curve` (REST half of POA&M-166).
+        //
+        // ## NIST 800-53 Rev5: SC-8, SC-13, SC-12
+        if let Some(ref tls) = api_config.tls {
+            app_state.tls_acceptor = Some(
+                ApiServer::build_tls_acceptor(tls, api_tls_curve).map_err(|e| {
+                    RuntimeError::InitFailed {
+                        component: "api-tls".to_string(),
+                        reason: e.to_string(),
+                    }
+                })?,
+            );
+        }
         app_state.sip_stack = Some(Arc::clone(server.sip_stack()));
+        app_state.flows = Some(Arc::clone(server.flows()));
 
         // Initialize phone provisioning server when [provisioning] is set in
         // config.toml. Without this, /provision/{file} returns 503 because
@@ -470,11 +637,11 @@ impl Runtime {
         app_state.zone_registry = zone_registry.clone();
 
         // User store init moved to sbc-api as of PR10 — sbc-api owns
-        // /users CRUD via PostgresUserStore. The daemon no longer holds
-        // a UserStore handle here. (SIP digest auth will read the same
-        // Postgres `users` table directly once that wiring lands; until
-        // then, the daemon's auth path still relies on whatever is in
-        // its in-memory state.)
+        // /users CRUD via PostgresUserStore. The daemon holds no
+        // UserStore and SIP digest auth does not read the Postgres
+        // `users` table. If that is ever wired, the daemon must also load
+        // SBC_USER_HA1_KEY_FILE and read through EncryptedUserStore
+        // (digest_ha1 is AES-256-GCM ciphertext at rest).
 
         // Initialize Postgres-backed config stores when a DSN is
         // configured. Same `SBC_POSTGRES_URL` env var the user store
@@ -724,42 +891,32 @@ impl Runtime {
                         info!(count = csses.len(), "Seeded calling search spaces");
                     }
                     if let Some(rps) = seed.get("route_patterns").and_then(|v| v.as_array()) {
+                        let mut installed = 0usize;
                         for rp in rps {
-                            let id = rp.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-                            let partition = rp
-                                .get("partition_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default();
-                            let pattern_value =
-                                rp.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-                            let pattern_type = rp
-                                .get("pattern_type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("prefix");
-                            let pattern = match pattern_type {
-                                "exact" => uc_routing::DialPattern::exact(pattern_value),
-                                "wildcard" => uc_routing::DialPattern::wildcard(pattern_value),
-                                "any" => uc_routing::DialPattern::Any,
-                                _ => uc_routing::DialPattern::prefix(pattern_value),
-                            };
-                            let mut route_pattern =
-                                uc_routing::RoutePattern::new(id, pattern, partition);
-                            if let Some(desc) = rp.get("description").and_then(|v| v.as_str()) {
-                                route_pattern = route_pattern.with_description(desc);
+                            match seed_route_pattern(rp) {
+                                Ok(route_pattern) => {
+                                    sbc_w.add_route_pattern(route_pattern);
+                                    installed += 1;
+                                }
+                                Err(e) => {
+                                    // NIST 800-53 Rev5: CM-6, SI-10 — a mistyped
+                                    // (possibly blocking) pattern is reported, not
+                                    // silently turned into a prefix route.
+                                    crate::sip_stack::ROUTE_PATTERN_REJECTED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::error!(
+                                        id = rp.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                                        error = %e,
+                                        "Seed route pattern rejected; not installed"
+                                    );
+                                }
                             }
-                            if let Some(rg) = rp.get("route_group_id").and_then(|v| v.as_str())
-                                && !rg.is_empty()
-                            {
-                                route_pattern = route_pattern.with_route_group(rg);
-                            }
-                            if let Some(rl) = rp.get("route_list_id").and_then(|v| v.as_str())
-                                && !rl.is_empty()
-                            {
-                                route_pattern = route_pattern.with_route_list(rl);
-                            }
-                            sbc_w.add_route_pattern(route_pattern);
                         }
-                        info!(count = rps.len(), "Seeded route patterns");
+                        info!(
+                            count = installed,
+                            rejected = rps.len() - installed,
+                            "Seeded route patterns"
+                        );
                     }
                 }
             }
@@ -811,6 +968,12 @@ impl Runtime {
 
         let app_state = Arc::new(app_state);
 
+        // 47 CFR 9.16; NIST 800-53 Rev5: CP-8, CM-6 — warn loudly when an
+        // emergency number would not route.
+        if let Some(ref sip_stack) = app_state.sip_stack {
+            sip_stack.check_emergency_routability().await;
+        }
+
         // Postgres path: replay DIDs from the directory store. Done here
         // (after the Arc::new cut-over) for symmetry with the JSON path's
         // second-pass replay below, and so the sip_stack registrations
@@ -843,7 +1006,14 @@ impl Runtime {
             match ts.list().await {
                 Ok(groups) => {
                     for group_json in &groups {
-                        crate::api_server::sync_trunk_group_to_router(&app_state, group_json).await;
+                        if let Err(e) =
+                            crate::api_server::sync_trunk_group_to_router(&app_state, group_json)
+                                .await
+                        {
+                            // NIST 800-53 Rev5: SC-5 — rejected, not installed.
+                            warn!(error = %e, "Trunk group rejected during replay");
+                            continue;
+                        }
                         if let Some(trunks) = group_json.get("trunks").and_then(|v| v.as_array()) {
                             for trunk in trunks {
                                 crate::api_server::start_trunk_services(&app_state, trunk);
@@ -949,6 +1119,18 @@ impl Runtime {
             }
         }
 
+        // OPTIONS health → trunk selection: a trunk that stops answering is
+        // skipped by routing and failover until it answers again. Subscribe
+        // before starting the config-file monitors so no first result is
+        // missed; trunks already started above are reconciled from the
+        // health snapshot when the task starts.
+        if let (Some(monitor), Some(stack)) =
+            (app_state.trunk_monitor.clone(), app_state.sip_stack.clone())
+        {
+            spawn_trunk_health_feed(&monitor, stack, signal.clone());
+            start_config_trunk_monitors(&monitor, &config_trunk_groups, zone_registry.as_deref());
+        }
+
         // Replay trunk groups and DID mappings: sync to router and start services
         {
             let store = app_state.mem_store.read().await;
@@ -957,7 +1139,13 @@ impl Runtime {
             drop(store);
 
             for group_json in &groups {
-                crate::api_server::sync_trunk_group_to_router(&app_state, group_json).await;
+                if let Err(e) =
+                    crate::api_server::sync_trunk_group_to_router(&app_state, group_json).await
+                {
+                    // NIST 800-53 Rev5: SC-5 — rejected, not installed.
+                    warn!(error = %e, "Trunk group rejected during replay");
+                    continue;
+                }
                 if let Some(trunks) = group_json.get("trunks").and_then(|v| v.as_array()) {
                     for trunk in trunks {
                         crate::api_server::start_trunk_services(&app_state, trunk);
@@ -1034,8 +1222,18 @@ impl Runtime {
         let args = self.args.clone();
         let reload_interval = self.reload_check_interval;
 
+        let reload_cdr = cdr.clone();
+        let reload_stir = stir.clone();
         let reload_handle = tokio::spawn(async move {
-            Self::config_reload_loop(reload_signal, config_ref, args, reload_interval).await;
+            Self::config_reload_loop(
+                reload_signal,
+                config_ref,
+                args,
+                reload_interval,
+                reload_cdr,
+                reload_stir,
+            )
+            .await;
         });
 
         // Run main SIP server loop
@@ -1060,6 +1258,41 @@ impl Runtime {
         info!("Initiating graceful shutdown with connection draining");
         let drain_result = self.shutdown.shutdown_gracefully().await;
 
+        // Calls still up get a `shutdown` CDR, then the CDR writer drains
+        // and closes its file (sidecar digest) before the audit flush, so
+        // the rotation audit event is flushed too (plan §5).
+        //
+        // ## NIST 800-53 Rev5: AU-12, AU-9
+        if let Some(ref c) = cdr {
+            let ended = server.sip_stack().end_remaining_calls_for_shutdown().await;
+            if ended > 0 {
+                info!(calls = ended, "Ended remaining calls with shutdown CDRs");
+            }
+            let emitter = Arc::clone(c.emitter());
+            if !tokio::task::spawn_blocking(move || {
+                emitter.shutdown(crate::cdr::SHUTDOWN_FLUSH_TIMEOUT)
+            })
+            .await
+            .unwrap_or(false)
+            {
+                warn!("CDR queue not drained before shutdown");
+            }
+        }
+
+        uc_audit::log_event(uc_audit::AuditEvent::SystemShutdown(
+            uc_audit::event::SystemShutdown {
+                reason: "shutdown signal".to_string(),
+                graceful: drain_result.drained,
+            },
+        ));
+        // The audit writer runs on its own thread; let it drain the queue
+        // (including the shutdown record) before the process exits (AU-5).
+        if !tokio::task::spawn_blocking(|| uc_audit::flush(std::time::Duration::from_secs(2)))
+            .await
+            .unwrap_or(false)
+        {
+            warn!("Audit queue not drained before shutdown");
+        }
         if drain_result.drained {
             warn!(
                 duration_ms = drain_result.drain_duration_ms,
@@ -1110,6 +1343,8 @@ impl Runtime {
         config: Arc<RwLock<SbcConfig>>,
         args: Args,
         poll_interval: Duration,
+        cdr: Option<Arc<crate::cdr::CdrContext>>,
+        stir: Option<Arc<crate::stir::StirService>>,
     ) {
         let mut interval = tokio::time::interval(poll_interval);
 
@@ -1121,10 +1356,20 @@ impl Runtime {
 
                         let config_path = args.effective_config_path();
                         info!(path = %config_path.display(), "SIGHUP received, reloading configuration");
+                        // SIGHUP also reloads the STI-CR trust anchors.
+                        if let Some(ref s) = stir {
+                            s.reload_anchors().await;
+                        }
 
                         if Path::new(&config_path).exists() {
                             match load_from_file(&config_path) {
                                 Ok(new_config) => {
+                                    if let Some(ref c) = cdr {
+                                        let old = config.read().await.cdr.clone();
+                                        if old != new_config.cdr {
+                                            crate::cdr::reload(c, &old, &new_config.cdr);
+                                        }
+                                    }
                                     *config.write().await = new_config;
                                     info!("Configuration reloaded successfully");
                                     warn!("Note: running Server and SipStack retain their original config snapshots; a full restart is required for all settings to take effect");
@@ -1175,6 +1420,32 @@ pub enum RuntimeError {
         /// Error reason.
         reason: String,
     },
+    /// The configured audit file could not be opened (AU-5 fail closed).
+    AuditFailed {
+        /// Configured `logging.audit_path`.
+        path: String,
+        /// Error reason.
+        reason: String,
+    },
+}
+
+/// Process exit code when `logging.audit_path` is configured but the audit
+/// file sink cannot be opened. Every other startup/runtime failure (config,
+/// CDR, server) exits 1; this code is dedicated so supervisors can tell an
+/// audit-trail refusal apart.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+pub const AUDIT_INIT_FAILED_EXIT_CODE: i32 = 3;
+
+impl RuntimeError {
+    /// Process exit code for this error.
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        match self {
+            Self::AuditFailed { .. } => AUDIT_INIT_FAILED_EXIT_CODE,
+            Self::ConfigFailed { .. } | Self::InitFailed { .. } | Self::ServerFailed { .. } => 1,
+        }
+    }
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -1189,6 +1460,9 @@ impl std::fmt::Display for RuntimeError {
             Self::ServerFailed { reason } => {
                 write!(f, "Server error: {reason}")
             }
+            Self::AuditFailed { path, reason } => {
+                write!(f, "Cannot open audit log {path}: {reason}")
+            }
         }
     }
 }
@@ -1202,6 +1476,9 @@ pub struct ConfigReloadResult {
     pub success: bool,
     /// List of changed configuration sections.
     pub changes: Vec<String>,
+    /// Changed settings that are stored but only take effect after a
+    /// restart (e.g. `security.require_tls_trunks`, `trunk_groups`).
+    pub restart_required: Vec<String>,
     /// Human-readable message.
     pub message: String,
 }
@@ -1236,6 +1513,93 @@ level = "debug"
 "#
 }
 
+/// Starts OPTIONS monitoring for config-file trunks with
+/// `options_ping_enabled` (API-created trunks start theirs in
+/// `api_server::start_trunk_services`). Pings leave from the trunk group's
+/// zone, else `outside`, else `inside`, matching the API path.
+fn start_config_trunk_monitors(
+    monitor: &crate::trunk_monitor::TrunkMonitor,
+    groups: &[sbc_config::TrunkGroupConfig],
+    zones: Option<&crate::zone::ResolvedZoneRegistry>,
+) {
+    for group in groups {
+        let bind_ip = zones.and_then(|zr| {
+            group
+                .zone
+                .as_deref()
+                .and_then(|z| zr.signaling_ip(z))
+                .or_else(|| zr.signaling_ip("outside"))
+                .or_else(|| zr.signaling_ip("inside"))
+        });
+        for trunk in group.trunks.iter().filter(|t| t.options_ping_enabled) {
+            monitor.monitor_trunk(crate::trunk_monitor::MonitoredTrunk {
+                trunk_id: trunk.id.clone(),
+                host: trunk.host.clone(),
+                port: trunk.port,
+                interval_secs: trunk.options_ping_interval_secs,
+                bind_ip,
+            });
+            info!(trunk_id = %trunk.id, group = %group.id, "Started OPTIONS health monitor from config");
+        }
+    }
+}
+
+/// Applies OPTIONS reachability transitions from the in-process trunk
+/// monitor to the SIP stack's router. One task, owned by the runtime and
+/// stopped on shutdown. On start and on broadcast lag it reconciles from
+/// the full health snapshot.
+///
+/// ## NIST 800-53 Rev5: SC-5, CP-8 (Telecommunications Services)
+fn spawn_trunk_health_feed(
+    monitor: &crate::trunk_monitor::TrunkMonitor,
+    stack: Arc<crate::sip_stack::SipStack>,
+    signal: ShutdownSignal,
+) {
+    let mut rx = monitor.subscribe();
+    let health = monitor.health();
+    tokio::spawn(async move {
+        let resync = |health: Arc<
+            tokio::sync::RwLock<
+                std::collections::HashMap<String, crate::trunk_monitor::TrunkHealthStatus>,
+            >,
+        >,
+                      stack: Arc<crate::sip_stack::SipStack>| async move {
+            let snapshot: Vec<(String, bool)> = health
+                .read()
+                .await
+                .values()
+                .filter(|h| h.total_pings > 0)
+                .map(|h| (h.trunk_id.clone(), h.reachable))
+                .collect();
+            for (trunk_id, reachable) in snapshot {
+                stack.set_trunk_reachable(&trunk_id, reachable).await;
+            }
+        };
+        resync(Arc::clone(&health), Arc::clone(&stack)).await;
+        loop {
+            tokio::select! {
+                () = signal.wait_for_shutdown() => break,
+                event = rx.recv() => match event {
+                    Ok(ev) => {
+                        stack
+                            .apply_trunk_reachability_change(
+                                &ev.trunk_id,
+                                ev.reachable,
+                                uc_audit::event::ReachabilitySource::Options,
+                            )
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(missed, "Trunk health feed lagged; resyncing from snapshot");
+                        resync(Arc::clone(&health), Arc::clone(&stack)).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1258,6 +1622,31 @@ mod tests {
         assert_eq!(config.general.instance_name, "sbc-01");
     }
 
+    /// NIST 800-53 Rev5: AU-5 -- a configured but unopenable audit path is
+    /// a startup error with the dedicated exit code, not a tracing fallback.
+    #[test]
+    fn init_audit_bad_path_is_error() {
+        let mut config = SbcConfig::default();
+        config.logging.audit_enabled = true;
+        config.logging.audit_path = Some("/dev/null/audit/audit.log".into());
+        let r = Runtime::init_audit(&config, &Args::default());
+        assert!(
+            matches!(&r, Err(e @ RuntimeError::AuditFailed { path, .. })
+                if path.contains("/dev/null/audit") && e.exit_code() == AUDIT_INIT_FAILED_EXIT_CODE),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn audit_exit_code_is_distinct() {
+        let other = RuntimeError::InitFailed {
+            component: "cdr".to_string(),
+            reason: String::new(),
+        };
+        assert_eq!(other.exit_code(), 1);
+        assert_ne!(AUDIT_INIT_FAILED_EXIT_CODE, 1);
+    }
+
     #[test]
     fn test_config_from_string() {
         let toml = test_config_toml();
@@ -1273,7 +1662,7 @@ mod tests {
 
         // No changes
         let changes = Runtime::detect_config_changes(&config1, &config2);
-        assert!(changes.is_empty());
+        assert_eq!(changes, [] as [std::string::String; 0]);
 
         // Change general section
         config2.general.instance_name = "changed-sbc".to_string();
@@ -1281,15 +1670,111 @@ mod tests {
         assert!(changes.contains(&"general".to_string()));
     }
 
+    // SEC-001 / QA-1: require_tls and trunk-group edits are restart-only.
+    #[test]
+    fn reload_reports_require_tls_as_restart_required() {
+        let old = SbcConfig::default();
+        let mut new = old.clone();
+        assert_eq!(
+            Runtime::detect_restart_required(&old, &new),
+            Vec::<String>::new()
+        );
+        new.security.require_tls_trunks = true;
+        assert_eq!(
+            Runtime::detect_restart_required(&old, &new),
+            vec!["security.require_tls_trunks".to_string()]
+        );
+        let mut new = old.clone();
+        new.trunk_groups.push(sbc_config::TrunkGroupConfig {
+            id: "g".to_string(),
+            name: "g".to_string(),
+            strategy: "priority".to_string(),
+            trunks: Vec::new(),
+            zone: None,
+            require_tls: true,
+        });
+        let keys = Runtime::detect_restart_required(&old, &new);
+        assert!(keys.contains(&"trunk_groups".to_string()), "{keys:?}");
+        assert!(keys.contains(&"trunk_groups.require_tls".to_string()));
+    }
+
     #[test]
     fn test_config_reload_result() {
         let result = ConfigReloadResult {
             success: true,
             changes: vec!["general".to_string(), "logging".to_string()],
+            restart_required: Vec::new(),
             message: "Configuration reloaded".to_string(),
         };
 
         assert!(result.success);
         assert_eq!(result.changes.len(), 2);
+    }
+}
+
+/// Builds a route pattern from a seed-file JSON row. Honours `blocked` and
+/// `priority` like the API sync path.
+///
+/// ## NIST 800-53 Rev5: SI-10, CM-6
+///
+/// # Errors
+/// An unknown `pattern_type` (`uc_routing::DialPattern::from_kind`).
+fn seed_route_pattern(
+    rp: &serde_json::Value,
+) -> uc_routing::RoutingResult<uc_routing::RoutePattern> {
+    let id = rp.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    let partition = rp
+        .get("partition_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let pattern_value = rp.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+    let pattern_type = rp
+        .get("pattern_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("prefix");
+    let pattern = uc_routing::DialPattern::from_kind(pattern_type, pattern_value)?;
+    let mut route_pattern = uc_routing::RoutePattern::new(id, pattern, partition);
+    if let Some(desc) = rp.get("description").and_then(|v| v.as_str()) {
+        route_pattern = route_pattern.with_description(desc);
+    }
+    if let Some(rg) = rp.get("route_group_id").and_then(|v| v.as_str())
+        && !rg.is_empty()
+    {
+        route_pattern = route_pattern.with_route_group(rg);
+    }
+    if let Some(rl) = rp.get("route_list_id").and_then(|v| v.as_str())
+        && !rl.is_empty()
+    {
+        route_pattern = route_pattern.with_route_list(rl);
+    }
+    if let Some(p) = rp
+        .get("priority")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|p| u32::try_from(p).ok())
+    {
+        route_pattern = route_pattern.with_priority(p);
+    }
+    if rp
+        .get("blocked")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        route_pattern = route_pattern.with_block(true);
+    }
+    Ok(route_pattern)
+}
+
+#[cfg(test)]
+mod seed_route_pattern_tests {
+    use super::seed_route_pattern;
+    use serde_json::json;
+
+    #[test]
+    fn unknown_pattern_type_is_rejected_not_prefix() {
+        let rp = json!({"id": "b", "partition_id": "p", "pattern": "1900",
+                        "pattern_type": "regex", "blocked": true});
+        assert!(seed_route_pattern(&rp).is_err());
+        let rp = json!({"id": "b", "partition_id": "p", "pattern": "1900", "blocked": true});
+        assert!(matches!(seed_route_pattern(&rp), Ok(ref p) if p.is_blocked()));
     }
 }

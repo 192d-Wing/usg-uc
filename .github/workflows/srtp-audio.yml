@@ -28,6 +28,11 @@ on:
       - '.github/workflows/srtp-audio.yml'
   workflow_dispatch:
 
+# CodeQL actions/missing-workflow-permissions: this workflow only checks out
+# and builds; it never writes to the repo, packages, or PRs.
+permissions:
+  contents: read
+
 jobs:
   srtp-audio:
     name: SRTP audio (real DTLS-SRTP interop)

@@ -7,6 +7,854 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
+
+### BREAKING (SBC config, live batch POA&M-190..192, 166)
+
+- **SBC: `[monitoring]` and `[telemetry.otlp]` are now rejected at config
+  load.** (CM-6, CM-7, SI-10; POA&M-191) Before, both tables were parsed and
+  silently ignored: no metrics exporter, SNMP, syslog or OTLP exporter
+  read them. This covers every `[monitoring]` key, including
+  `[monitoring.snmp]` and `[monitoring.syslog]` (`[cdr.syslog]` is a
+  different table, still supported, and not affected). **We chose to reject
+  rather than warn.** A setting that loads and is then ignored makes
+  operators and assessors think monitoring or OTLP export is running when it
+  is not. A log warning is easy to miss, and a failed start is not.
+  **Upgrade:** remove these tables from `sbc.toml` before upgrading. In a
+  mixed-version cluster, old nodes still accept the tables and new nodes
+  refuse them, so remove them from the shared config first.
+- **SBC: the TLS private key must match `security.curve`.** (SC-12, SC-13;
+  POA&M-166) The SIP-TLS listener key and the trunk mTLS client key are
+  loaded pinned to the configured curve. A P-521 key with
+  `curve = "P-384"` (or the reverse) now stops startup.
+- **SBC: new `stir_shaken.verification.max_fetches_per_source` key
+  (default 4; must be in `1..=max_concurrent_fetches`).** (SC-5; POA&M-190)
+  This caps concurrent x5u certificate fetches per source (IPv4 address or
+  IPv6 /64). Sources that can't be identified share one budget. **Upgrade:**
+  if you set `max_concurrent_fetches` below 4, also set
+  `max_fetches_per_source` to that value or lower, or config load fails.
+  When verification is on and `x5u_allow_hosts` is empty, startup logs a
+  warning.
+- **Helm (`deploy/helm/sbc`): `[monitoring]` is no longer rendered into
+  `sbc.toml`.** `sbcDaemon.config.metrics_listen` is kept but reserved.
+  `services.metrics.enabled` now defaults to `false`, because the
+  `<release>-metrics` Service pointed at port 9090 and nothing listens
+  there. Before re-enabling it, check whether anything scrapes it.
+
+### Added
+
+- **SBC audit schema (additive):** `CryptoKeyOperation` events gain
+  `outcome` (`failure`) and `reason` (sanitised, at most 256 bytes, file
+  names only). Both fields are omitted on success, so success records are
+  byte-identical to before. SIEM parsers should treat both as optional. TLS
+  key load at startup and gRPC `ReloadTls` now emit these events (AU-2,
+  AU-3, SC-12; POA&M-166).
+
+### Changed
+
+- **SBC routing:** partition-scoped route lookups use a per-partition index.
+  Results and ordering are unchanged (POA&M-192).
+
+### Security
+
+- **SBC: management-API hardening (BREAKING for admin sessions,
+  provisioning URLs and REST TLS).** (NIST 800-53 Rev5: IA-2, IA-5, SC-8,
+  SC-12, SC-13, SC-5, SC-23; POA&M-210..214) **Upgrade notes:**
+  - Admin tokens are now `v2.` HMAC-SHA-384 with `aud=sbc-api`. v1 tokens
+    are rejected with no fallback; operators must log in again after
+    upgrade.
+  - `SBC_AUTH_SIGNING_KEY` (if set) must be hex and decode to at least 32
+    bytes (48 recommended; shorter keys log a warning). Empty, non-hex or
+    short keys stop startup. `SBC_AUTH_TOKEN_TTL_SECS` must be within 60..=86400.
+    New Helm installs generate a 48-byte hex key; existing 32-byte keys are
+    kept and still load.
+  - Provisioning tokens are now HMAC-SHA-384 (96 hex chars). When
+    `SBC_PROVISION_SECRET` is set it must be hex and decode to at least 32
+    bytes (`openssl rand -hex 48`). Existing `?token=` URLs return 403 until
+    re-minted with `sbc-provision-server --mint-token <MAC>`. Deployments
+    that rely only on `allowedSourceCidrs` are unaffected.
+  - The REST HTTPS listener uses the CNSA provider, TLS 1.3 only (whatever
+    `security.min_tls_version` says) and HTTP/1.1 only. It applies the
+    checked key load and curve enforcement, fails closed when no acceptor
+    is configured, caps connections at 256, and sets a 10 s handshake
+    timeout, a 10 s idle/header timeout and a 300 s maximum connection age.
+    The cert and key are reloaded within 30 s of changing on disk.
+  - `SBC_API_TOKEN` is compared in constant time.
+  - New metrics: `sbc_api_tls_handshake_timeouts_total`,
+    `sbc_api_tls_connections_rejected_total`,
+    `sbc_api_tls_cert_reloads_total`,
+    `sbc_api_tls_cert_reload_failures_total`.
+
+- **SBC: TLS private key files are checked at load and the key curve is
+  enforced (BREAKING, SEC-001).** (NIST 800-53 Rev5: SC-12, SC-13, SC-28,
+  SC-4) **Upgrade note:** the SIP-TLS listeners, the trunk client key and
+  the REST HTTPS listener now refuse to start, or keep the old key on
+  reload, when the key file is a symlink, is not a regular file, is group-
+  or world-readable (any `0o077` bit), is not owned by the SBC's effective
+  user, or exceeds 64 KiB. RSA and P-256 keys are rejected; only ECDSA
+  P-384 or P-521 are accepted. Before upgrading, `chmod 0600` (or `0400`)
+  the key, `chown` it to the SBC user, and reissue any RSA or P-256
+  certificates on P-384. In `uc-crypto`, AES-256-GCM and P-384 PKCS#8 key
+  bytes are now wiped on drop, and the `open()` buffer is wiped when the
+  tag check fails (POA&M-160..164).
+
+- **SBC: topology hiding covers the whole dialog, both directions
+  (peer-visible).** (NIST 800-53 Rev5: SC-7, AC-4, SI-17, SI-11, AU-12, SI-4;
+  RFC 3261 §8.2.6.2, §18.2.2; POA&M-155, POA&M-156) With
+  `topology_hiding.enabled`, every request and response the SBC sends toward
+  a hidden leg is rewritten, not only the B-leg initial INVITE: 1xx/2xx and
+  error relays, ACK, re-INVITE, UPDATE, BYE, CANCEL, the local 405 to
+  in-dialog PRACK/INFO/MESSAGE/NOTIFY (not relayed yet, POA&M-182),
+  out-of-dialog responses (OPTIONS, REGISTER, 405, 481),
+  timer 408/BYE, failover INVITEs, media-failure BYEs and the
+  post-announcement BYE. Retransmissions resend the hidden bytes.
+  - **Upgrade note:** the caller-facing leg is now hidden when the caller is
+    an inbound trunk or outside `topology_hiding.internal_networks`, so
+    inbound trunk calls see `external_host` in the SBC's Via/Contact/
+    Record-Route. `external_host` must route back to the SBC. The callee
+    leg is likewise hidden toward a trunk or any destination outside
+    `internal_networks` (e.g. a remote registered endpoint).
+  - **3xx Contacts:** in redirect responses only Contacts with an internal
+    host are rewritten to `external_host`; external redirect targets pass
+    unchanged (RFC 3261 §8.1.3.4, §21.3).
+  - **rport:** the SBC's own (rewritten) Via keeps a bare `;rport` flag
+    (RFC 3581) instead of dropping it; the B-leg initial INVITE on UDP now
+    carries `;rport` too, so CANCEL and non-2xx ACK Vias equal the INVITE's
+    (RFC 3261 §9.1, §17.1.1.3).
+  - Response Via stacks are never rewritten (new
+    `TopologyHider::hide_b2bua_response`); the hider no longer clones the
+    header map per call.
+  - Fail closed: a message that cannot be hidden is never sent raw. A
+    relayed request is dropped and its sender gets 500; a final response
+    becomes a bare 500 and an unreliable 1xx is dropped; a reliable
+    (`Require: 100rel`) 1xx becomes 500 and the unanswered call is
+    CANCELed (on a re-INVITE both legs are BYEd, so no late final is
+    relayed after the 500); a 2xx to INVITE becomes 500 and the other leg is BYEd
+    (peer-induced teardowns audited as `PolicyTerminated`); a failover
+    INVITE fails the call with 503. Each failure is audited as
+    `sip.topology_hiding.failed:<Header>`, naming the peer whose message
+    failed; the warning log is sampled, the counter and audit are not.
+  - New counters `topology_hiding_failures` and
+    `header_manipulation_failures` (to be exported as
+    `sbc_topology_hiding_failures_total` /
+    `sbc_header_manipulation_failures_total`; counted, export deferred to
+    POA&M-180).
+
+- **proto-sip / SBC: SIP URI parser, topology hiding and header manipulation
+  (BREAKING for some configs and malformed peers).** (NIST 800-53 Rev5: SI-10,
+  SC-7, SC-8, SC-5, SC-30, AC-4, CM-6, SI-17; POA&M-150..152)
+  - URIs are parsed per the RFC 3261 §25 grammar. The userinfo delimiter is
+    the last `@`, so `sip:victim;x=@evil.com` now resolves to host
+    `evil.com`. Illegal characters, bad `%` escapes, invalid ports (`:0`,
+    `:70000`, `:abc`) and duplicate `transport`/`user`/`ttl`/`method`/
+    `maddr`/`lr` parameters are rejected instead of being dropped or
+    accepted. URI headers in a Request-URI are rejected. New
+    `SipUri::equivalent` (§19.1.4) and generic `Uri` (`sip`/`tel`/other).
+  - A Request-URI with a non-SIP scheme (`tel:`, `urn:` ...) is answered
+    **416 Unsupported URI Scheme** instead of being dropped.
+  - Topology hiding matches internal hosts by CIDR / DNS label, not string
+    prefix, and covers 100.64/10, 127/8, 169.254/16, IPv6 ULA, link-local
+    and IPv4-mapped IPv6. On the B-leg initial INVITE toward an external
+    (trunk) zone, every Via/Contact/Record-Route instance and comma-folded
+    element is rewritten, and an element that cannot be parsed rejects the
+    call (400 plus audit record `sip.topology_hiding.failed:<header>`)
+    instead of being forwarded. Responses relayed back to the caller and
+    in-dialog requests were not hidden by this change (POA&M-155, since closed; see above). An invalid
+    `internal_networks`/`internal_domains` entry now stops the SBC at
+    startup instead of being skipped. Contact rewrites keep
+    `transport=tls` / `sips:` and use the new
+    `topology_hiding.external_tls_port` (default 5061). New keys
+    `topology_hiding.internal_networks` and `internal_domains` add to the
+    built-in list. `full` mode is the recommended mode: it hides every host
+    that is not `external_host`. `signaling_only` (basic) is best effort and
+    leaves public hostnames alone. Call-ID obfuscation uses random tokens in
+    a bounded map.
+  - Replace/regex-replace/prepend/append results longer than the 8 KiB
+    header bound are refused before the value is built (SC-5).
+  - Header manipulation now acts on every instance of a header, and
+    conditions match if any instance matches. `set` still collapses to one
+    instance. Output is validated (no CR/LF/CTL, From/To/Contact/Route/CSeq
+    grammar, single From/To/Call-ID/CSeq). An invalid result leaves the
+    headers untouched and the SBC rejects the INVITE with 500 and an audit
+    record (`sip.header_manipulation.failed:<rule>`).
+  - **Config break:** `header_manipulation` rules that target `Via`,
+    `Content-Length`, `CSeq` or `Call-ID` (including compact forms) are
+    refused at load.
+  - **SIEM/alerting:** these failures are written as the existing
+    `AuthorizationDecision` event (granted=false). The schema is unchanged.
+    The new policy values are `sip.header_manipulation.failed:<rule>` and
+    `sip.topology_hiding.failed:<header>`. No Prometheus failure metrics yet
+    (counters added under POA&M-156; export is POA&M-180), so alert from audit records.
+  - **proto-sip API (client/library consumers):** `obfuscate_call_id`
+    returns `SipResult<String>`. `with_internal_network` was removed (use
+    `try_with_internal_network`). `SipError` gains `UnsupportedUriScheme`,
+    `TopologyHiding` and `ManipulationInvalid`, which breaks exhaustive matches.
+  - Helm: `sbcDaemon.topologyHiding.externalTlsPort`, `internalNetworks`
+    and `internalDomains` are exposed.
+- **Client: SIP-TLS and provisioning HTTPS use the CNSA 2.0 provider.** The
+  soft client's SIP-TLS transport (client-core) and the provisioning HTTPS client
+  (client-provisioning, which gets a preconfigured rustls config passed to
+  reqwest) now build rustls from `uc_transport::tls::cnsa_provider()`, which
+  allows TLS 1.3 only with the CNSA suites and key-exchange groups. Before this
+  they used the default aws-lc provider. Servers that only offer TLS 1.2 or
+  non-CNSA suites now fail the handshake. (NIST 800-53 Rev5: SC-8, SC-13;
+  POA&M-173 tracks the residual CM-2 item)
+
+- **SBC: audit trail integrity (uc-audit) (BREAKING for SIEM parsers and
+  alerting).** (NIST 800-53 Rev5: AU-5, AU-9, AU-10, AU-8, SI-10)
+  - Audit sink writes can now fail and are counted. A write error (for
+    example ENOSPC) no longer drops records silently. New gauge
+    `sbc_audit_write_failures`, and the `audit` health component reports
+    Unhealthy while the sink is failing. **Alert change:**
+    `sbc_audit_records_dropped` now counts queue drops plus sink write
+    failures, so existing thresholds may fire more often.
+  - The hash chain resumes from the last complete record on restart instead
+    of starting again at sequence 0. An unterminated tail is truncated and a
+    marker is chained. A file that holds only a torn fragment, or that has no
+    parsable record, is refused and left untouched.
+  - Audit files are created with mode 0640 (existing looser files are
+    tightened) and missing directories with 0750. Symlinks, non-regular files
+    and group- or world-writable parent directories are refused.
+  - New event type `audit_records_dropped` (`count`, `total`, `reason`:
+    queue full, sink write failed, torn tail). SIEM parsers must accept it.
+  - The record timestamp is now taken on the writer thread.
+  - New `sbc-cli audit verify <FILE>... [--require-anchor]`. It checks the
+    chain against canonical record bytes, so reordered, extra or re-encoded
+    fields count as tampering. Unanchored first files give a warning, or exit 1
+    with `--require-anchor`.
+  - `sbc-api-server` (`SBC_API_AUDIT_PATH`) and `central-config-api`
+    (`CENTRAL_API_AUDIT_PATH`) can write a hash-chained audit file (absolute
+    path; unset or empty means tracing only). When it is set, startup fails
+    closed (exit 5 / exit 6) if the file cannot be opened, and `/readyz`
+    reports not-ready while the sink is failing. Helm: optional
+    `sbcApi.auditPath` / `api.auditPath`, unset by default, and the path must
+    be on a writable volume. **BREAKING for deployments with an unwritable
+    `logging.audit_path`:** sbc-daemon now fails closed and exits with code 3
+    when `logging.audit_path` is set but the file cannot be opened or resumed
+    (including refused files); the tracing fallback is removed. Unset
+    `audit_path` is unchanged (tracing only).
+  - Dependency: workspace `hex = "0.4"` (already in the lock tree, 0.4.3; not
+    a crypto dependency). Replaces hand-written hex decoding that could panic.
+  - Open items: POA&M-130 (keyed chain, HMAC-SHA-384 or ML-DSA-87),
+    POA&M-131 (residual O_NOFOLLOW open race), POA&M-133 (audit file rotation and retention; capacity is the platform's job).
+
+- **SBC: phone-config output escaping for all vendors.** `uc-phone-mgmt`
+  now escapes every operator-supplied string in Polycom VVX, Poly Edge,
+  Cisco MPP, Cisco 9800 and Teo configs (XML text, attribute, comment and
+  MPP key/value contexts). Benign output is byte-identical. (SI-15, SI-10;
+  POA&M-122: Cisco MPP `$VAR` macros are not escaped yet, pending firmware
+  confirmation)
+- **SBC: provisioning token no longer in request logs.**
+  `sbc-provision-server` request spans record only method and path, so the
+  `?token=` query string is never logged. The token design itself is still
+  open as POA&M-120. (IA-5, AU-9)
+- **SBC: user HA1 digests encrypted at rest; key required (BREAKING, fail closed).**
+  `sbc-api-server` now refuses to start without `SBC_USER_HA1_KEY_FILE`
+  (64 hex chars, mode 0400, owned by uid 1000). On first start it re-encrypts
+  existing plaintext `digest_ha1` rows once (Postgres advisory lock, 60 s
+  timeout; a lost row race is retried next start). Helm now requires
+  `sbcApi.ha1Key.existingSecret`; default values fail to render.
+  `sbcApi.ha1Key.generate=true` is for disposable labs only. No mixed-version
+  rollout: stop every old sbc-api replica before starting the new one, because
+  old binaries cannot read encrypted rows. Recovery for malformed rows is in
+  RUNBOOK.md. (NIST 800-53 Rev5: IA-5(1), SC-28, SC-12)
+- **SBC: `/users` requires `users:read` / `users:admin` (BREAKING).** New
+  Keycloak roles `users-reader` and `users-admin`. Existing API clients need the
+  new roles before upgrade (see deploy/keycloak/central-config-clients.md).
+  (AC-3, AC-6)
+- **SBC: new `AccountManagement` audit event (SIEM schema addition).** It records
+  user create/update/delete and rejected request bodies, with `actor_issuer` and
+  `changed` (field-group names only). SIEM parsers must accept the new event
+  type. (AC-2(4), AU-2, AU-3)
+
+- **SBC: dormant AAA, policy-regex, dial-plan-regex and T.38 paths fail
+  closed.** (NIST 800-53 Rev5: AC-3, IA-2, SI-10, CM-6; POA&M-200..206)
+  None of these paths is wired by default. The Diameter Cx stubs
+  (UAR/MAR/SAR, `authenticate`, `account`) now return `DiameterError`
+  instead of accepting (POA&M-200). Policy `StringMatch::Regex` now
+  evaluates a compiled, size-bounded regex (1 KiB pattern, 1 MiB compiled
+  limit) instead of always matching; an invalid pattern cannot be
+  constructed (POA&M-201). Dial-plan `DialPattern::Regex` is compiled once,
+  an invalid pattern never matches, and `DialPattern::validate` /
+  `DialPlan::try_add_entry` reject it (POA&M-205). **Upgrade note:** a
+  policy or dial-plan regex that was silently accepted before may now fail
+  to load or stop matching. UDPTL/IFP decoding in `uc-t38` is
+  bounds-checked, with new cargo-fuzz targets (POA&M-202/203). `uc-t38` is
+  now documented as a non-interoperable T.38-style encoding, not ITU-T T.38
+  PER (POA&M-204). `uc-policy` now depends on `regex` (already in the
+  workspace; no new crate in `Cargo.lock`).
+
+### Changed
+
+- **SBC + client: uc-dns uses the system DNS configuration and has no public
+  fallback (behaviour change).** `SipResolver::new` and the client call agent
+  now build a hickory resolver from the host config (`/etc/resolv.conf` or the
+  OS equivalent). The resolver no longer falls back to public resolvers. All
+  `SipResolver::new` callers are affected, including the SBC: hosts with no
+  usable system DNS config get a resolver-init error. `DnsConfig::default()`
+  now has an empty `servers` list, which means "use system config". Set
+  `servers` explicitly if you relied on the old defaults. (CM-7; POA&M-172 and
+  POA&M-174 track the residual items)
+- **SBC + client: real RFC 3263 NAPTR/SRV resolution.** NAPTR and SRV are now
+  queried. SRV targets are chosen by RFC 2782 weighted-random selection; before
+  this the median was always picked. "." targets are filtered out, and
+  unresolvable targets are skipped. A `sips` lookup never downgrades to a
+  non-TLS target.
+- **uc-dns: cache eviction is O(log n).** Eviction no longer does an O(n) scan
+  on every insert. Each `put` evicts at most 32 expired entries.
+- **Client:** the call agent initializes its resolver lazily (OnceCell built
+  on a blocking task).
+
+- **SBC: config-store write validation (operator-visible).** Phone and
+  directory-number upserts are validated first and fail with the new
+  `ConfigStoreError::Invalid { field, reason }`. Rows that used to be accepted
+  are now rejected: control characters, oversize fields, bad charsets. Dial
+  strings must be ASCII alphanumerics plus `*#+,.-_`. Re-check existing
+  provisioning data before upgrade. Known gaps: sbc-api-server still returns
+  500 for `Invalid` instead of 400 and emits no audit event for the reject (POA&M-123), and `sbc-config-sync` apply bypasses
+  validation (POA&M-121). (SI-10)
+- **SBC: transport is case-insensitive on Cisco MPP/9800 and Teo.** A stored
+  `"TLS"`/`"TCP"` used to render `UDP` on MPP/9800. It now renders TLS/TCP,
+  so affected phones change transport on their next resync.
+- **SBC: `SBC_PROVISION_HOST` must be `host[:port]`.** Any other value makes
+  `sbc-provision-server` refuse to start. (CM-6)
+- **SBC: `/users` API semantics (BREAKING for API clients).** PUT/DELETE
+  return real status codes (404 etc.) instead of blanket success. A duplicate
+  POST returns 409. `GET /users` is paged (`limit` default 100, max 1000;
+  `offset`), and the response includes `limit` and `offset`. Ansible
+  `configure-sbc.yml` treats 409 as already-present.
+
+### Security
+
+- **SBC: transport-level DoS hardening for TCP/TLS/WebSocket (SC-5, SC-7, SC-10).**
+  Each stream listener now has its own connection pool. There is also a
+  node-wide ceiling and a per-source cap; a source is one IPv4 address or one
+  IPv6 prefix (`rate_limit.ipv6_prefix_len`). Admission checks the per-source
+  cap first, then the listener pool, then the total. TLS and WebSocket
+  handshakes run under `handshake_timeout_secs`. A new connection must send an
+  accepted SIP message within `first_message_timeout_secs`; CRLF keep-alives
+  and frames the parser rejects do not count. After that, idle time is
+  measured by the wall clock, so dripping one byte at a time no longer keeps
+  a connection open. Stream framing uses the same Content-Length rules as the
+  parser (#167). A bad frame gets a sanitized 400 and the connection closes.
+  On TCP/TLS, RFC 5626 CRLFCRLF pings get a single CRLF pong. WebSocket
+  messages are capped at 65,535 bytes, and a truncated WS message is
+  discarded instead of being joined to the next one.
+- **SBC: per-source rate-limiter state is bounded (SC-5).** In global mode the
+  limiter never blocks. Per-source buckets are capped at
+  `max_tracked_sources`. Once the cap is reached, new sources share an
+  overflow bucket. Blocked sources are capped at `max_blocked_sources`.
+  Expired state is cleared by a periodic sweep. Known gaps: blocks are not
+  replicated across the cluster (POA&M-90), and rotating through /48
+  prefixes is bounded only by the overflow bucket (POA&M-91).
+- **SBC: API-synced trunks now use their configured transport (behaviour change).**
+  Trunk groups created over the REST API, TrunkSync, the config store or
+  central config used to be sent over UDP whatever the trunk said. The daemon
+  now reads the trunk's `protocol`, or `transport` if `protocol` is absent
+  (`udp`/`tcp`/`tls`, case-insensitive; absent = `udp`). A row that already
+  says `"transport": "tls"` switches to TLS on upgrade and needs
+  `security.trunk_tls_ca_path`; without it the trunk fails closed. An unknown
+  value now skips the trunk with a warning instead of falling back to UDP.
+  `tls_server_name` and `tls_client_cert` are read for TLS trunks.
+  (NIST 800-53 Rev5: SC-8)
+- **SBC: API/synced trunk ports follow the transport (behaviour change).** A
+  TLS trunk with no `port` now dials 5061 (was 5060). A port of 0, above
+  65535 or non-integer is rejected with 400 by sbc-api-server and
+  central-config-api, and skipped with a warning by the daemon; it is never
+  truncated.
+
+### Added
+
+- **SBC: new `[transport]` keys** (defaults; valid range):
+  `max_connections_per_listener` (10000; 1..=1,000,000),
+  `max_connections_total` (20000; 1..=4,000,000),
+  `max_connections_per_source` (128; 1..=`max_connections_per_listener`;
+  raise it for large enterprise NATs with many TLS phones),
+  `handshake_timeout_secs` (10; 1..=60),
+  `first_message_timeout_secs` (30; 1..=`tcp_idle_timeout_secs`),
+  `ws_require_sip_subprotocol` (true).
+- **SBC: new `[rate_limit]` keys** (defaults; valid range):
+  `ipv6_prefix_len` (64; 32..=128, checked even when rate limiting is
+  disabled), `max_tracked_sources` (65536; 1024..=4,194,304),
+  `max_blocked_sources` (16384; 1..=`max_tracked_sources`),
+  `overflow_rps` (0 = auto, which is 1000 clamped into
+  `per_ip_rps..=global_rps`; a non-zero value must be in that range),
+  `block_duration_secs` (60; 1..=86400), `sweep_interval_secs` (10; 1..=300),
+  `audit_interval_secs` (60; 1..=3600),
+  `audit_max_records_per_interval` (1024; 1..=65536).
+  Existing configs that omit these keys still load and get the defaults.
+- **SBC: `require_tls` trunk-group policy (POA&M-48, SC-8).** `require_tls = true`
+  on a `[[trunk_groups]]` entry (or `"require_tls": true` in the API/central
+  body) limits primary selection and every failover hop to TLS trunks. If no
+  TLS trunk is usable the INVITE gets 503 and is never sent over UDP/TCP (a
+  policy refusal carries `Reason: Q.850;cause=79;text="no TLS trunk"` and no
+  Retry-After). A `sips:` Request-URI makes the call TLS-only in every group
+  on its route, failover included. `security.require_tls_trunks = true` (Helm
+  `sbcDaemon.trunkTls.requireTlsTrunks`) applies this to every group, and
+  groups cannot opt out. Refusals are audited as `InviteDenied` with reason
+  `no-tls-trunk` and counted in `routing_tls_required_skips` and
+  `routing_tls_required_rejects`.
+  - Validation: a config file with a TLS-only group that has no TLS trunk
+    fails to load.
+  - REST API: a non-bool `require_tls` or an unknown protocol returns 400. A
+    TLS-only group that has trunks but none of them TLS returns 422; nothing
+    is stored. An empty TLS-only group is accepted with a `warnings` entry.
+  - Central config returns 422 for any TLS-only group without a TLS trunk.
+    Trunk-group upserts and deletes that change transport policy write a
+    `ConfigurationChange` audit record. `central-config-api` now exits with
+    code 6 if audit init fails (server errors keep code 5).
+  - The dashboard has a "Require TLS" checkbox and a "TLS only" badge.
+  - Policy is per group. A route that lists a TLS-only group and then a plain
+    group can still fail over to the plain group: set the flag on every
+    group in the route, or use the global key.
+  - Covers signaling only; it does not require SRTP.
+  - Takes effect on restart only; a reload reports it as `restart_required`.
+  - `require_tls` and trunk-protocol changes made through sbc-api-server or
+    central config are audited as `ConfigurationChange`.
+  - API/synced trunks without a `port` default to 5061 for TLS (was 5060);
+    an out-of-range port is rejected (400) or skipped, never truncated.
+  - **Upgrade all nodes before enabling it.** Older nodes ignore the flag.
+
+### Changed
+
+- **SBC: `transport.tcp_idle_timeout_secs` is now enforced (behaviour
+  change).** The key used to be accepted and ignored. It is now the idle
+  timeout for TCP, TLS and WS connections after their first message, and it
+  must be 30..=3600. A config outside that range now fails to load. The
+  default of 300 is unchanged.
+- **SBC: WebSocket upgrades must offer the `sip` subprotocol (behaviour
+  change, RFC 7118 §4).** An upgrade that does not offer `sip` is refused
+  with 400. Setting `transport.ws_require_sip_subprotocol = false` admits
+  upgrades that send no `Sec-WebSocket-Protocol` header, but that is
+  non-conformant with RFC 7118. An offer that lists only other subprotocols
+  is refused either way.
+- **SBC: rate-limit audit records changed (SIEM parsers: action needed).**
+  - Rate-limit rejections are no longer logged one record per packet. They
+    are summed per source and per `limit_name` every
+    `audit_interval_secs`, with at most `audit_max_records_per_interval`
+    records per interval. Anything over that cap goes into one
+    `per_ip_rps_suppressed` record.
+  - New `limit_name` values: `per_ip_rps_suppressed`,
+    `per_ip_blocked_drops`, `listener_conn`, `total_conn` and `framing`.
+    Global, overflow and pool records use the placeholder source `0.0.0.0`
+    (POA&M-92).
+  - `per_ip_block` is written once, when the block starts. Its `limit_name`
+    is now `per_ip_block:/<prefix>:<secs>s` (for example
+    `per_ip_block:/32:60s`). Its source is the blocked address or IPv6
+    network, `request_count` is 0, and the threshold is `per_ip_rps`.
+  - **SIEM rules that match `limit_name == "per_ip_block"` exactly must
+    switch to a prefix match on `per_ip_block:`.**
+  - The audit control tag is now `AU-4, AU-12, SC-5`.
+  - The new server counters (`framing_errors`, `conn_rejected_per_source`,
+    `ws_handshake_failures`, `handshake_timeouts`) are not yet exported by
+    the API (POA&M-93).
+- **BREAKING (SBC operators): `central-config-api` audit init is fail-closed.**
+  It now depends on `sbc-config-store` and `uc-audit` at runtime and exits
+  with code 6 if audit logging cannot start (server errors keep code 5).
+  Supervisors and alerting that match exit codes must know code 6.
+- **SBC: config reload reports `require_tls` changes as `restart_required`.**
+  `security.require_tls_trunks`, `trunk_groups.require_tls` and
+  `trunk_groups` changes are logged and returned as needing a restart.
+- **SBC: new audit records.** Trunk-group transport-policy changes emit the
+  existing `ConfigurationChange` event (change type `Modified`, also for a
+  central delete). The audit schema is unchanged; SIEM parsers see more
+  records of an existing type. The CDR schema is unchanged.
+- **SBC: mixed-version cluster rollout.** Nodes older than this release ignore
+  `require_tls` and keep sending API trunks over UDP. Upgrade every node
+  (and central-config-api) before setting the flag or the global key, or
+  calls routed by old nodes still leave in clear text.
+- **BREAKING (trunk TLS, CDR syslog, STIR/SHAKEN x5u fetch, SIP-TLS listeners):**
+  TLS is now limited to CNSA 2.0 algorithms through the new shared
+  `uc_transport::tls::cnsa_provider()` (POA&M-26, POA&M-40). TLS 1.3 offers
+  only `TLS_AES_256_GCM_SHA384`; where TLS 1.2 is allowed
+  (`security.min_tls_version = "1.2"`, and always for x5u fetches) only
+  `ECDHE-ECDSA-AES256-GCM-SHA384`. Key exchange is ML-KEM-1024 (preferred)
+  or P-384; X25519, P-256 and the ML-KEM-768 hybrids are gone. Peers that
+  will stop connecting:
+  - SIP trunks and SIP-TLS clients (phones) that support only AES-128-GCM,
+    ChaCha20-Poly1305, X25519 or P-256, or that use TLS 1.2 with an RSA
+    certificate.
+  - RFC 5425 syslog collectors (`cdr.syslog`) with the same limits.
+  - STIR/SHAKEN certificate repositories (`x5u` hosts) with the same limits;
+    calls signed with their certificates then fail verification.
+
+  Check a peer with
+  `openssl s_client -connect host:port -tls1_3 -ciphersuites TLS_AES_256_GCM_SHA384 -groups secp384r1`.
+  The REST HTTPS listener, daemon gRPC and the soft client are unchanged.
+
+- **SBC, STIR/SHAKEN (behaviour change):** attestation A for a registered
+  endpoint is now tied to the TCP/TLS connection that carried its REGISTER,
+  not to the source `ip:port`. When that connection closes, the binding is
+  dropped. A new connection from the same address (CGNAT port reuse) no
+  longer gets A (POA&M-36). What operators will see:
+  - Phones that reconnect get B until they re-REGISTER on the new connection.
+  - A de-REGISTER only removes the binding when it arrives on the connection
+    that owns it.
+  - UDP is unchanged and stays at B.
+
+  There are no config or schema changes. TLS peer-certificate binding is
+  still open as POA&M-70.
+
+### Fixed
+
+- **Route-pattern digit manipulation reaches the daemon** — route patterns created or updated through the REST API accept `transform_type` / `transform_value` (`strip_prefix`, `add_prefix`, `replace_prefix`, `replace`, same spelling as dial-plan entries), the API rejects malformed values with 400, the daemon's sync path sets the transform on the `SbcRouter` pattern, and the dashboard form exposes it. Previously the field was dropped and every API-created pattern routed with no transform (`sbc-daemon`, `sbc-api-server`, `sbc-dashboard`, closes #144)
+- **SBC:** at registration capacity, the full STIR flow-table sweep is now
+  rate-limited to once per second. Before, it ran under the location write
+  lock on every new-flow REGISTER (POA&M-35).
+
+### Security (SBC, call-path routing and number normalisation)
+
+- **SBC: blocked route patterns fail closed (behaviour change).** A call that
+  matches a `blocked` route pattern now gets `403 Forbidden` and does not fall
+  back to a later partition, the dial plan or `default_trunk_group`. A block is
+  also tested against the dialled number with `+` stripped, so a `1900` block
+  catches `+1-900-…`. A block written as `+1900` does not catch the national
+  form `1900…`, so write blocks without `+`. Audited as `route:blocked`; new
+  metric `sbc_route_blocked_total`. (AC-3, AC-4)
+- **SBC: `routing.default_trunk_group` is outbound-only (behaviour change).**
+  Inbound calls that match nothing get 404 and are no longer sent to the
+  default group. Deployments that relied on inbound catch-all through the
+  default group need an explicit dial-plan entry with `direction = "inbound"`
+  or `"both"`. (AC-4)
+- **SBC: dial-plan `direction`, `source_trunk` and `domain_pattern` are
+  enforced (behaviour change).** They were parsed but ignored before.
+  `domain_pattern` now matches on a label boundary and ignores ASCII case
+  (`*.mil` no longer matches `evilmil`). API/JSON dial plans still carry only
+  the pattern kind. (AC-4)
+- **SBC: unknown `pattern_type` is rejected (behaviour change).** Only
+  `exact|prefix|wildcard|any` (case-sensitive) are accepted. Config load fails
+  validation. Daemon seed and gRPC sync skip the row with a warning
+  (`sbc_route_pattern_rejected_total`). REST POST/PUT `/route-patterns`
+  returns 400 for an unknown or non-string value. Seeded `blocked` and
+  `priority` are now honoured. (SI-10, CM-6)
+- **SBC: canonical dialled-number handling (behaviour change).** R-URI users
+  are canonicalised once (`uc_types::DialedNumber`: separators, percent
+  decoding, `tel:`/`sip:` forms) before routing, VPS screening, blocklist and
+  emergency matching. A numeric-looking user that is not canonical (for
+  example `+19005551234x`), an empty user or a user over 256 bytes is never
+  routed and gets 404, including against `any` catch-alls and the default
+  group. Alias users such as `alice` still route. `;phone-context` is dropped,
+  not applied (POA&M-100). (SI-10)
+- **SBC: per-user INVITE/REGISTER limiter rekeyed (behaviour change).**
+  Buckets are keyed on the authenticated AOR when the request arrives on a
+  flow bound by an authenticated REGISTER, and otherwise on
+  `(source /32 or /64, From user)`, so a spoofed `From` from another network
+  cannot drain a victim's bucket. More than 64 unauthenticated users per
+  network share one bucket. Trunk sources are exempt (bounded by trunk
+  `max_calls` and VPS caps). Emergency INVITEs bypass the limiter. Overflow of
+  the key table is allowed, not rejected. Burst is fixed at `rps x 2` and
+  `rate_limit.burst_multiplier` is ignored for this limiter (POA&M-101).
+  Audit `limit_name` is now `per_user_rps:auth:…` or
+  `per_user_rps:unauth:<net>`, which affects SIEM parsers. New metrics
+  `sbc_user_limiter_overflow_total` and
+  `sbc_user_limiter_emergency_bypass_total`. (SC-5)
+- **SBC: emergency calls (behaviour change).** Emergency numbers are
+  canonicalised (`9-1-1` and `%39%311` match `911`). They are force-routed to
+  the new optional `routing.emergency_trunk_group` when it is set, and a
+  matching block is ignored and audited (`route:blocked-ignored`). An emergency
+  call with no route gets 503 without `Retry-After` and is audited as
+  `emergency_unrouted`. Routability is checked at startup only. New metrics
+  `sbc_emergency_force_routed_emergency_trunk_total`,
+  `sbc_emergency_force_routed_blocked_ignored_total` and
+  `sbc_emergency_unrouted_total`. Route audit subjects are now
+  `trunk_group:<tg>`, the flow-bound AOR, or `unverified:<From URI>`.
+  (CP-8, CM-6, AU-3; 47 CFR 9.16)
+- POA&M-100 to POA&M-103 record the deferred items from this work, including
+  phone-context-aware normalisation (POA&M-100) and `burst_multiplier` for
+  the per-user limiter (POA&M-101). See `docs/NIST-800-53-CONTROLS.md`.
+
+### Changed (SBC, call-path routing)
+
+- **Breaking API (library): `uc_routing::SbcRouter::route` now returns
+  `SbcRouteOutcome { Routed, Blocked { pattern_id, partition_id }, NoMatch }`**
+  instead of an `Option`. Use `routed()` and `is_blocked()` for the old shape.
+  `Router::route_call` takes a `CallRouteContext` and uses
+  `DialPlan::match_extended`. `route`/`route_for`/`route_for_tls` keep their
+  old semantics and are documented as legacy.
+- **VPS: canonical comparisons.** Blocklist rule names are canonical
+  (`blocklist:1900`, was `blocklist:+1900`) and the reserved callee key is
+  canonical (`12135552000`). Update any SIEM rules that match these strings.
+  CDR causes are unchanged: a blocked route records `PolicyDenied` and an
+  unrouted emergency call records `NoRoute`.
+- `uc-vps` now depends on `uc-types` (workspace crate). `uc-types` gains
+  `proptest` as a dev-dependency only. No new third-party runtime
+  dependencies.
+
+### Changed (SBC and client, proto-sip message-layer hardening, Phase 1)
+
+- **SIP parsing is strict.** Messages with bare CR or LF line ends, header
+  names that are not tokens, control characters (other than HTAB) in header
+  values, malformed or duplicate Content-Length (`+5`, `-1`, `l:` plus
+  `Content-Length:`), duplicate Call-ID/To/From/CSeq/Max-Forwards, CSeq of
+  2^31 or more, a CSeq method that differs from the request method, or
+  Max-Forwards above 255 are now rejected, as is a header section without
+  its terminating empty line (missing final CRLF). Peers that send LF-only
+  messages no longer interoperate; there is no compatibility switch.
+- Over UDP, bytes after Content-Length are discarded (RFC 3261 §18.3). The
+  soft client requires Content-Length on TCP/TLS, and its stream framer now
+  applies the parser's Content-Length rules: a missing, duplicate or
+  non-numeric Content-Length closes the connection instead of framing as 0.
+  WS/WSS/SCTP use a new `Framing::Message` mode: Content-Length optional,
+  exact if present (RFC 7118 §5, RFC 4168).
+- **SIP methods are case-sensitive** (RFC 3261 §7.1). `invite` is now an
+  extension method, not INVITE, and extension methods keep the case they
+  were received in. `CSeq: 1 invite` on an INVITE is rejected.
+- Binary message bodies are no longer dropped on re-serialization.
+- Header names compare case-insensitively everywhere (custom spellings of
+  known headers such as `Min-Expires` and `Accept` now match). New compact
+  forms: `e`, `x`, `b`, `y`, `a`, `j`, `d`.
+- Per-message limits: 256 header fields, 8 KiB per header and start line,
+  4 KiB URIs, 64 parameters, 64 list elements.
+- Fixed a panic in Route/Contact list splitting with non-ASCII display names.
+- Known gap (SBC): sbc-daemon still frames TCP/TLS with datagram rules and
+  does not yet use the stream framer (POA&M-64, deferred).
+- Dev only: proptest and criterion dev-dependencies and a standalone
+  cargo-fuzz crate (`crates/proto/proto-sip/fuzz`, excluded from the
+  workspace). No runtime dependency or config/CDR/audit schema change.
+
+### Fixed (client, media audit 2026-11-06)
+
+- **Client: Opus FEC/PLC no longer drifts 60 ms per lost 20 ms frame.**
+  A lost frame used to be concealed into a 2880-sample (60 ms) buffer, so
+  playout drifted on every loss. Now each lost frame produces exactly one
+  ptime: in-band FEC from packet N+1 (when its TOC can carry LBRR), then
+  Opus native PLC, then WSOLA. `fec_recovered` / `fec_recovered_frames`
+  count FEC-path decodes only. They do not confirm that LBRR was present
+  (POA&M-141). The hot path does not allocate on loss.
+
+### Fixed (SBC / uc-codecs, media audit 2026-11-06)
+
+- **G.722 level fix.** Input at -3 dBFS used to clip at -6 dBFS (-1.8 dB
+  gain, rail hits). The QMF scaling now follows the ITU-T G.191 STL / spandsp
+  16-bit convention, and the -3 and -10 dBFS level tests both show 0.00 dB.
+  Transcoded G.722 audio is louder near full scale than before. Only a
+  self-generated regression vector is used, not the official ITU vectors
+  (POA&M-140).
+- **G.722 encode/decode return errors instead of `Ok(0)`.** Odd PCM length
+  gives `CodecError::InvalidInput` and a short output buffer gives
+  `CodecError::BufferTooSmall`. sbc-media-core transcoder callers map these
+  to the existing `DecryptionFailed`/`EncryptionFailed`. (SI-10)
+- **Codec negotiation hardened (library only, NOT wired in sbc-daemon).**
+  `CodecRegistry::negotiate` now matches channel count. Opus is exempt per
+  RFC 7587 §7. It adopts the remote PT for any non-reserved PT and rejects
+  reserved PTs (72-76, >127) and conflicting PT bindings. It caps remote
+  entries at 64. The answer gives local Opus fmtp (minptime is reconciled)
+  and keeps the peer's parsed fmtp in `CodecCapability::remote_fmtp`.
+  telephone-event events are intersected (RFC 4733). Remote fmtp that is
+  oversize or contains control characters is rejected. telephone-event at
+  8 kHz (PT 101) and 48 kHz (PT 110) is in the default registry. The
+  transcoder refuses telephone-event/CN legs. `MediaSession::negotiate_codecs`
+  now delegates to the registry. **These code paths are reached only from
+  tests today. The live sbc-daemon SDP answer path does not use them, so this
+  gives no production protection yet (POA&M-142).** PTs 64-95 are still adopted
+  under rtcp-mux (POA&M-143).
+
+### Changed (BREAKING, uc-codecs / uc-media-engine library API)
+
+- `AudioCodec::decode_fec` now takes `(next_packet, output)` and sizes the
+  output to the lost frame. New trait methods `conceal(output)` and
+  `supports_plc()` have defaults. External `AudioCodec` implementors must
+  update.
+- New `CodecError` variants: `InvalidInput { reason }` and
+  `LossRecoveryFailed { reason: &'static str }`. Exhaustive matches must
+  handle them. `G722Encoder::encode`/`G722Decoder::decode` return
+  `CodecResult<usize>`. `PayloadType::is_dynamic` now uses the RFC 3551
+  ranges, so `Dynamic(72)` returns false.
+- New public field `CodecCapability::remote_fmtp` and new modules `fmtp` and
+  `opus_toc`.
+- uc-media-engine: removed `StreamStats::{packets_lost, jitter_ms, rtt_ms}`
+  (they were always 0). Crate docs no longer claim RTP/RTCP/SRTP/transcoding.
+- Client: `AudioError::LossRecovery` variant and
+  `JitterBufferResult::Lost { fec_source }` field added.
+- No config, CDR, audit or gRPC schema change. Dev only: `criterion`
+  (workspace 0.8) dev-dependency and `benches/codecs.rs` in uc-codecs. No new
+  runtime or crypto dependency.
+
+## [0.10.0] — 2026-11-06
+
+SBC release with three operator-breaking changes: call detail records,
+STIR/SHAKEN, and SIP transport on every leg (POA&M-5). The client is not
+released with this version; client crates share the workspace version
+number only.
+
+### Upgrade checklist (operators)
+
+1. **CDRs are on by default.** Make sure the CDR directory is writable (Helm
+   gives it its own PVC). The daemon refuses to start if it isn't, or if none
+   of the newest CDR files holds a complete record.
+2. **CDR access moved.** OIDC `config-admin` alone no longer reads CDRs; grant
+   `cdr:read` / `cdr:export`. In Helm, `/api/v1/cdrs` returns 503 until
+   `sbcDaemon.grpcMtls` is configured. sbc-api exits with code 5 if audit
+   logging can't start.
+3. **CDR schema is v2** (STIR fields added). Readers must accept v1 and v2;
+   a file mixing both is rejected by `sbc-cli cdrs verify`.
+4. **STIR/SHAKEN config is nested.** `[stir_shaken]` now has
+   `signing` / `attestation` / `verification` tables and rejects unknown keys;
+   the old flat keys still parse for this release with a warning.
+   `verification_enabled` now defaults to false and the default attestation
+   is C. Helm: `sbcDaemon.stirShaken`.
+5. **TLS trunks need trust anchors and a listener.** Set
+   `security.trunk_tls_ca_path` (Helm: `sbcDaemon.trunkTls.caConfigMap` or
+   `caSecretName`) and `tls_listen`; TCP trunks need `tcp_listen`. Without the
+   CA a TLS trunk fails closed.
+6. **Trunk Request-URI uses the trunk host:port**, not the dialled host; the
+   CDR destination host can change accordingly.
+7. **Registered phones are reached only on the connection they registered
+   on.** A phone registered over TLS whose connection is gone gets 503, never
+   UDP.
+
+### Changed (release)
+
+- Workspace version 0.9.0 → 0.10.0; Helm chart version and appVersion
+  0.8.0 → 0.10.0.
+- tokio 1.53.2 → 1.54.1, fixing RUSTSEC-2026-0386 (`AsyncFd` I/O-safety
+  unsoundness).
+- New `deny.toml`: `cargo deny check` (licenses, advisories, bans, sources)
+  now passes. Licenses are an explicit permissive allow-list; git sources are
+  limited to the first-party RADIUS crate (NIST 800-53 SR-3, SR-4, CM-10).
+- `client-gui-tauri` now inherits the workspace license (Apache-2.0).
+- `security.trunk_tls_ca_path` is accepted with no TLS trunk in the config
+  file, so TLS trunks synced over the API (as in Helm) can connect.
+
+### Added (deploy)
+
+- Helm `sbcDaemon.trunkTls` (trunk CA bundle from a ConfigMap or Secret,
+  mounted at `/etc/sbc/trunk-ca`).
+- Helm `sbcDaemon.stirShaken`: verification with an STI-CR anchors ConfigMap,
+  and signing with a Secret. The init container copies the signing key to a
+  memory-backed volume owned by the daemon uid at mode 0400, as the signer
+  requires. Per-trunk sign/verify still come only from `[[trunk_groups]]` in
+  the config file (POA&M-34).
+
+### Fixed (SBC, Security, POA&M-5 / SC-8)
+
+- **Requests go out on the target leg's transport.** Before this fix, a B-leg INVITE, BYE or CANCEL triggered by a TCP/TLS caller was written back down the *caller's* connection. That was a misroute, and it leaked trunk routing and the STIR Identity to the caller. Timer-driven sends (retransmissions, failover INVITEs, BYEs, 408s) all went out on the UDP socket. Now every message carries an explicit flow: the caller's transport for the A-leg, and the trunk's `protocol` for the B-leg. The daemon opens outbound TCP/TLS connections to trunks, reuses them, and reads trunk responses from them (`sbc-daemon`)
+- **Failover follows the next trunk.** The retried INVITE gets that trunk's Request-URI (`sips:` for TLS, `;transport=tcp` for TCP), a Via with the matching transport and listener port, a matching Contact, and a transaction with that transport's timers. STIR re-signing on failover is unchanged (`sbc-daemon`)
+- **No plaintext fallback.** Trunk TLS always verifies the server certificate. A connect, handshake or verification failure fails the attempt over to the next trunk, or returns 503 (`sbc-daemon`)
+- **CANCEL uses the B-leg INVITE's Request-URI** (RFC 3261 §9.1) and goes out on the B-leg flow, not the dialled R-URI over UDP (`sbc-daemon`)
+- **Phones registered over TLS/TCP were reached over UDP.** Requests to a registered contact now go on the flow the REGISTER arrived on (`sbc-daemon`, `proto-registrar`)
+- **TCP/TLS transports split read and write halves**, so a send no longer waits behind a pending receive on the same connection (`uc-transport`)
+
+### Added (SBC, config)
+
+- `security.trunk_tls_ca_path` sets the trust anchors for trunk server certificates. It is required when any trunk in the config file uses `protocol = "tls"`, and may also be set with no TLS trunk in the file so that TLS trunks synced over the API can connect. Per-trunk `tls_server_name` and `tls_client_cert` (mTLS to the trunk, default off) are TLS-only (`sbc-config`, `uc-routing`)
+- Flow metrics on `/metrics`: `sip_egress_connections`, `sip_egress_connect_failures_total`, `sip_egress_dial_backoff_total`, `sip_send_no_connection_total`, `sip_stream_write_timeouts_total`, `sip_send_lane_dropped_total`, `sip_send_lane_overflow_total` (`sbc-daemon`)
+- Via `rport` (RFC 3581) on SBC-originated UDP requests (`sbc-daemon`)
+- `uc_transport::tls::create_client_config_with(TlsClientOptions)` takes extra roots, a minimum TLS version and an optional client certificate (`uc-transport`)
+
+### Changed (BREAKING, SBC config)
+
+- A config with a `protocol = "tls"` trunk now fails validation unless `security.trunk_tls_ca_path` is set. Operators must mount the trunk CA bundle before upgrading (Helm: `sbcDaemon.trunkTls`)
+- A `protocol = "tcp"` or `"tls"` trunk now requires a matching listener of that transport; configs without one fail validation
+- B-leg INVITEs to trunks now use the trunk's host and port in the Request-URI instead of the dialled host. Trunks or downstream parsers matching on the dialled host must be updated
+- Registered phones are reached only on their registration flow. A UDP caller calling a TLS-registered phone whose connection has closed gets 503 (no UDP fallback, SC-8)
+- B-leg transaction timers follow the trunk transport (Timer A not used on TCP/TLS, RFC 3261 §17.1.2.2), changing retransmission and failover timing on stream trunks
+- `proto_registrar::Binding` gains a `source_transport` field; struct-literal constructors must set it (`proto-registrar`, internal API)
+
+### Added (SBC, STIR/SHAKEN)
+
+- **STIR/SHAKEN verification and signing in the call path** — inbound INVITEs are verified (RFC 8224/8225/8588, ATIS-1000074) after Max-Forwards and before VPS. The verstat result is written into From/P-Asserted-Identity and fed to VPS enforcement. Outbound INVITEs to trunks with `sign = true` are signed at egress after manipulation and topology hiding, and any inbound Identity is stripped unless the trunk is trusted. Failures follow `verification.failure_policy` (`pass-through` | `mark` | `reject`). Rejects carry a `Reason: SIP;cause=N` header and produce a PolicyDenied CDR (`sbc-daemon`, `proto-sip`)
+- **New crate `uc-sti`** — STI certificate fetch over HTTPS with SSRF protection (all resolved addresses are vetted, no redirects, body cap, timeout), a bounded single-flight certificate cache, trust anchors reloaded on SIGHUP and on a timer, the A/B/C attestation policy, and a file signing key (opened `O_NOFOLLOW`, mode 0600/0400, owned by the daemon user, zeroized) (`uc-sti`)
+- **ES256 and STI certificate validation in `uc-crypto`** — behind the new `stir-shaken-es256` feature: `interop::ecdsa_p256` and `x509::verify_sti_chain` (rustls-webpki on aws-lc-rs FIPS, TNAuthList per RFC 8226). This is a documented **CNSA 2.0 exception**: ATIS-1000074 requires ES256 (P-256) (`uc-crypto`)
+- **SIP response codes** — 428 Use Identity Header, 436 Bad Identity Info, 437 Unsupported Credential, 438 Invalid Identity Header. A stale or future `iat` gets **403 Stale Date** (RFC 8224 §6.2.2) (`proto-sip`, `proto-stir-shaken`)
+- **Per-trunk switches** — `stir_shaken = { sign, verify, strip_inbound_identity }` on a trunk. They need the matching global switch (`sbc-config`)
+- **Audit events, for SIEM parsers** — `StirSignFailure`, `StirVerifyFailure` (aggregated per trunk and reason, with `count`, last `source_ip` and Call-ID hash), `StirTrustAnchorsReloaded`, `StirTrustAnchorReloadFailed`, `StirKeyLoaded`, and `StirAuditEventsDropped` (Security, `count`/`total`, AU-5) when the aggregator drops events. Strict-schema parsers must accept them (`uc-audit`, `sbc-daemon`)
+- **gRPC** — `CallInfo.verstat` (field 15); `CdrRecord` fields 42-45 for the STIR CDR fields. The CDR attestation mapping uses stable strings instead of debug formatting (`sbc-grpc-api`)
+- **Metrics** — STIR gauges and counters on the daemon metrics endpoint (`sbc-daemon`)
+
+### Changed (BREAKING, SBC, STIR/SHAKEN)
+
+- **`stir_shaken.verification_enabled` now defaults to `false`** — before this release it defaulted to `true` but did not verify anything. With verification on, `verification.trust_anchors_path` (STI-CR bundle, file or directory) is required, and the daemon refuses to start without it. The shipped `deploy/config/config.toml` used to set `verification_enabled = true` with no anchors, and would fail validation now. It has been migrated
+- **Default attestation is now `C`** (was `B`). Set `stir_shaken.attestation.default` and `owned_numbers` to get A/B
+- **`[stir_shaken]` is nested and strict** — new `[stir_shaken.signing]`, `[stir_shaken.attestation]` and `[stir_shaken.verification]` sections with `deny_unknown_fields`, so a misspelled key now stops startup. The old flat keys (`default_attestation`, `certificate_path`, `private_key_path`, `certificate_url`, `max_passport_age_secs`, `ca_bundle_path`) are **deprecated aliases**: still accepted, with a startup warning. Setting an old key and its new key together is an error. `certificate_url` must be `https`, and `pkcs11` keys are rejected
+- **Attestation A needs a TCP/TLS REGISTER flow** — an endpoint INVITE gets A only on the connection flow its REGISTER came in on. Bindings created another way (API, replication) are not attested. **For UDP endpoints the most you get is B**
+- **CDR schema v2** — `schema_version = 2` adds `stir_verstat`, `stir_verify_reason`, `stir_inbound_attestation` and `stir_x5u_host` (JSONL fields and CSV columns). When these fields are absent, v1 records serialise exactly as before, and existing v1 files still verify. The verifier rejects a file that mixes v1 and v2 records. Billing/SIEM parsers must accept v2 and the wider CSV
+- **`proto-stir-shaken` API rewritten** — the structural-only `verify_identity` and the hand-written base64 are gone. They are replaced by `IdentityHeader::parse`, the `Signer`/`VerifyingKey`/`KeyResolver` traits and the two-stage `Verifier::prepare`/`verify`. `KeyResolver::cached` returns `Option<Arc<VerifiedKey>>`. `Attestation` is now an alias for `uc_types::AttestationLevel`. Code that uses the crate must be ported
+- **Audit event set grows** — see the new `Stir*` events above
+
+### Added (SBC, CDR)
+
+- **Call Detail Records (schema v1)** — the daemon writes one CDR per INVITE that reaches admission through a bounded queue to a dedicated writer thread (emits never block signalling; overflow is dropped and counted). Records are SHA-384 hash-chained with a per-file `.sha384` sidecar, rotated by size/interval and pruned by `retention_files`/`retention_days`. PII handling is `full`, `mask_caller` or `hash` (HMAC with `pii_hash_key_file`, opened `O_NOFOLLOW`, must be a 0400/0600 regular file >= 48 bytes). CSV output guards against formula injection by prefixing `'`, which also applies to E.164 numbers such as `'+15551234567` (NIST AU-2/AU-3/AU-9/AU-12) (`uc-cdr`, `sbc-daemon`)
+- **CDR sinks** — a local file sink (`jsonl` or `csv`, directory 0750, files 0640) and an optional RFC 5425 syslog-over-TLS sink (`[cdr.syslog]`, TLS only), plus an in-memory ring of recent CDRs for the API (`uc-cdr`, `sbc-daemon`)
+- **gRPC `CdrService`** — list, get, stats and streaming export of CDRs (`proto/cdr.proto`). The new `grpc.allowed_client_names` restricts daemon gRPC callers by client-certificate name when mTLS is on (`sbc-grpc-api`, `sbc-daemon`, `sbc-config`)
+- **REST CDR API** — `GET /api/v1/cdrs`, `/api/v1/cdrs/{record_id}`, `/api/v1/cdrs/stats` and `/api/v1/cdrs/export` (JSONL/CSV) on `sbc-api`, served from the daemon `CdrService` (`sbc-api-server`)
+- **CLI** — `sbc-cli cdrs list|get|stats|export|verify`. `verify` checks the hash chain and sidecars of CDR files offline (`sbc-cli`)
+- **Dashboard** — the CDRs page reads the real API, with filters and export (`sbc-dashboard`)
+- **Config keys** — `[cdr]`: `enabled`, `format`, `directory`, `node_id`, `rotate_size_mb`, `rotate_interval`, `retention_files`, `retention_days`, `fsync_interval_ms`, `queue_capacity`, `ring_capacity`, `hash_chain`, `record_unanswered`, `record_auth_challenges`, `pii`, `pii_hash_key_file`, `on_failure` (`continue` | `reject_new_calls`, emergency calls are always admitted); `[cdr.syslog]`: `enabled`, `target`, `ca_path`, `facility`; `grpc.allowed_client_names`. See `deploy/config/config.toml` and `docs/SBC-ADMIN-GUIDE.md` "Call Detail Records" (`sbc-config`)
+- **Metrics** — `sbc_cdr_emitted_total`, `sbc_cdr_dropped_queue_full_total`, `sbc_cdr_dropped_writer_dead_total`, `sbc_cdr_write_errors_total`, `sbc_cdr_rotations_total`, `sbc_cdr_syslog_dropped_total`, `sbc_cdr_queue_depth`, `sbc_cdr_writer_alive`, `sbc_cdr_last_write_timestamp_seconds`. A new `cdr` health component reports degraded on drops and unhealthy when the writer has exited. Operators should alert on the drop counters and `sbc_cdr_writer_alive` (`sbc-daemon`)
+- **Audit events, for SIEM parsers** — `CdrSinkFailure` and `CdrFileRotated` (System), and `CdrExport` (Authorization) with fields `user`, `on_behalf_of`, `filter`, `count`, `format`, written for every CDR read or export through `sbc-api`. Strict-schema parsers must accept the new event types (`uc-audit`, `sbc-daemon`, `sbc-api-server`)
+- **Deploy assets** — the Dockerfile creates `/var/lib/usg-sbc/cdr` (0750, owned by `sbc`); the Helm chart adds `sbcDaemon.cdr.*` values, a dedicated CDR PVC (`<fullname>-cdr`, kept apart from the data volume, AU-4) and an optional daemon gRPC mTLS template (`26-sbc-grpc-mtls.yaml`); Ansible creates the CDR directory when `sbc_host_install=true`
+
+### Changed (BREAKING, SBC operators and integrators)
+
+- **CDRs are on by default and need a writable directory** — `cdr.enabled` defaults to `true`, and the daemon refuses to start if `cdr.directory` (default `/var/lib/usg-sbc/cdr`) cannot be created or written. The container image, Helm chart and Ansible playbook (with `sbc_host_install=true`) create it. Bare-metal installs must create it for the daemon user, or set `cdr.enabled = false`
+- **Daemon refuses to start on unrecoverable CDR files** — if no resume point can be found in the newest CDR files (a broken chain or foreign content), startup fails rather than reusing record IDs. Move the affected files aside and check them with `sbc-cli cdrs verify`
+- **`uc-cdr` API replaced** — the old `uc-cdr` types, writer and format API are gone, replaced by the schema v1 record, sink, chain and ring API. The crate now depends on `uc-crypto`, not `uc-types`. Downstream code that uses `uc-cdr` must be ported
+- **Daemon `/cdrs` REST stub removed** — the daemon's own placeholder `/cdrs` endpoint no longer exists. Use `sbc-api` `/api/v1/cdrs` or gRPC `CdrService`
+- **CDR read access needs a CDR role** — OIDC `config-admin` alone can no longer read CDRs. Grant `cdr-reader`, `auditor`, `cdr-exporter` or `fleet-admin`, or the `cdr:read` / `cdr:export` scopes (export needs `cdr-exporter`/`fleet-admin` or `cdr:export`) (AC-3, AC-6)
+- **Helm: `/api/v1/cdrs` returns 503 until daemon gRPC mTLS is set up** — with default values `sbc-api` does not send CDRs over plaintext gRPC. Configure `sbcDaemon.grpcMtls`. `grpcMtls` cannot be combined with `sbcTrunkAgent`, and the chart fails to render if both are set
+- **New `sbc-api` environment variables** — `SBC_DAEMON_GRPC_TLS_CA_FILE`, `SBC_DAEMON_GRPC_TLS_CERT_FILE`, `SBC_DAEMON_GRPC_TLS_KEY_FILE` (set all three or none) enable mTLS to the daemon
+- **`sbc-api` exits with code 5 if audit init fails** — supervisors and health probes that treat specific exit codes must account for it (AU-5)
+- **CDR and audit schemas for billing/SIEM parsers** — CDR schema v1 is new (JSONL/CSV, `schema_version` field). `CdrExport`, `CdrSinkFailure` and `CdrFileRotated` are new audit event types
+
+### Added (SBC)
+
+- **Emergency calls get reserved headroom** — calls to a number in `vps.emergency_numbers` (default `["911", "933", "112"]`, exact match on the dialed user part; at most 32 entries of up to 32 characters each, and an entry like `9-1-1` is rejected) are admitted past `general.max_calls` and trunk `max_calls` up to a bounded reserve: `general.emergency_reserve_calls`, and the per-trunk `emergency_reserve_calls` (each defaults to 10% of the matching `max_calls`, minimum 1; valid range 1–`max_calls`). Once the reserve is used up, emergency calls get 503 too, and normal calls never use it. Emergency calls skip VPS number/caller deny rules, but these still apply: operator source-IP blocklist entries, ACLs, authentication and the source-IP flood limiter. Each bypass is audited as `emergency-bypass` with `source_ip`. STIR/SHAKEN attestation is **not** checked for emergency calls (accepted deviation SEC-003 / NIST-002). New metric `sbc_emergency_calls_admitted` (`sbc-config`, `sbc-daemon`, `uc-vps`, `uc-routing`)
+- **Trunk `Retry-After` honoured** — a 503 from a trunk that carries `Retry-After` puts that trunk in cooldown for the given time, capped by `general.trunk_retry_after_max_secs` (default 300, valid 1–3600) (`sbc-daemon`, `uc-routing`, `sbc-config`)
+- **Immediate failover on transport errors** — if sending the first B-leg INVITE fails with a transport error, the SBC moves to the next trunk right away instead of waiting for Timer B (`sbc-daemon`)
+- **New audit events, for SIEM parsers** — `TrunkFailover` and `TrunkReachabilityChanged`. `AuthorizationDecision` gains a `source_ip` field (additive). It is filled in on the `no-usable-trunk`, `number-translation-invalid`, `max-registrations` and `emergency-bypass` decisions, and anywhere else the source address is known. Strict-schema parsers must accept the new event types and field (`uc-audit`, `sbc-daemon`)
+
+### Changed (SBC)
+
+- **Audit writes no longer block signalling** — records go on a bounded queue to a dedicated writer thread, which hash-chains and writes them in queue order. The hash chain still covers every record that is written. When the queue is full or the writer has died, the record is **dropped and counted** rather than holding up the caller, and the loss is logged at error level, rate limited (AU-5). The queue is flushed with a timeout at shutdown. A new `audit` health component reports degraded when records have been dropped and unhealthy when the writer thread has exited. New metrics: `sbc_audit_records_dropped` and `sbc_audit_writer_alive`. Operators should alert on both. A gap in the written sequence now means records were dropped, not that the chain was tampered with: compare it against `sbc_audit_records_dropped` (`uc-audit`, `sbc-daemon`)
+
+- **Audit health recovers after drops (operator-visible)** — the `audit` health component now reports degraded only for 60 s after the most recent dropped record, then returns to healthy; it is still unhealthy while the writer thread has exited. `sbc_audit_records_dropped` stays cumulative and never resets. Operators who relied on health staying degraded must alert on the **rate** of `sbc_audit_records_dropped` (e.g. `increase(...) > 0`) instead (POA&M-12, AU-5) (`uc-audit`, `sbc-daemon`)
+
+### Fixed (SBC)
+
+- **No SIP retransmissions over reliable transports** — client and server transactions on TCP, TLS, WS, WSS and SCTP are now built as reliable: Timers A, E and G no longer fire, and Timers I, J and K are zero (RFC 3261 §17.1.1.2, §17.1.2.2, §17.2.1, §17.2.2). Timers B, F and H are still armed. UDP is unchanged. Requests and responses sent from the timer loop (failover INVITEs, BYEs, 408s) still go out on the UDP timer socket and are tracked as UDP until POA&M-5 (POA&M-10) (`sbc-daemon`)
+- **`max_calls` admission is atomic** — the call-slot check and reservation are a single atomic step, so concurrent INVITEs can no longer push active calls past `general.max_calls`. The slot is released on every reject and teardown path. Emergency reserve behaviour (`emergency_reserve_calls`) is unchanged (POA&M-11, SC-5) (`sbc-daemon`)
+
+### Changed (BREAKING, SBC operators)
+
+- **Configuration keys the SBC accepted but ignored are now rejected by `validate_config`** — the daemon refuses to start (CM-6/CM-7) when: `media.default_mode` is anything other than `Relay` (there is no media bypass); `media.realm_modes` has any entries; `media.codecs` differs from the default set `["Opus", "G722", "G711Ulaw", "G711Alaw"]` (order ignored; there is no SDP codec filtering or transcoding); a trunk has `max_calls = 0` or `max_failures = 0`; or `options_ping_interval_secs` is outside 5–3600 while `options_ping_enabled = true`. `sbc-media` exits at startup if `SBC_MEDIA_DEFAULT_MODE` is not `relay`. The `codecs` line was removed from `deploy/test/sbc-test.toml`. Remove or fix these keys before upgrading (`sbc-config`, `sbc-media`)
+
+### Fixed
+
+- **SBC features that could be configured but had no effect now work** — the SBC-router and dial-plan number translation is written into the B-leg Request-URI/To user part; trunk failover is filled in from the remaining trunks in the selected trunk group/route group, and `TrunkMonitor` OPTIONS health drives trunk selection so a down trunk is skipped (new config-file trunk keys `options_ping_enabled` / `options_ping_interval_secs`); per-trunk `max_calls`, `cooldown_secs` and `max_failures` are enforced; VPS `per_callee_max_concurrent` is enforced; `general.max_registrations` is enforced after authentication; the trunk-status publish service is bounded. Call counts are released on every teardown path (failure, CANCEL, timeout, BYE from either side) (`sbc-daemon`, `sbc-config`, `sbc-trunk-services`, `uc-routing`, `uc-vps`, `proto-registrar`)
+
+### Added
+
+- **Mid-dialog re-INVITE and UPDATE relay** — the daemon now relays re-INVITE (RFC 3261 §14) and UPDATE (RFC 3311) across both legs of a B2BUA call, re-anchoring the new offer and answer through the media relay and following each leg's new RTP address, so hold/resume, codec changes and RFC 4028 session refreshes work end to end. Body-less refreshes are answered locally; a second change while one is in flight gets 491; `Supported: timer`, `Session-Expires` and `Min-SE` are carried through the initial INVITE and the 2xx (`sbc-daemon`, closes #117)
+
+### Added
+
+- **SIP over WebSocket listeners** — `transport.ws_listen` now binds RFC 7118 WebSocket listeners (plain `ws`); `wss_listen` is rejected by `validate_config` because the WebSocket transport does not terminate TLS (`sbc-daemon`, `sbc-config`)
+- **Audit trail** — `logging.audit_enabled` starts the `uc-audit` logger (hash-chained JSON lines at `logging.audit_path`, or the tracing output); the daemon records startup/shutdown, REGISTER authentication outcomes, INVITE admission and VPS rejections, call establishment/termination with duration, and rate-limit rejections (NIST AU-2/AU-3/AU-9) (`sbc-daemon`, `uc-audit`)
+
+### Fixed
+
+- **Configuration keys that were parsed but ignored are now enforced** — `security.min_tls_version` and `security.require_mtls` (with the new `security.tls_ca_path`) are applied to SIP-TLS listeners via `uc-transport::tls::create_server_config_with`; `rate_limit.per_user_rps` limits requests per From user after parsing (503 + `Retry-After`); `logging.level`/`format`/`output` configure the tracing subscriber (json/text, stdout/stderr/file). `validate_config` rejects `require_mtls` without certificate and CA paths and malformed `[logging]` values (`sbc-daemon`, `sbc-config`, `uc-transport`, `uc-dos-protection`, closes #145)
+- **ICE connectivity checks run in the soft client** — `IceHandler::start_checks` now drives RFC 8445 checks on the media socket: priority-ordered checks paced by Ta, retransmission, role-conflict handling, regular and aggressive nomination, and answering the peer's checks; the media session falls back to the SDP `c=`/`m=` address on ICE mismatch (RFC 8445 §5.1.1, e.g. through a B2BUA) or check failure. STUN servers and the nomination mode come from `[network]` settings (`client-sip-ua`, `client-core`, closes #142)
+- **Dead ICE module removed from sbc-daemon** — `ice_agent.rs` was never constructed; the SBC anchors media with symmetric latching and does not run ICE. `proto-ice` and `proto-turn` are no longer daemon dependencies (`sbc-daemon`)
+- **Compliance documents reconciled with what ships** — `PROTO_RFC_COMPLIANCE.md`, `docs/RFC_COMPLIANCE_GAPS.md`, `docs/NIST-800-53-CONTROLS.md`, `docs/CNSA-2-COMPLIANCE.md`, `docs/CLUSTERING.md`, `docs/route-patterns.md`, `docs/SBC-ADMIN-GUIDE.md` and `ROADMAP.md` now label every "Full"/"Complete"/"Implemented" entry as *Wired* (naming the binary), *Library-only* or *Planned*, use the real `proto-*`/`uc-*` crate names, and correct config keys and enum spellings that did not match `sbc-config` (closes #118)
+- **SIP transaction layer is driven** — the daemon now steps the `proto-transaction` state machines it creates: a timer task retransmits forwarded INVITEs (Timer A), non-2xx finals toward the caller (Timer G) and 2xx responses until ACKed (RFC 3261 §13.3.1.4); an unanswered B-leg INVITE fails the call with 408 (Timer B); retransmitted requests are answered from the stored response instead of being re-processed; every non-2xx final from the far end is ACKed (§17.1.1.3) and retransmitted finals are absorbed, so a lost ACK no longer leaves the far end retransmitting for 32 s or restarts the media relay (`sbc-daemon`)
+- **481 for unmatched in-dialog requests** — BYE, re-INVITE, UPDATE and other tagged requests for a dialog the SBC does not have, and CANCEL for an unknown INVITE, now get 481 Call/Transaction Does Not Exist instead of 200 OK or 405 (RFC 3261 §9.2, §12.2.2, §15.1.2) (`sbc-daemon`)
+
+### Security
+
+- **No untrusted-CA override in release builds** — the provisioning HTTP client's accept-any-certificate mode (`CaTrust::Insecure`) and the sign-in "continue anyway" prompt now exist only under `debug_assertions`, matching the SIP TLS transport. Release clients must install a private CA via `[provisioning] extra_ca_cert_file` (`client-provisioning`, `client-gui-tauri`)
+- **Security Audit is blocking** — the `cargo audit` job is part of the `CI OK` gate
+- **Opus binding → `opusic-c`** — the `opus-ffi` feature now uses the maintained `opusic-c` 1.6 binding (bundled libopus 1.6.1, CMake 4 compatible) instead of the unmaintained `audiopus`/`audiopus_sys` (RUSTSEC-2026-0150). No system libopus needed; the audit ignore is removed (`uc-codecs`)
+- **cryptoki 0.7 → 0.12** — fixes RUSTSEC-2026-0286 (out-of-bounds read decoding `CKA_ALLOWED_MECHANISMS`) in the PKCS#11 smart-card certificate enumeration (`client-core`). Also drops the unmaintained `paste` crate from the lockfile
+- **cargo-audit clean** — CI installs `libopus-dev` so the `opus-ffi` feature links the system libopus instead of running `audiopus_sys`'s unmaintained source build; `.cargo/audit.toml` documents the remaining GTK3-pinned advisories
+
+### Changed
+
+- **Path-scoped CI** — PRs lint/test only the crate groups they touch (`crates/sbc`, `crates/client`); changes to the shared `uc-*`/`proto-*` core, workspace manifests, or the workflow widen to the full workspace, and pushes to `main` always run everything. A single `CI OK` status gates the result (`.github/workflows/ci.yml`)
+- **Independent release tags** — SBC images are cut from `sbc-v*` (`release-sbc.yml`, formerly `release.yml` on `v*`); a new `release-client.yml` builds the soft-client desktop binaries and `client-ffi` libraries from `client-v*`. Bare `v*` tags no longer trigger a release
+- **Integration tests** no longer run for client-only PRs (`integration.yml`)
+
 ## [0.9.0] — 2026-07-19
 
 ### Security

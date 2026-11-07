@@ -7,6 +7,7 @@
 //!
 //! - `ConfigService` - Configuration management
 //! - `CallService` - Call monitoring and control
+//! - `CdrService` - Recent Call Detail Records (read-only ring)
 //! - `RegistrationService` - Registration management
 //! - `SystemService` - System operations
 //! - `TrunkSyncService` - "Trunk group X changed in Postgres; please re-sync"
@@ -28,12 +29,16 @@
 //! - **IA-3**: Device Identification (mTLS support)
 
 mod call_service;
+mod cdr_service;
 #[cfg(feature = "cluster")]
 mod cluster_service;
 mod config_service;
 mod dial_plan_sync_service;
 mod did_mapping_sync_service;
 mod health_service;
+#[cfg(test)]
+mod mtls_handshake_tests;
+mod peer_identity;
 mod registration_service;
 mod sbc_sync_service;
 mod system_service;
@@ -48,6 +53,7 @@ use crate::shutdown::ShutdownSignal;
 use sbc_config::schema::GrpcConfig;
 use sbc_grpc_api::health::health_server::HealthServer;
 use sbc_grpc_api::sbc::call_service_server::CallServiceServer;
+use sbc_grpc_api::sbc::cdr_service_server::CdrServiceServer;
 #[cfg(feature = "cluster")]
 use sbc_grpc_api::sbc::cluster_service_server::ClusterServiceServer;
 use sbc_grpc_api::sbc::config_service_server::ConfigServiceServer;
@@ -66,12 +72,14 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tracing::{info, warn};
 
 pub use call_service::CallServiceImpl;
+pub use cdr_service::CdrServiceImpl;
 #[cfg(feature = "cluster")]
 pub use cluster_service::ClusterServiceImpl;
 pub use config_service::ConfigServiceImpl;
 pub use dial_plan_sync_service::DialPlanSyncServiceImpl;
 pub use did_mapping_sync_service::DidMappingSyncServiceImpl;
 pub use health_service::HealthServiceImpl;
+pub use peer_identity::{ClientCertGate, PeerPrincipal};
 pub use registration_service::RegistrationServiceImpl;
 pub use sbc_sync_service::SbcSyncServiceImpl;
 pub use system_service::SystemServiceImpl;
@@ -192,9 +200,18 @@ impl GrpcServer {
         // snapshots here when trunk services run externally.
         let trunk_status_publish_svc = TrunkStatusPublishServiceImpl::new(Arc::clone(&self.state));
         let sbc_sync_svc = SbcSyncServiceImpl::new(Arc::clone(&self.state));
+        // Read-only CDR ring queries. CDRs carry PII and this listener has
+        // no per-RPC authorization, so the service is mounted only when
+        // every caller is authenticated (mTLS) or local (loopback).
+        let cdr_svc = cdr_service_permitted(&self.config)
+            .then(|| CdrServiceServer::new(CdrServiceImpl::new(Arc::clone(&self.state))));
 
         // Configure TLS if enabled
         let tls_config = self.configure_tls()?;
+
+        // NIST 800-53 Rev5: AC-3, IA-3 — under mTLS every RPC (all services)
+        // must come from a certificate on grpc.allowed_client_names.
+        let gate = client_cert_gate(&self.config);
 
         // Build the server with or without TLS
         let mut server = if let Some(tls) = tls_config {
@@ -204,9 +221,10 @@ impl GrpcServer {
                 .map_err(|e| GrpcServerError::TlsError {
                     reason: e.to_string(),
                 })?
+                .layer(tonic::service::InterceptorLayer::new(gate))
         } else {
             warn!("gRPC server running WITHOUT TLS - not recommended for production");
-            Server::builder()
+            Server::builder().layer(tonic::service::InterceptorLayer::new(gate))
         };
 
         // Build router with core services (no cluster, no reflection)
@@ -224,7 +242,8 @@ impl GrpcServer {
             .add_service(TrunkStatusPublishServiceServer::new(
                 trunk_status_publish_svc,
             ))
-            .add_service(SbcSyncServiceServer::new(sbc_sync_svc));
+            .add_service(SbcSyncServiceServer::new(sbc_sync_svc))
+            .add_optional_service(cdr_svc);
 
         // Build router with reflection but no cluster
         #[cfg(all(not(feature = "cluster"), feature = "grpc-reflection"))]
@@ -239,7 +258,8 @@ impl GrpcServer {
                 .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
                 .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
                 .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
-                .add_service(SbcSyncServiceServer::new(sbc_sync_svc));
+                .add_service(SbcSyncServiceServer::new(sbc_sync_svc))
+                .add_optional_service(cdr_svc);
 
             // Add reflection service if enabled in config
             if self.config.enable_reflection {
@@ -269,7 +289,8 @@ impl GrpcServer {
                 .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
                 .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
                 .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
-                .add_service(SbcSyncServiceServer::new(sbc_sync_svc));
+                .add_service(SbcSyncServiceServer::new(sbc_sync_svc))
+                .add_optional_service(cdr_svc);
 
             // Add ClusterService if cluster manager is available
             if let Some(cluster) = &self.cluster {
@@ -295,7 +316,8 @@ impl GrpcServer {
                 .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
                 .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
                 .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
-                .add_service(SbcSyncServiceServer::new(sbc_sync_svc));
+                .add_service(SbcSyncServiceServer::new(sbc_sync_svc))
+                .add_optional_service(cdr_svc);
 
             // Add ClusterService if cluster manager is available
             let with_cluster = if let Some(cluster) = &self.cluster {
@@ -393,6 +415,75 @@ impl GrpcServer {
         }
 
         Ok(Some(tls_config))
+    }
+}
+
+/// Builds the per-RPC client-certificate gate, warning at startup when mTLS
+/// admits any certificate from the CA (empty `grpc.allowed_client_names`).
+// POAM: SEC-9 (SC-13) the gRPC server and the sbc-api client use tonic's
+// default rustls provider and suites (TLS 1.2/1.3, AES-128, X25519 allowed),
+// not the uc-transport CNSA 2.0 profile; the P-384 keys alone do not make
+// the negotiated suite CNSA compliant.
+fn client_cert_gate(config: &GrpcConfig) -> ClientCertGate {
+    if config.require_mtls && config.allowed_client_names.is_empty() {
+        warn!(
+            "grpc.require_mtls is set but grpc.allowed_client_names is empty: any client \
+             certificate issued by grpc.tls_ca_path may call every gRPC service; set \
+             grpc.allowed_client_names and use a dedicated issuer for this CA"
+        );
+    }
+    ClientCertGate::new(config.require_mtls, &config.allowed_client_names)
+}
+
+/// Whether `CdrService` may be mounted on this listener: only when every
+/// client is authenticated by certificate (`grpc.require_mtls`) or the
+/// listener is bound to loopback. Otherwise it is not registered (clients
+/// get `Unimplemented`) and a warning names the keys to change.
+///
+/// ## NIST 800-53 Rev5: AC-3 (Access Enforcement), SC-8, SI-12
+fn cdr_service_permitted(config: &GrpcConfig) -> bool {
+    if config.require_mtls || config.listen_addr.ip().is_loopback() {
+        return true;
+    }
+    warn!(
+        listen_addr = %config.listen_addr,
+        "CdrService NOT mounted: CDRs carry PII and this gRPC listener is neither \
+         mTLS-authenticated nor loopback. Set grpc.require_mtls = true (with \
+         grpc.tls_cert_path, grpc.tls_key_path, grpc.tls_ca_path) or bind \
+         grpc.listen_addr to 127.0.0.1/::1"
+    );
+    false
+}
+
+// Runs under every feature set (the module below is no-cluster only).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cdr_gate_tests {
+    use super::*;
+
+    #[test]
+    fn cdr_service_only_on_mtls_or_loopback_listener() {
+        // SEC-1: the default listener (0.0.0.0, no mTLS) must not serve PII.
+        let default = GrpcConfig::default();
+        assert!(!default.require_mtls && !default.listen_addr.ip().is_loopback());
+        assert!(!cdr_service_permitted(&default));
+        let public_v6 = GrpcConfig {
+            listen_addr: "[::]:9091".parse().unwrap(),
+            ..GrpcConfig::default()
+        };
+        assert!(!cdr_service_permitted(&public_v6));
+        for addr in ["127.0.0.1:9091", "[::1]:9091"] {
+            let local = GrpcConfig {
+                listen_addr: addr.parse().unwrap(),
+                ..GrpcConfig::default()
+            };
+            assert!(cdr_service_permitted(&local), "{addr}");
+        }
+        let mtls = GrpcConfig {
+            require_mtls: true,
+            ..GrpcConfig::default()
+        };
+        assert!(cdr_service_permitted(&mtls));
     }
 }
 

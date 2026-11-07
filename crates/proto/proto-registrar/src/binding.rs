@@ -56,6 +56,11 @@ pub struct Binding {
     q_value: f32,
     /// Source address of the registration.
     source_addr: Option<SocketAddr>,
+    /// Transport the registration arrived on (`udp`, `tcp`, `tls`, `ws`,
+    /// `wss`), as observed by the receiver, never taken from a header.
+    /// Requests toward the binding go back on that transport only.
+    // NIST 800-53 Rev5: SC-8 (no downgrade of a binding learned over TLS)
+    source_transport: Option<String>,
     /// Instance ID (RFC 5626).
     instance_id: Option<String>,
     /// Reg-ID (RFC 5626).
@@ -86,6 +91,7 @@ impl Binding {
             state: BindingState::Active,
             q_value: 1.0,
             source_addr: None,
+            source_transport: None,
             instance_id: None,
             reg_id: None,
             user_agent: None,
@@ -143,6 +149,11 @@ impl Binding {
         self.source_addr
     }
 
+    /// Returns the transport the registration arrived on, if recorded.
+    pub fn source_transport(&self) -> Option<&str> {
+        self.source_transport.as_deref()
+    }
+
     /// Returns the instance ID.
     pub fn instance_id(&self) -> Option<&str> {
         self.instance_id.as_deref()
@@ -186,6 +197,11 @@ impl Binding {
     /// Sets the source address.
     pub fn set_source_addr(&mut self, addr: SocketAddr) {
         self.source_addr = Some(addr);
+    }
+
+    /// Records the transport the registration arrived on (lowercase token).
+    pub fn set_source_transport(&mut self, transport: impl Into<String>) {
+        self.source_transport = Some(transport.into().to_ascii_lowercase());
     }
 
     /// Sets the instance ID.
@@ -368,6 +384,9 @@ mod storable {
         pub q_value: f32,
         /// Source address of the registration (serialized as string).
         pub source_addr: Option<String>,
+        /// Transport the registration arrived on.
+        #[serde(default)]
+        pub source_transport: Option<String>,
         /// Instance ID (RFC 5626).
         pub instance_id: Option<String>,
         /// Reg-ID (RFC 5626).
@@ -387,8 +406,7 @@ mod storable {
         pub fn from_binding(binding: &Binding) -> Self {
             let now_unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
 
             // Calculate Unix timestamps from Instant elapsed times
             let created_at_unix = now_unix.saturating_sub(binding.created_at.elapsed().as_secs());
@@ -405,6 +423,7 @@ mod storable {
                 state: binding.state.into(),
                 q_value: binding.q_value,
                 source_addr: binding.source_addr.map(|a| a.to_string()),
+                source_transport: binding.source_transport.clone(),
                 instance_id: binding.instance_id.clone(),
                 reg_id: binding.reg_id,
                 user_agent: binding.user_agent.clone(),
@@ -422,8 +441,7 @@ mod storable {
         pub fn to_binding(&self) -> Binding {
             let now_unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
 
             // Create a new binding with basic fields
             let mut binding = Binding::new(&self.aor, &self.contact_uri, &self.call_id, self.cseq);
@@ -439,6 +457,9 @@ mod storable {
                 && let Ok(addr) = addr_str.parse()
             {
                 binding.set_source_addr(addr);
+            }
+            if let Some(ref t) = self.source_transport {
+                binding.set_source_transport(t);
             }
 
             // Set RFC 5626 outbound fields
@@ -512,8 +533,7 @@ mod storable {
 
             let now_unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
 
             let expiry_time = self.updated_at_unix + self.expires as u64;
             now_unix >= expiry_time
@@ -528,8 +548,7 @@ mod storable {
 
             let now_unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
 
             let expiry_time = self.updated_at_unix + self.expires as u64;
             expiry_time.saturating_sub(now_unix) as u32
@@ -671,6 +690,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060);
         binding.set_source_addr(addr);
         assert_eq!(binding.source_addr(), Some(addr));
+        assert!(binding.source_transport().is_none());
+        binding.set_source_transport("TLS");
+        assert_eq!(binding.source_transport(), Some("tls"));
     }
 
     #[test]
@@ -710,6 +732,7 @@ mod tests {
 
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060);
             binding.set_source_addr(addr);
+            binding.set_source_transport("tls");
 
             // Convert to storable
             let storable = StorableBinding::from_binding(&binding);
@@ -728,6 +751,12 @@ mod tests {
             assert_eq!(storable.user_agent, Some("TestUA/1.0".to_string()));
             assert_eq!(storable.path.len(), 1);
             assert_eq!(storable.source_addr, Some("192.168.1.100:5060".to_string()));
+            assert_eq!(storable.source_transport.as_deref(), Some("tls"));
+            assert_eq!(
+                storable.to_binding().source_transport(),
+                Some("tls"),
+                "source transport survives storage"
+            );
 
             // Convert back to binding
             let recovered = storable.to_binding();

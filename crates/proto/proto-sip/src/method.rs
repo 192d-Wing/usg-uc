@@ -126,9 +126,9 @@ impl FromStr for Method {
     type Err = std::convert::Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // RFC 3261 Section 7.1: Methods are case-sensitive, but we're lenient
-        // in parsing (accept lowercase) while being strict in generation (uppercase).
-        Ok(match s.to_uppercase().as_str() {
+        // RFC 3261 §7.1: methods are case-sensitive. A lower-case `invite`
+        // is an (unknown) extension method, not INVITE.
+        Ok(match s {
             "INVITE" => Self::Invite,
             "ACK" => Self::Ack,
             "BYE" => Self::Bye,
@@ -143,8 +143,8 @@ impl FromStr for Method {
             "REFER" => Self::Refer,
             "MESSAGE" => Self::Message,
             "UPDATE" => Self::Update,
-            // RFC 3261 allows extension methods - store as uppercase
-            _ => Self::Extension(s.to_uppercase()),
+            // RFC 3261 §7.1: extension methods are kept exactly as received
+            _ => Self::Extension(s.to_string()),
         })
     }
 }
@@ -163,7 +163,15 @@ mod tests {
     #[test]
     fn test_method_from_str() {
         assert_eq!("INVITE".parse::<Method>().unwrap(), Method::Invite);
-        assert_eq!("invite".parse::<Method>().unwrap(), Method::Invite);
+        // RFC 3261 §7.1: case-sensitive
+        assert_eq!(
+            "invite".parse::<Method>().unwrap(),
+            Method::Extension("invite".to_string())
+        );
+        assert_ne!(
+            "foo".parse::<Method>().unwrap(),
+            "FOO".parse::<Method>().unwrap()
+        );
         assert_eq!("BYE".parse::<Method>().unwrap(), Method::Bye);
     }
 

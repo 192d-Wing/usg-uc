@@ -95,8 +95,8 @@ mod tests {
 
     #[test]
     fn parse_cidr_list_handles_blanks_and_errors() {
-        assert!(parse_cidr_list("").unwrap().is_empty());
-        assert!(parse_cidr_list("  ,  ").unwrap().is_empty());
+        assert_eq!(parse_cidr_list("").unwrap(), [] as [ipnet::IpNet; 0]);
+        assert_eq!(parse_cidr_list("  ,  ").unwrap(), [] as [ipnet::IpNet; 0]);
         let ok = parse_cidr_list("10.0.0.0/8, 192.168.1.0/24 ,::1/128").unwrap();
         assert_eq!(ok.len(), 3);
         assert!(parse_cidr_list("10.0.0.0/8, nonsense").is_err());

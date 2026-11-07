@@ -171,7 +171,7 @@ sbcDaemon:
 | `image` + `<component>.image` | Image refs | Model A: `localhost/*:local` + `Never`; Model B: `ghcr.io/192d-wing/*:<tag>` + `IfNotPresent` |
 | `auth` | Mgmt-plane admin | Fail-closed: `sbc-api`/`sbc-provision` won't start without a credential. Prefer `adminPasswordHash` (argon2 PHC) to keep plaintext out of values |
 | `sbcPostgres` | Config store | `enabled: true` for the in-chart StatefulSet (set `password`), or `enabled: false` + `existingSecret.name` (key `dsn`) for managed Postgres |
-| `sbcDaemon.config` | SIP tuning | `max_calls`, `max_registrations`, `media_mode`, `srtp_required`, listen addrs (`grpc_listen` must differ from `metrics_listen`) |
+| `sbcDaemon.config` | SIP tuning | `max_calls`, `max_registrations`, `media_mode`, `srtp_required`, listen addrs (`metrics_listen` is reserved and not rendered; the daemon rejects a `[monitoring]` table). The `-metrics` Service (`services.metrics`, port 9090) is off by default and has no listener behind it: no metrics exporter exists (POA&M-195) |
 | `sbcDaemon.sipTls` | SIP-over-TLS | `secretName` of a `kubernetes.io/tls` Secret covering the registrar domain; empty = UDP/TCP only |
 | `sbcDaemon.oidc` | REGISTER authz | RFC 8898 bearer-token REGISTER; requires an IdP (see `sbcClientConfig.oidc`) |
 | `gateway` | Edge HTTPS | Opt-in Gateway API + cert-manager termination; needs the Gateway API CRDs + cert-manager |
@@ -183,6 +183,37 @@ from a CSV/YAML inventory + template for many sites — the only
 per-site differences are `site.*` and `bgp.upstream.ip`.
 
 ---
+
+### SIP user HA1 encryption key (`sbcApi.ha1Key`)
+
+sbc-api seals every SIP digest HA1 in the `users` table with AES-256-GCM and
+**will not start without the key** (`SBC_USER_HA1_KEY_FILE`). The chart
+requires `sbcApi.ha1Key.existingSecret`; rendering fails without it. Create
+the Secret out-of-band (or via sealed-secrets / SOPS / Vault):
+
+```bash
+openssl rand -hex 32 | tr -d '\n' > ha1-key
+kubectl -n <ns> create secret generic <name> --from-file=ha1-key=ha1-key
+shred -u ha1-key
+# values: sbcApi.ha1Key.existingSecret: <name>
+```
+
+**Lab only:** `sbcApi.ha1Key.generate: true` makes the chart generate the
+key once into `<fullname>-ha1-key` (kept across upgrades and on uninstall via
+`helm.sh/resource-policy: keep`). Do not use it with `helm template`,
+`--dry-run`, Argo CD or Flux: `lookup` is empty there, so a render would emit
+a new key and orphan every stored HA1. The key also ends up in Helm release
+records. On `helm upgrade` the chart fails rather than regenerate if the
+existing Secret cannot be read.
+
+An init container copies the key into a memory-backed volume owned by the
+pod uid with mode 0400 (the server rejects group/other-readable or
+foreign-owned key files). On first start of this version, sbc-api encrypts
+any existing plaintext HA1 rows before it begins serving (serialized across
+replicas with a Postgres advisory lock). **Back the key up with the
+database**: a database restore without its key leaves every SIP user unable
+to authenticate until their passwords are re-provisioned. Key rotation is
+not supported yet (POA&M-111).
 
 ## 5. Install
 
@@ -297,6 +328,36 @@ helm uninstall sbc-<site-id> -n sbc-system
 > app.kubernetes.io/instance=sbc-<site-id>`) only when you intend to discard the
 > site's config/registration state. The SBC daemon runs a single replica per
 > site (`ReadWriteOnce`); upgrades are a brief restart, not a rolling handover.
+
+### Upgrading to the management-API hardening release (fix/mgmt-api-hardening)
+
+This upgrade has breaking changes. Check each point before you upgrade.
+
+- **Everyone must log in again.** Management API tokens are now `v2.`
+  (HMAC-SHA-384, with `aud` and `iat` claims). `v1.` tokens are rejected and
+  there is no fallback.
+- **`SBC_AUTH_SIGNING_KEY`** must be hex and decode to at least 32 bytes; 48
+  bytes is recommended (`openssl rand -hex 48`). A key that is set but empty,
+  is not hex, or is shorter than 32 bytes stops startup. Keys of 32 to 47 bytes
+  load with a warning. The chart generates a 48-byte key for new installs and
+  keeps an existing key on upgrade.
+- **`SBC_AUTH_TOKEN_TTL_SECS`** must be between 60 and 86400. Values outside
+  that range stop startup.
+- **`SBC_PROVISION_SECRET`** (only if set) must be hex and decode to at least
+  32 bytes (`openssl rand -hex 48`). Provisioning tokens are now HMAC-SHA-384,
+  so old 64-character `?token=` values return 403. Re-mint every phone's
+  provisioning URL token with `sbc-provision-server --mint-token <MAC>` (reads
+  `SBC_PROVISION_SECRET`, prints the token, exits 2 on error). Deployments that
+  use only CIDR allow-lists are not affected.
+- **Daemon REST API over HTTPS** is now TLS 1.3 only with the CNSA suite set,
+  whatever `security.min_tls_version` says. The key must match
+  `security.curve`, or the daemon will not start. It serves HTTP/1.1 only (no
+  HTTP/2) and limits connections: 256 concurrent, a 10 s handshake timeout, a
+  10 s header-read/idle timeout, and a 300 s maximum connection age.
+- **Certificate hot reload:** the daemon polls the REST API certificate and key
+  files every 30 s and reloads them when they change, so cert-manager renewals
+  apply without a restart. A failed reload keeps the old certificate in use;
+  watch `sbc_api_tls_cert_reload_failures_total`.
 
 ---
 

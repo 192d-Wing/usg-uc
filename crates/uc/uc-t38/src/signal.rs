@@ -291,7 +291,7 @@ impl SignalDetector {
         for &sample in &self.samples {
             s2 = s1;
             s1 = s0;
-            s0 = f64::from(sample) + coeff * s1 - s2;
+            s0 = coeff.mul_add(s1, f64::from(sample)) - s2;
         }
 
         // Magnitude squared

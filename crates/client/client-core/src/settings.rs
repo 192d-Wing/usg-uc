@@ -111,7 +111,8 @@ pub struct GeneralSettings {
     /// Offer a "continue anyway" warning when the service presents a TLS
     /// certificate chain this device does not trust (private-CA lab
     /// networks). When false, untrusted certificates are rejected outright
-    /// with no override prompt.
+    /// with no override prompt. Release builds ignore this flag: the
+    /// override does not exist there, so the prompt is never offered.
     #[serde(default = "default_true")]
     pub allow_untrusted_cert_warning: bool,
 }

@@ -27,7 +27,15 @@ sbc-config = { path = "../sbc-config", features = ["telemetry"] }
 sbc-config-store = { workspace = true }
 uc-health.workspace = true
 uc-metrics.workspace = true
-uc-transport.workspace = true
+uc-transport = { workspace = true, features = ["websocket"] }
+uc-audit.workspace = true
+# Call Detail Records (schema v1, file/syslog sinks, ring).
+uc-cdr.workspace = true
+# STIR/SHAKEN: protocol (pure) + services (cert cache, anchors, signer).
+proto-stir-shaken.workspace = true
+uc-sti.workspace = true
+uc-crypto.workspace = true
+chrono.workspace = true
 uc-telemetry.workspace = true
 proto-sip = { workspace = true, features = ["digest-auth"] }
 proto-transaction.workspace = true
@@ -43,8 +51,6 @@ proto-dtls.workspace = true
 uc-media-engine.workspace = true
 uc-codecs.workspace = true
 proto-stun.workspace = true
-proto-turn.workspace = true
-proto-ice.workspace = true
 uc-api.workspace = true
 uc-dos-protection.workspace = true
 uc-vps.workspace = true
@@ -75,6 +81,9 @@ thiserror.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
+# Client-certificate name parsing for grpc.allowed_client_names (already in
+# the tree via rustls; parsing only, no crypto provider features).
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"] }
 # Self-signed P-384 cert generation for the SBC's DTLS-SRTP identity. aws_lc_rs
 # backend matches the workspace crypto provider (rustls aws-lc-rs); no `ring`.
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
@@ -83,6 +92,8 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hyper.workspace = true
 hyper-util.workspace = true
+# Constant-time SBC_API_TOKEN comparison (already in the tree via uc-auth).
+subtle = "2.6"
 
 # gRPC dependencies (optional)
 sbc-grpc-api = { workspace = true, optional = true }
@@ -97,3 +108,12 @@ rand = "0.8"
 [[bin]]
 name = "sbc-daemon"
 path = "src/main.rs"
+
+[dev-dependencies]
+# PEM output for the CNSA syslog TLS handshake test CA.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+# Thread-local audit capture for tests asserting audit records.
+uc-audit = { workspace = true, features = ["test-capture"] }
+tempfile.workspace = true
+# Paused-clock tests for stream idle / first-message deadlines.
+tokio = { workspace = true, features = ["test-util"] }

@@ -177,7 +177,9 @@ fn load_pcm_file(filename: &str) -> Option<Vec<i16>> {
         let bytes = file.contents();
         // Parse as signed 16-bit little-endian samples
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
             .collect()
     })

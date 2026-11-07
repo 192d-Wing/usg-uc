@@ -776,7 +776,7 @@ async fn io_loop(
                                         // Send any response chunks
                                         if !response_chunks.is_empty() {
                                             let vtag = handle.peer_verification_tag().await;
-                                            let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                                            let local_port = socket.local_addr().map_or(0, |a| a.port());
                                             let mut response_packet = SctpPacket::new(
                                                 local_port,
                                                 peer_addr.port(),
@@ -858,7 +858,7 @@ async fn send_data_chunks(
     }
 
     let vtag = handle.peer_verification_tag().await;
-    let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let local_port = socket.local_addr().map_or(0, |a| a.port());
     let mut packet = SctpPacket::new(local_port, peer_addr.port(), vtag);
 
     for chunk in chunks {
@@ -893,7 +893,7 @@ async fn send_heartbeat(
     use super::chunk::HeartbeatChunk;
 
     let vtag = handle.peer_verification_tag().await;
-    let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let local_port = socket.local_addr().map_or(0, |a| a.port());
     let mut packet = SctpPacket::new(local_port, peer_addr.port(), vtag);
 
     // Create heartbeat with timestamp for RTT calculation
@@ -933,7 +933,7 @@ async fn send_heartbeat_to_path(
     local_addr: Option<&SocketAddr>,
 ) -> Result<(), std::io::Error> {
     let vtag = handle.peer_verification_tag().await;
-    let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let local_port = socket.local_addr().map_or(0, |a| a.port());
     let mut packet = SctpPacket::new(local_port, target_addr.port(), vtag);
 
     // Create heartbeat with path info for proper routing of HEARTBEAT-ACK

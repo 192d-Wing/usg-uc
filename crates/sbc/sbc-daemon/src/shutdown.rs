@@ -93,6 +93,10 @@ impl ShutdownSignal {
     ///
     /// On Unix, this installs handlers for SIGTERM, SIGINT, and SIGHUP.
     /// On other platforms, only Ctrl+C is handled.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     pub async fn install_handlers(&self) -> Result<(), ShutdownError> {
         let shutdown = self.clone();
 
@@ -233,7 +237,7 @@ impl ConnectionTracker {
         // ~4 billion and make is_drained() permanently false.
         let _ = self
             .active_calls
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the active call count.
@@ -252,7 +256,7 @@ impl ConnectionTracker {
         // ~4 billion and make is_drained() permanently false.
         let _ = self
             .active_transactions
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the active transaction count.
@@ -271,7 +275,7 @@ impl ConnectionTracker {
         // ~4 billion and make is_drained() permanently false.
         let _ = self
             .pending_registrations
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the pending registration count.

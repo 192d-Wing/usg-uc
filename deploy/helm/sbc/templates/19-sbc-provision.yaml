@@ -60,6 +60,10 @@ spec:
             - name: SBC_PROVISION_ALLOWED_CIDRS
               value: {{ join "," . | quote }}
             {{- end }}
+            {{- if .Values.sbcProvision.allowUnauthenticated }}
+            - name: SBC_PROVISION_ALLOW_UNAUTHENTICATED
+              value: "true"
+            {{- end }}
             # Same Postgres DSN the daemon + sbc-api read.
             {{- if .Values.sbcPostgres.enabled }}
             - name: SBC_POSTGRES_URL

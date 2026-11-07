@@ -39,6 +39,27 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
+      {{- $ha1Secret := .Values.sbcApi.ha1Key.existingSecret | default (printf "%s-ha1-key" (include "sbc.fullname" .)) }}
+      initContainers:
+        # HA1 key: sbc-api refuses a key file not owned by its own uid with
+        # owner-only mode. Secret volumes are root-owned and fsGroup-readable,
+        # so copy into a memory-backed emptyDir as this (same-uid) container
+        # and chmod 0400. NIST 800-53 Rev5: SC-12, SC-28(1)
+        - name: ha1-key
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              cp /etc/sbc/ha1-key-src/{{ .Values.sbcApi.ha1Key.key | quote }} /run/secrets/sbc-ha1/ha1-key
+              chmod 0400 /run/secrets/sbc-ha1/ha1-key
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: ha1-key-src, mountPath: /etc/sbc/ha1-key-src, readOnly: true }
+            - { name: ha1-key, mountPath: /run/secrets/sbc-ha1 }
       containers:
         - name: sbc-api
           image: "{{ .Values.sbcApi.image.repository }}:{{ .Values.sbcApi.image.tag }}"
@@ -53,7 +74,17 @@ spec:
             - name: SBC_DAEMON_HTTP_URL
               value: "http://{{ include "sbc.fullname" . }}-api.{{ .Release.Namespace }}.svc.cluster.local:80"
             - name: SBC_DAEMON_GRPC_URL
-              value: "http://{{ include "sbc.fullname" . }}-grpc.{{ .Release.Namespace }}.svc.cluster.local:9091"
+              value: {{ include "sbc.daemonGrpcUrl" . | quote }}
+            {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+            # mTLS client identity for the daemon gRPC listener; needed for
+            # the CDR API (CdrService is mTLS/loopback only). NIST: IA-3, SC-8
+            - name: SBC_DAEMON_GRPC_TLS_CA_FILE
+              value: /etc/sbc/grpc-tls/ca.crt
+            - name: SBC_DAEMON_GRPC_TLS_CERT_FILE
+              value: /etc/sbc/grpc-tls/tls.crt
+            - name: SBC_DAEMON_GRPC_TLS_KEY_FILE
+              value: /etc/sbc/grpc-tls/tls.key
+            {{- end }}
             # Postgres DSN — same Secret the daemon reads. sbc-api owns
             # the write side of the four config-entity tables; the
             # daemon still reads the same tables for SIP-router replay.
@@ -86,6 +117,16 @@ spec:
               value: "/etc/ssl/extra-ca/oopl-ca.pem"
             {{- end }}
             {{- end }}
+            {{- with .Values.sbcApi.auditPath }}
+            # Optional hash-chained audit file (fail-closed when set: the pod
+            # exits if it cannot be opened). Must be on a writable volume
+            # mounted via extraVolumes. NIST: AU-9
+            - name: SBC_API_AUDIT_PATH
+              value: {{ . | quote }}
+            {{- end }}
+            # HA1-at-rest key (required, fail-closed). NIST: SC-28(1)
+            - name: SBC_USER_HA1_KEY_FILE
+              value: /run/secrets/sbc-ha1/ha1-key
             # Management-plane auth (fail-closed: the pod won't start
             # without these). Shared signing key so any replica validates
             # any replica's tokens.
@@ -126,16 +167,33 @@ spec:
             capabilities:
               drop: [ALL]
               add: [NET_BIND_SERVICE]
-          {{- if and .Values.sbcApi.oidc.issuer .Values.sbcClientConfig.extraCaCert }}
+          {{- $extraCa := and .Values.sbcApi.oidc.issuer .Values.sbcClientConfig.extraCaCert }}
           volumeMounts:
+            - { name: ha1-key, mountPath: /run/secrets/sbc-ha1, readOnly: true }
+            {{- if $extraCa }}
             - { name: extra-ca, mountPath: /etc/ssl/extra-ca, readOnly: true }
-          {{- end }}
-      {{- if and .Values.sbcApi.oidc.issuer .Values.sbcClientConfig.extraCaCert }}
+            {{- end }}
+            {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+            - { name: grpc-tls, mountPath: /etc/sbc/grpc-tls, readOnly: true }
+            {{- end }}
       volumes:
+        - name: ha1-key-src
+          secret:
+            secretName: {{ $ha1Secret }}
+            defaultMode: 0440
+        - name: ha1-key
+          emptyDir: { medium: Memory, sizeLimit: 1Mi }
+        {{- if $extraCa }}
         - name: extra-ca
           configMap:
             name: {{ include "sbc.fullname" . }}-client-config-ca
-      {{- end }}
+        {{- end }}
+        {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+        - name: grpc-tls
+          secret:
+            secretName: {{ include "sbc.grpcClientTlsSecret" . }}
+            defaultMode: 0440
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service

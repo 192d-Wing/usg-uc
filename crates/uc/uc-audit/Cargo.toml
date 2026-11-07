@@ -11,6 +11,8 @@ categories.workspace = true
 
 [features]
 default = []
+# Thread-local capture of logged events for tests (`uc_audit::capture`).
+test-capture = []
 
 [dependencies]
 uc-types = { workspace = true, features = ["serde"] }
@@ -20,6 +22,10 @@ serde_json.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

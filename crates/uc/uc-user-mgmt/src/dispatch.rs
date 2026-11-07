@@ -72,4 +72,8 @@ impl UserStore for DynUserStore {
     async fn count_users(&self) -> Result<usize> {
         dispatch!(self, count_users)
     }
+
+    async fn replace_digest_ha1(&self, id: &str, expected: &str, new: &str) -> Result<bool> {
+        dispatch!(self, replace_digest_ha1, id, expected, new)
+    }
 }

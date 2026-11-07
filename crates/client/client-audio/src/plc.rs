@@ -169,7 +169,7 @@ fn levinson_durbin(signal: &[i16]) -> [f32; LPC_ORDER] {
     for lag in 0..=LPC_ORDER {
         let mut sum = 0.0f64;
         for i in lag..n {
-            sum += f64::from(signal[i]) * f64::from(signal[i - lag]);
+            sum = f64::mul_add(f64::from(signal[i]), f64::from(signal[i - lag]), sum);
         }
         r[lag] = sum;
     }
@@ -188,7 +188,7 @@ fn levinson_durbin(signal: &[i16]) -> [f32; LPC_ORDER] {
         // Compute reflection coefficient
         let mut lambda = 0.0f64;
         for j in 1..i {
-            lambda += a_prev[j] * r[i - j];
+            lambda = f64::mul_add(a_prev[j], r[i - j], lambda);
         }
         lambda = (r[i] - lambda) / error;
 
@@ -226,7 +226,7 @@ fn synthesize(coeffs: &[f32; LPC_ORDER], state: &mut Vec<f32>, output: &mut [f32
         let mut val = 0.0f32;
         for (k, &coeff) in coeffs.iter().enumerate() {
             if k < state.len() {
-                val += coeff * state[state.len() - 1 - k];
+                val = f32::mul_add(coeff, state[state.len() - 1 - k], val);
             }
         }
 

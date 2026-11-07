@@ -13,7 +13,8 @@ use uc_types::protocol::{CnsaCurve, CnsaHash, CnsaSrtpProfile};
 // Re-export cluster config types (feature-gated)
 #[cfg(feature = "cluster")]
 pub use uc_cluster::{
-    ClusterConfig, FailoverConfig, FailoverStrategy, HeartbeatConfig, NodeRole, ReplicationConfig,
+    AdmissionSplit, ClusterAdmissionConfig, ClusterConfig, FailoverConfig, FailoverStrategy,
+    HeartbeatConfig, NodeRole, ReplicationConfig,
 };
 #[cfg(feature = "cluster")]
 pub use uc_discovery::{
@@ -88,9 +89,10 @@ pub struct SbcConfig {
     #[cfg(feature = "aaa")]
     pub aaa: Option<AaaConfig>,
 
-    /// Monitoring settings.
+    /// Monitoring settings. Not implemented: any `[monitoring]` table is
+    /// rejected at config load (see [`MonitoringConfig`]).
     ///
-    /// ## NIST 800-53 Rev5: AU-6 (Audit Record Review)
+    /// ## NIST 800-53 Rev5: CM-6, CM-7 (POA&M-191)
     pub monitoring: Option<MonitoringConfig>,
 
     /// OpenTelemetry distributed tracing configuration.
@@ -148,6 +150,196 @@ pub struct SbcConfig {
     /// vendor-specific provisioning fields (e.g. TEO `update_server`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning: Option<ProvisioningConfig>,
+
+    /// Call Detail Record pipeline settings.
+    ///
+    /// ## NIST 800-53 Rev5: AU-2 (Event Logging), AU-12 (Audit Record Generation)
+    pub cdr: CdrConfig,
+}
+
+/// CDR file format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdrFormatConfig {
+    /// JSON lines (carries the hash chain).
+    #[default]
+    Jsonl,
+    /// Fixed-column CSV (RFC 4180).
+    Csv,
+}
+
+/// Which unanswered call attempts produce a CDR.
+///
+/// ## NIST 800-53 Rev5: AU-2 (organisation-defined event set)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdrRecordUnanswered {
+    /// Every INVITE that reaches admission, including admission, policy and
+    /// no-route rejects and trunk 4xx/5xx/6xx.
+    #[default]
+    All,
+    /// Only attempts that were routed to a B-leg.
+    Routed,
+    /// Answered calls only.
+    None,
+}
+
+/// How caller/callee numbers are stored in CDRs.
+///
+/// ## NIST 800-53 Rev5: SI-12 (Information Management and Retention)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdrPiiMode {
+    /// Store numbers as received.
+    #[default]
+    Full,
+    /// Mask caller numbers except the last four characters.
+    MaskCaller,
+    /// Replace numbers with HMAC-SHA-384 (key from `pii_hash_key_file`).
+    Hash,
+}
+
+/// Call handling when the CDR writer has failed.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures), AU-5(4)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdrOnFailure {
+    /// Keep admitting calls; drop and count CDRs, report health degraded.
+    #[default]
+    Continue,
+    /// Reject new non-emergency INVITEs while the writer is dead.
+    /// Emergency calls are always admitted.
+    RejectNewCalls,
+}
+
+/// CDR syslog forwarding (RFC 5424 over TLS, RFC 5425).
+///
+/// ## NIST 800-53 Rev5: AU-9(2) (Store on Separate Physical Systems), SC-8
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CdrSyslogConfig {
+    /// Forward CDRs to a syslog collector.
+    pub enabled: bool,
+    /// Collector as `tls://host:port`. Only TLS is accepted.
+    pub target: String,
+    /// PEM CA bundle that issues the collector's certificate. Empty uses the
+    /// daemon's configured trust store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_path: Option<PathBuf>,
+    /// Syslog facility, 0..=23 (16 = local0).
+    pub facility: u8,
+}
+
+impl Default for CdrSyslogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target: "tls://collector:6514".to_string(),
+            ca_path: None,
+            facility: 16,
+        }
+    }
+}
+
+/// Call Detail Record settings (`[cdr]`).
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-4 (Storage Capacity), AU-9, AU-11 (Retention), SI-12
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CdrConfig {
+    /// Produce CDRs.
+    pub enabled: bool,
+    /// File format.
+    pub format: CdrFormatConfig,
+    /// Absolute directory for CDR files (created 0750 if missing).
+    pub directory: PathBuf,
+    /// Node id stamped on records and file names. Unset uses
+    /// `general.instance_name` (when it is a valid node id), then `$HOSTNAME`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Rotate a file at this size, 1..=4096 MiB.
+    pub rotate_size_mb: u32,
+    /// Rotate a non-empty file after this long (`"0"` = size only;
+    /// otherwise 5m..=24h). Units: s, m, h.
+    pub rotate_interval: String,
+    /// Closed files to keep (0 = unlimited).
+    pub retention_files: u32,
+    /// Days to keep closed files (0 = unlimited).
+    pub retention_days: u32,
+    /// fsync at most this often (0 = after every record), 0..=60000 ms.
+    pub fsync_interval_ms: u32,
+    /// Writer queue capacity, `64..=1_000_000`.
+    pub queue_capacity: usize,
+    /// Recent CDRs held in memory for the API, `0..=200_000`.
+    pub ring_capacity: usize,
+    /// SHA-384 hash chain over records.
+    pub hash_chain: bool,
+    /// Which unanswered attempts produce a CDR.
+    pub record_unanswered: CdrRecordUnanswered,
+    /// Produce CDRs for INVITEs answered with a 401/407 challenge.
+    pub record_auth_challenges: bool,
+    /// Number storage policy.
+    pub pii: CdrPiiMode,
+    /// HMAC-SHA-384 key file (at least 48 bytes); required when `pii = "hash"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pii_hash_key_file: Option<PathBuf>,
+    /// Call handling when the CDR writer fails.
+    pub on_failure: CdrOnFailure,
+    /// Syslog forwarding.
+    pub syslog: CdrSyslogConfig,
+}
+
+impl Default for CdrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            format: CdrFormatConfig::Jsonl,
+            directory: PathBuf::from("/var/lib/usg-sbc/cdr"),
+            node_id: None,
+            rotate_size_mb: 100,
+            rotate_interval: "1h".to_string(),
+            retention_files: 168,
+            retention_days: 90,
+            fsync_interval_ms: 1000,
+            queue_capacity: 8192,
+            ring_capacity: 10_000,
+            hash_chain: true,
+            record_unanswered: CdrRecordUnanswered::All,
+            record_auth_challenges: false,
+            pii: CdrPiiMode::Full,
+            pii_hash_key_file: None,
+            on_failure: CdrOnFailure::Continue,
+            syslog: CdrSyslogConfig::default(),
+        }
+    }
+}
+
+impl CdrConfig {
+    /// Parses `rotate_interval` into seconds (`0` = size-only rotation).
+    /// Accepts a bare number of seconds or a number with an `s`, `m` or `h`
+    /// suffix. `None` when malformed.
+    #[must_use]
+    pub fn rotate_interval_secs(&self) -> Option<u64> {
+        parse_duration_secs(&self.rotate_interval)
+    }
+}
+
+/// Parses `"90"`, `"30s"`, `"5m"`, `"1h"` into seconds.
+#[must_use]
+pub fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = match s.as_bytes().last()? {
+        b's' => (s.get(..s.len() - 1)?, 1),
+        b'm' => (s.get(..s.len() - 1)?, 60),
+        b'h' => (s.get(..s.len() - 1)?, 3600),
+        b'0'..=b'9' => (s, 1),
+        _ => return None,
+    };
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num.parse::<u64>().ok()?.checked_mul(mult)
 }
 
 /// Phone provisioning settings.
@@ -190,6 +382,69 @@ pub struct ZoneConfig {
     pub external_ip: Option<String>,
 }
 
+/// Default `general.trunk_retry_after_max_secs`.
+pub const DEFAULT_TRUNK_RETRY_AFTER_MAX_SECS: u32 = 300;
+
+/// Largest accepted `general.trunk_retry_after_max_secs`.
+pub const MAX_TRUNK_RETRY_AFTER_SECS: u32 = 3600;
+
+/// Default emergency headroom above a `max_calls` limit: 10% of it,
+/// at least 1. Used when `emergency_reserve_calls` is not set.
+///
+/// ## 47 CFR 9.16; NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+#[must_use]
+pub const fn default_emergency_reserve(max_calls: u32) -> u32 {
+    let tenth = max_calls / 10;
+    if tenth == 0 { 1 } else { tenth }
+}
+
+/// One node's share of a cluster-wide cap: `cap / divisor`, rounded
+/// down, at least 1 (a divisor of 0 or 1 returns `cap`).
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+#[must_use]
+pub const fn cluster_share(cap: u32, divisor: u32) -> u32 {
+    if divisor <= 1 {
+        return cap;
+    }
+    let share = cap / divisor;
+    if share == 0 { 1 } else { share }
+}
+
+impl SbcConfig {
+    /// Divisor this node applies to cluster-divided caps
+    /// (`cluster.admission`): `expected_nodes` under `split = "divide"`,
+    /// otherwise 1.
+    ///
+    /// The emergency reserve, VPS `per_callee_max_concurrent` and rate
+    /// limits are never divided.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, CP-2(2) (Capacity Planning)
+    #[must_use]
+    pub fn admission_divisor(&self) -> u32 {
+        #[cfg(feature = "cluster")]
+        {
+            self.cluster.as_ref().map_or(1, |c| c.admission.divisor())
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            1
+        }
+    }
+
+    /// `general.max_calls` enforced on this node (cluster share).
+    #[must_use]
+    pub fn effective_max_calls(&self) -> u32 {
+        cluster_share(self.general.max_calls, self.admission_divisor())
+    }
+
+    /// `general.max_registrations` enforced on this node (cluster share).
+    #[must_use]
+    pub fn effective_max_registrations(&self) -> u32 {
+        cluster_share(self.general.max_registrations, self.admission_divisor())
+    }
+}
+
 /// General SBC settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -200,16 +455,49 @@ pub struct GeneralConfig {
     /// Cluster ID if running in a cluster.
     pub cluster_id: Option<String>,
 
-    /// Maximum concurrent calls.
+    /// Maximum concurrent calls on this node. A normal INVITE over the limit
+    /// gets 503 with no `Retry-After` (emergency calls may use
+    /// `emergency_reserve_calls` beyond it, and a refused emergency caller
+    /// may redial at once).
     pub max_calls: u32,
+
+    /// Extra concurrent calls above `max_calls` that only emergency calls
+    /// (`vps.emergency_numbers`) may use. A normal call is refused (503)
+    /// at `max_calls`; an emergency call is refused (503) only at
+    /// `max_calls + emergency_reserve_calls`, so held calls cannot block
+    /// 911 while an emergency flood stays bounded. Defaults to 10% of
+    /// `max_calls` (at least 1); must be 1..=`max_calls` when set.
+    ///
+    /// ## 47 CFR 9.16; NIST 800-53 Rev5: SC-5
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emergency_reserve_calls: Option<u32>,
 
     /// Maximum concurrent registrations.
     pub max_registrations: u32,
+
+    /// Upper bound, in seconds, on a trunk's `Retry-After` honoured as its
+    /// cooldown after a 503 (RFC 3261 §21.5.4), so a hostile or buggy peer
+    /// cannot take a trunk out indefinitely. Range 1-3600, default 300. A
+    /// missing, invalid or zero `Retry-After` uses the trunk's
+    /// `cooldown_secs`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, CP-8
+    pub trunk_retry_after_max_secs: u32,
 
     /// Default zone for internal registrations (phones, softclients).
     /// Must reference a defined zone name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_internal_zone: Option<String>,
+}
+
+impl GeneralConfig {
+    /// Emergency headroom above `max_calls` in effect (configured or
+    /// the 10% default).
+    #[must_use]
+    pub fn effective_emergency_reserve_calls(&self) -> u32 {
+        self.emergency_reserve_calls
+            .unwrap_or_else(|| default_emergency_reserve(self.max_calls))
+    }
 }
 
 impl Default for GeneralConfig {
@@ -218,7 +506,9 @@ impl Default for GeneralConfig {
             instance_name: "sbc-01".to_string(),
             cluster_id: None,
             max_calls: 10000,
+            emergency_reserve_calls: None,
             max_registrations: 50000,
+            trunk_retry_after_max_secs: DEFAULT_TRUNK_RETRY_AFTER_MAX_SECS,
             default_internal_zone: None,
         }
     }
@@ -251,8 +541,44 @@ pub struct TransportConfig {
     /// TCP connection timeout in seconds.
     pub tcp_timeout_secs: u64,
 
-    /// TCP idle timeout in seconds.
+    /// Idle timeout in seconds for accepted stream connections (TCP, TLS,
+    /// WebSocket) once they have delivered a SIP message. Valid 30..=3600.
+    ///
+    /// ## NIST 800-53 Rev5: SC-10 (Network Disconnect)
     pub tcp_idle_timeout_secs: u64,
+
+    /// Connection pool size of each stream listener (TCP, TLS, WS), so a
+    /// flood on one listener cannot starve another. Valid 1..=1,000,000.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub max_connections_per_listener: u32,
+
+    /// Ceiling on accepted stream connections across all listeners (fd
+    /// budget). Valid 1..=4,000,000.
+    pub max_connections_total: u32,
+
+    /// Concurrent stream connections allowed from one source (IPv4 address
+    /// or IPv6 `rate_limit.ipv6_prefix_len` prefix), across all listeners.
+    /// An enterprise NAT funnelling many TLS phones may need more. Valid
+    /// 1..=`max_connections_per_listener`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    pub max_connections_per_source: u32,
+
+    /// TLS / WebSocket handshake deadline in seconds. Valid 1..=60.
+    pub handshake_timeout_secs: u64,
+
+    /// Deadline in seconds for a new stream connection to deliver its first
+    /// accepted SIP message; until then CRLF keep-alives do not count as
+    /// activity. Valid 1..=`tcp_idle_timeout_secs`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-10
+    pub first_message_timeout_secs: u64,
+
+    /// Refuse WebSocket upgrades that do not offer the `sip` subprotocol
+    /// (RFC 7118 §4 MUST). When false, an upgrade with no
+    /// `Sec-WebSocket-Protocol` header is admitted.
+    pub ws_require_sip_subprotocol: bool,
 
     /// External/public IP address for SIP Contact and SDP.
     /// Used when behind NAT. If unset, auto-detected from outgoing socket.
@@ -297,6 +623,12 @@ impl Default for TransportConfig {
             wss_listen: Vec::new(),
             tcp_timeout_secs: 30,
             tcp_idle_timeout_secs: 300,
+            max_connections_per_listener: 10_000,
+            max_connections_total: 20_000,
+            max_connections_per_source: 128,
+            handshake_timeout_secs: 10,
+            first_message_timeout_secs: 30,
+            ws_require_sip_subprotocol: true,
             external_ip: None,
             signaling_ip: None,
             media_ip: None,
@@ -311,13 +643,16 @@ impl Default for TransportConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MediaConfig {
-    /// Default media mode for calls.
+    /// Default media mode for calls. Only `Relay` is accepted: the call path
+    /// always anchors media (validation rejects other values).
     pub default_mode: MediaMode,
 
-    /// Per-realm media mode overrides.
+    /// Per-realm media mode overrides. Not supported (needs media bypass);
+    /// validation rejects a non-empty map.
     pub realm_modes: HashMap<String, MediaMode>,
 
-    /// Enabled codecs in priority order.
+    /// Enabled codecs. Not enforced (no SDP codec filtering or
+    /// transcoding); validation accepts only the default set, in any order.
     pub codecs: Vec<CodecId>,
 
     /// RTP port range start.
@@ -452,11 +787,34 @@ pub struct SecurityConfig {
     /// Elliptic curve for key generation (CNSA 2.0).
     pub curve: CnsaCurve,
 
-    /// Minimum TLS version (CNSA 2.0: TLS 1.3 preferred).
+    /// Minimum TLS version for SIP-over-TLS listeners: "1.3" (CNSA 2.0
+    /// default) or "1.2" (also accepts TLS 1.2 clients).
     pub min_tls_version: String,
 
-    /// Require mutual TLS for SIP.
+    /// Require mutual TLS for SIP: TLS clients must present a certificate
+    /// chaining to `tls_ca_path`.
     pub require_mtls: bool,
+
+    /// PEM bundle of CA certificates trusted for client certificates.
+    /// Required when `require_mtls` is set.
+    pub tls_ca_path: Option<PathBuf>,
+
+    /// PEM bundle of CA certificates trusted for SIP trunk **server**
+    /// certificates (outbound TLS to `protocol = "tls"` trunks). Kept
+    /// separate from `tls_ca_path` so a client-issuing CA cannot
+    /// impersonate a trunk. Required when any trunk uses TLS; there is no
+    /// implicit public-root fallback.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-23 (Session Authenticity)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trunk_tls_ca_path: Option<PathBuf>,
+
+    /// Global TLS-only egress: every trunk group behaves as if it had
+    /// `require_tls = true` (a group cannot opt out). Applies to config-file
+    /// and API-synced groups alike. Signaling only; does not imply SRTP.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8 (POA&M-48)
+    pub require_tls_trunks: bool,
 }
 
 impl Default for SecurityConfig {
@@ -467,38 +825,67 @@ impl Default for SecurityConfig {
             curve: CnsaCurve::P384,
             min_tls_version: "1.3".to_string(),
             require_mtls: false,
+            tls_ca_path: None,
+            trunk_tls_ca_path: None,
+            require_tls_trunks: false,
         }
     }
 }
 
-/// STIR/SHAKEN configuration.
+/// STIR/SHAKEN configuration (`[stir_shaken]`).
 ///
-/// ## NIST 800-53 Rev5: IA-9 (Service Identification)
+/// Breaking change (schema for 0.10): `verification_enabled` now defaults to
+/// `false` (it previously defaulted to `true` and verified nothing), the
+/// signing/verification settings are nested, and `default_attestation` is a
+/// typed A/B/C that defaults to `C`. The flat v0.9 keys
+/// (`certificate_path`, `private_key_path`, `certificate_url`,
+/// `ca_bundle_path`, `default_attestation`, `max_passport_age_secs`) are
+/// accepted as deprecated aliases for one release; see
+/// [`StirShakenConfig::normalized`].
+///
+/// ## NIST 800-53 Rev5: IA-9 (Service Identification), CM-6 (secure defaults)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+// NIST 800-53 Rev5: CM-6 (a misspelt key is an error, never silently ignored)
+#[serde(default, deny_unknown_fields)]
 pub struct StirShakenConfig {
-    /// Enable STIR/SHAKEN signing for outbound calls.
+    /// Sign outbound INVITEs on trunks with `stir_shaken.sign = true`.
     pub signing_enabled: bool,
 
-    /// Enable STIR/SHAKEN verification for inbound calls.
+    /// Verify inbound Identity on trunks with `stir_shaken.verify = true`.
+    /// Requires `verification.trust_anchors_path`.
     pub verification_enabled: bool,
 
-    /// Path to STI certificate (P-384).
+    /// `PASSporT` algorithm. `ES256` is mandatory for SHAKEN interop
+    /// (CNSA-EXCEPTION: ATIS-1000074). `ES384` is reserved for bilateral
+    /// profiles and rejected by validation in this release.
+    pub algorithm: StirAlgorithm,
+
+    /// Signing (authentication service) settings.
+    pub signing: StirSigningConfig,
+
+    /// Attestation policy.
+    pub attestation: StirAttestationConfig,
+
+    /// Verification service settings.
+    pub verification: StirVerificationConfig,
+
+    /// Deprecated alias for `signing.certificate_path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub certificate_path: Option<PathBuf>,
-
-    /// Path to STI private key (P-384).
+    /// Deprecated alias for `signing.private_key_path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub private_key_path: Option<PathBuf>,
-
-    /// Certificate URL for x5u header.
+    /// Deprecated alias for `signing.certificate_url`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub certificate_url: Option<String>,
-
-    /// Default attestation level for signing.
-    pub default_attestation: String,
-
-    /// Maximum `PASSporT` age in seconds.
-    pub max_passport_age_secs: u64,
-
-    /// CA bundle path for certificate verification.
+    /// Deprecated alias for `attestation.default`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_attestation: Option<String>,
+    /// Deprecated alias for `verification.max_passport_age_secs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_passport_age_secs: Option<u64>,
+    /// Deprecated alias for `verification.trust_anchors_path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ca_bundle_path: Option<PathBuf>,
 }
 
@@ -506,13 +893,303 @@ impl Default for StirShakenConfig {
     fn default() -> Self {
         Self {
             signing_enabled: false,
-            verification_enabled: true,
+            verification_enabled: false,
+            algorithm: StirAlgorithm::Es256,
+            signing: StirSigningConfig::default(),
+            attestation: StirAttestationConfig::default(),
+            verification: StirVerificationConfig::default(),
             certificate_path: None,
             private_key_path: None,
             certificate_url: None,
-            default_attestation: "B".to_string(),
-            max_passport_age_secs: 60,
+            default_attestation: None,
+            max_passport_age_secs: None,
             ca_bundle_path: None,
+        }
+    }
+}
+
+impl StirShakenConfig {
+    /// Folds the deprecated flat keys into the nested structure and returns
+    /// the result plus the deprecated keys that were used (for a startup
+    /// warning).
+    ///
+    /// # Errors
+    /// A deprecated key and its replacement are both set to different
+    /// values, or `default_attestation` is not A/B/C.
+    pub fn normalized(&self) -> Result<(Self, Vec<&'static str>), String> {
+        fn fold<T: Clone + PartialEq>(
+            old: Option<&T>,
+            new: &mut Option<T>,
+            key: &'static str,
+            used: &mut Vec<&'static str>,
+        ) -> Result<(), String> {
+            if let Some(o) = old {
+                used.push(key);
+                match new {
+                    Some(n) if n != o => {
+                        return Err(format!(
+                            "stir_shaken.{key} (deprecated) conflicts with its nested replacement"
+                        ));
+                    }
+                    _ => *new = Some(o.clone()),
+                }
+            }
+            Ok(())
+        }
+        let mut out = self.clone();
+        let mut used = Vec::new();
+        fold(
+            self.certificate_path.as_ref(),
+            &mut out.signing.certificate_path,
+            "certificate_path",
+            &mut used,
+        )?;
+        fold(
+            self.private_key_path.as_ref(),
+            &mut out.signing.private_key_path,
+            "private_key_path",
+            &mut used,
+        )?;
+        fold(
+            self.certificate_url.as_ref(),
+            &mut out.signing.certificate_url,
+            "certificate_url",
+            &mut used,
+        )?;
+        fold(
+            self.ca_bundle_path.as_ref(),
+            &mut out.verification.trust_anchors_path,
+            "ca_bundle_path",
+            &mut used,
+        )?;
+        // Nested non-Option keys count as set when they differ from their
+        // default, so an alias that disagrees with them is a conflict too.
+        let attest = match self.default_attestation.as_deref() {
+            None => None,
+            Some("A") => Some(StirAttestation::A),
+            Some("B") => Some(StirAttestation::B),
+            Some("C") => Some(StirAttestation::C),
+            Some(_) => return Err("stir_shaken.default_attestation must be A, B, or C".into()),
+        };
+        let mut nested_attest = (out.attestation.default
+            != StirAttestationConfig::default().default)
+            .then_some(out.attestation.default);
+        fold(
+            attest.as_ref(),
+            &mut nested_attest,
+            "default_attestation",
+            &mut used,
+        )?;
+        if let Some(a) = nested_attest {
+            out.attestation.default = a;
+        }
+        let default_age = StirVerificationConfig::default().max_passport_age_secs;
+        let mut nested_age = (out.verification.max_passport_age_secs != default_age)
+            .then_some(out.verification.max_passport_age_secs);
+        fold(
+            self.max_passport_age_secs.as_ref(),
+            &mut nested_age,
+            "max_passport_age_secs",
+            &mut used,
+        )?;
+        if let Some(age) = nested_age {
+            out.verification.max_passport_age_secs = age;
+        }
+        out.certificate_path = None;
+        out.private_key_path = None;
+        out.certificate_url = None;
+        out.ca_bundle_path = None;
+        out.default_attestation = None;
+        out.max_passport_age_secs = None;
+        Ok((out, used))
+    }
+}
+
+/// `PASSporT` signature algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StirAlgorithm {
+    /// ECDSA P-256 / SHA-256 (SHAKEN mandatory; CNSA-EXCEPTION).
+    #[default]
+    #[serde(rename = "ES256")]
+    Es256,
+    /// ECDSA P-384 / SHA-384 (CNSA 2.0; non-interoperable for SHAKEN).
+    /// Reserved: rejected by validation in this release.
+    // POAM: ES384 bilateral PASSporT signing (needs P-384 STI certificates).
+    #[serde(rename = "ES384")]
+    Es384,
+}
+
+/// Where the signing key lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StirKeySource {
+    /// PKCS#8 DER/PEM file (owner-only permissions enforced).
+    #[default]
+    File,
+    /// PKCS#11 token. Reserved; rejected by validation in this release.
+    // POAM: PKCS#11/HSM custody of the STIR signing key.
+    Pkcs11,
+}
+
+/// `[stir_shaken.signing]`.
+///
+/// ## NIST 800-53 Rev5: SC-12, SC-17, SC-28
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+// NIST 800-53 Rev5: CM-6 (a misspelt key is an error, never silently ignored)
+#[serde(default, deny_unknown_fields)]
+pub struct StirSigningConfig {
+    /// Public HTTPS URL of the signing certificate (`PASSporT` `x5u`).
+    pub certificate_url: Option<String>,
+    /// PKCS#8 P-256 private key. Must not be group/world accessible and
+    /// must not be a symlink.
+    pub private_key_path: Option<PathBuf>,
+    /// The STI-CA-issued certificate (PEM) published at `certificate_url`;
+    /// used for the startup key/cert match and expiry self-check.
+    pub certificate_path: Option<PathBuf>,
+    /// Key custody.
+    pub key_source: StirKeySource,
+}
+
+/// Attestation level as configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StirAttestation {
+    /// Full.
+    A,
+    /// Partial.
+    B,
+    /// Gateway (default).
+    #[default]
+    C,
+}
+
+/// `[stir_shaken.attestation]`: first matching rule wins, then the
+/// `owned_numbers` A/B rule, then `default`.
+///
+/// ## NIST 800-53 Rev5: IA-9
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+// NIST 800-53 Rev5: CM-6 (a misspelt key is an error, never silently ignored)
+#[serde(default, deny_unknown_fields)]
+pub struct StirAttestationConfig {
+    /// Attestation when no rule matches.
+    pub default: StirAttestation,
+    /// Calling-number prefixes this operator owns (digits, optional trailing
+    /// `*`). An authenticated caller with an owned number gets A; an
+    /// authenticated caller without one gets B.
+    pub owned_numbers: Vec<String>,
+    /// Explicit rules, evaluated in order before `owned_numbers`.
+    pub rules: Vec<StirAttestationRule>,
+}
+
+/// One attestation rule. Every set field must match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct StirAttestationRule {
+    /// Ingress trunk group id.
+    pub source_trunk: Option<String>,
+    /// Ingress zone (realm).
+    pub source_realm: Option<String>,
+    /// Caller authenticated (registered endpoint).
+    pub authenticated: Option<bool>,
+    /// Calling-number prefix (digits).
+    pub orig_prefix: Option<String>,
+    /// Attestation to apply.
+    pub attest: StirAttestation,
+}
+
+/// What to do when verification fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum StirFailurePolicy {
+    /// Forward without verstat.
+    PassThrough,
+    /// Forward with `verstat=TN-Validation-Failed` (default).
+    #[default]
+    Mark,
+    /// Reject with the RFC 8224 §6.2.2 code (436/437/438).
+    Reject,
+}
+
+/// `[stir_shaken.verification]`.
+///
+/// ## NIST 800-53 Rev5: IA-5(2), SC-7, SC-5, SC-17
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// NIST 800-53 Rev5: CM-6 (a misspelt key is an error, never silently ignored)
+#[serde(default, deny_unknown_fields)]
+pub struct StirVerificationConfig {
+    /// Failure policy.
+    pub failure_policy: StirFailurePolicy,
+    /// Reject an INVITE with no Identity (428) on verify trunks.
+    pub require_identity: bool,
+    /// Certificate fetch deadline (100..=5000 ms).
+    pub cert_fetch_timeout_ms: u64,
+    /// Cached certificates (1..=100000).
+    pub cert_cache_entries: usize,
+    /// Positive cache TTL cap (seconds).
+    pub cert_cache_ttl_secs: u64,
+    /// Negative cache TTL (seconds).
+    pub negative_cache_ttl_secs: u64,
+    /// Maximum certificate response body (bytes, 1024..=65536).
+    pub max_cert_bytes: usize,
+    /// Concurrent certificate fetches (1..=1024).
+    pub max_concurrent_fetches: usize,
+    /// Concurrent certificate fetches started for one SIP source (IPv4
+    /// address or IPv6 /64), `1..=max_concurrent_fetches`. Bounds how much
+    /// of the fetch pool one peer can hold with `x5u` URLs on hosts it
+    /// controls (POA&M-190).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub max_fetches_per_source: usize,
+    /// STI-CR trust anchors: a PEM bundle file or a directory of PEM files.
+    pub trust_anchors_path: Option<PathBuf>,
+    /// Trust-anchor reload interval (seconds, >= 60).
+    pub trust_anchor_refresh_secs: u64,
+    /// Optional `x5u` host allow-list (exact, case-insensitive). Empty =
+    /// any public host.
+    pub x5u_allow_hosts: Vec<String>,
+    /// Maximum `PASSporT` age in seconds (RFC 8224 §6.2.2), 10..=300.
+    pub max_passport_age_secs: u64,
+}
+
+impl Default for StirVerificationConfig {
+    fn default() -> Self {
+        Self {
+            failure_policy: StirFailurePolicy::Mark,
+            require_identity: false,
+            cert_fetch_timeout_ms: 1500,
+            cert_cache_entries: 4096,
+            cert_cache_ttl_secs: 3600,
+            negative_cache_ttl_secs: 60,
+            max_cert_bytes: 16 * 1024,
+            max_concurrent_fetches: 32,
+            max_fetches_per_source: 4,
+            trust_anchors_path: None,
+            trust_anchor_refresh_secs: 86_400,
+            x5u_allow_hosts: Vec::new(),
+            max_passport_age_secs: 60,
+        }
+    }
+}
+
+/// Per-trunk STIR/SHAKEN settings (`[[trunk_groups.trunks]] stir_shaken`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrunkStirConfig {
+    /// Sign INVITEs sent to this trunk.
+    pub sign: bool,
+    /// Verify Identity on INVITEs received from this trunk.
+    pub verify: bool,
+    /// Drop inbound Identity headers instead of passing them through to the
+    /// B-leg. `false` marks the trunk trusted: its Identity is relayed
+    /// verbatim and the call is not re-signed.
+    pub strip_inbound_identity: bool,
+}
+
+impl Default for TrunkStirConfig {
+    fn default() -> Self {
+        Self {
+            sign: false,
+            verify: false,
+            strip_inbound_identity: true,
         }
     }
 }
@@ -537,6 +1214,53 @@ pub struct RateLimitConfig {
 
     /// Burst allowance multiplier.
     pub burst_multiplier: f32,
+
+    /// IPv6 prefix length per-source limiter and connection state is keyed
+    /// on (one /64 is one source). Valid 32..=128.
+    pub ipv6_prefix_len: u8,
+
+    /// Cap on per-source token buckets. Valid 1024..=4,194,304.
+    pub max_tracked_sources: u32,
+
+    /// Cap on simultaneously blocked sources. Valid
+    /// 1..=`max_tracked_sources`.
+    pub max_blocked_sources: u32,
+
+    /// Rate of the shared bucket that new sources use once
+    /// `max_tracked_sources` is reached. `0` (default) means automatic:
+    /// 1000 clamped into `per_ip_rps`..=`global_rps`. A non-zero value must
+    /// lie in `per_ip_rps`..=`global_rps`.
+    pub overflow_rps: u32,
+
+    /// How long a source over 2x `per_ip_rps` stays blocked. Valid 1..=86400.
+    pub block_duration_secs: u64,
+
+    /// Interval of the limiter maintenance sweep (expired blocks, idle
+    /// buckets). Valid 1..=300.
+    pub sweep_interval_secs: u64,
+
+    /// Interval at which rate-limit rejections are aggregated into audit
+    /// records. Valid 1..=3600.
+    ///
+    /// ## NIST 800-53 Rev5: AU-4, AU-12
+    pub audit_interval_secs: u64,
+
+    /// Cap on aggregated rate-limit audit records per interval; the rest
+    /// are summed into one `per_ip_rps_suppressed` record. Valid 1..=65536.
+    pub audit_max_records_per_interval: u32,
+}
+
+impl RateLimitConfig {
+    /// The overflow bucket rate in effect (resolves the `0` = automatic
+    /// setting of `overflow_rps`).
+    #[must_use]
+    pub fn effective_overflow_rps(&self) -> u32 {
+        if self.overflow_rps != 0 {
+            return self.overflow_rps;
+        }
+        let ceiling = self.global_rps.max(self.per_ip_rps);
+        1_000u32.clamp(self.per_ip_rps.min(ceiling), ceiling)
+    }
 }
 
 impl Default for RateLimitConfig {
@@ -547,6 +1271,14 @@ impl Default for RateLimitConfig {
             per_ip_rps: 100,
             per_user_rps: 50,
             burst_multiplier: 2.0,
+            ipv6_prefix_len: 64,
+            max_tracked_sources: 65_536,
+            max_blocked_sources: 16_384,
+            overflow_rps: 0,
+            block_duration_secs: 60,
+            sweep_interval_secs: 10,
+            audit_interval_secs: 60,
+            audit_max_records_per_interval: 1_024,
         }
     }
 }
@@ -560,10 +1292,10 @@ pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error).
     pub level: String,
 
-    /// Output format (json, text).
+    /// Output format: "json" or "text".
     pub format: String,
 
-    /// Output destination (stdout, file path).
+    /// Output destination: "stdout", "stderr" or a file path (appended).
     pub output: String,
 
     /// Enable audit logging.
@@ -587,9 +1319,16 @@ impl Default for LoggingConfig {
 
 /// Monitoring configuration.
 ///
-/// ## NIST 800-53 Rev5: AU-6 (Audit Record Review)
+/// Not implemented: no Prometheus, SNMP or syslog exporter reads these
+/// keys, so `validate_config` rejects a present `[monitoring]` table rather
+/// than silently ignoring it. The type is kept for API compatibility;
+/// `deny_unknown_fields` makes feature-gated subkeys (`snmp`, `syslog`) an
+/// error instead of vanishing in builds without those features.
+///
+/// ## NIST 800-53 Rev5: CM-6, CM-7 (POA&M-191)
+// POAM: POA&M-195 telemetry export (Prometheus/SNMP/syslog/OTLP) not implemented.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MonitoringConfig {
     /// Enable SNMP trap sending.
     #[cfg(feature = "snmp")]
@@ -653,6 +1392,15 @@ pub struct GrpcConfig {
     /// Require mutual TLS (client certificate authentication).
     pub require_mtls: bool,
 
+    /// Client certificate names allowed to call the gRPC API when
+    /// `require_mtls` is set. Each entry is matched exactly (DNS names
+    /// ASCII case-insensitively) against the client certificate's SAN DNS
+    /// names, SAN URIs and subject CN. Empty = any certificate that chains
+    /// to `tls_ca_path` (a startup warning is logged).
+    ///
+    /// ## NIST 800-53 Rev5: AC-3 (Access Enforcement), IA-3
+    pub allowed_client_names: Vec<String>,
+
     /// Maximum concurrent gRPC connections.
     pub max_connections: u32,
 
@@ -676,6 +1424,7 @@ impl Default for GrpcConfig {
             tls_key_path: None,
             tls_ca_path: None,
             require_mtls: false,
+            allowed_client_names: Vec::new(),
             max_connections: 1000,
             request_timeout_secs: 30,
             enable_reflection: true,
@@ -693,8 +1442,21 @@ pub struct RoutingConfig {
     pub use_dial_plan: bool,
     /// Maximum failover attempts per call.
     pub max_failover_attempts: u32,
-    /// Default trunk group for unmatched calls.
+    /// Default trunk group for unmatched calls. Applies to outbound calls
+    /// only (calls not arriving from a configured trunk), so a
+    /// trunk-originated call is never relayed out another trunk by default.
+    ///
+    /// ## NIST 800-53 Rev5: AC-4 (Information Flow Enforcement)
     pub default_trunk_group: String,
+    /// Trunk group that emergency-classified calls (`[vps]
+    /// emergency_numbers`) are force-routed to, bypassing CSS, route
+    /// patterns, the dial plan and every number transform. When unset, an
+    /// emergency call follows normal routing with route-pattern blocks
+    /// ignored. Must name a `[[trunk_groups]]` id.
+    ///
+    /// ## 47 CFR 9.16; NIST 800-53 Rev5: CP-8 (Telecommunications Services)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emergency_trunk_group: Option<String>,
 }
 
 impl Default for RoutingConfig {
@@ -703,6 +1465,7 @@ impl Default for RoutingConfig {
             use_dial_plan: true,
             max_failover_attempts: 3,
             default_trunk_group: "default".to_string(),
+            emergency_trunk_group: None,
         }
     }
 }
@@ -736,7 +1499,9 @@ pub struct DialPlanEntryConfig {
     /// Domain pattern to match (e.g., "uc.mil", "*.mil").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain_pattern: Option<String>,
-    /// Source trunk filter (only match calls from this trunk ID).
+    /// Source trunk filter: only match calls arriving on this trunk group.
+    /// A trunk id is accepted and resolved to its trunk group at load
+    /// (`validate::resolve_source_trunk`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_trunk: Option<String>,
     /// Trunk group to route to.
@@ -795,6 +1560,15 @@ pub struct TrunkGroupConfig {
     /// Zone this trunk group is bound to (must match a `[[zones]]` name).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone: Option<String>,
+    /// Only trunks with `protocol = "tls"` are used for this group, on the
+    /// primary selection and on every failover hop. With no usable TLS
+    /// trunk the call is rejected with 503; it never falls back to UDP/TCP.
+    /// Validation rejects a `require_tls` group without a TLS trunk.
+    /// Signaling only; does not imply SRTP.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8 (POA&M-48); RFC 5630 §3.1.3
+    #[serde(default)]
+    pub require_tls: bool,
 }
 
 /// Individual trunk configuration.
@@ -813,12 +1587,54 @@ pub struct TrunkConfigSchema {
     pub priority: u32,
     /// Weight for weighted selection.
     pub weight: u32,
-    /// Maximum concurrent calls.
+    /// Maximum concurrent calls through this trunk on this node. When
+    /// reached, routing skips the trunk; if every trunk is full or down the
+    /// INVITE gets 503 with `Retry-After`. Must be > 0.
     pub max_calls: u32,
-    /// Cooldown period after failures (seconds).
+    /// Extra calls above `max_calls` on this trunk that only emergency
+    /// calls may use: routing skips the trunk for a normal call at
+    /// `max_calls` and for an emergency call at `max_calls +
+    /// emergency_reserve_calls` (503 when no trunk is left). Defaults to
+    /// 10% of `max_calls` (at least 1); must be 1..=`max_calls` when set.
+    ///
+    /// ## 47 CFR 9.16; NIST 800-53 Rev5: SC-5
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emergency_reserve_calls: Option<u32>,
+    /// Cooldown period (seconds) after `max_failures` consecutive failed
+    /// calls (timeout, transport error, 5xx), or immediately after a 503.
     pub cooldown_secs: u32,
-    /// Maximum consecutive failures before cooldown.
+    /// Consecutive failed calls before cooldown. Must be > 0.
     pub max_failures: u32,
+    /// Send periodic SIP OPTIONS to this trunk; a trunk that stops answering
+    /// 2xx is skipped by routing until it answers again.
+    pub options_ping_enabled: bool,
+    /// OPTIONS ping interval in seconds (5-3600) when enabled.
+    pub options_ping_interval_secs: u32,
+    /// STIR/SHAKEN per-trunk behaviour.
+    pub stir_shaken: TrunkStirConfig,
+    /// TLS server name the trunk certificate is verified against
+    /// (`protocol = "tls"` only). Unset: `host` is verified (a DNS name,
+    /// or an IP SAN when `host` is an IP literal). Verification is never
+    /// skipped.
+    ///
+    /// ## NIST 800-53 Rev5: SC-23; RFC 5922 §7
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_server_name: Option<String>,
+    /// Present `security.tls_cert_path` / `tls_key_path` to this trunk as
+    /// the TLS client certificate (mutual TLS). `protocol = "tls"` only.
+    ///
+    /// ## NIST 800-53 Rev5: IA-3
+    pub tls_client_cert: bool,
+}
+
+impl TrunkConfigSchema {
+    /// Emergency headroom above `max_calls` in effect (configured or
+    /// the 10% default).
+    #[must_use]
+    pub fn effective_emergency_reserve_calls(&self) -> u32 {
+        self.emergency_reserve_calls
+            .unwrap_or_else(|| default_emergency_reserve(self.max_calls))
+    }
 }
 
 impl Default for TrunkConfigSchema {
@@ -831,8 +1647,14 @@ impl Default for TrunkConfigSchema {
             priority: 1,
             weight: 100,
             max_calls: 100,
+            emergency_reserve_calls: None,
             cooldown_secs: 30,
             max_failures: 5,
+            options_ping_enabled: false,
+            options_ping_interval_secs: 30,
+            stir_shaken: TrunkStirConfig::default(),
+            tls_server_name: None,
+            tls_client_cert: false,
         }
     }
 }
@@ -902,6 +1724,17 @@ pub struct TopologyHidingConfig {
     pub external_port: u16,
     /// Whether to obfuscate SIP Call-ID headers.
     pub obfuscate_call_id: bool,
+    /// External port presented for TLS elements (`transport=tls`, `sips:`),
+    /// so the return path is not downgraded to a cleartext port
+    /// (RFC 3261 §26.2; NIST 800-53 Rev5: SC-8). POA&M-151.
+    pub external_tls_port: u16,
+    /// Extra internal networks (CIDR, e.g. `"10.20.0.0/16"`), added to the
+    /// built-in RFC 1918 / RFC 6598 / loopback / link-local / ULA defaults.
+    pub internal_networks: Vec<String>,
+    /// Extra internal DNS domains (a host matches `d` or `*.d`), added to
+    /// the built-in defaults (`localhost`, `local`, `internal`, `lan`,
+    /// `home.arpa`).
+    pub internal_domains: Vec<String>,
 }
 
 impl Default for TopologyHidingConfig {
@@ -912,6 +1745,9 @@ impl Default for TopologyHidingConfig {
             external_host: String::new(),
             external_port: 5060,
             obfuscate_call_id: false,
+            external_tls_port: 5061,
+            internal_networks: Vec::new(),
+            internal_domains: Vec::new(),
         }
     }
 }
@@ -1136,5 +1972,28 @@ mod tests {
         assert_eq!(topo.mode, "full");
         assert_eq!(topo.external_host, "sbc.uc.mil");
         assert!(topo.obfuscate_call_id);
+    }
+
+    // POAM-151 (QA): pre-POA&M-151 TOML without the new topology keys loads
+    // with safe defaults; new keys round-trip when present.
+    #[test]
+    fn qa_topology_hiding_new_keys_default_and_parse() {
+        let old: SbcConfig = toml::from_str(
+            "[topology_hiding]\nenabled = true\nmode = \"basic\"\nexternal_host = \"sbc.example.com\"\n",
+        )
+        .expect("old TOML loads");
+        let t = old.topology_hiding.unwrap();
+        assert_eq!(t.external_tls_port, 5061);
+        assert_eq!(t.internal_networks, Vec::<String>::new());
+        assert_eq!(t.internal_domains, Vec::<String>::new());
+
+        let new: SbcConfig = toml::from_str(
+            "[topology_hiding]\nenabled = true\nexternal_host = \"sbc.example.com\"\nexternal_tls_port = 15061\ninternal_networks = [\"10.20.0.0/16\"]\ninternal_domains = [\"corp.example\"]\n",
+        )
+        .expect("new TOML loads");
+        let t = new.topology_hiding.unwrap();
+        assert_eq!(t.external_tls_port, 15061);
+        assert_eq!(t.internal_networks, vec!["10.20.0.0/16".to_string()]);
+        assert_eq!(t.internal_domains, vec!["corp.example".to_string()]);
     }
 }

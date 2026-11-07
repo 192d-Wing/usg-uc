@@ -17,12 +17,14 @@ use crate::state::AppState;
 
 mod auth;
 mod calls;
+mod cdrs;
 mod dial_plans;
 mod directory;
 mod phones;
 mod proxy;
 mod redact;
 mod registrations;
+mod route_pattern_rules;
 mod sbc;
 mod system;
 mod trunk_groups;
@@ -83,15 +85,40 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/calls", get(calls::list))
         .route("/calls/{call_id}/ladder", get(calls::ladder))
         .route("/calls/{call_id}/terminate", post(calls::terminate))
+        // CDRs (PII): gRPC CdrService on the daemon. `cdr:read` for
+        // list/show/stats, `cdr:export` for export; no purge endpoint
+        // (retention is config-driven, AU-9).
+        //
+        // ## NIST 800-53 Rev5: AC-3, AC-6
+        .route(
+            "/cdrs",
+            get(cdrs::list).route_layer(axum::middleware::from_fn(crate::authmw::require_cdr_read)),
+        )
+        .route(
+            "/cdrs/stats",
+            get(cdrs::stats)
+                .route_layer(axum::middleware::from_fn(crate::authmw::require_cdr_read)),
+        )
+        .route(
+            "/cdrs/export",
+            get(cdrs::export)
+                .route_layer(axum::middleware::from_fn(crate::authmw::require_cdr_export)),
+        )
+        .route(
+            "/cdrs/{record_id}",
+            get(cdrs::get).route_layer(axum::middleware::from_fn(crate::authmw::require_cdr_read)),
+        )
         .route("/registrations", get(registrations::list))
         .route("/registrations/{aor}", delete(registrations::delete))
-        // Users CRUD — Postgres-backed via uc-user-mgmt as of PR10.
-        // Replaces the daemon's REST /users handlers.
-        .route("/users", get(users::list).post(users::create))
-        .route(
-            "/users/{id}",
-            get(users::get).put(users::update).delete(users::delete),
-        )
+        // Users CRUD — Postgres-backed via uc-user-mgmt (HA1 encrypted
+        // at rest). Reads need `users:read`, writes `users:admin`; every
+        // account change is audited.
+        //
+        // ## NIST 800-53 Rev5: AC-2, AC-3, AC-6
+        .merge(users::routes(users::UsersState {
+            store: Arc::clone(&state.users),
+            trusted_proxies: Arc::clone(&state.trusted_proxies),
+        }))
         // SBC routing CRUD — Postgres-backed as of PR11. Each write
         // notifies the daemon via SbcSyncService so the live router
         // catches up without a daemon restart. Replaces the daemon's

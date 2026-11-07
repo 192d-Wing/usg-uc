@@ -37,8 +37,9 @@ tcp_idle_timeout_secs = 300
 # api_listen = "10.0.1.10:8080"
 
 [media]
+# Only "Relay" is accepted; per-realm overrides (realm_modes) are rejected
+# by validation, and codecs must be the default set (any order).
 default_mode = "Relay"
-# Per-realm overrides: realm_modes = { "external" = "PassThrough" }
 codecs = ["Opus", "G722", "G711Ulaw", "G711Alaw"]
 rtp_port_min = 16384
 rtp_port_max = 32768
@@ -62,16 +63,32 @@ fingerprint_hash = "Sha384"
 curve = "P384"
 min_tls_version = "1.3"
 require_mtls = false
+# NIST 800-53 Rev5: SC-8 — every trunk group sends only on TLS trunks (no
+# UDP/TCP fallback; 503 when none is usable). Per group: `require_tls = true`.
+# require_tls_trunks = false
 
 [stir_shaken]
+# Verification is off until STI-CR trust anchors are configured (it was on by
+# default before 0.10 but verified nothing). Enable per trunk with
+# `stir_shaken = { verify = true }` / `{ sign = true }`.
 signing_enabled = false
-verification_enabled = true
-# certificate_path = "/etc/sbc/certs/sti.crt"
-# private_key_path = "/etc/sbc/certs/sti.key"
-# certificate_url = "https://certs.example.com/sti.crt"
-default_attestation = "B"
+verification_enabled = false
+# SHAKEN mandates ES256 (documented CNSA 2.0 exception).
+algorithm = "ES256"
+
+[stir_shaken.signing]
+# certificate_url = "https://certs.example.com/sti.pem"
+# private_key_path = "/etc/sbc/certs/sti.key"   # PKCS#8 P-256, mode 0600/0400
+# certificate_path = "/etc/sbc/certs/sti.pem"
+
+[stir_shaken.attestation]
+default = "C"
+# owned_numbers = ["1202555*"]
+
+[stir_shaken.verification]
+failure_policy = "mark"     # pass-through | mark | reject
 max_passport_age_secs = 60
-# ca_bundle_path = "/etc/sbc/certs/ca-bundle.crt"
+# trust_anchors_path = "/etc/sbc/certs/sti-cr"
 
 [rate_limit]
 enabled = true
@@ -86,3 +103,31 @@ format = "json"
 output = "stdout"
 audit_enabled = true
 # audit_path = "/var/log/sbc/audit.log"
+
+# Call Detail Records (schema v1). One record per INVITE that reaches
+# admission. See docs/SBC-ADMIN-GUIDE.md "Call Detail Records".
+[cdr]
+enabled = true
+format = "jsonl"                    # jsonl | csv
+directory = "/var/lib/usg-sbc/cdr"  # absolute; created 0750, files 0640. Must be
+                                    # writable by the daemon user or startup fails.
+# node_id = "sbc-a"                 # default: general.instance_name, then $HOSTNAME
+rotate_size_mb = 100                # 1..=4096
+rotate_interval = "1h"              # "0" = size only; 5m..=24h
+retention_files = 168               # 0 = unlimited
+retention_days = 90                 # 0 = unlimited
+fsync_interval_ms = 1000            # 0 = fsync every record
+queue_capacity = 8192               # 64..=1000000
+ring_capacity = 10000               # recent CDRs kept for the API, 0..=200000
+hash_chain = true                   # SHA-384 chain + per-file .sha384 sidecar
+record_unanswered = "all"           # all | routed | none
+record_auth_challenges = false
+pii = "full"                        # full | mask_caller | hash
+# pii_hash_key_file = "/etc/usg-sbc/cdr-hmac.key"   # required for pii = "hash" (>= 48 bytes)
+on_failure = "continue"             # continue | reject_new_calls (emergency calls always admitted)
+
+[cdr.syslog]
+enabled = false
+target = "tls://collector.example.net:6514"   # RFC 5425; TLS only
+# ca_path = "/etc/usg-sbc/syslog-ca.pem"
+facility = 16                       # local0

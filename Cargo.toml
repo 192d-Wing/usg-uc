@@ -38,6 +38,7 @@ members = [
     "crates/uc/uc-vps",
     "crates/uc/uc-routing",
     "crates/uc/uc-cdr",
+    "crates/uc/uc-sti",
 
     # Layer 6: Recording (uc-* = reusable)
     "crates/uc/uc-siprec",
@@ -101,13 +102,15 @@ members = [
     "crates/client/client-gui-tauri",
     "crates/client/client-integration-tests",
 ]
+# Nightly-only cargo-fuzz crate; its own workspace (see its Cargo.toml).
+exclude = ["crates/proto/proto-sip/fuzz", "crates/uc/uc-t38/fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 # Per CONTRIBUTING.md requirements
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://gitlab.com/192d-wing/usg-uc"
 keywords = ["sip", "sbc", "voip", "session-border-controller", "cnsa"]
@@ -115,10 +118,10 @@ categories = ["network-programming", "multimedia"]
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 
 # Cryptography (CNSA 2.0 compliant)
-aws-lc-rs = { version = "1.15", default-features = false }
+aws-lc-rs = { version = "1.18", default-features = false }
 # `fips` routes rustls + webpki through aws-lc-fips-sys (the same FIPS module
 # uc-crypto uses) and turns on rustls' FIPS posture (provider self-check,
 # TLS 1.2 extended-master-secret enforcement). The non-FIPS aws-lc-sys still
@@ -129,11 +132,13 @@ rustls = { version = "0.23", default-features = false, features = [
     "fips",
     "tls12",
 ] }
-zeroize = { version = "1.8", features = ["derive"] }
+zeroize = { version = "1.9", features = ["derive"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Hex encoding (audit hash-chain fields).
+hex = "0.4"
 toml = "1.1"
 
 # Error handling
@@ -144,7 +149,7 @@ async-trait = "0.1"
 
 # Logging and tracing
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -156,7 +161,7 @@ regex = "1"
 validator = { version = "0.20", features = ["derive"] }
 
 # Networking
-bytes = "1.11.1"
+bytes = "1.12.1"
 socket2 = { version = "0.6", features = ["all"] }
 nix = { version = "0.31", features = ["net"] }
 ipnet = "2"
@@ -168,12 +173,12 @@ include_dir = "0.7"
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
-http = "1.4"
+http = "1.5"
 http-body-util = "0.1"
-hyper = { version = "1.8", features = ["server", "http1", "http2"] }
+hyper = { version = "1.12", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-rustls = "0.26"
-rustls-pki-types = { version = "1.14", features = ["std"] }
+rustls-pki-types = { version = "1.15", features = ["std"] }
 rustls-native-certs = "0.8"
 
 # OIDC bearer-token validation (sbc-client-config-server). aws_lc_rs
@@ -194,6 +199,7 @@ uc-policy = { path = "crates/uc/uc-policy" }
 uc-vps = { path = "crates/uc/uc-vps" }
 uc-routing = { path = "crates/uc/uc-routing" }
 uc-cdr = { path = "crates/uc/uc-cdr" }
+uc-sti = { path = "crates/uc/uc-sti" }
 uc-api = { path = "crates/uc/uc-api" }
 uc-metrics = { path = "crates/uc/uc-metrics" }
 uc-health = { path = "crates/uc/uc-health" }
@@ -273,9 +279,10 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Time",
 ] }
-uuid = { version = "1.20", features = ["v4"] }
-tempfile = "3.24"
+uuid = { version = "1.28", features = ["v4"] }
+tempfile = "3.27"
 criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1"
 
 [workspace.lints.rust]
 # Use deny instead of forbid to allow platform-specific unsafe code with explicit #[allow(unsafe_code)]

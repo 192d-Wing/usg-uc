@@ -50,7 +50,7 @@ pub async fn login(
         let mut limiter = state
             .login_rate_limiter
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         limiter.retain(|_, (_, window_start)| window_start.elapsed() < RATE_LIMIT_WINDOW * 2);
         if let Some(&(count, window_start)) = limiter.get(&client_ip)
             && window_start.elapsed() < RATE_LIMIT_WINDOW
@@ -81,13 +81,16 @@ pub async fn login(
             let mut limiter = state
                 .login_rate_limiter
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let entry = limiter.entry(client_ip).or_insert((0, Instant::now()));
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = limiter
+                .entry(client_ip)
+                .or_insert_with(|| (0, Instant::now()));
             if entry.1.elapsed() >= RATE_LIMIT_WINDOW {
                 *entry = (1, Instant::now());
             } else {
                 entry.0 += 1;
             }
+            drop(limiter);
         }
         return (
             StatusCode::UNAUTHORIZED,
@@ -101,7 +104,7 @@ pub async fn login(
         let mut limiter = state
             .login_rate_limiter
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         limiter.remove(&client_ip);
     }
 
@@ -142,19 +145,17 @@ pub async fn session(
     let legacy_ok = uc_auth::extract_credential(&headers).is_some_and(|c| state.auth.authorize(&c));
 
     // OIDC bearer token (operator SSO via Keycloak).
-    let oidc_ok = if !legacy_ok {
-        if let Some(validator) = &state.oidc {
-            let token = headers
-                .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .map(|t| t.trim().to_string());
-            match token {
-                Some(t) => validator.validate(&t).await.is_ok(),
-                None => false,
-            }
-        } else {
-            false
+    let oidc_ok = if legacy_ok {
+        false
+    } else if let Some(validator) = &state.oidc {
+        let token = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|t| t.trim().to_string());
+        match token {
+            Some(t) => validator.validate(&t).await.is_ok(),
+            None => false,
         }
     } else {
         false

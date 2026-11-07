@@ -54,6 +54,12 @@ spec:
             - name: CENTRAL_OIDC_EXTRA_CA_CERT_FILE
               value: "/etc/ssl/extra-ca/ca.pem"
             {{- end }}
+            {{- with .Values.api.auditPath }}
+            # Optional hash-chained audit file (fail-closed when set). Must be
+            # on a writable volume. NIST: AU-9
+            - name: CENTRAL_API_AUDIT_PATH
+              value: {{ . | quote }}
+            {{- end }}
           ports:
             - { name: http, containerPort: {{ .Values.api.listenPort }}, protocol: TCP }
           livenessProbe:

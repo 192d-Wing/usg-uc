@@ -61,6 +61,23 @@ pub enum CodecError {
         name: String,
     },
 
+    /// Invalid input (e.g. odd-length 16-bit PCM, malformed packet).
+    // NIST 800-53 Rev5: SI-10 (Information Input Validation)
+    #[error("invalid input: {reason}")]
+    InvalidInput {
+        /// Error description.
+        reason: String,
+    },
+
+    /// Packet-loss recovery (FEC or PLC) could not run. Carries a static
+    /// reason so the decode-thread loss path never allocates (an attacker
+    /// can trigger it once per lost packet).
+    #[error("loss recovery failed: {reason}")]
+    LossRecoveryFailed {
+        /// Static error description.
+        reason: &'static str,
+    },
+
     /// Invalid configuration.
     #[error("invalid configuration: {reason}")]
     InvalidConfig {

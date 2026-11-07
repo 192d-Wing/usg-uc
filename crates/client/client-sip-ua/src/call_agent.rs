@@ -17,7 +17,6 @@ use proto_transaction::client::{ClientInviteTransaction, ClientNonInviteTransact
 use proto_transaction::{TransactionKey, TransportType};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -43,8 +42,9 @@ pub struct CallAgent {
     transport_type: String,
     /// RFC 3263 resolver (NAPTR/SRV/A) for SIP URI destinations. Created
     /// lazily on first use because the underlying DNS resolver needs a
-    /// running tokio runtime.
-    resolver: OnceLock<SipResolver>,
+    /// running tokio runtime; built on the blocking pool because reading
+    /// the system DNS configuration is synchronous I/O.
+    resolver: tokio::sync::OnceCell<SipResolver>,
     /// Our public address as seen by the peer, learned from `received`/
     /// `rport` on the top Via of responses (RFC 3581). When set, it is
     /// used as the advertised address (Via sent-by, Contact) of
@@ -271,7 +271,7 @@ impl CallAgent {
             aor,
             display_name,
             transport_type: "TLS".to_string(), // Default to TLS, updated by configure()
-            resolver: OnceLock::new(),
+            resolver: tokio::sync::OnceCell::new(),
             public_addr: None,
             #[cfg(feature = "digest-auth")]
             digest_credentials: None,
@@ -424,7 +424,7 @@ impl CallAgent {
         let destination = self.parse_destination(remote_uri).await?;
 
         // Get the local IP address that can reach the destination
-        let effective_local_addr = self.effective_local_addr(destination).await?;
+        let effective_local_addr = self.effective_local_addr(destination)?;
         debug!(
             destination = %destination,
             local_addr = %effective_local_addr,
@@ -702,7 +702,7 @@ impl CallAgent {
         };
 
         let destination = self.parse_destination(&target.next_hop).await?;
-        let effective_local_addr = self.effective_local_addr(destination).await?;
+        let effective_local_addr = self.effective_local_addr(destination)?;
 
         // The transaction key must carry the branch actually sent on the
         // wire so responses match it (RFC 3261 §17.1.3).
@@ -790,7 +790,7 @@ impl CallAgent {
         };
 
         let destination = self.parse_destination(&target.next_hop).await?;
-        let effective_local_addr = self.effective_local_addr(destination).await?;
+        let effective_local_addr = self.effective_local_addr(destination)?;
         let branch = generate_branch();
 
         // Build re-INVITE request
@@ -1355,7 +1355,7 @@ impl CallAgent {
         // routed through the dialog's route set to the remote target
         // (RFC 3261 §13.2.2.4 / §12.2.1.1).
         let destination = self.parse_destination(&target.next_hop).await?;
-        let effective_local_addr = self.effective_local_addr(destination).await?;
+        let effective_local_addr = self.effective_local_addr(destination)?;
         let ack_request = Self::build_ack_request_static(
             &target.request_uri,
             &remote_uri,
@@ -1461,7 +1461,7 @@ impl CallAgent {
 
         // ACK the 2xx: a new transaction with a fresh Via/branch (§13.2.2.4).
         let destination = self.parse_destination(&target.next_hop).await?;
-        let effective_local_addr = self.effective_local_addr(destination).await?;
+        let effective_local_addr = self.effective_local_addr(destination)?;
         let ack_request = Self::build_ack_request_static(
             &target.request_uri,
             &remote_uri,
@@ -1610,7 +1610,7 @@ impl CallAgent {
 
                         // Re-derive effective local address for the new request
                         let destination = self.parse_destination(&remote_uri).await?;
-                        let effective_local_addr = self.effective_local_addr(destination).await?;
+                        let effective_local_addr = self.effective_local_addr(destination)?;
 
                         // Rebuild the INVITE with a new branch (new transaction)
                         let new_branch = generate_branch();
@@ -2091,7 +2091,7 @@ impl CallAgent {
         };
 
         let destination = self.parse_destination(&remote_uri).await?;
-        let effective_local_addr = self.effective_local_addr(destination).await?;
+        let effective_local_addr = self.effective_local_addr(destination)?;
         let new_branch = generate_branch();
 
         let mut request = Self::build_invite_request_static(
@@ -2277,7 +2277,7 @@ impl CallAgent {
         );
 
         let destination = self.parse_destination(&target.next_hop).await?;
-        let effective_local_addr = self.effective_local_addr(destination).await?;
+        let effective_local_addr = self.effective_local_addr(destination)?;
 
         // RFC 3261 §17.1.1.3: the ACK for a non-2xx final response must
         // carry the INVITE's Via verbatim (same branch, same sent-by
@@ -2497,7 +2497,7 @@ impl CallAgent {
         };
 
         let destination = self.parse_destination(&target.next_hop).await?;
-        let effective_local_addr = self.effective_local_addr(destination).await?;
+        let effective_local_addr = self.effective_local_addr(destination)?;
 
         // The transaction key must carry the branch actually sent on the
         // wire so the BYE's 200 matches it (RFC 3261 §17.1.3).
@@ -2585,7 +2585,7 @@ impl CallAgent {
         };
 
         let destination = self.parse_destination(&target.next_hop).await?;
-        let effective_local_addr = self.effective_local_addr(destination).await?;
+        let effective_local_addr = self.effective_local_addr(destination)?;
 
         let request = Self::build_info_request_static(
             &target.request_uri,
@@ -3141,7 +3141,20 @@ impl CallAgent {
             _ => TransportPreference::Udp,
         };
 
-        let resolver = self.resolver.get_or_init(SipResolver::with_defaults);
+        let resolver = self
+            .resolver
+            .get_or_init(|| async {
+                // System DNS config read is blocking file/OS I/O; keep it off
+                // the async worker threads.
+                match tokio::task::spawn_blocking(Self::build_resolver).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(error = %e, "resolver init task failed; building inline");
+                        Self::build_resolver()
+                    }
+                }
+            })
+            .await;
         match resolver
             .resolve(&sip_uri.host, sip_uri.port, preference)
             .await
@@ -3178,6 +3191,22 @@ impl CallAgent {
         }
     }
 
+    /// Builds the RFC 3263 resolver with the system-configured DNS backend.
+    ///
+    /// NIST 800-53 Rev5: CM-7 — the enterprise resolver from the host
+    /// configuration is used; if it is unavailable the resolver runs with no
+    /// DNS backend (numeric/cached only, then the system A/AAAA fallback) and
+    /// never queries hickory's public default resolvers.
+    fn build_resolver() -> SipResolver {
+        let resolver = SipResolver::with_defaults();
+        if resolver.has_dns_resolver() {
+            debug!("RFC 3263 resolver using system DNS configuration");
+        } else {
+            warn!("RFC 3263 NAPTR/SRV lookups disabled: system DNS configuration unavailable");
+        }
+        resolver
+    }
+
     /// Plain system A/AAAA lookup used when RFC 3263 resolution fails.
     async fn lookup_host_fallback(sip_uri: &SipUri, transport: &str) -> SipUaResult<SocketAddr> {
         let host = &sip_uri.host;
@@ -3208,7 +3237,7 @@ impl CallAgent {
     /// request toward `destination`: the NAT public address learned via
     /// RFC 3581 `received`/`rport` when known, otherwise the locally
     /// discovered interface address.
-    async fn effective_local_addr(&self, destination: SocketAddr) -> SipUaResult<SocketAddr> {
+    fn effective_local_addr(&self, destination: SocketAddr) -> SipUaResult<SocketAddr> {
         // RFC 3581: a UAC honors rport simply by sending `;rport` in its Via —
         // the server then routes responses to the source address it actually
         // received from, independent of our advertised sent-by. We therefore
@@ -3219,7 +3248,7 @@ impl CallAgent {
         // still learned (see update_public_addr_from_via) for diagnostics and
         // potential future Contact use, but is not applied here.
         let _ = self.public_addr;
-        Self::get_local_addr_for_destination(destination, self.local_addr).await
+        Self::get_local_addr_for_destination(destination, self.local_addr)
     }
 
     /// Gets the local address to use for reaching a destination.
@@ -3228,8 +3257,7 @@ impl CallAgent {
     /// determines the appropriate local IP by creating a UDP socket connected
     /// to the destination. This ensures the Via/Contact headers contain a
     /// routable IP address.
-    #[allow(clippy::unused_async)]
-    async fn get_local_addr_for_destination(
+    fn get_local_addr_for_destination(
         destination: SocketAddr,
         configured_addr: SocketAddr,
     ) -> SipUaResult<SocketAddr> {
@@ -3485,7 +3513,7 @@ impl CallAgent {
         let via = response.headers.get_value(&HeaderName::Via)?;
         let start = via.find("branch=")? + "branch=".len();
         let rest = &via[start..];
-        let end = rest.find([';', ',', ' ', '\t']).map_or(rest.len(), |i| i);
+        let end = rest.find([';', ',', ' ', '\t']).unwrap_or(rest.len());
         Some(rest[..end].to_string())
     }
 

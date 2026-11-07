@@ -100,10 +100,10 @@ impl DtmfToneGenerator {
 
         // Wrap phases to prevent float precision issues
         if self.low_phase >= 2.0 * PI {
-            self.low_phase -= 2.0 * PI;
+            self.low_phase = 2.0f32.mul_add(-PI, self.low_phase);
         }
         if self.high_phase >= 2.0 * PI {
-            self.high_phase -= 2.0 * PI;
+            self.high_phase = 2.0f32.mul_add(-PI, self.high_phase);
         }
 
         pcm

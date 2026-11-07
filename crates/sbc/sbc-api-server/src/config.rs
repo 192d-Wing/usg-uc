@@ -54,6 +54,40 @@ pub struct Config {
     /// forge its address. Empty = trust `X-Real-IP` unconditionally
     /// (a startup warning is logged).
     pub trusted_proxies: Vec<ipnet::IpNet>,
+
+    /// Client certificate for mTLS to the daemon's gRPC listener
+    /// (`SBC_DAEMON_GRPC_TLS_{CA,CERT,KEY}_FILE`, all three or none). The
+    /// daemon serves `CdrService` (PII) only over mTLS or loopback.
+    ///
+    /// ## NIST 800-53 Rev5: IA-3 (Device Identification and Authentication), SC-8
+    pub daemon_grpc_tls: Option<GrpcClientTls>,
+
+    /// File holding the AES-256-GCM key (64 hex chars) that seals SIP
+    /// digest HA1 values at rest (`SBC_USER_HA1_KEY_FILE`, required).
+    /// Must be owner-only and owned by the sbc-api uid.
+    ///
+    /// ## NIST 800-53 Rev5: SC-28(1), SC-12
+    pub user_ha1_key_file: std::path::PathBuf,
+
+    /// Optional hash-chained audit file (`SBC_API_AUDIT_PATH`, absolute).
+    /// Unset (or empty): audit records go to the tracing output (target
+    /// `audit`) and must be shipped off-host by the log pipeline.
+    ///
+    /// ## NIST 800-53 Rev5: AU-9, AU-12 (capacity, AU-4, is the platform's:
+    /// volume sizing, rotation and retention)
+    // POAM: POA&M-133 -- no in-process audit file rotation or retention.
+    pub audit_path: Option<std::path::PathBuf>,
+}
+
+/// PEM file paths for the daemon gRPC mTLS client.
+#[derive(Debug, Clone)]
+pub struct GrpcClientTls {
+    /// CA that signed the daemon's server certificate.
+    pub ca: std::path::PathBuf,
+    /// Client certificate chain.
+    pub cert: std::path::PathBuf,
+    /// Client private key.
+    pub key: std::path::PathBuf,
 }
 
 impl Config {
@@ -97,6 +131,37 @@ impl Config {
             reason,
         })?;
 
+        let tls_var = |k: &'static str| std::env::var(k).ok().filter(|s| !s.is_empty());
+        let daemon_grpc_tls = match (
+            tls_var("SBC_DAEMON_GRPC_TLS_CA_FILE"),
+            tls_var("SBC_DAEMON_GRPC_TLS_CERT_FILE"),
+            tls_var("SBC_DAEMON_GRPC_TLS_KEY_FILE"),
+        ) {
+            (None, None, None) => None,
+            (Some(ca), Some(cert), Some(key)) => Some(GrpcClientTls {
+                ca: ca.into(),
+                cert: cert.into(),
+                key: key.into(),
+            }),
+            _ => {
+                return Err(ConfigError::Invalid {
+                    var: "SBC_DAEMON_GRPC_TLS_{CA,CERT,KEY}_FILE",
+                    reason: "set all three or none".to_string(),
+                });
+            }
+        };
+
+        let user_ha1_key_file = std::env::var("SBC_USER_HA1_KEY_FILE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or(ConfigError::Missing("SBC_USER_HA1_KEY_FILE"))?
+            .into();
+
+        let audit_path = parse_audit_path(
+            "SBC_API_AUDIT_PATH",
+            std::env::var("SBC_API_AUDIT_PATH").ok(),
+        )?;
+
         Ok(Self {
             listen_addr,
             database_url,
@@ -105,6 +170,54 @@ impl Config {
             oidc_issuer,
             oidc_audience,
             trusted_proxies,
+            daemon_grpc_tls,
+            user_ha1_key_file,
+            audit_path,
         })
+    }
+}
+
+/// Parses an optional audit-file path: empty means unset; a set value must
+/// be absolute (no working-directory-relative audit trail).
+///
+/// ## NIST 800-53 Rev5: AU-9 (Protection of Audit Information)
+fn parse_audit_path(
+    var: &'static str,
+    value: Option<String>,
+) -> Result<Option<std::path::PathBuf>, ConfigError> {
+    let Some(v) = value.filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(v);
+    if !path.is_absolute() {
+        return Err(ConfigError::Invalid {
+            var,
+            reason: "must be an absolute path".to_string(),
+        });
+    }
+    Ok(Some(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_path_empty_is_unset_and_relative_rejected() {
+        let p = |v: Option<&str>| parse_audit_path("SBC_API_AUDIT_PATH", v.map(String::from));
+        assert!(matches!(p(None), Ok(None)));
+        assert!(matches!(p(Some("")), Ok(None)));
+        assert!(matches!(p(Some("  ")), Ok(None)));
+        assert!(matches!(
+            p(Some("audit.log")),
+            Err(ConfigError::Invalid {
+                var: "SBC_API_AUDIT_PATH",
+                ..
+            })
+        ));
+        assert_eq!(
+            p(Some("/var/log/sbc-api/audit.log")).ok().flatten(),
+            Some(std::path::PathBuf::from("/var/log/sbc-api/audit.log"))
+        );
     }
 }

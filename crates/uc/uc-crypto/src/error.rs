@@ -65,6 +65,11 @@ pub enum CryptoError {
     /// An attempt was made to use a non-compliant algorithm.
     #[error("CNSA 2.0 violation: {0}")]
     CnsaViolation(String),
+
+    /// An X.509 certificate is malformed, untrusted, expired, or out of
+    /// profile. The reason is a fixed, non-sensitive token.
+    #[error("certificate invalid: {0}")]
+    CertificateInvalid(&'static str),
 }
 
 impl From<CryptoError> for TypesCryptoError {
@@ -81,6 +86,7 @@ impl From<CryptoError> for TypesCryptoError {
             }
             CryptoError::RandomFailed => TypesCryptoError::KeyGenerationFailed,
             CryptoError::CnsaViolation(_) => TypesCryptoError::CnsaViolation,
+            CryptoError::CertificateInvalid(_) => TypesCryptoError::VerificationFailed,
         }
     }
 }

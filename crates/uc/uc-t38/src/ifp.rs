@@ -1,4 +1,5 @@
-//! IFP (Internet Fax Protocol) packet handling per ITU-T T.38.
+//! IFP (Internet Fax Protocol) packet handling modelled on ITU-T T.38
+//! (non-interoperable encoding, POA&M-204).
 //!
 //! IFP packets encapsulate T.30 fax data for transmission over IP networks.
 
@@ -7,7 +8,7 @@ use crate::signal::T30Signal;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
-/// IFP packet data types per ITU-T T.38.
+/// IFP packet data types, modelled on ITU-T T.38 (non-interoperable encoding, POA&M-204).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum DataType {
@@ -179,7 +180,7 @@ impl From<T30Signal> for T30Indication {
     }
 }
 
-/// IFP packet per ITU-T T.38.
+/// IFP packet, modelled on ITU-T T.38 (non-interoperable encoding, POA&M-204).
 #[derive(Debug, Clone)]
 pub struct IfpPacket {
     /// Packet sequence number.
@@ -246,6 +247,9 @@ impl IfpPacket {
     ///
     /// Returns an error if the packet is malformed.
     pub fn decode(mut data: Bytes) -> T38Result<Self> {
+        // NIST 800-53 Rev5: SI-10 -- POA&M-203 fixed: the 4-byte minimum covers seq (2) + type (1) + indication or
+        // length (1); the payload read below is length-checked. Never panics.
+        // NIST 800-53 Rev5: SI-10 (input validation)
         if data.len() < 4 {
             return Err(T38Error::InvalidIfpPacket {
                 reason: "packet too short".to_string(),
@@ -345,5 +349,18 @@ mod tests {
             T30Indication::from(T30Signal::Unknown),
             T30Indication::NoSignal
         );
+    }
+
+    // NIST 800-53 Rev5: SI-10 -- POA&M-203: truncated IFP packets are rejected, never panic.
+    #[test]
+    fn test_decode_truncated_never_panics() {
+        let data = IfpPacket::new(5, DataType::V21, vec![1, 2, 3, 4]).encode();
+        for n in 0..data.len() {
+            assert!(IfpPacket::decode(data.slice(..n)).is_err(), "prefix {n}");
+        }
+        let ind = IfpPacket::indication(5, T30Indication::Cng).encode();
+        for n in 0..ind.len() {
+            assert!(IfpPacket::decode(ind.slice(..n)).is_err(), "prefix {n}");
+        }
     }
 }

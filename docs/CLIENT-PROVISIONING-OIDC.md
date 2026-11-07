@@ -524,7 +524,10 @@ round trip — no browser unless the refresh token is dead.
    Registration runs over SIP-over-TLS: the UA derives the default port
    from the registrar URI scheme (`sips:` → 5061), presents the registrar
    domain as SNI, and trusts the provisioning extra-CA file for SIP TLS in
-   private-CA environments. **Still pending:** RFC 3263 NAPTR/SRV
+   private-CA environments. That extra-CA file is the *only* way to reach
+   a private-CA service from a release build — the "continue anyway"
+   untrusted-certificate prompt exists in debug builds only (see
+   [deploy/keycloak/README.md → Private-CA labs](../deploy/keycloak/README.md#private-ca-labs-soft-client-trust)). **Still pending:** RFC 3263 NAPTR/SRV
    resolution (the UA currently does A/AAAA lookup of the registrar
    domain, preferring IPv6) and RFC 5626 outbound (reg-id, instance-id,
    keepalives) — until those land, transport selection comes from the

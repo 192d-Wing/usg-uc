@@ -17,8 +17,10 @@
 //! - Call routing (add/modify Route headers)
 //! - Caller ID manipulation (From/P-Asserted-Identity)
 
-use crate::error::SipResult;
-use crate::header::{Header, HeaderName, Headers};
+use crate::error::{SipError, SipResult};
+use crate::header::{Header, HeaderName, Headers, is_token_byte, parse_content_length};
+use crate::header_params::{CSeqHeader, NameAddr, ViaHeader};
+use crate::list::split_list_bounded;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -521,66 +523,85 @@ impl HeaderManipulator {
 
     /// Applies all matching policies to headers.
     ///
-    /// # Errors
-    /// Returns an error if the operation fails.
+    /// Atomic and validated (POAM: POA&M-152): rules run against a working
+    /// copy that is only cloned once a rule's condition matches. After each
+    /// rule the headers it touched are validated (token name, no CR/LF/NUL
+    /// or other CTL except HTAB, length bound, structured re-parse, singleton
+    /// cardinality). On the first failure the original `headers` are left
+    /// untouched and [`SipError::ManipulationInvalid`] is returned - callers
+    /// must fail closed (NIST 800-53 Rev5: SI-10, SI-17, AC-4).
     ///
     /// # Errors
-    /// Returns an error if the operation fails.
+    /// [`SipError::ManipulationInvalid`] naming the rule and header.
     pub fn apply(&self, headers: &mut Headers, context: &ManipulationContext) -> SipResult<usize> {
         let mut applied_count = 0;
+        let mut work: Option<Headers> = None;
 
-        // Apply global policies first
-        for policy in &self.global_policies {
+        let trunk = context
+            .trunk_id
+            .as_ref()
+            .and_then(|t| self.trunk_policies.get(t))
+            .into_iter()
+            .flatten();
+        // Global policies first, then trunk-specific ones.
+        for policy in self.global_policies.iter().chain(trunk) {
             if policy.applies_to(context) {
-                applied_count += self.apply_policy(headers, policy, context);
+                applied_count += self.apply_policy(headers, &mut work, policy, context)?;
             }
         }
 
-        // Apply trunk-specific policies
-        if let Some(trunk_id) = &context.trunk_id
-            && let Some(trunk_policies) = self.trunk_policies.get(trunk_id)
-        {
-            for policy in trunk_policies {
-                if policy.applies_to(context) {
-                    applied_count += self.apply_policy(headers, policy, context);
-                }
-            }
+        if let Some(w) = work {
+            *headers = w;
         }
-
         Ok(applied_count)
     }
 
-    /// Applies a single policy to headers.
+    /// Applies a single policy to the working copy (cloned from `orig` on
+    /// first use).
     fn apply_policy(
         &self,
-        headers: &mut Headers,
+        orig: &Headers,
+        work: &mut Option<Headers>,
         policy: &ManipulationPolicy,
         context: &ManipulationContext,
-    ) -> usize {
+    ) -> SipResult<usize> {
         let mut applied_count = 0;
 
         for rule in policy.rules() {
             if !rule.enabled {
                 continue;
             }
-
-            if self.evaluate_condition(&rule.condition, headers, context) {
-                self.apply_action(&rule.action, headers);
-                applied_count += 1;
+            let current = work.as_ref().unwrap_or(orig);
+            if !self.evaluate_condition(&rule.condition, current, context) {
+                continue;
             }
+            let w = work.get_or_insert_with(|| orig.clone());
+            let within_bound = self.apply_action(&rule.action, w);
+            for name in touched(&rule.action) {
+                if !within_bound || !validate_header(w, name) {
+                    return Err(SipError::ManipulationInvalid {
+                        rule: rule.name.clone(),
+                        header: name.as_str().to_string(),
+                    });
+                }
+            }
+            applied_count += 1;
         }
 
-        applied_count
+        Ok(applied_count)
     }
 
     /// Evaluates a condition against headers and context.
+    ///
+    /// Header-value conditions are true if ANY instance matches (POAM:
+    /// POA&M-152 - a spoofed second instance must trigger a strip rule).
     fn evaluate_condition(
         &self,
         condition: &ManipulationCondition,
         headers: &Headers,
         context: &ManipulationContext,
     ) -> bool {
-        let _ = self; // Silence unused_self - method may use self in future for caching
+        let _ = self; // Silence only_used_in_recursion - kept as a method for future caching
         match condition {
             ManipulationCondition::Always => true,
 
@@ -588,31 +609,17 @@ impl HeaderManipulator {
 
             ManipulationCondition::HeaderMissing(name) => headers.get(name).is_none(),
 
-            ManipulationCondition::HeaderContains { name, pattern } => {
-                headers.get(name).is_some_and(|h| h.value.contains(pattern))
-            }
+            ManipulationCondition::HeaderContains { name, pattern } => headers
+                .get_all(name)
+                .any(|h| h.value.contains(pattern.as_str())),
 
             ManipulationCondition::HeaderEquals { name, value } => {
-                headers.get(name).is_some_and(|h| h.value == *value)
+                headers.get_all(name).any(|h| h.value == *value)
             }
 
-            ManipulationCondition::HeaderMatches { name, pattern } => {
-                // Simple regex-like matching using contains for now
-                // In production, would use the regex crate
-                headers.get(name).is_some_and(|h| {
-                    // Handle common regex patterns
-                    if pattern.starts_with('^') && pattern.ends_with('$') {
-                        // Exact match
-                        h.value == pattern[1..pattern.len() - 1]
-                    } else if let Some(stripped) = pattern.strip_prefix('^') {
-                        h.value.starts_with(stripped)
-                    } else if pattern.ends_with('$') {
-                        h.value.ends_with(&pattern[..pattern.len() - 1])
-                    } else {
-                        h.value.contains(pattern)
-                    }
-                })
-            }
+            ManipulationCondition::HeaderMatches { name, pattern } => headers
+                .get_all(name)
+                .any(|h| simple_match(&h.value, pattern)),
 
             ManipulationCondition::MethodEquals(method) => context
                 .method
@@ -631,9 +638,17 @@ impl HeaderManipulator {
         }
     }
 
-    /// Applies an action to headers.
-    fn apply_action(&self, action: &ManipulationAction, headers: &mut Headers) {
-        let _ = self; // Silence unused_self - method may use self in future for caching
+    /// Applies an action to headers, to every instance (POAM: POA&M-152).
+    ///
+    /// `Set` is the only action that collapses instances (explicit
+    /// replace-all is the operator intent).
+    ///
+    /// Returns `false` if a `Replace`/`RegexReplace`/`Prepend`/`Append`
+    /// would grow a value past [`crate::MAX_HEADER_LEN`]; the output length
+    /// is computed before any allocation, so a short pattern with a long
+    /// replacement cannot amplify memory per message (NIST 800-53 Rev5:
+    /// SC-5). The caller then fails the rule closed.
+    fn apply_action(&self, action: &ManipulationAction, headers: &mut Headers) -> bool {
         match action {
             ManipulationAction::Add { name, value } => {
                 headers.add(Header::new(name.clone(), value.clone()));
@@ -648,12 +663,7 @@ impl HeaderManipulator {
             }
 
             ManipulationAction::RemoveMatching { name, pattern } => {
-                // Get current value and only remove if it matches
-                if let Some(header) = headers.get(name)
-                    && header.value.contains(pattern)
-                {
-                    headers.remove(name);
-                }
+                headers.retain(|h| !(h.name == *name && h.value.contains(pattern.as_str())));
             }
 
             ManipulationAction::Replace {
@@ -661,9 +671,11 @@ impl HeaderManipulator {
                 pattern,
                 replacement,
             } => {
-                if let Some(header) = headers.get(name) {
-                    let new_value = header.value.replace(pattern, replacement);
-                    headers.set(name.clone(), new_value);
+                for h in headers.get_all_mut(name) {
+                    match bounded_replace(&h.value, pattern, replacement) {
+                        Some(v) => h.value = v,
+                        None => return false,
+                    }
                 }
             }
 
@@ -674,41 +686,54 @@ impl HeaderManipulator {
             } => {
                 // Simplified regex replacement
                 // Supports basic patterns like (.*) capture groups
-                if let Some(header) = headers.get(name) {
-                    let new_value = self.regex_replace(&header.value, pattern, replacement);
-                    headers.set(name.clone(), new_value);
+                for h in headers.get_all_mut(name) {
+                    match self.regex_replace(&h.value, pattern, replacement) {
+                        Some(v) => h.value = v,
+                        None => return false,
+                    }
                 }
             }
 
             ManipulationAction::Rename { from, to } => {
-                if let Some(header) = headers.get(from) {
-                    let value = header.value.clone();
-                    headers.remove(from);
-                    headers.set(to.clone(), value);
-                }
+                headers.rename_all(from, to);
             }
 
             ManipulationAction::Copy { from, to } => {
-                if let Some(header) = headers.get(from) {
-                    let value = header.value.clone();
-                    headers.set(to.clone(), value);
+                let values: Vec<String> = headers.get_all(from).map(|h| h.value.clone()).collect();
+                if values.is_empty() {
+                    return true;
+                }
+                let at = headers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, h)| h.name == *to)
+                    .map(|(i, _)| i + 1)
+                    .last()
+                    .unwrap_or(headers.len());
+                for (i, v) in values.into_iter().enumerate() {
+                    headers.insert(at + i, Header::new(to.clone(), v));
                 }
             }
 
             ManipulationAction::Prepend { name, prefix } => {
-                if let Some(header) = headers.get(name) {
-                    let new_value = format!("{}{}", prefix, header.value);
-                    headers.set(name.clone(), new_value);
+                for h in headers.get_all_mut(name) {
+                    if h.value.len().saturating_add(prefix.len()) > crate::MAX_HEADER_LEN {
+                        return false;
+                    }
+                    h.value.insert_str(0, prefix);
                 }
             }
 
             ManipulationAction::Append { name, suffix } => {
-                if let Some(header) = headers.get(name) {
-                    let new_value = format!("{}{}", header.value, suffix);
-                    headers.set(name.clone(), new_value);
+                for h in headers.get_all_mut(name) {
+                    if h.value.len().saturating_add(suffix.len()) > crate::MAX_HEADER_LEN {
+                        return false;
+                    }
+                    h.value.push_str(suffix);
                 }
             }
         }
+        true
     }
 
     /// Simplified regex replacement.
@@ -717,7 +742,9 @@ impl HeaderManipulator {
     /// - `(.*)` - capture group (referenced as $1, $2, etc.)
     /// - `^` - start anchor
     /// - `$` - end anchor
-    fn regex_replace(&self, value: &str, pattern: &str, replacement: &str) -> String {
+    ///
+    /// Returns `None` if the output would exceed [`crate::MAX_HEADER_LEN`].
+    fn regex_replace(&self, value: &str, pattern: &str, replacement: &str) -> Option<String> {
         let _ = self; // Silence unused_self - method may use self in future for caching
 
         // Simple implementation without full regex support
@@ -726,7 +753,7 @@ impl HeaderManipulator {
         // Handle simple patterns
         if pattern == "(.*)" {
             // Entire string capture
-            return replacement.replace("$1", value);
+            return bounded_replace(replacement, "$1", value);
         }
 
         // Handle prefix pattern: ^prefix(.*)
@@ -734,7 +761,7 @@ impl HeaderManipulator {
             && let Some(prefix) = inner.strip_suffix("(.*)")
             && let Some(captured) = value.strip_prefix(prefix)
         {
-            return replacement.replace("$1", captured);
+            return bounded_replace(replacement, "$1", captured);
         }
 
         // Handle suffix pattern: (.*)suffix$
@@ -742,11 +769,11 @@ impl HeaderManipulator {
             && let Some(suffix) = inner.strip_suffix('$')
             && let Some(captured) = value.strip_suffix(suffix)
         {
-            return replacement.replace("$1", captured);
+            return bounded_replace(replacement, "$1", captured);
         }
 
         // Fallback: simple string replacement
-        value.replace(pattern, replacement)
+        bounded_replace(value, pattern, replacement)
     }
 
     /// Returns the number of global policies.
@@ -759,6 +786,130 @@ impl HeaderManipulator {
     #[must_use]
     pub fn trunk_count(&self) -> usize {
         self.trunk_policies.len()
+    }
+}
+
+/// `str::replace` that computes the output length first and returns `None`
+/// (without allocating the result) if it would exceed
+/// [`crate::MAX_HEADER_LEN`].
+///
+/// NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection) - bounds growth
+/// before the intermediate string is built (SEC-002).
+fn bounded_replace(value: &str, pattern: &str, replacement: &str) -> Option<String> {
+    // An empty pattern matches at every char boundary (`str::replace`).
+    let matches = if pattern.is_empty() {
+        value.chars().count().saturating_add(1)
+    } else {
+        value.matches(pattern).count()
+    };
+    let out_len = (value
+        .len()
+        .saturating_sub(matches.saturating_mul(pattern.len())))
+    .saturating_add(matches.saturating_mul(replacement.len()));
+    (out_len <= crate::MAX_HEADER_LEN).then(|| value.replace(pattern, replacement))
+}
+
+/// `HeaderMatches` pattern semantics (`^x$`, `^x`, `x$`, substring).
+fn simple_match(value: &str, pattern: &str) -> bool {
+    if let Some(inner) = pattern.strip_prefix('^').and_then(|p| p.strip_suffix('$')) {
+        value == inner
+    } else if let Some(stripped) = pattern.strip_prefix('^') {
+        value.starts_with(stripped)
+    } else if let Some(stripped) = pattern.strip_suffix('$') {
+        value.ends_with(stripped)
+    } else {
+        value.contains(pattern)
+    }
+}
+
+/// Header names an action may modify.
+fn touched(action: &ManipulationAction) -> Vec<&HeaderName> {
+    match action {
+        ManipulationAction::Add { name, .. }
+        | ManipulationAction::Set { name, .. }
+        | ManipulationAction::Remove { name }
+        | ManipulationAction::RemoveMatching { name, .. }
+        | ManipulationAction::Replace { name, .. }
+        | ManipulationAction::RegexReplace { name, .. }
+        | ManipulationAction::Prepend { name, .. }
+        | ManipulationAction::Append { name, .. } => vec![name],
+        ManipulationAction::Rename { from, to } => vec![from, to],
+        ManipulationAction::Copy { to, .. } => vec![to],
+    }
+}
+
+/// Every list element of every instance parses with `f` (empty -> false).
+fn all_elements(headers: &Headers, name: &HeaderName, f: impl Fn(&str) -> bool) -> bool {
+    headers.get_all(name).all(|h| {
+        split_list_bounded(&h.value, crate::MAX_LIST_ELEMENTS)
+            .is_ok_and(|parts| !parts.is_empty() && parts.iter().all(|p| f(p)))
+    })
+}
+
+/// Validates every instance of `name` after a manipulation.
+///
+/// NIST 800-53 Rev5: SI-10 (Information Input Validation) - header
+/// injection (CR/LF), grammar and cardinality of SBC-relevant headers.
+fn validate_header(headers: &Headers, name: &HeaderName) -> bool {
+    let n = name.as_str();
+    if n.is_empty() || !n.bytes().all(is_token_byte) {
+        return false;
+    }
+    let count = headers.count(name);
+    for h in headers.get_all(name) {
+        if h.value.len() > crate::MAX_HEADER_LEN
+            || h.value
+                .bytes()
+                .any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+        {
+            return false;
+        }
+    }
+    match name {
+        HeaderName::From | HeaderName::To => {
+            count == 1
+                && headers
+                    .get_all(name)
+                    .all(|h| h.value.parse::<NameAddr>().is_ok())
+        }
+        HeaderName::CallId => {
+            count == 1
+                && headers.get_all(name).all(|h| {
+                    let v = h.value.trim();
+                    !v.is_empty() && !v.bytes().any(|b| b == b' ' || b == b'\t')
+                })
+        }
+        HeaderName::CSeq => {
+            count == 1
+                && headers
+                    .get_all(name)
+                    .all(|h| h.value.parse::<CSeqHeader>().is_ok())
+        }
+        HeaderName::MaxForwards => {
+            count <= 1
+                && headers
+                    .get_all(name)
+                    .all(|h| h.value.trim().parse::<u8>().is_ok())
+        }
+        HeaderName::ContentLength => {
+            count <= 1
+                && headers
+                    .get_all(name)
+                    .all(|h| parse_content_length(&h.value).is_ok())
+        }
+        HeaderName::ContentType => headers.get_all(name).all(|h| {
+            h.value
+                .split_once('/')
+                .is_some_and(|(t, s)| !t.trim().is_empty() && !s.trim().is_empty())
+        }),
+        HeaderName::Via => all_elements(headers, name, |e| e.parse::<ViaHeader>().is_ok()),
+        HeaderName::Contact => all_elements(headers, name, |e| {
+            e.trim() == "*" || e.parse::<NameAddr>().is_ok()
+        }),
+        HeaderName::Route | HeaderName::RecordRoute => {
+            all_elements(headers, name, |e| e.parse::<NameAddr>().is_ok())
+        }
+        _ => true,
     }
 }
 
@@ -1222,7 +1373,7 @@ mod tests {
 
         // Test capture group replacement
         let result = manipulator.regex_replace("sip:alice@example.com", "(.*)", "Modified: $1");
-        assert_eq!(result, "Modified: sip:alice@example.com");
+        assert_eq!(result.as_deref(), Some("Modified: sip:alice@example.com"));
 
         // Test prefix removal (simplified - actual regex would need the regex crate)
         let _result = manipulator.regex_replace("+1234567890", "^\\+1(.*)", "$1");
@@ -1274,5 +1425,234 @@ mod tests {
         // High priority (1) should be first
         assert_eq!(policy.rules()[0].name, "high-priority");
         assert_eq!(policy.rules()[1].name, "low-priority");
+    }
+
+    fn x_foo() -> HeaderName {
+        HeaderName::Custom("X-Foo".to_string())
+    }
+
+    fn run(
+        headers: &mut Headers,
+        action: ManipulationAction,
+        cond: ManipulationCondition,
+    ) -> SipResult<usize> {
+        let mut m = HeaderManipulator::new();
+        let mut p = ManipulationPolicy::new("p");
+        p.add_rule(ManipulationRule::new("r", cond, action));
+        m.add_global_policy(p);
+        m.apply(
+            headers,
+            &ManipulationContext::for_request("INVITE", ManipulationDirection::Outbound),
+        )
+    }
+
+    fn vals(h: &Headers, n: &HeaderName) -> Vec<String> {
+        h.get_all(n).map(|h| h.value.clone()).collect()
+    }
+
+    fn snapshot(h: &Headers) -> Vec<(String, String)> {
+        h.iter()
+            .map(|h| (h.name.as_str().to_string(), h.value.clone()))
+            .collect()
+    }
+
+    // POAM-152: RemoveMatching removes only matching instances, incl. the 2nd.
+    #[test]
+    fn remove_matching_second_instance() {
+        let mut h = Headers::new();
+        h.add(Header::new(x_foo(), "ok"));
+        h.add(Header::new(x_foo(), "evil"));
+        run(
+            &mut h,
+            ManipulationAction::RemoveMatching {
+                name: x_foo(),
+                pattern: "evil".into(),
+            },
+            ManipulationCondition::Always,
+        )
+        .unwrap();
+        assert_eq!(vals(&h, &x_foo()), vec!["ok"]);
+    }
+
+    // POAM-152: conditions match any instance.
+    #[test]
+    fn condition_matches_any_instance() {
+        let pai = HeaderName::Custom("P-Asserted-Identity".into());
+        let mut h = Headers::new();
+        h.add(Header::new(pai.clone(), "<sip:alice@example.com>"));
+        h.add(Header::new(pai.clone(), "<sip:+1911@example.com>"));
+        let n = run(
+            &mut h,
+            ManipulationAction::remove(pai.clone()),
+            ManipulationCondition::header_contains(pai.clone(), "+1911"),
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(h.count(&pai), 0);
+    }
+
+    // POAM-152: per-instance edits keep count and order.
+    #[test]
+    fn per_instance_edits() {
+        let mk = || {
+            let mut h = Headers::new();
+            for v in ["a1", "a2", "a3"] {
+                h.add(Header::new(x_foo(), v));
+            }
+            h
+        };
+        let mut h = mk();
+        run(
+            &mut h,
+            ManipulationAction::replace(x_foo(), "a", "b"),
+            ManipulationCondition::Always,
+        )
+        .unwrap();
+        assert_eq!(vals(&h, &x_foo()), vec!["b1", "b2", "b3"]);
+        let mut h = mk();
+        run(
+            &mut h,
+            ManipulationAction::Prepend {
+                name: x_foo(),
+                prefix: "p-".into(),
+            },
+            ManipulationCondition::Always,
+        )
+        .unwrap();
+        assert_eq!(vals(&h, &x_foo()), vec!["p-a1", "p-a2", "p-a3"]);
+        let mut h = mk();
+        run(
+            &mut h,
+            ManipulationAction::Append {
+                name: x_foo(),
+                suffix: "-s".into(),
+            },
+            ManipulationCondition::Always,
+        )
+        .unwrap();
+        assert_eq!(vals(&h, &x_foo()), vec!["a1-s", "a2-s", "a3-s"]);
+        let mut h = mk();
+        run(
+            &mut h,
+            ManipulationAction::set(x_foo(), "one"),
+            ManipulationCondition::Always,
+        )
+        .unwrap();
+        assert_eq!(vals(&h, &x_foo()), vec!["one"]);
+    }
+
+    // POAM-152: Rename / Copy keep every instance.
+    #[test]
+    fn rename_and_copy_all_instances() {
+        let bar = HeaderName::Custom("X-Bar".into());
+        let mut h = Headers::new();
+        h.add(Header::new(x_foo(), "1"));
+        h.add(Header::new(x_foo(), "2"));
+        run(
+            &mut h,
+            ManipulationAction::copy(x_foo(), bar.clone()),
+            ManipulationCondition::Always,
+        )
+        .unwrap();
+        assert_eq!(vals(&h, &bar), vec!["1", "2"]);
+        assert_eq!(vals(&h, &x_foo()), vec!["1", "2"]);
+        let baz = HeaderName::Custom("X-Baz".into());
+        run(
+            &mut h,
+            ManipulationAction::rename(x_foo(), baz.clone()),
+            ManipulationCondition::Always,
+        )
+        .unwrap();
+        assert_eq!(vals(&h, &baz), vec!["1", "2"]);
+        assert_eq!(h.count(&x_foo()), 0);
+    }
+
+    // POAM-152: invalid output rejected atomically.
+    #[test]
+    fn invalid_output_rejected_atomically() {
+        let mut h = create_test_headers();
+        let before = snapshot(&h);
+        let e = run(
+            &mut h,
+            ManipulationAction::regex_replace(HeaderName::UserAgent, "(.*)", "$1\r\nX-Injected: 1"),
+            ManipulationCondition::Always,
+        )
+        .unwrap_err();
+        assert!(matches!(e, SipError::ManipulationInvalid { .. }));
+        assert_eq!(snapshot(&h), before);
+
+        let e = run(
+            &mut h,
+            ManipulationAction::replace(HeaderName::From, "<sip:", "<"),
+            ManipulationCondition::Always,
+        );
+        assert!(e.is_err());
+        assert_eq!(snapshot(&h), before);
+
+        let e = run(
+            &mut h,
+            ManipulationAction::copy(HeaderName::From, HeaderName::To),
+            ManipulationCondition::Always,
+        );
+        assert!(e.is_err(), "two To headers must be rejected");
+        assert_eq!(snapshot(&h), before);
+    }
+
+    // SEC-002: amplifying replace/prepend/append rejected before the
+    // oversized value is built; headers untouched.
+    #[test]
+    fn amplifying_rewrite_rejected_before_growth() {
+        let x = HeaderName::Custom("X-Amp".to_string());
+        let mut h = create_test_headers();
+        h.add(Header::new(x.clone(), "a".repeat(1024)));
+        let before = snapshot(&h);
+        let big = "b".repeat(1024);
+        for action in [
+            ManipulationAction::replace(x.clone(), "a", &big),
+            ManipulationAction::regex_replace(x.clone(), "a", &big),
+            ManipulationAction::regex_replace(x.clone(), "(.*)", "$1".repeat(16)),
+            ManipulationAction::replace(x.clone(), "", "z".repeat(8)),
+        ] {
+            let e = run(&mut h, action, ManipulationCondition::Always).unwrap_err();
+            assert!(matches!(e, SipError::ManipulationInvalid { .. }));
+            assert_eq!(snapshot(&h), before);
+        }
+        let long = "p".repeat(crate::MAX_HEADER_LEN);
+        for action in [
+            ManipulationAction::Prepend {
+                name: x.clone(),
+                prefix: long.clone(),
+            },
+            ManipulationAction::Append {
+                name: x.clone(),
+                suffix: long.clone(),
+            },
+        ] {
+            assert!(run(&mut h, action, ManipulationCondition::Always).is_err());
+            assert_eq!(snapshot(&h), before);
+        }
+        assert_eq!(bounded_replace("aXa", "a", "bb").as_deref(), Some("bbXbb"));
+        assert_eq!(bounded_replace("ab", "", "-").as_deref(), Some("-a-b-"));
+    }
+
+    // POAM-152: Headers helpers.
+    #[test]
+    fn headers_helpers() {
+        let mut h = Headers::new();
+        h.add(Header::new(x_foo(), "1"));
+        h.add(Header::new(HeaderName::To, "<sip:b@example.com>"));
+        h.add(Header::new(x_foo(), "2"));
+        for x in h.get_all_mut(&x_foo()) {
+            x.value.push('!');
+        }
+        assert_eq!(vals(&h, &x_foo()), vec!["1!", "2!"]);
+        let bar = HeaderName::Custom("X-Bar".into());
+        h.rename_all(&x_foo(), &bar);
+        assert_eq!(snapshot(&h)[2], ("X-Bar".to_string(), "2!".to_string()));
+        h.retain(|x| x.value != "1!");
+        assert_eq!(h.len(), 2);
+        h.replace_instances(&bar, vec!["a".into(), "b".into()]);
+        assert_eq!(snapshot(&h)[1].1, "a");
+        assert_eq!(snapshot(&h)[2].1, "b");
     }
 }

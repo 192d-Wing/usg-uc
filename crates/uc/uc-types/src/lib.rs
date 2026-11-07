@@ -30,6 +30,7 @@
 pub mod address;
 pub mod attestation;
 pub mod codec;
+pub mod dialed_number;
 pub mod error;
 pub mod identifier;
 pub mod media;
@@ -39,6 +40,7 @@ pub mod protocol;
 pub use address::SbcSocketAddr;
 pub use attestation::AttestationLevel;
 pub use codec::CodecId;
+pub use dialed_number::{DialedNumber, NumberKind, canonical_prefix};
 pub use error::{SbcError, SbcResult};
 pub use identifier::{CallId, DialogId, TransactionId};
 pub use media::MediaMode;

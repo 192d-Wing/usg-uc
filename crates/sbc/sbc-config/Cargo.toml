@@ -33,6 +33,8 @@ serde_yaml_ng = "0.10"
 thiserror.workspace = true
 validator.workspace = true
 nix.workspace = true
+# ServerName parsing only (no crypto) for trunk tls_server_name validation.
+rustls-pki-types.workspace = true
 
 # Optional clustering dependencies
 uc-cluster = { workspace = true, optional = true }

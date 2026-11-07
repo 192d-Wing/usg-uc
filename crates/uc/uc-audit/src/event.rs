@@ -87,6 +87,49 @@ pub enum AuditEvent {
 
     /// System shutdown.
     SystemShutdown(SystemShutdown),
+
+    /// A call failed over from one trunk to the next.
+    TrunkFailover(TrunkFailover),
+
+    /// A trunk became reachable or unreachable.
+    TrunkReachabilityChanged(TrunkReachabilityChanged),
+
+    /// The CDR pipeline failed to write or is dropping records.
+    CdrSinkFailure(CdrSinkFailure),
+
+    /// A CDR file was closed and its digest sidecar written.
+    CdrFileRotated(CdrFileRotated),
+
+    /// CDRs were read in bulk through the management plane.
+    CdrExport(CdrExport),
+
+    /// Outbound `PASSporT` signing failed (call continues unsigned).
+    StirSignFailure(StirSignFailure),
+
+    /// Inbound Identity verification failed (aggregated per trunk + reason).
+    StirVerifyFailure(StirVerifyFailure),
+
+    /// STI-CR trust anchors (re)loaded.
+    StirTrustAnchorsReloaded(StirTrustAnchorsReloaded),
+
+    /// STI-CR trust-anchor reload failed; the previous set stays active.
+    StirTrustAnchorReloadFailed(StirTrustAnchorReloadFailed),
+
+    /// The STIR signing key and certificate were loaded and self-checked.
+    StirKeyLoaded(StirKeyLoaded),
+
+    /// STIR failure audit events were dropped because an aggregation table
+    /// was full (AU-5 capacity alert).
+    StirAuditEventsDropped(StirAuditEventsDropped),
+
+    /// A managed user account was created, modified or removed (or the
+    /// attempt failed).
+    AccountManagement(AccountManagement),
+
+    /// Audit records were lost (queue full, sink write failure) or a torn
+    /// tail was found at startup. Chained by the writer so the loss is
+    /// visible inside the trail itself.
+    AuditRecordsDropped(AuditRecordsDropped),
 }
 
 impl AuditEvent {
@@ -98,13 +141,26 @@ impl AuditEvent {
                 AuditEventType::Call
             }
             Self::AuthenticationAttempt(_) => AuditEventType::Authentication,
-            Self::AuthorizationDecision(_) => AuditEventType::Authorization,
-            Self::ConfigurationChange(_) => AuditEventType::Configuration,
-            Self::CryptoKeyOperation(_) => AuditEventType::Cryptographic,
+            Self::AuthorizationDecision(_) | Self::CdrExport(_) => AuditEventType::Authorization,
+            Self::CryptoKeyOperation(_) | Self::StirSignFailure(_) | Self::StirKeyLoaded(_) => {
+                AuditEventType::Cryptographic
+            }
             Self::DosDetected(_)
             | Self::StirShakenVerification(_)
-            | Self::RateLimitTriggered(_) => AuditEventType::Security,
-            Self::SystemStartup(_) | Self::SystemShutdown(_) => AuditEventType::System,
+            | Self::RateLimitTriggered(_)
+            | Self::StirVerifyFailure(_)
+            | Self::StirAuditEventsDropped(_)
+            | Self::AuditRecordsDropped(_) => AuditEventType::Security,
+            Self::ConfigurationChange(_)
+            | Self::StirTrustAnchorsReloaded(_)
+            | Self::StirTrustAnchorReloadFailed(_)
+            | Self::AccountManagement(_) => AuditEventType::Configuration,
+            Self::SystemStartup(_)
+            | Self::SystemShutdown(_)
+            | Self::TrunkFailover(_)
+            | Self::TrunkReachabilityChanged(_)
+            | Self::CdrSinkFailure(_)
+            | Self::CdrFileRotated(_) => AuditEventType::System,
         }
     }
 }
@@ -210,6 +266,12 @@ pub struct AuthorizationDecision {
     pub granted: bool,
     /// Policy that made the decision.
     pub policy: String,
+    /// Source IP address of the request, when known (additive; absent in
+    /// records written before it existed).
+    ///
+    /// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ip: Option<IpAddr>,
 }
 
 /// Configuration change type.
@@ -260,6 +322,90 @@ pub struct CryptoKeyOperation {
     pub operation: KeyOperationType,
     /// Algorithm associated with the key.
     pub algorithm: String,
+    /// Outcome of the operation. Omitted from the serialized form on
+    /// success so records written before this field existed re-serialize
+    /// byte-identically (canonical form, see `record::parse_canonical`).
+    ///
+    /// NIST 800-53 Rev5: AU-3 (outcome of the event)
+    #[serde(default, skip_serializing_if = "KeyOperationOutcome::is_success")]
+    pub outcome: KeyOperationOutcome,
+    /// Failure reason (sanitized: no CR/LF, bounded length). Must never
+    /// contain key material or full file paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Maximum length (bytes) of [`CryptoKeyOperation::reason`].
+pub const MAX_KEY_OPERATION_REASON_LEN: usize = 256;
+
+impl CryptoKeyOperation {
+    /// Successful key operation.
+    #[must_use]
+    pub fn success(
+        key_id: impl Into<String>,
+        operation: KeyOperationType,
+        algorithm: impl Into<String>,
+    ) -> Self {
+        Self {
+            key_id: key_id.into(),
+            operation,
+            algorithm: algorithm.into(),
+            outcome: KeyOperationOutcome::Success,
+            reason: None,
+        }
+    }
+
+    /// Failed key operation. `reason` is sanitized: control characters
+    /// (including CR/LF) are replaced and it is truncated to
+    /// [`MAX_KEY_OPERATION_REASON_LEN`] bytes on a char boundary.
+    ///
+    /// NIST 800-53 Rev5: AU-3, SI-10 (no log injection via reason)
+    #[must_use]
+    pub fn failure(
+        key_id: impl Into<String>,
+        operation: KeyOperationType,
+        algorithm: impl Into<String>,
+        reason: &str,
+    ) -> Self {
+        Self {
+            key_id: key_id.into(),
+            operation,
+            algorithm: algorithm.into(),
+            outcome: KeyOperationOutcome::Failure,
+            reason: Some(sanitize_reason(reason)),
+        }
+    }
+}
+
+fn sanitize_reason(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len().min(MAX_KEY_OPERATION_REASON_LEN));
+    for c in reason.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if out.len() + c.len_utf8() > MAX_KEY_OPERATION_REASON_LEN {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Outcome of a [`CryptoKeyOperation`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyOperationOutcome {
+    /// Operation succeeded.
+    #[default]
+    Success,
+    /// Operation failed.
+    Failure,
+}
+
+impl KeyOperationOutcome {
+    /// `true` for [`KeyOperationOutcome::Success`].
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
 }
 
 /// `DoS` attack type.
@@ -334,10 +480,364 @@ pub struct SystemShutdown {
     pub graceful: bool,
 }
 
+/// Why a call failed over to the next trunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailoverReason {
+    /// The trunk answered with a failover status (408/5xx).
+    Status(u16),
+    /// No response before Timer B (RFC 3261 §17.1.1.2).
+    Timeout,
+    /// The INVITE could not be sent (RFC 3261 §8.1.3.1).
+    TransportError,
+}
+
+/// Trunk failover event.
+///
+/// ## NIST 800-53 Rev5: CP-8 (Telecommunications Services), AU-2
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrunkFailover {
+    /// Call identifier (A-leg Call-ID).
+    pub call_id: CallId,
+    /// Trunk group of the failed trunk.
+    pub group_id: String,
+    /// Trunk that failed.
+    pub failed_trunk_id: String,
+    /// Why the trunk failed.
+    pub reason: FailoverReason,
+    /// Trunk tried next.
+    pub next_trunk_id: String,
+}
+
+/// Where a trunk reachability change was detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachabilitySource {
+    /// Local SIP OPTIONS health probe.
+    Options,
+    /// Trunk-services agent status publish.
+    Agent,
+}
+
+/// Trunk reachability change event.
+///
+/// ## NIST 800-53 Rev5: CP-8 (Telecommunications Services), AU-2
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrunkReachabilityChanged {
+    /// Trunk identifier.
+    pub trunk_id: String,
+    /// New reachability.
+    pub reachable: bool,
+    /// Detector of the change.
+    pub source: ReachabilitySource,
+}
+
+/// CDR pipeline failure.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdrSinkFailure {
+    /// `"write_error"`, `"queue_full"` or `"writer_dead"`.
+    pub reason: String,
+    /// Error text or drop count; never record content.
+    pub detail: String,
+}
+
+/// CDR file rotation.
+///
+/// ## NIST 800-53 Rev5: AU-9 (Protection of Audit Information), AU-11
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdrFileRotated {
+    /// Closed file path.
+    pub file: String,
+    /// Hex SHA-384 of the closed file.
+    pub sha384: String,
+}
+
+/// Account-management action.
+///
+/// ## NIST 800-53 Rev5: AC-2 (Account Management)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAction {
+    /// Account created.
+    Create,
+    /// Account modified (attributes, credential or enabled flag).
+    Update,
+    /// Account removed.
+    Delete,
+}
+
+/// A management-plane change to a managed (SIP) user account.
+///
+/// Never carries the password, HA1 or any other authenticator.
+///
+/// ## NIST 800-53 Rev5: AC-2 (Account Management), AC-2(4) (Automated Audit
+/// Actions), AU-3 (Content of Audit Records)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountManagement {
+    /// Authenticated principal that requested the change.
+    pub actor: String,
+    /// Issuer that authenticated `actor` (OIDC `iss`), when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_issuer: Option<String>,
+    /// Target account identifier (empty when not yet assigned/unknown).
+    pub target_user_id: String,
+    /// Target account username, when known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target_username: String,
+    /// What was attempted.
+    pub action: AccountAction,
+    /// Whether the change was applied.
+    pub success: bool,
+    /// Fixed failure token (`not_found`, `already_exists`, `invalid`,
+    /// `storage`); `None` on success. Never contains backend error text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    /// Source IP address of the request, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ip: Option<IpAddr>,
+    /// Which attribute groups an update touched (`password`, `enabled`,
+    /// `username`, `profile`), so credential resets and enable/disable are
+    /// distinguishable from edits. Names only, never values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<String>,
+}
+
+/// Bulk CDR read (export) by a management user. CDRs carry PII.
+///
+/// ## NIST 800-53 Rev5: AU-2, AC-3, SI-12
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdrExport {
+    /// Authenticated principal: the REST user in sbc-api; in the daemon the
+    /// gRPC client certificate name (`cert:<name>`), or `unauthenticated`
+    /// on a loopback listener without mTLS.
+    pub user: String,
+    /// End user the authenticated principal says it acts for (gRPC
+    /// `x-sbc-user`). Caller-asserted, never the principal. Additive.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub on_behalf_of: String,
+    /// Filter as given (query string form).
+    pub filter: String,
+    /// Records returned.
+    pub count: u64,
+    /// Export format.
+    pub format: String,
+    /// Outcome: `success`, `truncated`, `failed`, `busy` or `denied`.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records)
+    #[serde(default)]
+    pub outcome: String,
+}
+
+/// Outbound STIR signing failure.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-3, SC-13
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirSignFailure {
+    /// Hex SHA-384 prefix of the A-leg Call-ID (no raw Call-ID).
+    pub call_id_hash: String,
+    /// Egress trunk.
+    pub trunk: String,
+    /// Fixed reason token: `key-unusable`, `cert-expired`, `no-attestation`,
+    /// `bad-number`.
+    pub reason: String,
+    /// Failures folded into this event (>= 1); one event is emitted per
+    /// (`trunk`, `reason`) per aggregation window.
+    pub count: u64,
+}
+
+/// Inbound STIR verification failures, aggregated.
+///
+/// One event is emitted per (`source_trunk`, `reason`) per aggregation window
+/// so an attacker sending bad Identity headers cannot flood the audit log.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-3, IA-9, SI-10
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirVerifyFailure {
+    /// Hex SHA-384 prefix of the first Call-ID in the window.
+    pub call_id_hash: String,
+    /// Ingress trunk.
+    pub source_trunk: String,
+    /// Source IP of the first failure in the window.
+    pub source_ip: Option<IpAddr>,
+    /// Host of the `x5u` URL (no path), if known.
+    pub x5u_host: Option<String>,
+    /// Fixed failure reason token (see `proto_stir_shaken::FailureReason`).
+    pub reason: String,
+    /// Action taken: `pass`, `mark` or `reject`.
+    pub action: String,
+    /// Failures folded into this event (>= 1).
+    pub count: u64,
+}
+
+/// Trust-anchor set loaded.
+///
+/// ## NIST 800-53 Rev5: SC-17 (PKI Certificates), CM-6
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirTrustAnchorsReloaded {
+    /// Anchors loaded.
+    pub count: u64,
+    /// Hex SHA-384 over the concatenated anchor DER.
+    pub sha384: String,
+}
+
+/// Trust-anchor reload failure.
+///
+/// ## NIST 800-53 Rev5: SC-17, AU-5
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirTrustAnchorReloadFailed {
+    /// Error text (path / parse error; never key material).
+    pub reason: String,
+}
+
+/// STIR failure events dropped since the previous report because an
+/// aggregation table was full of live keys.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirAuditEventsDropped {
+    /// Events dropped since the previous report (>= 1).
+    pub count: u64,
+    /// Total dropped since startup.
+    pub total: u64,
+}
+
+/// Audit records lost since the previous marker of the same reason.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures), AU-9
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditRecordsDropped {
+    /// Records lost since the previous marker of this reason (0 for a torn
+    /// tail whose fragment was not a whole record).
+    pub count: u64,
+    /// Total lost for this reason since startup.
+    pub total: u64,
+    /// Why the records were lost.
+    pub reason: AuditDropReason,
+}
+
+/// Cause of an [`AuditRecordsDropped`] marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDropReason {
+    /// The bounded writer queue was full.
+    QueueFull,
+    /// The sink failed to persist the record (e.g. ENOSPC).
+    SinkWriteFailed,
+    /// The audit file ended in an unterminated or unreadable tail at open
+    /// (crash-torn write or tamper); the chain resumes after the last good
+    /// record.
+    TornTail,
+}
+
+/// Signing key loaded.
+///
+/// ## NIST 800-53 Rev5: SC-12, SC-17
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StirKeyLoaded {
+    /// Hex SHA-384 fingerprint of the signing certificate.
+    pub cert_fingerprint_sha384: String,
+    /// Certificate `notAfter` (Unix seconds).
+    pub not_after: u64,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn stir_events_serialize_and_categorize() {
+        let e = AuditEvent::StirVerifyFailure(StirVerifyFailure {
+            call_id_hash: "ab".into(),
+            source_trunk: "carrier".into(),
+            source_ip: None,
+            x5u_host: Some("cert.example.invalid".into()),
+            reason: "bad-signature".into(),
+            action: "mark".into(),
+            count: 3,
+        });
+        assert_eq!(e.event_type(), AuditEventType::Security);
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""type":"stir_verify_failure""#), "{json}");
+        let k = AuditEvent::StirKeyLoaded(StirKeyLoaded {
+            cert_fingerprint_sha384: "00".into(),
+            not_after: 1,
+        });
+        assert_eq!(k.event_type(), AuditEventType::Cryptographic);
+        let d = AuditEvent::StirAuditEventsDropped(StirAuditEventsDropped { count: 2, total: 5 });
+        assert_eq!(d.event_type(), AuditEventType::Security);
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            json.contains(r#""type":"stir_audit_events_dropped""#),
+            "{json}"
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn crypto_key_operation_success_is_byte_compatible() {
+        // Golden: pre-outcome-field serialization must be unchanged.
+        let e = AuditEvent::CryptoKeyOperation(CryptoKeyOperation::success(
+            "k",
+            KeyOperationType::Loaded,
+            "ECDSA-P384",
+        ));
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"crypto_key_operation","key_id":"k","operation":"Loaded","algorithm":"ECDSA-P384"}"#
+        );
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        let op = match back {
+            AuditEvent::CryptoKeyOperation(op) => Some(op),
+            _ => None,
+        }
+        .unwrap();
+        assert_eq!(op.outcome, KeyOperationOutcome::Success);
+        assert!(op.reason.is_none());
+    }
+
+    #[test]
+    fn crypto_key_operation_failure_round_trips_and_sanitizes() {
+        let long = format!("bad\r\nINJECT {}", "x".repeat(400));
+        let op = CryptoKeyOperation::failure("k", KeyOperationType::Loaded, "ECDSA-P384", &long);
+        let r = op.reason.clone().unwrap();
+        assert!(!r.contains('\n') && !r.contains('\r'));
+        assert!(r.len() <= MAX_KEY_OPERATION_REASON_LEN);
+        let e = AuditEvent::CryptoKeyOperation(op);
+        assert_eq!(e.event_type(), AuditEventType::Cryptographic);
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""outcome":"failure""#), "{json}");
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        let op = match back {
+            AuditEvent::CryptoKeyOperation(op) => Some(op),
+            _ => None,
+        }
+        .unwrap();
+        assert_eq!(op.outcome, KeyOperationOutcome::Failure);
+    }
+
+    #[test]
+    fn audit_records_dropped_serializes_snake_case_and_is_security() {
+        let d = AuditEvent::AuditRecordsDropped(AuditRecordsDropped {
+            count: 3,
+            total: 7,
+            reason: AuditDropReason::QueueFull,
+        });
+        assert_eq!(d.event_type(), AuditEventType::Security);
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"audit_records_dropped","count":3,"total":7,"reason":"queue_full"}"#
+        );
+        let json = serde_json::to_string(&AuditDropReason::SinkWriteFailed).unwrap();
+        assert_eq!(json, r#""sink_write_failed""#);
+        let json = serde_json::to_string(&AuditDropReason::TornTail).unwrap();
+        assert_eq!(json, r#""torn_tail""#);
+    }
 
     #[test]
     fn test_event_type_categorization() {
@@ -365,5 +865,123 @@ mod tests {
         let json = serde_json::to_string(&event).expect("serialize event");
         assert!(json.contains("authentication_attempt"));
         assert!(json.contains("alice"));
+    }
+
+    fn as_authz(event: AuditEvent) -> Option<AuthorizationDecision> {
+        match event {
+            AuditEvent::AuthorizationDecision(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn authorization_decision_source_ip_is_additive() {
+        let old = r#"{"type":"authorization_decision","identity":"a","resource":"sip:911@x","action":"INVITE","granted":false,"policy":"vps"}"#;
+        let d = as_authz(serde_json::from_str(old).unwrap()).unwrap();
+        assert_eq!(d.source_ip, None);
+        let none = serde_json::to_string(&AuditEvent::AuthorizationDecision(d.clone())).unwrap();
+        assert!(!none.contains("source_ip"));
+
+        let with = AuditEvent::AuthorizationDecision(AuthorizationDecision {
+            source_ip: Some("192.0.2.7".parse().unwrap()),
+            ..d
+        });
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""source_ip":"192.0.2.7""#));
+        let back = as_authz(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(back.source_ip, Some("192.0.2.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn cdr_export_is_authorization_and_outcome_is_additive() {
+        let old = r#"{"user":"op1","filter":"","count":2,"format":"csv"}"#;
+        let e: CdrExport = serde_json::from_str(old).unwrap();
+        assert_eq!(e.outcome, "");
+        assert_eq!(e.on_behalf_of, "");
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("on_behalf_of"), "{json}");
+        assert_eq!(
+            AuditEvent::CdrExport(e).event_type(),
+            AuditEventType::Authorization
+        );
+    }
+
+    #[test]
+    fn trunk_events_serialize_and_categorize() {
+        let failover = AuditEvent::TrunkFailover(TrunkFailover {
+            call_id: CallId::new("c\"1"),
+            group_id: "g".to_string(),
+            failed_trunk_id: "t1".to_string(),
+            reason: FailoverReason::Status(503),
+            next_trunk_id: "t2".to_string(),
+        });
+        assert_eq!(failover.event_type(), AuditEventType::System);
+        let json = serde_json::to_string(&failover).unwrap();
+        assert!(json.contains(r#""type":"trunk_failover""#));
+        assert!(json.contains(r#""reason":{"status":503}"#));
+        assert!(json.contains(r#"c\"1"#), "call_id JSON-escaped: {json}");
+        let t = serde_json::to_string(&FailoverReason::TransportError).unwrap();
+        assert_eq!(t, r#""transport_error""#);
+
+        let reach = AuditEvent::TrunkReachabilityChanged(TrunkReachabilityChanged {
+            trunk_id: "t1".to_string(),
+            reachable: false,
+            source: ReachabilitySource::Options,
+        });
+        assert_eq!(reach.event_type(), AuditEventType::System);
+        let json = serde_json::to_string(&reach).unwrap();
+        assert!(json.contains(r#""type":"trunk_reachability_changed""#));
+        assert!(json.contains(r#""source":"options""#));
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, AuditEvent::TrunkReachabilityChanged(r) if !r.reachable));
+    }
+
+    #[test]
+    fn account_management_serializes_without_secrets() {
+        let ev = AuditEvent::AccountManagement(AccountManagement {
+            actor: "op1".to_string(),
+            actor_issuer: Some("https://idp.example.invalid".to_string()),
+            target_user_id: "u-1".to_string(),
+            target_username: "alice".to_string(),
+            action: AccountAction::Create,
+            success: false,
+            failure_reason: Some("already_exists".to_string()),
+            source_ip: None,
+            changed: vec!["password".to_string()],
+        });
+        assert_eq!(ev.event_type(), AuditEventType::Configuration);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"account_management""#), "{json}");
+        assert!(json.contains(r#""action":"create""#), "{json}");
+        assert!(!json.contains("source_ip"), "{json}");
+        assert!(json.contains(r#""changed":["password"]"#), "{json}");
+        assert!(json.contains(r#""actor_issuer""#), "{json}");
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, AuditEvent::AccountManagement(a) if !a.success));
+    }
+
+    /// QA (POA&M-166, SI-10): every control char is replaced, the cap is
+    /// exact, and truncation never splits a multi-byte char.
+    #[test]
+    fn qa_key_operation_reason_sanitization_edges() {
+        let f = |r: &str| {
+            CryptoKeyOperation::failure("k", KeyOperationType::Loaded, "ECDSA-P384", r)
+                .reason
+                .unwrap()
+        };
+        let r = f("a\tb\0c\x1bd\x7fe\u{85}f");
+        assert!(!r.chars().any(char::is_control), "{r:?}");
+        assert_eq!(r, "a b c d e f");
+        let exact = "x".repeat(MAX_KEY_OPERATION_REASON_LEN);
+        assert_eq!(f(&exact), exact);
+        let r = f(&format!(
+            "{}\u{20ac}",
+            "x".repeat(MAX_KEY_OPERATION_REASON_LEN - 1)
+        ));
+        assert_eq!(r.len(), MAX_KEY_OPERATION_REASON_LEN - 1);
+        let r = f(&"\u{20ac}".repeat(200));
+        assert!(r.len() <= MAX_KEY_OPERATION_REASON_LEN);
+        assert_eq!(r.len() % 3, 0);
+        assert_eq!(f(""), "");
     }
 }

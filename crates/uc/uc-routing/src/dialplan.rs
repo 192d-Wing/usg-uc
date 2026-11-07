@@ -2,6 +2,35 @@
 
 use crate::DEFAULT_PRIORITY;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Maximum dial-plan regex pattern length in bytes.
+// NIST 800-53 Rev5: SC-5 (DoS protection), SI-10 (input validation)
+pub const MAX_REGEX_PATTERN_LEN: usize = 1024;
+
+/// Maximum compiled program / lazy DFA size for a dial-plan regex, in bytes.
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
+/// Compiles a dial-plan regex with bounded length and compiled size.
+fn compile_bounded_regex(pattern: &str) -> crate::RoutingResult<regex::Regex> {
+    if pattern.len() > MAX_REGEX_PATTERN_LEN {
+        return Err(crate::RoutingError::InvalidPattern {
+            pattern: pattern.chars().take(64).collect(),
+            reason: format!(
+                "regex pattern length {} exceeds {MAX_REGEX_PATTERN_LEN}",
+                pattern.len()
+            ),
+        });
+    }
+    regex::RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|e| crate::RoutingError::InvalidPattern {
+            pattern: pattern.chars().take(64).collect(),
+            reason: format!("invalid regex: {e}"),
+        })
+}
 
 /// Number transformation operation.
 #[derive(Debug, Clone, Default)]
@@ -53,13 +82,9 @@ impl NumberTransform {
                 }
             }
             Self::AddPrefix { prefix } => format!("{prefix}{number}"),
-            Self::ReplacePrefix { from, to } => {
-                if let Some(rest) = number.strip_prefix(from.as_str()) {
-                    format!("{to}{rest}")
-                } else {
-                    number.to_string()
-                }
-            }
+            Self::ReplacePrefix { from, to } => number
+                .strip_prefix(from.as_str())
+                .map_or_else(|| number.to_string(), |rest| format!("{to}{rest}")),
             Self::Replace {
                 number: replacement,
             } => replacement.clone(),
@@ -111,13 +136,42 @@ pub enum DialPattern {
 
 impl DialPattern {
     /// Checks if a number matches this pattern.
+    ///
+    /// For [`DialPattern::Regex`] this compiles the regex on every call;
+    /// prefer [`DialPlanEntry::matches`], which compiles once. An invalid or
+    /// oversized regex never matches (fail closed).
     pub fn matches(&self, number: &str) -> bool {
         match self {
             Self::Exact(pattern) => number == pattern,
             Self::Prefix(prefix) => number.starts_with(prefix),
             Self::Wildcard(pattern) => Self::match_wildcard(pattern, number),
-            Self::Regex(pattern) => regex::Regex::new(pattern).is_ok_and(|re| re.is_match(number)),
+            Self::Regex(pattern) => {
+                compile_bounded_regex(pattern).is_ok_and(|re| re.is_match(number))
+            }
             Self::Any => true,
+        }
+    }
+
+    /// Validates the pattern. Only [`DialPattern::Regex`] can be invalid:
+    /// the regex must compile within the length and size limits.
+    ///
+    /// ## NIST 800-53 Rev5: SI-10 (Information Input Validation), SC-24
+    ///
+    /// # Errors
+    /// [`RoutingError::InvalidPattern`] if the regex is invalid or too large.
+    pub fn validate(&self) -> crate::RoutingResult<()> {
+        if let Self::Regex(pattern) = self {
+            compile_bounded_regex(pattern)?;
+        }
+        Ok(())
+    }
+
+    /// Compiles the regex for a [`DialPattern::Regex`]; `None` otherwise or
+    /// if the regex is invalid.
+    fn compile(&self) -> Option<Arc<regex::Regex>> {
+        match self {
+            Self::Regex(pattern) => compile_bounded_regex(pattern).ok().map(Arc::new),
+            _ => None,
         }
     }
 
@@ -152,6 +206,30 @@ impl DialPattern {
 
         // Pattern exhausted, number should also be exhausted
         number_chars.next().is_none()
+    }
+
+    /// Builds a pattern from its configured kind (`exact`, `prefix`,
+    /// `wildcard`, `any`; case-sensitive). `regex` is deliberately not
+    /// accepted from configuration: an invalid regex fails open.
+    ///
+    /// ## NIST 800-53 Rev5: SI-10 (Information Input Validation), CM-6
+    ///
+    /// # Errors
+    /// [`RoutingError::InvalidPattern`] for any other kind, so a mistyped
+    /// kind is rejected rather than silently becoming a prefix route.
+    pub fn from_kind(kind: &str, value: &str) -> crate::RoutingResult<Self> {
+        match kind {
+            "exact" => Ok(Self::exact(value)),
+            "prefix" => Ok(Self::prefix(value)),
+            "wildcard" => Ok(Self::wildcard(value)),
+            "any" => Ok(Self::Any),
+            other => Err(crate::RoutingError::InvalidPattern {
+                pattern: value.to_string(),
+                reason: format!(
+                    "unknown pattern_type {other:?}; expected exact, prefix, wildcard or any"
+                ),
+            }),
+        }
     }
 
     /// Creates a prefix pattern.
@@ -213,6 +291,10 @@ pub struct DialPlanEntry {
     name: String,
     /// Pattern to match (user part of Request-URI).
     pattern: DialPattern,
+    /// Regex compiled once from `pattern` when it is [`DialPattern::Regex`].
+    /// `None` for a regex pattern means it was invalid: the entry never
+    /// matches (POA&M-205, fail closed).
+    compiled_regex: Option<Arc<regex::Regex>>,
     /// Number transformation.
     transform: NumberTransform,
     /// Trunk group to route to (for `DestinationType::TrunkGroup`).
@@ -247,6 +329,7 @@ impl DialPlanEntry {
         Self {
             id: id.into(),
             name: String::new(),
+            compiled_regex: pattern.compile(),
             pattern,
             transform: NumberTransform::None,
             trunk_group: trunk_group.into(),
@@ -399,7 +482,19 @@ impl DialPlanEntry {
 
     /// Checks if this entry matches a number (user part only, legacy).
     pub fn matches(&self, number: &str) -> bool {
-        self.enabled && self.pattern.matches(number)
+        self.enabled && self.pattern_matches(number)
+    }
+
+    /// Matches the user part against the pattern, using the cached regex.
+    // NIST 800-53 Rev5: SC-5, SI-10 -- POA&M-205 fixed; regex compiled once, invalid never matches.
+    fn pattern_matches(&self, number: &str) -> bool {
+        match self.pattern {
+            DialPattern::Regex(_) => self
+                .compiled_regex
+                .as_ref()
+                .is_some_and(|re| re.is_match(number)),
+            ref other => other.matches(number),
+        }
     }
 
     /// Checks if this entry matches with full URI context.
@@ -435,7 +530,7 @@ impl DialPlanEntry {
         }
 
         // User/number pattern match
-        self.pattern.matches(user)
+        self.pattern_matches(user)
     }
 
     /// Transforms a number according to this entry.
@@ -446,21 +541,25 @@ impl DialPlanEntry {
 
 /// Matches a domain pattern against a domain.
 ///
-/// - `"uc.mil"` matches `"uc.mil"` and `"sip.uc.mil"` (suffix match)
-/// - `"*.mil"` matches any `.mil` domain
+/// - `"uc.mil"` matches `"uc.mil"` and `"sip.uc.mil"` (label-suffix match)
+/// - `"*.mil"` matches `"mil"` and any `.mil` domain, never `"evilmil"`
 /// - `""` or empty matches everything
+///
+/// RFC 3261 §19.1.4: host comparison is case-insensitive. Allocation-free.
 fn match_domain(pattern: &str, domain: &str) -> bool {
     if pattern.is_empty() {
         return true;
     }
-
-    // Wildcard prefix: "*.mil" matches "anything.mil"
-    if let Some(suffix) = pattern.strip_prefix("*.") {
-        return domain.ends_with(suffix) || domain == suffix;
+    let suffix = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if domain.eq_ignore_ascii_case(suffix) {
+        return true;
     }
-
-    // Exact or suffix match: "uc.mil" matches "uc.mil" and "sip.uc.mil"
-    domain == pattern || domain.ends_with(&format!(".{pattern}"))
+    // Label boundary: the byte before the suffix must be '.'.
+    domain.len() > suffix.len()
+        && domain
+            .get(domain.len() - suffix.len()..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+        && domain.as_bytes().get(domain.len() - suffix.len() - 1) == Some(&b'.')
 }
 
 /// Dial plan result.
@@ -514,7 +613,23 @@ impl DialPlan {
         &self.name
     }
 
+    /// Adds an entry after validating its pattern.
+    ///
+    /// ## NIST 800-53 Rev5: SI-10 (Information Input Validation), CM-6
+    ///
+    /// # Errors
+    /// [`RoutingError::InvalidPattern`] if the entry's regex is invalid or
+    /// too large; the plan is left unchanged.
+    pub fn try_add_entry(&mut self, entry: DialPlanEntry) -> crate::RoutingResult<()> {
+        entry.pattern().validate()?;
+        self.add_entry(entry);
+        Ok(())
+    }
+
     /// Adds an entry to the plan.
+    ///
+    /// An entry with an invalid regex is stored but never matches; use
+    /// [`DialPlan::try_add_entry`] to reject it instead.
     pub fn add_entry(&mut self, entry: DialPlanEntry) {
         let id = entry.id().to_string();
         self.entries.insert(id.clone(), entry);
@@ -988,5 +1103,83 @@ mod tests {
         let inbound = plan.entries_with_tag("inbound");
         assert_eq!(inbound.len(), 1);
         assert_eq!(inbound[0].id(), "toll-free");
+    }
+
+    #[test]
+    fn match_domain_respects_label_boundary_and_case() {
+        assert!(!match_domain("*.mil", "evilmil"));
+        assert!(!match_domain("uc.mil", "evil-uc.mil"));
+        assert!(match_domain("*.mil", "ARMY.MIL"));
+        assert!(match_domain("UC.mil", "sip.uc.MIL"));
+        assert!(match_domain("*.mil", "mil"));
+    }
+
+    #[test]
+    fn from_kind_accepts_known_and_rejects_unknown() {
+        assert!(matches!(
+            DialPattern::from_kind("exact", "911"),
+            Ok(DialPattern::Exact(_))
+        ));
+        assert!(matches!(
+            DialPattern::from_kind("prefix", "1"),
+            Ok(DialPattern::Prefix(_))
+        ));
+        assert!(matches!(
+            DialPattern::from_kind("wildcard", "XXXX"),
+            Ok(DialPattern::Wildcard(_))
+        ));
+        assert!(matches!(
+            DialPattern::from_kind("any", ""),
+            Ok(DialPattern::Any)
+        ));
+        for bad in ["regex", "bogus", "Prefix", "EXACT", ""] {
+            assert!(
+                matches!(
+                    DialPattern::from_kind(bad, "1"),
+                    Err(crate::RoutingError::InvalidPattern { .. })
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    // NIST 800-53 Rev5: SC-5, SI-10 -- POA&M-205: regex compiled once, bounded, invalid fails closed.
+    #[test]
+    fn test_regex_entry_compiled_once_and_matches() {
+        let entry = DialPlanEntry::new("r", DialPattern::Regex(r"^9\d{3}$".to_string()), "tg");
+        assert!(entry.compiled_regex.is_some());
+        assert!(entry.matches("9123"));
+        assert!(!entry.matches("91234"));
+        assert!(entry.matches_extended("9123", "uc.mil", entry.direction(), None));
+    }
+
+    #[test]
+    fn test_invalid_regex_rejected_and_never_matches() {
+        let bad = DialPattern::Regex("(".to_string());
+        assert!(matches!(
+            bad.validate(),
+            Err(crate::RoutingError::InvalidPattern { .. })
+        ));
+        assert!(!bad.matches("("));
+        let entry = DialPlanEntry::new("bad", bad, "tg");
+        assert!(!entry.matches(""));
+        assert!(!entry.matches("("));
+        let mut plan = DialPlan::new("p", "p");
+        assert!(plan.try_add_entry(entry).is_err());
+        assert!(
+            plan.try_add_entry(DialPlanEntry::new("ok", DialPattern::Any, "tg"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_oversized_regex_rejected() {
+        assert!(
+            DialPattern::Regex("a{100000}{100000}".to_string())
+                .validate()
+                .is_err()
+        );
+        let long = "a".repeat(MAX_REGEX_PATTERN_LEN + 1);
+        assert!(DialPattern::Regex(long).validate().is_err());
     }
 }

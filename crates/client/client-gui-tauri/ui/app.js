@@ -207,7 +207,11 @@ function generateSecureId() {
 
 // Sanitize alert messages to prevent confusion attacks
 function safeAlert(message) {
-    const clean = String(message).replace(/<[^>]*>/g, '').slice(0, 500);
+    // Strip the angle brackets themselves rather than `<...>` pairs: a tag
+    // regex leaves `<scr<x>ipt` as `<script` (CodeQL js/incomplete-multi-
+    // character-sanitization). The text only ever reaches alert(), never the
+    // DOM, so dropping the characters is sufficient.
+    const clean = String(message).replace(/[<>]/g, '').slice(0, 500);
     alert(clean);
 }
 

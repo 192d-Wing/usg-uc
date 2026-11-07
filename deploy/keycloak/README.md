@@ -72,6 +72,41 @@ throwaway lab.
 > trust a DoD-PKI-served IdP. Switch to `rustls-tls-native-roots` + mount
 > the DoD bundle before pointing the pod at icam. Tracked as a follow-up.
 
+## Private-CA labs: soft-client trust
+
+Lab IdPs and provisioning endpoints are usually served from a private CA
+(the OOPL internal CA, a throwaway Keycloak container, a self-signed
+cert). The soft client's handling of that depends on the build profile:
+
+| Build | Untrusted-CA behaviour at sign-in |
+| --- | --- |
+| **Debug** (`cargo run`, `cargo tauri dev`) | Shows the *Continue / Cancel* warning. *Continue* skips server-certificate verification for provisioning HTTP for the rest of that app run (`allow_untrusted_cert_warning` in settings gates whether the prompt is offered). |
+| **Release** (anything tagged `client-v*`, any `--release` build) | **No prompt and no override.** The accept-any-certificate path (`CaTrust::Insecure`) is compiled out, the same as the SIP transport's `CertVerificationMode::Insecure`. Sign-in fails with a TLS error until the CA is trusted. |
+
+So on a release build, give the client the lab CA explicitly:
+
+1. Export the lab CA certificate as PEM (for the `kc-dev` container above
+   it is Keycloak's own self-signed cert; for OOPL it is the internal root).
+2. Point the client at it in `settings.toml`, under the OS config dir for
+   `com.usg.sip-client` (macOS:
+   `~/Library/Application Support/com.usg.sip-client/settings.toml`;
+   Linux: `~/.config/sip-client/settings.toml`;
+   Windows: `%APPDATA%\usg\sip-client\config\settings.toml`):
+
+   ```toml
+   [provisioning]
+   extra_ca_cert_file = "/path/to/lab-ca.pem"
+   ```
+
+   The file is added to the OS trust store roots for discovery and IdP
+   HTTPS, and is reused for SIP-over-TLS to the registrar.
+3. Alternatively install the CA in the OS trust store, which covers both
+   the client and this directory's PowerShell scripts at once.
+
+Do not try to work around this by shipping a debug build to lab users: the
+prompt also leaves the SIP TLS path unverified for the run, and debug
+builds are not what the release workflow signs or packages.
+
 ## Realm choice
 
 `-Realm` must already exist. Two valid shapes:
