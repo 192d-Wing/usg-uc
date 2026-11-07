@@ -12,7 +12,7 @@ use uc_audit::sink::AuditSink;
 struct Panicking;
 
 impl AuditSink for Panicking {
-    fn write(&self, _record: &AuditRecord) {
+    fn write(&self, _record: &AuditRecord) -> std::io::Result<()> {
         panic!("simulated sink failure");
     }
 }

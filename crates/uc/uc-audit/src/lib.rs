@@ -6,9 +6,14 @@
 //!
 //! - **AU-2**: Event Logging - defines auditable events
 //! - **AU-3**: Content of Audit Records - specifies required fields
-//! - **AU-8**: Time Stamps - uses reliable time sources
+//! - **AU-8**: Time Stamps - UTC timestamps from the system clock, stamped at
+//!   sequence assignment
 //! - **AU-9**: Protection of Audit Information - integrity via hash chain
-//! - **AU-10**: Non-repudiation - cryptographic binding of records
+//! - **AU-10**: Non-repudiation - planned; the chain is unkeyed today
+//!   (`// POAM: POA&M-130`)
+//! - **AU-5**: Response to Audit Logging Process Failures - queue drops and
+//!   sink write failures are counted, reported, and chained as
+//!   `AuditRecordsDropped` markers
 //!
 //! ## Features
 //!
@@ -41,13 +46,14 @@
 pub mod event;
 pub mod record;
 pub mod sink;
+pub mod verify;
 
-pub use event::{AuditEvent, AuditEventType};
+pub use event::{AuditDropReason, AuditEvent, AuditEventType, AuditRecordsDropped};
 pub use record::AuditRecord;
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Minimum interval between AU-5 error logs about dropped records.
@@ -61,66 +67,54 @@ pub const AUDIT_QUEUE_CAPACITY: usize = 4096;
 /// Global audit logger instance.
 static AUDIT_LOGGER: OnceLock<AuditHandle> = OnceLock::new();
 
-/// Audit logger with hash chain integrity.
-///
-/// Owned by the writer thread; callers reach it through [`log_event`].
-pub struct AuditLogger {
-    sink: Box<dyn sink::AuditSink>,
-    sequence: u64,
-    last_hash: [u8; 48],
-}
-
-impl AuditLogger {
-    /// Creates a new audit logger with the given sink.
-    fn new(sink: Box<dyn sink::AuditSink>) -> Self {
-        Self {
-            sink,
-            sequence: 0,
-            last_hash: [0u8; 48],
-        }
-    }
-
-    /// Chains and writes one event.
-    ///
-    /// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records), AU-9
-    fn log_at(&mut self, event: AuditEvent, timestamp: chrono::DateTime<chrono::Utc>) {
-        let record = AuditRecord::new(self.sequence, event, timestamp, self.last_hash);
-        self.sequence = self.sequence.wrapping_add(1);
-        self.last_hash = record.hash_chain;
-        self.sink.write(&record);
-    }
-}
-
-/// Work item for the writer thread.
-enum Job {
-    Record(Box<AuditEvent>, chrono::DateTime<chrono::Utc>),
-    Flush(SyncSender<()>),
-}
-
-/// Caller-side handle: a bounded queue to the writer thread.
-///
-/// The hand-off never blocks the caller (async signalling tasks emit audit
-/// records): a full queue or a dead writer drops the record and counts it,
-/// and `log_event` (caller side) reports the loss on the error log, at most
-/// once per [`DROP_REPORT_INTERVAL`].
+/// Loss and liveness counters shared by callers and the writer thread.
+/// Atomics only: no lock is taken on either side.
 ///
 /// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
-struct AuditHandle {
-    tx: SyncSender<Job>,
+struct AuditCounters {
+    /// Queue drops plus sink write failures.
     dropped: AtomicU64,
+    /// Records dropped on the caller side (queue full or writer gone).
+    queue_drops: AtomicU64,
+    /// Queue drops not yet recorded in the chain by a marker.
+    queue_drops_unreported: AtomicU64,
+    /// Records the sink failed to persist.
+    write_failures: AtomicU64,
+    /// The last sink write failed; cleared by the next successful write.
+    sink_failing: AtomicBool,
     /// Cleared when the writer thread exits (including by panic).
     writer_alive: AtomicBool,
-    /// Milliseconds since `epoch` of the last drop report, plus one (0 =
-    /// never reported).
+    /// Milliseconds since `epoch` of the last queue-drop report, plus one
+    /// (0 = never reported).
     last_drop_report_ms: AtomicU64,
-    /// Milliseconds since `epoch` of the most recent drop, plus one (0 =
-    /// never dropped). Unlike `last_drop_report_ms` this is not rate-limited,
-    /// so health checks can tell whether drops are recent.
+    /// Same, for sink write-failure reports.
+    last_failure_report_ms: AtomicU64,
+    /// Milliseconds since `epoch` of the most recent loss of any kind, plus
+    /// one (0 = never). Not rate-limited, so health checks can tell whether
+    /// loss is recent.
     last_drop_ms: AtomicU64,
+    /// Same, for sink write failures only.
+    last_write_failure_ms: AtomicU64,
     epoch: Instant,
 }
 
-impl AuditHandle {
+impl AuditCounters {
+    fn new() -> Self {
+        Self {
+            dropped: AtomicU64::new(0),
+            queue_drops: AtomicU64::new(0),
+            queue_drops_unreported: AtomicU64::new(0),
+            write_failures: AtomicU64::new(0),
+            sink_failing: AtomicBool::new(false),
+            writer_alive: AtomicBool::new(true),
+            last_drop_report_ms: AtomicU64::new(0),
+            last_failure_report_ms: AtomicU64::new(0),
+            last_drop_ms: AtomicU64::new(0),
+            last_write_failure_ms: AtomicU64::new(0),
+            epoch: Instant::now(),
+        }
+    }
+
     /// Milliseconds since `epoch`, plus one (0 is reserved for "never").
     fn now_ms(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_millis())
@@ -128,31 +122,29 @@ impl AuditHandle {
             .saturating_add(1)
     }
 
-    /// Counts one dropped record and stamps the drop time.
+    /// True at most once per [`DROP_REPORT_INTERVAL`] per `stamp`.
+    /// Lock-free; the caller never waits.
+    fn should_report(&self, stamp: &AtomicU64) -> bool {
+        let now_ms = self.now_ms();
+        let last = stamp.load(Ordering::Relaxed);
+        let interval_ms = u64::try_from(DROP_REPORT_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+        if last != 0 && now_ms.saturating_sub(last) < interval_ms {
+            return false;
+        }
+        stamp
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Counts one record dropped on the caller side and stamps the drop time.
     ///
     /// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
     fn record_drop(&self, writer_dead: bool) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.queue_drops.fetch_add(1, Ordering::Relaxed);
+        self.queue_drops_unreported.fetch_add(1, Ordering::Relaxed);
         self.last_drop_ms.store(self.now_ms(), Ordering::Relaxed);
-        self.report_drop(writer_dead);
-    }
-
-    /// Logs dropped records at error level, at most once per
-    /// [`DROP_REPORT_INTERVAL`]. Lock-free; the caller never waits.
-    ///
-    /// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
-    fn report_drop(&self, writer_dead: bool) {
-        let now_ms = self.now_ms();
-        let last = self.last_drop_report_ms.load(Ordering::Relaxed);
-        let interval_ms = u64::try_from(DROP_REPORT_INTERVAL.as_millis()).unwrap_or(u64::MAX);
-        if last != 0 && now_ms.saturating_sub(last) < interval_ms {
-            return;
-        }
-        if self
-            .last_drop_report_ms
-            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
+        if !self.should_report(&self.last_drop_report_ms) {
             return;
         }
         let dropped_total = self.dropped.load(Ordering::Relaxed);
@@ -168,36 +160,212 @@ impl AuditHandle {
             );
         }
     }
+
+    /// Marks the sink failing and stamps the failure time; when
+    /// `count_loss`, also counts one lost record (markers are not counted,
+    /// so a long outage does not inflate the loss).
+    ///
+    /// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+    fn record_write_failure(&self, error: &std::io::Error, count_loss: bool) {
+        let now = self.now_ms();
+        self.sink_failing.store(true, Ordering::Relaxed);
+        self.last_write_failure_ms.store(now, Ordering::Relaxed);
+        if count_loss {
+            self.write_failures.fetch_add(1, Ordering::Relaxed);
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.last_drop_ms.store(now, Ordering::Relaxed);
+        }
+        if self.should_report(&self.last_failure_report_ms) {
+            tracing::error!(
+                write_failures = self.write_failures.load(Ordering::Relaxed),
+                error = %error,
+                "audit sink write failed; audit records are being dropped"
+            );
+        }
+    }
+}
+
+/// Audit logger with hash chain integrity.
+///
+/// Owned by the writer thread; callers reach it through [`log_event`].
+pub struct AuditLogger {
+    sink: Box<dyn sink::AuditSink>,
+    sequence: u64,
+    last_hash: [u8; 48],
+    counters: Arc<AuditCounters>,
+    /// Sink write failures not yet recorded in the chain by a marker.
+    pending_sink_drops: u64,
+    /// `Some(count)` until the torn-tail marker for the resumed file is
+    /// chained.
+    pending_torn: Option<u64>,
+}
+
+impl AuditLogger {
+    /// Creates a logger continuing the sink's persisted chain, if any.
+    ///
+    /// ## NIST 800-53 Rev5: AU-9 (Protection of Audit Information)
+    fn new(sink: Box<dyn sink::AuditSink>, counters: Arc<AuditCounters>) -> Self {
+        let resume = sink
+            .resume_point()
+            .unwrap_or_else(sink::ResumePoint::genesis);
+        Self {
+            sink,
+            sequence: resume.next_sequence,
+            last_hash: resume.last_hash,
+            counters,
+            pending_sink_drops: 0,
+            pending_torn: (!resume.clean).then_some(resume.skipped_lines.max(1)),
+        }
+    }
+
+    /// Chains and writes one event, timestamped now. The chain advances only
+    /// when the sink persisted the record, so a failed write leaves no gap.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3, AU-8 (timestamp at sequence assignment), AU-9
+    fn try_write(&mut self, event: AuditEvent) -> std::io::Result<()> {
+        let record = AuditRecord::new(self.sequence, event, chrono::Utc::now(), self.last_hash);
+        self.sink.write(&record)?;
+        self.sequence = self.sequence.wrapping_add(1);
+        self.last_hash = record.hash_chain;
+        self.counters.sink_failing.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Chains pending loss markers, then the event; a failed write is
+    /// counted as a dropped record.
+    ///
+    /// While the sink is failing, markers are not retried before each
+    /// record (that would multiply failing writes on a full or stale
+    /// filesystem); they are chained right after the first record that
+    /// persists again.
+    ///
+    /// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures), SC-5
+    fn log(&mut self, event: AuditEvent) {
+        let failing = self.counters.sink_failing.load(Ordering::Relaxed);
+        if !failing {
+            self.emit_pending();
+        }
+        match self.try_write(event) {
+            Ok(()) if failing => self.emit_pending(),
+            Ok(()) => {}
+            Err(e) => {
+                self.counters.record_write_failure(&e, true);
+                self.pending_sink_drops = self.pending_sink_drops.saturating_add(1);
+            }
+        }
+    }
+
+    /// Chains one `AuditRecordsDropped` marker per outstanding loss reason.
+    /// A marker that fails to write stays pending (it is not itself counted
+    /// as a lost record), so markers never stack up during an outage.
+    ///
+    /// ## NIST 800-53 Rev5: AU-5, AU-9 (loss is visible inside the chain)
+    fn emit_pending(&mut self) {
+        if let Some(count) = self.pending_torn {
+            let marker = AuditRecordsDropped {
+                count,
+                total: count,
+                reason: AuditDropReason::TornTail,
+            };
+            if self.write_marker(marker) {
+                self.pending_torn = None;
+            }
+        }
+        let queued = self
+            .counters
+            .queue_drops_unreported
+            .swap(0, Ordering::Relaxed);
+        if queued > 0 {
+            let marker = AuditRecordsDropped {
+                count: queued,
+                total: self.counters.queue_drops.load(Ordering::Relaxed),
+                reason: AuditDropReason::QueueFull,
+            };
+            if !self.write_marker(marker) {
+                self.counters
+                    .queue_drops_unreported
+                    .fetch_add(queued, Ordering::Relaxed);
+            }
+        }
+        if self.pending_sink_drops > 0 {
+            let marker = AuditRecordsDropped {
+                count: self.pending_sink_drops,
+                total: self.counters.write_failures.load(Ordering::Relaxed),
+                reason: AuditDropReason::SinkWriteFailed,
+            };
+            if self.write_marker(marker) {
+                self.pending_sink_drops = 0;
+            }
+        }
+    }
+
+    fn write_marker(&mut self, marker: AuditRecordsDropped) -> bool {
+        match self.try_write(AuditEvent::AuditRecordsDropped(marker)) {
+            Ok(()) => true,
+            Err(e) => {
+                self.counters.record_write_failure(&e, false);
+                false
+            }
+        }
+    }
+
+    fn flush_sink(&self) {
+        if let Err(e) = self.sink.flush() {
+            self.counters.record_write_failure(&e, false);
+        }
+    }
+}
+
+/// Work item for the writer thread. The timestamp is taken by the writer
+/// when it assigns the sequence (AU-8), not on the caller.
+enum Job {
+    Record(Box<AuditEvent>),
+    Flush(SyncSender<()>),
+}
+
+/// Caller-side handle: a bounded queue to the writer thread.
+///
+/// The hand-off never blocks the caller (async signalling tasks emit audit
+/// records): a full queue or a dead writer drops the record and counts it,
+/// and `log_event` (caller side) reports the loss on the error log, at most
+/// once per [`DROP_REPORT_INTERVAL`].
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+struct AuditHandle {
+    tx: SyncSender<Job>,
+    counters: Arc<AuditCounters>,
 }
 
 /// Clears `writer_alive` when the writer thread ends, even by panic.
-struct WriterAliveGuard;
+struct WriterAliveGuard(Arc<AuditCounters>);
 
 impl Drop for WriterAliveGuard {
     fn drop(&mut self) {
-        if let Some(handle) = AUDIT_LOGGER.get() {
-            handle.writer_alive.store(false, Ordering::Relaxed);
-        }
+        self.0.writer_alive.store(false, Ordering::Relaxed);
         tracing::error!("audit writer thread exited; audit records will be dropped");
     }
 }
 
 /// Writer thread body: chains and writes records in queue order.
 fn run_writer(mut logger: AuditLogger, rx: Receiver<Job>) {
-    let _alive = WriterAliveGuard;
+    let _alive = WriterAliveGuard(Arc::clone(&logger.counters));
     // Declared after the guard so the queue closes (later sends count as
     // drops) before `writer_alive` is cleared.
     let rx = rx;
+    // A torn tail found at open is chained before anything else.
+    logger.emit_pending();
     while let Ok(job) = rx.recv() {
         match job {
-            Job::Record(event, timestamp) => logger.log_at(*event, timestamp),
+            Job::Record(event) => logger.log(*event),
             Job::Flush(done) => {
-                logger.sink.flush();
+                logger.emit_pending();
+                logger.flush_sink();
                 let _ = done.try_send(());
             }
         }
     }
-    logger.sink.flush();
+    logger.emit_pending();
+    logger.flush_sink();
 }
 
 /// Initializes the global audit logger.
@@ -220,6 +388,7 @@ pub fn init() -> Result<(), AuditError> {
 ///
 /// Records are written by a dedicated thread fed through a queue of
 /// [`AUDIT_QUEUE_CAPACITY`] records, so sink I/O never runs on the caller.
+/// The chain continues from [`sink::AuditSink::resume_point`].
 ///
 /// ## Errors
 ///
@@ -233,17 +402,14 @@ pub fn init_with_sink(sink: Box<dyn sink::AuditSink>) -> Result<(), AuditError> 
         return Err(AuditError::AlreadyInitialized);
     }
     let (tx, rx) = std::sync::mpsc::sync_channel(AUDIT_QUEUE_CAPACITY);
+    let counters = Arc::new(AuditCounters::new());
     AUDIT_LOGGER
         .set(AuditHandle {
             tx,
-            dropped: AtomicU64::new(0),
-            writer_alive: AtomicBool::new(true),
-            last_drop_report_ms: AtomicU64::new(0),
-            last_drop_ms: AtomicU64::new(0),
-            epoch: Instant::now(),
+            counters: Arc::clone(&counters),
         })
         .map_err(|_| AuditError::AlreadyInitialized)?;
-    let logger = AuditLogger::new(sink);
+    let logger = AuditLogger::new(sink, counters);
     std::thread::Builder::new()
         .name("uc-audit-writer".to_string())
         .spawn(move || run_writer(logger, rx))
@@ -264,11 +430,55 @@ pub fn log_event(event: AuditEvent) {
     let Some(handle) = AUDIT_LOGGER.get() else {
         return;
     };
-    let job = Job::Record(Box::new(event), chrono::Utc::now());
-    match handle.tx.try_send(job) {
+    match handle.tx.try_send(Job::Record(Box::new(event))) {
         Ok(()) => {}
-        Err(TrySendError::Full(_)) => handle.record_drop(false),
-        Err(TrySendError::Disconnected(_)) => handle.record_drop(true),
+        Err(TrySendError::Full(_)) => handle.counters.record_drop(false),
+        Err(TrySendError::Disconnected(_)) => handle.counters.record_drop(true),
+    }
+}
+
+/// Point-in-time view of the audit pipeline, for health checks and metrics.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuditStats {
+    /// Writer thread running (`true` when no logger is initialized).
+    pub writer_alive: bool,
+    /// Records lost: queue drops plus sink write failures.
+    pub dropped: u64,
+    /// Records dropped on the caller side (queue full or writer gone).
+    pub queue_drops: u64,
+    /// Records the sink failed to persist.
+    pub write_failures: u64,
+    /// The most recent sink write failed (no success since).
+    pub sink_failing: bool,
+    /// Time since the most recent loss of any kind.
+    pub last_drop: Option<Duration>,
+    /// Time since the most recent sink write failure.
+    pub last_write_failure: Option<Duration>,
+}
+
+/// Snapshot of the audit pipeline counters.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+#[must_use]
+pub fn stats() -> AuditStats {
+    let Some(h) = AUDIT_LOGGER.get() else {
+        return AuditStats {
+            writer_alive: true,
+            ..AuditStats::default()
+        };
+    };
+    let c = &h.counters;
+    let now = c.now_ms();
+    AuditStats {
+        writer_alive: c.writer_alive.load(Ordering::Relaxed),
+        dropped: c.dropped.load(Ordering::Relaxed),
+        queue_drops: c.queue_drops.load(Ordering::Relaxed),
+        write_failures: c.write_failures.load(Ordering::Relaxed),
+        sink_failing: c.sink_failing.load(Ordering::Relaxed),
+        last_drop: elapsed_since(c.last_drop_ms.load(Ordering::Relaxed), now),
+        last_write_failure: elapsed_since(c.last_write_failure_ms.load(Ordering::Relaxed), now),
     }
 }
 
@@ -281,31 +491,54 @@ pub fn log_event(event: AuditEvent) {
 pub fn writer_alive() -> bool {
     AUDIT_LOGGER
         .get()
-        .is_none_or(|h| h.writer_alive.load(Ordering::Relaxed))
+        .is_none_or(|h| h.counters.writer_alive.load(Ordering::Relaxed))
 }
 
-/// Audit records dropped because the writer queue was full or the writer
-/// thread had exited.
+/// Whether the most recent sink write failed (e.g. ENOSPC). `false` when no
+/// logger is initialized. Surface it as unhealthy: records are being lost.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+#[must_use]
+pub fn sink_failing() -> bool {
+    AUDIT_LOGGER
+        .get()
+        .is_some_and(|h| h.counters.sink_failing.load(Ordering::Relaxed))
+}
+
+/// Audit records lost: dropped because the writer queue was full or the
+/// writer thread had exited, plus records the sink failed to persist.
 ///
 /// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
 #[must_use]
 pub fn dropped_records() -> u64 {
     AUDIT_LOGGER
         .get()
-        .map_or(0, |h| h.dropped.load(Ordering::Relaxed))
+        .map_or(0, |h| h.counters.dropped.load(Ordering::Relaxed))
 }
 
-/// Time since the most recent dropped audit record.
+/// Audit records the sink failed to persist (included in
+/// [`dropped_records`]).
 ///
-/// `None` when no logger is initialized or nothing has been dropped. Lets health checks
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+#[must_use]
+pub fn write_failures() -> u64 {
+    AUDIT_LOGGER
+        .get()
+        .map_or(0, |h| h.counters.write_failures.load(Ordering::Relaxed))
+}
+
+/// Time since the most recent lost audit record (queue drop or sink write
+/// failure).
+///
+/// `None` when no logger is initialized or nothing has been lost. Lets health checks
 /// report recent loss as degraded and recover once drops stop, while
 /// [`dropped_records`] stays cumulative.
 ///
 /// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
 #[must_use]
 pub fn last_drop_elapsed() -> Option<Duration> {
-    let handle = AUDIT_LOGGER.get()?;
-    elapsed_since(handle.last_drop_ms.load(Ordering::Relaxed), handle.now_ms())
+    let c = &AUDIT_LOGGER.get()?.counters;
+    elapsed_since(c.last_drop_ms.load(Ordering::Relaxed), c.now_ms())
 }
 
 /// Elapsed time between two `+1`-encoded millisecond stamps; `None` when
@@ -414,8 +647,8 @@ mod tests {
 
     struct Shared(Arc<sink::MemorySink>);
     impl sink::AuditSink for Shared {
-        fn write(&self, record: &AuditRecord) {
-            self.0.write(record);
+        fn write(&self, record: &AuditRecord) -> std::io::Result<()> {
+            self.0.write(record)
         }
     }
 
@@ -454,6 +687,174 @@ mod tests {
         }
         assert_eq!(dropped_records(), 0);
         assert_eq!(last_drop_elapsed(), None);
+    }
+
+    /// Fails the first `fail` writes, then forwards to memory.
+    struct FailN {
+        mem: Arc<sink::MemorySink>,
+        fail: std::sync::atomic::AtomicU32,
+        resume: Option<sink::ResumePoint>,
+    }
+    impl sink::AuditSink for FailN {
+        fn write(&self, record: &AuditRecord) -> std::io::Result<()> {
+            let left = self.fail.load(Ordering::Relaxed);
+            if left > 0 {
+                self.fail.store(left - 1, Ordering::Relaxed);
+                return Err(std::io::Error::other("ENOSPC"));
+            }
+            self.mem.write(record)
+        }
+        fn resume_point(&self) -> Option<sink::ResumePoint> {
+            self.resume
+        }
+    }
+
+    fn shutdown_ev(i: u32) -> AuditEvent {
+        AuditEvent::SystemShutdown(event::SystemShutdown {
+            reason: format!("r{i}"),
+            graceful: true,
+        })
+    }
+
+    fn assert_chain(records: &[AuditRecord], first: u64, mut prev: [u8; 48]) {
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.sequence, first + i as u64);
+            assert!(r.verify(&prev), "chain broken at {i}");
+            prev = r.hash_chain;
+        }
+    }
+
+    #[test]
+    fn failing_sink_counts_and_does_not_advance_chain() {
+        let mem = Arc::new(sink::MemorySink::new());
+        let counters = Arc::new(AuditCounters::new());
+        let mut logger = AuditLogger::new(
+            Box::new(FailN {
+                mem: Arc::clone(&mem),
+                fail: std::sync::atomic::AtomicU32::new(0),
+                resume: None,
+            }),
+            Arc::clone(&counters),
+        );
+        logger.log(shutdown_ev(0));
+        // Swap in a sink that fails the next 3 records; markers are not
+        // retried while failing, keeping the chain position.
+        logger.sink = Box::new(FailN {
+            mem: Arc::clone(&mem),
+            fail: std::sync::atomic::AtomicU32::new(3),
+            resume: None,
+        });
+        for i in 1..=3 {
+            logger.log(shutdown_ev(i));
+            assert!(counters.sink_failing.load(Ordering::Relaxed));
+        }
+        assert_eq!(
+            logger.sequence, 1,
+            "failed writes must not advance the chain"
+        );
+        assert_eq!(counters.write_failures.load(Ordering::Relaxed), 3);
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 3);
+        assert_ne!(counters.last_write_failure_ms.load(Ordering::Relaxed), 0);
+        logger.log(shutdown_ev(4));
+        assert!(!counters.sink_failing.load(Ordering::Relaxed));
+        let records = mem.records();
+        assert_eq!(records.len(), 3);
+        // The marker follows the first record that persisted again.
+        assert!(matches!(&records[1].event, AuditEvent::SystemShutdown(_)));
+        assert!(matches!(
+            &records[2].event,
+            AuditEvent::AuditRecordsDropped(m)
+                if m.reason == AuditDropReason::SinkWriteFailed && m.count == 3
+        ));
+        assert_chain(&records, 0, [0u8; 48]);
+        // Markers are not counted as further loss.
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn failed_marker_write_stays_pending_without_counting() {
+        let mem = Arc::new(sink::MemorySink::new());
+        let counters = Arc::new(AuditCounters::new());
+        let mut logger = AuditLogger::new(
+            Box::new(FailN {
+                mem: Arc::clone(&mem),
+                fail: std::sync::atomic::AtomicU32::new(3),
+                resume: None,
+            }),
+            Arc::clone(&counters),
+        );
+        logger.log(shutdown_ev(0)); // record fails (1)
+        logger.log(shutdown_ev(1)); // failing: no marker attempt; record fails (2)
+        assert_eq!(counters.write_failures.load(Ordering::Relaxed), 2);
+        // A flush retries the marker once; it fails (3) and stays pending
+        // without counting a lost record.
+        logger.emit_pending();
+        assert_eq!(counters.write_failures.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 2);
+        logger.log(shutdown_ev(2)); // persists, then the marker
+        let records = mem.records();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            &records[1].event,
+            AuditEvent::AuditRecordsDropped(m) if m.count == 2 && m.total == 2
+        ));
+        assert_chain(&records, 0, [0u8; 48]);
+    }
+
+    #[test]
+    fn logger_resumes_and_marks_torn_tail_first() {
+        let mem = Arc::new(sink::MemorySink::new());
+        let resume = sink::ResumePoint {
+            next_sequence: 7,
+            last_hash: [9u8; 48],
+            clean: false,
+            torn_bytes: 12,
+            skipped_lines: 3,
+        };
+        let mut logger = AuditLogger::new(
+            Box::new(FailN {
+                mem: Arc::clone(&mem),
+                fail: std::sync::atomic::AtomicU32::new(0),
+                resume: Some(resume),
+            }),
+            Arc::new(AuditCounters::new()),
+        );
+        logger.emit_pending();
+        logger.log(shutdown_ev(0));
+        let records = mem.records();
+        assert!(matches!(
+            &records[0].event,
+            AuditEvent::AuditRecordsDropped(m)
+                if m.reason == AuditDropReason::TornTail && m.count == 3
+        ));
+        assert_chain(&records, 7, [9u8; 48]);
+    }
+
+    #[test]
+    fn queue_drops_become_one_marker() {
+        let mem = Arc::new(sink::MemorySink::new());
+        let counters = Arc::new(AuditCounters::new());
+        let mut logger = AuditLogger::new(
+            Box::new(FailN {
+                mem: Arc::clone(&mem),
+                fail: std::sync::atomic::AtomicU32::new(0),
+                resume: None,
+            }),
+            Arc::clone(&counters),
+        );
+        for _ in 0..5 {
+            counters.record_drop(false);
+        }
+        logger.log(shutdown_ev(0));
+        logger.log(shutdown_ev(1));
+        let records = mem.records();
+        assert_eq!(records.len(), 3);
+        assert!(matches!(
+            &records[0].event,
+            AuditEvent::AuditRecordsDropped(m)
+                if m.reason == AuditDropReason::QueueFull && m.count == 5 && m.total == 5
+        ));
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 5);
     }
 
     #[test]

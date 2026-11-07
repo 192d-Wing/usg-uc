@@ -31,12 +31,13 @@ pub async fn liveness() -> impl IntoResponse {
 /// against an arbitrary store. If Postgres is down, sbc-api is useless
 /// and should be pulled from the LB rotation.
 ///
-/// Also not ready when the audit writer has died: CDR exports and
-/// permission denials would go unrecorded (NIST 800-53 Rev5: AU-5).
+/// Also not ready when the audit writer has died or the audit sink is
+/// failing writes (e.g. disk full): CDR exports and permission denials
+/// would go unrecorded (NIST 800-53 Rev5: AU-5).
 pub async fn readiness(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let audit_ok = uc_audit::writer_alive();
+    let audit_ok = audit_ready(&uc_audit::stats());
     if !audit_ok {
-        warn!("readiness: audit writer not running");
+        warn!("readiness: audit pipeline not persisting records");
         return readiness_response::<()>(false, &Ok(()));
     }
     let db = state.phones.is_empty().await.map(|_| ());
@@ -44,6 +45,13 @@ pub async fn readiness(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         warn!(error = %e, "readiness: postgres check failed");
     }
     readiness_response(audit_ok, &db)
+}
+
+/// Audit half of readiness: writer running and the sink persisting.
+///
+/// NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+const fn audit_ready(stats: &uc_audit::AuditStats) -> bool {
+    stats.writer_alive && !stats.sink_failing
 }
 
 /// Status + body for `/readyz`. Unauthenticated endpoint: the backend error
@@ -245,5 +253,27 @@ mod readiness_tests {
         let (code, Json(body)) = readiness_response::<&str>(true, &Ok(()));
         assert_eq!(code, axum::http::StatusCode::OK);
         assert_eq!(body, serde_json::json!({"status": "ready"}));
+    }
+
+    #[test]
+    fn not_ready_when_audit_sink_failing() {
+        let ok = uc_audit::AuditStats {
+            writer_alive: true,
+            ..uc_audit::AuditStats::default()
+        };
+        assert!(audit_ready(&ok));
+        let failing = uc_audit::AuditStats {
+            sink_failing: true,
+            write_failures: 1,
+            ..ok
+        };
+        assert!(!audit_ready(&failing));
+        let (code, _) = readiness_response::<&str>(audit_ready(&failing), &Ok(()));
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let dead = uc_audit::AuditStats {
+            writer_alive: false,
+            ..ok
+        };
+        assert!(!audit_ready(&dead));
     }
 }

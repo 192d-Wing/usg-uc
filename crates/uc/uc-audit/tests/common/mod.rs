@@ -26,8 +26,9 @@ impl MemorySink {
 }
 
 impl AuditSink for MemorySink {
-    fn write(&self, record: &AuditRecord) {
+    fn write(&self, record: &AuditRecord) -> std::io::Result<()> {
         self.0.lock().unwrap().push(record.clone());
+        Ok(())
     }
 }
 
@@ -35,8 +36,8 @@ impl AuditSink for MemorySink {
 pub struct Shared(pub Arc<MemorySink>);
 
 impl AuditSink for Shared {
-    fn write(&self, record: &AuditRecord) {
-        self.0.write(record);
+    fn write(&self, record: &AuditRecord) -> std::io::Result<()> {
+        self.0.write(record)
     }
 }
 
@@ -50,7 +51,7 @@ pub struct Gated {
 }
 
 impl AuditSink for Gated {
-    fn write(&self, record: &AuditRecord) {
+    fn write(&self, record: &AuditRecord) -> std::io::Result<()> {
         let (lock, cv) = &*self.gate;
         let mut g = lock.lock().unwrap();
         g.0 = true;
@@ -59,7 +60,7 @@ impl AuditSink for Gated {
             g = cv.wait(g).unwrap();
         }
         drop(g);
-        self.mem.write(record);
+        self.mem.write(record)
     }
 }
 

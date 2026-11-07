@@ -112,8 +112,11 @@ async fn healthz() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-/// Readiness: the database is reachable and the JWKS cache is primed.
+/// Readiness: the database is reachable, the JWKS cache is primed and the
+/// audit pipeline is persisting records (writer alive, sink not failing).
 /// Unready (503) keeps the pod out of rotation until it can serve.
+///
+/// NIST 800-53 Rev5: AU-5 (config changes must not go unrecorded)
 async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     // Readiness gates only on the critical deps: the primary DB and a primed
     // JWKS. The read replica is best-effort (reported, not gating) — a
@@ -122,7 +125,8 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     let db_ok = state.store.ping().await.is_ok();
     let jwks_ok = state.sync_validator.jwks().ready().await;
     let replica_ok = state.store.replica_ready().await;
-    if db_ok && jwks_ok {
+    let audit_ok = uc_audit::writer_alive() && !uc_audit::sink_failing();
+    if db_ok && jwks_ok && audit_ok {
         Json(json!({ "status": "ready", "replica": replica_ok,
             "uptime_secs": state.start_time.elapsed().as_secs() }))
         .into_response()
@@ -130,7 +134,7 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Response {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "unready", "db": db_ok, "jwks": jwks_ok,
-                "replica": replica_ok })),
+                "audit": audit_ok, "replica": replica_ok })),
         )
             .into_response()
     }
