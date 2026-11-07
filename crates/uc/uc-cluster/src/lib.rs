@@ -22,7 +22,9 @@
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-24**: Fail in Known State
+//! - **SC-24**: Fail in Known State (library-only; no fencing, POA&M-232)
+//! - **IA-3 / SC-23**: Peer authentication and anti-replay via
+//!   [`auth::PeerAuthenticator`] (library-only; no transport, POA&M-231)
 //! - **CP-7**: Alternate Processing Site
 //! - **CP-10**: System Recovery and Reconstitution
 //!
@@ -52,6 +54,7 @@
 //! manager.start().await?;
 //! ```
 
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod failover;
@@ -59,6 +62,7 @@ pub mod health;
 pub mod membership;
 pub mod node;
 
+pub use auth::{AuthError, AuthenticatedEnvelope, ClusterAuthKey, PeerAuthenticator};
 pub use config::{
     AdmissionSplit, ClusterAdmissionConfig, ClusterConfig, FailoverConfig, FailoverStrategy,
     HeartbeatConfig, MAX_EXPECTED_NODES, ReplicationConfig,

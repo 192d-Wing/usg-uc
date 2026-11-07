@@ -3,12 +3,13 @@
 use crate::config::StateSyncConfig;
 use crate::error::{StateSyncError, StateSyncResult};
 use crate::protocol::{ReplicationMessage, ReplicationPayload};
+use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-use uc_cluster::NodeId;
+use uc_cluster::{AuthError, AuthenticatedEnvelope, NodeId, PeerAuthenticator};
 
 /// Trait for types that can be replicated.
 pub trait Replicable: Send + Sync + 'static {
@@ -265,6 +266,63 @@ impl StateReplicator {
         )
     }
 
+    /// Seals an outbound replication message for a peer.
+    ///
+    /// NIST 800-53 Rev5: IA-3, SC-8(1), SC-13 (HMAC-SHA-384).
+    /// Library-only (no transport; POA&M-231).
+    ///
+    /// # Errors
+    /// Returns an error if serialization fails or the message is too large.
+    pub fn seal_message(
+        &self,
+        auth: &PeerAuthenticator,
+        message: &ReplicationMessage,
+    ) -> StateSyncResult<AuthenticatedEnvelope> {
+        let bytes =
+            serde_json::to_vec(message).map_err(|e| StateSyncError::SerializationError {
+                reason: e.to_string(),
+            })?;
+        auth.seal(Bytes::from(bytes))
+            .map_err(|e| StateSyncError::SerializationError {
+                reason: e.to_string(),
+            })
+    }
+
+    /// Verifies and decodes an inbound replication message.
+    ///
+    /// This is the only supported inbound path: the envelope must pass
+    /// HMAC-SHA-384, timestamp, sequence and generation checks, and any
+    /// node identity inside the message must equal the authenticated sender.
+    /// Callers must take the peer identity for [`Self::handle_ack`] from the
+    /// returned message, never from unauthenticated input.
+    ///
+    /// NIST 800-53 Rev5: IA-3 (peer authentication), SC-23 (anti-replay),
+    /// SI-10 (input validation). Library-only (no transport; POA&M-231).
+    ///
+    /// # Errors
+    /// Returns [`StateSyncError::AuthenticationFailed`] or
+    /// [`StateSyncError::DeserializationError`]; nothing is applied.
+    pub fn open_message(
+        &self,
+        auth: &PeerAuthenticator,
+        envelope: &AuthenticatedEnvelope,
+    ) -> StateSyncResult<ReplicationMessage> {
+        auth.verify(envelope)?;
+        let message: ReplicationMessage =
+            serde_json::from_slice(&envelope.payload).map_err(|e| {
+                StateSyncError::DeserializationError {
+                    reason: e.to_string(),
+                }
+            })?;
+        if message
+            .claimed_sender()
+            .is_some_and(|claimed| claimed != envelope.sender.as_str())
+        {
+            return Err(AuthError::SenderMismatch.into());
+        }
+        Ok(message)
+    }
+
     /// Updates the sync lag.
     pub fn update_lag(&self, lag_ms: u64) {
         self.sync_lag_ms.store(lag_ms, Ordering::SeqCst);
@@ -288,7 +346,6 @@ impl std::fmt::Debug for StateReplicator {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
 
     fn create_test_replicator() -> StateReplicator {
         StateReplicator::new(NodeId::new("local"), StateSyncConfig::default())
@@ -399,5 +456,126 @@ mod tests {
         let removed = replicator.cleanup_completed().await;
         assert_eq!(removed, 1);
         assert_eq!(replicator.pending_count().await, 0);
+    }
+
+    fn auth(local: &str, peer: &str) -> PeerAuthenticator {
+        let key =
+            uc_cluster::ClusterAuthKey::new(vec![0x33; uc_cluster::auth::MIN_KEY_LEN]).unwrap();
+        PeerAuthenticator::new(key, 1, NodeId::new(local), 1, [NodeId::new(peer)]).unwrap()
+    }
+
+    #[test]
+    fn authenticated_message_round_trip() {
+        let sender = StateReplicator::new(NodeId::new("peer"), StateSyncConfig::default());
+        let receiver = create_test_replicator();
+        let (a_peer, a_local) = (auth("peer", "local"), auth("local", "peer"));
+        let msg = ReplicationMessage::ack_success(3, &NodeId::new("peer"));
+        let env = sender.seal_message(&a_peer, &msg).unwrap();
+        let opened = receiver.open_message(&a_local, &env).unwrap();
+        assert_eq!(opened.claimed_sender(), Some("peer"));
+        // Replay is rejected.
+        assert!(matches!(
+            receiver.open_message(&a_local, &env),
+            Err(StateSyncError::AuthenticationFailed(AuthError::Replayed))
+        ));
+    }
+
+    #[test]
+    fn tampered_message_rejected() {
+        let sender = StateReplicator::new(NodeId::new("peer"), StateSyncConfig::default());
+        let receiver = create_test_replicator();
+        let (a_peer, a_local) = (auth("peer", "local"), auth("local", "peer"));
+        let msg = ReplicationMessage::ack_success(3, &NodeId::new("peer"));
+        let mut env = sender.seal_message(&a_peer, &msg).unwrap();
+        env.payload = Bytes::from(
+            serde_json::to_vec(&ReplicationMessage::ack_success(4, &NodeId::new("peer"))).unwrap(),
+        );
+        assert!(matches!(
+            receiver.open_message(&a_local, &env),
+            Err(StateSyncError::AuthenticationFailed(AuthError::BadTag))
+        ));
+    }
+
+    #[test]
+    fn spoofed_inner_identity_rejected() {
+        let sender = StateReplicator::new(NodeId::new("peer"), StateSyncConfig::default());
+        let receiver = create_test_replicator();
+        let (a_peer, a_local) = (auth("peer", "local"), auth("local", "peer"));
+        let msg = ReplicationMessage::ack_success(3, &NodeId::new("someone-else"));
+        let env = sender.seal_message(&a_peer, &msg).unwrap();
+        assert!(matches!(
+            receiver.open_message(&a_local, &env),
+            Err(StateSyncError::AuthenticationFailed(
+                AuthError::SenderMismatch
+            ))
+        ));
+    }
+
+    #[test]
+    fn unknown_peer_rejected() {
+        let sender = StateReplicator::new(NodeId::new("intruder"), StateSyncConfig::default());
+        let receiver = create_test_replicator();
+        let msg = ReplicationMessage::ack_success(3, &NodeId::new("intruder"));
+        let env = sender
+            .seal_message(&auth("intruder", "local"), &msg)
+            .unwrap();
+        assert!(matches!(
+            receiver.open_message(&auth("local", "peer"), &env),
+            Err(StateSyncError::AuthenticationFailed(
+                AuthError::UnknownSender
+            ))
+        ));
+    }
+
+    #[test]
+    fn wrong_key_message_rejected() {
+        let sender = StateReplicator::new(NodeId::new("peer"), StateSyncConfig::default());
+        let receiver = create_test_replicator();
+        let other_key =
+            uc_cluster::ClusterAuthKey::new(vec![0x44; uc_cluster::auth::MIN_KEY_LEN]).unwrap();
+        let a_peer =
+            PeerAuthenticator::new(other_key, 1, NodeId::new("peer"), 1, [NodeId::new("local")])
+                .unwrap();
+        let msg = ReplicationMessage::ack_success(3, &NodeId::new("peer"));
+        let env = sender.seal_message(&a_peer, &msg).unwrap();
+        assert!(matches!(
+            receiver.open_message(&auth("local", "peer"), &env),
+            Err(StateSyncError::AuthenticationFailed(AuthError::BadTag))
+        ));
+    }
+
+    #[test]
+    fn generation_rollback_rejected() {
+        let sender = StateReplicator::new(NodeId::new("peer"), StateSyncConfig::default());
+        let receiver = create_test_replicator();
+        let a_local = auth("local", "peer");
+        let key =
+            || uc_cluster::ClusterAuthKey::new(vec![0x33; uc_cluster::auth::MIN_KEY_LEN]).unwrap();
+        let gen5 = PeerAuthenticator::new(key(), 1, NodeId::new("peer"), 5, [NodeId::new("local")])
+            .unwrap();
+        let gen4 = PeerAuthenticator::new(key(), 1, NodeId::new("peer"), 4, [NodeId::new("local")])
+            .unwrap();
+        let msg = ReplicationMessage::ack_success(3, &NodeId::new("peer"));
+        let env5 = sender.seal_message(&gen5, &msg).unwrap();
+        assert!(receiver.open_message(&a_local, &env5).is_ok());
+        let env4 = sender.seal_message(&gen4, &msg).unwrap();
+        assert!(matches!(
+            receiver.open_message(&a_local, &env4),
+            Err(StateSyncError::AuthenticationFailed(
+                AuthError::StaleGeneration
+            ))
+        ));
+    }
+
+    #[test]
+    fn authenticated_garbage_payload_rejected() {
+        let receiver = create_test_replicator();
+        let env = auth("peer", "local")
+            .seal(Bytes::from_static(b"{not json"))
+            .unwrap();
+        assert!(matches!(
+            receiver.open_message(&auth("local", "peer"), &env),
+            Err(StateSyncError::DeserializationError { .. })
+        ));
     }
 }

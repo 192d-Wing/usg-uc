@@ -3,7 +3,7 @@
 use crate::error::{StateSyncError, StateSyncResult};
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, info};
 
 /// State snapshot for bulk transfer.
@@ -175,12 +175,24 @@ impl SnapshotWriter {
     }
 }
 
+/// Maximum number of chunks accepted for one snapshot.
+///
+/// NIST 800-53 Rev5: SC-5 (bounded state), SI-10 (input validation)
+pub const MAX_SNAPSHOT_CHUNKS: u32 = 65_536;
+
+/// Maximum total assembled snapshot size in bytes (256 MiB).
+///
+/// NIST 800-53 Rev5: SC-5 (bounded state)
+pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+
 /// Snapshot reader for processing incoming snapshots.
 pub struct SnapshotReader {
-    /// Chunks received.
-    chunks: Vec<(u32, Bytes)>,
-    /// Total expected chunks.
+    /// Chunks received, keyed by index (unique, in order).
+    chunks: BTreeMap<u32, Bytes>,
+    /// Total expected chunks (fixed by the first accepted chunk).
     total_chunks: Option<u32>,
+    /// Bytes buffered so far.
+    buffered_bytes: usize,
     /// Version being received.
     version: u64,
 }
@@ -190,18 +202,51 @@ impl SnapshotReader {
     #[must_use]
     pub fn new(version: u64) -> Self {
         Self {
-            chunks: Vec::new(),
+            chunks: BTreeMap::new(),
             total_chunks: None,
+            buffered_bytes: 0,
             version,
         }
     }
 
-    /// Adds a chunk.
-    pub fn add_chunk(&mut self, index: u32, total: u32, data: Bytes) {
-        if self.total_chunks.is_none() {
-            self.total_chunks = Some(total);
+    /// Adds a chunk received from a peer.
+    ///
+    /// Peer input is untrusted: the chunk is rejected (and the reader left
+    /// unchanged) when `total` is zero, above [`MAX_SNAPSHOT_CHUNKS`], or
+    /// differs from the first chunk's `total`; when `index >= total`; when
+    /// `index` was already received; or when the buffered size would exceed
+    /// [`MAX_SNAPSHOT_BYTES`].
+    ///
+    /// NIST 800-53 Rev5: SI-10 (input validation), SC-5 (bounded state)
+    ///
+    /// # Errors
+    /// Returns [`StateSyncError::SnapshotApplicationFailed`] on any of the
+    /// conditions above.
+    pub fn add_chunk(&mut self, index: u32, total: u32, data: Bytes) -> StateSyncResult<()> {
+        let reject = |reason: &str| StateSyncError::SnapshotApplicationFailed {
+            reason: reason.to_string(),
+        };
+        if total == 0 || total > MAX_SNAPSHOT_CHUNKS {
+            return Err(reject("snapshot chunk total out of range"));
         }
-        self.chunks.push((index, data));
+        if self.total_chunks.is_some_and(|t| t != total) {
+            return Err(reject("snapshot chunk total changed mid-transfer"));
+        }
+        if index >= total {
+            return Err(reject("snapshot chunk index out of range"));
+        }
+        if self.chunks.contains_key(&index) {
+            return Err(reject("duplicate snapshot chunk"));
+        }
+        let buffered = self
+            .buffered_bytes
+            .checked_add(data.len())
+            .filter(|n| *n <= MAX_SNAPSHOT_BYTES)
+            .ok_or_else(|| reject("snapshot exceeds maximum size"))?;
+        self.total_chunks = Some(total);
+        self.buffered_bytes = buffered;
+        self.chunks.insert(index, data);
+        Ok(())
     }
 
     /// Checks if all chunks have been received.
@@ -234,12 +279,9 @@ impl SnapshotReader {
             });
         }
 
-        // Sort chunks by index and concatenate
-        let mut sorted: Vec<_> = self.chunks.iter().collect();
-        sorted.sort_by_key(|(idx, _)| *idx);
-
-        let mut data = BytesMut::new();
-        for (_, chunk) in sorted {
+        // BTreeMap iterates in index order; indices are unique and < total.
+        let mut data = BytesMut::with_capacity(self.buffered_bytes);
+        for chunk in self.chunks.values() {
             data.extend_from_slice(chunk);
         }
 
@@ -331,7 +373,7 @@ mod tests {
         let total = chunks.len() as u32;
 
         for (idx, chunk) in chunks.into_iter().enumerate() {
-            reader.add_chunk(idx as u32, total, chunk);
+            reader.add_chunk(idx as u32, total, chunk).unwrap();
         }
 
         assert!(reader.is_complete());
@@ -348,5 +390,69 @@ mod tests {
 
         let result = reader.assemble();
         assert!(result.is_err());
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn duplicate_chunk_rejected() {
+        let mut reader = SnapshotReader::new(1);
+        reader.add_chunk(0, 2, Bytes::from_static(b"a")).unwrap();
+        assert!(reader.add_chunk(0, 2, Bytes::from_static(b"a")).is_err());
+        assert!(!reader.is_complete());
+    }
+
+    #[test]
+    fn index_out_of_range_rejected() {
+        let mut reader = SnapshotReader::new(1);
+        assert!(reader.add_chunk(2, 2, Bytes::new()).is_err());
+        assert!(reader.add_chunk(u32::MAX, 2, Bytes::new()).is_err());
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn total_change_rejected() {
+        let mut reader = SnapshotReader::new(1);
+        reader.add_chunk(0, 3, Bytes::from_static(b"a")).unwrap();
+        assert!(reader.add_chunk(1, 2, Bytes::from_static(b"b")).is_err());
+        // A lying total cannot make the reader "complete" early.
+        assert!(!reader.is_complete());
+    }
+
+    #[test]
+    fn zero_and_oversize_total_rejected() {
+        let mut reader = SnapshotReader::new(1);
+        assert!(reader.add_chunk(0, 0, Bytes::new()).is_err());
+        assert!(
+            reader
+                .add_chunk(0, MAX_SNAPSHOT_CHUNKS + 1, Bytes::new())
+                .is_err()
+        );
+        assert!(reader.total_chunks.is_none());
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn byte_cap_enforced() {
+        let mut reader = SnapshotReader::new(1);
+        reader.buffered_bytes = MAX_SNAPSHOT_BYTES - 1;
+        assert!(reader.add_chunk(0, 2, Bytes::from_static(b"ab")).is_err());
+        reader.add_chunk(0, 2, Bytes::from_static(b"a")).unwrap();
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn out_of_order_assembles_correctly() {
+        let mut writer = SnapshotWriter::new(1, "node1", 16);
+        for i in 0..5 {
+            writer.write(format!("key{i}"), Bytes::from("v"), EntryType::KeyValue);
+        }
+        let chunks = writer.to_chunks().unwrap();
+        let total = chunks.len() as u32;
+        let mut reader = SnapshotReader::new(1);
+        for (idx, chunk) in chunks.into_iter().enumerate().rev() {
+            reader.add_chunk(idx as u32, total, chunk).unwrap();
+        }
+        assert!(reader.is_complete());
+        assert_eq!(reader.assemble().unwrap().len(), 5);
     }
 }

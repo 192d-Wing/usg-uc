@@ -25,7 +25,8 @@ pub struct PkiIdentity {
 
 /// Validator for DoD PKI certificates.
 ///
-/// Holds the trusted CA bundle for chain validation.
+/// Holds the CA bundle path. Identity extraction currently fails closed
+/// (POA&M-233); no chain validation is performed.
 pub struct PkiValidator {
     /// Path to the CA bundle PEM file.
     ca_bundle_path: String,
@@ -59,72 +60,31 @@ impl PkiValidator {
 
     /// Extract identity information from a DER-encoded X.509 certificate.
     ///
-    /// This performs string-based parsing of the Subject DN to extract CN,
-    /// EDIPI, and email. Full ASN.1 parsing will be added later with the
-    /// `x509-cert` crate.
+    /// **Fails closed: always returns an error.** The previous implementation
+    /// substring-matched `CN=` in the raw DER bytes without validating the
+    /// chain, validity period, key usage or revocation status, so any
+    /// self-signed certificate containing `CN=` would have authenticated.
+    /// No caller uses this today; it stays rejected until a real validator
+    /// exists.
+    ///
+    /// NIST 800-53 Rev5: IA-2(12) (PIV acceptance), IA-5(2) (PKI-based
+    /// authentication), SC-24 (fail in known state)
+    ///
+    /// POAM: POA&M-233 - implement RFC 5280 §6 path validation with
+    /// rustls-webpki `EndEntityCert::verify_for_usage` (CNSA signature
+    /// algorithms, client-auth EKU, `RevocationOptionsBuilder` with CRLs and
+    /// `UnknownStatusPolicy::Deny`), plus a DER subject/SAN parser for
+    /// EDIPI/UPN (needs an `x509-cert` dependency plan entry).
     ///
     /// # Errors
     ///
-    /// Returns `UserMgmtError::CertificateValidationFailed` if the certificate
-    /// cannot be parsed.
-    // `subject_dn` and `subject_cn` are distinct X.509 fields; the names are
-    // intentionally parallel.
-    #[allow(clippy::similar_names)]
+    /// Always returns `UserMgmtError::CertificateValidationFailed`.
     pub fn extract_identity(&self, cert_der: &[u8]) -> Result<PkiIdentity, UserMgmtError> {
-        // Convert DER bytes to a lossy string for basic DN extraction.
-        // This is a placeholder until full ASN.1 parsing is implemented.
-        let cert_text = String::from_utf8_lossy(cert_der);
-
-        let subject_dn = extract_field(&cert_text, "CN=")
-            .map(|cn| format!("CN={cn}"))
-            .unwrap_or_default();
-
-        let subject_cn = extract_field(&cert_text, "CN=").unwrap_or_default();
-
-        // DoD EDIPI is typically the last 10 digits of the CN
-        let edipi = extract_edipi(&subject_cn);
-
-        let email =
-            extract_field(&cert_text, "E=").or_else(|| extract_field(&cert_text, "emailAddress="));
-
-        let issuer_cn = extract_field(&cert_text, "CN=").unwrap_or_default();
-
-        Ok(PkiIdentity {
-            subject_dn,
-            subject_cn,
-            email,
-            upn: None,
-            edipi,
-            issuer_cn,
-            serial_number: hex::encode(&cert_der[..std::cmp::min(cert_der.len(), 20)]),
-            not_after: 0, // Requires ASN.1 parsing for actual value
-        })
+        let _ = cert_der;
+        Err(UserMgmtError::CertificateValidationFailed(
+            "PKI certificate validation not implemented (POA&M-233)".to_owned(),
+        ))
     }
-}
-
-/// Extract a field value from a DN string by prefix.
-fn extract_field(text: &str, prefix: &str) -> Option<String> {
-    text.find(prefix).map(|start| {
-        let value_start = start + prefix.len();
-        let end = text[value_start..]
-            .find([',', '/', '\0'])
-            .map_or(text.len(), |e| value_start + e);
-        text[value_start..end].to_owned()
-    })
-}
-
-/// Extract EDIPI from a DoD Common Name.
-///
-/// DoD CNs typically end with a 10-digit EDIPI.
-fn extract_edipi(cn: &str) -> Option<String> {
-    let trimmed = cn.trim();
-    if trimmed.len() >= 10 {
-        let last10 = &trimmed[trimmed.len() - 10..];
-        if last10.chars().all(|c| c.is_ascii_digit()) {
-            return Some(last10.to_owned());
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -132,24 +92,37 @@ fn extract_edipi(cn: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_extract_field() {
-        let dn = "CN=DOE.JOHN.M.1234567890,OU=DoD,O=U.S. Government";
-        assert_eq!(
-            extract_field(dn, "CN="),
-            Some("DOE.JOHN.M.1234567890".to_owned())
-        );
-        assert_eq!(extract_field(dn, "OU="), Some("DoD".to_owned()));
-        assert_eq!(extract_field(dn, "DC="), None);
+    fn validator() -> PkiValidator {
+        // Any existing path satisfies `new`; the bundle is not parsed.
+        PkiValidator::new(env!("CARGO_MANIFEST_DIR")).unwrap()
     }
 
     #[test]
-    fn test_extract_edipi() {
-        assert_eq!(
-            extract_edipi("DOE.JOHN.M.1234567890"),
-            Some("1234567890".to_owned())
-        );
-        assert_eq!(extract_edipi("short"), None);
-        assert_eq!(extract_edipi("DOE.JOHN.M.ABCDEFGHIJ"), None);
+    fn missing_bundle_rejected() {
+        assert!(PkiValidator::new("/nonexistent/ca-bundle.pem").is_err());
+    }
+
+    #[test]
+    fn self_signed_with_cn_rejected() {
+        // Bytes that the old substring parser would have accepted as
+        // CN=DOE.JOHN.M.1234567890 with an EDIPI.
+        let forged = b"\x30\x82CN=DOE.JOHN.M.1234567890,OU=DoD,E=x@example.mil";
+        assert!(matches!(
+            validator().extract_identity(forged),
+            Err(UserMgmtError::CertificateValidationFailed(_))
+        ));
+    }
+
+    #[test]
+    fn any_input_rejected() {
+        let v = validator();
+        for input in [&[0x30u8, 0x03, 0x02, 0x01, 0x01][..], &[0xff; 64][..]] {
+            assert!(v.extract_identity(input).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_input_rejected() {
+        assert!(validator().extract_identity(&[]).is_err());
     }
 }

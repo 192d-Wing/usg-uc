@@ -18,14 +18,23 @@
 //! supporting:
 //!
 //! - **In-Memory**: Fast, local storage for single-node deployments
-//! - **Redis**: Distributed caching with cluster support
+//! - **Redis**: Distributed caching (single node; `cluster_mode` is rejected)
 //! - **PostgreSQL**: Persistent relational storage
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-28**: Protection of Information at Rest
-//! - **AU-4**: Audit Log Storage Capacity
-//! - **CP-9**: System Backup
+//! Library-only: these hold when a caller uses the crate as configured;
+//! the daemon does not yet pass CA / opt-in settings through (POA&M-230).
+//!
+//! - **SC-8**: Redis (`rediss://`) and PostgreSQL (`verify-full` default)
+//!   connections are TLS with server authentication. Plaintext, `prefer`,
+//!   `require` and unverified TLS fail closed unless
+//!   `allow_insecure_transport` is set. Suites are the aws-lc-rs defaults,
+//!   not CNSA-pinned (POA&M-230).
+//! - **SI-11 / IA-5(1)**: connection-URL passwords are redacted in `Debug`,
+//!   logs and error reasons ([`redact_url`]). `Serialize` still emits them
+//!   (POA&M-237).
+//! - **SC-28** is *not* provided: there is no at-rest encryption.
 //!
 //! ## Architecture
 //!
@@ -64,7 +73,7 @@ pub mod postgres;
 pub use backend::StorageBackend;
 pub use config::{
     PostgresConfig, PostgresSslMode, RedisConfig, RedisTlsConfig, RetryConfig, StorageBackendType,
-    StorageConfig,
+    StorageConfig, redact_error, redact_url,
 };
 pub use error::{StorageError, StorageResult};
 pub use memory::InMemoryBackend;
@@ -97,7 +106,10 @@ pub async fn create_backend(config: &StorageConfig) -> StorageResult<Box<dyn Sto
                 .ok_or_else(|| StorageError::ConfigError {
                     reason: "Redis backend requires redis configuration".to_string(),
                 })?;
-            info!(url = %redis_config.url, "Creating Redis storage backend");
+            info!(
+                url = %config::redact_url(&redis_config.url),
+                "Creating Redis storage backend"
+            );
             let backend = RedisBackend::new(redis_config.clone()).await?;
             Ok(Box::new(backend))
         }

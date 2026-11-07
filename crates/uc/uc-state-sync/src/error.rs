@@ -91,6 +91,12 @@ pub enum StateSyncError {
     #[error("sync already in progress")]
     SyncInProgress,
 
+    /// Peer message authentication failed.
+    ///
+    /// NIST 800-53 Rev5: IA-3, SC-23
+    #[error("peer authentication failed: {0}")]
+    AuthenticationFailed(#[from] uc_cluster::AuthError),
+
     /// Not synchronized.
     #[error("node not synchronized")]
     NotSynchronized,

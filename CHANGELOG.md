@@ -9,6 +9,80 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC storage, dormant data-plane batch POA&M-230..237)
+
+- **SBC: `uc-storage` now fails closed on insecure transport.** (SC-8,
+  SC-13, SI-10; POA&M-230) Postgres `ssl_mode` now defaults to
+  `verify-full` (it used to be `prefer`). `disable`, `prefer` and `require`
+  are rejected at startup unless `allow_insecure_transport = true` is set.
+  `require` is included because it does not authenticate the server.
+  Redis `redis://` and `unix://` URLs need the same opt-in. These are always
+  rejected, opt-in or not: `tls.verify_certificate = false`, an `#insecure`
+  URL fragment, a client cert without its key (or a key without its cert),
+  and a `tls` block on a non-`rediss://` URL. A URL `sslmode=` can no longer
+  downgrade the configured `ssl_mode`. When the opt-in is used, a `warn!` is
+  logged. New keys: `postgres.ssl_root_cert`,
+  `postgres.allow_insecure_transport`, `redis.allow_insecure_transport`.
+  **Upgrade:** use `verify-ca`/`verify-full` and `rediss://` (setting
+  `ssl_root_cert` if needed), or set `allow_insecure_transport` on purpose.
+  The negotiated suites are the aws-lc-rs defaults and are not yet pinned to
+  CNSA (POA&M-230).
+- **SBC: Redis `cluster_mode = true` is now rejected.** (CM-6, SI-10) It was
+  never implemented and used to be ignored without any warning.
+- **Library API:** `StorageError::InsecureTransport`,
+  `ClusterError::AuthenticationFailed` and
+  `StateSyncError::AuthenticationFailed` are new variants. `ClusterMembership::handle_heartbeat` is now `pub(crate)`; use
+  `handle_authenticated_heartbeat` instead.
+  `SnapshotReader::add_chunk` now returns `StateSyncResult<()>`.
+  `SyslogTransport::Tls` is new.
+
+### Security
+
+- **uc-cluster / uc-state-sync: authenticated peer envelopes.** (IA-3,
+  SC-8, SC-23; POA&M-231, -232) Heartbeats and replication messages are
+  sealed with HMAC-SHA-384 (key at least 48 bytes, compared in constant
+  time). Messages are checked against the configured peer list, a 30 s
+  timestamp window, and a generation/sequence replay window. Snapshot
+  reassembly is bounded (65,536 chunks, 256 MiB) and rejects duplicate and
+  out-of-range chunks. This is library-only for now: there is no transport,
+  key distribution or rotation (POA&M-231) and no split-brain fencing
+  (POA&M-232). sbc-config and sbc-daemon still need to wire `cluster.auth`.
+- **uc-user-mgmt: `PkiValidator` now always rejects.** (IA-2(12), IA-5(2);
+  POA&M-233) The old substring CN/EDIPI parser did not validate the
+  certificate chain, so it has been removed. Every certificate gets
+  `CertificateValidationFailed` until validation with webpki, a client-auth
+  EKU check and a CRL check is in place.
+- **uc-api: routes are denied by default.** (AC-3, AC-6; POA&M-234) A route
+  must have a permission or be marked `public()`. Every SBC route now has a
+  `*:read`/`*:admin` permission. `/config` needs `config:read` for GET and
+  `config:admin` for PUT. Only the health check is public. Library-only:
+  sbc-daemon must call `Router::authorize`.
+- **uc-storage:** passwords are redacted in `Debug` output, logs and driver
+  errors. This covers URL userinfo, query parameters and quoted libpq DSNs.
+  Serialize still emits the password (POA&M-237). Redis `KEYS` is replaced
+  by a capped `SCAN` (COUNT 1000, at most 100,000 results), and pooled Redis
+  connections are marked broken after fatal I/O errors.
+- **uc-syslog: RFC 5425 TLS transport.** (AU-9, SC-8, SC-13; POA&M-235)
+  `transport = "tls"` (default port 6514) uses the CNSA 2.0 provider
+  (TLS 1.3 only, or 1.2 with CNSA suites if `allow_tls12` is set), supports
+  optional mTLS, and uses octet-counted framing. `close()` sends
+  close_notify. Startup fails if the `tls` block is missing or incomplete,
+  if a `tls` block is set on udp/tcp, or if `use_rfc5424 = false`.
+  Delivery is at-least-once and messages are not buffered while the
+  collector is down. Certificate-fingerprint pinning is not implemented
+  (POA&M-235). Library-only. SNMP is unchanged (POA&M-236).
+
+### Changed
+
+- **Dependencies (SBC):** `bb8-redis` has been removed and replaced by a
+  local bb8 manager. New feature flags: `redis/tokio-rustls-comp` and
+  `sqlx/tls-rustls-aws-lc-rs` (`tls-rustls-insecure` is not enabled).
+  `uc-cluster` now uses `uc-crypto` and `zeroize`. `uc-syslog` now uses
+  `uc-transport` and `tokio-rustls`, with dev-dependencies `rcgen`,
+  `tempfile` and `serde_json`. No new third-party runtime crates: the lock
+  only adds a `webpki-roots` 0.26 compatibility shim, which comes in through
+  the sqlx TLS feature and is not in the active build.
+
 ### BREAKING (SBC config, live batch POA&M-190..192, 166)
 
 - **SBC: `[monitoring]` and `[telemetry.otlp]` are now rejected at config

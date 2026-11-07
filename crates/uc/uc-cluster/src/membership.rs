@@ -1,5 +1,6 @@
 //! Cluster membership management.
 
+use crate::auth::{AuthError, AuthenticatedEnvelope, PeerAuthenticator};
 use crate::config::{ClusterConfig, FailoverStrategy};
 use crate::error::{ClusterError, ClusterResult};
 use crate::health::{HealthChecker, HealthStatus, Heartbeat};
@@ -226,8 +227,44 @@ impl ClusterMembership {
         }
     }
 
-    /// Handles a heartbeat from a peer.
-    pub async fn handle_heartbeat(&self, heartbeat: Heartbeat) -> ClusterResult<()> {
+    /// Handles an authenticated heartbeat from a peer.
+    ///
+    /// The envelope is verified (HMAC-SHA-384, timestamp, sequence and
+    /// generation) before the members lock is taken, and the heartbeat's
+    /// `node_id` and `generation` must match the authenticated envelope.
+    /// Nothing is applied on failure.
+    ///
+    /// NIST 800-53 Rev5: IA-3 (peer authentication), SC-23 (anti-replay),
+    /// SI-10 (input validation). Library-only (no transport; POA&M-231).
+    ///
+    /// # Errors
+    /// Returns [`ClusterError::AuthenticationFailed`] or
+    /// [`ClusterError::SerializationError`] when the envelope is rejected.
+    pub async fn handle_authenticated_heartbeat(
+        &self,
+        auth: &PeerAuthenticator,
+        envelope: &AuthenticatedEnvelope,
+    ) -> ClusterResult<()> {
+        auth.verify(envelope)?;
+        let heartbeat: Heartbeat = serde_json::from_slice(&envelope.payload).map_err(|e| {
+            ClusterError::SerializationError {
+                reason: format!("invalid heartbeat payload: {e}"),
+            }
+        })?;
+        let same_sender = heartbeat.node_id == envelope.sender;
+        let same_generation = heartbeat.generation == envelope.generation;
+        if !(same_sender && same_generation) {
+            return Err(AuthError::SenderMismatch.into());
+        }
+        self.handle_heartbeat(heartbeat).await
+    }
+
+    /// Applies an already-authenticated heartbeat.
+    ///
+    /// Crate-private: external callers must go through
+    /// [`Self::handle_authenticated_heartbeat`] so unauthenticated or
+    /// replayed heartbeats can never change membership state.
+    pub(crate) async fn handle_heartbeat(&self, heartbeat: Heartbeat) -> ClusterResult<()> {
         let mut members = self.members.write().await;
 
         if let Some(state) = members.get_mut(&heartbeat.node_id) {
@@ -491,5 +528,121 @@ mod tests {
 
         membership.add_node(node).await.unwrap();
         assert!(membership.view_version() > initial_version);
+    }
+
+    fn auth_pair() -> (PeerAuthenticator, PeerAuthenticator) {
+        let key =
+            || crate::auth::ClusterAuthKey::new(vec![0x5a; crate::auth::MIN_KEY_LEN]).unwrap();
+        let sender = PeerAuthenticator::new(key(), 1, NodeId::new("node-01"), 1, []).unwrap();
+        let receiver = PeerAuthenticator::new(
+            key(),
+            1,
+            NodeId::new("local-node"),
+            1,
+            [NodeId::new("node-01")],
+        )
+        .unwrap();
+        (sender, receiver)
+    }
+
+    async fn membership_with_peer() -> ClusterMembership {
+        let membership = ClusterMembership::new(create_test_config());
+        let node = ClusterNode::new(
+            NodeId::new("node-01"),
+            NodeRole::Secondary,
+            "us-east-1".to_string(),
+            "us-east-1a".to_string(),
+            create_test_endpoints(),
+        );
+        membership.add_node(node).await.unwrap();
+        membership
+    }
+
+    fn sealed(sender: &PeerAuthenticator, hb: &Heartbeat) -> AuthenticatedEnvelope {
+        sender
+            .seal(bytes::Bytes::from(serde_json::to_vec(hb).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticated_heartbeat_applied_once() {
+        let membership = membership_with_peer().await;
+        let (sender, receiver) = auth_pair();
+        let mut hb = Heartbeat::new(NodeId::new("node-01"), NodeState::Active, 1);
+        hb.active_calls = 7;
+        let env = sealed(&sender, &hb);
+        membership
+            .handle_authenticated_heartbeat(&receiver, &env)
+            .await
+            .unwrap();
+        let summary = membership.get_node(&NodeId::new("node-01")).await.unwrap();
+        assert_eq!(summary.active_calls, 7);
+        assert!(matches!(
+            membership
+                .handle_authenticated_heartbeat(&receiver, &env)
+                .await,
+            Err(ClusterError::AuthenticationFailed(AuthError::Replayed))
+        ));
+    }
+
+    #[tokio::test]
+    async fn forged_heartbeat_not_applied() {
+        let membership = membership_with_peer().await;
+        let (sender, receiver) = auth_pair();
+        let mut hb = Heartbeat::new(NodeId::new("node-01"), NodeState::Active, 1);
+        hb.active_calls = 9;
+        let mut env = sealed(&sender, &hb);
+        env.tag[3] ^= 1;
+        assert!(matches!(
+            membership
+                .handle_authenticated_heartbeat(&receiver, &env)
+                .await,
+            Err(ClusterError::AuthenticationFailed(AuthError::BadTag))
+        ));
+        let summary = membership.get_node(&NodeId::new("node-01")).await.unwrap();
+        assert_eq!(summary.active_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn sender_mismatch_with_heartbeat_node_id_rejected() {
+        let membership = membership_with_peer().await;
+        let (sender, receiver) = auth_pair();
+        // Authenticated as node-01 but claims to be local-node.
+        let hb = Heartbeat::new(NodeId::new("local-node"), NodeState::Unhealthy, 1);
+        let env = sealed(&sender, &hb);
+        assert!(matches!(
+            membership
+                .handle_authenticated_heartbeat(&receiver, &env)
+                .await,
+            Err(ClusterError::AuthenticationFailed(
+                AuthError::SenderMismatch
+            ))
+        ));
+        let mut hb = Heartbeat::new(NodeId::new("node-01"), NodeState::Active, 2);
+        hb.generation = 99;
+        let env = sealed(&sender, &hb);
+        assert!(matches!(
+            membership
+                .handle_authenticated_heartbeat(&receiver, &env)
+                .await,
+            Err(ClusterError::AuthenticationFailed(
+                AuthError::SenderMismatch
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_heartbeat_payload_rejected() {
+        let membership = membership_with_peer().await;
+        let (sender, receiver) = auth_pair();
+        let env = sender
+            .seal(bytes::Bytes::from_static(b"{not json"))
+            .unwrap();
+        assert!(matches!(
+            membership
+                .handle_authenticated_heartbeat(&receiver, &env)
+                .await,
+            Err(ClusterError::SerializationError { .. })
+        ));
     }
 }

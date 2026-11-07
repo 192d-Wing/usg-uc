@@ -9,12 +9,13 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use crate::backend::StorageBackend;
-use crate::config::PostgresConfig;
+use crate::config::{PostgresConfig, PostgresSslMode, redact_error, redact_url};
 use crate::error::{StorageError, StorageResult};
 use bytes::Bytes;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, trace, warn};
 
@@ -34,16 +35,28 @@ impl PostgresBackend {
     /// # Errors
     /// Returns an error if connection pool creation or migrations fail.
     pub async fn new(config: PostgresConfig) -> StorageResult<Self> {
-        debug!(url = %config.url, "Creating PostgreSQL backend");
+        // NIST 800-53 Rev5: SC-8 (fail closed on unauthenticated transport)
+        if config.validate_transport_security()? {
+            warn!(
+                url = %redact_url(&config.url),
+                ssl_mode = %config.ssl_mode,
+                "PostgreSQL allow_insecure_transport is set: server is not authenticated"
+            );
+        }
+        debug!(url = %redact_url(&config.url), "Creating PostgreSQL backend");
 
+        let options = connect_options(&config)?;
         let pool = PgPoolOptions::new()
             .min_connections(config.pool_min_size)
             .max_connections(config.pool_max_size)
             .acquire_timeout(config.connection_timeout())
-            .connect(&config.url)
+            .connect_with(options)
             .await
             .map_err(|e| StorageError::ConnectionFailed {
-                reason: format!("Failed to create PostgreSQL connection pool: {e}"),
+                reason: format!(
+                    "Failed to create PostgreSQL connection pool: {}",
+                    redact_error(&e.to_string(), &config.url)
+                ),
             })?;
 
         // Run migrations if enabled
@@ -562,10 +575,43 @@ fn glob_to_like(pattern: &str) -> String {
     result
 }
 
+/// Maps the configured SSL mode to sqlx.
+const fn pg_ssl_mode(mode: PostgresSslMode) -> PgSslMode {
+    match mode {
+        PostgresSslMode::Disable => PgSslMode::Disable,
+        PostgresSslMode::Prefer => PgSslMode::Prefer,
+        PostgresSslMode::Require => PgSslMode::Require,
+        PostgresSslMode::VerifyCa => PgSslMode::VerifyCa,
+        PostgresSslMode::VerifyFull => PgSslMode::VerifyFull,
+    }
+}
+
+/// Builds connect options from the URL, then applies the configured SSL
+/// mode and root certificate last so `sslmode=` in the URL cannot
+/// downgrade the validated policy.
+///
+/// NIST 800-53 Rev5: SC-8, CM-6
+// POAM: POA&M-230 sqlx builds its own rustls ClientConfig with the aws-lc-rs
+// default provider; suites are not pinned to the CNSA 2.0 set.
+fn connect_options(config: &PostgresConfig) -> StorageResult<PgConnectOptions> {
+    let mut options =
+        PgConnectOptions::from_str(&config.url).map_err(|e| StorageError::ConfigError {
+            reason: format!(
+                "invalid PostgreSQL URL: {}",
+                redact_error(&e.to_string(), &config.url)
+            ),
+        })?;
+    options = options.ssl_mode(pg_ssl_mode(config.ssl_mode));
+    if let Some(root) = &config.ssl_root_cert {
+        options = options.ssl_root_cert(root);
+    }
+    Ok(options)
+}
+
 impl std::fmt::Debug for PostgresBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgresBackend")
-            .field("url", &self.config.url)
+            .field("url", &redact_url(&self.config.url))
             .field("pool_min_size", &self.config.pool_min_size)
             .field("pool_max_size", &self.config.pool_max_size)
             .finish()
@@ -604,8 +650,26 @@ mod tests {
             pool_min_size: 1,
             pool_max_size: 5,
             run_migrations: true,
+            ssl_mode: PostgresSslMode::Disable,
+            allow_insecure_transport: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn url_sslmode_cannot_downgrade_config() {
+        let cfg = PostgresConfig::new("postgres://u:p@db.example.invalid/sbc?sslmode=disable");
+        let opts = connect_options(&cfg).unwrap();
+        assert!(matches!(opts.get_ssl_mode(), PgSslMode::VerifyFull));
+    }
+
+    #[tokio::test]
+    async fn prefer_rejected_before_connect() {
+        let mut cfg = PostgresConfig::new("postgres://u:hunter2@127.0.0.1:1/sbc");
+        cfg.ssl_mode = PostgresSslMode::Prefer;
+        let err = PostgresBackend::new(cfg).await.unwrap_err();
+        assert!(matches!(err, StorageError::InsecureTransport { .. }));
+        assert!(!err.to_string().contains("hunter2"));
     }
 
     #[tokio::test]

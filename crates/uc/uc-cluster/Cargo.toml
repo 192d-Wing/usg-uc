@@ -29,6 +29,10 @@ chrono.workspace = true
 # Bytes handling
 bytes.workspace = true
 
+# Crypto (HMAC-SHA-384 peer authentication, CNSA 2.0)
+uc-crypto.workspace = true
+zeroize.workspace = true
+
 # Types from workspace
 uc-types = { workspace = true, features = ["serde"] }
 

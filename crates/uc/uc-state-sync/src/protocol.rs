@@ -75,6 +75,20 @@ pub enum ReplicationMessage {
 }
 
 impl ReplicationMessage {
+    /// Returns the node identity the message claims to come from, if the
+    /// variant carries one.
+    #[must_use]
+    pub fn claimed_sender(&self) -> Option<&str> {
+        match self {
+            Self::ReplicateRequest { source, .. } => Some(source),
+            Self::ReplicateAck { node_id, .. }
+            | Self::SnapshotRequest { node_id, .. }
+            | Self::SnapshotAck { node_id, .. }
+            | Self::SyncHeartbeat { node_id, .. } => Some(node_id),
+            Self::SnapshotResponse { .. } => None,
+        }
+    }
+
     /// Creates a new replicate request.
     #[must_use]
     pub fn replicate(sequence: u64, source: &NodeId, payload: ReplicationPayload) -> Self {
