@@ -7,7 +7,11 @@
 
 use std::fmt::Write as _;
 
+use crate::escape::{transport_token, xml_comment, xml_text};
 use crate::model::{Phone, PhoneModel};
+
+// NIST 800-53 Rev5: SI-15 (Information Output Filtering) -- every operator
+// string goes through `crate::escape`; numerics and static strs are type-safe.
 
 /// Generate a Teo phone XML configuration.
 ///
@@ -22,8 +26,9 @@ pub fn generate_teo_config(phone: &Phone, sbc_host: &str) -> String {
     let _ = writeln!(
         xml,
         "<!-- SBC-generated config for {} (MAC {}) -->",
-        xml_escape(&phone.name),
-        xml_escape(&phone.mac_address),
+        // XML 1.0 §2.5: comments do not decode entities; neutralise `--`.
+        xml_comment(&phone.name),
+        xml_comment(&phone.mac_address),
     );
     xml.push_str("<TEO_settings schema_vers=\"2.0\">\n");
     let _ = writeln!(xml, "  <TEO_phone model=\"{model_attr}\">");
@@ -68,7 +73,7 @@ fn write_update_server(xml: &mut String, sbc_host: &str) {
     let _ = writeln!(
         xml,
         "      <update_server source=\"STATIC\">http://{}/provision</update_server>",
-        xml_escape(sbc_host),
+        xml_text(sbc_host),
     );
     xml.push_str("      <protocol>HTTP</protocol>\n");
     xml.push_str("      <config_auto>ON</config_auto>\n");
@@ -88,23 +93,19 @@ fn write_sip_settings(xml: &mut String, phone: &Phone, sbc_host: &str) {
         |l| (l.sip_server.clone(), l.sip_port, l.transport.clone()),
     );
 
-    let sip_transport = match transport.to_lowercase().as_str() {
-        "tcp" => "TCP",
-        "tls" => "TLS",
-        _ => "UDP",
-    };
+    let sip_transport = transport_token(&transport);
 
     let _ = writeln!(xml, "    <sip_transport>{sip_transport}</sip_transport>");
     let _ = writeln!(
         xml,
         "    <sip_proxy_addr source=\"STATIC\">{}</sip_proxy_addr>",
-        xml_escape(&sip_host),
+        xml_text(&sip_host),
     );
     let _ = writeln!(xml, "    <sip_proxy_port>{sip_port}</sip_proxy_port>");
     let _ = writeln!(
         xml,
         "    <sip_registrar>{}</sip_registrar>",
-        xml_escape(&sip_host),
+        xml_text(&sip_host),
     );
     let _ = writeln!(xml, "    <sip_reg_port>{sip_port}</sip_reg_port>");
     xml.push_str("    <sip_registration>ON</sip_registration>\n");
@@ -115,7 +116,7 @@ fn write_dial_plan(xml: &mut String, phone: &Phone) {
     let _ = writeln!(
         xml,
         "    <emergency_number>{}</emergency_number>",
-        xml_escape(emergency),
+        xml_text(emergency),
     );
 }
 
@@ -134,27 +135,27 @@ fn write_line_keys(xml: &mut String, phone: &Phone) {
         let _ = writeln!(
             xml,
             "        <line_id>{}</line_id>",
-            xml_escape(&teo_line_id(&line.directory_number)),
+            xml_text(&teo_line_id(&line.directory_number)),
         );
         let _ = writeln!(
             xml,
             "        <sip_name>{}</sip_name>",
-            xml_escape(&line.display_name),
+            xml_text(&line.display_name),
         );
         let _ = writeln!(
             xml,
             "        <sip_auth_id>{}</sip_auth_id>",
-            xml_escape(&line.sip_username),
+            xml_text(&line.sip_username),
         );
         let _ = writeln!(
             xml,
             "        <sip_password>{}</sip_password>",
-            xml_escape(&line.sip_password),
+            xml_text(&line.sip_password),
         );
         let _ = writeln!(
             xml,
             "        <label>{}</label>",
-            xml_escape(&line.display_name),
+            xml_text(&line.display_name),
         );
         // Codec order: G.711μ-law primary, G.722 wideband secondary, G.729A as last
         // resort. Matches the SBC's default media negotiation order.
@@ -177,21 +178,6 @@ fn teo_line_id(dn: &str) -> String {
         .or_else(|| dn.strip_prefix('+'))
         .unwrap_or(dn)
         .to_string()
-}
-
-fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

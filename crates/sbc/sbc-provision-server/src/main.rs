@@ -87,32 +87,10 @@ async fn main() -> ExitCode {
         phones,
         provisioning,
         start_time: std::time::Instant::now(),
-        provision_secret: cfg.provision_secret.map(Arc::new),
+        provision_secret: cfg.provision_secret.clone().map(Arc::new),
     };
 
-    // Source-network restriction (defense in depth behind the Cilium
-    // NetworkPolicy). Health/version probes come from the node, not the
-    // phone subnet, so they bypass the check.
-    let restriction = SourceRestriction {
-        allowed: Arc::new(cfg.allowed_cidrs.clone()),
-        trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
-    };
-    if restriction.allowed.is_empty() {
-        info!(
-            "SBC_PROVISION_ALLOWED_CIDRS unset — app-layer source restriction disabled (NetworkPolicy only)"
-        );
-    } else {
-        info!(cidrs = ?restriction.allowed, "provisioning restricted to source networks");
-        if restriction.trusted_proxies.is_empty() {
-            warn!(
-                "SBC_TRUSTED_PROXIES unset — X-Real-IP is trusted unconditionally; a caller \
-                 reaching this pod directly (bypassing nginx) can forge an allowed source IP and \
-                 defeat the source-network check. Set it to the frontend nginx pod network."
-            );
-        } else {
-            info!(trusted_proxies = ?restriction.trusted_proxies, "X-Real-IP trusted only from these networks");
-        }
-    }
+    let restriction = source_restriction(&cfg);
 
     let app = Router::new()
         .route("/healthz", get(liveness))
@@ -130,7 +108,9 @@ async fn main() -> ExitCode {
             restrict_source,
         ))
         .with_state(state)
-        .layer(TraceLayer::new_for_http());
+        // NIST 800-53 Rev5: IA-5 (protect authenticator) -- record only the path in the request
+        // span; the query string carries the device token (POA&M-120).
+        .layer(TraceLayer::new_for_http().make_span_with(http_span));
 
     let listener = match tokio::net::TcpListener::bind(cfg.listen_addr).await {
         Ok(l) => l,
@@ -284,6 +264,16 @@ struct ProvisionQuery {
     token: Option<String>,
 }
 
+/// Request span without the query string (which carries `?token=`).
+fn http_span<B>(req: &axum::http::Request<B>) -> tracing::Span {
+    tracing::info_span!("http", method = %req.method(), path = %span_path(req.uri()))
+}
+
+/// The URI component recorded in request spans: path only, never query.
+fn span_path(uri: &axum::http::Uri) -> &str {
+    uri.path()
+}
+
 /// Serve a per-MAC phone provisioning config.
 ///
 /// Logic is a faithful port of the daemon's old `serve_phone_config`
@@ -306,13 +296,20 @@ async fn serve_phone_config(
     let mac_key = mac_token.replace([':', '-'], "").to_lowercase();
 
     // Verify HMAC device token when a provision secret is configured.
+    // POAM: POA&M-120 -- the token is a static HMAC(secret, mac) in the
+    // query string: it never expires, cannot be revoked per device, and
+    // reaches proxy access logs (it is kept out of this service's spans by
+    // `http_span`). Planned v2: `v2.<key_id>.<device_epoch>.<hmac>` with a
+    // per-phone `provision_epoch` for revocation, keyed rotation, and the
+    // token carried in the generated resync URLs (IA-3, IA-5(1), AC-2(3)).
     if let Some(ref secret) = state.provision_secret {
         let valid = query.token.as_deref().is_some_and(|token| {
             let Ok(token_bytes) = hex::decode(token) else {
                 return false;
             };
-            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-                .expect("HMAC accepts any key length");
+            let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+                return false;
+            };
             mac.update(mac_key.as_bytes());
             mac.verify_slice(&token_bytes).is_ok()
         });
@@ -364,5 +361,49 @@ async fn serve_phone_config(
                 .body(axum::body::Body::from("internal server error"))
                 .unwrap_or_default()
         }
+    }
+}
+
+/// Build the source-network restriction and log its effective posture.
+fn source_restriction(cfg: &Config) -> SourceRestriction {
+    // Source-network restriction (defense in depth behind the Cilium
+    // NetworkPolicy). Health/version probes come from the node, not the
+    // phone subnet, so they bypass the check.
+    let restriction = SourceRestriction {
+        allowed: Arc::new(cfg.allowed_cidrs.clone()),
+        trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
+    };
+    if restriction.allowed.is_empty() {
+        info!(
+            "SBC_PROVISION_ALLOWED_CIDRS unset — app-layer source restriction disabled (NetworkPolicy only)"
+        );
+    } else {
+        info!(cidrs = ?restriction.allowed, "provisioning restricted to source networks");
+        if restriction.trusted_proxies.is_empty() {
+            warn!(
+                "SBC_TRUSTED_PROXIES unset — X-Real-IP is trusted unconditionally; a caller \
+                 reaching this pod directly (bypassing nginx) can forge an allowed source IP and \
+                 defeat the source-network check. Set it to the frontend nginx pod network."
+            );
+        } else {
+            info!(trusted_proxies = ?restriction.trusted_proxies, "X-Real-IP trusted only from these networks");
+        }
+    }
+    restriction
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod span_tests {
+    use super::*;
+
+    #[test]
+    fn span_path_drops_query_token() {
+        let uri: axum::http::Uri = "/provision/aabbccddeeff.cfg?token=deadbeef"
+            .parse()
+            .unwrap();
+        assert_eq!(span_path(&uri), "/provision/aabbccddeeff.cfg");
+        let req = axum::http::Request::get(uri).body(()).unwrap();
+        let _span = http_span(&req);
     }
 }
