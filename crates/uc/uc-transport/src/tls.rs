@@ -17,6 +17,10 @@
 //! - **SC-8**: Transmission Confidentiality and Integrity
 //! - **SC-12**: Cryptographic Key Establishment and Management
 //! - **SC-13**: Cryptographic Protection
+//! - **SC-28 / IA-5(7)**: TLS private key files are checked fail-closed at
+//!   load (see [`load_private_key_with`]): symlinks, group/other-accessible
+//!   modes and foreign owners are rejected. Decision: this is a boundary
+//!   device, so an insecure key file stops the listener rather than warning.
 //!
 //! ## IPv6-First Design
 //!
@@ -323,23 +327,194 @@ pub fn load_certs(path: &Path) -> TransportResult<Vec<CertificateDer<'static>>> 
     Ok(certs)
 }
 
-/// Loads a private key from a PEM file.
-///
-/// ## Errors
-///
-/// Returns an error if the file cannot be read or parsed.
-///
-/// # Errors
-/// Returns an error if the operation fails.
-///
-/// # Errors
-/// Returns an error if the operation fails.
-pub fn load_private_key(path: &Path) -> TransportResult<PrivateKeyDer<'static>> {
-    use rustls::pki_types::pem::PemObject;
+/// Maximum private key file size read (PEM).
+const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
 
-    PrivateKeyDer::from_pem_file(path).map_err(|e| TransportError::TlsCertificateError {
-        reason: format!("failed to load private key: {e}"),
+/// Curve the TLS private key must use, from `security.curve`.
+///
+/// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequiredKeyCurve {
+    /// ECDSA P-384 (CNSA 2.0 default).
+    P384,
+    /// ECDSA P-521.
+    P521,
+}
+
+impl RequiredKeyCurve {
+    const fn as_ec(self) -> uc_crypto::ecdsa::EcCurve {
+        match self {
+            Self::P384 => uc_crypto::ecdsa::EcCurve::P384,
+            Self::P521 => uc_crypto::ecdsa::EcCurve::P521,
+        }
+    }
+}
+
+/// Loads a TLS private key from a PEM file.
+///
+/// Accepts only ECDSA P-384 (the CNSA 1.0 curve) or P-521 (accepted by repo
+/// policy, `CnsaCurve`); ECDSA is transitional under CNSA 2.0.
+/// RSA and P-256 keys are rejected. Use [`load_private_key_with`] for an
+/// exact match against `security.curve`. The file checks are those of
+/// [`load_private_key_with`].
+///
+/// # Errors
+/// The file is insecure, unreadable or unparsable, or the key is not on
+/// P-384 or P-521.
+// POAM: POA&M-166: sbc-daemon (`server.rs` TLS listener setup) does not yet pass
+// `security.curve`; it calls this function, which accepts P-384 or P-521.
+// POAM: POA&M-165: symlinked parent directories are not detected; copies held
+// inside rustls `PrivateKeyDer` / aws-lc `EVP_PKEY` are not wiped by us.
+pub fn load_private_key(path: &Path) -> TransportResult<PrivateKeyDer<'static>> {
+    load_private_key_checked(path, None)
+}
+
+/// Loads a TLS private key from a PEM file, requiring `required` curve.
+///
+/// ## Fail-closed file checks (boundary device)
+///
+/// The key file is opened with `O_NOFOLLOW` and checked on the open
+/// descriptor (no TOCTOU window). It is rejected, and the listener does not
+/// start, when it:
+/// - is a symlink, or not a regular file;
+/// - has any group or other permission bit (`mode & 0o077 != 0`);
+/// - is not owned by the effective user (root-owned keys are rejected
+///   unless the SBC runs as root; this matches uc-sti `FileSigner`, so both
+///   key loaders give the same operator guidance: install keys `0600`/`0400`
+///   owned by the service account);
+/// - is larger than 64 KiB.
+///
+/// On non-unix targets key loading is refused outright (fail closed), as in
+/// the sbc-api-server HA1 key loader.
+///
+/// The read buffer is zeroized. The returned `PrivateKeyDer` and the copy
+/// rustls/aws-lc keep inside the `ServerConfig` are not wiped by this
+/// crate (`PrivateKeyDer` implements `Zeroize` but not drop-wipe).
+///
+/// ## NIST 800-53 Rev5: SC-12, SC-13, SC-28, IA-5(7), AC-3, AC-6
+///
+/// # Errors
+/// The file is insecure, unreadable or unparsable, or the key curve does
+/// not match `required`.
+// NIST 800-53 Rev5: SC-28, AC-3 (POA&M-164 closed: key file mode/owner/symlink
+// checks, fail closed; non-unix refused).
+// POAM: POA&M-165: symlinked parent directories are not detected; copies held
+// inside rustls `PrivateKeyDer` / aws-lc `EVP_PKEY` are not wiped by us.
+pub fn load_private_key_with(
+    path: &Path,
+    required: RequiredKeyCurve,
+) -> TransportResult<PrivateKeyDer<'static>> {
+    load_private_key_checked(path, Some(required))
+}
+
+pub(crate) fn load_private_key_checked(
+    path: &Path,
+    required: Option<RequiredKeyCurve>,
+) -> TransportResult<PrivateKeyDer<'static>> {
+    use rustls::pki_types::pem::PemObject;
+    use zeroize::Zeroize;
+
+    let pem = read_key_file(path)?;
+    let mut key =
+        PrivateKeyDer::from_pem_slice(&pem).map_err(|e| TransportError::TlsCertificateError {
+            reason: format!("failed to load private key: {e}"),
+        })?;
+    if let Err(e) = check_key_curve(&key, required) {
+        key.zeroize();
+        return Err(e);
+    }
+    Ok(key)
+}
+
+/// Rejects a key that is not on the required curve (or, with none, not on
+/// P-384/P-521).
+fn check_key_curve(
+    key: &PrivateKeyDer<'_>,
+    required: Option<RequiredKeyCurve>,
+) -> TransportResult<()> {
+    use uc_crypto::ecdsa::{EcCurve, ec_private_key_curve};
+
+    let found = ec_private_key_curve(key.secret_der());
+    let ok = match (found, required) {
+        (Some(c), Some(r)) => c == r.as_ec(),
+        (Some(c), None) => matches!(c, EcCurve::P384 | EcCurve::P521),
+        (None, _) => false,
+    };
+    if ok {
+        return Ok(());
+    }
+    let found = found.map_or_else(|| "non-EC or unsupported".to_owned(), |c| c.to_string());
+    let want = required.map_or_else(|| "P-384 or P-521".to_owned(), |r| r.as_ec().to_string());
+    Err(TransportError::TlsCertificateError {
+        reason: format!("private key curve {found} does not match security.curve {want}"),
     })
+}
+
+fn key_file_error(reason: impl Into<String>) -> TransportError {
+    TransportError::TlsCertificateError {
+        reason: reason.into(),
+    }
+}
+
+/// Opens and reads the key file with the fail-closed checks above.
+///
+/// Mirrors uc-sti `FileSigner` (uc-sti sits above this crate), including
+/// its owner rule (`uid == euid`, no uid-0 exception).
+#[cfg(unix)]
+fn read_key_file(path: &Path) -> TransportResult<zeroize::Zeroizing<Vec<u8>>> {
+    use std::io::Read;
+
+    use nix::fcntl::OFlag;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    // O_NONBLOCK: opening a FIFO must not hang startup.
+    opts.custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits());
+    let f = opts.open(path).map_err(|e| {
+        if e.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32) {
+            return key_file_error("private key file must not be a symlink");
+        }
+        key_file_error(format!("failed to open private key file: {e}"))
+    })?;
+    let meta = f
+        .metadata()
+        .map_err(|e| key_file_error(format!("failed to stat private key file: {e}")))?;
+    if !meta.is_file() {
+        return Err(key_file_error("private key file must be a regular file"));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(key_file_error(format!(
+            "private key file mode {mode:04o} is accessible by group or other; chmod 0600 (or 0400) it"
+        )));
+    }
+    if meta.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(key_file_error(
+            "private key file must be owned by the SBC's user",
+        ));
+    }
+    if meta.len() > MAX_KEY_FILE_BYTES {
+        return Err(key_file_error("private key file too large"));
+    }
+    let mut buf =
+        zeroize::Zeroizing::new(Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0)));
+    f.take(MAX_KEY_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| key_file_error(format!("failed to read private key file: {e}")))?;
+    if buf.len() as u64 > MAX_KEY_FILE_BYTES {
+        return Err(key_file_error("private key file too large"));
+    }
+    Ok(buf)
+}
+
+/// Non-unix targets cannot check mode/owner on the open descriptor, so key
+/// loading is refused (fail closed).
+#[cfg(not(unix))]
+fn read_key_file(_path: &Path) -> TransportResult<zeroize::Zeroizing<Vec<u8>>> {
+    Err(key_file_error(
+        "TLS private key loading is only supported on unix",
+    ))
 }
 
 /// TLS transport for secure SIP messaging.
@@ -838,7 +1013,7 @@ mod tests {
         let config = create_client_config(root_store).unwrap();
 
         // Verify TLS 1.3 is configured
-        assert!(config.alpn_protocols.is_empty()); // No ALPN by default
+        assert_eq!(config.alpn_protocols.len(), 0); // No ALPN by default
     }
 
     // ---- CNSA 2.0 handshake tests (POA&M-26 / POA&M-40) ----
@@ -1106,5 +1281,150 @@ mod tests {
         })
         .unwrap();
         assert!(handshake(client, server_with(weak_provider(), &pki)).is_err());
+    }
+
+    // ---- Key file checks (POA&M-164) and curve checks (POA&M-166) ----
+
+    #[cfg(unix)]
+    mod key_file {
+        use super::super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_key(dir: &Path, name: &str, pem: &str, mode: u32) -> std::path::PathBuf {
+            let p = dir.join(name);
+            std::fs::write(&p, pem).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            p
+        }
+
+        fn pem_for(alg: &'static rcgen::SignatureAlgorithm) -> String {
+            rcgen::KeyPair::generate_for(alg).unwrap().serialize_pem()
+        }
+
+        fn p384() -> String {
+            pem_for(&rcgen::PKCS_ECDSA_P384_SHA384)
+        }
+
+        fn err_reason(r: TransportResult<PrivateKeyDer<'static>>) -> String {
+            match r {
+                Err(TransportError::TlsCertificateError { reason }) => reason,
+                Err(e) => format!("unexpected error {e}"),
+                Ok(_) => "unexpectedly accepted".to_owned(),
+            }
+        }
+
+        #[test]
+        fn mode_0600_and_0400_accepted() {
+            let d = tempfile::tempdir().unwrap();
+            let pem = p384();
+            for (i, mode) in [0o600, 0o400].into_iter().enumerate() {
+                let p = write_key(d.path(), &format!("k{i}.pem"), &pem, mode);
+                load_private_key(&p).unwrap();
+            }
+        }
+
+        #[test]
+        fn group_or_world_mode_rejected() {
+            let d = tempfile::tempdir().unwrap();
+            let pem = p384();
+            for (i, mode) in [0o644, 0o640, 0o604, 0o660].into_iter().enumerate() {
+                let p = write_key(d.path(), &format!("k{i}.pem"), &pem, mode);
+                assert!(err_reason(load_private_key(&p)).contains("group or other"));
+            }
+        }
+
+        #[test]
+        fn symlink_rejected() {
+            let d = tempfile::tempdir().unwrap();
+            let real = write_key(d.path(), "real.pem", &p384(), 0o600);
+            let link = d.path().join("link.pem");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(err_reason(load_private_key(&link)).contains("symlink"));
+        }
+
+        #[test]
+        fn directory_and_fifo_rejected() {
+            let d = tempfile::tempdir().unwrap();
+            let sub = d.path().join("dir.pem");
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(err_reason(load_private_key(&sub)).contains("regular file"));
+
+            let fifo = d.path().join("fifo.pem");
+            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+            assert!(err_reason(load_private_key(&fifo)).contains("regular file"));
+        }
+
+        #[test]
+        fn oversize_rejected() {
+            let d = tempfile::tempdir().unwrap();
+            let big = "A".repeat(usize::try_from(MAX_KEY_FILE_BYTES).unwrap() + 1);
+            let p = write_key(d.path(), "big.pem", &big, 0o600);
+            assert!(err_reason(load_private_key(&p)).contains("too large"));
+        }
+
+        #[test]
+        fn wrong_owner_rejected() {
+            // Only root can create a file owned by another user.
+            if !nix::unistd::geteuid().is_root() {
+                eprintln!("Skipping wrong-owner test: not running as root");
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            let p = write_key(d.path(), "k.pem", &p384(), 0o600);
+            let nobody = nix::unistd::Uid::from_raw(65534);
+            nix::unistd::chown(&p, Some(nobody), None).unwrap();
+            assert!(err_reason(load_private_key(&p)).contains("owned"));
+        }
+
+        #[test]
+        fn curve_enforced() {
+            let d = tempfile::tempdir().unwrap();
+            let p256 = write_key(
+                d.path(),
+                "p256.pem",
+                &pem_for(&rcgen::PKCS_ECDSA_P256_SHA256),
+                0o600,
+            );
+            let p384k = write_key(d.path(), "p384.pem", &p384(), 0o600);
+            let p521 = write_key(
+                d.path(),
+                "p521.pem",
+                &pem_for(&rcgen::PKCS_ECDSA_P521_SHA512),
+                0o600,
+            );
+
+            assert!(err_reason(load_private_key(&p256)).contains("P-256"));
+            load_private_key(&p384k).unwrap();
+            load_private_key(&p521).unwrap();
+
+            load_private_key_with(&p384k, RequiredKeyCurve::P384).unwrap();
+            assert!(
+                err_reason(load_private_key_with(&p521, RequiredKeyCurve::P384)).contains("P-521")
+            );
+            load_private_key_with(&p521, RequiredKeyCurve::P521).unwrap();
+            assert!(
+                err_reason(load_private_key_with(&p384k, RequiredKeyCurve::P521)).contains("P-384")
+            );
+        }
+
+        #[test]
+        fn rsa_rejected() {
+            let d = tempfile::tempdir().unwrap();
+            let p = write_key(
+                d.path(),
+                "rsa.pem",
+                &pem_for(&rcgen::PKCS_RSA_SHA256),
+                0o600,
+            );
+            assert!(err_reason(load_private_key(&p)).contains("non-EC"));
+        }
+
+        #[test]
+        fn garbage_rejected() {
+            let d = tempfile::tempdir().unwrap();
+            let p = write_key(d.path(), "junk.pem", "not a key", 0o600);
+            assert!(load_private_key(&p).is_err());
+        }
     }
 }

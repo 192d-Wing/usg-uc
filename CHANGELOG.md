@@ -11,6 +11,18 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Security
 
+- **SBC: TLS private key files are checked at load and the key curve is
+  enforced (BREAKING, SEC-001).** (NIST 800-53 Rev5: SC-12, SC-13, SC-28,
+  SC-4) **Upgrade note:** the SIP-TLS listeners, the trunk client key and
+  the REST HTTPS listener now refuse to start, or keep the old key on
+  reload, when the key file is a symlink, is not a regular file, is group-
+  or world-readable (any `0o077` bit), is not owned by the SBC's effective
+  user, or exceeds 64 KiB. RSA and P-256 keys are rejected; only ECDSA
+  P-384 or P-521 are accepted. Before upgrading, `chmod 0600` (or `0400`)
+  the key, `chown` it to the SBC user, and reissue any RSA or P-256
+  certificates on P-384. In `uc-crypto`, AES-256-GCM and P-384 PKCS#8 key
+  bytes are now wiped on drop, and the `open()` buffer is wiped when the
+  tag check fails (POA&M-160..164).
 - **SBC: audit trail integrity (uc-audit) (BREAKING for SIEM parsers and
   alerting).** (NIST 800-53 Rev5: AU-5, AU-9, AU-10, AU-8, SI-10)
   - Audit sink writes can now fail and are counted. A write error (for

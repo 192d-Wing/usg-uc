@@ -8786,6 +8786,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "futures-util",
+ "nix 0.31.3",
  "rand 0.9.5",
  "rcgen",
  "rustls",
@@ -8800,6 +8801,7 @@ dependencies = [
  "uc-crypto",
  "uc-types",
  "windows",
+ "zeroize",
 ]
 
 [[package]]

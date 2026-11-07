@@ -718,7 +718,7 @@ require_mtls = false             # SIP-TLS clients must present a certificate (n
 
 Notes on what the daemon actually does with these keys:
 
-- `tls_cert_path` / `tls_key_path` (wired): used for SIP-over-TLS listeners (`transport.tls_listen`) and REST HTTPS. Must be set together.
+- `tls_cert_path` / `tls_key_path` (wired): used for SIP-over-TLS listeners (`transport.tls_listen`) and REST HTTPS. Must be set together. The key file must be a regular file (not a symlink), mode `0600` or `0400`, owned by the SBC user, and at most 64 KiB, and it must hold an ECDSA P-384 or P-521 key. RSA and P-256 keys are rejected. Otherwise the listener does not start, and a reload keeps the previous key. `security.curve` is not yet used to require one specific curve (POA&M-166).
 - `min_tls_version` (wired): SIP-TLS listeners accept TLS 1.3 only by default; `"1.2"` also admits TLS 1.2 clients (`ECDHE-ECDSA-AES256-GCM-SHA384` only). Cipher suites and key exchange are limited to CNSA 2.0. The REST HTTPS listener uses rustls defaults (TLS 1.2 permitted) and is not affected by this key.
 - `curve` only constrains the configuration enum; the key type of the loaded certificate is not checked (P-256/RSA certificates are accepted by rustls).
 - `trunk_tls_ca_path` (wired): PEM bundle of the CAs that issue trunk server certificates. Required when any trunk uses `protocol = "tls"`; separate from `tls_ca_path` (client CA for the listener). See Trunk Groups.

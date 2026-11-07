@@ -290,13 +290,25 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
   acceptor, timeout + semaphore; POA&M row (CNSA doc :106 discloses the gap).
 - [ ] **MAJOR, LIVE (client) — soft client TLS uses the default aws-lc provider,
   not `cnsa_provider()`** (`client-core/src/sip_transport.rs:722`).
-- [ ] **MAJOR, LIVE — `Aes256GcmKey` and `P384KeyPair` don't zeroize their
+- [x] **MAJOR, LIVE — `Aes256GcmKey` and `P384KeyPair` don't zeroize their
   secrets** (`uc-crypto/src/aead.rs:33`, `ecdsa.rs:23`: `ZeroizeOnDrop` with the
   only secret field `#[zeroize(skip)]`); `open()` leaves an unwiped plaintext
   copy. Remove the skips, add a test; rustdoc overclaims.
-- [ ] **MINOR, LIVE — `load_private_key` doesn't check key file mode, owner or
-  symlinks** (`uc-transport/src/tls.rs` ~336), and `security.curve` P-384 isn't
-  enforced on the loaded key. Reuse uc-sti's `FileSigner` checks.
+  fixed: key array wiped on drop, PKCS#8 held in `Zeroizing`, `open()` returns the in-place buffer and wipes it on failure; opaque aws-lc objects documented as relying on aws-lc cleanse (POA&M-160, -161, -162; fix/crypto-key-zeroize).
+- [x] **MINOR, LIVE — `load_private_key` doesn't check key file mode, owner or
+  symlinks** (`uc-transport/src/tls.rs` ~336). Reuse uc-sti's `FileSigner` checks.
+  fixed: fail closed (boundary device) — `O_NOFOLLOW`, fd-based fstat, regular
+  file, `mode & 0o077 == 0`, owner == euid, 64 KiB cap, zeroized read buffer;
+  RSA/P-256 keys rejected, `load_private_key_with` gives an exact curve match
+  (POA&M-164, fix/crypto-key-zeroize). Residual: symlinked parent dirs and
+  copies inside rustls/aws-lc not wiped (POA&M-165). Non-unix builds refuse key loading (fail closed).
+- [ ] **MINOR, LIVE — `security.curve` isn't passed to TLS key loading**
+  (POA&M-166). `sbc-daemon/src/server.rs:1162,1303` call `load_private_key`,
+  which accepts P-384 or P-521; switch to
+  `load_private_key_with(path, security.curve)` so a P-384 config rejects a
+  P-521 key (and vice versa). Also emit a `CryptoKeyOperation` audit event
+  (AU-2, AU-12) with outcome on TLS key load and on every cert reload,
+  pass or fail (uc-transport has no audit sink).
 - [ ] **MINOR, LIVE (client) — uc-dns resolver built without a DNS backend**
   (`uc-dns/src/resolver.rs:163`, `client-sip-ua/src/call_agent.rs:3144`), so
   NAPTR/SRV are never queried; RFC 3263 isn't actually done.
@@ -318,7 +330,9 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
   (`uc-acl/src/network.rs`, `filter.rs:20`).
 - [ ] **MINOR, DORMANT — uc-discovery gossip accepts Join/Update/Leave
   unauthenticated, unbounded members** (`gossip.rs:224`). Auth + cap before wiring.
-- [ ] **Docs:** uc-crypto zeroize rustdoc; PROTO_RFC_COMPLIANCE.md:26,508 (client
+- [x] **Docs:** uc-crypto zeroize rustdoc.
+  fixed: crate/struct docs state what is wiped, what relies on aws-lc and what is not covered (POA&M-163, fix/crypto-key-zeroize).
+- [ ] **Docs:** PROTO_RFC_COMPLIANCE.md:26,508 (client
   SRV via uc-dns) and :43 (RFC 7118 "Wired"); ROADMAP.md:466 (ENUM done); SC-5
   row presents the limiters without caveats; CNSA doc :113 (client) reads as
   compliant. No fuzz targets anywhere in the repo for the stream framer, SCTP,

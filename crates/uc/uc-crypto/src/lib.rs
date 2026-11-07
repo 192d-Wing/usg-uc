@@ -28,11 +28,28 @@
 //! (`stir-shaken-es256`), never re-exported here, and used for caller-identity
 //! signatures only.
 //!
+//! ## Key material in memory
+//!
+//! What is wiped, and what is not:
+//!
+//! - **Wiped on drop**: buffers this crate owns — the AES-256-GCM key array
+//!   ([`aead::Aes256GcmKey`]), the PKCS#8 DER held by
+//!   [`ecdsa::P384KeyPair`], and ECDH shared-secret bytes.
+//! - **Relies on aws-lc**: opaque aws-lc objects (AES key schedules,
+//!   `EVP_PKEY` private keys, ECDH ephemeral keys). aws-lc cleanses these
+//!   when it frees them; Rust code cannot reach them.
+//! - **Not covered**: copies the caller keeps (inputs to constructors,
+//!   bytes copied out of accessors), plaintext returned by `open`, which the
+//!   caller owns, and stack/register copies the compiler may leave on moves.
+//!
 //! ## NIST 800-53 Rev5 Controls
 //!
 //! This crate implements:
 //! - **SC-12**: Cryptographic Key Establishment and Management
 //! - **SC-13**: Cryptographic Protection
+//! - **SC-4 / SI-16**: residual key material in memory (see above)
+//!
+//! POA&M-163: earlier docs claimed all key material was zeroized; corrected above.
 //!
 //! ## Usage
 //!
