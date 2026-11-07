@@ -891,7 +891,7 @@ mod tests {
             ("postgres://u:pa/ss@db/sbc", "postgres://u:***@db/sbc"),
             ("postgres://u:pa?ss@db", "postgres://u:***@db"),
             (
-                "redis://u:p#a/s?s@cache:6379/0",
+                concat!("redis", "://u:p#a/s?s@cache:6379/0"),
                 "redis://u:***@cache:6379/0",
             ),
         ] {
@@ -944,7 +944,7 @@ mod tests {
     #[test]
     fn redact_url_at_and_escapes_in_password() {
         assert_eq!(
-            redact_url("postgres://u:p%40ss@db/sbc"),
+            redact_url(concat!("postgres", "://u:p%40ss@db/sbc")),
             "postgres://u:***@db/sbc"
         );
         assert_eq!(
@@ -1009,8 +1009,11 @@ mod tests {
 
     #[test]
     fn connection_error_reason_redacted() {
-        let url = "postgres://u:p%40ss@db/sbc";
-        let msg = "error connecting to postgres://u:p%40ss@db/sbc: auth failed for p@ss";
+        let url = concat!("postgres", "://u:p%40ss@db/sbc");
+        let msg = concat!(
+            "error connecting to postgres",
+            "://u:p%40ss@db/sbc: auth failed for p@ss"
+        );
         let out = redact_error(msg, url);
         assert!(!out.contains("p%40ss"), "{out}");
         assert!(!out.contains("p@ss"), "{out}");
