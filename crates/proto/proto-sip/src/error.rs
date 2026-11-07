@@ -106,6 +106,40 @@ pub enum SipError {
         /// Static reason (never attacker data).
         reason: &'static str,
     },
+
+    /// The URI scheme is well-formed but not SIP/SIPS (RFC 3261 §8.2.2.1:
+    /// a Request-URI with such a scheme SHOULD get 416).
+    ///
+    /// POAM: POA&M-150.
+    #[error("unsupported URI scheme: {scheme}")]
+    UnsupportedUriScheme {
+        /// Scheme (truncated / escaped for logging).
+        scheme: String,
+    },
+
+    /// Topology hiding could not safely rewrite a header element; the
+    /// message must not be forwarded (fail closed).
+    ///
+    /// POAM: POA&M-151. NIST 800-53 Rev5: SC-7, SI-17.
+    #[error("topology hiding failed on {header}: {reason}")]
+    TopologyHiding {
+        /// Header name (canonical).
+        header: String,
+        /// Static reason (never attacker data).
+        reason: &'static str,
+    },
+
+    /// A header-manipulation rule produced invalid output; the original
+    /// headers were left untouched.
+    ///
+    /// POAM: POA&M-152. NIST 800-53 Rev5: SI-10, SI-17.
+    #[error("manipulation rule '{rule}' produced invalid header {header}")]
+    ManipulationInvalid {
+        /// Rule name (operator configured).
+        rule: String,
+        /// Header name (canonical).
+        header: String,
+    },
 }
 
 impl SipError {
@@ -130,7 +164,26 @@ impl SipError {
                 | Self::DuplicateHeader { .. }
                 | Self::LimitExceeded { .. }
                 | Self::InvalidContentLength { .. }
+                | Self::UnsupportedUriScheme { .. }
+                | Self::TopologyHiding { .. }
         )
+    }
+
+    /// Returns the SIP status code a server should answer with when this
+    /// error is raised while processing a request.
+    ///
+    /// - [`SipError::UnsupportedUriScheme`] -> 416 (RFC 3261 §21.4.17;
+    ///   meaningful for the Request-URI);
+    /// - other peer-caused errors -> 400;
+    /// - local faults (encoding, manipulation output) -> 500 (no detail is
+    ///   echoed, NIST 800-53 Rev5: SI-11).
+    #[must_use]
+    pub fn status_code(&self) -> u16 {
+        match self {
+            Self::UnsupportedUriScheme { .. } => 416,
+            e if e.is_client_error() => 400,
+            _ => 500,
+        }
     }
 }
 

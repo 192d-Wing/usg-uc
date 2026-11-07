@@ -343,6 +343,18 @@ fn qa_helm_rendered_sbc_config_validates() {
             "5060",
         ),
         (
+            "{{ .Values.sbcDaemon.topologyHiding.externalTlsPort | default 5061 }}",
+            "5061",
+        ),
+        (
+            "{{ .Values.sbcDaemon.topologyHiding.internalNetworks | toJson }}",
+            "[\"10.0.0.0/8\", \"fd00::/8\"]",
+        ),
+        (
+            "{{ .Values.sbcDaemon.topologyHiding.internalDomains | toJson }}",
+            "[\"corp.example\"]",
+        ),
+        (
             "{{ .Values.sbcDaemon.topologyHiding.obfuscateCallId }}",
             "false",
         ),

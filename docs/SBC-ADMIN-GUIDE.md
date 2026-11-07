@@ -677,6 +677,16 @@ header = "P-Asserted-Identity"
 | `prepend` | Add a prefix to the header value |
 | `append` | Add a suffix to the header value |
 
+Rules apply to every instance of a header, and a condition matches if any
+instance matches. If a rule produces a header that does not parse, or one
+longer than the header length limit, the SBC discards the rule's changes and
+rejects the B-leg INVITE with 500. It also writes an audit record with
+policy `sip.header_manipulation.failed:<rule>`.
+
+The SBC owns these headers, so they cannot be manipulated: `Via` (`v`),
+`Content-Length` (`l`), `CSeq` and `Call-ID`. A rule that targets one of
+them, in any letter case, is refused when the configuration loads.
+
 ---
 
 ## Topology Hiding
@@ -690,7 +700,27 @@ mode = "full"                    # none, signaling_only, or full
 external_host = "sbc.uc.mil"    # hostname to present externally
 external_port = 5060
 obfuscate_call_id = true         # replace internal Call-IDs
+external_tls_port = 5061         # port presented for TLS / sips: elements (default 5061, must be non-zero)
+internal_networks = ["10.20.0.0/16", "fd00:1::/32"]  # extra internal CIDRs (bare IP = single host)
+internal_domains = ["corp.example"]                  # extra internal DNS domains (matches d and *.d)
 ```
+
+`internal_networks` and `internal_domains` add to the built-in internal set
+(RFC 1918, RFC 6598 100.64/10, loopback, link-local, IPv6 ULA, and the
+domains `localhost`, `local`, `internal`, `lan` and `home.arpa`). Hosts are
+matched as IP addresses or DNS labels, not by string prefix, so
+`10.example.com` is not internal. A CIDR prefix longer than /32 (IPv4) or
+/128 (IPv6), a malformed CIDR, or an invalid domain fails validation, and
+the daemon will not start. All three keys are optional. Older configurations
+that omit them load with the defaults shown.
+
+Scope: topology hiding is applied only to the B-leg initial INVITE. It is
+not applied to responses relayed back to the caller, to in-dialog requests
+(BYE, re-INVITE, UPDATE) or to other out-of-dialog requests (POA&M-155).
+If a Via, Contact or Record-Route value cannot be parsed for rewriting, the
+INVITE is rejected with 400 and an audit record with policy
+`sip.topology_hiding.failed:<header>` is written. The request is never
+forwarded partly rewritten.
 
 ### Modes
 

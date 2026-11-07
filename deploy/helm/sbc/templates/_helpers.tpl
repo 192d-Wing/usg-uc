@@ -295,6 +295,13 @@ mode = {{ .Values.sbcDaemon.topologyHiding.mode | quote }}
 external_host = {{ .Values.sbcDaemon.topologyHiding.externalHost | default (printf "sbc.%s" .Values.site.fqdn_base) | quote }}
 external_port = {{ .Values.sbcDaemon.topologyHiding.externalPort }}
 obfuscate_call_id = {{ .Values.sbcDaemon.topologyHiding.obfuscateCallId }}
+external_tls_port = {{ .Values.sbcDaemon.topologyHiding.externalTlsPort | default 5061 }}
+{{- if .Values.sbcDaemon.topologyHiding.internalNetworks }}
+internal_networks = {{ .Values.sbcDaemon.topologyHiding.internalNetworks | toJson }}
+{{- end }}
+{{- if .Values.sbcDaemon.topologyHiding.internalDomains }}
+internal_domains = {{ .Values.sbcDaemon.topologyHiding.internalDomains | toJson }}
+{{- end }}
 {{- end }}
 
 [logging]

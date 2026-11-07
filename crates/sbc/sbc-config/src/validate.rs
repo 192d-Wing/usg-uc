@@ -1253,6 +1253,21 @@ fn validate_manipulation_rule(
         });
     }
 
+    // POAM: POA&M-152 - Via, Content-Length, CSeq and Call-ID are owned by
+    // the SBC's transaction layer; editing them breaks transaction matching
+    // and framing. Refused at load (NIST 800-53 Rev5: CM-6, SI-10).
+    if SBC_OWNED_HEADERS
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(header))
+    {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "header manipulation rule '{name}': header '{header}' is owned by the SBC \
+                 (Via, Content-Length, CSeq, Call-ID cannot be manipulated)"
+            ),
+        });
+    }
+
     if has_ascii_control(value) {
         return Err(ConfigError::Validation {
             message: format!(
@@ -1266,10 +1281,14 @@ fn validate_manipulation_rule(
     Ok(())
 }
 
+/// Headers (full and compact forms) that header manipulation may not target.
+const SBC_OWNED_HEADERS: [&str; 6] = ["via", "v", "content-length", "l", "cseq", "call-id"];
+
 fn validate_topology_hiding(config: &SbcConfig) -> ConfigResult<()> {
-    if let Some(topo) = &config.topology_hiding
-        && has_ascii_control(&topo.external_host)
-    {
+    let Some(topo) = &config.topology_hiding else {
+        return Ok(());
+    };
+    if has_ascii_control(&topo.external_host) {
         return Err(ConfigError::Validation {
             message: format!(
                 "topology_hiding.external_host '{}' contains ASCII control characters",
@@ -1277,8 +1296,72 @@ fn validate_topology_hiding(config: &SbcConfig) -> ConfigResult<()> {
             ),
         });
     }
+    // POAM: POA&M-151 - internal networks/domains are validated at load so
+    // a typo cannot silently weaken topology hiding (NIST 800-53 Rev5: CM-6,
+    // SC-7).
+    if topo.external_tls_port == 0 {
+        return Err(ConfigError::Validation {
+            message: "topology_hiding.external_tls_port must be non-zero".to_string(),
+        });
+    }
+    for cidr in &topo.internal_networks {
+        if !is_valid_cidr(cidr) {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "topology_hiding.internal_networks: '{}' is not a valid CIDR \
+                     (e.g. 10.0.0.0/8, fd00::/8)",
+                    cidr.escape_default()
+                ),
+            });
+        }
+    }
+    for domain in &topo.internal_domains {
+        if !is_valid_domain(domain) {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "topology_hiding.internal_domains: '{}' is not a valid DNS name",
+                    domain.escape_default()
+                ),
+            });
+        }
+    }
 
     Ok(())
+}
+
+/// `addr/prefix` with prefix <= 32 (IPv4) or <= 128 (IPv6), or a bare IP.
+fn is_valid_cidr(s: &str) -> bool {
+    let (a, p) = match s.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (s, None),
+    };
+    let Ok(addr) = a.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    p.is_none_or(|p| {
+        !p.is_empty()
+            && p.len() <= 3
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u8>().is_ok_and(|n| n <= max)
+    })
+}
+
+/// Hostname grammar: dot-separated labels of alnum/`-`, no leading or
+/// trailing `-`, at most 253 octets (RFC 1123 §2.1).
+#[must_use]
+pub fn is_valid_domain(s: &str) -> bool {
+    let s = s.strip_suffix('.').unwrap_or(s);
+    !s.is_empty()
+        && s.len() <= 253
+        && s.split('.').all(|l| {
+            let b = l.as_bytes();
+            !b.is_empty()
+                && b.len() <= 63
+                && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+                && b.first() != Some(&b'-')
+                && b.last() != Some(&b'-')
+        })
 }
 
 /// Returns `true` if `s` is a non-empty RFC 3261 token
@@ -2356,6 +2439,91 @@ max_passport_age_secs = 120
 
     // ── Header manipulation ────────────────────────────────────────
 
+    // POAM-152: SBC-owned headers cannot be manipulated.
+    #[test]
+    fn test_header_manipulation_sbc_owned_rejected() {
+        for header in [
+            "Via",
+            "v",
+            "Content-Length",
+            "l",
+            "CSeq",
+            "Call-ID",
+            "call-id",
+        ] {
+            let mut rule = global_rule();
+            rule.header = header.to_string();
+            assert_rejected(&config_with_global_rule(rule), "owned by the SBC");
+        }
+    }
+
+    // POAM-151: internal networks/domains validated.
+    #[test]
+    fn test_topology_hiding_internal_networks() {
+        let mut config = SbcConfig::default();
+        config.topology_hiding = Some(TopologyHidingConfig {
+            enabled: true,
+            mode: "full".to_string(),
+            external_host: "sbc.example.com".to_string(),
+            internal_networks: vec!["10.20.0.0/16".into(), "fd00::/8".into(), "192.0.2.1".into()],
+            internal_domains: vec!["corp.example".into()],
+            ..Default::default()
+        });
+        assert!(validate_config(&config).is_ok());
+        for bad in [
+            "10.0.0.0/33",
+            "::/129",
+            "10.0.0.0/8x",
+            "garbage",
+            "10.0.0.0/",
+        ] {
+            let mut c = config.clone();
+            if let Some(t) = c.topology_hiding.as_mut() {
+                t.internal_networks = vec![bad.to_string()];
+            }
+            assert_rejected(&c, "internal_networks");
+        }
+        for bad in ["", "-bad.example", "a..b", "x y"] {
+            let mut c = config.clone();
+            if let Some(t) = c.topology_hiding.as_mut() {
+                t.internal_domains = vec![bad.to_string()];
+            }
+            assert_rejected(&c, "internal_domains");
+        }
+    }
+
+    // POAM-151 (QA): external_tls_port = 0 refused; boundary prefixes and
+    // trunk-scoped SBC-owned header rules handled.
+    #[test]
+    fn qa_topology_tls_port_and_prefix_boundaries() {
+        let mut config = SbcConfig::default();
+        config.topology_hiding = Some(TopologyHidingConfig {
+            enabled: true,
+            external_host: "sbc.example.com".to_string(),
+            internal_networks: vec!["10.0.0.0/32".into(), "::/128".into(), "0.0.0.0/0".into()],
+            ..Default::default()
+        });
+        assert!(validate_config(&config).is_ok());
+        let mut c = config.clone();
+        if let Some(t) = c.topology_hiding.as_mut() {
+            t.external_tls_port = 0;
+        }
+        assert_rejected(&c, "external_tls_port");
+        for bad in ["10.0.0.0/-1", "10.0.0.0/0032", "10.0.0.0/ 8", "fd00::/8/8"] {
+            let mut c = config.clone();
+            if let Some(t) = c.topology_hiding.as_mut() {
+                t.internal_networks = vec![bad.to_string()];
+            }
+            assert_rejected(&c, "internal_networks");
+        }
+        let mut rule = global_rule();
+        rule.header = "VIA".to_string();
+        assert_rejected(&config_with_global_rule(rule), "owned by the SBC");
+        let mut rule = global_rule();
+        rule.header = "X-Via".to_string();
+        assert!(validate_config(&config_with_global_rule(rule)).is_ok());
+    }
+
     fn config_with_global_rule(rule: ManipulationRuleConfig) -> SbcConfig {
         let mut config = SbcConfig::default();
         config.header_manipulation = Some(HeaderManipulationConfig {
@@ -2449,6 +2617,7 @@ max_passport_age_secs = 120
             external_host: "sbc.example.com\r\nVia: evil".to_string(),
             external_port: 5060,
             obfuscate_call_id: false,
+            ..Default::default()
         });
         assert_rejected(&config, "topology_hiding.external_host");
 
