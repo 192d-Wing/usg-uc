@@ -24,6 +24,9 @@ thiserror = "2.0"
 # workspace uses.
 md5 = "0.7"
 aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
+# RFC 3261 §19.1.4 URI comparison for the digest `uri` binding (RFC 7616
+# §3.4.6). Plain message layer only - not the `digest-auth` feature.
+proto-sip.workspace = true
 
 # Optional storage dependencies
 serde = { workspace = true, features = ["derive"], optional = true }

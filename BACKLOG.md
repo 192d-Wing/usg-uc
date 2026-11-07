@@ -253,15 +253,43 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   without storing them, so responses could not reach internal hops
   (RFC 3261 §16.7, §18.2.2). No daemon caller today; needs branch-keyed
   Via restoration before proxy use.
-- [ ] **MAJOR, DORMANT — RFC 3261 §12.1.1/§12.1.2 route-set order swapped**
+- [x] **MAJOR, DORMANT — RFC 3261 §12.1.1/§12.1.2 route-set order swapped**
   (`routing.rs:309,323`); §16.4 route preprocessing missing; loop detection
   rejects spirals and ignores branch hash; 100 Trying copies only the first Via
   and no Timestamp (`proxy.rs`).
-- [ ] **MAJOR, DORMANT — digest auth:** SHA-256/SHA-512-256 listed but hashed
+  Fixed at the proto layer (POA&M-231): route-set order, §16.4 preprocessing
+  (except `maddr`, POA&M-235), loop hash in the branch with spiral detection
+  (topmost Via not hashed, documented deviation), 100 Trying copies all Vias
+  and Timestamp. Still library-only (POA&M-236).
+- [x] **MAJOR, DORMANT — digest auth:** SHA-256/SHA-512-256 listed but hashed
   with MD5; verifier trusts client `algorithm`/`qop` (downgrade), no
   `uri` == Request-URI check, no nonce/nc enforcement (`auth.rs:815`).
-- [ ] **MAJOR, DORMANT — no RFC 3323 `Privacy` header; PAI-stripping presets
+  Fixed at the proto layer (POA&M-230): real SHA-256/SHA-512-256 hashers, hashers
+  fail closed on an unimplemented algorithm, RFC 7616 `DigestVerifier`
+  (`digest_verifier.rs`), and the proto-registrar verifier now pins
+  realm/algorithm/qop, checks opaque and nc. Follow-ups POA&M-233, -234, -236.
+- [x] **MAJOR, DORMANT — no RFC 3323 `Privacy` header; PAI-stripping presets
   are no-ops on parsed messages** (`strip_pai_outbound`, `rpid_to_pai`).
+  Fixed at the proto layer (POA&M-232): `privacy.rs` (`Privacy` header,
+  `apply_privacy`, `sanitize_inbound_identity`, `rpid_to_pai` for `screen=yes`
+  only); presets match parsed `HeaderName::PAssertedIdentity`. Library-only
+  (POA&M-236).
+- [ ] **MINOR, LIVE (sbc-daemon) — digest-uri check skipped on REGISTER**
+  (POA&M-233): `handle_register` (`sip_stack.rs` ~5826) builds
+  `RegisterRequest` without the Request-URI. Call
+  `.with_request_uri(req.uri.to_string())`.
+- [ ] **MAJOR, LIVE (sbc-trunk-services, client sessions) — UAC digest still
+  uses `Md5DigestHasher`** (POA&M-234): `sbc-trunk-services/src/registrar.rs:411`,
+  `client-sip-ua/src/registration.rs:957`, `call_agent.rs:1637`. SHA-256
+  challenges now error instead of sending a wrong MD5 answer. Switch to
+  `AlgorithmHasher::for_algorithm(challenge.algorithm)`.
+- [ ] **MINOR, DORMANT — RFC 3261 §16.4 `maddr` not handled** (POA&M-235):
+  `// POAM:` in `routing.rs` `preprocess_route_information`.
+- [ ] **MAJOR, DORMANT (sbc-daemon wiring) — wire the POA&M-230..232 helpers**
+  (POA&M-236): `DigestVerifier` with uc-audit events for digest rejects,
+  route preprocessing with ACL/dial plan after preprocessing, loop-hash
+  branches, `apply_privacy` / `sanitize_inbound_identity`; cluster-shared nc
+  state for `DigestVerifier`. Also RFC 7616 `userhash`.
 - [ ] **MINOR — method case rewritten; Call-ID predictable** (timestamp +
   counter); no server-side `received`/`rport` helper; missing status codes;
   `choose_best_response` doesn't follow §16.7; redirect `sips:`→`sip:` recursion.

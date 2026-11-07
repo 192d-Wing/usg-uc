@@ -12,12 +12,16 @@ readme = "README.md"
 
 [features]
 default = []
-digest-auth = ["dep:md5"]
+# Digest authentication: MD5 (legacy interop) plus SHA-256 / SHA-512-256
+# and the HMAC-SHA-384 nonce issuer through the aws-lc-rs FIPS module
+# (RFC 7616; NIST 800-53 Rev5: SC-13).
+digest-auth = ["dep:md5", "dep:aws-lc-rs"]
 
 [dependencies]
 thiserror = "2.0"
 bytes = "1.12"
 md5 = { version = "0.7", optional = true }
+aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"], optional = true }
 getrandom = "0.4.3"
 
 [lints.rust]

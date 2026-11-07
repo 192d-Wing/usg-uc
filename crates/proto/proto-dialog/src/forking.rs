@@ -161,7 +161,9 @@ impl ForkedDialogSet {
     ///
     /// * `remote_tag` - The To tag from the response
     /// * `remote_target` - The Contact URI from the response (if present)
-    /// * `route_set` - The Record-Route headers from the response
+    /// * `route_set` - The UAC route set, i.e. the response's Record-Route
+    ///   URIs in **reverse** order (RFC 3261 §12.1.2). Stored as given; build
+    ///   it with `proto_sip::process_record_route_for_uac`.
     pub fn receive_provisional(
         &mut self,
         remote_tag: impl Into<String>,
@@ -219,6 +221,9 @@ impl ForkedDialogSet {
     /// - All other early dialogs SHOULD be terminated (with BYE or CANCEL)
     ///
     /// Returns the confirmed dialog and the list of early dialogs to terminate.
+    ///
+    /// `route_set` has the same meaning as in [`Self::receive_provisional`]
+    /// (RFC 3261 §12.1.2: Record-Route reversed).
     pub fn receive_2xx(
         &mut self,
         remote_tag: impl Into<String>,

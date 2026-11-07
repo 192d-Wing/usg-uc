@@ -1110,7 +1110,7 @@ mod tests {
 
         // Temporary GRUU
         let (value, is_temp) = extract_gruu_info("sip:xyz@example.com;gr").unwrap();
-        assert!(value.is_empty());
+        assert_eq!(value, "");
         assert!(is_temp);
 
         // Not a GRUU

@@ -99,6 +99,11 @@ pub enum ManipulationAction {
         /// Value to append.
         suffix: String,
     },
+    /// Convert Remote-Party-ID to a clean RFC 3325 §9.1 P-Asserted-Identity
+    /// (name-addr only, at most one sip and one tel, only `screen=yes`
+    /// elements) and add `Privacy: id` (plus `user` for name privacy) when
+    /// the RPID asks for privacy. See [`crate::privacy::rpid_to_pai`].
+    RpidToPai,
 }
 
 impl ManipulationAction {
@@ -164,6 +169,12 @@ impl ManipulationAction {
     #[must_use]
     pub fn copy(from: HeaderName, to: HeaderName) -> Self {
         Self::Copy { from, to }
+    }
+
+    /// Creates a Remote-Party-ID to P-Asserted-Identity conversion action.
+    #[must_use]
+    pub fn rpid_to_pai() -> Self {
+        Self::RpidToPai
     }
 }
 
@@ -732,6 +743,10 @@ impl HeaderManipulator {
                     h.value.push_str(suffix);
                 }
             }
+
+            ManipulationAction::RpidToPai => {
+                crate::privacy::rpid_to_pai(headers);
+            }
         }
         true
     }
@@ -835,6 +850,9 @@ fn touched(action: &ManipulationAction) -> Vec<&HeaderName> {
         | ManipulationAction::Append { name, .. } => vec![name],
         ManipulationAction::Rename { from, to } => vec![from, to],
         ManipulationAction::Copy { to, .. } => vec![to],
+        ManipulationAction::RpidToPai => {
+            vec![&HeaderName::PAssertedIdentity, &HeaderName::Privacy]
+        }
     }
 }
 
@@ -952,12 +970,14 @@ impl ManipulationPresets {
     }
 
     /// Creates a rule to strip P-Asserted-Identity on outbound.
+    ///
+    /// RFC 3325 §5: asserted identity MUST NOT leave the trust domain.
     #[must_use]
     pub fn strip_pai_outbound() -> ManipulationRule {
         ManipulationRule::new(
             "strip-pai-outbound",
             ManipulationCondition::always(),
-            ManipulationAction::remove(HeaderName::Custom("P-Asserted-Identity".to_string())),
+            ManipulationAction::remove(HeaderName::PAssertedIdentity),
         )
     }
 
@@ -976,7 +996,7 @@ impl ManipulationPresets {
         )
     }
 
-    /// Creates a rule to copy Remote-Party-ID to P-Asserted-Identity.
+    /// Creates a rule to convert Remote-Party-ID to P-Asserted-Identity.
     #[must_use]
     pub fn rpid_to_pai() -> ManipulationRule {
         ManipulationRule::new(
@@ -985,14 +1005,12 @@ impl ManipulationPresets {
                 ManipulationCondition::header_exists(HeaderName::Custom(
                     "Remote-Party-ID".to_string(),
                 )),
-                ManipulationCondition::header_missing(HeaderName::Custom(
-                    "P-Asserted-Identity".to_string(),
-                )),
+                ManipulationCondition::header_missing(HeaderName::PAssertedIdentity),
             ]),
-            ManipulationAction::copy(
-                HeaderName::Custom("Remote-Party-ID".to_string()),
-                HeaderName::Custom("P-Asserted-Identity".to_string()),
-            ),
+            // POA&M-232: previously a verbatim Copy, which put RPID's
+            // `party`/`screen`/`privacy` params into PAI (not RFC 3325 §9.1)
+            // and dropped the privacy request.
+            ManipulationAction::rpid_to_pai(),
         )
     }
 
@@ -1654,5 +1672,62 @@ mod tests {
         h.replace_instances(&bar, vec!["a".into(), "b".into()]);
         assert_eq!(snapshot(&h)[1].1, "a");
         assert_eq!(snapshot(&h)[2].1, "b");
+    }
+
+    fn parsed_request(extra: &str) -> crate::message::SipRequest {
+        let raw = format!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 192.0.2.1;branch=z9hG4bK1\r\n\
+             From: <sip:alice@example.org>;tag=abc\r\n\
+             To: <sip:bob@example.com>\r\n\
+             Call-ID: c1\r\n\
+             CSeq: 1 INVITE\r\n\
+             Max-Forwards: 70\r\n\
+             {extra}\
+             Content-Length: 0\r\n\r\n"
+        );
+        match crate::message::SipMessage::parse(raw.as_bytes()).unwrap() {
+            crate::message::SipMessage::Request(r) => r,
+            crate::message::SipMessage::Response(_) => unreachable!(),
+        }
+    }
+
+    /// POA&M-232 regression on a **parsed** message (header names are
+    /// normalised by the parser, including odd case).
+    #[test]
+    fn trunk_interop_strips_pai_from_parsed_message() {
+        let mut req = parsed_request(
+            "p-asserted-identity: <sip:alice@example.org>\r\n\
+             P-Asserted-Identity: <tel:+15550100>\r\n",
+        );
+        assert_eq!(req.headers.count(&HeaderName::PAssertedIdentity), 2);
+        let mut m = HeaderManipulator::new();
+        m.add_global_policy(ManipulationPresets::trunk_interop_policy("t1"));
+        let ctx = ManipulationContext::for_request("INVITE", ManipulationDirection::Outbound);
+        m.apply(&mut req.headers, &ctx).unwrap();
+        assert!(!req.headers.contains(&HeaderName::PAssertedIdentity));
+        assert!(!req.to_string().to_ascii_lowercase().contains("p-asserted"));
+    }
+
+    #[test]
+    fn rpid_to_pai_preset_on_parsed_message() {
+        let mut req = parsed_request(
+            "Remote-Party-ID: \"Alice\" <sip:alice@example.org>;party=calling;privacy=full;screen=yes\r\n",
+        );
+        let mut policy = ManipulationPolicy::new("rpid");
+        policy.add_rule(ManipulationPresets::rpid_to_pai());
+        let mut m = HeaderManipulator::new();
+        m.add_global_policy(policy);
+        let ctx = ManipulationContext::for_request("INVITE", ManipulationDirection::Outbound);
+        assert_eq!(m.apply(&mut req.headers, &ctx).unwrap(), 1);
+        assert_eq!(
+            req.headers.get_value(&HeaderName::PAssertedIdentity),
+            Some("\"Alice\" <sip:alice@example.org>")
+        );
+        assert_eq!(req.headers.get_value(&HeaderName::Privacy), Some("id;user"));
+        // Existing PAI: the rule's header_missing condition holds it off.
+        let mut again = req.clone();
+        assert_eq!(m.apply(&mut again.headers, &ctx).unwrap(), 0);
+        assert_eq!(again.headers.count(&HeaderName::PAssertedIdentity), 1);
     }
 }

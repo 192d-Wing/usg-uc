@@ -57,6 +57,35 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Security
 
+- **SBC and proto-sip: SIP digest, routing and privacy fail closed
+  (peer-visible REGISTER auth change).** (NIST 800-53 Rev5: IA-2(8),
+  IA-5(1), SC-13, SC-23, SC-7, AC-21, SI-10, SC-5; POA&M-230..232, follow-ups
+  POA&M-233..236)
+  - **REGISTER digest (proto-registrar, used by sbc-daemon when digest auth
+    is enabled):** credentials whose `algorithm` differs from the configured
+    one (default SHA-256), that omit or change `qop`, or that do not echo
+    `opaque` are now rejected; the realm is checked. Unknown or `-sess`
+    algorithms and unknown qop get a fresh challenge instead of being treated
+    as MD5. A wrong response no longer consumes the nonce count, and with qop
+    disabled a nonce is single-use. The nonce table is bounded (65,536,
+    oldest evicted). Compliant RFC 7616 phones are unaffected. The digest-uri
+    = Request-URI check exists but is not yet active because sbc-daemon does
+    not pass the Request-URI (POA&M-233).
+  - **Digest hashing (proto-sip `auth.rs`):** SHA-256 and SHA-512-256 are now
+    real hashes (they used MD5). A hasher given an algorithm it does not
+    implement returns an error. `sbc-trunk-services` trunk REGISTER and the
+    soft client still use the MD5 hasher, so a SHA-256 challenge now fails
+    instead of sending a wrong answer (POA&M-234).
+  - **RPID→PAI (`rpid_to_pai`, `ManipulationAction::RpidToPai`):** only
+    `Remote-Party-ID` with `screen=yes` is converted to
+    `P-Asserted-Identity`; RPID without `screen=yes` is no longer converted.
+    The PAI is a re-serialized name-addr without RPID parameters.
+    `strip_pai_outbound` / `rpid_to_pai` presets now act on parsed messages.
+  - **Library only, not yet wired (POA&M-236):** RFC 7616 `DigestVerifier`
+    (`digest-auth` feature), RFC 3261 §12.1 route-set order fix, §16.4 route
+    preprocessing (no `maddr` handling, POA&M-235), spiral-aware loop
+    detection, full 100 Trying, RFC 3323 `Privacy` service and RFC 3325
+    inbound identity sanitizing.
 - **SBC: management-API hardening (BREAKING for admin sessions,
   provisioning URLs and REST TLS).** (NIST 800-53 Rev5: IA-2, IA-5, SC-8,
   SC-12, SC-13, SC-5, SC-23; POA&M-210..214) **Upgrade notes:**
