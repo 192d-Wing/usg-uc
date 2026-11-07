@@ -137,6 +137,8 @@ zeroize = { version = "1.9", features = ["derive"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Hex encoding (audit hash-chain fields).
+hex = "0.4"
 toml = "1.1"
 
 # Error handling

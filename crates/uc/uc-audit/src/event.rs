@@ -125,6 +125,11 @@ pub enum AuditEvent {
     /// A managed user account was created, modified or removed (or the
     /// attempt failed).
     AccountManagement(AccountManagement),
+
+    /// Audit records were lost (queue full, sink write failure) or a torn
+    /// tail was found at startup. Chained by the writer so the loss is
+    /// visible inside the trail itself.
+    AuditRecordsDropped(AuditRecordsDropped),
 }
 
 impl AuditEvent {
@@ -144,7 +149,8 @@ impl AuditEvent {
             | Self::StirShakenVerification(_)
             | Self::RateLimitTriggered(_)
             | Self::StirVerifyFailure(_)
-            | Self::StirAuditEventsDropped(_) => AuditEventType::Security,
+            | Self::StirAuditEventsDropped(_)
+            | Self::AuditRecordsDropped(_) => AuditEventType::Security,
             Self::ConfigurationChange(_)
             | Self::StirTrustAnchorsReloaded(_)
             | Self::StirTrustAnchorReloadFailed(_)
@@ -615,6 +621,34 @@ pub struct StirAuditEventsDropped {
     pub total: u64,
 }
 
+/// Audit records lost since the previous marker of the same reason.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures), AU-9
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditRecordsDropped {
+    /// Records lost since the previous marker of this reason (0 for a torn
+    /// tail whose fragment was not a whole record).
+    pub count: u64,
+    /// Total lost for this reason since startup.
+    pub total: u64,
+    /// Why the records were lost.
+    pub reason: AuditDropReason,
+}
+
+/// Cause of an [`AuditRecordsDropped`] marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDropReason {
+    /// The bounded writer queue was full.
+    QueueFull,
+    /// The sink failed to persist the record (e.g. ENOSPC).
+    SinkWriteFailed,
+    /// The audit file ended in an unterminated or unreadable tail at open
+    /// (crash-torn write or tamper); the chain resumes after the last good
+    /// record.
+    TornTail,
+}
+
 /// Signing key loaded.
 ///
 /// ## NIST 800-53 Rev5: SC-12, SC-17
@@ -658,6 +692,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn audit_records_dropped_serializes_snake_case_and_is_security() {
+        let d = AuditEvent::AuditRecordsDropped(AuditRecordsDropped {
+            count: 3,
+            total: 7,
+            reason: AuditDropReason::QueueFull,
+        });
+        assert_eq!(d.event_type(), AuditEventType::Security);
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"audit_records_dropped","count":3,"total":7,"reason":"queue_full"}"#
+        );
+        let json = serde_json::to_string(&AuditDropReason::SinkWriteFailed).unwrap();
+        assert_eq!(json, r#""sink_write_failed""#);
+        let json = serde_json::to_string(&AuditDropReason::TornTail).unwrap();
+        assert_eq!(json, r#""torn_tail""#);
+    }
 
     #[test]
     fn test_event_type_categorization() {

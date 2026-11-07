@@ -337,25 +337,34 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   `AccountManagement` audit (NIST AC-2, AC-3, AC-6). Contradiction: the IA-2 row
   was correct (the daemon does not read this table); the `state.rs` comment was
   wrong and is fixed.
-- [ ] **MAJOR, LIVE — uc-audit sink write failures are silent**
+- [x] **MAJOR, LIVE — uc-audit sink write failures are silent**
   (`uc-audit/src/sink.rs:77`): ENOSPC loses every later record while `audit`
   health stays Healthy and `sbc_audit_records_dropped` stays 0. Make `write`
-  fallible, count failures, report Unhealthy (as uc-cdr does).
-- [ ] **MAJOR, LIVE — uc-audit hash chain restarts at zero on every process
+  fallible, count failures, report Unhealthy (as uc-cdr does). Fixed 2026-11-06
+  (uc-audit-integrity): `io::Result` writes, `sbc_audit_write_failures`,
+  Unhealthy while failing (NIST AU-5).
+- [x] **MAJOR, LIVE — uc-audit hash chain restarts at zero on every process
   start**, has no file verifier, and the file is umask-mode (typically 0644)
   (`uc-audit/src/lib.rs:75`, `sink.rs:57`). Resume from the file tail like
   uc-cdr, 0600/0640 file and 0750 dir, `sbc-cli audit verify`; POA&M for a keyed
-  chain (HMAC-SHA-384 or ML-DSA-87).
+  chain (HMAC-SHA-384 or ML-DSA-87). Fixed 2026-11-06 (uc-audit-integrity):
+  resume from tail, 0640/0750, symlink and writable-dir refusal,
+  `sbc-cli audit verify [--require-anchor]`; keyed chain is POA&M-130, residual
+  open race POA&M-131 (NIST AU-9).
 - [x] **MAJOR, LIVE — SHA-256 HA1 not listed as a CNSA exception**
   (`uc-user-mgmt/src/digest.rs`). Fixed 2026-11-06 (ha1-users-authz): POA&M-110,
   `CNSA-EXCEPTION` marker, CNSA-2-COMPLIANCE.md.
 - [ ] **MAJOR, LIVE — HMAC-SHA256 provisioning tokens not listed as a CNSA
   exception** (`sbc-provision-server/src/main.rs:314`; split from the HA1 item
   above). Record as an exception with POA&M, or move the HMAC to SHA-384.
-- [ ] **MINOR, LIVE — dropped audit records leave no trace in the chain**
+- [x] **MINOR, LIVE — dropped audit records leave no trace in the chain**
   (sequence assigned in the writer). Emit an `AuditRecordsDropped{count}` record.
-- [ ] **MINOR, LIVE — sbc-api-server and central-config-api audit only to
+  Fixed 2026-11-06 (uc-audit-integrity): markers for queue-full, sink-write
+  failure and torn tail (NIST AU-5).
+- [x] **MINOR, LIVE — sbc-api-server and central-config-api audit only to
   tracing** (no FileSink option). Add an audit path or document log shipping.
+  Fixed 2026-11-06 (uc-audit-integrity): `SBC_API_AUDIT_PATH` /
+  `CENTRAL_API_AUDIT_PATH`, fail closed at startup.
 - [x] **MINOR, LIVE — raw DB/user-mgmt errors returned to clients**, including on
   unauthenticated `/readyz` (`handlers/users.rs`, `handlers/system.rs:50`).
   Fixed 2026-11-06 (ha1-users-authz): fixed messages (NIST SI-11).
@@ -397,10 +406,14 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
 - [ ] **MINOR, DORMANT — audit hex deserialiser panics on odd-length/multibyte
   input** (`uc-audit/src/record.rs:128`); **digest verify not constant-time,
   ignores qop/cnonce/nc and realm** (`uc-user-mgmt/src/digest.rs`).
+  Hex half fixed 2026-11-06 (uc-audit-integrity): `hex::decode`, error not
+  panic. The digest half stays open.
 - [ ] **NIT, DORMANT — Redis `KEYS`** (`uc-storage/src/redis.rs:159`); use `SCAN`.
 - [ ] **Docs (`docs/NIST-800-53-CONTROLS.md`):** AU-9 and AU-5 rows overclaim
   uc-audit; SC-13 omits the SHA-256 uses; IA-5 omits the live plaintext HA1 (no
   SC-28 row); SI-11 claims no leakage; AC-2 account management unmentioned.
+  AU-5/AU-9 uc-audit rows corrected 2026-11-06 (uc-audit-integrity); the
+  other parts stay open.
   Crate-level annotations with no backing code: uc-api, uc-syslog, uc-storage,
   uc-cluster, uc-state-sync, uc-snmp, uc-telemetry — mark library-only.
 

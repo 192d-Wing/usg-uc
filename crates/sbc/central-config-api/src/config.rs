@@ -43,6 +43,14 @@ pub struct Config {
     /// the `IdP` JWKS — needed when Keycloak is fronted by an internal CA the
     /// system roots don't include. Mirrors sbc's `SBC_OIDC_EXTRA_CA_CERT_FILE`.
     pub oidc_extra_ca_cert_file: Option<String>,
+    /// Optional hash-chained audit file (`CENTRAL_API_AUDIT_PATH`,
+    /// absolute). Unset (or empty): audit records go to the tracing output
+    /// (target `audit`) and must be shipped off-host by the log pipeline.
+    ///
+    /// ## NIST 800-53 Rev5: AU-9, AU-12 (capacity, AU-4, is the platform's:
+    /// volume sizing, rotation and retention)
+    // POAM: POA&M-133 -- no in-process audit file rotation or retention.
+    pub audit_path: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -88,6 +96,20 @@ impl Config {
             lookup("CENTRAL_OIDC_AUDIENCE").ok_or(ConfigError::Missing("CENTRAL_OIDC_AUDIENCE"))?;
         let oidc_extra_ca_cert_file =
             lookup("CENTRAL_OIDC_EXTRA_CA_CERT_FILE").filter(|s| !s.trim().is_empty());
+        let audit_path = match lookup("CENTRAL_API_AUDIT_PATH").filter(|s| !s.trim().is_empty()) {
+            None => None,
+            Some(v) => {
+                let p = std::path::PathBuf::from(v);
+                // NIST 800-53 Rev5: AU-9 -- no working-directory-relative trail.
+                if !p.is_absolute() {
+                    return Err(ConfigError::Invalid {
+                        var: "CENTRAL_API_AUDIT_PATH",
+                        reason: "must be an absolute path".to_string(),
+                    });
+                }
+                Some(p)
+            }
+        };
         Ok(Self {
             listen_addr,
             database_url,
@@ -96,6 +118,7 @@ impl Config {
             oidc_issuer,
             oidc_audience,
             oidc_extra_ca_cert_file,
+            audit_path,
         })
     }
 }
@@ -118,6 +141,34 @@ mod tests {
             map.insert(k, (*v).to_string());
         }
         move |var| map.get(var).cloned()
+    }
+
+    #[test]
+    fn audit_path_parsed_blank_unset_relative_rejected() -> Result<(), ConfigError> {
+        let cfg = Config::from_lookup(lookup_with(&[]))?;
+        assert_eq!(cfg.audit_path, None);
+        let cfg = Config::from_lookup(lookup_with(&[("CENTRAL_API_AUDIT_PATH", " ")]))?;
+        assert_eq!(cfg.audit_path, None);
+        let cfg = Config::from_lookup(lookup_with(&[(
+            "CENTRAL_API_AUDIT_PATH",
+            "/var/log/central-config-api/audit.log",
+        )]))?;
+        assert_eq!(
+            cfg.audit_path.as_deref(),
+            Some(std::path::Path::new(
+                "/var/log/central-config-api/audit.log"
+            ))
+        );
+        let err =
+            Config::from_lookup(lookup_with(&[("CENTRAL_API_AUDIT_PATH", "audit.log")])).err();
+        assert!(matches!(
+            err,
+            Some(ConfigError::Invalid {
+                var: "CENTRAL_API_AUDIT_PATH",
+                ..
+            })
+        ));
+        Ok(())
     }
 
     #[test]

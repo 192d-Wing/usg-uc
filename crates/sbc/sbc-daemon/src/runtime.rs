@@ -107,7 +107,7 @@ impl Runtime {
     pub async fn new(args: Args) -> Result<Self, RuntimeError> {
         // Load configuration
         let config = Self::load_config(&args)?;
-        Self::init_audit(&config, &args);
+        Self::init_audit(&config, &args)?;
 
         // Initialize telemetry provider
         let telemetry = Self::init_telemetry(&config)?;
@@ -192,30 +192,43 @@ impl Runtime {
     /// `logging.audit_enabled`: hash-chained JSON-lines at
     /// `logging.audit_path`, or the tracing output (target `audit`) when no
     /// path is configured. Records the startup event.
-    fn init_audit(config: &SbcConfig, args: &Args) {
+    ///
+    /// # Errors
+    /// [`RuntimeError::AuditFailed`] when `logging.audit_path` is set but the
+    /// file sink cannot be opened or resumed (including files `FileSink`
+    /// refuses: symlink, group/world-writable directory, torn-only file).
+    fn init_audit(config: &SbcConfig, args: &Args) -> Result<(), RuntimeError> {
         if !config.logging.audit_enabled {
-            return;
+            return Ok(());
         }
-        let result = config.logging.audit_path.as_deref().map_or_else(
-            || {
+        let result = match config.logging.audit_path.as_deref() {
+            None => {
                 info!("Audit events enabled on the tracing output (target \"audit\")");
                 uc_audit::init()
-            },
-            |path| match uc_audit::sink::FileSink::open(path) {
+            }
+            Some(path) => match uc_audit::sink::FileSink::open(path) {
                 Ok(sink) => {
                     info!(path = %path.display(), "Audit log enabled");
                     uc_audit::init_with_sink(Box::new(sink))
                 }
                 Err(e) => {
+                    // NIST 800-53 Rev5: AU-5 (Response to Audit Logging
+                    // Process Failures) -- fail closed: an operator who
+                    // configured a protected audit file never gets a daemon
+                    // running without it. main() exits with
+                    // AUDIT_INIT_FAILED_EXIT_CODE.
                     error!(
                         path = %path.display(),
                         error = %e,
-                        "Cannot open audit log; audit events go to the tracing output"
+                        "Cannot open audit log; SBC cannot start"
                     );
-                    uc_audit::init()
+                    return Err(RuntimeError::AuditFailed {
+                        path: path.display().to_string(),
+                        reason: e.to_string(),
+                    });
                 }
             },
-        );
+        };
         if let Err(e) = result {
             debug!(error = %e, "Audit logger already initialised");
         }
@@ -225,6 +238,7 @@ impl Runtime {
                 config_path: args.effective_config_path().display().to_string(),
             },
         ));
+        Ok(())
     }
 
     /// Loads configuration from file or uses defaults.
@@ -1390,6 +1404,32 @@ pub enum RuntimeError {
         /// Error reason.
         reason: String,
     },
+    /// The configured audit file could not be opened (AU-5 fail closed).
+    AuditFailed {
+        /// Configured `logging.audit_path`.
+        path: String,
+        /// Error reason.
+        reason: String,
+    },
+}
+
+/// Process exit code when `logging.audit_path` is configured but the audit
+/// file sink cannot be opened. Every other startup/runtime failure (config,
+/// CDR, server) exits 1; this code is dedicated so supervisors can tell an
+/// audit-trail refusal apart.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+pub const AUDIT_INIT_FAILED_EXIT_CODE: i32 = 3;
+
+impl RuntimeError {
+    /// Process exit code for this error.
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        match self {
+            Self::AuditFailed { .. } => AUDIT_INIT_FAILED_EXIT_CODE,
+            Self::ConfigFailed { .. } | Self::InitFailed { .. } | Self::ServerFailed { .. } => 1,
+        }
+    }
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -1403,6 +1443,9 @@ impl std::fmt::Display for RuntimeError {
             }
             Self::ServerFailed { reason } => {
                 write!(f, "Server error: {reason}")
+            }
+            Self::AuditFailed { path, reason } => {
+                write!(f, "Cannot open audit log {path}: {reason}")
             }
         }
     }
@@ -1561,6 +1604,31 @@ mod tests {
         // Check default config values
         let config = runtime.config().await;
         assert_eq!(config.general.instance_name, "sbc-01");
+    }
+
+    /// NIST 800-53 Rev5: AU-5 -- a configured but unopenable audit path is
+    /// a startup error with the dedicated exit code, not a tracing fallback.
+    #[test]
+    fn init_audit_bad_path_is_error() {
+        let mut config = SbcConfig::default();
+        config.logging.audit_enabled = true;
+        config.logging.audit_path = Some("/dev/null/audit/audit.log".into());
+        let r = Runtime::init_audit(&config, &Args::default());
+        assert!(
+            matches!(&r, Err(e @ RuntimeError::AuditFailed { path, .. })
+                if path.contains("/dev/null/audit") && e.exit_code() == AUDIT_INIT_FAILED_EXIT_CODE),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn audit_exit_code_is_distinct() {
+        let other = RuntimeError::InitFailed {
+            component: "cdr".to_string(),
+            reason: String::new(),
+        };
+        assert_eq!(other.exit_code(), 1);
+        assert_ne!(AUDIT_INIT_FAILED_EXIT_CODE, 1);
     }
 
     #[test]
