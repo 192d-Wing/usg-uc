@@ -1,3 +1,7 @@
+{{- /* POA&M-183 (CM-6): sbc-config rejects any other mode when hiding is enabled; fail at render time too. */ -}}
+{{- if and .Values.sbcDaemon.topologyHiding.enabled (not (has .Values.sbcDaemon.topologyHiding.mode (list "signaling_only" "full"))) }}
+{{- fail "sbcDaemon.topologyHiding.mode must be signaling_only or full when enabled (POA&M-183)" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

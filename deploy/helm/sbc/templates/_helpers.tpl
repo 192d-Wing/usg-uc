@@ -283,9 +283,6 @@ per_ip_rps = 10000
 per_user_rps = 50
 burst_multiplier = 2.0
 {{- if .Values.sbcDaemon.topologyHiding.enabled }}
-{{- if not (has .Values.sbcDaemon.topologyHiding.mode (list "signaling_only" "full")) }}
-{{- fail "sbcDaemon.topologyHiding.mode must be signaling_only or full when enabled (POA&M-183)" }}
-{{- end }}
 
 # Topology hiding (SC-7): anonymize the SBC's internal signaling host in the
 # Via/Contact of outbound trunk-facing INVITEs. Applies only to outside-facing
