@@ -89,9 +89,10 @@ pub struct SbcConfig {
     #[cfg(feature = "aaa")]
     pub aaa: Option<AaaConfig>,
 
-    /// Monitoring settings.
+    /// Monitoring settings. Not implemented: any `[monitoring]` table is
+    /// rejected at config load (see [`MonitoringConfig`]).
     ///
-    /// ## NIST 800-53 Rev5: AU-6 (Audit Record Review)
+    /// ## NIST 800-53 Rev5: CM-6, CM-7 (POA&M-191)
     pub monitoring: Option<MonitoringConfig>,
 
     /// OpenTelemetry distributed tracing configuration.
@@ -1131,6 +1132,13 @@ pub struct StirVerificationConfig {
     pub max_cert_bytes: usize,
     /// Concurrent certificate fetches (1..=1024).
     pub max_concurrent_fetches: usize,
+    /// Concurrent certificate fetches started for one SIP source (IPv4
+    /// address or IPv6 /64), `1..=max_concurrent_fetches`. Bounds how much
+    /// of the fetch pool one peer can hold with `x5u` URLs on hosts it
+    /// controls (POA&M-190).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub max_fetches_per_source: usize,
     /// STI-CR trust anchors: a PEM bundle file or a directory of PEM files.
     pub trust_anchors_path: Option<PathBuf>,
     /// Trust-anchor reload interval (seconds, >= 60).
@@ -1153,6 +1161,7 @@ impl Default for StirVerificationConfig {
             negative_cache_ttl_secs: 60,
             max_cert_bytes: 16 * 1024,
             max_concurrent_fetches: 32,
+            max_fetches_per_source: 4,
             trust_anchors_path: None,
             trust_anchor_refresh_secs: 86_400,
             x5u_allow_hosts: Vec::new(),
@@ -1310,9 +1319,16 @@ impl Default for LoggingConfig {
 
 /// Monitoring configuration.
 ///
-/// ## NIST 800-53 Rev5: AU-6 (Audit Record Review)
+/// Not implemented: no Prometheus, SNMP or syslog exporter reads these
+/// keys, so `validate_config` rejects a present `[monitoring]` table rather
+/// than silently ignoring it. The type is kept for API compatibility;
+/// `deny_unknown_fields` makes feature-gated subkeys (`snmp`, `syslog`) an
+/// error instead of vanishing in builds without those features.
+///
+/// ## NIST 800-53 Rev5: CM-6, CM-7 (POA&M-191)
+// POAM: POA&M-195 telemetry export (Prometheus/SNMP/syslog/OTLP) not implemented.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MonitoringConfig {
     /// Enable SNMP trap sending.
     #[cfg(feature = "snmp")]

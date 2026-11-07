@@ -611,3 +611,41 @@ require_tls = true
     assert_eq!(d.trunk_id, "tls1");
     assert_eq!(d.failover_targets, Vec::<(String, String)>::new());
 }
+
+/// QA (POA&M-191): `[monitoring]` fails a full config load end to end,
+/// alongside otherwise valid tables; `[cdr.syslog]`-free baseline loads.
+#[test]
+fn qa_monitoring_table_rejected_on_load() {
+    let base = "[general]\ninstance_name = \"qa\"\n";
+    assert!(load_from_str(base).is_ok());
+    let err = load_from_str(&format!(
+        "{base}[monitoring]\nmetrics_bind = \"0.0.0.0:9090\"\n"
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("monitoring"), "{err}");
+    // Unknown keys under [monitoring] are an error too (deny_unknown_fields).
+    assert!(load_from_str(&format!("{base}[monitoring]\nbogus = 1\n")).is_err());
+}
+
+/// QA (POA&M-190): `max_fetches_per_source` bounds via TOML.
+#[test]
+fn qa_stir_max_fetches_per_source_toml_bounds() {
+    let t = |n: usize| {
+        format!(
+            "[stir_shaken.verification]\nmax_concurrent_fetches = 8\nmax_fetches_per_source = {n}\n"
+        )
+    };
+    assert!(load_from_str(&t(0)).is_err());
+    assert!(load_from_str(&t(9)).is_err());
+    let c = load_from_str(&t(8)).unwrap();
+    assert_eq!(c.stir_shaken.verification.max_fetches_per_source, 8);
+    assert_eq!(
+        load_from_str("")
+            .unwrap()
+            .stir_shaken
+            .verification
+            .max_fetches_per_source,
+        4
+    );
+}

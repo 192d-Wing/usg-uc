@@ -640,7 +640,15 @@ async fn negative_flood_cannot_evict_positive() {
 async fn per_host_fetch_cap() {
     let p = pki(true);
     let src = source(p.ee_pem.clone(), 300);
-    let cache = StiCertCache::new(CacheConfig::default(), src.clone(), anchors_for(&p));
+    // Per-source budget out of the way: this test isolates the host cap.
+    let cache = StiCertCache::new(
+        CacheConfig {
+            max_fetches_per_source: 32,
+            ..CacheConfig::default()
+        },
+        src.clone(),
+        anchors_for(&p),
+    );
     let mut tasks = Vec::new();
     for i in 0..crate::cache::MAX_FETCHES_PER_HOST {
         let c = Arc::clone(&cache);
@@ -709,4 +717,212 @@ async fn stale_generation_result_dropped() {
     );
     assert!(cache.cached(X5U).is_some());
     assert_eq!(src.calls.load(Ordering::SeqCst), 2);
+}
+
+/// Fetch source that panics (fetch task dies mid-flight).
+struct PanicSource;
+
+impl CertSource for PanicSource {
+    fn fetch<'a>(
+        &'a self,
+        _url: &'a X5uUrl,
+        _timeout: Duration,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Fetched, FetchError>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            std::panic::resume_unwind(Box::new("fetch panicked"))
+        })
+    }
+}
+
+/// POA&M-190: one SIP source cannot start more than
+/// `max_fetches_per_source` fetches (on distinct hosts it controls); other
+/// sources are unaffected; joining an in-flight URL is free; the budget is
+/// returned when the fetch ends and the map does not leak.
+#[tokio::test]
+async fn per_source_fetch_budget() {
+    use crate::cache::DEFAULT_MAX_FETCHES_PER_SOURCE;
+    use std::net::IpAddr;
+    let p = pki(true);
+    let src = source(p.ee_pem.clone(), 300);
+    let cache = StiCertCache::new(CacheConfig::default(), src.clone(), anchors_for(&p));
+    let attacker: IpAddr = "192.0.2.10".parse().unwrap();
+    let other: IpAddr = "198.51.100.7".parse().unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..DEFAULT_MAX_FETCHES_PER_SOURCE {
+        let c = Arc::clone(&cache);
+        tasks.push(tokio::spawn(async move {
+            c.get_or_fetch_from(
+                attacker,
+                &format!("https://h{i}.example.com/c"),
+                Duration::from_secs(2),
+            )
+            .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        cache.inflight_for_source(attacker),
+        DEFAULT_MAX_FETCHES_PER_SOURCE
+    );
+    // A new fetch on yet another host from the same source: refused.
+    assert_eq!(
+        cache
+            .get_or_fetch_from(
+                attacker,
+                "https://h99.example.com/c",
+                Duration::from_secs(2)
+            )
+            .await
+            .unwrap_err(),
+        FetchError::Busy
+    );
+    assert_eq!(cache.stats.busy_source.load(Ordering::Relaxed), 1);
+    // Joining an in-flight URL does not consume budget.
+    let c = Arc::clone(&cache);
+    let joiner = tokio::spawn(async move {
+        c.get_or_fetch_from(attacker, "https://h0.example.com/c", Duration::from_secs(2))
+            .await
+    });
+    // A different source still gets a fetch slot.
+    assert!(
+        cache
+            .get_or_fetch_from(other, "https://legit.example.com/c", Duration::from_secs(2))
+            .await
+            .is_ok()
+    );
+    assert!(joiner.await.unwrap().is_ok());
+    for t in tasks {
+        assert!(t.await.unwrap().is_ok());
+    }
+    assert_eq!(src.calls.load(Ordering::SeqCst), 5, "joiner shared a fetch");
+    assert_eq!(cache.inflight_for_source(attacker), 0);
+    assert_eq!(cache.inflight_sources(), 0, "no per-source entries leak");
+    // Budget is back.
+    assert!(
+        cache
+            .get_or_fetch_from(
+                attacker,
+                "https://h99.example.com/c",
+                Duration::from_secs(2)
+            )
+            .await
+            .is_ok()
+    );
+}
+
+/// POA&M-190: IPv6 sources in one /64 share a budget; IPv4-mapped IPv6 is
+/// the IPv4 source; the source-less path is budgeted too.
+#[tokio::test]
+async fn per_source_budget_v6_prefix_and_unspecified() {
+    use std::net::IpAddr;
+    let p = pki(true);
+    let src = source(p.ee_pem.clone(), 300);
+    let cache = StiCertCache::new(
+        CacheConfig {
+            max_fetches_per_source: 1,
+            ..CacheConfig::default()
+        },
+        src,
+        anchors_for(&p),
+    );
+    let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+    let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+    let c6: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+    let c1 = Arc::clone(&cache);
+    let t1 = tokio::spawn(async move {
+        c1.get_or_fetch_from(a, "https://a.example.com/c", Duration::from_secs(2))
+            .await
+    });
+    let c2 = Arc::clone(&cache);
+    let t2 = tokio::spawn(async move {
+        c2.get_or_fetch("https://u.example.com/c", Duration::from_secs(2))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        cache
+            .get_or_fetch_from(b, "https://b.example.com/c", Duration::from_secs(2))
+            .await
+            .unwrap_err(),
+        FetchError::Busy,
+        "same /64 shares the budget"
+    );
+    assert_eq!(
+        cache
+            .get_or_fetch("https://u2.example.com/c", Duration::from_secs(2))
+            .await
+            .unwrap_err(),
+        FetchError::Busy,
+        "source-less callers are budgeted"
+    );
+    let v4: IpAddr = "192.0.2.1".parse().unwrap();
+    let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+    let c3 = Arc::clone(&cache);
+    let t3 = tokio::spawn(async move {
+        c3.get_or_fetch_from(v4, "https://v4.example.com/c", Duration::from_secs(2))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        cache
+            .get_or_fetch_from(mapped, "https://m.example.com/c", Duration::from_secs(2))
+            .await
+            .unwrap_err(),
+        FetchError::Busy,
+        "IPv4-mapped is the IPv4 source"
+    );
+    assert!(
+        cache
+            .get_or_fetch_from(c6, "https://c.example.com/c", Duration::from_secs(2))
+            .await
+            .is_ok(),
+        "another /64 is independent"
+    );
+    for t in [t1, t2, t3] {
+        assert!(t.await.unwrap().is_ok());
+    }
+    assert_eq!(cache.inflight_sources(), 0);
+}
+
+/// POA&M-190: a fetch task that panics, or whose waiter times out, still
+/// returns the source budget.
+#[tokio::test]
+async fn per_source_budget_released_on_panic_and_timeout() {
+    use std::net::IpAddr;
+    let p = pki(true);
+    let cache = StiCertCache::new(
+        CacheConfig {
+            max_fetches_per_source: 1,
+            ..CacheConfig::default()
+        },
+        Arc::new(PanicSource),
+        anchors_for(&p),
+    );
+    let ip: IpAddr = "192.0.2.20".parse().unwrap();
+    let r = cache
+        .get_or_fetch_from(ip, "https://p.example.com/c", Duration::from_secs(2))
+        .await;
+    assert_eq!(r.unwrap_err(), FetchError::Transport("fetch-task-ended"));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(cache.inflight_for_source(ip), 0);
+    assert_eq!(cache.inflight_sources(), 0);
+
+    let slow = StiCertCache::new(
+        CacheConfig {
+            max_fetches_per_source: 1,
+            ..CacheConfig::default()
+        },
+        source(p.ee_pem.clone(), 100),
+        anchors_for(&p),
+    );
+    assert_eq!(
+        slow.get_or_fetch_from(ip, "https://t.example.com/c", Duration::from_millis(10))
+            .await
+            .unwrap_err(),
+        FetchError::Timeout
+    );
+    assert_eq!(slow.inflight_for_source(ip), 1, "fetch continues");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(slow.inflight_for_source(ip), 0);
 }
