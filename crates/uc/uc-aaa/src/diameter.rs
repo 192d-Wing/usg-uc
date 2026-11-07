@@ -8,22 +8,36 @@
 //! - **TS 29.228**: Cx and Dx interfaces based on the Diameter protocol
 //! - **TS 29.229**: Cx and Dx interfaces - signalling flows and message content
 //!
-//! ## Supported Commands
+//! ## Command Status
 //!
-//! - **UAR/UAA**: User-Authorization-Request/Answer
-//! - **MAR/MAA**: Multimedia-Auth-Request/Answer
-//! - **SAR/SAA**: Server-Assignment-Request/Answer
-//! - **LIR/LIA**: Location-Info-Request/Answer (stub)
+//! UAR, MAR and SAR are **not implemented**. They return
+//! [`AaaError::DiameterError`], and `authenticate` therefore always rejects
+//! (POA&M-200, fail closed). `account` likewise errors for every record type.
 //!
-//! ## Features
+//! ## Base Protocol (RFC 6733) Status
 //!
-//! - Async TCP/TLS transport
-//! - Capabilities exchange (CER/CEA)
-//! - Watchdog support (DWR/DWA)
-//! - Server failover
+//! - Async TCP transport and a CER is sent on connect, but the CER/CEA
+//!   exchange is **not** RFC 6733 conformant (no Host-IP-Address AVP, the
+//!   CEA Result-Code is not checked).
+//! - Watchdog (DWR/DWA, RFC 6733 §5.5) is **not** implemented.
+//! - Server failover is **not** implemented beyond a failure counter.
+
+use crate::error::AaaError;
+
+/// Builds the fail-closed error returned by unimplemented Cx commands.
+///
+/// Diameter Cx (UAR/MAR/SAR) is not implemented; every command errors so that
+/// enabling the provider can never accept a user.
+// POAM: POA&M-200 -- Diameter Cx UAR/MAR/SAR not implemented; fails closed
+fn not_implemented(command: &str) -> AaaError {
+    AaaError::DiameterError {
+        reason: format!("Diameter Cx {command} not implemented (POA&M-200)"),
+    }
+}
 
 #[cfg(feature = "diameter")]
 mod implementation {
+    use super::not_implemented;
     use crate::config::DiameterConfig;
     use crate::error::{AaaError, AaaResult};
     use crate::provider::{
@@ -239,13 +253,12 @@ mod implementation {
                 "Sending UAR"
             );
 
-            // In a real implementation, we'd construct and send the UAR message
-            // For now, return a stub response since we can't get mutable access easily
             drop(transport);
 
-            // Stub implementation - full implementation requires restructuring
-            // to handle mutable transport access properly
-            Ok(AuthResponse::accept())
+            // POAM: POA&M-200 -- Cx UAR (3GPP TS 29.229 §6.1.1) is not implemented. Fail
+            // closed rather than faking a successful authorization.
+            // NIST 800-53 Rev5: SC-24 (fail in known state), IA-2, AC-3
+            Err(not_implemented("UAR"))
         }
 
         /// Sends Multimedia-Auth-Request (MAR).
@@ -268,9 +281,10 @@ mod implementation {
                 "Sending MAR"
             );
 
-            // Stub implementation
-            // In full implementation, would send MAR and return auth vectors
-            Ok(AuthResponse::accept().with_timeout(3600))
+            // POAM: POA&M-200 -- Cx MAR (3GPP TS 29.229 §6.1.7) is not implemented; no auth
+            // vectors are retrieved, so authentication must fail closed.
+            // NIST 800-53 Rev5: SC-24 (fail in known state), IA-2, AC-3
+            Err(not_implemented("MAR"))
         }
 
         /// Sends Server-Assignment-Request (SAR).
@@ -291,8 +305,9 @@ mod implementation {
                 "Sending SAR"
             );
 
-            // Stub implementation
-            Ok(())
+            // POAM: POA&M-200 -- Cx SAR (3GPP TS 29.229 §6.1.3) is not implemented.
+            // NIST 800-53 Rev5: SC-24 (fail in known state)
+            Err(not_implemented("SAR"))
         }
 
         /// Records a failure and potentially triggers failover.
@@ -397,8 +412,10 @@ mod implementation {
                             .await?;
                     }
                     AccountingRecordType::Interim => {
-                        // Interim updates are typically handled by Rf interface
-                        // For Cx, we might send a re-registration SAR
+                        // POAM: POA&M-200 -- interim accounting (Rf ACR) is not
+                        // implemented; fail closed rather than report success.
+                        // NIST 800-53 Rev5: SC-24 (fail in known state)
+                        return Err(not_implemented("accounting (Interim)"));
                     }
                 }
 
@@ -448,6 +465,7 @@ pub use implementation::DiameterClient;
 // Stub implementation when diameter feature is not enabled
 #[cfg(not(feature = "diameter"))]
 mod stub {
+    use super::not_implemented;
     use crate::config::DiameterConfig;
     use crate::error::AaaResult;
     use crate::provider::{AaaProvider, AccountingRecord, AuthRequest, AuthResponse};
@@ -480,43 +498,49 @@ mod stub {
         }
 
         /// Connects to the Diameter server (stub).
-        pub async fn connect(&self) -> AaaResult<()> {
+        ///
+        /// Returns a ready future so the signature matches the `diameter`
+        /// feature's async API without an `.await`-less `async fn`.
+        pub fn connect(&self) -> impl Future<Output = AaaResult<()>> + Send + 'static {
             debug!("Diameter connect (stub)");
             self.connected.store(true, Ordering::Relaxed);
-            Ok(())
+            std::future::ready(Ok(()))
         }
 
         /// Sends UAR (stub).
-        pub async fn send_uar(
+        pub fn send_uar(
             &self,
             _public_identity: &str,
             _visited_network: &str,
-        ) -> AaaResult<AuthResponse> {
+        ) -> impl Future<Output = AaaResult<AuthResponse>> + Send + 'static {
             debug!("Diameter UAR (stub)");
-            Ok(AuthResponse::accept())
+            // POAM: POA&M-200 -- stub never authorizes. NIST 800-53 Rev5: SC-24, AC-3
+            std::future::ready(Err(not_implemented("UAR")))
         }
 
         /// Sends MAR (stub).
-        pub async fn send_mar(
+        pub fn send_mar(
             &self,
             _public_identity: &str,
             _private_identity: &str,
             _server_name: &str,
             _auth_scheme: &str,
-        ) -> AaaResult<AuthResponse> {
+        ) -> impl Future<Output = AaaResult<AuthResponse>> + Send + 'static {
             debug!("Diameter MAR (stub)");
-            Ok(AuthResponse::accept().with_timeout(3600))
+            // POAM: POA&M-200 -- stub never authenticates. NIST 800-53 Rev5: SC-24, IA-2
+            std::future::ready(Err(not_implemented("MAR")))
         }
 
         /// Sends SAR (stub).
-        pub async fn send_sar(
+        pub fn send_sar(
             &self,
             _public_identity: &str,
             _server_name: &str,
             _assignment_type: u32,
-        ) -> AaaResult<()> {
+        ) -> impl Future<Output = AaaResult<()>> + Send + 'static {
             debug!("Diameter SAR (stub)");
-            Ok(())
+            // POAM: POA&M-200 -- stub never fakes a server assignment. NIST 800-53 Rev5: SC-24
+            std::future::ready(Err(not_implemented("SAR")))
         }
     }
 
@@ -528,9 +552,14 @@ mod stub {
             Box::pin(async move {
                 debug!(
                     username = %request.username,
-                    "Diameter authentication (stub - always accepts)"
+                    "Diameter authentication (stub - rejects, feature 'diameter' disabled)"
                 );
-                Ok(AuthResponse::accept().with_timeout(3600))
+                // POAM: POA&M-200 -- the stub must never accept. Turning on the provider
+                // without a real Cx implementation fails closed.
+                // NIST 800-53 Rev5: SC-24 (fail in known state), IA-2, AC-3
+                Err(not_implemented(
+                    "authentication (feature 'diameter' disabled)",
+                ))
             })
         }
 
@@ -542,9 +571,12 @@ mod stub {
                 debug!(
                     session_id = %record.session_id,
                     record_type = ?record.record_type,
-                    "Diameter accounting (stub - always succeeds)"
+                    "Diameter accounting (stub - not implemented)"
                 );
-                Ok(())
+                // POAM: POA&M-200 -- accounting not implemented (AU-12 gap); do not
+                // report a record as stored when nothing was sent.
+                // NIST 800-53 Rev5: SC-24 (fail in known state)
+                Err(not_implemented("accounting"))
             })
         }
 
@@ -599,5 +631,60 @@ mod tests {
         let debug_str = format!("{client:?}");
         assert!(debug_str.contains("DiameterClient"));
         assert!(debug_str.contains("sbc.test.com"));
+    }
+
+    // POAM: POA&M-200 -- every Cx command and the authenticate path must fail closed.
+    #[tokio::test]
+    async fn test_cx_commands_fail_closed() {
+        let client = create_test_client();
+        assert!(matches!(
+            client.send_uar("sip:alice@test.com", "test.com").await,
+            Err(AaaError::DiameterError { .. })
+        ));
+        assert!(matches!(
+            client
+                .send_mar("sip:alice@test.com", "alice", "sbc.test.com", "SIP Digest")
+                .await,
+            Err(AaaError::DiameterError { .. })
+        ));
+        assert!(matches!(
+            client
+                .send_sar("sip:alice@test.com", "sbc.test.com", 1)
+                .await,
+            Err(AaaError::DiameterError { .. })
+        ));
+    }
+
+    #[cfg(not(feature = "diameter"))]
+    #[tokio::test]
+    async fn test_stub_authenticate_rejects() {
+        let client = create_test_client();
+        let result = client
+            .authenticate(crate::provider::AuthRequest::new("alice", "secret"))
+            .await;
+        assert!(result.is_err(), "stub must never accept");
+    }
+
+    // NIST 800-53 Rev5: IA-2, SA-11 -- feature-on authenticate must not accept
+    // (it errors at connect or at the unimplemented MAR).
+    #[cfg(feature = "diameter")]
+    #[tokio::test]
+    async fn test_feature_authenticate_rejects() {
+        let client = create_test_client();
+        let result = client
+            .authenticate(crate::provider::AuthRequest::new("alice", "secret"))
+            .await;
+        assert!(
+            !matches!(result, Ok(ref r) if r.success),
+            "feature authenticate must never accept"
+        );
+    }
+
+    #[cfg(feature = "diameter")]
+    #[tokio::test]
+    async fn test_feature_account_interim_fails_closed() {
+        let client = create_test_client();
+        let record = crate::provider::AccountingRecord::interim("sess-1", "alice");
+        assert!(client.account(record).await.is_err());
     }
 }

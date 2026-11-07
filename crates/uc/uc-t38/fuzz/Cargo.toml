@@ -1,0 +1,31 @@
+[package]
+name = "uc-t38-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+uc-t38 = { path = ".." }
+
+# Standalone workspace: keeps nightly-only fuzz code out of the main
+# workspace build (the root Cargo.toml also lists this dir in `exclude`).
+[workspace]
+
+[[bin]]
+name = "udptl_decode"
+path = "fuzz_targets/udptl_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ifp_decode"
+path = "fuzz_targets/ifp_decode.rs"
+test = false
+doc = false
+bench = false

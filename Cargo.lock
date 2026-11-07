@@ -8643,6 +8643,7 @@ dependencies = [
 name = "uc-policy"
 version = "0.10.0"
 dependencies = [
+ "regex",
  "tracing",
  "uc-types",
 ]

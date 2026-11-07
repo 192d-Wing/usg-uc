@@ -151,6 +151,23 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   `changed` (field-group names only). SIEM parsers must accept the new event
   type. (AC-2(4), AU-2, AU-3)
 
+- **SBC: dormant AAA, policy-regex, dial-plan-regex and T.38 paths fail
+  closed.** (NIST 800-53 Rev5: AC-3, IA-2, SI-10, CM-6; POA&M-200..206)
+  None of these paths is wired by default. The Diameter Cx stubs
+  (UAR/MAR/SAR, `authenticate`, `account`) now return `DiameterError`
+  instead of accepting (POA&M-200). Policy `StringMatch::Regex` now
+  evaluates a compiled, size-bounded regex (1 KiB pattern, 1 MiB compiled
+  limit) instead of always matching; an invalid pattern cannot be
+  constructed (POA&M-201). Dial-plan `DialPattern::Regex` is compiled once,
+  an invalid pattern never matches, and `DialPattern::validate` /
+  `DialPlan::try_add_entry` reject it (POA&M-205). **Upgrade note:** a
+  policy or dial-plan regex that was silently accepted before may now fail
+  to load or stop matching. UDPTL/IFP decoding in `uc-t38` is
+  bounds-checked, with new cargo-fuzz targets (POA&M-202/203). `uc-t38` is
+  now documented as a non-interoperable T.38-style encoding, not ITU-T T.38
+  PER (POA&M-204). `uc-policy` now depends on `regex` (already in the
+  workspace; no new crate in `Cargo.lock`).
+
 ### Changed
 
 - **SBC + client: uc-dns uses the system DNS configuration and has no public
