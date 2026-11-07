@@ -29,6 +29,11 @@ base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 # SHA-256 (PKCE S256) + CSPRNG (verifier/state/nonce) via the workspace FIPS
 # crypto module — same one the TLS stack links.
+# CNSA 2.0 rustls config handed to reqwest via `use_preconfigured_tls`
+# (NIST 800-53 Rev5: SC-13). Same rustls 0.23 that reqwest links.
+rustls.workspace = true
+rustls-native-certs.workspace = true
+uc-transport.workspace = true
 aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
 
 [dev-dependencies]

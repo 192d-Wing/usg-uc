@@ -65,6 +65,8 @@ impl StatusCode {
     pub const REQUEST_URI_TOO_LONG: Self = Self(414);
     /// 415 Unsupported Media Type.
     pub const UNSUPPORTED_MEDIA_TYPE: Self = Self(415);
+    /// 416 Unsupported URI Scheme (RFC 3261 §21.4.17).
+    pub const UNSUPPORTED_URI_SCHEME: Self = Self(416);
     /// 420 Bad Extension.
     pub const BAD_EXTENSION: Self = Self(420);
     /// 421 Extension Required.
@@ -218,9 +220,15 @@ impl StatusCode {
             413 => "Request Entity Too Large",
             414 => "Request-URI Too Long",
             415 => "Unsupported Media Type",
+            416 => "Unsupported URI Scheme",
             420 => "Bad Extension",
             421 => "Extension Required",
             423 => "Interval Too Brief",
+            // RFC 8224 §13.1-13.3
+            428 => "Use Identity Header",
+            436 => "Bad Identity Info",
+            437 => "Unsupported Credential",
+            438 => "Invalid Identity Header",
             480 => "Temporarily Unavailable",
             481 => "Call/Transaction Does Not Exist",
             482 => "Loop Detected",
@@ -273,6 +281,16 @@ impl TryFrom<u16> for StatusCode {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stir_reason_phrases() {
+        // RFC 8224 §13.1-13.3 registered phrases.
+        let phrase = |c| StatusCode::new(c).map(|s| s.reason_phrase());
+        assert_eq!(phrase(428).ok(), Some("Use Identity Header"));
+        assert_eq!(phrase(436).ok(), Some("Bad Identity Info"));
+        assert_eq!(phrase(437).ok(), Some("Unsupported Credential"));
+        assert_eq!(phrase(438).ok(), Some("Invalid Identity Header"));
+    }
 
     #[test]
     fn test_status_code_categories() {

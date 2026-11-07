@@ -53,13 +53,9 @@ impl NumberTransform {
                 }
             }
             Self::AddPrefix { prefix } => format!("{prefix}{number}"),
-            Self::ReplacePrefix { from, to } => {
-                if let Some(rest) = number.strip_prefix(from.as_str()) {
-                    format!("{to}{rest}")
-                } else {
-                    number.to_string()
-                }
-            }
+            Self::ReplacePrefix { from, to } => number
+                .strip_prefix(from.as_str())
+                .map_or_else(|| number.to_string(), |rest| format!("{to}{rest}")),
             Self::Replace {
                 number: replacement,
             } => replacement.clone(),
@@ -152,6 +148,30 @@ impl DialPattern {
 
         // Pattern exhausted, number should also be exhausted
         number_chars.next().is_none()
+    }
+
+    /// Builds a pattern from its configured kind (`exact`, `prefix`,
+    /// `wildcard`, `any`; case-sensitive). `regex` is deliberately not
+    /// accepted from configuration: an invalid regex fails open.
+    ///
+    /// ## NIST 800-53 Rev5: SI-10 (Information Input Validation), CM-6
+    ///
+    /// # Errors
+    /// [`RoutingError::InvalidPattern`] for any other kind, so a mistyped
+    /// kind is rejected rather than silently becoming a prefix route.
+    pub fn from_kind(kind: &str, value: &str) -> crate::RoutingResult<Self> {
+        match kind {
+            "exact" => Ok(Self::exact(value)),
+            "prefix" => Ok(Self::prefix(value)),
+            "wildcard" => Ok(Self::wildcard(value)),
+            "any" => Ok(Self::Any),
+            other => Err(crate::RoutingError::InvalidPattern {
+                pattern: value.to_string(),
+                reason: format!(
+                    "unknown pattern_type {other:?}; expected exact, prefix, wildcard or any"
+                ),
+            }),
+        }
     }
 
     /// Creates a prefix pattern.
@@ -446,21 +466,25 @@ impl DialPlanEntry {
 
 /// Matches a domain pattern against a domain.
 ///
-/// - `"uc.mil"` matches `"uc.mil"` and `"sip.uc.mil"` (suffix match)
-/// - `"*.mil"` matches any `.mil` domain
+/// - `"uc.mil"` matches `"uc.mil"` and `"sip.uc.mil"` (label-suffix match)
+/// - `"*.mil"` matches `"mil"` and any `.mil` domain, never `"evilmil"`
 /// - `""` or empty matches everything
+///
+/// RFC 3261 §19.1.4: host comparison is case-insensitive. Allocation-free.
 fn match_domain(pattern: &str, domain: &str) -> bool {
     if pattern.is_empty() {
         return true;
     }
-
-    // Wildcard prefix: "*.mil" matches "anything.mil"
-    if let Some(suffix) = pattern.strip_prefix("*.") {
-        return domain.ends_with(suffix) || domain == suffix;
+    let suffix = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if domain.eq_ignore_ascii_case(suffix) {
+        return true;
     }
-
-    // Exact or suffix match: "uc.mil" matches "uc.mil" and "sip.uc.mil"
-    domain == pattern || domain.ends_with(&format!(".{pattern}"))
+    // Label boundary: the byte before the suffix must be '.'.
+    domain.len() > suffix.len()
+        && domain
+            .get(domain.len() - suffix.len()..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+        && domain.as_bytes().get(domain.len() - suffix.len() - 1) == Some(&b'.')
 }
 
 /// Dial plan result.
@@ -988,5 +1012,43 @@ mod tests {
         let inbound = plan.entries_with_tag("inbound");
         assert_eq!(inbound.len(), 1);
         assert_eq!(inbound[0].id(), "toll-free");
+    }
+
+    #[test]
+    fn match_domain_respects_label_boundary_and_case() {
+        assert!(!match_domain("*.mil", "evilmil"));
+        assert!(!match_domain("uc.mil", "evil-uc.mil"));
+        assert!(match_domain("*.mil", "ARMY.MIL"));
+        assert!(match_domain("UC.mil", "sip.uc.MIL"));
+        assert!(match_domain("*.mil", "mil"));
+    }
+
+    #[test]
+    fn from_kind_accepts_known_and_rejects_unknown() {
+        assert!(matches!(
+            DialPattern::from_kind("exact", "911"),
+            Ok(DialPattern::Exact(_))
+        ));
+        assert!(matches!(
+            DialPattern::from_kind("prefix", "1"),
+            Ok(DialPattern::Prefix(_))
+        ));
+        assert!(matches!(
+            DialPattern::from_kind("wildcard", "XXXX"),
+            Ok(DialPattern::Wildcard(_))
+        ));
+        assert!(matches!(
+            DialPattern::from_kind("any", ""),
+            Ok(DialPattern::Any)
+        ));
+        for bad in ["regex", "bogus", "Prefix", "EXACT", ""] {
+            assert!(
+                matches!(
+                    DialPattern::from_kind(bad, "1"),
+                    Err(crate::RoutingError::InvalidPattern { .. })
+                ),
+                "{bad}"
+            );
+        }
     }
 }

@@ -5,6 +5,8 @@ This document describes the clustering architecture and configuration for the US
 > **Status legend.** *Wired (sbc-daemon | sbc-media-core | soft client)* — a shipped binary has a call site for this (the binary is named). *Library-only* — implemented and tested in a `proto-*`/`uc-*` crate, but no shipped binary calls it. *Planned* — not implemented. A row that says only "Full"/"Complete" describes crate-level capability; the wiring column/annotation says what the running SBC actually does.
 >
 > **Build requirement.** Everything in this document requires `sbc-daemon` to be built with the `cluster` cargo feature (`--features cluster` or `--features full`; Redis/PostgreSQL additionally need `redis` / `postgres`). The default build (`default = []`) compiles a stub `ClusterManager` and ignores the `[cluster]` and `[storage]` sections entirely (`sbc-daemon/src/cluster.rs`, `sbc-config/src/schema.rs`).
+>
+> **Release image.** The release `Dockerfile` builds `sbc-daemon` with only `--features sbc-daemon/grpc`. The `cluster`, `redis` and `postgres` features are not enabled, so none of the "Wired (`cluster` feature)" rows below are present in the shipped image; they apply only to a custom build with those features.
 
 ## Overview
 
@@ -135,7 +137,19 @@ batch_size = 100
 replication_interval_ms = 100
 snapshot_interval_secs = 300
 max_lag_ms = 5000
+
+[cluster.admission]              # wired (POA&M-1 phase 1)
+split = "per_node"               # per_node (default: each node enforces the full cap) | divide
+expected_nodes = 1               # 1-64; only with split = "divide"
 ```
+
+#### Cluster-wide admission caps (`[cluster.admission]`)
+
+By default (`split = "per_node"`) every node enforces the full `general.max_calls`, `general.max_registrations` and trunk `max_calls`, so an N-node cluster admits up to N x cap. With `split = "divide"` each node enforces `floor(cap / expected_nodes)` (at least 1) of those three caps, and so does every trunk group synced through the management API (gRPC `SyncTrunkGroup` returns `INVALID_ARGUMENT` for a trunk `max_calls` of 0 or below `expected_nodes`). The emergency reserves and `vps.per_callee_max_concurrent` are not divided.
+
+- `divide` requires `cluster.enabled = true`; every divided cap must be at least `expected_nodes`; `expected_nodes` other than 1 is rejected under `per_node`; unknown keys in the table are rejected.
+- The share is static (it does not follow live membership). **Keep `expected_nodes` equal to the cluster size**: after scaling, update it on every node, or the cluster total drifts from the configured cap. A dead node's share is stranded until then (fail-closed; POA&M-80).
+- The startup log line "Call limits configured (per-node enforced)" shows the caps this node enforces. A warning is logged when a cap is not a multiple of `expected_nodes` (unused remainder) and when `divide` is set with `expected_nodes = 1`.
 
 There is **no** `quorum_policy` key in `ClusterConfig`.
 

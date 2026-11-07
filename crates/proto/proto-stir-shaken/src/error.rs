@@ -1,4 +1,8 @@
 //! STIR/SHAKEN error types.
+//!
+//! ## NIST 800-53 Rev5: SI-11 (Error Handling)
+//!
+//! Errors carry fixed reason text; attacker-supplied bytes are never echoed.
 
 use std::fmt;
 
@@ -6,126 +10,42 @@ use std::fmt;
 pub type StirShakenResult<T> = Result<T, StirShakenError>;
 
 /// STIR/SHAKEN errors.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StirShakenError {
-    /// Invalid PASSporT format.
-    InvalidPASSporT {
-        /// Reason.
-        reason: String,
+    /// The Identity header or PASSporT is syntactically invalid.
+    Malformed {
+        /// Fixed reason.
+        reason: &'static str,
     },
-    /// Invalid algorithm.
-    InvalidAlgorithm {
-        /// Requested algorithm.
-        algorithm: String,
+    /// The `info` parameter is missing or not an acceptable URI.
+    BadInfo {
+        /// Fixed reason.
+        reason: &'static str,
     },
-    /// Signature verification failed.
-    SignatureVerificationFailed {
-        /// Reason.
-        reason: String,
-    },
-    /// Certificate error.
-    CertificateError {
-        /// Reason.
-        reason: String,
-    },
-    /// PASSporT expired.
-    Expired {
-        /// Age in seconds.
-        age_seconds: u64,
-        /// Maximum allowed age.
-        max_age: u64,
-    },
-    /// Invalid phone number.
-    InvalidPhoneNumber {
-        /// Number.
-        number: String,
-        /// Reason.
-        reason: String,
-    },
-    /// Invalid claim.
+    /// Algorithm not supported for this `ppt`.
+    UnsupportedAlgorithm,
+    /// A required claim is missing or invalid.
     InvalidClaim {
         /// Claim name.
-        claim: String,
-        /// Reason.
-        reason: String,
+        claim: &'static str,
     },
-    /// Missing required field.
-    MissingField {
-        /// Field name.
-        field: String,
-    },
-    /// Attestation level error.
-    AttestationError {
-        /// Reason.
-        reason: String,
-    },
-    /// Crypto error.
-    CryptoError {
-        /// Error message.
-        message: String,
-    },
-    /// Encoding error.
-    EncodingError {
-        /// Error message.
-        message: String,
-    },
-    /// Network error fetching certificate.
-    NetworkError {
-        /// URL.
-        url: String,
-        /// Error message.
-        message: String,
-    },
+    /// Invalid telephone number.
+    InvalidPhoneNumber,
+    /// Signing failed (key unusable).
+    SigningFailed,
 }
 
 impl fmt::Display for StirShakenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPASSporT { reason } => {
-                write!(f, "Invalid PASSporT: {reason}")
+            Self::Malformed { reason } => write!(f, "malformed identity: {reason}"),
+            Self::BadInfo { reason } => write!(f, "bad identity info: {reason}"),
+            Self::UnsupportedAlgorithm => {
+                write!(f, "unsupported algorithm (ES256 required for ppt=shaken)")
             }
-            Self::InvalidAlgorithm { algorithm } => {
-                write!(
-                    f,
-                    "Invalid algorithm '{algorithm}' (only ES384 is supported for CNSA 2.0)"
-                )
-            }
-            Self::SignatureVerificationFailed { reason } => {
-                write!(f, "Signature verification failed: {reason}")
-            }
-            Self::CertificateError { reason } => {
-                write!(f, "Certificate error: {reason}")
-            }
-            Self::Expired {
-                age_seconds,
-                max_age,
-            } => {
-                write!(
-                    f,
-                    "PASSporT expired: age {age_seconds}s exceeds maximum {max_age}s"
-                )
-            }
-            Self::InvalidPhoneNumber { number, reason } => {
-                write!(f, "Invalid phone number '{number}': {reason}")
-            }
-            Self::InvalidClaim { claim, reason } => {
-                write!(f, "Invalid claim '{claim}': {reason}")
-            }
-            Self::MissingField { field } => {
-                write!(f, "Missing required field: {field}")
-            }
-            Self::AttestationError { reason } => {
-                write!(f, "Attestation error: {reason}")
-            }
-            Self::CryptoError { message } => {
-                write!(f, "Crypto error: {message}")
-            }
-            Self::EncodingError { message } => {
-                write!(f, "Encoding error: {message}")
-            }
-            Self::NetworkError { url, message } => {
-                write!(f, "Network error fetching '{url}': {message}")
-            }
+            Self::InvalidClaim { claim } => write!(f, "invalid claim '{claim}'"),
+            Self::InvalidPhoneNumber => write!(f, "invalid telephone number"),
+            Self::SigningFailed => write!(f, "signing failed"),
         }
     }
 }
@@ -137,21 +57,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_error_display() {
-        let error = StirShakenError::InvalidAlgorithm {
-            algorithm: "ES256".to_string(),
-        };
-        assert!(error.to_string().contains("ES256"));
-        assert!(error.to_string().contains("CNSA 2.0"));
-    }
-
-    #[test]
-    fn test_expired_error() {
-        let error = StirShakenError::Expired {
-            age_seconds: 120,
-            max_age: 60,
-        };
-        assert!(error.to_string().contains("120"));
-        assert!(error.to_string().contains("60"));
+    fn display_is_fixed_text() {
+        let e = StirShakenError::InvalidClaim { claim: "iat" };
+        assert_eq!(e.to_string(), "invalid claim 'iat'");
+        assert!(
+            StirShakenError::UnsupportedAlgorithm
+                .to_string()
+                .contains("ES256")
+        );
     }
 }

@@ -556,7 +556,16 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.8.0",
+]
+
+[[package]]
+name = "bit-set"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56d87354e4229f54a44f7bf2435906a4656dba36026ab6eaca629a2c436a691c"
+dependencies = [
+ "bit-vec 0.10.1",
 ]
 
 [[package]]
@@ -564,6 +573,16 @@ name = "bit-vec"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
+name = "bit-vec"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5727b15fa97d4f4fee0a3b7c3d550ed0269f54329207b86388de918604e31269"
+dependencies = [
+ "borsh",
+ "serde",
+]
 
 [[package]]
 name = "bitflags"
@@ -627,6 +646,30 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "piper",
+]
+
+[[package]]
+name = "borsh"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "553c5d846a6ba5150c65e3b1b8ec073bcf1abc20f9b7220de384a4443ea4e20a"
+dependencies = [
+ "borsh-derive",
+ "bytes",
+ "cfg_aliases",
+]
+
+[[package]]
+name = "borsh-derive"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12cdfe656708a01f89b451a7d36466e6fe6c414de0aa18fc54f864f6f9ca9f56"
+dependencies = [
+ "once_cell",
+ "proc-macro-crate 3.5.0",
+ "proc-macro2 1.0.107",
+ "quote 1.0.47",
+ "syn 3.0.7",
 ]
 
 [[package]]
@@ -783,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "central-config-api"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
@@ -805,11 +848,12 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uc-audit",
 ]
 
 [[package]]
 name = "central-config-import"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "central-config-store",
  "sbc-config-store",
@@ -824,7 +868,7 @@ dependencies = [
 
 [[package]]
 name = "central-config-store"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "serde",
@@ -997,7 +1041,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "client-audio"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "client-types",
@@ -1017,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "client-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1044,6 +1088,7 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "uc-crypto",
+ "uc-transport",
  "whoami",
  "windows",
  "zeroize",
@@ -1051,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "client-ffi"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "client-audio",
@@ -1088,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "client-integration-tests"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "client-audio",
  "client-core",
@@ -1105,25 +1150,28 @@ dependencies = [
 
 [[package]]
 name = "client-provisioning"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
  "chrono",
  "client-types",
  "reqwest 0.12.28",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "uc-transport",
  "url",
  "zeroize",
 ]
 
 [[package]]
 name = "client-sip-ua"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -1151,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "client-types"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1521,7 +1569,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote 1.0.47",
- "syn 3.0.7",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1768,7 +1816,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1823,7 +1871,7 @@ version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fac5fca71e65e94cc718a6e2af65d6e0f9c6027751c2aa562fbb5087fda639bc"
 dependencies = [
- "bit-set",
+ "bit-set 0.8.0",
  "cssparser",
  "foldhash 0.2.0",
  "html5ever",
@@ -2000,7 +2048,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3947,7 +3995,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4057,7 +4105,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4686,7 +4734,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.45.0",
 ]
 
 [[package]]
@@ -5222,6 +5270,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
+dependencies = [
+ "bit-set 0.11.1",
+ "bit-vec 0.10.1",
+ "bitflags 2.13.2",
+ "chacha20",
+ "core_detect",
+ "num-traits",
+ "rand 0.10.3",
+ "rand_xorshift",
+ "regex-syntax",
+ "rusty-fork",
+ "tempfile",
+ "unarray",
+]
+
+[[package]]
 name = "prost"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5276,14 +5344,14 @@ dependencies = [
 
 [[package]]
 name = "proto-b2bua"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "proto-dialog"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "proto-sip",
  "thiserror 2.0.21",
@@ -5291,7 +5359,7 @@ dependencies = [
 
 [[package]]
 name = "proto-dtls"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5304,7 +5372,7 @@ dependencies = [
 
 [[package]]
 name = "proto-ice"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-stun",
@@ -5318,7 +5386,7 @@ dependencies = [
 
 [[package]]
 name = "proto-jwt"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -5333,7 +5401,7 @@ dependencies = [
 
 [[package]]
 name = "proto-registrar"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -5350,7 +5418,7 @@ dependencies = [
 
 [[package]]
 name = "proto-rtp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.21",
@@ -5360,7 +5428,7 @@ dependencies = [
 
 [[package]]
 name = "proto-sdp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -5371,17 +5439,19 @@ dependencies = [
 
 [[package]]
 name = "proto-sip"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
+ "criterion",
  "getrandom 0.4.3",
  "md5 0.7.0",
+ "proptest",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "proto-srtp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-rtp",
@@ -5394,14 +5464,20 @@ dependencies = [
 
 [[package]]
 name = "proto-stir-shaken"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
+ "base64 0.22.1",
+ "criterion",
+ "proptest",
+ "serde",
+ "serde_json",
+ "uc-crypto",
  "uc-types",
 ]
 
 [[package]]
 name = "proto-stun"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.21",
@@ -5413,7 +5489,7 @@ dependencies = [
 
 [[package]]
 name = "proto-transaction"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "proto-sip",
  "thiserror 2.0.21",
@@ -5421,7 +5497,7 @@ dependencies = [
 
 [[package]]
 name = "proto-turn"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-stun",
@@ -5443,9 +5519,9 @@ dependencies = [
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.13.4"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
 dependencies = [
  "bitflags 2.13.2",
  "memchr",
@@ -5460,6 +5536,12 @@ checksum = "84bbb29c624230c4bd1047bbdb2aa47e41c860e9665ce62ba9504eebe91bf867"
 dependencies = [
  "pulldown-cmark",
 ]
+
+[[package]]
+name = "quick-error"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
@@ -5523,7 +5605,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5655,6 +5737,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_xorshift"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
+dependencies = [
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5687,6 +5778,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
 dependencies = [
  "aws-lc-rs",
+ "pem",
  "rustls-pki-types",
  "time",
  "yasna",
@@ -5962,14 +6054,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -6005,9 +6097,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -6020,6 +6112,18 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rusty-fork"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc6bf79ff24e648f6da1f8d1f011e9cac26491b619e6b9280f2b47f1774e6ee2"
+dependencies = [
+ "fnv",
+ "quick-error",
+ "tempfile",
+ "wait-timeout",
+]
 
 [[package]]
 name = "ryu"
@@ -6038,7 +6142,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-announcement"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "include_dir",
@@ -6050,7 +6154,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-announcement-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "rand 0.8.8",
  "sbc-announcement",
@@ -6064,11 +6168,12 @@ dependencies = [
 
 [[package]]
 name = "sbc-api-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "hyper",
  "ipnet",
+ "nix 0.31.3",
  "proto-jwt",
  "reqwest 0.12.28",
  "sbc-config-store",
@@ -6076,6 +6181,7 @@ dependencies = [
  "sbc-http-util",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tonic",
@@ -6083,21 +6189,29 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uc-audit",
  "uc-auth",
+ "uc-cdr",
+ "uc-crypto",
  "uc-phone-mgmt",
  "uc-user-mgmt",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
 name = "sbc-cli"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
+ "chrono",
  "sbc-config",
  "sbc-grpc-api",
  "serde_json",
+ "tempfile",
  "tokio",
  "tonic",
+ "uc-audit",
+ "uc-cdr",
  "uc-health",
  "uc-metrics",
  "uc-types",
@@ -6105,7 +6219,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-client-config-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
@@ -6126,9 +6240,10 @@ dependencies = [
 
 [[package]]
 name = "sbc-config"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "nix 0.31.3",
+ "rustls-pki-types",
  "serde",
  "serde_yaml_ng",
  "thiserror 2.0.21",
@@ -6148,7 +6263,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-config-store"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6162,7 +6277,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-config-sync"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "central-config-store",
@@ -6183,11 +6298,12 @@ dependencies = [
 
 [[package]]
 name = "sbc-daemon"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "chrono",
  "hyper",
  "hyper-util",
  "prost",
@@ -6195,20 +6311,20 @@ dependencies = [
  "proto-b2bua",
  "proto-dialog",
  "proto-dtls",
- "proto-ice",
  "proto-jwt",
  "proto-registrar",
  "proto-rtp",
  "proto-sip",
  "proto-srtp",
+ "proto-stir-shaken",
  "proto-stun",
  "proto-transaction",
- "proto-turn",
  "rand 0.8.8",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
  "rustls-pki-types",
+ "rustls-webpki",
  "sbc-announcement",
  "sbc-config",
  "sbc-config-store",
@@ -6218,6 +6334,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -6230,8 +6347,11 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uc-api",
+ "uc-audit",
+ "uc-cdr",
  "uc-cluster",
  "uc-codecs",
+ "uc-crypto",
  "uc-discovery",
  "uc-dos-protection",
  "uc-health",
@@ -6240,6 +6360,7 @@ dependencies = [
  "uc-phone-mgmt",
  "uc-routing",
  "uc-state-sync",
+ "uc-sti",
  "uc-storage",
  "uc-telemetry",
  "uc-transport",
@@ -6249,19 +6370,21 @@ dependencies = [
 
 [[package]]
 name = "sbc-grpc-api"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "prost",
  "prost-types",
+ "serde_json",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tonic-reflection",
+ "uc-cdr",
 ]
 
 [[package]]
 name = "sbc-http-util"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "http",
  "ipnet",
@@ -6269,7 +6392,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-integration-tests"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -6283,17 +6406,19 @@ dependencies = [
  "uc-cdr",
  "uc-cluster",
  "uc-discovery",
+ "uc-dos-protection",
  "uc-health",
  "uc-metrics",
  "uc-policy",
  "uc-routing",
  "uc-storage",
+ "uc-transport",
  "uc-types",
 ]
 
 [[package]]
 name = "sbc-media"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "sbc-grpc-api",
  "sbc-media-core",
@@ -6307,7 +6432,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-media-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6330,7 +6455,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-provision-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "hex",
@@ -6352,7 +6477,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-trunk-agent"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "sbc-config-store",
  "sbc-grpc-api",
@@ -6367,7 +6492,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-trunk-services"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-sip",
@@ -6940,7 +7065,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7218,7 +7343,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7707,7 +7832,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7836,9 +7961,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -8283,7 +8408,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8323,7 +8448,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "uc-aaa"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "diameter",
@@ -8338,25 +8463,27 @@ dependencies = [
 
 [[package]]
 name = "uc-acl"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-api"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-audit"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
+ "hex",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
  "uc-crypto",
@@ -8365,7 +8492,7 @@ dependencies = [
 
 [[package]]
 name = "uc-auth"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "argon2",
  "axum",
@@ -8383,14 +8510,22 @@ dependencies = [
 
 [[package]]
 name = "uc-cdr"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
- "uc-types",
+ "chrono",
+ "criterion",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "uc-crypto",
+ "zeroize",
 ]
 
 [[package]]
 name = "uc-cluster"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -8405,10 +8540,11 @@ dependencies = [
 
 [[package]]
 name = "uc-codecs"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytemuck",
  "bytes",
+ "criterion",
  "opusic-c",
  "thiserror 2.0.21",
  "uc-types",
@@ -8416,9 +8552,11 @@ dependencies = [
 
 [[package]]
 name = "uc-crypto"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aws-lc-rs",
+ "rustls-pki-types",
+ "rustls-webpki",
  "thiserror 2.0.21",
  "uc-types",
  "zeroize",
@@ -8426,7 +8564,7 @@ dependencies = [
 
 [[package]]
 name = "uc-discovery"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "k8s-openapi",
@@ -8447,6 +8585,7 @@ name = "uc-dns"
 version = "0.1.0"
 dependencies = [
  "hickory-resolver",
+ "rand 0.9.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -8455,21 +8594,22 @@ dependencies = [
 
 [[package]]
 name = "uc-dos-protection"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
+ "criterion",
  "uc-types",
 ]
 
 [[package]]
 name = "uc-health"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-media-engine"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-rtp",
@@ -8483,14 +8623,14 @@ dependencies = [
 
 [[package]]
 name = "uc-metrics"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-phone-mgmt"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8501,7 +8641,7 @@ dependencies = [
 
 [[package]]
 name = "uc-policy"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "tracing",
  "uc-types",
@@ -8509,7 +8649,7 @@ dependencies = [
 
 [[package]]
 name = "uc-routing"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "regex",
  "serde",
@@ -8518,7 +8658,7 @@ dependencies = [
 
 [[package]]
 name = "uc-siprec"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "proto-sdp",
  "proto-sip",
@@ -8529,7 +8669,7 @@ dependencies = [
 
 [[package]]
 name = "uc-snmp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "serde",
@@ -8540,7 +8680,7 @@ dependencies = [
 
 [[package]]
 name = "uc-state-sync"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -8555,8 +8695,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "uc-sti"
+version = "0.10.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "criterion",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "nix 0.31.3",
+ "proto-stir-shaken",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "uc-crypto",
+ "uc-transport",
+ "uc-types",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "uc-storage"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bb8",
  "bb8-redis",
@@ -8574,7 +8743,7 @@ dependencies = [
 
 [[package]]
 name = "uc-syslog"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "serde",
@@ -8598,7 +8767,7 @@ dependencies = [
 
 [[package]]
 name = "uc-telemetry"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "opentelemetry",
@@ -8615,13 +8784,16 @@ dependencies = [
 
 [[package]]
 name = "uc-transport"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "bytes",
  "crc32c",
+ "criterion",
  "futures-util",
+ "nix 0.31.3",
  "rand 0.9.5",
+ "rcgen",
  "rustls",
  "rustls-pki-types",
  "socket2",
@@ -8634,23 +8806,26 @@ dependencies = [
  "uc-crypto",
  "uc-types",
  "windows",
+ "zeroize",
 ]
 
 [[package]]
 name = "uc-types"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
+ "proptest",
  "serde",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "uc-user-mgmt"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
  "ldap3",
+ "proptest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -8661,11 +8836,12 @@ dependencies = [
  "tracing",
  "uc-crypto",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
 name = "uc-vps"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "serde",
@@ -8674,11 +8850,12 @@ dependencies = [
  "tracing",
  "uc-dos-protection",
  "uc-policy",
+ "uc-types",
 ]
 
 [[package]]
 name = "uc-webrtc"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bytes",
  "proto-dtls",
@@ -8707,8 +8884,14 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
+
+[[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
 name = "unicase"
@@ -9023,6 +9206,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9209,9 +9401,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -9298,7 +9490,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -9319,7 +9511,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
  "raw-window-handle",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "windows-version",
 ]
 
@@ -9784,7 +9976,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

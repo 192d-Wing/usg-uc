@@ -6,6 +6,8 @@
 //! zero adaptive predictor with logarithmic step size adaptation per
 //! ITU-T G.722 Tables 6-11.
 
+use crate::error::{CodecError, CodecResult};
+
 // ============================================================
 // ITU-T G.722 constant tables
 // ============================================================
@@ -356,16 +358,29 @@ impl G722Encoder {
     /// Encodes 16-bit PCM samples at 16 kHz to G.722 (2 samples per byte).
     ///
     /// Returns the number of bytes written to `output`.
-    pub fn encode(&mut self, pcm: &[i16], output: &mut [u8]) -> usize {
+    ///
+    /// # Errors
+    /// [`CodecError::InvalidInput`] if `pcm` has an odd number of samples
+    /// (the QMF consumes sample pairs), [`CodecError::BufferTooSmall`] if
+    /// `output` cannot hold `pcm.len() / 2` bytes.
+    // NIST 800-53 Rev5: SI-10 (reject rather than silently return 0)
+    pub fn encode(&mut self, pcm: &[i16], output: &mut [u8]) -> CodecResult<usize> {
         let num_samples = pcm.len();
+        if !num_samples.is_multiple_of(2) {
+            return Err(CodecError::InvalidInput {
+                reason: format!("G.722 encode needs an even sample count, got {num_samples}"),
+            });
+        }
         let num_bytes = num_samples / 2;
-
         if output.len() < num_bytes {
-            return 0;
+            return Err(CodecError::BufferTooSmall {
+                needed: num_bytes,
+                available: output.len(),
+            });
         }
 
-        for i in (0..num_samples & !1).step_by(2) {
-            let (xlow, xhigh) = self.tx_qmf(pcm[i] as i32, pcm[i + 1] as i32);
+        for (pair, out) in pcm.as_chunks::<2>().0.iter().zip(output.iter_mut()) {
+            let (xlow, xhigh) = self.tx_qmf(i32::from(pair[0]), i32::from(pair[1]));
 
             // Lower band encoder
             let ilow = self.quantize_lower(xlow);
@@ -379,10 +394,10 @@ impl G722Encoder {
             self.upper.det = block3h(&mut self.upper, ihigh);
             self.upper.s = predictor_update(&mut self.upper, dhigh);
 
-            output[i / 2] = ((ihigh << 6) | ilow) as u8;
+            *out = ((ihigh << 6) | ilow) as u8;
         }
 
-        num_bytes
+        Ok(num_bytes)
     }
 
     /// QMF analysis filter (tx_qmf).
@@ -398,8 +413,16 @@ impl G722Encoder {
             sumodd += self.x[i + 1] as i64 * QMF_COEFF[i + 1] as i64;
         }
 
-        let lo = saturate(((sumeven + sumodd) >> 13) as i32, 16383, -16384);
-        let hi = saturate(((sumeven - sumodd) >> 13) as i32, 16383, -16383);
+        // The G.722 core works on 14-bit-range sub-band signals (G.722
+        // §3.1); the 16-bit input scaling itself is not in the G.722 text
+        // but is the ITU-T G.191 STL / spandsp convention. 16-bit input is
+        // scaled down by one bit here (>> 14 rather
+        // than the unity-gain >> 13; the QMF taps sum to 8192), matching the
+        // spandsp/ITU-STL 16-bit front end, so full-scale input no longer
+        // saturates the sub-band signals at +/-16384 (-6 dBFS clipping).
+        // The decoder undoes this in `rx_qmf`.
+        let lo = saturate(((sumeven + sumodd) >> 14) as i32, 16383, -16384);
+        let hi = saturate(((sumeven - sumodd) >> 14) as i32, 16383, -16383);
         (lo, hi)
     }
 
@@ -480,17 +503,25 @@ impl G722Decoder {
     /// Decodes G.722 encoded data to 16-bit PCM at 16 kHz (1 byte per 2 samples).
     ///
     /// Returns the number of samples written to `output`.
-    pub fn decode(&mut self, encoded: &[u8], output: &mut [i16]) -> usize {
+    ///
+    /// # Errors
+    /// [`CodecError::BufferTooSmall`] if `output` cannot hold
+    /// `encoded.len() * 2` samples.
+    // NIST 800-53 Rev5: SI-10 (explicit error instead of a silent Ok(0))
+    pub fn decode(&mut self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize> {
         let num_bytes = encoded.len();
         let num_samples = num_bytes * 2;
 
         if output.len() < num_samples {
-            return 0;
+            return Err(CodecError::BufferTooSmall {
+                needed: num_samples,
+                available: output.len(),
+            });
         }
 
-        for i in 0..num_bytes {
-            let ilowr = (encoded[i] & 63) as i32;
-            let ihigh = ((encoded[i] >> 6) & 3) as i32;
+        for (&byte, out) in encoded.iter().zip(output.as_chunks_mut::<2>().0.iter_mut()) {
+            let ilowr = i32::from(byte & 63);
+            let ihigh = i32::from((byte >> 6) & 3);
 
             // Lower band: output uses qm6 (full 6-bit), predictor uses qm4 (4-bit)
             let ylow = self.inv_quantize_lower_output(ilowr);
@@ -507,11 +538,11 @@ impl G722Decoder {
 
             // QMF synthesis
             let (pcm1, pcm2) = self.rx_qmf(rlow, rhigh);
-            output[i * 2] = pcm1 as i16;
-            output[i * 2 + 1] = pcm2 as i16;
+            out[0] = pcm1 as i16;
+            out[1] = pcm2 as i16;
         }
 
-        num_samples
+        Ok(num_samples)
     }
 
     /// INVQBL: Inverse quantize lower band for output (6-bit, MODE 1 / 64 kbit/s).
@@ -537,14 +568,18 @@ impl G722Decoder {
         for j in 0..12 {
             xout1 += self.xd[j] as i64 * QMF_COEFF[2 * j] as i64;
         }
-        let pcm1 = saturate((xout1 >> 12) as i32, 16383, -16384);
+        // ITU-T G.191 STL / spandsp convention (not specified in G.722
+        // §4.4): scale the 15-bit QMF output back to 16-bit PCM
+        // (>> 11 instead of >> 12) and saturate to the i16 range; mirrors the
+        // >> 14 in `tx_qmf` for unity end-to-end gain.
+        let pcm1 = saturate((xout1 >> 11) as i32, 32767, -32768);
 
         // ACCUMD
         let mut xout2: i64 = 0;
         for j in 0..12 {
             xout2 += self.xs[j] as i64 * QMF_COEFF[2 * j + 1] as i64;
         }
-        let pcm2 = saturate((xout2 >> 12) as i32, 16383, -16384);
+        let pcm2 = saturate((xout2 >> 11) as i32, 32767, -32768);
 
         (pcm1, pcm2)
     }
@@ -574,11 +609,11 @@ mod tests {
         }
 
         let mut enc_output = vec![0u8; 160];
-        let encoded_len = encoder.encode(&input, &mut enc_output);
+        let encoded_len = encoder.encode(&input, &mut enc_output).unwrap();
         assert_eq!(encoded_len, 160);
 
         let mut output = vec![0i16; 320];
-        let decoded_len = decoder.decode(&enc_output, &mut output);
+        let decoded_len = decoder.decode(&enc_output, &mut output).unwrap();
         assert_eq!(decoded_len, 320);
 
         let non_zero = output.iter().any(|&s| s != 0);
@@ -591,7 +626,7 @@ mod tests {
 
         let input = [1000i16; 64];
         let mut output = [0u8; 32];
-        encoder.encode(&input, &mut output);
+        encoder.encode(&input, &mut output).unwrap();
 
         encoder.reset();
         assert_eq!(encoder.lower.s, 0);
@@ -604,7 +639,7 @@ mod tests {
 
         let input = [0x55u8; 32];
         let mut output = [0i16; 64];
-        decoder.decode(&input, &mut output);
+        decoder.decode(&input, &mut output).unwrap();
 
         decoder.reset();
         assert_eq!(decoder.lower.s, 0);
@@ -617,7 +652,7 @@ mod tests {
 
         let input = [0i16; 320];
         let mut output = [0u8; 160];
-        let len = encoder.encode(&input, &mut output);
+        let len = encoder.encode(&input, &mut output).unwrap();
         assert_eq!(len, 160);
     }
 
@@ -627,8 +662,37 @@ mod tests {
 
         let input = [0i16; 320];
         let mut output = [0u8; 10];
-        let len = encoder.encode(&input, &mut output);
-        assert_eq!(len, 0);
+        assert!(matches!(
+            encoder.encode(&input, &mut output),
+            Err(CodecError::BufferTooSmall {
+                needed: 160,
+                available: 10
+            })
+        ));
+
+        let mut decoder = G722Decoder::new();
+        let mut pcm = [0i16; 19];
+        assert!(matches!(
+            decoder.decode(&[0u8; 10], &mut pcm),
+            Err(CodecError::BufferTooSmall {
+                needed: 20,
+                available: 19
+            })
+        ));
+        let mut pcm = [0i16; 20];
+        assert_eq!(decoder.decode(&[0u8; 10], &mut pcm).unwrap(), 20);
+        let mut exact = [0u8; 160];
+        assert_eq!(encoder.encode(&input, &mut exact).unwrap(), 160);
+    }
+
+    #[test]
+    fn test_odd_length_rejected() {
+        let mut encoder = G722Encoder::new();
+        let mut output = [0u8; 16];
+        assert!(matches!(
+            encoder.encode(&[0i16; 31], &mut output),
+            Err(CodecError::InvalidInput { .. })
+        ));
     }
 
     #[test]
@@ -654,14 +718,14 @@ mod tests {
         for frame in 0..num_frames {
             let start = frame * frame_samples;
             let end = start + frame_samples;
-            encoder.encode(&input[start..end], &mut enc_buf);
-            decoder.decode(&enc_buf, &mut output[start..end]);
+            encoder.encode(&input[start..end], &mut enc_buf).unwrap();
+            decoder.decode(&enc_buf, &mut output[start..end]).unwrap();
         }
 
         // Verify output is NOT saturated (the pre-fix bug)
         let max_amp = output.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
         assert!(
-            max_amp < 32767,
+            max_amp < 32767 && max_amp > 4000,
             "Output appears saturated (max={max_amp}), decoder bug may persist"
         );
 
@@ -691,9 +755,9 @@ mod tests {
             for i in 0..cmp_len {
                 let da = a[i] as f64 - mean_a;
                 let db = b[i] as f64 - mean_b;
-                cov += da * db;
-                var_a += da * da;
-                var_b += db * db;
+                cov = da.mul_add(db, cov);
+                var_a = da.mul_add(da, var_a);
+                var_b = db.mul_add(db, var_b);
             }
             let corr = if var_a > 0.0 && var_b > 0.0 {
                 cov / (var_a.sqrt() * var_b.sqrt())
@@ -710,5 +774,167 @@ mod tests {
             best_corr > 0.80,
             "Cross-correlation too low ({best_corr:.4}), expected >0.80 for G.722 roundtrip"
         );
+    }
+
+    /// Encodes then decodes 1 s of a sine at `dbfs` / `freq_hz` (16 kHz) and
+    /// returns (output RMS / input RMS in dB, output samples at the i16
+    /// rails, output peak).
+    /// The first 40 ms are skipped as QMF/ADPCM warm-up.
+    fn level_roundtrip(dbfs: f64, freq_hz: f64) -> (f64, usize, u16) {
+        let mut encoder = G722Encoder::new();
+        let mut decoder = G722Decoder::new();
+        let n = 16000;
+        let amp = 32767.0 * 10f64.powf(dbfs / 20.0);
+        let input: Vec<i16> = (0..n)
+            .map(|i| {
+                (amp * (2.0 * std::f64::consts::PI * freq_hz * i as f64 / 16000.0).sin()) as i16
+            })
+            .collect();
+        let mut enc = vec![0u8; n / 2];
+        let mut out = vec![0i16; n];
+        encoder.encode(&input, &mut enc).unwrap();
+        decoder.decode(&enc, &mut out).unwrap();
+        let skip = 640;
+        let rms = |x: &[i16]| {
+            (x.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / x.len() as f64).sqrt()
+        };
+        let gain_db = 20.0 * (rms(&out[skip..]) / rms(&input[skip..])).log10();
+        let clipped = out[skip..]
+            .iter()
+            .filter(|&&s| s == i16::MAX || s == i16::MIN)
+            .count();
+        let peak = out[skip..]
+            .iter()
+            .map(|s| s.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        (gain_db, clipped, peak)
+    }
+
+    #[test]
+    fn test_level_1khz() {
+        // ITU-T G.722 is unity-gain end to end; a 14<->16-bit scaling error
+        // shows up as a 6 dB offset or as clipping at high levels.
+        for dbfs in [-10.0, -3.0] {
+            let (gain, clipped, _) = level_roundtrip(dbfs, 1000.0);
+            assert!(gain.abs() <= 1.0, "{dbfs} dBFS gain {gain:.2} dB");
+            assert!(clipped == 0, "{dbfs} dBFS clipped {clipped} samples");
+        }
+        // Before the fix the decoder saturated at +/-16384 (-6 dBFS).
+        let (_, _, peak) = level_roundtrip(-3.0, 1000.0);
+        assert!(peak > 20000, "-3 dBFS peak {peak} is capped below input");
+    }
+
+    #[test]
+    fn test_level_lower_and_upper_band() {
+        for freq in [300.0, 6000.0] {
+            let (gain, _, _) = level_roundtrip(-10.0, freq);
+            assert!(gain.abs() <= 2.0, "{freq} Hz gain {gain:.2} dB");
+        }
+    }
+
+    #[test]
+    fn test_silence_has_no_dc_offset() {
+        let mut encoder = G722Encoder::new();
+        let mut decoder = G722Decoder::new();
+        let input = [0i16; 3200];
+        let mut enc = [0u8; 1600];
+        let mut out = [0i16; 3200];
+        encoder.encode(&input, &mut enc).unwrap();
+        decoder.decode(&enc, &mut out).unwrap();
+        let peak = out.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(peak <= 8, "silence decoded with peak {peak}");
+    }
+
+    /// FNV-1a 64 over a byte stream (test-only checksum, not crypto).
+    fn fnv1a(bytes: impl Iterator<Item = u8>) -> u64 {
+        bytes.fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    #[test]
+    fn test_self_generated_regression_vector() {
+        // SELF-GENERATED regression lock, NOT an ITU-T test vector: it pins
+        // the current bitstream and decoded output for a fixed pseudo-random
+        // input so unintended changes are caught.
+        // POAM: POA&M-140 -- run the official ITU-T G.722 Appendix II /
+        // G.191 STL vectors in CI once they are vendored as test fixtures.
+        let mut state: u32 = 0x00C0_FFEE;
+        let input: Vec<i16> = (0..4000)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 16) as i16) / 4
+            })
+            .collect();
+        let mut enc = vec![0u8; 2000];
+        let mut out = vec![0i16; 4000];
+        G722Encoder::new().encode(&input, &mut enc).unwrap();
+        G722Decoder::new().decode(&enc, &mut out).unwrap();
+        let enc_hash = fnv1a(enc.iter().copied());
+        let dec_hash = fnv1a(out.iter().flat_map(|s| s.to_le_bytes()));
+        assert_eq!(enc_hash, ENC_HASH);
+        assert_eq!(dec_hash, DEC_HASH);
+    }
+
+    const ENC_HASH: u64 = 0x4c76_8503_b349_6571;
+    const DEC_HASH: u64 = 0xe670_8f96_6424_ba47;
+
+    // QA: odd/short/empty buffer boundaries (SI-10).
+    #[test]
+    fn test_qa_g722_empty_and_single_sample() {
+        let mut enc = G722Encoder::new();
+        let mut out = [0u8; 4];
+        assert_eq!(enc.encode(&[], &mut out).unwrap(), 0);
+        assert_eq!(enc.encode(&[], &mut []).unwrap(), 0);
+        assert!(matches!(
+            enc.encode(&[1000], &mut out),
+            Err(CodecError::InvalidInput { .. })
+        ));
+        // Odd check precedes the size check.
+        assert!(matches!(
+            enc.encode(&[0i16; 3], &mut []),
+            Err(CodecError::InvalidInput { .. })
+        ));
+        assert_eq!(enc.encode(&[0i16; 2], &mut out[..1]).unwrap(), 1);
+        assert!(matches!(
+            enc.encode(&[0i16; 4], &mut out[..1]),
+            Err(CodecError::BufferTooSmall {
+                needed: 2,
+                available: 1
+            })
+        ));
+
+        let mut dec = G722Decoder::new();
+        assert_eq!(dec.decode(&[], &mut []).unwrap(), 0);
+        let mut pcm = [0i16; 1];
+        assert!(matches!(
+            dec.decode(&[0u8], &mut pcm),
+            Err(CodecError::BufferTooSmall {
+                needed: 2,
+                available: 1
+            })
+        ));
+        // Oversized output is fine; only the needed prefix is written.
+        let mut big = [0x7777i16; 8];
+        assert_eq!(dec.decode(&[0u8; 2], &mut big).unwrap(), 4);
+        assert!(big[4..].iter().all(|&s| s == 0x7777));
+    }
+
+    #[test]
+    fn test_qa_g722_error_does_not_mutate_state() {
+        let input: Vec<i16> = (0..320)
+            .map(|i| ((f64::from(i) * 0.39).sin() * 8000.0) as i16)
+            .collect();
+        let mut a = G722Encoder::new();
+        let mut b = G722Encoder::new();
+        let mut small = [0u8; 1];
+        let _ = a.encode(&input[..31], &mut small);
+        let _ = a.encode(&input, &mut small);
+        let mut oa = [0u8; 160];
+        let mut ob = [0u8; 160];
+        a.encode(&input, &mut oa).unwrap();
+        b.encode(&input, &mut ob).unwrap();
+        assert_eq!(oa, ob, "rejected calls must not advance encoder state");
     }
 }

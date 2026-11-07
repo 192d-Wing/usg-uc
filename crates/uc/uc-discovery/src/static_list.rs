@@ -98,7 +98,7 @@ mod tests {
         assert_eq!(discovery.peers().len(), 1);
 
         assert!(discovery.remove_peer(&addr));
-        assert!(discovery.peers().is_empty());
+        assert_eq!(discovery.peers(), []);
 
         assert!(!discovery.remove_peer(&addr));
     }

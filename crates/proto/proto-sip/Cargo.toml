@@ -33,3 +33,11 @@ panic = "deny"
 
 [package.metadata.docs.rs]
 all-features = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "parse"
+harness = false

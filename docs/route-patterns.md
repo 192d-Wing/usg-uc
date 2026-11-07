@@ -52,7 +52,7 @@ Matches **all numbers** unconditionally. Used as a catch-all or default route.
 
 ### Regex (library-only)
 
-`uc-routing::DialPattern::Regex` exists in the routing library, but the API-to-daemon sync (`apply_route_pattern_to_router`) does not accept a `regex` pattern type — it falls back to `prefix`. Regex patterns cannot currently be created through the REST API.
+`uc-routing::DialPattern::Regex` exists in the routing library, but `regex` is not an accepted `pattern_type` anywhere a pattern enters the daemon. The REST API rejects it with 400 (`handlers/route_pattern_rules.rs::validate_pattern_type`), and the gRPC sync (`apply_route_pattern_to_router`), the startup seed (`runtime.rs::seed_route_pattern`) and TOML dial-plan loading reject it via `DialPattern::from_kind`. Regex patterns cannot be created through the REST API.
 
 ## Route Pattern Fields
 
@@ -60,11 +60,11 @@ Matches **all numbers** unconditionally. Used as a catch-all or default route.
 |-------|----------|-------------|
 | `id` | Yes | Unique identifier (e.g., `rp-emergency`) |
 | `pattern` | Yes | The pattern string (see types above) |
-| `pattern_type` | No | `prefix` (default), `exact`, `wildcard`, or `any`. Unknown values (including `regex`) fall back to `prefix` when applied to the daemon. |
+| `pattern_type` | No | `prefix` (default), `exact`, `wildcard`, or `any` (exact, lower-case spelling). Any other value (including `regex`, `Prefix`, padded strings) or a non-string is rejected: the REST API answers 400; a gRPC sync of an unknown kind is skipped with a warning and the previous pattern is kept; a seed row with an unknown kind is skipped and logged. The `sbc_route_pattern_rejected_total` gauge counts daemon-side rejections. |
 | `partition_id` | Yes | Partition this pattern belongs to |
 | `route_group_id` | No | Trunk group to route matched calls to |
 | `route_list_id` | No | Route list (ordered route groups; overrides route_group_id). See the failover note below. |
-| `blocked` | No | `true` rejects any call matching this pattern in this partition (checked before normal matches) |
+| `blocked` | No | `true` rejects any call matching this pattern in this partition with **403 Forbidden** (checked before normal matches). Fails closed: no dial-plan or `default_trunk_group` fallback. Write block patterns without a leading `+` (e.g. `1900`); see Blocked Patterns below. |
 | `description` | No | Human-readable description |
 | `priority` | No | Lower number = higher priority (default: 100) |
 | `transform_type` | No | Digit manipulation applied to the dialled number before routing: `none` (default), `strip_prefix`, `add_prefix`, `replace_prefix`, `replace`. Same spelling as dial-plan entries. |
@@ -97,6 +97,16 @@ Partitions are walked in CSS order and **the first partition containing any matc
 In practice this yields Exact > Prefix > Wildcard > Any for patterns of similar length, but a long prefix can outscore a short exact pattern (e.g. `+1213916` prefix scores 8, `911` exact scores 6).
 
 If scores are equal, the `priority` field breaks the tie (lower = preferred). A `blocked` pattern matching the digits in the current partition rejects the call before any other pattern is considered.
+
+### Blocked Patterns
+
+A blocked match ends routing for that call (`SbcRouteOutcome::Blocked` in `uc-routing/src/sbc_router.rs`). The daemon answers **403 Forbidden**, releases admission slots, writes an `AuthorizationDecision` deny audit event with policy `route:blocked` (pattern id in the audit resource only, not in the SIP reason phrase), and increments `sbc_route_blocked_total`. It does **not** fall through to the dial plan or `routing.default_trunk_group`. Test: `sip_stack.rs::blocked_route_pattern_answers_403_without_dial_plan_or_default_fallback`.
+
+- The dialled number is canonicalised first (`uc-types::DialedNumber`): visual separators (`-`, `.`, `(`, `)`, space), `%xx` escapes and URI parameters are removed, so `1-900-555-1212`, `(900)…` and `%2B1900…` are compared in canonical form.
+- A block is also tested against the number with its `+` stripped, so a `1900` block catches `+19005551212`. The reverse is not done: a block written `+1900` does **not** catch a national-form dial `19005551212`. Write blocks without `+`.
+- A block in a later partition does not apply if an earlier partition in the CSS already has a routable match.
+- Emergency numbers ignore blocks (audited as `route:blocked-ignored`). A near-emergency number such as `+1911` is not exempt.
+- An R-URI user that looks numeric but does not parse as a number (for example `+19005551234x`), or is empty or longer than 256 bytes, is never routed; the call gets 404 (Number Not In Service).
 
 ### Route List Failover (partially wired)
 

@@ -34,6 +34,8 @@ pub enum VerdictSource {
     PolicyRule,
     /// The configured default action.
     Default,
+    /// The callee is an emergency number; screening was bypassed.
+    EmergencyBypass,
 }
 
 /// The result of screening a call attempt.

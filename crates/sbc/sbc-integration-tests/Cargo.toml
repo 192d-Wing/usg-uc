@@ -30,6 +30,9 @@ uc-policy.workspace = true
 uc-routing.workspace = true
 uc-cdr.workspace = true
 uc-api.workspace = true
+# Transport DoS scenarios (transport_dos_tests).
+uc-dos-protection.workspace = true
+uc-transport = { workspace = true, features = ["websocket"] }
 
 # Cluster crates (optional)
 uc-cluster = { path = "../../uc/uc-cluster", optional = true }

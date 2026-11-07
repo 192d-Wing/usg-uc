@@ -27,6 +27,27 @@ impl TrunkState {
     }
 }
 
+/// Default emergency headroom for a limit of `max_calls`: 10%, at least 1.
+///
+/// ## 47 CFR 9.16; NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+pub const fn default_emergency_reserve(max_calls: u32) -> u32 {
+    let tenth = max_calls / 10;
+    if tenth == 0 { 1 } else { tenth }
+}
+
+/// How a call is admitted to trunk capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Admission {
+    /// Normal call: a trunk at `max_calls` is skipped.
+    #[default]
+    Normal,
+    /// Emergency call (47 CFR 9.16): may use the trunk's emergency reserve
+    /// on top of `max_calls`, so held normal calls never block an emergency
+    /// call. The reserve is bounded (SC-5); reachability, enable state and
+    /// cooldown still apply; the slot is still counted and released.
+    Emergency,
+}
+
 /// Trunk protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrunkProtocol {
@@ -115,6 +136,9 @@ pub struct TrunkConfig {
     pub weight: u32,
     /// Maximum concurrent calls.
     pub max_calls: u32,
+    /// Extra calls above `max_calls` that only emergency calls may use.
+    /// `None` uses [`default_emergency_reserve`] of `max_calls`.
+    pub emergency_reserve_calls: Option<u32>,
     /// Cooldown period after failure (seconds).
     pub cooldown_secs: u64,
     /// Maximum consecutive failures before cooldown.
@@ -123,6 +147,16 @@ pub struct TrunkConfig {
     pub outbound_enabled: bool,
     /// Whether inbound calling is enabled.
     pub inbound_enabled: bool,
+    /// TLS server name to verify the trunk certificate against when
+    /// `protocol` is TLS. `None` verifies against `host` (DNS name or, for
+    /// an IP literal, an IP SAN).
+    ///
+    /// ## NIST 800-53 Rev5: SC-23 (Session Authenticity)
+    pub tls_server_name: Option<String>,
+    /// Present the SBC certificate to this trunk (mutual TLS).
+    ///
+    /// ## NIST 800-53 Rev5: IA-3 (Device Identification and Authentication)
+    pub tls_client_cert: bool,
 }
 
 impl Default for TrunkConfig {
@@ -136,10 +170,13 @@ impl Default for TrunkConfig {
             priority: DEFAULT_PRIORITY,
             weight: DEFAULT_WEIGHT,
             max_calls: 100,
+            emergency_reserve_calls: None,
             cooldown_secs: 60,
             max_failures: 3,
             outbound_enabled: true,
             inbound_enabled: true,
+            tls_server_name: None,
+            tls_client_cert: false,
         }
     }
 }
@@ -195,6 +232,68 @@ impl TrunkConfig {
         self.max_calls = max;
         self
     }
+
+    /// Sets the emergency-only headroom above `max_calls`.
+    #[must_use]
+    pub const fn with_emergency_reserve_calls(mut self, reserve: u32) -> Self {
+        self.emergency_reserve_calls = Some(reserve);
+        self
+    }
+
+    /// Emergency-only headroom above `max_calls` in effect for this trunk.
+    pub fn emergency_reserve(&self) -> u32 {
+        self.emergency_reserve_calls
+            .unwrap_or_else(|| default_emergency_reserve(self.max_calls))
+    }
+
+    /// Sets the cooldown period after `max_failures` consecutive failures.
+    #[must_use]
+    pub fn with_cooldown_secs(mut self, secs: u64) -> Self {
+        self.cooldown_secs = secs;
+        self
+    }
+
+    /// Sets the TLS server name verified on the trunk certificate.
+    #[must_use]
+    pub fn with_tls_server_name(mut self, name: impl Into<String>) -> Self {
+        self.tls_server_name = Some(name.into());
+        self
+    }
+
+    /// Presents the SBC certificate to this trunk (mutual TLS).
+    #[must_use]
+    pub const fn with_tls_client_cert(mut self, on: bool) -> Self {
+        self.tls_client_cert = on;
+        self
+    }
+
+    /// Name the trunk's TLS certificate is verified against.
+    pub fn tls_name(&self) -> &str {
+        self.tls_server_name.as_deref().unwrap_or(&self.host)
+    }
+
+    /// Sets the consecutive-failure count that puts the trunk into cooldown.
+    #[must_use]
+    pub fn with_max_failures(mut self, max: u32) -> Self {
+        self.max_failures = max;
+        self
+    }
+}
+
+/// How a call that held a trunk slot ended, for [`Trunk`] accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrunkOutcome {
+    /// The trunk answered the call; `setup_ms` is INVITE-to-answer time.
+    Completed {
+        /// Call setup time in milliseconds.
+        setup_ms: u64,
+    },
+    /// The trunk failed the call (timeout, transport error, 5xx). Counts
+    /// toward `max_failures` / cooldown.
+    Failed,
+    /// The call went away for a reason that is not the trunk's fault
+    /// (CANCEL, callee reject, local failure). Releases the slot only.
+    Abandoned,
 }
 
 /// A SIP trunk/carrier.
@@ -208,17 +307,36 @@ pub struct Trunk {
     stats: TrunkStats,
     /// Cooldown expiry time.
     cooldown_until: Option<Instant>,
+    /// `config.host`, shared: built once so a per-call endpoint read is an
+    /// `Arc` clone, not an allocation.
+    host_shared: std::sync::Arc<str>,
+    /// `config.tls_name()`, shared (see `host_shared`).
+    tls_name_shared: std::sync::Arc<str>,
 }
 
 impl Trunk {
     /// Creates a new trunk.
     pub fn new(config: TrunkConfig) -> Self {
+        let host_shared = std::sync::Arc::from(config.host.as_str());
+        let tls_name_shared = std::sync::Arc::from(config.tls_name());
         Self {
             config,
             state: TrunkState::Available,
             stats: TrunkStats::default(),
             cooldown_until: None,
+            host_shared,
+            tls_name_shared,
         }
+    }
+
+    /// The configured host, shared (no allocation per call).
+    pub fn host_shared(&self) -> &std::sync::Arc<str> {
+        &self.host_shared
+    }
+
+    /// The TLS server name ([`TrunkConfig::tls_name`]), shared.
+    pub fn tls_name_shared(&self) -> &std::sync::Arc<str> {
+        &self.tls_name_shared
     }
 
     /// Returns the trunk ID.
@@ -250,7 +368,25 @@ impl Trunk {
 
     /// Returns whether the trunk is usable for outbound calls.
     pub fn is_usable(&self) -> bool {
-        self.state().is_usable() && self.config.outbound_enabled && !self.is_at_capacity()
+        self.is_usable_for(Admission::Normal)
+    }
+
+    /// Whether the trunk can take a call admitted as `admission`.
+    pub fn is_usable_for(&self, admission: Admission) -> bool {
+        self.state().is_usable()
+            && self.config.outbound_enabled
+            && match admission {
+                Admission::Normal => !self.is_at_capacity(),
+                // Bounded headroom: emergency calls may use the reserve,
+                // never more (SC-5); normal calls never reach it.
+                Admission::Emergency => {
+                    self.stats.active_calls
+                        < self
+                            .config
+                            .max_calls
+                            .saturating_add(self.config.emergency_reserve())
+                }
+            }
     }
 
     /// Returns whether the trunk is at capacity.
@@ -294,9 +430,68 @@ impl Trunk {
         self.state = TrunkState::Disabled;
     }
 
-    /// Records a call attempt.
+    /// Records a call attempt (takes one of the `max_calls` slots).
     pub fn start_call(&mut self) {
-        self.stats.active_calls += 1;
+        self.stats.active_calls = self.stats.active_calls.saturating_add(1);
+    }
+
+    /// Releases a call slot without counting a success or a failure.
+    pub fn abandon_call(&mut self) {
+        self.stats.active_calls = self.stats.active_calls.saturating_sub(1);
+    }
+
+    /// Releases a call slot with the given outcome.
+    pub fn end_call(&mut self, outcome: TrunkOutcome) {
+        match outcome {
+            TrunkOutcome::Completed { setup_ms } => self.complete_call(setup_ms),
+            TrunkOutcome::Failed => self.fail_call(),
+            TrunkOutcome::Abandoned => self.abandon_call(),
+        }
+    }
+
+    /// Applies an out-of-band reachability probe result (SIP OPTIONS ping).
+    ///
+    /// Unreachable marks the trunk `Failed` so selection skips it; reachable
+    /// returns a `Failed` trunk to `Available`. An operator `Disabled` trunk
+    /// and a trunk in `Cooldown` are left alone.
+    pub fn set_reachable(&mut self, reachable: bool) {
+        match (reachable, self.state) {
+            (false, TrunkState::Available | TrunkState::Busy) => {
+                self.state = TrunkState::Failed;
+            }
+            (false, TrunkState::Cooldown) => {
+                // Keep the cooldown timer but stay unusable once it lapses.
+                self.state = TrunkState::Failed;
+                self.cooldown_until = None;
+            }
+            (true, TrunkState::Failed) => self.state = TrunkState::Available,
+            _ => {}
+        }
+    }
+
+    /// Puts the trunk into cooldown now, regardless of the failure count
+    /// (e.g. the trunk answered 503, RFC 3261 §21.5.4). A disabled or
+    /// probe-failed trunk keeps its state.
+    pub fn start_cooldown(&mut self) {
+        self.start_cooldown_for(std::time::Duration::from_secs(self.config.cooldown_secs));
+    }
+
+    /// Like [`Self::start_cooldown`] but for `duration` instead of
+    /// `cooldown_secs` (e.g. the trunk's `Retry-After`, RFC 3261 §21.5.4).
+    pub fn start_cooldown_for(&mut self, duration: std::time::Duration) {
+        if matches!(self.state, TrunkState::Available | TrunkState::Busy) {
+            self.state = TrunkState::Cooldown;
+            self.cooldown_until = Some(Instant::now() + duration);
+        }
+    }
+
+    /// When the current cooldown ends, if the trunk is cooling down.
+    pub fn cooldown_until(&self) -> Option<Instant> {
+        if self.state == TrunkState::Cooldown {
+            self.cooldown_until
+        } else {
+            None
+        }
     }
 
     /// Records a successful call completion.
@@ -314,8 +509,11 @@ impl Trunk {
         }
         self.stats.record_failure();
 
-        // Check if we need to enter cooldown
-        if self.stats.consecutive_failures >= self.config.max_failures {
+        // Check if we need to enter cooldown. A disabled or probe-failed
+        // trunk stays in that state (cooldown would expire it to Available).
+        if self.stats.consecutive_failures >= self.config.max_failures
+            && matches!(self.state, TrunkState::Available | TrunkState::Busy)
+        {
             self.enter_cooldown();
         }
     }
@@ -364,6 +562,13 @@ pub struct TrunkGroup {
     strategy: SelectionStrategy,
     /// Round-robin index.
     round_robin_idx: usize,
+    /// Only TLS trunks are eligible for selection and failover.
+    ///
+    /// NIST 800-53 Rev5: SC-8 (no clear-text egress for this group)
+    require_tls: bool,
+    /// Number of non-TLS trunks in the group, kept current by
+    /// `add_trunk`/`remove_trunk` so the skip metric costs no scan.
+    non_tls_count: u32,
 }
 
 impl TrunkGroup {
@@ -375,7 +580,73 @@ impl TrunkGroup {
             trunks: HashMap::new(),
             strategy: SelectionStrategy::Priority,
             round_robin_idx: 0,
+            require_tls: false,
+            non_tls_count: 0,
         }
+    }
+
+    /// Sets the `require_tls` policy (builder form).
+    ///
+    /// NIST 800-53 Rev5: SC-8 — when set, only trunks whose protocol is TLS
+    /// are selected, ordered for failover or acquired. A group with no usable
+    /// TLS trunk fails the call instead of falling back to UDP/TCP.
+    #[must_use]
+    pub fn with_require_tls(mut self, require_tls: bool) -> Self {
+        self.require_tls = require_tls;
+        self
+    }
+
+    /// Returns whether this group only admits TLS trunks.
+    pub fn require_tls(&self) -> bool {
+        self.require_tls
+    }
+
+    /// Sets the `require_tls` policy.
+    pub fn set_require_tls(&mut self, require_tls: bool) {
+        self.require_tls = require_tls;
+    }
+
+    /// Number of non-TLS trunks in the group.
+    pub fn non_tls_count(&self) -> u32 {
+        self.non_tls_count
+    }
+
+    /// Whether `trunk` passes the group's transport policy.
+    #[inline]
+    pub fn transport_allowed(&self, trunk: &Trunk) -> bool {
+        self.transport_allowed_with(trunk, false)
+    }
+
+    /// [`Self::transport_allowed`] for a call that itself requires TLS
+    /// (`tls_only`, e.g. a `sips:` Request-URI, RFC 3261 §26.2.2): the
+    /// group's `require_tls` ORed with the call's requirement.
+    #[inline]
+    pub fn transport_allowed_with(&self, trunk: &Trunk, tls_only: bool) -> bool {
+        !(self.require_tls || tls_only) || trunk.config().protocol == TrunkProtocol::Tls
+    }
+
+    /// Eligibility predicate shared by selection, failover and counting.
+    #[inline]
+    fn eligible(&self, trunk: &Trunk, admission: Admission, tls_only: bool) -> bool {
+        trunk.is_usable_for(admission) && self.transport_allowed_with(trunk, tls_only)
+    }
+
+    /// Failure-path only: true when the `require_tls` policy is what left the
+    /// group without a usable trunk (some non-TLS trunk would have been
+    /// usable). Not called on the success path.
+    pub fn tls_blocked(&self, admission: Admission) -> bool {
+        self.tls_blocked_with(admission, false)
+    }
+
+    /// [`Self::tls_blocked`] with the call's own TLS requirement ORed in.
+    /// A `require_tls` group with no trunk at all (e.g. every synced trunk
+    /// skipped for an unknown protocol) also counts as a policy refusal.
+    pub fn tls_blocked_with(&self, admission: Admission, tls_only: bool) -> bool {
+        (self.require_tls && self.trunks.is_empty())
+            || ((self.require_tls || tls_only)
+                && self.trunks.values().any(|t| {
+                    t.config().protocol != TrunkProtocol::Tls && t.is_usable_for(admission)
+                }))
     }
 
     /// Returns the group ID.
@@ -397,12 +668,26 @@ impl TrunkGroup {
 
     /// Adds a trunk to the group.
     pub fn add_trunk(&mut self, trunk: Trunk) {
-        self.trunks.insert(trunk.id().to_string(), trunk);
+        let is_tls = trunk.config().protocol == TrunkProtocol::Tls;
+        if let Some(old) = self.trunks.insert(trunk.id().to_string(), trunk)
+            && old.config().protocol != TrunkProtocol::Tls
+        {
+            self.non_tls_count = self.non_tls_count.saturating_sub(1);
+        }
+        if !is_tls {
+            self.non_tls_count = self.non_tls_count.saturating_add(1);
+        }
     }
 
     /// Removes a trunk from the group.
     pub fn remove_trunk(&mut self, id: &str) -> Option<Trunk> {
-        self.trunks.remove(id)
+        let removed = self.trunks.remove(id);
+        if let Some(t) = &removed
+            && t.config().protocol != TrunkProtocol::Tls
+        {
+            self.non_tls_count = self.non_tls_count.saturating_sub(1);
+        }
+        removed
     }
 
     /// Gets a trunk by ID.
@@ -420,14 +705,34 @@ impl TrunkGroup {
         self.trunks.len()
     }
 
-    /// Returns the number of usable trunks.
+    /// Returns the number of usable trunks (honouring `require_tls`).
     pub fn usable_trunk_count(&self) -> usize {
-        self.trunks.values().filter(|t| t.is_usable()).count()
+        self.trunks
+            .values()
+            .filter(|t| self.eligible(t, Admission::Normal, false))
+            .count()
     }
 
     /// Selects a trunk for routing.
     pub fn select_trunk(&mut self) -> Option<&str> {
-        let usable: Vec<_> = self.trunks.iter().filter(|(_, t)| t.is_usable()).collect();
+        self.select_trunk_for(Admission::Normal)
+    }
+
+    /// Selects a trunk for a call admitted as `admission`.
+    pub fn select_trunk_for(&mut self, admission: Admission) -> Option<&str> {
+        self.select_trunk_with(admission, false)
+    }
+
+    /// [`Self::select_trunk_for`]; `tls_only` restricts selection to TLS
+    /// trunks for this call (RFC 3261 §26.2.2 `sips:` Request-URI).
+    pub fn select_trunk_with(&mut self, admission: Admission, tls_only: bool) -> Option<&str> {
+        // NIST 800-53 Rev5: SC-8 — `eligible` drops non-TLS trunks when
+        // the group requires TLS (POA&M-48).
+        let usable: Vec<_> = self
+            .trunks
+            .iter()
+            .filter(|(_, t)| self.eligible(t, admission, tls_only))
+            .collect();
 
         if usable.is_empty() {
             return None;
@@ -479,7 +784,23 @@ impl TrunkGroup {
 
     /// Returns an ordered list of trunk IDs for failover.
     pub fn failover_order(&self) -> Vec<&str> {
-        let mut usable: Vec<_> = self.trunks.iter().filter(|(_, t)| t.is_usable()).collect();
+        self.failover_order_for(Admission::Normal)
+    }
+
+    /// Failover order for a call admitted as `admission`.
+    pub fn failover_order_for(&self, admission: Admission) -> Vec<&str> {
+        self.failover_order_with(admission, false)
+    }
+
+    /// [`Self::failover_order_for`]; `tls_only` as in [`Self::select_trunk_with`].
+    pub fn failover_order_with(&self, admission: Admission, tls_only: bool) -> Vec<&str> {
+        // NIST 800-53 Rev5: SC-8 — failover never lists a non-TLS trunk in a
+        // `require_tls` group (RFC 5630 §3.1.3: no TLS-to-clear downgrade).
+        let mut usable: Vec<_> = self
+            .trunks
+            .iter()
+            .filter(|(_, t)| self.eligible(t, admission, tls_only))
+            .collect();
 
         usable.sort_by_key(|(_, t)| t.priority());
         usable.into_iter().map(|(id, _)| id.as_str()).collect()
@@ -576,6 +897,80 @@ mod tests {
     }
 
     #[test]
+    fn test_trunk_end_call_outcomes_never_underflow() {
+        let mut trunk = Trunk::new(TrunkConfig::new("t", "t.example.com").with_max_calls(1));
+        trunk.start_call();
+        assert!(trunk.is_at_capacity());
+        assert!(!trunk.is_usable());
+        trunk.end_call(TrunkOutcome::Abandoned);
+        assert_eq!(trunk.stats().active_calls, 0);
+        assert_eq!(trunk.stats().calls_attempted, 0);
+
+        trunk.start_call();
+        trunk.end_call(TrunkOutcome::Completed { setup_ms: 50 });
+        assert_eq!(trunk.stats().active_calls, 0);
+        assert_eq!(trunk.stats().calls_succeeded, 1);
+
+        trunk.start_call();
+        trunk.end_call(TrunkOutcome::Failed);
+        assert_eq!(trunk.stats().active_calls, 0);
+        assert_eq!(trunk.stats().calls_failed, 1);
+
+        // Extra releases are clamped at zero.
+        trunk.end_call(TrunkOutcome::Abandoned);
+        trunk.end_call(TrunkOutcome::Failed);
+        assert_eq!(trunk.stats().active_calls, 0);
+    }
+
+    #[test]
+    fn test_trunk_max_failures_and_cooldown_config() {
+        let config = TrunkConfig::new("t", "t.example.com")
+            .with_max_failures(1)
+            .with_cooldown_secs(3600);
+        assert_eq!(config.cooldown_secs, 3600);
+        let mut trunk = Trunk::new(config);
+        trunk.start_call();
+        trunk.fail_call();
+        assert_eq!(trunk.state(), TrunkState::Cooldown);
+    }
+
+    #[test]
+    fn test_trunk_start_cooldown() {
+        let mut trunk = Trunk::new(TrunkConfig::new("t", "t.example.com"));
+        trunk.start_cooldown();
+        assert_eq!(trunk.state(), TrunkState::Cooldown);
+        assert!(!trunk.is_usable());
+
+        let mut disabled = Trunk::new(TrunkConfig::new("d", "d.example.com"));
+        disabled.disable();
+        disabled.start_cooldown();
+        assert_eq!(disabled.state(), TrunkState::Disabled);
+    }
+
+    #[test]
+    fn test_trunk_set_reachable() {
+        let mut trunk = Trunk::new(TrunkConfig::new("t", "t.example.com"));
+        trunk.set_reachable(false);
+        assert_eq!(trunk.state(), TrunkState::Failed);
+        assert!(!trunk.is_usable());
+        trunk.set_reachable(true);
+        assert!(trunk.is_usable());
+
+        // Never overrides an operator disable.
+        trunk.disable();
+        trunk.set_reachable(true);
+        assert_eq!(trunk.state(), TrunkState::Disabled);
+        trunk.set_reachable(false);
+        assert_eq!(trunk.state(), TrunkState::Disabled);
+
+        // Up does not cut a cooldown short.
+        let mut cooling = Trunk::new(TrunkConfig::new("c", "c.example.com"));
+        cooling.start_cooldown();
+        cooling.set_reachable(true);
+        assert_eq!(cooling.state(), TrunkState::Cooldown);
+    }
+
+    #[test]
     fn test_trunk_disable_enable() {
         let config = TrunkConfig::new("trunk-1", "sip.example.com");
         let mut trunk = Trunk::new(config);
@@ -662,6 +1057,25 @@ mod tests {
     }
 
     #[test]
+    fn non_tls_count_tracks_add_replace_remove() {
+        let mut g = TrunkGroup::new("g", "g");
+        g.add_trunk(Trunk::new(
+            TrunkConfig::new("a", "a.example.com").with_protocol(TrunkProtocol::Udp),
+        ));
+        assert_eq!(g.non_tls_count(), 1);
+        g.add_trunk(Trunk::new(
+            TrunkConfig::new("a", "a.example.com").with_protocol(TrunkProtocol::Tls),
+        ));
+        assert_eq!(g.non_tls_count(), 0);
+        g.add_trunk(Trunk::new(
+            TrunkConfig::new("b", "b.example.com").with_protocol(TrunkProtocol::Tcp),
+        ));
+        assert_eq!(g.non_tls_count(), 1);
+        g.remove_trunk("b");
+        assert_eq!(g.non_tls_count(), 0);
+    }
+
+    #[test]
     fn test_trunk_group_usable_count() {
         let mut group = TrunkGroup::new("group-1", "Test Group");
 
@@ -675,5 +1089,80 @@ mod tests {
 
         assert_eq!(group.trunk_count(), 2);
         assert_eq!(group.usable_trunk_count(), 1);
+    }
+
+    #[test]
+    fn emergency_admission_ignores_max_calls_only() {
+        let mut trunk = Trunk::new(TrunkConfig::new("t", "t.example.com").with_max_calls(1));
+        trunk.start_call();
+        assert!(!trunk.is_usable());
+        assert!(trunk.is_usable_for(Admission::Emergency));
+        // Default reserve for max_calls=1 is 1: the second slot is the last.
+        trunk.start_call();
+        assert!(!trunk.is_usable_for(Admission::Emergency));
+        trunk.end_call(TrunkOutcome::Abandoned);
+        trunk.start_cooldown();
+        assert!(!trunk.is_usable_for(Admission::Emergency));
+        trunk.reset();
+        trunk.set_reachable(false);
+        assert!(!trunk.is_usable_for(Admission::Emergency));
+        trunk.set_reachable(true);
+        trunk.disable();
+        assert!(!trunk.is_usable_for(Admission::Emergency));
+
+        let mut group = TrunkGroup::new("g", "g");
+        let mut full = Trunk::new(TrunkConfig::new("full", "f.example.com").with_max_calls(1));
+        full.start_call();
+        group.add_trunk(full);
+        assert!(group.select_trunk().is_none());
+        assert_eq!(group.failover_order(), Vec::<&str>::new());
+        assert_eq!(group.select_trunk_for(Admission::Emergency), Some("full"));
+        assert_eq!(group.failover_order_for(Admission::Emergency), vec!["full"]);
+    }
+
+    #[test]
+    fn emergency_reserve_is_bounded_and_configurable() {
+        assert_eq!(default_emergency_reserve(0), 1);
+        assert_eq!(default_emergency_reserve(9), 1);
+        assert_eq!(default_emergency_reserve(100), 10);
+        let mut trunk = Trunk::new(
+            TrunkConfig::new("t", "t.example.com")
+                .with_max_calls(2)
+                .with_emergency_reserve_calls(2),
+        );
+        for _ in 0..2 {
+            trunk.start_call();
+        }
+        // Normal calls never use the reserve.
+        assert!(!trunk.is_usable());
+        assert!(trunk.is_usable_for(Admission::Emergency));
+        trunk.start_call();
+        assert!(!trunk.is_usable());
+        assert!(trunk.is_usable_for(Admission::Emergency));
+        trunk.start_call();
+        // max_calls + reserve reached: emergency skipped too.
+        assert!(!trunk.is_usable_for(Admission::Emergency));
+    }
+
+    #[test]
+    fn start_cooldown_for_uses_given_duration() {
+        let mut trunk = Trunk::new(TrunkConfig::new("t", "t.example.com").with_cooldown_secs(30));
+        let before = Instant::now();
+        trunk.start_cooldown_for(std::time::Duration::from_secs(120));
+        let until = trunk.cooldown_until().unwrap();
+        assert!(until >= before + std::time::Duration::from_secs(120));
+        assert!(until < before + std::time::Duration::from_secs(121));
+        assert!(!trunk.is_usable());
+
+        let mut short = Trunk::new(TrunkConfig::new("s", "s.example.com"));
+        short.start_cooldown_for(std::time::Duration::ZERO);
+        assert!(short.is_usable(), "an elapsed cooldown lapses to Available");
+
+        let mut dflt = Trunk::new(TrunkConfig::new("d", "d.example.com").with_cooldown_secs(30));
+        let before = Instant::now();
+        dflt.start_cooldown();
+        let until = dflt.cooldown_until().unwrap();
+        assert!(until >= before + std::time::Duration::from_secs(30));
+        assert!(until < before + std::time::Duration::from_secs(31));
     }
 }

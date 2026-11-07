@@ -1,6 +1,10 @@
 //! Poly Edge series provisioning configuration generator.
 
+use crate::escape::{transport_token, xml_attr, xml_text};
 use crate::model::Phone;
+
+// NIST 800-53 Rev5: SI-15 (Information Output Filtering) -- every operator
+// string goes through `crate::escape`; numerics/bools/enums are type-safe.
 
 /// Generate a Poly Edge series provisioning XML configuration.
 ///
@@ -8,6 +12,7 @@ use crate::model::Phone;
 /// line appearances, provisioning server URL, and codec preferences.
 #[must_use]
 pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
+    let sbc_host = xml_text(sbc_host);
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <phone>
@@ -21,7 +26,7 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
         xml.push_str(&format!("    <port>{}</port>\n", line.sip_port));
         xml.push_str(&format!(
             "    <transport>{}</transport>\n",
-            line.transport.to_uppercase()
+            transport_token(&line.transport)
         ));
         xml.push_str("    <expires>3600</expires>\n");
     }
@@ -31,34 +36,37 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
         xml.push_str(&format!("    <line index=\"{}\">\n", line.index));
         xml.push_str(&format!(
             "      <address>{}</address>\n",
-            line.directory_number
+            xml_text(&line.directory_number)
         ));
         xml.push_str(&format!(
             "      <displayName>{}</displayName>\n",
-            line.display_name
+            xml_text(&line.display_name)
         ));
         xml.push_str(&format!(
             "      <authUser>{}</authUser>\n",
-            line.sip_username
+            xml_text(&line.sip_username)
         ));
         xml.push_str(&format!(
             "      <authPassword>{}</authPassword>\n",
-            line.sip_password
+            xml_text(&line.sip_password)
         ));
-        xml.push_str(&format!("      <label>{}</label>\n", line.display_name));
+        xml.push_str(&format!(
+            "      <label>{}</label>\n",
+            xml_text(&line.display_name)
+        ));
         if let Some(vm) = &line.voicemail_uri {
-            xml.push_str(&format!("      <voicemail>{vm}</voicemail>\n"));
+            xml.push_str(&format!("      <voicemail>{}</voicemail>\n", xml_text(vm)));
         }
         if let Some(cf) = &line.call_forward {
             xml.push_str("      <callForward>\n");
             if let Some(all) = &cf.all {
-                xml.push_str(&format!("        <all>{all}</all>\n"));
+                xml.push_str(&format!("        <all>{}</all>\n", xml_text(all)));
             }
             if let Some(busy) = &cf.busy {
-                xml.push_str(&format!("        <busy>{busy}</busy>\n"));
+                xml.push_str(&format!("        <busy>{}</busy>\n", xml_text(busy)));
             }
             if let Some(na) = &cf.no_answer {
-                xml.push_str(&format!("        <noAnswer>{na}</noAnswer>\n"));
+                xml.push_str(&format!("        <noAnswer>{}</noAnswer>\n", xml_text(na)));
                 xml.push_str(&format!(
                     "        <noAnswerTimeout>{}</noAnswerTimeout>\n",
                     cf.no_answer_timeout
@@ -77,7 +85,9 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
         for sd in &phone.speed_dials {
             xml.push_str(&format!(
                 "    <entry index=\"{}\" label=\"{}\" number=\"{}\" />\n",
-                sd.index, sd.label, sd.number
+                sd.index,
+                xml_attr(&sd.label),
+                xml_attr(&sd.number)
             ));
         }
         xml.push_str("  </speedDial>\n\n");
@@ -89,7 +99,9 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
         for blf in &phone.blf_entries {
             xml.push_str(&format!(
                 "    <entry index=\"{}\" label=\"{}\" address=\"{}\" />\n",
-                blf.index, blf.label, blf.address
+                blf.index,
+                xml_attr(&blf.label),
+                xml_attr(&blf.address)
             ));
         }
         xml.push_str("  </blf>\n\n");
@@ -143,10 +155,10 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
     if phone.display.timezone.is_some() || phone.display.ntp_server.is_some() {
         xml.push_str("  <time>\n");
         if let Some(tz) = &phone.display.timezone {
-            xml.push_str(&format!("    <timezone>{tz}</timezone>\n"));
+            xml.push_str(&format!("    <timezone>{}</timezone>\n", xml_text(tz)));
         }
         if let Some(ntp) = &phone.display.ntp_server {
-            xml.push_str(&format!("    <ntpServer>{ntp}</ntpServer>\n"));
+            xml.push_str(&format!("    <ntpServer>{}</ntpServer>\n", xml_text(ntp)));
         }
         xml.push_str(&format!(
             "    <format24hr>{}</format24hr>\n",
@@ -165,10 +177,13 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
             xml.push_str(&format!("    <brightness>{brightness}</brightness>\n"));
         }
         if let Some(lang) = &phone.display.language {
-            xml.push_str(&format!("    <language>{lang}</language>\n"));
+            xml.push_str(&format!("    <language>{}</language>\n", xml_text(lang)));
         }
         if let Some(ringtone) = &phone.display.ringtone {
-            xml.push_str(&format!("    <ringtone>{ringtone}</ringtone>\n"));
+            xml.push_str(&format!(
+                "    <ringtone>{}</ringtone>\n",
+                xml_text(ringtone)
+            ));
         }
         xml.push_str("  </display>\n\n");
     }
@@ -190,16 +205,25 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
     if phone.directory.enabled {
         xml.push_str("  <directory>\n");
         if let Some(server) = &phone.directory.ldap_server {
-            xml.push_str(&format!("    <ldapServer>{server}</ldapServer>\n"));
+            xml.push_str(&format!(
+                "    <ldapServer>{}</ldapServer>\n",
+                xml_text(server)
+            ));
         }
         if let Some(port) = phone.directory.ldap_port {
             xml.push_str(&format!("    <ldapPort>{port}</ldapPort>\n"));
         }
         if let Some(base_dn) = &phone.directory.ldap_base_dn {
-            xml.push_str(&format!("    <ldapBaseDN>{base_dn}</ldapBaseDN>\n"));
+            xml.push_str(&format!(
+                "    <ldapBaseDN>{}</ldapBaseDN>\n",
+                xml_text(base_dn)
+            ));
         }
         if let Some(bind_dn) = &phone.directory.ldap_bind_dn {
-            xml.push_str(&format!("    <ldapBindDN>{bind_dn}</ldapBindDN>\n"));
+            xml.push_str(&format!(
+                "    <ldapBindDN>{}</ldapBindDN>\n",
+                xml_text(bind_dn)
+            ));
         }
         if phone.directory.ldap_tls {
             xml.push_str("    <ldapTLS>true</ldapTLS>\n");
@@ -211,13 +235,13 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
     if phone.emergency.emergency_number.is_some() {
         xml.push_str("  <emergency>\n");
         if let Some(num) = &phone.emergency.emergency_number {
-            xml.push_str(&format!("    <number>{num}</number>\n"));
+            xml.push_str(&format!("    <number>{}</number>\n", xml_text(num)));
         }
         if let Some(loc) = &phone.emergency.location_id {
-            xml.push_str(&format!("    <locationId>{loc}</locationId>\n"));
+            xml.push_str(&format!("    <locationId>{}</locationId>\n", xml_text(loc)));
         }
         if let Some(elin) = &phone.emergency.elin {
-            xml.push_str(&format!("    <elin>{elin}</elin>\n"));
+            xml.push_str(&format!("    <elin>{}</elin>\n", xml_text(elin)));
         }
         xml.push_str("  </emergency>\n\n");
     }

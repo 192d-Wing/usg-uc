@@ -17,9 +17,9 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tracing::{debug, instrument, trace};
@@ -37,7 +37,11 @@ use uc_types::address::{SbcSocketAddr, TransportType};
 /// TCP provides basic integrity via checksums but no confidentiality.
 /// Use TLS for secure signaling.
 pub struct TcpTransport {
-    stream: Arc<Mutex<TcpStream>>,
+    /// Read and write halves are locked separately so a send from another
+    /// task (timer retransmission, a request routed onto this connection)
+    /// never waits behind a pending `recv` on the connection's reader task.
+    reader: Mutex<OwnedReadHalf>,
+    writer: Mutex<OwnedWriteHalf>,
     local_addr: SbcSocketAddr,
     peer_addr: SbcSocketAddr,
     read_buffer: Mutex<BytesMut>,
@@ -72,8 +76,10 @@ impl TcpTransport {
 
         debug!(local = %local_addr, peer = %peer_addr, "TCP transport created");
 
+        let (reader, writer) = stream.into_split();
         Ok(Self {
-            stream: Arc::new(Mutex::new(stream)),
+            reader: Mutex::new(reader),
+            writer: Mutex::new(writer),
             local_addr,
             peer_addr,
             read_buffer: Mutex::new(BytesMut::with_capacity(MAX_STREAM_MESSAGE_SIZE)),
@@ -97,6 +103,8 @@ impl TcpTransport {
                     address: dest,
                     reason: e.to_string(),
                 })?;
+        // SIP requests are small and latency-sensitive (RFC 3261 §18.3).
+        let _ = stream.set_nodelay(true);
 
         Self::from_stream(stream)
     }
@@ -109,6 +117,10 @@ impl TcpTransport {
 }
 
 impl Transport for TcpTransport {
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     fn send<'a>(
         &'a self,
         data: &'a [u8],
@@ -129,7 +141,7 @@ impl Transport for TcpTransport {
             trace!(size = data.len(), "sending TCP data");
 
             {
-                let mut stream = self.stream.lock().await;
+                let mut stream = self.writer.lock().await;
                 stream
                     .write_all(data)
                     .await
@@ -160,7 +172,7 @@ impl Transport for TcpTransport {
 
             let data = {
                 let mut read_buffer = self.read_buffer.lock().await;
-                let mut stream = self.stream.lock().await;
+                let mut stream = self.reader.lock().await;
 
                 // Read available data
                 let mut temp_buffer = [0u8; 4096];
@@ -211,7 +223,7 @@ impl Transport for TcpTransport {
             }
 
             {
-                let mut stream = self.stream.lock().await;
+                let mut stream = self.writer.lock().await;
                 let _ = stream.shutdown().await;
                 drop(stream);
             }
@@ -235,7 +247,8 @@ impl StreamTransport for TcpTransport {
 impl std::fmt::Debug for TcpTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TcpTransport")
-            .field("stream", &"<mutex>")
+            .field("reader", &"<mutex>")
+            .field("writer", &"<mutex>")
             .field("local_addr", &self.local_addr)
             .field("peer_addr", &self.peer_addr)
             .field("read_buffer", &"<mutex>")
@@ -523,5 +536,78 @@ mod tests {
         // Second close should fail
         let result = client.close().await;
         assert!(matches!(result, Err(TransportError::AlreadyClosed)));
+    }
+
+    // POA&M-5: read and write halves are locked separately, so a send from
+    // another task (timer loop, routed request) completes while the reader
+    // task is parked in recv(), and the pending recv still gets its data.
+    #[tokio::test]
+    async fn test_tcp_send_not_blocked_by_pending_recv() {
+        use std::sync::Arc;
+        let listener = TcpListener::bind(SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = *listener.local_addr();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let conn = Arc::new(TcpTransport::connect(addr).await.unwrap());
+        let server = accept.await.unwrap();
+        let reader = {
+            let c = Arc::clone(&conn);
+            tokio::spawn(async move { c.recv().await.map(|m| m.data.to_vec()) })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!reader.is_finished(), "recv is pending");
+        let secs = std::time::Duration::from_secs(2);
+        let mut senders = Vec::new();
+        for i in 0..4u8 {
+            let c = Arc::clone(&conn);
+            senders.push(tokio::spawn(async move {
+                tokio::time::timeout(secs, c.send(&[b'A' + i], &addr)).await
+            }));
+        }
+        for s in senders {
+            s.await
+                .unwrap()
+                .expect("send must not wait on the pending recv")
+                .unwrap();
+        }
+        let mut got = Vec::new();
+        while got.len() < 4 {
+            got.extend_from_slice(&server.recv().await.unwrap().data);
+        }
+        got.sort_unstable();
+        assert_eq!(got, b"ABCD");
+        server.send(b"200", &addr).await.unwrap();
+        let r = tokio::time::timeout(secs, reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(r, b"200");
+    }
+
+    // Closing while a recv is pending does not hang the reader forever:
+    // the peer's close ends it with an error.
+    #[tokio::test]
+    async fn test_tcp_pending_recv_ends_on_peer_close() {
+        use std::sync::Arc;
+        let listener = TcpListener::bind(SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = *listener.local_addr();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let conn = Arc::new(TcpTransport::connect(addr).await.unwrap());
+        let server = accept.await.unwrap();
+        let reader = {
+            let c = Arc::clone(&conn);
+            tokio::spawn(async move { c.recv().await })
+        };
+        server.close().await.unwrap();
+        drop(server);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("reader must end on peer close")
+            .unwrap();
+        assert!(r.is_err());
     }
 }

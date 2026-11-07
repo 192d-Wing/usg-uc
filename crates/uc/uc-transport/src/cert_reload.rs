@@ -30,7 +30,7 @@
 //! ```
 
 use crate::error::TransportResult;
-use crate::tls::{create_server_config, load_certs, load_private_key};
+use crate::tls::{RequiredKeyCurve, create_server_config, load_certs, load_private_key_checked};
 use arc_swap::ArcSwap;
 use rustls::ServerConfig;
 use std::path::{Path, PathBuf};
@@ -64,6 +64,8 @@ pub struct ReloadableTlsAcceptor {
     reload_count: AtomicU64,
     /// Last reload timestamp (Unix epoch seconds).
     last_reload: AtomicU64,
+    /// Exact key curve required (`None`: P-384 or P-521).
+    required_curve: Option<RequiredKeyCurve>,
 }
 
 impl ReloadableTlsAcceptor {
@@ -75,7 +77,22 @@ impl ReloadableTlsAcceptor {
     ///
     /// Returns an error if the initial certificate loading fails.
     pub fn new(cert_path: PathBuf, key_path: PathBuf) -> TransportResult<Self> {
-        let server_config = Self::load_config(&cert_path, &key_path)?;
+        Self::new_with_curve(cert_path, key_path, None)
+    }
+
+    /// Creates a reloadable TLS acceptor whose key must be on `curve`
+    /// (`security.curve`) at initial load and at every reload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the initial certificate loading fails.
+    // NIST 800-53 Rev5: SC-13 (library half of POA&M-166; daemon wiring open).
+    pub fn new_with_curve(
+        cert_path: PathBuf,
+        key_path: PathBuf,
+        required_curve: Option<RequiredKeyCurve>,
+    ) -> TransportResult<Self> {
+        let server_config = Self::load_config(&cert_path, &key_path, required_curve)?;
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
         let now = SystemTime::now()
@@ -94,6 +111,7 @@ impl ReloadableTlsAcceptor {
             key_path,
             reload_count: AtomicU64::new(0),
             last_reload: AtomicU64::new(now),
+            required_curve,
         })
     }
 
@@ -119,6 +137,7 @@ impl ReloadableTlsAcceptor {
             key_path,
             reload_count: AtomicU64::new(0),
             last_reload: AtomicU64::new(now),
+            required_curve: None,
         }
     }
 
@@ -140,7 +159,7 @@ impl ReloadableTlsAcceptor {
         );
 
         // Load new certificates
-        let new_config = Self::load_config(&self.cert_path, &self.key_path)?;
+        let new_config = Self::load_config(&self.cert_path, &self.key_path, self.required_curve)?;
         let new_acceptor = TlsAcceptor::from(Arc::new(new_config));
 
         // Atomically swap the acceptor
@@ -214,7 +233,11 @@ impl ReloadableTlsAcceptor {
     }
 
     /// Loads TLS configuration from certificate and key files.
-    fn load_config(cert_path: &Path, key_path: &Path) -> TransportResult<ServerConfig> {
+    fn load_config(
+        cert_path: &Path,
+        key_path: &Path,
+        required_curve: Option<RequiredKeyCurve>,
+    ) -> TransportResult<ServerConfig> {
         debug!(
             cert_path = %cert_path.display(),
             key_path = %key_path.display(),
@@ -222,7 +245,7 @@ impl ReloadableTlsAcceptor {
         );
 
         let certs = load_certs(cert_path)?;
-        let key = load_private_key(key_path)?;
+        let key = load_private_key_checked(key_path, required_curve)?;
 
         debug!(cert_count = certs.len(), "Loaded certificate chain");
 
@@ -294,6 +317,13 @@ mod tests {
 
         if cert_result.is_err() || !cert_result.as_ref().is_ok_and(|o| o.status.success()) {
             return None;
+        }
+
+        // Key files must not be group/other accessible (POA&M-164).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).ok()?;
         }
 
         Some((temp_dir, cert_path, key_path))
@@ -403,6 +433,96 @@ mod tests {
         let debug_str = format!("{acceptor:?}");
         assert!(debug_str.contains("ReloadableTlsAcceptor"));
         assert!(debug_str.contains("reload_count"));
+    }
+
+    #[test]
+    fn test_required_curve_mismatch_rejected() {
+        let Some((_temp_dir, cert_path, key_path)) = create_test_certs() else {
+            eprintln!("Skipping test: openssl not available");
+            return;
+        };
+        assert!(
+            ReloadableTlsAcceptor::new_with_curve(
+                cert_path.clone(),
+                key_path.clone(),
+                Some(RequiredKeyCurve::P521)
+            )
+            .is_err()
+        );
+        assert!(
+            ReloadableTlsAcceptor::new_with_curve(
+                cert_path,
+                key_path,
+                Some(RequiredKeyCurve::P384)
+            )
+            .is_ok()
+        );
+    }
+
+    /// POA&M-164: a reload against an insecure key file fails closed and
+    /// leaves the previously loaded acceptor in place.
+    #[cfg(unix)]
+    #[test]
+    fn test_reload_fails_closed_on_insecure_key_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some((temp_dir, cert_path, key_path)) = create_test_certs() else {
+            eprintln!("Skipping test: openssl not available");
+            return;
+        };
+        let acceptor = ReloadableTlsAcceptor::new(cert_path, key_path.clone()).expect("acceptor");
+        let before = acceptor.acceptor_arc();
+
+        // World-readable key: rejected on reload.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(acceptor.reload().is_err());
+        assert!(!acceptor.try_reload());
+        assert_eq!(acceptor.reload_count(), 0);
+        assert!(Arc::ptr_eq(&before, &acceptor.acceptor_arc()));
+
+        // Key replaced by a symlink to a 0600 file: rejected (O_NOFOLLOW).
+        let real = temp_dir.path().join("real-key.pem");
+        std::fs::rename(&key_path, &real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&real, &key_path).unwrap();
+        assert!(acceptor.reload().is_err());
+        assert_eq!(acceptor.reload_count(), 0);
+
+        // Restore a regular 0600 key: reload succeeds again.
+        std::fs::remove_file(&key_path).unwrap();
+        std::fs::rename(&real, &key_path).unwrap();
+        acceptor.reload().expect("reload");
+        assert_eq!(acceptor.reload_count(), 1);
+    }
+
+    /// POA&M-166: swapping in a P-256 key at reload time is rejected.
+    #[cfg(unix)]
+    #[test]
+    fn test_reload_rejects_p256_key_swap() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some((_temp_dir, cert_path, key_path)) = create_test_certs() else {
+            eprintln!("Skipping test: openssl not available");
+            return;
+        };
+        let acceptor = ReloadableTlsAcceptor::new(cert_path, key_path.clone()).expect("acceptor");
+        let ok = Command::new("openssl")
+            .args([
+                "ecparam",
+                "-name",
+                "prime256v1",
+                "-genkey",
+                "-noout",
+                "-out",
+            ])
+            .arg(&key_path)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !ok {
+            eprintln!("Skipping test: openssl P-256 keygen failed");
+            return;
+        }
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(acceptor.reload().is_err());
+        assert_eq!(acceptor.reload_count(), 0);
     }
 
     #[test]

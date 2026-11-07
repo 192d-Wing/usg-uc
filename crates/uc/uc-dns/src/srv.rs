@@ -123,61 +123,44 @@ impl SrvResolver {
 
     /// Selects the next target using RFC 2782 weighted selection.
     ///
-    /// Within each priority level, targets are selected randomly
-    /// based on their weight.
+    /// Within the best priority level, a target is chosen at random with
+    /// probability proportional to its weight (zero-weight targets remain
+    /// reachable with a small probability).
     #[must_use]
     pub fn select_target(&self) -> Option<&SrvRecord> {
-        if self.records.is_empty() {
-            return None;
-        }
-
-        // Filter out null records
-        let valid_records: Vec<_> = self.records.iter().filter(|r| !r.is_null()).collect();
-        if valid_records.is_empty() {
-            return None;
-        }
-
-        // Get the lowest (best) priority
-        let best_priority = valid_records.iter().map(|r| r.priority).min().unwrap_or(0);
-
-        // Get all records at the best priority level
-        let priority_records: Vec<_> = valid_records
-            .iter()
-            .filter(|r| r.priority == best_priority)
-            .collect();
-
-        if priority_records.len() == 1 {
-            return Some(priority_records[0]);
-        }
-
-        // Weighted random selection
-        let total_weight: u32 = priority_records.iter().map(|r| u32::from(r.weight)).sum();
-        if total_weight == 0 {
-            // All weights are 0, select first one
-            return priority_records.first().copied().copied();
-        }
-
-        // Simple weighted selection (deterministic for testing)
-        // In production, would use random selection
-        let mut running_weight = 0u32;
-        let target_weight = total_weight / 2; // Select median
-
-        for record in &priority_records {
-            running_weight += u32::from(record.weight);
-            if running_weight > target_weight {
-                return Some(*record);
-            }
-        }
-
-        priority_records.last().copied().copied()
+        Self::select_with(&self.records, random_inclusive)
     }
 
-    /// Selects all targets in priority/weight order.
+    /// RFC 2782 selection with an injectable RNG: `rng(max)` must return a
+    /// uniform value in `0..=max`.
+    fn select_with(records: &[SrvRecord], rng: impl FnMut(u32) -> u32) -> Option<&SrvRecord> {
+        let valid: Vec<&SrvRecord> = records.iter().filter(|r| !r.is_null()).collect();
+        let best = valid.iter().map(|r| r.priority).min()?;
+        let tier: Vec<&SrvRecord> = valid.into_iter().filter(|r| r.priority == best).collect();
+        pick_weighted(&tier, rng).and_then(|i| tier.get(i).copied())
+    }
+
+    /// Selects all targets in RFC 2782 order: ascending priority, and within
+    /// each priority a weighted-random permutation.
     #[must_use]
     pub fn select_all(&self) -> Vec<&SrvRecord> {
-        let mut records: Vec<_> = self.records.iter().filter(|r| !r.is_null()).collect();
-        records.sort();
-        records
+        order_with(
+            self.records.iter().filter(|r| !r.is_null()).collect(),
+            random_inclusive,
+        )
+    }
+
+    /// Orders `records` per RFC 2782 (null targets dropped), returning owned
+    /// copies in the order a client should try them.
+    #[must_use]
+    pub fn order_rfc2782(records: &[SrvRecord]) -> Vec<SrvRecord> {
+        order_with(
+            records.iter().filter(|r| !r.is_null()).collect(),
+            random_inclusive,
+        )
+        .into_iter()
+        .cloned()
+        .collect()
     }
 
     /// Constructs an SRV query name for a SIP domain.
@@ -237,6 +220,60 @@ impl SrvResolver {
     }
 }
 
+/// Uniform random value in `0..=max` from the thread-local CSPRNG.
+fn random_inclusive(max: u32) -> u32 {
+    use rand::Rng;
+    rand::rng().random_range(0..=max)
+}
+
+/// RFC 2782 "Usage rules": pick one index from a single priority tier.
+///
+/// Zero-weight records are placed first, running sums are computed, a
+/// uniform value in `0..=total` is drawn, and the first record whose running
+/// sum is `>=` the draw is selected. Weights are summed as `u32` with
+/// `saturating_add`, so attacker-supplied weights cannot overflow.
+fn pick_weighted(tier: &[&SrvRecord], mut rng: impl FnMut(u32) -> u32) -> Option<usize> {
+    if tier.is_empty() {
+        return None;
+    }
+    // Zero weights first (RFC 2782), stable otherwise.
+    let mut order: Vec<usize> = (0..tier.len()).collect();
+    order.sort_by_key(|&i| tier.get(i).is_some_and(|r| r.weight != 0));
+    let total = tier
+        .iter()
+        .fold(0u32, |acc, r| acc.saturating_add(u32::from(r.weight)));
+    let draw = rng(total);
+    let mut running = 0u32;
+    for &i in &order {
+        running = running.saturating_add(tier.get(i).map_or(0, |r| u32::from(r.weight)));
+        if running >= draw {
+            return Some(i);
+        }
+    }
+    order.last().copied()
+}
+
+/// RFC 2782 full ordering: priority ascending, weighted-random within tier.
+fn order_with(mut records: Vec<&SrvRecord>, mut rng: impl FnMut(u32) -> u32) -> Vec<&SrvRecord> {
+    records.sort_by_key(|r| r.priority);
+    let mut out = Vec::with_capacity(records.len());
+    let mut start = 0;
+    while start < records.len() {
+        let prio = records.get(start).map_or(0, |r| r.priority);
+        let end = records
+            .iter()
+            .skip(start)
+            .position(|r| r.priority != prio)
+            .map_or(records.len(), |n| start + n);
+        let mut tier: Vec<&SrvRecord> = records.get(start..end).unwrap_or_default().to_vec();
+        while let Some(i) = pick_weighted(&tier, &mut rng) {
+            out.push(tier.remove(i));
+        }
+        start = end;
+    }
+    out
+}
+
 impl Default for SrvResolver {
     fn default() -> Self {
         Self::new()
@@ -294,6 +331,87 @@ mod tests {
         assert!(target.is_some());
         // Should select the lower priority (10) first
         assert_eq!(target.unwrap().target, "primary.example.com");
+    }
+
+    fn tier() -> Vec<SrvRecord> {
+        vec![
+            SrvRecord::new("", 10, 10, 5060, "a.test", 300),
+            SrvRecord::new("", 10, 30, 5060, "b.test", 300),
+            SrvRecord::new("", 10, 60, 5060, "c.test", 300),
+            SrvRecord::new("", 20, 100, 5060, "backup.test", 300),
+        ]
+    }
+
+    #[test]
+    fn test_weighted_boundaries() {
+        let recs = tier();
+        // Running sums: a=10, b=40, c=100 (draw in 0..=100).
+        let pick = |d: u32| SrvResolver::select_with(&recs, |_| d).map(|r| r.target.clone());
+        assert_eq!(pick(0).as_deref(), Some("a.test"));
+        assert_eq!(pick(10).as_deref(), Some("a.test"));
+        assert_eq!(pick(11).as_deref(), Some("b.test"));
+        assert_eq!(pick(40).as_deref(), Some("b.test"));
+        assert_eq!(pick(41).as_deref(), Some("c.test"));
+        assert_eq!(pick(100).as_deref(), Some("c.test"));
+    }
+
+    #[test]
+    fn test_zero_weight_reachable_and_all_zero() {
+        let recs = vec![
+            SrvRecord::new("", 1, 5, 5060, "w.test", 300),
+            SrvRecord::new("", 1, 0, 5060, "z.test", 300),
+        ];
+        // Zero-weight is ordered first and selected on a draw of 0.
+        let r = SrvResolver::select_with(&recs, |_| 0);
+        assert_eq!(r.map(|r| r.target.as_str()), Some("z.test"));
+        let r = SrvResolver::select_with(&recs, |m| m);
+        assert_eq!(r.map(|r| r.target.as_str()), Some("w.test"));
+
+        let zeros = vec![
+            SrvRecord::new("", 1, 0, 5060, "x.test", 300),
+            SrvRecord::new("", 1, 0, 5060, "y.test", 300),
+        ];
+        assert!(SrvResolver::select_with(&zeros, |_| 0).is_some());
+        let mut r = SrvResolver::new();
+        r.add_records(zeros);
+        assert_eq!(r.select_all().len(), 2);
+    }
+
+    #[allow(clippy::panic)]
+    #[test]
+    fn test_weighted_distribution() {
+        let mut resolver = SrvResolver::new();
+        resolver.add_records(tier());
+        let (mut a, mut b, mut c) = (0u32, 0u32, 0u32);
+        let n = 10_000u32;
+        for _ in 0..n {
+            match resolver.select_target().map(|r| r.target.as_str()) {
+                Some("a.test") => a += 1,
+                Some("b.test") => b += 1,
+                Some("c.test") => c += 1,
+                other => panic!("unexpected selection {other:?}"),
+            }
+        }
+        // Expected shares 10/30/60.
+        for (count, expected) in [(a, 0.10_f64), (b, 0.30), (c, 0.60)] {
+            let share = f64::from(count) / f64::from(n);
+            assert!(
+                (share - expected).abs() < 0.03,
+                "share {share} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_order_respects_priority_and_is_permutation() {
+        let recs = tier();
+        let mut draws = [100u32, 0, 0].into_iter();
+        let ordered = order_with(recs.iter().collect(), |m| draws.next().unwrap_or(m));
+        let names: Vec<_> = ordered.iter().map(|r| r.target.as_str()).collect();
+        assert_eq!(names, ["c.test", "a.test", "b.test", "backup.test"]);
+        let owned = SrvResolver::order_rfc2782(&recs);
+        assert_eq!(owned.len(), 4);
+        assert_eq!(owned.last().map(|r| r.target.as_str()), Some("backup.test"));
     }
 
     #[test]

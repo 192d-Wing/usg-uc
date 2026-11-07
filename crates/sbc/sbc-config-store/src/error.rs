@@ -24,6 +24,17 @@ pub enum ConfigStoreError {
     /// File I/O failed (only raised by the JSON migration helper).
     #[error("io error: {0}")]
     Io(String),
+
+    /// A field failed write-time validation. Names the field only; the value
+    /// is never echoed because it may be a credential.
+    /// NIST 800-53 Rev5: SI-10, SI-11 (Error Handling)
+    #[error("invalid field {field}: {reason}")]
+    Invalid {
+        /// Field path, e.g. `lines[0].display_name`.
+        field: String,
+        /// Static description of the rule that failed.
+        reason: &'static str,
+    },
 }
 
 impl From<sqlx::Error> for ConfigStoreError {

@@ -15,12 +15,17 @@ default = ["fips"]
 fips = ["aws-lc-rs/fips"]
 # Prepare for post-quantum (ML-KEM) integration
 pqc = []
+# CNSA-EXCEPTION: ATIS-1000074 mandates ES256 for SHAKEN PASSporTs. Enables
+# `interop::ecdsa_p256` and STI certificate path validation (`x509`).
+stir-shaken-es256 = ["dep:webpki", "dep:rustls-pki-types"]
 
 [dependencies]
 aws-lc-rs.workspace = true
 uc-types = { workspace = true, features = ["serde"] }
 zeroize.workspace = true
 thiserror.workspace = true
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "aws-lc-rs-fips"], optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 
 [dev-dependencies]
 # For testing with known test vectors

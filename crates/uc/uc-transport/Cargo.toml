@@ -25,6 +25,7 @@ thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
 socket2.workspace = true
+zeroize.workspace = true
 
 # TLS support
 rustls = { workspace = true, optional = true }
@@ -40,6 +41,12 @@ futures-util = { version = "0.3", optional = true }
 crc32c = { version = "0.6", optional = true }
 rand = { version = "0.9", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW open and geteuid for TLS key-file checks (POA&M-164).
+# Not `workspace = true`: the workspace entry enables "net", which does not
+# build for iOS targets (client-ffi depends on uc-transport).
+nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Networking_WinSock",
@@ -47,6 +54,12 @@ windows = { workspace = true, features = [
 
 [dev-dependencies]
 tempfile = "3"
+criterion.workspace = true
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+
+[[bench]]
+name = "transport_rtt"
+harness = false
 
 [lints]
 workspace = true

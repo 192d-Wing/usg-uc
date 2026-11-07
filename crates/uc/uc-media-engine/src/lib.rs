@@ -1,27 +1,33 @@
-//! Media processing and orchestration engine.
+//! Media session orchestration.
 //!
-//! This crate coordinates media handling including codec negotiation,
-//! RTP stream management, and media path setup for the SBC.
+//! This crate tracks per-call media session and stream state, selects the
+//! media mode, and negotiates codecs for the SBC. It does not touch RTP
+//! packets: RTP/RTCP relay, SRTP and transcoding live in `sbc-media-core`
+//! (built on `proto-rtp`, `proto-srtp` and `uc-codecs`).
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-8**: Transmission Confidentiality and Integrity
-//! - **SC-13**: Cryptographic Protection (SRTP)
+//! - **SC-8**: Transmission Confidentiality and Integrity (orchestration
+//!   only: records whether SRTP is required for a session; performs no
+//!   cryptography itself)
+//! - **SI-10**: Information Input Validation (remote codec offers are
+//!   negotiated through `uc_codecs::CodecRegistry::negotiate`; not wired
+//!   in sbc-daemon; POA&M-142)
 //!
 //! ## Media Modes
 //!
 //! The SBC supports two media handling modes:
 //!
-//! - **Relay (B2BUA)**: Full media relay with transcoding capability
+//! - **Relay (B2BUA)**: media is anchored on the SBC (transcoding, where
+//!   needed, is performed by `sbc-media-core`)
 //! - **Pass-through**: Direct media forwarding between endpoints
 //!
 //! ## Features
 //!
-//! - Media session management
-//! - Codec negotiation and transcoding
-//! - RTP/RTCP stream handling
-//! - SRTP encryption/decryption
-//! - Media statistics and monitoring
+//! - Media session and stream state machines
+//! - Media mode selection (Relay / Pass-through)
+//! - Codec negotiation (delegated to `uc-codecs`)
+//! - Packet and byte counters per stream
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

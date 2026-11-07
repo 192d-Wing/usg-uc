@@ -168,6 +168,10 @@ sbcPostgres:
 # daemon's API ClusterIP to sbc-api's, so operator/dashboard traffic
 # stops sharing a process lifecycle with SIP.
 sbcApi:
+  # Absolute path for the hash-chained audit file (SBC_API_AUDIT_PATH).
+  # Unset = audit to tracing only. When set, startup fails closed if the file
+  # cannot be opened; mount a writable volume (dir 0750, not group/world-writable).
+  auditPath: ""
   enabled: true
   replicas: 2                            # rolling update needs >1
   image:
@@ -184,6 +188,19 @@ sbcApi:
   oidc:
     issuer: ""
     audience: "usg-uc-config"
+  # AES-256-GCM key sealing SIP digest HA1 at rest (required; the pod will
+  # not start without it). Set existingSecret to a Secret you manage
+  # (key `ha1-key`, 64 hex chars, e.g. `openssl rand -hex 32`); rendering
+  # fails without it. Back it up with the database: losing it means
+  # re-provisioning every SIP user's password.
+  # generate: LAB ONLY. Chart generates the key via `lookup`; unsafe with
+  # helm template / --dry-run / Argo CD / Flux (would emit a new key) and
+  # stores the key in Helm release records. Fails on upgrade if the
+  # existing Secret cannot be read.
+  ha1Key:
+    existingSecret: ""
+    generate: false
+    key: ha1-key
 
 # sbc-provision-server — stand-alone phone-provisioning pod (PR6).
 # Owns /provision/<MAC>.{cfg,xml}: reads the phone record from Postgres
@@ -395,6 +412,13 @@ sbcConfigSync:
     key: token
 
 sbcDaemon:
+  # The chart renders no [cluster] section, so every replica enforces the
+  # full max_calls / max_registrations / trunk max_calls (per-node caps;
+  # N replicas admit N x cap). To keep the cluster total at the configured
+  # caps, build the daemon with the `cluster` feature and set
+  #   [cluster.admission] split = "divide", expected_nodes = <replicas>
+  # in config.toml, and update expected_nodes whenever replicas changes
+  # (NIST 800-53 SC-5, POA&M-1; see docs/CLUSTERING.md).
   replicas: 1
   # PVC for /var/lib/sbc — holds the file-backed SQLite (users / HA1s) and
   # JSON-persisted phones, directory_numbers, trunk_groups. Survives pod
@@ -405,6 +429,48 @@ sbcDaemon:
     storageClass: ""        # empty = cluster default; on microk8s = "microk8s-hostpath"
     # accessMode: ReadWriteOnce because the SBC is single-replica per site.
     accessMode: ReadWriteOnce
+  # Call Detail Records ([cdr] in config.toml), about 1 KiB per call.
+  # Disabling CDRs is an AU-12 deviation. CDRs get their own volume
+  # (cdr.persistence) mounted at `directory`, so a flood of rejected calls
+  # cannot fill the data volume above. Keep
+  # retentionFiles * rotateSizeMb below cdr.persistence.size (AU-4); the
+  # defaults use 48 * 16 MiB = 768 MiB of a 1 GiB volume. Retention deletes
+  # the oldest closed file once either limit is hit, so size the volume for
+  # the evidence window you need (retentionDays).
+  cdr:
+    enabled: true
+    directory: /var/lib/sbc/cdr
+    format: jsonl          # jsonl | csv
+    rotateSizeMb: 16
+    retentionDays: 90
+    retentionFiles: 48
+    persistence:
+      enabled: true
+      size: 1Gi
+      storageClass: ""
+      accessMode: ReadWriteOnce
+  # mTLS on the daemon gRPC listener. Required for sbc-api to serve the CDR
+  # API (CdrService carries PII and is mounted only on an mTLS or loopback
+  # listener); while disabled /api/v1/cdrs* answers 503. Provide either a
+  # cert-manager issuer (the chart then issues ECDSA P-384 server and client
+  # certificates, CNSA 2.0) or two existing Secrets holding tls.crt, tls.key
+  # and ca.crt. sbcTrunkAgent has no gRPC TLS client yet and cannot be
+  # enabled together with this (POAM).
+  #
+  # The daemon also checks the client certificate name on every RPC against
+  # allowedClientNames (grpc.allowed_client_names). Empty = only the chart's
+  # sbc-api client certificate (CN <release>-sbc-api). Use a DEDICATED
+  # issuer for this CA (issuerKind: Issuer, a namespaced CA Issuer used for
+  # nothing else): with a shared ClusterIssuer any workload that can request
+  # a certificate from it chains to the same CA. The `clusterIssuer` value
+  # holds the issuer name for either kind.
+  grpcMtls:
+    enabled: false
+    clusterIssuer: ""
+    issuerKind: ClusterIssuer   # Issuer recommended (dedicated, namespaced)
+    allowedClientNames: []
+    serverSecretName: ""   # default <release>-grpc-server-tls
+    clientSecretName: ""   # default <release>-grpc-client-tls
   resources:
     requests: { cpu: "500m", memory: "512Mi" }
     limits:   { cpu: "2",    memory: "2Gi"   }
@@ -427,6 +493,39 @@ sbcDaemon:
   # logs a warning for the configured tls_listen.
   sipTls:
     secretName: ""
+  # Trust anchors for TLS SIP trunks (security.trunk_tls_ca_path). Name of a
+  # ConfigMap or Secret (key below) holding a PEM bundle of the CAs that issue
+  # trunk server certificates, mounted at /etc/sbc/trunk-ca. Required before
+  # any trunk with protocol = "tls" can connect: without it the daemon has no
+  # trunk TLS client and TLS trunks fail closed (never downgrade). Kept apart
+  # from the client-issuing CA used for mTLS.
+  trunkTls:
+    caConfigMap: ""
+    caSecretName: ""
+    caKey: "ca.crt"
+    # security.require_tls_trunks (NIST 800-53 Rev5: SC-8): every trunk group
+    # sends only on TLS trunks; with none usable the call gets 503, never
+    # UDP/TCP. Groups cannot opt out. Needs caConfigMap/caSecretName.
+    requireTlsTrunks: false
+  # STIR/SHAKEN (RFC 8224/8225/8588). Off by default. Note: per-trunk
+  # sign/verify switches come only from [[trunk_groups]] in the config file
+  # (POA&M-34); trunks synced over the API get neither.
+  stirShaken:
+    # Inbound verification. Needs the STI-CR trust-anchor bundle.
+    verificationEnabled: false
+    # ConfigMap holding the STI-CR anchors PEM (key below), mounted at
+    # /etc/sbc/sti-cr.
+    trustAnchorsConfigMap: ""
+    trustAnchorsKey: "sti-cr.pem"
+    # Outbound signing (ES256, documented CNSA 2.0 exception).
+    signingEnabled: false
+    # Secret with the STI certificate chain (tls.crt) and PKCS#8 key (tls.key).
+    # The init container copies them to a memory-backed /etc/sbc/sti owned by
+    # the daemon uid with the key at mode 0400 (the signer rejects anything
+    # group/other-readable or owned by another uid).
+    signingSecretName: ""
+    # Public HTTPS URL where the STI certificate is published (x5u).
+    certificateUrl: ""
   # RFC 8898 Bearer-token REGISTER authorization. When enabled, the daemon
   # rejects REGISTERs that don't carry a valid OIDC access token whose `dn`
   # claim equals the AOR user part — the server-side half of the soft
@@ -472,17 +571,26 @@ sbcDaemon:
     grpc_listen: "0.0.0.0:9091"
 
   # Topology hiding (NIST SC-7): anonymize the SBC's internal signaling host
-  # in the Via/Contact of outbound trunk-facing INVITEs so internal topology
+  # in the Via/Contact/Record-Route of outbound trunk-facing initial INVITEs
+  # (B-leg only; responses/in-dialog not yet hidden, POA&M-155) so internal topology
   # is not disclosed to carriers. Opt-in; applies only to outside-facing legs
   # (inside-facing legs are never rewritten). Default disabled = no change.
   topologyHiding:
     enabled: false
-    # none | signaling_only (anonymize host) | full (also drops display names)
+    # none | signaling_only (best effort: hides internal hosts, leaves public
+    # hostnames) | full (recommended: hides every host except externalHost)
     mode: signaling_only
     # Public host presented in the anonymized Via/Contact. Empty defaults to
     # sbc.<site.fqdn_base>.
     externalHost: ""
     externalPort: 5060
+    # Port presented for TLS elements (transport=tls / sips:). Default 5061.
+    externalTlsPort: 5061
+    # Extra internal CIDRs / DNS domains, added to the built-in defaults
+    # (RFC1918, 100.64/10, loopback, link-local, ULA; localhost, local,
+    # internal, lan, home.arpa). An invalid entry stops the SBC at startup.
+    internalNetworks: []
+    internalDomains: []
     # The B2BUA already emits a fresh per-leg Call-ID, so Call-ID obfuscation
     # is not applied to B2BUA legs; kept for config-schema completeness.
     obfuscateCallId: false

@@ -25,10 +25,12 @@ flowchart TB
 | --- | --- | --- |
 | 0 — Foundation | `uc-types`, `uc-crypto`, `uc-audit` | Shared types, CNSA 2.0 cryptography (aws-lc-rs / FIPS), audit logging |
 | 1 — Transport | `uc-transport` | UDP/TCP/TLS transport for SIP |
+
+> **Egress flow layer (sbc-daemon):** each `ProcessResult` carries a `Flow` (the leg's transport plus, for a trunk, the right to dial it with a configured TLS name). `FlowTable` turns it into the UDP socket, the accepted connection, or a cached, certificate-verified trunk connection with its own reader task. Requests are never written to the connection they were triggered from unless that is the target leg.
 | 2 — Protocol core | `proto-sip`, `proto-transaction`, `proto-dialog`, `proto-b2bua`, `proto-registrar`, `proto-sdp`, `proto-rtp`, `proto-srtp`, `proto-dtls`, `proto-stun`, `proto-turn`, `proto-ice`, `proto-stir-shaken` | RFC protocol implementations |
 | 3 — Media engine | `uc-codecs`, `uc-media-engine` | Codec encode/decode (G.711 et al.), transcoding, media relay |
 | 4 — Security | `uc-acl`, `uc-auth`, `uc-dos-protection` | Access control, digest auth, rate limiting |
-| 5 — Orchestration | `uc-policy`, `uc-routing`, `uc-cdr` | Policy, dial-plan routing, call detail records |
+| 5 — Orchestration | `uc-policy`, `uc-routing`, `uc-cdr`, `uc-sti` | Policy, dial-plan routing, call detail records, STIR/SHAKEN services (x5u cert cache, trust anchors, attestation policy, signing key) |
 | 6 — Recording | `uc-siprec` | SIPREC call recording |
 | 7 — Management | `uc-api`, `uc-metrics`, `uc-health`, `uc-telemetry` | Management APIs and observability |
 | 8 — HA & clustering | `uc-cluster`, `uc-discovery`, `uc-storage`, `uc-state-sync`, `uc-aaa`, `uc-user-mgmt`, `uc-phone-mgmt`, `uc-snmp`, `uc-syslog` | Cluster membership, state replication, user/phone management |
@@ -91,6 +93,42 @@ flowchart LR
 exactly one replica (a second agent would double-REGISTER to carriers);
 the daemon must then run with `SBC_TRUNK_SERVICES=external`.
 
+### CDR data flow
+
+``` mermaid
+flowchart LR
+    sip["sip_stack.rs<br>call end / reject"]
+    emit["CdrEmitter<br>(uc-cdr, bounded queue,<br>try_send)"]
+    writer["writer thread<br>PII policy, sequence,<br>SHA-384 chain"]
+    file[("rotated JSONL/CSV files<br>+ .sha384 sidecars<br>(cdr.directory)")]
+    ring["in-memory ring<br>(ring_capacity)"]
+    sys["syslog sink thread<br>RFC 5424 over RFC 5425 TLS<br>(optional)"]
+    audit["uc-audit<br>CdrFileRotated, CdrSinkFailure"]
+    svc["gRPC CdrService<br>(mTLS or loopback only)"]
+    api["sbc-api-server<br>/api/v1/cdrs* (cdr:read / cdr:export)"]
+    cli["sbc-cli cdrs<br>list/show/export (gRPC)<br>verify (offline, files)"]
+    dash["sbc-dashboard Cdrs page"]
+    sip --> emit --> writer
+    writer --> file
+    writer --> ring
+    writer -->|"own queue"| sys
+    writer --> audit
+    ring --> svc
+    svc -->|"mTLS, client-cert allow-list"| api
+    svc -->|"loopback"| cli
+    api --> dash
+    file --> cli
+```
+
+Each daemon node writes its own CDRs; `node_id` and `sequence` identify the
+source. The files are the durable record. The API, CLI and dashboard read
+only the node's in-memory ring. The chain and sidecars are tamper-evident
+only; they are anchored by uc-audit or syslog, not signed. The daemon has
+no dialog-takeover path, so a call lost in a node crash produces no CDR.
+Configuration and limits are in the
+[Administrator Guide](SBC-ADMIN-GUIDE.md#call-detail-records) and the
+POA&M in the [NIST control matrix](NIST-800-53-CONTROLS.md).
+
 A further decomposition of the daemon itself (signaling pod + N media
 relay pods) is explored in
 [Signaling / Media Split](SIGNALING-MEDIA-SPLIT.md).
@@ -115,9 +153,12 @@ direction of travel is described in the
 
 ## Security posture
 
-Cryptography is CNSA 2.0 compliant: all TLS and SRTP key material flows
-through `uc-crypto` backed by the AWS-LC FIPS module, and rustls is built
-with its FIPS posture enabled. See
+Cryptography targets CNSA 2.0: TLS and SRTP use the AWS-LC FIPS module
+(`uc-crypto`, rustls with its FIPS posture enabled). Not every TLS channel
+restricts its suites to CNSA 2.0. The daemon gRPC / sbc-api channel uses
+tonic's default suites, and the SIP-TLS and CDR syslog configs pin the TLS
+version but not the suites. These gaps are tracked in the CNSA and NIST
+documents. See
 [CNSA 2.0 Compliance](CNSA-2-COMPLIANCE.md) and the
 [NIST 800-53 control matrix](NIST-800-53-CONTROLS.md) for the full
 mapping, and the RFC compliance pages for protocol conformance status.

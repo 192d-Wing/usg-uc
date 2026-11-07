@@ -102,10 +102,10 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Goal**: Full NAT traversal support
 
-- ✅ proto-stun client for server-reflexive address discovery [wired: sbc-daemon] (zone external-IP discovery); STUN connectivity checks [library-only]
+- ✅ proto-stun client for server-reflexive address discovery [wired: sbc-daemon] (zone external-IP discovery); STUN connectivity checks [wired: soft client]
 - ✅ proto-turn relay allocation [library-only] — dependency declared, never imported
-- ✅ proto-ice candidate gathering/selection [library-only] — the daemon's `ice_agent.rs` `IceManager` is never constructed; no `a=ice-*` SDP handling
-- ✅ ICE-lite mode [library-only] — flag exists only in the unused `IceManager`
+- ✅ proto-ice candidate gathering/selection [wired: soft client] — the SBC does not run ICE (media anchoring with symmetric latching); its dead `ice_agent.rs` was removed
+- ✅ ICE-lite mode [library-only] — `IceConfig.ice_lite` flag; no binary sets it
 
 ### ✅ Phase 14: REST API Server
 
@@ -214,9 +214,9 @@ _The daemon relays 183-with-SDP by rewriting the SDP inline; `EarlyMediaHandler`
 - ✅ Per-leg early media session tracking
 - ✅ Mode-based early media disposition
 
-**ICE Connectivity Checks** (RFC 8445 §6.2) ✅ [library-only]
+**ICE Connectivity Checks** (RFC 8445 §6.2) ✅ [wired: soft client]
 
-_Reachable only through the daemon's unused `IceManager`._
+_Driven by `client-sip-ua/src/ice_handler.rs` on the media socket; the SBC does not run ICE._
 
 - ✅ STUN-based connectivity check implementation in proto-ice
 - ✅ ConnectivityChecker with triggered check queue
@@ -410,15 +410,15 @@ _Neither sbc-daemon nor sbc-media-core handles `a=crypto`; only DTLS-SRTP is wir
 
 **New Crate**: `uc-webrtc`
 
-**WebSocket SIP Transport** (RFC 7118) [library-only]
+**WebSocket SIP Transport** (RFC 7118) [wired: sbc-daemon] (plain `ws`)
 
-_The daemon binds UDP, TCP and TLS listeners only._
+_`transport.ws_listen` binds SIP-over-WebSocket listeners; `wss_listen` is rejected by `validate_config` because the transport does not terminate TLS._
 
-- ✅ WebSocket transport in `uc-transport/websocket.rs`
-- ✅ SIP-over-WebSocket framing (text frames for SIP messages)
-- ✅ Secure WebSocket (WSS) support
-- ✅ WebSocket ping/pong keepalives
-- ✅ WebSocketListener for accepting connections
+- ✅ WebSocket transport in `uc-transport/websocket.rs` [wired: sbc-daemon]
+- ✅ SIP-over-WebSocket framing (text frames for SIP messages) [wired: sbc-daemon]
+- ✅ Secure WebSocket (WSS) support [planned] — `accept` wraps the plain TCP stream; no TLS termination
+- ✅ WebSocket ping/pong keepalives [library-only]
+- ✅ WebSocketListener for accepting connections [wired: sbc-daemon]
 
 **WebRTC Gateway** (`uc-webrtc` crate) [library-only]
 
@@ -1814,7 +1814,7 @@ not the per-packet crypto state). This item is the heavier tier above that.
 | RFC 7675 | STUN Consent | ✅ Enhanced (consent revocation) | library |
 | RFC 7865 | SIPREC Metadata | ✅ Implemented (recording metadata XML) | library |
 | RFC 7866 | SIPREC Protocol | ✅ Implemented (session recording) | library |
-| RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) | library (daemon IceManager never constructed) |
+| RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) | soft client (checks + nomination); consent/keepalives library |
 | RFC 8224 | STIR | ✅ Implemented (ES384) | library (no shipped consumer of proto-stir-shaken) |
 | RFC 8225 | PASSporT | ✅ Implemented (ES384) | library (no shipped consumer of proto-stir-shaken) |
 | RFC 9260 | SCTP | ✅ Complete (100% compliant - all chunks, state machine, timers, congestion control) | library (uc-transport) |

@@ -1,6 +1,13 @@
 //! Cisco MPP (6800/7800/8800) series provisioning configuration generator.
 
+use crate::escape::{mpp_kv_value, transport_token, xml_text};
 use crate::model::Phone;
+
+// NIST 800-53 Rev5: SI-15 (Information Output Filtering) -- every operator
+// string goes through `crate::escape`; numerics (`Line {i}` comment is a u8)
+// and static strs are type-safe.
+// POAM: POA&M-122 -- MPP `$` macro expansion is not escaped pending firmware
+// confirmation of the escape syntax; `$` in operator values passes through.
 
 /// Generate a Cisco MPP provisioning XML configuration.
 ///
@@ -8,6 +15,7 @@ use crate::model::Phone;
 /// SIP transport configuration, codec preferences, and provisioning rules.
 #[must_use]
 pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
+    let sbc_host = xml_text(sbc_host);
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <flat-profile>
@@ -25,23 +33,24 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
         ));
         xml.push_str(&format!(
             "  <Line{i}_User_ID>{}</Line{i}_User_ID>\n",
-            line.sip_username
+            xml_text(&line.sip_username)
         ));
         xml.push_str(&format!(
             "  <Line{i}_Password>{}</Line{i}_Password>\n",
-            line.sip_password
+            xml_text(&line.sip_password)
         ));
         xml.push_str(&format!(
             "  <Line{i}_Display_Name>{}</Line{i}_Display_Name>\n",
-            line.display_name
+            xml_text(&line.display_name)
         ));
         xml.push_str(&format!(
             "  <Line{i}_Auth_ID>{}</Line{i}_Auth_ID>\n",
-            line.sip_username
+            xml_text(&line.sip_username)
         ));
         xml.push_str(&format!("  <Line{i}_Enabled>Yes</Line{i}_Enabled>\n"));
 
         if let Some(vm) = &line.voicemail_uri {
+            let vm = xml_text(vm);
             xml.push_str(&format!(
                 "  <Line{i}_Voice_Mail>{vm}</Line{i}_Voice_Mail>\n"
             ));
@@ -49,14 +58,17 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
 
         if let Some(cf) = &line.call_forward {
             if let Some(all) = &cf.all {
+                let all = xml_text(all);
                 xml.push_str(&format!("  <Line{i}_Cfwd_All>{all}</Line{i}_Cfwd_All>\n"));
             }
             if let Some(busy) = &cf.busy {
+                let busy = xml_text(busy);
                 xml.push_str(&format!(
                     "  <Line{i}_Cfwd_Busy>{busy}</Line{i}_Cfwd_Busy>\n"
                 ));
             }
             if let Some(na) = &cf.no_answer {
+                let na = xml_text(na);
                 xml.push_str(&format!(
                     "  <Line{i}_Cfwd_No_Answer>{na}</Line{i}_Cfwd_No_Answer>\n"
                 ));
@@ -75,11 +87,15 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
         for sd in &phone.speed_dials {
             xml.push_str(&format!(
                 "  <Speed_Dial_{}_Name>{}</Speed_Dial_{}_Name>\n",
-                sd.index, sd.label, sd.index
+                sd.index,
+                xml_text(&sd.label),
+                sd.index
             ));
             xml.push_str(&format!(
                 "  <Speed_Dial_{}_Number>{}</Speed_Dial_{}_Number>\n",
-                sd.index, sd.number, sd.index
+                sd.index,
+                xml_text(&sd.number),
+                sd.index
             ));
         }
         xml.push('\n');
@@ -91,7 +107,10 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
         for blf in &phone.blf_entries {
             xml.push_str(&format!(
                 "  <Extended_Function_{}_>fnc=blf+sd;sub={};nme={}</Extended_Function_{}_>\n",
-                blf.index, blf.address, blf.label, blf.index
+                blf.index,
+                mpp_kv_value(&blf.address),
+                mpp_kv_value(&blf.label),
+                blf.index
             ));
         }
         xml.push('\n');
@@ -130,11 +149,13 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
     if phone.display.ntp_server.is_some() || phone.display.timezone.is_some() {
         xml.push_str("  <!-- Time -->\n");
         if let Some(ntp) = &phone.display.ntp_server {
+            let ntp = xml_text(ntp);
             xml.push_str(&format!(
                 "  <Primary_NTP_Server>{ntp}</Primary_NTP_Server>\n"
             ));
         }
         if let Some(tz) = &phone.display.timezone {
+            let tz = xml_text(tz);
             xml.push_str(&format!("  <Time_Zone>{tz}</Time_Zone>\n"));
         }
         xml.push('\n');
@@ -145,19 +166,23 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
         xml.push_str("  <!-- Directory -->\n");
         xml.push_str("  <LDAP_Dir_Enable>Yes</LDAP_Dir_Enable>\n");
         if let Some(server) = &phone.directory.ldap_server {
+            let server = xml_text(server);
             xml.push_str(&format!(
                 "  <LDAP_Corp_Dir_Server>{server}</LDAP_Corp_Dir_Server>\n"
             ));
         }
         if let Some(base_dn) = &phone.directory.ldap_base_dn {
+            let base_dn = xml_text(base_dn);
             xml.push_str(&format!(
                 "  <LDAP_Search_Base>{base_dn}</LDAP_Search_Base>\n"
             ));
         }
         if let Some(bind_dn) = &phone.directory.ldap_bind_dn {
+            let bind_dn = xml_text(bind_dn);
             xml.push_str(&format!("  <LDAP_Bind_DN>{bind_dn}</LDAP_Bind_DN>\n"));
         }
         if let Some(pw) = &phone.directory.ldap_password {
+            let pw = xml_text(pw);
             xml.push_str(&format!("  <LDAP_Password>{pw}</LDAP_Password>\n"));
         }
         xml.push('\n');
@@ -165,6 +190,7 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
 
     // Emergency
     if let Some(num) = &phone.emergency.emergency_number {
+        let num = xml_text(num);
         xml.push_str(&format!("  <Emergency_Number>{num}</Emergency_Number>\n\n"));
     }
 
@@ -172,11 +198,7 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
     let transport = phone
         .lines
         .first()
-        .map_or("UDP", |l| match l.transport.as_str() {
-            "tls" => "TLS",
-            "tcp" => "TCP",
-            _ => "UDP",
-        });
+        .map_or("UDP", |l| transport_token(&l.transport));
 
     xml.push_str("  <!-- SIP Settings -->\n");
     xml.push_str(&format!("  <SIP_Transport>{transport}</SIP_Transport>\n"));

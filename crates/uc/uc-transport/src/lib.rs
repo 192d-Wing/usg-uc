@@ -153,6 +153,12 @@ pub trait Transport: Send + Sync {
 
     /// Closes the transport.
     fn close(&self) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + '_>>;
+
+    /// Returns true once [`Transport::close`] has been called. A reader
+    /// parked in `recv` does not wake on close; it polls this to stop.
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 /// Connection-oriented transport for stream protocols (TCP, TLS, WebSocket).

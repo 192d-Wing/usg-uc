@@ -11,6 +11,7 @@
 //! trunk loops — two concurrent writers would make trunk status flap
 //! between sources.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,6 +41,33 @@ impl TrunkStatusPublishServiceImpl {
     }
 }
 
+/// Upper bound on `health` and `registrations` entries per publish. A
+/// deployment has tens of trunks; anything near this is a broken or
+/// hostile publisher.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+const MAX_PUBLISHED_TRUNKS: usize = 4096;
+
+/// Trunks whose OPTIONS reachability differs between two snapshots, plus
+/// trunks seen for the first time with at least one ping result. Trunks
+/// missing from `next` are left alone (the agent may publish partially).
+fn reachability_changes(
+    prev: &[TrunkHealthStatus],
+    next: &[TrunkHealthStatus],
+) -> Vec<(String, bool)> {
+    let prev: HashMap<&str, bool> = prev
+        .iter()
+        .map(|p| (p.trunk_id.as_str(), p.reachable))
+        .collect();
+    next.iter()
+        .filter(|n| {
+            prev.get(n.trunk_id.as_str())
+                .map_or(n.total_pings > 0, |&reachable| reachable != n.reachable)
+        })
+        .map(|n| (n.trunk_id.clone(), n.reachable))
+        .collect()
+}
+
 /// 0 means "absent" on the wire (proto3 scalar defaults).
 const fn opt_nonzero_i64(v: i64) -> Option<i64> {
     if v == 0 { None } else { Some(v) }
@@ -64,6 +92,20 @@ impl TrunkStatusPublishService for TrunkStatusPublishServiceImpl {
                           set SBC_TRUNK_SERVICES=external to delegate them"
                     .to_string(),
             }));
+        }
+
+        // NIST 800-53 Rev5: SI-10 (Information Input Validation)
+        if req.health.len() > MAX_PUBLISHED_TRUNKS || req.registrations.len() > MAX_PUBLISHED_TRUNKS
+        {
+            warn!(
+                agent_id = %req.agent_id,
+                health = req.health.len(),
+                registrations = req.registrations.len(),
+                "Rejecting oversized trunk status publish"
+            );
+            return Err(Status::invalid_argument(format!(
+                "at most {MAX_PUBLISHED_TRUNKS} health and registration entries per publish"
+            )));
         }
 
         let health: Vec<TrunkHealthStatus> = req
@@ -121,14 +163,74 @@ impl TrunkStatusPublishService for TrunkStatusPublishServiceImpl {
             registrations = registrations.len(),
             "Stored trunk status snapshot"
         );
+        let changes = reachability_changes(&snapshot.health, &health);
         snapshot.agent_id = req.agent_id;
         snapshot.health = health;
         snapshot.registrations = registrations;
         snapshot.received_at = Some(Instant::now());
+        drop(snapshot);
+
+        // Feed the agent's OPTIONS health into trunk selection so a down
+        // trunk is skipped (the in-process monitor does the same via
+        // `TrunkMonitor::subscribe`).
+        if let Some(ref stack) = self.state.sip_stack {
+            for (trunk_id, reachable) in changes {
+                // Only trunks this daemon routes to may change selection;
+                // unknown IDs from the agent are ignored.
+                if !stack.has_trunk(&trunk_id).await {
+                    debug!(%trunk_id, "Ignoring reachability for unknown trunk");
+                    continue;
+                }
+                stack
+                    .apply_trunk_reachability_change(
+                        &trunk_id,
+                        reachable,
+                        uc_audit::event::ReachabilitySource::Agent,
+                    )
+                    .await;
+            }
+        }
 
         Ok(Response::new(PublishTrunkStatusResponse {
             accepted: true,
             message: String::new(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(id: &str, reachable: bool, pings: u64) -> TrunkHealthStatus {
+        TrunkHealthStatus {
+            trunk_id: id.to_string(),
+            reachable,
+            last_response_ms: None,
+            last_success: None,
+            last_failure: None,
+            consecutive_success: 0,
+            consecutive_failures: 0,
+            total_pings: pings,
+            total_success: 0,
+            uptime_pct: 0.0,
+            in_service_since: None,
+        }
+    }
+
+    #[test]
+    fn reachability_changes_reports_flips_and_first_results_only() {
+        let prev = vec![status("a", true, 3), status("b", false, 3)];
+        let next = vec![
+            status("a", false, 4), // flipped down
+            status("b", false, 4), // steady
+            status("c", true, 1),  // new with a result
+            status("d", false, 0), // new, never pinged
+        ];
+        assert_eq!(
+            reachability_changes(&prev, &next),
+            vec![("a".to_string(), false), ("c".to_string(), true)]
+        );
+        assert_eq!(reachability_changes(&next, &next), Vec::new());
     }
 }

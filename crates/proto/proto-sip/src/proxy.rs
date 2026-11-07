@@ -49,9 +49,11 @@
 //! 2. Choosing the best response (for forked requests)
 //! 3. Forwarding upstream
 
+use crate::MAX_LIST_ELEMENTS;
 use crate::error::{SipError, SipResult};
 use crate::header::{Header, HeaderName};
 use crate::header_params::{MaxForwardsHeader, ViaHeader};
+use crate::list::split_list_bounded;
 use crate::message::{SipRequest, SipResponse};
 use crate::routing::create_record_route;
 use crate::uri::SipUri;
@@ -412,40 +414,20 @@ impl RequestForwarder {
     }
 
     /// Prepends a Via header to the beginning of the Via headers list.
+    ///
+    /// RFC 3261 §16.6 step 8: the proxy inserts its Via before the
+    /// existing values. One O(n) insert; the order of every other header
+    /// is preserved.
+    ///
+    /// NIST 800-53 Rev5: SC-5 - replaces an O(n²) clone/remove rebuild.
     fn prepend_via_header(&self, request: &mut SipRequest, value: String) {
         let _ = self; // Silence unused_self - method may use self in future for caching
-        // Collect all existing headers
-        let existing: Vec<Header> = request.headers.iter().cloned().collect();
-
-        // Clear and rebuild with new Via first (among Via headers)
-        let new_via = Header::new(HeaderName::Via, value);
-
-        // Find where Via headers start
-        let via_pos = existing.iter().position(|h| h.name == HeaderName::Via);
-
-        // Clear existing headers
-        for header in &existing {
-            request.headers.remove(&header.name);
-        }
-
-        // Re-add headers with new Via in correct position
-        if let Some(idx) = via_pos {
-            // Add headers before Via position
-            for header in existing.iter().take(idx) {
-                request.headers.add(header.clone());
-            }
-            // Add new Via
-            request.headers.add(new_via);
-            // Add remaining headers (including existing Via headers)
-            for header in existing.iter().skip(idx) {
-                request.headers.add(header.clone());
-            }
-        } else {
-            // No existing Via, just add ours at the end
-            for header in existing {
-                request.headers.add(header);
-            }
-            request.headers.add(new_via);
+        match request.headers.position(&HeaderName::Via) {
+            Some(idx) => request
+                .headers
+                .insert(idx, Header::new(HeaderName::Via, value)),
+            // No existing Via: keep the previous behaviour (append).
+            None => request.headers.add(Header::new(HeaderName::Via, value)),
         }
     }
 
@@ -527,21 +509,34 @@ impl ResponseProcessor {
     }
 
     /// Removes the topmost Via header.
+    ///
+    /// RFC 3261 §16.7 step 3: remove the topmost Via *value*. If the first
+    /// Via field carries a combined list (`Via: a, b`, §7.3.1) only its
+    /// first element is removed. Header order is preserved.
     fn remove_topmost_via(&self, response: &mut SipResponse) -> SipResult<()> {
-        let via_headers: Vec<Header> = response
+        let idx =
+            response
+                .headers
+                .position(&HeaderName::Via)
+                .ok_or_else(|| SipError::MissingHeader {
+                    name: "Via".to_string(),
+                })?;
+        // Validate before mutating so an error leaves the response intact.
+        let value = response
             .headers
-            .get_all(&HeaderName::Via)
-            .cloned()
-            .collect();
-
-        if via_headers.is_empty() {
-            return Err(SipError::MissingHeader {
+            .get_value(&HeaderName::Via)
+            .unwrap_or_default()
+            .to_string();
+        let elements = split_list_bounded(&value, MAX_LIST_ELEMENTS)?;
+        let Some((topmost, rest)) = elements.split_first() else {
+            return Err(SipError::InvalidHeader {
                 name: "Via".to_string(),
+                reason: "empty Via".to_string(),
             });
-        }
+        };
 
         // Verify the topmost Via is ours
-        if let Ok(via) = via_headers[0].value.parse::<ViaHeader>() {
+        if let Ok(via) = topmost.parse::<ViaHeader>() {
             let via_host = via.host.to_lowercase();
             let our_host = self.context.host.to_lowercase();
 
@@ -556,10 +551,11 @@ impl ResponseProcessor {
             }
         }
 
-        // Remove all Via headers and re-add without the topmost one
-        response.headers.remove(&HeaderName::Via);
-        for header in via_headers.into_iter().skip(1) {
-            response.headers.add(header);
+        let _ = response.headers.remove_first(&HeaderName::Via);
+        if !rest.is_empty() {
+            response
+                .headers
+                .insert(idx, Header::new(HeaderName::Via, rest.join(", ")));
         }
 
         Ok(())

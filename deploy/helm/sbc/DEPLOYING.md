@@ -184,6 +184,37 @@ per-site differences are `site.*` and `bgp.upstream.ip`.
 
 ---
 
+### SIP user HA1 encryption key (`sbcApi.ha1Key`)
+
+sbc-api seals every SIP digest HA1 in the `users` table with AES-256-GCM and
+**will not start without the key** (`SBC_USER_HA1_KEY_FILE`). The chart
+requires `sbcApi.ha1Key.existingSecret`; rendering fails without it. Create
+the Secret out-of-band (or via sealed-secrets / SOPS / Vault):
+
+```bash
+openssl rand -hex 32 | tr -d '\n' > ha1-key
+kubectl -n <ns> create secret generic <name> --from-file=ha1-key=ha1-key
+shred -u ha1-key
+# values: sbcApi.ha1Key.existingSecret: <name>
+```
+
+**Lab only:** `sbcApi.ha1Key.generate: true` makes the chart generate the
+key once into `<fullname>-ha1-key` (kept across upgrades and on uninstall via
+`helm.sh/resource-policy: keep`). Do not use it with `helm template`,
+`--dry-run`, Argo CD or Flux: `lookup` is empty there, so a render would emit
+a new key and orphan every stored HA1. The key also ends up in Helm release
+records. On `helm upgrade` the chart fails rather than regenerate if the
+existing Secret cannot be read.
+
+An init container copies the key into a memory-backed volume owned by the
+pod uid with mode 0400 (the server rejects group/other-readable or
+foreign-owned key files). On first start of this version, sbc-api encrypts
+any existing plaintext HA1 rows before it begins serving (serialized across
+replicas with a Postgres advisory lock). **Back the key up with the
+database**: a database restore without its key leaves every SIP user unable
+to authenticate until their passwords are re-provisioned. Key rotation is
+not supported yet (POA&M-111).
+
 ## 5. Install
 
 ```bash

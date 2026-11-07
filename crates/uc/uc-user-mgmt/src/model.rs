@@ -2,9 +2,23 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+
+/// Default page size for [`UserFilter::limit`] at API layers.
+pub const DEFAULT_PAGE_SIZE: u32 = 100;
+/// Hard cap on rows returned by one `list_users` call. Stores clamp
+/// `limit` to this and apply it when `limit` is `None`.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+pub const MAX_PAGE_SIZE: u32 = 1000;
 
 /// A managed user account.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is implemented by hand so `digest_ha1` (password-equivalent)
+/// never reaches logs.
+///
+/// ## NIST 800-53 Rev5: IA-5(1)(c), SI-11
+#[derive(Clone, Serialize, Deserialize)]
 pub struct User {
     /// Unique user identifier (UUID).
     pub id: String,
@@ -48,6 +62,33 @@ pub struct User {
     pub metadata: HashMap<String, String>,
 }
 
+impl fmt::Debug for User {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("User")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("display_name", &self.display_name)
+            .field("email", &self.email)
+            .field("sip_uri", &self.sip_uri)
+            .field("auth_type", &self.auth_type)
+            .field(
+                "digest_ha1",
+                &self.digest_ha1.as_ref().map(|_| "<redacted>"),
+            )
+            .field("certificate_dn", &self.certificate_dn)
+            .field("certificate_san", &self.certificate_san)
+            .field("calling_search_space", &self.calling_search_space)
+            .field("device_ids", &self.device_ids)
+            .field("partition", &self.partition)
+            .field("enabled", &self.enabled)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("last_login", &self.last_login)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
 /// Authentication method for a user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthType {
@@ -60,7 +101,9 @@ pub enum AuthType {
 }
 
 /// A stored credential for a user.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` redacts `value` (it may be an HA1).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UserCredential {
     /// User this credential belongs to.
     pub user_id: String,
@@ -72,6 +115,18 @@ pub struct UserCredential {
     pub realm: String,
     /// Unix timestamp of credential creation.
     pub created_at: i64,
+}
+
+impl fmt::Debug for UserCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserCredential")
+            .field("user_id", &self.user_id)
+            .field("credential_type", &self.credential_type)
+            .field("value", &"<redacted>")
+            .field("realm", &self.realm)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 /// Type of stored credential.
@@ -96,8 +151,77 @@ pub struct UserFilter {
     pub css_id: Option<String>,
     /// Filter by enabled/disabled status.
     pub enabled: Option<bool>,
-    /// Maximum number of results to return.
+    /// Maximum number of results to return; clamped to [`MAX_PAGE_SIZE`],
+    /// which also applies when `None`.
     pub limit: Option<u32>,
     /// Number of results to skip (for pagination).
     pub offset: Option<u32>,
+}
+
+impl UserFilter {
+    /// Effective `LIMIT` for a store query (SC-5 bound).
+    #[must_use]
+    pub fn effective_limit(&self) -> i64 {
+        i64::from(self.limit.unwrap_or(MAX_PAGE_SIZE).min(MAX_PAGE_SIZE))
+    }
+
+    /// Effective `OFFSET` for a store query.
+    #[must_use]
+    pub fn effective_offset(&self) -> i64 {
+        i64::from(self.offset.unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_ha1() {
+        let u = User {
+            id: "u-1".into(),
+            username: "alice".into(),
+            display_name: String::new(),
+            email: String::new(),
+            sip_uri: String::new(),
+            auth_type: AuthType::Digest,
+            digest_ha1: Some("deadbeefcafe".into()),
+            certificate_dn: None,
+            certificate_san: None,
+            calling_search_space: None,
+            device_ids: Vec::new(),
+            partition: None,
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+            last_login: None,
+            metadata: HashMap::new(),
+        };
+        let d = format!("{u:?}");
+        assert!(!d.contains("deadbeefcafe"), "{d}");
+        assert!(d.contains("<redacted>") && d.contains("alice"), "{d}");
+        let c = UserCredential {
+            user_id: "u-1".into(),
+            credential_type: CredentialType::DigestHA1,
+            value: "deadbeefcafe".into(),
+            realm: "r".into(),
+            created_at: 0,
+        };
+        assert!(!format!("{c:?}").contains("deadbeefcafe"));
+    }
+
+    #[test]
+    fn page_bounds() {
+        let f = UserFilter::default();
+        assert_eq!(f.effective_limit(), i64::from(MAX_PAGE_SIZE));
+        assert_eq!(f.effective_offset(), 0);
+        let f = UserFilter {
+            limit: Some(u32::MAX),
+            offset: Some(u32::MAX),
+            ..UserFilter::default()
+        };
+        assert_eq!(f.effective_limit(), i64::from(MAX_PAGE_SIZE));
+        assert_eq!(f.effective_offset(), i64::from(u32::MAX));
+    }
 }

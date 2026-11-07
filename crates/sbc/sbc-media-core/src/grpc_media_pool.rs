@@ -110,6 +110,9 @@ impl MediaPool {
     /// so the SIP layer BYEs it (their media is gone with the node). New calls
     /// route away via [`Self::select`].
     async fn fail_node(&self, idx: usize) {
+        if idx >= self.nodes.len() {
+            return;
+        }
         self.nodes[idx].healthy.store(false, Ordering::Relaxed);
         let doomed: Vec<String> = {
             let mut affinity = self.affinity.write().await;
@@ -137,6 +140,17 @@ impl MediaPool {
                 }
             }
         }
+    }
+
+    /// Marks node `idx` down as soon as the daemon sees it fail outside a
+    /// control RPC (its `WatchMediaEvents` stream errored or closed), so new
+    /// calls route away at once instead of each queuing on the dead node's
+    /// channel for a full connect timeout. Same effect as a failed RPC: in-flight
+    /// calls on the node are torn down, and the node rejoins after the next
+    /// optimistic health reset. Out-of-range indices are ignored.
+    // NIST 800-53 Rev5: SC-5, CP-10 — fast route-away from a failed media node.
+    pub async fn mark_node_down(&self, idx: usize) {
+        self.fail_node(idx).await;
     }
 
     /// Number of nodes in the pool.
@@ -479,5 +493,23 @@ mod tests {
         assert!(!pool.nodes[node].healthy.load(Ordering::Relaxed));
         assert_eq!(pool.nodes[node].active.load(Ordering::Relaxed), 0);
         assert_eq!(rx.recv().await.unwrap(), "c1");
+    }
+
+    #[tokio::test]
+    async fn mark_node_down_routes_new_calls_away_immediately() {
+        let pool = two_node_pool().await;
+        pool.mark_node_down(1).await;
+        assert!(!pool.nodes[1].healthy.load(Ordering::Relaxed));
+        for i in 0..4 {
+            pool.create_session_with_zones(&format!("c{i}"), None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                pool.affinity.read().await.get(&format!("c{i}")).copied(),
+                Some(0)
+            );
+        }
+        // Out of range is a no-op, not a panic.
+        pool.mark_node_down(99).await;
     }
 }

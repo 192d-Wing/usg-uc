@@ -7,7 +7,7 @@
 
 > **Status legend.** *Wired (sbc-daemon | sbc-media-core | soft client)* — a shipped binary has a call site for this (the binary is named). *Library-only* — implemented and tested in a `proto-*`/`uc-*` crate, but no shipped binary calls it. *Planned* — not implemented. A row that says only "Full"/"Complete" describes crate-level capability; the wiring column/annotation says what the running SBC actually does.
 
-**Dependency facts behind the wiring labels** (from `Cargo.toml`): `sbc-daemon` depends on proto-sip, proto-transaction, proto-dialog, proto-b2bua, proto-registrar, proto-jwt, proto-rtp, proto-srtp, proto-dtls, proto-stun, proto-turn, proto-ice and `sbc-media-core` — but **not** proto-sdp or proto-stir-shaken. `sbc-media-core` (linked into `sbc-daemon` and `sbc-media`) depends on proto-dtls, proto-rtp, proto-srtp. `client-sip-ua` lists proto-sdp, proto-registrar, proto-stun and proto-turn but has no source references to them. Nothing depends on proto-stir-shaken. `sbc-daemon/src/ice_agent.rs` (`IceManager`) is declared but never constructed. SBC DTLS-SRTP termination is a Go sidecar (`sbc-media-core/src/dtls_sidecar.rs`), not proto-dtls.
+**Dependency facts behind the wiring labels** (from `Cargo.toml`): `sbc-daemon` depends on proto-sip, proto-transaction, proto-dialog, proto-b2bua, proto-registrar, proto-jwt, proto-rtp, proto-srtp, proto-dtls, proto-stun, proto-stir-shaken, `uc-sti` and `sbc-media-core` — but **not** proto-sdp. `sbc-media-core` (linked into `sbc-daemon` and `sbc-media`) depends on proto-dtls, proto-rtp, proto-srtp. `client-sip-ua` lists proto-sdp, proto-registrar, proto-stun and proto-turn but has no source references to them. proto-stir-shaken is used by `sbc-daemon` and `uc-sti`. The SBC does not run ICE (it anchors media and latches symmetrically). SBC DTLS-SRTP termination is a Go sidecar (`sbc-media-core/src/dtls_sidecar.rs`), not proto-dtls.
 
 ---
 
@@ -20,16 +20,16 @@
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| **RFC 3261** | SIP: Session Initiation Protocol — message layer | **Full** — message parsing, URI, headers, methods, Via/From/To/CSeq/Max-Forwards, builder, header manipulation, auth (§22). **Wired (sbc-daemon `sip_stack.rs`; soft client `client-sip-ua`)** |
-| **RFC 3261** | SIP — proxy forwarding (§16), routing (§16.12.1), redirect (§13.2.2.4), OPTIONS (§11) modules | **Full** — `proxy.rs`, `routing.rs`, `redirect.rs`, `options.rs`. **Library-only** — no shipped binary uses `RequestForwarder`/`RouteSet`/`RedirectHandler`/`OptionsCapabilities`; the daemon answers OPTIONS with its own 200 (`sip_stack.rs`) and the client reads Record-Route manually |
+| **RFC 3261** | SIP: Session Initiation Protocol — message layer | **Partial** — strict byte-based message parsing (CRLF, token names, CTL rejection, §18.3 Content-Length framing per transport (datagram / stream / message-framed WS-WSS-SCTP), case-sensitive methods (§7.1) and exact CSeq method match, CSeq/duplicate-header checks, Max-Forwards limited to 0-255 (stricter than the §20.22 `1*DIGIT` grammar), parser limits; RFC 4475 vectors in `tests/rfc4475.rs` with known gaps), URI grammar: §25.1 parser, `%HH` validation, strict ports and 416 for non-SIP Request-URIs (POA&M-150, `tests/uri_abnf.rs`); §19.1.4 comparison implemented as `SipUri::equivalent` but **not used** by registrar/dialog/ACL matching (POA&M-154), so §19.1.4 is not met end to end; `tel:`/absoluteURI in name-addr headers not parsed (POA&M-153), no daemon 400 (POA&M-63). Deviation: every CTL except HTAB is rejected, even inside a quoted-pair (§25.1 allows it; RFC 4475 `intmeth`). sbc-daemon still parses TCP/TLS with datagram rules (POA&M-64); message parsing, URI, headers, methods, Via/From/To/CSeq/Max-Forwards, builder, header manipulation, auth (§22). **Wired (sbc-daemon `sip_stack.rs`; soft client `client-sip-ua`)** |
+| **RFC 3261** | SIP — proxy forwarding (§16), routing (§16.12.1), redirect (§13.2.2.4), OPTIONS (§11) modules | **Partial** — only the list splitter and Via insert/pop were reviewed in the Phase 1 hardening (POA&M-65); `proxy.rs`, `routing.rs`, `redirect.rs`, `options.rs`. **Library-only** — no shipped binary uses `RequestForwarder`/`RouteSet`/`RedirectHandler`/`OptionsCapabilities`; the daemon answers OPTIONS with its own 200 (`sip_stack.rs`) and the client reads Record-Route manually |
 | **RFC 2617** | HTTP Digest Authentication | **Full** — HA1/HA2 computation (§3.2.2), digest response, nonce handling. **Wired (sbc-daemon: registrar challenge via proto-registrar, trunk REGISTER via `sbc-trunk-services`; soft client `registration.rs`)** |
-| **RFC 3263** | Locating SIP Servers | Referenced — soft client resolves SRV via `uc-dns`; sbc-daemon/trunk-services use plain `lookup_host` (no SRV/NAPTR) |
+| **RFC 3263** | Locating SIP Servers | **Partial** — soft client (`client-sip-ua` `call_agent.rs` `build_resolver`) uses `uc_dns::SipResolver::new`, whose hickory backend reads the host system DNS configuration (`HickoryDnsResolver::from_system_conf`); with no usable system config it runs with no backend (numeric hosts and cache only, never public resolvers). NAPTR → SRV → A/AAAA; SRV targets ordered by RFC 2782 weighted random selection (`SrvResolver::order_rfc2782`), `.` targets filtered, unresolvable targets skipped, `sips:` never downgraded to non-TLS targets. TLS verify name is the registrar-URI domain, not the SRV target (§4.4 / RFC 5922 §4). No DNSSEC (NIST POA&M-172). Tests: `uc-dns` `test_resolve_preserves_weighted_order`, `test_naptr_srv_filters_null_target`, `test_unresolvable_srv_target_is_skipped`, `test_naptr_any_skips_non_sip_service`, `test_sips_never_downgrades_via_naptr_or_srv`, `test_no_backend_fallback_serves_numeric_and_cached`, `test_weighted_distribution`. The NAPTR/SRV path through the real hickory backend has no network test. sbc-daemon/trunk-services use plain `lookup_host` (no SRV/NAPTR) |
 | **RFC 3264** | Offer/Answer Model with SDP | Referenced |
 | **RFC 3311** | UPDATE Method | Method enum entry. **Wired (sbc-daemon)** — relayed in-dialog via `handle_update` → `handle_in_dialog_request` (`sip_stack.rs`) |
-| **RFC 3323** | Privacy Mechanism for SIP | **Implemented** — topology hiding module. **Wired (sbc-daemon)** — `TopologyHider::hide_b2bua_request` on external B-leg (`sip_stack.rs`) |
+| **RFC 3323** | Privacy Mechanism for SIP | **Partial** — not reviewed in the Phase 1 hardening (POA&M-65); topology hiding module. **Wired (sbc-daemon)** — `TopologyHider::hide_b2bua_request` on external B-leg (`sip_stack.rs`) |
 | **RFC 3325** | P-Asserted-Identity | Header support, topology hiding. **Wired (sbc-daemon)** via topology hider only |
-| **RFC 3326** | Reason Header | Header name defined. Library-only |
-| **RFC 3327** | Path Header | **Full** — `path_headers()`, `prepend_path()`, validation. **Library-only** — daemon REGISTER handling never reads or inserts Path |
+| **RFC 3326** | Reason Header | Header name defined in proto-sip. **Wired (sbc-daemon, CDR only)**: `sbc-daemon/src/cdr.rs` reads every `Reason` header field (`sip_stack.rs` `reason_headers()`, `CdrEnd::with_reasons`). Splitting on `,` and `;` respects quoted strings and quoted-pairs (RFC 3261 §25.1, `split_unquoted`). The first `protocol=Q.850` cause in 1..=127 is recorded as `q850_cause`. The daemon does not add or rewrite Reason. Tests `q850_parses_rfc3326_reason`, `q850_from_separate_reason_headers`, `cdr_answered_then_callee_bye_with_q850` |
+| **RFC 3327** | Path Header | **Partial** — `path_values()` (splits combined values), `prepend_path()`; only list handling was reviewed. **Library-only** — daemon REGISTER handling never reads or inserts Path |
 | **RFC 3428** | MESSAGE Method | Method enum entry. Library-only — daemon returns 405 |
 | **RFC 3455** | P-Headers | Header names defined. Library-only |
 | **RFC 3515** | REFER Method | Method enum entry, header support. **Wired (soft client only)** — `call_agent.rs` sends REFER; daemon returns 405 (not relayed) |
@@ -40,8 +40,8 @@
 | **RFC 4566** | SDP | Referenced |
 | **RFC 6086** | INFO Method | Method enum entry. Library-only — daemon returns 405 |
 | **RFC 6665** | SIP Events (SUBSCRIBE/NOTIFY) | Method enum entries, header support. Library-only — daemon returns 405; client only reads Subscription-State on REFER NOTIFY |
-| **RFC 7118** | WebSocket Transport for SIP | Transport: WS/WSS. Library-only — `uc-transport` `websocket` feature not enabled by any binary |
-| **RFC 8224** | STIR Identity | Header name defined. Library-only |
+| **RFC 7118** | WebSocket Transport for SIP | Transport: WS/WSS. Wired (sbc-daemon `transport.ws_listen`, plain WS); WSS planned — the transport does not terminate TLS. §4: `sip` subprotocol required (HTTP 400 otherwise; `ws_require_sip_subprotocol = false` is a non-conformant opt-out). §5: one SIP message per WS message; incomplete messages discarded. RFC 6455 message/frame caps 65,535 bytes. See `docs/RFC_COMPLIANCE_GAPS.md` |
+| **RFC 8224** | STIR Identity | Header name defined; reason phrases 428/436/437/438 in `response.rs` (test `stir_reason_phrases`). Wired (sbc-daemon STIR path, off by default) |
 
 ### Key Files
 - `src/lib.rs` — module exports, max message size
@@ -63,6 +63,15 @@
 - No `TODO`/`FIXME` related to standards gaps found
 - Compact header forms (§7.3.3) supported for core headers (parse-only; the daemon/client framers special-case only `l:`)
 - sbc-daemon relays only REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE; all other methods receive 405
+- sbc-daemon trunk failover (RFC 3263 §4.3): 408/Timer B/503 plus local-policy 500/502/504; a transport error on the first send of a B-leg INVITE also fails over immediately; a trunk's 503 `Retry-After` (§21.5.4, §20.33) sets the trunk cooldown, clamped to `general.trunk_retry_after_max_secs` (RFC-001 resolved). See `docs/RFC_COMPLIANCE_GAPS.md`
+- sbc-daemon transaction timers follow the receive transport (reliable on TCP/TLS/WS/WSS/SCTP, so no Timer A/E/G there; RFC 3261 §17.1.1.2/§17.1.2.2/§17.2.1/§17.2.2). Timer-loop sends (failover INVITEs, BYEs) still go out on UDP (POA&M-5); the stream-loop wiring has no end-to-end test. See `docs/RFC_COMPLIANCE_GAPS.md`
+- sbc-daemon stream framing (RFC 3261 §18.3/§20.14): on TCP/TLS a missing, duplicate, conflicting or malformed Content-Length gets a 400 and the connection closes; the framer shares `SipMessage::stream_message_len` with the parser. Post-framing parse still uses datagram rules (POA&M-64)
+- sbc-daemon RFC 5626 §4.4.1: CRLFCRLF pings on TCP/TLS are answered with a CRLF pong, one per batch of pings read together
+- The `general.max_calls` admission-ceiling 503 carries no `Retry-After`
+- sbc-daemon call-path responses: a blocked route pattern gets 403 with no fallback (RFC 3261 §21.4.4); an emergency call with no route gets 503 without `Retry-After` (`emergency_unrouted`); a numeric-looking malformed, empty or >256-byte R-URI user gets 404
+- sbc-daemon per-user limiter: 503 `Retry-After: 1`, keyed on the authenticated AOR or on source /32 or /64 plus canonical From user; trunk sources, ACK and emergency INVITEs are exempt (RFC 6881 §5)
+- Open: RFC 3966 `;phone-context` dropped (POA&M-100), translated local numbers lose their context, `urn:service:sos` not classified as emergency (RFC 5031, RFC 6881 §6.2); see `docs/RFC_COMPLIANCE_GAPS.md`
+- sbc-daemon trunk TLS policy: a `sips:` Request-URI restricts trunk egress to TLS trunks in every routed group (RFC 3261 §26.2.2); `require_tls` groups / `security.require_tls_trunks` do the same per group (cross-group fallback for `sip:` calls remains, NIST POA&M-57). With no eligible TLS trunk the SBC answers 503 with `Reason: Q.850;cause=79` (RFC 6432) and no `Retry-After`. API trunks without a port default to 5061 for TLS, 5060 otherwise (RFC 3261 §19.1.2 / RFC 3263). Open: the last trunk's 503 is relayed unchanged when failover is exhausted (RFC-004). See `docs/RFC_COMPLIANCE_GAPS.md`
 
 ---
 
@@ -115,7 +124,7 @@
 | **RFC 3550** | RTP — packet format (§5), sequence/jitter tracking (§6.4.1) | **Full**. **Wired (sbc-media-core `media_pipeline.rs`: `RtpHeader::parse`, `SequenceTracker`; sbc-announcement-server: `RtpPacket`; soft client `client-audio`)** |
 | **RFC 3550** | RTCP SR/RR (§6.4), SDES, BYE | **Full**. **Wired (soft client only)** — `client-audio/rtcp_session.rs` builds SR/RR; sbc-media-core relays RTCP opaquely (no parsing) |
 | **RFC 3550** | Translator/mixer (§7), SSRC collision detection (§8.2), RTCP scheduling (§6.3, A.7), CSRC validation (§5.1), timer reconsideration (§6.3.6) | **Full**. **Library-only** — `RtpTranslator`, `RtpMixer`, `RtcpScheduler`, `SsrcCollisionDetector`, `JitterCalculator` have no call sites in any binary |
-| **RFC 3551** | RTP Profile for Audio/Video | **Full** — standard payload type table (PCMU=0, PCMA=8, G722=9, etc.). **Wired (soft client `payload_types`)**; sbc-media-core uses `uc-codecs` `CodecCapability` instead |
+| **RFC 3551** | RTP Profile for Audio/Video | **Partial** — standard payload type table (PCMU=0, PCMA=8, G722=9, etc.). **Wired (soft client `payload_types`)**; sbc-media-core uses `uc-codecs` `CodecCapability` instead. Dynamic PTs 64-71/77-95 are adopted under rtcp-mux, against RFC 5761 §4 advice (72-76 rejected; POA&M-143, test `test_is_dynamic_ranges`) |
 | **RFC 5761** | Multiplexing RTP/RTCP | Referenced — `rtcp_mux` is an sbc-media-core pipeline config flag, not proto-rtp code |
 
 ### Key Files
@@ -221,7 +230,7 @@
 
 **Primary Standard:** RFC 5766 / RFC 8656
 
-**Wiring note:** **Library-only.** The only caller is proto-ice's `IceAgent` (relay candidate gathering when `IceConfig.turn_servers` is non-empty). The soft client always uses `IceConfig::default()` (`set_ice_config` has no production callers; `settings.rs` `turn_server` is unused), and the sbc-daemon `IceManager` is never constructed. No `proto_turn` references exist in `crates/sbc` or `crates/client`.
+**Wiring note:** **Library-only.** The only caller is proto-ice's `IceAgent` (relay candidate gathering when `IceConfig.turn_servers` is non-empty). The soft client configures STUN servers from settings but no TURN server (the settings schema carries no TURN password), and the SBC does not run ICE. No `proto_turn` references exist in `crates/sbc` or `crates/client`.
 
 ### RFCs Referenced
 
@@ -249,13 +258,13 @@
 
 **Primary Standard:** RFC 8445 (supersedes RFC 5245)
 
-**Wiring note:** **Wired (soft client only)** — `client-sip-ua/ice_handler.rs` constructs `IceAgent` and `media_session.rs` drives `IceHandler::for_outbound`/`for_inbound`; host candidates only (no STUN/TURN servers configured). `sbc-daemon/src/ice_agent.rs` (`IceManager`) exists but is never constructed, so ICE is not active in the SBC.
+**Wiring note:** **Wired (soft client only)** — `client-sip-ua/ice_handler.rs` constructs `IceAgent`, gathers host (and, when a STUN server is configured in `[network]` settings, server-reflexive) candidates, and runs connectivity checks with nomination on the media socket; `media_session.rs` falls back to the SDP address on ICE mismatch or failure. The SBC does not run ICE by design (media anchoring with symmetric latching).
 
 ### RFCs Referenced
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| **RFC 8445** | ICE | **Full** — candidate types and priority (§5.1.2), pair priority (§6.1.2.3), checklist initialization (§6.1.2.6), connectivity checks (§6-7), role conflict (§7.3.1.1), aggressive nomination (§7.2.2), keepalives (§10), retransmission (§14.3). **Wired (soft client only, host candidates)**; sbc-daemon `ice_agent.rs` dead |
+| **RFC 8445** | ICE | **Full** — candidate types and priority (§5.1.2), pair priority (§6.1.2.3), checklist initialization (§6.1.2.6), connectivity checks (§6-7), role conflict (§7.3.1.1), aggressive nomination (§7.2.2), keepalives (§10), retransmission (§14.3). **Wired (soft client only)**; the SBC does not run ICE |
 | **RFC 5245** | ICE (legacy) | Referenced |
 | **RFC 7675** | Consent Freshness | **Full** — 5s interval, 30s timeout, consent revocation (§6), MUST cease sending. **Library-only** — `consent.rs` is not driven by `IceAgent` or any binary |
 | **RFC 8839** | SDP for ICE | Referenced — soft client parses `a=candidate`/ufrag/pwd itself (`IceHandler::parse_sdp_candidate`, `call_manager.rs`) |
@@ -277,7 +286,7 @@
 
 ### Gaps
 - No `TODO`/`FIXME` found
-- sbc-daemon ICE (`ice_agent.rs`) is not constructed by any runtime path
+- The SBC does not run ICE (by design: media anchoring with symmetric latching); ICE is a soft-client feature
 
 ---
 
@@ -435,20 +444,25 @@
 
 **Primary Standard:** RFC 8224/8225/8226
 
-**Wiring note:** **Library-only.** No crate in the workspace depends on proto-stir-shaken (workspace member only); sbc-daemon neither signs nor verifies Identity headers.
+**Wiring note:** **Wired (sbc-daemon), off by default.** `sbc-daemon` (`src/stir.rs`, `src/sip_stack.rs`) and `uc-sti` use proto-stir-shaken to sign B-leg INVITEs toward `sign = true` trunks and verify Identity on `verify = true` trunks. The crate itself is pure and synchronous; certificate fetch/cache/anchors/signing key live in `uc-sti`, ES256 and X.509 in `uc-crypto` (`interop::ecdsa_p256`, `x509`).
 
 ### RFCs Referenced
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| **RFC 8224** | Authenticated Identity Management | **Full** — SIP Identity header parsing/generation. **Library-only** |
-| **RFC 8225** | PASSporT | **Full** — JWT-like token, compact form, x5u certificate URL. **Library-only** |
-| **RFC 8226** | Secure Telephone Identity Credentials | Referenced. Library-only |
+| **RFC 8224** | Authenticated Identity Management | **Partial — Wired (sbc-daemon)**. Identity header parse/generate with `info`, `alg`, `ppt` (`identity.rs`; 4 KiB, 16 params); verification service with 428/436/437/438 and 403 Stale Date (`verification.rs` `FailureReason::sip_code`, tests `codes`, `qa_stir_stale_iat_rejected_403_stale_date`); authentication service sets `Date` to match `iat` (`sbc-daemon/src/stir.rs` `sign_outbound`). TN canonicalisation §8.3 strips separators and `+`, but non-E.164 numbers are not converted by local policy (RFC-004, POA&M-44). Verifier accepts `orig` matching PAI or From (RFC-005, POA&M-45). No replay cache (POA&M-43). |
+| **RFC 8225** | PASSporT | **Partial — Wired (sbc-daemon)**. Compact form, deterministic §9 JSON, strict decode (duplicate members, `alg=none`, `crit`, `typ` rejected) (`passport.rs`, tests `sign_decode_roundtrip`, `malformed_cases`, proptests). ES256 only for `ppt=shaken` (CNSA exception POA&M-27); ES384 rejected (POA&M-32). |
+| **RFC 8226** | Secure Telephone Identity Credentials | **Partial — Wired (sbc-daemon)**. TNAuthList extracted and scope-checked for TN/range (`uc-crypto/src/x509.rs`, test `tn_auth_list_parse_and_scope`); SPC scope not checked against TN ownership (POA&M-30); no CRL/OCSP (POA&M-28). |
+| **RFC 8588** | SHAKEN PASSporT extension | **Wired (sbc-daemon)**. `attest` A/B/C and `origid` (required on decode); attestation policy in `uc-sti/src/policy.rs` (test `matrix`). Registered-endpoint A requires the INVITE on the same TCP/TLS connection as the REGISTER, following RFC 5626 §3.1/§5.2 flow semantics (`ConnId`, unbound on close; `sbc-daemon/src/stir_binding.rs`, tests `poam36_*`); not bound to the TLS peer certificate (POA&M-70). |
+| **RFC 8946** | `div` PASSporT | **Missing.** `ppt=div` is ignored, not verified (test `div_is_ignored`). |
+| ATIS-1000074 | SHAKEN | **Partial — Wired (sbc-daemon)**. `info` must equal `x5u`; `verstat` placed on PAI, else From (`apply_verstat`, test `verstat_rewrite`). |
 
 ### Key Files
-- `src/lib.rs` — attestation levels (A/B/C), RFC listing
-- `src/passport.rs` — PASSporT per RFC 8225
-- `src/identity.rs` — Identity header per RFC 8224, ES384 algorithm
+- `src/canon.rs` — TN canonicalisation (RFC 8224 §8.3)
+- `src/jws.rs` — base64url and compact JWS split (4 KiB cap)
+- `src/passport.rs` — PASSporT per RFC 8225 / RFC 8588
+- `src/identity.rs` — Identity header per RFC 8224
+- `src/verification.rs` — verifier, failure reasons and SIP codes, verstat
 
 ---
 
@@ -461,9 +475,9 @@
 4. **Comprehensive test coverage** — all crates have `#[cfg(test)]` modules exercising standards-specific behavior
 
 ### Wiring Gaps (crate capability not reached by any shipped binary)
-- **proto-sdp**, **proto-turn**, **proto-stir-shaken** — entire crates library-only
+- **proto-sdp**, **proto-turn** — entire crates library-only (proto-stir-shaken is now wired in sbc-daemon)
 - **proto-dialog** — only `refer.rs` reaches a binary (soft client); dialog store, session timer, subscriptions, forking unused
-- **proto-ice** — soft client only (host candidates); sbc-daemon `ice_agent.rs` never constructed; RFC 7675 consent unused
+- **proto-ice** — soft client only (checks, nomination; STUN via settings); the SBC does not run ICE; RFC 7675 consent and §10 keepalives unused
 - **proto-dtls** — soft client only; SBC DTLS termination is the Go sidecar
 - **proto-sip** proxy/routing/redirect/options modules, Path header; **proto-transaction** PRACK; **proto-registrar** GRUU/Path/Service-Route/flow manager; **proto-b2bua** early-media module; **proto-rtp** translator/mixer/scheduler/collision detector
 - **sbc-daemon** relays only REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE; REFER, SUBSCRIBE/NOTIFY, PRACK, MESSAGE, INFO, PUBLISH receive 405
@@ -482,6 +496,10 @@
 1. **proto-rtp**: Mixer/translator reception reports have `jitter`, `last_sr`, `delay_since_last_sr` hardcoded to 0 — would need per-source JitterCalculator and SR timestamp tracking
 2. **proto-stun**: SASLprep (RFC 4013) is simplified — full compliance noted as incomplete in comments
 
+### CDR syslog sink (not a proto-* crate)
+
+`uc-cdr` hand-formats the CDR syslog output. It does not use `uc-syslog`, which has no TLS support. The format is RFC 5424: PRI = facility * 8 + 6 (informational), VERSION `1`, an RFC 3339 UTC timestamp with milliseconds and `Z`, the sanitised hostname (`node_id`), APP-NAME `usg-sbc`, PROCID `-`, MSGID `CDR`, STRUCTURED-DATA as NILVALUE `-`, and MSG as the UTF-8 BOM (§6.4) followed by the record's canonical JSON. Framing is RFC 6587 octet counting; the count includes the 3 BOM octets. The transport is RFC 5425 over TLS 1.3 only (`uc_transport::tls::create_client_config`). Cipher suites and key-exchange groups are not restricted, so the suite is not CNSA 2.0 enforced (NIST POA&M-26). Gap: RFC 5425 §4.2 mutual authentication is absent because no client certificate is sent (NIST POA&M-15). Tests: `syslog_octet_counted_rfc5424`, `syslog_sink_octet_counted_frames_via_fake_connector`. No test performs a TLS handshake.
+
 ### Complete RFC Index
 
 "Shipped in" names the binary with a call site; "library" means no shipped binary calls it. "soft client" = `client-*` crates (Tauri/FFI client).
@@ -492,12 +510,13 @@
 | RFC 2617 | HTTP Digest Authentication | proto-sip, proto-registrar | sbc-daemon, soft client |
 | RFC 3261 | SIP | proto-sip, proto-transaction, proto-dialog, proto-registrar, proto-b2bua | sbc-daemon, soft client (message layer, transactions, registrar); dialog layer, proxy/routing/redirect/options: library |
 | RFC 3262 | 100rel / PRACK | proto-transaction | library |
-| RFC 3263 | Locating SIP Servers | proto-sip | soft client (via uc-dns) |
-| RFC 3264 | Offer/Answer Model with SDP | proto-sdp, proto-b2bua | library (daemon relays SDP opaquely) |
+| RFC 3263 | Locating SIP Servers | proto-sip, uc-dns | soft client (uc-dns system-conf resolver; partial, no DNSSEC) |
+| RFC 2782 | DNS SRV | uc-dns | soft client (weighted random order) |
+| RFC 3264 | Offer/Answer Model with SDP | proto-sdp, proto-b2bua | library (daemon relays SDP opaquely; its CDR code reads the answer and skips port-0 `m=audio` per §6, see docs/SDP_RFC_Compliance.md) |
 | RFC 3311 | UPDATE Method | proto-sip, proto-transaction | sbc-daemon |
 | RFC 3323 | Privacy Mechanism for SIP | proto-sip | sbc-daemon |
 | RFC 3325 | P-Asserted-Identity | proto-sip | sbc-daemon (topology hider) |
-| RFC 3326 | Reason Header | proto-sip | library |
+| RFC 3326 | Reason Header | proto-sip; sbc-daemon `cdr.rs` | proto-sip + sbc-daemon (CDR Q.850 extraction) |
 | RFC 3327 | Path Header | proto-sip, proto-registrar | library |
 | RFC 3428 | MESSAGE Method | proto-sip | library |
 | RFC 3455 | P-Headers | proto-sip | library |
@@ -532,6 +551,8 @@
 | RFC 5359 | Line Event Package | proto-dialog | library |
 | RFC 5362 | Resource Lists Event Package | proto-dialog | library |
 | RFC 5373 | Call Completion | proto-dialog | library |
+| RFC 5424 | The Syslog Protocol | uc-cdr (`sink.rs` `SyslogSink`, hand-formatted; not uc-syslog) | sbc-daemon (CDR syslog sink, opt-in) |
+| RFC 5425 | TLS Transport for Syslog | uc-cdr, sbc-daemon `cdr.rs` `TlsSyslogConnector` | sbc-daemon (CDR syslog sink, TLS 1.3 only, server-auth only: no client certificate) |
 | RFC 5389 | STUN | proto-stun | sbc-daemon (zone external-IP discovery), soft client (ICE checks); long-term credentials: library |
 | RFC 5626 | SIP Outbound | proto-registrar | sbc-daemon (instance-id/reg-id, CRLF ping); flow manager: library |
 | RFC 5627 | GRUU | proto-registrar | library |
@@ -549,19 +570,21 @@
 | RFC 6188 | AES-256-CM | proto-sdp | library |
 | RFC 6347 | DTLS 1.2 | proto-dtls | soft client (SBC uses Go sidecar) |
 | RFC 6446 | Session Recording | proto-dialog | library |
+| RFC 6587 | Syslog over TCP (octet-counting framing) | uc-cdr | sbc-daemon (CDR syslog sink; octet counting only) |
 | RFC 6665 | SIP Events | proto-sip, proto-dialog | library |
 | RFC 6910 | Auto-Configuration | proto-dialog | library |
 | RFC 7092 | B2BUA Taxonomy | proto-b2bua | sbc-daemon |
-| RFC 7118 | WebSocket Transport for SIP | proto-sip | library |
+| RFC 7118 | WebSocket Transport for SIP | proto-sip, uc-transport | sbc-daemon (ws); wss library |
 | RFC 7614 | Location Conveyance | proto-dialog | library |
 | RFC 7627 | Extended Master Secret | proto-dtls | soft client |
 | RFC 7675 | Consent Freshness | proto-ice | library |
 | RFC 7714 | AES-GCM for SRTP | proto-srtp, proto-sdp, proto-dtls | sbc-media-core, soft client |
 | RFC 7840 | Multiple Phone Numbers | proto-dialog | library |
 | RFC 8068 | Pending Additions | proto-dialog | library |
-| RFC 8224 | STIR Identity | proto-sip, proto-stir-shaken | library |
-| RFC 8225 | PASSporT | proto-stir-shaken | library |
-| RFC 8226 | Secure Telephone Identity Credentials | proto-stir-shaken | library |
+| RFC 8224 | STIR Identity | proto-sip, proto-stir-shaken | sbc-daemon (off by default) |
+| RFC 8225 | PASSporT | proto-stir-shaken | sbc-daemon (off by default) |
+| RFC 8226 | Secure Telephone Identity Credentials | proto-stir-shaken, uc-crypto | sbc-daemon (off by default) |
+| RFC 8588 | SHAKEN PASSporT | proto-stir-shaken, uc-sti | sbc-daemon (off by default) |
 | RFC 8445 | ICE | proto-stun, proto-ice | soft client (host candidates); sbc-daemon: library |
 | RFC 8489 | STUN (updated) | proto-stun | sbc-daemon, soft client |
 | RFC 8656 | TURN (updated) | proto-turn | library |

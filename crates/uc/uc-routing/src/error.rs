@@ -17,6 +17,11 @@ pub enum RoutingError {
     AllTrunksFailed {
         /// Number of trunks tried.
         trunks_tried: usize,
+        /// True when the failure was caused by a `require_tls` policy: at
+        /// least one non-TLS trunk would otherwise have been usable.
+        ///
+        /// NIST 800-53 Rev5: SC-8 (TLS-only egress policy refused the call)
+        tls_required: bool,
     },
     /// Trunk not found.
     TrunkNotFound {
@@ -58,8 +63,15 @@ impl fmt::Display for RoutingError {
             Self::NoRoute { destination } => {
                 write!(f, "No route found for: {destination}")
             }
-            Self::AllTrunksFailed { trunks_tried } => {
-                write!(f, "All {trunks_tried} trunks failed")
+            Self::AllTrunksFailed {
+                trunks_tried,
+                tls_required,
+            } => {
+                if *tls_required {
+                    write!(f, "All {trunks_tried} trunks failed (no usable TLS trunk)")
+                } else {
+                    write!(f, "All {trunks_tried} trunks failed")
+                }
             }
             Self::TrunkNotFound { trunk_id } => {
                 write!(f, "Trunk not found: {trunk_id}")
@@ -99,7 +111,15 @@ mod tests {
 
     #[test]
     fn test_all_trunks_failed_display() {
-        let error = RoutingError::AllTrunksFailed { trunks_tried: 3 };
+        let error = RoutingError::AllTrunksFailed {
+            trunks_tried: 3,
+            tls_required: false,
+        };
         assert!(error.to_string().contains('3'));
+        let error = RoutingError::AllTrunksFailed {
+            trunks_tried: 2,
+            tls_required: true,
+        };
+        assert!(error.to_string().contains("TLS"));
     }
 }

@@ -30,16 +30,48 @@ pub async fn liveness() -> impl IntoResponse {
 /// Readiness checks Postgres reachability via a cheap `is_empty()` call
 /// against an arbitrary store. If Postgres is down, sbc-api is useless
 /// and should be pulled from the LB rotation.
+///
+/// Also not ready when the audit writer has died or the audit sink is
+/// failing writes (e.g. disk full): CDR exports and permission denials
+/// would go unrecorded (NIST 800-53 Rev5: AU-5).
 pub async fn readiness(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match state.phones.is_empty().await {
-        Ok(_) => (
+    let audit_ok = audit_ready(&uc_audit::stats());
+    if !audit_ok {
+        warn!("readiness: audit pipeline not persisting records");
+        return readiness_response::<()>(false, &Ok(()));
+    }
+    let db = state.phones.is_empty().await.map(|_| ());
+    if let Err(e) = &db {
+        warn!(error = %e, "readiness: postgres check failed");
+    }
+    readiness_response(audit_ok, &db)
+}
+
+/// Audit half of readiness: writer running and the sink persisting.
+///
+/// NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+const fn audit_ready(stats: &uc_audit::AuditStats) -> bool {
+    stats.writer_alive && !stats.sink_failing
+}
+
+/// Status + body for `/readyz`. Unauthenticated endpoint: the backend error
+/// never reaches the body, only the log (done by the caller).
+///
+/// NIST 800-53 Rev5: SI-11 (Error Handling)
+fn readiness_response<E>(
+    audit_ok: bool,
+    db: &Result<(), E>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    if audit_ok && db.is_ok() {
+        (
             axum::http::StatusCode::OK,
             Json(serde_json::json!({"status": "ready"})),
-        ),
-        Err(e) => (
+        )
+    } else {
+        (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"status": "not_ready", "error": e.to_string()})),
-        ),
+            Json(serde_json::json!({"status": "not_ready"})),
+        )
     }
 }
 
@@ -202,5 +234,46 @@ pub async fn tls_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "error": status.message(),
             }))
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn not_ready_body_carries_no_backend_detail() {
+        let secret = "connection to 10.0.0.5:5432 refused for user sbc password=hunter2";
+        for (audit_ok, db) in [(true, Err(secret)), (false, Ok(())), (false, Err(secret))] {
+            let (code, Json(body)) = readiness_response(audit_ok, &db);
+            assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body, serde_json::json!({"status": "not_ready"}));
+        }
+        let (code, Json(body)) = readiness_response::<&str>(true, &Ok(()));
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"status": "ready"}));
+    }
+
+    #[test]
+    fn not_ready_when_audit_sink_failing() {
+        let ok = uc_audit::AuditStats {
+            writer_alive: true,
+            ..uc_audit::AuditStats::default()
+        };
+        assert!(audit_ready(&ok));
+        let failing = uc_audit::AuditStats {
+            sink_failing: true,
+            write_failures: 1,
+            ..ok
+        };
+        assert!(!audit_ready(&failing));
+        let (code, _) = readiness_response::<&str>(audit_ready(&failing), &Ok(()));
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let dead = uc_audit::AuditStats {
+            writer_alive: false,
+            ..ok
+        };
+        assert!(!audit_ready(&dead));
     }
 }

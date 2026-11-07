@@ -61,4 +61,19 @@ pub trait UserStore: Send + Sync {
 
     /// Return the total number of users in the store.
     fn count_users(&self) -> impl std::future::Future<Output = Result<usize>> + Send;
+
+    /// Compare-and-swap the stored `digest_ha1` column of one row.
+    ///
+    /// Writes `new` only if the row `id` still holds exactly `expected`;
+    /// no other column is touched. Returns `Ok(true)` if the row was
+    /// updated and `Ok(false)` if it changed (or vanished) concurrently.
+    /// Values are the raw stored column, not decrypted HA1.
+    ///
+    /// ## NIST 800-53 Rev5: SC-28(1), SI-7
+    fn replace_digest_ha1(
+        &self,
+        id: &str,
+        expected: &str,
+        new: &str,
+    ) -> impl std::future::Future<Output = Result<bool>> + Send;
 }

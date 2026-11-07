@@ -101,12 +101,9 @@ pub struct StreamStats {
     pub bytes_sent: u64,
     /// Bytes received.
     pub bytes_received: u64,
-    /// Packets lost.
-    pub packets_lost: u64,
-    /// Jitter in milliseconds.
-    pub jitter_ms: f64,
-    /// Round-trip time in milliseconds.
-    pub rtt_ms: Option<f64>,
+    // Loss, jitter and RTT are not reported here: this crate never sees RTP
+    // headers or RTCP. sbc-media-core's relay derives them from
+    // `proto-rtp` sequence tracking. (NIST 800-53 Rev5: SI-10)
 }
 
 /// Media stream configuration.
@@ -327,9 +324,6 @@ impl MediaStream {
             packets_received: self.packets_received.load(Ordering::Relaxed),
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
-            packets_lost: 0, // Would be calculated from RTP sequence numbers
-            jitter_ms: 0.0,  // Would be calculated from RTP timestamps
-            rtt_ms: None,    // Would come from RTCP
         }
     }
 

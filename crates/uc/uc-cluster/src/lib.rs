@@ -60,7 +60,8 @@ pub mod membership;
 pub mod node;
 
 pub use config::{
-    ClusterConfig, FailoverConfig, FailoverStrategy, HeartbeatConfig, ReplicationConfig,
+    AdmissionSplit, ClusterAdmissionConfig, ClusterConfig, FailoverConfig, FailoverStrategy,
+    HeartbeatConfig, MAX_EXPECTED_NODES, ReplicationConfig,
 };
 pub use error::{ClusterError, ClusterResult};
 pub use failover::{FailoverCoordinator, TakeoverResult};

@@ -757,7 +757,7 @@ mod tests {
         let config = MediaTerminationConfig::default();
         assert_eq!(config.codec_negotiation, CodecNegotiationMode::Common);
         assert!(config.jitter_buffer_enabled);
-        assert!(!config.preferred_codecs.is_empty());
+        assert_ne!(config.preferred_codecs, [] as [std::string::String; 0]);
     }
 
     #[test]

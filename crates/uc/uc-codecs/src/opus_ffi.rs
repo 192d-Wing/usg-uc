@@ -242,12 +242,18 @@ impl FfiOpusDecoder {
             let output_u16: &mut [u16] = bytemuck::cast_slice_mut(output);
             decoder
                 .decode_to_slice(encoded, output_u16, fec)
-                .map_err(|e| CodecError::DecodingFailed {
-                    reason: format!(
-                        "Opus {}decoding failed: {}",
-                        if fec { "FEC " } else { "" },
-                        e.message()
-                    ),
+                .map_err(|e| {
+                    // FEC and PLC run once per lost packet on the decode
+                    // thread: keep that path allocation-free.
+                    if fec || encoded.is_empty() {
+                        CodecError::LossRecoveryFailed {
+                            reason: e.message(),
+                        }
+                    } else {
+                        CodecError::DecodingFailed {
+                            reason: format!("Opus decoding failed: {}", e.message()),
+                        }
+                    }
                 })?
         };
 
@@ -264,14 +270,62 @@ impl FfiOpusDecoder {
         self.decode_inner(encoded, output, false)
     }
 
-    /// Decodes with Forward Error Correction for lost packets.
+    /// Checks that `output` holds exactly one decodable Opus frame
+    /// (2.5-60 ms, RFC 6716 §2.1.4) for the configured rate and channels.
     ///
-    /// Call this when a packet is lost to attempt FEC recovery.
+    /// libopus takes the concealment/FEC duration from the buffer length, so
+    /// an oversized buffer would silently synthesize extra audio (the old
+    /// 60 ms-per-lost-20 ms-frame bug).
+    fn check_frame_buffer(&self, output: &[i16]) -> CodecResult<usize> {
+        let channels = self.channels as usize;
+        let per_channel = output.len() / channels;
+        if !output.len().is_multiple_of(channels)
+            || !crate::opus_toc::is_valid_frame_size(per_channel, self.sample_rate)
+        {
+            return Err(CodecError::InvalidFrameSize {
+                expected: self.sample_rate as usize / 50 * channels,
+                actual: output.len(),
+            });
+        }
+        Ok(per_channel)
+    }
+
+    /// Rebuilds a lost frame from the in-band FEC (LBRR) data in the packet
+    /// that followed it.
+    ///
+    /// `output` must be sized to the lost frame's duration. Returns an error
+    /// (without touching decoder state) when `next_packet` cannot carry FEC
+    /// for that duration, e.g. CELT-only mode or an empty/malformed packet;
+    /// the caller should then use [`Self::conceal`].
     ///
     /// # Errors
-    /// Returns an error if the operation fails.
-    pub fn decode_fec(&self, output: &mut [i16]) -> CodecResult<usize> {
-        self.decode_inner(&[], output, true)
+    /// Returns an error if the buffer size is invalid, the next packet cannot
+    /// carry FEC, or libopus rejects the packet.
+    // RFC 7587 §3.4: the receiver uses in-band FEC from packet N+1 to recover N.
+    // RFC 6716 §2.1.7: LBRR is present only in SILK and Hybrid modes.
+    // NIST 800-53 Rev5: SI-10 (packet N+1 is attacker-controlled; size checked first)
+    pub fn decode_fec(&self, next_packet: &[u8], output: &mut [i16]) -> CodecResult<usize> {
+        let per_channel = self.check_frame_buffer(output)?;
+        if !crate::opus_toc::may_carry_fec(next_packet, per_channel, self.sample_rate) {
+            return Err(CodecError::LossRecoveryFailed {
+                reason: "next packet carries no usable in-band FEC",
+            });
+        }
+        // POAM: POA&M-141 -- a SILK/Hybrid packet sent without LBRR still
+        // decodes via this path (libopus falls back to PLC internally); the
+        // LBRR flag is range-coded and `opus_packet_has_lbrr` is not exposed
+        // by the safe binding, so callers count FEC-path decodes.
+        self.decode_inner(next_packet, output, true)
+    }
+
+    /// Generates libopus packet loss concealment (RFC 6716 §4.4) for one
+    /// lost frame. `output` must be sized to one ptime.
+    ///
+    /// # Errors
+    /// Returns an error if the buffer is not a valid Opus frame size.
+    pub fn conceal(&self, output: &mut [i16]) -> CodecResult<usize> {
+        self.check_frame_buffer(output)?;
+        self.decode_inner(&[], output, false)
     }
 
     /// Returns the configured sample rate.
@@ -379,12 +433,20 @@ impl AudioCodec for FfiOpusCodec {
         self.get_decoder()?.decode(encoded, output)
     }
 
-    fn decode_fec(&self, output: &mut [i16]) -> CodecResult<usize> {
-        self.get_decoder()?.decode_fec(output)
+    fn decode_fec(&self, next_packet: &[u8], output: &mut [i16]) -> CodecResult<usize> {
+        self.get_decoder()?.decode_fec(next_packet, output)
+    }
+
+    fn conceal(&self, output: &mut [i16]) -> CodecResult<usize> {
+        self.get_decoder()?.conceal(output)
     }
 
     fn supports_fec(&self) -> bool {
         self.config.fec
+    }
+
+    fn supports_plc(&self) -> bool {
+        true
     }
 }
 
@@ -480,11 +542,10 @@ mod tests {
         let mut decoded = vec![0i16; 960];
         let _ = codec.decode(&encoded[..100], &mut decoded);
 
-        // Now try FEC decode (simulating lost packet)
+        // Now try FEC decode (simulating lost packet) using the next packet.
         let mut fec_output = vec![0i16; 960];
-        let fec_result = codec.decode_fec(&mut fec_output);
-        // FEC may produce output or may fail depending on encoder state
-        // Just verify it doesn't panic
+        let fec_result = codec.decode_fec(&encoded[..100], &mut fec_output);
+        // The truncated packet may or may not decode; it must not panic.
         let _ = fec_result;
     }
 
@@ -536,8 +597,10 @@ mod tests {
         for frame_idx in 0..num_frames {
             let mut decoded = vec![0i16; samples_per_frame];
             if frame_idx == lost_frame {
-                // Simulate loss: use decoder PLC/FEC (decode(None, fec=true))
-                let len = codec.decode_fec(&mut decoded).unwrap();
+                // Simulate loss: recover from the LBRR data in packet N+1.
+                let len = codec
+                    .decode_fec(&encoded_packets[frame_idx + 1], &mut decoded)
+                    .unwrap();
                 assert_eq!(len, samples_per_frame, "FEC should produce a full frame");
 
                 // Compute RMS of recovered frame
@@ -602,9 +665,9 @@ mod tests {
             codec.decode(&packets[f], &mut decoded).unwrap();
         }
 
-        // FEC recovery for lost frame 8
+        // Native PLC for lost frame 8
         let mut fec_output = vec![0i16; spf];
-        let fec_len = codec.decode_fec(&mut fec_output).unwrap();
+        let fec_len = codec.conceal(&mut fec_output).unwrap();
         assert_eq!(fec_len, spf);
 
         // Compute RMS of FEC output and original frame
@@ -633,6 +696,110 @@ mod tests {
             fec_rms > 500.0,
             "FEC output should not be silent: RMS={fec_rms:.1}"
         );
+    }
+
+    /// Encodes `frames` 20 ms frames of a voiced-like signal with FEC on.
+    /// Samples before frame `onset` are silent.
+    fn encode_voice(codec: &FfiOpusCodec, frames: usize, onset: usize) -> (Vec<i16>, Vec<Vec<u8>>) {
+        let spf = 960;
+        let input: Vec<i16> = (0..spf * frames)
+            .map(|i| {
+                if i < onset * spf {
+                    return 0;
+                }
+                let t = i as f32 / 48000.0;
+                let f0 = 2.0 * std::f32::consts::PI * 180.0 * t;
+                (0.25f32.mul_add(
+                    f32::sin(3.0 * f0),
+                    0.5f32.mul_add(f32::sin(2.0 * f0), f32::sin(f0)),
+                ) * 8000.0) as i16
+            })
+            .collect();
+        let mut packets = Vec::new();
+        for f in 0..frames {
+            let mut enc = vec![0u8; 1275];
+            let len = codec
+                .encode(&input[f * spf..(f + 1) * spf], &mut enc)
+                .unwrap();
+            packets.push(enc[..len].to_vec());
+        }
+        (input, packets)
+    }
+
+    #[test]
+    fn test_decode_fec_returns_exactly_lost_frame() {
+        // Regression: the lost 20 ms frame must yield 960 samples, never the
+        // 2880 (60 ms) the old buffer-sized PLC produced.
+        let enc = FfiOpusCodec::new(
+            OpusConfig {
+                packet_loss_perc: 20,
+                ..OpusConfig::voip()
+            },
+            111,
+        );
+        let (_, packets) = encode_voice(&enc, 30, 20);
+        let lost = 20;
+
+        let fec_dec = FfiOpusCodec::voip(111);
+        let plc_dec = FfiOpusCodec::voip(111);
+        let mut buf = vec![0i16; 960];
+        for p in &packets[..lost] {
+            fec_dec.decode(p, &mut buf).unwrap();
+            plc_dec.decode(p, &mut buf).unwrap();
+        }
+        let mut fec_out = vec![0i16; 960];
+        let n = fec_dec
+            .decode_fec(&packets[lost + 1], &mut fec_out)
+            .unwrap();
+        assert_eq!(n, 960);
+        let mut plc_out = vec![0i16; 960];
+        assert_eq!(plc_dec.conceal(&mut plc_out).unwrap(), 960);
+
+        // The talker starts speaking exactly on the lost frame: PLC can only
+        // extrapolate the preceding silence, while LBRR in packet N+1 carries
+        // a coarse copy of frame N.
+        let energy = |x: &[i16]| x.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
+        let fec_energy = energy(&fec_out);
+        let plc_energy = energy(&plc_out);
+        assert!(
+            fec_energy > 4.0f64.mul_add(plc_energy, 1.0),
+            "FEC energy {fec_energy:.0} should exceed PLC energy {plc_energy:.0}"
+        );
+    }
+
+    #[test]
+    fn test_decode_fec_rejects_bad_buffers_and_packets() {
+        let codec = FfiOpusCodec::voip(111);
+        let (_, packets) = encode_voice(&codec, 2, 0);
+        let mut odd = vec![0i16; 961];
+        assert!(matches!(
+            codec.decode_fec(&packets[1], &mut odd),
+            Err(CodecError::InvalidFrameSize { .. })
+        ));
+        let mut huge = vec![0i16; 5760];
+        assert!(codec.conceal(&mut huge).is_err());
+        let mut ok = vec![0i16; 960];
+        assert!(codec.decode_fec(&[], &mut ok).is_err());
+        // CELT-only TOC (config 19) never carries LBRR.
+        assert!(codec.decode_fec(&[19 << 3, 0, 0], &mut ok).is_err());
+        // A 10 ms lost frame cannot be rebuilt from a 20 ms next packet.
+        let mut short = vec![0i16; 480];
+        assert!(codec.decode_fec(&[1 << 3, 0, 0], &mut short).is_err());
+    }
+
+    #[test]
+    fn test_conceal_sized_to_ptime() {
+        let codec = FfiOpusCodec::voip(111);
+        let (_, packets) = encode_voice(&codec, 5, 0);
+        let mut buf = vec![0i16; 960];
+        for p in &packets {
+            codec.decode(p, &mut buf).unwrap();
+        }
+        let mut ten_ms = vec![0i16; 480];
+        assert_eq!(codec.conceal(&mut ten_ms).unwrap(), 480);
+        let mut twenty_ms = vec![0i16; 960];
+        assert_eq!(codec.conceal(&mut twenty_ms).unwrap(), 960);
+        assert!(codec.supports_plc());
     }
 
     #[test]

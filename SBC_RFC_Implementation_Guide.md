@@ -45,6 +45,17 @@ This document provides a comprehensive summary of RFCs required for implementing
 - Certificate validation must use SHA-384 or SHA-512 for fingerprints
 - RSA and ECDSA certificates will need migration to ML-DSA-87 by 2035
 
+**Current implementation (sbc-daemon), call-path responses:**
+
+| Condition | Response | Notes |
+|-----------|----------|-------|
+| Route pattern `blocked` matched | 403 Forbidden | No dial-plan or default-group fallback; audited `route:blocked` |
+| Emergency number with no route | 503, no `Retry-After` | Audited `emergency_unrouted` |
+| Numeric-looking malformed, empty or >256-byte R-URI user | 404 | Number Not In Service announcement, then the final response |
+| Per-user rate exceeded | 503, `Retry-After: 1` | Keyed on the authenticated AOR, else source /32 or /64 plus canonical From user; trunk sources, ACK and emergency INVITEs are exempt |
+
+Open: RFC 3966 `;phone-context` is dropped (POA&M-100) and `urn:service:sos` is not classified as emergency; see `docs/RFC_COMPLIANCE_GAPS.md`.
+
 ---
 
 ### RFC 3263 - Locating SIP Servers
@@ -64,6 +75,8 @@ This document provides a comprehensive summary of RFCs required for implementing
 - **Load Balancing:** Must respect SRV weight values for load distribution
 - **Deterministic Ordering:** For stateless proxies, must define deterministic ordering for equal-priority SRV records
 - **SIPS URI Handling:** Must enforce TLS-only transport for SIPS URIs
+
+**Current implementation (sbc-daemon):** no NAPTR/SRV; trunk hosts are resolved with A/AAAA only. Failover is across configured trunks in the selected route groups, not SRV targets: 408, Timer B and 503 (RFC 3263 §4.3) plus 500/502/504 (local policy) move the call to the next trunk, and a transport error on the first send of a B-leg INVITE also fails over. A trunk's 503 `Retry-After` sets the trunk cooldown, clamped to `general.trunk_retry_after_max_secs`. A `sips:` Request-URI makes only TLS trunks eligible in every routed group (RFC 3261 §26.2.2); with none eligible the SBC answers 503 with `Reason: Q.850;cause=79` (RFC 6432) and no `Retry-After`. Trunks without a port default to 5061 for TLS and 5060 otherwise. Open: the last trunk's 503 is relayed unchanged when failover is exhausted (RFC-004). See `docs/RFC_COMPLIANCE_GAPS.md`.
 
 **CNSA 2.0 Notes:**
 - DNSSEC validation SHOULD be implemented for DNS security
@@ -365,11 +378,15 @@ This document provides a comprehensive summary of RFCs required for implementing
 - **Origination Identifier Validation:** Must validate calling party identity against PASSporT
 - **438 Response:** Must generate "438 Invalid Identity Header" for validation failures
 - **428 Response:** Must generate "428 Use Identity Header" when identity required but absent
+- **436 / 437 Responses:** "436 Bad Identity Info" when the `info` URI cannot be used or dereferenced; "437 Unsupported Credential" when the credential is untrusted or its algorithm unsupported
+- **403 Stale Date:** when `iat` is outside the freshness window (RFC 8224 §6.2.2)
+
+**USG SBC status (sbc-daemon):** Wired, off by default. On `verify = true` trunks the verifier maps failures to 428/436/437/438 and 403 "Stale Date" (`proto-stir-shaken/src/verification.rs` `FailureReason::sip_code`), with a `Reason: SIP;cause=N;text="..."` header. These responses are sent only with `failure_policy = "reject"`; the **default is `mark`** (forward with `verstat=TN-Validation-Failed`). The signer sets `Date` to match `iat`. Not implemented: `div` PASSporTs (RFC 8946), replay cache, certificate revocation. See `docs/SBC-ADMIN-GUIDE.md` (STIR/SHAKEN).
 
 **CNSA 2.0 Notes:**
 - PASSporT signatures must transition to ML-DSA-87
 - ES384 (ECDSA with P-384 and SHA-384) acceptable during transition
-- NO ES256 (P-256/SHA-256)
+- NO ES256 (P-256/SHA-256), except where SHAKEN requires it: the USG SBC uses ES256 under a documented CNSA exception (ATIS-1000074; NIST POA&M-27, see `docs/CNSA-2-COMPLIANCE.md`)
 
 ---
 
@@ -729,6 +746,13 @@ Target (by 2035):
    - Complete migration to post-quantum algorithms
    - Remove all classical asymmetric cryptography
 
+### Recorded Implementation Deviations (CDR change)
+
+These are deviations in the shipped code from the guidance above. They are recorded so the security profile and the NIST POA&M in `docs/NIST-800-53-CONTROLS.md` stay aligned.
+
+1. **CDR syslog (RFC 5424 / 5425 / 6587) does not use `uc-syslog`.** `uc-syslog` has no TLS and pulls in tokio, so `uc-cdr` (`src/sink.rs` `SyslogSink`) hand-formats RFC 5424 messages: MSGID `CDR`, UTF-8 BOM, JSON MSG and RFC 6587 octet counting. `sbc-daemon/src/cdr.rs` `TlsSyslogConnector` supplies the TLS transport. That transport is TLS 1.3 only (`uc_transport::tls::create_client_config`). Like the SIP-TLS configs, it does not restrict cipher suites or key-exchange groups, so the suite list in "TLS/DTLS Configuration" is not enforced on it either (POA&M-26). It presents no client certificate, so RFC 5425 mutual authentication is absent (POA&M-15). See `docs/RFC_COMPLIANCE_GAPS.md`, section "sbc-daemon CDR".
+2. **The sbc-api to sbc-daemon gRPC channel is not on the CNSA 2.0 TLS profile.** Both the daemon's tonic `ServerTlsConfig` and sbc-api's client use tonic's default rustls provider and suites, which allow TLS 1.2, AES-128 and X25519. The suite settings in "TLS/DTLS Configuration" above are therefore **not** enforced on this channel. The Helm chart's certificates are ECDSA P-384, but that does not make the negotiated suite compliant. Tracked as POA&M-16 (`// POAM: SEC-9` in `sbc-daemon/src/grpc_server/mod.rs`, `// POAM:` in `sbc-api-server/src/state.rs`). Cross-reference: `docs/CNSA-2-COMPLIANCE.md`.
+
 ---
 
 ## Sources
@@ -752,7 +776,7 @@ Target (by 2035):
 ### Security RFCs
 - [RFC 5630 - SIPS URI](https://datatracker.ietf.org/doc/html/rfc5630)
 - [RFC 8224 - SIP Identity](https://datatracker.ietf.org/doc/html/rfc8224)
-- [RFC 8225 - PASSporT](https://www.rfc-editor.org/rfc/rfc8224)
+- [RFC 8225 - PASSporT](https://www.rfc-editor.org/rfc/rfc8225)
 - [RFC 5763 - DTLS-SRTP Framework](https://datatracker.ietf.org/doc/html/rfc5763)
 - [RFC 5764 - DTLS-SRTP](https://datatracker.ietf.org/doc/html/rfc5764)
 

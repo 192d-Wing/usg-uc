@@ -60,6 +60,16 @@ spec:
               set -e
               sed "s|__POD_IP__|${POD_IP}|g" /etc/sbc-template/config.toml > /etc/sbc-rendered/config.toml
               echo "Rendered config.toml with POD_IP=${POD_IP}"
+              {{- if .Values.sbcDaemon.stirShaken.signingSecretName }}
+              # STIR/SHAKEN signing key: the daemon refuses a key that is not
+              # owned by its own uid with owner-only mode. Secret volumes are
+              # root-owned and fsGroup-readable, so copy into a memory-backed
+              # emptyDir as this (same-uid) container and chmod 0400.
+              cp /etc/sbc/sti-src/tls.crt /etc/sbc/sti/tls.crt
+              cp /etc/sbc/sti-src/tls.key /etc/sbc/sti/tls.key
+              chmod 0444 /etc/sbc/sti/tls.crt
+              chmod 0400 /etc/sbc/sti/tls.key
+              {{- end }}
           env:
             - name: POD_IP
               valueFrom:
@@ -71,6 +81,10 @@ spec:
           volumeMounts:
             - { name: config-template, mountPath: /etc/sbc-template, readOnly: true }
             - { name: config-rendered, mountPath: /etc/sbc-rendered }
+            {{- if .Values.sbcDaemon.stirShaken.signingSecretName }}
+            - { name: sti-signing-src, mountPath: /etc/sbc/sti-src, readOnly: true }
+            - { name: sti-signing, mountPath: /etc/sbc/sti }
+            {{- end }}
         {{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
         # DTLS-SRTP terminator as a native sidecar (restartPolicy: Always): it
         # starts before the sbc container and runs for the pod's life. The
@@ -226,6 +240,13 @@ spec:
           volumeMounts:
             - { name: config-rendered, mountPath: /etc/sbc/config.toml, subPath: config.toml, readOnly: true }
             - { name: data, mountPath: /var/lib/sbc }
+            {{- if and .Values.sbcDaemon.cdr.enabled .Values.sbcDaemon.cdr.persistence.enabled }}
+            # Dedicated CDR volume (AU-4): CDR growth cannot fill /var/lib/sbc.
+            - { name: cdr, mountPath: {{ .Values.sbcDaemon.cdr.directory | quote }} }
+            {{- end }}
+            {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+            - { name: grpc-tls, mountPath: /etc/sbc/grpc-tls, readOnly: true }
+            {{- end }}
             - { name: logs, mountPath: /var/log/sbc }
             {{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
             # Shared with the terminator sidecar: read the fingerprint file +
@@ -237,6 +258,15 @@ spec:
             {{- end }}
             {{- if .Values.sbcDaemon.sipTls.secretName }}
             - { name: sip-tls, mountPath: /etc/sbc/sip-tls, readOnly: true }
+            {{- end }}
+            {{- if or .Values.sbcDaemon.trunkTls.caConfigMap .Values.sbcDaemon.trunkTls.caSecretName }}
+            - { name: trunk-ca, mountPath: /etc/sbc/trunk-ca, readOnly: true }
+            {{- end }}
+            {{- if .Values.sbcDaemon.stirShaken.trustAnchorsConfigMap }}
+            - { name: sti-cr, mountPath: /etc/sbc/sti-cr, readOnly: true }
+            {{- end }}
+            {{- if .Values.sbcDaemon.stirShaken.signingSecretName }}
+            - { name: sti-signing, mountPath: /etc/sbc/sti, readOnly: true }
             {{- end }}
         {{- if .Values.mediaSplit.enabled }}
         # ── Media plane (signaling↔media split, co-located) ──
@@ -298,6 +328,17 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if and .Values.sbcDaemon.cdr.enabled .Values.sbcDaemon.cdr.persistence.enabled }}
+        - name: cdr
+          persistentVolumeClaim:
+            claimName: {{ include "sbc.fullname" . }}-cdr
+        {{- end }}
+        {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+        - name: grpc-tls
+          secret:
+            secretName: {{ include "sbc.grpcServerTlsSecret" . }}
+            defaultMode: 0440
+        {{- end }}
         - name: logs
           emptyDir: {}
         {{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
@@ -316,4 +357,29 @@ spec:
         - name: sip-tls
           secret:
             secretName: {{ .Values.sbcDaemon.sipTls.secretName }}
+        {{- end }}
+        {{- if .Values.sbcDaemon.trunkTls.caSecretName }}
+        - name: trunk-ca
+          secret:
+            secretName: {{ .Values.sbcDaemon.trunkTls.caSecretName }}
+            items: [{ key: {{ .Values.sbcDaemon.trunkTls.caKey | quote }}, path: ca.pem }]
+        {{- else if .Values.sbcDaemon.trunkTls.caConfigMap }}
+        - name: trunk-ca
+          configMap:
+            name: {{ .Values.sbcDaemon.trunkTls.caConfigMap }}
+            items: [{ key: {{ .Values.sbcDaemon.trunkTls.caKey | quote }}, path: ca.pem }]
+        {{- end }}
+        {{- if .Values.sbcDaemon.stirShaken.trustAnchorsConfigMap }}
+        - name: sti-cr
+          configMap:
+            name: {{ .Values.sbcDaemon.stirShaken.trustAnchorsConfigMap }}
+            items: [{ key: {{ .Values.sbcDaemon.stirShaken.trustAnchorsKey | quote }}, path: sti-cr.pem }]
+        {{- end }}
+        {{- if .Values.sbcDaemon.stirShaken.signingSecretName }}
+        - name: sti-signing-src
+          secret:
+            secretName: {{ .Values.sbcDaemon.stirShaken.signingSecretName }}
+        # Copied by render-config with daemon-uid ownership and mode 0400.
+        - name: sti-signing
+          emptyDir: { medium: Memory, sizeLimit: 1Mi }
         {{- end }}

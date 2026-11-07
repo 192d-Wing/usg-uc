@@ -1,6 +1,10 @@
 //! Polycom VVX series provisioning configuration generator.
 
+use crate::escape::{transport_token, xml_attr, xml_text};
 use crate::model::Phone;
+
+// NIST 800-53 Rev5: SI-15 (Information Output Filtering) -- every operator
+// string goes through `crate::escape`; numerics/bools/static strs are type-safe.
 
 /// Generate a Polycom VVX provisioning XML configuration.
 ///
@@ -8,6 +12,7 @@ use crate::model::Phone;
 /// line appearances, voicemail, call forwarding, and codec preferences.
 #[must_use]
 pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
+    let sbc_host = xml_text(sbc_host);
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <polycomConfig xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -26,7 +31,7 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
         ));
         xml.push_str(&format!(
             "    <sipServer.1.transport>{}</sipServer.1.transport>\n",
-            line.transport.to_uppercase()
+            transport_token(&line.transport)
         ));
         xml.push_str("    <sipServer.1.expires>3600</sipServer.1.expires>\n");
     }
@@ -36,8 +41,8 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
     for line in &phone.lines {
         let i = line.index;
         xml.push_str(&format!("  <reg reg.{i}.displayName=\"{}\" reg.{i}.label=\"{}\" reg.{i}.address=\"{}\" reg.{i}.auth.userId=\"{}\" reg.{i}.auth.password=\"{}\" />\n",
-            line.display_name, line.display_name, line.directory_number,
-            line.sip_username, line.sip_password));
+            xml_attr(&line.display_name), xml_attr(&line.display_name), xml_attr(&line.directory_number),
+            xml_attr(&line.sip_username), xml_attr(&line.sip_password)));
     }
     if !phone.lines.is_empty() {
         xml.push('\n');
@@ -49,6 +54,7 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
         xml.push_str("  <voiceMailConfig>\n");
         for line in &phone.lines {
             if let Some(vm) = &line.voicemail_uri {
+                let vm = xml_attr(vm);
                 xml.push_str(&format!(
                     "    <msg.mwi.{}.subscribe=\"{}\" msg.mwi.{}.callBackMode=\"contact\" msg.mwi.{}.callBack=\"{}\" />\n",
                     line.index, vm, line.index, line.index, vm
@@ -66,14 +72,17 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
             if let Some(cf) = &line.call_forward {
                 let i = line.index;
                 if let Some(all) = &cf.all {
+                    let all = xml_attr(all);
                     xml.push_str(&format!(
                         "    <divert.{i}.autoOnSpecificCaller=\"1\" divert.{i}.contact=\"{all}\" />\n"
                     ));
                 }
                 if let Some(busy) = &cf.busy {
+                    let busy = xml_attr(busy);
                     xml.push_str(&format!("    <divert.{i}.busy.contact=\"{busy}\" />\n"));
                 }
                 if let Some(na) = &cf.no_answer {
+                    let na = xml_attr(na);
                     xml.push_str(&format!(
                         "    <divert.{i}.noanswer.contact=\"{na}\" divert.{i}.noanswer.timeout=\"{}\" />\n",
                         cf.no_answer_timeout
@@ -89,7 +98,10 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
         for sd in &phone.speed_dials {
             xml.push_str(&format!(
                 "  <sd sd.{}.label=\"{}\" sd.{}.number=\"{}\" />\n",
-                sd.index, sd.label, sd.index, sd.number
+                sd.index,
+                xml_attr(&sd.label),
+                sd.index,
+                xml_attr(&sd.number)
             ));
         }
         xml.push('\n');
@@ -100,7 +112,10 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
         for blf in &phone.blf_entries {
             xml.push_str(&format!(
                 "  <attendant attendant.{}.address=\"{}\" attendant.{}.label=\"{}\" />\n",
-                blf.index, blf.address, blf.index, blf.label
+                blf.index,
+                xml_attr(&blf.address),
+                blf.index,
+                xml_attr(&blf.label)
             ));
         }
         xml.push('\n');
@@ -125,6 +140,7 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
     if phone.display.ntp_server.is_some() || !phone.display.time_24hr {
         xml.push_str("  <tcpIpApp.sntp");
         if let Some(ntp) = &phone.display.ntp_server {
+            let ntp = xml_attr(ntp);
             xml.push_str(&format!(" tcpIpApp.sntp.address=\"{ntp}\""));
         }
         xml.push_str(&format!(
@@ -136,6 +152,7 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
 
     // Display language
     if let Some(lang) = &phone.display.language {
+        let lang = xml_attr(lang);
         xml.push_str(&format!("  <lcl.ml.lang=\"{lang}\" />\n\n"));
     }
 
@@ -144,6 +161,7 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
         && let (Some(server), Some(base_dn)) =
             (&phone.directory.ldap_server, &phone.directory.ldap_base_dn)
     {
+        let (server, base_dn) = (xml_attr(server), xml_attr(base_dn));
         xml.push_str(&format!(
             "  <dir.corp.address=\"{server}\" dir.corp.baseDN=\"{base_dn}\"",
         ));
@@ -151,9 +169,11 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
             xml.push_str(&format!(" dir.corp.port=\"{port}\""));
         }
         if let Some(bind_dn) = &phone.directory.ldap_bind_dn {
+            let bind_dn = xml_attr(bind_dn);
             xml.push_str(&format!(" dir.corp.user=\"{bind_dn}\""));
         }
         if let Some(pw) = &phone.directory.ldap_password {
+            let pw = xml_attr(pw);
             xml.push_str(&format!(" dir.corp.password=\"{pw}\""));
         }
         xml.push_str(" />\n\n");

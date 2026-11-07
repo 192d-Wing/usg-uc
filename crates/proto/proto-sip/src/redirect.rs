@@ -283,44 +283,17 @@ pub fn parse_redirect_response(
 
 /// Splits a Contact header value that may contain multiple contacts.
 ///
-/// Handles quoted strings and angle brackets properly.
+/// Thin wrapper over [`crate::list::split_list`] (byte-indexed,
+/// quoted-pair aware). The `*` wildcard is returned as-is. A value that
+/// cannot be split (unterminated quote/angle) or exceeds
+/// [`crate::MAX_LIST_ELEMENTS`] yields no contacts.
 fn split_contact_header(header: &str) -> Vec<&str> {
     // Handle the special case of "*" (wildcard)
     let header = header.trim();
     if header == "*" {
         return vec![header];
     }
-
-    let mut result = Vec::new();
-    let mut start = 0;
-    let mut in_quotes = false;
-    let mut in_angle = false;
-
-    let chars: Vec<char> = header.chars().collect();
-
-    for (i, &c) in chars.iter().enumerate() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            '<' if !in_quotes => in_angle = true,
-            '>' if !in_quotes => in_angle = false,
-            ',' if !in_quotes && !in_angle => {
-                let entry = header[start..i].trim();
-                if !entry.is_empty() {
-                    result.push(entry);
-                }
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-
-    // Add last entry
-    let entry = header[start..].trim();
-    if !entry.is_empty() {
-        result.push(entry);
-    }
-
-    result
+    crate::list::split_list_bounded(header, crate::MAX_LIST_ELEMENTS).unwrap_or_default()
 }
 
 /// Redirect handler for managing redirect attempts.
@@ -601,6 +574,14 @@ mod tests {
         let parts = split_contact_header(header);
         assert_eq!(parts.len(), 2);
         assert!(parts[0].contains("Name, Jr."));
+
+        // Multibyte display name before the comma (used to panic).
+        let header = "\"Ünïcödé\" <sip:a@example.com>, <sip:b@example.com>";
+        assert_eq!(split_contact_header(header).len(), 2);
+        // Escaped quote inside the display name.
+        let header = r#""a \" , b" <sip:a@example.com>, <sip:b@example.com>"#;
+        assert_eq!(split_contact_header(header).len(), 2);
+        assert_eq!(split_contact_header(" * "), vec!["*"]);
     }
 
     #[test]
