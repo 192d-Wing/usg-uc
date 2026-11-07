@@ -364,6 +364,7 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
 ### Fixed
 
+- **Route-pattern digit manipulation reaches the daemon** — route patterns created or updated through the REST API accept `transform_type` / `transform_value` (`strip_prefix`, `add_prefix`, `replace_prefix`, `replace`, same spelling as dial-plan entries), the API rejects malformed values with 400, the daemon's sync path sets the transform on the `SbcRouter` pattern, and the dashboard form exposes it. Previously the field was dropped and every API-created pattern routed with no transform (`sbc-daemon`, `sbc-api-server`, `sbc-dashboard`, closes #144)
 - **SBC:** at registration capacity, the full STIR flow-table sweep is now
   rate-limited to once per second. Before, it ran under the location write
   lock on every new-flow REGISTER (POA&M-35).
