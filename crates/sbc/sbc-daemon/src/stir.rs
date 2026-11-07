@@ -273,6 +273,37 @@ impl CallIdHash {
     }
 }
 
+/// Loud warning for verify trunks with an empty `x5u` allow-list: any
+/// public host is fetched, so the fetch pool is protected only by the
+/// per-host and per-source budgets. Not an error: SHAKEN certificates are
+/// served from STI-CA-chosen hosts. RFC 8224 §7.3 only asks for caution
+/// when dereferencing `info` URIs; host restriction is ATIS-1000080 /
+/// local policy. `None` when no warning applies.
+///
+/// ## NIST 800-53 Rev5: SC-5, SC-7, CM-6 (POA&M-190)
+pub fn allow_list_warning(config: &SbcConfig) -> Option<String> {
+    let ss = &config.stir_shaken;
+    let v = &ss.verification;
+    let verify_trunks = config
+        .trunk_groups
+        .iter()
+        .flat_map(|g| &g.trunks)
+        .filter(|t| t.stir_shaken.verify)
+        .count();
+    (ss.verification_enabled && verify_trunks > 0 && v.x5u_allow_hosts.is_empty()).then(|| {
+        format!(
+            "stir_shaken.verification.x5u_allow_hosts is EMPTY with {verify_trunks} verify \
+             trunk(s): x5u certificates are fetched from ANY public host; fetch pool \
+             bounded only by max_concurrent_fetches={}, {} per x5u host and \
+             max_fetches_per_source={} per SIP source. Set x5u_allow_hosts to the \
+             STI-CA repositories you trust",
+            v.max_concurrent_fetches,
+            uc_sti::cache::MAX_FETCHES_PER_HOST,
+            v.max_fetches_per_source,
+        )
+    })
+}
+
 impl StirService {
     /// Builds the service from configuration. Returns `Ok(None)` when both
     /// signing and verification are disabled.
@@ -370,6 +401,7 @@ impl StirService {
                     fetch_timeout: Duration::from_millis(v.cert_fetch_timeout_ms),
                     max_concurrent_fetches: v.max_concurrent_fetches,
                     allow_hosts: v.x5u_allow_hosts.clone(),
+                    max_fetches_per_source: v.max_fetches_per_source,
                 },
                 Arc::new(fetcher),
                 Arc::new(AnchorStore::new(set)),
@@ -401,6 +433,9 @@ impl StirService {
                     ingress.insert(ip, (t.id.clone(), t.stir_shaken));
                 }
             }
+        }
+        if let Some(msg) = allow_list_warning(config) {
+            warn!("{msg}");
         }
         Ok(Some(Self {
             signing,
@@ -595,7 +630,15 @@ impl StirService {
                         Ok(k)
                     } else {
                         self.metrics.parked.fetch_add(1, Ordering::Relaxed);
-                        let r = v.cache.get_or_fetch(p.x5u(), v.fetch_timeout).await;
+                        // POA&M-190: new fetches are charged to the SIP
+                        // source's budget (SC-5).
+                        // POAM: POA&M-196, on UDP trunks the source IP can be
+                        // spoofed (bounded: it must still match a verify
+                        // trunk address), so attribution is best effort.
+                        let r = v
+                            .cache
+                            .get_or_fetch_from(source, p.x5u(), v.fetch_timeout)
+                            .await;
                         self.metrics.parked.fetch_sub(1, Ordering::Relaxed);
                         r.map_err(|e| e.reason())
                     };
@@ -1066,6 +1109,7 @@ pub mod test_support {
                     fetch_timeout: std::time::Duration::from_millis(v.cert_fetch_timeout_ms),
                     max_concurrent_fetches: v.max_concurrent_fetches,
                     allow_hosts: v.x5u_allow_hosts.clone(),
+                    max_fetches_per_source: v.max_fetches_per_source,
                 },
                 source,
                 anchors,
@@ -1087,6 +1131,39 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// POA&M-190: loud warning only when verification is on, a trunk
+    /// verifies, and the allow-list is empty.
+    #[test]
+    fn allow_list_warning_only_for_open_verify() {
+        let mut c = SbcConfig::default();
+        c.stir_shaken.verification_enabled = true;
+        assert!(allow_list_warning(&c).is_none(), "no verify trunk");
+        c.trunk_groups.push(sbc_config::TrunkGroupConfig {
+            id: "g".into(),
+            name: String::new(),
+            strategy: "priority".into(),
+            trunks: vec![sbc_config::TrunkConfigSchema {
+                id: "v".into(),
+                host: "192.0.2.10".into(),
+                stir_shaken: TrunkStirConfig {
+                    verify: true,
+                    ..TrunkStirConfig::default()
+                },
+                ..Default::default()
+            }],
+            zone: None,
+            require_tls: false,
+        });
+        let msg = allow_list_warning(&c).unwrap();
+        assert!(msg.contains("x5u_allow_hosts is EMPTY"), "{msg}");
+        assert!(msg.contains("max_fetches_per_source=4"), "{msg}");
+        c.stir_shaken.verification.x5u_allow_hosts = vec!["cr.example.com".into()];
+        assert!(allow_list_warning(&c).is_none());
+        c.stir_shaken.verification.x5u_allow_hosts.clear();
+        c.stir_shaken.verification_enabled = false;
+        assert!(allow_list_warning(&c).is_none());
     }
 
     #[test]

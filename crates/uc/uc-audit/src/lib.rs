@@ -724,6 +724,26 @@ mod tests {
         }
     }
 
+    /// Regression (BACKLOG NIT, fixed by #174): timestamp and sequence are
+    /// both assigned in the writer, so timestamps never decrease along the
+    /// sequence order. NIST 800-53 Rev5: AU-8, AU-3
+    #[test]
+    fn timestamps_non_decreasing_in_sequence_order() {
+        let mem = Arc::new(sink::MemorySink::new());
+        let counters = Arc::new(AuditCounters::new());
+        let mut logger =
+            AuditLogger::new(Box::new(Shared(Arc::clone(&mem))), Arc::clone(&counters));
+        for i in 0..50 {
+            logger.log(shutdown_ev(i));
+        }
+        let records = mem.records();
+        assert_eq!(records.len(), 50);
+        for w in records.windows(2) {
+            assert_eq!(w[1].sequence, w[0].sequence + 1);
+            assert!(w[1].timestamp >= w[0].timestamp);
+        }
+    }
+
     #[test]
     fn failing_sink_counts_and_does_not_advance_chain() {
         let mem = Arc::new(sink::MemorySink::new());

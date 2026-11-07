@@ -165,11 +165,11 @@ impl AppState {
         // NIST 800-53 Rev5: SC-28(1), SC-12, IA-5(1)(c)
         let ha1_key = crate::ha1_key::load_ha1_key(&cfg.user_ha1_key_file)?;
         uc_audit::log_event(uc_audit::AuditEvent::CryptoKeyOperation(
-            uc_audit::event::CryptoKeyOperation {
-                key_id: "sbc-user-ha1".to_string(),
-                operation: uc_audit::event::KeyOperationType::Loaded,
-                algorithm: "AES-256-GCM".to_string(),
-            },
+            uc_audit::event::CryptoKeyOperation::success(
+                "sbc-user-ha1",
+                uc_audit::event::KeyOperationType::Loaded,
+                "AES-256-GCM",
+            ),
         ));
         let users = Arc::new(EncryptedUserStore::new(
             PostgresUserStore::new(&cfg.database_url)

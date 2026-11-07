@@ -72,8 +72,15 @@ pub struct SbcRouter {
     partitions: HashMap<String, Partition>,
     /// Calling Search Spaces indexed by ID.
     css_list: HashMap<String, CallingSearchSpace>,
-    /// All route patterns (searched linearly per partition).
+    /// All route patterns, in insertion order (listing order).
     route_patterns: Vec<RoutePattern>,
+    /// Indices into `route_patterns` per partition, in insertion order, so
+    /// routing walks only the CSS partitions' own patterns (POA&M-192).
+    /// Keyed by operator-configured partition ids, bounded by the pattern
+    /// count; rebuilt on removal.
+    ///
+    /// NIST 800-53 Rev5: SC-5 (bounded per-call work)
+    by_partition: HashMap<String, Vec<usize>>,
     /// Route lists indexed by ID.
     route_lists: HashMap<String, RouteList>,
     /// Route groups (trunk groups) indexed by ID.
@@ -89,6 +96,7 @@ impl SbcRouter {
             partitions: HashMap::new(),
             css_list: HashMap::new(),
             route_patterns: Vec::new(),
+            by_partition: HashMap::new(),
             route_lists: HashMap::new(),
             route_groups: HashMap::new(),
             default_css: None,
@@ -149,16 +157,41 @@ impl SbcRouter {
 
     /// Adds a route pattern.
     pub fn add_route_pattern(&mut self, pattern: RoutePattern) {
+        self.by_partition
+            .entry(pattern.partition_id().to_string())
+            .or_default()
+            .push(self.route_patterns.len());
         self.route_patterns.push(pattern);
     }
 
     /// Removes a route pattern by ID. Returns it if found.
+    ///
+    /// O(n): the partition index is rebuilt (control plane only).
     pub fn remove_route_pattern(&mut self, id: &str) -> Option<RoutePattern> {
-        if let Some(pos) = self.route_patterns.iter().position(|rp| rp.id() == id) {
-            Some(self.route_patterns.remove(pos))
-        } else {
-            None
+        let pos = self.route_patterns.iter().position(|rp| rp.id() == id)?;
+        let removed = self.route_patterns.remove(pos);
+        self.rebuild_partition_index();
+        Some(removed)
+    }
+
+    fn rebuild_partition_index(&mut self) {
+        self.by_partition.clear();
+        for (i, rp) in self.route_patterns.iter().enumerate() {
+            self.by_partition
+                .entry(rp.partition_id().to_string())
+                .or_default()
+                .push(i);
         }
+    }
+
+    /// Patterns of `partition_id`, in insertion order.
+    fn patterns_in<'a>(&'a self, partition_id: &str) -> impl Iterator<Item = &'a RoutePattern> {
+        self.by_partition
+            .get(partition_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|&i| self.route_patterns.get(i))
     }
 
     /// Lists all route patterns.
@@ -168,10 +201,7 @@ impl SbcRouter {
 
     /// Lists route patterns belonging to a specific partition.
     pub fn list_route_patterns_by_partition(&self, partition_id: &str) -> Vec<&RoutePattern> {
-        self.route_patterns
-            .iter()
-            .filter(|rp| rp.partition_id() == partition_id)
-            .collect()
+        self.patterns_in(partition_id).collect()
     }
 
     // ---- Route List CRUD ----
@@ -301,25 +331,21 @@ impl SbcRouter {
     /// ## NIST 800-53 Rev5: AC-3 (Access Enforcement)
     fn blocked_in_partition(&self, partition_id: &str, digits: &str) -> Option<&RoutePattern> {
         let national = digits.strip_prefix('+');
-        self.route_patterns.iter().find(|rp| {
-            rp.partition_id() == partition_id
-                && rp.is_blocked()
-                && (rp.matches(digits) || national.is_some_and(|n| rp.matches(n)))
+        self.patterns_in(partition_id).find(|rp| {
+            rp.is_blocked() && (rp.matches(digits) || national.is_some_and(|n| rp.matches(n)))
         })
     }
 
     /// Returns enabled, non-blocked patterns in the given partition that match `digits`.
+    ///
+    /// Walks only the partition's indexed patterns and does not allocate.
     fn matching_patterns_in_partition<'a>(
         &'a self,
         partition_id: &str,
-        digits: &str,
-    ) -> Vec<&'a RoutePattern> {
-        self.route_patterns
-            .iter()
-            .filter(|rp| {
-                rp.partition_id() == partition_id && !rp.is_blocked() && rp.matches(digits)
-            })
-            .collect()
+        digits: &'a str,
+    ) -> impl Iterator<Item = &'a RoutePattern> {
+        self.patterns_in(partition_id)
+            .filter(move |rp| !rp.is_blocked() && rp.matches(digits))
     }
 
     /// Heuristic specificity score for tie-breaking: longer literal prefix = more specific.
@@ -732,5 +758,134 @@ mod tests {
         assert!(result.is_some());
         // pt-a is checked first; it has a match, so pt-b is never considered.
         assert_eq!(result.unwrap().partition_id, "pt-a");
+    }
+
+    /// Reference: the pre-index linear scan (POA&M-192 equivalence oracle).
+    fn reference_route(router: &SbcRouter, digits: &str, css_id: &str) -> Option<(bool, String)> {
+        let css = router.css_list.get(css_id)?;
+        let national = digits.strip_prefix('+');
+        for pt in css.partitions() {
+            if let Some(rp) = router.route_patterns.iter().find(|rp| {
+                rp.partition_id() == pt
+                    && rp.is_blocked()
+                    && (rp.matches(digits) || national.is_some_and(|n| rp.matches(n)))
+            }) {
+                return Some((true, rp.id().to_string()));
+            }
+            let mut best: Option<&RoutePattern> = None;
+            let mut best_spec = 0;
+            for rp in router
+                .route_patterns
+                .iter()
+                .filter(|rp| rp.partition_id() == pt && !rp.is_blocked() && rp.matches(digits))
+            {
+                let spec = SbcRouter::pattern_specificity(rp, digits);
+                let better = best.is_none_or(|c| match spec.cmp(&best_spec) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => rp.priority() < c.priority(),
+                    std::cmp::Ordering::Less => false,
+                });
+                if better {
+                    best = Some(rp);
+                    best_spec = spec;
+                }
+            }
+            if let Some(b) = best {
+                return Some((false, b.id().to_string()));
+            }
+        }
+        None
+    }
+
+    fn outcome_key(o: &SbcRouteOutcome) -> Option<(bool, String)> {
+        match o {
+            SbcRouteOutcome::Routed(r) => Some((false, r.pattern_id.clone())),
+            SbcRouteOutcome::Blocked { pattern_id, .. } => Some((true, pattern_id.clone())),
+            SbcRouteOutcome::NoMatch => None,
+        }
+    }
+
+    /// POA&M-192: the partition-indexed router decides exactly like the
+    /// linear scan over random patterns, partitions, CSS orders and
+    /// numbers (incl. `+` strip and blocked-first ordering), across
+    /// add/remove/re-add.
+    #[test]
+    fn partition_index_matches_linear_reference() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let prefixes = ["1", "19", "1900", "1202", "911", "011", "2", "20", "5"];
+        for round in 0..40 {
+            let mut router = SbcRouter::new();
+            let parts = 1 + next(6);
+            for p in 0..parts {
+                router.add_partition(Partition::new(format!("pt{p}"), "p"));
+            }
+            let n = 1 + next(60);
+            for k in 0..n {
+                let pre = prefixes[usize::try_from(next(prefixes.len() as u64)).unwrap()];
+                let pattern = match next(3) {
+                    0 => DialPattern::prefix(pre),
+                    1 => DialPattern::exact(format!("{pre}5551212")),
+                    _ => DialPattern::Any,
+                };
+                let rp = RoutePattern::new(format!("rp{k}"), pattern, format!("pt{}", next(parts)))
+                    .with_route_group("tg")
+                    .with_priority(u32::try_from(next(5)).unwrap())
+                    .with_block(next(4) == 0);
+                router.add_route_pattern(rp);
+            }
+            // Remove and re-add some patterns to exercise index rebuild.
+            for _ in 0..next(5) {
+                let id = format!("rp{}", next(n));
+                if let Some(rp) = router.remove_route_pattern(&id)
+                    && next(2) == 0
+                {
+                    router.add_route_pattern(rp);
+                }
+            }
+            let mut css = CallingSearchSpace::new("css", "css");
+            for _ in 0..=next(parts + 1) {
+                css.add_partition(format!("pt{}", next(parts + 1)));
+            }
+            router.add_css(css);
+            for num in [
+                "19005551212",
+                "+19005551212",
+                "12025551212",
+                "911",
+                "9115551212",
+                "0115551212",
+                "205551212",
+                "55555",
+                "alice",
+            ] {
+                assert_eq!(
+                    outcome_key(&router.route(num, Some("css"))),
+                    reference_route(&router, num, "css"),
+                    "round {round} number {num}"
+                );
+            }
+            // Listing by partition agrees with a filter over the full list.
+            for p in 0..=parts {
+                let pt = format!("pt{p}");
+                let by: Vec<&str> = router
+                    .list_route_patterns_by_partition(&pt)
+                    .iter()
+                    .map(|r| r.id())
+                    .collect();
+                let all: Vec<&str> = router
+                    .list_route_patterns()
+                    .iter()
+                    .filter(|r| r.partition_id() == pt)
+                    .map(|r| r.id())
+                    .collect();
+                assert_eq!(by, all);
+            }
+        }
     }
 }
