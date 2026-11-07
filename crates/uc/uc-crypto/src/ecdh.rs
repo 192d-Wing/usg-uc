@@ -17,7 +17,8 @@ use zeroize::Zeroize;
 /// P-384 ECDH ephemeral key pair for key exchange.
 ///
 /// This key pair is designed for single-use key exchange operations.
-/// The private key is automatically zeroed when dropped.
+/// The private key is an opaque aws-lc object; aws-lc cleanses it when it
+/// is freed (on drop or when consumed by agreement). Rust code cannot wipe it.
 ///
 /// ## NIST 800-53 Rev5: SC-12 (Cryptographic Key Establishment)
 pub struct P384EphemeralKeyPair {

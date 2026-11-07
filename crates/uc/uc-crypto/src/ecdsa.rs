@@ -12,20 +12,29 @@
 use crate::error::{CryptoError, CryptoResult};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{
-    ECDSA_P384_SHA384_ASN1, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair, KeyPair,
+    ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1, ECDSA_P384_SHA384_ASN1_SIGNING,
+    ECDSA_P521_SHA512_ASN1_SIGNING, EcdsaKeyPair, EcdsaSigningAlgorithm, KeyPair,
     UnparsedPublicKey,
 };
-use zeroize::ZeroizeOnDrop;
+use zeroize::Zeroizing;
 
 /// P-384 ECDSA key pair for signing operations.
 ///
-/// ## NIST 800-53 Rev5: SC-12 (Cryptographic Key Establishment)
-#[derive(ZeroizeOnDrop)]
+/// ## Key material lifecycle
+///
+/// - The PKCS#8 DER copy owned by this struct is held in
+///   [`Zeroizing`] and wiped on drop.
+/// - The parsed key (`EcdsaKeyPair`) is an opaque aws-lc `EVP_PKEY`; aws-lc
+///   clears the private scalar when it is freed (`EC_KEY_free` ->
+///   `BN_clear_free`). Rust code cannot wipe it.
+/// - Not covered: the caller's input slice to [`Self::from_pkcs8`], and
+///   copies the caller makes from [`Self::pkcs8_bytes`].
+///
+/// ## NIST 800-53 Rev5: SC-12 (Cryptographic Key Establishment), SC-4, SI-16
+// NIST 800-53 Rev5: SC-12, SC-4 (POA&M-162 closed: PKCS#8 bytes held in `Zeroizing`).
 pub struct P384KeyPair {
-    #[zeroize(skip)]
     inner: EcdsaKeyPair,
-    #[zeroize(skip)]
-    pkcs8_bytes: Vec<u8>,
+    pkcs8_bytes: Zeroizing<Vec<u8>>,
 }
 
 impl P384KeyPair {
@@ -47,9 +56,10 @@ impl P384KeyPair {
         let inner = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8_bytes.as_ref())
             .map_err(|_| CryptoError::InvalidKeyMaterial)?;
 
+        // aws-lc-rs `pkcs8::Document` zeroizes its own buffer on drop.
         Ok(Self {
             inner,
-            pkcs8_bytes: pkcs8_bytes.as_ref().to_vec(),
+            pkcs8_bytes: Zeroizing::new(pkcs8_bytes.as_ref().to_vec()),
         })
     }
 
@@ -67,7 +77,7 @@ impl P384KeyPair {
 
         Ok(Self {
             inner,
-            pkcs8_bytes: pkcs8_bytes.to_vec(),
+            pkcs8_bytes: Zeroizing::new(pkcs8_bytes.to_vec()),
         })
     }
 
@@ -114,6 +124,49 @@ impl std::fmt::Debug for P384KeyPair {
             .field("private_key", &"[REDACTED]")
             .finish()
     }
+}
+
+/// Elliptic curve of an EC private key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EcCurve {
+    /// NIST P-256 (not permitted by CNSA 1.0 or this repo's policy).
+    P256,
+    /// NIST P-384 (the CNSA 1.0 ECDSA curve; transitional under CNSA 2.0).
+    P384,
+    /// NIST P-521 (not a CNSA curve; accepted by repo policy, `CnsaCurve`).
+    P521,
+}
+
+impl std::fmt::Display for EcCurve {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::P256 => "P-256",
+            Self::P384 => "P-384",
+            Self::P521 => "P-521",
+        })
+    }
+}
+
+/// Identifies the curve of a DER private key (PKCS#8 or SEC1).
+///
+/// Returns `None` for non-EC keys (e.g. RSA), unsupported curves, or
+/// malformed input. Used to enforce the configured CNSA curve on loaded
+/// keys; P-256 is recognised only so it can be rejected.
+///
+/// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection)
+// NIST 800-53 Rev5: SC-13 (library half of POA&M-166: key curve check at load).
+#[must_use]
+pub fn ec_private_key_curve(der: &[u8]) -> Option<EcCurve> {
+    const CANDIDATES: [(EcCurve, &EcdsaSigningAlgorithm); 3] = [
+        (EcCurve::P384, &ECDSA_P384_SHA384_ASN1_SIGNING),
+        (EcCurve::P521, &ECDSA_P521_SHA512_ASN1_SIGNING),
+        (EcCurve::P256, &ECDSA_P256_SHA256_ASN1_SIGNING),
+    ];
+    CANDIDATES.iter().find_map(|(curve, alg)| {
+        (EcdsaKeyPair::from_pkcs8(alg, der).is_ok()
+            || EcdsaKeyPair::from_private_key_der(alg, der).is_ok())
+        .then_some(*curve)
+    })
 }
 
 /// Verifies a P-384 ECDSA signature.
@@ -275,6 +328,59 @@ mod tests {
         let signature = keypair.sign(message).unwrap();
 
         pubkey.verify(message, &signature).unwrap();
+    }
+
+    // POA&M-162 (closed): the PKCS#8 copy is `Zeroizing`, so its drop wipes it.
+    #[test]
+    fn test_pkcs8_bytes_zeroizing() {
+        use zeroize::{Zeroize, ZeroizeOnDrop};
+        fn assert_zod<T: ZeroizeOnDrop>(_: &T) {}
+
+        let keypair = P384KeyPair::generate().unwrap();
+        assert_zod(&keypair.pkcs8_bytes);
+        let P384KeyPair {
+            pkcs8_bytes: mut der,
+            ..
+        } = keypair;
+        assert!(der.iter().any(|b| *b != 0));
+        der.zeroize();
+        assert!(der.is_empty());
+    }
+
+    #[test]
+    fn test_ec_private_key_curve() {
+        let rng = SystemRandom::new();
+        for (alg, want) in [
+            (&ECDSA_P256_SHA256_ASN1_SIGNING, EcCurve::P256),
+            (&ECDSA_P384_SHA384_ASN1_SIGNING, EcCurve::P384),
+            (&ECDSA_P521_SHA512_ASN1_SIGNING, EcCurve::P521),
+        ] {
+            let doc = EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
+            assert_eq!(ec_private_key_curve(doc.as_ref()), Some(want));
+        }
+        assert_eq!(ec_private_key_curve(b""), None);
+        assert_eq!(ec_private_key_curve(&[0x30, 0x82, 0xff, 0xff, 0x02]), None);
+    }
+
+    #[test]
+    fn test_ec_private_key_curve_rejects_non_ec_and_accepts_sec1() {
+        use aws_lc_rs::encoding::AsDer;
+        // RSA PKCS#8 must not be classified as any EC curve.
+        let rsa = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
+        let rsa_der = rsa.as_der().unwrap();
+        assert_eq!(ec_private_key_curve(rsa_der.as_ref()), None);
+        // Ed25519 PKCS#8 is not an ECDSA curve either.
+        let rng = SystemRandom::new();
+        let ed = aws_lc_rs::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        assert_eq!(ec_private_key_curve(ed.as_ref()), None);
+        // SEC1 ("EC PRIVATE KEY") encoding of a P-384 key is recognised.
+        let kp = EcdsaKeyPair::generate(&ECDSA_P384_SHA384_ASN1_SIGNING).unwrap();
+        let sec1 = kp.private_key().as_der().unwrap();
+        assert_eq!(ec_private_key_curve(sec1.as_ref()), Some(EcCurve::P384));
+        // Truncated PKCS#8 is rejected.
+        let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, &rng).unwrap();
+        let bytes = doc.as_ref();
+        assert_eq!(ec_private_key_curve(&bytes[..bytes.len() / 2]), None);
     }
 
     #[test]

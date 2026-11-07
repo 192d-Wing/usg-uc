@@ -92,7 +92,7 @@ fn validate_cnsa_curve(curve: CnsaCurve) {
 }
 ```
 
-Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_version` (`"1.3"` default, `"1.2"` allowed) is applied to the SIP-TLS listeners (`uc-transport::tls::create_server_config_with`); the REST HTTPS listener uses rustls defaults regardless. `security.curve` is validated as an enum but **no code checks the key type of the loaded certificate**.
+Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_version` (`"1.3"` default, `"1.2"` allowed) is applied to the SIP-TLS listeners (`uc-transport::tls::create_server_config_with`); the REST HTTPS listener uses rustls defaults regardless. `security.curve` is validated as an enum. **Load-time key curve check:** `uc_transport::tls::load_private_key`, which sbc-daemon uses for SIP-TLS and trunk keys and which the REST `ReloadableTlsAcceptor` uses, rejects RSA and P-256 private keys and accepts only ECDSA P-384 or P-521, at startup and on reload. P-384 is the CNSA ECDSA curve. P-521 is accepted under repository policy and is not a CNSA 2.0 algorithm. The daemon does not yet pass `security.curve` for an exact match (POA&M-166). The certificate's public key is not checked separately. Tests: `tls::tests::key_file::curve_enforced`, `cert_reload::tests::test_reload_rejects_p256_key_swap`.
 
 ## Protocol-Specific Compliance
 

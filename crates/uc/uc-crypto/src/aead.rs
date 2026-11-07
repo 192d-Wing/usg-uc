@@ -14,7 +14,7 @@ use crate::random;
 use aws_lc_rs::aead::{
     self, AES_256_GCM, Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey,
 };
-use zeroize::ZeroizeOnDrop;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// AES-256-GCM key length in bytes.
 pub const KEY_LEN: usize = 32;
@@ -27,17 +27,30 @@ pub const TAG_LEN: usize = 16;
 
 /// AES-256-GCM key for AEAD operations.
 ///
-/// The key material is automatically zeroed when dropped.
+/// ## Key material lifecycle
 ///
-/// ## NIST 800-53 Rev5: SC-12 (Cryptographic Key Establishment)
-#[derive(ZeroizeOnDrop)]
+/// - The 32-byte key array owned by this struct is wiped when the key is
+///   dropped (`ZeroizeOnDrop`).
+/// - Each `seal`/`open` builds a short-lived aws-lc AES key schedule from
+///   these bytes. aws-lc wipes it (`EVP_AEAD_CTX_cleanup` ->
+///   `OPENSSL_cleanse`) when it is freed at the end of the call; Rust cannot
+///   reach it.
+/// - Not covered: the caller's copy of the array passed to [`Self::new`]
+///   (`[u8; 32]` is `Copy`; zeroize it yourself), and stack copies the
+///   compiler may leave when the key is moved.
+///
+/// ## NIST 800-53 Rev5: SC-12 (Cryptographic Key Establishment), SC-4, SI-16
+// NIST 800-53 Rev5: SC-12, SC-4 (POA&M-160 closed: key array wiped on drop).
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Aes256GcmKey {
-    #[zeroize(skip)] // aws-lc-rs handles its own memory
     key_bytes: [u8; KEY_LEN],
 }
 
 impl Aes256GcmKey {
     /// Creates a new key from raw bytes.
+    ///
+    /// The array is copied in; the caller still owns (and should zeroize)
+    /// its own copy.
     ///
     /// ## Errors
     ///
@@ -58,8 +71,11 @@ impl Aes256GcmKey {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn generate() -> CryptoResult<Self> {
-        let key_bytes = random::generate_key_256()?;
-        Ok(Self { key_bytes })
+        let mut key_bytes = random::generate_key_256()?;
+        let key = Self { key_bytes };
+        // `[u8; 32]` is `Copy`: wipe the local so only `key` holds it.
+        key_bytes.zeroize();
+        Ok(key)
     }
 
     /// Returns the raw key bytes.
@@ -104,7 +120,9 @@ impl Aes256GcmKey {
 
     /// Decrypts ciphertext with additional authenticated data.
     ///
-    /// The ciphertext must include the authentication tag at the end.
+    /// The ciphertext must include the authentication tag at the end. The
+    /// returned plaintext is owned by the caller, who is responsible for
+    /// wiping it if it is sensitive (e.g. wrap it in `zeroize::Zeroizing`).
     ///
     /// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection)
     ///
@@ -127,12 +145,18 @@ impl Aes256GcmKey {
         let nonce_seq = SingleNonce::new(*nonce);
         let mut opening_key = OpeningKey::new(unbound_key, nonce_seq);
 
+        // NIST 800-53 Rev5: SC-4 (POA&M-161 closed): decrypt in place and hand back the same buffer; the
+        // former `plaintext.to_vec()` left an unwiped plaintext copy behind.
         let mut in_out = ciphertext.to_vec();
-        let plaintext = opening_key
+        let Ok(plaintext_len) = opening_key
             .open_in_place(Aad::from(aad), &mut in_out)
-            .map_err(|_| CryptoError::OpenFailed)?;
-
-        Ok(plaintext.to_vec())
+            .map(|p| p.len())
+        else {
+            in_out.zeroize();
+            return Err(CryptoError::OpenFailed);
+        };
+        in_out.truncate(plaintext_len);
+        Ok(in_out)
     }
 }
 
@@ -154,6 +178,9 @@ impl std::fmt::Debug for Aes256GcmKey {
 /// Uses `LessSafeKey` from aws-lc-rs, which requires the caller to manage
 /// nonce uniqueness (appropriate for SRTP where nonces are derived from
 /// packet index + SSRC).
+///
+/// The expanded key lives inside an opaque aws-lc `EVP_AEAD_CTX`; aws-lc
+/// cleanses it when this value is dropped. Rust code cannot wipe it.
 pub struct CachedAeadKey {
     inner: aead::LessSafeKey,
 }
@@ -215,11 +242,15 @@ impl CachedAeadKey {
 
         let nonce = Nonce::assume_unique_for_key(*nonce);
         let mut in_out = ciphertext.to_vec();
-        let plaintext_len = self
+        let Ok(plaintext_len) = self
             .inner
             .open_in_place(nonce, Aad::from(aad), &mut in_out)
-            .map_err(|_| CryptoError::OpenFailed)?
-            .len();
+            .map(|p| p.len())
+        else {
+            // NIST 800-53 Rev5: SC-4 (POA&M-161 closed): wipe the working buffer on failure as well.
+            in_out.zeroize();
+            return Err(CryptoError::OpenFailed);
+        };
 
         // Truncate in-place instead of copying: open_in_place returns
         // a subslice of in_out (ciphertext minus the 16-byte auth tag).
@@ -255,7 +286,8 @@ impl CachedAeadKey {
     /// Decrypts ciphertext into a caller-provided buffer, avoiding allocation.
     ///
     /// The buffer is cleared and filled with ciphertext, then decrypted
-    /// in-place. On return it contains the plaintext (tag stripped).
+    /// in-place. On return it contains the plaintext (tag stripped). The
+    /// caller owns `buf` and is responsible for wiping it.
     ///
     /// # Errors
     /// Returns an error if decryption or authentication fails.
@@ -414,6 +446,65 @@ mod tests {
         let (nonce, ciphertext) = seal_with_random_nonce(&key, aad, plaintext).unwrap();
         let decrypted = key.open(&nonce, aad, &ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    // POA&M-160 (closed): the derive set must cover the key array. `Zeroize` and
+    // `ZeroizeOnDrop` are derived over the same fields, so wiping through
+    // `Zeroize` proves the drop path reaches `key_bytes`.
+    #[test]
+    fn test_key_zeroize_wipes_key_bytes() {
+        fn assert_zod<T: ZeroizeOnDrop>() {}
+        assert_zod::<Aes256GcmKey>();
+
+        let mut key = Aes256GcmKey::new([0xA5; KEY_LEN]).unwrap();
+        assert_eq!(key.as_bytes(), &[0xA5; KEY_LEN]);
+        key.zeroize();
+        assert_eq!(key.as_bytes(), &[0u8; KEY_LEN]);
+    }
+
+    #[test]
+    fn test_open_returns_single_buffer() {
+        let key = Aes256GcmKey::generate().unwrap();
+        let nonce = random::generate_nonce().unwrap();
+        let ct = key.seal(&nonce, b"", b"0123456789").unwrap();
+        let pt = key.open(&nonce, b"", &ct).unwrap();
+        assert_eq!(pt, b"0123456789");
+        // Returned vec is the in-place working buffer (no second copy).
+        assert!(pt.capacity() >= ct.len());
+    }
+
+    #[test]
+    fn test_cached_open_roundtrip_and_failure() {
+        let ck = CachedAeadKey::new(Aes256GcmKey::generate().unwrap().as_bytes()).unwrap();
+        let nonce = random::generate_nonce().unwrap();
+        let mut ct = ck.seal(&nonce, b"a", b"secret").unwrap();
+        let pt = ck.open(&nonce, b"a", &ct).unwrap();
+        assert_eq!(pt, b"secret");
+        assert!(pt.capacity() >= ct.len());
+        ct[0] ^= 1;
+        assert!(ck.open(&nonce, b"a", &ct).is_err());
+    }
+
+    #[test]
+    fn test_open_tag_failure_paths() {
+        let key = Aes256GcmKey::generate().unwrap();
+        let nonce = random::generate_nonce().unwrap();
+        let ct = key.seal(&nonce, b"aad", b"secret plaintext").unwrap();
+        // Shorter than the tag: rejected before any decryption.
+        assert!(key.open(&nonce, b"aad", &ct[..TAG_LEN - 1]).is_err());
+        assert!(key.open(&nonce, b"aad", &[]).is_err());
+        // Tag-only (empty body, wrong tag) and flipped tag byte fail closed.
+        assert!(key.open(&nonce, b"aad", &[0u8; TAG_LEN]).is_err());
+        let mut bad = ct.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        assert!(key.open(&nonce, b"aad", &bad).is_err());
+        // Wrong nonce fails.
+        let mut wrong_nonce = nonce;
+        wrong_nonce[0] ^= 1;
+        assert!(key.open(&wrong_nonce, b"aad", &ct).is_err());
+        // Key remains usable after failures (failure wipe touches only the temp buffer).
+        assert_eq!(key.open(&nonce, b"aad", &ct).unwrap(), b"secret plaintext");
     }
 
     #[test]
