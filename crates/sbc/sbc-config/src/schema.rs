@@ -1716,7 +1716,10 @@ pub struct TrunkManipulationRuleConfig {
 pub struct TopologyHidingConfig {
     /// Whether topology hiding is enabled.
     pub enabled: bool,
-    /// Hiding mode: "none", "`signaling_only`", "full".
+    /// Hiding mode: "`signaling_only`" or "full" when `enabled`; "none" is
+    /// only valid with `enabled = false`. Any other value (including the
+    /// never-enforced "basic", POA&M-183) is rejected by validation
+    /// (NIST 800-53 Rev5: CM-6).
     pub mode: String,
     /// External hostname to present.
     pub external_host: String,
@@ -1979,7 +1982,7 @@ mod tests {
     #[test]
     fn qa_topology_hiding_new_keys_default_and_parse() {
         let old: SbcConfig = toml::from_str(
-            "[topology_hiding]\nenabled = true\nmode = \"basic\"\nexternal_host = \"sbc.example.com\"\n",
+            "[topology_hiding]\nenabled = true\nmode = \"full\"\nexternal_host = \"sbc.example.com\"\n",
         )
         .expect("old TOML loads");
         let t = old.topology_hiding.unwrap();

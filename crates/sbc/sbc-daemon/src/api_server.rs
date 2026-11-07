@@ -449,6 +449,25 @@ pub const ROUTING_METRICS: &[(&str, &str)] = &[
         "sbc_route_pattern_rejected_total",
         "Route patterns rejected for an unknown pattern_type (seed or sync)",
     ),
+    // NIST 800-53 Rev5: SI-4, AU-6 - POA&M-156 fail-closed counters.
+    (
+        "sbc_topology_hiding_failures_total",
+        "Messages dropped or replaced because topology hiding failed (fail closed)",
+    ),
+    (
+        "sbc_header_manipulation_failures_total",
+        "Messages whose header manipulation rules failed",
+    ),
+    // RFC 3261 §13.2.2.4: late INVITE 2xx after release, ACKed and BYE'd.
+    (
+        "sbc_late_invite_2xx_teardown_total",
+        "INVITE 2xx responses received after the call was released, torn down with ACK+BYE",
+    ),
+    // NIST 800-53 Rev5: SI-4, AU-5, SC-5 - deferred-send queue overflow.
+    (
+        "sbc_deferred_send_dropped_total",
+        "SBC-originated requests (e.g. post-announcement BYE) dropped because the deferred-send queue was full",
+    ),
 ];
 /// Gauge: CDRs accepted onto the writer queue.
 pub const METRIC_CDR_EMITTED: &str = "cdr_emitted_total";
@@ -756,7 +775,9 @@ impl AppState {
             let c = stack.routing_counters();
             let load =
                 |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
-            let values = [
+            // Sized by ROUTING_METRICS so a missing value is a compile error
+            // (the zip below would otherwise drop it silently).
+            let values: [u64; ROUTING_METRICS.len()] = [
                 load(&c.route_blocked),
                 load(&c.emergency_force_routed_trunk),
                 load(&c.emergency_force_routed_blocked_ignored),
@@ -764,6 +785,10 @@ impl AppState {
                 load(&c.user_limiter_overflow),
                 load(&c.user_limiter_emergency_bypass),
                 load(&crate::sip_stack::ROUTE_PATTERN_REJECTED),
+                load(&c.topology_hiding_failures),
+                load(&c.header_manipulation_failures),
+                load(&c.late_2xx_teardowns),
+                stack.deferred_send_dropped(),
             ];
             for (&(name, _), v) in ROUTING_METRICS.iter().zip(values) {
                 if let Some(g) = self.metrics.gauge(name) {
@@ -2321,6 +2346,31 @@ mod tests {
             text.contains("sbc_cdr_dropped_writer_dead_total 1"),
             "{text}"
         );
+    }
+
+    // POA&M-180: the fail-closed counters reach the metrics endpoint.
+    #[test]
+    fn metrics_export_topology_and_manipulation_failures() {
+        use std::sync::atomic::Ordering;
+        let stack = crate::sip_stack::SipStack::new(crate::sip_stack::SipStackConfig::default());
+        let c = stack.routing_counters();
+        c.topology_hiding_failures.store(3, Ordering::Relaxed);
+        c.header_manipulation_failures.store(5, Ordering::Relaxed);
+        c.late_2xx_teardowns.store(7, Ordering::Relaxed);
+        stack.set_deferred_send_dropped_for_tests(11);
+        let mut state = AppState::new(SbcMetrics::standard(), Arc::new(ServerStats::default()));
+        state.sip_stack = Some(Arc::new(stack));
+        state.refresh_daemon_metrics();
+        let text = state.metrics.export();
+        for (name, v) in [
+            ("sbc_topology_hiding_failures_total", 3),
+            ("sbc_header_manipulation_failures_total", 5),
+            ("sbc_late_invite_2xx_teardown_total", 7),
+            ("sbc_deferred_send_dropped_total", 11),
+        ] {
+            let want = format!("{name} {v}");
+            assert!(text.lines().any(|l| l.ends_with(&want)), "{want}: {text}");
+        }
     }
 
     /// Stats with the writer alive and the given loss.

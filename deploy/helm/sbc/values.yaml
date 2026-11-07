@@ -581,8 +581,10 @@ sbcDaemon:
   # (inside-facing legs are never rewritten). Default disabled = no change.
   topologyHiding:
     enabled: false
-    # none | signaling_only (best effort: hides internal hosts, leaves public
-    # hostnames) | full (recommended: hides every host except externalHost)
+    # signaling_only (best effort: hides internal hosts, leaves public
+    # hostnames) | full (recommended: hides every host except externalHost).
+    # With enabled: true, any other mode (none, basic) fails SBC config
+    # validation (POA&M-183); to turn hiding off, set enabled: false.
     mode: signaling_only
     # Public host presented in the anonymized Via/Contact. Empty defaults to
     # sbc.<site.fqdn_base>.
