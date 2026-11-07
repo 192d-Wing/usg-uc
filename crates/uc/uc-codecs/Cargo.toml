@@ -30,3 +30,10 @@ bytemuck = { version = "1.25", optional = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "codecs"
+harness = false

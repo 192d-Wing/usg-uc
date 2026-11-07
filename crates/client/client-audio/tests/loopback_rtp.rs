@@ -861,7 +861,8 @@ fn opus_fec_recovery_via_jitter_buffer() {
 
     let num_frames = 50;
     let total_samples = num_frames * spf;
-    let lost_frame = 25;
+    // 10% loss, never consecutive, so each loss has packet N+1 buffered.
+    let is_lost = |f: usize| f % 10 == 5;
 
     // Generate 1s of 440Hz sine at 48kHz mono
     let input: Vec<i16> = (0..total_samples)
@@ -889,7 +890,7 @@ fn opus_fec_recovery_via_jitter_buffer() {
     let jitter_buffer = SharedJitterBuffer::new(clock_rate, ts_inc, 80);
 
     for f in 0..num_frames {
-        if f == lost_frame {
+        if is_lost(f) {
             continue; // Skip this packet — simulates network loss
         }
         let pkt = BufferedPacket::new(
@@ -916,19 +917,23 @@ fn opus_fec_recovery_via_jitter_buffer() {
                 output.extend_from_slice(&decoded[..len]);
                 decoded_count += 1;
             }
-            JitterBufferResult::Lost { .. } => {
+            JitterBufferResult::Lost { fec_source, .. } => {
                 loss_count += 1;
-                // Attempt FEC recovery (Opus decoder PLC with FEC hint)
+                // RFC 7587 §3.4: recover from the LBRR data in packet N+1,
+                // into a buffer sized to exactly one lost frame.
                 let mut decoded = vec![0i16; spf];
-                if decode_codec.supports_fec() {
-                    if let Ok(len) = decode_codec.decode_fec(&mut decoded) {
-                        output.extend_from_slice(&decoded[..len]);
-                        fec_count += 1;
-                    } else {
-                        output.extend_from_slice(&vec![0i16; spf]);
-                    }
+                let fec = fec_source
+                    .as_deref()
+                    .filter(|_| decode_codec.supports_fec())
+                    .and_then(|next| decode_codec.decode_fec(next, &mut decoded).ok());
+                if let Some(len) = fec {
+                    assert_eq!(len, spf, "FEC must yield exactly one lost frame");
+                    output.extend_from_slice(&decoded[..len]);
+                    fec_count += 1;
                 } else {
-                    output.extend_from_slice(&vec![0i16; spf]);
+                    let len = decode_codec.conceal(&mut decoded).unwrap();
+                    assert_eq!(len, spf, "PLC must yield exactly one ptime");
+                    output.extend_from_slice(&decoded[..len]);
                 }
             }
             JitterBufferResult::Empty | JitterBufferResult::NotReady => {
@@ -942,6 +947,14 @@ fn opus_fec_recovery_via_jitter_buffer() {
         }
     }
 
+    // Regression for the 60 ms-per-lost-frame bug: playout length must be
+    // exactly one ptime per packet slot, lost or not.
+    assert_eq!(
+        output.len(),
+        (decoded_count + loss_count) * spf,
+        "concealment must not add surplus audio"
+    );
+
     // Should have detected at least one loss and recovered with FEC
     assert!(
         loss_count >= 1,
@@ -951,10 +964,11 @@ fn opus_fec_recovery_via_jitter_buffer() {
         fec_count >= 1,
         "Expected at least 1 FEC recovery, got {fec_count}"
     );
+    let sent = (0..num_frames).filter(|&f| !is_lost(f)).count();
     assert!(
-        decoded_count >= num_frames - 2,
+        decoded_count >= sent - 1,
         "Expected >= {} decoded, got {decoded_count}",
-        num_frames - 2
+        sent - 1
     );
 
     // Output should have reasonable energy (not dominated by silence)

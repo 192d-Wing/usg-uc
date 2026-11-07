@@ -150,6 +150,11 @@ pub enum AudioError {
     #[error("Codec error: {0}")]
     CodecError(String),
 
+    /// Packet-loss recovery (FEC/PLC) unavailable or failed. Static reason:
+    /// the decode-thread loss path must not allocate per lost packet.
+    #[error("Loss recovery failed: {0}")]
+    LossRecovery(&'static str),
+
     /// RTP error.
     #[error("RTP error: {0}")]
     RtpError(String),

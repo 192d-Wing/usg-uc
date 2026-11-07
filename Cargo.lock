@@ -8536,6 +8536,7 @@ version = "0.10.0"
 dependencies = [
  "bytemuck",
  "bytes",
+ "criterion",
  "opusic-c",
  "thiserror 2.0.21",
  "uc-types",

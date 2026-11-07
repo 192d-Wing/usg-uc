@@ -124,7 +124,7 @@
 | **RFC 3550** | RTP — packet format (§5), sequence/jitter tracking (§6.4.1) | **Full**. **Wired (sbc-media-core `media_pipeline.rs`: `RtpHeader::parse`, `SequenceTracker`; sbc-announcement-server: `RtpPacket`; soft client `client-audio`)** |
 | **RFC 3550** | RTCP SR/RR (§6.4), SDES, BYE | **Full**. **Wired (soft client only)** — `client-audio/rtcp_session.rs` builds SR/RR; sbc-media-core relays RTCP opaquely (no parsing) |
 | **RFC 3550** | Translator/mixer (§7), SSRC collision detection (§8.2), RTCP scheduling (§6.3, A.7), CSRC validation (§5.1), timer reconsideration (§6.3.6) | **Full**. **Library-only** — `RtpTranslator`, `RtpMixer`, `RtcpScheduler`, `SsrcCollisionDetector`, `JitterCalculator` have no call sites in any binary |
-| **RFC 3551** | RTP Profile for Audio/Video | **Full** — standard payload type table (PCMU=0, PCMA=8, G722=9, etc.). **Wired (soft client `payload_types`)**; sbc-media-core uses `uc-codecs` `CodecCapability` instead |
+| **RFC 3551** | RTP Profile for Audio/Video | **Partial** — standard payload type table (PCMU=0, PCMA=8, G722=9, etc.). **Wired (soft client `payload_types`)**; sbc-media-core uses `uc-codecs` `CodecCapability` instead. Dynamic PTs 64-71/77-95 are adopted under rtcp-mux, against RFC 5761 §4 advice (72-76 rejected; POA&M-143, test `test_is_dynamic_ranges`) |
 | **RFC 5761** | Multiplexing RTP/RTCP | Referenced — `rtcp_mux` is an sbc-media-core pipeline config flag, not proto-rtp code |
 
 ### Key Files

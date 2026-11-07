@@ -91,9 +91,9 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 
 ---
 
-### RFC 4733 - RTP Payload for DTMF (telephone-event) ✅ COMPLIANT
+### RFC 4733 - RTP Payload for DTMF (telephone-event) ⚠️ PARTIAL
 
-**Status**: Fully compliant
+**Status**: Compliant in the soft client SDP templates (8 kHz). SBC: `uc-codecs` negotiation now registers `telephone-event/8000` and `telephone-event/48000` (PT 110) and answers each on its own PT, so the 8 kHz-only gap is closed in the library: telephone-event is offered at 8 kHz (PT 101) and 48 kHz (PT 110) (tests `test_negotiate_telephone_event`, `test_negotiate_telephone_event_48k`), but sbc-daemon does not call this negotiation (POA&M-142), so it is not in effect on the SBC.
 **Priority**: MEDIUM
 **Link**: <https://datatracker.ietf.org/doc/html/rfc4733>
 
@@ -202,9 +202,9 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 
 ---
 
-### RFC 7587 - RTP Payload Format for Opus ✅ COMPLIANT
+### RFC 7587 - RTP Payload Format for Opus ⚠️ PARTIAL
 
-**Status**: Fully compliant - **FIXED 2026-02-07**
+**Status**: SDP parameters present (2026-02-07). In-band FEC: since 2026-11-06 the soft client decodes packet N+1 with fec=1 sized to the lost frame (`uc-codecs/src/opus_ffi.rs` `decode_fec`; tests `test_decode_fec_returns_exactly_lost_frame`, `test_lost_frame_opus_with_next_packet_uses_fec`). The LBRR flag is not checked, so a SILK/Hybrid packet without LBRR is still decoded on the FEC path and counted in `fec_recovered` (POA&M-141). SBC fmtp answering (`fmtp.rs` `intersect_opus`, test `test_negotiate_opus_fmtp_intersection`) is not wired into sbc-daemon (POA&M-142). Known limitation (RFC-008): client-audio `CodecPipeline::from_payload_type` hard-codes static PT to codec and maps 96-127 to Opus; it is reached only from tests today.
 **Priority**: MEDIUM
 **Link**: <https://datatracker.ietf.org/doc/html/rfc7587>
 
@@ -213,7 +213,7 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 - `a=rtpmap:111 opus/48000/2` - Correct format (48000 Hz clock rate, 2 channels per RFC 7587 Section 7)
 - `a=fmtp:111 minptime=20;useinbandfec=1;stereo=1` - **FIXED 2026-02-07**
     - `minptime=20`: Minimum packet time (matches `a=ptime:20`)
-    - `useinbandfec=1`: Enables Opus in-band FEC for packet loss resilience
+    - `useinbandfec=1`: Advertises Opus in-band FEC; receiver-side recovery is limited as described above (POA&M-141)
     - `stereo=1`: Enables stereo decoding capability
 - `a=maxptime:120` - Maximum packet time for Opus (up to 120ms frames)
 
@@ -331,7 +331,7 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 
 4. ✅ **Opus SDP Parameters** (RFC 7587) - **COMPLETED 2026-02-07**
     - Fix: Added `a=fmtp:111 minptime=20;useinbandfec=1;stereo=1` to SRTP templates
-    - Result: Full Opus fmtp compliance with FEC and stereo support
+    - Result: Opus fmtp parameters advertised; FEC decode limits tracked in POA&M-141
 
 5. ✅ **maxptime Attribute** (RFC 8866 Section 5.13) - **COMPLETED 2026-02-07**
     - Fix: Added `a=maxptime:120` to all four SDP templates
@@ -386,11 +386,11 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 |-----|-------|--------|--------------|
 | RFC 8866 | SDP: Session Description Protocol | ✅ Compliant | 100% |
 | RFC 3264 | Offer/Answer Model with SDP | ✅ Compliant | 98% |
-| RFC 4733 | RTP Payload for DTMF | ✅ Compliant | 100% |
+| RFC 4733 | RTP Payload for DTMF | ⚠️ Partial (SBC negotiation not wired, POA&M-142) | n/a |
 | RFC 3550 | RTP Transport Protocol | ✅ Compliant | 98% |
 | RFC 5245 | ICE | ⚠️ Partial (external lib) | 70% |
 | RFC 8122 | DTLS in SDP | ✅ Compliant | 95% |
-| RFC 7587 | RTP Payload for Opus | ✅ Compliant | 100% |
+| RFC 7587 | RTP Payload for Opus | ⚠️ Partial (POA&M-141, POA&M-142) | n/a |
 | RFC 4568 | SDP Security Descriptions | ❌ Not Implemented | 0% (by design) |
 
 **Overall Compliance**: ~98% for all actionable SDP-related RFCs

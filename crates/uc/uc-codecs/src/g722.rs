@@ -161,7 +161,7 @@ impl AudioCodec for G722Codec {
                 .map_err(|_| crate::error::CodecError::EncodingFailed {
                     reason: "failed to acquire encoder lock".to_string(),
                 })?;
-        Ok(encoder.encode(pcm, output))
+        encoder.encode(pcm, output)
     }
 
     fn decode(&self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize> {
@@ -171,7 +171,7 @@ impl AudioCodec for G722Codec {
                 .map_err(|_| crate::error::CodecError::DecodingFailed {
                     reason: "failed to acquire decoder lock".to_string(),
                 })?;
-        Ok(decoder.decode(encoded, output))
+        decoder.decode(encoded, output)
     }
 }
 
