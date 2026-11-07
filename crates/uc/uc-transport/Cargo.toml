@@ -43,7 +43,9 @@ rand = { version = "0.9", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW open and geteuid for TLS key-file checks (POA&M-164).
-nix = { workspace = true, features = ["fs", "user"] }
+# Not `workspace = true`: the workspace entry enables "net", which does not
+# build for iOS targets (client-ffi depends on uc-transport).
+nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
