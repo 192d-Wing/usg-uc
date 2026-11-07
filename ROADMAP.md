@@ -426,7 +426,7 @@ _`uc-webrtc` is not a dependency of any shipped sbc binary._
 
 - ✅ `WebRtcGateway` for SIP-to-WebRTC call bridging
 - ✅ `SdpMunger` for WebRTC SDP compatibility
-- ✅ `TrickleIce` for ICE candidate trickling (RFC 8838)
+- ⚠️ `TrickleIce` for ICE candidate trickling (RFC 8838): partial; no ufrag/generation check, unbounded candidate lists (POA&M-206)
 - ✅ `WebRtcSession` and `SessionManager` for session tracking
 - ✅ DTLS-SRTP support via existing `proto-dtls` integration
 
@@ -447,9 +447,9 @@ _`uc-webrtc` is not a dependency of any shipped sbc binary._
 
 _`uc-siprec` is not a dependency of any shipped sbc binary._
 
-- ✅ SIPREC support for call recording (`uc-siprec` crate)
+- ⚠️ SIPREC support for call recording (`uc-siprec` crate): partial; metadata not RFC 7865 schema, no RFC 7866 SRC signalling (POA&M-206)
 - ✅ Media forking to recording server
-- ✅ Metadata generation for recordings (XML per RFC 7865)
+- ⚠️ Metadata generation for recordings: does not follow the RFC 7865 schema, values unescaped (POA&M-206)
 
 **QoS & Traffic Management** [library-only]
 
@@ -565,10 +565,10 @@ _Reachable only as optional `sbc-config` feature dependencies; no daemon call si
 
 _`uc-t38` is not a dependency of any shipped sbc binary._
 
-- ✅ T.38 over UDPTL transport with redundancy/FEC
+- ⚠️ T.38 over UDPTL transport with redundancy/FEC: partial, non-interoperable wire format (POA&M-204); redundancy recovery unused, FEC a stub
 - ✅ Audio-to-T.38 gateway with signal detection (CNG/CED)
-- ✅ Error correction modes (none, redundancy, FEC)
-- ✅ IFP packet encoding/decoding per ITU-T T.38
+- ⚠️ Error correction modes (none, redundancy, FEC): partial, FEC is a stub (POA&M-204)
+- ⚠️ IFP packet encoding/decoding: project-specific format, NOT ITU-T T.38 ASN.1 PER, non-interoperable (POA&M-204)
 - ✅ T.30 signal handling (all phases A-E)
 - ✅ T38Session management with state machine
 - ✅ Goertzel algorithm for tone detection
@@ -1812,8 +1812,8 @@ not the per-packet crypto state). This item is the heavier tier above that.
 | RFC 6665 | SIP Events | ✅ Enhanced (event package validation) | library |
 | RFC 7092 | B2BUA Taxonomy | ✅ Implemented | sbc-daemon |
 | RFC 7675 | STUN Consent | ✅ Enhanced (consent revocation) | library |
-| RFC 7865 | SIPREC Metadata | ✅ Implemented (recording metadata XML) | library |
-| RFC 7866 | SIPREC Protocol | ✅ Implemented (session recording) | library |
+| RFC 7865 | SIPREC Metadata | ⚠️ Partial (metadata XML does not follow the RFC 7865 schema; POA&M-206) | library |
+| RFC 7866 | SIPREC Protocol | ⚠️ Partial (no SRC signalling; POA&M-206) | library |
 | RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) | soft client (checks + nomination); consent/keepalives library |
 | RFC 8224 | STIR | ✅ Implemented (ES384) | library (no shipped consumer of proto-stir-shaken) |
 | RFC 8225 | PASSporT | ✅ Implemented (ES384) | library (no shipped consumer of proto-stir-shaken) |

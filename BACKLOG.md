@@ -138,18 +138,24 @@ DORMANT items before anyone wires them in.
   call.** Index patterns by partition.
   Fixed 2026-11-07 (fix/live-batch-190): POA&M-192, `by_partition` index,
   test `partition_index_matches_linear_reference`. No bench (perf unmeasured).
-- [ ] **BLOCKER if wired, DORMANT — Diameter accepts everyone**
+- [x] **BLOCKER if wired, DORMANT — Diameter accepts everyone** (POA&M-200)
   (`uc-aaa/src/diameter.rs:223-360`, `send_mar` returns accept). Return an error
   or remove; POA&M so nobody enables the `aaa` feature.
+  Fixed: UAR/MAR/SAR and the stub `authenticate`/`account` return
+  `DiameterError` in both cfgs (fail closed). Real Cx remains unimplemented.
 - [ ] **MAJOR, DORMANT — RADIUS:** Message-Authenticator not required on
   responses (BlastRADIUS, CVE-2024-3596); non-constant-time compare despite the
   comment (`radius.rs:563`); 8-bit identifier wraps; shared secret not zeroized;
   UDP+MD5 not CNSA (RadSec only).
-- [ ] **BLOCKER if used, DORMANT — policy `StringMatch::Regex` always returns
-  true** (`uc-policy/src/condition.rs:46`). Implement with compiled `regex` or
+- [x] **BLOCKER if used, DORMANT — policy `StringMatch::Regex` always returns
+  true** (POA&M-201) (`uc-policy/src/condition.rs:46`). Implement with compiled `regex` or
   remove the variant.
-- [ ] **MINOR, DORMANT — routing `DialPattern::Regex` recompiles per match and
-  fails open on a bad pattern** (`dialplan.rs:119`). Compile once, reject invalid.
+  Fixed: `BoundedRegex` (compiled once, 1 KiB pattern cap, 1 MiB size limits);
+  an invalid pattern cannot be constructed.
+- [x] **MINOR, DORMANT — routing `DialPattern::Regex` recompiles per match and
+  fails open on a bad pattern** (POA&M-205) (`dialplan.rs:119`). Compile once, reject invalid.
+  Fixed: `DialPlanEntry` caches a bounded compiled regex; invalid never matches;
+  `DialPattern::validate` and `DialPlan::try_add_entry` reject it.
 
 ### SIP message layer (proto-sip)
 
@@ -248,8 +254,12 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   corrected (`uc-media-engine/src/lib.rs`).
 - [ ] **BLOCKER, DORMANT — T.38 UDPTL/IFP use a home-made wire format**, not
   ASN.1 PER (`uc-t38/src/udptl.rs`, `ifp.rs`); no real gateway interoperates.
-- [ ] **BLOCKER, DORMANT — T.38 decode panics on a 5-byte datagram**
-  (`udptl.rs` ~118-137, unchecked `get_u8`). Bounds checks + fuzz target (cheap).
+  POA&M-204: documented as non-interoperable in crate docs and ROADMAP; the
+  ASN.1 PER encoding is still open.
+- [x] **BLOCKER, DORMANT — T.38 decode panics on a 5-byte datagram**
+  (POA&M-202/203) (`udptl.rs` ~118-137, unchecked `get_u8`). Bounds checks + fuzz target (cheap).
+  Fixed: bounds-checked UDPTL/IFP decode, truncation tests for every prefix,
+  `uc-t38/fuzz` targets `udptl_decode` and `ifp_decode`.
 - [ ] **MAJOR, DORMANT — T.38 redundancy recovery is dead code, FEC a stub, no
   SDP (RFC 4612/6913 attributes), fixed 512-byte buffer.**
 - [ ] **MAJOR, DORMANT — SIPREC metadata doesn't follow the RFC 7865 schema**,
@@ -266,6 +276,11 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
 - [ ] **Docs:** ROADMAP marks T.38, SIPREC and trickle ICE as implemented;
   `docs/SDP_RFC_Compliance.md` says uc-webrtc/uc-siprec use proto-sdp; RFC 3551
   "Full" and RFC 7587 "FEC support" overclaim.
+  Partial (POA&M-204/206): ROADMAP T.38, SIPREC and trickle ICE marks changed
+  to ⚠️ partial; `docs/architecture.md` caveats added; `SDP_RFC_Compliance.md`
+  no longer says uc-webrtc/uc-siprec use proto-sdp. RFC 7587 is already
+  ⚠️ Partial there (POA&M-141/142) and no RFC 3551 "Full" claim remains in
+  `docs/`. Still open: historical CHANGELOG entries (T.38, RFC 6733, RFC 7865).
 
 ### Transport, crypto, DNS, ACL (uc-transport, uc-crypto, uc-dns, uc-discovery, uc-dos-protection, uc-acl)
 

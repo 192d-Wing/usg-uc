@@ -1,5 +1,80 @@
 //! Policy conditions for matching requests.
 
+use crate::error::{PolicyError, PolicyResult};
+use std::sync::Arc;
+
+/// Maximum regex pattern length in bytes.
+// NIST 800-53 Rev5: SC-5 (DoS protection), SI-10 (input validation)
+pub const MAX_REGEX_PATTERN_LEN: usize = 1024;
+
+/// Maximum compiled program / lazy DFA size for a policy regex, in bytes.
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
+/// A regex compiled once, at construction, with bounded size.
+///
+/// An invalid or oversized pattern cannot be constructed, so a
+/// [`StringMatch::Regex`] condition can never fall back to matching
+/// everything (POA&M-201).
+///
+/// Equality compares the source pattern.
+// NIST 800-53 Rev5: SC-24 (fail in known state), SI-10 (input validation)
+#[derive(Debug, Clone)]
+pub struct BoundedRegex {
+    pattern: String,
+    regex: Arc<regex::Regex>,
+}
+
+impl BoundedRegex {
+    /// Compiles `pattern` with bounded size limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::InvalidCondition`] if the pattern is longer
+    /// than [`MAX_REGEX_PATTERN_LEN`], fails to parse, or exceeds the
+    /// compiled size limit.
+    pub fn new(pattern: &str) -> PolicyResult<Self> {
+        if pattern.len() > MAX_REGEX_PATTERN_LEN {
+            return Err(PolicyError::InvalidCondition {
+                reason: format!(
+                    "regex pattern length {} exceeds {MAX_REGEX_PATTERN_LEN}",
+                    pattern.len()
+                ),
+            });
+        }
+        let regex = regex::RegexBuilder::new(pattern)
+            .size_limit(REGEX_SIZE_LIMIT)
+            .dfa_size_limit(REGEX_SIZE_LIMIT)
+            .build()
+            .map_err(|e| PolicyError::InvalidCondition {
+                reason: format!("invalid regex pattern: {e}"),
+            })?;
+        Ok(Self {
+            pattern: pattern.to_string(),
+            regex: Arc::new(regex),
+        })
+    }
+
+    /// Returns the source pattern.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.pattern
+    }
+
+    /// Returns whether `value` matches the compiled regex.
+    #[must_use]
+    pub fn is_match(&self, value: &str) -> bool {
+        self.regex.is_match(value)
+    }
+}
+
+impl PartialEq for BoundedRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern
+    }
+}
+
+impl Eq for BoundedRegex {}
+
 /// Condition match result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConditionMatch {
@@ -29,8 +104,8 @@ pub enum StringMatch {
     Suffix(String),
     /// Contains substring.
     Contains(String),
-    /// Regex match.
-    Regex(String),
+    /// Regex match (compiled and size-bounded at construction).
+    Regex(BoundedRegex),
     /// Any value.
     Any,
 }
@@ -43,11 +118,8 @@ impl StringMatch {
             Self::Prefix(pattern) => value.starts_with(pattern),
             Self::Suffix(pattern) => value.ends_with(pattern),
             Self::Contains(pattern) => value.contains(pattern),
-            Self::Regex(_pattern) => {
-                // In production, would use regex crate
-                // For now, just do contains match
-                true
-            }
+            // NIST 800-53 Rev5: SC-24, SI-10 -- POA&M-201 fixed; previously matched everything.
+            Self::Regex(regex) => regex.is_match(value),
             Self::Any => true,
         }
     }
@@ -419,6 +491,34 @@ mod tests {
 
         assert!(StringMatch::Contains("example".to_string()).matches("sip:user@example.com"));
         assert!(StringMatch::Any.matches("anything"));
+    }
+
+    #[test]
+    fn test_string_match_regex() {
+        let m = StringMatch::Regex(BoundedRegex::new(r"^\+1\d{10}$").unwrap());
+        assert!(m.matches("+15551234567"));
+        assert!(!m.matches("+445551234567"));
+        assert!(!m.matches(""));
+    }
+
+    #[test]
+    fn test_bounded_regex_rejects_invalid() {
+        assert!(matches!(
+            BoundedRegex::new("("),
+            Err(PolicyError::InvalidCondition { .. })
+        ));
+        let long = "a".repeat(MAX_REGEX_PATTERN_LEN + 1);
+        assert!(BoundedRegex::new(&long).is_err());
+        assert!(BoundedRegex::new("a{100000}{100000}").is_err());
+    }
+
+    #[test]
+    fn test_bounded_regex_eq_by_pattern() {
+        assert_eq!(
+            BoundedRegex::new("ab").unwrap(),
+            BoundedRegex::new("ab").unwrap()
+        );
+        assert_eq!(BoundedRegex::new("ab").unwrap().as_str(), "ab");
     }
 
     #[test]

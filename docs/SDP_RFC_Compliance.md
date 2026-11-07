@@ -233,7 +233,7 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 **Status**: Fully compliant for all SDP line types
 **Updated**: 2026-02-07
 
-The `proto-sdp` crate provides structured SDP parsing and generation used by `client-sip-ua`, `uc-webrtc`, `uc-siprec`, and integration tests.
+The `proto-sdp` crate provides structured SDP parsing and generation used by `client-sip-ua` and integration tests. `uc-webrtc` and `uc-siprec` list `proto-sdp` as a dependency but do not use it to parse or generate SDP: `uc-webrtc/src/sdp_munge.rs` rewrites SDP as text, and `uc-siprec` only wraps `proto_sdp::SdpError` (`uc-siprec/src/error.rs`). Both crates are dormant (POA&M-206).
 
 #### Implemented ✅
 
