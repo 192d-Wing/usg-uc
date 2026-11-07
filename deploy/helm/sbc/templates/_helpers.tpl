@@ -296,11 +296,11 @@ external_host = {{ .Values.sbcDaemon.topologyHiding.externalHost | default (prin
 external_port = {{ .Values.sbcDaemon.topologyHiding.externalPort }}
 obfuscate_call_id = {{ .Values.sbcDaemon.topologyHiding.obfuscateCallId }}
 external_tls_port = {{ .Values.sbcDaemon.topologyHiding.externalTlsPort | default 5061 }}
-{{- with .Values.sbcDaemon.topologyHiding.internalNetworks }}
-internal_networks = [{{ range $i, $n := . }}{{ if $i }}, {{ end }}{{ $n | quote }}{{ end }}]
+{{- if .Values.sbcDaemon.topologyHiding.internalNetworks }}
+internal_networks = {{ .Values.sbcDaemon.topologyHiding.internalNetworks | toJson }}
 {{- end }}
-{{- with .Values.sbcDaemon.topologyHiding.internalDomains }}
-internal_domains = [{{ range $i, $n := . }}{{ if $i }}, {{ end }}{{ $n | quote }}{{ end }}]
+{{- if .Values.sbcDaemon.topologyHiding.internalDomains }}
+internal_domains = {{ .Values.sbcDaemon.topologyHiding.internalDomains | toJson }}
 {{- end }}
 {{- end }}
 
