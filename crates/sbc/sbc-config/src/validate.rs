@@ -1323,6 +1323,32 @@ fn validate_topology_hiding(config: &SbcConfig) -> ConfigResult<()> {
     let Some(topo) = &config.topology_hiding else {
         return Ok(());
     };
+    // NIST 800-53 Rev5: CM-6, CM-7, SC-7 - an accepted mode must be an
+    // enforced one. "basic" was accepted but never enforced (POA&M-183),
+    // and `enabled = true` with mode "none" silently turns hiding off.
+    // Exact, case-sensitive match; a disabled section is not checked so an
+    // old config with hiding off still loads.
+    if topo.enabled {
+        match topo.mode.as_str() {
+            "signaling_only" | "full" => {}
+            "none" => {
+                return Err(ConfigError::Validation {
+                    message: "topology_hiding.enabled = true with mode 'none' disables hiding; \
+                              set enabled = false or choose a mode (\"signaling_only\" or \"full\")"
+                        .to_string(),
+                });
+            }
+            other => {
+                return Err(ConfigError::Validation {
+                    message: format!(
+                        "topology_hiding.mode '{}' is not supported; use \"signaling_only\" or \
+                         \"full\" (\"basic\" was never enforced, POA&M-183)",
+                        other.escape_default()
+                    ),
+                });
+            }
+        }
+    }
     if has_ascii_control(&topo.external_host) {
         return Err(ConfigError::Validation {
             message: format!(
@@ -2585,6 +2611,7 @@ max_passport_age_secs = 120
         let mut config = SbcConfig::default();
         config.topology_hiding = Some(TopologyHidingConfig {
             enabled: true,
+            mode: "full".to_string(),
             external_host: "sbc.example.com".to_string(),
             internal_networks: vec!["10.0.0.0/32".into(), "::/128".into(), "0.0.0.0/0".into()],
             ..Default::default()
@@ -3621,5 +3648,71 @@ mod transport_dos_limits {
             mutate(&mut c);
             assert!(validate_config(&c).is_err(), "case {i} should fail");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod topology_mode {
+    use super::validate_config;
+    use crate::schema::{SbcConfig, TopologyHidingConfig};
+
+    fn with_mode(enabled: bool, mode: &str) -> SbcConfig {
+        SbcConfig {
+            topology_hiding: Some(TopologyHidingConfig {
+                enabled,
+                mode: mode.to_string(),
+                external_host: "sbc.example.com".to_string(),
+                ..TopologyHidingConfig::default()
+            }),
+            ..SbcConfig::default()
+        }
+    }
+
+    #[test]
+    fn topology_mode_basic_rejected() {
+        let err = validate_config(&with_mode(true, "basic"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("basic"), "{err}");
+        assert!(
+            err.contains("signaling_only") && err.contains("full"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn topology_enabled_mode_none_rejected() {
+        let err = validate_config(&with_mode(true, "none"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("enabled = false"), "{err}");
+    }
+
+    #[test]
+    fn topology_disabled_any_mode_accepted() {
+        for mode in ["basic", "none", "Full", ""] {
+            validate_config(&with_mode(false, mode)).unwrap();
+        }
+    }
+
+    #[test]
+    fn topology_mode_case_sensitive() {
+        assert!(validate_config(&with_mode(true, "Full")).is_err());
+        assert!(validate_config(&with_mode(true, "SIGNALING_ONLY")).is_err());
+    }
+
+    #[test]
+    fn topology_supported_modes_accepted() {
+        validate_config(&with_mode(true, "signaling_only")).unwrap();
+        validate_config(&with_mode(true, "full")).unwrap();
+    }
+
+    #[test]
+    fn topology_mode_error_escapes_control_chars() {
+        let err = validate_config(&with_mode(true, "full\r\nX: y"))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\r') && !err.contains('\n'), "{err}");
     }
 }

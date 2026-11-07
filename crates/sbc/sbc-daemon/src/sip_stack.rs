@@ -32,7 +32,7 @@ use proto_sip::manipulation::{
 };
 use proto_sip::message::{SipRequest, SipResponse};
 use proto_sip::uri::SipUri;
-use proto_sip::{Header, HeaderName, Method, SipMessage, StatusCode};
+use proto_sip::{Header, HeaderName, Headers, Method, SipMessage, StatusCode};
 use proto_sip::{TopologyHider, TopologyHidingConfig as SipTopologyConfig, TopologyHidingMode};
 use proto_transaction::client::ClientInviteState as ClientInvitePhase;
 use proto_transaction::timer::TimerType;
@@ -120,6 +120,15 @@ pub struct SipStack {
     /// previously entries were never removed (unbounded growth from
     /// unroutable INVITEs).
     announcement_calls: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    /// SBC-originated requests built off the request path (the BYE after an
+    /// announcement), drained and tracked by [`Self::poll_timers`] so they
+    /// leave on the caller's own flow. Leaf lock, never held across
+    /// `.await`; bounded by [`MAX_DEFERRED_SENDS`] (NIST 800-53 Rev5: SC-5).
+    deferred_sends: Arc<std::sync::Mutex<DeferredSends>>,
+    /// Unanswered calls released recently, so a crossing INVITE 2xx is
+    /// ACKed and BYE'd (RFC 3261 §13.2.2.4). Leaf lock, taken only after
+    /// `call_correlation` is released; bounded (SC-5).
+    released_invites: std::sync::Mutex<ReleasedCalls>,
     /// Voice Protection System engine for pre-routing call screening
     /// (see docs/VPS-ARCHITECTURE.md). Mutex: screening mutates rate
     /// counters and stats.
@@ -179,15 +188,16 @@ pub struct RoutingCounters {
     /// Emergency INVITEs that bypassed the per-user limiter.
     pub user_limiter_emergency_bypass: AtomicU64,
     /// Egress messages that failed topology hiding and were not sent raw
-    /// (`sbc_topology_hiding_failures_total`, POA&M-156).
-    ///
-    /// POAM: POA&M-180 - counted but not yet exported by the metrics
-    /// endpoint (`api_server.rs` `ROUTING_METRICS`).
+    /// (`sbc_topology_hiding_failures_total`, POA&M-156; exported via
+    /// `api_server.rs` `ROUTING_METRICS`).
     pub topology_hiding_failures: AtomicU64,
     /// Header-manipulation rule failures that rejected a request
-    /// (`sbc_header_manipulation_failures_total`, POA&M-156). Export: see
-    /// `topology_hiding_failures`.
+    /// (`sbc_header_manipulation_failures_total`, POA&M-156).
     pub header_manipulation_failures: AtomicU64,
+    /// INVITE 2xx responses that arrived after the call was released and
+    /// were ACKed and BYE'd (`sbc_late_invite_2xx_teardown_total`,
+    /// RFC 3261 §13.2.2.4).
+    pub late_2xx_teardowns: AtomicU64,
 }
 
 /// Route patterns rejected (unknown `pattern_type`) at seed or sync time.
@@ -530,6 +540,262 @@ fn try_reserve_slot(counter: &Arc<AtomicUsize>, ceiling: usize) -> Option<CallSl
         })
         .ok()
         .map(|_| CallSlot(Arc::clone(counter)))
+}
+
+/// Upper bound on queued [`SipStack::deferred_sends`]. Concurrent
+/// announcements are bounded already; this is the backstop (SC-5).
+const MAX_DEFERRED_SENDS: usize = 1024;
+
+/// CSeq of the BYE after an announcement: the UAS's first request in its own
+/// CSeq space, any value is valid (RFC 3261 §12.2.1.1). Assumes the SBC
+/// sends no other in-dialog request (re-INVITE, UPDATE, INFO) toward the
+/// caller during the announcement; if one is ever added it must take its
+/// CSeq from a per-dialog local counter and this BYE must follow it
+/// (§12.2.1.1: strictly increasing).
+const ANNOUNCEMENT_BYE_CSEQ: u32 = 2;
+
+/// Requests queued for [`SipStack::poll_timers`] (see `deferred_sends`).
+#[derive(Debug, Default)]
+struct DeferredSends {
+    queue: Vec<ProcessResult>,
+    /// Pushes refused because the queue was full.
+    dropped: u64,
+}
+
+/// Locks a leaf std mutex, recovering from poisoning (the data are plain
+/// queues; a panicked holder cannot leave them half-updated).
+fn lock_leaf<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Queues `r` for the timer loop. Returns false (and counts it) when full.
+fn push_deferred(q: &std::sync::Mutex<DeferredSends>, r: ProcessResult) -> bool {
+    let mut g = lock_leaf(q);
+    if g.queue.len() >= MAX_DEFERRED_SENDS {
+        g.dropped += 1;
+        let dropped = g.dropped;
+        drop(g);
+        // PERF-004: sampled.
+        if dropped < 10 || dropped.is_multiple_of(1000) {
+            warn!(
+                dropped,
+                "Deferred send queue full; SBC-originated request dropped"
+            );
+        }
+        return false;
+    }
+    g.queue.push(r);
+    true
+}
+
+/// Released unanswered calls remembered for a crossing 2xx (SC-5).
+const RELEASED_CALLS_CAP: usize = 4096;
+/// How long a released call is remembered: 64*T1 (T1 = 500 ms), the UAS 2xx
+/// retransmission window (RFC 3261 §13.3.1.4).
+const RELEASED_CALL_TTL: std::time::Duration = std::time::Duration::from_secs(32);
+/// To-tags (forks) per released call that get a BYE; later ones only an ACK.
+/// Deliberate deviation from RFC 3261 §13.2.2.4 (SHOULD BYE every unwanted
+/// dialog): a 5th+ fork is ACKed but not BYE'd, bounding the BYEs one
+/// released call can make the SBC send (SC-5). Such a dialog ends by the
+/// far end's session timer / no-media timeout.
+const RELEASED_CALL_MAX_TAGS: usize = 4;
+/// Record-Route entries copied into the late ACK/BYE route set.
+const RELEASED_CALL_MAX_ROUTES: usize = 16;
+
+/// The B-leg INVITE attempt of a released, unanswered call: enough to ACK
+/// and BYE a 2xx that crosses the release (RFC 3261 §13.2.2.4). SBC-owned
+/// data only; nothing here comes from the late response.
+#[derive(Debug, Clone)]
+struct ReleasedInvite {
+    call_id: String,
+    /// Our INVITE's Via branch: a late 2xx must carry it (anti-forgery,
+    /// as in the transaction layer).
+    branch: String,
+    destination: SbcSocketAddr,
+    flow: LegFlow,
+    /// `hidden.b_leg`: the call's own topology-hiding decision.
+    hidden: bool,
+    sent_by: String,
+    from: String,
+    /// B-leg To without tag.
+    to: String,
+    /// The INVITE's Request-URI (fallback remote target).
+    request_uri: SipUri,
+    invite_cseq: u32,
+    released_at: Instant,
+    /// To-tags already sent a BYE (bounded by [`RELEASED_CALL_MAX_TAGS`]).
+    answered_tags: Vec<String>,
+}
+
+impl ReleasedInvite {
+    fn of(addrs: &CallAddresses, now: Instant) -> Self {
+        let request_uri = addrs.b_leg_ruri.clone().unwrap_or_else(|| {
+            leg_request_uri(
+                None,
+                &addrs.b_leg_destination.ip().to_string(),
+                addrs.b_leg_destination.port(),
+                &addrs.b_leg_flow,
+            )
+        });
+        let invite_cseq = addrs
+            .b_leg_invite
+            .as_ref()
+            .and_then(|r| r.headers.cseq_parsed())
+            .map_or(1, |c| c.sequence);
+        Self {
+            call_id: addrs.b_leg_sip_call_id.clone(),
+            branch: addrs.b_leg_branch.clone(),
+            destination: addrs.b_leg_destination,
+            flow: addrs.b_leg_flow.clone(),
+            hidden: addrs.hidden.b_leg,
+            sent_by: addrs.local_addr.clone(),
+            from: addrs.b_leg_from.clone(),
+            to: addrs.b_leg_to.clone(),
+            request_uri,
+            invite_cseq,
+            released_at: now,
+            answered_tags: Vec::new(),
+        }
+    }
+}
+
+/// Bounded, TTL'd store of [`ReleasedInvite`]s keyed by B-leg Call-ID (an
+/// SBC-generated value; `HashMap`'s default hasher is keyed). FIFO
+/// eviction when full; amortised O(1) pruning from the front.
+///
+/// ## NIST 800-53 Rev5: SC-5
+#[derive(Debug, Default)]
+struct ReleasedCalls {
+    by_call_id: HashMap<String, ReleasedInvite>,
+    order: std::collections::VecDeque<(Instant, String)>,
+}
+
+impl ReleasedCalls {
+    /// Drops `order`'s front entry, and its record if still the same one.
+    fn pop_front(&mut self) {
+        if let Some((at, id)) = self.order.pop_front()
+            && self
+                .by_call_id
+                .get(&id)
+                .is_some_and(|e| e.released_at == at)
+        {
+            self.by_call_id.remove(&id);
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .order
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= RELEASED_CALL_TTL)
+        {
+            self.pop_front();
+        }
+    }
+
+    fn insert(&mut self, entry: ReleasedInvite, now: Instant) {
+        self.prune(now);
+        // PERF-005: a re-inserted Call-ID (failover swap, then release)
+        // drops its old `order` slot so the cap counts live records. Rare,
+        // and bounded by RELEASED_CALLS_CAP.
+        if self.by_call_id.contains_key(&entry.call_id) {
+            self.order.retain(|(_, id)| *id != entry.call_id);
+        }
+        while self.order.len() >= RELEASED_CALLS_CAP {
+            self.pop_front();
+        }
+        self.order
+            .push_back((entry.released_at, entry.call_id.clone()));
+        self.by_call_id.insert(entry.call_id.clone(), entry);
+    }
+
+    fn len(&self) -> usize {
+        self.by_call_id.len()
+    }
+
+    /// Stored B-leg destination of a live record (no pruning, no mutation).
+    fn destination_of(&self, call_id: &str) -> Option<SbcSocketAddr> {
+        self.by_call_id.get(call_id).map(|e| e.destination)
+    }
+
+    /// The hiding snapshot of a released call, for the egress chokepoint.
+    fn hiding_for(&self, call_id: &str) -> Option<LegHiding> {
+        self.by_call_id.get(call_id).map(|e| LegHiding {
+            a_call_id: String::new(),
+            b_call_id: e.call_id.clone(),
+            a_hidden: false,
+            b_hidden: e.hidden,
+        })
+    }
+
+    /// Matches a late INVITE 2xx (`branch`, `cseq`, `to_tag`) against a live
+    /// record. Returns the record and whether this to-tag gets a BYE.
+    fn match_late_2xx(
+        &mut self,
+        call_id: &str,
+        branch: &str,
+        cseq: u32,
+        to_tag: &str,
+        now: Instant,
+    ) -> Option<(ReleasedInvite, bool)> {
+        self.prune(now);
+        let e = self.by_call_id.get_mut(call_id)?;
+        if e.branch != branch || e.invite_cseq != cseq {
+            return None;
+        }
+        let bye = if e.answered_tags.iter().any(|t| t == to_tag) {
+            false
+        } else if e.answered_tags.len() < RELEASED_CALL_MAX_TAGS {
+            e.answered_tags.push(to_tag.to_string());
+            true
+        } else {
+            false
+        };
+        Some((e.clone(), bye))
+    }
+}
+
+/// ACK or BYE for a late 2xx of a released call (RFC 3261 §13.2.2.4):
+/// remote target `uri`, `routes` the 2xx's Record-Route reversed
+/// (§12.1.2), a fresh branch (§17.1.1.3: the 2xx ACK is its own
+/// transaction).
+fn build_late_2xx_request(
+    e: &ReleasedInvite,
+    method: Method,
+    cseq: u32,
+    to_tag: &str,
+    uri: SipUri,
+    routes: &[String],
+) -> SipRequest {
+    let name = method.to_string();
+    let mut r = SipRequest::new(method, uri);
+    r.headers.add(Header::new(
+        HeaderName::Via,
+        crate::flow::via_for(&e.flow, &e.sent_by, &generate_branch()),
+    ));
+    r.headers.set(HeaderName::MaxForwards, "70");
+    r.headers.set(HeaderName::From, &e.from);
+    r.headers.set(HeaderName::To, with_tag(&e.to, Some(to_tag)));
+    r.headers.set(HeaderName::CallId, &e.call_id);
+    r.headers.set(HeaderName::CSeq, format!("{cseq} {name}"));
+    for route in routes {
+        r.headers.add(Header::new(HeaderName::Route, route));
+    }
+    r.headers.set(HeaderName::ContentLength, "0");
+    r
+}
+
+/// Whether `s` is a SIP token (RFC 3261 §25.1), e.g. a tag value.
+fn is_sip_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'.' | b'!' | b'%' | b'*' | b'_' | b'+' | b'`' | b'\'' | b'~'
+                )
+        })
 }
 
 /// Correlates A-leg and B-leg SIP Call-IDs with internal B2BUA CallIds.
@@ -1300,15 +1566,21 @@ fn hide_wire(hider: &TopologyHider, element: &mut ProcessResult) -> Option<HideF
     else {
         return None;
     };
+    // RFC 3264 §8 (RFC-001): one stable `o=` address per hidden leg.
+    let origin_host = hider.config().external_host.as_str();
     let res = match message {
-        SipMessage::Request(req) => hider.hide_b2bua_request(&mut req.headers),
+        SipMessage::Request(req) => hider
+            .hide_b2bua_request(&mut req.headers)
+            .map_err(|e| topology_policy(&e))
+            .and_then(|()| scrub_residual_topology(&mut req.headers, &mut req.body, origin_host)),
         // RFC 3261 §8.1.3.4 / §21.3: 3xx Contacts are redirect targets; only
         // internal ones are rewritten.
-        SipMessage::Response(resp) => {
-            hider.hide_b2bua_response_for_status(&mut resp.headers, resp.status.code())
-        }
+        SipMessage::Response(resp) => hider
+            .hide_b2bua_response_for_status(&mut resp.headers, resp.status.code())
+            .map_err(|e| topology_policy(&e))
+            .and_then(|()| scrub_residual_topology(&mut resp.headers, &mut resp.body, origin_host)),
     };
-    let e = res.err()?;
+    let policy = res.err()?;
     // Never forward the unhidden message: take it out of the result.
     let (ProcessResult::Response {
         message,
@@ -1371,13 +1643,363 @@ fn hide_wire(hider: &TopologyHider, element: &mut ProcessResult) -> Option<HideF
     };
     Some(HideFailure {
         kind,
-        policy: topology_policy(&e),
+        policy,
         method,
         call_id,
         cseq,
         destination,
         source: None,
     })
+}
+
+/// Removes the residual topology a B2BUA-hidden message can still carry
+/// toward a hidden leg (POA&M-181), after the hider has rewritten Via,
+/// Contact and Record-Route:
+///
+/// - `Server`, `User-Agent`, `Warning` are removed (optional headers,
+///   RFC 3261 §20.35 / §20.41 / §20.43; the Warning warn-agent is a host
+///   name and its text is free-form).
+/// - `Reason` (RFC 3326 §2) is reduced to `protocol;cause=N` per element;
+///   `text=` and other params are dropped, invalid elements removed.
+/// - SDP `o=` (RFC 8866 §5.2), in an `application/sdp` body or an
+///   `application/sdp` part of a `multipart/*` body (RFC 5621): username
+///   becomes `-`, unicast-address `origin_host` (the SBC's hidden-leg
+///   address, the hider's `external_host`) with the addrtype that matches
+///   it. The address is the same for every message of the session, so `o=`
+///   only changes where the peer's sess-version does (RFC 3264 §8: the
+///   origin of a re-offer must equal the previous one bar the version);
+///   sess-id, sess-version and nettype are kept byte-exact.
+///
+/// Atomic: the body is computed and the Reason values built before
+/// anything is committed; nothing after that can fail. A malformed `o=`,
+/// SDP without a usable `c=`, or a multipart body that cannot be walked
+/// returns the fail-closed policy `sip.topology_hiding.failed:sdp-o`.
+///
+/// ## NIST 800-53 Rev5: SC-7, SI-17
+// NIST 800-53 Rev5: SC-7 (accepted residual) - without a media relay the SDP
+// `c=` address is the peer's own one and is sent as-is: media must reach it.
+fn scrub_residual_topology(
+    headers: &mut Headers,
+    body: &mut Option<Bytes>,
+    origin_host: &str,
+) -> Result<(), String> {
+    let fail = |()| "sip.topology_hiding.failed:sdp-o".to_string();
+    let mut new_body = None;
+    if let Some(b) = body.as_ref()
+        && let Some(ct) = headers.get_value(&HeaderName::ContentType)
+    {
+        let media = ct.split(';').next().unwrap_or_default().trim();
+        let is_multi = media
+            .get(..10)
+            .is_some_and(|p| p.eq_ignore_ascii_case("multipart/"));
+        // RFC-006: an encoded body hides its `o=` from the scrubber; fail
+        // closed rather than pass it through.
+        if (is_multi || media.eq_ignore_ascii_case("application/sdp"))
+            && !headers
+                .iter()
+                .filter(|h| {
+                    h.name
+                        .as_str()
+                        .eq_ignore_ascii_case("content-transfer-encoding")
+                })
+                .all(|h| is_identity_cte(&h.value))
+        {
+            return Err(fail(()));
+        }
+        if media.eq_ignore_ascii_case("application/sdp") {
+            new_body = scrub_sdp_origin(b, origin_host).map_err(fail)?;
+        } else if is_multi {
+            new_body = scrub_multipart_sdp(b, ct, origin_host).map_err(fail)?;
+        }
+    }
+    let mut has_reason = false;
+    let mut has_other = false;
+    for h in headers.iter() {
+        match h.name {
+            HeaderName::Reason => has_reason = true,
+            HeaderName::Server | HeaderName::UserAgent | HeaderName::Warning => has_other = true,
+            _ => {}
+        }
+    }
+    // PERF-001: built from the borrowed headers, then committed in place
+    // (no clone of the whole map; the removals below cannot fail).
+    let reasons: Option<Vec<String>> = has_reason.then(|| {
+        headers
+            .get_all(&HeaderName::Reason)
+            .flat_map(|r| r.value.split(','))
+            .filter_map(sanitize_reason_element)
+            .collect()
+    });
+    if has_other {
+        headers.remove(&HeaderName::Server);
+        headers.remove(&HeaderName::UserAgent);
+        headers.remove(&HeaderName::Warning);
+    }
+    if let Some(reasons) = reasons {
+        headers.replace_instances(&HeaderName::Reason, reasons);
+    }
+    if let Some(b) = new_body {
+        headers.set(HeaderName::ContentLength, b.len().to_string());
+        *body = Some(b);
+    }
+    Ok(())
+}
+
+/// One Reason element reduced to `protocol;cause=N` (RFC 3326 §2), or
+/// `None` if it has no token protocol and numeric cause.
+fn sanitize_reason_element(el: &str) -> Option<String> {
+    let mut parts = el.split(';');
+    let protocol = parts.next()?.trim();
+    if !is_sip_token(protocol) {
+        return None;
+    }
+    let cause = parts.find_map(|p| {
+        let (k, v) = p.split_once('=')?;
+        k.trim().eq_ignore_ascii_case("cause").then(|| v.trim())
+    })?;
+    if cause.is_empty() || cause.len() > 5 || !cause.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("{protocol};cause={cause}"))
+}
+
+/// `true` for an identity Content-Transfer-Encoding (RFC 2045 §6.1:
+/// `7bit`, `8bit`, `binary`; case-insensitive).
+fn is_identity_cte(v: &str) -> bool {
+    let v = v.trim();
+    ["7bit", "8bit", "binary"]
+        .iter()
+        .any(|c| v.eq_ignore_ascii_case(c))
+}
+
+/// Rewrites the SDP `o=` line (see [`scrub_residual_topology`]). `Ok(None)`
+/// when nothing changes (no `o=`, or already hidden); `Err` on a malformed
+/// `o=`, no usable `c=`, or a non-UTF-8 body.
+fn scrub_sdp_origin(body: &Bytes, origin_host: &str) -> Result<Option<Bytes>, ()> {
+    let text = std::str::from_utf8(body).map_err(|_| ())?;
+    Ok(scrub_sdp_text(text, origin_host)?.map(Bytes::from))
+}
+
+/// [`scrub_sdp_origin`] on text. One pass over the lines (PERF-002).
+fn scrub_sdp_text(text: &str, origin_host: &str) -> Result<Option<String>, ()> {
+    let mut origin = None;
+    let mut session_c = None;
+    let mut media_c = None;
+    let mut in_media = false;
+    for l in text.lines() {
+        let l = l.strip_suffix('\r').unwrap_or(l);
+        if l.starts_with("m=") {
+            in_media = true;
+        } else if let Some(o) = l.strip_prefix("o=") {
+            origin.get_or_insert(o);
+        } else if let Some(c) = l.strip_prefix("c=") {
+            if in_media {
+                media_c.get_or_insert(c);
+            } else {
+                session_c.get_or_insert(c);
+            }
+        }
+    }
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    let mut f = origin.splitn(7, ' ');
+    let (
+        Some(_user),
+        Some(sess_id),
+        Some(sess_version),
+        Some(nettype),
+        Some(_at),
+        Some(_addr),
+        None,
+    ) = (
+        f.next(),
+        f.next(),
+        f.next(),
+        f.next(),
+        f.next(),
+        f.next(),
+        f.next(),
+    )
+    else {
+        return Err(());
+    };
+    // c=<nettype> <addrtype> <address>[/ttl]. No usable c= at all is
+    // malformed SDP (RFC 8866 §5.7); fail closed. The c= address is not
+    // used for `o=` (RFC-001: it may change per offer).
+    (session_c.or(media_c))
+        .and_then(|c| c.split(' ').nth(2))
+        .and_then(|a| a.split('/').next())
+        .filter(|a| !a.is_empty())
+        .ok_or(())?;
+    // RFC 8866 §5.2: addrtype from the same source as the address
+    // (RFC-002); an FQDN is allowed with IP4.
+    let host = origin_host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(origin_host);
+    if host.is_empty() || host.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return Err(());
+    }
+    let addrtype = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        "IP6"
+    } else {
+        "IP4"
+    };
+    let new_origin = format!("- {sess_id} {sess_version} {nettype} {addrtype} {host}");
+    if new_origin == origin {
+        return Ok(None);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut done = false;
+    for seg in text.split_inclusive('\n') {
+        if !done && seg.starts_with("o=") {
+            out.push_str("o=");
+            out.push_str(&new_origin);
+            if seg.ends_with("\r\n") {
+                out.push_str("\r\n");
+            } else if seg.ends_with('\n') {
+                out.push('\n');
+            }
+            done = true;
+        } else {
+            out.push_str(seg);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Body parts walked in a multipart body before failing closed (SC-5).
+const MAX_MULTIPART_PARTS: usize = 16;
+
+/// First index of `needle` in `hay` at or after `from`.
+fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    hay.get(from..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|i| i + from)
+}
+
+/// Scrubs `o=` in every `application/sdp` part of a `multipart/*` body
+/// (RFC 2046 §5.1, RFC 5621; SEC-001). Other parts (ISUP, PIDF) are kept
+/// byte-exact. `Err` (fail closed) for a missing or invalid boundary, an
+/// unterminated body, a nested multipart, too many parts, a malformed
+/// SDP part, or an SDP part with a non-identity Content-Transfer-Encoding
+/// (RFC-006). `Ok(None)` when nothing changes.
+fn scrub_multipart_sdp(
+    body: &Bytes,
+    content_type: &str,
+    origin_host: &str,
+) -> Result<Option<Bytes>, ()> {
+    let boundary = content_type
+        .split(';')
+        .skip(1)
+        .find_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            k.trim()
+                .eq_ignore_ascii_case("boundary")
+                .then(|| v.trim().trim_matches('"'))
+        })
+        .filter(|b| (1..=70).contains(&b.len()))
+        .ok_or(())?;
+    let mut delim = Vec::with_capacity(boundary.len() + 2);
+    delim.extend_from_slice(b"--");
+    delim.extend_from_slice(boundary.as_bytes());
+    let b: &[u8] = body;
+    // A delimiter only counts at the start of a line and when followed by
+    // `--`, SP, HTAB, CR or LF (RFC 2046 §5.1.1; RFC-007).
+    let next_delim = |from: usize| -> Option<usize> {
+        let mut at = from;
+        loop {
+            let i = find_bytes(b, &delim, at)?;
+            let at_line = i == 0 || b.get(i - 1) == Some(&b'\n');
+            let tail = b.get(i + delim.len()..).unwrap_or_default();
+            let ends = tail.starts_with(b"--")
+                || matches!(tail.first(), Some(b' ' | b'\t' | b'\r' | b'\n'));
+            if at_line && ends {
+                return Some(i);
+            }
+            at = i + 1;
+        }
+    };
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut d = next_delim(0).ok_or(())?;
+    for _ in 0..=MAX_MULTIPART_PARTS {
+        let after = d + delim.len();
+        if b.get(after..after + 2) == Some(b"--".as_slice()) {
+            // Close delimiter: done.
+            let mut out = Vec::with_capacity(b.len() + 8);
+            let mut pos = 0;
+            if edits.is_empty() {
+                return Ok(None);
+            }
+            for (s, e, text) in &edits {
+                out.extend_from_slice(b.get(pos..*s).ok_or(())?);
+                out.extend_from_slice(text.as_bytes());
+                pos = *e;
+            }
+            out.extend_from_slice(b.get(pos..).ok_or(())?);
+            return Ok(Some(Bytes::from(out)));
+        }
+        let part_start = find_bytes(b, b"\n", after).ok_or(())? + 1;
+        let nd = next_delim(part_start).ok_or(())?;
+        // The CRLF before a delimiter belongs to it.
+        let mut part_end = nd;
+        if part_end > part_start && b.get(part_end - 1) == Some(&b'\n') {
+            part_end -= 1;
+            if part_end > part_start && b.get(part_end - 1) == Some(&b'\r') {
+                part_end -= 1;
+            }
+        }
+        let part = b.get(part_start..part_end).ok_or(())?;
+        // Part headers end at the first empty line (or the part starts
+        // with one: no headers, text/plain).
+        let (hdr_len, body_off) = if part.starts_with(b"\r\n") {
+            (0, 2)
+        } else if part.starts_with(b"\n") {
+            (0, 1)
+        } else if let Some(i) = find_bytes(part, b"\r\n\r\n", 0) {
+            (i, i + 4)
+        } else if let Some(i) = find_bytes(part, b"\n\n", 0) {
+            (i, i + 2)
+        } else {
+            (part.len(), part.len())
+        };
+        let hdrs = part.get(..hdr_len).ok_or(())?;
+        let part_hdr = |name: &'static str| {
+            hdrs.split(|&c| c == b'\n')
+                .filter_map(|l| std::str::from_utf8(l).ok())
+                .filter_map(move |l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim().eq_ignore_ascii_case(name).then_some(v)
+                })
+        };
+        let ct = part_hdr("content-type")
+            .next()
+            .map(|v| v.split(';').next().unwrap_or_default().trim());
+        if let Some(ct) = ct {
+            if ct
+                .get(..10)
+                .is_some_and(|p| p.eq_ignore_ascii_case("multipart/"))
+            {
+                return Err(());
+            }
+            if ct.eq_ignore_ascii_case("application/sdp") {
+                // RFC-006: base64/quoted-printable would hide `o=`.
+                if !part_hdr("content-transfer-encoding").all(is_identity_cte) {
+                    return Err(());
+                }
+                let sdp_start = part_start + body_off;
+                let sdp =
+                    std::str::from_utf8(b.get(sdp_start..part_end).ok_or(())?).map_err(|_| ())?;
+                if let Some(t) = scrub_sdp_text(sdp, origin_host)? {
+                    edits.push((sdp_start, part_end, t));
+                }
+            }
+        }
+        d = nd;
+    }
+    Err(())
 }
 
 /// Message and destination of a wire element.
@@ -1707,6 +2329,8 @@ impl SipStack {
             announcement_calls: Arc::new(
                 tokio::sync::RwLock::new(std::collections::HashSet::new()),
             ),
+            deferred_sends: Arc::new(std::sync::Mutex::new(DeferredSends::default())),
+            released_invites: std::sync::Mutex::new(ReleasedCalls::default()),
             vps: None,
             stir: None,
         }
@@ -1774,6 +2398,8 @@ impl SipStack {
             announcement_calls: Arc::new(
                 tokio::sync::RwLock::new(std::collections::HashSet::new()),
             ),
+            deferred_sends: Arc::new(std::sync::Mutex::new(DeferredSends::default())),
+            released_invites: std::sync::Mutex::new(ReleasedCalls::default()),
             vps: None,
             stir: None,
         }
@@ -2369,7 +2995,15 @@ impl SipStack {
     /// responses that were never ACKed. The daemon calls this every ~100 ms
     /// (a fraction of T1).
     pub async fn poll_timers(&self) -> Vec<ProcessResult> {
-        let mut out = Vec::new();
+        // Requests queued off the request path (POA&M-184) open their client
+        // transaction here (Timer E/F, RFC 3261 §17.1.2) and go out through
+        // the same dispatch as every other SBC-originated request.
+        let deferred = std::mem::take(&mut lock_leaf(&self.deferred_sends).queue);
+        lock_leaf(&self.released_invites).prune(Instant::now());
+        for r in &deferred {
+            self.track_result(r).await;
+        }
+        let mut out = deferred;
         let mut timed_out: Vec<(String, CallId)> = Vec::new();
         {
             let mut txns = self.transactions.write().await;
@@ -2572,6 +3206,117 @@ impl SipStack {
         !hider.read().await.config().is_internal_ip(dest.ip())
     }
 
+    /// ACK (always) and BYE (once per to-tag) for an INVITE 2xx that arrived
+    /// after its call was released (RFC 3261 §13.2.2.4: the UAC MUST ACK
+    /// every 2xx and SHOULD BYE an unwanted dialog). Only a response that
+    /// carries the released attempt's Via branch and CSeq matches, and the
+    /// requests go to the stored B-leg destination and flow, never to an
+    /// address from the response (NIST 800-53 Rev5: SC-5, SC-8, SI-10).
+    /// `None` when nothing matches.
+    fn late_2xx_teardown(
+        &self,
+        resp: &SipResponse,
+        source: SbcSocketAddr,
+        call_id: &str,
+        branch: &str,
+        cseq: u32,
+    ) -> Option<ProcessResult> {
+        // A 2xx without a (valid) To tag is malformed; nothing to ACK.
+        let to_tag = resp
+            .headers
+            .get_value(&HeaderName::To)
+            .and_then(|t| extract_param(t, "tag"))
+            .filter(|t| is_sip_token(t))?
+            .to_string();
+        let (entry, send_bye) = {
+            let mut store = lock_leaf(&self.released_invites);
+            // NIST 800-53 Rev5: SC-5, SI-10 - only the peer the INVITE went
+            // to can answer it. Checked before matching so a replay from
+            // elsewhere neither regenerates an ACK nor uses a to-tag slot.
+            // IP only: a UDP UAS may answer from another port (RFC 3261
+            // §18.2.2 sends to the Via sent-by, not the INVITE's source),
+            // and on TCP/TLS the response rides the connection we opened.
+            if !store
+                .destination_of(call_id)
+                .is_some_and(|d| d.ip() == source.ip())
+            {
+                return None;
+            }
+            store.match_late_2xx(call_id, branch, cseq, &to_tag, Instant::now())?
+        };
+        let uri = resp
+            .headers
+            .get_value(&HeaderName::Contact)
+            .and_then(sanitize_remote_target)
+            .unwrap_or_else(|| entry.request_uri.clone());
+        // RFC 3261 §12.1.2: the UAC route set is the 2xx Record-Route in
+        // reverse. A malformed or oversized list gives no route set.
+        // RFC 3261 §8.1.2 would send to the first Route / the remote target.
+        // Deliberate B2BUA choice (RFC 7092 §3.1): the ACK/BYE goes to the
+        // stored B-leg destination and flow instead, the same next hop the
+        // INVITE used, so a late 2xx cannot steer SBC traffic (no SSRF or
+        // reflection); Route/Request-URI are carried for the far end only.
+        let mut routes: Vec<String> = Vec::new();
+        for rr in resp.headers.get_all(&HeaderName::RecordRoute) {
+            match proto_sip::split_list_bounded(&rr.value, RELEASED_CALL_MAX_ROUTES) {
+                Ok(v) if routes.len() + v.len() <= RELEASED_CALL_MAX_ROUTES => {
+                    routes.extend(v.into_iter().map(str::to_string));
+                }
+                _ => {
+                    routes.clear();
+                    break;
+                }
+            }
+        }
+        routes.reverse();
+        let send = |m: SipRequest| ProcessResult::Forward {
+            message: SipMessage::Request(m),
+            destination: entry.destination,
+            flow: entry.flow.clone().into(),
+        };
+        let ack = send(build_late_2xx_request(
+            &entry,
+            Method::Ack,
+            entry.invite_cseq,
+            &to_tag,
+            uri.clone(),
+            &routes,
+        ));
+        debug!(call_id = %call_id, status = resp.status.code(), bye = send_bye, "Late INVITE 2xx after release");
+        if !send_bye {
+            return Some(ack);
+        }
+        self.routing_counters
+            .late_2xx_teardowns
+            .fetch_add(1, Ordering::Relaxed);
+        // NIST 800-53 Rev5: AU-2, AU-12 - an SBC-initiated teardown is on the
+        // audit trail. One record per BYE (first 2xx per to-tag, at most
+        // RELEASED_CALL_MAX_TAGS per call), so a peer cannot flood it.
+        audit(uc_audit::AuditEvent::AuthorizationDecision(
+            uc_audit::event::AuthorizationDecision {
+                identity: "sbc".to_string(),
+                resource: format!(
+                    "{call_id};to-tag={to_tag};dest={};status={}",
+                    entry.destination,
+                    resp.status.code()
+                ),
+                action: "BYE".to_string(),
+                granted: true,
+                policy: "sip.late_2xx.teardown".to_string(),
+                source_ip: Some(source.ip()),
+            },
+        ));
+        let bye = send(build_late_2xx_request(
+            &entry,
+            Method::Bye,
+            entry.invite_cseq.saturating_add(1),
+            &to_tag,
+            uri,
+            &routes,
+        ));
+        Some(ProcessResult::Multiple(vec![ack, bye]))
+    }
+
     /// Counts, logs and audits one topology-hiding failure. The header value
     /// is never echoed (NIST 800-53 Rev5: SI-11; SI-4, AU-12).
     fn record_topology_failure(&self, f: &HideFailure) {
@@ -2608,13 +3353,16 @@ impl SipStack {
     /// failover INVITE fails the call (503 to the caller); a dropped 2xx to
     /// INVITE tears the dialog down (BYE). Returns the failure count.
     ///
+    /// Each hidden message also loses its residual topology
+    /// (`Server` / `User-Agent` / `Warning`, `Reason` text, SDP `o=`
+    /// username and address; see [`scrub_residual_topology`]). Failures are
+    /// counted in `sbc_topology_hiding_failures_total`.
+    ///
     /// Disabled hider: one `Option` check.
     ///
     /// ## NIST 800-53 Rev5: SC-7, AC-4, SI-17, AU-12
-    // POAM-181: residual leaks not covered here: Warning / Server /
-    // User-Agent / Reason headers, SDP `o=` / `c=` lines, and the missing
-    // Contact on the relayed 2xx (RFC 3261 §12.1.1). SC-7 is partial until
-    // POA&M-181 closes. POAM-180: failure counters are not yet exported.
+    ///
+    /// ## RFC 3261 §20.35, §20.41, §20.43; RFC 3326 §2; RFC 8866 §5.2
     async fn apply_egress_topology(
         &self,
         result: &mut ProcessResult,
@@ -3563,6 +4311,13 @@ impl SipStack {
             corr.b_leg.remove(&removed.b_leg_sip_call_id);
             removed
         };
+        // RFC 3261 §13.2.2.4: a 2xx can still cross the release of an
+        // unanswered call (CANCEL, Timer B, failover exhaustion, ...); keep
+        // the attempt so it gets ACK+BYE. Answered calls tear down normally.
+        if !removed.b_leg_answered && !removed.b_leg_branch.is_empty() {
+            let now = Instant::now();
+            lock_leaf(&self.released_invites).insert(ReleasedInvite::of(&removed, now), now);
+        }
         for port in &removed.rtp_ports {
             self.release_rtp_port(*port);
         }
@@ -4087,6 +4842,12 @@ impl SipStack {
             }
         };
 
+        if swapped.is_some() {
+            // The superseded attempt was CANCELled but its 2xx can still
+            // cross (RFC 3261 §13.2.2.4): remember it like a release.
+            let now = Instant::now();
+            lock_leaf(&self.released_invites).insert(ReleasedInvite::of(addrs, now), now);
+        }
         let Some(failed) = swapped else {
             router_lock.write().await.release_trunk(
                 &lease.group_id,
@@ -4474,6 +5235,21 @@ impl SipStack {
     /// ## NIST 800-53 Rev5: SI-4 (System Monitoring), SC-5
     pub fn emergency_admissions(&self) -> u64 {
         self.emergency_admissions.load(Ordering::Relaxed)
+    }
+
+    /// SBC-originated requests (e.g. the post-announcement BYE) dropped
+    /// because the deferred-send queue was full
+    /// (`sbc_deferred_send_dropped_total`).
+    ///
+    /// ## NIST 800-53 Rev5: SI-4, AU-5, SC-5
+    #[must_use]
+    pub fn deferred_send_dropped(&self) -> u64 {
+        lock_leaf(&self.deferred_sends).dropped
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_deferred_send_dropped_for_tests(&self, n: u64) {
+        lock_leaf(&self.deferred_sends).dropped = n;
     }
 
     /// `require_tls` policy counters (`routing_tls_required_*`).
@@ -4943,7 +5719,17 @@ impl SipStack {
         let mode = match config.mode.as_str() {
             "signaling_only" => TopologyHidingMode::Basic,
             "full" => TopologyHidingMode::Aggressive,
-            _ => return Ok(None), // "none"
+            // NIST 800-53 Rev5: CM-6, SC-7 - same rule as `validate_config`
+            // (POA&M-183): enabled with "none" or an unknown mode (e.g. the
+            // never-enforced "basic") fails closed instead of silently
+            // turning hiding off, even when validation was bypassed.
+            other => {
+                return Err(format!(
+                    "topology_hiding.mode '{}' is not supported when enabled; \
+                     use \"signaling_only\" or \"full\", or set enabled = false",
+                    other.escape_default()
+                ));
+            }
         };
 
         let mut topo_config = SipTopologyConfig::new(&config.external_host)
@@ -5091,7 +5877,12 @@ impl SipStack {
         // handler runs (BYE/CANCEL remove the record). Skipped entirely when
         // topology hiding is off.
         let hiding_snapshot = match (&self.topology_hider, message.call_id()) {
-            (Some(_), Some(id)) => self.leg_hiding_for(id).await,
+            // POA&M-185: a late 2xx's ACK/BYE use the released call's own
+            // hiding decision, not the destination fallback.
+            (Some(_), Some(id)) => self
+                .leg_hiding_for(id)
+                .await
+                .or_else(|| lock_leaf(&self.released_invites).hiding_for(id)),
             _ => None,
         };
         let is_request = message.is_request();
@@ -5277,8 +6068,15 @@ impl SipStack {
         } else if let Some(id) = corr.a_leg.get(&sip_call_id) {
             (id.clone(), false)
         } else {
-            debug!(call_id = %sip_call_id, "Response for unknown dialog (e.g. 200 to our BYE)");
             drop(corr);
+            if cseq.method == Method::Invite
+                && (200..300).contains(&status_code)
+                && let Some(r) =
+                    self.late_2xx_teardown(resp, source, &sip_call_id, &branch, cseq.sequence)
+            {
+                return r;
+            }
+            debug!(call_id = %sip_call_id, "Response for unknown dialog (e.g. 200 to our BYE)");
             return ack_action.unwrap_or(ProcessResult::NoAction);
         };
         let Some(a) = corr.addresses.get(&internal_id) else {
@@ -6667,6 +7465,7 @@ impl SipStack {
                             .play_announcement_to_caller(
                                 req,
                                 source,
+                                transport,
                                 crate::announcement::AnnouncementType::NumberNotInService,
                             )
                             .await;
@@ -6776,6 +7575,7 @@ impl SipStack {
                 .play_announcement_to_caller(
                     req,
                     source,
+                    transport,
                     crate::announcement::AnnouncementType::NumberNotInService,
                 )
                 .await;
@@ -8286,6 +9086,7 @@ impl SipStack {
         &self,
         req: &proto_sip::message::SipRequest,
         source: SbcSocketAddr,
+        transport: AddrTransport,
         announcement: crate::announcement::AnnouncementType,
     ) -> ProcessResult {
         // Extract the caller's RTP destination from their SDP offer up
@@ -8408,18 +9209,21 @@ impl SipStack {
         info!(sdp_ip = %sdp_ip, rtp_port = actual_rtp_port, zone_registry_present = self.zone_registry.is_some(), "SDP media address for announcement");
         let sdp = crate::announcement::build_announcement_sdp(&sdp_ip, actual_rtp_port);
 
+        // The caller's own flow: the 200 OK and the BYE go back on the
+        // transport (and, for streams, the connection) the INVITE used
+        // (RFC 3261 §18.2.2, RFC 5923; NIST 800-53 Rev5: SC-8).
+        let flow = LegFlow::inbound(transport);
+        let port = self.signaling_port(transport);
+
         // Build 200 OK with SDP
         let mut ok_response = create_response_from_request(req, StatusCode::OK);
-        // Contact is the daemon's SIP address — not sdp_ip, which is the
-        // announcement pod's media IP when playback runs remotely.
+        // RFC 3261 §12.1.1: Contact is the daemon's SIP address on the
+        // caller's transport and SBC listener port (not the caller's port,
+        // and not sdp_ip, which is the announcement pod's media IP when
+        // playback runs remotely).
         ok_response.add_header(Header::new(
             HeaderName::Contact,
-            format!(
-                "<sip:{}@{}:{}>",
-                self.config.instance_name,
-                daemon_ip,
-                source.port()
-            ),
+            leg_contact(&host_port(&daemon_ip, port), &flow),
         ));
         ok_response
             .headers
@@ -8452,40 +9256,36 @@ impl SipStack {
         let local_ip = rtp_bind_ip.map_or_else(|| daemon_ip.clone(), |ip| ip.to_string());
 
         // The BYE is built (and topology-hidden) up front: the hider and
-        // counters are not reachable from the playback task. C5 of
-        // POA&M-155: it is sent raw on a socket, bypassing the egress
-        // chokepoint, so it is hidden here and dropped if hiding fails
-        // (NIST 800-53 Rev5: SC-7, SI-17).
-        // POAM-184: this BYE is always sent as plain UDP from :5060 whatever
-        // the caller's transport (cleartext toward TLS callers, SC-8) and is
-        // logged in full at info.
-        let bye_bytes =
-            match build_announcement_bye(&local_ip, source, &call_id, &ok_to, &invite_from) {
-                Ok(mut bye_req) => {
-                    if self.destination_hidden(source).await
-                        && let Some(ref hider) = self.topology_hider
-                        && let Err(e) = hider.read().await.hide_b2bua_request(&mut bye_req.headers)
-                    {
-                        let failure = HideFailure {
-                            kind: HideFailureKind::Request,
-                            policy: topology_policy(&e),
-                            method: Method::Bye.to_string(),
-                            call_id: Some(call_id.clone()),
-                            cseq: None,
-                            destination: source,
-                            source: None,
-                        };
-                        self.record_topology_failure(&failure);
-                        None
-                    } else {
-                        Some(SipMessage::Request(bye_req).to_bytes())
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to build BYE after announcement");
-                    None
-                }
-            };
+        // counters are not reachable from the playback task. The task only
+        // queues it; `poll_timers` tracks it (Timer E/F) and the timer loop
+        // sends it on the caller's flow, so a TLS caller never gets a
+        // cleartext BYE (NIST 800-53 Rev5: SC-7, SC-8, SI-17).
+        let sent_by = host_port(&local_ip, port);
+        let remote_target = req.headers.get_value(&HeaderName::Contact);
+        let bye = build_announcement_bye(
+            &sent_by,
+            &flow,
+            remote_target,
+            source,
+            &call_id,
+            &ok_to,
+            &invite_from,
+        );
+        let mut bye = Some(ProcessResult::Forward {
+            message: SipMessage::Request(bye),
+            destination: source,
+            flow: flow.clone().into(),
+        });
+        if self.destination_hidden(source).await
+            && let Some(ref hider) = self.topology_hider
+            && let Some(el) = bye.as_mut()
+            && let Some(mut failure) = hide_wire(&*hider.read().await, el)
+        {
+            failure.call_id = Some(call_id.clone());
+            self.record_topology_failure(&failure);
+            bye = None;
+        }
+        let deferred = Arc::clone(&self.deferred_sends);
 
         // Spawn background task to play announcement then BYE
         tokio::spawn(async move {
@@ -8524,33 +9324,16 @@ impl SipStack {
             // Send BYE after announcement
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            if let Some(bye_bytes) = bye_bytes {
-                info!("Sending BYE:\n{}", String::from_utf8_lossy(&bye_bytes));
-                // Bind to the outside zone IP on port 5060 so the BYE comes
-                // from the same address the call was established on
-                let bind_addr: std::net::SocketAddr = format!("{local_ip}:5060")
-                    .parse()
-                    .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-                let sock2 = socket2::Socket::new(
-                    socket2::Domain::IPV4,
-                    socket2::Type::DGRAM,
-                    Some(socket2::Protocol::UDP),
+            if let Some(bye) = bye
+                && push_deferred(&deferred, bye)
+            {
+                // SI-11 / AU-9: summary only, never the message itself.
+                debug!(
+                    call_id = %call_id,
+                    destination = %source,
+                    transport = ?transport,
+                    "Queued BYE after announcement"
                 );
-                if let Ok(s) = sock2 {
-                    s.set_reuse_address(true).ok();
-                    #[cfg(target_os = "linux")]
-                    s.set_reuse_port(true).ok();
-                    s.set_nonblocking(true).ok();
-                    if s.bind(&bind_addr.into()).is_ok()
-                        && let Ok(sock) = tokio::net::UdpSocket::from_std(s.into())
-                    {
-                        if let Err(e) = sock.send_to(&bye_bytes, source.as_std()).await {
-                            warn!(error = %e, "Failed to send BYE after announcement");
-                        } else {
-                            info!(call_id = %call_id, destination = %source, "Sent BYE after announcement");
-                        }
-                    }
-                }
             }
 
             // Playback finished — drop the retransmit-dedup entry so the
@@ -8706,28 +9489,84 @@ fn unsupported_scheme_response(data: &[u8]) -> Option<proto_sip::message::SipRes
 /// BYE the SBC (as UAS) sends after an announcement: From/To are the
 /// dialog's exact headers, swapped (From = our 200 OK To, To = the caller's
 /// INVITE From).
+/// The UAS BYE after an announcement, on the caller's `flow`.
+///
+/// Request-URI: the caller's INVITE Contact (the remote target, RFC 3261
+/// §12.1.1 / §12.2.1.1), sanitised by [`sanitize_remote_target`]; else
+/// `source`. The destination stays `source` (the transport peer), so an
+/// attacker-chosen Contact cannot turn the SBC into a BYE reflector.
 fn build_announcement_bye(
-    local_ip: &str,
+    sent_by: &str,
+    flow: &LegFlow,
+    remote_target: Option<&str>,
     source: SbcSocketAddr,
     call_id: &str,
     ok_to: &str,
     invite_from: &str,
-) -> proto_sip::SipResult<SipRequest> {
-    let caller_ip = source.ip().to_string();
-    let bye_uri = SipUri::new(&caller_ip).with_port(source.port());
-    RequestBuilder::new(Method::Bye, bye_uri)
-        .via_auto("UDP", local_ip, Some(5060))
-        .from_auto(SipUri::new(local_ip), None)
-        .to_uri(SipUri::new(&caller_ip), None)
-        .call_id(call_id)
-        .cseq(2)
-        .max_forwards(70)
-        .build_with_defaults()
-        .map(|mut r| {
-            r.headers.set(HeaderName::From, ok_to);
-            r.headers.set(HeaderName::To, invite_from);
-            r
+) -> SipRequest {
+    let uri = remote_target
+        .and_then(sanitize_remote_target)
+        .unwrap_or_else(|| leg_request_uri(None, &source.ip().to_string(), source.port(), flow));
+    let mut bye = SipRequest::new(Method::Bye, uri);
+    bye.headers.add(Header::new(
+        HeaderName::Via,
+        crate::flow::via_for(flow, sent_by, &generate_branch()),
+    ));
+    bye.headers.set(HeaderName::MaxForwards, "70");
+    // In a BYE from the UAS: From = our To (with our tag), To = the
+    // caller's From (with their tag).
+    bye.headers.set(HeaderName::From, ok_to);
+    bye.headers.set(HeaderName::To, invite_from);
+    bye.headers.set(HeaderName::CallId, call_id);
+    bye.headers
+        .set(HeaderName::CSeq, format!("{ANNOUNCEMENT_BYE_CSEQ} BYE"));
+    bye.headers.set(HeaderName::ContentLength, "0");
+    bye
+}
+
+/// A received Contact / remote target reduced to a bare `sip:`/`sips:` URI
+/// safe to use as a Request-URI: header params (after `>`, or after `;` in
+/// the bare form), URI headers (`?...`) and the `method` param are dropped
+/// (RFC 3261 §19.1.1: not allowed in a Request-URI); CR/LF, whitespace,
+/// control characters or an unparseable URI give `None`. Only the
+/// Request-URI comes from it, never the destination.
+///
+/// ## NIST 800-53 Rev5: SI-10 (Information Input Validation)
+fn sanitize_remote_target(contact: &str) -> Option<SipUri> {
+    let v = contact.trim();
+    let raw = if let Some(start) = v.find('<') {
+        let rest = v.get(start + 1..)?;
+        rest.get(..rest.find('>')?)?
+    } else {
+        // Bare form: everything after the first ';' is a header param.
+        v.split(';').next()?
+    };
+    let raw = raw.split('?').next()?;
+    if raw.is_empty()
+        || raw.len() > 512
+        || raw
+            .bytes()
+            .any(|b| b.is_ascii_control() || b == b' ' || matches!(b, b'<' | b'>' | b'"' | b','))
+    {
+        return None;
+    }
+    let lower = raw.get(..5).map(str::to_ascii_lowercase)?;
+    if !(lower.starts_with("sip:") || lower == "sips:") {
+        return None;
+    }
+    let cleaned: Vec<&str> = raw
+        .split(';')
+        .enumerate()
+        .filter(|(i, p)| {
+            *i == 0
+                || !p
+                    .split('=')
+                    .next()
+                    .is_some_and(|k| k.trim().eq_ignore_ascii_case("method"))
         })
+        .map(|(_, p)| p)
+        .collect();
+    cleaned.join(";").parse::<SipUri>().ok()
 }
 
 fn create_response_from_request(
@@ -8880,6 +9719,16 @@ fn build_a_leg_response(
         .headers
         .set(HeaderName::CallId, &addrs.a_leg_sip_call_id);
     response.headers.set(HeaderName::CSeq, &addrs.a_leg_cseq);
+    // RFC 3261 §12.1.1: a UAS MUST put a Contact in a 2xx (and a 101-199)
+    // that creates a dialog. As a B2BUA the caller's dialog peer is the SBC:
+    // its own caller-facing address (config data, never a received header).
+    // The topology hider rewrites it toward a hidden leg.
+    if (101..300).contains(&status.code()) {
+        response.headers.set(
+            HeaderName::Contact,
+            leg_contact(&addrs.a_leg_local_addr, &addrs.a_leg_flow),
+        );
+    }
     response.headers.set(HeaderName::ContentLength, "0");
     response
 }
@@ -10552,6 +11401,28 @@ pub mod tests {
             assert!(stack.init_topology_hider_from_config(&topo).is_err());
             assert!(stack.topology_hider.is_none());
         }
+    }
+
+    // POA&M-183: an enabled hider with an unknown or "none" mode fails
+    // closed even when `validate_config` was bypassed.
+    #[test]
+    fn topology_config_from_unknown_mode_errs() {
+        for mode in ["basic", "none", "Full", ""] {
+            let topo = sbc_config::TopologyHidingConfig {
+                enabled: true,
+                mode: mode.to_string(),
+                external_host: "sbc.example".to_string(),
+                ..Default::default()
+            };
+            let err = SipStack::topology_config_from(&topo).expect_err(mode);
+            assert!(err.contains("not supported"), "{err}");
+        }
+        let off = sbc_config::TopologyHidingConfig {
+            enabled: false,
+            mode: "basic".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(SipStack::topology_config_from(&off), Ok(None)));
     }
 
     #[tokio::test]
@@ -18224,12 +19095,12 @@ pub mod tests {
         assert_no_internal(&results);
         let (ok, dest) = responded(&results, 200).expect("200 to alice");
         assert_eq!(dest, alice());
-        // The relayed 2xx carries no Contact today; if one is added it must
-        // be hidden (inbound trunk caller).
+        // RFC 3261 §12.1.1 (POA&M-181): the relayed 2xx carries the SBC's
+        // Contact, hidden toward the inbound trunk caller.
         assert!(
             ok.headers
                 .get_value(&HeaderName::Contact)
-                .is_none_or(|c| c.contains(TH_EXTERNAL)),
+                .is_some_and(|c| c.contains(TH_EXTERNAL)),
             "caller-facing Contact hidden: {:?}",
             ok.headers
         );
@@ -19207,5 +20078,1022 @@ pub mod tests {
         assert!(responded(&results, 500).is_some(), "{results:?}");
         assert!(forwarded(&results, &Method::Bye).is_none());
         assert_eq!(th_failures(&stack), 1);
+    }
+
+    // ── POA&M-181: residual topology toward hidden legs ──
+
+    fn residual_request(call_id: &str, sdp: Option<&str>) -> SipRequest {
+        let mut r = SipRequest::new(Method::Bye, SipUri::new("203.0.113.9"));
+        r.headers.add(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/UDP 203.0.113.1:5060;branch=z9hG4bK-res",
+        ));
+        r.headers.set(HeaderName::From, "<sip:a@example.com>;tag=1");
+        r.headers.set(HeaderName::To, "<sip:b@example.com>;tag=2");
+        r.headers.set(HeaderName::CallId, call_id);
+        r.headers.set(HeaderName::CSeq, "5 BYE");
+        r.headers
+            .set(HeaderName::Server, "pbx1.corp.internal Asterisk 20");
+        r.headers.set(HeaderName::UserAgent, "PolycomVVX 10.0.0.7");
+        r.headers.add(Header::new(
+            HeaderName::Warning,
+            "399 pbx1.corp.internal \"trunk 10.0.0.7 down\"",
+        ));
+        r.headers.add(Header::new(
+            HeaderName::Reason,
+            "Q.850;cause=16;text=\"pbx1 10.0.0.7\", SIP;cause=200;text=\"x\", bogus",
+        ));
+        match sdp {
+            Some(b) => {
+                r.headers.set(HeaderName::ContentType, "application/sdp");
+                r.headers
+                    .set(HeaderName::ContentLength, b.len().to_string());
+                r.body = Some(Bytes::from(b.to_string()));
+            }
+            None => r.headers.set(HeaderName::ContentLength, "0"),
+        }
+        r
+    }
+
+    fn hiding(call_id: &str, hidden: bool) -> LegHiding {
+        LegHiding {
+            a_call_id: String::new(),
+            b_call_id: call_id.to_string(),
+            a_hidden: false,
+            b_hidden: hidden,
+        }
+    }
+
+    fn only_request(result: &ProcessResult) -> &SipRequest {
+        match result {
+            ProcessResult::Forward {
+                message: SipMessage::Request(r),
+                ..
+            } => r,
+            other => panic!("expected a request: {other:?}"),
+        }
+    }
+
+    const INTERNAL_SDP: &str = "v=0\r\no=pbxuser 4711 9 IN IP4 10.0.0.7\r\ns=-\r\nc=IN IP4 198.51.100.20\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\n";
+
+    #[tokio::test]
+    async fn th_residual_headers_scrubbed() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        enable_hider(&mut stack).await;
+        let mut result = ProcessResult::Forward {
+            message: SipMessage::Request(residual_request("res-1", None)),
+            destination: t1(),
+            flow: Flow::UDP,
+        };
+        let n = stack
+            .apply_egress_topology(&mut result, None, &[hiding("res-1", true)])
+            .await;
+        assert_eq!(n, 0);
+        let r = only_request(&result);
+        for name in [
+            HeaderName::Server,
+            HeaderName::UserAgent,
+            HeaderName::Warning,
+        ] {
+            assert!(!r.headers.contains(&name), "{name:?} kept");
+        }
+        let reasons: Vec<&str> = r
+            .headers
+            .get_all(&HeaderName::Reason)
+            .map(|h| h.value.as_str())
+            .collect();
+        assert_eq!(reasons, ["Q.850;cause=16", "SIP;cause=200"]);
+        // A response toward a hidden leg is scrubbed the same way.
+        let mut resp = SipResponse::new(StatusCode::OK);
+        resp.headers.add(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/UDP 203.0.113.1:5060;branch=z9hG4bK-r2",
+        ));
+        resp.headers.set(HeaderName::CallId, "res-1");
+        resp.headers.set(HeaderName::CSeq, "5 BYE");
+        resp.headers.set(HeaderName::Server, "pbx1.corp.internal");
+        resp.headers
+            .set(HeaderName::Reason, "Q.850;text=\"only text\"");
+        let mut result = ProcessResult::Response {
+            message: SipMessage::Response(resp),
+            destination: t1(),
+            flow: Flow::UDP,
+        };
+        stack
+            .apply_egress_topology(&mut result, None, &[hiding("res-1", true)])
+            .await;
+        let ProcessResult::Response {
+            message: SipMessage::Response(resp),
+            ..
+        } = &result
+        else {
+            panic!("response kept: {result:?}");
+        };
+        assert!(!resp.headers.contains(&HeaderName::Server));
+        assert!(
+            !resp.headers.contains(&HeaderName::Reason),
+            "no valid element"
+        );
+    }
+
+    #[tokio::test]
+    async fn th_inside_leg_keeps_residual_headers() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        enable_hider(&mut stack).await;
+        let mut result = ProcessResult::Forward {
+            message: SipMessage::Request(residual_request("res-2", Some(INTERNAL_SDP))),
+            destination: t1(),
+            flow: Flow::UDP,
+        };
+        stack
+            .apply_egress_topology(&mut result, None, &[hiding("res-2", false)])
+            .await;
+        let r = only_request(&result);
+        assert!(r.headers.contains(&HeaderName::Server));
+        assert!(r.headers.contains(&HeaderName::UserAgent));
+        assert!(r.headers.contains(&HeaderName::Warning));
+        assert!(
+            r.headers
+                .get_value(&HeaderName::Reason)
+                .unwrap()
+                .contains("text=")
+        );
+        assert_eq!(r.body.as_deref(), Some(INTERNAL_SDP.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn th_sdp_origin_username_and_addr_hidden() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        enable_hider(&mut stack).await;
+        let mut result = ProcessResult::Forward {
+            message: SipMessage::Request(residual_request("res-3", Some(INTERNAL_SDP))),
+            destination: t1(),
+            flow: Flow::UDP,
+        };
+        stack
+            .apply_egress_topology(&mut result, None, &[hiding("res-3", true)])
+            .await;
+        let r = only_request(&result);
+        let body = std::str::from_utf8(r.body.as_ref().unwrap()).unwrap();
+        // RFC 3264 §8: sess-id / sess-version unchanged.
+        assert!(
+            body.contains("\r\no=- 4711 9 IN IP4 sbc.example.com\r\n"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("pbxuser") && !body.contains("10.0.0.7"),
+            "{body}"
+        );
+        assert_eq!(
+            r.headers.get_value(&HeaderName::ContentLength),
+            Some(body.len().to_string().as_str())
+        );
+        // Only `o=` changes; media-level c= is used when there is no
+        // session-level one; LF-only bodies keep their line endings.
+        let media_c = "v=0\no=u 1 2 IN IP4 10.0.0.7\ns=-\nt=0 0\nm=audio 4000 RTP/AVP 0\nc=IN IP4 198.51.100.30/127\n";
+        let out = scrub_sdp_origin(&Bytes::from(media_c), "2001:db8::5")
+            .unwrap()
+            .unwrap();
+        // RFC-002: addrtype follows the (IPv6) origin host.
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            media_c.replace("o=u 1 2 IN IP4 10.0.0.7", "o=- 1 2 IN IP6 2001:db8::5")
+        );
+        // Already hidden: unchanged (no copy).
+        assert!(
+            scrub_sdp_origin(
+                &Bytes::from("v=0\r\no=- 1 2 IN IP4 198.51.100.1\r\nc=IN IP4 198.51.100.1\r\n"),
+                "198.51.100.1"
+            )
+            .unwrap()
+            .is_none()
+        );
+        // A non-SDP body is left alone.
+        let mut h = Headers::new();
+        h.set(HeaderName::ContentType, "text/plain");
+        let mut b = Some(Bytes::from("o=garbage"));
+        scrub_residual_topology(&mut h, &mut b, TH_EXTERNAL).unwrap();
+        assert_eq!(b.as_deref(), Some(b"o=garbage".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn th_sdp_origin_malformed_fails_closed() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        enable_hider(&mut stack).await;
+        for sdp in [
+            "v=0\r\no=user 1 IN IP4 10.0.0.7\r\nc=IN IP4 198.51.100.1\r\n",
+            "v=0\r\no=user 1 2 IN IP4 10.0.0.7\r\n",
+        ] {
+            let before = th_failures(&stack);
+            let mut result = ProcessResult::Forward {
+                message: SipMessage::Request(residual_request("res-4", Some(sdp))),
+                destination: t1(),
+                flow: Flow::UDP,
+            };
+            let n = stack
+                .apply_egress_topology(&mut result, None, &[hiding("res-4", true)])
+                .await;
+            assert_eq!(n, 1, "{sdp}");
+            assert_eq!(th_failures(&stack), before + 1);
+            let leaked = flatten(result)
+                .iter()
+                .any(|r| wire_parts(r).is_some_and(|(m, _)| m.is_request()));
+            assert!(!leaked, "malformed SDP request never forwarded");
+        }
+    }
+
+    // RFC 3264 §8 (RFC-001): a re-offer whose c= moved keeps the identical
+    // hidden `o=` bar the peer's sess-version.
+    #[tokio::test]
+    async fn th_sdp_origin_stable_across_reinvite() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        enable_hider(&mut stack).await;
+        let mut origins = Vec::new();
+        for (ver, c) in [
+            (9, "198.51.100.20"),
+            (9, "198.51.100.21"),
+            (10, "203.0.113.40"),
+        ] {
+            let sdp = format!(
+                "v=0\r\no=pbxuser 4711 {ver} IN IP4 10.0.0.7\r\ns=-\r\nc=IN IP4 {c}\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\n"
+            );
+            let mut result = ProcessResult::Forward {
+                message: SipMessage::Request(residual_request("res-re", Some(&sdp))),
+                destination: t1(),
+                flow: Flow::UDP,
+            };
+            stack
+                .apply_egress_topology(&mut result, None, &[hiding("res-re", true)])
+                .await;
+            let r = only_request(&result);
+            let body = std::str::from_utf8(r.body.as_ref().unwrap()).unwrap();
+            assert!(body.contains(&format!("c=IN IP4 {c}")), "{body}");
+            origins.push(
+                body.lines()
+                    .find(|l| l.starts_with("o="))
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_eq!(origins[0], "o=- 4711 9 IN IP4 sbc.example.com");
+        assert_eq!(origins[0], origins[1], "c= change must not change o=");
+        assert_eq!(origins[2], "o=- 4711 10 IN IP4 sbc.example.com");
+    }
+
+    // SEC-001: `o=` is scrubbed inside multipart bodies; other parts kept.
+    #[tokio::test]
+    async fn th_multipart_sdp_origin_scrubbed() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        enable_hider(&mut stack).await;
+        let isup: &[u8] = b"\x01\x00\x49\xff\x0d\x0a\x00";
+        let mut body = Vec::new();
+        body.extend_from_slice(b"--uc1\r\nContent-Type: application/sdp\r\n\r\n");
+        body.extend_from_slice(INTERNAL_SDP.as_bytes());
+        body.extend_from_slice(
+            b"\r\n--uc1\r\nContent-Type: application/isup;version=itu-t92+\r\n\r\n",
+        );
+        body.extend_from_slice(isup);
+        body.extend_from_slice(b"\r\n--uc1--\r\n");
+        let mut req = residual_request("res-mp", None);
+        req.headers
+            .set(HeaderName::ContentType, "multipart/mixed;boundary=\"uc1\"");
+        req.headers
+            .set(HeaderName::ContentLength, body.len().to_string());
+        req.body = Some(Bytes::from(body));
+        let mut result = ProcessResult::Forward {
+            message: SipMessage::Request(req),
+            destination: t1(),
+            flow: Flow::UDP,
+        };
+        let n = stack
+            .apply_egress_topology(&mut result, None, &[hiding("res-mp", true)])
+            .await;
+        assert_eq!(n, 0);
+        let r = only_request(&result);
+        let out = r.body.as_ref().unwrap();
+        let text = String::from_utf8_lossy(out);
+        assert!(
+            text.contains("\r\no=- 4711 9 IN IP4 sbc.example.com\r\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("pbxuser") && !text.contains("10.0.0.7"),
+            "{text}"
+        );
+        assert!(
+            out.windows(isup.len()).any(|w| w == isup),
+            "ISUP part intact"
+        );
+        assert!(out.ends_with(b"\r\n--uc1--\r\n"));
+        assert_eq!(
+            r.headers.get_value(&HeaderName::ContentLength),
+            Some(out.len().to_string().as_str())
+        );
+        // Fail closed: unterminated, nested, no boundary, malformed SDP part.
+        let sdp_part =
+            |sdp: &str| format!("--b\r\nContent-Type: application/sdp\r\n\r\n{sdp}\r\n--b--\r\n");
+        for (ct, b) in [
+            (
+                "multipart/mixed;boundary=b",
+                "--b\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n".to_string(),
+            ),
+            (
+                "multipart/mixed;boundary=b",
+                "--b\r\nContent-Type: multipart/mixed;boundary=c\r\n\r\nx\r\n--b--\r\n".to_string(),
+            ),
+            ("multipart/mixed", sdp_part(INTERNAL_SDP)),
+            (
+                "multipart/mixed;boundary=b",
+                sdp_part("v=0\r\no=u 1 IN IP4 10.0.0.7\r\nc=IN IP4 198.51.100.1\r\n"),
+            ),
+            ("multipart/mixed;boundary=b", "no delimiter".to_string()),
+            // RFC-006: encoded SDP parts (any case) fail closed.
+            (
+                "multipart/mixed;boundary=b",
+                "--b\r\nContent-Type: application/sdp\r\nContent-Transfer-Encoding: base64\r\n\r\ndj0w\r\n--b--\r\n".to_string(),
+            ),
+            (
+                "multipart/mixed;boundary=b",
+                "--b\r\ncontent-transfer-encoding: Quoted-Printable\r\nContent-Type: application/sdp\r\n\r\nv=3D0\r\n--b--\r\n".to_string(),
+            ),
+            // RFC-007: `--bx` is not a delimiter, so the body is unterminated.
+            (
+                "multipart/mixed;boundary=b",
+                "--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n--bx--\r\n".to_string(),
+            ),
+        ] {
+            assert!(
+                scrub_multipart_sdp(&Bytes::from(b.clone()), ct, TH_EXTERNAL).is_err(),
+                "{ct} {b:?}"
+            );
+        }
+        // Identity CTE (any case) is scrubbed normally.
+        let ok = format!(
+            "--b\r\nContent-Type: application/sdp\r\nContent-Transfer-Encoding: 8BIT\r\n\r\n{INTERNAL_SDP}\r\n--b--\r\n"
+        );
+        assert!(matches!(
+            scrub_multipart_sdp(&Bytes::from(ok), "multipart/mixed;boundary=b", TH_EXTERNAL),
+            Ok(Some(_))
+        ));
+        // RFC-007: a look-alike line inside a part is content, and a
+        // delimiter with trailing whitespace still counts.
+        let look = "--b \r\nContent-Type: text/plain\r\n\r\n--bogus\r\n--b--\r\n";
+        assert_eq!(
+            scrub_multipart_sdp(
+                &Bytes::from(look),
+                "multipart/mixed;boundary=b",
+                TH_EXTERNAL
+            ),
+            Ok(None)
+        );
+        // RFC-006: top-level SDP and multipart with an encoded CTE fail closed.
+        for (ct, cte) in [
+            ("application/sdp", "BASE64"),
+            ("multipart/mixed;boundary=b", "quoted-printable"),
+        ] {
+            let mut h = Headers::new();
+            h.set(HeaderName::ContentType, ct);
+            h.set(
+                HeaderName::Custom("Content-Transfer-Encoding".to_string()),
+                cte,
+            );
+            let mut b = Some(Bytes::from("dj0w"));
+            assert_eq!(
+                scrub_residual_topology(&mut h, &mut b, TH_EXTERNAL),
+                Err("sip.topology_hiding.failed:sdp-o".to_string()),
+                "{ct} {cte}"
+            );
+        }
+        // No SDP part: unchanged.
+        let plain = "--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n--b--\r\n";
+        assert_eq!(
+            scrub_multipart_sdp(
+                &Bytes::from(plain),
+                "multipart/mixed; boundary=b",
+                TH_EXTERNAL
+            ),
+            Ok(None)
+        );
+    }
+
+    // No generated `o=` line toward a hidden leg keeps its internal address
+    // or username (deterministic sweep in place of a proptest dependency).
+    #[test]
+    fn scrub_never_emits_internal_ip_in_o_line() {
+        for (i, user) in ["pbx", "-", "a.b", "x_y"].iter().enumerate() {
+            for (j, ip) in ["10.0.0.7", "192.168.3.4", "172.16.0.1", "fd00::7"]
+                .iter()
+                .enumerate()
+            {
+                let at = if ip.contains(':') { "IP6" } else { "IP4" };
+                for eol in ["\r\n", "\n"] {
+                    let sdp = format!(
+                        "v=0{eol}o={user} {i} {j} IN {at} {ip}{eol}s=-{eol}c=IN IP4 198.51.100.9{eol}t=0 0{eol}"
+                    );
+                    let out = scrub_sdp_origin(&Bytes::from(sdp.clone()), "192.0.2.1")
+                        .unwrap()
+                        .map_or(sdp, |b| String::from_utf8(b.to_vec()).unwrap());
+                    let o = out.lines().find(|l| l.starts_with("o=")).unwrap();
+                    assert!(!o.contains(ip), "{o}");
+                    assert_eq!(o, format!("o=- {i} {j} IN IP4 192.0.2.1"), "{at}");
+                }
+            }
+        }
+    }
+
+    // RFC 3261 §12.1.1: dialog-creating responses to the caller carry the
+    // SBC's caller-facing Contact; 100 and finals >= 300 do not.
+    #[test]
+    fn relayed_2xx_has_sbc_contact() {
+        let mut addrs = confirmed_call_addresses();
+        for (code, want) in [
+            (200, Some("<sip:10.0.0.9:5060>")),
+            (180, Some("<sip:10.0.0.9:5060>")),
+            (100, None),
+            (486, None),
+        ] {
+            let r = build_a_leg_response(StatusCode::new(code).unwrap(), &addrs);
+            assert_eq!(r.headers.get_value(&HeaderName::Contact), want, "{code}");
+        }
+        addrs.a_leg_flow = LegFlow::inbound(AddrTransport::Tls);
+        addrs.a_leg_local_addr = "10.0.0.9:5061".to_string();
+        let r = build_a_leg_response(StatusCode::OK, &addrs);
+        assert_eq!(
+            r.headers.get_value(&HeaderName::Contact),
+            Some("<sips:10.0.0.9:5061>")
+        );
+        addrs.a_leg_flow = LegFlow::inbound(AddrTransport::Tcp);
+        let r = build_a_leg_response(StatusCode::OK, &addrs);
+        assert_eq!(
+            r.headers.get_value(&HeaderName::Contact),
+            Some("<sip:10.0.0.9:5061;transport=tcp>")
+        );
+    }
+
+    // ── POA&M-184: post-announcement BYE on the caller's flow ──
+
+    fn tls_announcement_invite(call_id: &str) -> Bytes {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\n";
+        Bytes::from(format!(
+            "INVITE sips:+15550000000@sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 192.168.1.1:5061;branch=z9hG4bK-{call_id}\r\n\
+             From: <sips:alice@example.com>;tag=a1\r\n\
+             To: <sips:+15550000000@sbc.local>\r\n\
+             Call-ID: {call_id}\r\nCSeq: 1 INVITE\r\n\
+             Contact: <sips:alice@192.168.1.1:5061;transport=tls;method=BYE?Route=%3Csip:evil%3E>\r\n\
+             Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+            sdp.len()
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn announcement_bye_uses_caller_flow_tls() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        let tls_port = stack.config.tls_port;
+        let result = flatten(
+            stack
+                .process_message_on(
+                    &tls_announcement_invite("ann-tls@test"),
+                    alice(),
+                    None,
+                    AddrTransport::Tls,
+                )
+                .await,
+        );
+        let Some((ok, _)) = responded(&result, 200) else {
+            // No announcement socket on this host (480): nothing to BYE.
+            assert!(responded(&result, 480).is_some(), "{result:?}");
+            return;
+        };
+        let contact = ok.headers.get_value(&HeaderName::Contact).unwrap();
+        assert!(
+            contact.starts_with("<sips:") && contact.ends_with(&format!(":{tls_port}>")),
+            "Contact on the SBC TLS port, not the caller's: {contact}"
+        );
+        let mut bye = None;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Some(b) = stack.poll_timers().await.into_iter().find(|r| {
+                matches!(r, ProcessResult::Forward { message: SipMessage::Request(q), .. } if q.method == Method::Bye)
+            }) {
+                bye = Some(b);
+                break;
+            }
+        }
+        let Some(ProcessResult::Forward {
+            message: SipMessage::Request(bye),
+            destination,
+            flow,
+        }) = bye
+        else {
+            panic!("BYE queued after the announcement");
+        };
+        assert_eq!(destination, alice());
+        assert_eq!(flow, Flow::Leg(LegFlow::inbound(AddrTransport::Tls)));
+        let via = bye.headers.get_value(&HeaderName::Via).unwrap();
+        assert!(via.starts_with("SIP/2.0/TLS "), "{via}");
+        assert!(via.contains(&format!(":{tls_port};")), "{via}");
+        assert!(!via.contains("rport"), "{via}");
+        let uri = bye.uri.to_string();
+        assert!(uri.starts_with("sips:alice@192.168.1.1:5061"), "{uri}");
+        assert!(
+            !uri.contains("method") && !uri.contains("evil") && !uri.contains('?'),
+            "{uri}"
+        );
+        assert_eq!(bye.headers.cseq(), Some("2 BYE"));
+        // Tracked: a client non-INVITE transaction retransmits it (Timer E).
+        assert!(
+            !stack.transactions.read().await.client_non_invite.is_empty(),
+            "BYE rides a client transaction"
+        );
+    }
+
+    #[test]
+    fn announcement_bye_udp_has_rport() {
+        let bye = build_announcement_bye(
+            "198.51.100.1:5060",
+            &LegFlow::UDP,
+            None,
+            alice(),
+            "c1",
+            "<sip:x@sbc>;tag=s",
+            "<sip:alice@example.com>;tag=a",
+        );
+        let via = bye.headers.get_value(&HeaderName::Via).unwrap();
+        assert!(
+            via.starts_with("SIP/2.0/UDP 198.51.100.1:5060;branch="),
+            "{via}"
+        );
+        assert!(via.ends_with(";rport"), "{via}");
+        assert_eq!(bye.uri.to_string(), "sip:192.168.1.1:5060");
+        assert_eq!(
+            bye.headers.get_value(&HeaderName::From),
+            Some("<sip:x@sbc>;tag=s")
+        );
+        assert_eq!(
+            bye.headers.get_value(&HeaderName::To),
+            Some("<sip:alice@example.com>;tag=a")
+        );
+    }
+
+    #[test]
+    fn announcement_bye_contact_injection_sanitised() {
+        for bad in [
+            "<sip:a@192.0.2.1\r\nX-Evil: 1>",
+            "<http://evil.example/>",
+            "<sip:a b@192.0.2.1>",
+            "<sip:a@192.0.2.1",
+            "",
+        ] {
+            assert!(sanitize_remote_target(bad).is_none(), "{bad:?}");
+        }
+        let ok = sanitize_remote_target(
+            "\"A\" <sip:a@192.0.2.1:5070;method=INVITE;lr?Subject=x>;expires=3",
+        )
+        .unwrap()
+        .to_string();
+        assert!(ok.starts_with("sip:a@192.0.2.1:5070"), "{ok}");
+        assert!(
+            !ok.contains("method") && !ok.contains("Subject") && !ok.contains("expires"),
+            "{ok}"
+        );
+        let bare = sanitize_remote_target("sip:b@192.0.2.2;expires=60").unwrap();
+        assert_eq!(bare.to_string(), "sip:b@192.0.2.2");
+    }
+
+    #[tokio::test]
+    async fn deferred_sends_bounded() {
+        let q = std::sync::Mutex::new(DeferredSends::default());
+        for _ in 0..MAX_DEFERRED_SENDS {
+            assert!(push_deferred(&q, ProcessResult::NoAction));
+        }
+        assert!(!push_deferred(&q, ProcessResult::NoAction));
+        let g = lock_leaf(&q);
+        assert_eq!(g.queue.len(), MAX_DEFERRED_SENDS);
+        assert_eq!(g.dropped, 1);
+    }
+
+    // ── POA&M-185: late INVITE 2xx after release ──
+
+    /// A 200 for `b_invite` with Record-Route and a Contact carrying URI
+    /// headers / method (sanitised away in the ACK/BYE Request-URI).
+    fn late_200(b_invite: &SipRequest, tag: &str) -> Bytes {
+        let base = String::from_utf8(response_to(b_invite, 200, Some(tag), None).to_vec()).unwrap();
+        Bytes::from(base.replacen(
+            "\r\nFrom:",
+            "\r\nRecord-Route: <sip:p1.example.net;lr>, <sip:p2.example.net;lr>\r\n\
+             Contact: <sip:bob@203.0.113.5:5070;method=INVITE?X-Evil=1>\r\nFrom:",
+            1,
+        ))
+    }
+
+    async fn cancelled_call(stack: &SipStack, call_id: &str) -> SipRequest {
+        let results = place_call(stack, call_id).await;
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
+        let b_invite = b_invite.clone();
+        let results = flatten(
+            stack
+                .process_message(
+                    &caller_request("CANCEL", DIALED, call_id, 1, None, None),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Cancel).is_some());
+        b_invite
+    }
+
+    fn late_teardowns(stack: &SipStack) -> u64 {
+        stack
+            .routing_counters
+            .late_2xx_teardowns
+            .load(Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn late_2xx_after_cancel_is_acked_and_byed() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let b_invite = cancelled_call(&stack, "late-1@test").await;
+        assert_eq!(lock_leaf(&stack.released_invites).len(), 1);
+        let results = flatten(
+            stack
+                .process_message(&late_200(&b_invite, "bobtag"), t1(), None)
+                .await,
+        );
+        let (ack, dest) = forwarded(&results, &Method::Ack).expect("ACK");
+        assert_eq!(dest, t1());
+        let (bye, dest) = forwarded(&results, &Method::Bye).expect("BYE");
+        assert_eq!(dest, t1());
+        for r in [ack, bye] {
+            assert_eq!(r.uri.to_string(), "sip:bob@203.0.113.5:5070");
+            assert_eq!(r.headers.call_id(), b_invite.headers.call_id());
+            assert!(
+                r.headers
+                    .get_value(&HeaderName::To)
+                    .unwrap()
+                    .ends_with(";tag=bobtag")
+            );
+            let routes: Vec<&str> = r
+                .headers
+                .get_all(&HeaderName::Route)
+                .map(|h| h.value.as_str())
+                .collect();
+            assert_eq!(
+                routes,
+                ["<sip:p2.example.net;lr>", "<sip:p1.example.net;lr>"]
+            );
+            // §17.1.1.3: own branch, not the INVITE's.
+            assert_ne!(r.headers.via_branch(), b_invite.headers.via_branch());
+        }
+        assert_eq!(ack.headers.cseq(), Some("1 ACK"));
+        assert_eq!(bye.headers.cseq(), Some("2 BYE"));
+        assert_eq!(late_teardowns(&stack), 1);
+        // The BYE rides a client transaction (Timer E/F).
+        assert!(!stack.transactions.read().await.client_non_invite.is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_2xx_retransmit_reacks_only() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let b_invite = cancelled_call(&stack, "late-2@test").await;
+        stack
+            .process_message(&late_200(&b_invite, "bobtag"), t1(), None)
+            .await;
+        let results = flatten(
+            stack
+                .process_message(&late_200(&b_invite, "bobtag"), t1(), None)
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Ack).is_some());
+        assert!(forwarded(&results, &Method::Bye).is_none());
+        assert_eq!(late_teardowns(&stack), 1);
+    }
+
+    #[tokio::test]
+    async fn late_2xx_forked_new_tag_gets_bye() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let b_invite = cancelled_call(&stack, "late-3@test").await;
+        for i in 0..RELEASED_CALL_MAX_TAGS {
+            let results = flatten(
+                stack
+                    .process_message(&late_200(&b_invite, &format!("fork{i}")), t1(), None)
+                    .await,
+            );
+            assert!(forwarded(&results, &Method::Bye).is_some(), "fork {i}");
+        }
+        // Past the per-call tag cap: ACK only (bounded fork state).
+        let results = flatten(
+            stack
+                .process_message(&late_200(&b_invite, "fork-extra"), t1(), None)
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Ack).is_some());
+        assert!(forwarded(&results, &Method::Bye).is_none());
+        assert_eq!(late_teardowns(&stack), RELEASED_CALL_MAX_TAGS as u64);
+    }
+
+    // SEC-002: a late 2xx from anywhere but the INVITE's destination is
+    // ignored and does not use up the to-tag's BYE.
+    #[tokio::test]
+    async fn late_2xx_from_wrong_source_ignored() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let b_invite = cancelled_call(&stack, "late-src@test").await;
+        let results = flatten(
+            stack
+                .process_message(&late_200(&b_invite, "bobtag"), t2(), None)
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Ack).is_none());
+        assert!(forwarded(&results, &Method::Bye).is_none());
+        assert_eq!(late_teardowns(&stack), 0);
+        let results = flatten(
+            stack
+                .process_message(&late_200(&b_invite, "bobtag"), t1(), None)
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Bye).is_some());
+        assert_eq!(late_teardowns(&stack), 1);
+    }
+
+    #[tokio::test]
+    async fn late_2xx_wrong_branch_ignored() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let b_invite = cancelled_call(&stack, "late-4@test").await;
+        let branch = b_invite.headers.via_branch().unwrap();
+        let forged = String::from_utf8(late_200(&b_invite, "bobtag").to_vec())
+            .unwrap()
+            .replace(&branch, "z9hG4bK-forged");
+        let results = flatten(
+            stack
+                .process_message(&Bytes::from(forged), t1(), None)
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Ack).is_none(), "{results:?}");
+        assert!(forwarded(&results, &Method::Bye).is_none());
+        // Wrong CSeq number on the right branch: also ignored.
+        let wrong_cseq = String::from_utf8(late_200(&b_invite, "bobtag").to_vec())
+            .unwrap()
+            .replace("CSeq: 1 INVITE", "CSeq: 7 INVITE");
+        let results = flatten(
+            stack
+                .process_message(&Bytes::from(wrong_cseq), t1(), None)
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Bye).is_none(), "{results:?}");
+        assert_eq!(late_teardowns(&stack), 0);
+    }
+
+    fn released(call_id: &str, at: Instant) -> ReleasedInvite {
+        let mut e = ReleasedInvite::of(&confirmed_call_addresses(), at);
+        e.call_id = call_id.to_string();
+        e
+    }
+
+    #[test]
+    fn late_2xx_after_ttl_ignored() {
+        let t0 = Instant::now();
+        let mut rc = ReleasedCalls::default();
+        let e = released("ttl-1", t0);
+        let branch = e.branch.clone();
+        let cseq = e.invite_cseq;
+        rc.insert(e, t0);
+        let fresh = t0 + std::time::Duration::from_secs(31);
+        assert!(
+            rc.match_late_2xx("ttl-1", &branch, cseq, "t", fresh)
+                .is_some()
+        );
+        let late = t0 + RELEASED_CALL_TTL + std::time::Duration::from_secs(1);
+        assert!(
+            rc.match_late_2xx("ttl-1", &branch, cseq, "t", late)
+                .is_none()
+        );
+        assert_eq!(rc.len(), 0, "expired entry pruned");
+    }
+
+    #[test]
+    fn released_calls_capacity_evicts_oldest() {
+        let t0 = Instant::now();
+        let mut rc = ReleasedCalls::default();
+        for i in 0..=RELEASED_CALLS_CAP {
+            rc.insert(released(&format!("cap-{i}"), t0), t0);
+        }
+        assert_eq!(rc.len(), RELEASED_CALLS_CAP);
+        assert!(rc.order.len() <= RELEASED_CALLS_CAP);
+        assert!(!rc.by_call_id.contains_key("cap-0"), "oldest evicted");
+        assert!(
+            rc.by_call_id
+                .contains_key(&format!("cap-{RELEASED_CALLS_CAP}"))
+        );
+        // Re-inserting a key keeps one record and a bounded order queue.
+        for _ in 0..10 {
+            rc.insert(released("cap-1", t0), t0);
+        }
+        assert!(rc.order.len() <= RELEASED_CALLS_CAP);
+        assert!(rc.by_call_id.contains_key("cap-1"));
+    }
+
+    #[tokio::test]
+    async fn answered_call_not_recorded() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "late-ans@test").await;
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
+        let b_invite = b_invite.clone();
+        stack
+            .process_message(
+                &response_to(&b_invite, 200, Some("bobtag"), Some(BOB_SDP)),
+                t1(),
+                None,
+            )
+            .await;
+        stack
+            .process_message(
+                &caller_request("ACK", DIALED, "late-ans@test", 1, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        stack
+            .process_message(
+                &caller_request("BYE", DIALED, "late-ans@test", 2, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        assert_eq!(lock_leaf(&stack.released_invites).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn late_2xx_from_superseded_failover_attempt_is_byed() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "late-fo@test").await;
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
+        let b_invite = b_invite.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&b_invite, 503, Some("x"), None), t1(), None)
+                .await,
+        );
+        let (_, dest) = forwarded(&results, &Method::Invite).expect("failover INVITE");
+        assert_eq!(dest, t2());
+        let results = flatten(
+            stack
+                .process_message(&late_200(&b_invite, "late"), t1(), None)
+                .await,
+        );
+        assert_eq!(
+            forwarded(&results, &Method::Bye).map(|(_, d)| d),
+            Some(t1())
+        );
+        assert!(forwarded(&results, &Method::Ack).is_some());
+    }
+
+    #[tokio::test]
+    async fn late_2xx_toward_hidden_leg_is_hidden() {
+        let stack = th_trunk_stack().await;
+        let b_invite = cancelled_call(&stack, "late-th@test").await;
+        let results = flatten(
+            stack
+                .process_message(&late_200(&b_invite, "bobtag"), t1(), None)
+                .await,
+        );
+        let (bye, _) = forwarded(&results, &Method::Bye).expect("BYE");
+        let (ack, _) = forwarded(&results, &Method::Ack).expect("ACK");
+        for r in [ack, bye] {
+            let via = r.headers.get_value(&HeaderName::Via).unwrap();
+            assert!(via.contains(TH_EXTERNAL), "{via}");
+        }
+        assert_no_internal(&results);
+        assert_eq!(th_failures(&stack), 0);
+    }
+
+    // QA (POA&M-181 / -185): direct boundary tests of the local helpers.
+    mod qa_live_gaps {
+        use super::*;
+
+        fn origin(b: &Bytes) -> String {
+            std::str::from_utf8(b)
+                .unwrap()
+                .lines()
+                .find(|l| l.starts_with("o="))
+                .unwrap()
+                .trim_end_matches('\r')
+                .to_string()
+        }
+
+        const QA_HOST: &str = "192.0.2.1";
+
+        #[test]
+        fn qa_sdp_origin_malformed_variants_err() {
+            for sdp in [
+                // 5 fields
+                "v=0\r\no=u 1 IN IP4 10.0.0.7\r\nc=IN IP4 198.51.100.1\r\n",
+                // 7 fields
+                "v=0\r\no=u 1 2 IN IP4 10.0.0.7 x\r\nc=IN IP4 198.51.100.1\r\n",
+                // empty o=
+                "v=0\r\no=\r\nc=IN IP4 198.51.100.1\r\n",
+                // no c= anywhere
+                "v=0\r\no=u 1 2 IN IP4 10.0.0.7\r\nm=audio 4000 RTP/AVP 0\r\n",
+                // truncated c=
+                "v=0\r\no=u 1 2 IN IP4 10.0.0.7\r\nc=IN IP4\r\n",
+                // empty address after ttl split
+                "v=0\r\no=u 1 2 IN IP4 10.0.0.7\r\nc=IN IP4 /127\r\n",
+            ] {
+                assert!(
+                    scrub_sdp_origin(&Bytes::from(sdp), QA_HOST).is_err(),
+                    "must fail closed: {sdp:?}"
+                );
+            }
+            let bad_utf8 = Bytes::from_static(b"v=0\r\no=u 1 2 IN IP4 10.0.0.7\xff\r\n");
+            assert!(scrub_sdp_origin(&bad_utf8, QA_HOST).is_err());
+        }
+
+        #[test]
+        fn qa_sdp_origin_no_o_line_untouched() {
+            let sdp = Bytes::from_static(b"v=0\r\nc=IN IP4 198.51.100.1\r\n");
+            assert_eq!(scrub_sdp_origin(&sdp, "198.51.100.9"), Ok(None));
+        }
+
+        #[test]
+        fn qa_sdp_origin_media_level_c_and_ttl_and_lf() {
+            let sdp = Bytes::from_static(
+                b"v=0\no=pbx 42 7 IN IP4 10.0.0.7\ns=-\nm=audio 4000 RTP/AVP 0\nc=IN IP4 233.252.0.1/127\n",
+            );
+            let out = scrub_sdp_origin(&sdp, QA_HOST).unwrap().unwrap();
+            assert_eq!(origin(&out), "o=- 42 7 IN IP4 192.0.2.1");
+            let s = std::str::from_utf8(&out).unwrap();
+            assert!(!s.contains('\r'), "LF line endings kept");
+            assert!(!s.contains("10.0.0.7") && !s.contains("pbx"));
+            // Session-level c= wins over media-level.
+            let sdp = Bytes::from_static(
+                b"v=0\r\no=pbx 1 2 IN IP4 10.0.0.7\r\nc=IN IP4 198.51.100.9\r\nm=audio 4000 RTP/AVP 0\r\nc=IN IP4 198.51.100.1\r\n",
+            );
+            let out = scrub_sdp_origin(&sdp, QA_HOST).unwrap().unwrap();
+            assert_eq!(origin(&out), "o=- 1 2 IN IP4 192.0.2.1");
+            assert_eq!(
+                out.len(),
+                sdp.len() - "pbx".len() + 1 - "10.0.0.7".len() + QA_HOST.len()
+            );
+        }
+
+        #[test]
+        fn qa_sdp_origin_already_clean_is_noop() {
+            let sdp = Bytes::from_static(
+                b"v=0\r\no=- 1 2 IN IP4 198.51.100.9\r\nc=IN IP4 198.51.100.9\r\n",
+            );
+            assert_eq!(scrub_sdp_origin(&sdp, "198.51.100.9"), Ok(None));
+        }
+
+        #[test]
+        fn qa_late_2xx_forgeries_do_not_consume_tag_slots() {
+            let t0 = Instant::now();
+            let mut rc = ReleasedCalls::default();
+            let e = released("forge-1", t0);
+            let (branch, cseq) = (e.branch.clone(), e.invite_cseq);
+            rc.insert(e, t0);
+            assert!(rc.match_late_2xx("other", &branch, cseq, "t", t0).is_none());
+            assert!(
+                rc.match_late_2xx("forge-1", "z9hG4bK-forged", cseq, "t", t0)
+                    .is_none()
+            );
+            assert!(
+                rc.match_late_2xx("forge-1", &branch, cseq + 1, "t", t0)
+                    .is_none()
+            );
+            assert!(
+                rc.match_late_2xx("forge-1", &branch, cseq.wrapping_sub(1), "t", t0)
+                    .is_none()
+            );
+            // Forgeries recorded no to-tags: all slots are still available.
+            for i in 0..RELEASED_CALL_MAX_TAGS {
+                let (_, bye) = rc
+                    .match_late_2xx("forge-1", &branch, cseq, &format!("t{i}"), t0)
+                    .unwrap();
+                assert!(bye, "slot {i}");
+            }
+            let (_, bye) = rc
+                .match_late_2xx("forge-1", &branch, cseq, "extra", t0)
+                .unwrap();
+            assert!(!bye, "tag cap enforced");
+        }
+
+        #[test]
+        fn qa_released_calls_bounded_under_churn() {
+            let t0 = Instant::now();
+            let mut rc = ReleasedCalls::default();
+            for i in 0..(RELEASED_CALLS_CAP * 3) {
+                rc.insert(released(&format!("churn-{i}"), t0), t0);
+                assert!(rc.len() <= RELEASED_CALLS_CAP);
+                assert!(rc.order.len() <= RELEASED_CALLS_CAP);
+            }
+            // After TTL everything is pruned by the next insert.
+            let later = t0 + RELEASED_CALL_TTL + std::time::Duration::from_secs(1);
+            rc.insert(released("fresh", later), later);
+            assert_eq!(rc.len(), 1);
+            assert!(rc.order.len() <= RELEASED_CALLS_CAP);
+        }
     }
 }

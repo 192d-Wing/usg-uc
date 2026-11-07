@@ -23,6 +23,7 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 
 - **Section 5.1 (Protocol Version)**: `v=0` - Correctly implemented
 - **Section 5.2 (Origin)**: `o=- <sess-id> <sess-version> IN {IP4|IP6} <address>` - **FIXED 2026-02-07**
+- **Section 5.2 (Origin), SBC topology hiding (POA&M-181)**: toward a hidden leg, sbc-daemon rewrites the relayed `o=` line to `- <sess-id> <sess-version> IN <IP4|IP6> <topology_hiding.external_host>`. sess-id and sess-version are kept byte-exact and the address is the same for every message on the leg, so RFC 3264 §8 version comparison still works (test `th_sdp_origin_stable_across_reinvite`); addrtype follows the host (IPv6 literal gives `IP6`). `application/sdp` parts inside `multipart/*` are rewritten too. A malformed `o=`, missing `c=` or unwalkable multipart fails closed (`sip.topology_hiding.failed:sdp-o`). Tests: `th_sdp_origin_username_and_addr_hidden`, `th_sdp_origin_malformed_fails_closed`, `th_multipart_sdp_origin_scrubbed`, `qa_sdp_origin_media_level_c_and_ttl_and_lf`. `c=` is not rewritten by this step; without a media relay the peer's address passes through (accepted residual POA&M-215).
     - Uses NTP-like timestamp format (high 32 bits: seconds, low 32 bits: fractional)
     - Session version tracked per call and increments on modifications
     - IPv4 and IPv6 support working
@@ -438,6 +439,7 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 | 2026-02-07 | Updated compliance: Overall (90%→98%), all action items completed | Claude Sonnet 4.5 |
 | 2026-02-07 | **FIXED**: proto-sdp: Added b=/z=/k= line parsing and media-level i= support | Claude Sonnet 4.5 |
 | 2026-02-07 | **FIXED**: proto-sdp: Replaced weak PRNG with OS CSPRNG for SRTP keying material | Claude Sonnet 4.5 |
+| 2026-11-07 | sbc-daemon: `o=` rewritten toward hidden legs (POA&M-181); `c=` residual recorded as POA&M-215 | compliance-scribe |
 | 2026-02-07 | **FIXED**: proto-sdp: Updated RFC 4566 references to RFC 8866 | Claude Sonnet 4.5 |
 | 2026-02-07 | **FIXED**: proto-sdp: Removed duplicate doc comments, exported BandwidthInfo | Claude Sonnet 4.5 |
 

@@ -83,6 +83,54 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   only adds a `webpki-roots` 0.26 compatibility shim, which comes in through
   the sqlx TLS feature and is not in the active build.
 
+### BREAKING (SBC config, live batch POA&M-180, 181, 183, 184, 185)
+
+- **SBC: an enabled `[topology_hiding]` must set `mode = "signaling_only"`
+  or `mode = "full"`.** (SC-7, CM-6, SI-10; POA&M-183) If `enabled = true`
+  and `mode` is `"basic"`, `"none"`, any other value, or missing (the
+  default is `none`), config validation now fails. This applies at startup
+  and on live reload. A reload that fails keeps the running config.
+  `basic` was accepted before but never enforced, so the SBC looked like it
+  was hiding topology when it was not. Mode values are case-sensitive.
+  A disabled section is not checked. **Upgrade:** before upgrading, set
+  `mode = "full"` (recommended) or `"signaling_only"`, or set
+  `enabled = false`. In a mixed-version cluster, update the shared config
+  first. Helm (`deploy/helm/sbc`): the default `mode` is already
+  `signaling_only`. `helm template` now fails if
+  `sbcDaemon.topologyHiding.enabled=true` is used with any other mode.
+
+### Added (SBC, POA&M-180, 184, 185)
+
+- **SBC metrics (additive):** `sbc_topology_hiding_failures_total`,
+  `sbc_header_manipulation_failures_total`,
+  `sbc_late_invite_2xx_teardown_total` and `sbc_deferred_send_dropped_total`
+  (SI-4; POA&M-180, 184, 185). Dashboards and alerts can pick these up.
+  Existing series are unchanged.
+- **SBC audit schema (additive):** new policy `sip.late_2xx.teardown`. It is
+  logged when a late INVITE 2xx arrives after a call is released and the SBC
+  ACKs it and sends a BYE (RFC 3261 §13.2.2.4; POA&M-185). The existing
+  fail-closed policy family `sip.topology_hiding.failed` gains the reason
+  `sdp-o`. SIEM parsers should accept the new values.
+
+### Security (SBC, POA&M-181, 184, 185)
+
+- **SBC topology hiding covers more of the message.** (SC-7, SI-17;
+  POA&M-181) On a hidden leg, `Server`, `User-Agent` and `Warning` are
+  removed. `Reason` is reduced to `protocol;cause=N`. The SDP `o=` username
+  and address are rewritten to the external host, and stay the same across
+  re-INVITEs. A malformed `o=` fails closed. A relayed 2xx to the caller now
+  carries the SBC's own Contact (RFC 3261 §12.1.1). Known residual: SDP `c=`
+  still carries the media relay address.
+- **SBC: the post-announcement BYE goes out on the caller's own transport
+  and flow** (TLS stays TLS). The ad-hoc UDP :5060 socket is gone, and the
+  full message is no longer logged at info (POA&M-184). The deferred-send
+  queue holds at most 1024 entries. Anything past that is dropped and
+  counted in `sbc_deferred_send_dropped_total`.
+- **SBC: a late INVITE 2xx after release, CANCEL or failover is ACKed and
+  BYEd** instead of leaving a stray dialog open at the far end. The SBC keeps
+  a bounded record of released calls for this: 4096 entries, 32 s TTL
+  (POA&M-185).
+
 ### BREAKING (SBC config, live batch POA&M-190..192, 166)
 
 - **SBC: `[monitoring]` and `[telemetry.otlp]` are now rejected at config
