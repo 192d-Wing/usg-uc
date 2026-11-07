@@ -475,8 +475,8 @@ mod tests {
 
     #[test]
     fn test_cached_open_roundtrip_and_failure() {
-        let ck = CachedAeadKey::new(&[7u8; KEY_LEN]).unwrap();
-        let nonce = [1u8; NONCE_LEN];
+        let ck = CachedAeadKey::new(Aes256GcmKey::generate().unwrap().as_bytes()).unwrap();
+        let nonce = random::generate_nonce().unwrap();
         let mut ct = ck.seal(&nonce, b"a", b"secret").unwrap();
         let pt = ck.open(&nonce, b"a", &ct).unwrap();
         assert_eq!(pt, b"secret");
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn test_open_tag_failure_paths() {
         let key = Aes256GcmKey::generate().unwrap();
-        let nonce = [7u8; NONCE_LEN];
+        let nonce = random::generate_nonce().unwrap();
         let ct = key.seal(&nonce, b"aad", b"secret plaintext").unwrap();
         // Shorter than the tag: rejected before any decryption.
         assert!(key.open(&nonce, b"aad", &ct[..TAG_LEN - 1]).is_err());
@@ -500,7 +500,9 @@ mod tests {
         bad[last] ^= 1;
         assert!(key.open(&nonce, b"aad", &bad).is_err());
         // Wrong nonce fails.
-        assert!(key.open(&[8u8; NONCE_LEN], b"aad", &ct).is_err());
+        let mut wrong_nonce = nonce;
+        wrong_nonce[0] ^= 1;
+        assert!(key.open(&wrong_nonce, b"aad", &ct).is_err());
         // Key remains usable after failures (failure wipe touches only the temp buffer).
         assert_eq!(key.open(&nonce, b"aad", &ct).unwrap(), b"secret plaintext");
     }
