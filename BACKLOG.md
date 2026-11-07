@@ -201,6 +201,10 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   `choose_best_response` doesn't follow §16.7; redirect `sips:`→`sip:` recursion.
 - [ ] **Docs:** `PROTO_RFC_COMPLIANCE.md` / `docs/RFC_COMPLIANCE_GAPS.md` claim
   RFC 3261 §16.4/§16.6/§19/§20/§22, RFC 3323 and RFC 3327 as Full/Complete.
+  Mostly fixed 2026-11-07 (proto-sip phase 1 and PR 179): the RFC 3261, RFC 3323
+  and RFC 3327 rows now read Partial. Still open: the proto-registrar section
+  (`PROTO_RFC_COMPLIANCE.md:426`) lists RFC 3327 Path as Full although the
+  registrar never populates `path`.
 
 ### Media (uc-codecs, uc-media-engine, uc-webrtc, uc-t38, uc-siprec)
 
