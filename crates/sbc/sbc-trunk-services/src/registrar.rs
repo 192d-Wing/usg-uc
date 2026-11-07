@@ -253,11 +253,8 @@ impl TrunkRegistrar {
             // CSeq method must match the request method.
             let cseq_ok = text.lines().any(|line| {
                 let line = line.trim();
-                if let Some(rest) = line.strip_prefix("CSeq:") {
-                    rest.trim().ends_with(cseq_method)
-                } else {
-                    false
-                }
+                line.strip_prefix("CSeq:")
+                    .is_some_and(|rest| rest.trim().ends_with(cseq_method))
             });
             if !cseq_ok {
                 trace!("Ignoring SIP response with non-matching CSeq method");

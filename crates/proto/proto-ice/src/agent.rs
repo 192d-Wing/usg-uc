@@ -820,8 +820,8 @@ mod tests {
     fn test_credentials_generation() {
         let creds = IceCredentials::generate();
 
-        assert!(!creds.ufrag.is_empty());
-        assert!(!creds.pwd.is_empty());
+        assert_ne!(creds.ufrag, "");
+        assert_ne!(creds.pwd, "");
         assert!(creds.ufrag.len() >= 4);
         assert!(creds.pwd.len() >= 22);
     }
@@ -849,7 +849,7 @@ mod tests {
         agent.gather_candidates(&local_addrs).unwrap();
 
         assert_eq!(agent.gathering_state(), GatheringState::Complete);
-        assert!(!agent.local_candidates().is_empty());
+        assert_ne!(agent.local_candidates(), []);
     }
 
     #[test]
@@ -866,7 +866,7 @@ mod tests {
         );
         agent.add_remote_candidate(&remote).unwrap();
 
-        assert!(!agent.remote_candidates().is_empty());
+        assert_ne!(agent.remote_candidates(), []);
     }
 
     #[test]
@@ -912,7 +912,7 @@ mod tests {
         agent.restart().unwrap();
 
         assert_eq!(agent.state(), IceState::New);
-        assert!(agent.local_candidates().is_empty());
+        assert_eq!(agent.local_candidates(), []);
         assert_ne!(agent.local_credentials(), &old_creds);
     }
 

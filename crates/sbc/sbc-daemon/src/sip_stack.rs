@@ -6981,6 +6981,10 @@ impl SipStack {
     }
 
     /// Handles OPTIONS request (keepalive/capability query).
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     async fn handle_options(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -7053,6 +7057,10 @@ impl SipStack {
     }
 
     /// Matches a response to its client transaction.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     async fn match_response_to_transaction(&self) -> ProcessResult {
         // In B2BUA mode, would forward response to appropriate leg
         // For now, just log it
@@ -7255,6 +7263,10 @@ impl SipStack {
     }
 
     /// Ensures a Router exists on the SipStack, creating a default one if needed.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async signature kept for callers; body has no await yet"
+    )]
     pub async fn ensure_router(&mut self) {
         if self.router.is_none() {
             let config = RouterConfig {
@@ -8507,13 +8519,13 @@ fn extract_param<'a>(header_value: &'a str, name: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-pub(crate) mod tests {
+pub mod tests {
     use super::*;
 
     /// For server tests: a stack with trunks t1 (127.0.0.2:5061) and t2
     /// (127.0.0.3:5061), both TLS, and a placed call's primary B-leg INVITE
     /// result (to t1).
-    pub(crate) async fn tls_failover_call(call_id: &str) -> (SipStack, ProcessResult) {
+    pub async fn tls_failover_call(call_id: &str) -> (SipStack, ProcessResult) {
         let stack = trunk_stack_protos(["tls", "tls"]).await;
         let primary = place_call(&stack, call_id)
             .await
@@ -8527,7 +8539,7 @@ pub(crate) mod tests {
     }
 
     /// Active calls on carrier trunk `trunk` (server tests).
-    pub(crate) async fn carrier_active(stack: &SipStack, trunk: &str) -> u32 {
+    pub async fn carrier_active(stack: &SipStack, trunk: &str) -> u32 {
         active(stack, trunk).await
     }
 
@@ -9089,8 +9101,8 @@ pub(crate) mod tests {
         let tag1 = generate_tag();
         let tag2 = generate_tag();
 
-        assert!(!tag1.is_empty());
-        assert!(!tag2.is_empty());
+        assert_ne!(tag1, "");
+        assert_ne!(tag2, "");
         assert!(tag1.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(tag2.chars().all(|c| c.is_ascii_hexdigit()));
     }

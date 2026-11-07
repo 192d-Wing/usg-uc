@@ -549,7 +549,7 @@ mod tests {
         let mut tracker = ConsentTracker::new();
 
         tracker.check_sent();
-        assert!(tracker.state() == ConsentState::Pending);
+        assert_eq!(tracker.state(), ConsentState::Pending);
 
         tracker.consent_received();
         assert_eq!(tracker.state(), ConsentState::Fresh);

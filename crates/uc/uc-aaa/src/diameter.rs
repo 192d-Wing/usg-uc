@@ -214,8 +214,7 @@ mod implementation {
             let counter = self.session_counter.fetch_add(1, Ordering::Relaxed);
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
             format!("{};{};{}", self.config.origin_host, timestamp, counter)
         }
 
@@ -250,6 +249,10 @@ mod implementation {
         }
 
         /// Sends Multimedia-Auth-Request (MAR).
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "stub; the real MAR exchange will await the transport"
+        )]
         pub async fn send_mar(
             &self,
             public_identity: &str,
@@ -271,6 +274,10 @@ mod implementation {
         }
 
         /// Sends Server-Assignment-Request (SAR).
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "stub; the real SAR exchange will await the transport"
+        )]
         pub async fn send_sar(
             &self,
             public_identity: &str,

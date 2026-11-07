@@ -67,6 +67,6 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert!(!DEFAULT_API_VERSION.is_empty());
+        assert_ne!(DEFAULT_API_VERSION, "");
     }
 }

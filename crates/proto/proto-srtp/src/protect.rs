@@ -244,7 +244,11 @@ impl<'a> SrtpUnprotect<'a> {
     ///
     /// # Errors
     /// Returns an error if decryption or authentication fails.
-    #[allow(clippy::unused_async)]
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "async kept for API stability with the RTP path"
+    )]
     pub async fn unprotect_rtcp(&self, data: &[u8]) -> SrtpResult<Bytes> {
         let auth_tag_len = self.context.profile().auth_tag_len();
 

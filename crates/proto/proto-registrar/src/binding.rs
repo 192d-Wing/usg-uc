@@ -406,8 +406,7 @@ mod storable {
         pub fn from_binding(binding: &Binding) -> Self {
             let now_unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
 
             // Calculate Unix timestamps from Instant elapsed times
             let created_at_unix = now_unix.saturating_sub(binding.created_at.elapsed().as_secs());
@@ -442,8 +441,7 @@ mod storable {
         pub fn to_binding(&self) -> Binding {
             let now_unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
 
             // Create a new binding with basic fields
             let mut binding = Binding::new(&self.aor, &self.contact_uri, &self.call_id, self.cseq);
@@ -535,8 +533,7 @@ mod storable {
 
             let now_unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
 
             let expiry_time = self.updated_at_unix + self.expires as u64;
             now_unix >= expiry_time
@@ -551,8 +548,7 @@ mod storable {
 
             let now_unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
 
             let expiry_time = self.updated_at_unix + self.expires as u64;
             expiry_time.saturating_sub(now_unix) as u32
