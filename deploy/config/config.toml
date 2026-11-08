@@ -131,3 +131,24 @@ enabled = false
 target = "tls://collector.example.net:6514"   # RFC 5425; TLS only
 # ca_path = "/etc/usg-sbc/syslog-ca.pem"
 facility = 16                       # local0
+
+# Clustering and shared storage (only with sbc-daemon built --features cluster;
+# ignored otherwise). Startup fails closed:
+#   - cluster.enabled = true requires [cluster.auth] (key_file >= 48 bytes,
+#     mode 0600; group/other-readable files are refused).
+#   - Non-TLS storage is refused unless allow_insecure_transport = true.
+# [cluster]
+# enabled = true
+# cluster_id = "production"
+# node_id = "sbc-01"
+# [cluster.auth]
+# key_file = "/etc/usg-sbc/cluster.key"
+# key_id = 1
+# [storage]
+# backend = "postgres"              # memory | redis | postgres
+# [storage.postgres]
+# url = "postgres://sbc@db.example.net/sbc"
+# ssl_mode = "verify_full"          # disable/prefer/require need allow_insecure_transport
+# ssl_root_cert = "/etc/usg-sbc/pg-ca.pem"
+# [storage.redis]
+# url = "rediss://redis.example.net:6379"   # redis:// needs allow_insecure_transport

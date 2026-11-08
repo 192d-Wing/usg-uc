@@ -46,6 +46,8 @@ flowchart TB
 
 ## Configuration
 
+> **Migration (2026-11-07, breaking).** With the `cluster` feature, sbc-config validates storage transport when the config is loaded. Startup fails unless PostgreSQL uses `ssl_mode = "verify_full"` (or `verify_ca`) and Redis uses a `rediss://` URL, or the backend table sets `allow_insecure_transport = true` (logged as `warn!` event `storage.insecure_transport_allowed`). A `[storage.redis]` / `[storage.postgres]` table must exist for the selected backend. `verify_certificate = false`, `#insecure` URLs, a half client cert/key pair, a `tls` block on a `redis://` URL and `cluster_mode = true` are always refused. TLS uses aws-lc-rs default suites, not CNSA-pinned (POA&M-240).
+
 ### Basic Configuration
 
 ```toml
@@ -89,7 +91,7 @@ backend = "redis"
 key_prefix = "sbc:"
 
 [storage.redis]
-url = "redis://localhost:6379"
+url = "rediss://localhost:6379"   # redis:// needs allow_insecure_transport = true
 pool_size = 10
 connection_timeout_ms = 5000
 command_timeout_ms = 1000
@@ -110,7 +112,8 @@ backoff_multiplier = 2.0
 | `pool_size` | 10 | Connection pool size |
 | `connection_timeout_ms` | 5000 | Connection timeout |
 | `command_timeout_ms` | 1000 | Command timeout |
-| `cluster_mode` | false | Enable Redis Cluster |
+| `cluster_mode` | false | Redis Cluster; currently always refused |
+| `allow_insecure_transport` | false | Permit `redis://` / `unix://` (logged warning) |
 
 #### Redis URL Formats
 
@@ -164,7 +167,8 @@ pool_max_size = 10
 connection_timeout_ms = 5000
 query_timeout_ms = 30000
 run_migrations = true
-ssl_mode = "prefer"
+ssl_mode = "verify_full"         # default; disable/prefer/require need allow_insecure_transport
+ssl_root_cert = "/etc/ssl/certs/pg-ca.crt"
 ```
 
 #### PostgreSQL Configuration Options
@@ -178,7 +182,9 @@ ssl_mode = "prefer"
 | `connection_timeout_ms` | 5000 | Connection timeout |
 | `query_timeout_ms` | 30000 | Query timeout |
 | `run_migrations` | true | Auto-run migrations |
-| `ssl_mode` | `prefer` | SSL connection mode |
+| `ssl_mode` | `verify_full` | SSL connection mode |
+| `ssl_root_cert` | none | CA bundle for server verification |
+| `allow_insecure_transport` | false | Permit `disable` / `prefer` / `require` (logged warning) |
 
 #### PostgreSQL SSL Modes
 

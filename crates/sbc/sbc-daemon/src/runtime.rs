@@ -127,17 +127,8 @@ impl Runtime {
         // Initialize cluster manager if cluster feature is enabled and configured
         #[cfg(feature = "cluster")]
         let cluster = if config.cluster.is_some() {
-            match ClusterManager::new(&config).await {
-                Ok(mgr) => {
-                    info!("Cluster manager initialized successfully");
-                    Some(Arc::new(mgr))
-                }
-                Err(e) => {
-                    // Log warning but continue - cluster is optional
-                    warn!(error = %e, "Cluster initialization failed, running in standalone mode");
-                    None
-                }
-            }
+            let enabled = config.cluster.as_ref().is_some_and(|c| c.enabled);
+            resolve_cluster_init(enabled, ClusterManager::new(&config).await)?.map(Arc::new)
         } else {
             debug!("Cluster configuration not present, running in standalone mode");
             None
@@ -1603,6 +1594,24 @@ fn spawn_trunk_health_feed(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn enabled_cluster_init_failure_fails_closed() {
+        use crate::cluster::ClusterError;
+        let err = || ClusterError::NotConfigured {
+            reason: "key".to_string(),
+        };
+        assert!(super::resolve_cluster_init::<()>(true, Err(err())).is_err());
+        assert!(matches!(
+            super::resolve_cluster_init::<()>(false, Err(err())),
+            Ok(None)
+        ));
+        assert!(matches!(
+            super::resolve_cluster_init(true, Ok(1)),
+            Ok(Some(1))
+        ));
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -1776,5 +1785,35 @@ mod seed_route_pattern_tests {
         assert!(seed_route_pattern(&rp).is_err());
         let rp = json!({"id": "b", "partition_id": "p", "pattern": "1900", "blocked": true});
         assert!(matches!(seed_route_pattern(&rp), Ok(ref p) if p.is_blocked()));
+    }
+}
+/// Maps the `ClusterManager::new` result to the runtime's cluster handle.
+///
+/// An enabled cluster that fails to initialise (e.g. unreadable peer key)
+/// aborts startup: running standalone would silently drop the configured
+/// peer authentication. A disabled cluster section falls back to standalone.
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings), SI-17 (Fail-Safe Procedures)
+#[cfg(feature = "cluster")]
+fn resolve_cluster_init<T>(
+    enabled: bool,
+    result: Result<T, crate::cluster::ClusterError>,
+) -> Result<Option<T>, RuntimeError> {
+    match result {
+        Ok(mgr) => {
+            info!("Cluster manager initialized successfully");
+            Ok(Some(mgr))
+        }
+        Err(e) if enabled => {
+            error!(event = "cluster.init_failed", error = %e, "Cluster initialization failed");
+            Err(RuntimeError::InitFailed {
+                component: "cluster".to_string(),
+                reason: e.to_string(),
+            })
+        }
+        Err(e) => {
+            warn!(error = %e, "Cluster disabled and initialization failed, running in standalone mode");
+            Ok(None)
+        }
     }
 }

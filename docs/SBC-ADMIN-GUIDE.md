@@ -1132,12 +1132,20 @@ No indicator is printed when trunk services run in-process (default mode).
 
 Requires `--features cluster` (plus `redis` / `postgres` for those backends; `--features full` enables everything). Without the feature the `[cluster]` and `[storage]` sections are ignored. What is wired today is **shared registration state** in the storage backend plus cluster health reporting; heartbeat, automatic failover, session takeover and call-state replication are planned. See [CLUSTERING.md](CLUSTERING.md) for the full status table.
 
+> **Migration (2026-11-07, breaking).** `cluster.enabled = true` now requires `[cluster.auth]` with `key_file` (a file of at least 48 random bytes, mode 0600 or stricter; group/other-readable files are refused) and `key_id`. Startup aborts if the section is missing or the key cannot be loaded. The key is loaded and a per-boot `PeerAuthenticator` is built, but there is no peer transport yet, so it authenticates nothing on the wire (POA&M-241, POA&M-264).
+>
+> **Migration (2026-11-07, breaking).** With the `cluster` feature, sbc-config validates storage transport when the config is loaded. Startup fails unless PostgreSQL uses `ssl_mode = "verify_full"` (or `verify_ca`) and Redis uses a `rediss://` URL, or the backend table sets `allow_insecure_transport = true` (logged as `warn!` event `storage.insecure_transport_allowed`). A `[storage.redis]` / `[storage.postgres]` table must exist for the selected backend. `verify_certificate = false`, `#insecure` URLs, a half client cert/key pair, a `tls` block on a `redis://` URL and `cluster_mode = true` are always refused. TLS uses aws-lc-rs default suites, not CNSA-pinned (POA&M-240).
+
 ```toml
 [cluster]
 enabled = true
 cluster_id = "production"
 node_id = "sbc-01"
 role = "primary"                 # primary, secondary, witness (key is `role`, not `node_role`)
+
+[cluster.auth]                   # required when enabled = true
+key_file = "/etc/sbc/cluster.key" # >= 48 bytes, mode 0600
+key_id = 1
 
 [cluster.heartbeat]              # parsed, not used yet (planned)
 interval_ms = 1000
@@ -1163,9 +1171,8 @@ backend = "redis"                # memory, redis, postgres
 key_prefix = "sbc:"
 
 [storage.redis]
-url = "redis://redis-cluster:6379"
-cluster_mode = true
-pool_size = 10
+url = "rediss://redis:6379"      # redis:// fails at startup unless allow_insecure_transport = true
+pool_size = 10                   # cluster_mode = true is refused
 ```
 
 ---
