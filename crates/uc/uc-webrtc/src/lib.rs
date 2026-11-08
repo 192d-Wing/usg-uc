@@ -49,7 +49,7 @@ pub mod trickle;
 pub use config::WebRtcConfig;
 pub use error::{WebRtcError, WebRtcResult};
 pub use gateway::WebRtcGateway;
-pub use sdp_munge::{SdpMunger, WebRtcSdpMode};
+pub use sdp_munge::{DtlsIceParams, DtlsSetup, FingerprintAlgorithm, SdpMunger, WebRtcSdpMode};
 pub use session::{WebRtcSession, WebRtcSessionState};
 pub use trickle::{TrickleCandidate, TrickleIce};
 

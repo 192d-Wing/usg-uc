@@ -334,8 +334,14 @@ impl Chunk {
             });
         }
 
-        // Extract the full chunk including header
-        let chunk_data = buf.split_to(padded_length(length));
+        // RFC 9260 §3.2: the Chunk Length excludes padding, and the padding of
+        // the last chunk in a packet may be absent. Consume up to the padded
+        // length but never past the buffer, and hand the body decoders exactly
+        // `length` bytes so no decoder can read into padding or past the end.
+        // NIST 800-53 Rev5: SI-10 (input validation), SC-5 (DoS protection)
+        let take = padded_length(length).min(buf.remaining());
+        let mut chunk_data = buf.split_to(take);
+        chunk_data.truncate(length);
 
         match ChunkType::from_u8(chunk_type) {
             Some(ChunkType::Data) => Ok(Self::Data(DataChunk::decode_body(flags, &chunk_data)?)),
@@ -1074,7 +1080,11 @@ impl SackChunk {
         let num_gap_blocks = u16::from_be_bytes([chunk_data[12], chunk_data[13]]) as usize;
         let num_dup_tsns = u16::from_be_bytes([chunk_data[14], chunk_data[15]]) as usize;
 
-        let mut gap_ack_blocks = Vec::with_capacity(num_gap_blocks);
+        // RFC 9260 §3.3.4: the wire counts are attacker-controlled; size the
+        // allocations by the bytes actually present, never by the counts.
+        // NIST 800-53 Rev5: SC-5 (resource exhaustion), SI-10
+        let available = chunk_data.len().saturating_sub(Self::HEADER_SIZE) / 4;
+        let mut gap_ack_blocks = Vec::with_capacity(num_gap_blocks.min(available));
         let mut offset = Self::HEADER_SIZE;
 
         for _ in 0..num_gap_blocks {
@@ -1087,7 +1097,8 @@ impl SackChunk {
             offset += 4;
         }
 
-        let mut dup_tsns = Vec::with_capacity(num_dup_tsns);
+        let mut dup_tsns =
+            Vec::with_capacity(num_dup_tsns.min(chunk_data.len().saturating_sub(offset) / 4));
         for _ in 0..num_dup_tsns {
             if offset + 4 > chunk_data.len() {
                 break;
@@ -2209,6 +2220,14 @@ impl ReConfigParam {
         let param_type = u16::from_be_bytes([data[0], data[1]]);
         let length = u16::from_be_bytes([data[2], data[3]]) as usize;
 
+        // RFC 6525 §4: parameter length includes the 4-byte header; a shorter
+        // value would yield zero progress in the caller's loop.
+        // NIST 800-53 Rev5: SI-10, SC-5
+        if length < 4 {
+            return Err(TransportError::ReceiveFailed {
+                reason: format!("Invalid RE-CONFIG parameter length: {length}"),
+            });
+        }
         if data.len() < length {
             return Err(TransportError::ReceiveFailed {
                 reason: "RE-CONFIG parameter truncated".to_string(),
@@ -2552,6 +2571,14 @@ impl AsconfParam {
         let length = u16::from_be_bytes([data[2], data[3]]) as usize;
         let correlation_id = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
 
+        // RFC 5061 §4.2: length covers type, length and correlation ID (8);
+        // anything shorter would stall the caller's loop (zero progress).
+        // NIST 800-53 Rev5: SI-10, SC-5
+        if length < 8 {
+            return Err(TransportError::ReceiveFailed {
+                reason: format!("Invalid ASCONF parameter length: {length}"),
+            });
+        }
         if data.len() < length {
             return Err(TransportError::ReceiveFailed {
                 reason: "ASCONF parameter truncated".to_string(),
@@ -2910,12 +2937,22 @@ impl AsconfAckParam {
         let length = u16::from_be_bytes([data[2], data[3]]) as usize;
         let correlation_id = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
 
+        // RFC 5061 §4.2: reject lengths that cannot hold the parameter header
+        // (zero progress in the caller's loop) or that exceed the chunk.
+        // NIST 800-53 Rev5: SI-10, SC-5
+        if length < 8 || data.len() < length {
+            return Err(TransportError::ReceiveFailed {
+                reason: format!("Invalid ASCONF-ACK parameter length: {length}"),
+            });
+        }
+
         let param = match param_type {
             Self::SUCCESS_INDICATION => Self::Success { correlation_id },
             Self::ERROR_CAUSE_INDICATION if length >= 12 => {
                 let error_code = u16::from_be_bytes([data[8], data[9]]);
                 let error_len = u16::from_be_bytes([data[10], data[11]]) as usize;
-                let error_info = if length > 12 && data.len() >= 12 + error_len {
+                // Bound the embedded cause by this parameter, not the chunk.
+                let error_info = if length > 12 && error_len <= length - 12 {
                     Bytes::copy_from_slice(&data[12..12 + error_len])
                 } else {
                     Bytes::new()
@@ -3697,7 +3734,7 @@ mod tests {
     fn test_forward_tsn_chunk_creation() {
         let ftsn = ForwardTsnChunk::new(12345);
         assert_eq!(ftsn.new_cumulative_tsn, 12345);
-        assert!(ftsn.streams.is_empty());
+        assert_eq!(ftsn.streams.len(), 0);
     }
 
     #[test]
@@ -3769,7 +3806,7 @@ mod tests {
 
         if let Chunk::ForwardTsn(f) = decoded {
             assert_eq!(f.new_cumulative_tsn, 50000);
-            assert!(f.streams.is_empty());
+            assert_eq!(f.streams.len(), 0);
         } else {
             panic!("Expected FORWARD-TSN chunk");
         }
@@ -3784,7 +3821,7 @@ mod tests {
     #[test]
     fn test_reconfig_chunk_creation() {
         let chunk = ReConfigChunk::new();
-        assert!(chunk.params.is_empty());
+        assert_eq!(chunk.params.len(), 0);
     }
 
     #[test]
@@ -4062,5 +4099,208 @@ mod tests {
     fn test_chunk_type_auth() {
         assert_eq!(ChunkType::from_u8(15), Some(ChunkType::Auth));
         assert_eq!(ChunkType::Auth.to_string(), "AUTH");
+    }
+
+    // -------------------------------------------------------------------------
+    // Decoder totality (RFC 9260 §3.2; NIST 800-53 Rev5: SI-10, SC-5)
+    // Every input must yield Ok or Err, never a panic, overflow or hang.
+    // -------------------------------------------------------------------------
+
+    /// Deterministic xorshift so the corpus is reproducible without a seed file.
+    fn xorshift(state: &mut u64) -> u8 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (*state & 0xFF) as u8
+    }
+
+    /// Decodes every chunk in `bytes` until error or exhaustion; must not panic.
+    fn decode_all(bytes: &[u8]) {
+        let mut buf = Bytes::copy_from_slice(bytes);
+        while buf.has_remaining() {
+            let before = buf.remaining();
+            if Chunk::decode(&mut buf).is_err() {
+                break;
+            }
+            assert!(buf.remaining() < before, "decode made no progress");
+        }
+    }
+
+    fn chunk_with(chunk_type: u8, flags: u8, length: u16, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![chunk_type, flags];
+        v.extend_from_slice(&length.to_be_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn decode_last_chunk_without_padding() {
+        // DATA chunk with 1 byte of user data: length 17, padded 20, but the
+        // trailing 3 padding bytes are absent (last chunk in packet).
+        let mut v = chunk_with(0, 0x03, 17, &[0; 12]);
+        v.push(0xAB);
+        let mut buf = Bytes::from(v);
+        let Chunk::Data(d) = Chunk::decode(&mut buf).unwrap() else {
+            panic!("expected DATA");
+        };
+        assert_eq!(&d.data[..], &[0xAB]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn decode_padded_chunk_consumes_padding() {
+        let mut v = chunk_with(0, 0x03, 17, &[0; 12]);
+        v.extend_from_slice(&[0xAB, 0, 0, 0]);
+        v.extend_from_slice(&chunk_with(11, 0, 4, &[])); // COOKIE ACK
+        let mut buf = Bytes::from(v);
+        assert!(matches!(Chunk::decode(&mut buf).unwrap(), Chunk::Data(_)));
+        assert!(matches!(
+            Chunk::decode(&mut buf).unwrap(),
+            Chunk::CookieAck(_)
+        ));
+        assert!(buf.is_empty());
+    }
+
+    fn valid_corpus() -> Vec<Vec<u8>> {
+        let chunks = [
+            Chunk::Data(DataChunk::new(1, 2, 3, 4, Bytes::from_static(b"hello"))),
+            Chunk::Init(InitChunk::new(0x1234, 65535, 10, 10, 1)),
+            Chunk::Sack(SackChunk::new(5, 1000)),
+            Chunk::Ecne(EcneChunk::new(100)),
+            Chunk::Cwr(CwrChunk::new(200)),
+            Chunk::CookieAck(CookieAckChunk),
+            Chunk::ShutdownAck(ShutdownAckChunk),
+        ];
+        chunks
+            .iter()
+            .map(|c| {
+                let mut b = BytesMut::new();
+                c.encode(&mut b);
+                b.to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn decode_every_prefix_of_valid_chunks() {
+        for enc in valid_corpus() {
+            for n in 0..=enc.len() {
+                decode_all(&enc[..n]);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_every_chunk_type_length_field_fuzz() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for chunk_type in 0..=255u8 {
+            for body_len in 0..=96usize {
+                let body: Vec<u8> = (0..body_len).map(|_| xorshift(&mut state)).collect();
+                let actual = (CHUNK_HEADER_SIZE + body_len) as u16;
+                for length in [
+                    0,
+                    1,
+                    3,
+                    4,
+                    5,
+                    actual.saturating_sub(1),
+                    actual,
+                    actual + 1,
+                    0xFFFF,
+                ] {
+                    let flags = xorshift(&mut state);
+                    decode_all(&chunk_with(chunk_type, flags, length, &body));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_structured_param_fuzz() {
+        // Bodies built from small TLVs with hostile lengths (0..=7) to exercise
+        // parameter/cause loops in INIT, ABORT, ERROR, RE-CONFIG, ASCONF(-ACK).
+        let mut state = 0x0123_4567_89AB_CDEF_u64;
+        for chunk_type in [
+            1u8, 2, 6, 9, 0x82, 0xC1, 0x80, 130, 192, 128, 15, 0x84, 0xC0,
+        ] {
+            for _ in 0..2000 {
+                let fixed = usize::from(xorshift(&mut state) % 24);
+                let mut body: Vec<u8> = (0..fixed).map(|_| xorshift(&mut state)).collect();
+                for _ in 0..usize::from(xorshift(&mut state) % 4) {
+                    body.push(xorshift(&mut state) % 4);
+                    body.push(xorshift(&mut state));
+                    body.extend_from_slice(&u16::from(xorshift(&mut state) % 8).to_be_bytes());
+                    let n = usize::from(xorshift(&mut state) % 8);
+                    body.extend((0..n).map(|_| xorshift(&mut state)));
+                }
+                let length = (CHUNK_HEADER_SIZE + body.len()) as u16;
+                decode_all(&chunk_with(chunk_type, 0, length, &body));
+            }
+        }
+    }
+
+    #[test]
+    fn asconf_reconfig_zero_length_params_terminate() {
+        // Regression (QA): ASCONF / ASCONF-ACK / RE-CONFIG parameters with
+        // length 0..=7 previously could yield zero progress (infinite loop).
+        for chunk_type in [0xC1u8, 0x80, 130] {
+            for plen in 0u16..8 {
+                for prefix in [0usize, 4, 12] {
+                    let mut body = vec![0u8; prefix];
+                    body.extend_from_slice(&0xC001u16.to_be_bytes());
+                    body.extend_from_slice(&plen.to_be_bytes());
+                    body.extend_from_slice(&[0; 8]);
+                    let length = (CHUNK_HEADER_SIZE + body.len()) as u16;
+                    decode_all(&chunk_with(chunk_type, 0, length, &body));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn init_param_short_lengths_terminate() {
+        for plen in [0u16, 1, 3] {
+            let mut body = vec![0u8; 16];
+            body.extend_from_slice(&5u16.to_be_bytes());
+            body.extend_from_slice(&plen.to_be_bytes());
+            body.extend_from_slice(&[0; 8]);
+            let length = (CHUNK_HEADER_SIZE + body.len()) as u16;
+            decode_all(&chunk_with(1, 0, length, &body));
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn proptest_chunk_decode_never_panics(
+            bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..2048)
+        ) {
+            decode_all(&bytes);
+        }
+
+        #[test]
+        fn proptest_chunk_typed_header_never_panics(
+            chunk_type in proptest::num::u8::ANY,
+            body in proptest::collection::vec(proptest::num::u8::ANY, 0..512)
+        ) {
+            let length = (CHUNK_HEADER_SIZE + body.len()) as u16;
+            decode_all(&chunk_with(chunk_type, 0, length, &body));
+        }
+
+        #[test]
+        fn proptest_data_round_trip(
+            tsn in proptest::num::u32::ANY,
+            sid in proptest::num::u16::ANY,
+            ssn in proptest::num::u16::ANY,
+            ppid in proptest::num::u32::ANY,
+            payload in proptest::collection::vec(proptest::num::u8::ANY, 1..256)
+        ) {
+            let chunk = Chunk::Data(DataChunk::new(tsn, sid, ssn, ppid, Bytes::from(payload)));
+            let mut b = BytesMut::new();
+            chunk.encode(&mut b);
+            let mut buf = b.freeze();
+            let decoded = Chunk::decode(&mut buf).unwrap();
+            proptest::prop_assert_eq!(decoded, chunk);
+            proptest::prop_assert!(buf.is_empty());
+        }
     }
 }

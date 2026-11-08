@@ -546,6 +546,8 @@
 | RFC 4013 | SASLprep | proto-stun | library |
 | RFC 4028 | Session Timers | proto-sip, proto-dialog, proto-transaction | sbc-daemon (header relay); proto-dialog refresher: library |
 | RFC 4168 | SCTP Transport for SIP | proto-sip | library |
+| RFC 9260 / RFC 6951 | SCTP / SCTP over UDP (decoder hardening; see `docs/RFC_COMPLIANCE_GAPS.md`) | uc-transport (`sctp` feature) | library, dormant |
+| RFC 2865 / 2869 / 3579, CVE-2024-3596 | RADIUS with required Message-Authenticator (POA&M-280/281) | uc-aaa (`radius` feature) | library, dormant |
 | RFC 4235 | Dialog Event Package | proto-dialog | library |
 | RFC 4347 | DTLS over UDP | proto-sip | library (transport enum only) |
 | RFC 4538 | Media Authorization | proto-dialog | library |

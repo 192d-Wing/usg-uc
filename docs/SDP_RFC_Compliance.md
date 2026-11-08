@@ -231,10 +231,10 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 
 ### RFC 8866 Parser/Generator ✅ COMPLIANT
 
-**Status**: Fully compliant for all SDP line types
-**Updated**: 2026-02-07
+**Status**: Fully compliant for all SDP line types, except: `parse_sdp_line` panics on a multibyte first character (POA&M-283)
+**Updated**: 2026-11-08
 
-The `proto-sdp` crate provides structured SDP parsing and generation used by `client-sip-ua` and integration tests. `uc-webrtc` and `uc-siprec` list `proto-sdp` as a dependency but do not use it to parse or generate SDP: `uc-webrtc/src/sdp_munge.rs` rewrites SDP as text, and `uc-siprec` only wraps `proto_sdp::SdpError` (`uc-siprec/src/error.rs`). Both crates are dormant (POA&M-206).
+The `proto-sdp` crate provides structured SDP parsing and generation used by `client-sip-ua` and integration tests. Since 2026-11-08 the dormant `uc-webrtc` munger (`uc-webrtc/src/sdp_munge.rs`) parses and renders SDP with `proto-sdp` (per-m-section `a=mid`, `UDP/TLS/RTP/SAVPF`, DTLS fingerprint/setup, ICE credentials, BUNDLE; tests in `sdp_munge.rs`). It works around two proto-sdp gaps: no `UDP/DTLS/SCTP`-family transport token, and a panic in `parse_sdp_line` on a multibyte first character (POA&M-283, not fixed in proto-sdp; `client-sip-ua` is likely exposed). `uc-siprec` only wraps `proto_sdp::SdpError` (`uc-siprec/src/error.rs`). Both crates are dormant (POA&M-206).
 
 #### Implemented ✅
 
