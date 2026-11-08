@@ -39,7 +39,7 @@ This document describes the CNSA 2.0 compliance status for the USG SIP Soft Clie
 - Uses proto-dtls for DTLS handshakes (TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)
 - Uses proto-srtp with SRTP_AEAD_AES_256_GCM profile only
 - ICE connectivity uses STUN with MESSAGE-INTEGRITY-SHA256
-- SIP digest authentication (RFC 7616/8760) is supported for REGISTER and INVITE (`registration.rs`, `call_agent.rs`); the strongest offered algorithm is used. SHA-256 / SHA-512-256 digest is a CNSA exception (POA&M-110). MD5 is answered when it is the only offered algorithm unless the account sets `allow_md5_digest = false` (default true; POA&M-255)
+- SIP digest authentication (RFC 7616/8760) is supported for REGISTER and INVITE (`registration.rs`, `call_agent.rs`); the strongest offered algorithm is used. SHA-256 / SHA-512-256 digest is a CNSA exception (POA&M-110). MD5 (offered alone) is answered only when the account's policy allows it: `allow_md5_digest` explicit `true`, or unset on a TLS-only account (`SipAccount::effective_allow_md5_digest`, `proto_sip::resolve_allow_md5`); UDP/TCP accounts refuse MD5 by default (POA&M-255 closed; tests `allow_md5_digest_settings_and_effective_policy`, `test_unset_md5_policy_follows_transport`, `test_invite_md5_refused_by_default_over_udp`). A legacy saved `true` loads as unset. Multi-realm 401/407 gets one header per realm (POA&M-256 closed). Residual MD5 use: POA&M-276; no expected-realm allow-list: POA&M-277
 
 ### client-core
 
@@ -64,7 +64,7 @@ This document describes the CNSA 2.0 compliance status for the USG SIP Soft Clie
 - ❌ SHA-256 for key derivation (use SHA-384+)
 - ❌ P-256 curves (use P-384 or P-521)
 - ❌ RSA < 3072 bits (use ECDSA or RSA-3072+)
-- ❌ MD5 (not CNSA; still answered for legacy SIP digest by default, see POA&M-255)
+- ❌ MD5 (not CNSA; answered for legacy SIP digest only on explicit opt-in or on TLS accounts with the policy unset, see POA&M-276)
 - ❌ Password-based authentication (use PKI only)
 
 ### Required Algorithms

@@ -496,6 +496,23 @@ require_tls = true              # default false
 - **Signaling only:** `require_tls` does not require SRTP on the B-leg. Configure media security separately. Trunk TLS is limited to CNSA 2.0 suites (POA&M-26 closed).
 - **Clusters:** upgrade every node before enabling the flag. Older nodes ignore it and also send API trunks over UDP.
 
+### Trunk registration digest: MD5 policy (POA&M-255)
+
+Applies to trunks that REGISTER (`register_enabled`), which come only from the trunk store / REST API / TrunkSync JSON. Set it on the trunk object:
+
+```json
+{ "register_enabled": true, "allow_md5_digest": true }
+```
+
+- Absent or `null`: MD5 is refused. Trunk REGISTER always goes over UDP (POA&M-275), so a carrier that offers only MD5 fails registration. SHA-256 / SHA-512-256 challenges are always answered.
+- `true`: MD5 is answered when it is the only offer. Each registration attempt that may use MD5 logs a warning. MD5 is not CNSA (POA&M-276).
+- `false`: MD5 refused.
+- A non-bool value (`"true"`, `1`) is rejected by the REST API with **400**. A non-bool value already in the store is treated as `false` and logged.
+- **Breaking:** before this change MD5 was answered by default. Trunks registering to MD5-only carriers need `"allow_md5_digest": true`.
+- **Config file:** `allow_md5_digest` on a `[[trunk_groups.trunks]]` entry is a validation error (with any value). Config-file trunks do not REGISTER, so the key would have no effect.
+- When a 401/407 carries challenges for several realms, one Authorization/Proxy-Authorization is sent per realm. If any realm offers only algorithms the policy refuses, the registration fails. There is no expected-realm allow-list (POA&M-277).
+- **Clusters:** upgrade every node before relying on the new default. Older nodes ignore the key and still answer MD5.
+
 ### Trunk transport: breaking changes (POA&M-5)
 
 - A config with any `protocol = "tls"` trunk is rejected unless `security.trunk_tls_ca_path` is set to an absolute path. Setting it with no TLS trunk is also rejected. The public web PKI is not trusted for trunks.

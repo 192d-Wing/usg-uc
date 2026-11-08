@@ -248,6 +248,12 @@ async fn start_trunk_services(
             .get("register_expires")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(25) as u32;
+        // NIST 800-53 Rev5: CM-6, SI-10 — POA&M-255 MD5 policy; a non-bool
+        // stored value refuses MD5 (fail closed).
+        let (allow_md5_digest, md5_err) = sbc_config_store::trunk_allow_md5_digest_or_refuse(trunk);
+        if let Some(e) = md5_err {
+            warn!(trunk_id = %trunk_id, error = %e, "Invalid allow_md5_digest; refusing MD5");
+        }
         registrar.register_trunk(TrunkRegConfig {
             trunk_id: trunk_id.to_string(),
             host: host.to_string(),
@@ -258,6 +264,7 @@ async fn start_trunk_services(
             expires,
             bind_ip: config.bind_ip,
             external_ip: config.contact_ip,
+            allow_md5_digest,
         });
         info!(trunk_id, host, "Started carrier registration");
     } else {

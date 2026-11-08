@@ -1046,6 +1046,26 @@ fn validate_trunk_tls(config: &SbcConfig) -> ConfigResult<()> {
     }
 }
 
+/// NIST 800-53 Rev5: CM-6 — accepted keys are enforced or rejected.
+/// Config-file trunks never REGISTER, so the UAC MD5 policy has no consumer
+/// here (POA&M-255; set it on the stored trunk instead).
+fn reject_trunk_md5_policy(
+    group: &crate::schema::TrunkGroupConfig,
+    trunk: &crate::schema::TrunkConfigSchema,
+) -> ConfigResult<()> {
+    if trunk.allow_md5_digest.is_some() {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "trunk '{}' (group '{}'): allow_md5_digest applies only to registering \
+                 trunks in the trunk store/API (register_enabled); config-file trunks \
+                 do not REGISTER",
+                trunk.id, group.id
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_trunks(group: &crate::schema::TrunkGroupConfig) -> ConfigResult<()> {
     let mut seen_trunks = HashSet::new();
 
@@ -1073,6 +1093,8 @@ fn validate_trunks(group: &crate::schema::TrunkGroupConfig) -> ConfigResult<()> 
                 ),
             });
         }
+
+        reject_trunk_md5_policy(group, trunk)?;
 
         if !is_valid_host(&trunk.host) {
             return Err(ConfigError::Validation {
@@ -3124,6 +3146,15 @@ max_passport_age_secs = 120
         c.security.tls_cert_path = Some("/etc/sbc/cert.pem".into());
         c.security.tls_key_path = Some("/etc/sbc/key.pem".into());
         super::validate_config(&c).unwrap();
+
+        // POA&M-255: the UAC MD5 policy has no consumer on config-file
+        // trunks (they never REGISTER); any value is rejected.
+        for v in [true, false] {
+            let mut m = c.clone();
+            m.trunk_groups[0].trunks[0].allow_md5_digest = Some(v);
+            let err = super::validate_config(&m).unwrap_err().to_string();
+            assert!(err.contains("allow_md5_digest"), "{err}");
+        }
 
         // TLS-only keys on a UDP trunk are rejected, as is an unused CA.
         let mut c = SbcConfig::default();

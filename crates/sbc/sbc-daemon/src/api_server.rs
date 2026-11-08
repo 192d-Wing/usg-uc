@@ -1583,6 +1583,13 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
                 .get("register_expires")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(25) as u32;
+            // NIST 800-53 Rev5: CM-6, SI-10 — POA&M-255 MD5 policy; a non-bool
+            // stored value refuses MD5 (fail closed).
+            let (allow_md5_digest, md5_err) =
+                sbc_config_store::trunk_allow_md5_digest_or_refuse(trunk);
+            if let Some(e) = md5_err {
+                tracing::warn!(trunk_id = %trunk_id, error = %e, "Invalid allow_md5_digest; refusing MD5");
+            }
             tracing::info!(
                 trunk_id,
                 ?bind_ip,
@@ -1600,6 +1607,7 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
                 expires,
                 bind_ip,
                 external_ip,
+                allow_md5_digest,
             });
             tracing::info!(trunk_id, "Started SIP registration via API");
         }

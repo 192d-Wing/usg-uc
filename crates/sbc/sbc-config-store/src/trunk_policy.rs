@@ -113,11 +113,41 @@ pub fn group_require_tls(group: &Value) -> Result<bool, String> {
     }
 }
 
+/// Reads a trunk's `allow_md5_digest` UAC digest policy (POA&M-255).
+///
+/// Absent or `null` means unset (`None`): MD5 is answered only when the
+/// REGISTER transport is TLS (`proto_sip::resolve_allow_md5`).
+///
+/// # Errors
+/// Any non-bool value (a string `"true"` is refused, never coerced). Callers
+/// that cannot reject the body treat it as `Some(false)` (fail closed).
+///
+/// ## NIST 800-53 Rev5: IA-5(1), SC-13, CM-6, SI-10
+pub fn trunk_allow_md5_digest(trunk: &Value) -> Result<Option<bool>, String> {
+    match trunk.get("allow_md5_digest") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err("trunk allow_md5_digest must be a boolean".to_string()),
+    }
+}
+
+/// [`trunk_allow_md5_digest`] for consumers of already-stored bodies: an
+/// invalid value refuses MD5 (`Some(false)`, fail closed) and is returned as
+/// the second element so the caller can log it.
+#[must_use]
+pub fn trunk_allow_md5_digest_or_refuse(trunk: &Value) -> (Option<bool>, Option<String>) {
+    match trunk_allow_md5_digest(trunk) {
+        Ok(policy) => (policy, None),
+        Err(e) => (Some(false), Some(e)),
+    }
+}
+
 /// Validates the transport policy of a trunk-group body as it would be
 /// stored. Returns warnings to pass back to the client.
 ///
-/// - `require_tls` not a bool, a trunk protocol outside {udp,tcp,tls}, or a
-///   trunk port outside `1..=65535`: [`TrunkPolicyError::Invalid`].
+/// - `require_tls` not a bool, a trunk protocol outside {udp,tcp,tls}, a
+///   trunk port outside `1..=65535`, or a non-bool trunk `allow_md5_digest`:
+///   [`TrunkPolicyError::Invalid`].
 /// - `require_tls` with at least one trunk and none TLS:
 ///   [`TrunkPolicyError::Policy`].
 /// - `require_tls` with no trunks: accepted with [`WARN_REQUIRE_TLS_EMPTY`]
@@ -140,6 +170,7 @@ pub fn validate_trunk_group_json(group: &Value) -> Result<Vec<String>, TrunkPoli
     for t in trunks {
         let transport = trunk_transport(t).map_err(TrunkPolicyError::Invalid)?;
         trunk_port(t, transport).map_err(TrunkPolicyError::Invalid)?;
+        trunk_allow_md5_digest(t).map_err(TrunkPolicyError::Invalid)?;
         any_tls |= transport == TrunkTransport::Tls;
     }
     if !require_tls {
@@ -321,5 +352,42 @@ mod tests {
             validate_trunk_group_json(&json!({"trunks": [{"protocol": "x"}]})),
             Err(TrunkPolicyError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn allow_md5_digest_parsing() {
+        assert_eq!(trunk_allow_md5_digest(&json!({})), Ok(None));
+        assert_eq!(
+            trunk_allow_md5_digest(&json!({"allow_md5_digest": null})),
+            Ok(None)
+        );
+        assert_eq!(
+            trunk_allow_md5_digest(&json!({"allow_md5_digest": true})),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            trunk_allow_md5_digest(&json!({"allow_md5_digest": false})),
+            Ok(Some(false))
+        );
+        for bad in [json!("true"), json!(1), json!("yes")] {
+            let t = json!({ "allow_md5_digest": bad });
+            assert!(trunk_allow_md5_digest(&t).is_err(), "{bad}");
+            assert!(matches!(
+                validate_trunk_group_json(&json!({ "trunks": [t.clone()] })),
+                Err(TrunkPolicyError::Invalid(_))
+            ));
+            let (policy, err) = trunk_allow_md5_digest_or_refuse(&t);
+            assert_eq!(policy, Some(false));
+            assert!(err.is_some());
+        }
+        // Explicit opt-in on a cleartext trunk is accepted without a warning
+        // (warnings are 422 on central-config-api); the daemon logs it.
+        assert_eq!(
+            validate_trunk_group_json(
+                &json!({"trunks": [{"transport": "udp", "allow_md5_digest": true}]})
+            )
+            .unwrap(),
+            Vec::<String>::new()
+        );
     }
 }

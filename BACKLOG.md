@@ -302,13 +302,25 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   used `Md5DigestHasher`** (POA&M-234): fixed. Strongest offered challenge
   selected (`proto-sip` `select_challenge_from_headers`) and answered with
   `AlgorithmHasher::for_algorithm`.
-- [ ] **MINOR, LIVE (sbc-trunk-services, client) — UAC MD5 allowed by
-  default** (POA&M-255): `allow_md5_digest` defaults true; no
-  sbc-config/sbc-daemon or client settings key to disable it. MD5 is
-  downgradable by stripping SHA challenges on non-TLS transport.
-- [ ] **MINOR — per-realm Proxy-Authorization for multi-realm 407**
-  (POA&M-256): RFC 3261 §22.3 / RFC 8760 §2.4; `select_challenge` ignores
-  realm and answers once.
+- [x] **MINOR, LIVE (sbc-trunk-services, client) — UAC MD5 allowed by
+  default** (POA&M-255): fixed. Per-trunk JSON `allow_md5_digest` and client
+  `Option<bool>`; unset allows MD5 only over TLS (trunk REGISTER is UDP, so
+  trunks refuse MD5 unless opted in). TOML trunk key is rejected.
+- [x] **MINOR — per-realm Proxy-Authorization for multi-realm 407**
+  (POA&M-256): fixed. `select_challenges_per_realm_from_headers`; one
+  header per realm, fail closed if any realm is unacceptable.
+- [ ] **MINOR, LIVE (sbc-trunk-services) — trunk REGISTER always UDP**
+  (POA&M-275): trunk digest never runs over TLS. Send REGISTER over the
+  trunk's configured transport.
+- [ ] **MINOR — residual MD5 digest** (POA&M-276): answered after explicit
+  opt-in and on TLS client accounts with the policy unset; warn log only.
+  Add a CNSA mode that forbids MD5 and an audit event on MD5 answers.
+- [ ] **MINOR — no expected-realm allow-list for UAC digest** (POA&M-277):
+  every challenged realm is answered. Add per-trunk/account expected realms.
+- [ ] **MINOR (ops) — mixed-version clusters and the MD5 default** (NIST-4,
+  POA&M-255 follow-up): nodes without the change ignore trunk
+  `allow_md5_digest` and still answer MD5 by default during a rolling
+  upgrade. Document in upgrade notes or gate on cluster version.
 - [ ] **MINOR, DORMANT — RFC 3261 §16.4 `maddr` not handled** (POA&M-235):
   `// POAM:` in `routing.rs` `preprocess_route_information`.
 - [ ] **MAJOR, DORMANT (sbc-daemon wiring) — wire the POA&M-230..232 helpers**

@@ -92,10 +92,11 @@ struct AccountRegistration {
     /// Nonce count for digest auth retries.
     #[cfg(feature = "digest-auth")]
     nonce_count: u32,
-    /// Last challenge received from server.
+    /// Challenges selected from the last 401/407: one per realm
+    /// (RFC 3261 §22.3). Empty when none.
     #[cfg(feature = "digest-auth")]
-    last_challenge: Option<proto_sip::auth::DigestChallenge>,
-    /// True when `last_challenge` came from a 407 (Proxy-Authenticate), so
+    last_challenges: Vec<proto_sip::auth::DigestChallenge>,
+    /// True when `last_challenges` came from a 407 (Proxy-Authenticate), so
     /// the retry carries Proxy-Authorization (RFC 3261 §22.3).
     #[cfg(feature = "digest-auth")]
     last_challenge_proxy: bool,
@@ -134,23 +135,27 @@ pub enum RegistrationEvent {
     },
 }
 
-/// Selects the strongest acceptable digest challenge from a 401/407.
+/// Selects the digest challenge(s) to answer from a 401/407.
 ///
 /// RFC 7616 §3.7: all `WWW-Authenticate` (401) / `Proxy-Authenticate` (407)
 /// values are considered; SHA-512-256 > SHA-256 > MD5, and MD5 only when
-/// `allow_md5` is set. Returns `None` (and logs the offered algorithms, never
-/// nonces) when nothing acceptable was offered. Logs a warning naming `target`
-/// (registrar URI, or the call ID for INVITE challenges) whenever an MD5 challenge is selected.
-/// Realm is not considered; see [`proto_sip::select_challenge`] (POA&M-256).
+/// `allow_md5` is set. Both 401 and 407 yield the strongest challenge per
+/// realm (RFC 3261 §22.3, POA&M-256): a forking proxy may merge several
+/// UAS/proxy realms into one response (RFC 3261 §16.7 step 6), so each realm
+/// gets its own `Authorization` / `Proxy-Authorization`; if any realm offers
+/// nothing acceptable the whole response is refused (fail closed). Returns `None` (and logs
+/// the offered algorithms and refused realms, never nonces) when nothing can
+/// be answered. Logs a warning naming `target` (registrar URI, or the call ID
+/// for INVITE challenges) whenever an MD5 challenge is selected.
 // NIST 800-53 Rev5: IA-5(1) (POA&M-234); IA-7 / SC-13 partial while MD5 may
 // be answered (POA&M-255); AU-2 (MD5 use / refusal logged).
 #[cfg(feature = "digest-auth")]
-pub(crate) fn select_auth_challenge(
+pub(crate) fn select_auth_challenges(
     response: &proto_sip::SipResponse,
     status_code: u16,
     allow_md5: bool,
     target: &str,
-) -> Option<proto_sip::auth::DigestChallenge> {
+) -> Option<Vec<proto_sip::auth::DigestChallenge>> {
     let header_name = if status_code == 401 {
         HeaderName::WwwAuthenticate
     } else {
@@ -160,24 +165,35 @@ pub(crate) fn select_auth_challenge(
         .headers
         .get_all(&header_name)
         .map(|h| h.value.as_str());
-    match proto_sip::auth::select_challenge_from_headers(header_name.as_str(), values, allow_md5) {
-        Ok(selection) => {
-            if selection.dropped > 0 {
-                debug!(
-                    target = %target,
-                    dropped = selection.dropped,
-                    "Digest challenges beyond cap ignored"
-                );
-            }
-            if selection.challenge.algorithm.is_md5() {
+    let selected = proto_sip::auth::select_challenges_per_realm_from_headers(
+        header_name.as_str(),
+        values,
+        allow_md5,
+    );
+    match selected {
+        Ok(proto_sip::auth::RealmSelection {
+            challenges,
+            dropped,
+        }) => {
+            if dropped > 0 {
+                // SC-5 cap hit: a realm past the cap goes unanswered (likely
+                // another 401/407). Operational log, count only, no nonces.
                 warn!(
                     target = %target,
                     status_code,
-                    algorithm = %selection.challenge.algorithm,
+                    dropped,
+                    "Digest challenges beyond cap ignored"
+                );
+            }
+            for ch in challenges.iter().filter(|c| c.algorithm.is_md5()) {
+                warn!(
+                    target = %target,
+                    status_code,
+                    algorithm = %ch.algorithm,
                     "Answering MD5 digest challenge (legacy, not CNSA; POA&M-255)"
                 );
             }
-            Some(selection.challenge)
+            Some(challenges)
         }
         Err(e) => {
             warn!(
@@ -264,7 +280,7 @@ impl RegistrationAgent {
                 #[cfg(feature = "digest-auth")]
                 nonce_count: 0,
                 #[cfg(feature = "digest-auth")]
-                last_challenge: None,
+                last_challenges: Vec::new(),
                 #[cfg(feature = "digest-auth")]
                 last_challenge_proxy: false,
             });
@@ -285,7 +301,7 @@ impl RegistrationAgent {
         #[cfg(feature = "digest-auth")]
         {
             registration.nonce_count = 0;
-            registration.last_challenge = None;
+            registration.last_challenges.clear();
         }
 
         // Update state
@@ -355,7 +371,7 @@ impl RegistrationAgent {
         #[cfg(feature = "digest-auth")]
         {
             registration.nonce_count = 0;
-            registration.last_challenge = None;
+            registration.last_challenges.clear();
         }
 
         // Build unregister request (Contact: *, Expires: 0)
@@ -486,22 +502,26 @@ impl RegistrationAgent {
                         // Parse WWW-Authenticate / Proxy-Authenticate header
                         // RFC 7616 §3.7: choose the strongest offered
                         // challenge (POA&M-234).
-                        if let Some(challenge) = select_auth_challenge(
+                        // POA&M-255: explicit setting, else MD5 only over TLS.
+                        // POAM: POA&M-276 — MD5 remains answerable via an
+                        // explicit opt-in (including over UDP/TCP) and by
+                        // default on TLS accounts.
+                        if let Some(challenges) = select_auth_challenges(
                             response,
                             status_code,
-                            creds.allow_md5_digest,
+                            registration.account.effective_allow_md5_digest(),
                             &registration.account.registrar_uri,
                         ) {
                             // Check retry limit to prevent infinite loops
                             if registration.nonce_count < 3 {
                                 info!(
                                     account_id = %account_id,
-                                    realm = %challenge.realm,
+                                    realms = challenges.len(),
                                     nonce_count = registration.nonce_count,
                                     "Digest auth challenge received, retrying with credentials"
                                 );
 
-                                registration.last_challenge = Some(challenge);
+                                registration.last_challenges = challenges;
                                 registration.last_challenge_proxy = status_code == 407;
                                 registration.nonce_count += 1;
                                 registration.cseq += 1;
@@ -992,10 +1012,12 @@ impl RegistrationAgent {
         use proto_sip::auth::{AlgorithmHasher, create_credentials, generate_cnonce};
 
         // Clone the data we need before mutating registration
-        let challenge = registration
-            .last_challenge
-            .clone()
-            .ok_or_else(|| SipUaError::InvalidState("No challenge available".to_string()))?;
+        let challenges = registration.last_challenges.clone();
+        if challenges.is_empty() {
+            return Err(SipUaError::InvalidState(
+                "No challenge available".to_string(),
+            ));
+        }
 
         let digest_creds = registration
             .account
@@ -1015,32 +1037,38 @@ impl RegistrationAgent {
             Self::build_register_request(registration, local_addr)?
         };
 
-        // Compute digest response.
-        // RFC 7616 §3.4.1: hash with the selected challenge's algorithm.
-        let hasher = AlgorithmHasher::for_algorithm(challenge.algorithm);
-        let cnonce = generate_cnonce();
-
-        let auth_creds = create_credentials(
-            &hasher,
-            &challenge,
-            &digest_creds.username,
-            &digest_creds.password,
-            "REGISTER",
-            &digest_uri,
-            Some(&cnonce),
-            Some(nonce_count),
-            None, // No body for REGISTER
-        )
-        .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
-
         // RFC 3261 §22.3: a 407 is answered with Proxy-Authorization, a 401
-        // with Authorization.
+        // with Authorization; one header per realm.
+        // POAM: POA&M-277 — no per-account expected-realm allow-list: a
+        // password-derived response is issued for every realm the peer (or
+        // an on-path attacker over UDP/TCP) names.
         let auth_header = if registration.last_challenge_proxy {
             HeaderName::ProxyAuthorization
         } else {
             HeaderName::Authorization
         };
-        request.headers.set(auth_header, auth_creds.to_string());
+        request.headers.remove(&auth_header);
+        for challenge in &challenges {
+            // RFC 7616 §3.4.1: hash with the selected challenge's algorithm.
+            let hasher = AlgorithmHasher::for_algorithm(challenge.algorithm);
+            let cnonce = generate_cnonce();
+            let auth_creds = create_credentials(
+                &hasher,
+                challenge,
+                &digest_creds.username,
+                &digest_creds.password,
+                "REGISTER",
+                &digest_uri,
+                Some(&cnonce),
+                Some(nonce_count),
+                None, // No body for REGISTER
+            )
+            .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+            request.headers.add(proto_sip::Header::new(
+                auth_header.clone(),
+                auth_creds.to_string(),
+            ));
+        }
 
         Ok(request)
     }
@@ -1271,6 +1299,118 @@ mod tests {
         let creds: proto_sip::DigestCredentials = auth.parse().unwrap();
         assert_eq!(creds.algorithm, proto_sip::DigestAlgorithm::Sha256);
         assert_eq!(creds.nonce, "ps");
+    }
+
+    /// POA&M-256 / RFC 3261 §22.3: a 407 carrying two proxy realms is
+    /// answered with one Proxy-Authorization per realm, each using that
+    /// realm's strongest challenge.
+    #[cfg(feature = "digest-auth")]
+    #[tokio::test]
+    async fn test_407_multi_realm_one_header_per_realm() {
+        let (mut agent, mut rx) = digest_agent(false).await;
+        let mut response = SipResponse::new(proto_sip::StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        for v in [
+            r#"Digest realm="p1", nonce="a1", algorithm=SHA-256"#,
+            r#"Digest realm="p2", nonce="b1", algorithm=SHA-256, Digest realm="p2", nonce="b2", algorithm=SHA-512-256"#,
+        ] {
+            response
+                .headers
+                .add(proto_sip::Header::new(HeaderName::ProxyAuthenticate, v));
+        }
+        agent.handle_response(&response, "test").await.unwrap();
+        let request = sent_request(rx.recv().await.unwrap());
+        let creds: Vec<proto_sip::DigestCredentials> = request
+            .headers
+            .get_all(&HeaderName::ProxyAuthorization)
+            .map(|h| h.value.parse().unwrap())
+            .collect();
+        let got: Vec<_> = creds
+            .iter()
+            .map(|c| (c.realm.as_str(), c.nonce.as_str(), c.algorithm))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("p1", "a1", proto_sip::DigestAlgorithm::Sha256),
+                ("p2", "b2", proto_sip::DigestAlgorithm::Sha512_256),
+            ]
+        );
+    }
+
+    /// RFC 3261 §16.7 / §22.3: a 401 merging two UAS realms is answered with
+    /// one Authorization per realm.
+    #[cfg(feature = "digest-auth")]
+    #[tokio::test]
+    async fn test_401_multi_realm_one_header_per_realm() {
+        let (mut agent, mut rx) = digest_agent(false).await;
+        let response = challenge_401(&[
+            r#"Digest realm="u1", nonce="a1", algorithm=SHA-256"#,
+            r#"Digest realm="u2", nonce="b1", algorithm=SHA-512-256"#,
+        ]);
+        agent.handle_response(&response, "test").await.unwrap();
+        let request = sent_request(rx.recv().await.unwrap());
+        let realms: Vec<String> = request
+            .headers
+            .get_all(&HeaderName::Authorization)
+            .map(|h| {
+                h.value
+                    .parse::<proto_sip::DigestCredentials>()
+                    .unwrap()
+                    .realm
+            })
+            .collect();
+        assert_eq!(realms, ["u1", "u2"]);
+    }
+
+    /// POA&M-256: a 407 where one realm offers only MD5 and MD5 is refused
+    /// fails closed (no partial answer).
+    #[cfg(feature = "digest-auth")]
+    #[tokio::test]
+    async fn test_407_md5_only_realm_fails_closed() {
+        let (mut agent, mut rx) = digest_agent(false).await;
+        let mut response = SipResponse::new(proto_sip::StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        response.headers.add(proto_sip::Header::new(
+            HeaderName::ProxyAuthenticate,
+            r#"Digest realm="p1", nonce="a1", algorithm=SHA-256, Digest realm="p2", nonce="b1", algorithm=MD5"#,
+        ));
+        agent.handle_response(&response, "test").await.unwrap();
+        let event = rx.recv().await.unwrap();
+        assert!(
+            !matches!(event, RegistrationEvent::SendRequest { .. }),
+            "unexpected authenticated REGISTER: {event:?}"
+        );
+    }
+
+    /// POA&M-255: with the MD5 setting unset, a UDP account refuses an
+    /// MD5-only challenge and a TLS account answers it.
+    #[cfg(feature = "digest-auth")]
+    #[tokio::test]
+    async fn test_unset_md5_policy_follows_transport() {
+        for (transport, answered) in [
+            (client_types::TransportPreference::Udp, false),
+            (client_types::TransportPreference::TlsOnly, true),
+        ] {
+            let (tx, mut rx) = mpsc::channel(10);
+            let local_addr: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+            let mut agent = RegistrationAgent::new(local_addr, tx);
+            let mut account = test_account();
+            account.registrar_uri = "sip:192.0.2.1:5060".to_string();
+            account.transport = transport;
+            account.auth_mode = client_types::SipAuthMode::Digest;
+            account.digest_credentials =
+                Some(client_types::DigestAuthCredentials::new("alice", "secret"));
+            agent.register(&account).await.unwrap();
+            let _ = rx.recv().await.unwrap(); // StateChanged
+            let _ = rx.recv().await.unwrap(); // SendRequest
+            let response = challenge_401(&[r#"Digest realm="r", nonce="n1", algorithm=MD5"#]);
+            agent.handle_response(&response, "test").await.unwrap();
+            let event = rx.recv().await.unwrap();
+            assert_eq!(
+                matches!(event, RegistrationEvent::SendRequest { .. }),
+                answered,
+                "{transport:?}: {event:?}"
+            );
+        }
     }
 
     /// Registers a digest account and drains the initial events.
