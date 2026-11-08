@@ -1751,6 +1751,16 @@ pub struct TrunkConfigSchema {
     ///
     /// ## NIST 800-53 Rev5: IA-3
     pub tls_client_cert: bool,
+    /// UAC digest MD5 policy for carrier REGISTER (POA&M-255). Parsed so
+    /// that it is rejected with guidance rather than silently ignored:
+    /// config-file trunks are not registered (only trunks in the trunk
+    /// store/API carry `register_enabled` and credentials), so the key is
+    /// accepted only on stored trunk JSON (`allow_md5_digest`, enforced by
+    /// `sbc-trunk-services`). Validation refuses any value here.
+    ///
+    /// ## NIST 800-53 Rev5: CM-6
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_md5_digest: Option<bool>,
 }
 
 impl TrunkConfigSchema {
@@ -1781,6 +1791,7 @@ impl Default for TrunkConfigSchema {
             stir_shaken: TrunkStirConfig::default(),
             tls_server_name: None,
             tls_client_cert: false,
+            allow_md5_digest: None,
         }
     }
 }
@@ -1950,6 +1961,29 @@ mod tests {
         assert!(monitoring.metrics_bind.is_none());
         assert!(!monitoring.per_call_metrics);
         assert_eq!(monitoring.scrape_interval_secs, 15);
+    }
+
+    #[test]
+    fn trunk_allow_md5_digest_parses_and_round_trips() {
+        let toml_str = r#"
+            [[trunk_groups]]
+            id = "g"
+            name = "g"
+            [[trunk_groups.trunks]]
+            id = "a"
+            host = "192.0.2.1"
+            [[trunk_groups.trunks]]
+            id = "b"
+            host = "192.0.2.2"
+            allow_md5_digest = false
+        "#;
+        let config: SbcConfig = toml::from_str(toml_str).expect("parse");
+        let trunks = &config.trunk_groups[0].trunks;
+        assert_eq!(trunks[0].allow_md5_digest, None);
+        assert_eq!(trunks[1].allow_md5_digest, Some(false));
+        let out = toml::to_string(&config).expect("serialize");
+        assert_eq!(out.matches("allow_md5_digest").count(), 1, "{out}");
+        assert!(toml::from_str::<SbcConfig>(&toml_str.replace("= false", "= \"no\"")).is_err());
     }
 
     // One long TOML fixture plus its assertions; splitting hides the example config.

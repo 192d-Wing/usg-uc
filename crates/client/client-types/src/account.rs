@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 /// support mTLS client certificates.
 #[cfg(feature = "digest-auth")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "DigestAuthCredentialsRepr")]
 pub struct DigestAuthCredentials {
     /// Authentication username (often the SIP username).
     pub username: String,
@@ -30,25 +31,68 @@ pub struct DigestAuthCredentials {
     #[serde(default)]
     pub password_persisted: bool,
     /// Whether an MD5/MD5-sess digest challenge may be answered when the
-    /// server offers nothing stronger (RFC 7616 §3.7).
+    /// server offers nothing stronger (RFC 7616 §3.7). Settings key
+    /// `digest_credentials.allow_md5_digest`.
     ///
-    /// Defaults to true as a legacy interoperability allowance for MD5-only
-    /// providers. When false, an MD5-only challenge fails closed. Neither MD5
-    /// nor SHA-256/SHA-512-256 digest is CNSA 2.0; SIP digest stays under the
-    /// POA&M-110 exception.
-    // NIST 800-53 Rev5: IA-5(1) (POA&M-234); IA-7 / SC-13 partial while MD5
-    // may be answered (POA&M-255).
-    #[serde(default = "default_allow_md5_digest")]
-    pub allow_md5_digest: bool,
+    /// `Some(true)` allows, `Some(false)` refuses. Unset (`None`) allows MD5
+    /// only on a TLS account ([`TransportPreference::TlsOnly`]): on UDP/TCP an
+    /// on-path attacker can strip SHA challenges and force an MD5 answer. Use
+    /// [`SipAccount::effective_allow_md5_digest`]. Neither MD5 nor
+    /// SHA-256/SHA-512-256 digest is CNSA 2.0; SIP digest stays under the
+    /// POA&M-110 exception. Settings saved before
+    /// [`DIGEST_MD5_POLICY_VERSION`] always carried `true` (the old default),
+    /// so a legacy `true` loads as `None`; see [`DigestAuthCredentialsRepr`].
+    // NIST 800-53 Rev5: IA-5(1), SC-13, CM-6 (POA&M-255).
+    // POAM: POA&M-276 — MD5 remains answerable via explicit opt-in
+    // (including over UDP/TCP) and by default on TLS accounts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_md5_digest: Option<bool>,
+    /// Settings-schema marker for `allow_md5_digest`. Always serialized as
+    /// [`DIGEST_MD5_POLICY_VERSION`]; absent (0) in settings written before
+    /// the tri-state policy, which triggers the one-time migration.
+    #[serde(default)]
+    pub md5_policy_version: u32,
 }
 
-/// Serde default for [`DigestAuthCredentials::allow_md5_digest`].
+/// Current [`DigestAuthCredentials::md5_policy_version`]. Version 0 settings
+/// stored `allow_md5_digest` as an always-serialized bool defaulting to true.
 #[cfg(feature = "digest-auth")]
-const fn default_allow_md5_digest() -> bool {
-    // POAM: POA&M-255 — MD5 UAC answers allowed by default; no
-    // sbc-config/sbc-daemon or client settings key to disable; on non-TLS an
-    // on-path attacker can strip SHA challenges.
-    true
+pub const DIGEST_MD5_POLICY_VERSION: u32 = 1;
+
+/// On-disk form of [`DigestAuthCredentials`], migrated on load.
+#[cfg(feature = "digest-auth")]
+#[derive(Deserialize)]
+struct DigestAuthCredentialsRepr {
+    username: String,
+    #[serde(default)]
+    password_persisted: bool,
+    #[serde(default)]
+    allow_md5_digest: Option<bool>,
+    #[serde(default)]
+    md5_policy_version: u32,
+}
+
+#[cfg(feature = "digest-auth")]
+impl From<DigestAuthCredentialsRepr> for DigestAuthCredentials {
+    /// One-time migration (SEC-001): a version-0 `allow_md5_digest: true` is
+    /// indistinguishable from the old default, so it becomes unset (MD5 only
+    /// over TLS). A version-0 `false` could only be a user choice and is
+    /// kept. Values saved at the current version are kept as-is, so an
+    /// explicit opt-in made after the upgrade survives reloads.
+    // NIST 800-53 Rev5: CM-6 (secure default reaches upgraded accounts).
+    fn from(r: DigestAuthCredentialsRepr) -> Self {
+        let allow_md5_digest = match (r.md5_policy_version, r.allow_md5_digest) {
+            (0, Some(true)) => None,
+            (_, v) => v,
+        };
+        Self {
+            username: r.username,
+            password: zeroize::Zeroizing::new(String::new()),
+            password_persisted: r.password_persisted,
+            allow_md5_digest,
+            md5_policy_version: DIGEST_MD5_POLICY_VERSION,
+        }
+    }
 }
 
 #[cfg(feature = "digest-auth")]
@@ -59,7 +103,8 @@ impl DigestAuthCredentials {
             username: username.into(),
             password: zeroize::Zeroizing::new(password.into()),
             password_persisted: false,
-            allow_md5_digest: true,
+            allow_md5_digest: None,
+            md5_policy_version: DIGEST_MD5_POLICY_VERSION,
         }
     }
 
@@ -69,14 +114,16 @@ impl DigestAuthCredentials {
             username: username.into(),
             password: zeroize::Zeroizing::new(password.into()),
             password_persisted: true,
-            allow_md5_digest: true,
+            allow_md5_digest: None,
+            md5_policy_version: DIGEST_MD5_POLICY_VERSION,
         }
     }
 
-    /// Sets whether MD5 digest challenges may be answered (default true).
+    /// Explicitly allows or refuses MD5 digest challenges (default: unset,
+    /// i.e. allowed only over TLS).
     #[must_use]
     pub const fn with_allow_md5_digest(mut self, allow: bool) -> Self {
-        self.allow_md5_digest = allow;
+        self.allow_md5_digest = Some(allow);
         self
     }
 
@@ -183,6 +230,23 @@ impl SipAccount {
             sip_uri: sip_uri.into(),
             registrar_uri: registrar_uri.into(),
             ..Default::default()
+        }
+    }
+
+    /// Effective MD5 digest policy for this account (POA&M-255).
+    ///
+    /// The explicit `digest_credentials.allow_md5_digest` setting wins;
+    /// unset allows MD5 only when the account transport is TLS (same rule as
+    /// `proto_sip::resolve_allow_md5`). No digest credentials: false.
+    // NIST 800-53 Rev5: SC-8, SC-13, IA-5(1), CM-6.
+    #[cfg(feature = "digest-auth")]
+    #[must_use]
+    pub fn effective_allow_md5_digest(&self) -> bool {
+        let tls = self.transport == TransportPreference::TlsOnly;
+        match self.digest_credentials.as_ref().map(|c| c.allow_md5_digest) {
+            Some(Some(allow)) => allow,
+            Some(None) => tls,
+            None => false,
         }
     }
 
@@ -503,6 +567,75 @@ mod tests {
         );
 
         assert_eq!(account.domain(), Some("example.com"));
+    }
+
+    #[cfg(feature = "digest-auth")]
+    #[test]
+    fn allow_md5_digest_settings_and_effective_policy() {
+        // Legacy settings with `true`/`false` and new settings without the key.
+        let parse = |v: &str| -> DigestAuthCredentials {
+            serde_json::from_str(&format!(r#"{{"username":"u"{v}}}"#)).unwrap()
+        };
+        assert_eq!(parse("").allow_md5_digest, None);
+        // SEC-001: legacy (version 0) `true` was the old always-serialized
+        // default and migrates to unset; legacy `false` is a user choice.
+        assert_eq!(parse(r#","allow_md5_digest":true"#).allow_md5_digest, None);
+        assert_eq!(
+            parse(r#","allow_md5_digest":false"#).allow_md5_digest,
+            Some(false)
+        );
+        // Current-version values are explicit and kept.
+        for v in [true, false] {
+            assert_eq!(
+                parse(&format!(
+                    r#","allow_md5_digest":{v},"md5_policy_version":1"#
+                ))
+                .allow_md5_digest,
+                Some(v)
+            );
+        }
+        // An opt-in set after the upgrade survives a save/load round trip,
+        // and a migrated account stays unset.
+        let opted = DigestAuthCredentials::new("u", "p").with_allow_md5_digest(true);
+        let saved = serde_json::to_string(&opted).unwrap();
+        assert!(saved.contains(r#""md5_policy_version":1"#), "{saved}");
+        let reloaded: DigestAuthCredentials = serde_json::from_str(&saved).unwrap();
+        assert_eq!(reloaded.allow_md5_digest, Some(true));
+        let migrated = parse(r#","allow_md5_digest":true"#);
+        let reloaded: DigestAuthCredentials =
+            serde_json::from_str(&serde_json::to_string(&migrated).unwrap()).unwrap();
+        assert_eq!(reloaded.allow_md5_digest, None);
+        assert!(
+            serde_json::from_str::<DigestAuthCredentials>(
+                r#"{"username":"u","allow_md5_digest":"yes"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            !serde_json::to_string(&parse(""))
+                .unwrap()
+                .contains("allow_md5")
+        );
+
+        let mut acct = SipAccount::default();
+        assert!(!acct.effective_allow_md5_digest(), "no creds");
+        for (transport, policy, want) in [
+            (TransportPreference::TlsOnly, None, true),
+            (TransportPreference::Udp, None, false),
+            (TransportPreference::Tcp, None, false),
+            (TransportPreference::Udp, Some(true), true),
+            (TransportPreference::TlsOnly, Some(false), false),
+        ] {
+            acct.transport = transport;
+            let mut c = DigestAuthCredentials::new("u", "p");
+            c.allow_md5_digest = policy;
+            acct.digest_credentials = Some(c);
+            assert_eq!(
+                acct.effective_allow_md5_digest(),
+                want,
+                "{transport:?} {policy:?}"
+            );
+        }
     }
 
     #[test]

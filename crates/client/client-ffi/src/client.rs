@@ -615,7 +615,9 @@ fn apply_digest_credentials(
     };
 
     let previous = core.digest_credentials.take();
-    let credentials = if let Some(password) = digest_password.filter(|p| !p.is_empty()) {
+    // Keep the saved MD5 policy (POA&M-255) across a password change.
+    let allow_md5_digest = previous.as_ref().and_then(|p| p.allow_md5_digest);
+    let mut credentials = if let Some(password) = digest_password.filter(|p| !p.is_empty()) {
         let persisted = manager
             .store_digest_password(&core.id, password)
             .map_err(ClientError::from)?;
@@ -633,6 +635,7 @@ fn apply_digest_credentials(
     } else {
         DigestAuthCredentials::new(username, String::new())
     };
+    credentials.allow_md5_digest = allow_md5_digest;
     core.digest_credentials = Some(credentials);
     Ok(())
 }

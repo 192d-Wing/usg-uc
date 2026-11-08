@@ -356,14 +356,13 @@ pub const MAX_DIGEST_CHALLENGES: usize = 16;
 /// [`select_challenge_from_headers`] applies [`MAX_DIGEST_CHALLENGES`].
 ///
 /// The realm is not considered: all challenges are treated as one set and a
-/// single winner is returned, so a 407 carrying challenges from several
-/// proxy realms (forking / proxy chain) gets a single answer rather than one
-/// `Proxy-Authorization` per realm.
-// POAM: POA&M-256 — per-realm Proxy-Authorization answering (RFC 3261 §22.3,
-// RFC 8760 §2.4) is not implemented.
+/// single winner is returned. Use this for 401 (`WWW-Authenticate`, one
+/// registrar/UAS realm); answer 407 with [`select_challenges_per_realm`] so
+/// each proxy realm gets its own `Proxy-Authorization` (POA&M-256).
 //
 // NIST 800-53 Rev5: IA-5(1), SC-13 (POA&M-234); IA-7 / SC-13 partial: MD5 may
-// be answered when `allow_md5` is true (POA&M-255), and SHA-256 / SHA-512-256
+// be answered when `allow_md5` is true (see [`resolve_allow_md5`]; POA&M-255
+// default refuses it on cleartext transport), and SHA-256 / SHA-512-256
 // are not CNSA 2.0 hashes either (SIP digest stays under the POA&M-110
 // exception).
 pub fn select_challenge<'a>(
@@ -403,8 +402,8 @@ pub struct ChallengeSelection {
 /// RFC 7616 §3.7: challenges that do not parse (non-Digest schemes, unknown
 /// `algorithm=` tokens such as `SHA3-512`, missing realm/nonce) are skipped
 /// rather than failing the whole set. MD5 is only selected when `allow_md5`
-/// is true (legacy interop allowance, POA&M-255). See [`select_challenge`]
-/// for the realm limitation (POA&M-256).
+/// is true (legacy interop allowance, POA&M-255). The realm is not
+/// considered; see [`select_challenges_per_realm_from_headers`] for 407.
 ///
 /// `header_name` is used only in the error.
 ///
@@ -417,6 +416,44 @@ pub fn select_challenge_from_headers<'a>(
     values: impl IntoIterator<Item = &'a str>,
     allow_md5: bool,
 ) -> SipResult<ChallengeSelection> {
+    let ParsedChallenges {
+        parsed,
+        offered,
+        dropped,
+    } = parse_challenge_headers(values);
+    match select_challenge(parsed.iter(), allow_md5) {
+        Some(ch) => Ok(ChallengeSelection {
+            challenge: ch.clone(),
+            dropped,
+        }),
+        None => Err(SipError::InvalidHeader {
+            name: header_name.to_string(),
+            reason: format!(
+                "no acceptable digest challenge (md5 {}); offered: [{}]{}",
+                if allow_md5 { "allowed" } else { "disallowed" },
+                offered.join(", "),
+                if dropped > 0 {
+                    format!("; {dropped} beyond cap ignored")
+                } else {
+                    String::new()
+                }
+            ),
+        }),
+    }
+}
+
+/// Challenges parsed from a set of header values (internal).
+struct ParsedChallenges {
+    parsed: Vec<DigestChallenge>,
+    /// Algorithm labels in offer order (never nonces); used in errors.
+    offered: Vec<String>,
+    dropped: usize,
+}
+
+/// Splits and parses challenge header values, applying
+/// [`MAX_DIGEST_CHALLENGES`] (NIST 800-53 Rev5: SC-5). Unparseable challenges
+/// are skipped but recorded in `offered`.
+fn parse_challenge_headers<'a>(values: impl IntoIterator<Item = &'a str>) -> ParsedChallenges {
     let mut parsed: Vec<DigestChallenge> = Vec::new();
     let mut offered: Vec<String> = Vec::new();
     let mut seen = 0usize;
@@ -442,25 +479,147 @@ pub fn select_challenge_from_headers<'a>(
             }
         }
     }
-    match select_challenge(parsed.iter(), allow_md5) {
-        Some(ch) => Ok(ChallengeSelection {
-            challenge: ch.clone(),
-            dropped,
-        }),
-        None => Err(SipError::InvalidHeader {
-            name: header_name.to_string(),
-            reason: format!(
-                "no acceptable digest challenge (md5 {}); offered: [{}]{}",
-                if allow_md5 { "allowed" } else { "disallowed" },
-                offered.join(", "),
-                if dropped > 0 {
-                    format!("; {dropped} beyond cap ignored")
-                } else {
-                    String::new()
-                }
-            ),
-        }),
+    ParsedChallenges {
+        parsed,
+        offered,
+        dropped,
     }
+}
+
+/// Resolves the effective MD5 digest policy (POA&M-255).
+///
+/// `policy` is the operator setting: `Some(true)` allows MD5, `Some(false)`
+/// refuses it, and unset allows MD5 only when the signaling transport that
+/// carries the challenge is TLS. On cleartext an on-path attacker can strip
+/// SHA-256 / SHA-512-256 challenges and force an MD5 answer (downgrade); on
+/// TLS the challenge set is integrity-protected, so MD5-only peers are a
+/// genuine legacy case. `transport_tls` must reflect the transport actually
+/// used, not a configured preference.
+// NIST 800-53 Rev5: SC-8, SC-13, IA-5(1), CM-6 (explicit override).
+// POAM: POA&M-276 — MD5 remains answerable via explicit opt-in (including
+// over cleartext) and by default on TLS.
+#[must_use]
+pub const fn resolve_allow_md5(policy: Option<bool>, transport_tls: bool) -> bool {
+    match policy {
+        Some(allow) => allow,
+        None => transport_tls,
+    }
+}
+
+/// Selects the strongest acceptable challenge for each distinct realm.
+///
+/// RFC 3261 §22.3: a UAC answering a 407 carrying several
+/// `Proxy-Authenticate` challenges (forking / proxy chain) sends one
+/// `Proxy-Authorization` per realm. Realms are compared as exact strings
+/// (RFC 3261 §22.1: opaque). Within a realm RFC 7616 §3.7 strength order
+/// applies (SHA-512-256 > SHA-256 > MD5, MD5 only when `allow_md5`), ties keep
+/// the first offered. RFC 8760 §2.4 / RFC 7616 §3.7 have the UAC use the
+/// topmost supported challenge "unless a local policy dictates otherwise";
+/// strongest-first is such a local policy (it also defeats reordering on
+/// cleartext transport).
+/// Output preserves first-seen realm order. The input is caller-bounded.
+///
+/// # Errors
+///
+/// Fail-closed: if any realm has no acceptable challenge, returns the list of
+/// such realms and no selection. A partial answer would only earn another 407
+/// while disclosing a response hash. An empty input yields `Ok(vec![])`.
+// NIST 800-53 Rev5: IA-5(1), SC-13, SC-8 (POA&M-256).
+pub fn select_challenges_per_realm<'a>(
+    challenges: impl IntoIterator<Item = &'a DigestChallenge>,
+    allow_md5: bool,
+) -> Result<Vec<&'a DigestChallenge>, Vec<String>> {
+    // (realm, best acceptable challenge). Linear scan: input is capped small.
+    let mut groups: Vec<(&'a str, Option<&'a DigestChallenge>)> = Vec::new();
+    for ch in challenges {
+        let idx = if let Some(idx) = groups.iter().position(|(r, _)| *r == ch.realm.as_str()) {
+            idx
+        } else {
+            groups.push((ch.realm.as_str(), None));
+            groups.len() - 1
+        };
+        if ch.algorithm.is_md5() && !allow_md5 {
+            continue;
+        }
+        if let Some((_, best)) = groups.get_mut(idx)
+            && best.is_none_or(|b| ch.algorithm.strength() > b.algorithm.strength())
+        {
+            *best = Some(ch);
+        }
+    }
+    let refused: Vec<String> = groups
+        .iter()
+        .filter(|(_, best)| best.is_none())
+        .map(|(realm, _)| (*realm).to_string())
+        .collect();
+    if !refused.is_empty() {
+        return Err(refused);
+    }
+    Ok(groups.into_iter().filter_map(|(_, best)| best).collect())
+}
+
+/// Result of [`select_challenges_per_realm_from_headers`].
+#[derive(Debug, Clone)]
+pub struct RealmSelection {
+    /// One selected challenge per realm, in first-seen realm order (never
+    /// empty).
+    pub challenges: Vec<DigestChallenge>,
+    /// Number of challenges ignored because [`MAX_DIGEST_CHALLENGES`] was
+    /// reached (callers should log this at debug level).
+    pub dropped: usize,
+}
+
+/// Parses every `Proxy-Authenticate` (or `WWW-Authenticate`) value and
+/// selects the strongest acceptable Digest challenge per realm (POA&M-256).
+///
+/// Splitting, the [`MAX_DIGEST_CHALLENGES`] cap and skipping of unparseable
+/// challenges are as in [`select_challenge_from_headers`]; selection is as in
+/// [`select_challenges_per_realm`] (fail-closed when any realm has no
+/// acceptable challenge).
+///
+/// # Errors
+///
+/// Returns [`SipError::InvalidHeader`] when no Digest challenge parsed or when
+/// any realm has no acceptable challenge. The error names the refused realms
+/// and the offered algorithms, never nonces or other parameters.
+pub fn select_challenges_per_realm_from_headers<'a>(
+    header_name: &str,
+    values: impl IntoIterator<Item = &'a str>,
+    allow_md5: bool,
+) -> SipResult<RealmSelection> {
+    let ParsedChallenges {
+        parsed,
+        offered,
+        dropped,
+    } = parse_challenge_headers(values);
+    let refused = match select_challenges_per_realm(parsed.iter(), allow_md5) {
+        Ok(sel) if !sel.is_empty() => {
+            return Ok(RealmSelection {
+                challenges: sel.into_iter().cloned().collect(),
+                dropped,
+            });
+        }
+        Ok(_) => Vec::new(),
+        Err(refused) => refused,
+    };
+    Err(SipError::InvalidHeader {
+        name: header_name.to_string(),
+        reason: format!(
+            "no acceptable digest challenge for realm(s) [{}] (md5 {}); offered: [{}]{}",
+            refused
+                .iter()
+                .map(|r| format!("{r:?}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if allow_md5 { "allowed" } else { "disallowed" },
+            offered.join(", "),
+            if dropped > 0 {
+                format!("; {dropped} beyond cap ignored")
+            } else {
+                String::new()
+            }
+        ),
+    })
 }
 
 /// Splits one challenge header value into its comma-joined challenges.
@@ -1836,6 +1995,174 @@ mod tests {
         #[test]
         fn empty_set_is_error() {
             assert!(sel(std::iter::empty(), true).is_err());
+        }
+
+        #[test]
+        fn resolve_allow_md5_truth_table() {
+            assert!(resolve_allow_md5(Some(true), false));
+            assert!(resolve_allow_md5(Some(true), true));
+            assert!(!resolve_allow_md5(Some(false), false));
+            assert!(!resolve_allow_md5(Some(false), true));
+            assert!(!resolve_allow_md5(None, false));
+            assert!(resolve_allow_md5(None, true));
+        }
+
+        // POA&M-256: per-realm selection.
+        const A_MD5: &str = r#"Digest realm="a", nonce="na1", algorithm=MD5"#;
+        const A_SHA: &str = r#"Digest realm="a", nonce="na2", algorithm=SHA-256"#;
+        const B_SHA512: &str = r#"Digest realm="b", nonce="nb1", algorithm=SHA-512-256"#;
+        const B_SHA: &str = r#"Digest realm="b", nonce="nb2", algorithm=SHA-256"#;
+        const C_MD5: &str = r#"Digest realm="c", nonce="nc1", algorithm=MD5"#;
+
+        fn per_realm<'a>(
+            values: impl IntoIterator<Item = &'a str>,
+            allow_md5: bool,
+        ) -> SipResult<RealmSelection> {
+            select_challenges_per_realm_from_headers("Proxy-Authenticate", values, allow_md5)
+        }
+
+        #[test]
+        fn per_realm_strongest_each_in_first_seen_order() {
+            let s = per_realm([A_MD5, B_SHA, A_SHA, B_SHA512], false).unwrap();
+            let got: Vec<_> = s
+                .challenges
+                .iter()
+                .map(|c| (c.realm.as_str(), c.algorithm))
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    ("a", DigestAlgorithm::Sha256),
+                    ("b", DigestAlgorithm::Sha512_256)
+                ]
+            );
+        }
+
+        #[test]
+        fn per_realm_comma_joined_line() {
+            let line = format!("{B_SHA}, {A_MD5}");
+            let s = per_realm([line.as_str()], true).unwrap();
+            assert_eq!(s.challenges.len(), 2);
+            assert_eq!(s.challenges[0].realm, "b");
+            assert_eq!(s.challenges[1].algorithm, DigestAlgorithm::Md5);
+        }
+
+        #[test]
+        fn per_realm_tie_keeps_first() {
+            let other = r#"Digest realm="b", nonce="later", algorithm=SHA-256"#;
+            let s = per_realm([B_SHA, other], false).unwrap();
+            assert_eq!(s.challenges.len(), 1);
+            assert_eq!(s.challenges[0].nonce, "nb2");
+        }
+
+        #[test]
+        fn per_realm_md5_only_realm_fails_closed() {
+            let err = per_realm([A_SHA, C_MD5], false).unwrap_err().to_string();
+            assert!(err.contains("\"c\""), "{err}");
+            assert!(!err.contains("\"a\""), "{err}");
+            assert!(err.contains("MD5"), "{err}");
+            assert!(
+                !err.contains("nc1") && !err.contains("na2"),
+                "nonce leaked: {err}"
+            );
+            let s = per_realm([A_SHA, C_MD5], true).unwrap();
+            assert_eq!(s.challenges.len(), 2);
+            let a = DigestChallenge::new("x", "n");
+            assert_eq!(
+                select_challenges_per_realm([&a], false).unwrap_err(),
+                vec!["x".to_string()]
+            );
+        }
+
+        #[test]
+        fn per_realm_realm_is_case_sensitive() {
+            // RFC 3261 §22.1: realm is opaque; "A" and "a" are distinct realms.
+            let upper = r#"Digest realm="A", nonce="nA", algorithm=SHA-256"#;
+            let s = per_realm([A_SHA, upper], false).unwrap();
+            let realms: Vec<&str> = s.challenges.iter().map(|c| c.realm.as_str()).collect();
+            assert_eq!(realms, ["a", "A"]);
+        }
+
+        #[test]
+        fn per_realm_cap_spans_header_lines() {
+            // 16 separate header lines fill the cap; a 17th line (new realm)
+            // is dropped and counted, never answered.
+            let mut lines = vec![A_SHA; MAX_DIGEST_CHALLENGES];
+            lines.push(C_MD5);
+            let s = per_realm(lines, false).unwrap();
+            assert_eq!(s.dropped, 1);
+            assert_eq!(s.challenges.len(), 1);
+            assert_eq!(s.challenges[0].realm, "a");
+        }
+
+        #[test]
+        fn per_realm_md5_sess_only_realm_fails_closed() {
+            let sess = r#"Digest realm="d", nonce="nd", algorithm=MD5-sess, qop="auth""#;
+            let err = per_realm([B_SHA512, sess], false).unwrap_err().to_string();
+            assert!(err.contains("\"d\""), "{err}");
+            assert!(!err.contains("nd\""), "nonce leaked: {err}");
+        }
+
+        #[test]
+        fn per_realm_empty_and_cap() {
+            assert!(per_realm(std::iter::empty(), true).is_err());
+            assert!(per_realm([r#"Basic realm="x""#], true).is_err());
+            assert_eq!(
+                select_challenges_per_realm(std::iter::empty(), true).map(|v| v.len()),
+                Ok(0)
+            );
+            let many = vec![A_SHA; MAX_DIGEST_CHALLENGES].join(", ");
+            let line = format!("{many}, {B_SHA}");
+            let s = per_realm([line.as_str()], false).unwrap();
+            assert_eq!(s.dropped, 1);
+            assert_eq!(s.challenges.len(), 1);
+        }
+
+        proptest::proptest! {
+            #[test]
+            fn per_realm_unique_and_strongest(
+                items in proptest::collection::vec((0u8..4, 0usize..6), 0..16),
+                allow_md5 in proptest::bool::ANY,
+            ) {
+                const ALGS: [DigestAlgorithm; 6] = [
+                    DigestAlgorithm::Md5,
+                    DigestAlgorithm::Md5Sess,
+                    DigestAlgorithm::Sha256,
+                    DigestAlgorithm::Sha256Sess,
+                    DigestAlgorithm::Sha512_256,
+                    DigestAlgorithm::Sha512_256Sess,
+                ];
+                let chs: Vec<DigestChallenge> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (r, a))| {
+                        DigestChallenge::new(format!("r{r}"), format!("n{i}"))
+                            .with_algorithm(ALGS[*a])
+                    })
+                    .collect();
+                match select_challenges_per_realm(chs.iter(), allow_md5) {
+                    Ok(sel) => {
+                        let mut realms: Vec<_> = sel.iter().map(|c| c.realm.clone()).collect();
+                        let n = realms.len();
+                        realms.sort();
+                        realms.dedup();
+                        proptest::prop_assert_eq!(realms.len(), n);
+                        for c in &sel {
+                            proptest::prop_assert!(allow_md5 || !c.algorithm.is_md5());
+                            let max = chs
+                                .iter()
+                                .filter(|o| o.realm == c.realm && (allow_md5 || !o.algorithm.is_md5()))
+                                .map(|o| o.algorithm.strength())
+                                .max();
+                            proptest::prop_assert_eq!(Some(c.algorithm.strength()), max);
+                        }
+                    }
+                    Err(refused) => {
+                        proptest::prop_assert!(!refused.is_empty());
+                        proptest::prop_assert!(!allow_md5);
+                    }
+                }
+            }
         }
 
         #[test]

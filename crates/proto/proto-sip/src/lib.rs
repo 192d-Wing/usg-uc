@@ -84,9 +84,10 @@ pub mod uri;
 pub use auth::{AlgorithmHasher, Md5DigestHasher, Sha256DigestHasher, Sha512_256DigestHasher};
 pub use auth::{
     ChallengeSelection, DigestAlgorithm, DigestChallenge, DigestCredentials, DigestHasher,
-    MAX_DIGEST_CHALLENGES, Qop, compute_digest_response, compute_ha1, compute_ha2,
-    compute_response, create_credentials, select_challenge, select_challenge_from_headers,
-    verify_credentials,
+    MAX_DIGEST_CHALLENGES, Qop, RealmSelection, compute_digest_response, compute_ha1, compute_ha2,
+    compute_response, create_credentials, resolve_allow_md5, select_challenge,
+    select_challenge_from_headers, select_challenges_per_realm,
+    select_challenges_per_realm_from_headers, verify_credentials,
 };
 pub use builder::{
     RequestBuilder, ResponseBuilder, generate_branch, generate_call_id, generate_tag,

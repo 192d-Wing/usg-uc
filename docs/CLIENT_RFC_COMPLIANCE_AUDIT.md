@@ -64,8 +64,10 @@ wave 2 = b79893b0.
 - Hold via `a=sendonly` (3264 §8.4 / 6337).
 - Incoming re-INVITE glare → 491 (3261 §14.1).
 - Digest re-challenge bounded (max 2 attempts) with nonce dedup.
-- RFC 7616 §3.7 / RFC 8760: strongest offered digest algorithm chosen for REGISTER and INVITE (`select_auth_challenge`; tests `test_401_sha256_challenge_preferred_over_md5`, `test_401_md5_only_fails_closed_when_disallowed`). REGISTER 407 is answered with Proxy-Authorization (RFC 3261 §22.3; test `test_407_answered_with_proxy_authorization`).
-- 📋 documented limitation — MD5 answered by default when it is the only offer (`allow_md5_digest`, NIST POA&M-255); multi-realm 407 gets one answer, not one per realm (POA&M-256).
+- RFC 7616 §3.7 / RFC 8760: strongest offered digest algorithm chosen for REGISTER and INVITE (`select_auth_challenges`; tests `test_401_sha256_challenge_preferred_over_md5`, `test_401_md5_only_fails_closed_when_disallowed`). REGISTER 407 is answered with Proxy-Authorization (RFC 3261 §22.3; test `test_407_answered_with_proxy_authorization`).
+- RFC 3261 §22.3 / RFC 8760 §2.4: a multi-realm 401/407 gets one Authorization/Proxy-Authorization per realm, strongest permitted algorithm in each (stricter than §2.4 "topmost supported", allowed by its local-policy clause); a realm with no permitted algorithm fails the whole response (tests `test_401_multi_realm_one_header_per_realm`, `test_407_multi_realm_one_header_per_realm`, `test_407_md5_only_realm_fails_closed`, `test_invite_407_multi_realm_one_header_per_realm`; POA&M-256 closed).
+- MD5 answered only when `allow_md5_digest` is explicitly `true`, or unset on a TLS-only account (tests `test_unset_md5_policy_follows_transport`, `test_invite_md5_refused_by_default_over_udp`; POA&M-255 closed).
+- 📋 documented limitation — residual MD5 after opt-in (POA&M-276); every challenged realm is answered, no expected-realm allow-list (POA&M-277).
 
 ## Suggested fix order
 

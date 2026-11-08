@@ -1544,12 +1544,20 @@ impl CallAgent {
 
                 // RFC 7616 §3.7: choose the strongest offered challenge
                 // (POA&M-234).
-                if let Some(challenge) = crate::registration::select_auth_challenge(
+                // POA&M-255: explicit setting, else MD5 only over TLS.
+                let allow_md5 = proto_sip::resolve_allow_md5(
+                    creds.allow_md5_digest,
+                    self.transport_type == "TLS",
+                );
+                // RFC 3261 §22.3: one challenge per realm on 401 and 407
+                // (POA&M-256).
+                if let Some(challenges) = crate::registration::select_auth_challenges(
                     response,
                     status_code,
-                    creds.allow_md5_digest,
+                    allow_md5,
                     call_id,
-                ) {
+                ) && let Some(challenge) = challenges.first().cloned()
+                {
                     // Skip retransmitted 401s — if the nonce matches the last
                     // challenge we already processed, this is a retransmit from
                     // the server for a previous INVITE we already ACK'd.
@@ -1630,34 +1638,41 @@ impl CallAgent {
                             &self.transport_type,
                         )?;
 
-                        // Compute and add Authorization header.
-                        // RFC 7616 §3.4.1: hash with the challenge's algorithm.
-                        let hasher = AlgorithmHasher::for_algorithm(challenge.algorithm);
-                        let cnonce = generate_cnonce();
-
-                        // Use the Request-URI for the digest URI
-                        let digest_uri = remote_uri.clone();
-
-                        let auth_creds = create_credentials(
-                            &hasher,
-                            &challenge,
-                            &creds.username,
-                            &creds.password,
-                            "INVITE",
-                            &digest_uri,
-                            Some(&cnonce),
-                            Some(1_u32),
-                            None,
-                        )
-                        .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
-
-                        // Use Authorization for 401, Proxy-Authorization for 407
+                        // Use Authorization for 401, Proxy-Authorization for
+                        // 407 (one per realm, RFC 3261 §22.3).
                         let auth_header = if status_code == 401 {
                             HeaderName::Authorization
                         } else {
                             HeaderName::ProxyAuthorization
                         };
-                        request.headers.set(auth_header, auth_creds.to_string());
+                        // Use the Request-URI for the digest URI
+                        let digest_uri = remote_uri.clone();
+                        request.headers.remove(&auth_header);
+                        // POAM: POA&M-277 — no per-account expected-realm
+                        // allow-list: a password-derived response is issued
+                        // for every realm the peer (or an on-path attacker
+                        // over UDP/TCP) names.
+                        for ch in &challenges {
+                            // RFC 7616 §3.4.1: hash with the challenge's algorithm.
+                            let hasher = AlgorithmHasher::for_algorithm(ch.algorithm);
+                            let cnonce = generate_cnonce();
+                            let auth_creds = create_credentials(
+                                &hasher,
+                                ch,
+                                &creds.username,
+                                &creds.password,
+                                "INVITE",
+                                &digest_uri,
+                                Some(&cnonce),
+                                Some(1_u32),
+                                None,
+                            )
+                            .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+                            request.headers.add(proto_sip::Header::new(
+                                auth_header.clone(),
+                                auth_creds.to_string(),
+                            ));
+                        }
 
                         // Carry an already-negotiated session interval
                         // (RFC 4028) on the authenticated resend, like any
@@ -4187,6 +4202,114 @@ mod tests {
     /// copy ITS exact Via line (RFC 3261 §9.1), and the ACK to the 401 must
     /// copy the FIRST INVITE's exact Via line (RFC 3261 §17.1.1.3) along
     /// with the 401's To-tag.
+    /// Sends one INVITE challenge (`code` 401/407 with `values`) to a UDP
+    /// digest agent and returns every request sent in response.
+    #[cfg(feature = "digest-auth")]
+    async fn invite_challenge_requests(
+        creds: client_types::DigestAuthCredentials,
+        status: proto_sip::response::StatusCode,
+        header: HeaderName,
+        values: &[&str],
+    ) -> Vec<SipRequest> {
+        let (tx, mut rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+        agent.configure(
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            None,
+            "UDP",
+            Some(creds),
+        );
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", "v=0\r\n")
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap();
+        let invite1 = sent_request(rx.recv().await.unwrap());
+        let mut challenge = SipResponse::new(status);
+        challenge
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=t");
+        challenge.headers.set(HeaderName::CSeq, "1 INVITE");
+        challenge.headers.set(
+            HeaderName::Via,
+            invite1
+                .headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .to_string(),
+        );
+        for v in values {
+            challenge
+                .headers
+                .add(proto_sip::Header::new(header.clone(), *v));
+        }
+        agent.handle_response(&challenge, &call_id).await.unwrap();
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CallEvent::SendRequest { request, .. } = ev {
+                out.push(request);
+            }
+        }
+        out
+    }
+
+    /// POA&M-256 / RFC 3261 §22.3: a 407 for an INVITE with two proxy
+    /// realms is answered with one Proxy-Authorization per realm.
+    #[cfg(feature = "digest-auth")]
+    #[tokio::test]
+    async fn test_invite_407_multi_realm_one_header_per_realm() {
+        let sent = invite_challenge_requests(
+            client_types::DigestAuthCredentials::new("alice", "secret"),
+            proto_sip::response::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            HeaderName::ProxyAuthenticate,
+            &[
+                r#"Digest realm="p1", nonce="a1", algorithm=SHA-256"#,
+                r#"Digest realm="p2", nonce="b1", algorithm=SHA-512-256"#,
+            ],
+        )
+        .await;
+        let invite = sent
+            .iter()
+            .find(|r| r.method.to_string() == "INVITE")
+            .unwrap();
+        let realms: Vec<String> = invite
+            .headers
+            .get_all(&HeaderName::ProxyAuthorization)
+            .map(|h| {
+                h.value
+                    .parse::<proto_sip::DigestCredentials>()
+                    .unwrap()
+                    .realm
+            })
+            .collect();
+        assert_eq!(realms, ["p1", "p2"]);
+    }
+
+    /// POA&M-255: over UDP with the MD5 setting unset, an MD5-only INVITE
+    /// challenge is refused (ACK only, no authenticated INVITE).
+    #[cfg(feature = "digest-auth")]
+    #[tokio::test]
+    async fn test_invite_md5_refused_by_default_over_udp() {
+        let sent = invite_challenge_requests(
+            client_types::DigestAuthCredentials::new("alice", "secret"),
+            proto_sip::response::StatusCode::UNAUTHORIZED,
+            HeaderName::WwwAuthenticate,
+            &[r#"Digest realm="r", nonce="n1""#],
+        )
+        .await;
+        assert!(
+            sent.iter().all(|r| r.method.to_string() != "INVITE"),
+            "unexpected authenticated INVITE"
+        );
+    }
+
     #[cfg(feature = "digest-auth")]
     #[tokio::test]
     async fn test_cancel_via_matches_authed_invite_after_401_resend() {
@@ -4205,7 +4328,11 @@ mod tests {
             "Alice".to_string(),
             None,
             "UDP",
-            Some(client_types::DigestAuthCredentials::new("alice", "secret")),
+            // MD5 challenge over UDP: explicit opt-in (POA&M-255).
+            Some(
+                client_types::DigestAuthCredentials::new("alice", "secret")
+                    .with_allow_md5_digest(true),
+            ),
         );
 
         let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";

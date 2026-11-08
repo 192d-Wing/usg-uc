@@ -44,5 +44,8 @@ pub use sbc::{
 };
 pub use schema::ensure_schema;
 pub use trunk_groups::PostgresTrunkGroupStore;
-pub use trunk_policy::{TrunkPolicyError, TrunkTransport, validate_trunk_group_json};
+pub use trunk_policy::{
+    TrunkPolicyError, TrunkTransport, trunk_allow_md5_digest, trunk_allow_md5_digest_or_refuse,
+    validate_trunk_group_json,
+};
 pub use validate::{validate_directory_number, validate_phone};

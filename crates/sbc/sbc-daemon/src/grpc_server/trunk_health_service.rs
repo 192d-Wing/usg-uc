@@ -190,6 +190,13 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             }));
         };
 
+        // NIST 800-53 Rev5: CM-6, SI-10 — POA&M-255 MD5 policy; a non-bool
+        // stored value refuses MD5 (fail closed).
+        let (allow_md5_digest, md5_err) =
+            sbc_config_store::trunk_allow_md5_digest_or_refuse(&trunk);
+        if let Some(e) = md5_err {
+            warn!(trunk_id = %trunk_id, error = %e, "Invalid allow_md5_digest; refusing MD5");
+        }
         registrar.register_trunk(TrunkRegConfig {
             trunk_id: trunk_id.clone(),
             host: host.clone(),
@@ -200,6 +207,7 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             expires: 3600,
             bind_ip: None,
             external_ip: None,
+            allow_md5_digest,
         });
         Ok(Response::new(RegisterTrunkResponse {
             success: true,

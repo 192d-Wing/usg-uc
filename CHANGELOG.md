@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC and client, MD5 digest policy, POA&M-255, 256)
+
+- **SBC: trunk REGISTER refuses MD5 digest by default.** (IA-2, IA-5(1),
+  SC-13; POA&M-255) Trunk registration always uses UDP, so an unset
+  policy now refuses MD5-only carriers (tracked as POA&M-275). Operators
+  must set `"allow_md5_digest": true` on the stored trunk JSON (store or
+  API) for each carrier that offers only MD5. Opting in logs a `warn!`
+  on every registration. A value that is not a bool (for example `"true"`)
+  is rejected by `validate_trunk_group_json` with 400. Already-stored
+  invalid values are treated as `false`.
+- **SBC: `allow_md5_digest` in a TOML `[[trunks]]` entry is a config
+  error.** Config-file trunks never send REGISTER, so the key would do
+  nothing. Startup validation fails and tells you to set it on the stored
+  or API trunk instead. Check `deploy/config` and Helm/Ansible overrides.
+- **SBC (Rust API): `sbc-trunk-services`** `TrunkRegConfig` has a new pub
+  field `allow_md5_digest: Option<bool>` (plus `effective_allow_md5()`),
+  and `TrunkRegistrar::with_allow_md5_digest` was removed. Struct literals
+  must add the field.
+- **SBC: mixed-version clusters.** Nodes older than this release ignore
+  the `allow_md5_digest` key and keep allowing MD5. Upgrade every node
+  that runs trunk registration before you rely on the refusal.
+- **Client: UDP/TCP digest accounts refuse MD5 unless explicitly
+  enabled.** (POA&M-276) The policy is now tri-state. When unset, MD5 is
+  allowed only over TLS. TLS-only accounts are unchanged. Saved accounts
+  get a `md5_policy_version` marker. A legacy saved `true` (the old
+  default) is migrated to unset, and a legacy `false` is kept. Users on
+  MD5-only UDP/TCP servers must re-enable the setting after upgrading.
+  `DigestAuthCredentials.allow_md5_digest` is now `Option<bool>`.
+
+### Fixed (SBC and client, POA&M-255, 256)
+
+- **proto-sip / client / SBC trunk: one Authorization or
+  Proxy-Authorization per realm.** (IA-2, SC-13; POA&M-256) For both 401
+  and 407, the strongest RFC 7616 challenge is answered for each realm.
+  If any realm offers no permitted algorithm, the request fails closed.
+  Errors name the realms and algorithms, never nonces. Challenges past
+  the 16-challenge cap are logged with a count. The client keeps the
+  saved MD5 policy when the password or username changes. Known gap:
+  POA&M-277 (per-realm answer loops).
+
 ### BREAKING (SBC dormant WebRTC/AAA/SCTP batch, POA&M-280..284)
 
 - **SBC: `uc-webrtc` SDP munging is rebuilt on `proto-sdp`.** (SI-10, SC-8,
