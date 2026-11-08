@@ -22706,12 +22706,11 @@ pub mod tests {
             ..Default::default()
         };
         // Per-run test secret (not a hard-coded credential).
-        let test_password = format!(
-            "t{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        );
+        let test_password = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string();
         config
             .auth_credentials
             .insert("alice".to_string(), test_password.clone());
