@@ -231,10 +231,21 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 
 ### RFC 8866 Parser/Generator ✅ COMPLIANT
 
-**Status**: Fully compliant for all SDP line types, except: `parse_sdp_line` panics on a multibyte first character (POA&M-283)
+**Status**: Fully compliant for all SDP line types
 **Updated**: 2026-11-08
 
-The `proto-sdp` crate provides structured SDP parsing and generation used by `client-sip-ua` and integration tests. Since 2026-11-08 the dormant `uc-webrtc` munger (`uc-webrtc/src/sdp_munge.rs`) parses and renders SDP with `proto-sdp` (per-m-section `a=mid`, `UDP/TLS/RTP/SAVPF`, DTLS fingerprint/setup, ICE credentials, BUNDLE; tests in `sdp_munge.rs`). It works around two proto-sdp gaps: no `UDP/DTLS/SCTP`-family transport token, and a panic in `parse_sdp_line` on a multibyte first character (POA&M-283, not fixed in proto-sdp; `client-sip-ua` is likely exposed). `uc-siprec` only wraps `proto_sdp::SdpError` (`uc-siprec/src/error.rs`). Both crates are dormant (POA&M-206).
+**Input validation (POA&M-283)**: each line must be `<type>=<value>` with
+`<type>` exactly one ASCII letter (§5), checked on bytes. Lines that do not
+match, including lines starting with a multibyte UTF-8 character, are a parse
+error rather than a panic. UTF-8 in values is accepted. Typed time values
+(§5.10) are digits only with an optional `d`/`h`/`m`/`s` unit, and values that
+overflow u64 are rejected. Leading and trailing whitespace on a line is trimmed,
+which is more lenient than §5 requires. Number of lines, media sections and
+attributes is not capped (POA&M-285). Tests:
+`proto-sdp/tests/parser_totality.rs`, including no-panic proptests over
+arbitrary input.
+
+The `proto-sdp` crate provides structured SDP parsing and generation used by `client-sip-ua` and integration tests. Since 2026-11-08 the dormant `uc-webrtc` munger (`uc-webrtc/src/sdp_munge.rs`) parses and renders SDP with `proto-sdp` (per-m-section `a=mid`, `UDP/TLS/RTP/SAVPF`, DTLS fingerprint/setup, ICE credentials, BUNDLE; tests in `sdp_munge.rs`). It works around two proto-sdp gaps: no `UDP/DTLS/SCTP`-family transport token, (POA&M-283). Its ASCII `x=` line pre-check predates the proto-sdp parser fix and is kept as defence in depth. `uc-siprec` only wraps `proto_sdp::SdpError` (`uc-siprec/src/error.rs`). Both crates are dormant (POA&M-206).
 
 #### Implemented ✅
 

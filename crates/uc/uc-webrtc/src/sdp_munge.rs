@@ -703,8 +703,8 @@ fn parse_sdp(sdp: &str, config: &SdpConfig) -> WebRtcResult<ParsedSdp> {
             continue;
         }
         let bytes = line.as_bytes();
-        // POAM: POA&M-283 proto-sdp `parse_sdp_line` slices `&line[2..]` and panics on a
-        // multibyte first character; this ASCII `x=` guard keeps such input away from it.
+        // RFC 8866 §5: `<type>=` with an ASCII type. proto-sdp enforces this too since
+        // POA&M-283 was fixed; kept here as defence in depth.
         if bytes.len() < 2 || !bytes[0].is_ascii_lowercase() || bytes[1] != b'=' {
             return Err(sdp_err("malformed SDP line"));
         }

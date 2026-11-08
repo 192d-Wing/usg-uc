@@ -341,6 +341,25 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   (`PROTO_RFC_COMPLIANCE.md:426`) lists RFC 3327 Path as Full although the
   registrar never populates `path`.
 
+### SDP (proto-sdp)
+
+- [x] **MAJOR, LIVE (client) — proto-sdp panics on a line starting with a
+  multibyte UTF-8 character** (POA&M-283; found during the uc-transport /
+  uc-aaa / uc-webrtc audit). `parse_sdp_line` sliced `&line[2..]` after
+  char-based checks; remote SDP reaches it through `client-sip-ua`
+  (`media_session.rs`, `ice_handler.rs`). *Done 2026-11-08:* the line type
+  is checked on bytes (one ASCII letter then `=`, RFC 8866 §5). The
+  crate-wide audit also fixed time-value and `2^n` lifetime overflow, a
+  non-ASCII `inline:` slice, `+`-signed numbers and `increment_version`
+  overflow. Tests: `proto-sdp/tests/parser_totality.rs`, including
+  proptests that feed arbitrary input to every public parser.
+- [ ] **MINOR, LIVE (client) — no count limits in proto-sdp** (POA&M-285):
+  the number of lines, media sections, attributes, `r=` offsets and
+  `b=`/`e=`/`p=` entries is not capped. Memory grows only with input size,
+  and the SIP body limit caps the input, but a 1 MB body yields ~100k
+  attribute strings. Add caps (for example 64 m-sections, 256 attributes
+  per section) with a parse error when they are exceeded.
+
 ### Media (uc-codecs, uc-media-engine, uc-webrtc, uc-t38, uc-siprec)
 
 - [x] **MAJOR, LIVE (client) — Opus "FEC" is plain PLC and over-sized**
@@ -394,7 +413,7 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   Fixed: rebuilt on proto-sdp; per-section mid, UDP/TLS/RTP/SAVPF, DTLS/ICE
   attributes, BUNDLE; data channel rejected in place; input size caps
   (pr/sctp-radius-webrtc-1d0d05). Residual: POA&M-282 (trickle ICE), POA&M-283 (proto-sdp
-  multibyte panic, likely live in client-sip-ua), POA&M-284 (SdpConfig
+  has no UDP/DTLS/SCTP token; its multibyte panic was fixed in #194), POA&M-284 (SdpConfig
   rewrite/codec keys rejected, not implemented).
 - [ ] **MINOR, DORMANT — trickle ICE:** no ufrag/generation check, unbounded
   candidate lists, `add_candidate` inserts before the target m-line.
