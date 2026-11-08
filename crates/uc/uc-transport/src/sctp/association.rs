@@ -3006,7 +3006,7 @@ mod tests {
         });
         let ack_old = inner.process_asconf(&asconf_old);
         assert_eq!(ack_old.serial_number, 99);
-        assert!(ack_old.params.is_empty()); // Old ASCONF, no params processed
+        assert_eq!(ack_old.params.len(), 0); // Old ASCONF, no params processed
     }
 
     #[test]
@@ -3365,7 +3365,7 @@ mod tests {
         assert_eq!(sack.dup_tsns[0], 1001);
 
         // Duplicates should be cleared after SACK creation
-        assert!(inner.duplicate_tsns.is_empty());
+        assert_eq!(inner.duplicate_tsns.len(), 0);
     }
 
     #[test]

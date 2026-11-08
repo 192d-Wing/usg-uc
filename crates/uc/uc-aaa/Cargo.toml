@@ -11,7 +11,7 @@ categories.workspace = true
 
 [features]
 default = []
-radius = ["dep:radius-proto"]
+radius = ["dep:radius-proto", "dep:zeroize"]
 diameter = ["dep:diameter"]
 
 [dependencies]
@@ -33,6 +33,9 @@ bytes.workspace = true
 
 # RADIUS protocol (RFC 2865, RFC 2866) - using usg-radius project
 radius-proto = { git = "https://github.com/192d-Wing/usg-radius.git", optional = true }
+
+# Shared-secret zeroization for the RADIUS client (NIST 800-53 Rev5: IA-5, SC-4)
+zeroize = { workspace = true, optional = true }
 
 # Diameter protocol (RFC 6733)
 diameter = { version = "0.7", optional = true }

@@ -162,7 +162,8 @@ impl SctpPacket {
                 Ok(chunk) => chunks.push(chunk),
                 Err(e) => {
                     // Log partial parse and return what we have
-                    tracing::warn!("Error parsing chunk: {e}");
+                    // Attacker-triggerable: keep below info (NIST 800-53 Rev5: SC-5, AU-4).
+                    tracing::debug!("Error parsing chunk: {e}");
                     break;
                 }
             }
@@ -221,7 +222,7 @@ mod tests {
         assert_eq!(decoded.source_port, 5060);
         assert_eq!(decoded.dest_port, 5061);
         assert_eq!(decoded.verification_tag, 0x12345678);
-        assert!(decoded.chunks.is_empty());
+        assert_eq!(decoded.chunks.len(), 0);
     }
 
     #[test]
@@ -325,5 +326,42 @@ mod tests {
         let checksum = crc32c(data);
         // CRC32c of "Hello, SCTP!" should be consistent
         assert_ne!(checksum, 0);
+    }
+
+    /// Wraps `body` in a common header with a valid CRC32c so fuzzed chunk
+    /// bytes reach the chunk parser instead of failing the checksum.
+    fn with_valid_checksum(body: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x13, 0xC4, 0x13, 0xC5, 0, 0, 0, 1, 0, 0, 0, 0];
+        v.extend_from_slice(body);
+        let crc = crc32c(&v);
+        v[8..12].copy_from_slice(&crc.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn decode_packet_last_chunk_without_padding() {
+        // DATA chunk, 1 byte payload (length 17) with padding omitted.
+        let mut body = vec![0, 0x03, 0, 17];
+        body.extend_from_slice(&[0; 12]);
+        body.push(0x5A);
+        let packet = SctpPacket::decode_slice(&with_valid_checksum(&body)).unwrap();
+        assert_eq!(packet.chunks.len(), 1);
+    }
+
+    #[test]
+    fn decode_packet_every_short_input() {
+        for n in 0..HEADER_SIZE {
+            assert!(SctpPacket::decode_slice(&vec![0u8; n]).is_err());
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn proptest_packet_decode_never_panics(
+            bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..2048)
+        ) {
+            let _ = SctpPacket::decode_slice(&bytes);
+            let _ = SctpPacket::decode_slice(&with_valid_checksum(&bytes));
+        }
     }
 }

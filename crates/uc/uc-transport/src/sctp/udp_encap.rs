@@ -300,7 +300,16 @@ impl EncapsulatedPacket {
         let udp_header = UdpHeader::decode(&mut buf)?;
 
         // Validate length
-        let expected_sctp_len = udp_header.length as usize - UDP_HEADER_SIZE;
+        // RFC 768 / RFC 6951 §5.4: the UDP length includes the 8-byte header.
+        // A smaller value must be rejected, not subtracted (usize underflow).
+        // NIST 800-53 Rev5: SI-10
+        let Some(expected_sctp_len) = (udp_header.length as usize).checked_sub(UDP_HEADER_SIZE)
+        else {
+            return Err(UdpEncapError::InvalidLength {
+                header_length: udp_header.length,
+                actual_remaining: buf.remaining(),
+            });
+        };
         if buf.remaining() < expected_sctp_len {
             return Err(UdpEncapError::InvalidLength {
                 header_length: udp_header.length,
@@ -569,5 +578,24 @@ mod tests {
         let err = UdpEncapError::SctpDecodeError("test error".to_string());
         let msg = err.to_string();
         assert!(msg.contains("test error"));
+    }
+
+    #[test]
+    fn decode_udp_length_below_header_is_rejected() {
+        let mut v = vec![0x26, 0x8E, 0x26, 0x8E, 0x00, 0x04, 0x00, 0x00];
+        v.extend_from_slice(&[0u8; 16]);
+        assert!(matches!(
+            EncapsulatedPacket::decode(Bytes::from(v)),
+            Err(UdpEncapError::InvalidLength { .. })
+        ));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn proptest_udp_encap_decode_never_panics(
+            bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..1024)
+        ) {
+            let _ = EncapsulatedPacket::decode(Bytes::from(bytes));
+        }
     }
 }

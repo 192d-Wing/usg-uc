@@ -245,7 +245,7 @@ attributes is not capped (POA&M-285). Tests:
 `proto-sdp/tests/parser_totality.rs`, including no-panic proptests over
 arbitrary input.
 
-The `proto-sdp` crate provides structured SDP parsing and generation used by `client-sip-ua` and integration tests. `uc-webrtc` and `uc-siprec` list `proto-sdp` as a dependency but do not use it to parse or generate SDP: `uc-webrtc/src/sdp_munge.rs` rewrites SDP as text, and `uc-siprec` only wraps `proto_sdp::SdpError` (`uc-siprec/src/error.rs`). Both crates are dormant (POA&M-206).
+The `proto-sdp` crate provides structured SDP parsing and generation used by `client-sip-ua` and integration tests. Since 2026-11-08 the dormant `uc-webrtc` munger (`uc-webrtc/src/sdp_munge.rs`) parses and renders SDP with `proto-sdp` (per-m-section `a=mid`, `UDP/TLS/RTP/SAVPF`, DTLS fingerprint/setup, ICE credentials, BUNDLE; tests in `sdp_munge.rs`). It works around two proto-sdp gaps: no `UDP/DTLS/SCTP`-family transport token, (POA&M-283). Its ASCII `x=` line pre-check predates the proto-sdp parser fix and is kept as defence in depth. `uc-siprec` only wraps `proto_sdp::SdpError` (`uc-siprec/src/error.rs`). Both crates are dormant (POA&M-206).
 
 #### Implemented ✅
 

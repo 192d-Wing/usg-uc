@@ -8460,6 +8460,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -8801,6 +8802,7 @@ dependencies = [
  "criterion",
  "futures-util",
  "nix 0.31.3",
+ "proptest",
  "rand 0.9.5",
  "rcgen",
  "rustls",

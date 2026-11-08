@@ -49,6 +49,35 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   saved MD5 policy when the password or username changes. Known gap:
   POA&M-277 (per-realm answer loops).
 
+### BREAKING (SBC dormant WebRTC/AAA/SCTP batch, POA&M-280..284)
+
+- **SBC: `uc-webrtc` SDP munging is rebuilt on `proto-sdp`.** (SI-10, SC-8,
+  SC-5) Breaking for the dormant API. Helpers return `WebRtcResult`, and
+  `process_sip_offer` takes `DtlsIceParams`. The new
+  `sip_to_webrtc_offer` requires `setup:actpass` and `sip_to_webrtc_answer`
+  rejects it. Offers advertise a session-level `a=ice-options:trickle`.
+  `SdpConfig` defaults: `rewrite_connection` and `strip_non_webrtc_codecs`
+  are now `false`. Non-inert values (`force_dtls_srtp=false`,
+  `rewrite_connection=true`, `strip_non_webrtc_codecs=true`, non-empty
+  `audio_codecs`/`video_codecs`, zero limits) are rejected with
+  `ConfigError` at `try_new` and on every transform (POA&M-284). New
+  limits: `max_sdp_bytes` (default 64 KiB), `max_attributes_per_section`
+  (default 256), and `max_media_sections`. Operators with these keys set
+  must remove them. Remaining gaps are tracked in POA&M-282 and 283.
+- **SBC: `uc-aaa` RADIUS requires Message-Authenticator.** (IA-5, SC-23,
+  SC-4, AU-2) Access responses without a valid Message-Authenticator, with
+  a mismatched Identifier, or that cannot be decoded are silently
+  discarded and logged at warn. The client keeps waiting until the
+  per-attempt deadline, so a forged reply can no longer pre-empt the
+  genuine one. The shared secret is zeroized on drop. RADIUS/UDP still
+  relies on MD5/HMAC-MD5, which is not CNSA 2.0 (POA&M-280, 281).
+
+### Fixed (SBC transport)
+
+- **SBC: `uc-transport` SCTP decoding is total.** (SI-10, SC-5) Malformed
+  packets, chunks and UDP-encapsulated datagrams return errors and never
+  panic. The decoder is covered by proptest.
+
 ### Added (SBC, POA&M-236 partial, 250, 251, 252)
 
 - **SBC: REGISTER digest uses the proto-sip `DigestVerifier`.** (IA-2,
