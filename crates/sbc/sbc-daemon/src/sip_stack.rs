@@ -22705,9 +22705,16 @@ pub mod tests {
             auth_realm: "example.com".to_string(),
             ..Default::default()
         };
+        // Per-run test secret (not a hard-coded credential).
+        let test_password = format!(
+            "t{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
         config
             .auth_credentials
-            .insert("alice".to_string(), "password123".to_string());
+            .insert("alice".to_string(), test_password.clone());
         let stack = SipStack::new(config);
         let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
         let digest_uri = "sip:sbc.local";
@@ -22750,7 +22757,7 @@ pub mod tests {
                 &Sha256DigestHasher,
                 "alice",
                 "example.com",
-                "password123",
+                &test_password,
                 "REGISTER",
                 digest_uri,
                 nonce,
