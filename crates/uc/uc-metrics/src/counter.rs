@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::labels::{self, MAX_LABEL_SERIES};
+
 /// A monotonically increasing counter.
 #[derive(Debug)]
 pub struct Counter {
@@ -17,6 +19,10 @@ pub struct Counter {
     values: HashMap<Vec<String>, AtomicU64>,
     /// Default value (no labels).
     default_value: AtomicU64,
+    /// Maximum distinct labelled series (SC-5).
+    max_series: usize,
+    /// Updates redirected to the overflow series.
+    overflowed: AtomicU64,
 }
 
 impl Counter {
@@ -28,6 +34,8 @@ impl Counter {
             label_names: Vec::new(),
             values: HashMap::new(),
             default_value: AtomicU64::new(0),
+            max_series: MAX_LABEL_SERIES,
+            overflowed: AtomicU64::new(0),
         }
     }
 
@@ -43,7 +51,44 @@ impl Counter {
             label_names,
             values: HashMap::new(),
             default_value: AtomicU64::new(0),
+            max_series: MAX_LABEL_SERIES,
+            overflowed: AtomicU64::new(0),
         }
+    }
+
+    /// Creates a counter with labels and an explicit series cap.
+    ///
+    /// Once `max_series` distinct label tuples exist, further new tuples
+    /// update a single series whose labels are all `"__overflow__"`.
+    pub fn with_labels_capped(
+        name: impl Into<String>,
+        help: impl Into<String>,
+        label_names: Vec<String>,
+        max_series: usize,
+    ) -> Self {
+        let mut m = Self::with_labels(name, help, label_names);
+        m.max_series = max_series;
+        m
+    }
+
+    /// Returns how many labelled updates were redirected to the overflow
+    /// series (cap reached or label arity mismatch).
+    pub fn overflowed(&self) -> u64 {
+        self.overflowed.load(Ordering::Relaxed)
+    }
+
+    /// Resolves the bounded series for `labels`, creating it if needed.
+    fn series(&mut self, labels: &[&str]) -> &AtomicU64 {
+        let (key, overflow) = labels::series_key(
+            &self.values,
+            self.label_names.len(),
+            self.max_series,
+            labels,
+        );
+        if overflow {
+            self.overflowed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.values.entry(key).or_insert_with(|| AtomicU64::new(0))
     }
 
     /// Returns the metric name.
@@ -78,11 +123,7 @@ impl Counter {
 
     /// Increments the counter by the given amount with labels.
     pub fn inc_by_with_labels(&mut self, labels: &[&str], n: u64) {
-        let key: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
-        self.values
-            .entry(key)
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(n, Ordering::Relaxed);
+        self.series(labels).fetch_add(n, Ordering::Relaxed);
     }
 
     /// Gets the current value.
@@ -92,7 +133,11 @@ impl Counter {
 
     /// Gets the value for specific labels.
     pub fn get_with_labels(&self, labels: &[&str]) -> u64 {
-        let key: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
+        let key = if labels.len() == self.label_names.len() {
+            labels::lookup_key(labels)
+        } else {
+            labels::overflow_key(self.label_names.len())
+        };
         self.values
             .get(&key)
             .map_or(0, |v| v.load(Ordering::Relaxed))
@@ -243,5 +288,115 @@ mod tests {
     fn test_label_escaping() {
         let escaped = Counter::escape_label_value("test\"value\\with\nnewline");
         assert_eq!(escaped, "test\\\"value\\\\with\\nnewline");
+    }
+
+    #[test]
+    fn test_series_cap_overflows() {
+        let mut c = Counter::with_labels_capped("c_total", "c", vec!["peer".to_string()], 2);
+        c.inc_with_labels(&["a"]);
+        c.inc_with_labels(&["b"]);
+        c.inc_with_labels(&["c"]);
+        c.inc_with_labels(&["d"]);
+        c.inc_with_labels(&["a"]);
+        assert_eq!(c.get_with_labels(&["a"]), 2);
+        assert_eq!(c.get_with_labels(&["b"]), 1);
+        assert_eq!(c.get_with_labels(&["c"]), 0);
+        assert_eq!(c.get_with_labels(&["__overflow__"]), 2);
+        assert_eq!(c.overflowed(), 2);
+        assert_eq!(c.values.len(), 3);
+        let out = c.export();
+        assert!(out.contains("c_total{peer=\"__overflow__\"} 2"));
+    }
+
+    #[test]
+    fn test_arity_mismatch_overflows() {
+        let mut c = Counter::with_labels("c_total", "c", vec!["a".to_string(), "b".to_string()]);
+        c.inc_with_labels(&["only-one"]);
+        assert_eq!(c.overflowed(), 1);
+        assert_eq!(c.get_with_labels(&["__overflow__", "__overflow__"]), 1);
+        assert!(
+            c.export()
+                .contains("c_total{a=\"__overflow__\",b=\"__overflow__\"} 1")
+        );
+    }
+
+    #[test]
+    fn test_long_label_value_truncated() {
+        let mut c = Counter::with_labels("c_total", "c", vec!["peer".to_string()]);
+        let long = "x".repeat(1000);
+        c.inc_with_labels(&[&long]);
+        assert_eq!(c.get_with_labels(&[&long]), 1);
+        let key = c.values.keys().next().unwrap();
+        assert_eq!(key[0].len(), crate::labels::MAX_LABEL_VALUE_LEN);
+    }
+
+    #[test]
+    fn test_default_cap() {
+        let mut c = Counter::with_labels("c_total", "c", vec!["n".to_string()]);
+        for i in 0..(MAX_LABEL_SERIES + 10) {
+            c.inc_with_labels(&[&i.to_string()]);
+        }
+        assert_eq!(c.values.len(), MAX_LABEL_SERIES + 1);
+        assert_eq!(c.overflowed(), 10);
+    }
+
+    // QA: exact cap boundary -- the Nth distinct series is admitted, N+1 folds.
+    #[test]
+    fn qa_cap_boundary_exact() {
+        let mut c = Counter::with_labels_capped("c_total", "c", vec!["p".to_string()], 3);
+        for v in ["a", "b", "c"] {
+            c.inc_with_labels(&[v]);
+        }
+        assert_eq!(c.overflowed(), 0);
+        assert_eq!(c.values.len(), 3);
+        c.inc_with_labels(&["d"]);
+        assert_eq!(c.overflowed(), 1);
+        assert_eq!(c.values.len(), 4);
+        // overflow series does not consume a real slot; more new keys keep folding
+        c.inc_with_labels(&["e"]);
+        assert_eq!(c.values.len(), 4);
+        assert_eq!(c.get_with_labels(&["__overflow__"]), 2);
+    }
+
+    #[test]
+    fn qa_cap_zero_all_overflow() {
+        let mut c = Counter::with_labels_capped("c_total", "c", vec!["p".to_string()], 0);
+        c.inc_by_with_labels(&["a"], 5);
+        assert_eq!(c.get_with_labels(&["a"]), 0);
+        assert_eq!(c.get_with_labels(&["__overflow__"]), 5);
+        assert_eq!(c.overflowed(), 1);
+    }
+
+    #[test]
+    fn qa_truncated_values_share_series_and_bound_export() {
+        let mut c = Counter::with_labels_capped("c_total", "c", vec!["p".to_string()], 4);
+        let a = format!("{}A", "x".repeat(200));
+        let b = format!("{}B", "x".repeat(200));
+        c.inc_with_labels(&[&a]);
+        c.inc_with_labels(&[&b]);
+        assert_eq!(c.values.len(), 1);
+        assert_eq!(c.overflowed(), 0);
+        let out = c.export();
+        assert!(out.lines().all(|l| l.len() < 128 + 64));
+    }
+
+    #[test]
+    fn qa_totals_preserved_across_overflow() {
+        let mut c = Counter::with_labels_capped("c_total", "c", vec!["p".to_string()], 2);
+        for i in 0..50u64 {
+            c.inc_by_with_labels(&[&format!("peer{i}")], i);
+        }
+        let total: u64 = c.values.values().map(|v| v.load(Ordering::Relaxed)).sum();
+        assert_eq!(total, (0..50u64).sum::<u64>());
+        assert_eq!(c.overflowed(), 48);
+    }
+
+    #[test]
+    fn qa_too_many_labels_overflow() {
+        let mut c = Counter::with_labels("c_total", "c", vec!["a".to_string()]);
+        c.inc_with_labels(&["x", "y"]);
+        c.inc_with_labels(&[]);
+        assert_eq!(c.overflowed(), 2);
+        assert_eq!(c.get_with_labels(&["__overflow__"]), 2);
     }
 }

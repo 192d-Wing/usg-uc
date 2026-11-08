@@ -13,7 +13,7 @@
 //!
 //! - Counter, gauge, and histogram metrics
 //! - Prometheus text format export
-//! - Label support
+//! - Label support (series count and value length bounded, SC-5)
 //! - Metric registry
 
 #![forbid(unsafe_code)]
@@ -38,11 +38,13 @@
 pub mod counter;
 pub mod gauge;
 pub mod histogram;
+pub mod labels;
 pub mod registry;
 
 pub use counter::Counter;
 pub use gauge::Gauge;
 pub use histogram::Histogram;
+pub use labels::{MAX_LABEL_SERIES, MAX_LABEL_VALUE_LEN, OVERFLOW_LABEL_VALUE};
 pub use registry::{MetricRegistry, MetricType, SbcMetrics};
 
 /// Default histogram buckets for latency (in milliseconds).

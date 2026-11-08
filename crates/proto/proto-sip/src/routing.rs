@@ -16,7 +16,7 @@ use crate::header::HeaderName;
 use crate::header_params::NameAddr;
 use crate::list::split_list_bounded;
 use crate::message::SipRequest;
-use crate::uri::SipUri;
+use crate::uri::{SipUri, UriScheme};
 
 /// A Route entry (parsed Route or Record-Route header value).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +311,23 @@ pub fn compute_request_target(
     }
 }
 
+/// Compares the URI's transport against the transport the request arrived on.
+///
+/// RFC 3261 §26.2.2 / RFC 5630 §3.1.3: on a secured leg (`sips` scheme or a
+/// TLS-received request) `transport=tcp` denotes TLS over TCP and `ws`
+/// denotes `wss`, so those pairs are equal for the §16.4 maddr check.
+fn transport_matches(scheme: UriScheme, uri_transport: &str, received: &str) -> bool {
+    if uri_transport.eq_ignore_ascii_case(received) {
+        return true;
+    }
+    let secured = scheme == UriScheme::Sips
+        || received.eq_ignore_ascii_case("tls")
+        || received.eq_ignore_ascii_case("wss");
+    secured
+        && ((uri_transport.eq_ignore_ascii_case("tcp") && received.eq_ignore_ascii_case("tls"))
+            || (uri_transport.eq_ignore_ascii_case("ws") && received.eq_ignore_ascii_case("wss")))
+}
+
 /// Builds the UAS route set from the Record-Route headers of a
 /// dialog-creating request.
 ///
@@ -346,11 +363,93 @@ pub enum RoutePreprocess {
         restored_from_strict_route: bool,
         /// The topmost Route value was ours and was removed.
         popped_own_route: bool,
+        /// The Request-URI `maddr` named this proxy and was removed, with
+        /// any non-default `port` / `transport` (§16.4 paragraph 3).
+        stripped_maddr: bool,
     },
     /// The Request-URI is one of our Record-Route URIs but the request has
     /// no Route header to restore it from. Nothing was changed; the caller
     /// decides (typically 404 or 416).
     NoRouteForOwnUri,
+}
+
+/// Transport and port a request was received on, for the §16.4 `maddr`
+/// check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceivedOn<'a> {
+    /// Local port the request arrived on.
+    pub port: u16,
+    /// Transport, lowercase: `udp`, `tcp`, `tls`, `ws`, `wss` or `sctp`.
+    pub transport: &'a str,
+}
+
+/// What this proxy is responsible for, used by
+/// [`preprocess_route_information`].
+pub struct OwnAddressing<'a> {
+    /// Recognises the URIs this proxy places in Record-Route.
+    pub is_own_uri: &'a dyn Fn(&SipUri) -> bool,
+    /// Recognises a host or IP (brackets removed, any case) this proxy is
+    /// responsible for, as named by a Request-URI `maddr`.
+    pub is_own_maddr: &'a dyn Fn(&str) -> bool,
+    /// Where the request was received. `None` skips the `maddr` step.
+    pub received: Option<ReceivedOn<'a>>,
+}
+
+impl std::fmt::Debug for OwnAddressing<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnAddressing")
+            .field("received", &self.received)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Longest `maddr` value considered (RFC 1035 name limit); anything longer
+/// is never treated as ours.
+const MAX_MADDR_LEN: usize = 255;
+
+/// RFC 3261 §16.4 paragraph 3: if the Request-URI `maddr` names this proxy
+/// and the request arrived on the port and transport the URI indicates
+/// (explicitly or by default, §19.1.1), strip `maddr` and any non-default
+/// `port` / `transport`. Returns whether the URI changed.
+///
+/// NIST 800-53 Rev5: SC-7, SI-10 - a malformed, oversized or foreign
+/// `maddr` is left untouched.
+fn strip_own_maddr(uri: &mut SipUri, own: &OwnAddressing<'_>) -> bool {
+    let Some(received) = own.received else {
+        return false;
+    };
+    let Some(maddr) = uri.maddr() else {
+        return false;
+    };
+    if maddr.is_empty() || maddr.len() > MAX_MADDR_LEN {
+        return false;
+    }
+    let host = maddr
+        .strip_prefix('[')
+        .and_then(|m| m.strip_suffix(']'))
+        .unwrap_or(maddr);
+    if host.is_empty() || !(own.is_own_maddr)(host) {
+        return false;
+    }
+    let (default_port, default_transport) = match uri.scheme {
+        UriScheme::Sip => (5060, "udp"),
+        UriScheme::Sips => (5061, "tls"),
+    };
+    let transport = uri.transport().unwrap_or(default_transport);
+    if uri.port.unwrap_or(default_port) != received.port
+        || !transport_matches(uri.scheme, transport, received.transport)
+    {
+        return false;
+    }
+    let strip_transport = !transport.eq_ignore_ascii_case(default_transport);
+    uri.params.retain(|(n, _)| {
+        !(n.eq_ignore_ascii_case("maddr")
+            || (strip_transport && n.eq_ignore_ascii_case("transport")))
+    });
+    if uri.port.is_some_and(|p| p != default_port) {
+        uri.port = None;
+    }
+    true
 }
 
 /// Collects every Route element across all Route headers.
@@ -375,15 +474,20 @@ fn route_elements(request: &SipRequest) -> SipResult<Vec<String>> {
 
 /// RFC 3261 §16.4 route information preprocessing for a proxy.
 ///
-/// Runs before target selection (§16.5). `is_own` must recognise the URIs
-/// this proxy places in Record-Route (see `ProxyContext::is_own`):
+/// Runs before target selection (§16.5). `own.is_own_uri` must recognise
+/// the URIs this proxy places in Record-Route (see `ProxyContext::is_own`):
 ///
 /// 1. If the Request-URI is ours, the previous hop was a strict router:
 ///    the Request-URI MUST be replaced by the **last** Route value, and that
 ///    value removed (also when it is part of a comma-joined header).
 /// 2. Then, if the **topmost** Route value is ours, it MUST be removed.
+/// 3. Then, on the resulting Request-URI: if its `maddr` names a host
+///    `own.is_own_maddr` recognises and the request was received on the
+///    port and transport the URI indicates (defaults 5060/udp for `sip`,
+///    5061/tls for `sips`), `maddr` and any non-default `port` and
+///    `transport` are removed. Skipped when `own.received` is `None`.
 ///
-/// Only values `is_own` recognises are consumed, so an attacker-supplied
+/// Only values `is_own_uri` recognises are consumed, so an attacker-supplied
 /// last Route can become the Request-URI only when the Request-URI was one
 /// of our own Record-Route URIs (RFC-mandated); routing policy still applies
 /// afterwards. NIST 800-53 Rev5: SC-7 (Boundary Protection), SI-10.
@@ -397,8 +501,10 @@ fn route_elements(request: &SipRequest) -> SipResult<Vec<String>> {
 /// value as received, or a sender can steer the request past them.
 /// NIST 800-53 Rev5: AC-4, SC-7.
 ///
-/// POAM: §16.4 paragraph 3 (`maddr` naming this proxy) is not implemented;
-/// a Request-URI with such a `maddr` is forwarded unchanged.
+/// The `maddr` strip (step 3) only ever removes parameters naming this
+/// proxy; user and host are never changed. A foreign, malformed or oversized
+/// `maddr` is left in place and is not trusted for routing here.
+/// NIST 800-53 Rev5: SC-7, SI-10.
 ///
 /// # Errors
 /// Returns an error if a Route value cannot be split or parsed, or there are
@@ -406,8 +512,9 @@ fn route_elements(request: &SipRequest) -> SipResult<Vec<String>> {
 /// on error.
 pub fn preprocess_route_information(
     request: &mut SipRequest,
-    is_own: &dyn Fn(&SipUri) -> bool,
+    own: &OwnAddressing<'_>,
 ) -> SipResult<RoutePreprocess> {
+    let is_own = own.is_own_uri;
     let mut routes = route_elements(request)?;
     let mut new_uri = None;
     let mut changed = false;
@@ -435,6 +542,9 @@ pub fn preprocess_route_information(
     if let Some(uri) = new_uri {
         request.uri = uri;
     }
+    // RFC 3261 §16.4 paragraph 3: runs on the (possibly restored) R-URI.
+    // Infallible, so the request is still untouched on any error above.
+    let stripped_maddr = strip_own_maddr(&mut request.uri, own);
     if changed {
         request
             .headers
@@ -443,6 +553,7 @@ pub fn preprocess_route_information(
     Ok(RoutePreprocess::Done {
         restored_from_strict_route,
         popped_own_route,
+        stripped_maddr,
     })
 }
 
@@ -657,6 +768,326 @@ mod tests {
         uri.user.is_none() && uri.host.eq_ignore_ascii_case("me.example.com")
     }
 
+    fn own_maddr(host: &str) -> bool {
+        host.eq_ignore_ascii_case("me.example.com")
+            || host == "192.0.2.10"
+            || host.eq_ignore_ascii_case("2001:db8::10")
+    }
+
+    fn ctx() -> OwnAddressing<'static> {
+        OwnAddressing {
+            is_own_uri: &own,
+            is_own_maddr: &own_maddr,
+            received: None,
+        }
+    }
+
+    fn ctx_on(port: u16, transport: &'static str) -> OwnAddressing<'static> {
+        OwnAddressing {
+            received: Some(ReceivedOn { port, transport }),
+            ..ctx()
+        }
+    }
+
+    fn maddr_out(ruri: &str, port: u16, transport: &'static str) -> (SipRequest, RoutePreprocess) {
+        let mut req = req_with_routes(ruri, &[]);
+        let out = preprocess_route_information(&mut req, &ctx_on(port, transport)).unwrap();
+        (req, out)
+    }
+
+    fn stripped(out: RoutePreprocess) -> bool {
+        matches!(
+            out,
+            RoutePreprocess::Done {
+                stripped_maddr: true,
+                ..
+            }
+        )
+    }
+
+    #[test]
+    fn maddr_sips_transport_tcp_matches_tls_leg() {
+        // RFC 5630 §3.1.3: sips;transport=tcp is TLS over TCP.
+        let (req, out) = maddr_out(
+            "sips:bob@target.example.com;transport=tcp;maddr=me.example.com",
+            5061,
+            "tls",
+        );
+        assert!(stripped(out));
+        assert_eq!(req.uri.maddr(), None);
+    }
+
+    #[test]
+    fn maddr_ws_matches_wss_leg_but_not_cleartext() {
+        let (req, out) = maddr_out(
+            "sip:bob@target.example.com:5061;transport=ws;maddr=me.example.com",
+            5061,
+            "wss",
+        );
+        assert!(stripped(out));
+        assert_eq!(req.uri.maddr(), None);
+        // A sip:;transport=tls URI does not match a cleartext tcp leg.
+        let (req, out) = maddr_out(
+            "sip:bob@target.example.com:5061;transport=tls;maddr=me.example.com",
+            5061,
+            "tcp",
+        );
+        assert!(!stripped(out));
+        assert!(req.uri.maddr().is_some());
+    }
+
+    #[test]
+    fn maddr_own_default_port_transport_stripped() {
+        let (req, out) = maddr_out("sip:bob@target.example.com;maddr=192.0.2.10", 5060, "udp");
+        assert!(stripped(out));
+        assert_eq!(req.uri.maddr(), None);
+        assert_eq!(req.uri.host, "target.example.com");
+        assert_eq!(req.uri.user.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn maddr_own_with_tcp_and_port_strips_all() {
+        let (req, out) = maddr_out(
+            "sip:bob@target.example.com:5070;transport=tcp;maddr=me.example.com;user=phone",
+            5070,
+            "tcp",
+        );
+        assert!(stripped(out));
+        assert_eq!(req.uri.maddr(), None);
+        assert_eq!(req.uri.transport(), None);
+        assert_eq!(req.uri.port, None);
+        assert_eq!(req.uri.user_param(), Some("phone"));
+    }
+
+    #[test]
+    fn maddr_sips_default_tls() {
+        let (req, out) = maddr_out(
+            "sips:bob@target.example.com;maddr=me.example.com",
+            5061,
+            "tls",
+        );
+        assert!(stripped(out));
+        assert_eq!(req.uri.maddr(), None);
+        let (_, out) = maddr_out(
+            "sips:bob@target.example.com;maddr=me.example.com",
+            5061,
+            "tcp",
+        );
+        assert!(!stripped(out));
+    }
+
+    #[test]
+    fn maddr_mismatched_received_unchanged() {
+        let ruri = "sip:bob@target.example.com;maddr=192.0.2.10";
+        for (port, t) in [(5060, "tcp"), (5080, "udp")] {
+            let (req, out) = maddr_out(ruri, port, t);
+            assert!(!stripped(out));
+            assert_eq!(req.uri.maddr(), Some("192.0.2.10"));
+        }
+        // An explicit transport the request did not arrive on.
+        let (req, _) = maddr_out(
+            "sip:bob@t.example.com;transport=tcp;maddr=192.0.2.10",
+            5060,
+            "udp",
+        );
+        assert_eq!(req.uri.maddr(), Some("192.0.2.10"));
+    }
+
+    #[test]
+    fn maddr_foreign_or_bad_unchanged() {
+        for ruri in [
+            "sip:bob@target.example.com;maddr=198.51.100.1",
+            "sip:bob@target.example.com;maddr=[]",
+        ] {
+            let (req, out) = maddr_out(ruri, 5060, "udp");
+            assert!(!stripped(out), "{ruri}");
+            assert!(req.uri.has_param("maddr"), "{ruri}");
+        }
+        let long = format!("sip:bob@t.example.com;maddr={}", "a".repeat(300));
+        let (_, out) = maddr_out(&long, 5060, "udp");
+        assert!(!stripped(out));
+    }
+
+    #[test]
+    fn maddr_ipv6_brackets_and_uppercase_param() {
+        let (req, out) = maddr_out(
+            "sip:bob@target.example.com;MADDR=[2001:DB8::10]",
+            5060,
+            "UDP",
+        );
+        assert!(stripped(out));
+        assert!(!req.uri.has_param("maddr"));
+    }
+
+    #[test]
+    fn maddr_skipped_without_received() {
+        let mut req = req_with_routes("sip:bob@target.example.com;maddr=192.0.2.10", &[]);
+        let out = preprocess_route_information(&mut req, &ctx()).unwrap();
+        assert!(!stripped(out));
+        assert_eq!(req.uri.maddr(), Some("192.0.2.10"));
+    }
+
+    #[test]
+    fn maddr_strip_runs_on_restored_uri() {
+        let mut req = req_with_routes(
+            "sip:me.example.com",
+            &[
+                "<sip:next.example.com;lr>",
+                "<sip:bob@target.example.com;maddr=me.example.com>",
+            ],
+        );
+        let out = preprocess_route_information(&mut req, &ctx_on(5060, "udp")).unwrap();
+        assert_eq!(
+            out,
+            RoutePreprocess::Done {
+                restored_from_strict_route: true,
+                popped_own_route: false,
+                stripped_maddr: true
+            }
+        );
+        assert_eq!(req.uri.host, "target.example.com");
+        assert_eq!(req.uri.maddr(), None);
+    }
+
+    #[test]
+    fn maddr_error_leaves_request_unchanged() {
+        let mut req = req_with_routes(
+            "sip:bob@target.example.com;maddr=192.0.2.10",
+            &["<sip:a.example.com;lr>", "<bad"],
+        );
+        assert!(preprocess_route_information(&mut req, &ctx_on(5060, "udp")).is_err());
+        assert_eq!(req.uri.maddr(), Some("192.0.2.10"));
+    }
+
+    // ---- QA: negative / malformed maddr ----
+
+    #[test]
+    fn qa_maddr_lookalike_hosts_not_own() {
+        for ruri in [
+            "sip:bob@t.example.com;maddr=me.example.com.evil.net",
+            "sip:bob@t.example.com;maddr=xme.example.com",
+            "sip:bob@t.example.com;maddr=192.0.2.100",
+            "sip:bob@t.example.com;maddr=[192.0.2.10",
+            "sip:bob@t.example.com;maddr=192.0.2.10]",
+            "sip:bob@t.example.com;maddr=",
+        ] {
+            if let Ok(mut req) = std::panic::catch_unwind(|| req_with_routes(ruri, &[])) {
+                let before = req.uri.to_string();
+                let out = preprocess_route_information(&mut req, &ctx_on(5060, "udp"));
+                if let Ok(out) = out {
+                    assert!(!stripped(out), "{ruri}");
+                }
+                assert_eq!(req.uri.to_string(), before, "{ruri}");
+            }
+        }
+    }
+
+    #[test]
+    fn qa_maddr_length_guard_independent_of_predicate() {
+        fn any(_: &str) -> bool {
+            true
+        }
+        let own = OwnAddressing {
+            is_own_uri: &own,
+            is_own_maddr: &any,
+            received: Some(ReceivedOn {
+                port: 5060,
+                transport: "udp",
+            }),
+        };
+        let ruri = format!("sip:bob@t.example.com;maddr={}", "a".repeat(256));
+        let mut req = req_with_routes(&ruri, &[]);
+        let out = preprocess_route_information(&mut req, &own).unwrap();
+        assert!(!stripped(out));
+        assert!(req.uri.has_param("maddr"));
+        let ok = format!("sip:bob@t.example.com;maddr={}", "a".repeat(255));
+        let mut req = req_with_routes(&ok, &[]);
+        assert!(stripped(
+            preprocess_route_information(&mut req, &own).unwrap()
+        ));
+    }
+
+    #[test]
+    fn qa_maddr_port_transport_mismatches() {
+        // explicit default port, received elsewhere
+        let (r, o) = maddr_out("sip:bob@t.example.com:5060;maddr=192.0.2.10", 5070, "udp");
+        assert!(!stripped(o));
+        assert!(r.uri.has_param("maddr"));
+        // sips default is tls/5061; received over udp/5060 must not strip
+        let (r, o) = maddr_out("sips:bob@t.example.com;maddr=192.0.2.10", 5060, "udp");
+        assert!(!stripped(o));
+        assert!(r.uri.has_param("maddr"));
+        // transport=tcp but received udp on same port
+        let (r, o) = maddr_out(
+            "sip:bob@t.example.com;transport=tcp;maddr=192.0.2.10",
+            5060,
+            "udp",
+        );
+        assert!(!stripped(o));
+        assert_eq!(r.uri.transport(), Some("tcp"));
+        // explicit default port kept when it matches (only non-default removed)
+        let (r, o) = maddr_out("sip:bob@t.example.com:5060;maddr=192.0.2.10", 5060, "udp");
+        assert!(stripped(o));
+        assert!(!r.uri.has_param("maddr"));
+    }
+
+    #[test]
+    fn qa_maddr_duplicate_params_rejected_by_parser() {
+        // Duplicate maddr can never reach the strip step.
+        assert!(
+            "sip:bob@t.example.com;maddr=198.51.100.1;maddr=192.0.2.10"
+                .parse::<SipUri>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn qa_maddr_with_foreign_route_still_strips_ruri_only() {
+        let mut req = req_with_routes(
+            "sip:bob@t.example.com;maddr=192.0.2.10",
+            &["<sip:next.example.net;lr>"],
+        );
+        let routes_before: Vec<_> = req
+            .headers
+            .get_all(&HeaderName::Route)
+            .map(|h| h.value.clone())
+            .collect();
+        let out = preprocess_route_information(&mut req, &ctx_on(5060, "udp")).unwrap();
+        assert!(stripped(out));
+        let routes_after: Vec<_> = req
+            .headers
+            .get_all(&HeaderName::Route)
+            .map(|h| h.value.clone())
+            .collect();
+        assert_eq!(routes_before, routes_after);
+    }
+
+    proptest::proptest! {
+        /// The strip is idempotent and never touches user or host.
+        #[test]
+        fn maddr_strip_idempotent(
+            user in "[a-z0-9]{1,8}",
+            host in "[a-z]{1,8}\\.example\\.com",
+            port in proptest::option::of(5060u16..5063),
+            transport in proptest::option::of(proptest::sample::select(vec!["udp", "tcp", "tls"])),
+            maddr in proptest::sample::select(vec!["me.example.com", "192.0.2.10", "198.51.100.9"]),
+            rx_port in 5060u16..5063,
+            rx_t in proptest::sample::select(vec!["udp", "tcp", "tls"]),
+        ) {
+            let port_s = port.map(|p| format!(":{p}")).unwrap_or_default();
+            let t_s = transport.map(|t| format!(";transport={t}")).unwrap_or_default();
+            let ruri = format!("sip:{user}@{host}{port_s}{t_s};maddr={maddr}");
+            let c = ctx_on(rx_port, rx_t);
+            let mut req = req_with_routes(&ruri, &[]);
+            preprocess_route_information(&mut req, &c).unwrap();
+            let once = req.uri.clone();
+            preprocess_route_information(&mut req, &c).unwrap();
+            proptest::prop_assert_eq!(&once, &req.uri);
+            proptest::prop_assert_eq!(once.user.as_deref(), Some(user.as_str()));
+            proptest::prop_assert_eq!(once.host, host);
+        }
+    }
+
     fn req_with_routes(ruri: &str, routes: &[&str]) -> SipRequest {
         let mut req = SipRequest::new(crate::method::Method::Invite, ruri.parse().unwrap());
         for r in routes {
@@ -671,12 +1102,13 @@ mod tests {
             "sip:me.example.com",
             &["<sip:next.example.com;lr>", "<sip:bob@target.example.com>"],
         );
-        let out = preprocess_route_information(&mut req, &own).unwrap();
+        let out = preprocess_route_information(&mut req, &ctx()).unwrap();
         assert_eq!(
             out,
             RoutePreprocess::Done {
                 restored_from_strict_route: true,
-                popped_own_route: false
+                popped_own_route: false,
+                stripped_maddr: false
             }
         );
         assert_eq!(req.uri.host, "target.example.com");
@@ -689,7 +1121,7 @@ mod tests {
             "sip:me.example.com",
             &["<sip:next.example.com;lr>, <sip:bob@target.example.com>"],
         );
-        preprocess_route_information(&mut req, &own).unwrap();
+        preprocess_route_information(&mut req, &ctx()).unwrap();
         assert_eq!(req.uri.host, "target.example.com");
         assert_eq!(req.headers.route_values(), ["<sip:next.example.com;lr>"]);
     }
@@ -700,12 +1132,13 @@ mod tests {
             "sip:bob@target.example.com",
             &["<sip:me.example.com;lr>", "<sip:next.example.com;lr>"],
         );
-        let out = preprocess_route_information(&mut req, &own).unwrap();
+        let out = preprocess_route_information(&mut req, &ctx()).unwrap();
         assert_eq!(
             out,
             RoutePreprocess::Done {
                 restored_from_strict_route: false,
-                popped_own_route: true
+                popped_own_route: true,
+                stripped_maddr: false
             }
         );
         assert_eq!(req.uri.host, "target.example.com");
@@ -718,7 +1151,7 @@ mod tests {
             "sip:bob@target.example.com",
             &["<sip:me.example.com;lr>, <sip:next.example.com;lr>"],
         );
-        preprocess_route_information(&mut req, &own).unwrap();
+        preprocess_route_information(&mut req, &ctx()).unwrap();
         assert_eq!(req.headers.route_values(), ["<sip:next.example.com;lr>"]);
     }
 
@@ -728,12 +1161,13 @@ mod tests {
             "sip:bob@target.example.com",
             &["<sip:next.example.com;lr>, <sip:me.example.com;lr>"],
         );
-        let out = preprocess_route_information(&mut req, &own).unwrap();
+        let out = preprocess_route_information(&mut req, &ctx()).unwrap();
         assert_eq!(
             out,
             RoutePreprocess::Done {
                 restored_from_strict_route: false,
-                popped_own_route: false
+                popped_own_route: false,
+                stripped_maddr: false
             }
         );
         assert_eq!(req.headers.route_values().len(), 2);
@@ -743,7 +1177,7 @@ mod tests {
     fn preprocess_own_ruri_without_route() {
         let mut req = req_with_routes("sip:me.example.com", &[]);
         assert_eq!(
-            preprocess_route_information(&mut req, &own).unwrap(),
+            preprocess_route_information(&mut req, &ctx()).unwrap(),
             RoutePreprocess::NoRouteForOwnUri
         );
         assert_eq!(req.uri.host, "me.example.com");
@@ -752,7 +1186,7 @@ mod tests {
     #[test]
     fn preprocess_bad_route_is_error_and_request_unchanged() {
         let mut req = req_with_routes("sip:me.example.com", &["<sip:a.example.com;lr>", "<bad"]);
-        assert!(preprocess_route_information(&mut req, &own).is_err());
+        assert!(preprocess_route_information(&mut req, &ctx()).is_err());
         assert_eq!(req.uri.host, "me.example.com");
         assert_eq!(req.headers.count(&HeaderName::Route), 2);
     }

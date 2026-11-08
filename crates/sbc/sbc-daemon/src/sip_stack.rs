@@ -196,11 +196,12 @@ pub struct SipStack {
     ///
     /// ## NIST 800-53 Rev5: AU-2, AU-4, AU-5, SC-5
     signaling_audit: Arc<crate::signaling_audit::SignalingAudit>,
-    /// Trunk groups configured with `trust_domain = false` (RFC 3325 §5).
-    /// Groups not listed (including API-created ones) are trusted.
+    /// Trunk groups configured with `trust_domain = true` (RFC 3325 §5).
+    /// Allow-set, fail-closed: groups not listed (unset in config,
+    /// API-created, or removed on reload) are outside the trust domain.
     ///
-    /// ## NIST 800-53 Rev5: AC-21, SC-4, CM-6
-    untrusted_trunk_groups: RwLock<HashSet<String>>,
+    /// ## NIST 800-53 Rev5: AC-21, SC-4, CM-6 (secure default)
+    trusted_trunk_groups: RwLock<HashSet<String>>,
 }
 
 /// The daemon digest verifier and the decoy secret used for unknown users.
@@ -241,9 +242,14 @@ impl OwnAddrs {
     /// `host[:port]` names this SBC. A missing port is the default port and
     /// matches.
     fn matches(&self, host: &str, port: Option<u16>) -> bool {
+        self.is_own_host(host) && port.is_none_or(|p| self.ports.contains(&p))
+    }
+
+    /// `host` (any case, IPv6 with or without brackets) names this SBC.
+    /// Used for the RFC 3261 §16.4 paragraph 3 `maddr` check.
+    fn is_own_host(&self, host: &str) -> bool {
         let host = host.trim_start_matches('[').trim_end_matches(']');
         self.hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
-            && port.is_none_or(|p| self.ports.contains(&p))
     }
 
     /// A URI this SBC could have placed in Record-Route: own host/port and
@@ -2465,6 +2471,28 @@ fn top_route_may_change(req: &SipRequest, own: &OwnAddrs) -> bool {
     }
 }
 
+/// Whether the Request-URI carries a `maddr` naming this SBC, so §16.4
+/// paragraph 3 may strip it (POA&M-235). The port/transport match is left
+/// to `proto_sip::preprocess_route_information`; this only gates the copy.
+///
+/// ## NIST 800-53 Rev5: SC-7, SI-10
+fn maddr_may_strip(req: &SipRequest, own: &OwnAddrs) -> bool {
+    req.uri.maddr().is_some_and(|m| own.is_own_host(m))
+}
+
+/// RFC 3261 §18 / RFC 7118 transport token, lowercase, for comparing with
+/// a URI `transport` parameter.
+const fn transport_token(transport: AddrTransport) -> &'static str {
+    match transport {
+        AddrTransport::Udp => "udp",
+        AddrTransport::Tcp => "tcp",
+        AddrTransport::Tls => "tls",
+        AddrTransport::WebSocket => "ws",
+        AddrTransport::WebSocketSecure => "wss",
+        AddrTransport::Sctp => "sctp",
+    }
+}
+
 /// Largest `message/sipfrag` body relayed toward a hidden leg.
 ///
 /// ## NIST 800-53 Rev5: SC-5, SI-10
@@ -2760,7 +2788,7 @@ impl SipStack {
             stir: None,
             digest,
             signaling_audit,
-            untrusted_trunk_groups: RwLock::new(HashSet::new()),
+            trusted_trunk_groups: RwLock::new(HashSet::new()),
         }
     }
 
@@ -2839,7 +2867,7 @@ impl SipStack {
             stir: None,
             digest,
             signaling_audit,
-            untrusted_trunk_groups: RwLock::new(HashSet::new()),
+            trusted_trunk_groups: RwLock::new(HashSet::new()),
         }
     }
 
@@ -5949,21 +5977,23 @@ impl SipStack {
     }
 
     /// Records the RFC 3325 trust-domain membership of a trunk group
-    /// (`trunk_groups[].trust_domain`). Groups never set are trusted.
+    /// (`trunk_groups[].trust_domain`). Groups never set are untrusted
+    /// (fail-closed, RFC 3325 §9.1).
     ///
-    /// ## NIST 800-53 Rev5: AC-21, CM-6
+    /// ## NIST 800-53 Rev5: AC-21, CM-6 (secure default)
     pub async fn set_trunk_group_trust_domain(&self, group_id: &str, trusted: bool) {
-        let mut set = self.untrusted_trunk_groups.write().await;
+        let mut set = self.trusted_trunk_groups.write().await;
         if trusted {
-            set.remove(group_id);
-        } else {
             set.insert(group_id.to_string());
+        } else {
+            set.remove(group_id);
         }
     }
 
     /// Whether trunk group `group_id` is inside the RFC 3325 trust domain.
+    /// Only groups explicitly set to `true` are (allow-set).
     async fn trunk_group_trusted(&self, group_id: &str) -> bool {
-        !self.untrusted_trunk_groups.read().await.contains(group_id)
+        self.trusted_trunk_groups.read().await.contains(group_id)
     }
 
     /// Whether a request from `ip` comes from inside the trust domain: only
@@ -6062,6 +6092,7 @@ impl SipStack {
         &self,
         req: &SipRequest,
         source: SbcSocketAddr,
+        transport: AddrTransport,
     ) -> Result<(Option<SipRequest>, Option<PrivacyHeader>), Box<ProcessResult>> {
         let reject = |status: StatusCode, policy: &'static str| {
             self.signaling_audit
@@ -6099,19 +6130,38 @@ impl SipStack {
 
         let mut routed: Option<SipRequest> = None;
 
-        // §16.4: only a Route header or a user-less own Request-URI can
-        // change anything; endpoint INVITEs take the no-copy path.
+        // §16.4: only a Route header, a user-less own Request-URI or a
+        // Request-URI `maddr` can change anything; endpoint INVITEs without
+        // them take the no-copy path.
         let has_route = req.headers.contains(&HeaderName::Route);
-        let own = if has_route || req.uri.user.is_none() {
+        let has_maddr = req.uri.maddr().is_some();
+        let own = if has_route || has_maddr || req.uri.user.is_none() {
             Some(self.own_addrs().await)
         } else {
             None
         };
         if let Some(own) = own
-            && (own.is_own_uri(&req.uri) || (has_route && top_route_may_change(req, &own)))
+            && (own.is_own_uri(&req.uri)
+                || (has_route && top_route_may_change(req, &own))
+                || maddr_may_strip(req, &own))
         {
             let mut copy = req.clone();
-            match proto_sip::preprocess_route_information(&mut copy, &|u| own.is_own_uri(u)) {
+            // RFC 3261 §16.4 paragraph 3: the received port is this SBC's
+            // listener for the transport (ws/wss: the configured WebSocket /
+            // TLS listener, open question 1).
+            // POAM: received port is the per-transport configured listener,
+            // not the receiving socket's local port (not plumbed into
+            // handle_invite); a distinct wss/extra listener port fails safe
+            // (maddr left in place).
+            let own_addressing = proto_sip::OwnAddressing {
+                is_own_uri: &|u| own.is_own_uri(u),
+                is_own_maddr: &|h| own.is_own_host(h),
+                received: Some(proto_sip::ReceivedOn {
+                    port: self.signaling_port(transport),
+                    transport: transport_token(transport),
+                }),
+            };
+            match proto_sip::preprocess_route_information(&mut copy, &own_addressing) {
                 Ok(RoutePreprocess::NoRouteForOwnUri) => {
                     debug!("Request-URI is ours with no Route to restore, 404");
                     return Err(reject(
@@ -6122,11 +6172,14 @@ impl SipStack {
                 Ok(RoutePreprocess::Done {
                     restored_from_strict_route,
                     popped_own_route,
+                    stripped_maddr,
                 }) => {
-                    if restored_from_strict_route || popped_own_route {
+                    if restored_from_strict_route || popped_own_route || stripped_maddr {
+                        // A maddr strip is benign: debug only, not audited.
                         debug!(
                             restored_from_strict_route,
                             popped_own_route,
+                            stripped_maddr,
                             uri = %copy.uri,
                             "RFC 3261 §16.4 route preprocessing applied"
                         );
@@ -6927,6 +6980,11 @@ impl SipStack {
         let mut router = Router::new(router_config);
         self.prepare_router(&mut router);
 
+        // RFC 3325 §9.1: rebuild the trust allow-set from this config only,
+        // so a group removed or flipped to untrusted is not left trusted.
+        // NIST 800-53 Rev5: AC-21, CM-6
+        self.trusted_trunk_groups.get_mut().clear();
+
         // Load trunk groups first (dial plan entries reference them)
         for tg_config in trunk_group_configs {
             let strategy = match tg_config.strategy.as_str() {
@@ -6977,13 +7035,14 @@ impl SipStack {
 
             router.add_trunk_group(group);
 
-            // RFC 3325 trust domain (`trust_domain`, default true).
-            // NIST 800-53 Rev5: AC-21, CM-6
-            let untrusted = self.untrusted_trunk_groups.get_mut();
+            // RFC 3325 §9.1 trust domain (`trust_domain`, default false):
+            // allow-set, only explicit `true` is trusted.
+            // NIST 800-53 Rev5: AC-21, CM-6 (secure default)
+            let trusted = self.trusted_trunk_groups.get_mut();
             if tg_config.trust_domain {
-                untrusted.remove(&tg_config.id);
+                trusted.insert(tg_config.id.clone());
             } else {
-                untrusted.insert(tg_config.id.clone());
+                trusted.remove(&tg_config.id);
             }
 
             // Config-file trunks are admitted INVITE sources too (the API
@@ -8567,7 +8626,8 @@ impl SipStack {
         // fresh.
         //
         // ## NIST 800-53 Rev5: AC-4, SC-7, SC-5, AC-21
-        let (routed, a_privacy) = match self.preprocess_initial_invite(req, source).await {
+        let (routed, a_privacy) = match self.preprocess_initial_invite(req, source, transport).await
+        {
             Ok(r) => r,
             Err(resp) => return *resp,
         };
@@ -18349,6 +18409,9 @@ pub mod tests {
         tweak: impl FnOnce(&mut sbc_config::SbcConfig),
     ) -> QaStir {
         let (mut stack, cdr) = cdr_stack().await;
+        // RFC 3325 §9.1 fail-closed: alice's inbound group must be trusted
+        // explicitly for her PAI to be kept and signed.
+        stack.set_trunk_group_trust_domain("pbx", true).await;
         if manip_pai {
             stack.init_manipulator_from_config(&sbc_config::HeaderManipulationConfig {
                 global_rules: vec![sbc_config::ManipulationRuleConfig {
@@ -20169,6 +20232,8 @@ pub mod tests {
         let mut q = qa_stir_stack(sbc_config::StirFailurePolicy::Mark, 0, 500, true, false).await;
         let (r, d, g) = carrier_routing(10, ("none", ""), ["udp", "tls"]);
         q.stack.init_router_from_config(&r, &d, &g);
+        // Re-init rebuilds the trust allow-set from config only.
+        q.stack.set_trunk_group_trust_domain("pbx", true).await;
         let results = flatten(
             q.stack
                 .process_message(&qa_invite("qa-tls@test", None), alice(), None)
@@ -24228,6 +24293,100 @@ pub mod tests {
         assert!(!fwd.headers.contains(&HeaderName::Route), "plan 13");
     }
 
+    /// POA&M-235 / RFC 3261 §16.4 para 3: a Request-URI `maddr` naming the
+    /// SBC, received on the indicated (default) UDP port, is stripped; a
+    /// foreign `maddr` is left; an endpoint INVITE without one takes the
+    /// no-copy path.
+    #[tokio::test]
+    async fn route_preprocess_strips_own_maddr() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let port = stack.signaling_port(AddrTransport::Udp);
+        let raw = with_start_line(
+            &caller_request("INVITE", DIALED, "rt-maddr@test", 1, None, None),
+            &format!("INVITE sip:{DIALED}@carrier.example.net:{port};maddr=sbc.local SIP/2.0"),
+        );
+        let Ok(SipMessage::Request(req)) = SipMessage::parse(&raw) else {
+            panic!("parse");
+        };
+        let Ok((Some(routed), _)) = stack
+            .preprocess_initial_invite(&req, alice(), AddrTransport::Udp)
+            .await
+        else {
+            panic!("maddr stripped copy");
+        };
+        assert_eq!(routed.uri.maddr(), None);
+        assert_eq!(routed.uri.user.as_deref(), Some(DIALED));
+        assert_eq!(routed.uri.host, "carrier.example.net");
+
+        // Received on TCP: the URI indicates UDP, so nothing changes.
+        let Ok((routed, _)) = stack
+            .preprocess_initial_invite(&req, alice(), AddrTransport::Tcp)
+            .await
+        else {
+            panic!("accepted");
+        };
+        assert!(routed.is_none());
+
+        let raw = with_start_line(
+            &caller_request("INVITE", DIALED, "rt-maddr2@test", 1, None, None),
+            &format!("INVITE sip:{DIALED}@carrier.example.net;maddr=198.51.100.7 SIP/2.0"),
+        );
+        let Ok(SipMessage::Request(req)) = SipMessage::parse(&raw) else {
+            panic!("parse");
+        };
+        let Ok((routed, _)) = stack
+            .preprocess_initial_invite(&req, alice(), AddrTransport::Udp)
+            .await
+        else {
+            panic!("accepted");
+        };
+        assert!(routed.is_none(), "foreign maddr untouched, no copy");
+
+        let raw = caller_request("INVITE", DIALED, "rt-nomaddr@test", 1, None, None);
+        let Ok(SipMessage::Request(req)) = SipMessage::parse(&raw) else {
+            panic!("parse");
+        };
+        let Ok((routed, _)) = stack
+            .preprocess_initial_invite(&req, alice(), AddrTransport::Udp)
+            .await
+        else {
+            panic!("accepted");
+        };
+        assert!(routed.is_none(), "endpoint INVITE: no-copy path");
+    }
+
+    /// POA&M-235: `sips:` with `maddr` naming the SBC received on the TLS
+    /// listener with `transport=tls` explicit and the listener port.
+    #[tokio::test]
+    async fn route_preprocess_strips_own_maddr_tls() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let port = stack.signaling_port(AddrTransport::Tls);
+        let raw = with_start_line(
+            &caller_request("INVITE", DIALED, "rt-maddr-tls@test", 1, None, None),
+            &format!(
+                "INVITE sip:{DIALED}@carrier.example.net:{port};transport=tls;maddr=SBC.LOCAL SIP/2.0"
+            ),
+        );
+        let Ok(SipMessage::Request(req)) = SipMessage::parse(&raw) else {
+            panic!("parse");
+        };
+        let Ok((Some(routed), _)) = stack
+            .preprocess_initial_invite(&req, alice(), AddrTransport::Tls)
+            .await
+        else {
+            panic!("maddr stripped copy");
+        };
+        assert_eq!(routed.uri.maddr(), None);
+        assert_eq!(
+            routed.uri.transport(),
+            None,
+            "non-default transport stripped"
+        );
+        if port != 5060 {
+            assert_eq!(routed.uri.port, None, "non-default port stripped");
+        }
+    }
+
     /// Plan 10: a loose Route naming the SBC is popped and the call routes.
     #[tokio::test]
     async fn route_preprocess_pops_own_loose_route() {
@@ -24424,13 +24583,31 @@ pub mod tests {
         let Ok(SipMessage::Request(req)) = SipMessage::parse(&raw) else {
             panic!("parse");
         };
-        let Ok((routed, _)) = stack.preprocess_initial_invite(&req, alice()).await else {
+        let Ok((routed, _)) = stack
+            .preprocess_initial_invite(&req, alice(), AddrTransport::Udp)
+            .await
+        else {
+            panic!("accepted");
+        };
+        assert!(
+            routed.is_some(),
+            "unset group is untrusted (fail-closed): PAI stripped"
+        );
+
+        stack.set_trunk_group_trust_domain("pbx", true).await;
+        let Ok((routed, _)) = stack
+            .preprocess_initial_invite(&req, alice(), AddrTransport::Udp)
+            .await
+        else {
             panic!("accepted");
         };
         assert!(routed.is_none(), "trusted trunk: PAI kept, no copy");
 
         stack.set_trunk_group_trust_domain("pbx", false).await;
-        let Ok((Some(routed), _)) = stack.preprocess_initial_invite(&req, alice()).await else {
+        let Ok((Some(routed), _)) = stack
+            .preprocess_initial_invite(&req, alice(), AddrTransport::Udp)
+            .await
+        else {
             panic!("stripped copy");
         };
         assert!(!routed.headers.contains(&HeaderName::PAssertedIdentity));
@@ -24438,10 +24615,79 @@ pub mod tests {
 
         // Plan 18: a non-trunk (endpoint) source is never trusted.
         let endpoint = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 20), 5060);
-        let Ok((Some(routed), _)) = stack.preprocess_initial_invite(&req, endpoint).await else {
+        let Ok((Some(routed), _)) = stack
+            .preprocess_initial_invite(&req, endpoint, AddrTransport::Udp)
+            .await
+        else {
             panic!("stripped copy");
         };
         assert!(!routed.headers.contains(&HeaderName::PAssertedIdentity));
+    }
+
+    /// RFC 3325 §9.1 / CM-6: re-running `init_router_from_config` rebuilds
+    /// the trust allow-set; a group flipped to `false` or removed is no
+    /// longer trusted.
+    #[tokio::test]
+    async fn trust_domain_rebuilt_on_reinit() {
+        let mut stack = trunk_stack(10, ("none", ""), None).await;
+        assert!(stack.trunk_group_trusted("carriers").await);
+        let (routing, dial_plans, mut groups) = carrier_routing(10, ("none", ""), ["udp", "udp"]);
+        groups[0].trust_domain = false;
+        stack.init_router_from_config(&routing, &dial_plans, &groups);
+        assert!(!stack.trunk_group_trusted("carriers").await);
+        groups[0].trust_domain = true;
+        stack.init_router_from_config(&routing, &dial_plans, &groups);
+        assert!(stack.trunk_group_trusted("carriers").await);
+        stack.init_router_from_config(&routing, &dial_plans, &[]);
+        assert!(!stack.trunk_group_trusted("carriers").await);
+        assert!(!stack.trunk_group_trusted("never-configured").await);
+    }
+
+    /// QA: an API-registered inbound trunk group (no trust_domain field in
+    /// the API) is untrusted, so PAI from it is stripped (fail-closed).
+    #[tokio::test]
+    async fn qa_api_registered_group_untrusted_strips_pai() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        stack
+            .register_inbound_trunk("api-grp", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        assert!(!stack.trunk_group_trusted("api-grp").await);
+        let raw = with_extra(
+            &caller_request("INVITE", DIALED, "qa-api-pai@test", 1, None, None),
+            "P-Asserted-Identity: <sip:+12025550100@pbx.example>\r\n",
+            None,
+        );
+        let Ok(SipMessage::Request(req)) = SipMessage::parse(&raw) else {
+            panic!("parse");
+        };
+        let Ok((Some(routed), _)) = stack
+            .preprocess_initial_invite(&req, alice(), AddrTransport::Udp)
+            .await
+        else {
+            panic!("expected stripped copy");
+        };
+        assert!(!routed.headers.contains(&HeaderName::PAssertedIdentity));
+    }
+
+    /// QA: re-init clears trust granted at runtime via the setter, and an
+    /// explicit `false` in config wins over a prior runtime `true`.
+    #[tokio::test]
+    async fn qa_reinit_clears_runtime_trust() {
+        let mut stack = trunk_stack(10, ("none", ""), None).await;
+        stack.set_trunk_group_trust_domain("api-only", true).await;
+        assert!(stack.trunk_group_trusted("api-only").await);
+        let (routing, dial_plans, mut groups) = carrier_routing(10, ("none", ""), ["udp", "udp"]);
+        groups[0].trust_domain = false;
+        stack.init_router_from_config(&routing, &dial_plans, &groups);
+        assert!(!stack.trunk_group_trusted("api-only").await);
+        assert!(!stack.trunk_group_trusted("carriers").await);
+        // Group ids are exact-match: no case folding or prefix trust.
+        groups[0].trust_domain = true;
+        stack.init_router_from_config(&routing, &dial_plans, &groups);
+        assert!(stack.trunk_group_trusted("carriers").await);
+        assert!(!stack.trunk_group_trusted("Carriers").await);
+        assert!(!stack.trunk_group_trusted("carriers2").await);
+        assert!(!stack.trunk_group_trusted("").await);
     }
 
     async fn privacy_call(stack: &SipStack, call_id: &str, privacy: &str) -> Vec<ProcessResult> {

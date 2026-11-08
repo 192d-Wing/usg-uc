@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, RFC 3325 trust domain default)
+
+- **SBC: `trust_domain` now defaults to `false` (fail-closed).** (AC-21,
+  CM-6 (secure default); RFC 3325 §9.1) A trunk group or peer that does
+  not set `trust_domain` is outside the trust domain, so the SBC strips
+  P-Asserted-Identity from it. Before, an unset value meant trusted.
+  Operators must set `trust_domain = true` on each trunk group or peer
+  they trust, or PAI (and any STIR attestation that depends on it) is
+  dropped. A signing trunk with `trust_domain` unset or false logs a
+  config warning. Check `deploy/config` and Helm/Ansible overrides.
+- **SBC: API-created trunk groups are always untrusted.** Trunk groups
+  made through `register_inbound_trunk` (REST) have no `trust_domain`
+  field. Before, they were always trusted. Re-running config init also
+  clears trust that was set at runtime. There is no supported way to
+  trust an API-provisioned group yet (follow-up tracked). Do not widen
+  `trust_domain` on a shared config group to work around this.
+- **SBC: mixed-version rolling upgrades.** Nodes older than this release
+  treat an unset `trust_domain` as trusted and keep passing PAI. During
+  a rolling upgrade, set `trust_domain` explicitly on every group so
+  that all nodes behave the same.
+- **proto-sip (Rust API):** `preprocess_route_information` now takes an
+  `&OwnAddressing` argument, and `RoutePreprocess::Done` has a new
+  `stripped_maddr` field.
+
+### Fixed (SBC, RFC 3261 §16.4 maddr, POA&M-235)
+
+- **proto-sip / SBC: own `maddr` is stripped from the Request-URI.** (SC-7,
+  SI-10; POA&M-235) When the Request-URI `maddr` names an address or
+  domain the SBC owns, and the request came in on the port and transport
+  the URI names (or the default: 5060/udp for sip, 5061/tls for sips),
+  the SBC removes `maddr` and any non-default port/transport parameters.
+  This stops loops back to the SBC. On secured legs, `transport=tcp`
+  matches TLS and `ws` matches WSS. Empty, `[]` or longer-than-255-byte
+  values are never treated as own. Known residual: the received port is
+  the configured listener port for the transport, not the socket's
+  local port, so a separate WSS or extra listener port is not stripped
+  (this fails safe).
+
+### Changed (SBC, uc-metrics)
+
+- **uc-metrics: labelled series are capped.** (SC-5, SI-4) Each labelled
+  Counter and Gauge holds at most 1024 series (`MAX_LABEL_SERIES`), and
+  label values are cut to 128 bytes. Updates past the cap, updates with
+  the wrong label count, and a caller-supplied `__overflow__` value all
+  go to one `__overflow__` series and increment `overflowed()`. Totals
+  are kept. Scrapers and dashboards may see the new `__overflow__` label
+  value.
+
 ### BREAKING (SBC and client, MD5 digest policy, POA&M-255, 256)
 
 - **SBC: trunk REGISTER refuses MD5 digest by default.** (IA-2, IA-5(1),

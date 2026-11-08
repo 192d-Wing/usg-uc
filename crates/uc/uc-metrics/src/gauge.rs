@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+use crate::labels::{self, MAX_LABEL_SERIES};
 
 /// A gauge that can go up and down.
 #[derive(Debug)]
@@ -17,6 +19,10 @@ pub struct Gauge {
     values: HashMap<Vec<String>, AtomicI64>,
     /// Default value (no labels).
     default_value: AtomicI64,
+    /// Maximum distinct labelled series (SC-5).
+    max_series: usize,
+    /// Updates redirected to the overflow series.
+    overflowed: AtomicU64,
 }
 
 impl Gauge {
@@ -28,6 +34,8 @@ impl Gauge {
             label_names: Vec::new(),
             values: HashMap::new(),
             default_value: AtomicI64::new(0),
+            max_series: MAX_LABEL_SERIES,
+            overflowed: AtomicU64::new(0),
         }
     }
 
@@ -43,7 +51,44 @@ impl Gauge {
             label_names,
             values: HashMap::new(),
             default_value: AtomicI64::new(0),
+            max_series: MAX_LABEL_SERIES,
+            overflowed: AtomicU64::new(0),
         }
+    }
+
+    /// Creates a gauge with labels and an explicit series cap.
+    ///
+    /// Once `max_series` distinct label tuples exist, further new tuples
+    /// update a single series whose labels are all `"__overflow__"`.
+    pub fn with_labels_capped(
+        name: impl Into<String>,
+        help: impl Into<String>,
+        label_names: Vec<String>,
+        max_series: usize,
+    ) -> Self {
+        let mut m = Self::with_labels(name, help, label_names);
+        m.max_series = max_series;
+        m
+    }
+
+    /// Returns how many labelled updates were redirected to the overflow
+    /// series (cap reached or label arity mismatch).
+    pub fn overflowed(&self) -> u64 {
+        self.overflowed.load(Ordering::Relaxed)
+    }
+
+    /// Resolves the bounded series for `labels`, creating it if needed.
+    fn series(&mut self, labels: &[&str]) -> &AtomicI64 {
+        let (key, overflow) = labels::series_key(
+            &self.values,
+            self.label_names.len(),
+            self.max_series,
+            labels,
+        );
+        if overflow {
+            self.overflowed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.values.entry(key).or_insert_with(|| AtomicI64::new(0))
     }
 
     /// Returns the metric name.
@@ -68,11 +113,7 @@ impl Gauge {
 
     /// Sets the gauge with labels.
     pub fn set_with_labels(&mut self, labels: &[&str], value: i64) {
-        let key: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
-        self.values
-            .entry(key)
-            .or_insert_with(|| AtomicI64::new(0))
-            .store(value, Ordering::Relaxed);
+        self.series(labels).store(value, Ordering::Relaxed);
     }
 
     /// Increments the gauge by 1.
@@ -107,11 +148,7 @@ impl Gauge {
 
     /// Adds to the gauge with labels.
     pub fn add_with_labels(&mut self, labels: &[&str], n: i64) {
-        let key: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
-        self.values
-            .entry(key)
-            .or_insert_with(|| AtomicI64::new(0))
-            .fetch_add(n, Ordering::Relaxed);
+        self.series(labels).fetch_add(n, Ordering::Relaxed);
     }
 
     /// Gets the current value.
@@ -121,7 +158,11 @@ impl Gauge {
 
     /// Gets the value for specific labels.
     pub fn get_with_labels(&self, labels: &[&str]) -> i64 {
-        let key: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
+        let key = if labels.len() == self.label_names.len() {
+            labels::lookup_key(labels)
+        } else {
+            labels::overflow_key(self.label_names.len())
+        };
         self.values
             .get(&key)
             .map_or(0, |v| v.load(Ordering::Relaxed))
@@ -285,5 +326,31 @@ mod tests {
         let output = gauge.export();
         assert!(output.contains("temperature{location=\"server_room\"} 22"));
         assert!(output.contains("temperature{location=\"office\"} 24"));
+    }
+
+    #[test]
+    fn test_series_cap_overflows() {
+        let mut g = Gauge::with_labels_capped("g", "g", vec!["peer".to_string()], 1);
+        g.set_with_labels(&["a"], 5);
+        g.inc_with_labels(&["b"]);
+        g.inc_with_labels(&["c"]);
+        g.set_with_labels(&["a"], 7);
+        assert_eq!(g.get_with_labels(&["a"]), 7);
+        assert_eq!(g.get_with_labels(&["__overflow__"]), 2);
+        assert_eq!(g.overflowed(), 2);
+        assert!(g.export().contains("g{peer=\"__overflow__\"} 2"));
+    }
+
+    #[test]
+    fn qa_gauge_cap_boundary_and_arity() {
+        let mut g = Gauge::with_labels_capped("g", "g", vec!["p".to_string()], 1);
+        g.set_with_labels(&["a"], 7);
+        assert_eq!(g.overflowed(), 0);
+        g.inc_with_labels(&["b"]);
+        g.dec_with_labels(&["c"]);
+        g.add_with_labels(&["x", "y"], 3);
+        assert_eq!(g.get_with_labels(&["a"]), 7);
+        assert_eq!(g.get_with_labels(&["__overflow__"]), 3);
+        assert_eq!(g.overflowed(), 3);
     }
 }
