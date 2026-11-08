@@ -232,7 +232,18 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 ### RFC 8866 Parser/Generator ✅ COMPLIANT
 
 **Status**: Fully compliant for all SDP line types
-**Updated**: 2026-02-07
+**Updated**: 2026-11-08
+
+**Input validation (POA&M-283)**: each line must be `<type>=<value>` with
+`<type>` exactly one ASCII letter (§5), checked on bytes. Lines that do not
+match, including lines starting with a multibyte UTF-8 character, are a parse
+error rather than a panic. UTF-8 in values is accepted. Typed time values
+(§5.10) are digits only with an optional `d`/`h`/`m`/`s` unit, and values that
+overflow u64 are rejected. Leading and trailing whitespace on a line is trimmed,
+which is more lenient than §5 requires. Number of lines, media sections and
+attributes is not capped (POA&M-285). Tests:
+`proto-sdp/tests/parser_totality.rs`, including no-panic proptests over
+arbitrary input.
 
 The `proto-sdp` crate provides structured SDP parsing and generation used by `client-sip-ua` and integration tests. `uc-webrtc` and `uc-siprec` list `proto-sdp` as a dependency but do not use it to parse or generate SDP: `uc-webrtc/src/sdp_munge.rs` rewrites SDP as text, and `uc-siprec` only wraps `proto_sdp::SdpError` (`uc-siprec/src/error.rs`). Both crates are dormant (POA&M-206).
 

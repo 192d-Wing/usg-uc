@@ -509,15 +509,18 @@ impl CryptoAttribute {
     /// Parses inline key parameters.
     fn parse_key_params(s: &str, cipher: CipherSuite) -> SdpResult<KeyParams> {
         // Format: inline:base64|lifetime|mki:mki_length
+        // ASCII-only, byte-safe prefix match: `to_lowercase()` can change byte
+        // lengths for non-ASCII input, so slicing the original by the prefix
+        // length could land inside a char. POAM: 283
         let inline_prefix = "inline:";
-        if !s.to_lowercase().starts_with(inline_prefix) {
-            return Err(SdpError::InvalidAttribute {
+        let rest = s
+            .get(..inline_prefix.len())
+            .filter(|p| p.eq_ignore_ascii_case(inline_prefix))
+            .and_then(|_| s.get(inline_prefix.len()..))
+            .ok_or_else(|| SdpError::InvalidAttribute {
                 name: "crypto".to_string(),
                 reason: format!("unsupported key method (only inline supported): {s}"),
-            });
-        }
-
-        let rest = &s[inline_prefix.len()..];
+            })?;
         let parts: Vec<&str> = rest.split('|').collect();
 
         if parts.is_empty() {
@@ -548,12 +551,25 @@ impl CryptoAttribute {
 
     /// Parses the lifetime portion of key parameters.
     fn parse_lifetime(lifetime_str: &str) -> SdpResult<u64> {
+        // RFC 4568 §9.2: lifetime is DIGIT-only (from_str would accept '+').
+        let digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
+        let body = lifetime_str.strip_prefix("2^").unwrap_or(lifetime_str);
+        if !digits(body) {
+            return Err(SdpError::InvalidAttribute {
+                name: "crypto".to_string(),
+                reason: format!("invalid lifetime: {lifetime_str}"),
+            });
+        }
         if let Some(exp_str) = lifetime_str.strip_prefix("2^") {
             let exp: u32 = exp_str.parse().map_err(|_| SdpError::InvalidAttribute {
                 name: "crypto".to_string(),
                 reason: format!("invalid lifetime exponent: {exp_str}"),
             })?;
-            Ok(2u64.pow(exp))
+            2u64.checked_pow(exp)
+                .ok_or_else(|| SdpError::InvalidAttribute {
+                    name: "crypto".to_string(),
+                    reason: format!("lifetime exponent out of range: {exp_str}"),
+                })
         } else {
             lifetime_str
                 .parse()
