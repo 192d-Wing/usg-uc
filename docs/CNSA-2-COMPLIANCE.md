@@ -147,15 +147,15 @@ Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_ver
 
 ### Storage TLS (uc-storage, dormant) - known gap
 
-`uc-storage` Postgres (sqlx) and Redis TLS do **not** use `uc_transport::tls::cnsa_provider()`. Neither driver accepts a custom rustls `ClientConfig`: sqlx hard-codes `aws_lc_rs::default_provider()` and redis uses the process-default provider. Offered suites are the aws-lc-rs defaults (AES-128-GCM and X25519 are offered), so storage TLS is not CNSA 2.0 enforced. Installing `cnsa_provider` process-wide was not done because it would change every other rustls user. Tracked as POA&M-230 (`// POAM: POA&M-230` in `crates/uc/uc-storage/src/redis.rs` and `postgres.rs`). What is enforced: server certificate verification (`verify-full` default; plaintext and unverified modes refused unless `allow_insecure_transport`).
+`uc-storage` Postgres (sqlx) and Redis TLS do **not** use `uc_transport::tls::cnsa_provider()`. Neither driver accepts a custom rustls `ClientConfig`: sqlx hard-codes `aws_lc_rs::default_provider()` and redis uses the process-default provider. Offered suites are the aws-lc-rs defaults (AES-128-GCM and X25519 are offered), so storage TLS is not CNSA 2.0 enforced. Installing `cnsa_provider` process-wide was not done because it would change every other rustls user. Tracked as POA&M-240 (`// POAM: POA&M-240` in `crates/uc/uc-storage/src/redis.rs` and `postgres.rs`). What is enforced: server certificate verification (`verify-full` default; plaintext and unverified modes refused unless `allow_insecure_transport`).
 
 ### Syslog TLS (uc-syslog, dormant)
 
-`uc-syslog` `SyslogTransport::Tls` builds its client config with `create_client_config_with` and `cnsa_provider()`: TLS 1.3 only by default, `allow_tls12` adds TLS 1.2 with CNSA suites only. Library-only; not wired into sbc-daemon (POA&M-235). Test: `tls_delivers_octet_counted_frames` (`crates/uc/uc-syslog/src/forwarder.rs`, P-384 CA and leaf).
+`uc-syslog` `SyslogTransport::Tls` builds its client config with `create_client_config_with` and `cnsa_provider()`: TLS 1.3 only by default, `allow_tls12` adds TLS 1.2 with CNSA suites only. Library-only; not wired into sbc-daemon (POA&M-245). Test: `tls_delivers_octet_counted_frames` (`crates/uc/uc-syslog/src/forwarder.rs`, P-384 CA and leaf).
 
 ### Cluster message authentication (uc-cluster, dormant)
 
-HMAC-SHA-384 with a key of at least 48 bytes via `uc_crypto::hash` (aws-lc-rs, constant-time verify). Library-only, no transport (POA&M-231). Tests in `crates/uc/uc-cluster/src/auth.rs`.
+HMAC-SHA-384 with a key of at least 48 bytes via `uc_crypto::hash` (aws-lc-rs, constant-time verify). Library-only, no transport (POA&M-241). Tests in `crates/uc/uc-cluster/src/auth.rs`.
 
 ## FIPS 140-3 Validation
 

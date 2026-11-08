@@ -22,9 +22,9 @@
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-24**: Fail in Known State (library-only; no fencing, POA&M-232)
+//! - **SC-24**: Fail in Known State (library-only; no fencing, POA&M-242)
 //! - **IA-3 / SC-23**: Peer authentication and anti-replay via
-//!   [`auth::PeerAuthenticator`] (library-only; no transport, POA&M-231)
+//!   [`auth::PeerAuthenticator`] (library-only; no transport, POA&M-241)
 //! - **CP-7**: Alternate Processing Site
 //! - **CP-10**: System Recovery and Reconstitution
 //!

@@ -44,7 +44,7 @@ pub struct SyslogTlsConfig {
     pub ca_file: PathBuf,
     /// DNS name or IP address the collector certificate must match.
     ///
-    /// POAM: POA&M-235 RFC 5425 §5.2.2 end-entity certificate fingerprint
+    /// POAM: POA&M-245 RFC 5425 §5.2.2 end-entity certificate fingerprint
     /// matching is not implemented; only certification-path validation
     /// against `ca_file` is supported. A self-signed collector must have
     /// its certificate placed in `ca_file` as a trust anchor. The RFC's

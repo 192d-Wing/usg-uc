@@ -20,7 +20,7 @@
 //! ## NIST 800-53 Rev5 Controls
 //!
 //! Library-only: sbc-daemon does not yet wire the TLS transport
-//! (POA&M-235).
+//! (POA&M-245).
 //!
 //! - **AU-9 / SC-8**: only with `transport = tls` (CNSA 2.0 provider,
 //!   collector certificate and name verified). UDP and TCP give no

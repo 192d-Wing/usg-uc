@@ -269,7 +269,7 @@ impl StateReplicator {
     /// Seals an outbound replication message for a peer.
     ///
     /// NIST 800-53 Rev5: IA-3, SC-8(1), SC-13 (HMAC-SHA-384).
-    /// Library-only (no transport; POA&M-231).
+    /// Library-only (no transport; POA&M-241).
     ///
     /// # Errors
     /// Returns an error if serialization fails or the message is too large.
@@ -297,7 +297,7 @@ impl StateReplicator {
     /// returned message, never from unauthenticated input.
     ///
     /// NIST 800-53 Rev5: IA-3 (peer authentication), SC-23 (anti-replay),
-    /// SI-10 (input validation). Library-only (no transport; POA&M-231).
+    /// SI-10 (input validation). Library-only (no transport; POA&M-241).
     ///
     /// # Errors
     /// Returns [`StateSyncError::AuthenticationFailed`] or
