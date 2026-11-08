@@ -8,14 +8,15 @@ use bytes::Bytes;
 use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id};
 use proto_sip::uri::SipUri;
 use proto_sip::{
-    DigestChallenge, Header, HeaderName, Md5DigestHasher, SipMessage, create_credentials,
+    AlgorithmHasher, DigestChallenge, Header, HeaderName, SipMessage, SipResponse,
+    create_credentials, select_challenge_from_headers,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Registration state for a trunk.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -74,6 +75,11 @@ pub struct TrunkRegistrar {
     /// and so loops stop on trunk deletion and daemon shutdown.
     tasks: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     local_domain: String,
+    /// Whether an MD5/MD5-sess challenge may be answered when the trunk
+    /// offers nothing stronger. Default true: a legacy interop allowance for
+    /// MD5-only carriers (POA&M-234). MD5 is not CNSA; SHA-256/SHA-512-256
+    /// digest is not CNSA either and stays under the POA&M-110 exception.
+    allow_md5_digest: bool,
 }
 
 impl TrunkRegistrar {
@@ -85,7 +91,26 @@ impl TrunkRegistrar {
             statuses: Arc::new(RwLock::new(HashMap::new())),
             tasks: std::sync::Mutex::new(HashMap::new()),
             local_domain: local_domain.to_string(),
+            // POAM: POA&M-255 — MD5 UAC answers allowed by default; no
+            // sbc-config/sbc-daemon or client settings key to disable; on
+            // non-TLS an on-path attacker can strip SHA challenges.
+            allow_md5_digest: true,
         }
+    }
+
+    /// Sets whether MD5 digest challenges may be answered (default true).
+    ///
+    /// When false, a trunk that offers only MD5/MD5-sess fails closed and
+    /// the registration error names the offered algorithms.
+    // NIST 800-53 Rev5: IA-5(1) (POA&M-234); IA-7 / SC-13 partial while MD5
+    // may be answered (POA&M-255).
+    // POAM: POA&M-255 — sbc-daemon does not yet plumb a trunk
+    // `allow_md5_digest` config key into this setter; the daemon runs with
+    // the interop default (true).
+    #[must_use]
+    pub const fn with_allow_md5_digest(mut self, allow: bool) -> Self {
+        self.allow_md5_digest = allow;
+        self
     }
 
     /// Stops registration for a trunk and removes its status entry.
@@ -117,6 +142,7 @@ impl TrunkRegistrar {
     pub fn register_trunk(&self, config: TrunkRegConfig) {
         let statuses = Arc::clone(&self.statuses);
         let local_domain = self.local_domain.clone();
+        let allow_md5 = self.allow_md5_digest;
         let trunk_id = config.trunk_id.clone();
         let registrar = format!("{}:{}", config.host, config.port);
         let username = config.username.clone();
@@ -151,7 +177,7 @@ impl TrunkRegistrar {
 
             let mut backoff_secs: u64 = 5;
             loop {
-                let result = Self::do_register(&config, &local_domain).await;
+                let result = Self::do_register(&config, &local_domain, allow_md5).await;
 
                 let succeeded = result.is_ok();
                 let granted = *result.as_ref().unwrap_or(&config.expires);
@@ -268,7 +294,11 @@ impl TrunkRegistrar {
     // One linear SIP transaction (send, 401 challenge, re-send, parse);
     // splitting it would scatter the protocol flow.
     #[allow(clippy::too_many_lines)]
-    async fn do_register(config: &TrunkRegConfig, local_domain: &str) -> Result<u32, String> {
+    async fn do_register(
+        config: &TrunkRegConfig,
+        local_domain: &str,
+        allow_md5: bool,
+    ) -> Result<u32, String> {
         let addr_str = format!("{}:{}", config.host, config.port);
         // Async DNS — std::net::ToSocketAddrs blocks the tokio worker
         // thread for up to the resolver timeout (5s per nameserver).
@@ -393,22 +423,31 @@ impl TrunkRegistrar {
 
         // If 401/407, extract challenge and retry with credentials
         if status_code == 401 || status_code == 407 {
-            let auth_header = if status_code == 401 {
-                response.headers.get_value(&HeaderName::WwwAuthenticate)
-            } else {
-                response
-                    .headers
-                    .get_value(&HeaderName::Custom("Proxy-Authenticate".to_string()))
+            let challenge = match select_trunk_challenge(response, allow_md5) {
+                Ok(ch) => ch,
+                Err(e) => {
+                    // NIST 800-53 Rev5: AU-2 — algorithms only, no nonce/realm.
+                    warn!(
+                        trunk_id = %config.trunk_id,
+                        registrar = %config.host,
+                        status_code,
+                        allow_md5,
+                        error = %e,
+                        "Trunk digest challenge refused"
+                    );
+                    return Err(e);
+                }
             };
-
-            let challenge_str =
-                auth_header.ok_or_else(|| format!("{status_code} with no challenge header"))?;
-
-            let challenge: DigestChallenge = challenge_str
-                .parse()
-                .map_err(|e| format!("Parse challenge failed: {e}"))?;
-
-            let hasher = Md5DigestHasher;
+            if challenge.algorithm.is_md5() {
+                warn!(
+                    trunk_id = %config.trunk_id,
+                    registrar = %config.host,
+                    algorithm = %challenge.algorithm,
+                    "Answering MD5 digest challenge (legacy, not CNSA; POA&M-255)"
+                );
+            }
+            // RFC 7616 §3.4.1: hash with the selected challenge's algorithm.
+            let hasher = AlgorithmHasher::for_algorithm(challenge.algorithm);
             let cnonce = generate_branch();
             let digest_uri = format!("sip:{}", config.host);
 
@@ -442,7 +481,7 @@ impl TrunkRegistrar {
             let header_name = if status_code == 401 {
                 HeaderName::Authorization
             } else {
-                HeaderName::Custom("Proxy-Authorization".to_string())
+                HeaderName::ProxyAuthorization
             };
             auth_request
                 .headers
@@ -524,5 +563,124 @@ impl TrunkRegistrar {
     /// Returns registration status for a specific trunk.
     pub async fn get_status(&self, trunk_id: &str) -> Option<TrunkRegistrationStatus> {
         self.statuses.read().await.get(trunk_id).cloned()
+    }
+}
+
+/// Selects the strongest acceptable digest challenge from a 401/407.
+///
+/// RFC 7616 §3.7: every `WWW-Authenticate` (401) or `Proxy-Authenticate`
+/// (407) value is considered; the strongest supported algorithm wins and MD5
+/// is used only when `allow_md5` is true.
+/// Realm is not considered; see [`proto_sip::select_challenge`] (POA&M-256).
+// NIST 800-53 Rev5: IA-5(1) (POA&M-234); IA-7 / SC-13 partial while MD5 may
+// be answered (POA&M-255).
+fn select_trunk_challenge(
+    response: &SipResponse,
+    allow_md5: bool,
+) -> Result<DigestChallenge, String> {
+    let status_code = response.status.code();
+    let name = if status_code == 401 {
+        HeaderName::WwwAuthenticate
+    } else {
+        HeaderName::ProxyAuthenticate
+    };
+    let mut values = response
+        .headers
+        .get_all(&name)
+        .map(|h| h.value.as_str())
+        .peekable();
+    if values.peek().is_none() {
+        return Err(format!("{status_code} with no challenge header"));
+    }
+    let selection = select_challenge_from_headers(name.as_str(), values, allow_md5)
+        .map_err(|e| format!("No usable digest challenge: {e}"))?;
+    if selection.dropped > 0 {
+        debug!(
+            dropped = selection.dropped,
+            "Digest challenges beyond cap ignored"
+        );
+    }
+    Ok(selection.challenge)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::fmt::Write as _;
+
+    fn response(raw: &str) -> SipResponse {
+        match SipMessage::parse(&Bytes::copy_from_slice(raw.as_bytes())) {
+            Ok(SipMessage::Response(r)) => r,
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    fn challenge_response(code: &str, header: &str, values: &[&str]) -> SipResponse {
+        let mut raw = format!(
+            "SIP/2.0 {code}\r\nVia: SIP/2.0/UDP 192.0.2.1;branch=z9hG4bKx\r\n\
+             From: <sip:u@example.invalid>;tag=a\r\nTo: <sip:u@example.invalid>;tag=b\r\n\
+             Call-ID: c1\r\nCSeq: 1 REGISTER\r\n"
+        );
+        for v in values {
+            let _ = write!(raw, "{header}: {v}\r\n");
+        }
+        raw.push_str("Content-Length: 0\r\n\r\n");
+        response(&raw)
+    }
+
+    const MD5: &str = r#"Digest realm="r", nonce="n1", algorithm=MD5"#;
+    const SHA256: &str = r#"Digest realm="r", nonce="n2", algorithm=SHA-256, qop="auth""#;
+
+    #[test]
+    fn selects_sha256_over_md5_from_401() {
+        let resp = challenge_response("401 Unauthorized", "WWW-Authenticate", &[MD5, SHA256]);
+        let ch = select_trunk_challenge(&resp, true).unwrap();
+        assert_eq!(ch.algorithm, proto_sip::DigestAlgorithm::Sha256);
+        let creds = create_credentials(
+            &AlgorithmHasher::for_algorithm(ch.algorithm),
+            &ch,
+            "u",
+            "p",
+            "REGISTER",
+            "sip:example.invalid",
+            Some("c"),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        assert!(creds.to_string().contains("algorithm=SHA-256"));
+    }
+
+    #[test]
+    fn proxy_authenticate_407_is_read() {
+        let resp = challenge_response(
+            "407 Proxy Authentication Required",
+            "Proxy-Authenticate",
+            &[SHA256],
+        );
+        let ch = select_trunk_challenge(&resp, false).unwrap();
+        assert_eq!(ch.nonce, "n2");
+    }
+
+    #[test]
+    fn md5_only_fails_closed_when_disallowed() {
+        let resp = challenge_response("401 Unauthorized", "WWW-Authenticate", &[MD5]);
+        assert!(select_trunk_challenge(&resp, true).is_ok());
+        let err = select_trunk_challenge(&resp, false).unwrap_err();
+        assert!(err.contains("MD5"), "{err}");
+    }
+
+    #[test]
+    fn missing_challenge_header_is_error() {
+        let resp = challenge_response("401 Unauthorized", "WWW-Authenticate", &[]);
+        assert!(select_trunk_challenge(&resp, true).is_err());
+    }
+
+    #[test]
+    fn md5_policy_builder() {
+        let r = TrunkRegistrar::new("example.invalid");
+        assert!(r.allow_md5_digest);
+        assert!(!r.with_allow_md5_digest(false).allow_md5_digest);
     }
 }
