@@ -1701,6 +1701,7 @@ mod tests {
             trunks: Vec::new(),
             zone: None,
             require_tls: true,
+            trust_domain: true,
         });
         let keys = Runtime::detect_restart_required(&old, &new);
         assert!(keys.contains(&"trunk_groups".to_string()), "{keys:?}");

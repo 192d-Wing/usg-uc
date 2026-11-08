@@ -11,9 +11,17 @@
 //!
 //! - **AU-2**: Event Logging - SIP events are logged
 //! - **IA-2**: Identification and Authentication - REGISTER handling
+//!   (RFC 7616 `DigestVerifier`, POA&M-236; partial: INVITE has no digest
+//!   challenge, POA&M-271)
+//! - **AC-4 / SC-7**: RFC 3261 §16.4 route preprocessing before routing
+//!   policy; sipfrag bodies scrubbed toward hidden legs (POA&M-251)
+//! - **AC-21 / SC-4**: RFC 3325 trust domain and RFC 3323 privacy service
+//! - **SC-5**: RFC 3261 §16.3 loop detection (482) and bounded audit
+//!   aggregation (POA&M-252)
 //! - **SC-8**: Transmission Confidentiality and Integrity
 
 use crate::flow::{Flow, LegFlow};
+use crate::signaling_audit::InDialogPolicy;
 use bytes::Bytes;
 use proto_b2bua::{
     B2buaMode, Call, CallConfig, CallId, MediaAddress, SdpRewriter, extract_media_address,
@@ -26,11 +34,16 @@ use proto_registrar::{
     RegisterRequest, RegistrarConfig, RegistrarMode,
 };
 use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id};
+use proto_sip::digest_verifier::{
+    DigestPolicy, DigestRequestView, DigestSecret, DigestVerdict, DigestVerifier, NonceIssuer,
+};
 use proto_sip::manipulation::{
     HeaderManipulator, ManipulationAction, ManipulationContext, ManipulationDirection,
     ManipulationPolicy, ManipulationRule,
 };
 use proto_sip::message::{SipRequest, SipResponse};
+use proto_sip::privacy::{PrivacyCapabilities, PrivacyError, PrivacyHeader};
+use proto_sip::routing::RoutePreprocess;
 use proto_sip::uri::SipUri;
 use proto_sip::{Header, HeaderName, Headers, Method, SipMessage, StatusCode};
 use proto_sip::{TopologyHider, TopologyHidingConfig as SipTopologyConfig, TopologyHidingMode};
@@ -168,6 +181,77 @@ pub struct SipStack {
     ///
     /// ## NIST 800-53 Rev5: AU-12 (Audit Record Generation)
     cdr: Option<Arc<crate::cdr::CdrContext>>,
+    /// Daemon-side RFC 7616 digest verifier for REGISTER (POA&M-236). `Some`
+    /// when `require_auth` is set; it then replaces the registrar's digest
+    /// check (the registrar runs with `require_auth = false`).
+    ///
+    /// POAM: POA&M-270 - not reachable from shipped configuration (no
+    /// `sbc-config` credential source); IA-2/IA-5(1) are not met in a
+    /// deployed SBC until it lands.
+    ///
+    /// ## NIST 800-53 Rev5: IA-2, IA-2(8), IA-5(1), IA-6, SC-23
+    digest: Option<DaemonDigest>,
+    /// Rate-limited audit of digest, in-dialog, route and loop rejections
+    /// (POA&M-236, POA&M-252).
+    ///
+    /// ## NIST 800-53 Rev5: AU-2, AU-4, AU-5, SC-5
+    signaling_audit: Arc<crate::signaling_audit::SignalingAudit>,
+    /// Trunk groups configured with `trust_domain = false` (RFC 3325 §5).
+    /// Groups not listed (including API-created ones) are trusted.
+    ///
+    /// ## NIST 800-53 Rev5: AC-21, SC-4, CM-6
+    untrusted_trunk_groups: RwLock<HashSet<String>>,
+}
+
+/// The daemon digest verifier and the decoy secret used for unknown users.
+///
+/// ## NIST 800-53 Rev5: IA-6 (Authentication Feedback)
+struct DaemonDigest {
+    /// Leaf lock, held only around `verify`/`challenge`, never across
+    /// `.await`.
+    verifier: std::sync::Mutex<DigestVerifier>,
+    /// Random per-process password verified for an unknown username, so
+    /// an unknown user costs the same and is audited as `bad_response`
+    /// (no user enumeration).
+    decoy: String,
+    /// Test hook: seconds added to the wall clock (nonce expiry tests).
+    #[cfg(test)]
+    clock_skew_secs: AtomicU64,
+}
+
+/// A 32-byte nonce issuer key with a redacted `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DigestNonceKey(pub [u8; 32]);
+
+impl std::fmt::Debug for DigestNonceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DigestNonceKey(<redacted>)")
+    }
+}
+
+/// Hosts and ports the SBC answers to (see `SipStack::own_addrs`).
+struct OwnAddrs {
+    /// Lower-case hosts (IPv6 without brackets).
+    hosts: Vec<String>,
+    /// Listener and advertised ports.
+    ports: Vec<u16>,
+}
+
+impl OwnAddrs {
+    /// `host[:port]` names this SBC. A missing port is the default port and
+    /// matches.
+    fn matches(&self, host: &str, port: Option<u16>) -> bool {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        self.hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+            && port.is_none_or(|p| self.ports.contains(&p))
+    }
+
+    /// A URI this SBC could have placed in Record-Route: own host/port and
+    /// no user part (RFC 3261 §16.4). A B2BUA records no route itself, so a
+    /// dialled `user@sbc` Request-URI is never treated as one.
+    fn is_own_uri(&self, uri: &SipUri) -> bool {
+        uri.user.is_none() && self.matches(&uri.host, uri.port)
+    }
 }
 
 /// Call-path routing counters (monotonic; exported as gauges).
@@ -222,6 +306,11 @@ pub struct SipStackConfig {
     /// Whether authentication is required for REGISTER.
     pub require_auth: bool,
     /// Static credentials: username → password (for standalone deployment).
+    ///
+    /// POAM: POA&M-270 - no `sbc-config` digest credential source (HA1 file
+    /// or secret reference, realm, algorithm, nonce TTL) and no `server.rs`
+    /// wiring; digest REGISTER auth is reachable only through this in-crate
+    /// config (tests, embedders).
     pub auth_credentials: HashMap<String, String>,
     /// Maximum concurrent calls — INVITEs beyond this are rejected with
     /// 503 (admission control, `general.max_calls`).
@@ -257,6 +346,23 @@ pub struct SipStackConfig {
     pub tls_port: u16,
     /// WebSocket listener port (`transport.ws_listen`, RFC 7118).
     pub ws_port: u16,
+    /// The only digest algorithm accepted when `require_auth` is set
+    /// (RFC 7616 §3.7: chosen by the server, never the client). SHA-256 by
+    /// default; SHA-512-256 is available.
+    ///
+    /// CNSA-EXCEPTION: RFC 7616 defines no SHA-384 digest; SIP digest runs
+    /// under the POA&M-110 exception, protected by CNSA TLS in deployment.
+    pub digest_algorithm: proto_sip::DigestAlgorithm,
+    /// Digest nonce lifetime in seconds (RFC 7616 §3.3 `stale=true` after).
+    pub digest_nonce_ttl_secs: u64,
+    /// Nonce issuer key. `None`: a random per-process key (nonces from
+    /// another node are `unknown_nonce` and re-challenged).
+    ///
+    /// POAM: POA&M-272 - a shared key needs cluster-shared nc state too.
+    pub digest_nonce_key: Option<DigestNonceKey>,
+    /// Signaling audit aggregation window in seconds
+    /// (`rate_limit.audit_interval_secs`).
+    pub signaling_audit_window_secs: u64,
 }
 
 impl Default for SipStackConfig {
@@ -279,6 +385,10 @@ impl Default for SipStackConfig {
             tcp_port: 5060,
             tls_port: 5061,
             ws_port: 5062,
+            digest_algorithm: proto_sip::DigestAlgorithm::Sha256,
+            digest_nonce_ttl_secs: 300,
+            digest_nonce_key: None,
+            signaling_audit_window_secs: 60,
         }
     }
 }
@@ -860,6 +970,9 @@ struct CallAddresses {
     /// STIR facts to redo the B-leg STIR step on failover (kept with
     /// `b_leg_invite`, which is stored before that step).
     stir_egress: Option<Arc<crate::stir::StirEgress>>,
+    /// The A-leg's RFC 3323 Privacy, re-applied on each failover attempt
+    /// after its STIR step (kept only when there are failover targets).
+    egress_privacy: Option<Arc<PrivacyHeader>>,
     /// A reliable (RSeq) 18x carrying SDP was relayed to the caller: the
     /// early media is committed to this trunk, so no more failover.
     early_media_committed: bool,
@@ -1606,13 +1719,17 @@ fn hide_wire(hider: &TopologyHider, element: &mut ProcessResult) -> Option<HideF
         SipMessage::Request(req) => hider
             .hide_b2bua_request(&mut req.headers)
             .map_err(|e| topology_policy(&e))
-            .and_then(|()| scrub_residual_topology(&mut req.headers, &mut req.body, origin_host)),
+            .and_then(|()| {
+                scrub_residual_topology(&mut req.headers, &mut req.body, origin_host, hider)
+            }),
         // RFC 3261 §8.1.3.4 / §21.3: 3xx Contacts are redirect targets; only
         // internal ones are rewritten.
         SipMessage::Response(resp) => hider
             .hide_b2bua_response_for_status(&mut resp.headers, resp.status.code())
             .map_err(|e| topology_policy(&e))
-            .and_then(|()| scrub_residual_topology(&mut resp.headers, &mut resp.body, origin_host)),
+            .and_then(|()| {
+                scrub_residual_topology(&mut resp.headers, &mut resp.body, origin_host, hider)
+            }),
     };
     let policy = res.err()?;
     // Never forward the unhidden message: take it out of the result.
@@ -1704,6 +1821,18 @@ fn hide_wire(hider: &TopologyHider, element: &mut ProcessResult) -> Option<HideF
 ///   origin of a re-offer must equal the previous one bar the version);
 ///   sess-id, sess-version and nettype are kept byte-exact.
 ///
+/// - A `message/sipfrag` body (RFC 3420; REFER progress NOTIFY, RFC 3515
+///   §2.4.5) is reduced to its start line by [`scrub_sipfrag`] (POA&M-251);
+///   a request line naming an internal host, a non-identity
+///   Content-Transfer-Encoding, a body over [`MAX_SIPFRAG_BYTES`] or a
+///   garbage start line fails closed with `sip.topology_hiding.failed:sipfrag`.
+///
+/// Other body types (text/plain MESSAGE, application/pidf+xml,
+/// application/dtmf-relay, application/vnd.*) are relayed as opaque payload.
+///
+/// POAM: POA&M-274 - non-SDP, non-sipfrag bodies are not scrubbed of
+/// internal hostnames.
+///
 /// Atomic: the body is computed and the Reason values built before
 /// anything is committed; nothing after that can fail. A malformed `o=`,
 /// SDP without a usable `c=`, or a multipart body that cannot be walked
@@ -1716,6 +1845,7 @@ fn scrub_residual_topology(
     headers: &mut Headers,
     body: &mut Option<Bytes>,
     origin_host: &str,
+    hider: &TopologyHider,
 ) -> Result<(), String> {
     let fail = |()| "sip.topology_hiding.failed:sdp-o".to_string();
     let mut new_body = None;
@@ -1726,9 +1856,10 @@ fn scrub_residual_topology(
         let is_multi = media
             .get(..10)
             .is_some_and(|p| p.eq_ignore_ascii_case("multipart/"));
+        let is_sipfrag = media.eq_ignore_ascii_case("message/sipfrag");
         // RFC-006: an encoded body hides its `o=` from the scrubber; fail
         // closed rather than pass it through.
-        if (is_multi || media.eq_ignore_ascii_case("application/sdp"))
+        if (is_multi || is_sipfrag || media.eq_ignore_ascii_case("application/sdp"))
             && !headers
                 .iter()
                 .filter(|h| {
@@ -1738,9 +1869,18 @@ fn scrub_residual_topology(
                 })
                 .all(|h| is_identity_cte(&h.value))
         {
-            return Err(fail(()));
+            return Err(if is_sipfrag {
+                "sip.topology_hiding.failed:sipfrag".to_string()
+            } else {
+                fail(())
+            });
         }
-        if media.eq_ignore_ascii_case("application/sdp") {
+        if is_sipfrag {
+            new_body = Some(
+                scrub_sipfrag(b, hider)
+                    .map_err(|()| "sip.topology_hiding.failed:sipfrag".to_string())?,
+            );
+        } else if media.eq_ignore_ascii_case("application/sdp") {
             new_body = scrub_sdp_origin(b, origin_host).map_err(fail)?;
         } else if is_multi {
             new_body = scrub_multipart_sdp(b, ct, origin_host).map_err(fail)?;
@@ -2195,6 +2335,191 @@ fn audit_route_blocked(req: &SipRequest, source: SbcSocketAddr, subject: String,
     ));
 }
 
+/// Builds the daemon digest verifier when `require_auth` is set.
+///
+/// `None` (logged) if the nonce key cannot be set up; the registrar then
+/// keeps enforcing auth itself, so REGISTER never runs unauthenticated.
+///
+/// POAM: POA&M-270 - `require_auth` with credentials is not reachable from
+/// shipped configuration (no `sbc-config` credential source).
+///
+/// ## NIST 800-53 Rev5: IA-2, IA-5(1), SC-12, SC-23; RFC 7616 §3.3, §3.7
+fn build_daemon_digest(config: &SipStackConfig) -> Option<DaemonDigest> {
+    if !config.require_auth {
+        return None;
+    }
+    let key = match config.digest_nonce_key.as_ref() {
+        Some(k) => k.0,
+        None => match uc_crypto::random::generate_random::<32>() {
+            Ok(k) => k,
+            Err(e) => {
+                error!(error = %e, "digest nonce key generation failed; registrar digest kept");
+                return None;
+            }
+        },
+    };
+    let issuer = match NonceIssuer::new(&key) {
+        Ok(i) => i,
+        Err(e) => {
+            error!(error = %e, "digest nonce issuer setup failed; registrar digest kept");
+            return None;
+        }
+    };
+    let decoy = match uc_crypto::random::generate_random::<32>() {
+        Ok(b) => b.iter().fold(String::with_capacity(64), |mut acc, x| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{x:02x}");
+            acc
+        }),
+        Err(e) => {
+            error!(error = %e, "digest decoy secret generation failed; registrar digest kept");
+            return None;
+        }
+    };
+    // SC-5: nc state is bounded; a full tracker answers `stale=true`.
+    let max_tracked = usize::try_from(config.max_registrations)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(2)
+        .max(1);
+    let policy = DigestPolicy::new(config.auth_realm.clone())
+        .with_algorithm(config.digest_algorithm)
+        .with_nonce_ttl(std::time::Duration::from_secs(
+            config.digest_nonce_ttl_secs.max(1),
+        ))
+        .with_max_tracked_nonces(max_tracked);
+    Some(DaemonDigest {
+        verifier: std::sync::Mutex::new(DigestVerifier::new(policy, issuer)),
+        decoy,
+        #[cfg(test)]
+        clock_skew_secs: AtomicU64::new(0),
+    })
+}
+
+/// User part of an AOR as the registrar binds it (`None` without `@`).
+/// RFC 3261 §10.3 step 4 / §19.1.4: case-sensitive.
+fn aor_user_strict(aor: &str) -> Option<&str> {
+    let without_scheme = aor
+        .strip_prefix("sips:")
+        .or_else(|| aor.strip_prefix("sip:"))
+        .unwrap_or(aor);
+    without_scheme.split_once('@').map(|(user, _)| user)
+}
+
+/// Separator between the random part and the loop hash in a B-leg INVITE
+/// branch (the `proxy.rs` `RequestForwarder` format).
+const LOOP_HASH_SEP: char = '.';
+
+/// RFC 3261 §16.6 step 8 branch carrying a loop hash:
+/// `z9hG4bK{rand:016x}.{hash:016x}` (the `proto_sip::proxy` format).
+fn loop_branch(hash: u64) -> String {
+    let mut rand = [0u8; 8];
+    if uc_crypto::random::fill_random(&mut rand).is_err() {
+        // CSPRNG failure: fall back to the builder's random branch with the
+        // hash appended, never a predictable branch.
+        return format!("{}{LOOP_HASH_SEP}{hash:016x}", generate_branch());
+    }
+    format!(
+        "z9hG4bK{:016x}{LOOP_HASH_SEP}{hash:016x}",
+        u64::from_be_bytes(rand)
+    )
+}
+
+/// Loop hash suffix of a branch in [`loop_branch`] format.
+fn branch_loop_hash(branch: &str) -> Option<u64> {
+    let rest = branch.strip_prefix("z9hG4bK")?;
+    let (_, suffix) = rest.rsplit_once(LOOP_HASH_SEP)?;
+    // Exactly 16 hex digits: `from_str_radix` alone would take a leading `+`.
+    if suffix.len() != 16 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(suffix, 16).ok()
+}
+
+/// Whether §16.4 preprocessing of a request whose Request-URI is not ours
+/// can do anything other than leave it unchanged: the top Route is ours (to
+/// pop), or the Route set is malformed / over the element cap (400). Mirrors
+/// the checks of `proto_sip::preprocess_route_information` without cloning
+/// the request, so a foreign preloaded Route costs no message copy.
+///
+/// ## NIST 800-53 Rev5: SC-5, SI-10
+fn top_route_may_change(req: &SipRequest, own: &OwnAddrs) -> bool {
+    let mut total = 0usize;
+    let mut top: Option<&str> = None;
+    for h in req.headers.get_all(&HeaderName::Route) {
+        let Ok(elements) = proto_sip::split_list_bounded(&h.value, proto_sip::MAX_LIST_ELEMENTS)
+        else {
+            return true;
+        };
+        total = total.saturating_add(elements.len());
+        if total > proto_sip::MAX_LIST_ELEMENTS {
+            return true;
+        }
+        if top.is_none() {
+            top = elements.first().copied();
+        }
+    }
+    match top.map(str::parse::<proto_sip::RouteEntry>) {
+        Some(Ok(entry)) => own.is_own_uri(entry.uri()),
+        Some(Err(_)) => true,
+        None => false,
+    }
+}
+
+/// Largest `message/sipfrag` body relayed toward a hidden leg.
+///
+/// ## NIST 800-53 Rev5: SC-5, SI-10
+const MAX_SIPFRAG_BYTES: usize = 8 * 1024;
+
+/// Reduces a `message/sipfrag` body (RFC 3420) to its start line before it
+/// reaches a hidden leg (POA&M-251). REFER progress NOTIFYs (RFC 3515
+/// §2.4.5) need only the status line, and RFC 3420 lets the sender send any
+/// subset, so every fragment header (Via, Contact, Record-Route, ...) is
+/// dropped. A status line is kept verbatim; a request line is kept only
+/// when its Request-URI host is not internal. Anything else fails closed.
+///
+/// ## NIST 800-53 Rev5: SC-7, SI-10, SI-17
+fn scrub_sipfrag(body: &[u8], hider: &TopologyHider) -> Result<Bytes, ()> {
+    if body.len() > MAX_SIPFRAG_BYTES {
+        return Err(());
+    }
+    let text = std::str::from_utf8(body).map_err(|_| ())?;
+    let line = text
+        .split('\n')
+        .next()
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .ok_or(())?;
+    if line.is_empty() || line.chars().any(char::is_control) {
+        return Err(());
+    }
+    if let Some(rest) = line.strip_prefix("SIP/2.0 ") {
+        // RFC 3261 §7.2/§25.1: Status-Code is three digits, then SP
+        // Reason-Phrase (which may be empty, but the SP is required).
+        let code = rest.get(..3).ok_or(())?;
+        if !code.bytes().all(|b| b.is_ascii_digit()) || rest.as_bytes().get(3) != Some(&b' ') {
+            return Err(());
+        }
+    } else {
+        // Request-Line: Method SP Request-URI SP SIP-Version.
+        let mut parts = line.split(' ');
+        let (Some(method), Some(uri), Some("SIP/2.0"), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(());
+        };
+        if method.is_empty() || !is_sip_token(method) {
+            return Err(());
+        }
+        let uri: SipUri = uri.parse().map_err(|_| ())?;
+        if hider.config().should_hide(&uri.host) {
+            return Err(());
+        }
+    }
+    let mut out = String::with_capacity(line.len() + 2);
+    out.push_str(line);
+    out.push_str("\r\n");
+    Ok(Bytes::from(out))
+}
+
 /// `AuthenticationAttempt` for a REGISTER outcome.
 fn audit_register_auth(
     aor: &str,
@@ -2368,12 +2693,19 @@ impl SipStack {
     pub fn new(config: SipStackConfig) -> Self {
         let location_service = Arc::new(RwLock::new(LocationService::new()));
 
+        let digest = build_daemon_digest(&config);
         let registrar_config = RegistrarConfig {
             mode: config.registrar_mode,
             realm: config.auth_realm.clone(),
-            require_auth: config.require_auth,
+            // Q5: the daemon verifier replaces the registrar's digest check;
+            // without it (key setup failed) the registrar still enforces
+            // auth (fail closed).
+            require_auth: config.require_auth && digest.is_none(),
             ..RegistrarConfig::default()
         };
+        let signaling_audit = Arc::new(crate::signaling_audit::SignalingAudit::new(
+            std::time::Duration::from_secs(config.signaling_audit_window_secs.max(1)),
+        ));
 
         // Build authenticated registrar with password lookup from config
         let credentials = config.auth_credentials.clone();
@@ -2426,6 +2758,9 @@ impl SipStack {
             released_invites: std::sync::Mutex::new(ReleasedCalls::default()),
             vps: None,
             stir: None,
+            digest,
+            signaling_audit,
+            untrusted_trunk_groups: RwLock::new(HashSet::new()),
         }
     }
 
@@ -2437,12 +2772,19 @@ impl SipStack {
     ) -> Self {
         let location_service = Arc::new(RwLock::new(LocationService::new()));
 
+        let digest = build_daemon_digest(&config);
         let registrar_config = RegistrarConfig {
             mode: config.registrar_mode,
             realm: config.auth_realm.clone(),
-            require_auth: config.require_auth,
+            // Q5: the daemon verifier replaces the registrar's digest check;
+            // without it (key setup failed) the registrar still enforces
+            // auth (fail closed).
+            require_auth: config.require_auth && digest.is_none(),
             ..RegistrarConfig::default()
         };
+        let signaling_audit = Arc::new(crate::signaling_audit::SignalingAudit::new(
+            std::time::Duration::from_secs(config.signaling_audit_window_secs.max(1)),
+        ));
 
         let credentials = config.auth_credentials.clone();
         let registrar = AuthenticatedRegistrar::new(registrar_config)
@@ -2495,6 +2837,9 @@ impl SipStack {
             released_invites: std::sync::Mutex::new(ReleasedCalls::default()),
             vps: None,
             stir: None,
+            digest,
+            signaling_audit,
+            untrusted_trunk_groups: RwLock::new(HashSet::new()),
         }
     }
 
@@ -3982,7 +4327,7 @@ impl SipStack {
     async fn match_dialog(
         &self,
         req: &SipRequest,
-    ) -> Result<(CallId, bool, CallAddresses), StatusCode> {
+    ) -> Result<(CallId, bool, CallAddresses), (StatusCode, InDialogPolicy)> {
         let method = &req.method;
         let sip_call_id = req.headers.call_id().unwrap_or("");
         let (internal_id, from_a_leg, addrs) = {
@@ -3996,7 +4341,10 @@ impl SipStack {
                 found.and_then(|(id, a)| corr.addresses.get(&id).map(|ad| (id, a, ad.clone())))
             else {
                 debug!(method = %method, call_id = %sip_call_id, "In-dialog request for unknown dialog, 481");
-                return Err(StatusCode::CALL_DOES_NOT_EXIST);
+                return Err((
+                    StatusCode::CALL_DOES_NOT_EXIST,
+                    InDialogPolicy::UnknownDialog,
+                ));
             };
             found
         };
@@ -4010,7 +4358,10 @@ impl SipStack {
             || req.headers.from_tag() != remote_tag
         {
             warn!(method = %method, call_id = %sip_call_id, "In-dialog request does not match the dialog's tags, 481");
-            return Err(StatusCode::CALL_DOES_NOT_EXIST);
+            return Err((
+                StatusCode::CALL_DOES_NOT_EXIST,
+                InDialogPolicy::FromTagMismatch,
+            ));
         }
         Ok((internal_id, from_a_leg, addrs))
     }
@@ -4038,9 +4389,14 @@ impl SipStack {
         // 1. Match the dialog: Call-ID on either leg, and the request's From
         //    tag must be that leg's remote tag (a forged request with a
         //    guessed Call-ID gets 481, not a relayed session change).
+        //    RFC 3261 §12.2.2; audited, rate limited (POA&M-252, AU-2).
         let (internal_id, from_a_leg, addrs) = match self.match_dialog(req).await {
             Ok(found) => found,
-            Err(status) => return respond(status),
+            Err((status, policy)) => {
+                self.signaling_audit
+                    .in_dialog_reject(req, source, policy, Instant::now());
+                return respond(status);
+            }
         };
 
         // 2. Glare (§14.2): a second session change while one is in flight.
@@ -4152,6 +4508,14 @@ impl SipStack {
             Some(offer.as_bytes()),
         );
         relay_session_timer_request_headers(&req.headers, &mut fwd.headers);
+        // POA&M-250: header manipulation toward the callee, as on the initial
+        // INVITE; fail closed before anything is reserved (POA&M-152).
+        if from_a_leg
+            && let Err(status) =
+                self.apply_in_dialog_manipulation(&mut fwd, req, source, &method, false)
+        {
+            return respond(status);
+        }
         let fwd_branch = fwd.headers.via_branch().unwrap_or_default();
 
         // 6. Remember what is in flight. The CSeq is reserved on the live
@@ -4229,9 +4593,13 @@ impl SipStack {
     /// egress topology hiding applies at the chokepoint. The far leg's
     /// response is relayed back by [`Self::handle_relay_response`].
     ///
-    /// POAM: POA&M-251 - MESSAGE/INFO/NOTIFY bodies other than SDP are
-    /// relayed as opaque payload; free-text bodies are not scrubbed of
-    /// internal hostnames.
+    /// Bodies toward a topology-hidden leg are scrubbed at the egress
+    /// chokepoint (`scrub_residual_topology`): SDP `o=` and `message/sipfrag`
+    /// (reduced to its start line, POA&M-251).
+    ///
+    /// POAM: POA&M-274 - other MESSAGE/INFO/NOTIFY bodies (text/plain,
+    /// application/pidf+xml, dtmf-relay, vnd.*) are relayed as opaque
+    /// payload and not scrubbed of internal hostnames.
     ///
     /// ## NIST 800-53 Rev5: SC-7, AC-4, SC-5, SI-10, SC-23
     async fn relay_in_dialog_non_session(
@@ -4247,13 +4615,19 @@ impl SipStack {
             flow: Flow::Reply,
         };
 
-        // RFC 3261 §12.2.2: no matching dialog (or a forged From tag) → 481.
-        //
-        // POAM: POA&M-252 - the unknown-dialog/forged-tag 481 is logged, not
-        // audited (NIST 800-53 AU-2, SI-4).
+        // RFC 3261 §12.2.2: no matching dialog (or a forged From tag) → 481,
+        // audited and rate limited per source (POA&M-252; NIST 800-53 Rev5:
+        // AU-2, SI-4).
+        let audit_reject = |policy: InDialogPolicy| {
+            self.signaling_audit
+                .in_dialog_reject(req, source, policy, Instant::now());
+        };
         let (internal_id, from_a_leg, addrs) = match self.match_dialog(req).await {
             Ok(found) => found,
-            Err(status) => return respond(status),
+            Err((status, policy)) => {
+                audit_reject(policy);
+                return respond(status);
+            }
         };
 
         // Method-specific headers that cross the B2BUA, validated (SI-10).
@@ -4287,6 +4661,7 @@ impl SipStack {
             if !from_a_leg {
                 // The SBC never relays reliable 1xx toward the callee.
                 debug!(call_id = %sip_call_id, "PRACK from the callee leg, 481");
+                audit_reject(InDialogPolicy::PrackFromCallee);
                 return respond(StatusCode::CALL_DOES_NOT_EXIST);
             }
             let Some((acked_rseq, invite_cseq, rack_method)) =
@@ -4310,15 +4685,15 @@ impl SipStack {
                 rack_method.eq_ignore_ascii_case("INVITE")
                     && invite_cseq == cseq_number(&addrs.a_leg_cseq)
             }) else {
-                // POAM: POA&M-252 - RAck/early-dialog mismatch 481 is logged,
-                // not audited (NIST 800-53 AU-2).
+                // RFC 3262 §7.2: audited (POA&M-252, NIST 800-53 Rev5: AU-2).
                 warn!(call_id = %sip_call_id, "PRACK matches no relayed reliable response, 481");
+                audit_reject(InDialogPolicy::RackMismatch);
                 return respond(StatusCode::CALL_DOES_NOT_EXIST);
             };
             if acked_rseq > last {
-                // POAM: POA&M-252 - RAck/early-dialog mismatch 481 is logged,
-                // not audited (NIST 800-53 AU-2).
+                // RFC 3262 §7.2: audited (POA&M-252, NIST 800-53 Rev5: AU-2).
                 warn!(call_id = %sip_call_id, "PRACK matches no relayed reliable response, 481");
+                audit_reject(InDialogPolicy::RackMismatch);
                 return respond(StatusCode::CALL_DOES_NOT_EXIST);
             }
             Some((
@@ -4330,12 +4705,11 @@ impl SipStack {
             None
         };
 
-        // SC-5: bounded per-call relay state.
-        //
-        // POAM: POA&M-252 - the over-cap 503 is logged, not audited
-        // (NIST 800-53 AU-2, SI-4).
+        // SC-5: bounded per-call relay state; the 503 is audited, rate
+        // limited (POA&M-252, NIST 800-53 Rev5: AU-2, SI-4).
         if addrs.pending_relays.len() >= MAX_PENDING_RELAYS {
             warn!(method = %method, call_id = %sip_call_id, "Too many in-dialog requests in flight, 503");
+            audit_reject(InDialogPolicy::PendingRelayCap);
             let mut r = create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
             r.headers.set(HeaderName::RetryAfter, "1");
             return ProcessResult::Response {
@@ -4426,29 +4800,15 @@ impl SipStack {
             fwd.body = Some(b);
         }
 
-        // Header manipulation toward the callee, as on the initial INVITE;
-        // fail closed (POA&M-152): a rule that did not run must not let
-        // the unmanipulated request through.
-        //
-        // POAM: POA&M-250 - relayed re-INVITE/UPDATE/BYE still skip header
-        // manipulation.
-        if from_a_leg && let Some(ref manipulator) = self.header_manipulator {
-            let method_name = method.to_string();
-            let context =
-                ManipulationContext::for_request(&method_name, ManipulationDirection::Outbound);
-            if let Err(e) = manipulator.apply(&mut fwd.headers, &context) {
-                warn!(error = %e, method = %method, "Header manipulation failed; rejecting in-dialog request");
-                self.routing_counters
-                    .header_manipulation_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                let (status, policy) = manipulation_failure(&e);
-                let mut event = invite_denied_event(req, source, &policy);
-                if let uc_audit::AuditEvent::AuthorizationDecision(ref mut d) = event {
-                    d.action = method_name;
-                }
-                audit(event);
-                return respond(status);
-            }
+        // Header manipulation toward the callee, as on the initial INVITE
+        // and relayed re-INVITE/UPDATE/BYE (POA&M-250); fail closed
+        // (POA&M-152): a rule that did not run must not let the
+        // unmanipulated request through.
+        if from_a_leg
+            && let Err(status) =
+                self.apply_in_dialog_manipulation(&mut fwd, req, source, &method, false)
+        {
+            return respond(status);
         }
         let fwd_branch = fwd.headers.via_branch().unwrap_or_default();
 
@@ -4458,9 +4818,10 @@ impl SipStack {
             let Some(a) = corr.addresses.get_mut(&internal_id) else {
                 return respond(StatusCode::CALL_DOES_NOT_EXIST);
             };
-            // POAM: POA&M-252 - the over-cap 503 is not audited (AU-2).
+            // Audited, rate limited (POA&M-252, AU-2).
             if a.pending_relays.len() >= MAX_PENDING_RELAYS {
                 drop(corr);
+                audit_reject(InDialogPolicy::PendingRelayCapRace);
                 let mut r = create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
                 r.headers.set(HeaderName::RetryAfter, "1");
                 return ProcessResult::Response {
@@ -5361,7 +5722,6 @@ impl SipStack {
         // client transaction and B-leg dialog: fresh Call-ID, branch, From tag.
         let mut request = SipRequest::clone(template);
         let new_call_id = generate_call_id(&self.config.domain);
-        let new_branch = generate_branch();
         request.headers.set(HeaderName::CallId, &new_call_id);
         request.headers.set(HeaderName::CSeq, "1 INVITE");
         // The wire format follows the *next* trunk, not the template's:
@@ -5378,10 +5738,6 @@ impl SipStack {
             endpoint.port,
             &new_flow,
         );
-        if let Some(via) = request.headers.get_value(&HeaderName::Via) {
-            let via = retarget_via(via, &new_flow, sent_by_port, &new_branch);
-            request.headers.set(HeaderName::Via, via);
-        }
         if let Some(contact) = request.headers.get_value(&HeaderName::Contact) {
             let contact = retarget_contact(contact, &new_flow, sent_by_port);
             request.headers.set(HeaderName::Contact, contact);
@@ -5393,6 +5749,13 @@ impl SipStack {
             .map(|f| replace_header_param(f, "tag", &generate_tag()))
             .unwrap_or_default();
         request.headers.set(HeaderName::From, &new_from);
+        // RFC 3261 §16.6 step 8: this attempt's own loop hash (its Call-ID,
+        // From tag and Request-URI are new), as on the first attempt.
+        let new_branch = loop_branch(proto_sip::compute_loop_hash(&request));
+        if let Some(via) = request.headers.get_value(&HeaderName::Via) {
+            let via = retarget_via(via, &new_flow, sent_by_port, &new_branch);
+            request.headers.set(HeaderName::Via, via);
+        }
         let new_to = request
             .headers
             .get_value(&HeaderName::To)
@@ -5407,6 +5770,29 @@ impl SipStack {
             }
             _ => None,
         };
+        // RFC 3323: privacy is re-applied after this attempt's STIR step,
+        // with this trunk's trust-domain membership.
+        if let Some(ref privacy) = addrs.egress_privacy {
+            let trusted = self.trunk_group_trusted(&lease.group_id).await;
+            let hidden = self.topology_hider.is_some();
+            if Self::apply_egress_privacy(
+                &mut request,
+                privacy,
+                addrs.media_a_leg_port.is_some(),
+                hidden,
+                trusted,
+            )
+            .is_err()
+            {
+                warn!(call_id = %addrs.a_leg_sip_call_id, trunk = %lease.trunk_id, "failover target cannot satisfy critical privacy; not failing over");
+                router_lock.write().await.release_trunk(
+                    &lease.group_id,
+                    &lease.trunk_id,
+                    TrunkOutcome::Abandoned,
+                );
+                return None;
+            }
+        }
 
         // Swap the lease in place only if the call is still on the attempt
         // that failed; otherwise (torn down, or another failover won) give
@@ -5555,6 +5941,463 @@ impl SipStack {
                 .await;
         }
         out
+    }
+
+    /// The rate-limited signaling audit (flush task, metrics).
+    pub fn signaling_audit(&self) -> &Arc<crate::signaling_audit::SignalingAudit> {
+        &self.signaling_audit
+    }
+
+    /// Records the RFC 3325 trust-domain membership of a trunk group
+    /// (`trunk_groups[].trust_domain`). Groups never set are trusted.
+    ///
+    /// ## NIST 800-53 Rev5: AC-21, CM-6
+    pub async fn set_trunk_group_trust_domain(&self, group_id: &str, trusted: bool) {
+        let mut set = self.untrusted_trunk_groups.write().await;
+        if trusted {
+            set.remove(group_id);
+        } else {
+            set.insert(group_id.to_string());
+        }
+    }
+
+    /// Whether trunk group `group_id` is inside the RFC 3325 trust domain.
+    async fn trunk_group_trusted(&self, group_id: &str) -> bool {
+        !self.untrusted_trunk_groups.read().await.contains(group_id)
+    }
+
+    /// Whether a request from `ip` comes from inside the trust domain: only
+    /// a configured trunk of a `trust_domain = true` group. Registered
+    /// endpoints never are (RFC 3325 §5).
+    async fn ingress_trusted(&self, ip: std::net::IpAddr) -> bool {
+        match self.lookup_inbound_trunk(ip.to_canonical()).await {
+            Some((group, _)) => self.trunk_group_trusted(&group).await,
+            None => false,
+        }
+    }
+
+    /// Snapshot of the hosts and ports the SBC answers to: `general`
+    /// domain/instance name, every zone signaling/external IP, the topology
+    /// hider's `external_host`, and every listener port.
+    async fn own_addrs(&self) -> OwnAddrs {
+        let mut hosts = vec![
+            self.config.domain.to_ascii_lowercase(),
+            self.config.instance_name.to_ascii_lowercase(),
+        ];
+        let mut ports: Vec<u16> = [
+            self.config.udp_port,
+            self.config.tcp_port,
+            self.config.tls_port,
+            self.config.ws_port,
+        ]
+        .into_iter()
+        .filter(|p| *p != 0)
+        .collect();
+        if let Some(ref zr) = self.zone_registry {
+            for zone in zr.zone_names() {
+                for ip in [zr.signaling_ip(&zone), zr.external_ip(&zone)]
+                    .into_iter()
+                    .flatten()
+                {
+                    hosts.push(ip.to_string());
+                }
+            }
+        }
+        if let Some(ref hider) = self.topology_hider {
+            let h = hider.read().await;
+            let c = h.config();
+            if !c.external_host.is_empty() {
+                hosts.push(c.external_host.to_ascii_lowercase());
+            }
+            ports.extend(c.external_port);
+            ports.push(c.external_tls_port);
+        }
+        OwnAddrs { hosts, ports }
+    }
+
+    /// RFC 3261 §16.3 item 4 / §16.6 step 8: the request carries one of
+    /// this SBC's Vias whose branch loop hash equals the request's own loop
+    /// hash, i.e. it came back unchanged (a loop, not a spiral). An own Via
+    /// without a hash suffix is not a loop (Q3: the SBC's in-dialog and
+    /// CANCEL branches carry none). Allocation-free unless a branch carries
+    /// the matching hash.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    async fn own_via_loop(&self, req: &SipRequest, loop_hash: u64) -> bool {
+        let mut candidates = Vec::new();
+        for h in req.headers.get_all(&HeaderName::Via) {
+            // Via has no quoted commas in practice; a mis-split can only
+            // miss a loop (Max-Forwards 483 still bounds it). No allocation.
+            for el in h.value.split(',').take(proto_sip::MAX_LIST_ELEMENTS) {
+                if extract_param(el, "branch").and_then(branch_loop_hash) == Some(loop_hash) {
+                    candidates.push(el.to_string());
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return false;
+        }
+        let own = self.own_addrs().await;
+        candidates.iter().any(|el| {
+            // `SIP/2.0/UDP host[:port];params`
+            let sent_by = el
+                .split(';')
+                .next()
+                .and_then(|v| v.split_whitespace().nth(1))
+                .unwrap_or_default();
+            let (host, port) = split_sent_by(sent_by);
+            own.matches(host, port)
+        })
+    }
+
+    /// RFC 3261 §16.4 route preprocessing, loop detection (§16.3 item 4),
+    /// RFC 3325 §5 inbound identity sanitizing and the RFC 3323 Privacy parse
+    /// for an initial INVITE, before any routing policy runs.
+    ///
+    /// Returns the request routing must use: `None` when nothing changed
+    /// (no copy), or the rewritten copy. `Err` is the response to send.
+    ///
+    /// ## NIST 800-53 Rev5: AC-4, SC-7, SC-5, SI-10, AC-21
+    async fn preprocess_initial_invite(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+    ) -> Result<(Option<SipRequest>, Option<PrivacyHeader>), Box<ProcessResult>> {
+        let reject = |status: StatusCode, policy: &'static str| {
+            self.signaling_audit
+                .signaling_reject(req, source, policy, Instant::now());
+            let resp = if status == StatusCode::LOOP_DETECTED {
+                proto_sip::create_loop_detected_response(req)
+            } else {
+                create_response_from_request(req, status)
+            };
+            Box::new(ProcessResult::Response {
+                message: SipMessage::Response(resp),
+                destination: source,
+                flow: Flow::Reply,
+            })
+        };
+
+        // §16.6 step 8: the hash is over the request as received.
+        let loop_hash = proto_sip::compute_loop_hash(req);
+        if self.own_via_loop(req, loop_hash).await {
+            warn!(
+                call_id = req.headers.call_id().unwrap_or_default(),
+                "INVITE loop detected (own Via with matching loop hash), 482"
+            );
+            return Err(reject(StatusCode::LOOP_DETECTED, "loop-detected"));
+        }
+
+        // RFC 3323 §4.2: a malformed Privacy header is a 400.
+        let privacy = match PrivacyHeader::from_headers(&req.headers) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(error = %e, "Malformed Privacy header, 400");
+                return Err(reject(StatusCode::BAD_REQUEST, "privacy:malformed"));
+            }
+        };
+
+        let mut routed: Option<SipRequest> = None;
+
+        // §16.4: only a Route header or a user-less own Request-URI can
+        // change anything; endpoint INVITEs take the no-copy path.
+        let has_route = req.headers.contains(&HeaderName::Route);
+        let own = if has_route || req.uri.user.is_none() {
+            Some(self.own_addrs().await)
+        } else {
+            None
+        };
+        if let Some(own) = own
+            && (own.is_own_uri(&req.uri) || (has_route && top_route_may_change(req, &own)))
+        {
+            let mut copy = req.clone();
+            match proto_sip::preprocess_route_information(&mut copy, &|u| own.is_own_uri(u)) {
+                Ok(RoutePreprocess::NoRouteForOwnUri) => {
+                    debug!("Request-URI is ours with no Route to restore, 404");
+                    return Err(reject(
+                        StatusCode::NOT_FOUND,
+                        "route-preprocess:no-route-for-own-uri",
+                    ));
+                }
+                Ok(RoutePreprocess::Done {
+                    restored_from_strict_route,
+                    popped_own_route,
+                }) => {
+                    if restored_from_strict_route || popped_own_route {
+                        debug!(
+                            restored_from_strict_route,
+                            popped_own_route,
+                            uri = %copy.uri,
+                            "RFC 3261 §16.4 route preprocessing applied"
+                        );
+                        routed = Some(copy);
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "Malformed Route set, 400");
+                    return Err(reject(
+                        StatusCode::BAD_REQUEST,
+                        "route-preprocess:malformed",
+                    ));
+                }
+            }
+        }
+
+        // RFC 3325 §5: asserted identity from outside the trust domain is
+        // removed before anything reads it. Copy only when there is some.
+        let current = routed.as_ref().unwrap_or(req);
+        if (current.headers.contains(&HeaderName::PAssertedIdentity)
+            || current.headers.contains(&HeaderName::PPreferredIdentity))
+            && !self.ingress_trusted(source.ip()).await
+        {
+            let mut copy = routed.take().unwrap_or_else(|| req.clone());
+            let removed = proto_sip::sanitize_inbound_identity(&mut copy.headers, false);
+            debug!(removed, source = %source, "Stripped untrusted P-Asserted/P-Preferred-Identity (RFC 3325 §5)");
+            routed = Some(copy);
+        }
+        Ok((routed, privacy))
+    }
+
+    /// RFC 3323 privacy service on an outgoing B-leg INVITE, after STIR.
+    /// `Err` only for `critical` that cannot be satisfied (RFC 3323 §5.1:
+    /// the caller answers 500).
+    ///
+    /// ## NIST 800-53 Rev5: AC-21, SC-4; RFC 3323 §4, §5.1; RFC 3325 §7
+    fn apply_egress_privacy(
+        b_leg: &mut SipRequest,
+        privacy: &PrivacyHeader,
+        media_anchored: bool,
+        hidden: bool,
+        egress_trusted: bool,
+    ) -> Result<(), ()> {
+        if !b_leg.headers.contains(&HeaderName::Privacy) {
+            b_leg.headers.set(HeaderName::Privacy, privacy.to_string());
+        }
+        let caps = PrivacyCapabilities {
+            session: media_anchored,
+        };
+        let outcome = match proto_sip::apply_privacy(b_leg, privacy, caps, egress_trusted) {
+            Ok(o) => o,
+            Err(PrivacyError::CannotSatisfy { unsatisfied }) => {
+                warn!(?unsatisfied, "critical privacy cannot be satisfied, 500");
+                return Err(());
+            }
+            Err(e) => {
+                // From is SBC-built; a failure here is unexpected. Critical
+                // requests fail closed, others continue without privacy.
+                warn!(error = %e, "privacy service failed");
+                return if privacy.is_critical() {
+                    Err(())
+                } else {
+                    Ok(())
+                };
+            }
+        };
+        if outcome.needs_topology_hiding && !hidden {
+            // RFC 3323 §5.1 `header`: Via/Contact are hidden only by the
+            // topology hider on this leg.
+            if privacy.is_critical() {
+                warn!("critical header privacy without topology hiding on the B-leg, 500");
+                return Err(());
+            }
+            warn!("header privacy requested but the B-leg is not topology-hidden");
+        }
+        if !outcome.unsatisfied.is_empty() {
+            debug!(unsatisfied = ?outcome.unsatisfied, "privacy values not satisfied (not critical)");
+        }
+        // Q2: privacy wins over a signature toward an untrusted peer.
+        if outcome.from_anonymized
+            && !egress_trusted
+            && b_leg.headers.contains(&HeaderName::Identity)
+        {
+            b_leg.headers.remove(&HeaderName::Identity);
+            warn!("Identity removed: From anonymized toward an untrusted trunk (privacy wins)");
+            audit(uc_audit::AuditEvent::AuthorizationDecision(
+                uc_audit::event::AuthorizationDecision {
+                    identity: "sbc".to_string(),
+                    resource: b_leg.uri.to_string(),
+                    action: "INVITE".to_string(),
+                    granted: true,
+                    policy: "privacy:identity-dropped".to_string(),
+                    source_ip: None,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Header manipulation toward the far leg on a relayed in-dialog request
+    /// (POA&M-250), only for requests from the A-leg. Fail closed
+    /// (POA&M-152) for every method except BYE: on a rule failure the
+    /// failure is counted and audited and the mapped status is returned.
+    ///
+    /// BYE is a deliberate, documented AC-4 exception (fail open, Q4): with
+    /// `bye_forwarded` the caller still forwards the SBC-built BYE with its
+    /// original, unmanipulated headers, because the call is already torn
+    /// down locally and refusing the BYE would strand the far leg. That BYE
+    /// carries nothing from the A-leg, so no A-leg header bypasses the
+    /// policy. The exception is counted and audited (rate limited) under
+    /// `sip.header_manipulation.failed;bye-forwarded-unmanipulated` (the
+    /// rule id is in the log).
+    ///
+    /// ## NIST 800-53 Rev5: AC-4 (exception: BYE fail-open), AU-12, SI-11
+    fn apply_in_dialog_manipulation(
+        &self,
+        fwd: &mut SipRequest,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+        method: &Method,
+        bye_forwarded: bool,
+    ) -> Result<(), StatusCode> {
+        let Some(ref manipulator) = self.header_manipulator else {
+            return Ok(());
+        };
+        let method_name = method.to_string();
+        let context =
+            ManipulationContext::for_request(&method_name, ManipulationDirection::Outbound);
+        match manipulator.apply(&mut fwd.headers, &context) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                warn!(error = %e, method = %method, "Header manipulation failed on in-dialog request");
+                self.routing_counters
+                    .header_manipulation_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                let (status, policy) = manipulation_failure(&e);
+                if bye_forwarded {
+                    warn!(%policy, "BYE forwarded with its original headers (Q4)");
+                    self.signaling_audit.signaling_reject(
+                        req,
+                        source,
+                        "sip.header_manipulation.failed;bye-forwarded-unmanipulated",
+                        Instant::now(),
+                    );
+                    return Err(status);
+                }
+                let mut event = invite_denied_event(req, source, &policy);
+                if let uc_audit::AuditEvent::AuthorizationDecision(ref mut d) = event {
+                    d.action = method_name;
+                }
+                audit(event);
+                Err(status)
+            }
+        }
+    }
+
+    /// RFC 7616 digest verification of a REGISTER by the daemon verifier
+    /// (POA&M-236). `Ok(true)` when authenticated, `Ok(false)` when the
+    /// verifier is off. `Err` is the response to send: a 401 (fresh
+    /// challenge; `stale=true` for a stale nonce), or a 403 without a
+    /// challenge when a valid digest user does not own the AOR (RFC 3261
+    /// §10.3 step 3). Every non-ok outcome except a missing Authorization
+    /// (the first challenge) is audited, rate limited.
+    ///
+    /// POAM: POA&M-270 - the IA-2/IA-5(1) controls below are not reachable
+    /// from shipped configuration: `sbc-config` has no digest credential
+    /// source, so `auth_credentials` is only populated programmatically.
+    ///
+    /// POAM: POA&M-273 - RFC 7616 §3.4.4 `userhash` is not supported; such
+    /// credentials are rejected (audited as `digest:malformed`/`bad_response`).
+    ///
+    /// ## NIST 800-53 Rev5: IA-2, IA-2(8), IA-5(1), IA-6, AU-2;
+    /// RFC 7616 §3.3, §3.4.5, §3.7; RFC 3261 §22.2, §22.4
+    fn verify_register_digest(
+        &self,
+        req: &SipRequest,
+        aor: &str,
+        source: SbcSocketAddr,
+    ) -> Result<bool, Box<SipResponse>> {
+        use crate::signaling_audit::DigestOutcome;
+        let Some(ref digest) = self.digest else {
+            return Ok(false);
+        };
+        #[cfg(test)]
+        let now = std::time::SystemTime::now()
+            + std::time::Duration::from_secs(digest.clock_skew_secs.load(Ordering::Relaxed));
+        #[cfg(not(test))]
+        let now = std::time::SystemTime::now();
+
+        let challenge = |stale: bool| -> Box<SipResponse> {
+            let mut resp = create_response_from_request(req, StatusCode::UNAUTHORIZED);
+            let issued = lock_leaf(&digest.verifier).challenge(now, stale);
+            match issued {
+                Ok(c) => {
+                    resp.add_header(Header::new(HeaderName::WwwAuthenticate, c.to_string()));
+                }
+                Err(e) => {
+                    error!(error = %e, "digest challenge could not be issued");
+                    resp = create_response_from_request(req, StatusCode::SERVER_INTERNAL_ERROR);
+                }
+            }
+            Box::new(resp)
+        };
+
+        // RFC 3261 §22.1: no credentials → challenge (not audited, as before).
+        let Some(auth) = req.headers.get_value(&HeaderName::Authorization) else {
+            return Err(challenge(false));
+        };
+        let reject = |outcome: DigestOutcome| -> Box<SipResponse> {
+            self.signaling_audit
+                .digest(aor, source, outcome, Instant::now());
+            challenge(outcome == DigestOutcome::Stale)
+        };
+        let scheme_ok = auth
+            .trim_start()
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("digest "));
+        let creds = match auth.parse::<proto_sip::DigestCredentials>() {
+            Ok(c) if scheme_ok => c,
+            _ => {
+                return Err(reject(DigestOutcome::Reject(
+                    proto_sip::digest_verifier::DigestReject::Malformed,
+                )));
+            }
+        };
+        // IA-6: an unknown user is verified against a random decoy, so it
+        // costs the same and fails as `bad_response`.
+        let secret = self
+            .config
+            .auth_credentials
+            .get(&creds.username)
+            .map_or(DigestSecret::Password(&digest.decoy), |p| {
+                DigestSecret::Password(p.as_str())
+            });
+        let request_uri = req.uri.to_string();
+        let view = DigestRequestView {
+            method: "REGISTER",
+            request_uri: &request_uri,
+            body: req.body.as_deref(),
+        };
+        let verdict = lock_leaf(&digest.verifier).verify(view, &creds, secret, now);
+        match verdict {
+            DigestVerdict::Ok { username } => {
+                // RFC 3261 §10.3 step 4: users register only their own AOR.
+                if aor_user_strict(aor) != Some(username.as_str()) {
+                    // RFC 3261 §10.3 step 3: the user authenticated but is
+                    // not authorized for this AOR, so 403 (MUST), with no
+                    // challenge: re-sending the same valid credentials
+                    // cannot help. Still audited (AU-2).
+                    warn!(aor = %aor, "digest user does not match the AOR, 403");
+                    self.signaling_audit.digest(
+                        aor,
+                        source,
+                        DigestOutcome::AorMismatch,
+                        Instant::now(),
+                    );
+                    return Err(Box::new(create_response_from_request(
+                        req,
+                        StatusCode::FORBIDDEN,
+                    )));
+                }
+                self.signaling_audit
+                    .digest(aor, source, DigestOutcome::Ok, Instant::now());
+                Ok(true)
+            }
+            DigestVerdict::Stale => Err(reject(DigestOutcome::Stale)),
+            DigestVerdict::Reject(r) => {
+                debug!(aor = %aor, reason = r.as_str(), "digest REGISTER rejected");
+                Err(reject(DigestOutcome::Reject(r)))
+            }
+        }
     }
 
     /// Enables RFC 8898 Bearer-token REGISTER authorization. When set,
@@ -6133,6 +6976,15 @@ impl SipStack {
             }
 
             router.add_trunk_group(group);
+
+            // RFC 3325 trust domain (`trust_domain`, default true).
+            // NIST 800-53 Rev5: AC-21, CM-6
+            let untrusted = self.untrusted_trunk_groups.get_mut();
+            if tg_config.trust_domain {
+                untrusted.remove(&tg_config.id);
+            } else {
+                untrusted.insert(tg_config.id.clone());
+            }
 
             // Config-file trunks are admitted INVITE sources too (the API
             // path does this in register_inbound_trunk). No CSS for these.
@@ -7287,6 +8139,24 @@ impl SipStack {
             }
         }
 
+        // RFC 7616 digest by the daemon verifier (POA&M-236, Q5): runs before
+        // the registrar lock, which then only does binding and capacity
+        // work. Bearer, when configured, already authorized or returned.
+        let digest_authenticated = if self.bearer.is_none() {
+            match self.verify_register_digest(req, &aor, source) {
+                Ok(done) => done,
+                Err(resp) => {
+                    return ProcessResult::Response {
+                        message: SipMessage::Response(*resp),
+                        destination: source,
+                        flow: Flow::Reply,
+                    };
+                }
+            }
+        } else {
+            false
+        };
+
         // Parse Contact headers into ContactInfo list, then latch any
         // unroutable contact host (an unspecified address such as "[::]"
         // from clients advertising their wildcard bind) to the request
@@ -7361,7 +8231,9 @@ impl SipStack {
         let reg_response = match admitted {
             Ok(Some(resp)) => resp,
             Ok(None) => {
-                let authenticated = registrar_guard.config().require_auth || self.bearer.is_some();
+                let authenticated = registrar_guard.config().require_auth
+                    || digest_authenticated
+                    || self.bearer.is_some();
                 drop(registrar_guard);
                 warn!(
                     aor = %aor,
@@ -7551,11 +8423,13 @@ impl SipStack {
                     bindings = binding_count,
                     "Registration successful"
                 );
-                if self.config.require_auth {
+                if digest_authenticated || (self.digest.is_none() && self.config.require_auth) {
                     audit_register_auth(&aor, source, uc_audit::event::AuthMethod::Digest, None);
                 }
             }
             401 => {
+                // Legacy registrar digest path only: with the daemon
+                // verifier active the registrar never challenges.
                 drop(registrar_guard);
                 if req.headers.get_value(&HeaderName::Authorization).is_some() {
                     audit_register_auth(
@@ -7636,6 +8510,69 @@ impl SipStack {
             return self.handle_in_dialog_request(req, source).await;
         }
 
+        // Source admission: only configured trunks and currently registered
+        // endpoints may place calls. Checked before any per-call state exists
+        // and before route preprocessing, so an unadmitted source sees only
+        // this 403, never the 482/404/400 of preprocessing (no own-address
+        // oracle, no audit state from spoofed sources). Admission reads the
+        // source IP only, so it cannot depend on the preprocessed URI; the
+        // audit resource is the Request-URI as received.
+        //
+        // ## NIST 800-53 Rev5: AC-3 (Access Enforcement)
+        if !self.is_admitted_source(source.ip()).await {
+            warn!(
+                call_id = %a_leg_call_id,
+                source = %source,
+                "INVITE from a source that is neither a trunk nor registered, rejecting"
+            );
+            audit_invite_denied(req, source, "source-admission");
+            let forbidden = create_response_from_request(req, StatusCode::FORBIDDEN);
+            return ProcessResult::Response {
+                message: SipMessage::Response(forbidden),
+                destination: source,
+                flow: Flow::Reply,
+            };
+        }
+
+        // Loop protection (RFC 3261 §16.3 item 3, before the item 4 loop
+        // check in preprocessing): honor the incoming Max-Forwards
+        // and propagate it decremented — previously every hop reset it to
+        // 70, so two SBCs could forward in a loop forever.
+        let incoming_max_forwards: u8 = req
+            .headers
+            .get_value(&HeaderName::MaxForwards)
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(70);
+        if incoming_max_forwards == 0 {
+            warn!(call_id = %a_leg_call_id, "Max-Forwards exhausted, rejecting INVITE");
+            let too_many_hops = create_response_from_request(
+                req,
+                StatusCode::new(483).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
+            );
+            return ProcessResult::Response {
+                message: SipMessage::Response(too_many_hops),
+                destination: source,
+                flow: Flow::Reply,
+            };
+        }
+        let b_leg_max_forwards = incoming_max_forwards - 1;
+
+        // RFC 3261 §16.3 item 4 loop detection (482), §16.4 route
+        // preprocessing, RFC 3325 §5 identity sanitizing and the RFC 3323
+        // Privacy parse (POA&M-236). Everything below (emergency
+        // classification, VPS, ACL, dial plan, translation,
+        // STIR, audit subject) reads the preprocessed request, never the
+        // Request-URI as received, so a Route cannot steer past policy.
+        // Remaining Route values never cross the B2BUA: the B-leg is built
+        // fresh.
+        //
+        // ## NIST 800-53 Rev5: AC-4, SC-7, SC-5, AC-21
+        let (routed, a_privacy) = match self.preprocess_initial_invite(req, source).await {
+            Ok(r) => r,
+            Err(resp) => return *resp,
+        };
+        let req: &SipRequest = routed.as_ref().unwrap_or(req);
+
         // One canonical dialled number (separators, %xx, `+` and
         // ;phone-context handled once), fed to emergency classification,
         // VPS screening and routing so they cannot disagree.
@@ -7650,7 +8587,7 @@ impl SipStack {
         // CDR for an INVITE refused before the call is stored (plan §0
         // reject sites). Rejections the RFC answers with a challenge
         // (401/407) and ACL/DoS drops never reach these sites, and the
-        // source-admission 403 below is an ACL-layer reject (audited as an
+        // source-admission 403 above is an ACL-layer reject (audited as an
         // AuthorizationDecision, no CDR) so a spoofed-source flood cannot
         // fill the CDR volume. Every reject site is after the retransmit
         // check, and `CdrContext::emit_rejected` drops repeats of a
@@ -7672,25 +8609,6 @@ impl SipStack {
                 cause,
             });
         };
-
-        // Source admission: only configured trunks and currently registered
-        // endpoints may place calls. Checked before any per-call state exists.
-        //
-        // ## NIST 800-53 Rev5: AC-3 (Access Enforcement)
-        if !self.is_admitted_source(source.ip()).await {
-            warn!(
-                call_id = %a_leg_call_id,
-                source = %source,
-                "INVITE from a source that is neither a trunk nor registered, rejecting"
-            );
-            audit_invite_denied(req, source, "source-admission");
-            let forbidden = create_response_from_request(req, StatusCode::FORBIDDEN);
-            return ProcessResult::Response {
-                message: SipMessage::Response(forbidden),
-                destination: source,
-                flow: Flow::Reply,
-            };
-        }
 
         // Check for INVITE retransmit — if we already know this Call-ID,
         // or it is already being processed (in-flight), absorb it.
@@ -7817,29 +8735,6 @@ impl SipStack {
             };
             slot
         };
-
-        // Loop protection (RFC 3261 §16.3): honor the incoming Max-Forwards
-        // and propagate it decremented — previously every hop reset it to
-        // 70, so two SBCs could forward in a loop forever.
-        let incoming_max_forwards: u8 = req
-            .headers
-            .get_value(&HeaderName::MaxForwards)
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(70);
-        if incoming_max_forwards == 0 {
-            warn!(call_id = %a_leg_call_id, "Max-Forwards exhausted, rejecting INVITE");
-            self.in_flight_invites.write().await.remove(&a_leg_call_id);
-            let too_many_hops = create_response_from_request(
-                req,
-                StatusCode::new(483).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
-            );
-            return ProcessResult::Response {
-                message: SipMessage::Response(too_many_hops),
-                destination: source,
-                flow: Flow::Reply,
-            };
-        }
-        let b_leg_max_forwards = incoming_max_forwards - 1;
 
         // STIR/SHAKEN verification (RFC 8224 §6.2) on INVITEs from trunks
         // with `stir_shaken.verify`. Before VPS so `[vps.stir_shaken]`
@@ -8402,7 +9297,6 @@ impl SipStack {
 
         // 7. Build B-leg INVITE
         let b_leg_sip_call_id = generate_call_id(&self.config.domain);
-        let b_leg_branch = generate_branch();
 
         // Toward a trunk the Request-URI is the trunk's own (scheme from its
         // protocol, its host/port), the same derivation failover uses
@@ -8616,7 +9510,7 @@ impl SipStack {
             // SEC-009: the flow match proves the provisioned TN only when the
             // source cannot be spoofed off-path. A UDP-bound caller is still
             // authenticated (its number is asserted) but is capped at B.
-            // POAM: no per-INVITE digest challenge, so a UDP caller has no
+            // POAM: POA&M-271 - no per-INVITE digest challenge, so a UDP caller has no
             // path to A.
             let attest_tn = assigned_tn
                 .as_deref()
@@ -8646,6 +9540,68 @@ impl SipStack {
             if b_leg_invite.is_some() {
                 stir_egress = Some(Arc::new(egress));
             }
+        }
+
+        // 7e. RFC 3323 privacy service toward the callee, after STIR (STIR
+        // signs PAI/From; privacy toward an untrusted peer then wins, Q2).
+        // A registered user is outside the trust domain.
+        //
+        // ## NIST 800-53 Rev5: AC-21, SC-4; RFC 3323 §5.1; RFC 3325 §7
+        let egress_trusted = match trunk_lease.as_ref() {
+            Some(l) => self.trunk_group_trusted(&l.group_id).await,
+            None => false,
+        };
+        if let Some(ref privacy) = a_privacy
+            && Self::apply_egress_privacy(
+                &mut b_leg_request,
+                privacy,
+                media_a_leg_port.is_some(),
+                b_leg_hidden && self.topology_hider.is_some(),
+                egress_trusted,
+            )
+            .is_err()
+        {
+            audit_invite_denied(req, source, "privacy:cannot-satisfy");
+            self.in_flight_invites.write().await.remove(&a_leg_call_id);
+            reject_cdr(500, uc_cdr::ReleaseCause::PolicyDenied);
+            self.release_slots(
+                trunk_lease.as_ref(),
+                vps_callee.as_deref(),
+                TrunkOutcome::Abandoned,
+            )
+            .await;
+            self.release_rtp_port(b_leg_rtp_port);
+            if let Some(ref pipeline) = self.media_pipeline {
+                let _ = pipeline.remove_session(&session_key).await;
+            }
+            return ProcessResult::Response {
+                message: SipMessage::Response(create_response_from_request(
+                    req,
+                    StatusCode::SERVER_INTERNAL_ERROR,
+                )),
+                destination: source,
+                flow: Flow::Reply,
+            };
+        }
+
+        // 7f. RFC 3261 §16.6 step 8: the B-leg branch carries the loop hash
+        // of the INVITE as sent (a B2BUA does not carry the A-leg's Call-ID,
+        // tags or Via, so only the B-leg's own hash can match if it comes
+        // back unchanged; see `own_via_loop`). Computed last, over the final
+        // Request-URI/Call-ID/From tag/CSeq/Route/Proxy-Require.
+        //
+        // POAM: POA&M-236 (residual, open) - two loop shapes are not caught
+        // by the 482 check and are bounded by Max-Forwards (483) only:
+        // (1) with `obfuscate_call_id` the returning request carries the
+        // obfuscated wire Call-ID, not the one hashed here, so its hash
+        // differs; (2) `compute_loop_hash` covers Route, so when the B-leg
+        // carries a Route to an outbound proxy that pops it (RFC 3261 §16.4)
+        // the returning request hashes differently and is treated as a
+        // spiral. Fixing either needs a proto-sip hash variant (out of scope).
+        let b_leg_branch = loop_branch(proto_sip::compute_loop_hash(&b_leg_request));
+        if let Some(via) = b_leg_request.headers.get_value(&HeaderName::Via) {
+            let via = replace_header_param(via, "branch", &b_leg_branch);
+            b_leg_request.headers.set(HeaderName::Via, via);
         }
 
         // CDR draft: the facts known at admission/routing (AU-3).
@@ -8778,6 +9734,11 @@ impl SipStack {
                     failover_targets,
                     trunk_lease,
                     vps_callee,
+                    egress_privacy: if b_leg_invite.is_some() {
+                        a_privacy.map(Arc::new)
+                    } else {
+                        None
+                    },
                     b_leg_invite,
                     b_leg_ruri: Some(b_leg_request.uri.clone()),
                     stir_egress,
@@ -8912,6 +9873,14 @@ impl SipStack {
             // (RFC 3261 §15.1.2). A 200 here would hide a stale dialog from
             // the far end and let a forged BYE look successful.
             debug!(call_id = %sip_call_id, "BYE for unknown dialog, 481");
+            // Audited, rate limited (POA&M-252; NIST 800-53 Rev5: AU-2, SI-4).
+            drop(corr);
+            self.signaling_audit.in_dialog_reject(
+                req,
+                source,
+                InDialogPolicy::UnknownDialog,
+                Instant::now(),
+            );
             let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
@@ -8921,6 +9890,13 @@ impl SipStack {
         };
 
         let Some(a) = corr.addresses.get(&internal_id) else {
+            drop(corr);
+            self.signaling_audit.in_dialog_reject(
+                req,
+                source,
+                InDialogPolicy::UnknownDialog,
+                Instant::now(),
+            );
             let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
@@ -8939,6 +9915,12 @@ impl SipStack {
                 source = %source,
                 status = status.code(),
                 "Rejecting BYE that does not match the dialog"
+            );
+            self.signaling_audit.in_dialog_reject(
+                req,
+                source,
+                InDialogPolicy::FromTagMismatch,
+                Instant::now(),
             );
             let response = create_response_from_request(req, status);
             return ProcessResult::Response {
@@ -9052,6 +10034,22 @@ impl SipStack {
                 crate::flow::via_for(&other_flow, other_sent_by, &branch),
             ));
             bye_request.headers.set(HeaderName::ContentLength, "0");
+            // POA&M-250: header manipulation toward the callee. Deliberate
+            // AC-4 exception (fail open, not fail closed; Q4): the call
+            // is already torn down locally, so on a rule failure the
+            // SBC-built BYE (nothing from the A-leg in it) is forwarded with
+            // its original headers rather than stranding the callee; the
+            // failure is counted and audited
+            // (`...;bye-forwarded-unmanipulated`).
+            if is_from_a_leg && self.header_manipulator.is_some() {
+                let original = bye_request.clone();
+                if self
+                    .apply_in_dialog_manipulation(&mut bye_request, req, source, &Method::Bye, true)
+                    .is_err()
+                {
+                    bye_request = original;
+                }
+            }
             bye_request
         };
 
@@ -10923,7 +11921,7 @@ fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
 /// - `<sip:alice@example.com>`
 /// - `"Alice" <sip:alice@example.com>;tag=1234`
 /// - `sip:alice@example.com`
-fn extract_uri_from_header(header_value: &str) -> String {
+pub fn extract_uri_from_header(header_value: &str) -> String {
     // Search for '>' only after the '<': a display name may itself contain '>'.
     if let Some(start) = header_value.find('<')
         && let Some(len) = header_value[start + 1..].find('>')
@@ -12141,6 +13139,7 @@ pub mod tests {
                 }],
                 zone: None,
                 require_tls: false,
+                trust_domain: true,
             },
             sbc_config::TrunkGroupConfig {
                 id: "emergency".to_string(),
@@ -12155,6 +13154,7 @@ pub mod tests {
                 }],
                 zone: None,
                 require_tls: false,
+                trust_domain: true,
             },
         ];
 
@@ -12374,6 +13374,7 @@ pub mod tests {
             b_leg_invite: None,
             b_leg_ruri: None,
             stir_egress: None,
+            egress_privacy: None,
             early_media_committed: false,
             a_leg_via: vec!["SIP/2.0/UDP 10.0.0.1;branch=z9hG4bK-a".to_string()],
             a_leg_from: "<sip:caller@10.0.0.1>;tag=callertag".to_string(),
@@ -13641,6 +14642,7 @@ pub mod tests {
             ],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         }];
         (routing, dial_plans, groups)
     }
@@ -13823,6 +14825,7 @@ pub mod tests {
                 }],
                 zone: None,
                 require_tls: false,
+                trust_domain: true,
             });
             routing.emergency_trunk_group = Some("e911".to_string());
         }
@@ -14034,6 +15037,7 @@ pub mod tests {
             }],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         });
         stack.init_router_from_config(&routing, &dial_plans, &groups);
         stack
@@ -15295,6 +16299,7 @@ pub mod tests {
             id: "g".to_string(),
             name: "G".to_string(),
             require_tls: false,
+            trust_domain: true,
             strategy: "priority".to_string(),
             trunks: vec![sbc_config::TrunkConfigSchema {
                 id: "tx".to_string(),
@@ -15338,6 +16343,7 @@ pub mod tests {
             }],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         }];
         stack.init_router_from_config(&sbc_config::RoutingConfig::default(), &[], &groups);
         let router = stack.router().expect("router").read().await;
@@ -16233,6 +17239,7 @@ pub mod tests {
             trunks: vec![trunk("t1", "127.0.0.2", 1), trunk("t2", "127.0.0.3", 2)],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         }];
         stack.init_router_from_config(&routing, &dial_plans, &groups);
         if let Some(engine) = vps {
@@ -17194,6 +18201,7 @@ pub mod tests {
             ],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         });
         stack.set_stir(Arc::new(crate::stir::test_support::service(&c)));
         (stack, f)
@@ -17403,6 +18411,7 @@ pub mod tests {
             ],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         });
         tweak(&mut c);
         let source = Arc::new(crate::stir::test_support::FakeSource {
@@ -19852,6 +20861,15 @@ pub mod tests {
 
     const TH_EXTERNAL: &str = "sbc.example.com";
 
+    /// A basic-mode hider with RFC 1918 / loopback internal networks.
+    fn th_test_hider() -> TopologyHider {
+        let mut cfg = SipTopologyConfig::new(TH_EXTERNAL).with_mode(TopologyHidingMode::Basic);
+        for net in ["10.0.0.0/8", "192.168.0.0/16", "127.0.0.0/8"] {
+            cfg = cfg.try_with_internal_network(net).unwrap();
+        }
+        TopologyHider::new(cfg)
+    }
+
     async fn enable_hider(stack: &mut SipStack) {
         stack
             .init_topology_hider_from_config(&sbc_config::TopologyHidingConfig {
@@ -21137,7 +22155,7 @@ pub mod tests {
         let mut h = Headers::new();
         h.set(HeaderName::ContentType, "text/plain");
         let mut b = Some(Bytes::from("o=garbage"));
-        scrub_residual_topology(&mut h, &mut b, TH_EXTERNAL).unwrap();
+        scrub_residual_topology(&mut h, &mut b, TH_EXTERNAL, &th_test_hider()).unwrap();
         assert_eq!(b.as_deref(), Some(b"o=garbage".as_slice()));
     }
 
@@ -21324,7 +22342,7 @@ pub mod tests {
             );
             let mut b = Some(Bytes::from("dj0w"));
             assert_eq!(
-                scrub_residual_topology(&mut h, &mut b, TH_EXTERNAL),
+                scrub_residual_topology(&mut h, &mut b, TH_EXTERNAL, &th_test_hider()),
                 Err("sip.topology_hiding.failed:sdp-o".to_string()),
                 "{ct} {cte}"
             );
@@ -22832,6 +23850,1040 @@ pub mod tests {
                 .read()
                 .await
                 .has_bindings("sip:alice@example.com")
+        );
+    }
+
+    // ── POA&M-236 / 250 / 251 / 252: data-plane wiring ──
+
+    /// Denied `AuthorizationDecision` policies in `events`.
+    fn denied_policies(events: &[uc_audit::AuditEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::AuthorizationDecision(d) if !d.granted => {
+                    Some(d.policy.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Failed `AuthenticationAttempt` reasons in `events`.
+    fn auth_failure_reasons(events: &[uc_audit::AuditEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::AuthenticationAttempt(a) if !a.success => {
+                    a.failure_reason.clone()
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Per-run test secrets (not hard-coded credentials).
+    fn test_secret(tag: &str) -> String {
+        format!(
+            "{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )
+    }
+
+    fn digest_stack(alice_pw: &str, bob_pw: &str) -> SipStack {
+        let mut config = SipStackConfig {
+            require_auth: true,
+            auth_realm: "example.com".to_string(),
+            ..Default::default()
+        };
+        config
+            .auth_credentials
+            .insert("alice".to_string(), alice_pw.to_string());
+        config
+            .auth_credentials
+            .insert("bob".to_string(), bob_pw.to_string());
+        SipStack::new(config)
+    }
+
+    /// REGISTER of `aor_user`@example.com with Request-URI `sip:sbc.local`.
+    fn digest_register(aor_user: &str, n: u32, auth: Option<&str>) -> Bytes {
+        let mut m = format!(
+            "REGISTER sip:sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-d{n}\r\n\
+             From: <sip:{aor_user}@example.com>;tag=1234\r\n\
+             To: <sip:{aor_user}@example.com>\r\n\
+             Call-ID: reg-{aor_user}@example.com\r\n\
+             CSeq: {n} REGISTER\r\n\
+             Contact: <sip:{aor_user}@client.example.com:5060>\r\n"
+        );
+        if let Some(a) = auth {
+            let _ = write!(m, "Authorization: {a}\r\n");
+        }
+        m.push_str("Content-Length: 0\r\n\r\n");
+        Bytes::from(m)
+    }
+
+    fn www_param(www: &str, key: &str) -> Option<String> {
+        www.split(&format!("{key}=\"")[..])
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .map(str::to_string)
+    }
+
+    /// Sends a credential-less REGISTER and returns the challenge.
+    async fn digest_challenge(stack: &SipStack, user: &str, n: u32) -> String {
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        let r = flatten(
+            stack
+                .process_message(&digest_register(user, n, None), src, None)
+                .await,
+        );
+        let (chal, _) = responded(&r, 401).expect("401 challenge");
+        chal.headers
+            .get_value(&HeaderName::WwwAuthenticate)
+            .unwrap()
+            .to_string()
+    }
+
+    /// SHA-256 `Authorization` value for `user`/`pw` against `nonce`.
+    fn sha256_auth(user: &str, pw: &str, nonce: &str, uri: &str, nc: u32) -> String {
+        let resp = proto_sip::compute_digest_response(
+            &proto_sip::Sha256DigestHasher,
+            user,
+            "example.com",
+            pw,
+            "REGISTER",
+            uri,
+            nonce,
+            proto_sip::DigestAlgorithm::Sha256,
+            Some(proto_sip::Qop::Auth),
+            Some(nc),
+            Some("c0ffee"),
+            None,
+        )
+        .unwrap();
+        format!(
+            "Digest username=\"{user}\", realm=\"example.com\", nonce=\"{nonce}\", \
+             uri=\"{uri}\", response=\"{resp}\", algorithm=SHA-256, qop=auth, \
+             cnonce=\"c0ffee\", nc={nc:08x}"
+        )
+    }
+
+    async fn register_with(stack: &SipStack, user: &str, n: u32, auth: &str) -> Vec<ProcessResult> {
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        flatten(
+            stack
+                .process_message(&digest_register(user, n, Some(auth)), src, None)
+                .await,
+        )
+    }
+
+    /// Plan 1/2: the challenge names SHA-256 and qop=auth and is not
+    /// audited; a valid response registers and is audited as a success.
+    #[tokio::test]
+    async fn digest_register_challenge_then_success_audited() {
+        let pw = test_secret("a");
+        let stack = digest_stack(&pw, &test_secret("b"));
+        let cap = uc_audit::capture::start();
+        let www = digest_challenge(&stack, "alice", 1).await;
+        assert!(www.contains("algorithm=SHA-256"), "{www}");
+        assert!(www.contains("qop=\"auth\""), "{www}");
+        assert!(!www.contains("stale=true"));
+        assert!(
+            cap.events()
+                .iter()
+                .all(|e| !matches!(e, uc_audit::AuditEvent::AuthenticationAttempt(_))),
+            "the first challenge is not audited"
+        );
+        let nonce = www_param(&www, "nonce").unwrap();
+        let r = register_with(
+            &stack,
+            "alice",
+            2,
+            &sha256_auth("alice", &pw, &nonce, "sip:sbc.local", 1),
+        )
+        .await;
+        assert!(responded(&r, 200).is_some(), "{r:?}");
+        assert!(cap.events().iter().any(|e| matches!(
+            e,
+            uc_audit::AuditEvent::AuthenticationAttempt(a)
+                if a.success && a.method == uc_audit::event::AuthMethod::Digest
+        )));
+        let ok = stack
+            .signaling_audit()
+            .digest_outcome_counts()
+            .find(|(l, _)| *l == "ok")
+            .unwrap();
+        assert_eq!(ok.1, 1);
+    }
+
+    /// Plan 3/5/6: every reject is a fresh 401 (Q1) with its own audit
+    /// reason; an unknown user is indistinguishable from a wrong password;
+    /// a valid user registering another AOR is `aor_mismatch`.
+    #[tokio::test]
+    async fn digest_register_rejects_each_audited_with_reason() {
+        let pw = test_secret("a");
+        let bob_pw = test_secret("b");
+        let stack = digest_stack(&pw, &bob_pw);
+        let cap = uc_audit::capture::start();
+        let www = digest_challenge(&stack, "alice", 1).await;
+        let nonce = www_param(&www, "nonce").unwrap();
+        let good = sha256_auth("alice", &pw, &nonce, "sip:sbc.local", 1);
+        let cases: Vec<(String, &str)> = vec![
+            (
+                good.replace("realm=\"example.com\"", "realm=\"evil.example\""),
+                "digest:realm_mismatch",
+            ),
+            (
+                good.replace("algorithm=SHA-256", "algorithm=MD5"),
+                "digest:algorithm_mismatch",
+            ),
+            (
+                good.replace(", cnonce=\"c0ffee\"", ""),
+                "digest:missing_qop_params",
+            ),
+            (
+                good.replace("uri=\"sip:sbc.local\"", "uri=\"sip:other.example.net\""),
+                "digest:uri_mismatch",
+            ),
+            (
+                good.replace(&nonce, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                "digest:unknown_nonce",
+            ),
+            (
+                sha256_auth("alice", "wrong-password", &nonce, "sip:sbc.local", 1),
+                "digest:bad_response",
+            ),
+            ("Basic YWxpY2U6cGFzcw==".to_string(), "digest:malformed"),
+        ];
+        for (i, (auth, reason)) in cases.iter().enumerate() {
+            let n = u32::try_from(i).unwrap() + 10;
+            let r = register_with(&stack, "alice", n, auth).await;
+            let (resp, _) =
+                responded(&r, 401).unwrap_or_else(|| panic!("{reason}: 401, got {r:?}"));
+            assert!(
+                resp.headers
+                    .get_value(&HeaderName::WwwAuthenticate)
+                    .is_some(),
+                "{reason}: fresh challenge"
+            );
+            assert!(
+                auth_failure_reasons(&cap.events())
+                    .iter()
+                    .any(|a| a == reason),
+                "{reason} audited: {:?}",
+                auth_failure_reasons(&cap.events())
+            );
+        }
+        assert!(
+            !stack
+                .location_service
+                .read()
+                .await
+                .has_bindings("sip:alice@example.com")
+        );
+
+        // Replay: the same Authorization twice → second is nonce_replay.
+        let r = register_with(&stack, "alice", 30, &good).await;
+        assert!(responded(&r, 200).is_some(), "{r:?}");
+        let r = register_with(&stack, "alice", 31, &good).await;
+        assert!(responded(&r, 401).is_some());
+        assert!(
+            auth_failure_reasons(&cap.events())
+                .iter()
+                .any(|a| a == "digest:nonce_replay")
+        );
+
+        // IA-6: unknown user → same status and reason as a wrong password.
+        let before = auth_failure_reasons(&cap.events()).len();
+        let www = digest_challenge(&stack, "mallory", 40).await;
+        let n2 = www_param(&www, "nonce").unwrap();
+        let r = register_with(
+            &stack,
+            "mallory",
+            41,
+            &sha256_auth("mallory", "x", &n2, "sip:sbc.local", 1),
+        )
+        .await;
+        assert!(responded(&r, 401).is_some());
+        // Same (source, reason) key as the wrong password above: folded into
+        // the aggregate, so no new event and no distinguishing reason.
+        assert_eq!(auth_failure_reasons(&cap.events()).len(), before);
+        let bad = stack
+            .signaling_audit()
+            .digest_outcome_counts()
+            .find(|(l, _)| *l == "bad_response")
+            .unwrap();
+        assert_eq!(bad.1, 2);
+
+        // RFC 3261 §10.3 step 4: bob's valid credentials cannot bind alice.
+        let www = digest_challenge(&stack, "alice", 50).await;
+        let n3 = www_param(&www, "nonce").unwrap();
+        let r = register_with(
+            &stack,
+            "alice",
+            51,
+            &sha256_auth("bob", &bob_pw, &n3, "sip:sbc.local", 1),
+        )
+        .await;
+        // RFC 3261 §10.3 step 3: authenticated but not authorized → 403,
+        // with no challenge (RFC-1); still audited.
+        let (forbidden, _) = responded(&r, 403).expect("403 for AOR mismatch");
+        assert!(
+            forbidden
+                .headers
+                .get_value(&HeaderName::WwwAuthenticate)
+                .is_none()
+        );
+        assert!(
+            auth_failure_reasons(&cap.events())
+                .iter()
+                .any(|a| a == "digest:aor_mismatch")
+        );
+    }
+
+    /// Plan 4: a valid digest on an expired nonce → 401 `stale=true`,
+    /// audited as `digest:stale`.
+    #[tokio::test]
+    async fn digest_register_stale_nonce_rechallenges_with_stale_true() {
+        let pw = test_secret("a");
+        let stack = digest_stack(&pw, &test_secret("b"));
+        let cap = uc_audit::capture::start();
+        let www = digest_challenge(&stack, "alice", 1).await;
+        let nonce = www_param(&www, "nonce").unwrap();
+        stack
+            .digest
+            .as_ref()
+            .unwrap()
+            .clock_skew_secs
+            .store(301, Ordering::Relaxed);
+        let r = register_with(
+            &stack,
+            "alice",
+            2,
+            &sha256_auth("alice", &pw, &nonce, "sip:sbc.local", 1),
+        )
+        .await;
+        let (resp, _) = responded(&r, 401).expect("401");
+        assert!(
+            resp.headers
+                .get_value(&HeaderName::WwwAuthenticate)
+                .is_some_and(|w| w.contains("stale=true"))
+        );
+        assert_eq!(auth_failure_reasons(&cap.events()), vec!["digest:stale"]);
+    }
+
+    /// Plan 7: 50 bad REGISTERs from one IP → one audit event, then one
+    /// flushed event with `count=49`.
+    #[tokio::test]
+    async fn digest_register_failures_rate_limited() {
+        let pw = test_secret("a");
+        let stack = digest_stack(&pw, &test_secret("b"));
+        let cap = uc_audit::capture::start();
+        let www = digest_challenge(&stack, "alice", 1).await;
+        let nonce = www_param(&www, "nonce").unwrap();
+        let bad = sha256_auth("alice", "nope", &nonce, "sip:sbc.local", 1);
+        for n in 0..50 {
+            register_with(&stack, "alice", n + 2, &bad).await;
+        }
+        assert_eq!(
+            auth_failure_reasons(&cap.events()),
+            vec!["digest:bad_response"]
+        );
+        stack
+            .signaling_audit()
+            .flush(Instant::now() + std::time::Duration::from_secs(61));
+        assert_eq!(
+            auth_failure_reasons(&cap.events()),
+            vec!["digest:bad_response", "digest:bad_response;count=49"]
+        );
+    }
+
+    /// Replaces the start line of `msg`.
+    fn with_start_line(msg: &Bytes, start: &str) -> Bytes {
+        let text = String::from_utf8(msg.to_vec()).unwrap();
+        let (_, rest) = text.split_once("\r\n").unwrap();
+        Bytes::from(format!("{start}\r\n{rest}"))
+    }
+
+    /// Plan 9: strict-router restore — the routed (restored) Request-URI
+    /// drives the dial plan, and no A-leg Route reaches the B-leg.
+    #[tokio::test]
+    async fn route_preprocess_strict_route_restores_request_uri() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let invite = with_extra(
+            &with_start_line(
+                &caller_request("INVITE", DIALED, "rt-strict@test", 1, None, Some(ALICE_SDP)),
+                "INVITE sip:sbc.local SIP/2.0",
+            ),
+            &format!("Route: <sip:{DIALED}@carrier.example.net>\r\n"),
+            Some(("application/sdp", ALICE_SDP)),
+        );
+        let r = flatten(stack.process_message(&invite, alice(), None).await);
+        let (fwd, dest) = forwarded(&r, &Method::Invite).expect("routed to the trunk");
+        assert_eq!(dest, t1());
+        assert_eq!(fwd.uri.user.as_deref(), Some(DIALED));
+        assert!(!fwd.headers.contains(&HeaderName::Route), "plan 13");
+    }
+
+    /// Plan 10: a loose Route naming the SBC is popped and the call routes.
+    #[tokio::test]
+    async fn route_preprocess_pops_own_loose_route() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let invite = with_extra(
+            &caller_request("INVITE", DIALED, "rt-loose@test", 1, None, None),
+            "Route: <sip:sbc.local;lr>, <sip:next.example.net;lr>\r\n",
+            Some(("application/sdp", ALICE_SDP)),
+        );
+        let r = flatten(stack.process_message(&invite, alice(), None).await);
+        let (fwd, dest) = forwarded(&r, &Method::Invite).expect("routed");
+        assert_eq!(dest, t1());
+        assert!(!fwd.headers.contains(&HeaderName::Route));
+    }
+
+    /// SEC-2/RFC-2: source admission and Max-Forwards (§16.3 item 3) run
+    /// before route preprocessing, so an unadmitted source gets only the
+    /// admission 403 (no own-URI 404 oracle, no preprocessing audit), and an
+    /// exhausted Max-Forwards is 483 even when preprocessing would reject.
+    #[tokio::test]
+    async fn admission_and_max_forwards_precede_route_preprocess() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let cap = uc_audit::capture::start();
+        let own = with_start_line(
+            &caller_request("INVITE", DIALED, "ord-403@test", 1, None, None),
+            "INVITE sip:sbc.local SIP/2.0",
+        );
+        let stranger = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(203, 0, 113, 99), 5060);
+        let r = flatten(stack.process_message(&own, stranger, None).await);
+        assert!(responded(&r, 403).is_some(), "{r:?}");
+        assert!(responded(&r, 404).is_none(), "{r:?}");
+        let p = denied_policies(&cap.events());
+        assert!(
+            !p.iter().any(|x| x.starts_with("route-preprocess:")),
+            "{p:?}"
+        );
+
+        let text = String::from_utf8(
+            with_start_line(
+                &caller_request("INVITE", DIALED, "ord-483@test", 1, None, None),
+                "INVITE sip:sbc.local SIP/2.0",
+            )
+            .to_vec(),
+        )
+        .unwrap();
+        let mf0 = Bytes::from(if text.contains("Max-Forwards:") {
+            text.replacen("Max-Forwards: 70", "Max-Forwards: 0", 1)
+        } else {
+            text.replacen("CSeq:", "Max-Forwards: 0\r\nCSeq:", 1)
+        });
+        let r = flatten(stack.process_message(&mf0, alice(), None).await);
+        assert!(responded(&r, 483).is_some(), "{r:?}");
+        assert!(responded(&r, 404).is_none(), "{r:?}");
+    }
+
+    /// Plans 11/12: own Request-URI without Route → 404; malformed or
+    /// too many Routes → 400. Each is audited and nothing is forwarded.
+    #[tokio::test]
+    async fn route_preprocess_failures_rejected_and_audited() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let cap = uc_audit::capture::start();
+        let own = with_start_line(
+            &caller_request("INVITE", DIALED, "rt-404@test", 1, None, None),
+            "INVITE sip:sbc.local SIP/2.0",
+        );
+        let r = flatten(stack.process_message(&own, alice(), None).await);
+        assert!(responded(&r, 404).is_some(), "{r:?}");
+        assert!(forwarded(&r, &Method::Invite).is_none());
+
+        let bad = with_extra(
+            &caller_request("INVITE", DIALED, "rt-400@test", 1, None, None),
+            "Route: <sip:sbc.local;lr\r\n",
+            None,
+        );
+        let r = flatten(stack.process_message(&bad, alice(), None).await);
+        assert!(responded(&r, 400).is_some(), "{r:?}");
+
+        let many = (0..=proto_sip::MAX_LIST_ELEMENTS).fold(String::new(), |mut acc, i| {
+            let _ = write!(acc, "Route: <sip:h{i}.example.net;lr>\r\n");
+            acc
+        });
+        let flood = with_extra(
+            &caller_request("INVITE", DIALED, "rt-many@test", 1, None, None),
+            &many,
+            None,
+        );
+        let r = flatten(stack.process_message(&flood, alice(), None).await);
+        assert!(responded(&r, 400).is_some(), "{r:?}");
+        assert_eq!(stack.admitted_call_slots(), 0);
+        let p = denied_policies(&cap.events());
+        assert!(
+            p.contains(&"route-preprocess:no-route-for-own-uri".to_string()),
+            "{p:?}"
+        );
+        // Two malformed rejects from one source: one event (rate limited).
+        assert_eq!(
+            p.iter()
+                .filter(|x| *x == "route-preprocess:malformed")
+                .count(),
+            1,
+            "{p:?}"
+        );
+    }
+
+    /// Plans 14-16: the B-leg branch carries the loop hash of the INVITE
+    /// as sent; the same INVITE coming back is a loop (482, audited), a
+    /// changed Request-URI is a spiral (not 482).
+    #[tokio::test]
+    async fn loop_hash_branch_detects_loop_not_spiral() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let cap = uc_audit::capture::start();
+        let r = place_call(&stack, "loop@test").await;
+        let (b_invite, _) = forwarded(&r, &Method::Invite).expect("B-leg INVITE");
+        let branch = b_invite.headers.via_branch().unwrap();
+        let rest = branch.strip_prefix("z9hG4bK").unwrap();
+        let (rand, hash) = rest.split_once('.').unwrap();
+        assert_eq!(rand.len(), 16);
+        assert!(
+            rand.bytes()
+                .chain(hash.bytes())
+                .all(|b| b.is_ascii_hexdigit())
+        );
+        assert_eq!(
+            branch_loop_hash(&branch),
+            Some(proto_sip::compute_loop_hash(b_invite))
+        );
+
+        // The peer sends it straight back (adds its own Via).
+        let text = wire_text(b_invite);
+        let (start, rest) = text.split_once("\r\n").unwrap();
+        let looped =
+            format!("{start}\r\nVia: SIP/2.0/UDP 127.0.0.2:5060;branch=z9hG4bK-peer1\r\n{rest}");
+        let r = flatten(
+            stack
+                .process_message(&Bytes::from(looped), t1(), None)
+                .await,
+        );
+        assert!(responded(&r, 482).is_some(), "{r:?}");
+        assert!(forwarded(&r, &Method::Invite).is_none());
+        assert!(denied_policies(&cap.events()).contains(&"loop-detected".to_string()));
+
+        // Spiral: the Request-URI changed on the way, so no 482.
+        let spiral_start = start.replacen(DIALED, "+15557654321", 1);
+        let spiral = format!(
+            "{spiral_start}\r\nVia: SIP/2.0/UDP 127.0.0.2:5060;branch=z9hG4bK-peer2\r\n{rest}"
+        );
+        let r = flatten(
+            stack
+                .process_message(&Bytes::from(spiral), t1(), None)
+                .await,
+        );
+        assert!(responded(&r, 482).is_none(), "spiral is not a loop: {r:?}");
+    }
+
+    /// Plan 17: the failover INVITE also carries its own loop hash.
+    #[tokio::test]
+    async fn loop_hash_branch_kept_on_failover() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let r = place_call(&stack, "loop-fo@test").await;
+        let first = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        let r = flatten(
+            stack
+                .process_message(&response_to(&first, 503, Some("t1tag"), None), t1(), None)
+                .await,
+        );
+        let (retry, dest) = forwarded(&r, &Method::Invite).expect("INVITE to t2");
+        assert_eq!(dest, t2());
+        let branch = retry.headers.via_branch().unwrap();
+        assert_eq!(
+            branch_loop_hash(&branch),
+            Some(proto_sip::compute_loop_hash(retry))
+        );
+        assert_ne!(Some(branch), first.headers.via_branch());
+    }
+
+    #[test]
+    fn loop_branch_format_round_trips() {
+        let b = loop_branch(0xdead_beef);
+        assert_eq!(branch_loop_hash(&b), Some(0xdead_beef));
+        assert_eq!(branch_loop_hash("z9hG4bK-plain"), None);
+        assert_eq!(branch_loop_hash("z9hG4bKabc.123"), None);
+    }
+
+    /// Plan 19: PAI from a trusted trunk is kept (no copy); from an
+    /// untrusted group or a registered endpoint it is stripped.
+    #[tokio::test]
+    async fn inbound_identity_sanitized_by_trust_domain() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let raw = with_extra(
+            &caller_request("INVITE", DIALED, "pai@test", 1, None, None),
+            "P-Asserted-Identity: <sip:+12025550100@pbx.example>\r\nP-Preferred-Identity: <sip:x@pbx.example>\r\n",
+            None,
+        );
+        let Ok(SipMessage::Request(req)) = SipMessage::parse(&raw) else {
+            panic!("parse");
+        };
+        let Ok((routed, _)) = stack.preprocess_initial_invite(&req, alice()).await else {
+            panic!("accepted");
+        };
+        assert!(routed.is_none(), "trusted trunk: PAI kept, no copy");
+
+        stack.set_trunk_group_trust_domain("pbx", false).await;
+        let Ok((Some(routed), _)) = stack.preprocess_initial_invite(&req, alice()).await else {
+            panic!("stripped copy");
+        };
+        assert!(!routed.headers.contains(&HeaderName::PAssertedIdentity));
+        assert!(!routed.headers.contains(&HeaderName::PPreferredIdentity));
+
+        // Plan 18: a non-trunk (endpoint) source is never trusted.
+        let endpoint = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 20), 5060);
+        let Ok((Some(routed), _)) = stack.preprocess_initial_invite(&req, endpoint).await else {
+            panic!("stripped copy");
+        };
+        assert!(!routed.headers.contains(&HeaderName::PAssertedIdentity));
+    }
+
+    async fn privacy_call(stack: &SipStack, call_id: &str, privacy: &str) -> Vec<ProcessResult> {
+        let invite = with_extra(
+            &caller_request("INVITE", DIALED, call_id, 1, None, None),
+            &format!("Privacy: {privacy}\r\n"),
+            Some(("application/sdp", ALICE_SDP)),
+        );
+        flatten(stack.process_message(&invite, alice(), None).await)
+    }
+
+    /// Plans 20/21: `id` toward an untrusted trunk removes the Privacy
+    /// header (all satisfied); toward a trusted one it is kept. `user`
+    /// anonymizes the B-leg From.
+    #[tokio::test]
+    async fn egress_privacy_follows_trust_domain() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let r = privacy_call(&stack, "priv-t@test", "id").await;
+        let (fwd, _) = forwarded(&r, &Method::Invite).expect("forwarded");
+        assert_eq!(fwd.headers.get_value(&HeaderName::Privacy), Some("id"));
+
+        stack.set_trunk_group_trust_domain("carriers", false).await;
+        let r = privacy_call(&stack, "priv-u@test", "id").await;
+        let (fwd, _) = forwarded(&r, &Method::Invite).expect("forwarded");
+        assert!(!fwd.headers.contains(&HeaderName::Privacy));
+        assert!(!fwd.headers.contains(&HeaderName::PAssertedIdentity));
+
+        let r = privacy_call(&stack, "priv-user@test", "user").await;
+        let (fwd, _) = forwarded(&r, &Method::Invite).expect("forwarded");
+        let from = fwd.headers.get_value(&HeaderName::From).unwrap();
+        assert!(from.contains("anonymous@anonymous.invalid"), "{from}");
+        assert!(from.contains("tag="), "tag kept: {from}");
+    }
+
+    /// Plans 22/23: `session;critical` without a media relay → 500,
+    /// audited, slots released; a malformed Privacy → 400.
+    #[tokio::test]
+    async fn egress_privacy_critical_unsatisfied_500_and_malformed_400() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let cap = uc_audit::capture::start();
+        let r = privacy_call(&stack, "priv-crit@test", "session;critical").await;
+        assert!(responded(&r, 500).is_some(), "{r:?}");
+        assert!(forwarded(&r, &Method::Invite).is_none());
+        assert!(denied_policies(&cap.events()).contains(&"privacy:cannot-satisfy".to_string()));
+        assert_eq!(stack.admitted_call_slots(), 0);
+        assert_eq!(stack.active_call_count().await, 0);
+        assert_eq!(active(&stack, "t1").await, 0);
+
+        let r = privacy_call(&stack, "priv-bad@test", "@bad").await;
+        assert!(responded(&r, 400).is_some(), "{r:?}");
+        assert_eq!(stack.admitted_call_slots(), 0);
+    }
+
+    fn add_rule(stack: &mut SipStack, header: &str, action: &str, value: &str) {
+        stack.init_manipulator_from_config(&sbc_config::HeaderManipulationConfig {
+            global_rules: vec![sbc_config::ManipulationRuleConfig {
+                name: "r250".to_string(),
+                direction: "both".to_string(),
+                action: action.to_string(),
+                header: header.to_string(),
+                value: value.to_string(),
+            }],
+            trunk_rules: Vec::new(),
+        });
+    }
+
+    /// Plans 24/25: re-INVITE, UPDATE and BYE from the A-leg get the rule
+    /// toward the callee; a re-INVITE from the B-leg does not.
+    #[tokio::test]
+    async fn in_dialog_manipulation_applies_toward_callee() {
+        let mut stack = trunk_stack(10, ("none", ""), None).await;
+        let r = place_call(&stack, "m250@test").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        answer(&stack, &inv, t1()).await;
+        add_rule(&mut stack, "X-Policy", "add", "on");
+
+        for (cseq, method) in [(2, "INVITE"), (3, "UPDATE")] {
+            let req = caller_request(
+                method,
+                DIALED,
+                "m250@test",
+                cseq,
+                Some("bobtag"),
+                Some(ALICE_SDP),
+            );
+            let r = flatten(stack.process_message(&req, alice(), None).await);
+            let m: Method = method.parse().unwrap();
+            let (fwd, dest) =
+                forwarded(&r, &m).unwrap_or_else(|| panic!("{method} relayed: {r:?}"));
+            assert_eq!(dest, t1());
+            assert_eq!(
+                ext_header_value(&fwd.headers, "X-Policy"),
+                Some("on"),
+                "{method}"
+            );
+            let fwd = fwd.clone();
+            stack
+                .process_message(&response_to(&fwd, 200, None, Some(BOB_SDP)), t1(), None)
+                .await;
+        }
+
+        let from_b = bob_request(&inv, "INVITE", 20, Some(BOB_SDP));
+        let r = flatten(stack.process_message(&from_b, t1(), None).await);
+        let (fwd, dest) = forwarded(&r, &Method::Invite).expect("re-INVITE to alice");
+        assert_eq!(dest, alice());
+        assert!(ext_header_value(&fwd.headers, "X-Policy").is_none());
+        let fwd = fwd.clone();
+        stack
+            .process_message(
+                &response_to(&fwd, 200, None, Some(ALICE_SDP)),
+                alice(),
+                None,
+            )
+            .await;
+
+        let bye = caller_request("BYE", DIALED, "m250@test", 4, Some("bobtag"), None);
+        let r = flatten(stack.process_message(&bye, alice(), None).await);
+        let (fwd, _) = forwarded(&r, &Method::Bye).expect("BYE to t1");
+        assert_eq!(ext_header_value(&fwd.headers, "X-Policy"), Some("on"));
+    }
+
+    /// Plans 26/27: a failing rule rejects the re-INVITE (500, counted,
+    /// audited); on BYE the original BYE is still forwarded (Q4), counted,
+    /// audited (rate limited) and the call is removed.
+    #[tokio::test]
+    async fn in_dialog_manipulation_failure_reinvite_rejected_bye_forwarded() {
+        let mut stack = trunk_stack(10, ("none", ""), None).await;
+        let r = place_call(&stack, "m250f@test").await;
+        let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
+        answer(&stack, &inv, t1()).await;
+        add_rule(&mut stack, "From", "set", "<garbage");
+        let cap = uc_audit::capture::start();
+
+        let reinvite = caller_request(
+            "INVITE",
+            DIALED,
+            "m250f@test",
+            2,
+            Some("bobtag"),
+            Some(ALICE_SDP),
+        );
+        let r = flatten(stack.process_message(&reinvite, alice(), None).await);
+        assert!(responded(&r, 500).is_some(), "{r:?}");
+        assert!(forwarded(&r, &Method::Invite).is_none());
+        let failures = || {
+            stack
+                .routing_counters
+                .header_manipulation_failures
+                .load(Ordering::Relaxed)
+        };
+        assert_eq!(failures(), 1);
+        assert!(cap.events().iter().any(|e| matches!(
+            e,
+            uc_audit::AuditEvent::AuthorizationDecision(d)
+                if d.action == "INVITE" && d.policy == "sip.header_manipulation.failed:r250"
+        )));
+
+        let bye = caller_request("BYE", DIALED, "m250f@test", 3, Some("bobtag"), None);
+        let r = flatten(stack.process_message(&bye, alice(), None).await);
+        let (fwd, _) = forwarded(&r, &Method::Bye).expect("BYE still forwarded");
+        assert!(
+            !fwd.headers
+                .get_value(&HeaderName::From)
+                .unwrap()
+                .contains("garbage")
+        );
+        assert_eq!(failures(), 2);
+        assert!(
+            denied_policies(&cap.events()).contains(
+                &"sip.header_manipulation.failed;bye-forwarded-unmanipulated".to_string()
+            )
+        );
+        assert_eq!(stack.call_count().await, 0);
+    }
+
+    /// Plan 28: a sipfrag NOTIFY toward a hidden leg is reduced to its
+    /// status line (no fragment Via/Contact).
+    #[tokio::test]
+    async fn sipfrag_notify_reduced_to_status_line() {
+        let stack = Box::pin(th_trunk_stack()).await;
+        let b_invite = Box::pin(th_established(&stack, "frag@test")).await;
+        let frag = "SIP/2.0 180 Ringing\r\nVia: SIP/2.0/UDP 10.0.0.5;branch=z9hG4bK-in\r\nContact: <sip:x@10.0.0.5>\r\n\r\n";
+        let ntf = with_extra(
+            &bob_request(&b_invite, "NOTIFY", 21, None),
+            "Event: refer\r\nSubscription-State: active;expires=60\r\n",
+            Some(("message/sipfrag", frag)),
+        );
+        let results = flatten(stack.process_message(&ntf, t1(), None).await);
+        assert_no_internal(&results);
+        let (fwd, _) = forwarded(&results, &Method::Notify).expect("NOTIFY to alice");
+        assert_eq!(fwd.body.as_deref(), Some(&b"SIP/2.0 180 Ringing\r\n"[..]));
+        assert_eq!(
+            fwd.headers.get_value(&HeaderName::ContentLength),
+            Some("21")
+        );
+        assert!(!wire_text(fwd).contains("10.0.0.5"));
+        assert_eq!(th_failures(&stack), 0);
+    }
+
+    /// Plans 29/30: a garbage or oversized fragment fails closed (NOTIFY
+    /// not forwarded, counted, audited).
+    #[tokio::test]
+    async fn sipfrag_notify_fails_closed() {
+        let stack = Box::pin(th_trunk_stack()).await;
+        let b_invite = Box::pin(th_established(&stack, "frag-bad@test")).await;
+        let cap = uc_audit::capture::start();
+        let big = format!("SIP/2.0 200 OK\r\nX: {}\r\n", "a".repeat(9 * 1024));
+        for (i, body) in ["U0lQLzIuMCAyMDAgT0sNCg==", big.as_str()]
+            .iter()
+            .enumerate()
+        {
+            let ntf = with_extra(
+                &bob_request(&b_invite, "NOTIFY", 30 + u32::try_from(i).unwrap(), None),
+                "Event: refer\r\nSubscription-State: active\r\n",
+                Some(("message/sipfrag", body)),
+            );
+            let results = flatten(stack.process_message(&ntf, t1(), None).await);
+            assert!(forwarded(&results, &Method::Notify).is_none(), "{i}");
+        }
+        assert_eq!(th_failures(&stack), 2);
+        assert!(
+            denied_policies(&cap.events())
+                .iter()
+                .any(|p| p == "sip.topology_hiding.failed:sipfrag")
+        );
+    }
+
+    /// Plans 29/30/32: `scrub_sipfrag` unit cases.
+    #[test]
+    fn scrub_sipfrag_cases() {
+        let h = th_test_hider();
+        let ok = |b: &str| {
+            scrub_sipfrag(b.as_bytes(), &h).map(|x| String::from_utf8(x.to_vec()).unwrap())
+        };
+        assert_eq!(ok("SIP/2.0 200 OK\r\n").unwrap(), "SIP/2.0 200 OK\r\n");
+        assert_eq!(ok("SIP/2.0 200 OK").unwrap(), "SIP/2.0 200 OK\r\n");
+        assert_eq!(
+            ok("SIP/2.0 503 Service Unavailable\nVia: SIP/2.0/UDP 10.0.0.5\n").unwrap(),
+            "SIP/2.0 503 Service Unavailable\r\n"
+        );
+        assert_eq!(
+            ok("INVITE sip:bob@203.0.113.9 SIP/2.0\r\nContact: <sip:a@10.0.0.5>\r\n").unwrap(),
+            "INVITE sip:bob@203.0.113.9 SIP/2.0\r\n"
+        );
+        // Request line naming an internal host: fail closed.
+        assert!(ok("INVITE sip:bob@10.0.0.5 SIP/2.0\r\n").is_err());
+        for bad in [
+            "",
+            "\r\n",
+            "garbage",
+            "SIP/2.0 2x0 OK",
+            "SIP/2.0 2000 OK",
+            "INVITE sip:bob@x",
+        ] {
+            assert!(ok(bad).is_err(), "{bad:?}");
+        }
+        assert!(ok(&"S".repeat(MAX_SIPFRAG_BYTES + 1)).is_err());
+        assert!(scrub_sipfrag(&[0xff, 0xfe], &h).is_err());
+        // Base64 CTE on a sipfrag body fails closed in the scrub pass.
+        let mut hd = Headers::new();
+        hd.set(HeaderName::ContentType, "message/sipfrag");
+        hd.set(
+            HeaderName::Custom("Content-Transfer-Encoding".to_string()),
+            "base64",
+        );
+        let mut b = Some(Bytes::from("SIP/2.0 200 OK\r\n"));
+        assert_eq!(
+            scrub_residual_topology(&mut hd, &mut b, TH_EXTERNAL, &h),
+            Err("sip.topology_hiding.failed:sipfrag".to_string())
+        );
+        // Plan 31: other bodies are opaque (POA&M-274).
+        let mut hd = Headers::new();
+        hd.set(HeaderName::ContentType, "text/plain");
+        let mut b = Some(Bytes::from("Via: 10.0.0.5"));
+        scrub_residual_topology(&mut hd, &mut b, TH_EXTERNAL, &h).unwrap();
+        assert_eq!(b.as_deref(), Some(&b"Via: 10.0.0.5"[..]));
+    }
+
+    /// Plans 33-36: every in-dialog 481/503 is audited with its policy.
+    #[tokio::test]
+    async fn in_dialog_rejects_audited_with_policy() {
+        let (stack, b_invite) = Box::pin(established_call()).await;
+        let cap = uc_audit::capture::start();
+        let unknown = with_start_line(
+            &alice_request("MESSAGE", 5, Some("bobtag"), None),
+            "MESSAGE sip:bob@sbc.local SIP/2.0",
+        );
+        let unknown = Bytes::from(
+            String::from_utf8(unknown.to_vec())
+                .unwrap()
+                .replace("call-relay@test", "no-such@test"),
+        );
+        let r = flatten(stack.process_message(&unknown, alice(), None).await);
+        assert!(responded(&r, 481).is_some());
+        let forged = String::from_utf8(alice_request("MESSAGE", 6, Some("bobtag"), None).to_vec())
+            .unwrap()
+            .replace("tag=i1", "tag=forged");
+        let r = flatten(
+            stack
+                .process_message(&Bytes::from(forged), alice(), None)
+                .await,
+        );
+        assert!(responded(&r, 481).is_some());
+        let prack_b = with_extra(
+            &bob_request(&b_invite, "PRACK", 40, None),
+            "RAck: 1 1 INVITE\r\n",
+            None,
+        );
+        let r = flatten(stack.process_message(&prack_b, bob(), None).await);
+        assert!(responded(&r, 481).is_some());
+        let prack_a = with_extra(
+            &alice_request("PRACK", 7, Some("bobtag"), None),
+            "RAck: 1 1 INVITE\r\n",
+            None,
+        );
+        let r = flatten(stack.process_message(&prack_a, alice(), None).await);
+        assert!(responded(&r, 481).is_some());
+        for cseq in 0..MAX_PENDING_RELAYS {
+            let info = alice_request(
+                "INFO",
+                10 + u32::try_from(cseq).unwrap(),
+                Some("bobtag"),
+                None,
+            );
+            let r = flatten(stack.process_message(&info, alice(), None).await);
+            assert!(forwarded(&r, &Method::Info).is_some());
+        }
+        let info = alice_request("INFO", 99, Some("bobtag"), None);
+        let r = flatten(stack.process_message(&info, alice(), None).await);
+        assert!(responded(&r, 503).is_some());
+
+        let p = denied_policies(&cap.events());
+        for want in [
+            "in-dialog:unknown-dialog",
+            "in-dialog:from-tag-mismatch",
+            "in-dialog:prack-from-callee",
+            "in-dialog:rack-mismatch",
+            "in-dialog:pending-relay-cap",
+        ] {
+            assert!(p.iter().any(|x| x == want), "{want}: {p:?}");
+        }
+        let unknown_ev = cap.events().into_iter().find_map(|e| match e {
+            uc_audit::AuditEvent::AuthorizationDecision(d)
+                if d.policy == "in-dialog:unknown-dialog" =>
+            {
+                Some(d)
+            }
+            _ => None,
+        });
+        let d = unknown_ev.unwrap();
+        assert_eq!(d.action, "MESSAGE");
+        assert_eq!(d.source_ip, Some(alice().ip()));
+        assert!(d.identity.contains("alice@example.com"));
+    }
+
+    /// Plan 37 end to end: 100 unknown-dialog MESSAGEs from one IP → one
+    /// event, then a flushed `count=99`; BYE 481 shares the key space.
+    #[tokio::test]
+    async fn in_dialog_unknown_dialog_flood_aggregated() {
+        let (stack, _) = Box::pin(established_call()).await;
+        let cap = uc_audit::capture::start();
+        for i in 0..100 {
+            let m = Bytes::from(
+                String::from_utf8(alice_request("MESSAGE", i + 1, Some("bobtag"), None).to_vec())
+                    .unwrap()
+                    .replace("call-relay@test", &format!("ghost-{i}@test")),
+            );
+            stack.process_message(&m, alice(), None).await;
+        }
+        assert_eq!(
+            denied_policies(&cap.events()),
+            vec!["in-dialog:unknown-dialog"]
+        );
+        stack
+            .signaling_audit()
+            .flush(Instant::now() + std::time::Duration::from_secs(61));
+        assert_eq!(
+            denied_policies(&cap.events()),
+            vec![
+                "in-dialog:unknown-dialog",
+                "in-dialog:unknown-dialog;count=99"
+            ]
+        );
+    }
+
+    /// QA (POA&M-251, SI-10): malformed / injection-shaped fragment start
+    /// lines fail closed; a fragment of exactly the cap is accepted.
+    #[test]
+    fn qa_scrub_sipfrag_malformed_edges() {
+        let h = th_test_hider();
+        let scrub = |b: &str| scrub_sipfrag(b.as_bytes(), &h);
+        for bad in [
+            "SIP/2.0 200OK",
+            "SIP/2.0 20 OK",
+            "SIP/2.0 200 OK\u{7}",
+            "SIP/2.0 200 OK\rInjected: 10.0.0.5",
+            "SIP/2.0 200 OK\u{0}",
+            "INVITE sip:bob@203.0.113.9 SIP/2.0 extra",
+            "INVITE sip:bob@203.0.113.9 SIP/3.0",
+            "INVITE  sip:bob@203.0.113.9 SIP/2.0",
+            "INV@TE sip:bob@203.0.113.9 SIP/2.0",
+            " SIP/2.0 200 OK",
+            "INVITE not-a-uri SIP/2.0",
+            "\nSIP/2.0 200 OK",
+        ] {
+            assert!(scrub(bad).is_err(), "{bad:?}");
+        }
+        let head = "SIP/2.0 200 OK\r\nX: ";
+        let exact = format!("{head}{}", "a".repeat(MAX_SIPFRAG_BYTES - head.len()));
+        assert_eq!(exact.len(), MAX_SIPFRAG_BYTES);
+        assert_eq!(&scrub(&exact).unwrap()[..], b"SIP/2.0 200 OK\r\n");
+    }
+
+    /// QA (POA&M-236c): `branch_loop_hash` only accepts the exact
+    /// `z9hG4bK<rand>.<16 hex>` shape; `loop_branch` emits that shape.
+    #[test]
+    fn qa_branch_loop_hash_rejects_malformed() {
+        for _ in 0..32 {
+            let b = loop_branch(7);
+            let rest = b.strip_prefix("z9hG4bK").unwrap();
+            let (r, h) = rest.split_once('.').unwrap();
+            assert_eq!(r.len(), 16, "{b}");
+            assert!(r.bytes().all(|c| c.is_ascii_hexdigit()), "{b}");
+            assert_eq!(h, "0000000000000007");
+        }
+        for bad in [
+            "",
+            "z9hG4bK",
+            "z9hG4bK.",
+            "z9hG4bk0123456789abcdef.0000000000000007",
+            "0123456789abcdef.0000000000000007",
+            "z9hG4bK0123456789abcdef.000000000000007",
+            "z9hG4bK0123456789abcdef.00000000000000070",
+            "z9hG4bK0123456789abcdef.zzzzzzzzzzzzzzzz",
+        ] {
+            assert_eq!(branch_loop_hash(bad), None, "{bad:?}");
+        }
+        // QA finding (fixed): `u64::from_str_radix` alone accepts a leading
+        // '+'; the suffix must be exactly 16 hex digits.
+        assert_eq!(
+            branch_loop_hash("z9hG4bK0123456789abcdef.+000000000000007"),
+            None
         );
     }
 }
