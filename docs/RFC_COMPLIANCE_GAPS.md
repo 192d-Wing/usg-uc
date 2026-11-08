@@ -29,7 +29,7 @@ The **Wiring** column says which shipped binary calls the code: `sbc-daemon` (SI
 | §12 | Dialogs | Partial | Library-only | proto-dialog `Dialog` is imported but the daemon's dialog map is never populated; dialog state lives in proto-b2bua `Call` |
 | §13 | Initiating a Session | Partial | Wired (sbc-daemon, soft client) | Daemon relays INVITE as a B2BUA (`sip_stack.rs` `handle_invite`); soft client originates INVITE (`call_agent.rs`) |
 | §13.2.2.4 | 3xx Redirect Responses | Complete | Library-only | `redirect.rs`; no caller. Daemon relays 3xx as a non-2xx final; soft client rejects redirects |
-| §14 | Modifying an Existing Session | Partial | Wired (sbc-daemon, soft client) | Daemon relays re-INVITE/UPDATE across legs, 491 on glare, 481 for unmatched in-dialog requests (`sip_stack.rs` `handle_in_dialog_request`); soft client sends hold/resume re-INVITE |
+| §14 | Modifying an Existing Session | Partial | Wired (sbc-daemon, soft client) | Daemon relays re-INVITE/UPDATE across legs, 491 on glare, 481 for unmatched in-dialog requests (`sip_stack.rs` `handle_in_dialog_request`); relays in-dialog PRACK/INFO/MESSAGE/NOTIFY (POA&M-182, see "Daemon in-dialog non-session relay" below); soft client sends hold/resume re-INVITE |
 | §15 | Terminating a Session | Partial | Wired (sbc-daemon, soft client) | Daemon relays BYE/CANCEL to the other leg (`sip_stack.rs` `handle_bye`, `handle_cancel`) |
 | §16.4 | Route Information Preprocessing | Partial | Library-only | `routing.rs` `preprocess_route_information` (POA&M-231, proto layer only, daemon wiring pending POA&M-236): strict-route Request-URI restore from the last Route (comma lists handled), pop of our own top Route, 64-element cap, request unchanged on error; tests `preprocess_*` (7). Gap: the `maddr` MUST is not implemented (`// POAM:`, NIST POA&M-235). ACL, dial plan and routing must run on the Request-URI after preprocessing (documented in `# Security`). The daemon is a B2BUA, not a proxy |
 | §16.3 / §16.6 step 8 | Loop detection | Partial | Library-only | `proxy.rs` `detect_loop`, `compute_loop_hash` (POA&M-231): branch `z9hG4bK{rand}.{loophash}`; every own Via checked; same hash = 482, different hash = spiral, missing hash = 482. Deviation: the hash leaves out the topmost Via (on a real loop it belongs to the previous hop); a spiral that differs only in its upstream Via is treated as a loop. Tests `same_request_back_is_loop`, `spiral_with_changed_ruri_allowed`, `spiral_with_changed_cseq_allowed`, `own_via_inside_comma_list_detected` |
@@ -187,7 +187,22 @@ Transport-dependent timers (§17.1.1.2, §17.1.2.2, §17.2.1, §17.2.2): the dae
 | §6 | RAck Header | Complete | Library-only | RAck validation |
 | §7 | PRACK Processing | Complete | Library-only | State machine |
 
-RFC 3261 §17 is wired into sbc-daemon and the soft client. RFC 3262 (PRACK/100rel) is implemented in `prack.rs` but no shipped binary sends, accepts, or relays PRACK; the daemon's Allow header omits it.
+RFC 3261 §17 is wired into sbc-daemon and the soft client. The `prack.rs` trackers above remain library-only. Since POA&M-182 sbc-daemon relays 100rel/PRACK as a B2BUA without using them (see next section); the daemon's Allow header still omits PRACK (RFC-006 below).
+
+### Daemon in-dialog non-session relay (sbc-daemon, POA&M-182)
+
+| Item | Status | Wiring | Notes |
+|------|--------|--------|-------|
+| RFC 6086 INFO, RFC 3428 MESSAGE, RFC 6665 NOTIFY in-dialog relay | Partial | Wired (sbc-daemon) | Tagged-To requests relayed to the other leg (`sip_stack.rs` `relay_in_dialog_non_session`), responses relayed back (`handle_relay_response`), 100 absorbed, Timer F gives 408 to the originator. NOTIFY must carry Event and Subscription-State (400 otherwise). 481 for no dialog / From-tag mismatch (RFC 3261 §12.2.2). Out-of-dialog MESSAGE/NOTIFY still 405. Tests `in_dialog_info_relayed_a_to_b_hides_topology`, `in_dialog_message_relayed_b_to_a_hides_topology`, `in_dialog_notify_relayed_keeps_event_and_sbc_contact`, `in_dialog_relay_unknown_dialog_and_tag_mismatch_481`, `out_of_dialog_message_notify_unchanged_405`, `timer_f_on_relayed_info_yields_408` |
+| In-dialog CSeq (RFC 3261 §12.2.1.1) | Complete | Wired (sbc-daemon) | CSeq reserved under the correlation write lock for relayed requests, re-INVITE/UPDATE and BYE (`reserve_local_cseq`). Test `concurrent_relays_get_distinct_cseqs` |
+| RFC 3262 100rel offered to callee | Partial | Wired (sbc-daemon) | `Supported: 100rel` on the B-leg INVITE only when the caller offered it; `Require: 100rel` when the caller required it (callee 420 relayed). Tests `b_leg_invite_supported_100rel_only_when_caller_offered`, `b_leg_invite_requires_100rel_when_caller_required` |
+| RFC 3262 reliable 1xx and PRACK relay | Partial | Wired (sbc-daemon) | Reliable 1xx relayed with `Require: 100rel` and RSeq unchanged when the caller supports 100rel, otherwise stripped (test `reliable_1xx_stripped_when_caller_lacks_100rel`). RSeq tracked per fork (B-leg To-tag, max 8 early dialogs); PRACK RAck strictly parsed (400 if malformed), must name INVITE, the A-leg INVITE CSeq and an RSeq relayed on that fork (481 otherwise), rewritten to the B-leg INVITE CSeq and sent in that fork's early dialog. PRACK from the B leg gets 481. Tests `prack_rack_cseq_rewritten`, `prack_routed_to_forked_early_dialog` |
+| RFC-004: 408 from far leg on relayed request | Gap | Wired (sbc-daemon) | A far-leg 408 or 481 to a relayed request releases the call; a local Timer F does not. RFC 5057 requires release only for 481 |
+| RFC-005: RFC 6086 Recv-Info negotiation | Gap | Wired (sbc-daemon) | `Recv-Info` crosses only on relayed INFO and its responses, not on the initial INVITE/18x/2xx or re-INVITE/UPDATE, so strict RFC 6086 peers may not send package INFO or may answer 469 |
+| RFC-006: Allow omits relayed methods | Gap | Wired (sbc-daemon) | `ALLOWED_METHODS` unchanged by design; Allow does not list PRACK/INFO/MESSAGE/NOTIFY although they are relayed in-dialog |
+| RFC-007: PRACK Request-URI in early dialog | Gap | Wired (sbc-daemon) | PRACK uses `build_leg_in_dialog_request`, so the Request-URI is the trunk address, not the remote target from the 1xx Contact (same as §12.2.1.1 gap above / NIST POA&M-54) |
+| 2xx from a later fork | Gap | Wired (sbc-daemon) | Pre-existing: the A-leg final 2xx uses the first learned B-leg To-tag (`dialog_to_tag`); a 2xx from a non-first fork is not mapped to its own dialog |
+| Non-SDP bodies | Gap | Wired (sbc-daemon) | Relayed as opaque payload, not scrubbed (NIST POA&M-251) |
 
 ---
 

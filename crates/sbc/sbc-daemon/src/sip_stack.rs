@@ -922,6 +922,25 @@ struct CallAddresses {
     b_leg_last_sdp: Option<Bytes>,
     /// Mid-dialog re-INVITE/UPDATE currently being relayed across the legs.
     pending_reinvite: Option<PendingReinvite>,
+    /// In-dialog PRACK/INFO/MESSAGE/NOTIFY requests relayed across the legs
+    /// and awaiting the far leg's final response (POA&M-182). Non-INVITE
+    /// transactions may overlap each other and a re-INVITE (RFC 3261
+    /// §12.2.1.1), so this is a list, capped at [`MAX_PENDING_RELAYS`].
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pending_relays: Vec<PendingRelay>,
+    /// The caller listed `100rel` in its INVITE's `Supported`/`Require`:
+    /// `Supported: 100rel` is relayed to the callee and reliable 1xx
+    /// (RFC 3262) are relayed with their `RSeq`.
+    caller_100rel: bool,
+    /// Highest `RSeq` relayed to the caller on a reliable 1xx, per B-leg
+    /// early dialog (the callee's To-tag): RSeq spaces are per early dialog,
+    /// and a forked INVITE may yield several (RFC 3262 §3, RFC 3261
+    /// §12.1.2). A PRACK must acknowledge one of those, and is sent in that
+    /// fork's early dialog (RFC 3262 §7.2). Capped at [`MAX_EARLY_DIALOGS`].
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    early_rseq: Vec<EarlyDialogRseq>,
     /// ACK sent for the last relayed re-INVITE's 2xx (keyed by that
     /// re-INVITE's client branch) — re-sent if the 2xx is retransmitted.
     last_reinvite_ack: Option<(String, SipMessage, SbcSocketAddr, LegFlow)>,
@@ -946,6 +965,21 @@ struct HiddenLegs {
 }
 
 impl CallAddresses {
+    /// Reserves the next CSeq of the SBC's request stream toward one leg.
+    /// Called only on the live record under the correlation write lock, so
+    /// concurrent in-dialog requests on one call never share a number
+    /// (RFC 3261 §12.2.1.1: strictly increasing; gaps are allowed).
+    fn reserve_local_cseq(&mut self, target_b_leg: bool) -> u32 {
+        let counter = if target_b_leg {
+            &mut self.b_leg_local_cseq
+        } else {
+            &mut self.a_leg_local_cseq
+        };
+        let n = *counter;
+        *counter = counter.saturating_add(1);
+        n
+    }
+
     /// Flow of one leg: the callee's (`target_b_leg`) or the caller's.
     fn leg_flow(&self, target_b_leg: bool) -> LegFlow {
         if target_b_leg {
@@ -2203,6 +2237,65 @@ struct PendingReinvite {
     offer_setup: Option<crate::sdp_dtls::SetupRole>,
 }
 
+/// An in-dialog PRACK/INFO/MESSAGE/NOTIFY received on one leg and relayed
+/// to the other (POA&M-182); the originator is answered when the far leg
+/// answers. Keyed by the forwarded request's client branch.
+#[derive(Clone)]
+struct PendingRelay {
+    /// Top Via branch of the forwarded request (client transaction key).
+    fwd_branch: String,
+    /// `true` when the caller (A-leg) originated it.
+    from_a_leg: bool,
+    /// PRACK, INFO, MESSAGE or NOTIFY.
+    method: Method,
+    /// The originator's Via stack, From, To and CSeq: its response must
+    /// carry these verbatim.
+    orig_via: Vec<String>,
+    orig_from: String,
+    orig_to: String,
+    orig_cseq: String,
+    /// For a relayed PRACK: the acknowledged fork's To-tag and RSeq, marked
+    /// acknowledged when the far leg answers the PRACK 2xx.
+    prack: Option<(String, u32)>,
+}
+
+/// Reliable-1xx state of one B-leg early dialog (RFC 3262 §3).
+#[derive(Clone, Debug)]
+struct EarlyDialogRseq {
+    /// The callee's To-tag naming the early dialog.
+    tag: String,
+    /// Highest RSeq relayed to the caller.
+    last_rseq: u32,
+    /// Highest RSeq whose PRACK the callee answered 2xx (0 = none). A
+    /// repeat of a reliable 1xx at or below it is a retransmission the
+    /// caller has already acknowledged end to end and is dropped; above it,
+    /// it is relayed so the caller's PRACK retransmission is triggered
+    /// (RFC 3262 §3: the UAS retransmits until the PRACK arrives).
+    acked_rseq: u32,
+}
+
+/// Per-call cap on concurrently relayed non-session in-dialog requests.
+///
+/// ## NIST 800-53 Rev5: SC-5
+const MAX_PENDING_RELAYS: usize = 8;
+
+/// Maximum B-leg early dialogs (forks) whose reliable 1xx RSeq state is
+/// tracked per call. A reliable 1xx from a further fork is relayed
+/// unreliably (no PRACK can be routed for it).
+///
+/// ## NIST 800-53 Rev5: SC-5
+const MAX_EARLY_DIALOGS: usize = 8;
+
+/// CSeq number of every B-leg INVITE the SBC sends (primary and failover);
+/// a PRACK's `RAck` toward the callee names it (RFC 3262 §7.2).
+const B_LEG_INVITE_CSEQ: u32 = 1;
+
+/// Longest value accepted for a relayed method-specific header
+/// (`Event`, `Info-Package`, `RAck`, ...).
+///
+/// ## NIST 800-53 Rev5: SI-10
+const MAX_RELAYED_HEADER_LEN: usize = 1024;
+
 /// A 2xx the SBC sent as UAS for an INVITE, retransmitted until the ACK
 /// arrives: 2xx reliability is the TU's job, not the transaction layer's
 /// (RFC 3261 §13.3.1.4).
@@ -3117,7 +3210,7 @@ impl SipStack {
             );
             let (resp, dest) = Self::build_reinvite_response(timeout, p, &addrs);
             let resp_flow = addrs.leg_flow(!p.from_a_leg);
-            let bye = Self::build_leg_bye(&addrs, p.from_a_leg);
+            let bye = self.reserved_leg_bye(call, &addrs, p.from_a_leg).await;
             let (bye_dest, bye_flow) = addrs.leg_target(p.from_a_leg);
             self.cleanup_terminated_call(
                 call,
@@ -3137,6 +3230,37 @@ impl SipStack {
                     flow: bye_flow.into(),
                 },
             ];
+        }
+
+        // A relayed PRACK/INFO/MESSAGE/NOTIFY got no answer (Timer F): its
+        // originator gets 408 and the relay entry is dropped. The dialog
+        // itself is left to its own requests (RFC 5057 §5.2 scopes the
+        // failure to the non-session usage).
+        if let Some(p) = addrs.pending_relays.iter().find(|p| p.fwd_branch == branch) {
+            debug!(
+                call_id = %addrs.a_leg_sip_call_id,
+                method = %p.method,
+                "Relayed in-dialog request got no response; 408 to originator"
+            );
+            let (resp, dest) = Self::originator_response(
+                timeout,
+                p.from_a_leg,
+                &p.orig_via,
+                &p.orig_from,
+                &p.orig_to,
+                &p.orig_cseq,
+                &addrs,
+            );
+            let resp_flow = addrs.leg_flow(!p.from_a_leg);
+            let mut corr = self.call_correlation.write().await;
+            if let Some(a) = corr.addresses.get_mut(call) {
+                a.pending_relays.retain(|q| q.fwd_branch != branch);
+            }
+            return vec![ProcessResult::Response {
+                message: resp,
+                destination: dest,
+                flow: resp_flow.into(),
+            }];
         }
 
         if branch == addrs.b_leg_branch {
@@ -3597,8 +3721,9 @@ impl SipStack {
                     }
                     for target_b in legs {
                         let (dest, flow) = addrs.leg_target(target_b);
+                        let bye = self.reserved_leg_bye(&internal, &addrs, target_b).await;
                         out.push(ProcessResult::Forward {
-                            message: SipMessage::Request(Self::build_leg_bye(&addrs, target_b)),
+                            message: SipMessage::Request(bye),
                             destination: dest,
                             flow: flow.into(),
                         });
@@ -3779,8 +3904,9 @@ impl SipStack {
                 let snapshot = LegHiding::of(&addrs);
                 for target_b_leg in [false, true] {
                     let (destination, flow) = addrs.leg_target(target_b_leg);
+                    let bye_req = self.reserved_leg_bye(&call, &addrs, target_b_leg).await;
                     let mut bye = ProcessResult::Forward {
-                        message: SipMessage::Request(Self::build_leg_bye(&addrs, target_b_leg)),
+                        message: SipMessage::Request(bye_req),
                         destination,
                         flow: flow.into(),
                     };
@@ -3821,6 +3947,74 @@ impl SipStack {
         self.handle_in_dialog_request(req, source).await
     }
 
+    /// Reserves the next CSeq toward one leg of a live call under the
+    /// correlation write lock (see [`CallAddresses::reserve_local_cseq`]).
+    /// `None` when the call is already gone.
+    async fn reserve_leg_cseq(&self, internal_id: &CallId, target_b_leg: bool) -> Option<u32> {
+        let mut corr = self.call_correlation.write().await;
+        corr.addresses
+            .get_mut(internal_id)
+            .map(|a| a.reserve_local_cseq(target_b_leg))
+    }
+
+    /// Builds a teardown BYE toward one leg with a CSeq reserved on the live
+    /// record, so it cannot collide with a concurrently relayed request.
+    async fn reserved_leg_bye(
+        &self,
+        internal_id: &CallId,
+        addrs: &CallAddresses,
+        target_b_leg: bool,
+    ) -> proto_sip::message::SipRequest {
+        let mut bye = Self::build_leg_bye(addrs, target_b_leg);
+        if let Some(n) = self.reserve_leg_cseq(internal_id, target_b_leg).await {
+            bye.headers.set(HeaderName::CSeq, format!("{n} BYE"));
+        }
+        bye
+    }
+
+    /// Matches an in-dialog request to its B2BUA call: the Call-ID names
+    /// either leg and the request's From tag is that leg's remote tag.
+    /// Returns the call, whether the caller (A-leg) sent it, and a snapshot
+    /// of its addressing; `Err(481)` when no dialog matches (RFC 3261
+    /// §12.2.2), so a forged request with a guessed Call-ID is never relayed.
+    ///
+    /// ## NIST 800-53 Rev5: SC-23, AC-4
+    async fn match_dialog(
+        &self,
+        req: &SipRequest,
+    ) -> Result<(CallId, bool, CallAddresses), StatusCode> {
+        let method = &req.method;
+        let sip_call_id = req.headers.call_id().unwrap_or("");
+        let (internal_id, from_a_leg, addrs) = {
+            let corr = self.call_correlation.read().await;
+            let found = corr
+                .a_leg
+                .get(sip_call_id)
+                .map(|id| (id.clone(), true))
+                .or_else(|| corr.b_leg.get(sip_call_id).map(|id| (id.clone(), false)));
+            let Some(found) =
+                found.and_then(|(id, a)| corr.addresses.get(&id).map(|ad| (id, a, ad.clone())))
+            else {
+                debug!(method = %method, call_id = %sip_call_id, "In-dialog request for unknown dialog, 481");
+                return Err(StatusCode::CALL_DOES_NOT_EXIST);
+            };
+            found
+        };
+        let remote_tag = if from_a_leg {
+            extract_param(&addrs.a_leg_from, "tag").map(String::from)
+        } else {
+            addrs.dialog_to_tag.clone()
+        };
+        if addrs.dialog_to_tag.is_none()
+            || remote_tag.is_none()
+            || req.headers.from_tag() != remote_tag
+        {
+            warn!(method = %method, call_id = %sip_call_id, "In-dialog request does not match the dialog's tags, 481");
+            return Err(StatusCode::CALL_DOES_NOT_EXIST);
+        }
+        Ok((internal_id, from_a_leg, addrs))
+    }
+
     /// Relays a mid-dialog re-INVITE or UPDATE from one leg to the other. The
     /// originator's new offer is re-anchored at the SBC's media address toward
     /// the far leg; the far leg's answer comes back re-anchored toward the
@@ -3844,33 +4038,10 @@ impl SipStack {
         // 1. Match the dialog: Call-ID on either leg, and the request's From
         //    tag must be that leg's remote tag (a forged request with a
         //    guessed Call-ID gets 481, not a relayed session change).
-        let (internal_id, from_a_leg, addrs) = {
-            let corr = self.call_correlation.read().await;
-            let found = corr
-                .a_leg
-                .get(&sip_call_id)
-                .map(|id| (id.clone(), true))
-                .or_else(|| corr.b_leg.get(&sip_call_id).map(|id| (id.clone(), false)));
-            let Some(found) =
-                found.and_then(|(id, a)| corr.addresses.get(&id).map(|ad| (id, a, ad.clone())))
-            else {
-                debug!(method = %method, call_id = %sip_call_id, "In-dialog request for unknown dialog, 481");
-                return respond(StatusCode::CALL_DOES_NOT_EXIST);
-            };
-            found
+        let (internal_id, from_a_leg, addrs) = match self.match_dialog(req).await {
+            Ok(found) => found,
+            Err(status) => return respond(status),
         };
-        let remote_tag = if from_a_leg {
-            extract_param(&addrs.a_leg_from, "tag").map(String::from)
-        } else {
-            addrs.dialog_to_tag.clone()
-        };
-        if addrs.dialog_to_tag.is_none()
-            || remote_tag.is_none()
-            || req.headers.from_tag() != remote_tag
-        {
-            warn!(method = %method, call_id = %sip_call_id, "In-dialog request does not match the dialog's tags, 481");
-            return respond(StatusCode::CALL_DOES_NOT_EXIST);
-        }
 
         // 2. Glare (§14.2): a second session change while one is in flight.
         if addrs.pending_reinvite.is_some() {
@@ -3983,15 +4154,18 @@ impl SipStack {
         relay_session_timer_request_headers(&req.headers, &mut fwd.headers);
         let fwd_branch = fwd.headers.via_branch().unwrap_or_default();
 
-        // 6. Remember what is in flight.
+        // 6. Remember what is in flight. The CSeq is reserved on the live
+        //    record under the write lock (RFC 3261 §12.2.1.1): the snapshot
+        //    number may already be taken by a concurrently relayed request.
         {
             let mut corr = self.call_correlation.write().await;
             if let Some(a) = corr.addresses.get_mut(&internal_id) {
+                let fwd_cseq = a.reserve_local_cseq(from_a_leg);
+                fwd.headers
+                    .set(HeaderName::CSeq, format!("{fwd_cseq} {method}"));
                 if from_a_leg {
-                    a.b_leg_local_cseq += 1;
                     a.b_leg_last_sdp = Some(Bytes::from(offer));
                 } else {
-                    a.a_leg_local_cseq += 1;
                     a.a_leg_last_sdp = Some(Bytes::from(offer));
                 }
                 a.pending_reinvite = Some(PendingReinvite {
@@ -4044,6 +4218,415 @@ impl SipStack {
             flow: addrs.leg_flow(from_a_leg).into(),
         });
         ProcessResult::Multiple(results)
+    }
+
+    /// Relays an in-dialog PRACK (RFC 3262), INFO (RFC 6086), MESSAGE
+    /// (RFC 3428) or NOTIFY (RFC 6665) to the other leg of the B2BUA call
+    /// (POA&M-182). Like [`Self::handle_in_dialog_request`] the forwarded
+    /// request is regenerated in the far leg's dialog (its Call-ID, tags,
+    /// the SBC's Via/CSeq); only the body and allow-listed method headers
+    /// cross, so no originator Via/Contact/Route reaches the far leg, and
+    /// egress topology hiding applies at the chokepoint. The far leg's
+    /// response is relayed back by [`Self::handle_relay_response`].
+    ///
+    /// POAM: POA&M-251 - MESSAGE/INFO/NOTIFY bodies other than SDP are
+    /// relayed as opaque payload; free-text bodies are not scrubbed of
+    /// internal hostnames.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7, AC-4, SC-5, SI-10, SC-23
+    async fn relay_in_dialog_non_session(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+    ) -> ProcessResult {
+        let method = req.method.clone();
+        let sip_call_id = req.headers.call_id().unwrap_or("").to_string();
+        let respond = |status: StatusCode| ProcessResult::Response {
+            message: SipMessage::Response(create_response_from_request(req, status)),
+            destination: source,
+            flow: Flow::Reply,
+        };
+
+        // RFC 3261 §12.2.2: no matching dialog (or a forged From tag) → 481.
+        //
+        // POAM: POA&M-252 - the unknown-dialog/forged-tag 481 is logged, not
+        // audited (NIST 800-53 AU-2, SI-4).
+        let (internal_id, from_a_leg, addrs) = match self.match_dialog(req).await {
+            Ok(found) => found,
+            Err(status) => return respond(status),
+        };
+
+        // Method-specific headers that cross the B2BUA, validated (SI-10).
+        // Everything else is regenerated for the far leg.
+        let names: &[&str] = match method {
+            Method::Info => &["Info-Package", "Recv-Info"],
+            Method::Notify => &["Event", "Subscription-State"],
+            Method::Message => &["Expires"],
+            _ => &[],
+        };
+        let mut carried: Vec<(&str, &str)> = Vec::with_capacity(names.len() + 1);
+        for name in names {
+            if let Some(v) = ext_header_value(&req.headers, name) {
+                if !relayable_header_value(name, v) {
+                    debug!(method = %method, call_id = %sip_call_id, header = name, "Malformed in-dialog header, 400");
+                    return respond(StatusCode::BAD_REQUEST);
+                }
+                carried.push((name, v));
+            }
+        }
+        // RFC 6665 §8.2.1: a NOTIFY MUST carry Event and Subscription-State.
+        if method == Method::Notify && carried.len() < 2 {
+            debug!(call_id = %sip_call_id, "NOTIFY without Event/Subscription-State, 400");
+            return respond(StatusCode::BAD_REQUEST);
+        }
+
+        // RFC 3262 §7.2: the PRACK must acknowledge a reliable 1xx the SBC
+        // actually relayed on this leg's INVITE; its RAck is mapped onto the
+        // B-leg INVITE's CSeq (the RSeq is relayed 1:1).
+        let rack = if method == Method::Prack {
+            if !from_a_leg {
+                // The SBC never relays reliable 1xx toward the callee.
+                debug!(call_id = %sip_call_id, "PRACK from the callee leg, 481");
+                return respond(StatusCode::CALL_DOES_NOT_EXIST);
+            }
+            let Some((acked_rseq, invite_cseq, rack_method)) =
+                ext_header_value(&req.headers, "RAck").and_then(parse_rack)
+            else {
+                debug!(call_id = %sip_call_id, "PRACK with missing or malformed RAck, 400");
+                return respond(StatusCode::BAD_REQUEST);
+            };
+            // RFC 3262 §3: RSeq is per early dialog. The PRACK's To-tag is
+            // the tag the SBC put on that fork's reliable 1xx (the callee's
+            // own tag), and its RAck must match that fork's RSeq space.
+            let to_tag = req.headers.to_tag();
+            let fork = to_tag.as_deref().and_then(|t| {
+                addrs
+                    .early_rseq
+                    .iter()
+                    .find(|e| e.tag == t)
+                    .map(|e| (e.tag.clone(), e.last_rseq))
+            });
+            let Some((fork_tag, last)) = fork.filter(|_| {
+                rack_method.eq_ignore_ascii_case("INVITE")
+                    && invite_cseq == cseq_number(&addrs.a_leg_cseq)
+            }) else {
+                // POAM: POA&M-252 - RAck/early-dialog mismatch 481 is logged,
+                // not audited (NIST 800-53 AU-2).
+                warn!(call_id = %sip_call_id, "PRACK matches no relayed reliable response, 481");
+                return respond(StatusCode::CALL_DOES_NOT_EXIST);
+            };
+            if acked_rseq > last {
+                // POAM: POA&M-252 - RAck/early-dialog mismatch 481 is logged,
+                // not audited (NIST 800-53 AU-2).
+                warn!(call_id = %sip_call_id, "PRACK matches no relayed reliable response, 481");
+                return respond(StatusCode::CALL_DOES_NOT_EXIST);
+            }
+            Some((
+                format!("{acked_rseq} {B_LEG_INVITE_CSEQ} INVITE"),
+                fork_tag,
+                acked_rseq,
+            ))
+        } else {
+            None
+        };
+
+        // SC-5: bounded per-call relay state.
+        //
+        // POAM: POA&M-252 - the over-cap 503 is logged, not audited
+        // (NIST 800-53 AU-2, SI-4).
+        if addrs.pending_relays.len() >= MAX_PENDING_RELAYS {
+            warn!(method = %method, call_id = %sip_call_id, "Too many in-dialog requests in flight, 503");
+            let mut r = create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+            r.headers.set(HeaderName::RetryAfter, "1");
+            return ProcessResult::Response {
+                message: SipMessage::Response(r),
+                destination: source,
+                flow: Flow::Reply,
+            };
+        }
+
+        // The body crosses with its Content-* headers. An SDP body (a PRACK
+        // answer/offer) is re-anchored at the SBC's media address facing the
+        // far leg, as for re-INVITE; other bodies are opaque.
+        let body = req.body.as_ref().filter(|b| !b.is_empty());
+        let content_type = req.headers.get_value(&HeaderName::ContentType);
+        let body: Option<Bytes> = match (body, content_type) {
+            (Some(b), Some(ct)) if is_sdp_content_type(ct) => {
+                let sdp_str = String::from_utf8_lossy(b);
+                if let Some(ref pipeline) = self.media_pipeline
+                    && let Some(media) = extract_media_address(&sdp_str)
+                    && let Some(addr) = admitted_media_addr(&media)
+                {
+                    let _ = pipeline
+                        .set_remote_address(&internal_id.to_string(), from_a_leg, addr)
+                        .await;
+                }
+                let local_media = leg_local_media(&addrs, from_a_leg);
+                Some(Bytes::from(
+                    self.sdp_rewriter
+                        .rewrite_reinvite(&sdp_str, &local_media)
+                        .rewritten,
+                ))
+            }
+            (Some(b), Some(_)) => Some(b.clone()),
+            // RFC 3261 §7.4.1: a body without Content-Type is not relayable.
+            (Some(_), None) => return respond(StatusCode::BAD_REQUEST),
+            (None, _) => None,
+        };
+
+        // Forward on the other leg as the next request in the SBC's own
+        // sequence space there.
+        let fwd_cseq = if from_a_leg {
+            addrs.b_leg_local_cseq
+        } else {
+            addrs.a_leg_local_cseq
+        };
+        let mut fwd =
+            Self::build_leg_in_dialog_request(&addrs, from_a_leg, &method, fwd_cseq, None);
+        // Only NOTIFY is a target refresh here (RFC 6665 §4.1.3); MESSAGE,
+        // INFO and PRACK carry no Contact (RFC 3428 §7, RFC 6086, RFC 3262).
+        if method != Method::Notify {
+            fwd.headers.remove(&HeaderName::Contact);
+        }
+        for (name, v) in carried {
+            fwd.headers
+                .set(HeaderName::Custom((*name).to_string()), v.to_string());
+        }
+        let prack = rack.as_ref().map(|(_, tag, rseq)| (tag.clone(), *rseq));
+        if let Some((rack, fork_tag, _)) = rack {
+            fwd.headers
+                .set(HeaderName::Custom("RAck".to_string()), rack);
+            // RFC 3262 §7.2: the PRACK goes in the acknowledged fork's early
+            // dialog, which may not be the first one learned.
+            fwd.headers.set(
+                HeaderName::To,
+                with_tag(&addrs.b_leg_to, Some(fork_tag.as_str())),
+            );
+        }
+        if let Some(b) = body {
+            for name in [
+                HeaderName::ContentType,
+                HeaderName::ContentDisposition,
+                HeaderName::ContentEncoding,
+            ] {
+                // NIST 800-53 Rev5: SI-10 - bounded, no control characters.
+                match req.headers.get_value(&name) {
+                    Some(v) if relayable_header_value(name.as_str(), v) => {
+                        fwd.headers.set(name, v);
+                    }
+                    Some(_) => {
+                        debug!(method = %method, call_id = %sip_call_id, header = %name, "Malformed Content-* header, 400");
+                        return respond(StatusCode::BAD_REQUEST);
+                    }
+                    None => {}
+                }
+            }
+            fwd.headers
+                .set(HeaderName::ContentLength, b.len().to_string());
+            fwd.body = Some(b);
+        }
+
+        // Header manipulation toward the callee, as on the initial INVITE;
+        // fail closed (POA&M-152): a rule that did not run must not let
+        // the unmanipulated request through.
+        //
+        // POAM: POA&M-250 - relayed re-INVITE/UPDATE/BYE still skip header
+        // manipulation.
+        if from_a_leg && let Some(ref manipulator) = self.header_manipulator {
+            let method_name = method.to_string();
+            let context =
+                ManipulationContext::for_request(&method_name, ManipulationDirection::Outbound);
+            if let Err(e) = manipulator.apply(&mut fwd.headers, &context) {
+                warn!(error = %e, method = %method, "Header manipulation failed; rejecting in-dialog request");
+                self.routing_counters
+                    .header_manipulation_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                let (status, policy) = manipulation_failure(&e);
+                let mut event = invite_denied_event(req, source, &policy);
+                if let uc_audit::AuditEvent::AuthorizationDecision(ref mut d) = event {
+                    d.action = method_name;
+                }
+                audit(event);
+                return respond(status);
+            }
+        }
+        let fwd_branch = fwd.headers.via_branch().unwrap_or_default();
+
+        // Remember what is in flight (cap re-checked under the write lock).
+        {
+            let mut corr = self.call_correlation.write().await;
+            let Some(a) = corr.addresses.get_mut(&internal_id) else {
+                return respond(StatusCode::CALL_DOES_NOT_EXIST);
+            };
+            // POAM: POA&M-252 - the over-cap 503 is not audited (AU-2).
+            if a.pending_relays.len() >= MAX_PENDING_RELAYS {
+                drop(corr);
+                let mut r = create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+                r.headers.set(HeaderName::RetryAfter, "1");
+                return ProcessResult::Response {
+                    message: SipMessage::Response(r),
+                    destination: source,
+                    flow: Flow::Reply,
+                };
+            }
+            // RFC 3261 §12.2.1.1: reserve the CSeq together with the cap
+            // check, on the live record, so two relays (or a relay and a
+            // re-INVITE/BYE) on one call never share a number.
+            let fwd_cseq = a.reserve_local_cseq(from_a_leg);
+            fwd.headers
+                .set(HeaderName::CSeq, format!("{fwd_cseq} {method}"));
+            a.pending_relays.push(PendingRelay {
+                prack,
+                fwd_branch,
+                from_a_leg,
+                method: method.clone(),
+                orig_via: req
+                    .headers
+                    .get_all(&HeaderName::Via)
+                    .map(|h| h.value.clone())
+                    .collect(),
+                orig_from: req
+                    .headers
+                    .get_value(&HeaderName::From)
+                    .unwrap_or_default()
+                    .to_string(),
+                orig_to: req
+                    .headers
+                    .get_value(&HeaderName::To)
+                    .unwrap_or_default()
+                    .to_string(),
+                orig_cseq: req.headers.cseq().unwrap_or_default().to_string(),
+            });
+        }
+
+        debug!(
+            method = %method,
+            call_id = %sip_call_id,
+            from_a_leg,
+            "Relaying in-dialog request to the other leg"
+        );
+        let (dest, flow) = addrs.leg_target(from_a_leg);
+        ProcessResult::Forward {
+            message: SipMessage::Request(fwd),
+            destination: dest,
+            flow: flow.into(),
+        }
+    }
+
+    /// Relays the far leg's response to a relayed PRACK/INFO/MESSAGE/NOTIFY
+    /// back to its originator, in the originator's dialog (its Via stack,
+    /// From, To, Call-ID, CSeq). Only the body with its Content-* headers
+    /// and `Allow`/`Accept`/`Recv-Info`/`Retry-After`/`Unsupported` cross.
+    /// A final response ends the relay; a 408/481 means the far leg's
+    /// dialog is gone (RFC 5057 §5.2) and the call is released.
+    async fn handle_relay_response(
+        &self,
+        resp: &SipResponse,
+        internal_id: &CallId,
+        addrs: &CallAddresses,
+        pending: &PendingRelay,
+    ) -> ProcessResult {
+        let code = resp.status.code();
+        if code == 100 {
+            return ProcessResult::NoAction;
+        }
+        let (mut relayed, orig_dest) = Self::originator_response(
+            resp.status,
+            pending.from_a_leg,
+            &pending.orig_via,
+            &pending.orig_from,
+            &pending.orig_to,
+            &pending.orig_cseq,
+            addrs,
+        );
+        let orig_flow = addrs.leg_flow(!pending.from_a_leg);
+        if let SipMessage::Response(r) = &mut relayed {
+            for name in [
+                HeaderName::Allow,
+                HeaderName::Accept,
+                HeaderName::RetryAfter,
+                HeaderName::Unsupported,
+            ] {
+                if let Some(v) = resp.headers.get_value(&name)
+                    && relayable_header_value(name.as_str(), v)
+                {
+                    r.headers.set(name, v);
+                }
+            }
+            if let Some(v) = ext_header_value(&resp.headers, "Recv-Info")
+                && relayable_header_value("Recv-Info", v)
+            {
+                r.headers
+                    .set(HeaderName::Custom("Recv-Info".to_string()), v.to_string());
+            }
+            if let (Some(b), Some(ct)) = (
+                resp.body.as_ref().filter(|b| !b.is_empty()),
+                resp.headers.get_value(&HeaderName::ContentType),
+            ) {
+                let b = if is_sdp_content_type(ct) {
+                    let sdp_str = String::from_utf8_lossy(b);
+                    let local_media = leg_local_media(addrs, !pending.from_a_leg);
+                    Bytes::from(
+                        self.sdp_rewriter
+                            .rewrite_reinvite(&sdp_str, &local_media)
+                            .rewritten,
+                    )
+                } else {
+                    b.clone()
+                };
+                for name in [
+                    HeaderName::ContentType,
+                    HeaderName::ContentDisposition,
+                    HeaderName::ContentEncoding,
+                ] {
+                    // NIST 800-53 Rev5: SI-10 - an invalid value is dropped.
+                    if let Some(v) = resp.headers.get_value(&name)
+                        && relayable_header_value(name.as_str(), v)
+                    {
+                        r.headers.set(name, v);
+                    }
+                }
+                r.headers
+                    .set(HeaderName::ContentLength, b.len().to_string());
+                r.body = Some(b);
+            }
+        }
+        if code >= 200 {
+            {
+                let mut corr = self.call_correlation.write().await;
+                if let Some(a) = corr.addresses.get_mut(internal_id) {
+                    a.pending_relays
+                        .retain(|p| p.fwd_branch != pending.fwd_branch);
+                    // RFC 3262 §3: the PRACK was answered 2xx; repeats of
+                    // that reliable 1xx are now retransmissions to drop.
+                    if (200..300).contains(&code)
+                        && let Some((tag, rseq)) = &pending.prack
+                        && let Some(e) = a.early_rseq.iter_mut().find(|e| e.tag == *tag)
+                    {
+                        e.acked_rseq = e.acked_rseq.max(*rseq);
+                    }
+                }
+            }
+            if code == 408 || code == 481 {
+                warn!(
+                    call_id = %addrs.a_leg_sip_call_id,
+                    method = %pending.method,
+                    status = code,
+                    "Far leg's dialog is gone; releasing call"
+                );
+                self.cleanup_terminated_call(
+                    internal_id,
+                    false,
+                    crate::cdr::CdrEnd::dialog_lost(addrs.b_leg_answered, code),
+                )
+                .await;
+            }
+        }
+        ProcessResult::Response {
+            message: relayed,
+            destination: orig_dest,
+            flow: orig_flow.into(),
+        }
     }
 
     /// Handles the far leg's response to a relayed re-INVITE/UPDATE: the
@@ -4232,19 +4815,42 @@ impl SipStack {
         pending: &PendingReinvite,
         addrs: &CallAddresses,
     ) -> (SipMessage, SbcSocketAddr) {
+        Self::originator_response(
+            status,
+            pending.from_a_leg,
+            &pending.orig_via,
+            &pending.orig_from,
+            &pending.orig_to,
+            &pending.orig_cseq,
+            addrs,
+        )
+    }
+
+    /// Builds a response toward the originator of a relayed in-dialog
+    /// request from the originator's own Via stack, From, To and CSeq and
+    /// its leg's Call-ID. Returns it with its destination.
+    fn originator_response(
+        status: StatusCode,
+        from_a_leg: bool,
+        orig_via: &[String],
+        orig_from: &str,
+        orig_to: &str,
+        orig_cseq: &str,
+        addrs: &CallAddresses,
+    ) -> (SipMessage, SbcSocketAddr) {
         let mut r = SipResponse::new(status);
-        for via in &pending.orig_via {
+        for via in orig_via {
             r.headers.add(Header::new(HeaderName::Via, via));
         }
-        r.headers.set(HeaderName::From, &pending.orig_from);
-        r.headers.set(HeaderName::To, &pending.orig_to);
-        let (call_id, dest) = if pending.from_a_leg {
+        r.headers.set(HeaderName::From, orig_from);
+        r.headers.set(HeaderName::To, orig_to);
+        let (call_id, dest) = if from_a_leg {
             (&addrs.a_leg_sip_call_id, addrs.a_leg_source)
         } else {
             (&addrs.b_leg_sip_call_id, addrs.b_leg_destination)
         };
         r.headers.set(HeaderName::CallId, call_id);
-        r.headers.set(HeaderName::CSeq, &pending.orig_cseq);
+        r.headers.set(HeaderName::CSeq, orig_cseq);
         r.headers.set(HeaderName::ContentLength, "0");
         (SipMessage::Response(r), dest)
     }
@@ -4824,6 +5430,7 @@ impl SipStack {
                     entry.b_leg_from = new_from;
                     entry.b_leg_to = new_to;
                     entry.dialog_to_tag = None;
+                    entry.early_rseq.clear();
                     entry.b_leg_ruri = Some(new_template.uri.clone());
                     entry.b_leg_invite = Some(new_template);
                     if addrs.stir_egress.is_some() {
@@ -4917,8 +5524,8 @@ impl SipStack {
             return Vec::new();
         }
 
-        let a_bye = Self::build_leg_bye(&addrs, false);
-        let b_bye = Self::build_leg_bye(&addrs, true);
+        let a_bye = self.reserved_leg_bye(&internal_id, &addrs, false).await;
+        let b_bye = self.reserved_leg_bye(&internal_id, &addrs, true).await;
         self.cleanup_terminated_call(&internal_id, false, crate::cdr::CdrEnd::media_failure())
             .await;
 
@@ -6031,8 +6638,15 @@ impl SipStack {
                             });
                         }
                         // 2xx always reaches the TU: their retransmissions
-                        // are the dialog layer's to re-ACK (§13.2.2.4).
-                        if !passed && !(200..300).contains(&status_code) {
+                        // are the dialog layer's to re-ACK (§13.2.2.4). A
+                        // reliable 1xx too: the transaction layer judges a
+                        // retransmission by status code only, but another
+                        // fork's (or a later) reliable 183 is a new response
+                        // (RFC 3262 §3); the TU dedupes on To-tag and RSeq.
+                        if !passed
+                            && !(200..300).contains(&status_code)
+                            && !is_reliable_provisional(resp)
+                        {
                             debug!(call_id = %sip_call_id, status = status_code, "Retransmitted final response absorbed");
                             return ack_action.unwrap_or(ProcessResult::NoAction);
                         }
@@ -6100,6 +6714,18 @@ impl SipStack {
                 Some(ack) => ProcessResult::Multiple(vec![ack, tu]),
                 None => tu,
             };
+        }
+
+        // 2a'. Response to a relayed PRACK/INFO/MESSAGE/NOTIFY (POA&M-182).
+        if let Some(pending) = addrs
+            .pending_relays
+            .iter()
+            .find(|p| p.fwd_branch == branch)
+            .cloned()
+        {
+            return self
+                .handle_relay_response(resp, &internal_id, &addrs, &pending)
+                .await;
         }
 
         // 2b. Retransmitted 2xx to a relayed re-INVITE: re-ACK it (§13.2.2.4).
@@ -6231,6 +6857,70 @@ impl SipStack {
             a_response
                 .headers
                 .set(HeaderName::ContentType, "application/sdp");
+        }
+
+        // RFC 3262 §4: a reliable 1xx is relayed reliable only when the
+        // caller supports 100rel. The SBC relays B's provisionals 1:1, so
+        // each B-leg early dialog's RSeq space is monotonic on the A-leg too
+        // and is kept as is; a PRACK's RAck is mapped back to the B-leg
+        // INVITE (POA&M-182). RSeq state is kept per early dialog (the
+        // callee's To-tag, RFC 3262 §3), and the A-leg 1xx carries that
+        // fork's tag so the caller's PRACK names the early dialog it
+        // acknowledges (RFC 3261 §12.1.2). A reliable 1xx toward a caller
+        // without 100rel (a callee violating §3), or from a fork beyond
+        // MAX_EARLY_DIALOGS, is relayed unreliable.
+        let fork_tag = resp.headers.to_tag();
+        if let (Some(tag), Some(rseq)) = (
+            fork_tag.as_deref(),
+            ext_header_value(&resp.headers, "RSeq").and_then(parse_rseq),
+        ) && addrs
+            .early_rseq
+            .iter()
+            .any(|e| e.tag == tag && rseq <= e.acked_rseq)
+        {
+            // RFC 3262 §3: a retransmitted reliable 1xx whose PRACK the
+            // callee already answered 2xx (it crossed ours in flight).
+            // Repeats before that are relayed: the caller may have lost the
+            // 1xx or its PRACK.
+            debug!(call_id = %addrs.a_leg_sip_call_id, "Retransmitted reliable provisional absorbed");
+            return ProcessResult::NoAction;
+        }
+        if addrs.caller_100rel
+            && lists_option(&resp.headers, &HeaderName::Require, "100rel")
+            && let Some(rseq) = ext_header_value(&resp.headers, "RSeq").and_then(parse_rseq)
+            && let Some(fork_tag) =
+                fork_tag.filter(|t| is_sip_token(t) && relayable_header_value("tag", t))
+        {
+            let tracked = {
+                let mut corr = self.call_correlation.write().await;
+                corr.addresses.get_mut(internal_id).is_some_and(|a| {
+                    if let Some(e) = a.early_rseq.iter_mut().find(|e| e.tag == fork_tag) {
+                        e.last_rseq = e.last_rseq.max(rseq);
+                        true
+                    } else if a.early_rseq.len() < MAX_EARLY_DIALOGS {
+                        a.early_rseq.push(EarlyDialogRseq {
+                            tag: fork_tag.clone(),
+                            last_rseq: rseq,
+                            acked_rseq: 0,
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                })
+            };
+            if tracked {
+                a_response.headers.set(HeaderName::Require, "100rel");
+                a_response
+                    .headers
+                    .set(HeaderName::Custom("RSeq".to_string()), rseq.to_string());
+                a_response.headers.set(
+                    HeaderName::To,
+                    with_tag(&addrs.a_leg_to, Some(fork_tag.as_str())),
+                );
+            } else {
+                debug!(call_id = %addrs.a_leg_sip_call_id, "Too many early dialogs; reliable 1xx relayed unreliably");
+            }
         }
 
         // A reliable 18x (RFC 3262, RSeq) carrying SDP commits the caller to
@@ -6621,10 +7311,7 @@ impl SipStack {
             .unwrap_or(1);
 
         // Build RegisterRequest
-        let register_req = RegisterRequest::new(&aor)
-            .with_contacts(contacts)
-            .with_call_id(&call_id)
-            .with_cseq(cseq);
+        let register_req = register_request_for(req, &aor, contacts, &call_id, cseq);
         let register_req = if let Some(exp) = expires {
             RegisterRequest {
                 expires: Some(exp),
@@ -7796,6 +8483,9 @@ impl SipStack {
         // carry the caller's timer support and Session-Expires/Min-SE so the
         // callee can pick the refresher; the SBC relays the refreshes.
         relay_session_timer_request_headers(&req.headers, &mut b_leg_request.headers);
+        // RFC 3262 §3: reliable provisionals are negotiated end to end, so the
+        // callee may only send them when the caller can PRACK (POA&M-182).
+        relay_100rel_supported(&req.headers, &mut b_leg_request.headers);
 
         // 7b. Apply header manipulation to B-leg INVITE.
         //
@@ -8054,6 +8744,7 @@ impl SipStack {
                 .unwrap_or_default()
                 .to_string();
             let a_leg_cseq = req.headers.cseq().unwrap_or("1 INVITE").to_string();
+            let caller_100rel = caller_offers_100rel(&req.headers);
             let b_leg_from = b_leg_request
                 .headers
                 .get_value(&HeaderName::From)
@@ -8112,6 +8803,9 @@ impl SipStack {
                     a_leg_last_sdp: None,
                     b_leg_last_sdp: b_leg_sdp.map(Bytes::from),
                     pending_reinvite: None,
+                    pending_relays: Vec::new(),
+                    caller_100rel,
+                    early_rseq: Vec::new(),
                     last_reinvite_ack: None,
                     established_at: None,
                     cdr: cdr_draft,
@@ -8296,6 +8990,14 @@ impl SipStack {
             other_dest.port(),
             &other_flow,
         );
+        // RFC 3261 §12.2.1.1: the BYE's CSeq is reserved on the live record,
+        // not taken from the snapshot, so it cannot repeat the number of a
+        // request relayed concurrently on this call.
+        let bye_cseq = if use_cancel {
+            None
+        } else {
+            self.reserve_leg_cseq(&internal_id, is_from_a_leg).await
+        };
         let forward_request = if use_cancel {
             // Early dialog: send CANCEL mirroring the original INVITE
             // (same Via branch, From, To without tag).
@@ -8325,9 +9027,10 @@ impl SipStack {
                     HeaderName::To,
                     with_tag(&addrs.b_leg_to, addrs.dialog_to_tag.as_deref()),
                 );
-                bye_request
-                    .headers
-                    .set(HeaderName::CSeq, format!("{} BYE", addrs.b_leg_local_cseq));
+                bye_request.headers.set(
+                    HeaderName::CSeq,
+                    format!("{} BYE", bye_cseq.unwrap_or(addrs.b_leg_local_cseq)),
+                );
             } else {
                 // SBC is the UAS on the A-leg: swap the A-leg dialog headers
                 // (our From = the To we answered with, our To = the caller's
@@ -8337,9 +9040,10 @@ impl SipStack {
                     with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
                 );
                 bye_request.headers.set(HeaderName::To, &addrs.a_leg_from);
-                bye_request
-                    .headers
-                    .set(HeaderName::CSeq, format!("{} BYE", addrs.a_leg_local_cseq));
+                bye_request.headers.set(
+                    HeaderName::CSeq,
+                    format!("{} BYE", bye_cseq.unwrap_or(addrs.a_leg_local_cseq)),
+                );
             }
             bye_request.headers.set(HeaderName::MaxForwards, "70");
             let branch = generate_branch();
@@ -8576,6 +9280,18 @@ impl SipStack {
                 reason: "Expected request".to_string(),
             };
         };
+
+        // In-dialog PRACK/INFO/MESSAGE/NOTIFY cross the B2BUA (POA&M-182).
+        // Out of dialog (untagged To) they stay 405 below: the SBC is not an
+        // open MESSAGE/NOTIFY relay, and `Allow` does not advertise them.
+        if req.headers.to_tag().is_some()
+            && matches!(
+                req.method,
+                Method::Prack | Method::Info | Method::Message | Method::Notify
+            )
+        {
+            return self.relay_in_dialog_non_session(req, source).await;
+        }
 
         // An in-dialog request (tagged To) for a dialog this SBC does not
         // have gets 481, not 405 (RFC 3261 §12.2.2).
@@ -9642,6 +10358,43 @@ fn a_leg_media_port(addrs: &CallAddresses) -> u16 {
         .unwrap_or(addrs.media_b_leg_port)
 }
 
+/// Builds the registrar request for a REGISTER. RFC 7616 §3.4.6 / RFC 3261
+/// §22.4: the Request-URI is passed so the registrar checks the digest
+/// `uri=` against it, and a digest computed for another URI cannot be
+/// replayed here (POA&M-233).
+///
+/// ## NIST 800-53 Rev5: IA-2, IA-5
+fn register_request_for(
+    req: &SipRequest,
+    aor: &str,
+    contacts: Vec<proto_registrar::ContactInfo>,
+    call_id: &str,
+    cseq: u32,
+) -> RegisterRequest {
+    RegisterRequest::new(aor)
+        .with_request_uri(req.uri.to_string())
+        .with_contacts(contacts)
+        .with_call_id(call_id)
+        .with_cseq(cseq)
+}
+
+/// True for an SDP `Content-Type` (parameters ignored).
+fn is_sdp_content_type(ct: &str) -> bool {
+    ct.split(';')
+        .next()
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/sdp"))
+}
+
+/// The SBC's media address facing one leg: the callee's (`target_b_leg`)
+/// or the caller's.
+fn leg_local_media(addrs: &CallAddresses, target_b_leg: bool) -> MediaAddress {
+    if target_b_leg {
+        MediaAddress::new(&addrs.media_b_leg_ip, addrs.media_b_leg_port)
+    } else {
+        MediaAddress::new(&addrs.media_a_leg_ip, a_leg_media_port(addrs))
+    }
+}
+
 /// The sequence number of a `CSeq` header value such as `"314 INVITE"`.
 fn cseq_number(cseq: &str) -> u32 {
     cseq.split_whitespace()
@@ -9660,11 +10413,112 @@ fn lists_timer_option(headers: &proto_sip::header::Headers, name: &HeaderName) -
     })
 }
 
+/// True when a `Supported`/`Require` header value lists `option` (option
+/// tags are case-insensitive tokens, RFC 3261 §19.2).
+fn lists_option(headers: &proto_sip::header::Headers, name: &HeaderName, option: &str) -> bool {
+    headers.get_all(name).any(|h| {
+        h.value
+            .split(',')
+            .any(|tag| tag.trim().eq_ignore_ascii_case(option))
+    })
+}
+
+/// True when an INVITE lists `100rel` in `Supported` or `Require`
+/// (RFC 3262 §3).
+fn caller_offers_100rel(headers: &proto_sip::header::Headers) -> bool {
+    lists_option(headers, &HeaderName::Supported, "100rel")
+        || lists_option(headers, &HeaderName::Require, "100rel")
+}
+
+/// Adds `100rel` to the B-leg INVITE's `Supported` when the caller offered
+/// it. When the caller *required* it, `Require: 100rel` is sent instead:
+/// the SBC, as the caller's UAS, MUST then deliver every non-100
+/// provisional reliably (RFC 3262 §3), so the callee must comply or answer
+/// 420, which is relayed (RFC 3261 §8.2.2.3). PRACKs are relayed with their
+/// `RAck` mapped across legs (RFC 3262 §7.2; POA&M-182).
+fn relay_100rel_supported(from: &proto_sip::header::Headers, to: &mut proto_sip::header::Headers) {
+    if lists_option(from, &HeaderName::Require, "100rel") {
+        if !lists_option(to, &HeaderName::Require, "100rel") {
+            let value = match to.get_value(&HeaderName::Require) {
+                Some(v) if !v.trim().is_empty() => format!("{v}, 100rel"),
+                _ => "100rel".to_string(),
+            };
+            to.set(HeaderName::Require, value);
+        }
+        return;
+    }
+    if !caller_offers_100rel(from) || lists_option(to, &HeaderName::Supported, "100rel") {
+        return;
+    }
+    let value = match to.get_value(&HeaderName::Supported) {
+        Some(v) if !v.trim().is_empty() => format!("{v}, 100rel"),
+        _ => "100rel".to_string(),
+    };
+    to.set(HeaderName::Supported, value);
+}
+
+/// A non-100 provisional sent reliably (`Require: 100rel` with an `RSeq`,
+/// RFC 3262 §3).
+fn is_reliable_provisional(resp: &proto_sip::message::SipResponse) -> bool {
+    (101..200).contains(&resp.status.code())
+        && lists_option(&resp.headers, &HeaderName::Require, "100rel")
+        && ext_header_value(&resp.headers, "RSeq").is_some()
+}
+
+/// First value of an extension header, matched case-insensitively by name
+/// (e.g. `RSeq`, `RAck`, `Info-Package`).
+fn ext_header_value<'a>(headers: &'a proto_sip::header::Headers, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|h| h.name.as_str().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str())
+}
+
+/// A valid `RSeq` value (RFC 3262 §7.1: 1 to 2**31 - 1).
+fn parse_rseq(v: &str) -> Option<u32> {
+    v.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|n| (1..=0x7fff_ffff).contains(n))
+}
+
+/// Parses `RAck: response-num CSeq-num Method` (RFC 3262 §7.2). `None` for
+/// any malformed value (missing parts, non-numeric, out of range, extra
+/// tokens).
+fn parse_rack(v: &str) -> Option<(u32, u32, &str)> {
+    let mut parts = v.split_whitespace();
+    let rseq = parse_rseq(parts.next()?)?;
+    let cseq = parts.next()?.parse::<u32>().ok()?;
+    let method = parts.next()?;
+    if parts.next().is_some() || !is_sip_token(method) {
+        return None;
+    }
+    Some((rseq, cseq, method))
+}
+
+/// A relayed method-specific header value is acceptable: bounded, no
+/// control characters (header injection), and, for `Event`/`Info-Package`,
+/// a SIP token as the package name (RFC 6665 §8.2.1, RFC 6086 §7).
+///
+/// ## NIST 800-53 Rev5: SI-10
+fn relayable_header_value(name: &str, v: &str) -> bool {
+    if v.is_empty() || v.len() > MAX_RELAYED_HEADER_LEN || v.chars().any(char::is_control) {
+        return false;
+    }
+    if name.eq_ignore_ascii_case("Event") || name.eq_ignore_ascii_case("Info-Package") {
+        let package = v.split(';').next().unwrap_or("").trim();
+        return is_sip_token(package);
+    }
+    true
+}
+
 /// Copies the RFC 4028 negotiation headers of a request across the B2BUA:
 /// `Session-Expires`/`Min-SE` verbatim and `Supported: timer` when the
-/// originator listed it. Only the `timer` option tag is relayed — other
-/// capabilities (e.g. `100rel`) are not implemented end to end by this SBC
-/// and must not be advertised on its behalf.
+/// originator listed it. Only the `timer` option tag is relayed here;
+/// `100rel` is relayed only on the initial INVITE by
+/// [`relay_100rel_supported`] (POA&M-182), other capabilities are not
+/// implemented end to end by this SBC and must not be advertised on its
+/// behalf.
 fn relay_session_timer_request_headers(
     from: &proto_sip::header::Headers,
     to: &mut proto_sip::header::Headers,
@@ -11542,6 +12396,9 @@ pub mod tests {
             a_leg_last_sdp: None,
             b_leg_last_sdp: None,
             pending_reinvite: None,
+            pending_relays: Vec::new(),
+            caller_100rel: false,
+            early_rseq: Vec::new(),
             last_reinvite_ack: None,
             established_at: None,
             cdr: crate::cdr::CdrDraft::default(),
@@ -19201,16 +20058,24 @@ pub mod tests {
         );
         assert_no_internal(&results);
 
-        // In-dialog INFO is NOT relayed today (POA&M-182: answered 405
-        // locally). This only checks that the local answer leaks nothing; it
-        // is not evidence of INFO relay hiding.
+        // In-dialog INFO from the callee is relayed to alice (POA&M-182),
+        // hidden, and its 200 relayed back hidden.
         let results = flatten(
             stack
                 .process_message(&bob_request(&b_invite, "INFO", 12, None), t1(), None)
                 .await,
         );
         assert_no_internal(&results);
-        assert!(forwarded(&results, &Method::Info).is_none(), "POA&M-182");
+        let (info, dest) = forwarded(&results, &Method::Info).expect("INFO to alice");
+        assert_eq!(dest, alice());
+        let info = info.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&info, 200, None, None), alice(), None)
+                .await,
+        );
+        assert_no_internal(&results);
+        assert_eq!(responded(&results, 200).expect("200 to t1").1, t1());
 
         // BYE from the caller: BYE to t1 + 200 to alice.
         let results = flatten(
@@ -19895,10 +20760,9 @@ pub mod tests {
     }
 
     // QA (POA&M-155): mid-dialog non-INVITE requests in both directions.
-    // UPDATE is relayed (asserted, not vacuous). INFO/PRACK/MESSAGE/NOTIFY
-    // are NOT relayed today: `handle_other_request` answers 405 locally
-    // (pre-existing gap, see qa-report). That local answer must still leak
-    // nothing toward the trunk peer.
+    // UPDATE is relayed (asserted, not vacuous). INFO/MESSAGE are relayed
+    // (POA&M-182); PRACK without RAck and NOTIFY without Event are answered
+    // 400 locally. Either way nothing leaks toward the trunk peer.
     #[tokio::test]
     async fn qa_th_mid_dialog_methods_both_directions() {
         let stack = th_trunk_stack().await;
@@ -19953,7 +20817,8 @@ pub mod tests {
         let (_, dest) = forwarded(&results, &Method::Update).expect("UPDATE relayed to alice");
         assert_eq!(dest, alice());
 
-        // Other in-dialog methods: answered locally, hidden, both directions.
+        // Other in-dialog methods: relayed or answered locally, hidden, both
+        // directions.
         for (i, method) in ["INFO", "PRACK", "MESSAGE", "NOTIFY"]
             .into_iter()
             .enumerate()
@@ -21095,5 +21960,878 @@ pub mod tests {
             assert_eq!(rc.len(), 1);
             assert!(rc.order.len() <= RELEASED_CALLS_CAP);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // POA&M-182: in-dialog PRACK/INFO/MESSAGE/NOTIFY relay; POA&M-233.
+    // ------------------------------------------------------------------
+
+    /// Inserts `extra` header lines (CRLF-terminated) before Content-Length
+    /// and optionally swaps the body for `body` with `content_type`.
+    fn with_extra(msg: &Bytes, extra: &str, body: Option<(&str, &str)>) -> Bytes {
+        let text = String::from_utf8(msg.to_vec()).unwrap();
+        let idx = text.find("Content-Length:").unwrap();
+        let mut out = format!("{}{extra}", &text[..idx]);
+        match body {
+            Some((ct, b)) => drop(write!(
+                out,
+                "Content-Type: {ct}\r\nContent-Length: {}\r\n\r\n{b}",
+                b.len()
+            )),
+            None => out.push_str(&text[idx..]),
+        }
+        Bytes::from(out)
+    }
+
+    fn wire_text(req: &proto_sip::message::SipRequest) -> String {
+        String::from_utf8(SipMessage::Request(req.clone()).to_bytes().to_vec()).unwrap()
+    }
+
+    /// INFO A→B on a hidden trunk call: regenerated in the B-leg dialog,
+    /// SBC Via only, no caller address on the wire, Info-Package and body
+    /// preserved, B-leg CSeq advanced; its 200 returns in alice's dialog.
+    #[tokio::test]
+    async fn in_dialog_info_relayed_a_to_b_hides_topology() {
+        let stack = th_trunk_stack().await;
+        let b_invite = th_established(&stack, "rel-info@test").await;
+        let info = with_extra(
+            &caller_request("INFO", DIALED, "rel-info@test", 2, Some("bobtag"), None),
+            "Info-Package: dtmf\r\n",
+            Some(("application/dtmf-relay", "Signal=5\r\nDuration=160\r\n")),
+        );
+        let results = flatten(stack.process_message(&info, alice(), None).await);
+        assert_no_internal(&results);
+        let (fwd, dest) = forwarded(&results, &Method::Info).expect("INFO to t1");
+        assert_eq!(dest, t1());
+        assert_eq!(fwd.headers.call_id(), b_invite.headers.call_id());
+        assert_eq!(fwd.headers.to_tag().as_deref(), Some("bobtag"));
+        assert_eq!(fwd.headers.cseq(), Some("2 INFO"));
+        assert_eq!(fwd.headers.get_all(&HeaderName::Via).count(), 1);
+        assert!(fwd.headers.get_value(&HeaderName::Contact).is_none());
+        assert_eq!(ext_header_value(&fwd.headers, "Info-Package"), Some("dtmf"));
+        assert_eq!(
+            fwd.headers.get_value(&HeaderName::ContentType),
+            Some("application/dtmf-relay")
+        );
+        assert_eq!(
+            fwd.body.as_deref(),
+            Some(&b"Signal=5\r\nDuration=160\r\n"[..])
+        );
+        let wire = wire_text(fwd);
+        assert!(
+            !wire.contains("192.168.1.1"),
+            "caller address on the wire: {wire}"
+        );
+        assert!(
+            !wire.contains("rel-info@test"),
+            "A-leg Call-ID leaked: {wire}"
+        );
+        let fwd = fwd.clone();
+
+        let results = flatten(
+            stack
+                .process_message(&response_to(&fwd, 200, None, None), t1(), None)
+                .await,
+        );
+        let (ok, dest) = responded(&results, 200).expect("200 to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(ok.headers.cseq(), Some("2 INFO"));
+        assert_eq!(ok.headers.call_id(), Some("rel-info@test"));
+        assert!(
+            ok.headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .contains("z9hG4bK-rel-info@test-2")
+        );
+        // Next relayed request continues the B-leg sequence.
+        let again = caller_request("MESSAGE", DIALED, "rel-info@test", 3, Some("bobtag"), None);
+        let results = flatten(stack.process_message(&again, alice(), None).await);
+        assert_eq!(
+            forwarded(&results, &Method::Message)
+                .unwrap()
+                .0
+                .headers
+                .cseq(),
+            Some("3 MESSAGE")
+        );
+        // A response on an unknown branch is not relayed.
+        let mut stray = fwd.clone();
+        stray.headers.set(
+            HeaderName::Via,
+            "SIP/2.0/UDP sbc.example.com:5060;branch=z9hG4bK-stray",
+        );
+        let results = flatten(
+            stack
+                .process_message(&response_to(&stray, 200, None, None), t1(), None)
+                .await,
+        );
+        assert!(responded(&results, 200).is_none());
+        assert_eq!(th_failures(&stack), 0);
+    }
+
+    /// MESSAGE B→A: relayed in alice's dialog, no callee address on the wire.
+    #[tokio::test]
+    async fn in_dialog_message_relayed_b_to_a_hides_topology() {
+        let stack = th_trunk_stack().await;
+        let b_invite = th_established(&stack, "rel-msg@test").await;
+        let msg = with_extra(
+            &bob_request(&b_invite, "MESSAGE", 20, None),
+            "",
+            Some(("text/plain", "hello")),
+        );
+        let results = flatten(stack.process_message(&msg, t1(), None).await);
+        assert_no_internal(&results);
+        let (fwd, dest) = forwarded(&results, &Method::Message).expect("MESSAGE to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(fwd.headers.call_id(), Some("rel-msg@test"));
+        assert_eq!(fwd.headers.cseq(), Some("1 MESSAGE"));
+        assert!(fwd.headers.get_value(&HeaderName::Contact).is_none());
+        assert_eq!(fwd.body.as_deref(), Some(&b"hello"[..]));
+        let wire = wire_text(fwd);
+        assert!(!wire.contains("127.0.0.1"), "callee address leaked: {wire}");
+        assert!(!wire.contains(b_invite.headers.call_id().unwrap()));
+        let fwd = fwd.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&fwd, 202, None, None), alice(), None)
+                .await,
+        );
+        let (ok, dest) = responded(&results, 202).expect("202 to t1");
+        assert_eq!(dest, t1());
+        assert_eq!(ok.headers.cseq(), Some("20 MESSAGE"));
+    }
+
+    /// NOTIFY keeps Event/Subscription-State and carries the SBC Contact
+    /// (target refresh); one without them is 400.
+    #[tokio::test]
+    async fn in_dialog_notify_relayed_keeps_event_and_sbc_contact() {
+        let stack = th_trunk_stack().await;
+        let b_invite = th_established(&stack, "rel-ntf@test").await;
+        let ntf = with_extra(
+            &bob_request(&b_invite, "NOTIFY", 21, None),
+            "Event: refer;id=3\r\nSubscription-State: active;expires=60\r\n",
+            Some(("message/sipfrag", "SIP/2.0 200 OK\r\n")),
+        );
+        let results = flatten(stack.process_message(&ntf, t1(), None).await);
+        assert_no_internal(&results);
+        let (fwd, dest) = forwarded(&results, &Method::Notify).expect("NOTIFY to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(
+            fwd.headers.get_value(&HeaderName::Event),
+            Some("refer;id=3")
+        );
+        assert_eq!(
+            fwd.headers.get_value(&HeaderName::SubscriptionState),
+            Some("active;expires=60")
+        );
+        let contact = fwd.headers.get_value(&HeaderName::Contact).unwrap();
+        assert!(contact.contains(TH_EXTERNAL), "SBC Contact: {contact}");
+        assert!(!wire_text(fwd).contains("127.0.0.1"));
+
+        let bare = bob_request(&b_invite, "NOTIFY", 22, None);
+        let results = flatten(stack.process_message(&bare, t1(), None).await);
+        assert!(responded(&results, 400).is_some());
+        assert!(forwarded(&results, &Method::Notify).is_none());
+        // Header injection attempt in Event package name: 400.
+        let bad = with_extra(
+            &bob_request(&b_invite, "NOTIFY", 23, None),
+            "Event: re fer\r\nSubscription-State: active\r\n",
+            None,
+        );
+        let results = flatten(stack.process_message(&bad, t1(), None).await);
+        assert!(responded(&results, 400).is_some());
+    }
+
+    /// Every relayed method answers 481 for an unknown dialog, and for a
+    /// known Call-ID with the wrong From tag.
+    #[tokio::test]
+    async fn in_dialog_relay_unknown_dialog_and_tag_mismatch_481() {
+        let (stack, _) = established_call().await;
+        for method in ["PRACK", "INFO", "MESSAGE", "NOTIFY"] {
+            let unknown = format!(
+                "{method} sip:bob@sbc.local SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-u-{method}\r\n\
+                 From: <sip:alice@example.com>;tag=zz\r\n\
+                 To: <sip:bob@sbc.local>;tag=nope\r\n\
+                 Call-ID: no-such-dialog@test\r\n\
+                 CSeq: 9 {method}\r\n\
+                 Content-Length: 0\r\n\r\n"
+            );
+            let results = flatten(
+                stack
+                    .process_message(&Bytes::from(unknown), alice(), None)
+                    .await,
+            );
+            assert!(responded(&results, 481).is_some(), "{method} unknown → 481");
+            let forged = String::from_utf8(alice_request(method, 5, Some("bobtag"), None).to_vec())
+                .unwrap()
+                .replace("tag=i1", "tag=forged");
+            let results = flatten(
+                stack
+                    .process_message(&Bytes::from(forged), alice(), None)
+                    .await,
+            );
+            assert!(
+                responded(&results, 481).is_some(),
+                "{method} forged tag → 481"
+            );
+            assert!(
+                results
+                    .iter()
+                    .all(|r| !matches!(r, ProcessResult::Forward { .. }))
+            );
+        }
+    }
+
+    /// Out-of-dialog MESSAGE/NOTIFY (untagged To) keep the 405 with the
+    /// unchanged Allow.
+    #[tokio::test]
+    async fn out_of_dialog_message_notify_unchanged_405() {
+        let (stack, _) = established_call().await;
+        for method in ["MESSAGE", "NOTIFY", "INFO", "PRACK"] {
+            let results = flatten(
+                stack
+                    .process_message(&alice_request(method, 9, None, None), alice(), None)
+                    .await,
+            );
+            let (r, _) = responded(&results, 405).expect("405");
+            assert_eq!(
+                r.headers.get_value(&HeaderName::Allow),
+                Some(ALLOWED_METHODS)
+            );
+            assert!(
+                results
+                    .iter()
+                    .all(|r| !matches!(r, ProcessResult::Forward { .. }))
+            );
+        }
+    }
+
+    /// Registers bob and sends alice's INVITE offering 100rel; returns the
+    /// stack and the B-leg INVITE.
+    async fn ringing_call_100rel() -> (SipStack, proto_sip::message::SipRequest) {
+        ringing_call_with_options("Supported: timer, 100rel").await
+    }
+
+    /// As [`ringing_call_100rel`], with alice's `Supported: timer` line
+    /// replaced by `options`.
+    async fn ringing_call_with_options(
+        options: &str,
+    ) -> (SipStack, proto_sip::message::SipRequest) {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\
+            From: <sip:bob@sbc.local>;tag=r1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: reg-bob@relay\r\n\
+            CSeq: 314 REGISTER\r\n\
+            Contact: <sip:bob@127.0.0.1:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        stack
+            .process_message(&Bytes::from_static(register), bob(), None)
+            .await;
+        let invite =
+            String::from_utf8(alice_request("INVITE", 314, None, Some(ALICE_SDP)).to_vec())
+                .unwrap()
+                .replace("Supported: timer", options);
+        let results = flatten(
+            stack
+                .process_message(&Bytes::from(invite), alice(), None)
+                .await,
+        );
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE forwarded");
+        (stack, b_invite.clone())
+    }
+
+    #[tokio::test]
+    async fn b_leg_invite_supported_100rel_only_when_caller_offered() {
+        let (_, b_invite) = ringing_call_100rel().await;
+        assert!(lists_option(
+            &b_invite.headers,
+            &HeaderName::Supported,
+            "100rel"
+        ));
+        assert!(lists_option(
+            &b_invite.headers,
+            &HeaderName::Supported,
+            "timer"
+        ));
+        assert!(!lists_option(
+            &b_invite.headers,
+            &HeaderName::Require,
+            "100rel"
+        ));
+        let (_, plain) = ringing_call().await;
+        assert!(!lists_option(
+            &plain.headers,
+            &HeaderName::Supported,
+            "100rel"
+        ));
+    }
+
+    /// RFC-003: a caller `Require: 100rel` is sent as `Require: 100rel` on
+    /// the B-leg, so the callee must answer reliably or 420.
+    #[tokio::test]
+    async fn b_leg_invite_requires_100rel_when_caller_required() {
+        let (_, b_invite) = ringing_call_with_options("Supported: timer\r\nRequire: 100rel").await;
+        assert!(lists_option(
+            &b_invite.headers,
+            &HeaderName::Require,
+            "100rel"
+        ));
+        assert!(!lists_option(
+            &b_invite.headers,
+            &HeaderName::Supported,
+            "100rel"
+        ));
+    }
+
+    /// RFC-002: reliable 183s from two forks keep separate RSeq spaces; each
+    /// reaches alice with its fork's To-tag, and alice's PRACK goes to the
+    /// early dialog it names with that fork's RSeq.
+    #[tokio::test]
+    async fn prack_routed_to_forked_early_dialog() {
+        let (stack, b_invite) = ringing_call_100rel().await;
+        for (tag, rseq) in [("bobtag", 7), ("fork2", 1)] {
+            let reliable = with_extra(
+                &response_to(&b_invite, 183, Some(tag), None),
+                &format!("Require: 100rel\r\nRSeq: {rseq}\r\n"),
+                None,
+            );
+            let results = flatten(stack.process_message(&reliable, bob(), None).await);
+            let (p, _) = responded(&results, 183).expect("183 to alice");
+            assert_eq!(p.headers.to_tag().as_deref(), Some(tag));
+            assert_eq!(
+                ext_header_value(&p.headers, "RSeq"),
+                Some(&*rseq.to_string())
+            );
+        }
+        let fork2_again = || {
+            with_extra(
+                &response_to(&b_invite, 183, Some("fork2"), None),
+                "Require: 100rel\r\nRSeq: 1\r\n",
+                None,
+            )
+        };
+        // RFC-008: a repeat of fork 2's reliable 183 before its PRACK is
+        // answered still reaches alice (she may have lost it).
+        let results = flatten(stack.process_message(&fork2_again(), bob(), None).await);
+        let (p, _) = responded(&results, 183).expect("repeat before PRACK relayed");
+        assert_eq!(p.headers.to_tag().as_deref(), Some("fork2"));
+        for (n, (tag, rack, b_rack)) in [
+            ("fork2", "1 314 INVITE", "1 1 INVITE"),
+            ("bobtag", "7 314 INVITE", "7 1 INVITE"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let prack = with_extra(
+                &alice_request("PRACK", 315 + u32::try_from(n).unwrap(), Some(tag), None),
+                &format!("RAck: {rack}\r\n"),
+                None,
+            );
+            let results = flatten(stack.process_message(&prack, alice(), None).await);
+            let (fwd, _) = forwarded(&results, &Method::Prack).expect("PRACK to bob");
+            assert_eq!(fwd.headers.to_tag().as_deref(), Some(tag));
+            assert_eq!(ext_header_value(&fwd.headers, "RAck"), Some(b_rack));
+            if tag == "fork2" {
+                let fwd = fwd.clone();
+                let results = flatten(
+                    stack
+                        .process_message(&response_to(&fwd, 200, None, None), bob(), None)
+                        .await,
+                );
+                assert!(responded(&results, 200).is_some(), "PRACK 200 to alice");
+                // After the PRACK's 2xx, a repeat is a retransmission: dropped.
+                let results = flatten(stack.process_message(&fork2_again(), bob(), None).await);
+                assert!(responded(&results, 183).is_none(), "repeat after PRACK 2xx");
+            }
+        }
+        // Fork 1's RSeq is not valid in fork 2's early dialog, and an
+        // unknown early dialog matches nothing.
+        for (tag, rack) in [("fork2", "7 314 INVITE"), ("nosuch", "1 314 INVITE")] {
+            let prack = with_extra(
+                &alice_request("PRACK", 330, Some(tag), None),
+                &format!("RAck: {rack}\r\n"),
+                None,
+            );
+            let results = flatten(stack.process_message(&prack, alice(), None).await);
+            assert!(responded(&results, 481).is_some(), "{tag} {rack}");
+            assert!(forwarded(&results, &Method::Prack).is_none());
+        }
+    }
+
+    /// RFC-001: two in-dialog requests relayed concurrently on one call get
+    /// distinct, increasing CSeqs on the far leg, and a following BYE
+    /// continues the sequence.
+    #[tokio::test]
+    async fn concurrent_relays_get_distinct_cseqs() {
+        let (stack, _) = established_call().await;
+        let info = alice_request("INFO", 2, Some("bobtag"), None);
+        let msg = alice_request("MESSAGE", 3, Some("bobtag"), None);
+        let (r1, r2) = tokio::join!(
+            stack.process_message(&info, alice(), None),
+            stack.process_message(&msg, alice(), None)
+        );
+        let (r1, r2) = (flatten(r1), flatten(r2));
+        let c1 = forwarded(&r1, &Method::Info)
+            .expect("INFO to bob")
+            .0
+            .headers
+            .cseq_parsed()
+            .unwrap()
+            .sequence;
+        let c2 = forwarded(&r2, &Method::Message)
+            .expect("MESSAGE to bob")
+            .0
+            .headers
+            .cseq_parsed()
+            .unwrap()
+            .sequence;
+        assert_ne!(c1, c2);
+        let mut seen = [c1, c2];
+        seen.sort_unstable();
+        assert_eq!(seen, [2, 3]);
+        let bye = alice_request("BYE", 4, Some("bobtag"), None);
+        let results = flatten(stack.process_message(&bye, alice(), None).await);
+        let (b, _) = forwarded(&results, &Method::Bye).expect("BYE to bob");
+        assert_eq!(b.headers.cseq(), Some("4 BYE"));
+    }
+
+    /// RFC 3262: B's reliable 183 reaches alice with RSeq and Require;
+    /// alice's PRACK `RAck: 7 314 INVITE` reaches bob as `RAck: 7 1 INVITE`
+    /// and the 200 comes back. Unknown RSeq → 481, malformed RAck → 400.
+    #[tokio::test]
+    async fn prack_rack_cseq_rewritten() {
+        let (stack, b_invite) = ringing_call_100rel().await;
+        assert_eq!(b_invite.headers.cseq(), Some("1 INVITE"));
+        let reliable = with_extra(
+            &response_to(&b_invite, 183, Some("bobtag"), None),
+            "Require: 100rel\r\nRSeq: 7\r\n",
+            None,
+        );
+        let results = flatten(stack.process_message(&reliable, bob(), None).await);
+        let (p, dest) = responded(&results, 183).expect("183 to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(ext_header_value(&p.headers, "RSeq"), Some("7"));
+        assert!(lists_option(&p.headers, &HeaderName::Require, "100rel"));
+        assert_eq!(p.headers.cseq(), Some("314 INVITE"));
+
+        let prack = with_extra(
+            &alice_request("PRACK", 315, Some("bobtag"), None),
+            "RAck: 7 314 INVITE\r\n",
+            None,
+        );
+        let results = flatten(stack.process_message(&prack, alice(), None).await);
+        let (fwd, dest) = forwarded(&results, &Method::Prack).expect("PRACK to bob");
+        assert_eq!(dest, bob());
+        assert_eq!(ext_header_value(&fwd.headers, "RAck"), Some("7 1 INVITE"));
+        assert_eq!(fwd.headers.cseq(), Some("2 PRACK"));
+        assert!(fwd.headers.get_value(&HeaderName::Contact).is_none());
+        let fwd = fwd.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&fwd, 200, None, None), bob(), None)
+                .await,
+        );
+        let (ok, dest) = responded(&results, 200).expect("PRACK 200 to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(ok.headers.cseq(), Some("315 PRACK"));
+
+        for (n, (rack, status)) in [
+            ("8 314 INVITE", 481),
+            ("7 313 INVITE", 481),
+            ("7 314 UPDATE", 481),
+            ("x 314 INVITE", 400),
+            ("0 314 INVITE", 400),
+            ("7 99999999999 INVITE", 400),
+            ("7 314", 400),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let prack = with_extra(
+                &alice_request(
+                    "PRACK",
+                    320 + u32::try_from(n).unwrap(),
+                    Some("bobtag"),
+                    None,
+                ),
+                &format!("RAck: {rack}\r\n"),
+                None,
+            );
+            let results = flatten(stack.process_message(&prack, alice(), None).await);
+            assert!(
+                responded(&results, status).is_some(),
+                "RAck {rack} → {status}"
+            );
+            assert!(forwarded(&results, &Method::Prack).is_none());
+        }
+        let missing = alice_request("PRACK", 317, Some("bobtag"), None);
+        let results = flatten(stack.process_message(&missing, alice(), None).await);
+        assert!(responded(&results, 400).is_some());
+    }
+
+    #[tokio::test]
+    async fn reliable_1xx_stripped_when_caller_lacks_100rel() {
+        let (stack, b_invite) = ringing_call().await;
+        let reliable = with_extra(
+            &response_to(&b_invite, 183, Some("bobtag"), None),
+            "Require: 100rel\r\nRSeq: 7\r\n",
+            None,
+        );
+        let results = flatten(stack.process_message(&reliable, bob(), None).await);
+        let (p, _) = responded(&results, 183).expect("183 to alice");
+        assert!(ext_header_value(&p.headers, "RSeq").is_none());
+        assert!(!lists_option(&p.headers, &HeaderName::Require, "100rel"));
+        // And a PRACK cannot match anything.
+        let prack = with_extra(
+            &alice_request("PRACK", 2, Some("bobtag"), None),
+            "RAck: 7 1 INVITE\r\n",
+            None,
+        );
+        let results = flatten(stack.process_message(&prack, alice(), None).await);
+        assert!(responded(&results, 481).is_some());
+    }
+
+    /// Header manipulation applies to requests relayed toward the B-leg;
+    /// a failing rule rejects (500), counts and audits, never forwards.
+    #[tokio::test]
+    async fn relay_header_manipulation_applied_to_b_leg() {
+        let mut stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "rel-manip@test").await;
+        let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
+        let b_invite = b_invite.clone();
+        stack
+            .process_message(
+                &response_to(&b_invite, 200, Some("bobtag"), Some(BOB_SDP)),
+                t1(),
+                None,
+            )
+            .await;
+        let mut policy = ManipulationPolicy::new("p");
+        policy.add_rule(ManipulationRule::new(
+            "tag",
+            proto_sip::manipulation::ManipulationCondition::always(),
+            ManipulationAction::add(HeaderName::Custom("X-Relay".to_string()), "1"),
+        ));
+        let mut manipulator = HeaderManipulator::new();
+        manipulator.add_global_policy(policy);
+        stack.header_manipulator = Some(manipulator);
+        let info = caller_request("INFO", DIALED, "rel-manip@test", 2, Some("bobtag"), None);
+        let results = flatten(stack.process_message(&info, alice(), None).await);
+        let (fwd, _) = forwarded(&results, &Method::Info).expect("INFO to t1");
+        assert_eq!(ext_header_value(&fwd.headers, "X-Relay"), Some("1"));
+
+        let mut policy = ManipulationPolicy::new("bad");
+        policy.add_rule(ManipulationRule::new(
+            "inject",
+            proto_sip::manipulation::ManipulationCondition::always(),
+            ManipulationAction::add(HeaderName::Custom("X-Bad".to_string()), "a\r\nX-Evil: 1"),
+        ));
+        let mut manipulator = HeaderManipulator::new();
+        manipulator.add_global_policy(policy);
+        stack.header_manipulator = Some(manipulator);
+        let capture = uc_audit::capture::start();
+        let info = caller_request("INFO", DIALED, "rel-manip@test", 3, Some("bobtag"), None);
+        let results = flatten(stack.process_message(&info, alice(), None).await);
+        assert!(responded(&results, 500).is_some());
+        assert!(forwarded(&results, &Method::Info).is_none());
+        assert_eq!(
+            stack
+                .routing_counters
+                .header_manipulation_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1, "{authz:?}");
+        assert_eq!(authz[0].action, "INFO");
+        assert!(
+            authz[0]
+                .policy
+                .starts_with("sip.header_manipulation.failed")
+        );
+    }
+
+    /// A far-leg 481 to a relayed INFO is relayed and releases the call.
+    #[tokio::test]
+    async fn far_leg_481_on_relayed_request_releases_call() {
+        let (stack, _) = established_call().await;
+        let info = alice_request("INFO", 2, Some("bobtag"), None);
+        let results = flatten(stack.process_message(&info, alice(), None).await);
+        let (fwd, _) = forwarded(&results, &Method::Info).expect("INFO to bob");
+        let fwd = fwd.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&fwd, 481, None, None), bob(), None)
+                .await,
+        );
+        assert_eq!(responded(&results, 481).expect("481 to alice").1, alice());
+        assert_eq!(stack.call_count().await, 0);
+    }
+
+    /// Timer F on a relayed INFO: 408 to the originator, entry dropped.
+    #[tokio::test]
+    async fn timer_f_on_relayed_info_yields_408() {
+        let (stack, _) = established_call().await;
+        let info = alice_request("INFO", 2, Some("bobtag"), None);
+        let results = flatten(stack.process_message(&info, alice(), None).await);
+        let (fwd, _) = forwarded(&results, &Method::Info).expect("INFO to bob");
+        let branch = fwd.headers.via_branch().unwrap();
+        let call = stack
+            .call_correlation
+            .read()
+            .await
+            .a_leg
+            .get("call-relay@test")
+            .cloned()
+            .unwrap();
+        let out = stack.fail_timed_out_request(&branch, &call).await;
+        let (r, dest) = responded(&out, 408).expect("408 to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(r.headers.cseq(), Some("2 INFO"));
+        let corr = stack.call_correlation.read().await;
+        assert!(corr.addresses.get(&call).unwrap().pending_relays.is_empty());
+    }
+
+    /// SC-5: at most MAX_PENDING_RELAYS relayed requests per call.
+    #[tokio::test]
+    async fn pending_relay_cap_503() {
+        let (stack, _) = established_call().await;
+        for i in 0..MAX_PENDING_RELAYS {
+            let cseq = 2 + u32::try_from(i).unwrap();
+            let msg = alice_request("MESSAGE", cseq, Some("bobtag"), None);
+            let results = flatten(stack.process_message(&msg, alice(), None).await);
+            assert!(forwarded(&results, &Method::Message).is_some());
+        }
+        let msg = alice_request("MESSAGE", 100, Some("bobtag"), None);
+        let results = flatten(stack.process_message(&msg, alice(), None).await);
+        let (r, _) = responded(&results, 503).expect("503 over cap");
+        assert_eq!(r.headers.get_value(&HeaderName::RetryAfter), Some("1"));
+        assert!(forwarded(&results, &Method::Message).is_none());
+    }
+
+    /// POA&M-233: the registrar request carries the Request-URI, and a
+    /// digest whose `uri=` names another URI is refused.
+    #[tokio::test]
+    async fn register_passes_request_uri_to_registrar() {
+        let req = match SipMessage::parse(
+            b"REGISTER sip:sbc.local SIP/2.0\r\n\
+              Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-r\r\n\
+              From: <sip:alice@example.com>;tag=1\r\n\
+              To: <sip:alice@example.com>\r\n\
+              Call-ID: r@test\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap()
+        {
+            SipMessage::Request(r) => r,
+            SipMessage::Response(_) => unreachable!(),
+        };
+        let rr = register_request_for(&req, "sip:alice@example.com", Vec::new(), "r@test", 1);
+        assert_eq!(rr.request_uri.as_deref(), Some("sip:sbc.local"));
+
+        let mut config = SipStackConfig {
+            require_auth: true,
+            auth_realm: "example.com".to_string(),
+            ..Default::default()
+        };
+        config
+            .auth_credentials
+            .insert("alice".to_string(), "password123".to_string());
+        let stack = SipStack::new(config);
+        let base = "REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-{n}\r\n\
+            From: <sip:alice@example.com>;tag=1234\r\n\
+            To: <sip:alice@example.com>\r\n\
+            Call-ID: reg-uri@example.com\r\n\
+            CSeq: {n} REGISTER\r\n\
+            Contact: <sip:alice@client.example.com:5060>\r\n";
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        let first = format!("{}Content-Length: 0\r\n\r\n", base.replace("{n}", "1"));
+        let results = flatten(stack.process_message(&Bytes::from(first), src, None).await);
+        let (chal, _) = responded(&results, 401).expect("401 challenge");
+        let www = chal
+            .headers
+            .get_value(&HeaderName::WwwAuthenticate)
+            .unwrap()
+            .to_string();
+        let nonce = www
+            .split("nonce=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap();
+        let second = format!(
+            "{}Authorization: Digest username=\"alice\", realm=\"example.com\", \
+             nonce=\"{nonce}\", uri=\"sip:other.example.net\", response=\"00\", \
+             algorithm=SHA-256, qop=auth, cnonce=\"c\", nc=00000001\r\n\
+             Content-Length: 0\r\n\r\n",
+            base.replace("{n}", "2")
+        );
+        let results = flatten(stack.process_message(&Bytes::from(second), src, None).await);
+        assert!(
+            results.iter().all(|r| !matches!(
+                r,
+                ProcessResult::Response { message: SipMessage::Response(resp), .. }
+                    if resp.status.code() == 200
+            )),
+            "mismatched digest-uri must not register"
+        );
+        assert!(
+            !stack
+                .location_service
+                .read()
+                .await
+                .has_bindings("sip:alice@example.com")
+        );
+    }
+
+    /// POA&M-233 differential: a *cryptographically valid* digest with
+    /// `uri=` == Request-URI registers; the identical Authorization (same
+    /// response hash) replayed under another Request-URI is refused. The
+    /// only variable is the Request-URI, so the URI binding is what rejects.
+    #[tokio::test]
+    async fn register_valid_digest_bound_to_request_uri() {
+        use proto_sip::auth::{DigestAlgorithm, Qop};
+        use proto_sip::{Sha256DigestHasher, compute_digest_response};
+
+        let mut config = SipStackConfig {
+            require_auth: true,
+            auth_realm: "example.com".to_string(),
+            ..Default::default()
+        };
+        // Per-run test secret (not a hard-coded credential).
+        let test_password = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string();
+        config
+            .auth_credentials
+            .insert("alice".to_string(), test_password.clone());
+        let stack = SipStack::new(config);
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        let digest_uri = "sip:sbc.local";
+        let msg = |ruri: &str, n: u32, auth: Option<&str>| {
+            let mut m = format!(
+                "REGISTER {ruri} SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-b{n}\r\n\
+                 From: <sip:alice@example.com>;tag=1234\r\n\
+                 To: <sip:alice@example.com>\r\n\
+                 Call-ID: reg-bind@example.com\r\n\
+                 CSeq: {n} REGISTER\r\n\
+                 Contact: <sip:alice@client.example.com:5060>\r\n"
+            );
+            if let Some(a) = auth {
+                m.push_str("Authorization: ");
+                m.push_str(a);
+                m.push_str("\r\n");
+            }
+            m.push_str("Content-Length: 0\r\n\r\n");
+            Bytes::from(m)
+        };
+        let param = |www: &str, k: &str| -> Option<String> {
+            www.split(&format!("{k}=\"")[..])
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .map(str::to_string)
+        };
+        let challenge = |results: &[ProcessResult]| -> (String, Option<String>) {
+            let (chal, _) = responded(results, 401).expect("401 challenge");
+            let www = chal
+                .headers
+                .get_value(&HeaderName::WwwAuthenticate)
+                .unwrap()
+                .to_string();
+            assert!(www.contains("SHA-256"), "challenge: {www}");
+            (param(&www, "nonce").unwrap(), param(&www, "opaque"))
+        };
+        let auth_for = |(nonce, opaque): &(String, Option<String>)| {
+            let resp = compute_digest_response(
+                &Sha256DigestHasher,
+                "alice",
+                "example.com",
+                &test_password,
+                "REGISTER",
+                digest_uri,
+                nonce,
+                DigestAlgorithm::Sha256,
+                Some(Qop::Auth),
+                Some(1),
+                Some("c0ffee"),
+                None,
+            )
+            .unwrap();
+            let opaque = opaque
+                .as_ref()
+                .map(|o| format!(", opaque=\"{o}\""))
+                .unwrap_or_default();
+            format!(
+                "Digest username=\"alice\", realm=\"example.com\", nonce=\"{nonce}\", \
+                 uri=\"{digest_uri}\", response=\"{resp}\", algorithm=SHA-256, \
+                 qop=auth, cnonce=\"c0ffee\", nc=00000001{opaque}"
+            )
+        };
+        let not_200 = |results: &[ProcessResult]| {
+            results.iter().all(|r| {
+                !matches!(
+                    r,
+                    ProcessResult::Response { message: SipMessage::Response(resp), .. }
+                        if resp.status.code() == 200
+                )
+            })
+        };
+
+        // Negative first: valid hash, Request-URI differs from digest uri.
+        let r = flatten(
+            stack
+                .process_message(&msg("sip:other.example.net", 1, None), src, None)
+                .await,
+        );
+        let nonce = challenge(&r);
+        let auth = auth_for(&nonce);
+        let r = flatten(
+            stack
+                .process_message(&msg("sip:other.example.net", 2, Some(&auth)), src, None)
+                .await,
+        );
+        assert!(not_200(&r), "digest-uri != Request-URI must not register");
+        assert!(
+            !stack
+                .location_service
+                .read()
+                .await
+                .has_bindings("sip:alice@example.com")
+        );
+
+        // Positive control: same computation, Request-URI == digest uri.
+        let r = flatten(
+            stack
+                .process_message(&msg(digest_uri, 3, None), src, None)
+                .await,
+        );
+        let nonce = challenge(&r);
+        let auth = auth_for(&nonce);
+        let r = flatten(
+            stack
+                .process_message(&msg(digest_uri, 4, Some(&auth)), src, None)
+                .await,
+        );
+        assert!(
+            responded(&r, 200).is_some(),
+            "valid bound digest must register: {r:?}"
+        );
+        assert!(
+            stack
+                .location_service
+                .read()
+                .await
+                .has_bindings("sip:alice@example.com")
+        );
     }
 }

@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### Fixed (SBC, POA&M-182, 233)
+
+- **SBC: in-dialog PRACK, INFO, MESSAGE and NOTIFY are relayed.** (SC-7,
+  SC-5; POA&M-182) They used to be answered 405 locally. They are now
+  regenerated in the other leg's dialog with allow-listed, validated
+  headers and egress topology hiding, and responses are relayed back.
+  Unknown dialog or From-tag mismatch gets 481. At most 8 relayed requests
+  are in flight per call (503 with `Retry-After: 1` beyond that).
+  Out-of-dialog MESSAGE/NOTIFY still get 405, and `Allow` is unchanged.
+- **SBC: 100rel is offered to the callee when the caller offers it.**
+  `Supported: 100rel` (or `Require: 100rel` if the caller required it) on
+  the B-leg INVITE; reliable 1xx and PRACK are relayed with per-fork RSeq
+  tracking and RAck CSeq mapping. Reliable 1xx are stripped of reliability
+  for callers without 100rel.
+- **SBC: in-dialog CSeq is reserved atomically.** Concurrent relayed
+  requests, re-INVITE/UPDATE and BYE on one call no longer reuse a CSeq.
+- **SBC: REGISTER digest is bound to the Request-URI.** (IA-2(8), SC-23;
+  POA&M-233) The Request-URI is passed to the registrar, so the RFC 7616
+  digest-uri check now runs.
+- Known gaps: POA&M-250 (no header manipulation on re-INVITE/UPDATE/BYE),
+  POA&M-251 (non-SDP bodies unscrubbed), POA&M-252 (relay rejections not
+  audited); a far-leg 408 on a relayed request releases the call; no
+  Recv-Info negotiation; 2xx from a later fork not mapped.
+
 ### BREAKING (SBC storage, dormant data-plane batch POA&M-240..247)
 
 - **SBC: `uc-storage` now fails closed on insecure transport.** (SC-8,

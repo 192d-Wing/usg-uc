@@ -206,8 +206,8 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   500 to the originator, final response or reliable (100rel) 1xx replaced
   by 500, unreliable 1xx dropped, 2xx-to-INVITE or reliable 1xx tears the
   call down, failover INVITE fails the call with 503. Residual leaks:
-  POA&M-181; in-dialog INFO/PRACK/MESSAGE/NOTIFY are not relayed:
-  POA&M-182.
+  POA&M-181 (closed); in-dialog INFO/PRACK/MESSAGE/NOTIFY relay
+  added under POA&M-182 (closed).
 - [x] **MINOR — no topology-hiding / header-manipulation failure metrics**
   (POA&M-156): planned `sbc_topology_hiding_failures_total` (and the
   manipulation equivalent) were dropped; failures are only in the audit
@@ -237,8 +237,11 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   relay** (POA&M-215): the topology scrub does not rewrite `c=`; when no relay
   is anchored the peer's own media address reaches the hidden leg (SC-7).
   Accepted because media must reach it; no test.
-- [ ] **MINOR, LIVE — in-dialog PRACK/INFO/MESSAGE/NOTIFY answered 405, not
-  relayed** (POA&M-182): `handle_other_request` answers these locally with
+- [x] **MINOR, LIVE — in-dialog PRACK/INFO/MESSAGE/NOTIFY answered 405, not
+  relayed** (POA&M-182): fixed 2026-11-07 (branch pr/in-dialog-relay-e1edb8):
+  relayed with topology hiding via `relay_in_dialog_non_session`. Follow-ups
+  POA&M-250, -251, -252 and RFC-004..007 in `docs/RFC_COMPLIANCE_GAPS.md`.
+  Original finding: `handle_other_request` answers these locally with
   405 instead of relaying them to the other leg (RFC 3262 PRACK, RFC 6086
   INFO, RFC 3428 MESSAGE, RFC 6665 NOTIFY). Not a topology leak (the local
   405 is hidden), but the topology-hiding tests do not and cannot evidence
@@ -289,8 +292,10 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   `apply_privacy`, `sanitize_inbound_identity`, `rpid_to_pai` for `screen=yes`
   only); presets match parsed `HeaderName::PAssertedIdentity`. Library-only
   (POA&M-236).
-- [ ] **MINOR, LIVE (sbc-daemon) — digest-uri check skipped on REGISTER**
-  (POA&M-233): `handle_register` (`sip_stack.rs` ~5826) builds
+- [x] **MINOR, LIVE (sbc-daemon) — digest-uri check skipped on REGISTER**
+  (POA&M-233): fixed 2026-11-07 via `register_request_for`. Stale `// POAM:`
+  comment in `proto-registrar/src/authentication.rs` still to remove.
+  Original finding: `handle_register` (`sip_stack.rs` ~5826) builds
   `RegisterRequest` without the Request-URI. Call
   `.with_request_uri(req.uri.to_string())`.
 - [x] **MAJOR, LIVE (sbc-trunk-services, client sessions) — UAC digest
@@ -311,6 +316,16 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   route preprocessing with ACL/dial plan after preprocessing, loop-hash
   branches, `apply_privacy` / `sanitize_inbound_identity`; cluster-shared nc
   state for `DigestVerifier`. Also RFC 7616 `userhash`.
+- [ ] **MINOR, LIVE (sbc-daemon) — header manipulation not applied to relayed
+  re-INVITE/UPDATE/BYE** (POA&M-250): only the initial INVITE and relayed
+  PRACK/INFO/MESSAGE/NOTIFY toward the B leg run it. `// POAM:` in `sip_stack.rs`.
+- [ ] **MINOR, LIVE (sbc-daemon) — non-SDP bodies relayed unscrubbed**
+  (POA&M-251): MESSAGE/INFO/NOTIFY bodies and non-SDP response bodies (e.g.
+  `message/sipfrag`) cross as opaque payload. At least run sipfrag through
+  the topology hider.
+- [ ] **MINOR, LIVE (sbc-daemon) — in-dialog relay rejections not audited**
+  (POA&M-252): 481 (unknown dialog, From-tag or RAck mismatch) and 503
+  (pending-relay cap) go to tracing only; add rate-limited uc-audit events.
 - [ ] **MINOR — method case rewritten; Call-ID predictable** (timestamp +
   counter); no server-side `received`/`rport` helper; missing status codes;
   `choose_best_response` doesn't follow §16.7; redirect `sips:`→`sip:` recursion.
