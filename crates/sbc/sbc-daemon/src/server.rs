@@ -448,6 +448,26 @@ impl Server {
                 "vps.emergency_numbers is empty: emergency calls are subject to every call limit"
             );
         }
+        // NIST 800-53 Rev5: SC-8, CM-6 — plaintext storage transport passed
+        // validation only via `allow_insecure_transport`; make it visible.
+        #[cfg(feature = "cluster")]
+        match sbc_config::validate::storage_insecure_transport(config) {
+            Ok(Some(backend)) => {
+                warn!(
+                    event = "storage.insecure_transport_allowed",
+                    backend,
+                    "storage allow_insecure_transport is set: registrar state crosses the network without server-authenticated TLS"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    event = "storage.insecure_transport_check_failed",
+                    error = %e,
+                    "could not evaluate storage transport security"
+                );
+            }
+        }
         #[cfg(feature = "cluster")]
         if config.cluster.as_ref().is_some_and(|c| {
             c.admission.split == sbc_config::schema::AdmissionSplit::Divide
@@ -4499,7 +4519,8 @@ mod tests {
         let config = sbc_config::load_from_str(
             "[general]\nmax_calls = 1000\nmax_registrations = 3000\n\
              [cluster]\nenabled = true\n\
-             [cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 3\n",
+             [cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 3\n\
+             [cluster.auth]\nkey_file = \"/etc/sbc/cluster.key\"\nkey_id = 1\n",
         )
         .expect("config");
         let sip = Server::build_sip_config(&config);

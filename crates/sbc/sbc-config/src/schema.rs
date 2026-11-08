@@ -21,7 +21,115 @@ pub use uc_discovery::{
     DiscoveryConfig, DiscoveryMethod, DnsConfig, GossipConfig, KubernetesConfig,
 };
 #[cfg(feature = "cluster")]
-pub use uc_storage::{PostgresConfig, RedisConfig, StorageBackendType, StorageConfig};
+pub use uc_storage::{
+    PostgresConfig, PostgresSslMode, RedisConfig, StorageBackendType, StorageConfig,
+};
+
+/// `[cluster]` as accepted by the SBC: the `uc_cluster` settings plus the
+/// SBC-owned `[cluster.auth]` table.
+///
+/// Derefs to [`ClusterConfig`], so `cluster.enabled`, `cluster.admission`
+/// etc. read as before.
+///
+/// `Deserialize` is hand-written instead of `#[serde(flatten)]`: flatten
+/// routes the inner struct through serde's buffered map deserializer, which
+/// loses `deny_unknown_fields` diagnostics on nested tables such as
+/// `[cluster.admission]` (CM-6: a typo must fail the load).
+///
+/// The `Deserialize` impl buffers the section as a `toml::Table`, so it only
+/// works with TOML-backed deserializers (the config loader's format).
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings)
+// IA-3, SC-23: prerequisite only, no peer transport (POA&M-241).
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SbcClusterConfig {
+    /// `uc_cluster` settings (`[cluster]` minus `auth`).
+    pub inner: ClusterConfig,
+    /// Peer authentication key (`[cluster.auth]`); required when
+    /// `cluster.enabled` (POA&M-241).
+    pub auth: Option<ClusterAuthConfig>,
+}
+
+#[cfg(feature = "cluster")]
+impl From<ClusterConfig> for SbcClusterConfig {
+    fn from(inner: ClusterConfig) -> Self {
+        Self { inner, auth: None }
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl std::ops::Deref for SbcClusterConfig {
+    type Target = ClusterConfig;
+
+    fn deref(&self) -> &ClusterConfig {
+        &self.inner
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl std::ops::DerefMut for SbcClusterConfig {
+    fn deref_mut(&mut self) -> &mut ClusterConfig {
+        &mut self.inner
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl Serialize for SbcClusterConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Out<'a> {
+            #[serde(flatten)]
+            inner: &'a ClusterConfig,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            auth: Option<&'a ClusterAuthConfig>,
+        }
+        Out {
+            inner: &self.inner,
+            auth: self.auth.as_ref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl<'de> Deserialize<'de> for SbcClusterConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut table = toml::Table::deserialize(deserializer)?;
+        let auth = table
+            .remove("auth")
+            .map(|v| {
+                v.try_into::<ClusterAuthConfig>()
+                    .map_err(|e| D::Error::custom(format!("cluster.auth: {e}")))
+            })
+            .transpose()?;
+        let inner = toml::Value::Table(table)
+            .try_into::<ClusterConfig>()
+            .map_err(|e| D::Error::custom(format!("cluster: {e}")))?;
+        Ok(Self { inner, auth })
+    }
+}
+
+/// `[cluster.auth]`: pre-shared HMAC key used to authenticate cluster peer
+/// messages (`uc_cluster::PeerAuthenticator`).
+///
+/// The key file is read by the daemon at startup, not at validation time,
+/// so a config can be validated off-box. It must hold at least
+/// `uc_cluster::auth::MIN_KEY_LEN` bytes of random key material, be owned
+/// by the SBC user and mode 0600, and be identical on every node.
+///
+/// ## NIST 800-53 Rev5: CM-6, SC-12 (Cryptographic Key Establishment)
+// IA-3, SC-23: prerequisite only, no peer transport (POA&M-241).
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAuthConfig {
+    /// Path to the raw key material.
+    pub key_file: PathBuf,
+    /// Key identifier carried in every envelope (key rotation).
+    pub key_id: u32,
+}
 
 #[cfg(feature = "aaa")]
 pub use uc_aaa::{AaaConfig, AaaProviderType, RadiusConfig};
@@ -75,7 +183,7 @@ pub struct SbcConfig {
     ///
     /// ## NIST 800-53 Rev5: SC-24 (Fail in Known State)
     #[cfg(feature = "cluster")]
-    pub cluster: Option<ClusterConfig>,
+    pub cluster: Option<SbcClusterConfig>,
 
     /// Storage backend settings.
     ///
