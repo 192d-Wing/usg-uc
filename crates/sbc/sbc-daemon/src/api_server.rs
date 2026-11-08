@@ -626,6 +626,14 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
     for &(name, help) in ROUTING_METRICS {
         metrics.register_gauge(name, help);
     }
+    // NIST 800-53 Rev5: SI-4, AU-5 - POA&M-236/252 signaling audit counters.
+    for name in crate::signaling_audit::DIGEST_METRIC_NAMES
+        .iter()
+        .chain(crate::signaling_audit::IN_DIALOG_METRIC_NAMES.iter())
+        .chain(std::iter::once(&crate::signaling_audit::METRIC_DROPPED))
+    {
+        metrics.register_gauge(*name, crate::signaling_audit::METRIC_HELP);
+    }
     // NIST 800-53 Rev5: AU-5 (CDR pipeline failure visibility)
     for (name, help) in [
         (METRIC_CDR_EMITTED, "CDRs accepted onto the writer queue"),
@@ -791,6 +799,11 @@ impl AppState {
                 stack.deferred_send_dropped(),
             ];
             for (&(name, _), v) in ROUTING_METRICS.iter().zip(values) {
+                if let Some(g) = self.metrics.gauge(name) {
+                    g.set(as_gauge(v));
+                }
+            }
+            for (name, v) in stack.signaling_audit().metric_values() {
                 if let Some(g) = self.metrics.gauge(name) {
                     g.set(as_gauge(v));
                 }
@@ -2375,6 +2388,9 @@ mod tests {
             ("sbc_header_manipulation_failures_total", 5),
             ("sbc_late_invite_2xx_teardown_total", 7),
             ("sbc_deferred_send_dropped_total", 11),
+            ("sbc_signaling_audit_dropped_total", 0),
+            ("sbc_in_dialog_rejects_unknown_dialog_total", 0),
+            ("sbc_digest_verify_ok_total", 0),
         ] {
             let want = format!("{name} {v}");
             assert!(text.lines().any(|l| l.ends_with(&want)), "{want}: {text}");

@@ -323,20 +323,54 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   upgrade. Document in upgrade notes or gate on cluster version.
 - [ ] **MINOR, DORMANT — RFC 3261 §16.4 `maddr` not handled** (POA&M-235):
   `// POAM:` in `routing.rs` `preprocess_route_information`.
-- [ ] **MAJOR, DORMANT (sbc-daemon wiring) — wire the POA&M-230..232 helpers**
-  (POA&M-236): `DigestVerifier` with uc-audit events for digest rejects,
-  route preprocessing with ACL/dial plan after preprocessing, loop-hash
-  branches, `apply_privacy` / `sanitize_inbound_identity`; cluster-shared nc
-  state for `DigestVerifier`. Also RFC 7616 `userhash`.
-- [ ] **MINOR, LIVE (sbc-daemon) — header manipulation not applied to relayed
-  re-INVITE/UPDATE/BYE** (POA&M-250): only the initial INVITE and relayed
+- [ ] **MAJOR, PARTIAL (sbc-daemon wiring) — wire the POA&M-230..232 helpers**
+  (POA&M-236). Wired 2026-11-08 (data-plane wiring):
+  - [x] `DigestVerifier` on REGISTER with rate-limited uc-audit events for
+    every reject/stale outcome (`verify_register_digest`, `signaling_audit.rs`)
+    — but unreachable from shipped config (POA&M-270)
+  - [x] §16.4 route preprocessing before ACL/dial plan (`preprocess_initial_invite`)
+  - [x] loop-hash B-leg branches (`loop_branch`, `own_via_loop`)
+  - [x] `sanitize_inbound_identity` at ingress (per `trust_domain`) and egress
+    `apply_privacy`
+
+  Open residuals:
+  - [ ] split out: POA&M-270 (credential source), -271 (INVITE digest),
+    -272 (cluster-shared nc), -273 (`userhash`), -274 (other non-SDP bodies)
+  - [ ] loops through `obfuscate_call_id`, or an outbound proxy that pops its
+    Route (Route is in `compute_loop_hash`), look like spirals and are caught
+    only by Max-Forwards (483)
+  - [ ] signaling-audit aggregator overflow is reported as
+    `AuditRecordsDropped { reason: QueueFull }`; needs an aggregation-overflow
+    reason in uc-audit
+  - [ ] SEC-6 (proto-sip follow-up): `DigestVerifier::verify` records nc in the
+    tracker before the constant-time response check, so a holder of a
+    server-issued nonce can fill the tracker and force `stale=true`
+    re-challenges for legitimate users
+  - [ ] `[[trunk_groups]] trust_domain` defaults to `true` (fail-open for
+    PAI/PPI); flip the default or warn when unset
+- [ ] **MAJOR, DORMANT (sbc-daemon) — no digest credential source** (POA&M-270):
+  `SipStackConfig.auth_credentials` / `require_auth` have no sbc-config (HA1
+  file or user store) source and no server wiring, so the REGISTER
+  `DigestVerifier` path runs only in tests.
+- [ ] **MINOR (sbc-daemon) — no per-INVITE digest challenge** (POA&M-271):
+  UDP callers have no authenticated identity; caps STIR attestation.
+- [ ] **MINOR (sbc-daemon cluster) — shared nonce key needs cluster-shared nc
+  state** (POA&M-272).
+- [ ] **MINOR — RFC 7616 `userhash` not supported** (POA&M-273).
+- [ ] **MINOR, LIVE (sbc-daemon) — non-SDP, non-sipfrag bodies relayed as
+  opaque payload** (POA&M-274): text/plain, application/* etc. in relayed
+  MESSAGE/INFO/NOTIFY and responses are not scrubbed.
+- [x] **MINOR, LIVE (sbc-daemon) — header manipulation not applied to relayed
+  re-INVITE/UPDATE/BYE** (POA&M-250): fixed 2026-11-08; re-INVITE/UPDATE fail
+  closed, BYE fails open (audited, documented AC-4 exception): only the initial INVITE and relayed
   PRACK/INFO/MESSAGE/NOTIFY toward the B leg run it. `// POAM:` in `sip_stack.rs`.
-- [ ] **MINOR, LIVE (sbc-daemon) — non-SDP bodies relayed unscrubbed**
-  (POA&M-251): MESSAGE/INFO/NOTIFY bodies and non-SDP response bodies (e.g.
+- [x] **MINOR, LIVE (sbc-daemon) — non-SDP bodies relayed unscrubbed**
+  (POA&M-251): fixed 2026-11-08 for `message/sipfrag` (start line only, fail
+  closed); other bodies tracked as POA&M-274: MESSAGE/INFO/NOTIFY bodies and non-SDP response bodies (e.g.
   `message/sipfrag`) cross as opaque payload. At least run sipfrag through
   the topology hider.
-- [ ] **MINOR, LIVE (sbc-daemon) — in-dialog relay rejections not audited**
-  (POA&M-252): 481 (unknown dialog, From-tag or RAck mismatch) and 503
+- [x] **MINOR, LIVE (sbc-daemon) — in-dialog relay rejections not audited**
+  (POA&M-252): fixed 2026-11-08 (`SignalingAudit`, rate limited): 481 (unknown dialog, From-tag or RAck mismatch) and 503
   (pending-relay cap) go to tracing only; add rate-limited uc-audit events.
 - [ ] **MINOR — method case rewritten; Call-ID predictable** (timestamp +
   counter); no server-side `received`/`rport` helper; missing status codes;

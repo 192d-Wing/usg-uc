@@ -69,6 +69,7 @@ mod runtime;
 mod sdp_dtls;
 mod server;
 mod shutdown;
+mod signaling_audit;
 mod sip_stack;
 mod stir;
 mod stir_binding;

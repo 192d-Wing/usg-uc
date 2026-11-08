@@ -1266,6 +1266,21 @@ pub fn routing_warnings(config: &SbcConfig) -> Vec<String> {
             }
         }
     }
+    // RFC 3325 §5 / RFC 3323 §5.1: a signing trunk outside the trust domain
+    // gets privacy applied after signing, so Identity is dropped whenever
+    // From is anonymized. Allowed (privacy wins) but surfaced at load.
+    //
+    // NIST 800-53 Rev5: CM-6, AC-21
+    for group in config.trunk_groups.iter().filter(|g| !g.trust_domain) {
+        for trunk in group.trunks.iter().filter(|t| t.stir_shaken.sign) {
+            out.push(format!(
+                "trunk group '{}': trunk '{}' has stir_shaken.sign = true but the group has \
+                 trust_domain = false; RFC 3323 privacy is applied after signing and the \
+                 Identity header is dropped when From is anonymized",
+                group.id, trunk.id
+            ));
+        }
+    }
     out
 }
 
@@ -1749,6 +1764,7 @@ mod tests {
             trunks: vec![trunk("t1")],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         }
     }
 
@@ -1964,6 +1980,7 @@ mod tests {
             }],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         });
         assert_rejected(&c, "signing_enabled");
     }
@@ -2545,6 +2562,66 @@ max_passport_age_secs = 120
         let w = routing_warnings(&config);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("ghost"));
+    }
+
+    /// RFC 3325 trust domain: a missing `trust_domain` keeps today's
+    /// behaviour (true); an explicit `false` parses.
+    #[test]
+    fn trust_domain_defaults_true_and_parses_false() {
+        let c: SbcConfig = toml::from_str(
+            "[[trunk_groups]]\nid = \"a\"\n\n[[trunk_groups]]\nid = \"b\"\ntrust_domain = false\n",
+        )
+        .unwrap();
+        assert!(c.trunk_groups[0].trust_domain);
+        assert!(!c.trunk_groups[1].trust_domain);
+        let round: SbcConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert!(round.trunk_groups[0].trust_domain);
+        assert!(!round.trunk_groups[1].trust_domain);
+    }
+
+    /// CM-6: `stir_shaken.sign = true` on an untrusted group is warned
+    /// about (privacy wins over Identity); a trusted group is not.
+    #[test]
+    fn signing_trunk_outside_trust_domain_warns() {
+        let mut config = SbcConfig::default();
+        let mut g = trunk_group("carriers");
+        g.trunks[0].stir_shaken.sign = true;
+        config.trunk_groups = vec![g.clone()];
+        assert_eq!(routing_warnings(&config), Vec::<String>::new());
+        g.trust_domain = false;
+        config.trunk_groups = vec![g];
+        let w = routing_warnings(&config);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("trust_domain = false") && w[0].contains("carriers"));
+    }
+
+    /// QA: `trust_domain` is a strict bool; a string or integer is a parse
+    /// error, never silently coerced to trusted.
+    #[test]
+    fn qa_trust_domain_rejects_non_bool() {
+        for v in ["\"false\"", "0", "\"no\""] {
+            let src = format!("[[trunk_groups]]\nid = \"a\"\ntrust_domain = {v}\n");
+            assert!(toml::from_str::<SbcConfig>(&src).is_err(), "{v}");
+        }
+    }
+
+    /// QA: the warning fires per signing trunk only; a non-signing trunk
+    /// in an untrusted group is silent.
+    #[test]
+    fn qa_untrusted_group_warns_per_signing_trunk_only() {
+        let mut config = SbcConfig::default();
+        let mut g = trunk_group("carriers");
+        g.trust_domain = false;
+        g.trunks = vec![trunk("plain"), trunk("s1"), trunk("s2")];
+        config.trunk_groups = vec![g.clone()];
+        assert_eq!(routing_warnings(&config), Vec::<String>::new());
+        g.trunks[1].stir_shaken.sign = true;
+        g.trunks[2].stir_shaken.sign = true;
+        config.trunk_groups = vec![g];
+        let w = routing_warnings(&config);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("'s1'") && w[1].contains("'s2'"));
+        assert!(!w.iter().any(|x| x.contains("'plain'")));
     }
 
     #[test]
@@ -3190,6 +3267,7 @@ mod qa_trunk_tls_edges {
             }],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         }
     }
 
@@ -3541,6 +3619,7 @@ mod cluster_admission_tests {
         c.trunk_groups.push(TrunkGroupConfig {
             id: "g".to_string(),
             require_tls: false,
+            trust_domain: true,
             name: "g".to_string(),
             strategy: "priority".to_string(),
             trunks: vec![TrunkConfigSchema {
@@ -3633,6 +3712,7 @@ mod cluster_admission_tests {
         c.trunk_groups.push(TrunkGroupConfig {
             id: "g".to_string(),
             require_tls: false,
+            trust_domain: true,
             name: "g".to_string(),
             strategy: "priority".to_string(),
             trunks: vec![

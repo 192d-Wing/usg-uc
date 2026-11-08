@@ -1155,6 +1155,7 @@ mod tests {
             }],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         });
         let msg = allow_list_warning(&c).unwrap();
         assert!(msg.contains("x5u_allow_hosts is EMPTY"), "{msg}");
@@ -1207,6 +1208,7 @@ mod tests {
             ],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         });
         let svc = test_support::service(&c);
         let ctx = |trunk| SignCtx {
@@ -1280,6 +1282,7 @@ mod tests {
             }],
             zone: None,
             require_tls: false,
+            trust_domain: true,
         });
         c
     }

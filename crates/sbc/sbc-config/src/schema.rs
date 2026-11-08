@@ -1677,6 +1677,24 @@ pub struct TrunkGroupConfig {
     /// ## NIST 800-53 Rev5: SC-8 (POA&M-48); RFC 5630 §3.1.3
     #[serde(default)]
     pub require_tls: bool,
+    /// RFC 3325 Spec(T) trust-domain membership of this group's peers.
+    ///
+    /// - `true` (default, preserves existing caller-ID behaviour): inbound
+    ///   P-Asserted-Identity / P-Preferred-Identity from these trunks is
+    ///   kept, and outbound `Privacy: id` keeps PAI toward them (RFC 3325
+    ///   §7); the Privacy header is passed on for the next privacy service.
+    /// - `false` (hardening): inbound PAI/PPI is stripped at ingress
+    ///   (RFC 3325 §5) and outbound privacy is fully applied (RFC 3323
+    ///   §5.1), including removal of the Privacy header.
+    ///
+    /// Registered endpoints are always outside the trust domain.
+    /// `stir_shaken.sign = true` on a trunk of a `trust_domain = false`
+    /// group is a load warning: privacy wins and Identity is dropped when
+    /// From is anonymized.
+    ///
+    /// ## NIST 800-53 Rev5: AC-21, SC-4, CM-6; RFC 3325 §5, §7
+    #[serde(default = "default_true")]
+    pub trust_domain: bool,
 }
 
 /// Individual trunk configuration.

@@ -49,6 +49,64 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   saved MD5 policy when the password or username changes. Known gap:
   POA&M-277 (per-realm answer loops).
 
+### Added (SBC, POA&M-236 partial, 250, 251, 252)
+
+- **SBC: REGISTER digest uses the proto-sip `DigestVerifier`.** (IA-2,
+  IA-5(1), IA-6; POA&M-236) HMAC-keyed nonces (TTL 300 s, per-process
+  random key), nc replay tracking capped at `max_registrations * 2`, and a
+  decoy password for unknown users so they get the same timing and reason.
+  If verifier setup fails the registrar keeps enforcing auth (fail closed).
+  Every reject and stale outcome emits a rate-limited uc-audit event
+  (`digest:<reason>`, aggregated per source IP with `;count=n`). Not
+  reachable from shipped config: sbc-config has no credential source yet
+  (POA&M-270).
+- **SBC: RFC 3261 §16.4 route preprocessing on initial INVITE.** (SC-7)
+  Our own Request-URI / top Route is popped before ACL, dial plan, VPS,
+  STIR and emergency classification run. Malformed or oversized Route sets
+  get 400. The request is cloned only when a Route may change.
+- **SBC: loop-hash Via branches and 482 Loop Detected.** (SC-5) Residual
+  under POA&M-236: the obfuscated B-leg Call-ID and a Route popped by an
+  outbound proxy are bounded only by Max-Forwards (483).
+- **SBC: RFC 3323/3325 privacy.** (AC-21, SC-7) `Privacy` is applied and
+  inbound `P-Asserted-Identity` is sanitized at the trust boundary.
+- **SBC config: `trunk_groups[].trust_domain`** (bool, default `true`).
+  Defines the RFC 3325 trust domain. A group set to `false` has inbound PAI
+  stripped and gets no PAI on egress. `validate` warns when a trunk with
+  `stir_shaken.sign = true` is in an untrusted group. Existing configs parse
+  unchanged; the default keeps current behaviour (documented AC-21
+  deviation).
+- **SBC: header manipulation on relayed re-INVITE, UPDATE and BYE.** (AC-4;
+  POA&M-250) BYE fails open when manipulation errors (deliberate,
+  documented AC-4 exception) so calls can always be torn down.
+- **SBC: `message/sipfrag` bodies go through the topology hider.** (SC-7;
+  POA&M-251) A malformed status line fails closed. Other non-SDP bodies are
+  documented in the compliance docs.
+- **SBC: in-dialog relay 481/503 rejections are audited.** (AU-2, AU-12;
+  POA&M-252) Rate-limited uc-audit events per (source IP, policy):
+  `in-dialog:unknown-dialog`, `from-tag-mismatch`, `rack-mismatch`,
+  `prack-from-callee`, `pending-relay-cap`, `pending-relay-cap-race`. The
+  window is `rate_limit.audit_interval_secs`; table overflow emits
+  `AuditRecordsDropped`.
+- **SBC metrics:** `sbc_digest_verify_<outcome>_total` (13 gauges: ok,
+  stale, realm/algorithm/qop/uri/opaque mismatch, missing_qop_params,
+  unknown_nonce, nonce_replay, bad_response, malformed, aor_mismatch),
+  `sbc_in_dialog_rejects_<policy>_total` (6 gauges) and
+  `sbc_signaling_audit_dropped_total`.
+
+### Changed (SBC, behaviour)
+
+- **REGISTER challenges are SHA-256 only.** UACs that support only MD5
+  digest can no longer register when `require_auth` is on.
+- **REGISTER from a user who does not own the AOR gets 403 without
+  `WWW-Authenticate`** (RFC 3261 §10.3), audited as `digest:aor_mismatch`.
+  It used to be re-challenged.
+- **INVITE check order:** source admission (403) and Max-Forwards 0 (483)
+  now run before route preprocessing (482/404/400). The admission audit
+  `resource` is the Request-URI as received, and the 483 is a stateless
+  reply.
+- Audit schema unchanged: the new events reuse existing uc-audit event
+  types and fields. No CDR, API or config breaking change.
+
 ### Security (proto-sdp, POA&M-283)
 
 - **proto-sdp: malformed SDP can no longer crash the parser.** (SI-10,
@@ -95,7 +153,8 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 - Known gaps: POA&M-250 (no header manipulation on re-INVITE/UPDATE/BYE),
   POA&M-251 (non-SDP bodies unscrubbed), POA&M-252 (relay rejections not
   audited); a far-leg 408 on a relayed request releases the call; no
-  Recv-Info negotiation; 2xx from a later fork not mapped.
+  Recv-Info negotiation; 2xx from a later fork not mapped. (250-252
+  are closed by the Added entry above.)
 
 ### BREAKING (SBC storage, dormant data-plane batch POA&M-240..247)
 

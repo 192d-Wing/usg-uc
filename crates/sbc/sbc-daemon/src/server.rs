@@ -546,6 +546,9 @@ impl Server {
                 .ws_listen
                 .first()
                 .map_or(0, std::net::SocketAddr::port),
+            // NIST 800-53 Rev5: AU-4, AU-5 — the signaling audit aggregation
+            // window shares the rate-limit audit interval (1..=3600 s).
+            signaling_audit_window_secs: config.rate_limit.audit_interval_secs,
             ..SipStackConfig::default()
         }
     }
@@ -733,6 +736,11 @@ impl Server {
         // NIST 800-53 Rev5: SC-8, SI-4 — lets the API/TrunkSync path flag a
         // TLS trunk that cannot connect (no trust anchors configured).
         sip_stack.set_trunk_tls_ca_configured(config.security.trunk_tls_ca_path.is_some());
+
+        // CM-6: non-fatal routing/trust-domain configuration problems.
+        for w in sbc_config::validate::routing_warnings(config) {
+            warn!(event = "config.routing_warning", "{w}");
+        }
 
         // Initialize router from config (if routing section present)
         if let Some(ref routing) = config.routing {
@@ -1622,6 +1630,14 @@ impl Server {
                 Self::ws_accept_loop(listener, ctx).await;
             }));
         }
+
+        // Rate-limited signaling audit flush (digest, in-dialog, route and
+        // loop rejections; POA&M-236/252). NIST 800-53 Rev5: AU-4, AU-5.
+        handles.push(
+            self.sip_stack
+                .signaling_audit()
+                .spawn_flush(self.shutdown.clone()),
+        );
 
         // Limiter maintenance: expired blocks, idle buckets, aggregated
         // rate-limit audit (SC-5, AU-4).
