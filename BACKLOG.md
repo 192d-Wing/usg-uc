@@ -298,11 +298,17 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   Original finding: `handle_register` (`sip_stack.rs` ~5826) builds
   `RegisterRequest` without the Request-URI. Call
   `.with_request_uri(req.uri.to_string())`.
-- [ ] **MAJOR, LIVE (sbc-trunk-services, client sessions) — UAC digest still
-  uses `Md5DigestHasher`** (POA&M-234): `sbc-trunk-services/src/registrar.rs:411`,
-  `client-sip-ua/src/registration.rs:957`, `call_agent.rs:1637`. SHA-256
-  challenges now error instead of sending a wrong MD5 answer. Switch to
-  `AlgorithmHasher::for_algorithm(challenge.algorithm)`.
+- [x] **MAJOR, LIVE (sbc-trunk-services, client sessions) — UAC digest
+  used `Md5DigestHasher`** (POA&M-234): fixed. Strongest offered challenge
+  selected (`proto-sip` `select_challenge_from_headers`) and answered with
+  `AlgorithmHasher::for_algorithm`.
+- [ ] **MINOR, LIVE (sbc-trunk-services, client) — UAC MD5 allowed by
+  default** (POA&M-255): `allow_md5_digest` defaults true; no
+  sbc-config/sbc-daemon or client settings key to disable it. MD5 is
+  downgradable by stripping SHA challenges on non-TLS transport.
+- [ ] **MINOR — per-realm Proxy-Authorization for multi-realm 407**
+  (POA&M-256): RFC 3261 §22.3 / RFC 8760 §2.4; `select_challenge` ignores
+  realm and answers once.
 - [ ] **MINOR, DORMANT — RFC 3261 §16.4 `maddr` not handled** (POA&M-235):
   `// POAM:` in `routing.rs` `preprocess_route_information`.
 - [ ] **MAJOR, DORMANT (sbc-daemon wiring) — wire the POA&M-230..232 helpers**

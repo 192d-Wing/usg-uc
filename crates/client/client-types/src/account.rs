@@ -29,6 +29,26 @@ pub struct DigestAuthCredentials {
     /// encrypted file on application startup.
     #[serde(default)]
     pub password_persisted: bool,
+    /// Whether an MD5/MD5-sess digest challenge may be answered when the
+    /// server offers nothing stronger (RFC 7616 §3.7).
+    ///
+    /// Defaults to true as a legacy interoperability allowance for MD5-only
+    /// providers. When false, an MD5-only challenge fails closed. Neither MD5
+    /// nor SHA-256/SHA-512-256 digest is CNSA 2.0; SIP digest stays under the
+    /// POA&M-110 exception.
+    // NIST 800-53 Rev5: IA-5(1) (POA&M-234); IA-7 / SC-13 partial while MD5
+    // may be answered (POA&M-255).
+    #[serde(default = "default_allow_md5_digest")]
+    pub allow_md5_digest: bool,
+}
+
+/// Serde default for [`DigestAuthCredentials::allow_md5_digest`].
+#[cfg(feature = "digest-auth")]
+const fn default_allow_md5_digest() -> bool {
+    // POAM: POA&M-255 — MD5 UAC answers allowed by default; no
+    // sbc-config/sbc-daemon or client settings key to disable; on non-TLS an
+    // on-path attacker can strip SHA challenges.
+    true
 }
 
 #[cfg(feature = "digest-auth")]
@@ -39,6 +59,7 @@ impl DigestAuthCredentials {
             username: username.into(),
             password: zeroize::Zeroizing::new(password.into()),
             password_persisted: false,
+            allow_md5_digest: true,
         }
     }
 
@@ -48,7 +69,15 @@ impl DigestAuthCredentials {
             username: username.into(),
             password: zeroize::Zeroizing::new(password.into()),
             password_persisted: true,
+            allow_md5_digest: true,
         }
+    }
+
+    /// Sets whether MD5 digest challenges may be answered (default true).
+    #[must_use]
+    pub const fn with_allow_md5_digest(mut self, allow: bool) -> Self {
+        self.allow_md5_digest = allow;
+        self
     }
 
     /// Returns whether the password is stored in secure credential storage.

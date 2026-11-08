@@ -64,6 +64,8 @@ wave 2 = b79893b0.
 - Hold via `a=sendonly` (3264 §8.4 / 6337).
 - Incoming re-INVITE glare → 491 (3261 §14.1).
 - Digest re-challenge bounded (max 2 attempts) with nonce dedup.
+- RFC 7616 §3.7 / RFC 8760: strongest offered digest algorithm chosen for REGISTER and INVITE (`select_auth_challenge`; tests `test_401_sha256_challenge_preferred_over_md5`, `test_401_md5_only_fails_closed_when_disallowed`). REGISTER 407 is answered with Proxy-Authorization (RFC 3261 §22.3; test `test_407_answered_with_proxy_authorization`).
+- 📋 documented limitation — MD5 answered by default when it is the only offer (`allow_md5_digest`, NIST POA&M-255); multi-realm 407 gets one answer, not one per realm (POA&M-256).
 
 ## Suggested fix order
 

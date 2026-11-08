@@ -39,7 +39,7 @@ This document describes the CNSA 2.0 compliance status for the USG SIP Soft Clie
 - Uses proto-dtls for DTLS handshakes (TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)
 - Uses proto-srtp with SRTP_AEAD_AES_256_GCM profile only
 - ICE connectivity uses STUN with MESSAGE-INTEGRITY-SHA256
-- No digest authentication support - mutual TLS only
+- SIP digest authentication (RFC 7616/8760) is supported for REGISTER and INVITE (`registration.rs`, `call_agent.rs`); the strongest offered algorithm is used. SHA-256 / SHA-512-256 digest is a CNSA exception (POA&M-110). MD5 is answered when it is the only offered algorithm unless the account sets `allow_md5_digest = false` (default true; POA&M-255)
 
 ### client-core
 
@@ -64,7 +64,7 @@ This document describes the CNSA 2.0 compliance status for the USG SIP Soft Clie
 - ❌ SHA-256 for key derivation (use SHA-384+)
 - ❌ P-256 curves (use P-384 or P-521)
 - ❌ RSA < 3072 bits (use ECDSA or RSA-3072+)
-- ❌ MD5 (forbidden)
+- ❌ MD5 (not CNSA; still answered for legacy SIP digest by default, see POA&M-255)
 - ❌ Password-based authentication (use PKI only)
 
 ### Required Algorithms
@@ -82,7 +82,7 @@ The soft client ONLY supports smart card-based authentication:
 2. **PIV (Personal Identity Verification)** - Federal civilian certificates
 3. **SIPR Token** - Classified network tokens
 
-Password-based SIP digest authentication is explicitly NOT supported.
+Password-based SIP digest authentication is also supported (`DigestAuthCredentials` in `client-types/src/account.rs`); see the client-sip-ua section above for the algorithm rules and exceptions.
 
 ## Key Management
 

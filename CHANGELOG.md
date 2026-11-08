@@ -81,6 +81,27 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   the default-deny route permissions are not enforced on the SBC HTTP API
   (POA&M-261).
 
+### Fixed (UAC digest, POA&M-234)
+
+- **SBC trunk registration and soft client: RFC 7616 §3.7 digest algorithm
+  selection.** (IA-5, SC-13; POA&M-234) The UAC reads every
+  WWW-Authenticate / Proxy-Authenticate value, picks the strongest offered
+  algorithm (SHA-512-256 > SHA-256 > MD5) and answers with the matching
+  hasher. Before this, SHA-256 challenges failed registration. The trunk
+  registrar now reads 407 `Proxy-Authenticate` and answers with
+  `Proxy-Authorization`; client REGISTER now answers a 407 with
+  `Proxy-Authorization` (was `Authorization`).
+- **proto-sip public API:** new `select_challenge`,
+  `select_challenge_from_headers` (returns `ChallengeSelection`),
+  `MAX_DIGEST_CHALLENGES`, `DigestAlgorithm::strength` / `is_md5`.
+- **client-types:** new `DigestAuthCredentials.allow_md5_digest` (serde
+  default `true`). **sbc-trunk-services:** new
+  `TrunkRegistrar::with_allow_md5_digest` (default `true`);
+  `Md5DigestHasher` use removed.
+- Known gaps: MD5 is still answered by default when it is the only offer,
+  and the SBC has no config key to disable it (POA&M-255); multi-realm 407s
+  get one answer (POA&M-256).
+
 ### Security
 
 - **uc-cluster / uc-state-sync: authenticated peer envelopes.** (IA-3,

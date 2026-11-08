@@ -1540,19 +1540,16 @@ impl CallAgent {
         #[cfg(feature = "digest-auth")]
         {
             if let Some(ref creds) = self.digest_credentials {
-                use proto_sip::auth::{Md5DigestHasher, create_credentials, generate_cnonce};
+                use proto_sip::auth::{AlgorithmHasher, create_credentials, generate_cnonce};
 
-                let header_name = if status_code == 401 {
-                    HeaderName::WwwAuthenticate
-                } else {
-                    HeaderName::ProxyAuthenticate
-                };
-
-                if let Some(challenge_header) = response.headers.get(&header_name)
-                    && let Ok(challenge) = challenge_header
-                        .value
-                        .parse::<proto_sip::auth::DigestChallenge>()
-                {
+                // RFC 7616 §3.7: choose the strongest offered challenge
+                // (POA&M-234).
+                if let Some(challenge) = crate::registration::select_auth_challenge(
+                    response,
+                    status_code,
+                    creds.allow_md5_digest,
+                    call_id,
+                ) {
                     // Skip retransmitted 401s — if the nonce matches the last
                     // challenge we already processed, this is a retransmit from
                     // the server for a previous INVITE we already ACK'd.
@@ -1633,8 +1630,9 @@ impl CallAgent {
                             &self.transport_type,
                         )?;
 
-                        // Compute and add Authorization header
-                        let hasher = Md5DigestHasher;
+                        // Compute and add Authorization header.
+                        // RFC 7616 §3.4.1: hash with the challenge's algorithm.
+                        let hasher = AlgorithmHasher::for_algorithm(challenge.algorithm);
                         let cnonce = generate_cnonce();
 
                         // Use the Request-URI for the digest URI

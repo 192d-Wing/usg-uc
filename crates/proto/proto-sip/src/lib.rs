@@ -83,8 +83,9 @@ pub mod uri;
 #[cfg(feature = "digest-auth")]
 pub use auth::{AlgorithmHasher, Md5DigestHasher, Sha256DigestHasher, Sha512_256DigestHasher};
 pub use auth::{
-    DigestAlgorithm, DigestChallenge, DigestCredentials, DigestHasher, Qop,
-    compute_digest_response, compute_ha1, compute_ha2, compute_response, create_credentials,
+    ChallengeSelection, DigestAlgorithm, DigestChallenge, DigestCredentials, DigestHasher,
+    MAX_DIGEST_CHALLENGES, Qop, compute_digest_response, compute_ha1, compute_ha2,
+    compute_response, create_credentials, select_challenge, select_challenge_from_headers,
     verify_credentials,
 };
 pub use builder::{

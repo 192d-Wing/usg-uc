@@ -55,6 +55,27 @@ impl DigestAlgorithm {
             Self::Md5Sess | Self::Sha256Sess | Self::Sha512_256Sess
         )
     }
+
+    /// Returns the preference rank of this algorithm for UAC challenge
+    /// selection (higher is stronger).
+    ///
+    /// RFC 7616 §3.7: a client offered several challenges uses the most
+    /// preferred algorithm it supports: SHA-512-256 > SHA-256 > MD5. The
+    /// session variant shares the rank of its base hash.
+    #[must_use]
+    pub fn strength(&self) -> u8 {
+        match self {
+            Self::Md5 | Self::Md5Sess => 1,
+            Self::Sha256 | Self::Sha256Sess => 2,
+            Self::Sha512_256 | Self::Sha512_256Sess => 3,
+        }
+    }
+
+    /// Returns true if this algorithm is MD5 or MD5-sess.
+    #[must_use]
+    pub fn is_md5(&self) -> bool {
+        matches!(self, Self::Md5 | Self::Md5Sess)
+    }
 }
 
 impl fmt::Display for DigestAlgorithm {
@@ -318,6 +339,204 @@ impl FromStr for DigestChallenge {
                 .is_some_and(|s| s.eq_ignore_ascii_case("true")),
             params: extra_params,
         })
+    }
+}
+
+/// Upper bound on challenges examined by [`select_challenge_from_headers`],
+/// counted after splitting comma-joined header lines (Power of 10 rule 2;
+/// NIST 800-53 Rev5: SC-5). Challenges beyond this are dropped and reported
+/// in [`ChallengeSelection::dropped`].
+pub const MAX_DIGEST_CHALLENGES: usize = 16;
+
+/// Selects the strongest acceptable challenge from already-parsed challenges.
+///
+/// RFC 7616 §3.7: SHA-512-256(-sess) > SHA-256(-sess) > MD5(-sess). MD5
+/// challenges are considered only when `allow_md5` is true. Ties keep the
+/// first challenge offered. The input is caller-bounded;
+/// [`select_challenge_from_headers`] applies [`MAX_DIGEST_CHALLENGES`].
+///
+/// The realm is not considered: all challenges are treated as one set and a
+/// single winner is returned, so a 407 carrying challenges from several
+/// proxy realms (forking / proxy chain) gets a single answer rather than one
+/// `Proxy-Authorization` per realm.
+// POAM: POA&M-256 — per-realm Proxy-Authorization answering (RFC 3261 §22.3,
+// RFC 8760 §2.4) is not implemented.
+//
+// NIST 800-53 Rev5: IA-5(1), SC-13 (POA&M-234); IA-7 / SC-13 partial: MD5 may
+// be answered when `allow_md5` is true (POA&M-255), and SHA-256 / SHA-512-256
+// are not CNSA 2.0 hashes either (SIP digest stays under the POA&M-110
+// exception).
+pub fn select_challenge<'a>(
+    challenges: impl IntoIterator<Item = &'a DigestChallenge>,
+    allow_md5: bool,
+) -> Option<&'a DigestChallenge> {
+    let mut best: Option<&'a DigestChallenge> = None;
+    for ch in challenges {
+        if ch.algorithm.is_md5() && !allow_md5 {
+            continue;
+        }
+        if best.is_none_or(|b| ch.algorithm.strength() > b.algorithm.strength()) {
+            best = Some(ch);
+        }
+    }
+    best
+}
+
+/// Result of [`select_challenge_from_headers`].
+#[derive(Debug, Clone)]
+pub struct ChallengeSelection {
+    /// The selected challenge.
+    pub challenge: DigestChallenge,
+    /// Number of challenges ignored because [`MAX_DIGEST_CHALLENGES`] was
+    /// reached (callers should log this at debug level).
+    pub dropped: usize,
+}
+
+/// Parses every `WWW-Authenticate` / `Proxy-Authenticate` value and selects
+/// the strongest acceptable Digest challenge.
+///
+/// A single header line may carry several comma-joined challenges
+/// (`Digest a=.., Digest b=..`; RFC 7235 §4.1, RFC 3261 §7.3.1); these are
+/// split at scheme boundaries outside quoted strings. At most
+/// [`MAX_DIGEST_CHALLENGES`] challenges are examined in total.
+///
+/// RFC 7616 §3.7: challenges that do not parse (non-Digest schemes, unknown
+/// `algorithm=` tokens such as `SHA3-512`, missing realm/nonce) are skipped
+/// rather than failing the whole set. MD5 is only selected when `allow_md5`
+/// is true (legacy interop allowance, POA&M-255). See [`select_challenge`]
+/// for the realm limitation (POA&M-256).
+///
+/// `header_name` is used only in the error.
+///
+/// # Errors
+///
+/// Returns [`SipError::InvalidHeader`] naming the offered algorithms (never
+/// nonces or other parameters) when no acceptable challenge is present.
+pub fn select_challenge_from_headers<'a>(
+    header_name: &str,
+    values: impl IntoIterator<Item = &'a str>,
+    allow_md5: bool,
+) -> SipResult<ChallengeSelection> {
+    let mut parsed: Vec<DigestChallenge> = Vec::new();
+    let mut offered: Vec<String> = Vec::new();
+    let mut seen = 0usize;
+    let mut dropped = 0usize;
+    for value in values {
+        for v in split_challenges(value) {
+            if seen >= MAX_DIGEST_CHALLENGES {
+                dropped = dropped.saturating_add(1);
+                continue;
+            }
+            seen += 1;
+            let is_digest = v.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("digest"));
+            if !is_digest {
+                offered.push("non-Digest".to_string());
+                continue;
+            }
+            match v.parse::<DigestChallenge>() {
+                Ok(ch) => {
+                    offered.push(ch.algorithm.as_str().to_string());
+                    parsed.push(ch);
+                }
+                Err(_) => offered.push(unparsed_algorithm_label(v)),
+            }
+        }
+    }
+    match select_challenge(parsed.iter(), allow_md5) {
+        Some(ch) => Ok(ChallengeSelection {
+            challenge: ch.clone(),
+            dropped,
+        }),
+        None => Err(SipError::InvalidHeader {
+            name: header_name.to_string(),
+            reason: format!(
+                "no acceptable digest challenge (md5 {}); offered: [{}]{}",
+                if allow_md5 { "allowed" } else { "disallowed" },
+                offered.join(", "),
+                if dropped > 0 {
+                    format!("; {dropped} beyond cap ignored")
+                } else {
+                    String::new()
+                }
+            ),
+        }),
+    }
+}
+
+/// Splits one challenge header value into its comma-joined challenges.
+///
+/// A top-level comma (outside a quoted string) starts a new challenge when it
+/// is followed by `token SP` where the next non-space character is not `=`
+/// (an auth-scheme rather than an auth-param; RFC 7235 §2.1). Quoted strings
+/// honour backslash escapes. Yields trimmed, non-empty slices; never panics.
+fn split_challenges(value: &str) -> impl Iterator<Item = &str> {
+    let bytes = value.as_bytes();
+    let mut cuts: Vec<usize> = Vec::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        if b == b'"' {
+            in_quotes = true;
+        } else if b == b',' && starts_scheme(bytes.get(i + 1..).unwrap_or(&[])) {
+            cuts.push(i);
+        }
+    }
+    let mut start = 0usize;
+    let mut out: Vec<&str> = Vec::with_capacity(cuts.len() + 1);
+    for cut in cuts {
+        out.push(value.get(start..cut).unwrap_or(""));
+        start = cut + 1;
+    }
+    out.push(value.get(start..).unwrap_or(""));
+    out.into_iter().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// True if `rest` (text after a top-level comma) begins with an auth-scheme:
+/// optional whitespace, a token, at least one space, then a non-`=` byte.
+fn starts_scheme(rest: &[u8]) -> bool {
+    let is_tchar = |c: u8| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c);
+    let mut i = rest.iter().take_while(|c| c.is_ascii_whitespace()).count();
+    let tok_start = i;
+    while rest.get(i).copied().is_some_and(is_tchar) {
+        i += 1;
+    }
+    if i == tok_start || !rest.get(i).is_some_and(|c| *c == b' ' || *c == b'\t') {
+        return false;
+    }
+    while rest.get(i).is_some_and(|c| *c == b' ' || *c == b'\t') {
+        i += 1;
+    }
+    rest.get(i).is_some_and(|c| *c != b'=')
+}
+
+/// Best-effort, bounded label for an unparseable challenge (algorithm token
+/// only, sanitized; never includes nonce or other values).
+fn unparsed_algorithm_label(v: &str) -> String {
+    let lower = v.to_ascii_lowercase();
+    let Some(idx) = lower.find("algorithm=") else {
+        return "unparseable".to_string();
+    };
+    let rest = v.get(idx + "algorithm=".len()..).unwrap_or("");
+    let tok: String = rest
+        .trim_start_matches('"')
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(24)
+        .collect();
+    if tok.is_empty() {
+        "unparseable".to_string()
+    } else {
+        format!("unsupported:{tok}")
     }
 }
 
@@ -1526,6 +1745,131 @@ mod tests {
             let creds = DigestCredentials::new(USER, REALM, NONCE, URI, "00")
                 .with_algorithm(DigestAlgorithm::Sha256);
             assert!(verify_credentials(&Md5DigestHasher, &creds, PASS, "GET", None).is_err());
+        }
+    }
+
+    // POA&M-234: RFC 7616 §3.7 UAC challenge selection.
+    mod select {
+        use super::*;
+
+        const MD5: &str = r#"Digest realm="r", nonce="n1", algorithm=MD5, qop="auth""#;
+        const SHA256: &str = r#"Digest realm="r", nonce="n2", algorithm=SHA-256, qop="auth""#;
+        const SHA512: &str = r#"Digest realm="r", nonce="n3", algorithm=SHA-512-256, qop="auth""#;
+        const SHA3: &str = r#"Digest realm="r", nonce="n4", algorithm=SHA3-512"#;
+
+        fn sel<'a>(
+            values: impl IntoIterator<Item = &'a str>,
+            allow_md5: bool,
+        ) -> SipResult<DigestChallenge> {
+            select_challenge_from_headers("WWW-Authenticate", values, allow_md5)
+                .map(|s| s.challenge)
+        }
+
+        #[test]
+        fn several_challenges_on_one_line_are_split() {
+            let line = format!("{MD5}, {SHA256}");
+            let ch = sel([line.as_str()], true).unwrap();
+            assert_eq!(ch.algorithm, DigestAlgorithm::Sha256);
+            assert_eq!(ch.nonce, "n2");
+            // Comma + scheme-like text inside a quoted string is not a boundary.
+            let quoted = r#"Digest realm="a, Digest b", nonce="q", algorithm=SHA-256"#;
+            let ch = sel([quoted], true).unwrap();
+            assert_eq!(ch.realm, "a, Digest b");
+            // Mixed schemes on one line; MD5 refused, SHA-512-256 chosen.
+            let mixed = format!(r#"Basic realm="x", {MD5}, {SHA512}"#);
+            let ch = sel([mixed.as_str()], false).unwrap();
+            assert_eq!(ch.algorithm, DigestAlgorithm::Sha512_256);
+        }
+
+        #[test]
+        fn cap_applies_across_split_challenges() {
+            let many = vec![MD5; MAX_DIGEST_CHALLENGES].join(", ");
+            let line = format!("{many}, {SHA256}");
+            let s =
+                select_challenge_from_headers("Proxy-Authenticate", [line.as_str()], true).unwrap();
+            assert_eq!(s.challenge.algorithm, DigestAlgorithm::Md5);
+            assert_eq!(s.dropped, 1);
+            let err = select_challenge_from_headers("Proxy-Authenticate", [line.as_str()], false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Proxy-Authenticate"), "{err}");
+            assert!(err.contains("1 beyond cap"), "{err}");
+        }
+
+        #[test]
+        fn picks_strongest_offered() {
+            let ch = sel([MD5, SHA256, SHA512], true).unwrap();
+            assert_eq!(ch.algorithm, DigestAlgorithm::Sha512_256);
+            let ch = sel([MD5, SHA256], true).unwrap();
+            assert_eq!(ch.algorithm, DigestAlgorithm::Sha256);
+            let ch = sel([SHA256, MD5], false).unwrap();
+            assert_eq!(ch.algorithm, DigestAlgorithm::Sha256);
+        }
+
+        #[test]
+        fn tie_keeps_first_offered() {
+            let other = r#"Digest realm="r", nonce="second", algorithm=SHA-256"#;
+            let ch = sel([SHA256, other], true).unwrap();
+            assert_eq!(ch.nonce, "n2");
+        }
+
+        #[test]
+        fn md5_only_respects_policy() {
+            let ch = sel([MD5], true).unwrap();
+            assert_eq!(ch.algorithm, DigestAlgorithm::Md5);
+            let err = sel([MD5], false).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("MD5"), "{msg}");
+            assert!(!msg.contains("n1"), "nonce leaked: {msg}");
+        }
+
+        #[test]
+        fn unknown_algorithm_is_skipped() {
+            let err = sel([SHA3], true).unwrap_err();
+            assert!(err.to_string().contains("SHA3-512"));
+            let ch = sel([SHA3, SHA256], true).unwrap();
+            assert_eq!(ch.algorithm, DigestAlgorithm::Sha256);
+            let ch = sel([r#"Basic realm="r""#, "Digest garbage", SHA256], false).unwrap();
+            assert_eq!(ch.algorithm, DigestAlgorithm::Sha256);
+        }
+
+        #[test]
+        fn empty_set_is_error() {
+            assert!(sel(std::iter::empty(), true).is_err());
+        }
+
+        #[test]
+        fn parsed_selection_and_strength_order() {
+            let a = DigestChallenge::new("r", "a");
+            let b = DigestChallenge::new("r", "b").with_algorithm(DigestAlgorithm::Sha256Sess);
+            assert_eq!(select_challenge([&a, &b], true).unwrap().nonce, "b");
+            assert!(select_challenge([&a], false).is_none());
+            assert!(DigestAlgorithm::Sha512_256.strength() > DigestAlgorithm::Sha256.strength());
+            assert!(DigestAlgorithm::Sha256Sess.strength() > DigestAlgorithm::Md5Sess.strength());
+        }
+
+        #[cfg(feature = "digest-auth")]
+        #[test]
+        fn selected_credentials_verify_for_each_algorithm() {
+            for hdr in [MD5, SHA256, SHA512] {
+                let ch = sel([hdr], true).unwrap();
+                let hasher = AlgorithmHasher::for_algorithm(ch.algorithm);
+                let creds = create_credentials(
+                    &hasher,
+                    &ch,
+                    "alice",
+                    "pw",
+                    "REGISTER",
+                    "sip:example.invalid",
+                    Some("0a4f113b"),
+                    Some(1),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(creds.algorithm, ch.algorithm);
+                assert!(verify_credentials(&hasher, &creds, "pw", "REGISTER", None).unwrap());
+                assert!(!verify_credentials(&hasher, &creds, "bad", "REGISTER", None).unwrap());
+            }
         }
     }
 }
