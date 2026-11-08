@@ -5,7 +5,7 @@
 
 use crate::config::WebRtcConfig;
 use crate::error::{WebRtcError, WebRtcResult};
-use crate::sdp_munge::{SdpMunger, WebRtcSdpMode};
+use crate::sdp_munge::{DtlsIceParams, SdpMunger, WebRtcSdpMode};
 use crate::session::{SessionManager, WebRtcSessionState};
 use crate::trickle::{TrickleCandidate, TrickleIce, TrickleManager};
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,17 @@ impl WebRtcGateway {
         }
     }
 
+    /// Creates a new WebRTC gateway, rejecting unsupported configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebRtcError::ConfigError`] if [`WebRtcConfig::validate`] fails.
+    // NIST 800-53 Rev5: CM-6 (Configuration Settings)
+    pub fn try_new(config: WebRtcConfig) -> WebRtcResult<Self> {
+        config.validate()?;
+        Ok(Self::new(config))
+    }
+
     /// Creates a new WebRTC session for an incoming SIP call.
     ///
     /// # Errors
@@ -110,6 +121,9 @@ impl WebRtcGateway {
 
     /// Processes an incoming SIP offer and generates a WebRTC-compatible answer.
     ///
+    /// `local` carries the gateway's own ICE credentials and DTLS
+    /// fingerprint/role for the WebRTC leg.
+    ///
     /// # Errors
     ///
     /// Returns an error if SDP processing fails.
@@ -117,11 +131,12 @@ impl WebRtcGateway {
         &self,
         session_id: &str,
         sip_sdp: &str,
+        local: &DtlsIceParams,
     ) -> WebRtcResult<GatewayResponse> {
         // Transform SDP for WebRTC
-        let webrtc_sdp = self
-            .sdp_munger
-            .transform(sip_sdp, WebRtcSdpMode::SipToWebRtc)?;
+        let webrtc_sdp =
+            self.sdp_munger
+                .transform_with(sip_sdp, WebRtcSdpMode::SipToWebRtc, local)?;
 
         // Extract ICE credentials
         let ice_credentials = SdpMunger::extract_ice_credentials(&webrtc_sdp);
@@ -402,9 +417,16 @@ mod tests {
             t=0 0\r\n\
             m=audio 5000 RTP/AVP 0\r\n\
             a=rtpmap:0 PCMU/8000\r\n";
+        let local = crate::sdp_munge::DtlsIceParams {
+            ufrag: "Ufr4".to_string(),
+            pwd: "pwdpwdpwdpwdpwdpwdpwdp".to_string(),
+            fingerprint_alg: crate::sdp_munge::FingerprintAlgorithm::Sha384,
+            fingerprint: vec!["AB"; 48].join(":"),
+            setup: crate::sdp_munge::DtlsSetup::Actpass,
+        };
 
         let response = gateway
-            .process_sip_offer(&session_id, sip_sdp)
+            .process_sip_offer(&session_id, sip_sdp, &local)
             .await
             .unwrap();
         assert_ne!(response.sdp, "");

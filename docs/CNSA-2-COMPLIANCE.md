@@ -139,6 +139,10 @@ Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_ver
 - **x5u fetch TLS:** TLS 1.2/1.3 on `uc_transport::tls::cnsa_provider()` (`uc-sti/src/fetch.rs` `tls_config`) against the system web PKI: AES-256-GCM only, ML-KEM-1024 or P-384 only, and on TLS 1.2 `ECDHE-ECDSA-AES256-GCM-SHA384` only (POA&M-40 closed; test `sti_tests::x5u_tls_is_cnsa_only`). A certificate repository that offers only AES-128/ChaCha20, only X25519/P-256, or (on TLS 1.2) only an RSA certificate can no longer be fetched from, and calls signed with its certificates fail verification. The fetched chain's trust still comes from the STI-CR anchors.
 - **Implementation**: `proto-stir-shaken` (pure protocol), `uc-sti` (fetch/cache/anchors/signer), `sbc-daemon/src/stir.rs` (call path).
 
+### RADIUS (uc-aaa, dormant)
+
+- **Not CNSA 2.0 compliant, no exception (POA&M-280).** `uc-aaa` RADIUS/UDP (`radius` feature, enabled by no shipped binary) uses MD5 for the Response Authenticator and User-Password hiding and HMAC-MD5 for the Message-Authenticator (RFC 2865, RFC 2869, RFC 3579). Since 2026-11-08 every Access-Accept/Reject/Challenge must carry a valid Message-Authenticator (CVE-2024-3596) and both authenticators are compared in constant time (`uc-aaa/src/radius.rs` `verify_access_response`, `ct_eq`); this hardens the protocol but does not make MD5 acceptable. RadSec (RFC 6614, TLS) is not implemented. Do not enable the feature in a CNSA deployment until RadSec over `cnsa_provider()` exists.
+
 ### JWT (OIDC Bearer REGISTER and Management API)
 
 - **Accepted algorithms**: `proto-jwt::validator::ALLOWED_ALGS` = `RS256, PS256, ES256, ES384`. Only symmetric (HS*) algorithms are rejected. This validator **is wired** in `sbc-daemon` for RFC 8898 Bearer REGISTER (`SBC_AUTH_MODE=bearer`) and in `sbc-client-config-server`.

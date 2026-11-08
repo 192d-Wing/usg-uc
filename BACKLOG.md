@@ -146,10 +146,15 @@ DORMANT items before anyone wires them in.
   or remove; POA&M so nobody enables the `aaa` feature.
   Fixed: UAR/MAR/SAR and the stub `authenticate`/`account` return
   `DiameterError` in both cfgs (fail closed). Real Cx remains unimplemented.
-- [ ] **MAJOR, DORMANT — RADIUS:** Message-Authenticator not required on
+- [x] **MAJOR, DORMANT — RADIUS:** Message-Authenticator not required on
   responses (BlastRADIUS, CVE-2024-3596); non-constant-time compare despite the
   comment (`radius.rs:563`); 8-bit identifier wraps; shared secret not zeroized;
   UDP+MD5 not CNSA (RadSec only).
+  Fixed: Message-Authenticator required on every Access response and checked
+  first; constant-time compares; forged responses discarded until timeout;
+  client secret copy zeroized (pr/sctp-radius-webrtc-1d0d05). Residual: POA&M-280 (UDP/MD5, no RadSec,
+  no audit event), POA&M-281 (8-bit Identifier wrap, `RadiusConfig.secret`
+  plain String, Accounting-Response not verified).
 - [x] **BLOCKER if used, DORMANT — policy `StringMatch::Regex` always returns
   true** (POA&M-201) (`uc-policy/src/condition.rs:46`). Implement with compiled `regex` or
   remove the variant.
@@ -435,10 +440,15 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
 - [ ] **MAJOR, DORMANT — SIPREC metadata doesn't follow the RFC 7865 schema**,
   no RFC 7866 SRC signalling, and display names/AORs are written into the XML
   unescaped (injection into recorder evidence) (`uc-siprec/src/metadata.rs:474-532`).
-- [ ] **MAJOR, DORMANT — WebRTC SDP munging:** only the first m-section gets
+- [x] **MAJOR, DORMANT — WebRTC SDP munging:** only the first m-section gets
   `a=mid`; keeps `RTP/AVP` and adds no fingerprint/setup/ICE; data-channel
   removal changes the m-line count and orphans attributes
   (`uc-webrtc/src/sdp_munge.rs`). Rebuild on proto-sdp.
+  Fixed: rebuilt on proto-sdp; per-section mid, UDP/TLS/RTP/SAVPF, DTLS/ICE
+  attributes, BUNDLE; data channel rejected in place; input size caps
+  (pr/sctp-radius-webrtc-1d0d05). Residual: POA&M-282 (trickle ICE), POA&M-283 (proto-sdp
+  has no UDP/DTLS/SCTP token; its multibyte panic was fixed in #194), POA&M-284 (SdpConfig
+  rewrite/codec keys rejected, not implemented).
 - [ ] **MINOR, DORMANT — trickle ICE:** no ufrag/generation check, unbounded
   candidate lists, `add_candidate` inserts before the target m-line.
 - [ ] **NIT — `start_dtls_handshake` in sbc-media-core uses a zeroed placeholder
@@ -551,9 +561,12 @@ uc-acl are DORMANT. Every uc-transport TLS config path uses `cnsa_provider`.
 - [x] **NIT, LIVE (client) — uc-dns cache eviction is an O(n) scan per insert;
   SRV weighting always picks the median** (`cache.rs:139`, `srv.rs:160`).
   Fixed: O(log n) indexed eviction; RFC 2782 weighted random SRV order (fix/client-cnsa-tls-dns).
-- [ ] **MAJOR, DORMANT — SCTP `Chunk::decode` panics on a padded last chunk**
+- [x] **MAJOR, DORMANT — SCTP `Chunk::decode` panics on a padded last chunk**
   (`uc-transport/src/sctp/chunk.rs:311`, `split_to(padded_length)` past the
   buffer). Clamp and fuzz before enabling the `sctp` feature.
+  Fixed: decode clamped and total (ASCONF/RE-CONFIG zero-length loop,
+  SACK allocation, udp_encap underflow also fixed); fuzz and proptests
+  (pr/sctp-radius-webrtc-1d0d05). No residual POA&M.
 - [ ] **MINOR, DORMANT — `TlsListener::accept` handshakes inline with no
   timeout** (`tls.rs:711`); the daemon doesn't use it. Remove or add a timeout.
 - [ ] **MINOR, DORMANT — ENUM `apply_regexp` ignores the pattern and returns the
@@ -684,7 +697,9 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
     note in docs/STORAGE-BACKENDS.md, docs/SBC-ADMIN-GUIDE.md,
     deploy/helm/sbc/DEPLOYING.md, deploy/config/config.toml. Remains:
     CNSA-pinned suites (POA&M-240), no audit record of refusal.
-- [ ] **MAJOR, DORMANT — cluster/state-sync have no peer authentication**, no
+- [ ] **MAJOR, DORMANT — cluster/state-sync: peer auth done (lib + daemon key
+  load, #188/#192); remaining is transport, fencing and key lifecycle, not
+  just caller wiring.** Original finding: no peer authentication, no
   transport, replayable heartbeats, no fencing/epoch (split-brain), and
   `SnapshotReader::add_chunk` accepts duplicate/out-of-range chunks
   (`uc-cluster/src/membership.rs:230`, `uc-state-sync/src/snapshot.rs:200`).
@@ -710,13 +725,17 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   clock-rollback generation; first-contact replay; rejection auditing
   (POA&M-241); uc-state-sync has no daemon caller (POA&M-262); fencing
   (POA&M-242).
-- [ ] **MAJOR, DORMANT — `PkiValidator` validates nothing**
+- [ ] **MAJOR, DORMANT — `PkiValidator`: fails closed since #188 (every
+  `extract_identity` errors); remaining is library work, the RFC 5280
+  validator (POA&M-243).** Original finding: validates nothing
   (`uc-user-mgmt/src/pki.rs`): substring-matches `CN=` in the DER; any self-signed
   cert authenticates. Replace with webpki chain validation or delete; POA&M.
   Fail-closed half done 2026-11-07 (branch pr/data-plane-dormant-security-271dfc): `extract_identity` always
   errors; substring parser removed. Open: full RFC 5280 validator (webpki,
   client-auth EKU, CRL deny-on-unknown, SAN/EDIPI parser) (POA&M-243).
-- [ ] **MAJOR, DORMANT — uc-api claims AC-3/CM-6/AU-2** but `with_permission` is
+- [ ] **MAJOR, DORMANT — uc-api: default-deny `authorize` shipped (#188); no
+  caller exists, remaining is the adopt-or-delete decision (POA&M-261).**
+  Original finding: claims AC-3/CM-6/AU-2 but `with_permission` is
   unenforced metadata and `/config` has no permission. Mark library-only or delete.
   Library half fixed 2026-11-07 (branch pr/data-plane-dormant-security-271dfc): default-deny `Route::authorize` /
   `Router::authorize`; every route has a permission (`/config` read/admin);

@@ -532,6 +532,22 @@ This is **by design** for security compliance.
 
 ## Document Maintenance
 
+### uc-transport SCTP and uc-aaa RADIUS (library-only, dormant)
+
+Neither feature (`uc-transport` `sctp`, `uc-aaa` `radius`) is enabled by any shipped binary.
+
+| Requirement | Status | Wiring | Notes |
+|-------------|--------|--------|-------|
+| RFC 9260 §3.2 chunk padding / length | Implemented (decoder) | Library-only | `Chunk::decode` consumes `min(padded_length, remaining)` and hands body decoders exactly `length` bytes; truncated and hostile input returns an error, never panics. Tests: `decode_last_chunk_without_padding`, `decode_padded_chunk_consumes_padding`, `decode_every_prefix_of_valid_chunks`, `decode_every_chunk_type_length_field_fuzz`, proptests in `chunk.rs` / `packet.rs`. |
+| RFC 9260 §3.3.4 SACK | Implemented (decoder) | Library-only | Gap-block / duplicate-TSN capacity bounded by bytes present, not wire counts. |
+| RFC 6525 §4 / RFC 5061 parameters | Implemented (decoder) | Library-only | RE-CONFIG, ASCONF and ASCONF-ACK parameters shorter than their header are rejected (previously an infinite loop). Test: `asconf_reconfig_zero_length_params_terminate`, `decode_structured_param_fuzz`. |
+| RFC 6951 UDP encapsulation | Partial | Library-only | UDP length < 8 rejected (`udp_encap.rs`, test `decode_udp_length_below_header_is_rejected`). Decoder only; no association-level interop test. |
+| RFC 2865 §3 Response Authenticator | Implemented | Library-only | Verified with constant-time compare (`radius.rs` `verify_access_response`, `ct_eq`). Tests in `message_authenticator_tests`. |
+| RFC 2869 §5.14 / RFC 3579 §3.2 Message-Authenticator, CVE-2024-3596 | Implemented | Library-only | Required on every Access-Accept/Reject/Challenge (exactly one, 16 bytes), checked before the Response Authenticator; sent first in Access-Request. Invalid responses are discarded and the client waits for a valid one until timeout. Tests: `forged_responses_are_discarded_then_valid_accepted`, `only_forged_response_times_out`. |
+| RFC 2866 §3 Accounting-Response authenticator | Gap | Library-only | Not verified (POA&M-281). |
+| RFC 2865 Identifier | Partial | Library-only | 8-bit, wraps, no in-flight tracking (POA&M-281). |
+| RFC 6614 RadSec | Gap | Library-only | Not implemented; RADIUS/UDP MD5 is not CNSA (POA&M-280). |
+
 Last Updated: 2026-11-06
 
 2026-11-06: added the uc-codecs media section (G.722 vectors, RFC 5761 deviation).
