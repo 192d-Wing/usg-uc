@@ -116,8 +116,9 @@ pub use redirect::{
 };
 pub use response::StatusCode;
 pub use routing::{
-    RouteEntry, RoutePreprocess, RouteSet, compute_request_target, create_record_route,
-    preprocess_route_information, process_record_route_for_uac, process_record_route_for_uas,
+    OwnAddressing, ReceivedOn, RouteEntry, RoutePreprocess, RouteSet, compute_request_target,
+    create_record_route, preprocess_route_information, process_record_route_for_uac,
+    process_record_route_for_uas,
 };
 pub use topology::{TopologyHider, TopologyHidingConfig, TopologyHidingMode};
 pub use transport::Transport;

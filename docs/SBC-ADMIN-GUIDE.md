@@ -517,12 +517,12 @@ Applies to trunks that REGISTER (`register_enabled`), which come only from the t
 
 ```toml
 [[trunk_groups]]
-id = "customer-pbx"
-trust_domain = false            # default true
+id = "core-pbx"
+trust_domain = true             # default false
 ```
 
-- `trust_domain = true` (the default) treats every trunk in the group as inside the RFC 3325 trust domain: P-Asserted-Identity and P-Preferred-Identity received from it are kept, and egress `Privacy: id` keeps PAI toward it. `false` strips PAI/PPI from inbound INVITEs and applies `Privacy` toward the group as an untrusted peer (including dropping the Identity header when From is anonymized). Registered endpoints are always untrusted. Trunk groups created through the API are trusted.
-- **Hardening:** the default is fail-open for identity. Set `trust_domain = false` on every group that is not under your administrative control (customer PBXs, untrusted carriers); otherwise its PAI feeds STIR attestation and CDRs. Config load warns for each trunk with `stir_shaken.sign = true` in a `trust_domain = false` group (`sbc-config/src/validate.rs` `routing_warnings`; test `signing_trunk_outside_trust_domain_warns`). There is no warning for a group left at the default. See NIST AC-21 and POA&M-236.
+- `trust_domain = true` treats every trunk in the group as inside the RFC 3325 trust domain: P-Asserted-Identity and P-Preferred-Identity received from it are kept, and egress `Privacy: id` keeps PAI toward it. `false` (the default when unset) strips PAI/PPI from inbound INVITEs and applies `Privacy` toward the group as an untrusted peer (including dropping the Identity header when From is anonymized). Registered endpoints are always untrusted. Trunk groups created through the API have no trust setting and are always untrusted (POA&M-287).
+- **Breaking change (fail-closed default):** earlier releases defaulted to `true`. After upgrading, set `trust_domain = true` explicitly on every group under your administrative control whose PAI you rely on; otherwise PAI from those peers is stripped and no longer feeds STIR attestation or CDRs. Config load warns for each trunk with `stir_shaken.sign = true` in a group that is not trusted, whether set to `false` or left unset (`sbc-config/src/validate.rs` `routing_warnings`; tests `signing_trunk_outside_trust_domain_warns`, `signing_trunk_with_unset_trust_domain_warns`). See NIST AC-21.
 - Takes effect after a restart, like other `[[trunk_groups]]` edits.
 
 ### Trunk transport: breaking changes (POA&M-5)

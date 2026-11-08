@@ -281,7 +281,7 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   rejects spirals and ignores branch hash; 100 Trying copies only the first Via
   and no Timestamp (`proxy.rs`).
   Fixed at the proto layer (POA&M-231): route-set order, §16.4 preprocessing
-  (except `maddr`, POA&M-235), loop hash in the branch with spiral detection
+  (`maddr` added later, POA&M-235 closed), loop hash in the branch with spiral detection
   (topmost Via not hashed, documented deviation), 100 Trying copies all Vias
   and Timestamp. Still library-only (POA&M-236).
 - [x] **MAJOR, DORMANT — digest auth:** SHA-256/SHA-512-256 listed but hashed
@@ -326,8 +326,13 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   POA&M-255 follow-up): nodes without the change ignore trunk
   `allow_md5_digest` and still answer MD5 by default during a rolling
   upgrade. Document in upgrade notes or gate on cluster version.
-- [ ] **MINOR, DORMANT — RFC 3261 §16.4 `maddr` not handled** (POA&M-235):
-  `// POAM:` in `routing.rs` `preprocess_route_information`.
+- [ ] **NIT, LIVE — §16.4 `maddr` received port is the configured listener
+  port** (POA&M-286): sbc-daemon `ReceivedOn` uses `signaling_port(transport)`,
+  not the local socket port; `wss` uses the TLS port. Needs local-address
+  plumbing through the receive path. `// POAM:` in `sip_stack.rs`.
+- [ ] **MINOR, LIVE — trunk API has no `trust_domain` field** (POA&M-287):
+  API-created trunk groups are always untrusted and re-init clears runtime
+  trust. Add an authenticated, audited `trust_domain` field to the trunk API.
 - [ ] **MAJOR, PARTIAL (sbc-daemon wiring) — wire the POA&M-230..232 helpers**
   (POA&M-236). Wired 2026-11-08 (data-plane wiring):
   - [x] `DigestVerifier` on REGISTER with rate-limited uc-audit events for
@@ -351,8 +356,8 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
     tracker before the constant-time response check, so a holder of a
     server-issued nonce can fill the tracker and force `stale=true`
     re-challenges for legitimate users
-  - [ ] `[[trunk_groups]] trust_domain` defaults to `true` (fail-open for
-    PAI/PPI); flip the default or warn when unset
+  - [x] `[[trunk_groups]] trust_domain` default flipped to `false`
+    (fail-closed); load warns for signing trunks in untrusted groups
 - [ ] **MAJOR, DORMANT (sbc-daemon) — no digest credential source** (POA&M-270):
   `SipStackConfig.auth_credentials` / `require_auth` have no sbc-config (HA1
   file or user store) source and no server wiring, so the REGISTER
@@ -685,11 +690,6 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   unread; whole `[monitoring]` table rejected at load, `deny_unknown_fields`;
   Helm no longer renders it. Residual: Helm `-metrics` Service on 9090 has no
   listener (docs note only); POA&M-195.
-- [ ] **NIT, LIVE — audit timestamp taken on caller thread, sequence in writer**
-  (order can differ); **metric label map unbounded** (no labelled series yet).
-  Timestamp half fixed by #174 (writer assigns both); regression test
-  `timestamps_non_decreasing_in_sequence_order` added 2026-11-07
-  (fix/live-batch-190). Metric label map half still open.
 - [x] **MAJOR, DORMANT — uc-storage ignores `ssl_mode` and Redis `tls`**
   (default `Prefer`), and logs/Debug-prints URLs with embedded passwords
   (`uc-storage/src/config.rs`, `postgres.rs:37`, `redis.rs:33`). Apply TLS,

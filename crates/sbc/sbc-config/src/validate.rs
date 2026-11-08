@@ -1275,7 +1275,8 @@ pub fn routing_warnings(config: &SbcConfig) -> Vec<String> {
         for trunk in group.trunks.iter().filter(|t| t.stir_shaken.sign) {
             out.push(format!(
                 "trunk group '{}': trunk '{}' has stir_shaken.sign = true but the group has \
-                 trust_domain = false; RFC 3323 privacy is applied after signing and the \
+                 trust_domain = false (the default when unset; set trust_domain = true if \
+                 this peer is inside the RFC 3325 trust domain); RFC 3323 privacy is applied after signing and the \
                  Identity header is dropped when From is anonymized",
                 group.id, trunk.id
             ));
@@ -2564,19 +2565,34 @@ max_passport_age_secs = 120
         assert!(w[0].contains("ghost"));
     }
 
-    /// RFC 3325 trust domain: a missing `trust_domain` keeps today's
-    /// behaviour (true); an explicit `false` parses.
+    /// RFC 3325 §9.1 trust domain, fail-closed: a missing `trust_domain`
+    /// is `false`; an explicit `true` parses.
     #[test]
-    fn trust_domain_defaults_true_and_parses_false() {
+    fn trust_domain_defaults_false_and_parses_true() {
         let c: SbcConfig = toml::from_str(
-            "[[trunk_groups]]\nid = \"a\"\n\n[[trunk_groups]]\nid = \"b\"\ntrust_domain = false\n",
+            "[[trunk_groups]]\nid = \"a\"\n\n[[trunk_groups]]\nid = \"b\"\ntrust_domain = true\n",
         )
         .unwrap();
-        assert!(c.trunk_groups[0].trust_domain);
-        assert!(!c.trunk_groups[1].trust_domain);
+        assert!(!c.trunk_groups[0].trust_domain);
+        assert!(c.trunk_groups[1].trust_domain);
         let round: SbcConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
-        assert!(round.trunk_groups[0].trust_domain);
-        assert!(!round.trunk_groups[1].trust_domain);
+        assert!(!round.trunk_groups[0].trust_domain);
+        assert!(round.trunk_groups[1].trust_domain);
+    }
+
+    /// CM-6: an unset `trust_domain` on a signing trunk's group is surfaced
+    /// at load (upgrade visibility), not rejected.
+    #[test]
+    fn signing_trunk_with_unset_trust_domain_warns() {
+        let c: SbcConfig = toml::from_str(
+            "[[trunk_groups]]\nid = \"g\"\n[[trunk_groups.trunks]]\nid = \"t\"\nhost = \"192.0.2.1\"\n[trunk_groups.trunks.stir_shaken]\nsign = true\n",
+        )
+        .unwrap();
+        let w = routing_warnings(&c);
+        assert!(
+            w.iter().any(|x| x.contains("the default when unset")),
+            "{w:?}"
+        );
     }
 
     /// CM-6: `stir_shaken.sign = true` on an untrusted group is warned

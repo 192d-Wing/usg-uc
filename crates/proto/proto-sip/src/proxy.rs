@@ -22,8 +22,10 @@
 //!
 //! ### §16.4 Route Information Preprocessing
 //!
-//! [`crate::routing::preprocess_route_information`] with
-//! [`ProxyContext::is_own`]. It is a separate step; the caller runs, in order:
+//! [`crate::routing::preprocess_route_information`] with an
+//! [`crate::routing::OwnAddressing`] built from [`ProxyContext::is_own`]
+//! (plus own `maddr` hosts and the received port/transport for the
+//! §16.4 paragraph 3 `maddr` strip). It is a separate step; the caller runs, in order:
 //!
 //! 1. [`compute_loop_hash`] on the request **as received**;
 //! 2. [`RequestForwarder::validate_request`] (§16.3, loop/spiral check);
