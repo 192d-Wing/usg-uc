@@ -359,6 +359,21 @@ This upgrade has breaking changes. Check each point before you upgrade.
   apply without a restart. A failed reload keeps the old certificate in use;
   watch `sbc_api_tls_cert_reload_failures_total`.
 
+### Upgrading to the data-plane wiring release (pr/data-plane-wiring-b403f0)
+
+Applies only to daemons built with the `cluster` feature that set `[cluster]`
+or `[storage]` in `config.toml`. The chart renders neither section.
+
+- **Shared storage must use TLS.** Startup fails unless PostgreSQL uses
+  `ssl_mode = "verify_full"` (or `verify_ca`) and Redis uses a `rediss://` URL.
+  To keep a non-TLS backend, set `allow_insecure_transport = true` in the
+  backend table; the daemon logs a `storage.insecure_transport_allowed`
+  warning.
+- **`cluster.enabled = true` requires `[cluster.auth]`** with `key_file` (at
+  least 48 random bytes, mode 0600; group/other-readable files are refused)
+  and `key_id`. Startup aborts if the key is missing or unreadable. No peer
+  transport exists yet, so the key does not yet protect any traffic.
+
 ---
 
 ## 9. Multi-site rollout

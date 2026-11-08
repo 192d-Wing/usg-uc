@@ -107,6 +107,8 @@ stateDiagram-v2
 
 ### Basic Cluster Configuration
 
+> **Migration (2026-11-07, breaking).** `cluster.enabled = true` now requires `[cluster.auth]` with `key_file` (a file of at least 48 random bytes, mode 0600 or stricter; group/other-readable files are refused) and `key_id`. Startup aborts if the section is missing or the key cannot be loaded. The key is loaded and a per-boot `PeerAuthenticator` is built, but there is no peer transport yet, so it authenticates nothing on the wire (POA&M-241, POA&M-264).
+
 The `[cluster]` section is `uc_cluster::ClusterConfig` re-exported by `sbc-config` (feature `cluster`). All keys below **parse**; only `cluster_id`, `node_id`, `role` and the `[storage]` section are **acted on** by the daemon today. Heartbeat, failover and replication values are stored but have no consumer (Planned).
 
 ```toml
@@ -118,6 +120,10 @@ role = "primary"                 # primary, secondary, witness
 region = "us-east-1"             # parsed, not used
 zone = "us-east-1a"              # parsed, not used
 control_bind = "[::]:5070"       # parsed, nothing binds it (planned)
+
+[cluster.auth]                   # required when enabled = true
+key_file = "/etc/sbc/cluster.key" # >= 48 bytes, mode 0600
+key_id = 1
 
 [cluster.heartbeat]              # parsed, not used (planned)
 interval_ms = 1000

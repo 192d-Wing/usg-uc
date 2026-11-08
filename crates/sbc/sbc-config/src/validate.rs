@@ -85,6 +85,10 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_unimplemented(config)?;
     #[cfg(feature = "cluster")]
     validate_cluster_admission(config)?;
+    #[cfg(feature = "cluster")]
+    validate_cluster_auth(config)?;
+    #[cfg(feature = "cluster")]
+    validate_storage(config)?;
     if let Some(grpc) = &config.grpc {
         validate_grpc(grpc)?;
     }
@@ -118,6 +122,87 @@ fn validate_unimplemented(config: &SbcConfig) -> ConfigResult<()> {
         });
     }
     Ok(())
+}
+
+/// `[cluster.auth]` is required when `cluster.enabled`: an enabled cluster
+/// without a peer key would accept unauthenticated membership traffic once a
+/// peer transport exists (POA&M-241). The key file itself is read by the
+/// daemon at startup, so a config can be validated where the key is absent.
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings)
+// IA-3, SC-23: prerequisite only, no peer transport (POA&M-241).
+#[cfg(feature = "cluster")]
+fn validate_cluster_auth(config: &SbcConfig) -> ConfigResult<()> {
+    let Some(cluster) = &config.cluster else {
+        return Ok(());
+    };
+    match &cluster.auth {
+        None if cluster.enabled => Err(ConfigError::Validation {
+            message: "cluster.auth { key_file, key_id } is required when cluster.enabled \
+                      (POA&M-241)"
+                .to_string(),
+        }),
+        Some(auth) if auth.key_file.as_os_str().is_empty() => Err(ConfigError::Validation {
+            message: "cluster.auth.key_file must not be empty".to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// `[storage]` transport policy, checked at load so a plaintext Redis or
+/// PostgreSQL connection fails with a config error instead of at connect
+/// time. Delegates to the uc-storage validators (one source of truth; the
+/// connect-time check remains as defence in depth).
+///
+/// ## NIST 800-53 Rev5: SC-8, SC-8(1) (Cryptographic Protection), CM-6
+#[cfg(feature = "cluster")]
+fn validate_storage(config: &SbcConfig) -> ConfigResult<()> {
+    storage_insecure_transport(config).map(|_| ())
+}
+
+/// Reports a `[storage]` backend running on the insecure-transport opt-in.
+///
+/// Returns `Ok(Some(backend))` when plaintext transport is permitted only by
+/// `allow_insecure_transport`, so the daemon can warn at startup (CM-6).
+/// `Ok(None)` means TLS with server
+/// authentication, the in-memory backend, or no `[storage]` table.
+///
+/// # Errors
+/// Returns [`ConfigError::Validation`] naming the offending key when the
+/// selected backend's transport policy is violated or its table is missing.
+#[cfg(feature = "cluster")]
+pub fn storage_insecure_transport(config: &SbcConfig) -> ConfigResult<Option<&'static str>> {
+    use crate::schema::StorageBackendType;
+    let Some(storage) = &config.storage else {
+        return Ok(None);
+    };
+    let (name, result) = match storage.backend {
+        StorageBackendType::InMemory => return Ok(None),
+        StorageBackendType::Redis => (
+            "redis",
+            storage
+                .redis
+                .as_ref()
+                .map(crate::schema::RedisConfig::validate_transport_security),
+        ),
+        StorageBackendType::Postgres => (
+            "postgres",
+            storage
+                .postgres
+                .as_ref()
+                .map(crate::schema::PostgresConfig::validate_transport_security),
+        ),
+    };
+    match result {
+        None => Err(ConfigError::Validation {
+            message: format!("storage.backend = \"{name}\" requires a [storage.{name}] table"),
+        }),
+        Some(Err(e)) => Err(ConfigError::Validation {
+            message: format!("storage.{name}: {e}"),
+        }),
+        Some(Ok(true)) => Ok(Some(name)),
+        Some(Ok(false)) => Ok(None),
+    }
 }
 
 /// `cluster.admission`: under `split = "divide"` every divided cap must
@@ -3344,8 +3429,12 @@ facility = 16
 mod cluster_admission_tests {
     use super::*;
     use crate::schema::{
-        AdmissionSplit, ClusterConfig, TrunkConfigSchema, TrunkGroupConfig, cluster_share,
+        AdmissionSplit, ClusterAuthConfig, ClusterConfig, SbcClusterConfig, TrunkConfigSchema,
+        TrunkGroupConfig, cluster_share,
     };
+
+    /// Valid `[cluster.auth]` table appended to TOML fixtures.
+    const AUTH: &str = "[cluster.auth]\nkey_file = \"/etc/sbc/cluster.key\"\nkey_id = 1\n";
 
     fn divided(n: u32) -> SbcConfig {
         let mut config = SbcConfig::default();
@@ -3355,7 +3444,13 @@ mod cluster_admission_tests {
         };
         cluster.admission.split = AdmissionSplit::Divide;
         cluster.admission.expected_nodes = n;
-        config.cluster = Some(cluster);
+        config.cluster = Some(SbcClusterConfig {
+            inner: cluster,
+            auth: Some(ClusterAuthConfig {
+                key_file: "/etc/sbc/cluster.key".into(),
+                key_id: 1,
+            }),
+        });
         config
     }
 
@@ -3436,9 +3531,9 @@ mod cluster_admission_tests {
 
     #[test]
     fn toml_round_trip() {
-        let parsed = crate::load_from_str(
-            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 4\n",
-        )
+        let parsed = crate::load_from_str(&format!(
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 4\n{AUTH}"
+        ))
         .unwrap();
         assert_eq!(parsed.admission_divisor(), 4);
         assert_eq!(parsed.effective_max_calls(), 2500);
@@ -3546,7 +3641,7 @@ mod cluster_admission_tests {
     #[test]
     fn qa_toml_backward_compat_and_rejections() {
         // Existing [cluster] without an admission table: per_node, divisor 1.
-        let parsed = crate::load_from_str("[cluster]\nenabled = true\n").unwrap();
+        let parsed = crate::load_from_str(&format!("[cluster]\nenabled = true\n{AUTH}")).unwrap();
         let adm = &parsed.cluster.as_ref().unwrap().admission;
         assert_eq!(adm.split, AdmissionSplit::PerNode);
         assert_eq!(adm.expected_nodes, 1);
@@ -3556,9 +3651,9 @@ mod cluster_admission_tests {
         let parsed = crate::load_from_str("").unwrap();
         assert_eq!(parsed.admission_divisor(), 1);
         // Explicit per_node.
-        let parsed = crate::load_from_str(
-            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"per_node\"\n",
-        )
+        let parsed = crate::load_from_str(&format!(
+            "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"per_node\"\n{AUTH}"
+        ))
         .unwrap();
         assert_eq!(parsed.admission_divisor(), 1);
         // Rejections through the loader.
@@ -3571,7 +3666,9 @@ mod cluster_admission_tests {
             "[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = -1\n",
             "[general]\nmax_registrations = 3\n[cluster]\nenabled = true\n[cluster.admission]\nsplit = \"divide\"\nexpected_nodes = 4\n",
         ] {
-            assert!(crate::load_from_str(bad).is_err(), "accepted: {bad}");
+            // With a valid [cluster.auth] so the rejection is the admission one.
+            let bad = format!("{bad}{AUTH}");
+            assert!(crate::load_from_str(&bad).is_err(), "accepted: {bad}");
         }
     }
 }
@@ -3714,5 +3811,184 @@ mod topology_mode {
             .unwrap_err()
             .to_string();
         assert!(!err.contains('\r') && !err.contains('\n'), "{err}");
+    }
+}
+
+#[cfg(all(test, feature = "cluster"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod cluster_auth_storage_tests {
+    use super::*;
+    use crate::load_from_str;
+    use crate::schema::{ClusterAuthConfig, PostgresConfig, RedisConfig, StorageConfig};
+
+    fn err_containing(toml: &str, needle: &str) {
+        let msg = load_from_str(toml).expect_err("rejected").to_string();
+        assert!(msg.contains(needle), "'{msg}' should mention '{needle}'");
+    }
+
+    #[test]
+    fn enabled_cluster_without_auth_rejected() {
+        err_containing("[cluster]\nenabled = true\n", "cluster.auth");
+    }
+
+    #[test]
+    fn enabled_cluster_with_auth_accepted() {
+        let config = load_from_str(
+            "[cluster]\nenabled = true\n[cluster.auth]\nkey_file = \"/etc/sbc/cluster.key\"\nkey_id = 7\n",
+        )
+        .expect("valid");
+        let cluster = config.cluster.expect("cluster");
+        assert!(cluster.enabled);
+        assert_eq!(
+            cluster.auth,
+            Some(ClusterAuthConfig {
+                key_file: "/etc/sbc/cluster.key".into(),
+                key_id: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn disabled_cluster_without_auth_accepted() {
+        load_from_str("[cluster]\nenabled = false\n").expect("valid");
+    }
+
+    #[test]
+    fn empty_key_file_rejected() {
+        err_containing(
+            "[cluster]\nenabled = true\n[cluster.auth]\nkey_file = \"\"\nkey_id = 1\n",
+            "cluster.auth.key_file",
+        );
+    }
+
+    #[test]
+    fn unknown_key_under_cluster_auth_rejected() {
+        err_containing(
+            "[cluster]\nenabled = true\n[cluster.auth]\nkey_file = \"/k\"\nkey_id = 1\nkey = \"x\"\n",
+            "cluster.auth",
+        );
+    }
+
+    #[test]
+    fn missing_key_id_rejected() {
+        err_containing(
+            "[cluster]\nenabled = true\n[cluster.auth]\nkey_file = \"/k\"\n",
+            "key_id",
+        );
+    }
+
+    /// Guards the hand-written Deserialize: nested `deny_unknown_fields`
+    /// tables inside `[cluster]` must still reject typos.
+    #[test]
+    fn unknown_key_under_cluster_admission_still_rejected() {
+        err_containing(
+            "[cluster]\nenabled = false\n[cluster.admission]\nexpected_node = 2\n",
+            "expected_node",
+        );
+    }
+
+    #[test]
+    fn cluster_round_trips() {
+        let config = load_from_str(
+            "[cluster]\nenabled = true\nnode_id = \"n1\"\n[cluster.auth]\nkey_file = \"/k\"\nkey_id = 3\n",
+        )
+        .expect("valid");
+        let text = toml::to_string(&config).expect("serialize");
+        let back = load_from_str(&text).expect("reparse");
+        assert_eq!(config.cluster, back.cluster);
+    }
+
+    fn with_storage(storage: StorageConfig) -> SbcConfig {
+        SbcConfig {
+            storage: Some(storage),
+            ..SbcConfig::default()
+        }
+    }
+
+    #[test]
+    fn plaintext_redis_rejected() {
+        let c = with_storage(StorageConfig::redis("redis://cache.example.invalid:6379"));
+        let msg = validate_config(&c).expect_err("rejected").to_string();
+        assert!(msg.contains("storage.redis"), "{msg}");
+        assert!(msg.contains("allow_insecure_transport"), "{msg}");
+    }
+
+    #[test]
+    fn tls_redis_accepted() {
+        let c = with_storage(StorageConfig::redis("rediss://cache.example.invalid:6379"));
+        validate_config(&c).expect("valid");
+        assert_eq!(storage_insecure_transport(&c).expect("ok"), None);
+    }
+
+    #[test]
+    fn plaintext_redis_with_opt_in_accepted_and_reported() {
+        let mut redis = RedisConfig::new("redis://cache.example.invalid:6379");
+        redis.allow_insecure_transport = true;
+        let c = with_storage(StorageConfig {
+            backend: crate::schema::StorageBackendType::Redis,
+            redis: Some(redis),
+            ..StorageConfig::default()
+        });
+        validate_config(&c).expect("valid");
+        assert_eq!(storage_insecure_transport(&c).expect("ok"), Some("redis"));
+    }
+
+    #[test]
+    fn plaintext_redis_rejected_from_toml() {
+        err_containing(
+            "[storage]\nbackend = \"redis\"\n[storage.redis]\nurl = \"redis://cache.example.invalid\"\n",
+            "storage.redis",
+        );
+    }
+
+    #[test]
+    fn postgres_without_server_auth_rejected() {
+        let mut pg = PostgresConfig::new("postgres://db.example.invalid/sbc");
+        pg.ssl_mode = crate::schema::PostgresSslMode::Require;
+        let c = with_storage(StorageConfig {
+            backend: crate::schema::StorageBackendType::Postgres,
+            postgres: Some(pg.clone()),
+            ..StorageConfig::default()
+        });
+        let msg = validate_config(&c).expect_err("rejected").to_string();
+        assert!(msg.contains("storage.postgres"), "{msg}");
+
+        pg.allow_insecure_transport = true;
+        let c = with_storage(StorageConfig {
+            backend: crate::schema::StorageBackendType::Postgres,
+            postgres: Some(pg),
+            ..StorageConfig::default()
+        });
+        assert_eq!(
+            storage_insecure_transport(&c).expect("ok"),
+            Some("postgres")
+        );
+    }
+
+    #[test]
+    fn postgres_verify_full_accepted() {
+        let mut pg = PostgresConfig::new("postgres://db.example.invalid/sbc");
+        pg.ssl_mode = crate::schema::PostgresSslMode::VerifyFull;
+        let c = with_storage(StorageConfig {
+            backend: crate::schema::StorageBackendType::Postgres,
+            postgres: Some(pg),
+            ..StorageConfig::default()
+        });
+        validate_config(&c).expect("valid");
+    }
+
+    #[test]
+    fn missing_backend_table_rejected() {
+        let c = with_storage(StorageConfig {
+            backend: crate::schema::StorageBackendType::Redis,
+            ..StorageConfig::default()
+        });
+        let msg = validate_config(&c).expect_err("rejected").to_string();
+        assert!(msg.contains("[storage.redis]"), "{msg}");
+    }
+
+    #[test]
+    fn memory_backend_accepted() {
+        validate_config(&with_storage(StorageConfig::in_memory())).expect("valid");
     }
 }

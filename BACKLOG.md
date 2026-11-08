@@ -605,9 +605,17 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   and `redis://` refused unless `allow_insecure_transport`; Redis `tls`
   applied; passwords redacted in logs, Debug and errors. Open: CNSA-pinned
   suites (POA&M-240), `Serialize` still emits the password (POA&M-247).
-  **Caller change needed (sbc-config/sbc-daemon):** document and pass
-  `storage.postgres.ssl_root_cert`, `allow_insecure_transport` and Redis
-  `tls`; existing non-TLS deployments now fail at startup.
+  - [x] **Caller change (sbc-config/sbc-daemon):** document and pass
+    `storage.postgres.ssl_root_cert`, `allow_insecure_transport` and Redis
+    `tls`; existing non-TLS deployments now fail at startup.
+    Done 2026-11-07 (branch pr/data-plane-wiring-b403f0): the keys already
+    deserialize through the re-exported `StorageConfig`; sbc-config
+    `validate_storage` now runs the uc-storage transport check at config load
+    (missing backend table also rejected); the daemon logs
+    `storage.insecure_transport_allowed` when the opt-in is used; migration
+    note in docs/STORAGE-BACKENDS.md, docs/SBC-ADMIN-GUIDE.md,
+    deploy/helm/sbc/DEPLOYING.md, deploy/config/config.toml. Remains:
+    CNSA-pinned suites (POA&M-240), no audit record of refusal.
 - [ ] **MAJOR, DORMANT — cluster/state-sync have no peer authentication**, no
   transport, replayable heartbeats, no fencing/epoch (split-brain), and
   `SnapshotReader::add_chunk` accepts duplicate/out-of-range chunks
@@ -624,6 +632,16 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   `ClusterAuthKey::from_file`, builds `PeerAuthenticator` with a per-boot
   generation, keeps peers in step with membership; any transport uses only
   `handle_authenticated_heartbeat` / `open_message`.
+  Done 2026-11-07 (branch pr/data-plane-wiring-b403f0): `[cluster.auth]`
+  required when enabled; daemon loads the key at startup and aborts on
+  failure (error event logged), refuses a group/other-readable key file,
+  uses wall-clock ns as generation (pre-epoch clock is a startup error);
+  `ClusterManager::add_member` / `remove_member` update the authenticator
+  (remove always revokes). Remains: no peer transport and discovery does not
+  call add/remove_member (POA&M-264); key distribution/rotation;
+  clock-rollback generation; first-contact replay; rejection auditing
+  (POA&M-241); uc-state-sync has no daemon caller (POA&M-262); fencing
+  (POA&M-242).
 - [ ] **MAJOR, DORMANT — `PkiValidator` validates nothing**
   (`uc-user-mgmt/src/pki.rs`): substring-matches `CN=` in the DER; any self-signed
   cert authenticates. Replace with webpki chain validation or delete; POA&M.
@@ -636,6 +654,9 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   `Router::authorize`; every route has a permission (`/config` read/admin);
   claims now library-only. **Caller change needed:** sbc-daemon must call
   `Router::authorize` (POA&M-244).
+  Checked 2026-11-07 (branch pr/data-plane-wiring-b403f0): sbc-daemon does
+  not depend on uc-api at all (its REST API is `api_server.rs`), so there is
+  no caller to change. Remains: adopt uc-api or delete it (POA&M-261).
 - [ ] **MINOR, DORMANT — uc-syslog is UDP/plain TCP only** (claims AU-9);
   **uc-snmp is v2c with default `public` and malformed BER**. Remove or fix
   (v3 authPriv only; uc-cdr `SyslogSink` is the live RFC 5425 path).
@@ -643,7 +664,8 @@ and uc-snmp have no callers. uc-cdr was checked and found clean.
   and octet counting (library-only). Open: §5.2.2 fingerprints, RFC 5424
   header sanitising, buffering (POA&M-245). **Caller change needed:** a
   daemon `tls` syslog config if uc-syslog is ever wired. uc-snmp half open
-  (POA&M-246).
+  (POA&M-246). Checked 2026-11-07 (branch pr/data-plane-wiring-b403f0):
+  uc-syslog still has no daemon caller; nothing done (POA&M-263).
 - [ ] **MINOR, DORMANT — audit hex deserialiser panics on odd-length/multibyte
   input** (`uc-audit/src/record.rs:128`); **digest verify not constant-time,
   ignores qop/cnonce/nc and realm** (`uc-user-mgmt/src/digest.rs`).

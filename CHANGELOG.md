@@ -35,6 +35,27 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   `handle_authenticated_heartbeat` instead.
   `SnapshotReader::add_chunk` now returns `StateSyncResult<()>`.
   `SyslogTransport::Tls` is new.
+- **SBC config: storage transport security is validated at config load.**
+  (SC-8, CM-6; POA&M-240) A plaintext `redis://` URL or a Postgres
+  `sslmode` other than `verify-full` now fails startup unless
+  `allow_insecure_transport = true` is set (a warning is logged).
+  `storage.postgres.ssl_root_cert` and `storage.redis.tls` are now honored
+  by sbc-daemon.
+- **SBC config: `cluster.enabled = true` now requires `[cluster.auth]`.**
+  (IA-3, SC-8; POA&M-241) `key_file` and `key_id` are mandatory. The key
+  file must be at least 48 bytes and must not be group- or other-readable.
+  If the key cannot be loaded, startup fails closed; the daemon no longer
+  falls back to standalone mode. sbc-daemon builds a `PeerAuthenticator`
+  with a per-boot generation. There is still no peer transport
+  (POA&M-241). **Upgrade:** provision a key file (mode 0600/0400) and set
+  `cluster.auth.key_file` and `cluster.auth.key_id` on every node before
+  upgrading.
+
+### Documentation
+
+- **SBC:** `uc-api` `Router::authorize` is not yet called by sbc-daemon;
+  the default-deny route permissions are not enforced on the SBC HTTP API
+  (POA&M-261).
 
 ### Fixed (UAC digest, POA&M-234)
 
@@ -67,7 +88,8 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   reassembly is bounded (65,536 chunks, 256 MiB) and rejects duplicate and
   out-of-range chunks. This is library-only for now: there is no transport,
   key distribution or rotation (POA&M-241) and no split-brain fencing
-  (POA&M-242). sbc-config and sbc-daemon still need to wire `cluster.auth`.
+  (POA&M-242). sbc-config and sbc-daemon now wire `cluster.auth` (see
+  BREAKING below); peer transport is still missing (POA&M-241).
 - **uc-user-mgmt: `PkiValidator` now always rejects.** (IA-2(12), IA-5(2);
   POA&M-243) The old substring CN/EDIPI parser did not validate the
   certificate chain, so it has been removed. Every certificate gets
