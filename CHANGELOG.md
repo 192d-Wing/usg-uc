@@ -67,6 +67,30 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 - Audit schema unchanged: the new events reuse existing uc-audit event
   types and fields. No CDR, API or config breaking change.
 
+### Security (proto-sdp, POA&M-283)
+
+- **proto-sdp: malformed SDP can no longer crash the parser.** (SI-10,
+  SC-5; POA&M-283) A line starting with a multibyte UTF-8 character
+  panicked the parser. This was reachable from remote SDP in the soft
+  client (`client-sip-ua` `media_session.rs`, `ice_handler.rs`). Line types
+  are now checked on bytes: exactly one ASCII letter followed by `=`
+  (RFC 8866 §5). Anything else is a parse error. UTF-8 inside values is
+  still accepted. The same audit fixed other ways bad input could panic or
+  give wrong values:
+  - `r=`/typed time values that overflow u64 are rejected (they used to
+    panic in debug builds and wrap in release builds).
+  - `a=crypto` lifetimes of `2^n` with n ≥ 64 are rejected.
+  - A non-ASCII `inline:` key method is rejected instead of being sliced
+    mid-character.
+  - Time values and crypto lifetimes are digits only, so a leading `+` is
+    rejected (RFC 8866 §9, RFC 4568 §9.2).
+  - `Origin::increment_version` saturates instead of overflowing.
+
+  New tests in `proto-sdp/tests/parser_totality.rs`: negative cases and
+  proptests that feed arbitrary bytes and strings to every public parser.
+  Open: the number of SDP lines, media sections and attributes is not
+  capped; the parser relies on the SIP body size limit (POA&M-285).
+
 ### Fixed (SBC, POA&M-182, 233)
 
 - **SBC: in-dialog PRACK, INFO, MESSAGE and NOTIFY are relayed.** (SC-7,

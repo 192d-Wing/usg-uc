@@ -72,8 +72,9 @@ impl Origin {
 
     /// Increments the session version.
     pub fn increment_version(&mut self) {
+        // Saturates at u64::MAX rather than overflowing (POAM: 283).
         if let Ok(v) = self.session_version.parse::<u64>() {
-            self.session_version = (v + 1).to_string();
+            self.session_version = v.saturating_add(1).to_string();
         }
     }
 }
@@ -211,7 +212,7 @@ impl TimeValue {
     #[must_use]
     pub const fn from_days(days: u64) -> Self {
         Self {
-            seconds: days * 86400,
+            seconds: days.saturating_mul(86400),
         }
     }
 
@@ -219,7 +220,7 @@ impl TimeValue {
     #[must_use]
     pub const fn from_hours(hours: u64) -> Self {
         Self {
-            seconds: hours * 3600,
+            seconds: hours.saturating_mul(3600),
         }
     }
 
@@ -227,7 +228,7 @@ impl TimeValue {
     #[must_use]
     pub const fn from_minutes(minutes: u64) -> Self {
         Self {
-            seconds: minutes * 60,
+            seconds: minutes.saturating_mul(60),
         }
     }
 
@@ -252,13 +253,22 @@ impl TimeValue {
             .or_else(|| s.strip_suffix('s').map(|num| (num, 1u64)))
             .unwrap_or((s, 1u64));
 
-        let value: u64 = value_str.parse().map_err(|_| SdpError::ParseError {
-            reason: format!("invalid time value: {s}"),
-        })?;
+        // RFC 8866 §9: digits only (u64::from_str would also accept '+').
+        let value: u64 = Some(value_str)
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| SdpError::ParseError {
+                reason: format!("invalid time value: {s}"),
+            })?;
 
-        Ok(Self {
-            seconds: value * multiplier,
-        })
+        // NIST 800-53 Rev5: SI-10 — reject values whose product overflows u64
+        // instead of panicking (debug) or wrapping (release). POAM: 283
+        let seconds = value
+            .checked_mul(multiplier)
+            .ok_or_else(|| SdpError::ParseError {
+                reason: format!("time value out of range: {s}"),
+            })?;
+        Ok(Self { seconds })
     }
 
     /// Returns the value in seconds.
@@ -774,7 +784,7 @@ impl SdpParseState {
 
     fn parse_version(&mut self, value: &str, line_num: usize) -> SdpResult<()> {
         self.version = Some(value.parse().map_err(|_| SdpError::InvalidLine {
-            line: line_num + 1,
+            line: line_num.saturating_add(1),
             reason: "invalid version".to_string(),
         })?);
         Ok(())
@@ -859,7 +869,7 @@ impl SdpParseState {
             Ok(())
         } else {
             Err(SdpError::InvalidLine {
-                line: line_num + 1,
+                line: line_num.saturating_add(1),
                 reason: "r= line must follow t= line".to_string(),
             })
         }
@@ -930,20 +940,30 @@ impl SdpParseState {
 }
 
 /// Parses the line type and value from an SDP line.
+///
+/// RFC 8866 §5: every line is `<type>=<value>` where `<type>` is exactly one
+/// case-significant ASCII letter. The check is done on bytes so that a line
+/// starting with a multibyte UTF-8 character is rejected instead of being
+/// sliced inside a char boundary.
+// NIST 800-53 Rev5: SI-10, SC-5 — total parser on untrusted remote SDP. POAM: 283
 fn parse_sdp_line(line: &str, line_num: usize) -> SdpResult<(char, &str)> {
-    if line.len() < 2 || line.chars().nth(1) != Some('=') {
-        return Err(SdpError::InvalidLine {
-            line: line_num + 1,
-            reason: "invalid line format".to_string(),
-        });
+    let invalid = |reason: &str| SdpError::InvalidLine {
+        line: line_num.saturating_add(1),
+        reason: reason.to_string(),
+    };
+    match line.as_bytes() {
+        [t, b'=', ..] if t.is_ascii_alphabetic() => {
+            // Both leading bytes are ASCII, so index 2 is a char boundary.
+            let value = line
+                .get(2..)
+                .ok_or_else(|| invalid("invalid line format"))?;
+            Ok((char::from(*t), value))
+        }
+        [] => Err(invalid("empty line")),
+        _ => Err(invalid(
+            "invalid line format (expected single ASCII letter type followed by '=')",
+        )),
     }
-
-    let line_type = line.chars().next().ok_or_else(|| SdpError::InvalidLine {
-        line: line_num + 1,
-        reason: "empty line".to_string(),
-    })?;
-
-    Ok((line_type, &line[2..]))
 }
 
 impl FromStr for SessionDescription {
