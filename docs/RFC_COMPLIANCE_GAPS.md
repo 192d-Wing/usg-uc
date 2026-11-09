@@ -446,7 +446,7 @@ This is **by design** for security compliance.
 
 ## proto-sdp (RFC 4566 + RFC 3264)
 
-**Entire section Library-only.** No shipped binary calls proto-sdp. The daemon rewrites SDP with proto-b2bua's string-based `SdpRewriter` plus `sbc-daemon/src/sdp_dtls.rs`; the soft client builds and parses SDP in `client-core/src/call_manager.rs`.
+**Library-only except T.38 (2026-11-08).** The only shipped use of proto-sdp is the sbc-daemon T.38 switchover (`proto-b2bua::sdp_rewrite` stream selection, `sbc-daemon/src/t38.rs`); see "sbc-daemon T.38 fax relay" below. The daemon rewrites SDP with proto-b2bua's string-based `SdpRewriter` plus `sbc-daemon/src/sdp_dtls.rs`; the soft client builds and parses SDP in `client-core/src/call_manager.rs`.
 
 ### RFC 4566 Section Mapping
 
@@ -477,6 +477,20 @@ This is **by design** for security compliance.
 | §8.2 | Adding Media | Partial | Library-only | Basic support |
 | §8.3 | Removing Media | Partial | Library-only | port=0 handling |
 | §8.4 | Modifying Media | Complete | Library-only | `offer_answer.rs` |
+
+### sbc-daemon T.38 fax relay (RFC 3362, ITU-T T.38 Annex D, RFC 3264 §8, RFC 3261 §14)
+
+| Item | Status | Wiring | Notes |
+|------|--------|--------|-------|
+| RFC 3264 §8 port 0 preserved on rewrite | Fixed | Wired (sbc-daemon) | `proto-b2bua/src/sdp_rewrite.rs` `rewrite_connection_and_port` no longer gives declined (port 0) m-lines the anchored port. Affects all calls. Test `test_port_zero_preserved` |
+| RFC 3264 §6/§8.2 one anchored stream | Partial | Wired (sbc-daemon) | `select_anchored_stream`, `SdpRewriter::rewrite_with_selection`: m-lines never removed; extra active streams declined in place when an image m-line is involved. Tests `test_selection`, `test_selection_two_images_and_hostile`. Non-T.38 multi-stream still shares one port (POA&M-293) |
+| RFC 3362 image/t38 over UDPTL | Partial | Wired (sbc-daemon, off by default) | Audio/T.38 re-INVITE switchover with opaque UDPTL relay on the anchored ports. Tests `t38_switchover_moves_relay_only_after_2xx_and_back`, `audio_to_t38_and_back_relays_opaque_udptl_from_new_ports` (`sbc-integration-tests/tests/t38_switchover.rs`). No UDPTL/IFP inspection; datagrams over 2048 bytes truncated silently (POA&M-290) |
+| TCPTL, UDPTL over DTLS (RFC 7345) | Not implemented | — | Refused with 488 `unsupported_transport` (POA&M-291) |
+| T.38 Annex D attributes | Partial | Wired (sbc-daemon) | `proto-sdp/src/t38.rs`; offers and answers clamped to `[media.t38]` caps. Answer not checked against the offer (version downgrade, EC fallback) (POA&M-294). `uc-t38` redundancy/FEC dormant (POA&M-292) |
+| RFC 3261 §14 failed re-INVITE leaves session unchanged | Implemented | Wired (sbc-daemon) | Local refusal 488 (Warning 304/305/399 by reason), not forwarded; relay moved only after 2xx. Tests `t38_disabled_is_refused_locally_with_488`, `t38_local_reject_reasons`, `t38_remote_rejects_leave_relay_unchanged`, `t38_race_back_to_audio_glare_then_remote_488_keeps_image` |
+| RFC 3261 §13.2.2.4/§14.2 unacceptable 2xx answer | Implemented | Wired (sbc-daemon) | ACK then BYE both legs. Test `t38_malformed_answer_byes_both_legs` |
+| Media re-latch after remote change | Implemented | Wired (sbc-media-core) | Exact SDP `ip:port` preferred; same-IP other port only after a 500 ms grace (NAT); other IPs dropped. Tests `relay_leg_relatches_on_remote_change_and_counts_udptl`, `relay_leg_relatch_flip_flop_back_to_audio`, `relay_leg_relatch_nat_fallback_after_grace` |
+| `media.t38` hot reload | Not implemented | — | Reported restart-required (test `reload_reports_t38_as_restart_required`; POA&M-294) |
 
 ---
 

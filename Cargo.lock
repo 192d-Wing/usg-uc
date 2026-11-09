@@ -5337,6 +5337,7 @@ dependencies = [
 name = "proto-b2bua"
 version = "0.10.0"
 dependencies = [
+ "proto-sdp",
  "thiserror 2.0.21",
 ]
 
@@ -6311,6 +6312,7 @@ dependencies = [
  "proto-jwt",
  "proto-registrar",
  "proto-rtp",
+ "proto-sdp",
  "proto-sip",
  "proto-srtp",
  "proto-stir-shaken",
@@ -6394,9 +6396,11 @@ version = "0.10.0"
 dependencies = [
  "prost",
  "prost-types",
+ "proto-b2bua",
  "proto-registrar",
  "sbc-config",
  "sbc-grpc-api",
+ "sbc-media-core",
  "tokio",
  "tokio-stream",
  "tonic",

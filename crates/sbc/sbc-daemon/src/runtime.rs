@@ -353,6 +353,11 @@ impl Runtime {
             }
             keys.push("trunk_groups".to_string());
         }
+        // NIST 800-53 Rev5: CM-6 - the SIP stack reads `[media.t38]` at
+        // startup; say so rather than claim a reload applied it.
+        if old.media.t38 != new.media.t38 {
+            keys.push("media.t38".to_string());
+        }
         keys
     }
 
@@ -1706,6 +1711,17 @@ mod tests {
         let keys = Runtime::detect_restart_required(&old, &new);
         assert!(keys.contains(&"trunk_groups".to_string()), "{keys:?}");
         assert!(keys.contains(&"trunk_groups.require_tls".to_string()));
+    }
+
+    #[test]
+    fn reload_reports_t38_as_restart_required() {
+        let old = SbcConfig::default();
+        let mut new = old.clone();
+        new.media.t38.max_bit_rate = 9600;
+        assert_eq!(
+            Runtime::detect_restart_required(&old, &new),
+            vec!["media.t38".to_string()]
+        );
     }
 
     #[test]

@@ -130,6 +130,10 @@ pub enum AuditEvent {
     /// tail was found at startup. Chained by the writer so the loss is
     /// visible inside the trail itself.
     AuditRecordsDropped(AuditRecordsDropped),
+
+    /// A call's anchored media switched between audio and T.38 fax (image),
+    /// or the switchover was refused or failed.
+    MediaSwitchover(MediaSwitchover),
 }
 
 impl AuditEvent {
@@ -137,9 +141,10 @@ impl AuditEvent {
     #[must_use]
     pub const fn event_type(&self) -> AuditEventType {
         match self {
-            Self::CallAttempt(_) | Self::CallEstablished(_) | Self::CallTerminated(_) => {
-                AuditEventType::Call
-            }
+            Self::CallAttempt(_)
+            | Self::CallEstablished(_)
+            | Self::CallTerminated(_)
+            | Self::MediaSwitchover(_) => AuditEventType::Call,
             Self::AuthenticationAttempt(_) => AuditEventType::Authentication,
             Self::AuthorizationDecision(_) | Self::CdrExport(_) => AuditEventType::Authorization,
             Self::CryptoKeyOperation(_) | Self::StirSignFailure(_) | Self::StirKeyLoaded(_) => {
@@ -744,9 +749,139 @@ pub struct StirKeyLoaded {
     pub not_after: u64,
 }
 
+/// Media kind of an anchored call stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchoverMediaKind {
+    /// Audio (RTP).
+    Audio,
+    /// Image (T.38 fax over UDPTL, RFC 3362).
+    Image,
+}
+
+/// Which call leg sent the switchover offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchoverOriginator {
+    /// The A-leg (caller side).
+    ALeg,
+    /// The B-leg (callee side).
+    BLeg,
+}
+
+/// Outcome of a media switchover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchoverOutcome {
+    /// The far side accepted and the relay now carries the new kind.
+    Accepted,
+    /// The SBC refused the offer locally (488, not forwarded).
+    RejectedLocal,
+    /// The far side refused (non-2xx or declined stream); media unchanged.
+    RejectedRemote,
+    /// The switchover was accepted in signalling but the SBC could not
+    /// anchor it; the call is torn down.
+    Failed,
+}
+
+/// Why a media switchover was refused or failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchoverReason {
+    /// `media.t38.enabled = false`.
+    T38Disabled,
+    /// The leg is DTLS-SRTP terminated; UDPTL cannot be carried.
+    SrtpTerminate,
+    /// The image stream uses a transport other than `udptl`.
+    UnsupportedTransport,
+    /// The T.38 SDP attributes were malformed.
+    MalformedT38Sdp,
+    /// `T38FaxUdpEC` is not in `media.t38.allowed_ec`.
+    EcNotAllowed,
+    /// The far side answered with a non-2xx final response.
+    #[serde(rename = "remote_488")]
+    Remote488,
+    /// The far side declined the stream (port 0) or kept the old kind.
+    #[serde(rename = "remote_port0")]
+    RemotePort0,
+    /// The media relay could not be updated.
+    RelayUpdateFailed,
+}
+
+/// Transport of the switched-to stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchoverTransport {
+    /// UDPTL (ITU-T T.38 Annex D).
+    Udptl,
+}
+
+/// Media switchover (audio <-> T.38 fax) event.
+///
+/// Every field is an SBC-chosen enum or number; no SIP-supplied string is
+/// written to the record (audit-injection safe).
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-3, AU-12; CM-7 (fail-closed T.38 gate)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaSwitchover {
+    /// Internal SBC session identifier (correlates with the call's other
+    /// audit records; not the raw SIP Call-ID).
+    pub call_id: String,
+    /// Media kind before the switchover.
+    pub from_kind: SwitchoverMediaKind,
+    /// Media kind requested.
+    pub to_kind: SwitchoverMediaKind,
+    /// Leg that sent the offer.
+    pub originator: SwitchoverOriginator,
+    /// Outcome.
+    pub outcome: SwitchoverOutcome,
+    /// Reason, for any outcome other than `accepted`.
+    pub reason: Option<SwitchoverReason>,
+    /// Transport of the image stream, when switching to image.
+    pub transport: Option<SwitchoverTransport>,
+    /// `T38MaxBitRate` forwarded after clamping, if present.
+    pub max_bit_rate: Option<u32>,
+    /// New remote media address of the answering leg, as validated by the
+    /// SBC (source-admitted), on an accepted switchover (AU-3 "where").
+    #[serde(default)]
+    pub remote_media: Option<std::net::SocketAddr>,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn media_switchover_serializes_enums_only() {
+        let e = AuditEvent::MediaSwitchover(MediaSwitchover {
+            call_id: "sess-1".into(),
+            from_kind: SwitchoverMediaKind::Audio,
+            to_kind: SwitchoverMediaKind::Image,
+            originator: SwitchoverOriginator::ALeg,
+            outcome: SwitchoverOutcome::RejectedRemote,
+            reason: Some(SwitchoverReason::Remote488),
+            transport: Some(SwitchoverTransport::Udptl),
+            max_bit_rate: Some(14400),
+            remote_media: None,
+        });
+        assert_eq!(e.event_type(), AuditEventType::Call);
+        let json = serde_json::to_string(&e).unwrap();
+        for needle in [
+            r#""type":"media_switchover""#,
+            r#""from_kind":"audio""#,
+            r#""to_kind":"image""#,
+            r#""originator":"a_leg""#,
+            r#""outcome":"rejected_remote""#,
+            r#""reason":"remote_488""#,
+            r#""transport":"udptl""#,
+        ] {
+            assert!(json.contains(needle), "{json}");
+        }
+        let r = serde_json::to_string(&SwitchoverReason::RemotePort0).unwrap();
+        assert_eq!(r, r#""remote_port0""#);
+        let r = serde_json::to_string(&SwitchoverReason::MalformedT38Sdp).unwrap();
+        assert_eq!(r, r#""malformed_t38_sdp""#);
+    }
+
     #[test]
     fn stir_events_serialize_and_categorize() {
         let e = AuditEvent::StirVerifyFailure(StirVerifyFailure {

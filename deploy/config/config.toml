@@ -49,6 +49,17 @@ rtp_port_max = 32768
 required = true
 profile = "AeadAes256Gcm"
 
+[media.t38]
+# T.38 fax relay (RFC 3362 m=image udptl). Off by default: image offers get
+# 488. UDPTL is cleartext, so with media.srtp.required = true, enabling it
+# also needs allow_cleartext = true (NIST 800-53 SC-8, CM-6; POA&M-291).
+enabled = false
+allow_cleartext = false
+max_bit_rate = 14400
+max_datagram = 1400
+max_buffer = 4096
+allowed_ec = ["t38UDPRedundancy", "t38UDPFEC", "t38UDPNoEC"]
+
 [media.dtls]
 # DTLS certificate paths (mount via secrets)
 # cert_path = "/etc/sbc/certs/dtls.crt"

@@ -774,6 +774,63 @@ pub struct MediaConfig {
 
     /// DTLS configuration for DTLS-SRTP.
     pub dtls: DtlsConfig,
+
+    /// T.38 fax relay (`m=image udptl t38`) policy.
+    pub t38: T38Config,
+}
+
+/// `T38FaxUdpEC` error-correction modes an operator may allow
+/// (ITU-T T.38 Annex D spelling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum T38EcMode {
+    /// `t38UDPRedundancy`.
+    #[serde(rename = "t38UDPRedundancy")]
+    Redundancy,
+    /// `t38UDPFEC`.
+    #[serde(rename = "t38UDPFEC")]
+    Fec,
+    /// `t38UDPNoEC` (also what an absent `T38FaxUdpEC` means).
+    #[serde(rename = "t38UDPNoEC")]
+    NoEc,
+}
+
+/// T.38 fax relay policy (`[media.t38]`).
+///
+/// The SBC anchors and relays UDPTL opaquely on the call's existing media
+/// ports after an audio <-> T.38 re-INVITE switchover; it never decodes
+/// UDPTL/IFP (POA&M-290).
+///
+/// ## NIST 800-53 Rev5: CM-6, CM-7 (fail-closed default), SC-5 (caps), SC-8
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct T38Config {
+    /// Accept `m=image` T.38 streams. Default `false`: image offers get 488.
+    pub enabled: bool,
+    /// Acknowledge that UDPTL is cleartext. Must be `true` to enable T.38
+    /// when `media.srtp.required = true` (POA&M-291).
+    pub allow_cleartext: bool,
+    /// Cap for `T38MaxBitRate` in bit/s (2400..=33600); higher values are
+    /// clamped down before forwarding.
+    pub max_bit_rate: u32,
+    /// Cap for `T38FaxMaxDatagram` in octets (64..=1472).
+    pub max_datagram: u16,
+    /// Cap for `T38FaxMaxBuffer` in octets (64..=65535).
+    pub max_buffer: u32,
+    /// Allowed `T38FaxUdpEC` modes (non-empty, no duplicates).
+    pub allowed_ec: Vec<T38EcMode>,
+}
+
+impl Default for T38Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_cleartext: false,
+            max_bit_rate: 14_400,
+            max_datagram: 1400,
+            max_buffer: 4096,
+            allowed_ec: vec![T38EcMode::Redundancy, T38EcMode::Fec, T38EcMode::NoEc],
+        }
+    }
 }
 
 impl Default for MediaConfig {
@@ -791,6 +848,7 @@ impl Default for MediaConfig {
             rtp_port_max: 32768,
             srtp: SrtpConfig::default(),
             dtls: DtlsConfig::default(),
+            t38: T38Config::default(),
         }
     }
 }

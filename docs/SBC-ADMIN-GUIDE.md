@@ -638,6 +638,51 @@ sidecar_socket = "/run/sbc/dtls-sidecar.sock"
 fingerprint_file = "/run/sbc/dtls-fingerprint"
 ```
 
+### T.38 fax relay (`[media.t38]`)
+
+The SBC can carry T.38 fax (RFC 3362 `m=image ... udptl t38`) after an
+audio-to-fax re-INVITE, and back. UDPTL is relayed opaquely on the call's
+existing media ports: the relay follows each gateway to its new UDPTL port.
+It is off by default.
+
+```toml
+[media.t38]
+enabled = false            # default; image offers get 488 (Warning 304)
+allow_cleartext = false    # must be true to enable T.38 when srtp.required = true
+max_bit_rate = 14400       # T38MaxBitRate cap (2400..=33600); higher values are lowered
+max_datagram = 1400        # T38FaxMaxDatagram cap (64..=1472)
+max_buffer = 4096          # T38FaxMaxBuffer cap (64..=65535)
+allowed_ec = ["t38UDPRedundancy", "t38UDPFEC", "t38UDPNoEC"]  # non-empty, no duplicates
+```
+
+- UDPTL is **cleartext** (no SRTP). With `media.srtp.required = true`,
+  `enabled = true` fails validation unless `allow_cleartext = true`.
+- With `media.srtp.mode = "Terminate"` the daemon logs a warning: calls whose
+  media is DTLS-SRTP terminated refuse T.38 with 488.
+- `udptl` is the only transport; `TCP`/`TCPTL` image offers get 488.
+- An offer the SBC refuses gets 488 locally and is not forwarded. The
+  Warning code is 304 when T.38 is disabled, 305 for an unsupported
+  transport, a disallowed `T38FaxUdpEC` or a DTLS-terminated leg, and 399
+  for malformed T.38 SDP. If the far
+  side refuses (non-2xx or port 0), the call stays on audio. If the far side
+  accepts with malformed T.38 attributes, the SBC sends BYE on both legs.
+- Every switchover is audited (`media_switchover`, event type `Call`).
+  Fields: `call_id` (internal session id), `from_kind` and `to_kind`
+  (`audio`/`image`), `originator` (`a_leg`/`b_leg`), `outcome`
+  (`accepted`, `rejected_local`, `rejected_remote`, `failed`), `reason`
+  (`t38_disabled`, `srtp_terminate`, `unsupported_transport`,
+  `malformed_t38_sdp`, `ec_not_allowed`, `remote_488`, `remote_port0`,
+  `relay_update_failed`, or null), `transport` (`udptl` or null),
+  `max_bit_rate` (after clamping, or null) and `remote_media` (the
+  answering leg's new `ip:port`, set only on `accepted`). A refused
+  image-only initial INVITE is recorded as an `AuthorizationDecision` with
+  policy `t38:<reason>` and a rejected CDR, not as `media_switchover`.
+  Switchovers are counted: `sbc_t38_switchover_{to_t38,to_audio}_{accepted,rejected_local,rejected_remote,failed}_total`,
+  `sbc_t38_active_calls`, `sbc_udptl_packets_relayed_total`.
+- `[media.t38]` is read at startup. A config reload reports it as
+  restart-required.
+- Known gaps: POA&M-290 to POA&M-294.
+
 Values for `profile`, `fingerprint_hash` and `codecs` are the Rust enum variant names (see `deploy/config/config.toml` for the canonical example).
 
 ### Media Mode and Codecs

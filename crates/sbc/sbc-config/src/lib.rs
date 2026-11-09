@@ -25,6 +25,15 @@
 //! default_mode = "relay"
 //! codecs = ["opus", "g711-ulaw", "g711-alaw", "g722"]
 //!
+//! # T.38 fax relay: off by default (image offers get 488).
+//! [media.t38]
+//! enabled = true
+//! allow_cleartext = true   # UDPTL is cleartext; required when srtp.required
+//! max_bit_rate = 14400
+//! max_datagram = 1400
+//! max_buffer = 4096
+//! allowed_ec = ["t38UDPRedundancy", "t38UDPFEC", "t38UDPNoEC"]
+//!
 //! [security]
 //! tls_cert_path = "/etc/sbc/cert.pem"
 //! tls_key_path = "/etc/sbc/key.pem"
@@ -73,8 +82,8 @@ pub use schema::{
     DialPlanConfig, DialPlanEntryConfig, HeaderManipulationConfig, ManipulationRuleConfig,
     RoutingConfig, SbcConfig, SrtpMode, StirAlgorithm, StirAttestation, StirAttestationConfig,
     StirAttestationRule, StirFailurePolicy, StirKeySource, StirShakenConfig, StirSigningConfig,
-    StirVerificationConfig, TopologyHidingConfig, TrunkConfigSchema, TrunkGroupConfig,
-    TrunkManipulationRuleConfig, TrunkStirConfig, ZoneConfig,
+    StirVerificationConfig, T38Config, T38EcMode, TopologyHidingConfig, TrunkConfigSchema,
+    TrunkGroupConfig, TrunkManipulationRuleConfig, TrunkStirConfig, ZoneConfig,
 };
 
 use std::path::Path;

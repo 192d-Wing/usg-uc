@@ -742,6 +742,13 @@ impl Server {
             warn!(event = "config.routing_warning", "{w}");
         }
 
+        // NIST 800-53 Rev5: CM-6, CM-7 - `[media.t38]` fax relay policy
+        // (fail-closed default; enforced per offer in the SIP stack).
+        sip_stack.set_t38_config(config.media.t38.clone());
+        for w in sbc_config::validate::t38_warnings(config) {
+            warn!(event = "config.t38_warning", "{w}");
+        }
+
         // Initialize router from config (if routing section present)
         if let Some(ref routing) = config.routing {
             sip_stack.init_router_from_config(routing, &config.dial_plans, &config.trunk_groups);

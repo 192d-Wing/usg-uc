@@ -10,6 +10,10 @@
 //! with standards-conformant T.38 gateways or endpoints. RFC 4612 covers only
 //! the MIME registration. This crate is not a dependency of any shipped binary.
 //!
+//! The SBC relays UDPTL opaquely and does not use this crate: T.38 SDP is
+//! handled by `proto-sdp::t38` and the switchover by `sbc-daemon`
+//! (POA&M-290; redundancy/FEC/buffer residuals POA&M-292).
+//!
 //! ## Features
 //!
 //! - **UDPTL Transport**: UDPTL-style transport with redundancy (non-standard encoding)

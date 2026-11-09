@@ -296,8 +296,9 @@ impl SdpMunger {
                     | TransportProtocol::UdpTlsRtpSavpf => {
                         media.protocol = TransportProtocol::UdpTlsRtpSavpf;
                     }
-                    // Raw UDP/TCP cannot be secured by WebRTC: reject in place.
-                    TransportProtocol::Udp | TransportProtocol::Tcp => {
+                    // Raw UDP/TCP and T.38 UDPTL (RFC 3362) cannot be secured
+                    // by WebRTC: reject in place.
+                    TransportProtocol::Udp | TransportProtocol::Tcp | TransportProtocol::Udptl => {
                         warn!(index = idx, "Rejecting non-RTP m-section for WebRTC");
                         reject_in_place(media);
                         continue;
@@ -888,6 +889,17 @@ a=rtcp-mux\r\n";
         assert!(result.contains("m=audio 49170 UDP/TLS/RTP/SAVPF 0"));
         assert!(result.contains("a=fingerprint:sha-384 "));
         assert!(result.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn test_sip_to_webrtc_rejects_t38_image_in_place() {
+        let sdp = format!("{SAMPLE_SIP_SDP}m=image 5000 udptl t38\r\na=T38FaxVersion:0\r\n");
+        let result = SdpMunger::default()
+            .transform_with(&sdp, WebRtcSdpMode::SipToWebRtc, &params())
+            .unwrap();
+        let s = sections(&result);
+        assert_eq!(s.len(), 2, "m-line kept (RFC 3264 §8): {result}");
+        assert!(s[1].starts_with("m=image 0 "), "{result}");
     }
 
     #[test]

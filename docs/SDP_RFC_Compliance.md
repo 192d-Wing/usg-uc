@@ -86,6 +86,10 @@ The client implements comprehensive SDP functionality for audio-only calls with 
     - Resume uses re-INVITE with `a=sendrecv`
     - Verified correct implementation
 
+- **Section 8 (SBC rewrite, sbc-daemon via proto-b2bua)** - **FIXED 2026-11-08**
+    - `rewrite_connection_and_port` preserves port 0 on declined m-lines; previously it re-enabled them (test `test_port_zero_preserved`)
+    - Only one active m-line is anchored; when an image m-line is involved, extra active streams are declined in place (tests `test_selection`, `test_selection_two_images_and_hostile`). Non-T.38 multi-stream SDP still shares one port (POA&M-293)
+
 #### Notes
 
 - **Section 5.1 (Unicast Streams - Connection Address)**: Uses configured `local_media_addr` without STUN validation. Works correctly in practice with direct and NAT-forwarded setups. STUN-based address discovery could be added in future for complex NAT scenarios.
@@ -219,6 +223,16 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 - `a=maxptime:120` - Maximum packet time for Opus (up to 120ms frames)
 
 ---
+
+### RFC 3362 / ITU-T T.38 Annex D - T.38 Fax over SDP ⚠️ PARTIAL
+
+**Status**: Partial (sbc-daemon relay, off by default: `media.t38.enabled = false`)
+**Link**: <https://datatracker.ietf.org/doc/html/rfc3362>
+
+- `proto-sdp`: `m=image ... udptl t38` (`media.rs`, test `test_image_udptl`); Annex D attributes in `t38.rs` (`T38Params`; tests `parse_full_annex_d`, `round_trip`, `rejects_bad_values`, `clamp_only_lowers`, `table_round_trip`)
+- sbc-daemon: audio/T.38 re-INVITE switchover, attributes clamped to `[media.t38]` caps, UDPTL relayed opaquely (tests `t38_switchover_moves_relay_only_after_2xx_and_back`, `audio_to_t38_and_back_relays_opaque_udptl_from_new_ports`)
+- Not implemented: `TCPTL` and UDPTL over DTLS (POA&M-291); answer-vs-offer Annex D negotiation (POA&M-294); UDPTL/IFP inspection and ASN.1 PER (POA&M-290); `uc-t38` redundancy/FEC (POA&M-292)
+- Advisory (not a POA&M): the T.38 path parses each SDP body 3-4 times per message (PERF-003); bounded per-re-INVITE cost, deferred
 
 ### RFC 7742 - WebRTC Video Processing and Codec Requirements ℹ️ N/A
 

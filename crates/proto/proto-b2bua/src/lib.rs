@@ -67,7 +67,9 @@ pub use mode::{
     TopologyHidingConfig,
 };
 pub use sdp_rewrite::{
-    SdpRewriteResult, SdpRewriter, extract_media_address, is_connection_hold, is_hold_sdp,
+    AnchoredStream, SdpRewriteResult, SdpRewriter, StreamKind, StreamPreference,
+    extract_media_address, extract_media_address_for, has_image_stream, is_connection_hold,
+    is_hold_sdp, rewrite_t38_attributes, select_anchored_stream, stream_at, t38_params_at,
 };
 
 /// B2BUA operation mode.
