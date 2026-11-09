@@ -486,11 +486,25 @@ This is **by design** for security compliance.
 | RFC 3264 §6/§8.2 one anchored stream | Partial | Wired (sbc-daemon) | `select_anchored_stream`, `SdpRewriter::rewrite_with_selection`: m-lines never removed; extra active streams declined in place when an image m-line is involved. Tests `test_selection`, `test_selection_two_images_and_hostile`. Non-T.38 multi-stream still shares one port (POA&M-293) |
 | RFC 3362 image/t38 over UDPTL | Partial | Wired (sbc-daemon, off by default) | Audio/T.38 re-INVITE switchover with opaque UDPTL relay on the anchored ports. Tests `t38_switchover_moves_relay_only_after_2xx_and_back`, `audio_to_t38_and_back_relays_opaque_udptl_from_new_ports` (`sbc-integration-tests/tests/t38_switchover.rs`). No UDPTL/IFP inspection; datagrams over 2048 bytes truncated silently (POA&M-290) |
 | TCPTL, UDPTL over DTLS (RFC 7345) | Not implemented | — | Refused with 488 `unsupported_transport` (POA&M-291) |
-| T.38 Annex D attributes | Partial | Wired (sbc-daemon) | `proto-sdp/src/t38.rs`; offers and answers clamped to `[media.t38]` caps. Answer not checked against the offer (version downgrade, EC fallback) (POA&M-294). `uc-t38` redundancy/FEC dormant (POA&M-292) |
+| T.38 Annex D attributes | Partial | Wired (sbc-daemon) | `proto-sdp/src/t38.rs`; offers and answers clamped to `[media.t38]` caps. Answer not checked against the offer (version downgrade, EC fallback) (POA&M-294, still open). `uc-t38` redundancy/FEC dormant (POA&M-292) |
+| Remote media node media kind | Implemented | Wired (sbc-daemon / sbc-media-core, `grpc` feature) | `SetMediaKind` RPC with `MediaKind` enum (`media_controller.proto`); remote `update_relay` sends the kind first, then the leg remotes (not atomic, PERF-001). Unknown or UNSPECIFIED kind gets INVALID_ARGUMENT. Against an older media node (UNIMPLEMENTED) the switch fails closed: `RelayUpdateFailed`, call stays on audio; an initial image answer is torn down (BYE both legs). Tests `set_media_kind_unimplemented_fails_closed`, `set_media_kind_unimplemented_fails_closed_every_time`, `set_media_kind_rejects_every_out_of_range_value`, `t38_initial_image_answer_set_media_kind_failure_tears_down`. No end-to-end test of real client against real server |
+| CDR fax indicator | Implemented | Wired (sbc-daemon) | CDR schema v3 `media_kinds` (`audio`/`image`, kinds negotiated or attempted). Tests `draft_media_kinds_audio_image_audio`, `t38_initial_image_answer_success_records_image_kind`. This closes only these sub-items of POA&M-294; the Annex D answer-vs-offer check stays open |
 | RFC 3261 §14 failed re-INVITE leaves session unchanged | Implemented | Wired (sbc-daemon) | Local refusal 488 (Warning 304/305/399 by reason), not forwarded; relay moved only after 2xx. Tests `t38_disabled_is_refused_locally_with_488`, `t38_local_reject_reasons`, `t38_remote_rejects_leave_relay_unchanged`, `t38_race_back_to_audio_glare_then_remote_488_keeps_image` |
 | RFC 3261 §13.2.2.4/§14.2 unacceptable 2xx answer | Implemented | Wired (sbc-daemon) | ACK then BYE both legs. Test `t38_malformed_answer_byes_both_legs` |
 | Media re-latch after remote change | Implemented | Wired (sbc-media-core) | Exact SDP `ip:port` preferred; same-IP other port only after a 500 ms grace (NAT); other IPs dropped. Tests `relay_leg_relatches_on_remote_change_and_counts_udptl`, `relay_leg_relatch_flip_flop_back_to_audio`, `relay_leg_relatch_nat_fallback_after_grace` |
 | `media.t38` hot reload | Not implemented | — | Reported restart-required (test `reload_reports_t38_as_restart_required`; POA&M-294) |
+
+### uc-siprec SIPREC (RFC 7865, RFC 7866; library-only, phase 1)
+
+| Item | Status | Wiring | Notes |
+|------|--------|--------|-------|
+| RFC 7865 metadata (complete snapshot) | Partial | Library-only | `metadata.rs` `to_rfc7865_xml`; §9 element order; escaping and caps (`xml.rs`). Tests `test_rfc7865_golden`, `tests/hostile_metadata.rs`. No XSD validation; IDs not stable across serializations (POA&M-305) |
+| RFC 7865 partial updates (`datamode` partial) | Not implemented | — | POA&M-305 |
+| RFC 7866 §6.1.1 / §8.1.1 / §9.1 RS offer body | Partial | Library-only | `src_request.rs` `build_rs_offer`, `SrcHeaders`. Tests `builds_multipart_with_labels_and_disposition`, `forces_sendonly_direction` |
+| RFC 7866 §6 RS origination, media forking | Not implemented | — | POA&M-300, POA&M-301 |
+| RFC 7866 §6.1.2 recording indication | Not implemented | — | POA&M-303 |
+| RFC 7866 §6.2 SRS-initiated requests | Not implemented | — | POA&M-308 |
+| Transport security to SRS | Not implemented | — | POA&M-304 |
 
 ---
 

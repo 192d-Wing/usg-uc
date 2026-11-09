@@ -41,11 +41,13 @@ pub fn header_json_line(header: &FileHeader) -> CdrResult<String> {
     Ok(serde_json::to_string(header)?)
 }
 
-/// Fixed v2 CSV columns, in order. `sequence` is the second column and
+/// Fixed v3 CSV columns, in order. `sequence` is the second column and
 /// `hash` the last so the writer can resume from a file's last row.
 ///
 /// v2 inserts the four `stir_*` verification columns after
 /// `failover_takeover` (before the hash pair, which must stay last).
+/// v3 inserts `media_kinds` (`;`-separated tokens, empty when unset) after
+/// `stir_x5u_host`.
 pub const CSV_COLUMNS: &[&str] = &[
     "schema_version",
     "sequence",
@@ -90,12 +92,16 @@ pub const CSV_COLUMNS: &[&str] = &[
     "stir_verify_reason",
     "stir_inbound_attestation",
     "stir_x5u_host",
+    "media_kinds",
     "prev_hash",
     "hash",
 ];
 
 /// Number of CSV columns in schema v1 (readers accept both widths).
 pub const CSV_COLUMNS_V1: usize = 41;
+
+/// Number of CSV columns in schema v2.
+pub const CSV_COLUMNS_V2: usize = 45;
 
 /// CSV header row (no trailing newline).
 pub fn csv_header() -> String {
@@ -238,6 +244,12 @@ pub fn to_csv_row(r: &CallRecord) -> CdrResult<String> {
         &mut out
     ));
     col!(push_opt(r.stir_x5u_host.as_deref(), &mut out));
+    col!(for (i, k) in r.media_kinds.iter().enumerate() {
+        if i > 0 {
+            out.push(';');
+        }
+        out.push_str(k.as_str());
+    });
     col!(out.push_str(&r.prev_hash));
     col!(out.push_str(&r.hash));
     Ok(out)

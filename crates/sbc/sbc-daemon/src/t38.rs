@@ -60,6 +60,14 @@ impl CallMediaKind {
         }
     }
 
+    /// CDR representation (schema v3 `media_kinds`).
+    pub const fn cdr(self) -> uc_cdr::MediaKindTag {
+        match self {
+            Self::Audio => uc_cdr::MediaKindTag::Audio,
+            Self::Image => uc_cdr::MediaKindTag::Image,
+        }
+    }
+
     /// Media-pipeline representation.
     pub const fn pipeline(self) -> sbc_media_core::media_pipeline::MediaKind {
         match self {
@@ -235,6 +243,8 @@ pub const fn reason_policy(reason: SwitchoverReason) -> &'static str {
         SwitchoverReason::MalformedT38Sdp => "t38:malformed_t38_sdp",
         SwitchoverReason::EcNotAllowed => "t38:ec_not_allowed",
         SwitchoverReason::Remote488 => "t38:remote_488",
+        SwitchoverReason::RemoteDialogLost => "t38:remote_dialog_lost",
+        SwitchoverReason::RemoteRejected => "t38:remote_rejected",
         SwitchoverReason::RemotePort0 => "t38:remote_port0",
         SwitchoverReason::RelayUpdateFailed => "t38:relay_update_failed",
     }
@@ -255,6 +265,8 @@ pub fn warning_for(reason: SwitchoverReason, host: &str) -> String {
         }
         SwitchoverReason::MalformedT38Sdp
         | SwitchoverReason::Remote488
+        | SwitchoverReason::RemoteDialogLost
+        | SwitchoverReason::RemoteRejected
         | SwitchoverReason::RemotePort0
         | SwitchoverReason::RelayUpdateFailed => format!("399 {host} \"Malformed T.38 SDP\""),
     }

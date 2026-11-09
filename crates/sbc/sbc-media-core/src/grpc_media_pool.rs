@@ -258,6 +258,28 @@ impl MediaController for MediaPool {
             .await
     }
 
+    async fn set_media_kind(
+        &self,
+        call_id: &str,
+        kind: crate::media_pipeline::MediaKind,
+    ) -> Result<(), MediaPipelineError> {
+        let idx = self.node_for(call_id).await?;
+        self.nodes[idx].client.set_media_kind(call_id, kind).await
+    }
+
+    async fn update_relay(
+        &self,
+        call_id: &str,
+        remotes: [Option<(bool, SbcSocketAddr)>; 2],
+        kind: Option<crate::media_pipeline::MediaKind>,
+    ) -> Result<(), MediaPipelineError> {
+        let idx = self.node_for(call_id).await?;
+        self.nodes[idx]
+            .client
+            .update_relay(call_id, remotes, kind)
+            .await
+    }
+
     async fn start_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
         let idx = self.node_for(call_id).await?;
         self.nodes[idx].client.start_relay(call_id).await
@@ -369,6 +391,31 @@ mod tests {
         let ip1 = s1.media_ip.unwrap();
         let ip2 = s2.media_ip.unwrap();
         assert_ne!(ip1, ip2, "two calls should spread across both nodes");
+    }
+
+    #[tokio::test]
+    async fn set_media_kind_follows_call_affinity() -> Result<(), Box<dyn std::error::Error>> {
+        let pool = two_node_pool().await;
+        pool.create_session_with_zones("fax", Some(MediaMode::Relay), None, None)
+            .await?;
+        // A wrong node would answer SessionNotFound.
+        pool.set_media_kind("fax", crate::media_pipeline::MediaKind::Image)
+            .await?;
+        pool.update_relay(
+            "fax",
+            [
+                Some((true, SbcSocketAddr::new("192.0.2.9".parse()?, 5000))),
+                None,
+            ],
+            Some(crate::media_pipeline::MediaKind::Audio),
+        )
+        .await?;
+        assert!(matches!(
+            pool.set_media_kind("unknown", crate::media_pipeline::MediaKind::Image)
+                .await,
+            Err(MediaPipelineError::SessionNotFound)
+        ));
+        Ok(())
     }
 
     #[tokio::test]

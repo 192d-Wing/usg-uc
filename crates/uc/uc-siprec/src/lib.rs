@@ -43,7 +43,16 @@
 //!
 //! - **AU-4**: Audit Storage Capacity (recording storage)
 //! - **AU-9**: Protection of Audit Information
-//! - **SC-8**: Transmission Confidentiality and Integrity
+//! - **SC-8**: Transmission Confidentiality and Integrity (POA&M-304)
+//! - **SI-10 / SI-15**: metadata escaping, rejection and caps (`xml`, `metadata`)
+//!
+//! ## Phase 1 scope
+//!
+//! Library-level conformance only: the RFC 7865 serializer and a pure RFC 7866
+//! RS INVITE body builder. Nothing in the SBC consumes this crate yet.
+//! POA&M-300..309 track the SRC wiring, media forking, config, recording
+//! indication, SRS transport security, snapshots, audit/CDR, cluster, inbound
+//! SRS requests, and the remaining scaffolding (`forking`, `session`).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -56,6 +65,8 @@ pub mod error;
 pub mod forking;
 pub mod metadata;
 pub mod session;
+pub mod src_request;
+pub mod xml;
 
 pub use config::{RecordingConfig, RecordingMode, RecordingTrigger, SrsEndpoint};
 pub use error::{SiprecError, SiprecResult};
@@ -66,6 +77,7 @@ pub use metadata::{
 pub use session::{
     RecordingSession, RecordingSessionState, SessionRecordingClient, SessionRecordingEvent,
 };
+pub use src_request::{RsInviteParts, SrcHeaders, build_rs_offer};
 
 #[cfg(test)]
 mod tests {

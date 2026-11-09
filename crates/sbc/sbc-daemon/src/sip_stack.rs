@@ -1071,7 +1071,7 @@ struct CallAddresses {
     early_rseq: Vec<EarlyDialogRseq>,
     /// ACK sent for the last relayed re-INVITE's 2xx (keyed by that
     /// re-INVITE's client branch) — re-sent if the 2xx is retransmitted.
-    last_reinvite_ack: Option<(String, SipMessage, SbcSocketAddr, LegFlow)>,
+    last_reinvite_ack: Option<ReinviteAck>,
     /// When the B-leg answered (for the audit trail's call duration).
     established_at: Option<Instant>,
     /// CDR facts gathered over the call's life; emitted once by
@@ -2629,6 +2629,10 @@ struct PendingSwitch {
     offerer_addr: Option<SbcSocketAddr>,
 }
 
+/// ACK kept for a relayed re-INVITE's far-leg 2xx retransmissions: the
+/// forwarded request's branch, the ACK, and where it goes.
+type ReinviteAck = (String, SipMessage, SbcSocketAddr, LegFlow);
+
 /// What a T.38-involved re-INVITE 2xx did (see `apply_t38_answer`).
 #[derive(Default)]
 struct T38AnswerOutcome {
@@ -3665,7 +3669,7 @@ impl SipStack {
             .await;
             return vec![
                 ProcessResult::Response {
-                    message: resp,
+                    message: SipMessage::Response(resp),
                     destination: dest,
                     flow: resp_flow.into(),
                 },
@@ -3702,7 +3706,7 @@ impl SipStack {
                 a.pending_relays.retain(|q| q.fwd_branch != branch);
             }
             return vec![ProcessResult::Response {
-                message: resp,
+                message: SipMessage::Response(resp),
                 destination: dest,
                 flow: resp_flow.into(),
             }];
@@ -5054,7 +5058,7 @@ impl SipStack {
         if code == 100 {
             return ProcessResult::NoAction;
         }
-        let (mut relayed, orig_dest) = Self::originator_response(
+        let (relayed, orig_dest) = Self::originator_response(
             resp.status,
             pending.from_a_leg,
             &pending.orig_via,
@@ -5063,6 +5067,7 @@ impl SipStack {
             &pending.orig_cseq,
             addrs,
         );
+        let mut relayed = SipMessage::Response(relayed);
         let orig_flow = addrs.leg_flow(!pending.from_a_leg);
         if let SipMessage::Response(r) = &mut relayed {
             for name in [
@@ -5159,6 +5164,12 @@ impl SipStack {
     /// the far leg and the originator's 2xx retransmitted until it ACKs. A
     /// 408/481 means the far leg's dialog is gone (RFC 5057 §5.2): the
     /// originator gets it and the call is released.
+    //
+    // Split into `reinvite_final_failure`, `reanchor_reinvite_answer`,
+    // `ack_reinvite_2xx` and `commit_reinvite_state` (Sonar rust:S3776).
+    // Await and lock order is unchanged: correlation write (pending cleared),
+    // pipeline (relay update), 2xx-retransmit table, correlation write
+    // (commit). No lock is held across an await.
     async fn handle_reinvite_response(
         &self,
         resp: &SipResponse,
@@ -5170,12 +5181,12 @@ impl SipStack {
         if code == 100 {
             return ProcessResult::NoAction;
         }
-        let (mut relayed, orig_dest) = Self::build_reinvite_response(resp.status, pending, addrs);
+        let (mut ok, orig_dest) = Self::build_reinvite_response(resp.status, pending, addrs);
         // The originator's leg: the response goes back on its transport.
         let orig_flow = addrs.leg_flow(!pending.from_a_leg);
         if code < 200 {
             return ProcessResult::Response {
-                message: relayed,
+                message: SipMessage::Response(ok),
                 destination: orig_dest,
                 flow: orig_flow.into(),
             };
@@ -5190,107 +5201,27 @@ impl SipStack {
         }
 
         if code >= 300 {
-            // RFC 3261 §14.1: the session (and the relay) stays as it was;
-            // for T.38 this is the standard fallback to audio.
-            if let Some(sw) = pending
-                .switch
-                .as_ref()
-                .filter(|sw| sw.offered_kind != sw.prev_kind)
-            {
-                self.t38_counters
-                    .record(sw.offered_kind, SwitchoverOutcome::RejectedRemote);
-                audit(crate::t38::audit_event(
-                    &internal_id.to_string(),
-                    sw.prev_kind,
-                    sw.offered_kind,
-                    pending.from_a_leg,
-                    SwitchoverOutcome::RejectedRemote,
-                    Some(SwitchoverReason::Remote488),
-                    None,
-                ));
-            }
-            if code == 408 || code == 481 {
-                warn!(
-                    call_id = %addrs.a_leg_sip_call_id,
-                    status = code,
-                    "Far leg's dialog is gone; releasing call"
-                );
-                self.cleanup_terminated_call(
-                    internal_id,
-                    false,
-                    crate::cdr::CdrEnd::dialog_lost(addrs.b_leg_answered, code),
-                )
+            self.reinvite_final_failure(code, internal_id, addrs, pending)
                 .await;
-            } else {
-                info!(
-                    call_id = %addrs.a_leg_sip_call_id,
-                    status = code,
-                    "Session change rejected by far leg; relaying to originator"
-                );
-            }
             return ProcessResult::Response {
-                message: relayed,
+                message: SipMessage::Response(ok),
                 destination: orig_dest,
                 flow: orig_flow.into(),
             };
         }
 
         // 2xx: re-anchor the answer toward the originator.
-        let SipMessage::Response(ok) = &mut relayed else {
-            unreachable!("build_reinvite_response builds a response")
-        };
         relay_session_timer_response_headers(&resp.headers, &mut ok.headers);
         ok.headers.set(
             HeaderName::Contact,
             leg_contact(addrs.leg_sent_by(!pending.from_a_leg), &orig_flow),
         );
-        let mut answer_sdp = None;
         let session_key = internal_id.to_string();
         let mut t38 = T38AnswerOutcome::default();
-        if let Some(body) = resp.body.as_ref().filter(|b| !b.is_empty()) {
-            let sdp_str = String::from_utf8_lossy(body);
-            let local_media = if pending.from_a_leg {
-                MediaAddress::new(&addrs.media_a_leg_ip, a_leg_media_port(addrs))
-            } else {
-                MediaAddress::new(&addrs.media_b_leg_ip, addrs.media_b_leg_port)
-            };
-            let mut answer = if let Some(sw) = &pending.switch {
-                self.apply_t38_answer(
-                    &sdp_str,
-                    sw,
-                    pending.from_a_leg,
-                    &session_key,
-                    &local_media,
-                    &mut t38,
-                )
-                .await
-            } else {
-                if let Some(ref pipeline) = self.media_pipeline
-                    && let Some(media) = extract_media_address(&sdp_str)
-                    && let Some(addr) = admitted_media_addr(&media)
-                {
-                    let _ = pipeline
-                        .set_remote_address(&session_key, !pending.from_a_leg, addr)
-                        .await;
-                }
-                self.sdp_rewriter
-                    .rewrite_answer_for_a_leg(&sdp_str, &local_media)
-                    .rewritten
-            };
-            if let Some(fp) = &self.dtls_fingerprint_source {
-                let role = pending.offer_setup.map_or(
-                    crate::sdp_dtls::SetupRole::Passive,
-                    crate::sdp_dtls::SetupRole::answer_role,
-                );
-                answer = crate::sdp_dtls::rewrite_local_dtls(&answer, &fp.current(), role);
-            }
-            let answer = Bytes::from(answer);
-            ok.headers.set(HeaderName::ContentType, "application/sdp");
-            ok.headers
-                .set(HeaderName::ContentLength, answer.len().to_string());
-            ok.body = Some(answer.clone());
-            answer_sdp = Some(answer);
-        }
+        let answer_sdp = self
+            .reanchor_reinvite_answer(resp, pending, addrs, &session_key, &mut ok, &mut t38)
+            .await;
+        let relayed = SipMessage::Response(ok);
 
         let mut results = vec![ProcessResult::Response {
             message: relayed.clone(),
@@ -5299,63 +5230,16 @@ impl SipStack {
         }];
         let mut ack_record = None;
         if pending.method == Method::Invite {
-            // ACK the far leg's 2xx (same CSeq number as the re-INVITE) and
-            // keep it for the far leg's retransmissions; retransmit our own
-            // 2xx to the originator until it ACKs.
-            let ack = Self::build_leg_in_dialog_request(
-                addrs,
-                pending.from_a_leg,
-                &Method::Ack,
-                pending.fwd_cseq,
-                None,
-            );
-            let (ack_dest, ack_flow) = addrs.leg_target(pending.from_a_leg);
-            let ack = SipMessage::Request(ack);
-            ack_record = Some((
-                pending.fwd_branch.clone(),
-                ack.clone(),
-                ack_dest,
-                ack_flow.clone(),
-            ));
-            results.push(ProcessResult::Forward {
-                message: ack,
-                destination: ack_dest,
-                flow: ack_flow.into(),
-            });
-            let orig_call_id = if pending.from_a_leg {
-                &addrs.a_leg_sip_call_id
-            } else {
-                &addrs.b_leg_sip_call_id
-            };
-            self.arm_2xx_retransmit(
-                orig_call_id,
-                internal_id,
-                &relayed,
-                orig_dest,
-                orig_flow,
-                cseq_number(&pending.orig_cseq),
-            )
-            .await;
+            let (ack, record) = self
+                .ack_reinvite_2xx(internal_id, addrs, pending, &relayed, orig_dest, orig_flow)
+                .await;
+            results.push(ack);
+            ack_record = Some(record);
         }
         {
             let mut corr = self.call_correlation.write().await;
             if let Some(a) = corr.addresses.get_mut(internal_id) {
-                if let Some(sdp) = answer_sdp {
-                    if pending.from_a_leg {
-                        a.a_leg_last_sdp = Some(sdp);
-                    } else {
-                        a.b_leg_last_sdp = Some(sdp);
-                    }
-                }
-                if ack_record.is_some() {
-                    a.last_reinvite_ack = ack_record;
-                }
-                if let Some(index) = t38.anchored_index {
-                    a.anchored_index = index;
-                }
-                if let Some((kind, _)) = t38.switched {
-                    a.media_kind = kind;
-                }
+                Self::commit_reinvite_state(a, pending.from_a_leg, answer_sdp, ack_record, &t38);
             }
         }
         self.finish_t38_answer(&session_key, pending, &t38, &mut results)
@@ -5368,6 +5252,203 @@ impl SipStack {
             "Session change completed across both legs"
         );
         ProcessResult::Multiple(results)
+    }
+
+    /// A relayed re-INVITE/UPDATE got a final non-2xx. RFC 3261 §14.1: the
+    /// session (and the relay) stays as it was; for T.38 this is the standard
+    /// fallback to audio. A 408/481 releases the call (RFC 5057 §5.2).
+    ///
+    /// ## NIST 800-53 Rev5: AU-2, AU-12
+    async fn reinvite_final_failure(
+        &self,
+        code: u16,
+        internal_id: &CallId,
+        addrs: &CallAddresses,
+        pending: &PendingReinvite,
+    ) {
+        if let Some(sw) = pending
+            .switch
+            .as_ref()
+            .filter(|sw| sw.offered_kind != sw.prev_kind)
+        {
+            self.t38_counters
+                .record(sw.offered_kind, SwitchoverOutcome::RejectedRemote);
+            // NIST 800-53 Rev5: AU-3 - record why, by the actual status.
+            let reason = match code {
+                488 => SwitchoverReason::Remote488,
+                408 | 481 => SwitchoverReason::RemoteDialogLost,
+                _ => SwitchoverReason::RemoteRejected,
+            };
+            audit(crate::t38::audit_event(
+                &internal_id.to_string(),
+                sw.prev_kind,
+                sw.offered_kind,
+                pending.from_a_leg,
+                SwitchoverOutcome::RejectedRemote,
+                Some(reason),
+                None,
+            ));
+        }
+        if code == 408 || code == 481 {
+            warn!(
+                call_id = %addrs.a_leg_sip_call_id,
+                status = code,
+                "Far leg's dialog is gone; releasing call"
+            );
+            self.cleanup_terminated_call(
+                internal_id,
+                false,
+                crate::cdr::CdrEnd::dialog_lost(addrs.b_leg_answered, code),
+            )
+            .await;
+        } else {
+            info!(
+                call_id = %addrs.a_leg_sip_call_id,
+                status = code,
+                "Session change rejected by far leg; relaying to originator"
+            );
+        }
+    }
+
+    /// Re-anchors a re-INVITE/UPDATE 2xx answer toward the originator: the
+    /// relay learns the answerer's media address (or, when T.38 is involved,
+    /// `apply_t38_answer` moves it), the SDP is rewritten to the SBC's
+    /// address and DTLS identity, and set as `ok`'s body. Returns the
+    /// rewritten answer, or `None` for a body-less 2xx.
+    async fn reanchor_reinvite_answer(
+        &self,
+        resp: &SipResponse,
+        pending: &PendingReinvite,
+        addrs: &CallAddresses,
+        session_key: &str,
+        ok: &mut SipResponse,
+        t38: &mut T38AnswerOutcome,
+    ) -> Option<Bytes> {
+        let body = resp.body.as_ref().filter(|b| !b.is_empty())?;
+        let sdp_str = String::from_utf8_lossy(body);
+        let local_media = if pending.from_a_leg {
+            MediaAddress::new(&addrs.media_a_leg_ip, a_leg_media_port(addrs))
+        } else {
+            MediaAddress::new(&addrs.media_b_leg_ip, addrs.media_b_leg_port)
+        };
+        let mut answer = if let Some(sw) = &pending.switch {
+            self.apply_t38_answer(
+                &sdp_str,
+                sw,
+                pending.from_a_leg,
+                session_key,
+                &local_media,
+                t38,
+            )
+            .await
+        } else {
+            if let Some(ref pipeline) = self.media_pipeline
+                && let Some(media) = extract_media_address(&sdp_str)
+                && let Some(addr) = admitted_media_addr(&media)
+            {
+                let _ = pipeline
+                    .set_remote_address(session_key, !pending.from_a_leg, addr)
+                    .await;
+            }
+            self.sdp_rewriter
+                .rewrite_answer_for_a_leg(&sdp_str, &local_media)
+                .rewritten
+        };
+        if let Some(fp) = &self.dtls_fingerprint_source {
+            let role = pending.offer_setup.map_or(
+                crate::sdp_dtls::SetupRole::Passive,
+                crate::sdp_dtls::SetupRole::answer_role,
+            );
+            answer = crate::sdp_dtls::rewrite_local_dtls(&answer, &fp.current(), role);
+        }
+        let answer = Bytes::from(answer);
+        ok.headers.set(HeaderName::ContentType, "application/sdp");
+        ok.headers
+            .set(HeaderName::ContentLength, answer.len().to_string());
+        ok.body = Some(answer.clone());
+        Some(answer)
+    }
+
+    /// ACKs the far leg's 2xx to a relayed re-INVITE (same CSeq number as the
+    /// re-INVITE, RFC 3261 §13.2.2.4) and arms retransmission of our own 2xx
+    /// to the originator until it ACKs (§13.3.1.4). Returns the ACK to send
+    /// and the record kept for the far leg's 2xx retransmissions.
+    async fn ack_reinvite_2xx(
+        &self,
+        internal_id: &CallId,
+        addrs: &CallAddresses,
+        pending: &PendingReinvite,
+        relayed: &SipMessage,
+        orig_dest: SbcSocketAddr,
+        orig_flow: LegFlow,
+    ) -> (ProcessResult, ReinviteAck) {
+        let ack = Self::build_leg_in_dialog_request(
+            addrs,
+            pending.from_a_leg,
+            &Method::Ack,
+            pending.fwd_cseq,
+            None,
+        );
+        let (ack_dest, ack_flow) = addrs.leg_target(pending.from_a_leg);
+        let ack = SipMessage::Request(ack);
+        let record = (
+            pending.fwd_branch.clone(),
+            ack.clone(),
+            ack_dest,
+            ack_flow.clone(),
+        );
+        let forward = ProcessResult::Forward {
+            message: ack,
+            destination: ack_dest,
+            flow: ack_flow.into(),
+        };
+        let orig_call_id = if pending.from_a_leg {
+            &addrs.a_leg_sip_call_id
+        } else {
+            &addrs.b_leg_sip_call_id
+        };
+        self.arm_2xx_retransmit(
+            orig_call_id,
+            internal_id,
+            relayed,
+            orig_dest,
+            orig_flow,
+            cseq_number(&pending.orig_cseq),
+        )
+        .await;
+        (forward, record)
+    }
+
+    /// Commits a completed session change to the call record (called under
+    /// the `call_correlation` write lock): the originator's new SDP for
+    /// body-less refreshes, the ACK for far-leg retransmissions, the anchored
+    /// m-line, and a media-kind switch (also noted in the CDR, schema v3).
+    ///
+    /// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records) - POA&M-294
+    fn commit_reinvite_state(
+        a: &mut CallAddresses,
+        from_a_leg: bool,
+        answer_sdp: Option<Bytes>,
+        ack_record: Option<ReinviteAck>,
+        t38: &T38AnswerOutcome,
+    ) {
+        if let Some(sdp) = answer_sdp {
+            if from_a_leg {
+                a.a_leg_last_sdp = Some(sdp);
+            } else {
+                a.b_leg_last_sdp = Some(sdp);
+            }
+        }
+        if ack_record.is_some() {
+            a.last_reinvite_ack = ack_record;
+        }
+        if let Some(index) = t38.anchored_index {
+            a.anchored_index = index;
+        }
+        if let Some((kind, _)) = t38.switched {
+            a.media_kind = kind;
+            a.cdr.note_media_kind(kind.cdr());
+        }
     }
 
     /// Applies the far side's 2xx answer to a T.38-involved re-INVITE:
@@ -5493,7 +5574,7 @@ impl SipStack {
         status: StatusCode,
         pending: &PendingReinvite,
         addrs: &CallAddresses,
-    ) -> (SipMessage, SbcSocketAddr) {
+    ) -> (SipResponse, SbcSocketAddr) {
         Self::originator_response(
             status,
             pending.from_a_leg,
@@ -5516,7 +5597,7 @@ impl SipStack {
         orig_to: &str,
         orig_cseq: &str,
         addrs: &CallAddresses,
-    ) -> (SipMessage, SbcSocketAddr) {
+    ) -> (SipResponse, SbcSocketAddr) {
         let mut r = SipResponse::new(status);
         for via in orig_via {
             r.headers.add(Header::new(HeaderName::Via, via));
@@ -5531,7 +5612,7 @@ impl SipStack {
         r.headers.set(HeaderName::CallId, call_id);
         r.headers.set(HeaderName::CSeq, orig_cseq);
         r.headers.set(HeaderName::ContentLength, "0");
-        (SipMessage::Response(r), dest)
+        (r, dest)
     }
 
     /// Removes all state for a call the SBC is tearing down (dialog correlation,
@@ -8213,31 +8294,43 @@ impl SipStack {
             Some(crate::t38::AnswerCheck::Accepted(c)) => Some(c),
             _ => None,
         };
+        let mut kind_failed = None;
         if let Some(ref body) = resp.body {
             let sdp_str = String::from_utf8_lossy(body);
             let rtp_port = if let (Some(pipeline), Some(a_port)) =
                 (&self.media_pipeline, addrs.media_a_leg_port)
             {
                 let session_key = internal_id.to_string();
-                let callee_media = t38_answer.map_or_else(
-                    || extract_media_address(&sdp_str),
-                    |c| extract_media_address_for(&c.sdp, c.stream.index),
-                );
-                if let Some(callee_media) = callee_media
-                    && let Some(callee_addr) = admitted_media_addr(&callee_media)
-                {
-                    let _ = pipeline
-                        .set_remote_address(&session_key, false, callee_addr)
-                        .await;
-                }
-                if let Some(c) = t38_answer {
-                    let _ = pipeline
+                // POA&M-294 / Q2: fail closed when the media node cannot
+                // take the kind (e.g. an older remote node answering
+                // UNIMPLEMENTED). The kind is set first so a failure leaves
+                // no remote address or relay behind; the fax call is torn
+                // down below as for an un-anchorable answer.
+                // NIST 800-53 Rev5: SC-24, AU-2.
+                if let Some(c) = t38_answer
+                    && pipeline
                         .set_media_kind(&session_key, c.kind.pipeline())
+                        .await
+                        .is_err()
+                {
+                    kind_failed = Some(SwitchoverReason::RelayUpdateFailed);
+                }
+                if kind_failed.is_none() {
+                    let callee_media = t38_answer.map_or_else(
+                        || extract_media_address(&sdp_str),
+                        |c| extract_media_address_for(&c.sdp, c.stream.index),
+                    );
+                    if let Some(callee_media) = callee_media
+                        && let Some(callee_addr) = admitted_media_addr(&callee_media)
+                    {
+                        let _ = pipeline
+                            .set_remote_address(&session_key, false, callee_addr)
+                            .await;
+                    }
+                    terminated = self
+                        .start_media_relay(&**pipeline, &session_key, addrs, &sdp_str)
                         .await;
                 }
-                terminated = self
-                    .start_media_relay(&**pipeline, &session_key, addrs, &sdp_str)
-                    .await;
                 a_port
             } else {
                 // No relay attached: bare port (SDP rewritten, media not relayed).
@@ -8286,11 +8379,13 @@ impl SipStack {
                     a.media_kind = crate::t38::CallMediaKind::Image;
                     self.t38_counters.image_started();
                 }
+                // POA&M-294: CDR schema v3 records the answered media kind.
+                a.cdr.note_media_kind(a.media_kind.cdr());
             }
         }
         let t38_failed = match initial_t38 {
             Some(crate::t38::AnswerCheck::Failed(reason)) => Some(reason),
-            _ => None,
+            _ => kind_failed,
         };
         audit(uc_audit::AuditEvent::CallEstablished(
             uc_audit::event::CallEstablished {
@@ -14202,6 +14297,82 @@ pub mod tests {
             "ACK stops 2xx retransmission"
         );
         (stack, b_invite)
+    }
+
+    /// S3776 refactor gate (RFC 5057 §5.2): a far-leg 408 to a relayed
+    /// re-INVITE is relayed to the originator and releases the call.
+    #[tokio::test]
+    async fn reinvite_408_releases_call_and_relays() {
+        let (stack, _) = Box::pin(established_call()).await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let b_reinvite = forwarded(&results, &Method::Invite)
+            .expect("re-INVITE to bob")
+            .0
+            .clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&b_reinvite, 408, None, None), bob(), None)
+                .await,
+        );
+        let (resp, dest) = responded(&results, 408).expect("408 to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(resp.headers.cseq(), Some("2 INVITE"));
+        assert_eq!(stack.call_count().await, 0);
+    }
+
+    /// S3776 refactor gate: the relayed 2xx precedes the far-leg ACK in the
+    /// result list (RFC 3261 §13.2.2.4 / §13.3.1.4), and the ACK is kept for
+    /// far-leg 2xx retransmissions.
+    #[tokio::test]
+    async fn reinvite_2xx_orders_response_then_ack() {
+        let (stack, _) = Box::pin(established_call()).await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let b_reinvite = forwarded(&results, &Method::Invite)
+            .expect("re-INVITE to bob")
+            .0
+            .clone();
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_reinvite, 200, None, Some(BOB_SDP)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let pos_ok = results
+            .iter()
+            .position(|r| matches!(r, ProcessResult::Response { .. }))
+            .expect("200 to alice");
+        let pos_ack = results
+            .iter()
+            .position(|r| {
+                matches!(r, ProcessResult::Forward { message: SipMessage::Request(q), .. }
+                    if q.method == Method::Ack)
+            })
+            .expect("ACK to bob");
+        assert!(pos_ok < pos_ack, "{results:?}");
+        let corr = stack.call_correlation.read().await;
+        let a = corr.addresses.values().next().expect("call kept");
+        assert!(a.pending_reinvite.is_none());
+        assert!(a.last_reinvite_ack.is_some());
+        assert!(a.b_leg_last_sdp.is_some());
     }
 
     #[tokio::test]
@@ -25560,6 +25731,9 @@ pub mod tests {
     #[derive(Default)]
     struct RecordingMedia {
         log: std::sync::Mutex<Vec<String>>,
+        /// QA: model a media node that refuses SetMediaKind (e.g. an old
+        /// remote node answering UNIMPLEMENTED).
+        fail_kind: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingMedia {
@@ -25640,6 +25814,11 @@ pub mod tests {
             kind: sbc_media_core::media_pipeline::MediaKind,
         ) -> Result<(), sbc_media_core::media_pipeline::MediaPipelineError> {
             self.push(format!("kind {kind:?}"));
+            if self.fail_kind.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(sbc_media_core::media_pipeline::MediaPipelineError::Rpc(
+                    "unimplemented: SetMediaKind".to_string(),
+                ));
+            }
             Ok(())
         }
     }
@@ -25832,6 +26011,20 @@ pub mod tests {
         assert_eq!(call_kind(&stack).await, crate::t38::CallMediaKind::Audio);
         assert_eq!(stack.t38_counters().active(), 0);
         assert!(media.take().contains(&"kind Audio".to_string()));
+        // POA&M-294: CDR schema v3 records both kinds, in first-use order.
+        assert_eq!(
+            stack
+                .call_correlation
+                .read()
+                .await
+                .addresses
+                .values()
+                .next()
+                .unwrap()
+                .cdr
+                .media_kinds,
+            vec![uc_cdr::MediaKindTag::Audio, uc_cdr::MediaKindTag::Image]
+        );
         stack
             .process_message(
                 &alice_request("ACK", 3, Some("bobtag"), None),
@@ -25939,6 +26132,32 @@ pub mod tests {
                 .await,
         );
         assert!(responded(&results, 488).is_some(), "srtp_terminate");
+    }
+
+    #[tokio::test]
+    async fn t38_remote_503_audits_remote_rejected() {
+        // NIST-1: a non-488 rejection is not recorded as remote_488.
+        let (stack, _, media) = Box::pin(t38_call(t38_enabled())).await;
+        let capture = uc_audit::capture::start();
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let b_reinvite = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let _ = flatten(
+            stack
+                .process_message(&response_to(&b_reinvite, 503, None, None), bob(), None)
+                .await,
+        );
+        assert_eq!(media.take(), Vec::<String>::new());
+        assert_eq!(call_kind(&stack).await, crate::t38::CallMediaKind::Audio);
+        let ev = switchovers(&capture.events());
+        assert_eq!(ev[0].reason, Some(SwitchoverReason::RemoteRejected));
     }
 
     #[tokio::test]
@@ -26136,6 +26355,113 @@ pub mod tests {
         assert!(responded(&results, 488).is_some());
         assert!(forwarded(&results, &Method::Invite).is_none());
         assert_eq!(stack.call_count().await, 0);
+    }
+
+    /// QA (POA&M-294, Q2 fail closed): an initial INVITE answered with an
+    /// image stream whose `set_media_kind` fails is torn down (BYE both
+    /// legs, audit Failed/RelayUpdateFailed, gauge back to 0). With a
+    /// working media node the same call stays up in image mode and the CDR
+    /// draft records `[image]`.
+    async fn t38_initial_image_answer(
+        fail_kind: bool,
+    ) -> (SipStack, Vec<ProcessResult>, Arc<RecordingMedia>) {
+        let media = Arc::new(RecordingMedia::default());
+        media
+            .fail_kind
+            .store(fail_kind, std::sync::atomic::Ordering::Relaxed);
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.set_media_pipeline(Arc::clone(&media) as _);
+        stack.set_t38_config(t38_enabled());
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\
+            From: <sip:bob@sbc.local>;tag=r1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: reg-bob@relay\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:bob@127.0.0.1:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        stack
+            .process_message(&Bytes::from_static(register), bob(), None)
+            .await;
+        let image_only = ALICE_T38.replace("m=audio 0 RTP/AVP 0\r\n", "");
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 1, None, Some(&image_only)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let b_invite = forwarded(&results, &Method::Invite)
+            .expect("image INVITE forwarded")
+            .0
+            .clone();
+        let bob_image = BOB_T38.replace("m=audio 0 RTP/AVP 0\r\n", "");
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 200, Some("bobtag"), Some(&bob_image)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        (stack, results, media)
+    }
+
+    fn bye_destinations(results: &[ProcessResult]) -> Vec<SbcSocketAddr> {
+        results
+            .iter()
+            .filter_map(|r| match r {
+                ProcessResult::Forward {
+                    message: SipMessage::Request(q),
+                    destination,
+                    ..
+                } if q.method == Method::Bye => Some(*destination),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn t38_initial_image_answer_set_media_kind_failure_tears_down() {
+        let capture = uc_audit::capture::start();
+        let (stack, results, media) = Box::pin(t38_initial_image_answer(true)).await;
+        assert!(
+            media.take().iter().any(|l| l == "kind Image"),
+            "set_media_kind was attempted"
+        );
+        let byes = bye_destinations(&results);
+        assert_eq!(byes.len(), 2, "BYE both legs: {byes:?}");
+        assert!(byes.contains(&alice()) && byes.contains(&bob()));
+        assert_eq!(stack.call_count().await, 0);
+        let ev = switchovers(&capture.events());
+        let failed: Vec<_> = ev
+            .iter()
+            .filter(|e| e.outcome == SwitchoverOutcome::Failed)
+            .collect();
+        assert_eq!(failed.len(), 1, "{ev:?}");
+        assert_eq!(failed[0].reason, Some(SwitchoverReason::RelayUpdateFailed));
+        assert_eq!(stack.t38_counters().active(), 0);
+    }
+
+    #[tokio::test]
+    async fn t38_initial_image_answer_success_records_image_kind() {
+        let (stack, results, media) = Box::pin(t38_initial_image_answer(false)).await;
+        assert!(media.take().iter().any(|l| l == "kind Image"));
+        assert_eq!(bye_destinations(&results), Vec::<SbcSocketAddr>::new());
+        assert!(responded(&results, 200).is_some());
+        assert_eq!(stack.call_count().await, 1);
+        assert_eq!(call_kind(&stack).await, crate::t38::CallMediaKind::Image);
+        let corr = stack.call_correlation.read().await;
+        let a = corr.addresses.values().next().unwrap();
+        assert_eq!(a.cdr.media_kinds, vec![uc_cdr::MediaKindTag::Image]);
     }
 
     /// Puts a `t38_call` into image mode (A-originated switchover).

@@ -53,6 +53,18 @@ service MediaControllerService {
     // when the control stream reconnects.
     rpc GetDtlsFingerprint(google.protobuf.Empty) returns (DtlsFingerprint);
 
+    // Record what a call's anchored stream carries (audio or T.38 image) so
+    // the media node attributes UDPTL correctly (metrics, latching grace).
+    // Sent on an accepted re-INVITE kind switch and on an initial image
+    // answer. The server rejects UNSPECIFIED and unknown values with
+    // INVALID_ARGUMENT. A media node that predates this RPC answers
+    // UNIMPLEMENTED; the signaling process then fails the switch closed
+    // (RelayUpdateFailed) rather than relaying UDPTL counted as RTP.
+    // Not atomic with SetRemoteAddress (unlike the in-process PERF-004
+    // update): the client sends SetMediaKind first, then the addresses.
+    // NIST 800-53 Rev5: SI-4, SI-10. POA&M-294.
+    rpc SetMediaKind(SetMediaKindRequest) returns (google.protobuf.Empty);
+
     // Reverse channel: media process -> signaling. Server-streams media-plane
     // events. The signaling process opens one long-lived stream at startup.
     rpc WatchMediaEvents(google.protobuf.Empty) returns (stream MediaEvent);
@@ -113,6 +125,21 @@ message SetRemoteAddressRequest {
     bool is_a_leg = 2;
     // Remote RTP endpoint as "ip:port" (cf. announcement.proto rtp_destination).
     string address = 3;
+}
+
+// What a call's anchored stream carries. Mirrors media_pipeline::MediaKind.
+enum MediaKind {
+    // Rejected by the server (proto3 default; never a valid request).
+    MEDIA_KIND_UNSPECIFIED = 0;
+    // RTP audio.
+    MEDIA_KIND_AUDIO = 1;
+    // m=image: T.38 fax over UDPTL (RFC 3362).
+    MEDIA_KIND_IMAGE = 2;
+}
+
+message SetMediaKindRequest {
+    string call_id = 1;
+    MediaKind kind = 2;
 }
 
 // Mirrors media_pipeline::LegDtlsParams.

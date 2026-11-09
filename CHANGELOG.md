@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, CDR schema v3 and media gRPC, POA&M-294)
+
+- **SBC: CDR schema version 2 -> 3.** (AU-3, AU-12) Records carry a new
+  `media_kinds` set (e.g. `audio`, `image`). It lists the kinds that were
+  negotiated or attempted, including a failed T.38 switch. CSV output gains a
+  `media_kinds` column, and the gRPC `cdr.proto` gains the field. Readers still
+  accept v1 and up. Downstream SIEM and billing parsers that pin the CSV column
+  count or reject unknown JSONL keys must be updated before the upgrade.
+- **SBC: media-controller gRPC adds a `MediaKind` enum and a `SetMediaKind`
+  RPC.** (SC-24) Upgrade order: **upgrade sbc-media before sbc-daemon.** If a
+  new sbc-daemon talks to an old sbc-media, `SetMediaKind` returns
+  UNIMPLEMENTED. The daemon then fails closed: it audits `RelayUpdateFailed`,
+  logs a warning once, and keeps the call on audio, so the T.38 switch fails
+  during a rolling upgrade. Audio calls are not affected.
+- **uc-siprec API (library consumers).** `to_xml` is renamed
+  `to_rfc7865_xml` and returns `Result`. Metadata XML generation can now fail,
+  and there are new error variants.
+- **uc-audit: new `SwitchoverReason` values `RemoteDialogLost` (408/481) and
+  `RemoteRejected` (any other non-2xx).** `Remote488` now means only 488.
+  The policy strings are `t38:remote_dialog_lost` and `t38:remote_rejected`.
+  SIEM rules keyed on `t38:remote_488` for these failures must add them.
+
+### Added (SBC, SIPREC phase 1, POA&M-300..309)
+
+- **uc-siprec: RFC 7865 metadata now matches the schema.** It follows the
+  §9 XSD element order, escapes attacker-supplied display names and AORs in
+  XML, and takes metadata IDs from the uc-crypto RNG. Golden-file tests are
+  included.
+- **uc-siprec: building blocks for the RFC 7866 SRC side.** Recording-session
+  offers are forced to `a=sendonly`, and the `Require: siprec` and
+  `+sip.src` Contact helpers (`SrcHeaders`) are added.
+
+### Changed (SBC)
+
+- sbc-daemon: the T.38 initial-answer path runs `set_media_kind` first. If it
+  fails, the daemon does not set the remote address or start the relay.
+
 ### BREAKING (SBC, T.38 fax relay, POA&M-290..294)
 
 - **SBC: T.38 image offers are refused by default.** (CM-6, CM-7, SC-8) A

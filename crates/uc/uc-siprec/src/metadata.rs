@@ -16,6 +16,9 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::time::{Duration, SystemTime};
 
+use crate::error::{SiprecError, SiprecResult};
+use crate::xml::{escape_attr, escape_text};
+
 /// Unique identifier for recording entities.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RecordingId(String);
@@ -316,6 +319,8 @@ pub struct SessionMetadata {
     pub reason: Option<String>,
     /// Recording server URI.
     pub srs_uri: Option<String>,
+    /// RFC 7989 Session-ID of the CS, emitted as `<sipSessionID>`.
+    pub sip_session_id: Option<String>,
     /// Custom session attributes.
     pub attributes: HashMap<String, String>,
 }
@@ -332,6 +337,7 @@ impl SessionMetadata {
             state: SessionState::Pending,
             reason: None,
             srs_uri: None,
+            sip_session_id: None,
             attributes: HashMap::new(),
         }
     }
@@ -466,76 +472,305 @@ impl RecordingMetadata {
         self.streams.iter_mut().find(|s| s.id == id)
     }
 
-    /// Generates XML representation per RFC 7865.
+    /// Serializes the metadata as an RFC 7865 `application/rs-metadata+xml`
+    /// document (`urn:ietf:params:xml:ns:recording:1`, `datamode` complete).
     ///
-    /// Note: This is a simplified XML representation. A full implementation
-    /// would use proper XML libraries for namespace handling.
-    #[must_use]
-    pub fn to_xml(&self) -> String {
-        let mut xml = String::new();
-        xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        xml.push_str("<recording xmlns=\"urn:ietf:params:xml:ns:recording:1\">\n");
-
-        // Session info
-        let _ = writeln!(
-            xml,
-            "  <session id=\"{}\">",
-            self.session.recording_session_id
-        );
-        let _ = writeln!(
-            xml,
-            "    <call-id>{}</call-id>",
-            self.session.communication_session_id
-        );
-        let _ = writeln!(xml, "    <state>{}</state>", self.session.state);
-        if let Some(ref reason) = self.session.reason {
-            let _ = writeln!(xml, "    <reason>{reason}</reason>");
-        }
-        xml.push_str("  </session>\n");
-
-        // Participants
-        xml.push_str("  <participants>\n");
-        for participant in &self.participants {
-            let _ = writeln!(xml, "    <participant id=\"{}\">", participant.id);
-            let _ = writeln!(xml, "      <aor>{}</aor>", participant.aor);
-            if let Some(ref name) = participant.display_name {
-                let _ = writeln!(xml, "      <name>{name}</name>");
-            }
-            let _ = writeln!(xml, "      <role>{}</role>", participant.role);
-            xml.push_str("    </participant>\n");
-        }
-        xml.push_str("  </participants>\n");
-
-        // Streams
-        xml.push_str("  <streams>\n");
-        for stream in &self.streams {
-            let _ = writeln!(xml, "    <stream id=\"{}\">", stream.id);
-            let _ = writeln!(xml, "      <media-type>{}</media-type>", stream.media_type);
-            if let Some(ref codec) = stream.codec {
-                let _ = writeln!(xml, "      <codec>{codec}</codec>");
-            }
-            let _ = writeln!(xml, "      <direction>{}</direction>", stream.direction);
-            if let Some(ssrc) = stream.ssrc {
-                let _ = writeln!(xml, "      <ssrc>{ssrc}</ssrc>");
-            }
-            if let Some(ref participant_id) = stream.participant_id {
-                let _ = writeln!(
-                    xml,
-                    "      <participant-id>{participant_id}</participant-id>"
-                );
-            }
-            xml.push_str("    </stream>\n");
-        }
-        xml.push_str("  </streams>\n");
-
-        xml.push_str("</recording>\n");
-        xml
+    /// Element IDs (`session_id`, `participant_id`, `stream_id`) are fresh
+    /// base64-encoded 128-bit values from the `uc-crypto` RNG on every call.
+    /// RFC 7865 §6.1: IDs MUST be globally unique.
+    ///
+    /// Codec, SSRC, payload type and role are internal model fields that are
+    /// not part of the RFC 7865 schema and are not emitted; the SRS learns them
+    /// from the RS SDP (`a=label`, RFC 7866 §8.1.1).
+    ///
+    /// # Errors
+    ///
+    /// - [`SiprecError::InvalidMetadata`] if any field contains a code point
+    ///   that is illegal in XML 1.0, a stream label is not an RFC 4574 token,
+    ///   or a stream references an unknown participant.
+    /// - [`SiprecError::LimitExceeded`] if a count, field length, or the total
+    ///   document size exceeds the caps in this module.
+    /// - [`SiprecError::MetadataError`] if the RNG fails.
+    // NIST 800-53 Rev5: SI-10 (Information Input Validation), SI-15
+    // (Information Output Filtering) - every attacker-derived string is
+    // escaped or rejected; no markup is built from raw fields.
+    // NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection) - count, length
+    // and total-size caps.
+    // POAM: POA&M-305 - IDs are not stable across calls, so metadata
+    // snapshots/partial updates (re-INVITE, transfer, T.38 switch) cannot yet
+    // refer to previously sent elements.
+    pub fn to_rfc7865_xml(&self) -> SiprecResult<String> {
+        self.to_rfc7865_xml_with(&mut random_id)
     }
+
+    /// Serializer core with an injectable ID source (golden-file tests).
+    pub(crate) fn to_rfc7865_xml_with(
+        &self,
+        next_id: &mut dyn FnMut() -> SiprecResult<String>,
+    ) -> SiprecResult<String> {
+        self.check_limits()?;
+
+        let session_id = next_id()?;
+        let participant_ids = self
+            .participants
+            .iter()
+            .map(|_| next_id())
+            .collect::<SiprecResult<Vec<_>>>()?;
+        let stream_ids = self
+            .streams
+            .iter()
+            .map(|_| next_id())
+            .collect::<SiprecResult<Vec<_>>>()?;
+
+        // Owner index for each stream (validated before any output).
+        let mut owners = Vec::with_capacity(self.streams.len());
+        for stream in &self.streams {
+            check_label(&stream.id)?;
+            let owner = match &stream.participant_id {
+                Some(pid) => Some(
+                    self.participants
+                        .iter()
+                        .position(|p| &p.id == pid)
+                        .ok_or_else(|| invalid("stream references unknown participant"))?,
+                ),
+                None => None,
+            };
+            owners.push(owner);
+        }
+
+        let mut out = String::with_capacity(1024);
+        out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        out.push_str("<recording xmlns=\"urn:ietf:params:xml:ns:recording:1\">\n");
+        // RFC 7865 §6.2 / §9: the schema element is `datamode`.
+        out.push_str("  <datamode>complete</datamode>\n");
+
+        // RFC 7865 §6.3 Communication Session.
+        let _ = writeln!(out, "  <session session_id=\"{session_id}\">");
+        if let Some(sid) = &self.session.sip_session_id {
+            let _ = writeln!(
+                out,
+                "    <sipSessionID>{}</sipSessionID>",
+                escape_text(sid)?
+            );
+        }
+        out.push_str("  </session>\n");
+
+        // RFC 7865 §6.5 Participant.
+        for (p, pid) in self.participants.iter().zip(&participant_ids) {
+            let _ = writeln!(out, "  <participant participant_id=\"{pid}\">");
+            let _ = write!(out, "    <nameID aor=\"{}\"", escape_attr(&p.aor)?);
+            match &p.display_name {
+                Some(name) => {
+                    let _ = writeln!(out, ">\n      <name>{}</name>", escape_text(name)?);
+                    out.push_str("    </nameID>\n");
+                }
+                None => out.push_str("/>\n"),
+            }
+            out.push_str("  </participant>\n");
+        }
+
+        // RFC 7865 §6.6 Media Stream; label matches the RS SDP a=label.
+        for (s, sid) in self.streams.iter().zip(&stream_ids) {
+            let _ = writeln!(
+                out,
+                "  <stream stream_id=\"{sid}\" session_id=\"{session_id}\">"
+            );
+            let _ = writeln!(out, "    <label>{}</label>", escape_text(&s.id)?);
+            out.push_str("  </stream>\n");
+        }
+
+        // RFC 7865 §6.8 association of the CS with the RS.
+        let _ = writeln!(out, "  <sessionrecordingassoc session_id=\"{session_id}\">");
+        write_assoc_times(
+            &mut out,
+            Some(self.session.start_time),
+            self.session.end_time,
+        );
+        out.push_str("  </sessionrecordingassoc>\n");
+
+        // RFC 7865 §9: `recording` is an xs:sequence, so every
+        // participantsessionassoc precedes every participantstreamassoc.
+        for (p, pid) in self.participants.iter().zip(&participant_ids) {
+            let _ = writeln!(
+                out,
+                "  <participantsessionassoc participant_id=\"{pid}\" session_id=\"{session_id}\">"
+            );
+            write_assoc_times(&mut out, p.join_time, p.leave_time);
+            out.push_str("  </participantsessionassoc>\n");
+        }
+
+        for (idx, pid) in participant_ids.iter().enumerate() {
+            // RFC 7865 §6.9: a participant sends the streams it owns and
+            // receives the streams owned by the other participants.
+            let _ = writeln!(out, "  <participantstreamassoc participant_id=\"{pid}\">");
+            for (owner, sid) in owners.iter().zip(&stream_ids) {
+                if *owner == Some(idx) {
+                    let _ = writeln!(out, "    <send>{sid}</send>");
+                }
+            }
+            for (owner, sid) in owners.iter().zip(&stream_ids) {
+                if owner.is_some_and(|o| o != idx) {
+                    let _ = writeln!(out, "    <recv>{sid}</recv>");
+                }
+            }
+            out.push_str("  </participantstreamassoc>\n");
+        }
+
+        out.push_str("</recording>\n");
+
+        if out.len() > MAX_DOCUMENT_BYTES {
+            return Err(SiprecError::LimitExceeded {
+                what: "metadata document bytes",
+                limit: MAX_DOCUMENT_BYTES,
+            });
+        }
+        Ok(out)
+    }
+
+    fn check_limits(&self) -> SiprecResult<()> {
+        if self.participants.len() > MAX_PARTICIPANTS {
+            return Err(SiprecError::LimitExceeded {
+                what: "participants",
+                limit: MAX_PARTICIPANTS,
+            });
+        }
+        if self.streams.len() > MAX_STREAMS {
+            return Err(SiprecError::LimitExceeded {
+                what: "streams",
+                limit: MAX_STREAMS,
+            });
+        }
+        let fields = self
+            .participants
+            .iter()
+            .flat_map(|p| std::iter::once(p.aor.as_str()).chain(p.display_name.as_deref()))
+            .chain(self.streams.iter().map(|s| s.id.as_str()))
+            .chain(self.session.sip_session_id.as_deref());
+        for field in fields {
+            if field.len() > MAX_FIELD_BYTES {
+                return Err(SiprecError::LimitExceeded {
+                    what: "metadata field bytes",
+                    limit: MAX_FIELD_BYTES,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Maximum participants serialized into one metadata document.
+pub const MAX_PARTICIPANTS: usize = 16;
+/// Maximum media streams serialized into one metadata document.
+pub const MAX_STREAMS: usize = 32;
+/// Maximum length in bytes of any single string field.
+pub const MAX_FIELD_BYTES: usize = 1024;
+/// Maximum size in bytes of the serialized document.
+pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
+
+fn invalid(reason: &str) -> SiprecError {
+    SiprecError::InvalidMetadata {
+        reason: reason.to_string(),
+    }
+}
+
+/// RFC 4574 §4: `label` is a `token` (RFC 4566 token-char). We accept only
+/// the `[A-Za-z0-9._-]` subset so labels never need escaping anywhere.
+fn check_label(label: &str) -> SiprecResult<()> {
+    let ok = !label.is_empty()
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'));
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid("stream label is not an RFC 4574 token"))
+    }
+}
+
+fn write_assoc_times(out: &mut String, start: Option<SystemTime>, stop: Option<SystemTime>) {
+    if let Some(t) = start {
+        let _ = writeln!(out, "    <associate-time>{}</associate-time>", rfc3339(t));
+    }
+    if let Some(t) = stop {
+        let _ = writeln!(
+            out,
+            "    <disassociate-time>{}</disassociate-time>",
+            rfc3339(t)
+        );
+    }
+}
+
+/// RFC 7865 §6.1: a UUID-sized (128-bit) random value, base64 encoded.
+fn random_id() -> SiprecResult<String> {
+    // NIST 800-53 Rev5: SC-13 - randomness via uc-crypto (aws-lc-rs).
+    let bytes: [u8; 16] =
+        uc_crypto::random::generate_random().map_err(|e| SiprecError::MetadataError {
+            reason: format!("RNG failure: {e}"),
+        })?;
+    Ok(base64_encode(&bytes))
+}
+
+/// Standard base64 (RFC 4648 §4) with padding.
+pub(crate) fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk.first().copied().unwrap_or(0);
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        let idx = |shift: u32| {
+            char::from(
+                ALPHABET
+                    .get(((n >> shift) & 0x3f) as usize)
+                    .copied()
+                    .unwrap_or(b'A'),
+            )
+        };
+        out.push(idx(18));
+        out.push(idx(12));
+        out.push(if chunk.len() > 1 { idx(6) } else { '=' });
+        out.push(if chunk.len() > 2 { idx(0) } else { '=' });
+    }
+    out
+}
+
+/// Formats a time as RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`). Times before
+/// the Unix epoch clamp to the epoch.
+pub(crate) fn rfc3339(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Days since 1970-01-01 to (year, month, day), proleptic Gregorian
+/// (H. Hinnant's `civil_from_days`, unsigned domain).
+const fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn test_recording_id_generation() {
@@ -603,44 +838,168 @@ mod tests {
         assert!(metadata.end_time.is_some());
     }
 
-    #[test]
-    fn test_recording_metadata_xml() {
+    fn sample() -> RecordingMetadata {
         let mut metadata = RecordingMetadata::new("call-abc@example.com");
-
+        metadata.session.start_time = UNIX_EPOCH + Duration::from_secs(1_292_542_867);
+        metadata.session.sip_session_id =
+            Some("ab30317f1a784dc48ff824d0d3715d86;remote=47755a9de7794ba387653f2099600ef2".into());
         metadata.add_participant(
             Participant::new("p1", "sip:alice@example.com")
                 .with_display_name("Alice")
-                .with_role(ParticipantRole::Caller),
+                .with_role(ParticipantRole::Caller)
+                .with_join_time(UNIX_EPOCH + Duration::from_secs(1_292_542_867)),
         );
-
         metadata.add_participant(
             Participant::new("p2", "sip:bob@example.com")
-                .with_display_name("Bob")
-                .with_role(ParticipantRole::Callee),
+                .with_join_time(UNIX_EPOCH + Duration::from_secs(1_292_542_867)),
         );
-
         metadata.add_stream(
-            MediaStream::audio("s1")
+            MediaStream::audio("96")
                 .with_codec("PCMU")
                 .with_ssrc(11111)
                 .with_participant("p1"),
         );
+        metadata.add_stream(MediaStream::audio("97").with_participant("p2"));
+        metadata
+    }
 
-        metadata.add_stream(
-            MediaStream::audio("s2")
-                .with_codec("PCMU")
-                .with_ssrc(22222)
-                .with_participant("p2"),
+    fn counter_ids() -> impl FnMut() -> SiprecResult<String> {
+        let mut n = 0u8;
+        move || {
+            n = n.wrapping_add(1);
+            Ok(base64_encode(&[n; 16]))
+        }
+    }
+
+    #[test]
+    fn test_rfc7865_golden() -> Result<(), Box<dyn std::error::Error>> {
+        let xml = sample().to_rfc7865_xml_with(&mut counter_ids())?;
+        let golden = include_str!("../tests/fixtures/rfc7865_basic.xml");
+        assert_eq!(xml, golden);
+        // Internal-only fields never reach the SRS.
+        assert!(!xml.contains("PCMU"));
+        assert!(!xml.contains("11111"));
+        assert!(!xml.contains("caller"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_rfc7865_ids_are_random_base64() -> Result<(), Box<dyn std::error::Error>> {
+        let xml = sample().to_rfc7865_xml()?;
+        let start = xml.find("session_id=\"").ok_or("session_id")? + 12;
+        let id = xml.get(start..start + 24).ok_or("id")?;
+        assert!(id.ends_with("=="));
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
         );
+        let again = sample().to_rfc7865_xml()?;
+        assert_ne!(xml, again);
+        Ok(())
+    }
 
-        let xml = metadata.to_xml();
+    #[test]
+    fn test_rfc7865_escapes_display_name_and_aor() -> Result<(), Box<dyn std::error::Error>> {
+        let mut m = RecordingMetadata::new("c");
+        m.add_participant(
+            Participant::new("p1", "sip:\"x\"&<y>@example.com")
+                .with_display_name("</name><participant participant_id=\"evil\">"),
+        );
+        let xml = m.to_rfc7865_xml()?;
+        assert!(xml.contains(
+            "<name>&lt;/name&gt;&lt;participant participant_id=&quot;evil&quot;&gt;</name>"
+        ));
+        assert!(xml.contains("aor=\"sip:&quot;x&quot;&amp;&lt;y&gt;@example.com\""));
+        assert_eq!(xml.matches("<participant ").count(), 1);
+        Ok(())
+    }
 
-        assert!(xml.contains("urn:ietf:params:xml:ns:recording:1"));
-        assert!(xml.contains("call-abc@example.com"));
-        assert!(xml.contains("Alice"));
-        assert!(xml.contains("Bob"));
-        assert!(xml.contains("<media-type>audio</media-type>"));
-        assert!(xml.contains("<codec>PCMU</codec>"));
+    #[test]
+    fn test_rfc7865_rejects_control_chars() {
+        let mut m = RecordingMetadata::new("c");
+        m.add_participant(Participant::new("p1", "sip:a@b").with_display_name("a\u{1}b"));
+        assert!(matches!(
+            m.to_rfc7865_xml(),
+            Err(SiprecError::InvalidMetadata { .. })
+        ));
+    }
+
+    #[test]
+    fn test_rfc7865_limits() {
+        let mut m = RecordingMetadata::new("c");
+        for i in 0..=MAX_PARTICIPANTS {
+            m.add_participant(Participant::new(format!("p{i}"), "sip:a@b"));
+        }
+        assert!(matches!(
+            m.to_rfc7865_xml(),
+            Err(SiprecError::LimitExceeded {
+                what: "participants",
+                ..
+            })
+        ));
+
+        let mut m = RecordingMetadata::new("c");
+        m.add_participant(Participant::new("p", "a".repeat(MAX_FIELD_BYTES + 1)));
+        assert!(matches!(
+            m.to_rfc7865_xml(),
+            Err(SiprecError::LimitExceeded { .. })
+        ));
+
+        // Many maximal escaped fields push the document over the total cap.
+        let mut m = RecordingMetadata::new("c");
+        for i in 0..MAX_PARTICIPANTS {
+            m.add_participant(
+                Participant::new(format!("p{i}"), "&".repeat(MAX_FIELD_BYTES))
+                    .with_display_name("<".repeat(MAX_FIELD_BYTES)),
+            );
+        }
+        assert!(matches!(
+            m.to_rfc7865_xml(),
+            Err(SiprecError::LimitExceeded {
+                what: "metadata document bytes",
+                ..
+            })
+        ));
+
+        let mut m = RecordingMetadata::new("c");
+        for i in 0..=MAX_STREAMS {
+            m.add_stream(MediaStream::audio(format!("s{i}")));
+        }
+        assert!(matches!(
+            m.to_rfc7865_xml(),
+            Err(SiprecError::LimitExceeded {
+                what: "streams",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_rfc7865_rejects_bad_label_and_unknown_owner() {
+        let mut m = RecordingMetadata::new("c");
+        m.add_stream(MediaStream::audio("a b"));
+        assert!(m.to_rfc7865_xml().is_err());
+
+        let mut m = RecordingMetadata::new("c");
+        m.add_stream(MediaStream::audio("s1").with_participant("nobody"));
+        assert!(m.to_rfc7865_xml().is_err());
+    }
+
+    #[test]
+    fn test_rfc3339_and_base64() {
+        assert_eq!(rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            rfc3339(UNIX_EPOCH + Duration::from_secs(1_292_542_867)),
+            "2010-12-16T23:41:07Z"
+        );
+        assert_eq!(
+            rfc3339(UNIX_EPOCH + Duration::from_secs(951_782_401)),
+            "2000-02-29T00:00:01Z"
+        );
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(&[0u8; 16]).len(), 24);
     }
 
     #[test]

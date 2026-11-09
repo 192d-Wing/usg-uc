@@ -18,10 +18,14 @@
 //!   channel that is an in-process `mpsc` today (`media_failure_tx`).
 
 use crate::dtls_sidecar::Role;
-use crate::media_pipeline::{AllocatedPorts, LegDtlsParams, MediaController, MediaPipelineError};
+use crate::media_pipeline::{
+    AllocatedPorts, LegDtlsParams, MediaController, MediaKind, MediaPipelineError,
+};
 use sbc_grpc_api::sbc as pb;
 use sbc_grpc_api::sbc::media_controller_service_client::MediaControllerServiceClient;
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 use uc_media_engine::MediaMode;
@@ -42,6 +46,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 pub struct GrpcMediaController {
     client: MediaControllerServiceClient<Channel>,
+    /// `SetMediaKind` came back UNIMPLEMENTED (media node older than this
+    /// daemon) and was logged once.
+    kind_unimplemented_logged: Arc<AtomicBool>,
 }
 
 impl GrpcMediaController {
@@ -66,16 +73,17 @@ impl GrpcMediaController {
             .connect()
             .await
             .map_err(rpc_err)?;
-        Ok(Self {
-            client: MediaControllerServiceClient::new(channel),
-        })
+        Ok(Self::new(MediaControllerServiceClient::new(channel)))
     }
 
     /// Wraps an already-connected client (used by tests and by callers that
     /// build the channel themselves, e.g. with custom TLS).
     #[must_use]
-    pub const fn new(client: MediaControllerServiceClient<Channel>) -> Self {
-        Self { client }
+    pub fn new(client: MediaControllerServiceClient<Channel>) -> Self {
+        Self {
+            client,
+            kind_unimplemented_logged: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Fetches the SBC's current DTLS fingerprint (RFC 8122 form) from the media
@@ -142,6 +150,14 @@ const fn to_proto_mode(mode: Option<MediaMode>) -> i32 {
         Some(MediaMode::EarlyRelay) => pb::MediaMode::EarlyRelay,
     };
     m as i32
+}
+
+/// [`MediaKind`] → proto `MediaKind` discriminant.
+pub(crate) const fn to_proto_kind(kind: MediaKind) -> i32 {
+    match kind {
+        MediaKind::Audio => pb::MediaKind::Audio as i32,
+        MediaKind::Image => pb::MediaKind::Image as i32,
+    }
 }
 
 /// [`Role`] → proto `DtlsRole` discriminant.
@@ -216,6 +232,58 @@ impl MediaController for GrpcMediaController {
         };
         client.set_remote_address(req).await.map_err(map_status)?;
         Ok(())
+    }
+
+    /// POA&M-294: tells the media node what the anchored stream carries.
+    /// Fails closed: an UNIMPLEMENTED answer (node older than this daemon)
+    /// is an error, so a T.38 switch is refused (`RelayUpdateFailed`) rather
+    /// than relayed with UDPTL counted as RTP. Logged once per node at warn.
+    // NIST 800-53 Rev5: SC-24 (fail closed), AU-2 (warn-once log)
+    async fn set_media_kind(
+        &self,
+        call_id: &str,
+        kind: MediaKind,
+    ) -> Result<(), MediaPipelineError> {
+        let mut client = self.client.clone();
+        let req = pb::SetMediaKindRequest {
+            call_id: call_id.to_string(),
+            kind: to_proto_kind(kind),
+        };
+        match client.set_media_kind(req).await {
+            Ok(_) => Ok(()),
+            Err(status) => {
+                if status.code() == tonic::Code::Unimplemented
+                    && !self.kind_unimplemented_logged.swap(true, Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        "media node does not implement SetMediaKind; T.38 switchovers on it \
+                         fail closed until it is upgraded"
+                    );
+                }
+                Err(map_status(status))
+            }
+        }
+    }
+
+    /// Remote relay update: the kind first, then the leg remotes, so a node
+    /// that refuses the kind (UNIMPLEMENTED) is left unchanged. Not atomic
+    /// across RPCs, unlike the in-process PERF-004 update.
+    async fn update_relay(
+        &self,
+        call_id: &str,
+        remotes: [Option<(bool, SbcSocketAddr)>; 2],
+        kind: Option<MediaKind>,
+    ) -> Result<(), MediaPipelineError> {
+        if let Some(kind) = kind {
+            self.set_media_kind(call_id, kind).await?;
+        }
+        let mut result = Ok(());
+        for (is_a_leg, address) in remotes.into_iter().flatten() {
+            if let Err(e) = self.set_remote_address(call_id, is_a_leg, address).await {
+                result = Err(e);
+            }
+        }
+        result
     }
 
     async fn start_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
@@ -326,6 +394,21 @@ mod tests {
                     "bad address {}",
                     r.address
                 )));
+            }
+            Ok(Response::new(()))
+        }
+
+        async fn set_media_kind(
+            &self,
+            req: Request<pb::SetMediaKindRequest>,
+        ) -> Result<Response<()>, Status> {
+            let r = req.into_inner();
+            // "old" models a media node that predates SetMediaKind.
+            if r.call_id == "old" {
+                return Err(Status::unimplemented("SetMediaKind"));
+            }
+            if r.kind != pb::MediaKind::Image as i32 && r.kind != pb::MediaKind::Audio as i32 {
+                return Err(Status::invalid_argument("bad kind"));
             }
             Ok(Response::new(()))
         }
@@ -455,6 +538,56 @@ mod tests {
             matches!(result, Err(MediaPipelineError::Rpc(_))),
             "{result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn set_media_kind_sends_valid_enum() -> Result<(), Box<dyn std::error::Error>> {
+        let mc = connect().await;
+        mc.set_media_kind("c", MediaKind::Image).await?;
+        mc.set_media_kind("c", MediaKind::Audio).await?;
+        assert_eq!(to_proto_kind(MediaKind::Audio), pb::MediaKind::Audio as i32);
+        assert_eq!(to_proto_kind(MediaKind::Image), pb::MediaKind::Image as i32);
+        Ok(())
+    }
+
+    /// Q2 (fail closed): an old media node answers UNIMPLEMENTED; the switch
+    /// errors (the daemon reports RelayUpdateFailed) instead of succeeding.
+    #[tokio::test]
+    async fn set_media_kind_unimplemented_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let mc = connect().await;
+        let err = mc
+            .set_media_kind("old", MediaKind::Image)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert!(matches!(err, MediaPipelineError::Rpc(_)), "{err:?}");
+        let addr = SbcSocketAddr::new("192.0.2.1".parse()?, 5000);
+        let res = mc
+            .update_relay("old", [Some((true, addr)), None], Some(MediaKind::Image))
+            .await;
+        assert!(res.is_err());
+        // A pure address update does not need the new RPC.
+        mc.update_relay("old", [Some((true, addr)), None], None)
+            .await?;
+        Ok(())
+    }
+
+    /// QA: the warn-once latch only suppresses logging; every later call to
+    /// an UNIMPLEMENTED node still fails closed.
+    #[tokio::test]
+    async fn set_media_kind_unimplemented_fails_closed_every_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mc = connect().await;
+        for _ in 0..3 {
+            assert!(mc.set_media_kind("old", MediaKind::Image).await.is_err());
+            assert!(mc.set_media_kind("old", MediaKind::Audio).await.is_err());
+        }
+        // A clone shares the node and keeps failing closed too.
+        let mc2 = mc.clone();
+        assert!(mc2.set_media_kind("old", MediaKind::Image).await.is_err());
+        // Other calls on the same node are unaffected.
+        mc2.set_media_kind("new", MediaKind::Image).await?;
+        Ok(())
     }
 
     #[tokio::test]

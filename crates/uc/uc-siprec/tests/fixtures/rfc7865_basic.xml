@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<recording xmlns="urn:ietf:params:xml:ns:recording:1">
+  <datamode>complete</datamode>
+  <session session_id="AQEBAQEBAQEBAQEBAQEBAQ==">
+    <sipSessionID>ab30317f1a784dc48ff824d0d3715d86;remote=47755a9de7794ba387653f2099600ef2</sipSessionID>
+  </session>
+  <participant participant_id="AgICAgICAgICAgICAgICAg==">
+    <nameID aor="sip:alice@example.com">
+      <name>Alice</name>
+    </nameID>
+  </participant>
+  <participant participant_id="AwMDAwMDAwMDAwMDAwMDAw==">
+    <nameID aor="sip:bob@example.com"/>
+  </participant>
+  <stream stream_id="BAQEBAQEBAQEBAQEBAQEBA==" session_id="AQEBAQEBAQEBAQEBAQEBAQ==">
+    <label>96</label>
+  </stream>
+  <stream stream_id="BQUFBQUFBQUFBQUFBQUFBQ==" session_id="AQEBAQEBAQEBAQEBAQEBAQ==">
+    <label>97</label>
+  </stream>
+  <sessionrecordingassoc session_id="AQEBAQEBAQEBAQEBAQEBAQ==">
+    <associate-time>2010-12-16T23:41:07Z</associate-time>
+  </sessionrecordingassoc>
+  <participantsessionassoc participant_id="AgICAgICAgICAgICAgICAg==" session_id="AQEBAQEBAQEBAQEBAQEBAQ==">
+    <associate-time>2010-12-16T23:41:07Z</associate-time>
+  </participantsessionassoc>
+  <participantsessionassoc participant_id="AwMDAwMDAwMDAwMDAwMDAw==" session_id="AQEBAQEBAQEBAQEBAQEBAQ==">
+    <associate-time>2010-12-16T23:41:07Z</associate-time>
+  </participantsessionassoc>
+  <participantstreamassoc participant_id="AgICAgICAgICAgICAgICAg==">
+    <send>BAQEBAQEBAQEBAQEBAQEBA==</send>
+    <recv>BQUFBQUFBQUFBQUFBQUFBQ==</recv>
+  </participantstreamassoc>
+  <participantstreamassoc participant_id="AwMDAwMDAwMDAwMDAwMDAw==">
+    <send>BQUFBQUFBQUFBQUFBQUFBQ==</send>
+    <recv>BAQEBAQEBAQEBAQEBAQEBA==</recv>
+  </participantstreamassoc>
+</recording>

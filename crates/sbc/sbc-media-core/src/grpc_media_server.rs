@@ -17,7 +17,7 @@
 
 use crate::dtls_identity::DtlsFingerprintSource;
 use crate::dtls_sidecar::Role;
-use crate::media_pipeline::{LegDtlsParams, MediaPipeline, MediaPipelineError};
+use crate::media_pipeline::{LegDtlsParams, MediaKind, MediaPipeline, MediaPipelineError};
 use sbc_grpc_api::sbc as pb;
 use sbc_grpc_api::sbc::media_controller_service_server::MediaControllerService;
 use std::net::SocketAddr;
@@ -130,6 +130,19 @@ fn from_proto_leg(leg: Option<pb::LegDtlsParams>, which: &str) -> Result<LegDtls
     })
 }
 
+/// Proto discriminant → [`MediaKind`]. `UNSPECIFIED` and unknown values
+/// (proto3 enums are open) are rejected: fail closed.
+// NIST 800-53 Rev5: SI-10 (Information Input Validation)
+fn from_proto_kind(value: i32) -> Result<MediaKind, Status> {
+    match pb::MediaKind::try_from(value) {
+        Ok(pb::MediaKind::Audio) => Ok(MediaKind::Audio),
+        Ok(pb::MediaKind::Image) => Ok(MediaKind::Image),
+        Ok(pb::MediaKind::Unspecified) | Err(_) => Err(Status::invalid_argument(format!(
+            "invalid MediaKind {value}"
+        ))),
+    }
+}
+
 fn parse_addr(value: &str) -> Result<SbcSocketAddr, Status> {
     value
         .parse::<SocketAddr>()
@@ -171,6 +184,19 @@ impl MediaControllerService for MediaControllerServer {
         let addr = parse_addr(&r.address)?;
         self.pipeline
             .set_remote_address(&r.call_id, r.is_a_leg, addr)
+            .await
+            .map_err(|e| to_status(&e))?;
+        Ok(Response::new(()))
+    }
+
+    async fn set_media_kind(
+        &self,
+        req: Request<pb::SetMediaKindRequest>,
+    ) -> Result<Response<()>, Status> {
+        let r = req.into_inner();
+        let kind = from_proto_kind(r.kind)?;
+        self.pipeline
+            .set_media_kind(&r.call_id, kind)
             .await
             .map_err(|e| to_status(&e))?;
         Ok(Response::new(()))
@@ -279,10 +305,20 @@ mod tests {
         MediaControllerServiceClient<Channel>,
         mpsc::UnboundedSender<String>,
     ) {
+        let (client, tx, _) = harness_with_pipeline().await;
+        (client, tx)
+    }
+
+    async fn harness_with_pipeline() -> (
+        MediaControllerServiceClient<Channel>,
+        mpsc::UnboundedSender<String>,
+        Arc<MediaPipeline>,
+    ) {
         let pipeline = Arc::new(MediaPipeline::new(MediaPipelineConfig::default()));
         let fingerprint = Arc::new(DtlsFingerprintSource::from_static(FINGERPRINT.to_string()));
         let (failure_tx, failure_rx) = mpsc::unbounded_channel();
-        let server = MediaControllerServer::new(pipeline, Some(fingerprint), failure_rx);
+        let server =
+            MediaControllerServer::new(Arc::clone(&pipeline), Some(fingerprint), failure_rx);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -297,7 +333,105 @@ mod tests {
         let client = MediaControllerServiceClient::connect(format!("http://{addr}"))
             .await
             .unwrap();
-        (client, failure_tx)
+        (client, failure_tx, pipeline)
+    }
+
+    /// POA&M-294: SetMediaKind reaches the pipeline; UNSPECIFIED and unknown
+    /// enum values are refused with INVALID_ARGUMENT (fail closed).
+    #[tokio::test]
+    async fn set_media_kind_updates_pipeline_and_rejects_bad_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, _tx, pipeline) = harness_with_pipeline().await;
+        client
+            .create_session(pb::CreateSessionRequest {
+                call_id: "k1".to_string(),
+                mode: pb::MediaMode::Relay as i32,
+                a_leg_media_ip: None,
+                b_leg_media_ip: None,
+            })
+            .await?;
+        assert_eq!(pipeline.media_kind("k1").await, Some(MediaKind::Audio));
+        client
+            .set_media_kind(pb::SetMediaKindRequest {
+                call_id: "k1".into(),
+                kind: pb::MediaKind::Image as i32,
+            })
+            .await?;
+        assert_eq!(pipeline.media_kind("k1").await, Some(MediaKind::Image));
+
+        for bad in [pb::MediaKind::Unspecified as i32, 7] {
+            let err = client
+                .set_media_kind(pb::SetMediaKindRequest {
+                    call_id: "k1".into(),
+                    kind: bad,
+                })
+                .await
+                .err()
+                .ok_or("expected an error")?;
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{bad}");
+        }
+        assert_eq!(pipeline.media_kind("k1").await, Some(MediaKind::Image));
+
+        let err = client
+            .set_media_kind(pb::SetMediaKindRequest {
+                call_id: "nope".into(),
+                kind: pb::MediaKind::Audio as i32,
+            })
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    /// QA: proto3 open enums deliver arbitrary i32s; every value outside
+    /// {AUDIO, IMAGE} is refused and leaves the pipeline kind unchanged.
+    #[tokio::test]
+    async fn set_media_kind_rejects_every_out_of_range_value()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, _tx, pipeline) = harness_with_pipeline().await;
+        client
+            .create_session(pb::CreateSessionRequest {
+                call_id: "k2".to_string(),
+                mode: pb::MediaMode::Relay as i32,
+                a_leg_media_ip: None,
+                b_leg_media_ip: None,
+            })
+            .await?;
+        for bad in [-1, 3, 255, i32::MIN, i32::MAX] {
+            let err = client
+                .set_media_kind(pb::SetMediaKindRequest {
+                    call_id: "k2".into(),
+                    kind: bad,
+                })
+                .await
+                .err()
+                .ok_or("expected an error")?;
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{bad}");
+            assert_eq!(pipeline.media_kind("k2").await, Some(MediaKind::Audio));
+        }
+        // Validation precedes lookup: a bad kind on an unknown call is still
+        // INVALID_ARGUMENT or NOT_FOUND, never OK.
+        let err = client
+            .set_media_kind(pb::SetMediaKindRequest {
+                call_id: "missing".into(),
+                kind: 0,
+            })
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_ne!(err.code(), tonic::Code::Ok);
+        // Image then back to Audio round-trips.
+        for kind in [pb::MediaKind::Image, pb::MediaKind::Audio] {
+            client
+                .set_media_kind(pb::SetMediaKindRequest {
+                    call_id: "k2".into(),
+                    kind: kind as i32,
+                })
+                .await?;
+        }
+        assert_eq!(pipeline.media_kind("k2").await, Some(MediaKind::Audio));
+        Ok(())
     }
 
     #[tokio::test]

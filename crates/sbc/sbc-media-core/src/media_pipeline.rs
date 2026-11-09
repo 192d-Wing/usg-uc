@@ -414,8 +414,8 @@ pub trait MediaController: Send + Sync {
     async fn allocate_ports(&self) -> Result<(u16, u16), MediaPipelineError>;
 
     /// Records what the anchored stream carries (audio or T.38 image), for
-    /// metrics attribution only. Default: no-op; the gRPC controller has no
-    /// field for it, so a remote media node counts UDPTL as RTP (POA&M-294).
+    /// metrics attribution and latching grace. Default: no-op; the in-process
+    /// pipeline and the gRPC controller (`SetMediaKind`) both implement it.
     async fn set_media_kind(
         &self,
         _call_id: &str,
@@ -1435,6 +1435,20 @@ impl MediaPipeline {
         ctx.media_kind
             .store(kind.as_u8(), std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The call's current media kind, or `None` for an unknown call.
+    pub async fn media_kind(&self, call_id: &str) -> Option<MediaKind> {
+        let sessions = self.sessions.read().await;
+        let raw = sessions
+            .get(call_id)?
+            .media_kind
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Some(if raw == MediaKind::Image.as_u8() {
+            MediaKind::Image
+        } else {
+            MediaKind::Audio
+        })
     }
 
     /// Returns true if the call's relay is DTLS-SRTP terminated

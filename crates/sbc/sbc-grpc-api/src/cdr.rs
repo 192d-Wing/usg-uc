@@ -69,6 +69,11 @@ pub fn to_proto(r: &CallRecord) -> CdrRecord {
         stir_verify_reason: r.stir_verify_reason.clone(),
         stir_inbound_attestation: r.stir_inbound_attestation.map(|a| a.as_str().to_string()),
         stir_x5u_host: r.stir_x5u_host.clone(),
+        media_kinds: r
+            .media_kinds
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect(),
         failover_takeover: r.failover_takeover,
         prev_hash: r.prev_hash.clone(),
         hash: r.hash.clone(),
@@ -155,6 +160,16 @@ pub fn from_proto(p: &CdrRecord) -> Result<CallRecord, String> {
             serde_json::json!(p.stir_inbound_attestation),
         );
         obj.insert("stir_x5u_host".into(), serde_json::json!(p.stir_x5u_host));
+        // Schema v3. Bounded and set-like; unknown tokens are rejected by
+        // the MediaKindTag deserializer below.
+        // NIST 800-53 Rev5: SI-10 (Information Input Validation)
+        if p.media_kinds.len() > uc_cdr::MAX_MEDIA_KINDS {
+            return Err(format!(
+                "invalid CDR record: more than {} media_kinds",
+                uc_cdr::MAX_MEDIA_KINDS
+            ));
+        }
+        obj.insert("media_kinds".into(), serde_json::json!(p.media_kinds));
     }
     serde_json::from_value(v).map_err(|e| format!("invalid CDR record: {e}"))
 }
@@ -190,9 +205,14 @@ mod tests {
             stir_verstat: Some(uc_cdr::Verstat::TnValidationPassed),
             stir_inbound_attestation: Some(Attestation::A),
             stir_x5u_host: Some("cert.example.invalid".into()),
+            media_kinds: vec![uc_cdr::MediaKindTag::Audio, uc_cdr::MediaKindTag::Image],
             ..Default::default()
         };
         let p = to_proto(&r);
+        assert_eq!(
+            p.media_kinds,
+            vec!["audio".to_string(), "image".to_string()]
+        );
         assert_eq!(p.stir_attestation.as_deref(), Some("B"));
         assert_eq!(p.stir_verstat.as_deref(), Some("tn-validation-passed"));
         assert_eq!(from_proto(&p).unwrap(), r);
@@ -211,6 +231,12 @@ mod tests {
             outcome: "nope".into(),
             ..Default::default()
         });
+        assert!(from_proto(&p).is_err());
+        let mut p = to_proto(&CallRecord::default());
+        p.media_kinds = vec!["video".into()];
+        assert!(from_proto(&p).is_err());
+        let mut p = to_proto(&CallRecord::default());
+        p.media_kinds = vec!["audio".into(), "image".into(), "audio".into()];
         assert!(from_proto(&p).is_err());
     }
 }

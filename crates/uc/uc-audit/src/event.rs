@@ -798,9 +798,13 @@ pub enum SwitchoverReason {
     MalformedT38Sdp,
     /// `T38FaxUdpEC` is not in `media.t38.allowed_ec`.
     EcNotAllowed,
-    /// The far side answered with a non-2xx final response.
+    /// The far side answered 488 Not Acceptable Here.
     #[serde(rename = "remote_488")]
     Remote488,
+    /// The far side's dialog is gone (408 or 481, RFC 5057 §5.2).
+    RemoteDialogLost,
+    /// The far side answered any other non-2xx final response (e.g. 5xx).
+    RemoteRejected,
     /// The far side declined the stream (port 0) or kept the old kind.
     #[serde(rename = "remote_port0")]
     RemotePort0,

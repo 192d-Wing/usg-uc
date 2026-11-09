@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 /// `stir_inbound_attestation` and `stir_x5u_host`. They are omitted from JSON
 /// when unset, so a v1 record re-serialises byte-identically and its chain
 /// hash still verifies.
-pub const SCHEMA_VERSION: u16 = 2;
+///
+/// v3 (T.38 fax, POA&M-294) adds `media_kinds`, also omitted when empty so
+/// v1/v2 records keep verifying.
+pub const SCHEMA_VERSION: u16 = 3;
 
 /// Oldest schema version readers accept.
 pub const MIN_READ_SCHEMA_VERSION: u16 = 1;
@@ -342,6 +345,48 @@ impl Verstat {
     }
 }
 
+/// Media kind a call used (schema v3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaKindTag {
+    /// RTP audio.
+    Audio,
+    /// `m=image` (T.38 fax over UDPTL).
+    Image,
+}
+
+impl MediaKindTag {
+    /// Lower-case token, as serialised.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Image => "image",
+        }
+    }
+
+    /// Parses a token produced by [`Self::as_str`].
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "audio" => Some(Self::Audio),
+            "image" => Some(Self::Image),
+            _ => None,
+        }
+    }
+}
+
+/// Upper bound on `CallRecord::media_kinds` (one entry per [`MediaKindTag`]).
+pub const MAX_MEDIA_KINDS: usize = 2;
+
+/// Adds `kind` to a set-like media-kind list (ordered by first use, no
+/// duplicates, at most [`MAX_MEDIA_KINDS`] entries).
+pub fn note_media_kind(kinds: &mut Vec<MediaKindTag>, kind: MediaKindTag) {
+    if !kinds.contains(&kind) && kinds.len() < MAX_MEDIA_KINDS {
+        kinds.push(kind);
+    }
+}
+
 /// A Call Detail Record, schema v1.
 ///
 /// Producers fill the call facts; `schema_version`, `record_id`, `node_id`,
@@ -440,6 +485,12 @@ pub struct CallRecord {
     /// Host part of the inbound `x5u` (no path: limits PII/cardinality) (v2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stir_x5u_host: Option<String>,
+    /// Media kinds the call used, ordered by first use, no duplicates (v3).
+    /// An audio call that switched to T.38 and back is `["audio","image"]`.
+    // NIST 800-53 Rev5: AU-3 (Content of Audit Records) - fax calls are
+    // distinguishable in the record (POA&M-294).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media_kinds: Vec<MediaKindTag>,
     /// This node took the dialog over from a failed peer; timing is partial.
     pub failover_takeover: bool,
     /// Hex SHA-384 of the previous record (empty when chaining is off).
@@ -495,6 +546,17 @@ impl CallRecord {
         for id in &mut self.b_call_ids {
             truncate_str(id, MAX_FIELD_LEN);
         }
+        let (mut seen_audio, mut seen_image) = (false, false);
+        self.media_kinds.retain(|k| {
+            let seen = match k {
+                MediaKindTag::Audio => &mut seen_audio,
+                MediaKindTag::Image => &mut seen_image,
+            };
+            !std::mem::replace(seen, true)
+        });
+        // Unreachable today (dedup + two MediaKindTag variants); defence in
+        // depth. Raise MAX_MEDIA_KINDS when adding a variant, or it is dropped.
+        self.media_kinds.truncate(MAX_MEDIA_KINDS);
         self.trunks_tried.truncate(MAX_ATTEMPTS);
         for t in &mut self.trunks_tried {
             truncate_str(&mut t.trunk_id, MAX_FIELD_LEN);
@@ -538,6 +600,55 @@ pub struct FileHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_kinds_set_semantics_and_serde() {
+        let mut kinds = Vec::new();
+        for k in [
+            MediaKindTag::Audio,
+            MediaKindTag::Image,
+            MediaKindTag::Audio,
+            MediaKindTag::Image,
+        ] {
+            note_media_kind(&mut kinds, k);
+        }
+        assert_eq!(kinds, vec![MediaKindTag::Audio, MediaKindTag::Image]);
+
+        let r = CallRecord {
+            media_kinds: kinds,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains(r#""media_kinds":["audio","image"]"#),
+            "{json}"
+        );
+        let back: CallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+
+        // Empty set is omitted, so v1/v2 records re-serialise identically.
+        let json = serde_json::to_string(&CallRecord::default()).unwrap();
+        assert!(!json.contains("media_kinds"));
+
+        let mut dup = CallRecord {
+            media_kinds: vec![
+                MediaKindTag::Image,
+                MediaKindTag::Image,
+                MediaKindTag::Audio,
+            ],
+            ..Default::default()
+        };
+        dup.sanitize();
+        assert_eq!(
+            dup.media_kinds,
+            vec![MediaKindTag::Image, MediaKindTag::Audio]
+        );
+
+        assert!(is_readable_schema(3));
+        assert!(serde_json::from_str::<MediaKindTag>(r#""video""#).is_err());
+        assert_eq!(MediaKindTag::parse("image"), Some(MediaKindTag::Image));
+        assert_eq!(MediaKindTag::parse("x"), None);
+    }
 
     #[test]
     fn durations() {

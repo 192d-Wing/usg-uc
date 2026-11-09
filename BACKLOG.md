@@ -470,10 +470,20 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   (fail-closed), `media_switchover` audit, T.38 metrics. Residuals:
   POA&M-290 (opaque relay, no UDPTL validation), POA&M-291 (TCP/TPKT, DTLS,
   cleartext), POA&M-293 (general multi-stream anchoring), POA&M-294 (full
-  Annex D negotiation, CDR fax flag, gRPC media kind, HA).
+  Annex D negotiation, `sip.fax`, HA, reload; still open). CDR fax flag
+  (schema v3 `media_kinds`) and gRPC `SetMediaKind` (fail closed against older
+  media nodes) done in SIPREC phase 1; POA&M-294 itself is not closed.
 - [ ] **MAJOR, DORMANT — SIPREC metadata doesn't follow the RFC 7865 schema**,
   no RFC 7866 SRC signalling, and display names/AORs are written into the XML
   unescaped (injection into recorder evidence) (`uc-siprec/src/metadata.rs:474-532`).
+  *Phase 1 done (library-only, crate still has no caller):* RFC 7865 serializer
+  `to_rfc7865_xml` (replaces `to_xml`) with XML escaping, rejection of
+  XML-illegal code points and size caps (`uc-siprec/src/xml.rs`, `metadata.rs`);
+  RFC 7866 RS-offer body builder `build_rs_offer` + `SrcHeaders`
+  (`src_request.rs`). Open: SBC wiring and the rest of RFC 7865/7866,
+  deferred to POA&M-300..309 (RS origination, forking, config, recording
+  indication, SRS TLS/SRTP, stable IDs/updates, audit/CDR, cluster,
+  SRS-initiated requests, scaffolding review). No XSD validation in CI.
 - [x] **MAJOR, DORMANT — WebRTC SDP munging:** only the first m-section gets
   `a=mid`; keeps `RTP/AVP` and adds no fingerprint/setup/ICE; data-channel
   removal changes the m-line count and orphans attributes

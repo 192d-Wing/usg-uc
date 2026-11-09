@@ -276,6 +276,8 @@ pub struct CdrDraft {
     pub stir_inbound_attestation: Option<uc_cdr::Attestation>,
     /// Host of the inbound `x5u`.
     pub stir_x5u_host: Option<String>,
+    /// Media kinds used, set-like and bounded (schema v3, POA&M-294).
+    pub media_kinds: Vec<uc_cdr::MediaKindTag>,
 }
 
 impl CdrDraft {
@@ -296,6 +298,12 @@ impl CdrDraft {
             self.b_call_ids.push(b_call_id.to_string());
         }
         self.failover_count = self.failover_count.saturating_add(1);
+    }
+
+    /// Notes a media kind the call used (answer or accepted switchover).
+    /// Set-like, ordered by first use, at most `uc_cdr::MAX_MEDIA_KINDS`.
+    pub fn note_media_kind(&mut self, kind: uc_cdr::MediaKindTag) {
+        uc_cdr::note_media_kind(&mut self.media_kinds, kind);
     }
 
     /// Records the first 18x.
@@ -372,6 +380,7 @@ impl CdrDraft {
             stir_verify_reason: self.stir_verify_reason,
             stir_inbound_attestation: self.stir_inbound_attestation,
             stir_x5u_host: self.stir_x5u_host,
+            media_kinds: self.media_kinds,
             ..CallRecord::default()
         };
         r.compute_durations();
@@ -1077,6 +1086,26 @@ pub fn reload(ctx: &CdrContext, old: &CdrConfig, new: &CdrConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// POA&M-294: an audio call that switched to T.38 and back records both
+    /// kinds once, in first-use order (schema v3 `media_kinds`).
+    #[test]
+    fn draft_media_kinds_audio_image_audio() {
+        use crate::t38::CallMediaKind;
+        let mut d = CdrDraft::default();
+        for k in [
+            CallMediaKind::Audio,
+            CallMediaKind::Image,
+            CallMediaKind::Audio,
+        ] {
+            d.note_media_kind(k.cdr());
+        }
+        let r = d.into_record(&CdrEnd::bye(true, true));
+        assert_eq!(
+            r.media_kinds,
+            vec![uc_cdr::MediaKindTag::Audio, uc_cdr::MediaKindTag::Image]
+        );
+    }
 
     #[test]
     fn uri_user_handles_forms() {
