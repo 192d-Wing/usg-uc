@@ -291,7 +291,7 @@ pub fn verify_sidecar(path: &Path) -> CdrResult<bool> {
 mod tests {
     use super::*;
     use crate::format::{header_json_line, new_header, to_json_line};
-    use crate::record::{Attestation, SCHEMA_VERSION, Verstat};
+    use crate::record::{Attestation, MediaKindTag, SCHEMA_VERSION, Verstat};
 
     /// A v1 file (header and records at schema 1, no v2 fields) written by
     /// the previous release still verifies: unset v2 fields are not
@@ -376,6 +376,9 @@ mod tests {
                 r.stir_inbound_attestation = Some(Attestation::A);
                 r.stir_x5u_host = Some("cert.example.invalid".into());
             }
+            if version >= 3 {
+                r.media_kinds = vec![MediaKindTag::Audio, MediaKindTag::Image];
+            }
             prev = seal(&mut r, &prev).unwrap();
             out.push_str(&to_json_line(&r).unwrap());
             out.push('\n');
@@ -429,7 +432,56 @@ mod tests {
         assert!(verify_reader(stripped.as_bytes()).is_err());
     }
 
-    /// QA: future (v3) and zero schema headers are refused.
+    /// v1 and v2 files followed by a v3 file continuing the chain verify,
+    /// and tampering with or stripping `media_kinds` is detected.
+    #[test]
+    fn v2_then_v3_media_kinds_chain() {
+        let (v1, last) = versioned_file(1, 0, 1, GENESIS);
+        let (v2, last) = versioned_file(2, 1, 1, last);
+        let (v3, _) = versioned_file(SCHEMA_VERSION, 2, 2, last);
+        assert_eq!(SCHEMA_VERSION, 3);
+        assert!(!v2.contains("media_kinds"));
+        assert!(v3.contains(r#""media_kinds":["audio","image"]"#), "{v3}");
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = [v1, v2, v3.clone()]
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let p = dir.path().join(format!("{i}.jsonl"));
+                std::fs::write(&p, f).unwrap();
+                p
+            })
+            .collect();
+        let path_refs: Vec<_> = paths.iter().map(std::path::PathBuf::as_path).collect();
+        let reps = verify_files(&path_refs).unwrap();
+        assert_eq!(reps.iter().map(|r| r.records).sum::<u64>(), 4);
+
+        let tampered = v3.replacen(r#"["audio","image"]"#, r#"["audio"]"#, 1);
+        assert!(verify_reader(tampered.as_bytes()).is_err());
+        let stripped = v3.replacen(r#","media_kinds":["audio","image"]"#, "", 1);
+        assert_ne!(stripped, v3);
+        assert!(verify_reader(stripped.as_bytes()).is_err());
+    }
+
+    /// QA (POA&M-294): every edit to `media_kinds` in a sealed v3 record
+    /// (reorder, add, inject an unknown tag) breaks verification or parsing.
+    #[test]
+    fn qa_v3_media_kinds_edits_detected() {
+        let (v3, _) = versioned_file(SCHEMA_VERSION, 0, 2, GENESIS);
+        assert!(verify_reader(v3.as_bytes()).is_ok());
+        for (from, to) in [
+            (r#"["audio","image"]"#, r#"["image","audio"]"#),
+            (r#"["audio","image"]"#, r#"["audio","image","audio"]"#),
+            (r#"["audio","image"]"#, r#"["audio","video"]"#),
+            (r#"["audio","image"]"#, "[]"),
+        ] {
+            let t = v3.replacen(from, to, 1);
+            assert_ne!(t, v3);
+            assert!(verify_reader(t.as_bytes()).is_err(), "{to} accepted");
+        }
+    }
+
+    /// QA: future (v4) and zero schema headers are refused.
     #[test]
     fn qa_unknown_schema_versions_rejected() {
         for v in [0, SCHEMA_VERSION + 1] {

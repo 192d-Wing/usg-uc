@@ -650,7 +650,13 @@ fn csv_resume_from(rec: &[String]) -> Option<ResumePoint> {
             clean: true,
         });
     }
-    if rec.len() != format::CSV_COLUMNS.len() && rec.len() != format::CSV_COLUMNS_V1 {
+    if ![
+        format::CSV_COLUMNS.len(),
+        format::CSV_COLUMNS_V2,
+        format::CSV_COLUMNS_V1,
+    ]
+    .contains(&rec.len())
+    {
         return None;
     }
     let seq: u64 = rec.get(1)?.parse().ok()?;
@@ -1043,6 +1049,84 @@ mod tests {
         let cut = &both[both.find('\n').unwrap() + 1..];
         let p = super::resume_csv(cut, true).unwrap();
         assert_eq!((p.next_sequence, p.last_hash), (9, h2));
+    }
+
+    /// QA (POA&M-294): a CSV file holding v3 rows with `media_kinds`
+    /// resumes at the right sequence and hash, across a restart.
+    #[test]
+    fn resume_csv_v3_media_kinds_across_restart() {
+        use crate::record::MediaKindTag;
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.format = CdrFormat::Csv;
+        let mut prev = GENESIS;
+        {
+            let (mut sink, _) = FileSink::open(c.clone(), "n1", true, None).unwrap();
+            for i in 0..3u64 {
+                let mut r = CallRecord {
+                    schema_version: SCHEMA_VERSION,
+                    node_id: "n1".into(),
+                    sequence: i,
+                    record_id: format!("n1-{i}"),
+                    media_kinds: vec![MediaKindTag::Audio, MediaKindTag::Image],
+                    ..Default::default()
+                };
+                prev = seal(&mut r, &prev).unwrap();
+                let line = format::to_json_line(&r).unwrap();
+                sink.write_record(&r, &line).unwrap();
+            }
+            sink.close_current().unwrap();
+        }
+        let text: String = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".csv"))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(text.contains("audio;image"), "{text}");
+        let (_sink, resume) = FileSink::open(c, "n1", true, None).unwrap();
+        assert!(resume.clean);
+        assert_eq!(resume.next_sequence, 3);
+        assert_eq!(resume.last_hash, prev);
+    }
+
+    /// QA: resume accepts exactly the v1/v2/v3 CSV widths. A v2-width row
+    /// (no `media_kinds` column) resumes; any other width is treated as torn.
+    #[test]
+    fn csv_resume_accepts_only_known_widths() {
+        let mut r = CallRecord {
+            schema_version: SCHEMA_VERSION,
+            node_id: "n1".into(),
+            sequence: 41,
+            ..Default::default()
+        };
+        let h = seal(&mut r, &GENESIS).unwrap();
+        let row = format::to_csv_row(&r).unwrap();
+        let mut fields: Vec<&str> = row.split(',').collect();
+        assert_eq!(fields.len(), format::CSV_COLUMNS.len());
+        let p = super::resume_csv(&format!("{row}\n"), false).unwrap();
+        assert_eq!((p.next_sequence, p.last_hash, p.clean), (42, h, true));
+
+        let mk = format::CSV_COLUMNS
+            .iter()
+            .position(|c| *c == "media_kinds")
+            .unwrap();
+        fields.remove(mk);
+        assert_eq!(fields.len(), format::CSV_COLUMNS_V2);
+        let v2 = fields.join(",");
+        let p = super::resume_csv(&format!("{v2}\n"), false).unwrap();
+        assert_eq!((p.next_sequence, p.last_hash), (42, h));
+
+        // 44 and 47 columns: not a known width.
+        let short = fields[..fields.len() - 2]
+            .iter()
+            .chain(fields.last())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(super::resume_csv(&format!("{short}\n"), false).is_none());
+        let long = format!("{row},x");
+        assert!(super::resume_csv(&format!("{long}\n"), false).is_none());
     }
 
     #[test]

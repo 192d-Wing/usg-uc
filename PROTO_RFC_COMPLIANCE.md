@@ -515,6 +515,13 @@
 
 `uc-syslog` is not called by any shipped binary (NIST POA&M-245). Since 2026-11-07 it has an RFC 5425 transport (`SyslogTransport::Tls`): CNSA client config (`cnsa_provider()`, TLS 1.3 by default), server authenticated against `ca_file` and `server_name`, optional client certificate (§4.2), RFC 6587 / RFC 5425 §4.3 octet counting, close_notify via `SyslogForwarder::close()`, default port 6514, TLS with BSD (RFC 3164) format refused. Status: **Partial**. Gaps: no §5.2.2 end-entity fingerprint matching (SHA-1 mandatory-to-implement conflicts with CNSA 2.0; workaround: put the self-signed collector certificate in `ca_file`); RFC 5424 §6.2 header fields (HOSTNAME, APP-NAME, PROCID, MSGID) are not checked for PRINTUSASCII, length or NILVALUE; at-least-once delivery on reconnect; no buffering when the collector is down. UDP and plain TCP (LF framing) remain. Tests: `tls_delivers_octet_counted_frames`, `untrusted_server_cert_rejected`, `wrong_server_name_rejected`, `tls_with_bsd_format_rejected`, `drop_without_close_is_truncation`, `tls_octet_counted_framing`.
 
+### uc-siprec (library-only, not a proto-* crate)
+
+SIPREC phase 1 is library conformance only; no shipped binary calls `uc-siprec` (POA&M-300..309).
+
+- **RFC 7865 (Partial, library-only):** `metadata.rs` `to_rfc7865_xml` writes a complete snapshot (`datamode` complete) in namespace `urn:ietf:params:xml:ns:recording:1` with element groups in the §9 `xs:sequence` order (session, participant, stream, sessionrecordingassoc, participantsessionassoc, participantstreamassoc). IDs are base64 of 128 random bits. All caller strings are escaped and XML-illegal code points are rejected (`xml.rs`). Tests: `test_rfc7865_golden` (fixture `tests/fixtures/rfc7865_basic.xml`), `test_rfc7865_ids_are_random_base64`, `test_rfc7865_escapes_display_name_and_aor`, `tests/rfc7865_schema.rs`, `tests/hostile_metadata.rs`. Not done: no XSD validation in tests or CI; IDs are not stable across serializations, so partial updates are not possible (POA&M-305, RFC-004); `xml:lang` on `name` not emitted (MAY, RFC-005).
+- **RFC 7866 (Partial, library-only):** `src_request.rs` `build_rs_offer` builds the RS INVITE body only: multipart/mixed (RFC 2046 §5.1.1 boundary checked absent from both parts), `application/rs-metadata+xml` part with `Content-Disposition: recording-session` (§9.1), `a=label` per m-line and forced `a=sendonly` (§8.1.1); `SrcHeaders` supplies `Require: siprec` and `Contact: <uri>;+sip.src` values (§6.1.1). Tests: `builds_multipart_with_labels_and_disposition`, `forces_sendonly_direction`, `rejects_stream_count_mismatch`, `multipart_boundary_never_collides_with_hostile_content`. Not done: RS INVITE origination (POA&M-300), media forking (POA&M-301), recording indication §6.1.2 (POA&M-303), SRS-initiated requests §6.2 (POA&M-308).
+
 ### Complete RFC Index
 
 "Shipped in" names the binary with a call site; "library" means no shipped binary calls it. "soft client" = `client-*` crates (Tauri/FFI client).
@@ -597,6 +604,8 @@
 | RFC 7627 | Extended Master Secret | proto-dtls | soft client |
 | RFC 7675 | Consent Freshness | proto-ice | library |
 | RFC 7714 | AES-GCM for SRTP | proto-srtp, proto-sdp, proto-dtls | sbc-media-core, soft client |
+| RFC 7865 | SIPREC Metadata Model | uc-siprec | library (Partial, phase 1) |
+| RFC 7866 | SIPREC Protocol | uc-siprec | library (Partial, body builder only) |
 | RFC 7840 | Multiple Phone Numbers | proto-dialog | library |
 | RFC 8068 | Pending Additions | proto-dialog | library |
 | RFC 8224 | STIR Identity | proto-sip, proto-stir-shaken | sbc-daemon (off by default) |

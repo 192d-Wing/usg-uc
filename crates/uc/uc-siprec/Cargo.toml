@@ -11,10 +11,14 @@ categories.workspace = true
 
 [dependencies]
 uc-types.workspace = true
+uc-crypto.workspace = true
 proto-sip.workspace = true
 proto-sdp.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

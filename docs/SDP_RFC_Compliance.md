@@ -231,7 +231,7 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 
 - `proto-sdp`: `m=image ... udptl t38` (`media.rs`, test `test_image_udptl`); Annex D attributes in `t38.rs` (`T38Params`; tests `parse_full_annex_d`, `round_trip`, `rejects_bad_values`, `clamp_only_lowers`, `table_round_trip`)
 - sbc-daemon: audio/T.38 re-INVITE switchover, attributes clamped to `[media.t38]` caps, UDPTL relayed opaquely (tests `t38_switchover_moves_relay_only_after_2xx_and_back`, `audio_to_t38_and_back_relays_opaque_udptl_from_new_ports`)
-- Not implemented: `TCPTL` and UDPTL over DTLS (POA&M-291); answer-vs-offer Annex D negotiation (POA&M-294); UDPTL/IFP inspection and ASN.1 PER (POA&M-290); `uc-t38` redundancy/FEC (POA&M-292)
+- Not implemented: `TCPTL` and UDPTL over DTLS (POA&M-291); answer-vs-offer Annex D negotiation (POA&M-294, open; its CDR `media_kinds` and gRPC `SetMediaKind` sub-items are done, and a remote media node without `SetMediaKind` makes the switch fail closed); UDPTL/IFP inspection and ASN.1 PER (POA&M-290); `uc-t38` redundancy/FEC (POA&M-292)
 - Advisory (not a POA&M): the T.38 path parses each SDP body 3-4 times per message (PERF-003); bounded per-re-INVITE cost, deferred
 
 ### RFC 7742 - WebRTC Video Processing and Codec Requirements ℹ️ N/A

@@ -53,6 +53,23 @@ pub enum SiprecError {
         reason: String,
     },
 
+    /// Metadata contains a value that cannot be represented safely
+    /// (illegal XML code point, non-token label, dangling reference).
+    #[error("invalid recording metadata: {reason}")]
+    InvalidMetadata {
+        /// Rejection reason (never contains the offending value).
+        reason: String,
+    },
+
+    /// A count/size cap was exceeded.
+    #[error("recording metadata limit exceeded: {what} > {limit}")]
+    LimitExceeded {
+        /// What was capped.
+        what: &'static str,
+        /// The cap.
+        limit: usize,
+    },
+
     /// Media forking error.
     #[error("media forking failed: {reason}")]
     ForkingError {

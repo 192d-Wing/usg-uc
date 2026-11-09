@@ -8670,10 +8670,12 @@ dependencies = [
 name = "uc-siprec"
 version = "0.10.0"
 dependencies = [
+ "proptest",
  "proto-sdp",
  "proto-sip",
  "thiserror 2.0.21",
  "tracing",
+ "uc-crypto",
  "uc-types",
 ]
 

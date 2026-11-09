@@ -103,6 +103,12 @@ message CdrRecord {
     optional string stir_inbound_attestation = 44;
     // Host of the inbound x5u certificate URL (no path).
     optional string stir_x5u_host = 45;
+    // Schema v3 (POA&M-294). Additive. Media kinds the call used, ordered by
+    // first use, no duplicates: "audio" | "image" (T.38 fax). Empty = unknown
+    // (pre-v3 record). Records kinds negotiated or attempted, not kinds
+    // actually relayed: an image answer whose media-node switch failed (the
+    // call is then torn down) still lists "image".
+    repeated string media_kinds = 46;
 }
 
 // Filter for ListCdrs. Unset/empty fields match everything.

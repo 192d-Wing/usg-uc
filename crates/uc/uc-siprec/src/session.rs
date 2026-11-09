@@ -546,10 +546,12 @@ impl RecordingSession {
             .map_or(0, |d| d.as_secs())
     }
 
-    /// Generates XML metadata for the recording.
-    #[must_use]
-    pub fn metadata_xml(&self) -> String {
-        self.metadata.to_xml()
+    /// Generates RFC 7865 XML metadata for the recording.
+    ///
+    /// # Errors
+    /// See [`RecordingMetadata::to_rfc7865_xml`].
+    pub fn metadata_xml(&self) -> SiprecResult<String> {
+        self.metadata.to_rfc7865_xml()
     }
 }
 
@@ -1000,9 +1002,9 @@ mod tests {
         session.add_callee("sip:bob@example.com", Some("Bob".to_string()));
         session.add_stream("audio-1", "audio", StreamDirection::SendReceive);
 
-        let xml = session.metadata_xml();
-        assert!(xml.contains("<aor>sip:alice@example.com</aor>"));
-        assert!(xml.contains("<aor>sip:bob@example.com</aor>"));
-        assert!(xml.contains("<media-type>audio</media-type>"));
+        let xml = session.metadata_xml().expect("metadata");
+        assert!(xml.contains("<nameID aor=\"sip:alice@example.com\">"));
+        assert!(xml.contains("<nameID aor=\"sip:bob@example.com\">"));
+        assert!(xml.contains("<label>audio-1</label>"));
     }
 }
