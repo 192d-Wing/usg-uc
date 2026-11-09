@@ -176,7 +176,7 @@ impl fmt::Display for Timing {
         write!(f, "t={} {}", self.start_time, self.stop_time)?;
         // Write r= lines for repeat times
         for repeat in &self.repeat_times {
-            write!(f, "\n{repeat}")?;
+            write!(f, "\r\n{repeat}")?;
         }
         Ok(())
     }
@@ -673,60 +673,60 @@ impl SessionDescription {
 impl fmt::Display for SessionDescription {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // v= line
-        writeln!(f, "v={}", self.version)?;
+        write!(f, "v={}\r\n", self.version)?;
 
         // o= line
-        writeln!(f, "{}", self.origin)?;
+        write!(f, "{}\r\n", self.origin)?;
 
         // s= line
-        writeln!(f, "s={}", self.session_name)?;
+        write!(f, "s={}\r\n", self.session_name)?;
 
         // i= line (optional)
         if let Some(ref info) = self.session_info {
-            writeln!(f, "i={info}")?;
+            write!(f, "i={info}\r\n")?;
         }
 
         // u= line (optional)
         if let Some(ref uri) = self.uri {
-            writeln!(f, "u={uri}")?;
+            write!(f, "u={uri}\r\n")?;
         }
 
         // e= lines
         for email in &self.emails {
-            writeln!(f, "e={email}")?;
+            write!(f, "e={email}\r\n")?;
         }
 
         // p= lines
         for phone in &self.phones {
-            writeln!(f, "p={phone}")?;
+            write!(f, "p={phone}\r\n")?;
         }
 
         // c= line (optional)
         if let Some(ref conn) = self.connection {
-            writeln!(f, "{conn}")?;
+            write!(f, "{conn}\r\n")?;
         }
 
         // b= lines
         for bw in &self.bandwidth {
-            writeln!(f, "{bw}")?;
+            write!(f, "{bw}\r\n")?;
         }
 
         // t= line
-        writeln!(f, "{}", self.timing)?;
+        write!(f, "{}\r\n", self.timing)?;
 
         // z= line (optional)
         if let Some(ref tz) = self.time_zones {
-            writeln!(f, "z={tz}")?;
+            write!(f, "z={tz}\r\n")?;
         }
 
         // k= line (optional, deprecated)
         if let Some(ref key) = self.encryption_key {
-            writeln!(f, "k={key}")?;
+            write!(f, "k={key}\r\n")?;
         }
 
         // Session attributes
         for attr in &self.attributes {
-            writeln!(f, "{attr}")?;
+            write!(f, "{attr}\r\n")?;
         }
 
         // Media descriptions
@@ -1019,6 +1019,23 @@ mod tests {
         assert_eq!(session.origin.session_id, "123456");
         assert_eq!(session.media.len(), 1);
         assert_eq!(session.media[0].port, 5000);
+    }
+
+    /// RFC 8866 §5: every serialized line ends in CRLF, including the last.
+    #[test]
+    fn display_uses_crlf_line_endings() {
+        let sdp = "v=0\r\n\
+                   o=- 1 1 IN IP4 192.0.2.1\r\n\
+                   s=-\r\n\
+                   t=0 0\r\n\
+                   r=7d 1h 0 25h\r\n\
+                   m=audio 5000 RTP/AVP 0\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n";
+        let session: SessionDescription = sdp.parse().unwrap();
+        let text = session.to_string();
+        assert!(text.ends_with("\r\n"));
+        assert_eq!(text.matches('\n').count(), text.matches("\r\n").count());
+        assert!(text.contains("\r\nm=audio 5000 RTP/AVP 0\r\n"));
     }
 
     #[test]

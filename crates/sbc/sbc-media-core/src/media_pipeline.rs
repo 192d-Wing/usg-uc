@@ -446,6 +446,22 @@ pub trait MediaController: Send + Sync {
         }
         result
     }
+
+    /// Applies a relay update (as [`MediaController::update_relay`]) and then
+    /// starts the plain relay, as one operation. Any failure (kind, address
+    /// or start) is an error, so a caller can fail closed. Default: the two
+    /// calls in order; the gRPC controller sends one `UpdateRelay` RPC so a
+    /// remote node never relays against a half-applied update.
+    // NIST 800-53 Rev5: SC-24 (fail closed on partial update)
+    async fn update_and_start_relay(
+        &self,
+        call_id: &str,
+        remotes: [Option<(bool, SbcSocketAddr)>; 2],
+        kind: Option<MediaKind>,
+    ) -> Result<(), MediaPipelineError> {
+        self.update_relay(call_id, remotes, kind).await?;
+        self.start_relay(call_id).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -510,6 +526,15 @@ impl MediaController for MediaPipeline {
         kind: Option<MediaKind>,
     ) -> Result<(), MediaPipelineError> {
         Self::update_relay(self, call_id, remotes, kind).await
+    }
+
+    async fn update_and_start_relay(
+        &self,
+        call_id: &str,
+        remotes: [Option<(bool, SbcSocketAddr)>; 2],
+        kind: Option<MediaKind>,
+    ) -> Result<(), MediaPipelineError> {
+        Self::update_and_start_relay(self, call_id, remotes, kind).await
     }
 }
 
@@ -1391,6 +1416,52 @@ impl MediaPipeline {
         Ok(())
     }
 
+    /// Applies a relay update (as [`Self::update_relay`]) and starts the
+    /// plain relay. If the start fails, the prior remotes and media kind are
+    /// restored before the error is returned, so a failed `UpdateRelay`
+    /// leaves no half-applied state behind (the caller then tears the call
+    /// down).
+    ///
+    /// # Errors
+    /// [`MediaPipelineError::SessionNotFound`] for an unknown call, or the
+    /// [`Self::start_relay`] error.
+    // NIST 800-53 Rev5: SC-24 (fail closed; roll back on start failure)
+    pub async fn update_and_start_relay(
+        &self,
+        call_id: &str,
+        remotes: [Option<(bool, SbcSocketAddr)>; 2],
+        kind: Option<MediaKind>,
+    ) -> Result<(), MediaPipelineError> {
+        let prior = {
+            let sessions = self.sessions.read().await;
+            let ctx = sessions
+                .get(call_id)
+                .ok_or(MediaPipelineError::SessionNotFound)?;
+            (
+                ctx.a_leg_remote,
+                ctx.b_leg_remote,
+                ctx.media_kind.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        };
+        self.update_relay(call_id, remotes, kind).await?;
+        let Err(e) = self.start_relay(call_id).await else {
+            return Ok(());
+        };
+        let mut sessions = self.sessions.write().await;
+        if let Some(ctx) = sessions.get_mut(call_id) {
+            for (is_a_leg, prev) in [(true, prior.0), (false, prior.1)] {
+                match prev {
+                    Some(address) => Self::apply_remote(ctx, is_a_leg, address),
+                    None if is_a_leg => ctx.a_leg_remote = None,
+                    None => ctx.b_leg_remote = None,
+                }
+            }
+            ctx.media_kind
+                .store(prior.2, std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(e)
+    }
+
     fn apply_remote(session_ctx: &mut MediaSessionContext, is_a_leg: bool, address: SbcSocketAddr) {
         let (remote, target, ctl) = if is_a_leg {
             (
@@ -1435,6 +1506,18 @@ impl MediaPipeline {
         ctx.media_kind
             .store(kind.as_u8(), std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// A leg's current SDP remote (test inspection of all-or-nothing updates).
+    #[cfg(test)]
+    pub(crate) async fn leg_remote(&self, call_id: &str, is_a_leg: bool) -> Option<SbcSocketAddr> {
+        let sessions = self.sessions.read().await;
+        let ctx = sessions.get(call_id)?;
+        if is_a_leg {
+            ctx.a_leg_remote
+        } else {
+            ctx.b_leg_remote
+        }
     }
 
     /// The call's current media kind, or `None` for an unknown call.

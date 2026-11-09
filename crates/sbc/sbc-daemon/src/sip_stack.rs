@@ -8236,9 +8236,11 @@ impl SipStack {
         }
     }
 
-    /// Anchors the B-leg answer on the media relay: sets the media kind
-    /// first (direct T.38 calls), then learns the callee's remote and starts
-    /// the relay only when that succeeded. Returns `(terminated, kind_failed)`.
+    /// Anchors the B-leg answer on the media relay. A T.38 answer applies
+    /// the kind and the callee remote and starts the relay as ONE
+    /// `update_and_start_relay` call (one `UpdateRelay` RPC on a remote
+    /// node); an audio answer learns the remote and starts the relay as
+    /// before. Returns `(terminated, kind_failed)`.
     async fn anchor_answer_relay(
         &self,
         pipeline: &dyn sbc_media_core::media_pipeline::MediaController,
@@ -8247,25 +8249,34 @@ impl SipStack {
         sdp_str: &str,
         t38_answer: Option<&crate::t38::Classified>,
     ) -> (bool, Option<SwitchoverReason>) {
-        // POA&M-294 / Q2: fail closed when the media node cannot
-        // take the kind (e.g. an older remote node answering
-        // UNIMPLEMENTED). The kind is set first so a failure leaves
-        // no remote address or relay behind; the fax call is torn
-        // down by the caller as for an un-anchorable answer.
-        // NIST 800-53 Rev5: SC-24, AU-2.
-        if let Some(c) = t38_answer
-            && pipeline
-                .set_media_kind(session_key, c.kind.pipeline())
+        if let Some(c) = t38_answer {
+            // POA&M-294 / SEC-1 (#200 gate): fail closed. Any failure (kind
+            // refused, e.g. an old node answering UNIMPLEMENTED; no admitted
+            // callee remote; address or relay start failure) means no relay,
+            // and the caller tears the fax call down. UDPTL over DTLS is
+            // refused (POA&M-291), so a T.38 answer is always a plain relay.
+            // NIST 800-53 Rev5: SC-24 (fail closed), AU-2.
+            let Some(callee_addr) = extract_media_address_for(&c.sdp, c.stream.index)
+                .as_ref()
+                .and_then(admitted_media_addr)
+            else {
+                warn!(call_id = %addrs.a_leg_sip_call_id, "T.38 answer has no admitted media address");
+                return (false, Some(SwitchoverReason::RelayUpdateFailed));
+            };
+            if let Err(e) = pipeline
+                .update_and_start_relay(
+                    session_key,
+                    [Some((false, callee_addr)), None],
+                    Some(c.kind.pipeline()),
+                )
                 .await
-                .is_err()
-        {
-            return (false, Some(SwitchoverReason::RelayUpdateFailed));
+            {
+                warn!(error = %e, call_id = %addrs.a_leg_sip_call_id, "T.38 answer relay update failed");
+                return (false, Some(SwitchoverReason::RelayUpdateFailed));
+            }
+            return (false, None);
         }
-        let callee_media = t38_answer.map_or_else(
-            || extract_media_address(sdp_str),
-            |c| extract_media_address_for(&c.sdp, c.stream.index),
-        );
-        if let Some(callee_media) = callee_media
+        if let Some(callee_media) = extract_media_address(sdp_str)
             && let Some(callee_addr) = admitted_media_addr(&callee_media)
         {
             let _ = pipeline
@@ -25749,6 +25760,11 @@ pub mod tests {
         /// QA: model a media node that refuses SetMediaKind (e.g. an old
         /// remote node answering UNIMPLEMENTED).
         fail_kind: std::sync::atomic::AtomicBool,
+        /// Model a remote set that fails (the in-process pipeline's
+        /// `SessionNotFound`, e.g. the session raced away).
+        fail_remote: std::sync::atomic::AtomicBool,
+        /// Model a relay start that fails (e.g. socket bind failure).
+        fail_start: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingMedia {
@@ -25785,6 +25801,9 @@ pub mod tests {
             is_a_leg: bool,
             address: SbcSocketAddr,
         ) -> Result<(), sbc_media_core::media_pipeline::MediaPipelineError> {
+            if self.fail_remote.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(sbc_media_core::media_pipeline::MediaPipelineError::SessionNotFound);
+            }
             self.push(format!(
                 "remote {} {address}",
                 if is_a_leg { "a" } else { "b" }
@@ -25795,6 +25814,13 @@ pub mod tests {
             &self,
             _call_id: &str,
         ) -> Result<(), sbc_media_core::media_pipeline::MediaPipelineError> {
+            if self.fail_start.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(
+                    sbc_media_core::media_pipeline::MediaPipelineError::BindFailed(
+                        "test".to_string(),
+                    ),
+                );
+            }
             self.push("start".to_string());
             Ok(())
         }
@@ -26380,10 +26406,25 @@ pub mod tests {
     async fn t38_initial_image_answer(
         fail_kind: bool,
     ) -> (SipStack, Vec<ProcessResult>, Arc<RecordingMedia>) {
-        let media = Arc::new(RecordingMedia::default());
+        let media = RecordingMedia::default();
         media
             .fail_kind
             .store(fail_kind, std::sync::atomic::Ordering::Relaxed);
+        Box::pin(t38_initial_image_answer_with(media)).await
+    }
+
+    async fn t38_initial_image_answer_with(
+        media: RecordingMedia,
+    ) -> (SipStack, Vec<ProcessResult>, Arc<RecordingMedia>) {
+        let bob_image = BOB_T38.replace("m=audio 0 RTP/AVP 0\r\n", "");
+        Box::pin(t38_initial_image_answer_sdp(media, &bob_image)).await
+    }
+
+    async fn t38_initial_image_answer_sdp(
+        media: RecordingMedia,
+        bob_image: &str,
+    ) -> (SipStack, Vec<ProcessResult>, Arc<RecordingMedia>) {
+        let media = Arc::new(media);
         let mut stack = SipStack::new(SipStackConfig::default());
         stack.set_media_pipeline(Arc::clone(&media) as _);
         stack.set_t38_config(t38_enabled());
@@ -26417,11 +26458,10 @@ pub mod tests {
             .expect("image INVITE forwarded")
             .0
             .clone();
-        let bob_image = BOB_T38.replace("m=audio 0 RTP/AVP 0\r\n", "");
         let results = flatten(
             stack
                 .process_message(
-                    &response_to(&b_invite, 200, Some("bobtag"), Some(&bob_image)),
+                    &response_to(&b_invite, 200, Some("bobtag"), Some(bob_image)),
                     bob(),
                     None,
                 )
@@ -26464,6 +26504,72 @@ pub mod tests {
         assert_eq!(failed.len(), 1, "{ev:?}");
         assert_eq!(failed[0].reason, Some(SwitchoverReason::RelayUpdateFailed));
         assert_eq!(stack.t38_counters().active(), 0);
+    }
+
+    /// A1/A2: the image answer is one atomic update+start. A remote-set or
+    /// relay-start failure (not only a kind failure) tears the call down
+    /// and starts no relay.
+    /// QA (A2 / SEC-1 residual): an image answer whose callee media address
+    /// is not admitted (unspecified, loopback) never reaches the relay and
+    /// tears the call down, BYE on both legs, audit Failed.
+    #[tokio::test]
+    async fn t38_initial_image_answer_unadmitted_address_tears_down() {
+        for bad in ["0.0.0.0", "127.0.0.1"] {
+            let capture = uc_audit::capture::start();
+            let sdp = BOB_T38
+                .replace("m=audio 0 RTP/AVP 0\r\n", "")
+                .replace("c=IN IP4 10.20.30.40", &format!("c=IN IP4 {bad}"));
+            let (stack, results, media) = Box::pin(t38_initial_image_answer_sdp(
+                RecordingMedia::default(),
+                &sdp,
+            ))
+            .await;
+            let log = media.take();
+            assert!(
+                !log.iter().any(|l| l == "start"),
+                "{bad}: no relay: {log:?}"
+            );
+            let byes = bye_destinations(&results);
+            assert_eq!(byes.len(), 2, "{bad}: BYE both legs: {byes:?}");
+            assert_eq!(stack.call_count().await, 0, "{bad}");
+            let ev = switchovers(&capture.events());
+            assert!(
+                ev.iter().any(|e| e.outcome == SwitchoverOutcome::Failed
+                    && e.reason == Some(SwitchoverReason::RelayUpdateFailed)),
+                "{bad}: {ev:?}"
+            );
+            assert_eq!(stack.t38_counters().active(), 0, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn t38_initial_image_answer_update_failure_tears_down() {
+        for which in ["remote", "start"] {
+            let capture = uc_audit::capture::start();
+            let media = RecordingMedia::default();
+            let flag = if which == "remote" {
+                &media.fail_remote
+            } else {
+                &media.fail_start
+            };
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            let (stack, results, media) = Box::pin(t38_initial_image_answer_with(media)).await;
+            assert!(
+                !media.take().iter().any(|l| l == "start"),
+                "{which}: no relay started"
+            );
+            let byes = bye_destinations(&results);
+            assert_eq!(byes.len(), 2, "{which}: BYE both legs: {byes:?}");
+            assert!(byes.contains(&alice()) && byes.contains(&bob()));
+            assert_eq!(stack.call_count().await, 0, "{which}");
+            let ev = switchovers(&capture.events());
+            assert!(
+                ev.iter().any(|e| e.outcome == SwitchoverOutcome::Failed
+                    && e.reason == Some(SwitchoverReason::RelayUpdateFailed)),
+                "{which}: {ev:?}"
+            );
+            assert_eq!(stack.t38_counters().active(), 0, "{which}");
+        }
     }
 
     #[tokio::test]

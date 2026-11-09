@@ -96,12 +96,12 @@
 | **RFC 3551** | RTP/AVP Profile | Transport protocol enum. Library-only |
 | **RFC 3711** | SRTP | Transport protocol: RTP/SAVP. Library-only |
 | **RFC 3890** | TIAS Bandwidth | Bandwidth modifier. Library-only |
-| **RFC 4568** | SDP Security Descriptions (SDES) | **Full** — crypto attribute parsing, cipher suites, key params. **Library-only** — shipped media path is DTLS-SRTP only; no `a=crypto` handling in any binary |
+| **RFC 4568** | SDP Security Descriptions (SDES) | **Full** — crypto attribute parsing, cipher suites, key params. **Library-only** — shipped media path is DTLS-SRTP only; no `a=crypto` handling in any binary. `uc-siprec` `build_rs_offer` generates `a=crypto` lines for the SIPREC RS offer (library-only, no caller; unusable until the POA&M-304 TLS client to the SRS exists, RFC 4568 §8.3) |
 | **RFC 4572** | Fingerprint Attribute for DTLS | Referenced |
 | **RFC 4585** | RTP/AVPF | Transport protocol enum. Library-only |
 | **RFC 5245** | ICE Candidates in SDP | Referenced |
 | **RFC 6188** | AES-256-CM | Cipher suite enum. Library-only |
-| **RFC 7714** | AES-GCM for SRTP | Cipher suite: AEAD_AES_256_GCM. Library-only |
+| **RFC 7714** | AES-GCM for SRTP | Cipher suite: AEAD_AES_256_GCM. Library-only. `uc-siprec` RS offer uses only `AEAD_AES_256_GCM` (library-only; an AES_CM_128-only SRS would answer 488) |
 | **RFC 3362** | image/t38 MIME type | **Partial** — `MediaType::Image`, `TransportProtocol::Udptl` (`media.rs`, test `test_image_udptl`). `TCPTL` rejected (POA&M-291). **Wired (sbc-daemon T.38 switchover)** |
 | **ITU-T T.38 Annex D** | T.38 SDP attributes | **Partial** — `t38.rs` `T38Params`: total parsing (duplicates, overflow, non-ASCII rejected), absent `T38FaxUdpEC` = no EC, `clamp` only lowers. Tests `parse_full_annex_d`, `round_trip`, `rejects_bad_values`, `clamp_only_lowers`, `table_round_trip`. Answer is not checked against the offer (version downgrade, EC fallback; POA&M-294). **Wired (sbc-daemon)** |
 
@@ -110,6 +110,7 @@
 - `src/session.rs` — session description, repeat times (§5.11), bandwidth (§5.8)
 - `src/media.rs` — media description, transport protocols
 - `src/attribute.rs` — SDP attributes per RFC 8866
+- `src/session.rs`, `src/media.rs` — `Display` emits CRLF line endings (RFC 8866 §5; test `display_uses_crlf_line_endings`). Before 2026-11-08 it emitted bare LF.
 - `src/offer_answer.rs` — RFC 3264 full implementation
 - `src/multicast.rs` — RFC 3264 §6.2 multicast negotiation, RFC 2365 scoping
 - `src/srtp.rs` — RFC 4568 SDES crypto attributes
@@ -517,10 +518,10 @@
 
 ### uc-siprec (library-only, not a proto-* crate)
 
-SIPREC phase 1 is library conformance only; no shipped binary calls `uc-siprec` (POA&M-300..309).
+SIPREC phases 1 and 2 (subset) are library conformance only; no shipped binary calls `uc-siprec` (POA&M-300..308). The unwired scaffolding `forking.rs`, `session.rs` and `config.rs` was deleted (POA&M-309 closed); the recording config schema lives in `sbc-config` `[recording]`, where `enabled = true` is rejected (POA&M-302).
 
 - **RFC 7865 (Partial, library-only):** `metadata.rs` `to_rfc7865_xml` writes a complete snapshot (`datamode` complete) in namespace `urn:ietf:params:xml:ns:recording:1` with element groups in the §9 `xs:sequence` order (session, participant, stream, sessionrecordingassoc, participantsessionassoc, participantstreamassoc). IDs are base64 of 128 random bits. All caller strings are escaped and XML-illegal code points are rejected (`xml.rs`). Tests: `test_rfc7865_golden` (fixture `tests/fixtures/rfc7865_basic.xml`), `test_rfc7865_ids_are_random_base64`, `test_rfc7865_escapes_display_name_and_aor`, `tests/rfc7865_schema.rs`, `tests/hostile_metadata.rs`. Not done: no XSD validation in tests or CI; IDs are not stable across serializations, so partial updates are not possible (POA&M-305, RFC-004); `xml:lang` on `name` not emitted (MAY, RFC-005).
-- **RFC 7866 (Partial, library-only):** `src_request.rs` `build_rs_offer` builds the RS INVITE body only: multipart/mixed (RFC 2046 §5.1.1 boundary checked absent from both parts), `application/rs-metadata+xml` part with `Content-Disposition: recording-session` (§9.1), `a=label` per m-line and forced `a=sendonly` (§8.1.1); `SrcHeaders` supplies `Require: siprec` and `Contact: <uri>;+sip.src` values (§6.1.1). Tests: `builds_multipart_with_labels_and_disposition`, `forces_sendonly_direction`, `rejects_stream_count_mismatch`, `multipart_boundary_never_collides_with_hostile_content`. Not done: RS INVITE origination (POA&M-300), media forking (POA&M-301), recording indication §6.1.2 (POA&M-303), SRS-initiated requests §6.2 (POA&M-308).
+- **RFC 7866 (Partial, library-only):** `src_request.rs` `build_rs_offer` builds the RS INVITE body only: multipart/mixed (RFC 2046 §5.1.1 boundary checked absent from both parts), `application/rs-metadata+xml` part with `Content-Disposition: recording-session` (§9.1), `a=label` per m-line and forced `a=sendonly` (§8.1.1); `SrcHeaders` supplies `Require: siprec` and `Contact: <uri>;+sip.src` values (§6.1.1). Every RS m-line is forced to `RTP/SAVP` with one SDES `a=crypto:1 AEAD_AES_256_GCM inline:` line per stream from `SdesKey` (uc-crypto CSPRNG, zeroized, redacted `Debug`; RFC 4568 / RFC 7714); existing crypto lines are replaced, a key-count mismatch is an error, and `RsInviteParts.body` is zeroized with a redacting `Debug`. Tests: `builds_multipart_with_labels_and_disposition`, `forces_sendonly_direction`, `rejects_stream_count_mismatch`, `multipart_boundary_never_collides_with_hostile_content`, `offer_is_srtp_with_one_sdes_line_per_stream`, `rejects_key_count_mismatch`, `generated_keys_are_distinct_and_carried_inline`, `rs_invite_parts_debug_does_not_leak_key`, `sdes_key_debug_is_redacted_and_split`. Not done: RS INVITE origination (POA&M-300), TLS client to the SRS (POA&M-304), media forking including the `a=rtcp-mux` decision (RFC 5761, MAY; POA&M-301), recording indication §6.1.2 (POA&M-303), SRS-initiated requests §6.2 (POA&M-308).
 
 ### Complete RFC Index
 
@@ -605,7 +606,7 @@ SIPREC phase 1 is library conformance only; no shipped binary calls `uc-siprec` 
 | RFC 7675 | Consent Freshness | proto-ice | library |
 | RFC 7714 | AES-GCM for SRTP | proto-srtp, proto-sdp, proto-dtls | sbc-media-core, soft client |
 | RFC 7865 | SIPREC Metadata Model | uc-siprec | library (Partial, phase 1) |
-| RFC 7866 | SIPREC Protocol | uc-siprec | library (Partial, body builder only) |
+| RFC 7866 | SIPREC Protocol | uc-siprec | library (Partial, body builder with SDES offer only) |
 | RFC 7840 | Multiple Phone Numbers | proto-dialog | library |
 | RFC 8068 | Pending Additions | proto-dialog | library |
 | RFC 8224 | STIR Identity | proto-sip, proto-stir-shaken | sbc-daemon (off by default) |

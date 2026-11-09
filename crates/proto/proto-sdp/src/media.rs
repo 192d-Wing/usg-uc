@@ -415,31 +415,31 @@ impl fmt::Display for MediaDescription {
         for fmt in &self.formats {
             write!(f, " {fmt}")?;
         }
-        writeln!(f)?;
+        f.write_str("\r\n")?;
 
         // i= line (optional)
         if let Some(ref info) = self.info {
-            writeln!(f, "i={info}")?;
+            write!(f, "i={info}\r\n")?;
         }
 
         // c= line (if present)
         if let Some(ref conn) = self.connection {
-            writeln!(f, "{conn}")?;
+            write!(f, "{conn}\r\n")?;
         }
 
         // b= lines
         for bw in &self.bandwidth {
-            writeln!(f, "{bw}")?;
+            write!(f, "{bw}\r\n")?;
         }
 
         // k= line (optional, deprecated)
         if let Some(ref key) = self.encryption_key {
-            writeln!(f, "k={key}")?;
+            write!(f, "k={key}\r\n")?;
         }
 
         // Attributes
         for attr in &self.attributes {
-            writeln!(f, "{attr}")?;
+            write!(f, "{attr}\r\n")?;
         }
 
         Ok(())

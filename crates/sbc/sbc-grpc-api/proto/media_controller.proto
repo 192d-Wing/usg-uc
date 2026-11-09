@@ -60,10 +60,20 @@ service MediaControllerService {
     // INVALID_ARGUMENT. A media node that predates this RPC answers
     // UNIMPLEMENTED; the signaling process then fails the switch closed
     // (RelayUpdateFailed) rather than relaying UDPTL counted as RTP.
-    // Not atomic with SetRemoteAddress (unlike the in-process PERF-004
-    // update): the client sends SetMediaKind first, then the addresses.
+    // Deprecated: superseded by UpdateRelay, which the client now uses.
+    // Kept for one release so mixed-version clusters keep working.
     // NIST 800-53 Rev5: SI-4, SI-10. POA&M-294.
     rpc SetMediaKind(SetMediaKindRequest) returns (google.protobuf.Empty);
+
+    // Applies a call's relay update atomically: every field is validated
+    // before any is applied; remotes and kind move under one session lock;
+    // then, if requested, the plain relay starts. Bad field = INVALID_ARGUMENT
+    // and nothing applied; unknown call = NOT_FOUND; a start failure after a
+    // committed update = INTERNAL. A node that predates this RPC answers
+    // UNIMPLEMENTED: the client fails T.38 closed and falls back to the
+    // legacy RPCs only when kind is unset.
+    // NIST 800-53 Rev5: SC-24 (fail closed), SI-10 (validate-all-then-apply).
+    rpc UpdateRelay(UpdateRelayRequest) returns (google.protobuf.Empty);
 
     // Reverse channel: media process -> signaling. Server-streams media-plane
     // events. The signaling process opens one long-lived stream at startup.
@@ -140,6 +150,23 @@ enum MediaKind {
 message SetMediaKindRequest {
     string call_id = 1;
     MediaKind kind = 2;
+}
+
+// One leg's remote RTP endpoint inside UpdateRelayRequest.
+message LegRemote {
+    bool is_a_leg = 1;
+    // "ip:port".
+    string address = 2;
+}
+
+message UpdateRelayRequest {
+    string call_id = 1;
+    // 0..=2 entries naming distinct legs, else INVALID_ARGUMENT.
+    repeated LegRemote remotes = 2;
+    // UNSPECIFIED = kind unchanged; unknown values are INVALID_ARGUMENT.
+    MediaKind kind = 3;
+    // Start the plain (opaque forwarding) relay after the update.
+    bool start_relay = 4;
 }
 
 // Mirrors media_pipeline::LegDtlsParams.

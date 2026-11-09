@@ -263,6 +263,112 @@ pub struct SbcConfig {
     ///
     /// ## NIST 800-53 Rev5: AU-2 (Event Logging), AU-12 (Audit Record Generation)
     pub cdr: CdrConfig,
+
+    /// SIPREC call recording (RFC 7866 SRC) policy. Default off.
+    ///
+    /// ## NIST 800-53 Rev5: CM-6, CM-7, PT-5, SC-8 (POA&M-302)
+    pub recording: RecordingConfig,
+}
+
+/// What to do with the communication session when its recording session
+/// cannot be set up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingFailureAction {
+    /// Keep the call up, unrecorded (audited).
+    #[default]
+    Continue,
+    /// BYE both legs of the call (audited). The RS is attempted after the
+    /// call's 200 OK, so this cannot avoid a short unrecorded window.
+    Reject,
+}
+
+/// SIPREC recording policy (`[recording]`, RFC 7866 SRC).
+///
+/// Off by default. Restart-required on reload. The SRS is reached only over
+/// `sips:` (TLS 1.3, server certificate validated against
+/// `srs_tls_ca_file`) because the RS SDP carries SDES SRTP keys
+/// (RFC 4568 §8.3).
+///
+/// Interop (RFC 4568 §6 / RFC 7866 §11): the RS offer carries only
+/// `AEAD_AES_256_GCM` SDES (RFC 7714; CNSA 2.0, no AES-128 / HMAC-SHA1).
+/// An SRS that implements only `AES_CM_128_HMAC_SHA1_80` answers 488 and
+/// the call is handled per `on_failure` (`continue`: unrecorded; `reject`:
+/// BYE both legs). Confirm the SRS supports `AEAD_AES_256_GCM` before
+/// enabling.
+///
+/// POAM: POA&M-300/-301 - the SRC (RS INVITE origination and media fork)
+/// is not wired yet, so `enabled = true` is rejected at load even when every
+/// other field is valid. The schema and its validation ship first so the
+/// accepted key set is final.
+///
+/// ## NIST 800-53 Rev5: CM-6, CM-7 (default off), PT-5 (notice), SC-8;
+/// SC-23 prerequisite only (POA&M-304)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecordingConfig {
+    /// Record calls. Default `false`.
+    pub enabled: bool,
+    /// Operator confirms call participants are notified of recording
+    /// (PT-5). Must be `true` to enable.
+    pub notice_acknowledged: bool,
+    /// SRS URI. `sips:` only, host required, no `maddr` and no `transport`
+    /// parameter (`sips:` implies TLS; RFC 5630 §3.2 deprecates
+    /// `transport=tls`).
+    pub srs_uri: Option<String>,
+    /// PEM CA bundle that validates the SRS certificate. Required when
+    /// enabled; must exist.
+    pub srs_tls_ca_file: Option<String>,
+    /// Name verified against the SRS certificate; defaults to the URI host.
+    pub srs_tls_server_name: Option<String>,
+    /// Record every call (otherwise only `trunk_groups` / `zones` matches).
+    pub record_all: bool,
+    /// Record calls with either leg on one of these trunk groups.
+    pub trunk_groups: Vec<String>,
+    /// Record calls with either leg in one of these zones.
+    pub zones: Vec<String>,
+    /// Concurrent recording sessions cap (1..=10000). SC-5 prerequisite
+    /// (range-checked only; enforced by the fork, POA&M-301).
+    pub max_sessions: u32,
+    /// RS INVITE final-response timeout in ms (1000..=32000, RFC 3261
+    /// Timer B ceiling).
+    pub rs_invite_timeout_ms: u32,
+    /// Action when the RS cannot be set up.
+    pub on_failure: RecordingFailureAction,
+    /// What to do when either leg's SDP carries `a=recordpref:never`
+    /// (RFC 7866 §6.1.2). Default: honour it (skip recording).
+    pub recordpref_never: RecordprefPolicy,
+}
+
+/// Policy for a participant's `a=recordpref:never` (RFC 7866 §6.1.2).
+/// Participants can only suppress recording, never enable it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordprefPolicy {
+    /// Skip recording the call (audited as a participant opt-out).
+    #[default]
+    Honour,
+    /// Record anyway (operator policy overrides the preference).
+    Ignore,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            notice_acknowledged: false,
+            srs_uri: None,
+            srs_tls_ca_file: None,
+            srs_tls_server_name: None,
+            record_all: false,
+            trunk_groups: Vec::new(),
+            zones: Vec::new(),
+            max_sessions: 256,
+            rs_invite_timeout_ms: 5000,
+            on_failure: RecordingFailureAction::Continue,
+            recordpref_never: RecordprefPolicy::Honour,
+        }
+    }
 }
 
 /// CDR file format.

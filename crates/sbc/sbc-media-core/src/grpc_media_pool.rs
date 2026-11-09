@@ -280,6 +280,19 @@ impl MediaController for MediaPool {
             .await
     }
 
+    async fn update_and_start_relay(
+        &self,
+        call_id: &str,
+        remotes: [Option<(bool, SbcSocketAddr)>; 2],
+        kind: Option<crate::media_pipeline::MediaKind>,
+    ) -> Result<(), MediaPipelineError> {
+        let idx = self.node_for(call_id).await?;
+        self.nodes[idx]
+            .client
+            .update_and_start_relay(call_id, remotes, kind)
+            .await
+    }
+
     async fn start_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
         let idx = self.node_for(call_id).await?;
         self.nodes[idx].client.start_relay(call_id).await
@@ -412,6 +425,32 @@ mod tests {
         .await?;
         assert!(matches!(
             pool.set_media_kind("unknown", crate::media_pipeline::MediaKind::Image)
+                .await,
+            Err(MediaPipelineError::SessionNotFound)
+        ));
+        Ok(())
+    }
+
+    /// A1: the atomic update+start follows call affinity (a wrong node
+    /// answers NotFound). The first call lands on node 0 (127.0.0.1, the
+    /// only bindable loopback on every platform).
+    #[tokio::test]
+    async fn update_and_start_relay_follows_call_affinity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let pool = two_node_pool().await;
+        pool.create_session_with_zones("fax", Some(MediaMode::Relay), None, None)
+            .await?;
+        pool.update_and_start_relay(
+            "fax",
+            [
+                Some((true, SbcSocketAddr::new("127.0.0.1".parse()?, 5000))),
+                Some((false, SbcSocketAddr::new("127.0.0.1".parse()?, 6000))),
+            ],
+            Some(crate::media_pipeline::MediaKind::Image),
+        )
+        .await?;
+        assert!(matches!(
+            pool.update_and_start_relay("nope", [None, None], None)
                 .await,
             Err(MediaPipelineError::SessionNotFound)
         ));
