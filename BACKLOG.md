@@ -13,6 +13,12 @@ BulkVS in the Simulator).
 - [ ] **GTK3 advisories** (RUSTSEC-2024-0429 glib, RUSTSEC-2024-0370
   proc-macro-error) clear themselves when `client-gui-tauri` is retired for
   the native clients.
+- [ ] **SQLite advisory** (RUSTSEC-2026-0459, bundled C SQLite in
+  `libsqlite3-sys` 0.30.1, medium) is ignored in `.cargo/audit.toml`. sqlx
+  0.8 and 0.9.0 cap `libsqlite3-sys` below 0.38 and the fix needs 0.39, so
+  `rusqlite` cannot move to 0.41. Only `uc-user-mgmt`'s `sqlite` feature
+  compiles it (tests and standalone builds; `sbc-api-server` ships on
+  Postgres). When sqlx lifts the cap: bump `rusqlite`, remove the ignore.
 
 ## iOS on-device
 
