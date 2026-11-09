@@ -8236,6 +8236,48 @@ impl SipStack {
         }
     }
 
+    /// Anchors the B-leg answer on the media relay: sets the media kind
+    /// first (direct T.38 calls), then learns the callee's remote and starts
+    /// the relay only when that succeeded. Returns `(terminated, kind_failed)`.
+    async fn anchor_answer_relay(
+        &self,
+        pipeline: &dyn sbc_media_core::media_pipeline::MediaController,
+        session_key: &str,
+        addrs: &CallAddresses,
+        sdp_str: &str,
+        t38_answer: Option<&crate::t38::Classified>,
+    ) -> (bool, Option<SwitchoverReason>) {
+        // POA&M-294 / Q2: fail closed when the media node cannot
+        // take the kind (e.g. an older remote node answering
+        // UNIMPLEMENTED). The kind is set first so a failure leaves
+        // no remote address or relay behind; the fax call is torn
+        // down by the caller as for an un-anchorable answer.
+        // NIST 800-53 Rev5: SC-24, AU-2.
+        if let Some(c) = t38_answer
+            && pipeline
+                .set_media_kind(session_key, c.kind.pipeline())
+                .await
+                .is_err()
+        {
+            return (false, Some(SwitchoverReason::RelayUpdateFailed));
+        }
+        let callee_media = t38_answer.map_or_else(
+            || extract_media_address(sdp_str),
+            |c| extract_media_address_for(&c.sdp, c.stream.index),
+        );
+        if let Some(callee_media) = callee_media
+            && let Some(callee_addr) = admitted_media_addr(&callee_media)
+        {
+            let _ = pipeline
+                .set_remote_address(session_key, false, callee_addr)
+                .await;
+        }
+        let terminated = self
+            .start_media_relay(pipeline, session_key, addrs, sdp_str)
+            .await;
+        (terminated, None)
+    }
+
     /// Handles 200 OK from B-leg: activate call, rewrite SDP, send ACK to B-leg.
     async fn handle_success_response(
         &self,
@@ -8301,36 +8343,9 @@ impl SipStack {
                 (&self.media_pipeline, addrs.media_a_leg_port)
             {
                 let session_key = internal_id.to_string();
-                // POA&M-294 / Q2: fail closed when the media node cannot
-                // take the kind (e.g. an older remote node answering
-                // UNIMPLEMENTED). The kind is set first so a failure leaves
-                // no remote address or relay behind; the fax call is torn
-                // down below as for an un-anchorable answer.
-                // NIST 800-53 Rev5: SC-24, AU-2.
-                if let Some(c) = t38_answer
-                    && pipeline
-                        .set_media_kind(&session_key, c.kind.pipeline())
-                        .await
-                        .is_err()
-                {
-                    kind_failed = Some(SwitchoverReason::RelayUpdateFailed);
-                }
-                if kind_failed.is_none() {
-                    let callee_media = t38_answer.map_or_else(
-                        || extract_media_address(&sdp_str),
-                        |c| extract_media_address_for(&c.sdp, c.stream.index),
-                    );
-                    if let Some(callee_media) = callee_media
-                        && let Some(callee_addr) = admitted_media_addr(&callee_media)
-                    {
-                        let _ = pipeline
-                            .set_remote_address(&session_key, false, callee_addr)
-                            .await;
-                    }
-                    terminated = self
-                        .start_media_relay(&**pipeline, &session_key, addrs, &sdp_str)
-                        .await;
-                }
+                (terminated, kind_failed) = self
+                    .anchor_answer_relay(&**pipeline, &session_key, addrs, &sdp_str, t38_answer)
+                    .await;
                 a_port
             } else {
                 // No relay attached: bare port (SDP rewritten, media not relayed).
