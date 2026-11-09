@@ -672,6 +672,14 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
     for (name, help) in TLS_POLICY_METRICS {
         metrics.register_gauge(*name, *help);
     }
+    // NIST 800-53 Rev5: SI-4 - T.38 switchovers (8 bounded series), active
+    // T.38 calls and UDPTL datagrams relayed.
+    for name in crate::t38::SWITCHOVER_METRIC_NAMES.iter().flatten().chain([
+        &crate::t38::METRIC_ACTIVE_CALLS,
+        &crate::t38::METRIC_UDPTL_RELAYED,
+    ]) {
+        metrics.register_gauge(*name, crate::t38::METRIC_HELP);
+    }
 }
 
 /// Health of the CDR pipeline (component `cdr`): unhealthy when the writer
@@ -804,6 +812,11 @@ impl AppState {
                 }
             }
             for (name, v) in stack.signaling_audit().metric_values() {
+                if let Some(g) = self.metrics.gauge(name) {
+                    g.set(as_gauge(v));
+                }
+            }
+            for (name, v) in stack.t38_counters().metric_values() {
                 if let Some(g) = self.metrics.gauge(name) {
                     g.set(as_gauge(v));
                 }

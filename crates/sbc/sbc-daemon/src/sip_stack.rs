@@ -25,6 +25,7 @@ use crate::signaling_audit::InDialogPolicy;
 use bytes::Bytes;
 use proto_b2bua::{
     B2buaMode, Call, CallConfig, CallId, MediaAddress, SdpRewriter, extract_media_address,
+    extract_media_address_for,
 };
 use proto_dialog::{Dialog, DialogId};
 #[cfg(feature = "cluster")]
@@ -59,6 +60,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+use uc_audit::event::{SwitchoverOutcome, SwitchoverReason};
 use uc_routing::{
     Admission, CallRouteContext, DestinationType, DialPattern, DialPlan, DialPlanEntry, Direction,
     NumberTransform, Router, RouterConfig, RoutingError, SbcRouteOutcome, SelectionStrategy, Trunk,
@@ -202,6 +204,13 @@ pub struct SipStack {
     ///
     /// ## NIST 800-53 Rev5: AC-21, SC-4, CM-6 (secure default)
     trusted_trunk_groups: RwLock<HashSet<String>>,
+    /// `[media.t38]` fax relay policy. Default: disabled (fail-closed).
+    /// Applied at startup; a reload reports it as restart-required.
+    ///
+    /// ## NIST 800-53 Rev5: CM-6, CM-7, SC-5, SC-8
+    t38: sbc_config::T38Config,
+    /// T.38 switchover counters and active-call gauge (SI-4).
+    t38_counters: crate::t38::T38Counters,
 }
 
 /// The daemon digest verifier and the decoy secret used for unknown users.
@@ -1070,6 +1079,17 @@ struct CallAddresses {
     ///
     /// ## NIST 800-53 Rev5: AU-3, AU-12
     cdr: crate::cdr::CdrDraft,
+    /// What the relay's anchored stream carries (audio or T.38 image).
+    /// Changed only when the far side accepts a switchover (2xx).
+    media_kind: crate::t38::CallMediaKind,
+    /// m-line index of the anchored stream in the current SDP.
+    anchored_index: usize,
+    /// The relay terminates DTLS-SRTP on both legs; UDPTL is refused
+    /// (POA&M-291).
+    media_terminated: crate::t38::RelaySecurity,
+    /// Kind of the initial INVITE's anchored stream; `Image` for a direct
+    /// fax call, checked against the callee's 2xx.
+    initial_offer_kind: crate::t38::CallMediaKind,
 }
 
 /// Which legs of a call get topology-hidden egress.
@@ -2588,6 +2608,40 @@ struct PendingReinvite {
     /// The originator's offered DTLS `a=setup`; picks the SBC's answering
     /// role when terminating DTLS-SRTP.
     offer_setup: Option<crate::sdp_dtls::SetupRole>,
+    /// The offer's anchored stream when T.38 is involved (`None`: legacy
+    /// audio handling).
+    switch: Option<PendingSwitch>,
+}
+
+/// A re-INVITE whose offer involves an `m=image` stream or leaves image
+/// mode. RFC 3261 §14.1: the relay changes only when the far side accepts.
+#[derive(Clone)]
+struct PendingSwitch {
+    /// Kind before the offer.
+    prev_kind: crate::t38::CallMediaKind,
+    /// Kind of the offered anchored stream.
+    offered_kind: crate::t38::CallMediaKind,
+    /// m-line index of the offered anchored stream.
+    offered_index: usize,
+    /// The offerer's media address for that stream, applied at the 2xx when
+    /// the kind changes (deferred so audio is not cut before the far side
+    /// accepts).
+    offerer_addr: Option<SbcSocketAddr>,
+}
+
+/// What a T.38-involved re-INVITE 2xx did (see `apply_t38_answer`).
+#[derive(Default)]
+struct T38AnswerOutcome {
+    /// Anchored m-line index of the accepted answer.
+    anchored_index: Option<usize>,
+    /// The kind changed: new kind and the clamped `T38MaxBitRate`.
+    switched: Option<(crate::t38::CallMediaKind, Option<u32>)>,
+    /// The far side declined the offered stream.
+    declined: bool,
+    /// The answer could not be anchored; the call is torn down.
+    failed: Option<SwitchoverReason>,
+    /// The answering leg's validated new remote media address (AU-3).
+    remote_media: Option<std::net::SocketAddr>,
 }
 
 /// An in-dialog PRACK/INFO/MESSAGE/NOTIFY received on one leg and relayed
@@ -2789,6 +2843,8 @@ impl SipStack {
             digest,
             signaling_audit,
             trusted_trunk_groups: RwLock::new(HashSet::new()),
+            t38: sbc_config::T38Config::default(),
+            t38_counters: crate::t38::T38Counters::default(),
         }
     }
 
@@ -2868,6 +2924,8 @@ impl SipStack {
             digest,
             signaling_audit,
             trusted_trunk_groups: RwLock::new(HashSet::new()),
+            t38: sbc_config::T38Config::default(),
+            t38_counters: crate::t38::T38Counters::default(),
         }
     }
 
@@ -2911,6 +2969,18 @@ impl SipStack {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         ports.remove(&port);
+    }
+
+    /// Sets the `[media.t38]` fax relay policy.
+    ///
+    /// ## NIST 800-53 Rev5: CM-6
+    pub fn set_t38_config(&mut self, t38: sbc_config::T38Config) {
+        self.t38 = t38;
+    }
+
+    /// T.38 switchover counters (metrics endpoint).
+    pub const fn t38_counters(&self) -> &crate::t38::T38Counters {
+        &self.t38_counters
     }
 
     /// Sets the media controller (RTP/SRTP relay). Takes `dyn MediaController`
@@ -3002,14 +3072,15 @@ impl SipStack {
     /// Starts the media relay for a call at 200-OK time: DTLS-SRTP termination
     /// when [`Self::terminate_params`] applies, else the opaque forwarding relay
     /// (plain RTP or SRTP pass-through). Errors are logged, not propagated —
-    /// media failure must not fail call setup.
+    /// media failure must not fail call setup. Returns true when the relay
+    /// terminates DTLS-SRTP (UDPTL is then refused on this call).
     async fn start_media_relay(
         &self,
         pipeline: &dyn sbc_media_core::media_pipeline::MediaController,
         session_key: &str,
         addrs: &CallAddresses,
         answer_sdp: &str,
-    ) {
+    ) -> bool {
         let params = Self::terminate_params(
             self.dtls_fingerprint_source.is_some(),
             addrs.dtls_caller_fingerprint.as_ref(),
@@ -3023,7 +3094,7 @@ impl SipStack {
             {
                 warn!(error = %e, call_id = %addrs.a_leg_sip_call_id, "start_relay_terminate failed");
             }
-            return;
+            return true;
         }
         if self.dtls_fingerprint_source.is_some() {
             // Terminate configured but a leg offered no fingerprint; SRTP↔RTP
@@ -3036,6 +3107,7 @@ impl SipStack {
         if let Err(e) = pipeline.start_relay(session_key).await {
             warn!(error = %e, call_id = %addrs.a_leg_sip_call_id, "start_relay failed");
         }
+        false
     }
 
     /// Builds a BYE for one leg of a confirmed dialog from stored dialog state.
@@ -4495,23 +4567,85 @@ impl SipStack {
         //    then re-anchor the offer at the SBC's address facing the far leg.
         let sdp_str = String::from_utf8_lossy(body);
         let session_key = internal_id.to_string();
-        if let Some(ref pipeline) = self.media_pipeline
-            && let Some(media) = extract_media_address(&sdp_str)
-            && let Some(addr) = admitted_media_addr(&media)
+        // T.38 (RFC 3362 / T.38 Annex D): classify the offer. `None` keeps
+        // the legacy audio handling; an image stream the relay cannot carry
+        // is refused here with 488 and never forwarded (RFC 3261 §14.2).
+        let t38 = match crate::t38::classify_offer(
+            &sdp_str,
+            addrs.media_kind,
+            &self.t38,
+            addrs.media_terminated == crate::t38::RelaySecurity::DtlsTerminated,
+            false,
+        ) {
+            Ok(c) => c,
+            Err(reason) => {
+                info!(method = %method, call_id = %sip_call_id, ?reason, "T.38 offer refused, 488");
+                self.t38_counters.record(
+                    crate::t38::CallMediaKind::Image,
+                    SwitchoverOutcome::RejectedLocal,
+                );
+                audit(crate::t38::audit_event(
+                    &session_key,
+                    addrs.media_kind,
+                    crate::t38::CallMediaKind::Image,
+                    from_a_leg,
+                    SwitchoverOutcome::RejectedLocal,
+                    Some(reason),
+                    None,
+                ));
+                let mut r = create_response_from_request(req, StatusCode::NOT_ACCEPTABLE_HERE);
+                // RFC 3261 §20.43: 304/305/399 by refusal reason.
+                r.headers.set(
+                    HeaderName::Warning,
+                    crate::t38::warning_for(reason, addrs.leg_sent_by(!from_a_leg)),
+                );
+                return ProcessResult::Response {
+                    message: SipMessage::Response(r),
+                    destination: source,
+                    flow: Flow::Reply,
+                };
+            }
+        };
+        let offer_addr = t38
+            .as_ref()
+            .map_or_else(
+                || extract_media_address(&sdp_str),
+                |c| extract_media_address_for(&c.sdp, c.stream.index),
+            )
+            .and_then(|m| admitted_media_addr(&m));
+        let kind_change = t38.as_ref().is_some_and(|c| c.kind != addrs.media_kind);
+        // RFC 3261 §14.1: a kind change (audio <-> T.38) moves the relay only
+        // when the far side accepts; a plain address change follows the
+        // offerer at once, as before.
+        if !kind_change
+            && let Some(ref pipeline) = self.media_pipeline
+            && let Some(addr) = offer_addr
         {
             let _ = pipeline
                 .set_remote_address(&session_key, from_a_leg, addr)
                 .await;
         }
+        let switch = t38.as_ref().map(|c| PendingSwitch {
+            prev_kind: addrs.media_kind,
+            offered_kind: c.kind,
+            offered_index: c.stream.index,
+            offerer_addr: offer_addr,
+        });
         let local_media = if from_a_leg {
             MediaAddress::new(&addrs.media_b_leg_ip, addrs.media_b_leg_port)
         } else {
             MediaAddress::new(&addrs.media_a_leg_ip, a_leg_media_port(&addrs))
         };
-        let mut offer = self
-            .sdp_rewriter
-            .rewrite_reinvite(&sdp_str, &local_media)
-            .rewritten;
+        // RFC 3264 §8: one anchored m-line; other active streams are
+        // declined in place (port 0) when an image stream is involved.
+        let mut offer = t38.as_ref().map_or_else(
+            || {
+                self.sdp_rewriter
+                    .rewrite_reinvite(&sdp_str, &local_media)
+                    .rewritten
+            },
+            |c| SdpRewriter::rewrite_with_selection(&c.sdp, &local_media, &c.stream),
+        );
         if let Some(fp) = &self.dtls_fingerprint_source {
             offer = crate::sdp_dtls::rewrite_local_dtls(
                 &offer,
@@ -4582,6 +4716,7 @@ impl SipStack {
                     fwd_branch,
                     fwd_cseq,
                     offer_setup,
+                    switch,
                 });
             }
         }
@@ -5055,6 +5190,25 @@ impl SipStack {
         }
 
         if code >= 300 {
+            // RFC 3261 §14.1: the session (and the relay) stays as it was;
+            // for T.38 this is the standard fallback to audio.
+            if let Some(sw) = pending
+                .switch
+                .as_ref()
+                .filter(|sw| sw.offered_kind != sw.prev_kind)
+            {
+                self.t38_counters
+                    .record(sw.offered_kind, SwitchoverOutcome::RejectedRemote);
+                audit(crate::t38::audit_event(
+                    &internal_id.to_string(),
+                    sw.prev_kind,
+                    sw.offered_kind,
+                    pending.from_a_leg,
+                    SwitchoverOutcome::RejectedRemote,
+                    Some(SwitchoverReason::Remote488),
+                    None,
+                ));
+            }
             if code == 408 || code == 481 {
                 warn!(
                     call_id = %addrs.a_leg_sip_call_id,
@@ -5091,26 +5245,38 @@ impl SipStack {
             leg_contact(addrs.leg_sent_by(!pending.from_a_leg), &orig_flow),
         );
         let mut answer_sdp = None;
+        let session_key = internal_id.to_string();
+        let mut t38 = T38AnswerOutcome::default();
         if let Some(body) = resp.body.as_ref().filter(|b| !b.is_empty()) {
             let sdp_str = String::from_utf8_lossy(body);
-            let session_key = internal_id.to_string();
-            if let Some(ref pipeline) = self.media_pipeline
-                && let Some(media) = extract_media_address(&sdp_str)
-                && let Some(addr) = admitted_media_addr(&media)
-            {
-                let _ = pipeline
-                    .set_remote_address(&session_key, !pending.from_a_leg, addr)
-                    .await;
-            }
             let local_media = if pending.from_a_leg {
                 MediaAddress::new(&addrs.media_a_leg_ip, a_leg_media_port(addrs))
             } else {
                 MediaAddress::new(&addrs.media_b_leg_ip, addrs.media_b_leg_port)
             };
-            let mut answer = self
-                .sdp_rewriter
-                .rewrite_answer_for_a_leg(&sdp_str, &local_media)
-                .rewritten;
+            let mut answer = if let Some(sw) = &pending.switch {
+                self.apply_t38_answer(
+                    &sdp_str,
+                    sw,
+                    pending.from_a_leg,
+                    &session_key,
+                    &local_media,
+                    &mut t38,
+                )
+                .await
+            } else {
+                if let Some(ref pipeline) = self.media_pipeline
+                    && let Some(media) = extract_media_address(&sdp_str)
+                    && let Some(addr) = admitted_media_addr(&media)
+                {
+                    let _ = pipeline
+                        .set_remote_address(&session_key, !pending.from_a_leg, addr)
+                        .await;
+                }
+                self.sdp_rewriter
+                    .rewrite_answer_for_a_leg(&sdp_str, &local_media)
+                    .rewritten
+            };
             if let Some(fp) = &self.dtls_fingerprint_source {
                 let role = pending.offer_setup.map_or(
                     crate::sdp_dtls::SetupRole::Passive,
@@ -5184,8 +5350,16 @@ impl SipStack {
                 if ack_record.is_some() {
                     a.last_reinvite_ack = ack_record;
                 }
+                if let Some(index) = t38.anchored_index {
+                    a.anchored_index = index;
+                }
+                if let Some((kind, _)) = t38.switched {
+                    a.media_kind = kind;
+                }
             }
         }
+        self.finish_t38_answer(&session_key, pending, &t38, &mut results)
+            .await;
 
         info!(
             call_id = %addrs.a_leg_sip_call_id,
@@ -5194,6 +5368,122 @@ impl SipStack {
             "Session change completed across both legs"
         );
         ProcessResult::Multiple(results)
+    }
+
+    /// Applies the far side's 2xx answer to a T.38-involved re-INVITE:
+    /// validates and clamps it, and moves the relay (both legs, media kind)
+    /// only when the offered stream was accepted (RFC 3261 §14.1). Returns
+    /// the answer re-anchored toward the originator.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7, SI-10, SC-5
+    async fn apply_t38_answer(
+        &self,
+        sdp: &str,
+        sw: &PendingSwitch,
+        from_a_leg: bool,
+        session_key: &str,
+        local_media: &MediaAddress,
+        out: &mut T38AnswerOutcome,
+    ) -> String {
+        let kind_change = sw.offered_kind != sw.prev_kind;
+        match crate::t38::check_answer(sdp, sw.offered_index, sw.offered_kind, &self.t38) {
+            crate::t38::AnswerCheck::Accepted(c) => {
+                let answerer = extract_media_address_for(&c.sdp, c.stream.index)
+                    .and_then(|m| admitted_media_addr(&m));
+                out.remote_media = answerer.map(Into::into);
+                if let Some(ref pipeline) = self.media_pipeline {
+                    // PERF-004: both remotes and the kind move under one
+                    // pipeline lock, so neither relay leg re-latches against
+                    // a half-applied update.
+                    let offerer = sw.offerer_addr.filter(|_| kind_change);
+                    let ok = pipeline
+                        .update_relay(
+                            session_key,
+                            [
+                                answerer.map(|a| (!from_a_leg, a)),
+                                offerer.map(|a| (from_a_leg, a)),
+                            ],
+                            kind_change.then(|| c.kind.pipeline()),
+                        )
+                        .await
+                        .is_ok();
+                    if kind_change && !ok {
+                        out.failed = Some(SwitchoverReason::RelayUpdateFailed);
+                    }
+                }
+                out.anchored_index = Some(c.stream.index);
+                if kind_change && out.failed.is_none() {
+                    out.switched = Some((c.kind, c.max_bit_rate));
+                }
+                SdpRewriter::rewrite_with_selection(&c.sdp, local_media, &c.stream)
+            }
+            crate::t38::AnswerCheck::Declined => {
+                if kind_change {
+                    out.declined = true;
+                }
+                self.sdp_rewriter
+                    .rewrite_answer_for_a_leg(sdp, local_media)
+                    .rewritten
+            }
+            crate::t38::AnswerCheck::Failed(reason) => {
+                out.failed = Some(reason);
+                self.sdp_rewriter
+                    .rewrite_answer_for_a_leg(sdp, local_media)
+                    .rewritten
+            }
+        }
+    }
+
+    /// Counts, audits and (on failure) tears down after a T.38-involved
+    /// re-INVITE 2xx. A malformed or un-anchorable T.38 answer BYEs both
+    /// legs: the dialog is committed and an unvalidated image stream must
+    /// not be anchored.
+    ///
+    /// ## NIST 800-53 Rev5: AU-2, AU-3, AU-12, SI-4
+    async fn finish_t38_answer(
+        &self,
+        session_key: &str,
+        pending: &PendingReinvite,
+        t38: &T38AnswerOutcome,
+        results: &mut Vec<ProcessResult>,
+    ) {
+        let Some(sw) = &pending.switch else {
+            return;
+        };
+        let event = |outcome, reason, rate, remote| {
+            audit(crate::t38::with_remote_media(
+                crate::t38::audit_event(
+                    session_key,
+                    sw.prev_kind,
+                    sw.offered_kind,
+                    pending.from_a_leg,
+                    outcome,
+                    reason,
+                    rate,
+                ),
+                remote,
+            ));
+            self.t38_counters.record(sw.offered_kind, outcome);
+        };
+        if let Some(reason) = t38.failed {
+            warn!(call_id = %session_key, ?reason, "T.38 answer cannot be anchored; tearing down call");
+            event(SwitchoverOutcome::Failed, Some(reason), None, None);
+            results.extend(self.terminate_call_on_media_failure(session_key).await);
+        } else if let Some((kind, rate)) = t38.switched {
+            match kind {
+                crate::t38::CallMediaKind::Image => self.t38_counters.image_started(),
+                crate::t38::CallMediaKind::Audio => self.t38_counters.image_ended(),
+            }
+            event(SwitchoverOutcome::Accepted, None, rate, t38.remote_media);
+            info!(call_id = %session_key, ?kind, "Media switchover accepted");
+        } else if t38.declined {
+            event(
+                SwitchoverOutcome::RejectedRemote,
+                Some(SwitchoverReason::RemotePort0),
+                None,
+                None,
+            );
+        }
     }
 
     /// Builds the response toward the originator of a relayed re-INVITE/UPDATE,
@@ -5315,6 +5605,10 @@ impl SipStack {
         }
         for port in &removed.rtp_ports {
             self.release_rtp_port(*port);
+        }
+        // Exactly once per call: only the remover of the record gets here.
+        if removed.media_kind == crate::t38::CallMediaKind::Image {
+            self.t38_counters.image_ended();
         }
         let outcome = match (removed.established_at, removed.trunk_lease.as_ref()) {
             (Some(at), Some(lease)) => TrunkOutcome::Completed {
@@ -7900,20 +8194,49 @@ impl SipStack {
         // learn the callee's remote from the answer and start forwarding RTP in
         // both directions. The advertised A-leg port is the relay's
         // caller-facing port allocated at INVITE time.
+        let mut terminated = false;
+        // Direct T.38 call (image-only initial offer): the callee's answer is
+        // validated and clamped like a re-INVITE answer.
+        let initial_t38 = resp
+            .body
+            .as_ref()
+            .filter(|_| addrs.initial_offer_kind == crate::t38::CallMediaKind::Image)
+            .map(|body| {
+                crate::t38::check_answer(
+                    &String::from_utf8_lossy(body),
+                    addrs.anchored_index,
+                    crate::t38::CallMediaKind::Image,
+                    &self.t38,
+                )
+            });
+        let t38_answer = match &initial_t38 {
+            Some(crate::t38::AnswerCheck::Accepted(c)) => Some(c),
+            _ => None,
+        };
         if let Some(ref body) = resp.body {
             let sdp_str = String::from_utf8_lossy(body);
             let rtp_port = if let (Some(pipeline), Some(a_port)) =
                 (&self.media_pipeline, addrs.media_a_leg_port)
             {
                 let session_key = internal_id.to_string();
-                if let Some(callee_media) = extract_media_address(&sdp_str)
+                let callee_media = t38_answer.map_or_else(
+                    || extract_media_address(&sdp_str),
+                    |c| extract_media_address_for(&c.sdp, c.stream.index),
+                );
+                if let Some(callee_media) = callee_media
                     && let Some(callee_addr) = admitted_media_addr(&callee_media)
                 {
                     let _ = pipeline
                         .set_remote_address(&session_key, false, callee_addr)
                         .await;
                 }
-                self.start_media_relay(&**pipeline, &session_key, addrs, &sdp_str)
+                if let Some(c) = t38_answer {
+                    let _ = pipeline
+                        .set_media_kind(&session_key, c.kind.pipeline())
+                        .await;
+                }
+                terminated = self
+                    .start_media_relay(&**pipeline, &session_key, addrs, &sdp_str)
                     .await;
                 a_port
             } else {
@@ -7926,12 +8249,15 @@ impl SipStack {
                 p
             };
             let local_media = MediaAddress::new(&addrs.media_a_leg_ip, rtp_port);
-            let result = self
-                .sdp_rewriter
-                .rewrite_answer_for_a_leg(&sdp_str, &local_media);
-            a_response.body = Some(Bytes::from(
-                self.rewrite_answer_dtls(result.rewritten, addrs),
-            ));
+            let rewritten = t38_answer.map_or_else(
+                || {
+                    self.sdp_rewriter
+                        .rewrite_answer_for_a_leg(&sdp_str, &local_media)
+                        .rewritten
+                },
+                |c| SdpRewriter::rewrite_with_selection(&c.sdp, &local_media, &c.stream),
+            );
+            a_response.body = Some(Bytes::from(self.rewrite_answer_dtls(rewritten, addrs)));
             a_response
                 .headers
                 .set(HeaderName::ContentType, "application/sdp");
@@ -7951,8 +8277,21 @@ impl SipStack {
                 a.a_leg_last_sdp.clone_from(&a_response.body);
                 a.established_at = Some(Instant::now());
                 a.cdr.record_answer(resp.body.as_deref());
+                a.media_terminated = if terminated {
+                    crate::t38::RelaySecurity::DtlsTerminated
+                } else {
+                    crate::t38::RelaySecurity::Opaque
+                };
+                if t38_answer.is_some() {
+                    a.media_kind = crate::t38::CallMediaKind::Image;
+                    self.t38_counters.image_started();
+                }
             }
         }
+        let t38_failed = match initial_t38 {
+            Some(crate::t38::AnswerCheck::Failed(reason)) => Some(reason),
+            _ => None,
+        };
         audit(uc_audit::AuditEvent::CallEstablished(
             uc_audit::event::CallEstablished {
                 call_id: uc_types::identifier::CallId::new(addrs.a_leg_sip_call_id.clone()),
@@ -8009,7 +8348,7 @@ impl SipStack {
         )
         .await;
 
-        ProcessResult::Multiple(vec![
+        let mut results = vec![
             ProcessResult::Response {
                 message: a_message,
                 destination: addrs.a_leg_source,
@@ -8020,7 +8359,28 @@ impl SipStack {
                 destination: addrs.b_leg_destination,
                 flow: addrs.b_leg_flow.clone().into(),
             },
-        ])
+        ];
+        // A malformed T.38 answer on a direct fax call: the dialog is
+        // committed, so BYE both legs (an unvalidated image stream is never
+        // anchored). NIST 800-53 Rev5: SI-10, AU-2.
+        if let Some(reason) = t38_failed {
+            let key = internal_id.to_string();
+            warn!(call_id = %addrs.a_leg_sip_call_id, ?reason, "T.38 answer cannot be anchored; tearing down call");
+            self.t38_counters
+                .record(crate::t38::CallMediaKind::Image, SwitchoverOutcome::Failed);
+            audit(crate::t38::audit_event(
+                &key,
+                crate::t38::CallMediaKind::Image,
+                crate::t38::CallMediaKind::Image,
+                // The caller (A-leg) made the offer.
+                true,
+                SwitchoverOutcome::Failed,
+                Some(reason),
+                None,
+            ));
+            results.extend(self.terminate_call_on_media_failure(&key).await);
+        }
+        ProcessResult::Multiple(results)
     }
 
     /// Handles 4xx/5xx/6xx error response from B-leg.
@@ -8713,6 +9073,45 @@ impl SipStack {
             };
         }
 
+        // T.38 (RFC 3362): an initial offer whose anchored stream is an
+        // image the relay cannot carry is refused before any per-call state
+        // exists. Audio is preferred; an extra image m-line is declined in
+        // place (RFC 3264 §8) by the B-leg rewrite.
+        //
+        // ## NIST 800-53 Rev5: CM-7, SI-10, AU-2
+        let t38_offer = match req.body.as_ref().filter(|b| !b.is_empty()) {
+            Some(body) => match crate::t38::classify_offer(
+                &String::from_utf8_lossy(body),
+                crate::t38::CallMediaKind::Audio,
+                &self.t38,
+                false,
+                true,
+            ) {
+                Ok(c) => c,
+                Err(reason) => {
+                    info!(call_id = %a_leg_call_id, ?reason, "T.38 INVITE refused, 488");
+                    self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                    self.t38_counters.record(
+                        crate::t38::CallMediaKind::Image,
+                        SwitchoverOutcome::RejectedLocal,
+                    );
+                    audit_invite_denied(req, source, crate::t38::reason_policy(reason));
+                    reject_cdr(488, uc_cdr::ReleaseCause::PolicyDenied);
+                    let mut r = create_response_from_request(req, StatusCode::NOT_ACCEPTABLE_HERE);
+                    let host = self.config.domain.clone();
+                    // RFC 3261 §20.43: 304/305/399 by refusal reason.
+                    r.headers
+                        .set(HeaderName::Warning, crate::t38::warning_for(reason, &host));
+                    return ProcessResult::Response {
+                        message: SipMessage::Response(r),
+                        destination: source,
+                        flow: Flow::Reply,
+                    };
+                }
+            },
+            None => None,
+        };
+
         // `cdr.on_failure = "reject_new_calls"`: while the CDR pipeline is
         // unhealthy, new calls that could not be accounted for are refused.
         // Emergency calls are never refused for an accounting failure.
@@ -9307,9 +9706,15 @@ impl SipStack {
                         a_media_ip_str = node_ip.to_string();
                         b_media_ip_str.clone_from(&a_media_ip_str);
                     }
-                    if let Some(ref body) = req.body
-                        && let Some(caller_media) =
-                            extract_media_address(&String::from_utf8_lossy(body))
+                    let caller_media = t38_offer.as_ref().map_or_else(
+                        || {
+                            req.body.as_ref().and_then(|body| {
+                                extract_media_address(&String::from_utf8_lossy(body))
+                            })
+                        },
+                        |c| extract_media_address_for(&c.sdp, c.stream.index),
+                    );
+                    if let Some(caller_media) = caller_media
                         && let Some(caller_addr) = admitted_media_addr(&caller_media)
                     {
                         let _ = pipeline
@@ -9341,10 +9746,14 @@ impl SipStack {
         let b_leg_sdp = req.body.as_ref().map(|body| {
             let sdp_str = String::from_utf8_lossy(body);
             let local_media = MediaAddress::new(&b_media_ip_str, b_leg_rtp_port);
-            let mut rewritten = self
-                .sdp_rewriter
-                .rewrite_offer_for_b_leg(&sdp_str, &local_media)
-                .rewritten;
+            let mut rewritten = t38_offer.as_ref().map_or_else(
+                || {
+                    self.sdp_rewriter
+                        .rewrite_offer_for_b_leg(&sdp_str, &local_media)
+                        .rewritten
+                },
+                |c| SdpRewriter::rewrite_with_selection(&c.sdp, &local_media, &c.stream),
+            );
             if let Some(source) = &self.dtls_fingerprint_source {
                 rewritten = crate::sdp_dtls::rewrite_local_dtls(
                     &rewritten,
@@ -9830,6 +10239,13 @@ impl SipStack {
                     last_reinvite_ack: None,
                     established_at: None,
                     cdr: cdr_draft,
+                    // Image mode starts only when the callee's 2xx accepts it.
+                    media_kind: crate::t38::CallMediaKind::Audio,
+                    anchored_index: t38_offer.as_ref().map_or(0, |c| c.stream.index),
+                    media_terminated: crate::t38::RelaySecurity::Opaque,
+                    initial_offer_kind: t38_offer
+                        .as_ref()
+                        .map_or(crate::t38::CallMediaKind::Audio, |c| c.kind),
                 },
             );
         }
@@ -13463,6 +13879,10 @@ pub mod tests {
             last_reinvite_ack: None,
             established_at: None,
             cdr: crate::cdr::CdrDraft::default(),
+            media_kind: crate::t38::CallMediaKind::Audio,
+            anchored_index: 0,
+            media_terminated: crate::t38::RelaySecurity::Opaque,
+            initial_offer_kind: crate::t38::CallMediaKind::Audio,
         }
     }
 
@@ -25131,5 +25551,774 @@ pub mod tests {
             branch_loop_hash("z9hG4bK0123456789abcdef.+000000000000007"),
             None
         );
+    }
+    // ------------------------------------------------------------------
+    // T.38 fax switchover (RFC 3362, T.38 Annex D; POA&M-290..294)
+    // ------------------------------------------------------------------
+
+    /// Records the media-controller calls the SIP stack makes.
+    #[derive(Default)]
+    struct RecordingMedia {
+        log: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingMedia {
+        fn push(&self, s: String) {
+            self.log.lock().unwrap().push(s);
+        }
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.log.lock().unwrap())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl sbc_media_core::media_pipeline::MediaController for RecordingMedia {
+        async fn create_session_with_zones(
+            &self,
+            _call_id: &str,
+            _mode: Option<uc_media_engine::MediaMode>,
+            _a: Option<std::net::IpAddr>,
+            _b: Option<std::net::IpAddr>,
+        ) -> Result<
+            sbc_media_core::media_pipeline::AllocatedPorts,
+            sbc_media_core::media_pipeline::MediaPipelineError,
+        > {
+            Ok(sbc_media_core::media_pipeline::AllocatedPorts {
+                a_leg_rtp_port: 20_000,
+                b_leg_rtp_port: 20_002,
+                media_ip: None,
+                dtls_fingerprint: None,
+            })
+        }
+        async fn set_remote_address(
+            &self,
+            _call_id: &str,
+            is_a_leg: bool,
+            address: SbcSocketAddr,
+        ) -> Result<(), sbc_media_core::media_pipeline::MediaPipelineError> {
+            self.push(format!(
+                "remote {} {address}",
+                if is_a_leg { "a" } else { "b" }
+            ));
+            Ok(())
+        }
+        async fn start_relay(
+            &self,
+            _call_id: &str,
+        ) -> Result<(), sbc_media_core::media_pipeline::MediaPipelineError> {
+            self.push("start".to_string());
+            Ok(())
+        }
+        async fn start_relay_terminate(
+            &self,
+            _call_id: &str,
+            _a: sbc_media_core::media_pipeline::LegDtlsParams,
+            _b: sbc_media_core::media_pipeline::LegDtlsParams,
+        ) -> Result<(), sbc_media_core::media_pipeline::MediaPipelineError> {
+            Ok(())
+        }
+        async fn stop_relay(
+            &self,
+            _call_id: &str,
+        ) -> Result<(), sbc_media_core::media_pipeline::MediaPipelineError> {
+            Ok(())
+        }
+        async fn remove_session(
+            &self,
+            _call_id: &str,
+        ) -> Result<(), sbc_media_core::media_pipeline::MediaPipelineError> {
+            Ok(())
+        }
+        async fn allocate_ports(
+            &self,
+        ) -> Result<(u16, u16), sbc_media_core::media_pipeline::MediaPipelineError> {
+            Ok((30_000, 30_001))
+        }
+        async fn set_media_kind(
+            &self,
+            _call_id: &str,
+            kind: sbc_media_core::media_pipeline::MediaKind,
+        ) -> Result<(), sbc_media_core::media_pipeline::MediaPipelineError> {
+            self.push(format!("kind {kind:?}"));
+            Ok(())
+        }
+    }
+
+    const ALICE_T38: &str = "v=0\r\no=- 1 2 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\n\
+        m=audio 0 RTP/AVP 0\r\nm=image 4100 udptl t38\r\na=T38FaxVersion:0\r\n\
+        a=T38MaxBitRate:33600\r\na=T38FaxMaxDatagram:9000\r\na=T38FaxUdpEC:t38UDPRedundancy\r\n";
+    const BOB_T38: &str = "v=0\r\no=- 2 3 IN IP4 10.20.30.40\r\ns=-\r\nc=IN IP4 10.20.30.40\r\nt=0 0\r\n\
+        m=audio 0 RTP/AVP 0\r\nm=image 5100 udptl t38\r\na=T38FaxVersion:0\r\n\
+        a=T38MaxBitRate:14400\r\na=T38FaxUdpEC:t38UDPRedundancy\r\n";
+    const BOB_AUDIO: &str = "v=0\r\no=- 2 4 IN IP4 10.20.30.40\r\ns=-\r\nc=IN IP4 10.20.30.40\r\nt=0 0\r\n\
+        m=audio 5000 RTP/AVP 0\r\na=sendrecv\r\n";
+
+    fn t38_enabled() -> sbc_config::T38Config {
+        sbc_config::T38Config {
+            enabled: true,
+            allow_cleartext: true,
+            ..sbc_config::T38Config::default()
+        }
+    }
+
+    /// An established audio call through a stack with a recording media
+    /// controller and the given T.38 policy.
+    async fn t38_call(
+        t38: sbc_config::T38Config,
+    ) -> (
+        SipStack,
+        proto_sip::message::SipRequest,
+        Arc<RecordingMedia>,
+    ) {
+        let media = Arc::new(RecordingMedia::default());
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.set_media_pipeline(Arc::clone(&media) as _);
+        stack.set_t38_config(t38);
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\
+            From: <sip:bob@sbc.local>;tag=r1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: reg-bob@relay\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:bob@127.0.0.1:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        stack
+            .process_message(&Bytes::from_static(register), bob(), None)
+            .await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let b_invite = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 200, Some("bobtag"), Some(BOB_AUDIO)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 200).is_some());
+        stack
+            .process_message(
+                &alice_request("ACK", 1, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        media.take();
+        (stack, b_invite, media)
+    }
+
+    fn switchovers(events: &[uc_audit::AuditEvent]) -> Vec<uc_audit::event::MediaSwitchover> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::MediaSwitchover(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn call_kind(stack: &SipStack) -> crate::t38::CallMediaKind {
+        let corr = stack.call_correlation.read().await;
+        corr.addresses.values().next().unwrap().media_kind
+    }
+
+    #[tokio::test]
+    async fn t38_switchover_moves_relay_only_after_2xx_and_back() {
+        let (stack, _b_invite, media) = Box::pin(t38_call(t38_enabled())).await;
+        let capture = uc_audit::capture::start();
+
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (b_reinvite, _) = forwarded(&results, &Method::Invite).expect("T.38 offer relayed");
+        let body = String::from_utf8_lossy(b_reinvite.body.as_ref().unwrap()).to_string();
+        assert!(
+            body.contains("m=audio 0 RTP/AVP 0"),
+            "declined audio stays 0: {body}"
+        );
+        assert!(body.contains("m=image 20002 udptl t38"), "{body}");
+        assert!(body.contains("a=T38MaxBitRate:14400"), "clamped: {body}");
+        assert!(body.contains("a=T38FaxMaxDatagram:1400"), "clamped: {body}");
+        // RFC 3261 §14.1: nothing moves before the far side accepts.
+        assert_eq!(media.take(), Vec::<String>::new());
+
+        let b_reinvite = b_reinvite.clone();
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_reinvite, 200, None, Some(BOB_T38)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let (ok, _) = responded(&results, 200).expect("answer to alice");
+        let answer = String::from_utf8_lossy(ok.body.as_ref().unwrap()).to_string();
+        assert!(answer.contains("m=image 20000 udptl t38"), "{answer}");
+        let log = media.take();
+        assert!(
+            log.contains(&"remote b 10.20.30.40:5100".to_string()),
+            "{log:?}"
+        );
+        assert!(
+            log.contains(&"remote a 192.168.1.1:4100".to_string()),
+            "{log:?}"
+        );
+        assert!(log.contains(&"kind Image".to_string()), "{log:?}");
+        assert_eq!(call_kind(&stack).await, crate::t38::CallMediaKind::Image);
+        assert_eq!(stack.t38_counters().active(), 1);
+        let ev = switchovers(&capture.events());
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].outcome, SwitchoverOutcome::Accepted);
+        assert_eq!(ev[0].max_bit_rate, Some(14_400));
+        // NIST AU-3: the validated new remote of the answering leg.
+        assert_eq!(
+            ev[0].remote_media,
+            Some("10.20.30.40:5100".parse().unwrap())
+        );
+        assert!(
+            !ev[0].call_id.contains('@'),
+            "internal id, not the SIP Call-ID"
+        );
+        stack
+            .process_message(
+                &alice_request("ACK", 2, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+
+        // Back to audio (image declined in place).
+        let back = ALICE_SDP.replace("a=sendrecv", "a=sendrecv\r\nm=image 0 udptl t38");
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 3, Some("bobtag"), Some(&back)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let b_reinvite = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        flatten(
+            stack
+                .process_message(
+                    &response_to(&b_reinvite, 200, None, Some(BOB_AUDIO)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        assert_eq!(call_kind(&stack).await, crate::t38::CallMediaKind::Audio);
+        assert_eq!(stack.t38_counters().active(), 0);
+        assert!(media.take().contains(&"kind Audio".to_string()));
+        stack
+            .process_message(
+                &alice_request("ACK", 3, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn t38_disabled_is_refused_locally_with_488() {
+        let (stack, _, media) = Box::pin(t38_call(sbc_config::T38Config::default())).await;
+        let capture = uc_audit::capture::start();
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (r, dest) = responded(&results, 488).expect("local 488");
+        assert_eq!(dest, alice());
+        assert!(
+            r.headers
+                .get_value(&HeaderName::Warning)
+                .is_some_and(|w| w.starts_with("304 ")),
+            "RFC 3261 §20.43 Warning 304"
+        );
+        assert!(
+            forwarded(&results, &Method::Invite).is_none(),
+            "not forwarded"
+        );
+        assert_eq!(media.take(), Vec::<String>::new());
+        let ev = switchovers(&capture.events());
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].outcome, SwitchoverOutcome::RejectedLocal);
+        assert_eq!(ev[0].reason, Some(SwitchoverReason::T38Disabled));
+        // The call is untouched: a later audio re-INVITE still relays.
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 3, Some("bobtag"), Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Invite).is_some());
+    }
+
+    #[tokio::test]
+    async fn t38_local_reject_reasons() {
+        for (sdp, cfg, reason) in [
+            (
+                ALICE_T38.replace("udptl", "TCP"),
+                t38_enabled(),
+                SwitchoverReason::UnsupportedTransport,
+            ),
+            (
+                ALICE_T38.replace("T38FaxVersion:0", "T38FaxVersion:7"),
+                t38_enabled(),
+                SwitchoverReason::MalformedT38Sdp,
+            ),
+            (
+                ALICE_T38.to_string(),
+                sbc_config::T38Config {
+                    allowed_ec: vec![sbc_config::T38EcMode::NoEc],
+                    ..t38_enabled()
+                },
+                SwitchoverReason::EcNotAllowed,
+            ),
+        ] {
+            let (stack, _, _) = Box::pin(t38_call(cfg)).await;
+            let capture = uc_audit::capture::start();
+            let results = flatten(
+                stack
+                    .process_message(
+                        &alice_request("INVITE", 2, Some("bobtag"), Some(&sdp)),
+                        alice(),
+                        None,
+                    )
+                    .await,
+            );
+            assert!(responded(&results, 488).is_some(), "{reason:?}");
+            assert_eq!(switchovers(&capture.events())[0].reason, Some(reason));
+        }
+        // DTLS-terminated call.
+        let (stack, _, _) = Box::pin(t38_call(t38_enabled())).await;
+        stack
+            .call_correlation
+            .write()
+            .await
+            .addresses
+            .values_mut()
+            .for_each(|a| a.media_terminated = crate::t38::RelaySecurity::DtlsTerminated);
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 488).is_some(), "srtp_terminate");
+    }
+
+    #[tokio::test]
+    async fn t38_remote_rejects_leave_relay_unchanged() {
+        // Remote 488: standard fallback, audio continues.
+        let (stack, _, media) = Box::pin(t38_call(t38_enabled())).await;
+        let capture = uc_audit::capture::start();
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let b_reinvite = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let results = flatten(
+            stack
+                .process_message(&response_to(&b_reinvite, 488, None, None), bob(), None)
+                .await,
+        );
+        assert!(responded(&results, 488).is_some());
+        assert_eq!(media.take(), Vec::<String>::new());
+        assert_eq!(call_kind(&stack).await, crate::t38::CallMediaKind::Audio);
+        let ev = switchovers(&capture.events());
+        assert_eq!(ev[0].reason, Some(SwitchoverReason::Remote488));
+
+        // Port-0 answer.
+        let (stack, _, media) = Box::pin(t38_call(t38_enabled())).await;
+        let capture = uc_audit::capture::start();
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let b_reinvite = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let declined = BOB_T38.replace("m=image 5100", "m=image 0");
+        flatten(
+            stack
+                .process_message(
+                    &response_to(&b_reinvite, 200, None, Some(&declined)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        assert!(!media.take().iter().any(|l| l.starts_with("kind")));
+        assert_eq!(call_kind(&stack).await, crate::t38::CallMediaKind::Audio);
+        assert_eq!(stack.t38_counters().active(), 0);
+        let ev = switchovers(&capture.events());
+        assert_eq!(ev[0].reason, Some(SwitchoverReason::RemotePort0));
+    }
+
+    #[tokio::test]
+    async fn t38_malformed_answer_byes_both_legs() {
+        let (stack, _, _) = Box::pin(t38_call(t38_enabled())).await;
+        let capture = uc_audit::capture::start();
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let b_reinvite = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let bad = BOB_T38.replace("T38MaxBitRate:14400", "T38MaxBitRate:fast");
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_reinvite, 200, None, Some(&bad)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let byes: Vec<_> = results
+            .iter()
+            .filter_map(|r| match r {
+                ProcessResult::Forward {
+                    message: SipMessage::Request(q),
+                    destination,
+                    ..
+                } if q.method == Method::Bye => Some(*destination),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(byes.len(), 2, "BYE both legs");
+        assert!(byes.contains(&alice()) && byes.contains(&bob()));
+        assert_eq!(stack.call_count().await, 0);
+        let ev = switchovers(&capture.events());
+        assert_eq!(ev[0].outcome, SwitchoverOutcome::Failed);
+        assert_eq!(ev[0].reason, Some(SwitchoverReason::MalformedT38Sdp));
+        assert_eq!(stack.t38_counters().active(), 0);
+    }
+
+    #[tokio::test]
+    async fn t38_bye_in_image_mode_decrements_gauge_once() {
+        let (stack, _, _) = Box::pin(t38_call(t38_enabled())).await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let b_reinvite = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        flatten(
+            stack
+                .process_message(
+                    &response_to(&b_reinvite, 200, None, Some(BOB_T38)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        stack
+            .process_message(
+                &alice_request("ACK", 2, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        assert_eq!(stack.t38_counters().active(), 1);
+
+        // Glare with a pending switchover: 491.
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 3, Some("bobtag"), Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let pending = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("UPDATE", 4, Some("bobtag"), Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 491).is_some());
+        flatten(
+            stack
+                .process_message(
+                    &response_to(&pending, 200, None, Some(BOB_T38)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        assert_eq!(
+            stack.t38_counters().active(),
+            1,
+            "image -> image is not a switchover"
+        );
+
+        let bye = alice_request("BYE", 5, Some("bobtag"), None);
+        stack.process_message(&bye, alice(), None).await;
+        stack.process_message(&bye, alice(), None).await;
+        assert_eq!(stack.call_count().await, 0);
+        assert_eq!(stack.t38_counters().active(), 0, "exactly once");
+    }
+
+    #[tokio::test]
+    async fn t38_initial_invite_disabled_gets_488() {
+        let media = Arc::new(RecordingMedia::default());
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.set_media_pipeline(Arc::clone(&media) as _);
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        let image_only = ALICE_T38.replace("m=audio 0 RTP/AVP 0\r\n", "");
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 1, None, Some(&image_only)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 488).is_some());
+        assert!(forwarded(&results, &Method::Invite).is_none());
+        assert_eq!(stack.call_count().await, 0);
+    }
+
+    /// Puts a `t38_call` into image mode (A-originated switchover).
+    async fn into_image(stack: &SipStack, cseq: u32) {
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", cseq, Some("bobtag"), Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let b_reinvite = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        flatten(
+            stack
+                .process_message(
+                    &response_to(&b_reinvite, 200, None, Some(BOB_T38)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        stack
+            .process_message(
+                &alice_request("ACK", cseq, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        assert_eq!(call_kind(stack).await, crate::t38::CallMediaKind::Image);
+    }
+
+    /// QA: race back to audio. While A's image -> audio re-INVITE is
+    /// pending, B fires its own re-INVITE (glare: 491, RFC 3261 §14.2);
+    /// then B refuses A's offer (488). The call must stay in image mode with
+    /// the relay untouched and the gauge unchanged. A retry then succeeds.
+    #[tokio::test]
+    async fn t38_race_back_to_audio_glare_then_remote_488_keeps_image() {
+        let (stack, b_invite, media) = Box::pin(t38_call(t38_enabled())).await;
+        Box::pin(into_image(&stack, 2)).await;
+        assert_eq!(stack.t38_counters().active(), 1);
+        media.take();
+        let capture = uc_audit::capture::start();
+
+        let back = ALICE_SDP.replace("a=sendrecv", "a=sendrecv\r\nm=image 0 udptl t38");
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 3, Some("bobtag"), Some(&back)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let pending = forwarded(&results, &Method::Invite)
+            .expect("back-to-audio offer relayed")
+            .0
+            .clone();
+        assert_eq!(media.take(), Vec::<String>::new(), "nothing moves pre-2xx");
+
+        // Glare from B while A's switch is pending.
+        let results = flatten(
+            stack
+                .process_message(
+                    &bob_request(&b_invite, "INVITE", 9, Some(BOB_AUDIO)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 491).is_some(), "glare -> 491");
+        assert!(forwarded(&results, &Method::Invite).is_none());
+
+        // B refuses A's back-to-audio offer.
+        let results = flatten(
+            stack
+                .process_message(&response_to(&pending, 488, None, None), bob(), None)
+                .await,
+        );
+        assert!(responded(&results, 488).is_some());
+        assert_eq!(media.take(), Vec::<String>::new(), "relay untouched");
+        assert_eq!(call_kind(&stack).await, crate::t38::CallMediaKind::Image);
+        assert_eq!(stack.t38_counters().active(), 1);
+        let ev = switchovers(&capture.events());
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].from_kind, uc_audit::event::SwitchoverMediaKind::Image);
+        assert_eq!(ev[0].to_kind, uc_audit::event::SwitchoverMediaKind::Audio);
+        assert_eq!(ev[0].outcome, SwitchoverOutcome::RejectedRemote);
+        assert_eq!(ev[0].reason, Some(SwitchoverReason::Remote488));
+        assert_eq!(
+            ev[0].originator,
+            uc_audit::event::SwitchoverOriginator::ALeg
+        );
+        assert_eq!(ev[0].transport, None);
+        stack
+            .process_message(
+                &alice_request("ACK", 3, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+
+        // Retry wins.
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 4, Some("bobtag"), Some(&back)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let retry = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        flatten(
+            stack
+                .process_message(
+                    &response_to(&retry, 200, None, Some(BOB_AUDIO)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        assert_eq!(call_kind(&stack).await, crate::t38::CallMediaKind::Audio);
+        assert_eq!(stack.t38_counters().active(), 0);
+        let log = media.take();
+        assert!(log.contains(&"kind Audio".to_string()), "{log:?}");
+        assert!(
+            log.contains(&"remote b 10.20.30.40:5000".to_string()),
+            "{log:?}"
+        );
+    }
+
+    /// QA: a B-originated switchover is audited as `b_leg`, and an image
+    /// re-INVITE whose every m-line is port 0 is refused locally.
+    #[tokio::test]
+    async fn t38_b_leg_originated_and_all_declined_offer() {
+        let (stack, b_invite, _media) = Box::pin(t38_call(t38_enabled())).await;
+        let capture = uc_audit::capture::start();
+        let results = flatten(
+            stack
+                .process_message(
+                    &bob_request(&b_invite, "INVITE", 9, Some(BOB_T38)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let a_reinvite = forwarded(&results, &Method::Invite)
+            .expect("B's T.38 offer relayed to A")
+            .0
+            .clone();
+        flatten(
+            stack
+                .process_message(
+                    &response_to(&a_reinvite, 200, None, Some(ALICE_T38)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let ev = switchovers(&capture.events());
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(
+            ev[0].originator,
+            uc_audit::event::SwitchoverOriginator::BLeg
+        );
+        assert_eq!(ev[0].outcome, SwitchoverOutcome::Accepted);
+        assert_eq!(call_kind(&stack).await, crate::t38::CallMediaKind::Image);
+
+        let (stack, _, media) = Box::pin(t38_call(t38_enabled())).await;
+        let all_off = ALICE_T38.replace("m=image 4100", "m=image 0");
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(&all_off)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 488).is_some());
+        assert!(forwarded(&results, &Method::Invite).is_none());
+        assert_eq!(media.take(), Vec::<String>::new());
     }
 }

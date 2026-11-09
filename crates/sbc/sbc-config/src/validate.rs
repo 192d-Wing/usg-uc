@@ -470,6 +470,7 @@ fn validate_media(config: &crate::schema::MediaConfig) -> ConfigResult<()> {
     }
 
     validate_media_enforced(config)?;
+    validate_t38(config)?;
 
     // CNSA 2.0: Validate SRTP profile
     validate_cnsa_srtp(&config.srtp);
@@ -528,6 +529,53 @@ fn validate_media_enforced(config: &crate::schema::MediaConfig) -> ConfigResult<
         });
     }
 
+    Ok(())
+}
+
+/// Validates `[media.t38]`.
+///
+/// `media.srtp.mode = Terminate` with T.38 enabled is allowed: image is
+/// refused (488) only on DTLS-terminated calls; the daemon logs a warning.
+///
+/// ## NIST 800-53 Rev5: CM-6, CM-7, SC-5, SC-8 (cleartext acknowledgement)
+fn validate_t38(config: &crate::schema::MediaConfig) -> ConfigResult<()> {
+    let t38 = &config.t38;
+    let err = |message: String| Err(ConfigError::Validation { message });
+    // NIST 800-53 Rev5: SC-8 - UDPTL has no SRTP; enabling it under
+    // srtp.required needs an explicit operator acknowledgement.
+    // POAM: POA&M-291 - UDPTL over DTLS (RFC 7345) and TCP/TPKT unsupported.
+    if t38.enabled && config.srtp.required && !t38.allow_cleartext {
+        return err(
+            "media.t38.enabled = true with media.srtp.required = true needs              media.t38.allow_cleartext = true (UDPTL fax relay is cleartext)"
+                .to_string(),
+        );
+    }
+    if !(2400..=33_600).contains(&t38.max_bit_rate) {
+        return err(format!(
+            "media.t38.max_bit_rate ({}) must be in 2400..=33600",
+            t38.max_bit_rate
+        ));
+    }
+    if !(64..=1472).contains(&t38.max_datagram) {
+        return err(format!(
+            "media.t38.max_datagram ({}) must be in 64..=1472",
+            t38.max_datagram
+        ));
+    }
+    if !(64..=65_535).contains(&t38.max_buffer) {
+        return err(format!(
+            "media.t38.max_buffer ({}) must be in 64..=65535",
+            t38.max_buffer
+        ));
+    }
+    if t38.allowed_ec.is_empty() {
+        return err("media.t38.allowed_ec must list at least one mode".to_string());
+    }
+    for (i, ec) in t38.allowed_ec.iter().enumerate() {
+        if t38.allowed_ec.iter().skip(i + 1).any(|o| o == ec) {
+            return err(format!("media.t38.allowed_ec lists {ec:?} more than once"));
+        }
+    }
     Ok(())
 }
 
@@ -1245,6 +1293,24 @@ pub fn resolve_source_trunk<'a>(config: &'a SbcConfig, id: &str) -> Option<&'a s
         .map(|g| g.id.as_str())
 }
 
+/// Non-fatal `[media.t38]` problems, for the daemon to log at load:
+/// T.38 enabled with `srtp.mode = Terminate` refuses image (488) on every
+/// DTLS-terminated call (POA&M-291).
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings)
+#[must_use]
+pub fn t38_warnings(config: &SbcConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    if config.media.t38.enabled && config.media.srtp.mode == crate::schema::SrtpMode::Terminate {
+        out.push(
+            "media.t38.enabled with media.srtp.mode = Terminate: T.38 is refused (488) on \
+             DTLS-SRTP terminated calls; only non-terminated calls can switch to fax"
+                .to_string(),
+        );
+    }
+    out
+}
+
 /// Non-fatal routing configuration problems, for the daemon to log at
 /// load: a dial-plan `source_trunk` naming no trunk group or trunk (the
 /// entry can then never match).
@@ -1739,6 +1805,144 @@ mod tests {
         TrunkManipulationRuleConfig, ZoneConfig,
     };
     use uc_types::media::MediaMode;
+
+    #[test]
+    fn t38_defaults_fail_closed_and_validate() {
+        let config = SbcConfig::default();
+        assert!(!config.media.t38.enabled);
+        assert!(!config.media.t38.allow_cleartext);
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn t38_enabled_with_srtp_required_needs_cleartext_ack() {
+        let mut config = SbcConfig::default();
+        config.media.srtp.required = true;
+        config.media.t38.enabled = true;
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("media.t38.allow_cleartext"), "{err}");
+        config.media.t38.allow_cleartext = true;
+        assert!(validate_config(&config).is_ok());
+        config.media.t38.allow_cleartext = false;
+        config.media.srtp.required = false;
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn t38_terminate_mode_is_not_an_error() {
+        let mut config = SbcConfig::default();
+        config.media.srtp.mode = crate::schema::SrtpMode::Terminate;
+        config.media.t38.enabled = true;
+        config.media.t38.allow_cleartext = true;
+        assert!(validate_media(&config.media).is_ok());
+        assert_eq!(t38_warnings(&config).len(), 1);
+        config.media.srtp.mode = crate::schema::SrtpMode::Passthrough;
+        assert_eq!(t38_warnings(&config), Vec::<String>::new());
+    }
+
+    #[test]
+    fn t38_ranges_rejected() {
+        use crate::schema::T38EcMode;
+        type Mutator = fn(&mut crate::schema::T38Config);
+        let cases: &[(Mutator, &str)] = &[
+            (|t| t.max_bit_rate = 2399, "max_bit_rate"),
+            (|t| t.max_bit_rate = 33_601, "max_bit_rate"),
+            (|t| t.max_datagram = 63, "max_datagram"),
+            (|t| t.max_datagram = 1473, "max_datagram"),
+            (|t| t.max_buffer = 63, "max_buffer"),
+            (|t| t.max_buffer = 65_536, "max_buffer"),
+            (|t| t.allowed_ec.clear(), "allowed_ec"),
+            (
+                |t| t.allowed_ec = vec![T38EcMode::Fec, T38EcMode::Fec],
+                "allowed_ec",
+            ),
+        ];
+        for (mutate, key) in cases {
+            let mut config = SbcConfig::default();
+            mutate(&mut config.media.t38);
+            let err = validate_config(&config).unwrap_err().to_string();
+            assert!(err.contains(key), "{key}: {err}");
+        }
+    }
+
+    /// QA: every `[media.t38]` key is enforced at both range edges, and
+    /// unknown EC names and wrong types are rejected at load.
+    #[test]
+    fn t38_config_matrix_boundaries() {
+        use crate::schema::T38EcMode;
+        type Mutator = fn(&mut crate::schema::T38Config);
+        let ok: &[Mutator] = &[
+            |t| t.max_bit_rate = 2400,
+            |t| t.max_bit_rate = 33_600,
+            |t| t.max_datagram = 64,
+            |t| t.max_datagram = 1472,
+            |t| t.max_buffer = 64,
+            |t| t.max_buffer = 65_535,
+            |t| t.allowed_ec = vec![T38EcMode::NoEc],
+            |t| {
+                t.enabled = true;
+                t.allow_cleartext = true;
+            },
+        ];
+        for mutate in ok {
+            let mut config = SbcConfig::default();
+            mutate(&mut config.media.t38);
+            assert!(validate_config(&config).is_ok(), "{:?}", config.media.t38);
+        }
+        // Range checks apply even while T.38 is disabled (fail at load, not
+        // at the first fax).
+        let mut config = SbcConfig::default();
+        assert!(!config.media.t38.enabled);
+        config.media.t38.max_datagram = 0;
+        assert!(validate_config(&config).is_err());
+
+        for bad in [
+            "[media.t38]\nallowed_ec = [\"t38UDPMagic\"]\n",
+            "[media.t38]\nallowed_ec = [\"redundancy\"]\n",
+            "[media.t38]\nenabled = \"yes\"\n",
+            "[media.t38]\nmax_datagram = 70000\n",
+            "[media.t38]\nmax_bit_rate = -1\n",
+        ] {
+            assert!(toml::from_str::<SbcConfig>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn t38_toml_round_trip() {
+        let toml_in = r#"
+[media.t38]
+enabled = true
+allow_cleartext = true
+max_bit_rate = 9600
+max_datagram = 512
+max_buffer = 2048
+allowed_ec = ["t38UDPRedundancy", "t38UDPNoEC"]
+"#;
+        let config: SbcConfig = toml::from_str(toml_in).unwrap();
+        let t38 = &config.media.t38;
+        assert!(t38.enabled && t38.allow_cleartext);
+        assert_eq!(
+            (t38.max_bit_rate, t38.max_datagram, t38.max_buffer),
+            (9600, 512, 2048)
+        );
+        assert_eq!(
+            t38.allowed_ec,
+            vec![
+                crate::schema::T38EcMode::Redundancy,
+                crate::schema::T38EcMode::NoEc
+            ]
+        );
+        let back: SbcConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(back.media.t38, config.media.t38);
+        assert!(
+            toml::from_str::<SbcConfig>(
+                "[media.t38]
+bogus = 1
+"
+            )
+            .is_err()
+        );
+    }
 
     fn zone(name: &str) -> ZoneConfig {
         ZoneConfig {

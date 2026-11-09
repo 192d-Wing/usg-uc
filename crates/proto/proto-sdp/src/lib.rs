@@ -14,6 +14,8 @@
 //! - **RFC 3264**: An Offer/Answer Model with SDP
 //! - **RFC 5245**: ICE candidates in SDP
 //! - **RFC 4572**: Fingerprint attribute for DTLS
+//! - **RFC 3362 / RFC 4612 / ITU-T T.38 Annex D**: `image/t38` media and
+//!   `T38*` attributes ([`t38`])
 //!
 //! ## Example SDP
 //!
@@ -39,6 +41,7 @@ pub mod multicast;
 pub mod offer_answer;
 pub mod session;
 pub mod srtp;
+pub mod t38;
 
 pub use attribute::{
     Attribute, AttributeName, Direction, Extmap, ExtmapDirection, NegotiatedExtensions,
@@ -52,6 +55,7 @@ pub use offer_answer::{
     hold_media_stream, resume_media_stream, validate_answer,
 };
 pub use session::{BandwidthInfo, Origin, RepeatTimes, SessionDescription, TimeValue, Timing};
+pub use t38::{T38Params, T38RateManagement, T38UdpEc};
 
 // RFC 3264 §6.2 Multicast stream negotiation
 pub use multicast::{

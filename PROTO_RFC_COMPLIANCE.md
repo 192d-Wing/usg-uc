@@ -84,7 +84,7 @@
 
 **Primary Standard:** RFC 8866 (SDP, supersedes RFC 4566)
 
-**Wiring note:** no shipped binary uses proto-sdp. `sbc-daemon` does string-based SDP handling via `proto_b2bua::SdpRewriter` / `extract_media_address` and `sdp_dtls.rs`; `client-sip-ua` lists the dependency but has no call sites. All rows below are **Library-only**.
+**Wiring note:** `sbc-daemon` uses proto-sdp only for T.38 (since 2026-11-08): `proto-b2bua::sdp_rewrite` stream selection and `sbc-daemon/src/t38.rs` parse SDP with proto-sdp to classify `image` m-lines and read T.38 Annex D attributes. Otherwise `sbc-daemon` does string-based SDP handling via `proto_b2bua::SdpRewriter` / `extract_media_address` and `sdp_dtls.rs`; `client-sip-ua` lists the dependency but has no call sites. All rows below are **Library-only** except RFC 3362 / T.38 Annex D.
 
 ### RFCs Referenced
 
@@ -102,6 +102,8 @@
 | **RFC 5245** | ICE Candidates in SDP | Referenced |
 | **RFC 6188** | AES-256-CM | Cipher suite enum. Library-only |
 | **RFC 7714** | AES-GCM for SRTP | Cipher suite: AEAD_AES_256_GCM. Library-only |
+| **RFC 3362** | image/t38 MIME type | **Partial** — `MediaType::Image`, `TransportProtocol::Udptl` (`media.rs`, test `test_image_udptl`). `TCPTL` rejected (POA&M-291). **Wired (sbc-daemon T.38 switchover)** |
+| **ITU-T T.38 Annex D** | T.38 SDP attributes | **Partial** — `t38.rs` `T38Params`: total parsing (duplicates, overflow, non-ASCII rejected), absent `T38FaxUdpEC` = no EC, `clamp` only lowers. Tests `parse_full_annex_d`, `round_trip`, `rejects_bad_values`, `clamp_only_lowers`, `table_round_trip`. Answer is not checked against the offer (version downgrade, EC fallback; POA&M-294). **Wired (sbc-daemon)** |
 
 ### Key Files
 - `src/lib.rs` — module exports, SDP version constant
@@ -111,10 +113,12 @@
 - `src/offer_answer.rs` — RFC 3264 full implementation
 - `src/multicast.rs` — RFC 3264 §6.2 multicast negotiation, RFC 2365 scoping
 - `src/srtp.rs` — RFC 4568 SDES crypto attributes
+- `src/t38.rs` — T.38 Annex D SDP attributes (wired: sbc-daemon)
 
 ### Gaps
 - No `TODO`/`FIXME` found
-- Not wired into any shipped binary (see wiring note above)
+- Only the T.38 types are wired into a shipped binary (see wiring note above)
+- T.38: no TCPTL / UDPTL-over-DTLS (POA&M-291); answer-vs-offer Annex D negotiation not enforced (POA&M-294). UDPTL payload is relayed opaquely; there is no ASN.1 PER codec on the shipped path (POA&M-290, POA&M-204)
 
 ---
 
@@ -405,7 +409,8 @@
 | **RFC 5853** | SBC Requirements | Referenced |
 | **RFC 3960** | Early Media (183) | **Full** — early media handling module. **Library-only** — `early_media.rs` (`EarlyMediaHandler`/`EarlyMediaSession`) has no call sites; sbc-daemon rewrites 183-with-SDP natively in its response path (`sip_stack.rs`) |
 | **RFC 3261** | SIP Core | Referenced |
-| **RFC 3264** | Offer/Answer | Hold signaling via direction — daemon relays re-INVITE SDP opaquely |
+| **RFC 3264** | Offer/Answer | Hold signaling via direction — daemon relays re-INVITE SDP opaquely. §8: `rewrite_connection_and_port` now preserves port 0 on declined m-lines (previously re-enabled them; test `test_port_zero_preserved`). Single anchored stream selection `select_anchored_stream` / `SdpRewriter::rewrite_with_selection` declines extra active streams in place when an image m-line is involved (tests `test_selection`, `test_selection_two_images_and_hostile`); general multi-stream anchoring is POA&M-293. **Wired (sbc-daemon)** |
+| **RFC 3362 / T.38 Annex D** | T.38 SDP | `rewrite_t38_attributes` clamps Annex D attributes, other lines byte-for-byte (test `test_rewrite_t38_attributes`). **Wired (sbc-daemon)** |
 | **RFC 4566** | SDP Format | Referenced for SDP rewrite |
 
 ### Key Files

@@ -250,6 +250,100 @@ struct MediaSessionContext {
     dtls_sidecar_a: Option<(SidecarReader, SidecarWriter)>,
     /// Live B-leg sidecar DTLS session halves (terminate mode).
     dtls_sidecar_b: Option<(SidecarReader, SidecarWriter)>,
+    /// A-leg re-latch control for the opaque relay (`None` until
+    /// `start_relay`, and for terminate-mode relays).
+    a_leg_remote_ctl: Option<Arc<LegRemote>>,
+    /// B-leg re-latch control for the opaque relay.
+    b_leg_remote_ctl: Option<Arc<LegRemote>>,
+    /// What the anchored stream carries ([`MediaKind`] as `u8`), read by the
+    /// relay legs for counter attribution only.
+    media_kind: Arc<std::sync::atomic::AtomicU8>,
+    /// `start_relay_terminate` ran for this session: media on both legs is
+    /// DTLS-SRTP terminated and cannot carry UDPTL.
+    terminated: bool,
+}
+
+/// What a call's anchored stream carries. Used for metrics attribution; the
+/// relay itself is payload-opaque either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    /// RTP audio (the default).
+    Audio,
+    /// T.38 fax over UDPTL (RFC 3362), relayed opaquely (POA&M-290).
+    Image,
+}
+
+impl MediaKind {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::Audio => 0,
+            Self::Image => 1,
+        }
+    }
+}
+
+/// Per-leg control the signalling plane uses to move an opaque relay leg to a
+/// new SDP remote. `set_remote_address` stores the new address, then bumps
+/// `epoch` with Release; the relay leg sees the change with one Acquire
+/// atomic load per packet (pairing with that Release so the new `expected`
+/// is visible), clears its symmetric latch and re-latches against the new
+/// address (RFC 4961).
+///
+/// Re-latch is exact-first: only a packet from the signalled SDP `ip:port`
+/// latches. A same-IP packet from another port (symmetric NAT, or a T.38
+/// gateway that sends UDPTL from a port other than the one it signalled)
+/// latches only after `grace` has passed with no exact match, so a late
+/// datagram from the previous stream's port cannot capture the latch or the
+/// reverse send target (RFC 3264 §8.3.1).
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
+struct LegRemote {
+    epoch: std::sync::atomic::AtomicU64,
+    expected: std::sync::RwLock<std::net::SocketAddr>,
+    /// How long a re-latch waits for an exact SDP `ip:port` match before a
+    /// same-IP, different-port source may latch.
+    grace: std::time::Duration,
+}
+
+/// Default re-latch grace window (see [`LegRemote`]).
+const RELATCH_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+impl LegRemote {
+    fn new(addr: std::net::SocketAddr) -> Self {
+        Self::with_grace(addr, RELATCH_GRACE)
+    }
+
+    fn with_grace(addr: std::net::SocketAddr, grace: std::time::Duration) -> Self {
+        Self {
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            expected: std::sync::RwLock::new(addr),
+            grace,
+        }
+    }
+
+    /// Stores a new expected remote and bumps the epoch when it changed.
+    fn update(&self, addr: std::net::SocketAddr) {
+        let changed = match self.expected.write() {
+            Ok(mut guard) if *guard != addr => {
+                *guard = addr;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// Re-latch and attribution state shared with one opaque relay leg.
+#[derive(Clone)]
+struct LegRelayControl {
+    /// Re-latch control (RTP legs; `None` for the RTCP port pair).
+    remote: Option<Arc<LegRemote>>,
+    /// The session's [`MediaKind`] as `u8`.
+    media_kind: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Allocated port info returned from `create_session`.
@@ -318,6 +412,40 @@ pub trait MediaController: Send + Sync {
     /// Allocates a standalone RTP/RTCP port pair (for announcement playback),
     /// returning `(rtp, rtcp)`. Replaces reaching into the internal allocator.
     async fn allocate_ports(&self) -> Result<(u16, u16), MediaPipelineError>;
+
+    /// Records what the anchored stream carries (audio or T.38 image), for
+    /// metrics attribution only. Default: no-op; the gRPC controller has no
+    /// field for it, so a remote media node counts UDPTL as RTP (POA&M-294).
+    async fn set_media_kind(
+        &self,
+        _call_id: &str,
+        _kind: MediaKind,
+    ) -> Result<(), MediaPipelineError> {
+        Ok(())
+    }
+
+    /// Applies up to two leg remotes (`(is_a_leg, address)`) and an optional
+    /// media kind as one relay update. Default: the individual calls in
+    /// order; [`MediaPipeline`] applies them under one session lock.
+    async fn update_relay(
+        &self,
+        call_id: &str,
+        remotes: [Option<(bool, SbcSocketAddr)>; 2],
+        kind: Option<MediaKind>,
+    ) -> Result<(), MediaPipelineError> {
+        let mut result = Ok(());
+        for (is_a_leg, address) in remotes.into_iter().flatten() {
+            if let Err(e) = self.set_remote_address(call_id, is_a_leg, address).await {
+                result = Err(e);
+            }
+        }
+        if let Some(kind) = kind
+            && let Err(e) = self.set_media_kind(call_id, kind).await
+        {
+            result = Err(e);
+        }
+        result
+    }
 }
 
 #[async_trait::async_trait]
@@ -365,6 +493,23 @@ impl MediaController for MediaPipeline {
 
     async fn allocate_ports(&self) -> Result<(u16, u16), MediaPipelineError> {
         self.port_allocator().allocate_pair().await
+    }
+
+    async fn set_media_kind(
+        &self,
+        call_id: &str,
+        kind: MediaKind,
+    ) -> Result<(), MediaPipelineError> {
+        Self::set_media_kind(self, call_id, kind).await
+    }
+
+    async fn update_relay(
+        &self,
+        call_id: &str,
+        remotes: [Option<(bool, SbcSocketAddr)>; 2],
+        kind: Option<MediaKind>,
+    ) -> Result<(), MediaPipelineError> {
+        Self::update_relay(self, call_id, remotes, kind).await
     }
 }
 
@@ -752,6 +897,10 @@ impl MediaPipeline {
             b_leg_codec: None,
             dtls_sidecar_a: None,
             dtls_sidecar_b: None,
+            a_leg_remote_ctl: None,
+            b_leg_remote_ctl: None,
+            media_kind: Arc::new(std::sync::atomic::AtomicU8::new(MediaKind::Audio.as_u8())),
+            terminated: false,
         };
 
         let mut sessions = self.sessions.write().await;
@@ -1202,22 +1351,7 @@ impl MediaPipeline {
         let session_ctx = sessions
             .get_mut(call_id)
             .ok_or(MediaPipelineError::SessionNotFound)?;
-
-        if is_a_leg {
-            session_ctx.a_leg_remote = Some(address);
-            if let Some(ref target) = session_ctx.a_leg_target
-                && let Ok(mut guard) = target.write()
-            {
-                *guard = address.into();
-            }
-        } else {
-            session_ctx.b_leg_remote = Some(address);
-            if let Some(ref target) = session_ctx.b_leg_target
-                && let Ok(mut guard) = target.write()
-            {
-                *guard = address.into();
-            }
-        }
+        Self::apply_remote(session_ctx, is_a_leg, address);
 
         debug!(
             call_id = %call_id,
@@ -1227,6 +1361,90 @@ impl MediaPipeline {
         );
 
         Ok(())
+    }
+
+    /// Applies both leg remotes and the media kind of a T.38 switchover
+    /// under one session write lock, so the relay legs never observe a
+    /// half-applied update.
+    ///
+    /// # Errors
+    /// [`MediaPipelineError::SessionNotFound`] for an unknown call.
+    pub async fn update_relay(
+        &self,
+        call_id: &str,
+        remotes: [Option<(bool, SbcSocketAddr)>; 2],
+        kind: Option<MediaKind>,
+    ) -> Result<(), MediaPipelineError> {
+        let mut sessions = self.sessions.write().await;
+        let session_ctx = sessions
+            .get_mut(call_id)
+            .ok_or(MediaPipelineError::SessionNotFound)?;
+        for (is_a_leg, address) in remotes.into_iter().flatten() {
+            Self::apply_remote(session_ctx, is_a_leg, address);
+            debug!(call_id = %call_id, is_a_leg, address = %address, "Remote address set");
+        }
+        if let Some(kind) = kind {
+            session_ctx
+                .media_kind
+                .store(kind.as_u8(), std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn apply_remote(session_ctx: &mut MediaSessionContext, is_a_leg: bool, address: SbcSocketAddr) {
+        let (remote, target, ctl) = if is_a_leg {
+            (
+                &mut session_ctx.a_leg_remote,
+                &session_ctx.a_leg_target,
+                &session_ctx.a_leg_remote_ctl,
+            )
+        } else {
+            (
+                &mut session_ctx.b_leg_remote,
+                &session_ctx.b_leg_target,
+                &session_ctx.b_leg_remote_ctl,
+            )
+        };
+        *remote = Some(address);
+        if let Some(target) = target
+            && let Ok(mut guard) = target.write()
+        {
+            *guard = address.into();
+        }
+        // RFC 4961: a new SDP remote re-arms the symmetric latch so the relay
+        // follows the far end to its new source (e.g. UDPTL after a T.38
+        // re-INVITE); the source-IP check still applies to the new address.
+        if let Some(ctl) = ctl {
+            ctl.update(address.into());
+        }
+    }
+
+    /// Records what the anchored stream carries; see [`MediaController::set_media_kind`].
+    ///
+    /// # Errors
+    /// [`MediaPipelineError::SessionNotFound`] for an unknown call.
+    pub async fn set_media_kind(
+        &self,
+        call_id: &str,
+        kind: MediaKind,
+    ) -> Result<(), MediaPipelineError> {
+        let sessions = self.sessions.read().await;
+        let ctx = sessions
+            .get(call_id)
+            .ok_or(MediaPipelineError::SessionNotFound)?;
+        ctx.media_kind
+            .store(kind.as_u8(), std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Returns true if the call's relay is DTLS-SRTP terminated
+    /// (`start_relay_terminate`), so it cannot carry UDPTL (POA&M-291).
+    pub async fn is_terminated(&self, call_id: &str) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(call_id)
+            .is_some_and(|ctx| ctx.terminated)
     }
 
     /// Sets the negotiated codecs for a call. Creates a transcoder if they differ.
@@ -1322,6 +1540,12 @@ impl MediaPipeline {
         let b_addr: std::net::SocketAddr = b_remote.into();
         let a_target = Arc::new(std::sync::RwLock::new(a_addr));
         let b_target = Arc::new(std::sync::RwLock::new(b_addr));
+        let a_ctl = Arc::new(LegRemote::new(a_addr));
+        let b_ctl = Arc::new(LegRemote::new(b_addr));
+        let no_relatch = LegRelayControl {
+            remote: None,
+            media_kind: Arc::clone(&ctx.media_kind),
+        };
 
         // Spawn A→B RTP relay task
         let handle_ab = tokio::spawn(relay_leg(
@@ -1333,6 +1557,10 @@ impl MediaPipeline {
             call_id.to_string(),
             "A→B",
             RelayKind::Rtp,
+            LegRelayControl {
+                remote: Some(Arc::clone(&a_ctl)),
+                media_kind: Arc::clone(&ctx.media_kind),
+            },
             shutdown_rx.clone(),
         ));
 
@@ -1346,6 +1574,10 @@ impl MediaPipeline {
             call_id.to_string(),
             "B→A",
             RelayKind::Rtp,
+            LegRelayControl {
+                remote: Some(Arc::clone(&b_ctl)),
+                media_kind: Arc::clone(&ctx.media_kind),
+            },
             shutdown_rx.clone(),
         ));
 
@@ -1382,6 +1614,7 @@ impl MediaPipeline {
                         call_id.to_string(),
                         "A→B",
                         RelayKind::Rtcp,
+                        no_relatch.clone(),
                         shutdown_rx.clone(),
                     )));
                     relay_handles.push(tokio::spawn(relay_leg(
@@ -1393,6 +1626,7 @@ impl MediaPipeline {
                         call_id.to_string(),
                         "B→A",
                         RelayKind::Rtcp,
+                        no_relatch,
                         shutdown_rx,
                     )));
                     true
@@ -1415,6 +1649,8 @@ impl MediaPipeline {
         ctx.relay_shutdown = Some(shutdown_tx);
         ctx.a_leg_target = Some(a_target);
         ctx.b_leg_target = Some(b_target);
+        ctx.a_leg_remote_ctl = Some(a_ctl);
+        ctx.b_leg_remote_ctl = Some(b_ctl);
 
         info!(
             call_id = %call_id,
@@ -1557,6 +1793,7 @@ impl MediaPipeline {
         // stop via the shutdown watch (task abort does not cascade to children).
         ctx.relay_handles = vec![supervisor];
         ctx.relay_shutdown = Some(shutdown_tx);
+        ctx.terminated = true;
         ctx.a_leg_target = Some(a_target);
         ctx.b_leg_target = Some(b_target);
 
@@ -1720,6 +1957,17 @@ pub fn record_rtp_relayed() {
 #[must_use]
 pub fn rtp_packets_relayed() -> u64 {
     RTP_PACKETS_RELAYED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-global count of UDPTL (T.38 fax) datagrams forwarded by the opaque
+/// relay on calls switched to image (RFC 3362). Counted instead of
+/// `RTP_PACKETS_RELAYED` so fax does not read as audio.
+static UDPTL_PACKETS_RELAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns the total UDPTL datagrams forwarded by the media relay since start.
+#[must_use]
+pub fn udptl_packets_relayed() -> u64 {
+    UDPTL_PACKETS_RELAYED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Records one forwarded RTCP packet. Called by the opaque non-muxed RTCP leg
@@ -1988,10 +2236,18 @@ async fn relay_leg(
     call_id: String,
     direction: &'static str,
     kind: RelayKind,
+    control: LegRelayControl,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    // POAM: POA&M-290 - tokio truncates datagrams over 2048 bytes silently;
+    // UDPTL is relayed opaquely with no IFP validation or truncation check.
     let mut buf = [0u8; 2048];
+    let mut expected_remote = expected_remote;
+    let mut seen_epoch: u64 = 0;
     let mut latched: Option<std::net::SocketAddr> = None;
+    // Set while a signalled re-latch waits for the exact SDP `ip:port`:
+    // the earliest instant a same-IP, different-port source may latch.
+    let mut relatch_fallback_at: Option<tokio::time::Instant> = None;
     let mut dropped: u64 = 0;
     let mut forwarded: u64 = 0;
 
@@ -2000,10 +2256,32 @@ async fn relay_leg(
             result = recv_sock.recv_from(&mut buf) => {
                 match result {
                     Ok((n, src)) => {
-                        let acceptable = latched.map_or_else(
-                            || src.ip() == expected_remote.ip(),
-                            |latched_src| src == latched_src,
-                        );
+                        // Re-latch after a signalled remote change: one
+                        // atomic load per packet, the lock only on change.
+                        if let Some(ctl) = &control.remote {
+                            let epoch = ctl.epoch.load(std::sync::atomic::Ordering::Acquire);
+                            if epoch != seen_epoch {
+                                seen_epoch = epoch;
+                                latched = None;
+                                if let Ok(guard) = ctl.expected.read() {
+                                    expected_remote = *guard;
+                                }
+                                relatch_fallback_at =
+                                    Some(tokio::time::Instant::now() + ctl.grace);
+                            }
+                        }
+                        // RFC 3264 §8.3.1 / RFC 4961: after a re-latch only the
+                        // exact SDP address latches until the grace window
+                        // passes; then a same-IP source may (symmetric NAT).
+                        // A stale packet from the old port is dropped and never
+                        // touches the reverse send target.
+                        let acceptable = match latched {
+                            Some(latched_src) => src == latched_src,
+                            None if src == expected_remote => true,
+                            None if src.ip() != expected_remote.ip() => false,
+                            None => relatch_fallback_at
+                                .is_none_or(|at| tokio::time::Instant::now() >= at),
+                        };
                         if !acceptable {
                             dropped += 1;
                             if dropped == 1 || dropped.is_multiple_of(1000) {
@@ -2022,6 +2300,7 @@ async fn relay_leg(
 
                         if latched.is_none() {
                             latched = Some(src);
+                            relatch_fallback_at = None;
                             if src != expected_remote {
                                 debug!(
                                     call_id = %call_id,
@@ -2050,7 +2329,15 @@ async fn relay_leg(
                                 // "audio is relaying" signal the CI gate greps for;
                                 // RTCP is counted separately so it doesn't inflate
                                 // the audio metric.
+                                let image = control
+                                    .media_kind
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    == MediaKind::Image.as_u8();
                                 match kind {
+                                    RelayKind::Rtp if image => {
+                                        UDPTL_PACKETS_RELAYED
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                     RelayKind::Rtp => {
                                         RTP_PACKETS_RELAYED
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2210,6 +2497,10 @@ mod tests {
             "test-call".to_string(),
             "A→B",
             RelayKind::Rtp,
+            LegRelayControl {
+                remote: None,
+                media_kind: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            },
             shutdown_rx,
         ));
 
@@ -2238,6 +2529,223 @@ mod tests {
         .expect("second legit packet must be forwarded")
         .unwrap();
         assert_eq!(&buf[..n], b"two", "injected packet must not be relayed");
+    }
+
+    async fn recv_payload(receiver: &UdpSocket) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 64];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .ok()?
+        .ok()
+        .map(|(n, _)| buf[..n].to_vec())
+    }
+
+    /// RFC 4961 re-latch: after the signalling plane moves the leg to a new
+    /// SDP remote (a T.38 gateway sending UDPTL from a new port), the old
+    /// latched source is dropped and the new source latches. Before it
+    /// latches, a source whose IP differs from the new SDP address is still
+    /// dropped. UDPTL is counted separately once the kind is Image.
+    #[tokio::test]
+    async fn relay_leg_relatches_on_remote_change_and_counts_udptl() {
+        let relay_in = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_out = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_src = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udptl_src = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_in.local_addr().unwrap();
+        let expected = rtp_src.local_addr().unwrap();
+        let ctl = Arc::new(LegRemote::new(expected));
+        let kind = Arc::new(std::sync::atomic::AtomicU8::new(MediaKind::Audio.as_u8()));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let _task = tokio::spawn(relay_leg(
+            relay_in,
+            relay_out,
+            expected,
+            Arc::new(std::sync::RwLock::new(expected)),
+            Arc::new(std::sync::RwLock::new(receiver.local_addr().unwrap())),
+            "relatch".to_string(),
+            "A→B",
+            RelayKind::Rtp,
+            LegRelayControl {
+                remote: Some(Arc::clone(&ctl)),
+                media_kind: Arc::clone(&kind),
+            },
+            shutdown_rx,
+        ));
+
+        rtp_src.send_to(b"rtp", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await.as_deref(), Some(&b"rtp"[..]));
+        // Before the switchover the UDPTL source is not the latched one.
+        udptl_src.send_to(b"early", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await, None);
+
+        // Move to an address whose IP is not ours: localhost sources drop.
+        ctl.update("192.0.2.1:9".parse().unwrap());
+        rtp_src.send_to(b"x", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await, None);
+
+        // Switch to image at the gateway's new UDPTL port.
+        kind.store(
+            MediaKind::Image.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        ctl.update(udptl_src.local_addr().unwrap());
+        let before = udptl_packets_relayed();
+        // Opaque, non-RTP first byte.
+        udptl_src
+            .send_to(&[0x00, 0xff, 0x10], relay_addr)
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_payload(&receiver).await.as_deref(),
+            Some(&[0x00, 0xff, 0x10][..])
+        );
+        assert!(udptl_packets_relayed() > before);
+        // Latched to the new source with the same IP: localhost on another
+        // port (the old RTP source) is dropped.
+        rtp_src.send_to(b"old", relay_addr).await.unwrap();
+        udptl_src.send_to(b"fax", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await.as_deref(), Some(&b"fax"[..]));
+    }
+
+    /// QA: flip-flop re-latch (audio -> T.38 -> audio). Each
+    /// `set_remote_address` re-opens the latch exactly once; the previous
+    /// source is dropped each time, and an update to the same address does
+    /// not unlatch.
+    #[tokio::test]
+    async fn relay_leg_relatch_flip_flop_back_to_audio() {
+        let relay_in = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_out = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_src = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udptl_src = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_in.local_addr().unwrap();
+        let rtp = rtp_src.local_addr().unwrap();
+        let udptl = udptl_src.local_addr().unwrap();
+        let ctl = Arc::new(LegRemote::new(rtp));
+        let kind = Arc::new(std::sync::atomic::AtomicU8::new(MediaKind::Audio.as_u8()));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let _task = tokio::spawn(relay_leg(
+            relay_in,
+            relay_out,
+            rtp,
+            Arc::new(std::sync::RwLock::new(rtp)),
+            Arc::new(std::sync::RwLock::new(receiver.local_addr().unwrap())),
+            "flipflop".to_string(),
+            "A→B",
+            RelayKind::Rtp,
+            LegRelayControl {
+                remote: Some(Arc::clone(&ctl)),
+                media_kind: Arc::clone(&kind),
+            },
+            shutdown_rx,
+        ));
+
+        rtp_src.send_to(b"a1", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await.as_deref(), Some(&b"a1"[..]));
+        // Same address again: latch kept, a different port stays dropped.
+        ctl.update(rtp);
+        udptl_src.send_to(b"no", relay_addr).await.unwrap();
+        rtp_src.send_to(b"a2", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await.as_deref(), Some(&b"a2"[..]));
+
+        // To T.38.
+        kind.store(
+            MediaKind::Image.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        ctl.update(udptl);
+        udptl_src.send_to(b"f1", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await.as_deref(), Some(&b"f1"[..]));
+
+        // Back to audio at the original RTP port.
+        kind.store(
+            MediaKind::Audio.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        ctl.update(rtp);
+        let before = udptl_packets_relayed();
+        udptl_src.send_to(b"stale", relay_addr).await.unwrap();
+        rtp_src.send_to(b"a3", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await.as_deref(), Some(&b"a3"[..]));
+        assert_eq!(recv_payload(&receiver).await, None, "stale UDPTL dropped");
+        assert_eq!(
+            udptl_packets_relayed(),
+            before,
+            "audio not counted as UDPTL"
+        );
+    }
+
+    /// Re-latch NAT fallback: when no packet arrives from the exact SDP
+    /// `ip:port` within the grace window, a same-IP, different-port source
+    /// (symmetric NAT) latches and becomes the reverse send target. Inside
+    /// the window it is dropped and the reverse target is untouched.
+    #[tokio::test]
+    async fn relay_leg_relatch_nat_fallback_after_grace() {
+        let relay_in = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_out = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_src = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let natted = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Signalled UDPTL port that never sends (the NAT rewrites it).
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_in.local_addr().unwrap();
+        let rtp = rtp_src.local_addr().unwrap();
+        let grace = std::time::Duration::from_millis(200);
+        let ctl = Arc::new(LegRemote::with_grace(rtp, grace));
+        let recv_target = Arc::new(std::sync::RwLock::new(rtp));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let _task = tokio::spawn(relay_leg(
+            relay_in,
+            relay_out,
+            rtp,
+            Arc::clone(&recv_target),
+            Arc::new(std::sync::RwLock::new(receiver.local_addr().unwrap())),
+            "natfallback".to_string(),
+            "A→B",
+            RelayKind::Rtp,
+            LegRelayControl {
+                remote: Some(Arc::clone(&ctl)),
+                media_kind: Arc::new(std::sync::atomic::AtomicU8::new(MediaKind::Audio.as_u8())),
+            },
+            shutdown_rx,
+        ));
+
+        rtp_src.send_to(b"a1", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await.as_deref(), Some(&b"a1"[..]));
+
+        ctl.update(silent.local_addr().unwrap());
+        // Inside the grace window: dropped, reverse target unchanged.
+        natted.send_to(b"early", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await, None);
+        assert_eq!(*recv_target.read().unwrap(), rtp);
+
+        // The 500 ms recv timeout above already exceeds the grace window.
+        natted.send_to(b"nat", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await.as_deref(), Some(&b"nat"[..]));
+        assert_eq!(*recv_target.read().unwrap(), natted.local_addr().unwrap());
+        // Latched: the old RTP port is now dropped.
+        rtp_src.send_to(b"old", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await, None);
+    }
+
+    #[tokio::test]
+    async fn media_kind_and_terminated_flags() {
+        let pipeline = MediaPipeline::new(MediaPipelineConfig::default());
+        pipeline.create_session("k", None).await.unwrap();
+        assert!(!pipeline.is_terminated("k").await);
+        assert!(!pipeline.is_terminated("missing").await);
+        pipeline
+            .set_media_kind("k", MediaKind::Image)
+            .await
+            .unwrap();
+        assert!(matches!(
+            pipeline.set_media_kind("missing", MediaKind::Image).await,
+            Err(MediaPipelineError::SessionNotFound)
+        ));
     }
 
     /// End-to-end relay: the full path the SIP call flow drives

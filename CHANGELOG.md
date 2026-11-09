@@ -9,6 +9,66 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, T.38 fax relay, POA&M-290..294)
+
+- **SBC: T.38 image offers are refused by default.** (CM-6, CM-7, SC-8) A
+  re-INVITE or initial INVITE whose anchored stream is `m=image` now gets a
+  local 488 and is not forwarded, until `[media.t38] enabled = true`.
+  Before this release such offers were forwarded but the relay followed the
+  declined audio port, so fax did not work through the SBC. Operators who
+  carry fax must opt in; with `media.srtp.required = true` they must also
+  set `allow_cleartext = true` (UDPTL has no SRTP), or config load fails.
+  `[media.t38]` is restart-required: a reload reports it and does not apply
+  it.
+
+### Added (SBC, T.38 fax relay, POA&M-290..294)
+
+- **SBC: T.38 fax switchover.** (RFC 3362, RFC 4612, ITU-T T.38 Annex D,
+  RFC 4961; NIST 800-53 Rev5 CM-6, SC-5, SI-10, AU-2, AU-3, SI-4) An
+  audio-to-fax re-INVITE (or an image-only initial INVITE) is anchored on
+  the call's existing media ports. UDPTL is relayed opaquely, and the relay
+  re-latches to the gateway's new port after the 2xx (exact SDP `ip:port`
+  first, same-IP NAT fallback after 500 ms). Relay changes are applied only
+  on the 2xx; a non-2xx or port-0 answer leaves the call on audio. A 2xx
+  with malformed T.38 attributes ends the call (BYE on both legs).
+  `T38MaxBitRate`, `T38FaxMaxDatagram` and `T38FaxMaxBuffer` are lowered to
+  the configured caps.
+- **Config:** new `[media.t38]` table: `enabled` (false), `allow_cleartext`
+  (false), `max_bit_rate` (14400, 2400..=33600), `max_datagram` (1400,
+  64..=1472), `max_buffer` (4096, 64..=65535), `allowed_ec` (all three
+  modes, non-empty, no duplicates). Unknown keys are rejected. Enabling it
+  with `media.srtp.mode = "Terminate"` logs a warning; DTLS-terminated calls
+  refuse T.38. Additive: existing configs parse unchanged.
+- **Audit (SIEM parsers):** new event `media_switchover` (type `Call`) with
+  `call_id`, `from_kind`, `to_kind`, `originator`, `outcome`, `reason`,
+  `transport`, `max_bit_rate` and `remote_media` (`ip:port`, set on
+  `accepted`). Enum and numeric values only. A refused image-only initial
+  INVITE is recorded as `AuthorizationDecision` with policy `t38:<reason>`
+  (a new policy value) and a rejected CDR. CDR schema is unchanged (a fax
+  indicator is deferred to POA&M-294).
+- **SIP:** local 488 carries `Warning: 304` (T.38 disabled), `305`
+  (unsupported transport, disallowed EC, DTLS-terminated leg) or `399`
+  (malformed T.38 SDP).
+- **Metrics:** `sbc_t38_switchover_{to_t38,to_audio}_{accepted,rejected_local,rejected_remote,failed}_total`
+  (8 gauges mirroring counters), `sbc_t38_active_calls`,
+  `sbc_udptl_packets_relayed_total`. With a remote `sbc-media` over gRPC,
+  UDPTL datagrams are still counted as RTP (POA&M-294).
+- **Crates (API, workspace-internal):** `proto-sdp` adds `MediaType::Image`,
+  `TransportProtocol::Udptl` and `t38::T38Params` (breaks exhaustive
+  matches; the soft client's proto-sdp now parses `m=image` instead of
+  erroring). `proto-b2bua` adds stream selection and now depends on
+  `proto-sdp`. `uc-audit` adds `AuditEvent::MediaSwitchover`.
+  `sbc-media-core` adds `MediaKind` and `MediaController::{set_media_kind,
+  update_relay}` (default impls). No new third-party dependencies.
+
+### Fixed (SBC, RFC 3264 port 0, affects every call)
+
+- **SBC: declined media streams stay declined.** The SDP rewriter gave
+  every m-line the anchored port, which re-enabled port-0 (declined)
+  streams (RFC 3264 §6, §8). Port 0 is now preserved on all calls. Peers
+  that relied on the SBC reviving a declined stream will now see it
+  declined; multi-stream non-T.38 SDP is otherwise unchanged (POA&M-293).
+
 ### BREAKING (SBC, RFC 3325 trust domain default)
 
 - **SBC: `trust_domain` now defaults to `false` (fail-closed).** (AC-21,

@@ -33,6 +33,9 @@ uc-api.workspace = true
 # Transport DoS scenarios (transport_dos_tests).
 uc-dos-protection.workspace = true
 uc-transport = { workspace = true, features = ["websocket"] }
+# T.38 switchover: SDP stream selection + the real opaque media relay.
+proto-b2bua.workspace = true
+sbc-media-core.workspace = true
 
 # Cluster crates (optional)
 uc-cluster = { path = "../../uc/uc-cluster", optional = true }

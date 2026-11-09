@@ -105,6 +105,15 @@ Open: RFC 3966 `;phone-context` is dropped (POA&M-100) and `urn:service:sos` is 
 **CNSA 2.0 Notes:**
 - SDP fingerprint attributes (for DTLS-SRTP) must use SHA-384 or SHA-512, NOT SHA-256
 
+**Implementation status: T.38 re-INVITE switchover (sbc-daemon, 2026-11-08):**
+
+- Off by default (`media.t38.enabled = false`); refused offers get 488 with Warning 304 (disabled), 305 (unsupported transport, EC not allowed, SRTP-terminated call) or 399 (malformed T.38 SDP) and are not forwarded (`sbc-daemon/src/t38.rs` `warning_for`; tests `t38_disabled_is_refused_locally_with_488`, `t38_local_reject_reasons`).
+- The relay moves to the new remote only after the 2xx; a non-2xx or port-0 answer leaves it unchanged; a malformed 2xx answer is ACKed and both legs get BYE (tests `t38_switchover_moves_relay_only_after_2xx_and_back`, `t38_remote_rejects_leave_relay_unchanged`, `t38_malformed_answer_byes_both_legs`, `t38_race_back_to_audio_glare_then_remote_488_keeps_image`, `t38_b_leg_originated_and_all_declined_offer`).
+- Port 0 is preserved on declined m-lines (`proto-b2bua` `rewrite_connection_and_port`, test `test_port_zero_preserved`).
+- UDPTL is relayed opaquely on the anchored ports, with re-latch to the new source (`sbc-media-core` `relay_leg`; integration test `audio_to_t38_and_back_relays_opaque_udptl_from_new_ports`).
+- Every switchover outcome is audited as `media_switchover`.
+- Gaps: POA&M-290 (no UDPTL inspection, truncation over 2048 bytes), -291 (no TCPTL/DTLS), -293 (one anchored stream), -294 (answer not checked against the offer, no live reload). SDP-less re-INVITE and 183 early-media answers are not T.38-classified.
+
 ---
 
 ### RFC 4566 - SDP: Session Description Protocol

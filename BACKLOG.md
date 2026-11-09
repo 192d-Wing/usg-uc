@@ -448,12 +448,29 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   ASN.1 PER (`uc-t38/src/udptl.rs`, `ifp.rs`); no real gateway interoperates.
   POA&M-204: documented as non-interoperable in crate docs and ROADMAP; the
   ASN.1 PER encoding is still open.
+  The SBC relay path does not depend on it: the SBC relays UDPTL opaquely
+  and never uses `uc-t38` (see the T.38 switchover entry below).
 - [x] **BLOCKER, DORMANT — T.38 decode panics on a 5-byte datagram**
   (POA&M-202/203) (`udptl.rs` ~118-137, unchecked `get_u8`). Bounds checks + fuzz target (cheap).
   Fixed: bounds-checked UDPTL/IFP decode, truncation tests for every prefix,
   `uc-t38/fuzz` targets `udptl_decode` and `ifp_decode`.
 - [ ] **MAJOR, DORMANT — T.38 redundancy recovery is dead code, FEC a stub, no
   SDP (RFC 4612/6913 attributes), fixed 512-byte buffer.**
+  *SDP part done 2026-11-08:* `proto-sdp` models `m=image ... udptl t38` and
+  the T.38 Annex D attributes (`proto-sdp/src/t38.rs`, `T38Params`; total
+  parsing, clamping). Remaining (`uc-t38` redundancy, FEC, 512-byte buffer)
+  re-scoped as POA&M-292.
+- [x] **MAJOR, LIVE — T.38 fax could not cross the SBC** (`m=image` rejected by
+  proto-sdp; port-0 streams re-enabled by the SDP rewriter; the relay stayed
+  latched to the old RTP source after a re-INVITE).
+  *Done 2026-11-08:* B2BUA audio <-> T.38 re-INVITE switchover
+  (`sbc-daemon/src/t38.rs`, `sip_stack.rs`), stream selection and port-0 fix
+  (`proto-b2bua/src/sdp_rewrite.rs`), opaque UDPTL relay with RFC 4961
+  re-latch (`sbc-media-core/src/media_pipeline.rs`), `[media.t38]` config
+  (fail-closed), `media_switchover` audit, T.38 metrics. Residuals:
+  POA&M-290 (opaque relay, no UDPTL validation), POA&M-291 (TCP/TPKT, DTLS,
+  cleartext), POA&M-293 (general multi-stream anchoring), POA&M-294 (full
+  Annex D negotiation, CDR fax flag, gRPC media kind, HA).
 - [ ] **MAJOR, DORMANT — SIPREC metadata doesn't follow the RFC 7865 schema**,
   no RFC 7866 SRC signalling, and display names/AORs are written into the XML
   unescaped (injection into recorder evidence) (`uc-siprec/src/metadata.rs:474-532`).

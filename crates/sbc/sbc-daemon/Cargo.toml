@@ -41,6 +41,7 @@ proto-sip = { workspace = true, features = ["digest-auth"] }
 proto-transaction.workspace = true
 proto-dialog.workspace = true
 proto-b2bua.workspace = true
+proto-sdp.workspace = true
 # `bearer` enables RFC 8898 OIDC Bearer-token REGISTER authorization.
 proto-registrar = { workspace = true, features = ["bearer"] }
 # Shared OIDC JWT validation (JWKS cache + validator) for Bearer REGISTER.
@@ -110,6 +111,8 @@ name = "sbc-daemon"
 path = "src/main.rs"
 
 [dev-dependencies]
+# Recording MediaController in the T.38 switchover tests.
+async-trait.workspace = true
 # PEM output for the CNSA syslog TLS handshake test CA.
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 # Thread-local audit capture for tests asserting audit records.

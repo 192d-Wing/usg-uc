@@ -35,7 +35,7 @@ flowchart TB
 | 7 — Management | `uc-api`, `uc-metrics`, `uc-health`, `uc-telemetry` | Management APIs and observability |
 | 8 — HA & clustering | `uc-cluster`, `uc-discovery`, `uc-storage`, `uc-state-sync`, `uc-aaa`, `uc-user-mgmt`, `uc-phone-mgmt`, `uc-snmp`, `uc-syslog` | Cluster membership, state replication, user/phone management |
 | 9 — WebRTC | `uc-webrtc` | WebRTC interop |
-| 10 — Specialized | `uc-t38` | T.38 fax relay (partial, dormant, not interoperable: UDPTL/IFP encoding is project-specific, not ITU-T T.38 ASN.1 PER; POA&M-204) |
+| 10 — Specialized | `uc-t38` | T.38 fax relay (partial, dormant, not interoperable: UDPTL/IFP encoding is project-specific, not ITU-T T.38 ASN.1 PER; POA&M-204). The SBC relays UDPTL opaquely and does not use this crate. |
 | 11 — DNS | `uc-dns` | DNS (NAPTR/SRV) integration |
 
 ## Applications
@@ -58,6 +58,15 @@ and media relay together. Supporting crates:
   in-process or as a dedicated single-replica pod
 - `sbc-cli` — operator command-line tool
 - `sbc-dashboard` — web dashboard
+
+**T.38 fax.** The B2BUA switches a call between audio and T.38
+(`m=image udptl t38`) on re-INVITE. `proto-sdp::t38` parses the T.38 Annex D
+attributes, `proto-b2bua` selects the one anchored m-line, and `sbc-daemon`
+(`t38.rs`, `sip_stack.rs`) applies the `[media.t38]` policy: 488 for refused
+offers, clamped capacity attributes, and the relay moved only on the far
+side's 2xx. The `sbc-media-core` relay forwards UDPTL opaquely on the call's
+existing ports and re-latches to the gateways' new source ports. The SBC does
+not use `uc-t38` (POA&M-290..294).
 
 ### SBC container topology
 

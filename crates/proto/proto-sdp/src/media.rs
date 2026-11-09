@@ -20,6 +20,8 @@ pub enum MediaType {
     Application,
     /// Message (for MSRP).
     Message,
+    /// Image (RFC 3362 `image/t38` fax relay).
+    Image,
 }
 
 impl MediaType {
@@ -32,6 +34,7 @@ impl MediaType {
             Self::Text => "text",
             Self::Application => "application",
             Self::Message => "message",
+            Self::Image => "image",
         }
     }
 }
@@ -52,6 +55,8 @@ impl FromStr for MediaType {
             "text" => Ok(Self::Text),
             "application" => Ok(Self::Application),
             "message" => Ok(Self::Message),
+            // RFC 3362 §1: `m=image` carries T.38 fax relay.
+            "image" => Ok(Self::Image),
             _ => Err(SdpError::InvalidMedia {
                 reason: format!("unknown media type: {s}"),
             }),
@@ -78,6 +83,8 @@ pub enum TransportProtocol {
     Udp,
     /// TCP (raw TCP).
     Tcp,
+    /// UDPTL (RFC 3362 / ITU-T T.38 Annex D: T.38 over UDP).
+    Udptl,
 }
 
 impl TransportProtocol {
@@ -93,6 +100,8 @@ impl TransportProtocol {
             Self::UdpTlsRtpSavpf => "UDP/TLS/RTP/SAVPF",
             Self::Udp => "UDP",
             Self::Tcp => "TCP",
+            // RFC 3362 registers the proto in lower case.
+            Self::Udptl => "udptl",
         }
     }
 
@@ -137,6 +146,9 @@ impl FromStr for TransportProtocol {
             "UDP/TLS/RTP/SAVPF" => Ok(Self::UdpTlsRtpSavpf),
             "UDP" => Ok(Self::Udp),
             "TCP" => Ok(Self::Tcp),
+            // RFC 3362: `udptl`, matched case-insensitively (some gateways
+            // send `UDPTL`). TCP/TPKT (`TCPTL`) is unsupported (POA&M-291).
+            "UDPTL" => Ok(Self::Udptl),
             _ => Err(SdpError::InvalidMedia {
                 reason: format!("unknown transport protocol: {s}"),
             }),
@@ -454,6 +466,23 @@ mod tests {
                 .unwrap()
                 .uses_dtls()
         );
+    }
+
+    #[test]
+    fn test_image_udptl() {
+        assert_eq!("image".parse::<MediaType>().unwrap(), MediaType::Image);
+        assert_eq!(
+            "UDPTL".parse::<TransportProtocol>().unwrap(),
+            TransportProtocol::Udptl
+        );
+        let media = MediaDescription::parse_mline("image 5000 udptl t38").unwrap();
+        assert_eq!(media.media_type, MediaType::Image);
+        assert_eq!(media.protocol, TransportProtocol::Udptl);
+        assert!(!media.protocol.is_secure());
+        assert!(format!("{media}").starts_with("m=image 5000 udptl t38"));
+        assert!("TCPTL".parse::<TransportProtocol>().is_err());
+        let tcp = MediaDescription::parse_mline("image 5000 TCP t38").unwrap();
+        assert_eq!(tcp.protocol, TransportProtocol::Tcp);
     }
 
     #[test]
