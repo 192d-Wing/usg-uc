@@ -558,8 +558,7 @@ mod tests {
         for len in 0..=300usize {
             let plaintext: Vec<u8> = (0..len).map(|i| (i * 7 + len) as u8).collect();
             let aad: Vec<u8> = (0..(len % 73)).map(|i| i as u8).collect();
-            let mut nonce = [0u8; NONCE_LEN];
-            nonce[..8].copy_from_slice(&(len as u64).to_be_bytes());
+            let nonce = random::generate_nonce().unwrap();
 
             let expected = ck.seal(&nonce, &aad, &plaintext).unwrap();
 
@@ -578,13 +577,15 @@ mod tests {
     #[test]
     fn test_seal_in_place_tag_binds_aad_and_nonce() {
         let ck = CachedAeadKey::new(&[0x11; KEY_LEN]).unwrap();
-        let nonce = [7u8; NONCE_LEN];
+        let nonce = random::generate_nonce().unwrap();
+        let mut other_nonce = nonce;
+        other_nonce[0] ^= 1;
         let mut buf = *b"payload bytes";
         let tag = ck.seal_in_place(&nonce, b"hdr", &mut buf).unwrap();
         let mut wire = buf.to_vec();
         wire.extend_from_slice(&tag);
         assert!(ck.open(&nonce, b"hdX", &wire).is_err());
-        assert!(ck.open(&[8u8; NONCE_LEN], b"hdr", &wire).is_err());
+        assert!(ck.open(&other_nonce, b"hdr", &wire).is_err());
         assert_eq!(ck.open(&nonce, b"hdr", &wire).unwrap(), b"payload bytes");
     }
 

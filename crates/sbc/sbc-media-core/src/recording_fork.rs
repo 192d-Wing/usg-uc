@@ -902,8 +902,7 @@ mod tests {
 
     #[test]
     fn debug_output_has_no_key_material() {
-        let key = vec![0xA7u8; 32];
-        let salt = vec![0xB9u8; 12];
+        let (key, salt) = material();
         let stream =
             ForkStream::bind(&keys(&key, &salt), "127.0.0.1:0".parse().unwrap(), 7).unwrap();
         let control = ForkControl::new();
@@ -916,8 +915,16 @@ mod tests {
         let text_stream = format!("{a:?}");
         session.set_prepared([a, b], [0, 0]);
         let text = format!("{tap:?} {control:?} {session:?} {text_stream}").to_lowercase();
-        for needle in ["a7a7", "b9b9", "167, 167", "185, 185"] {
-            assert!(!text.contains(needle), "key bytes in Debug: {text}");
+        // Any four consecutive key or salt bytes, as hex or as a decimal list.
+        let mut needles = Vec::new();
+        for secret in [&key, &salt] {
+            for w in secret.windows(4) {
+                needles.push(format!("{:02x}{:02x}{:02x}{:02x}", w[0], w[1], w[2], w[3]));
+                needles.push(w.iter().map(u8::to_string).collect::<Vec<_>>().join(", "));
+            }
+        }
+        for needle in &needles {
+            assert!(!text.contains(needle.as_str()), "key bytes in Debug");
         }
         assert!(text.contains("ssrc"));
     }

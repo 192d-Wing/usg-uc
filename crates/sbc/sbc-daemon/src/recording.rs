@@ -2072,10 +2072,10 @@ mod tests {
         assert_eq!(groups, vec![8, 4, 4, 4, 12]);
         assert!(id.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
         // RFC-013 (RFC 7865 §6.10, RFC 9562 §5.4): a version 4 UUID.
-        assert_eq!(id.as_bytes().get(14), Some(&b'4'), "version nibble: {id}");
+        assert_eq!(id.as_bytes().get(14), Some(&b'4'), "version nibble");
         assert!(
             matches!(id.as_bytes().get(19), Some(b'8' | b'9' | b'a' | b'b')),
-            "variant bits: {id}"
+            "variant bits"
         );
         assert_ne!(
             session_id_from_body(&offer_parts("<sip:a@b>", "<sip:c@d>").body),
