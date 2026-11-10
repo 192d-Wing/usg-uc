@@ -1483,11 +1483,17 @@ async fn qa_recording_keys_never_reach_the_log() {
             "{}::qa_recording_keys_never_reach_the_log",
             module_path!().split_once("::").map_or("", |(_, m)| m)
         );
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
-            .env(CHILD, "1")
-            .output()
-            .expect("re-run this test binary");
+        // The child runs to completion on the blocking pool, not on the
+        // async test thread.
+        let out = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+        })
+        .await
+        .expect("child runner task")
+        .expect("re-run this test binary");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(

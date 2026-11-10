@@ -55,6 +55,7 @@ use proto_transaction::{
     ServerNonInviteTransaction, TransactionKey, TransportType,
 };
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -4702,6 +4703,81 @@ impl SipStack {
         Ok((internal_id, from_a_leg, addrs))
     }
 
+    /// Builds the 2xx that answers a body-less session refresh locally
+    /// (RFC 4028 §7.4), facing the leg the request came from.
+    fn local_refresh_ok(
+        req: &SipRequest,
+        method: &Method,
+        addrs: &CallAddresses,
+        from_a_leg: bool,
+    ) -> SipResponse {
+        let mut ok = create_response_from_request(req, StatusCode::OK);
+        // RFC 4028 §9: the 2xx names the refresher — the requester keeps
+        // refreshing — and requires `timer` when the requester supports it.
+        if let Some(se) = req.headers.get_value(&HeaderName::SessionExpires) {
+            let se = if se.contains("refresher=") {
+                se.to_string()
+            } else {
+                format!("{se};refresher=uac")
+            };
+            ok.headers.set(HeaderName::SessionExpires, se);
+            if lists_timer_option(&req.headers, &HeaderName::Supported) {
+                ok.headers.set(HeaderName::Require, "timer");
+            }
+        }
+        if *method == Method::Invite {
+            // The Contact faces the requester's leg (RFC 3261 §12.1.1).
+            let orig_flow = addrs.leg_flow(!from_a_leg);
+            ok.headers.set(
+                HeaderName::Contact,
+                leg_contact(addrs.leg_sent_by(!from_a_leg), &orig_flow),
+            );
+            let last = if from_a_leg {
+                &addrs.a_leg_last_sdp
+            } else {
+                &addrs.b_leg_last_sdp
+            };
+            if let Some(sdp) = last {
+                ok.headers.set(HeaderName::ContentType, "application/sdp");
+                ok.headers
+                    .set(HeaderName::ContentLength, sdp.len().to_string());
+                ok.body = Some(sdp.clone());
+            }
+        }
+        ok
+    }
+
+    /// Classifies a mid-dialog offer for T.38 (see
+    /// [`crate::t38::classify_offer`]) and applies the recording policy to
+    /// an audio-to-image switch.
+    fn classify_in_dialog_offer(
+        &self,
+        sdp_str: &str,
+        addrs: &CallAddresses,
+    ) -> Result<Option<crate::t38::Classified>, SwitchoverReason> {
+        crate::t38::classify_offer(
+            sdp_str,
+            addrs.media_kind,
+            &self.t38,
+            addrs.media_terminated == crate::t38::RelaySecurity::DtlsTerminated,
+            false,
+        )
+        // A switch to T.38 would end the recording (the fork carries audio
+        // only): under `recording.on_failure = reject` it is refused and
+        // the session stays as it was (RFC 3261 §14.2; AU-5, SC-24).
+        .and_then(|c| {
+            let to_image = c
+                .as_ref()
+                .is_some_and(|c| c.kind == crate::t38::CallMediaKind::Image)
+                && addrs.media_kind == crate::t38::CallMediaKind::Audio;
+            if to_image && self.recording_refuses_switch(addrs) {
+                Err(SwitchoverReason::RecordingActive)
+            } else {
+                Ok(c)
+            }
+        })
+    }
+
     /// Relays a mid-dialog re-INVITE or UPDATE from one leg to the other. The
     /// originator's new offer is re-anchored at the SBC's media address toward
     /// the far leg; the far leg's answer comes back re-anchored toward the
@@ -4745,39 +4821,7 @@ impl SipStack {
         //    INVITE must carry an offer (§14.2), so replay the SDP this leg
         //    last got from us; the ACK's answer is not needed by the relay.
         let Some(body) = req.body.as_ref().filter(|b| !b.is_empty()) else {
-            let mut ok = create_response_from_request(req, StatusCode::OK);
-            // RFC 4028 §9: the 2xx names the refresher — the requester keeps
-            // refreshing — and requires `timer` when the requester supports it.
-            if let Some(se) = req.headers.get_value(&HeaderName::SessionExpires) {
-                let se = if se.contains("refresher=") {
-                    se.to_string()
-                } else {
-                    format!("{se};refresher=uac")
-                };
-                ok.headers.set(HeaderName::SessionExpires, se);
-                if lists_timer_option(&req.headers, &HeaderName::Supported) {
-                    ok.headers.set(HeaderName::Require, "timer");
-                }
-            }
-            if method == Method::Invite {
-                // The Contact faces the requester's leg (RFC 3261 §12.1.1).
-                let orig_flow = addrs.leg_flow(!from_a_leg);
-                ok.headers.set(
-                    HeaderName::Contact,
-                    leg_contact(addrs.leg_sent_by(!from_a_leg), &orig_flow),
-                );
-                let last = if from_a_leg {
-                    &addrs.a_leg_last_sdp
-                } else {
-                    &addrs.b_leg_last_sdp
-                };
-                if let Some(sdp) = last {
-                    ok.headers.set(HeaderName::ContentType, "application/sdp");
-                    ok.headers
-                        .set(HeaderName::ContentLength, sdp.len().to_string());
-                    ok.body = Some(sdp.clone());
-                }
-            }
+            let ok = Self::local_refresh_ok(req, &method, &addrs, from_a_leg);
             let ok = SipMessage::Response(ok);
             if method == Method::Invite {
                 self.arm_2xx_retransmit(
@@ -4806,27 +4850,7 @@ impl SipStack {
         // T.38 (RFC 3362 / T.38 Annex D): classify the offer. `None` keeps
         // the legacy audio handling; an image stream the relay cannot carry
         // is refused here with 488 and never forwarded (RFC 3261 §14.2).
-        let t38 = match crate::t38::classify_offer(
-            &sdp_str,
-            addrs.media_kind,
-            &self.t38,
-            addrs.media_terminated == crate::t38::RelaySecurity::DtlsTerminated,
-            false,
-        )
-        // A switch to T.38 would end the recording (the fork carries audio
-        // only): under `recording.on_failure = reject` it is refused and
-        // the session stays as it was (RFC 3261 §14.2; AU-5, SC-24).
-        .and_then(|c| {
-            let to_image = c
-                .as_ref()
-                .is_some_and(|c| c.kind == crate::t38::CallMediaKind::Image)
-                && addrs.media_kind == crate::t38::CallMediaKind::Audio;
-            if to_image && self.recording_refuses_switch(&addrs) {
-                Err(SwitchoverReason::RecordingActive)
-            } else {
-                Ok(c)
-            }
-        }) {
+        let t38 = match self.classify_in_dialog_offer(&sdp_str, &addrs) {
             Ok(c) => c,
             Err(reason) => {
                 info!(method = %method, call_id = %sip_call_id, ?reason, "T.38 offer refused, 488");
@@ -8222,6 +8246,90 @@ impl SipStack {
         }
     }
 
+    /// Passes a response through the client transaction that sent its
+    /// request (RFC 3261 §17.1.3: top Via branch + CSeq method). `Continue`
+    /// hands the response on to the transaction user, with the ACK for a
+    /// non-2xx INVITE final when one is due (§17.1.1.3); `Break` is the
+    /// result for a response the transaction layer absorbed or that matches
+    /// no request this SBC sent.
+    async fn client_transaction_receive(
+        &self,
+        resp: &SipResponse,
+        branch: &str,
+        cseq: &proto_sip::header_params::CSeqHeader,
+        sip_call_id: &str,
+    ) -> ControlFlow<ProcessResult, Option<ProcessResult>> {
+        let status_code = resp.status.code();
+        let mut ack_action = None;
+        {
+            let mut txns = self.transactions.write().await;
+            let key = TransactionKey::client(branch, cseq.method.to_string());
+            if cseq.method == Method::Invite {
+                match txns.client_invite.get_mut(&key) {
+                    Some(st) => {
+                        let passed = st
+                            .transaction
+                            .receive_response(status_code)
+                            .unwrap_or(false);
+                        if status_code >= 300 {
+                            // ACK every non-2xx final, and again for each
+                            // retransmission of it (§17.1.1.3).
+                            let SipMessage::Request(ref invite) = st.request else {
+                                unreachable!("client INVITE transaction stores a request")
+                            };
+                            let ack = st
+                                .ack
+                                .get_or_insert_with(|| Self::build_non2xx_ack(invite, resp))
+                                .clone();
+                            // §17.1.1.3: the ACK rides the INVITE's transport.
+                            ack_action = Some(ProcessResult::Forward {
+                                message: ack,
+                                destination: st.destination,
+                                flow: st.flow.clone().into(),
+                            });
+                        }
+                        // 2xx always reaches the TU: their retransmissions
+                        // are the dialog layer's to re-ACK (§13.2.2.4). A
+                        // reliable 1xx too: the transaction layer judges a
+                        // retransmission by status code only, but another
+                        // fork's (or a later) reliable 183 is a new response
+                        // (RFC 3262 §3); the TU dedupes on To-tag and RSeq.
+                        if !passed
+                            && !(200..300).contains(&status_code)
+                            && !is_reliable_provisional(resp)
+                        {
+                            debug!(call_id = %sip_call_id, status = status_code, "Retransmitted final response absorbed");
+                            return ControlFlow::Break(
+                                ack_action.unwrap_or(ProcessResult::NoAction),
+                            );
+                        }
+                    }
+                    None if (200..300).contains(&status_code) => {
+                        // Transaction already gone (2xx terminates it): a
+                        // late 200 retransmission, handled by the TU below.
+                    }
+                    None => {
+                        debug!(call_id = %sip_call_id, branch = %branch, "Response matches no client INVITE transaction, ignoring");
+                        return ControlFlow::Break(ProcessResult::NoAction);
+                    }
+                }
+            } else {
+                let Some(st) = txns.client_non_invite.get_mut(&key) else {
+                    debug!(call_id = %sip_call_id, method = %cseq.method, "Response matches no client transaction, ignoring");
+                    return ControlFlow::Break(ProcessResult::NoAction);
+                };
+                if !st
+                    .transaction
+                    .receive_response(status_code)
+                    .unwrap_or(false)
+                {
+                    return ControlFlow::Break(ProcessResult::NoAction);
+                }
+            }
+        }
+        ControlFlow::Continue(ack_action)
+    }
+
     /// Processes a SIP response.
     ///
     /// The response is first matched to the client transaction that sent the
@@ -8279,71 +8387,13 @@ impl SipStack {
         // 1. Transaction layer. Matching on Call-ID alone would let anyone who
         //    learned a Call-ID inject a forged 200 OK; the branch must match a
         //    request this SBC actually sent.
-        let mut ack_action = None;
+        let ack_action = match self
+            .client_transaction_receive(resp, &branch, &cseq, &sip_call_id)
+            .await
         {
-            let mut txns = self.transactions.write().await;
-            let key = TransactionKey::client(&branch, cseq.method.to_string());
-            if cseq.method == Method::Invite {
-                match txns.client_invite.get_mut(&key) {
-                    Some(st) => {
-                        let passed = st
-                            .transaction
-                            .receive_response(status_code)
-                            .unwrap_or(false);
-                        if status_code >= 300 {
-                            // ACK every non-2xx final, and again for each
-                            // retransmission of it (§17.1.1.3).
-                            let SipMessage::Request(ref invite) = st.request else {
-                                unreachable!("client INVITE transaction stores a request")
-                            };
-                            let ack = st
-                                .ack
-                                .get_or_insert_with(|| Self::build_non2xx_ack(invite, resp))
-                                .clone();
-                            // §17.1.1.3: the ACK rides the INVITE's transport.
-                            ack_action = Some(ProcessResult::Forward {
-                                message: ack,
-                                destination: st.destination,
-                                flow: st.flow.clone().into(),
-                            });
-                        }
-                        // 2xx always reaches the TU: their retransmissions
-                        // are the dialog layer's to re-ACK (§13.2.2.4). A
-                        // reliable 1xx too: the transaction layer judges a
-                        // retransmission by status code only, but another
-                        // fork's (or a later) reliable 183 is a new response
-                        // (RFC 3262 §3); the TU dedupes on To-tag and RSeq.
-                        if !passed
-                            && !(200..300).contains(&status_code)
-                            && !is_reliable_provisional(resp)
-                        {
-                            debug!(call_id = %sip_call_id, status = status_code, "Retransmitted final response absorbed");
-                            return ack_action.unwrap_or(ProcessResult::NoAction);
-                        }
-                    }
-                    None if (200..300).contains(&status_code) => {
-                        // Transaction already gone (2xx terminates it): a
-                        // late 200 retransmission, handled by the TU below.
-                    }
-                    None => {
-                        debug!(call_id = %sip_call_id, branch = %branch, "Response matches no client INVITE transaction, ignoring");
-                        return ProcessResult::NoAction;
-                    }
-                }
-            } else {
-                let Some(st) = txns.client_non_invite.get_mut(&key) else {
-                    debug!(call_id = %sip_call_id, method = %cseq.method, "Response matches no client transaction, ignoring");
-                    return ProcessResult::NoAction;
-                };
-                if !st
-                    .transaction
-                    .receive_response(status_code)
-                    .unwrap_or(false)
-                {
-                    return ProcessResult::NoAction;
-                }
-            }
-        }
+            ControlFlow::Continue(ack) => ack,
+            ControlFlow::Break(done) => return done,
+        };
 
         // 2. Transaction user: find the call this leg belongs to.
         let corr = self.call_correlation.read().await;
