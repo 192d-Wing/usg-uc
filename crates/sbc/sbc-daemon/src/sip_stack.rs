@@ -21573,10 +21573,36 @@ pub mod tests {
     }
 
     /// Internal hosts the SBC or the test peers use.
+    ///
+    /// A prefix only counts where a host can start (start of value or after
+    /// a separator). A bare substring match also fired on random tokens: a
+    /// Via branch such as `z9hG4bK3d82487b5427b127.7bf5...` contains `127.`.
     fn leaks_internal(v: &str) -> bool {
-        ["127.", "192.168.", "10.0.", "localhost"]
-            .iter()
-            .any(|p| v.contains(p))
+        ["127.", "192.168.", "10.0.", "localhost"].iter().any(|p| {
+            v.match_indices(p).any(|(i, _)| {
+                v[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+            })
+        })
+    }
+
+    #[test]
+    fn leaks_internal_matches_hosts_not_random_tokens() {
+        assert!(leaks_internal(
+            "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKabc"
+        ));
+        assert!(leaks_internal("<sip:alice@192.168.1.5:5060>"));
+        assert!(leaks_internal("<sip:10.0.0.7;lr>"));
+        assert!(leaks_internal("<sip:localhost:5060>"));
+        assert!(leaks_internal("SIP/2.0/UDP h.example;received=127.0.0.2"));
+        assert!(!leaks_internal(
+            "SIP/2.0/UDP sbc.example.com:5060;branch=z9hG4bK3d82487b5427b127.7bf51cd7ca8776be;rport"
+        ));
+        assert!(!leaks_internal(
+            "SIP/2.0/UDP sbc.example.com;branch=z9hG4bKa10.0.ff"
+        ));
     }
 
     /// Every Contact / Record-Route (and Via of requests) of every wire
