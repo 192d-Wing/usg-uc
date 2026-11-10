@@ -634,6 +634,21 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
     {
         metrics.register_gauge(*name, crate::signaling_audit::METRIC_HELP);
     }
+    // NIST 800-53 Rev5: SI-4, IA-5 - `[digest_auth]` credential table size
+    // and reloads that kept the previous table (POA&M-270). No user labels.
+    metrics.register_gauge(
+        crate::digest_credentials::METRIC_USERS,
+        "Users in the loaded digest credentials table",
+    );
+    metrics.register_gauge(
+        crate::digest_credentials::METRIC_RELOAD_FAILURES,
+        "Digest credential reloads that failed and kept the previous table",
+    );
+    // NIST 800-53 Rev5: SI-4, AC-7, SC-5 - digest backoff table overflow.
+    metrics.register_gauge(
+        crate::digest_throttle::METRIC_OVERFLOW,
+        "Digest failures of known usernames counted in the backoff overflow bucket",
+    );
     // NIST 800-53 Rev5: AU-5 (CDR pipeline failure visibility)
     for (name, help) in [
         (METRIC_CDR_EMITTED, "CDRs accepted onto the writer queue"),
@@ -821,6 +836,24 @@ impl AppState {
                 if let Some(g) = self.metrics.gauge(name) {
                     g.set(as_gauge(v));
                 }
+            }
+            if let Some(store) = stack.digest_credentials() {
+                for (name, v) in [
+                    (crate::digest_credentials::METRIC_USERS, store.users()),
+                    (
+                        crate::digest_credentials::METRIC_RELOAD_FAILURES,
+                        store.reload_failures(),
+                    ),
+                ] {
+                    if let Some(g) = self.metrics.gauge(name) {
+                        g.set(as_gauge(v));
+                    }
+                }
+            }
+            if let Some(v) = stack.digest_throttle_overflow()
+                && let Some(g) = self.metrics.gauge(crate::digest_throttle::METRIC_OVERFLOW)
+            {
+                g.set(as_gauge(v));
             }
             for (name, v) in stack.t38_counters().metric_values() {
                 if let Some(g) = self.metrics.gauge(name) {
@@ -2415,10 +2448,62 @@ mod tests {
             ("sbc_signaling_audit_dropped_total", 0),
             ("sbc_in_dialog_rejects_unknown_dialog_total", 0),
             ("sbc_digest_verify_ok_total", 0),
+            ("sbc_digest_credentials_users", 0),
+            ("sbc_digest_credentials_reload_failures_total", 0),
+            ("sbc_digest_throttle_overflow_total", 0),
         ] {
             let want = format!("{name} {v}");
             assert!(text.lines().any(|l| l.ends_with(&want)), "{want}: {text}");
         }
+    }
+
+    // QA POA&M-270: the credential table size and the failed-reload count
+    // reach the metrics endpoint with their real values, with no user label.
+    #[test]
+    fn qa_metrics_export_digest_credentials_users_and_reload_failures() {
+        let store = crate::sip_stack::tests::test_digest_store(
+            "sip.example.test",
+            &[("alice", "pw-a"), ("bob", "pw-b"), ("carol", "pw-c")],
+        );
+        let stack = crate::sip_stack::SipStack::new(crate::sip_stack::SipStackConfig {
+            require_auth: true,
+            auth_realm: "sip.example.test".to_string(),
+            digest_credentials: Some(Arc::clone(&store)),
+            ..Default::default()
+        });
+        let mut state = AppState::new(SbcMetrics::standard(), Arc::new(ServerStats::default()));
+        state.sip_stack = Some(Arc::new(stack));
+        let series = |state: &AppState, name: &str| {
+            state.refresh_daemon_metrics();
+            let text = state.metrics.export();
+            for user in ["alice", "bob", "carol"] {
+                assert!(!text.contains(user), "{text}");
+            }
+            // The series line may carry a registry prefix: match its tail.
+            text.lines()
+                .filter(|l| !l.starts_with('#'))
+                .find_map(|l| l.find(name).map(|at| l[at..].to_string()))
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            series(&state, "sbc_digest_credentials_users"),
+            "sbc_digest_credentials_users 3"
+        );
+        assert_eq!(
+            series(&state, "sbc_digest_credentials_reload_failures_total"),
+            "sbc_digest_credentials_reload_failures_total 0"
+        );
+        // The test store has no file: each reload fails and keeps the table.
+        assert!(store.reload().is_err());
+        assert!(store.reload().is_err());
+        assert_eq!(
+            series(&state, "sbc_digest_credentials_reload_failures_total"),
+            "sbc_digest_credentials_reload_failures_total 2"
+        );
+        assert_eq!(
+            series(&state, "sbc_digest_credentials_users"),
+            "sbc_digest_credentials_users 3"
+        );
     }
 
     // POA&M-306: the recording counters reach the metrics endpoint under

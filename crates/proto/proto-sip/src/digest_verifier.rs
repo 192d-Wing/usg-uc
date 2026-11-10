@@ -13,7 +13,7 @@
 //! - the `nonce` must be one this server issued (HMAC-SHA-384 tag) and must
 //!   be younger than the TTL, else the caller re-challenges with
 //!   `stale=true` (RFC 7616 §3.3);
-//! - `nc` must strictly increase per nonce (RFC 7616 §3.4.5), and is only
+//! - `nc` must strictly increase per nonce (RFC 7616 §3.4), and is only
 //!   committed after the response matched, so a party without the password
 //!   cannot burn a victim's nonce counts.
 //!
@@ -28,7 +28,9 @@
 //!   used only when the build enables the `aws-lc-rs/fips` feature, e.g. via
 //!   the workspace `fips` feature - this crate alone does not enable it)
 //! - **SC-23**: Session authenticity (nonce bound to realm and issuer key)
-//! - **SC-5**: Bounded nonce tracker; full tracker yields a re-challenge
+//! - **SC-5**: Bounded nonce tracker with a per-username share; a full
+//!   tracker or a user past their share yields a re-challenge
+//! - **IA-5(6)**: temporary strings holding a password or an HA1 are wiped
 //!
 //! ## CNSA 2.0
 //!
@@ -46,10 +48,12 @@ use crate::auth::{
 };
 use crate::error::{SipError, SipResult};
 use crate::uri::SipUri;
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Minimum nonce issuer key length in bytes.
 pub const MIN_NONCE_KEY_LEN: usize = 32;
@@ -62,6 +66,18 @@ pub const DEFAULT_MAX_NC: u32 = 1_000_000;
 
 /// Default bound on nonces tracked for nc replay detection.
 pub const DEFAULT_MAX_TRACKED_NONCES: usize = 65_536;
+
+/// Default bound on live nonces tracked for one username, so one
+/// authenticated user cannot fill the shared tracker and force every other
+/// user into re-challenges (NIST 800-53 Rev5: SC-5, SC-6).
+///
+/// A user at the bound is not locked out, whatever the nonce TTL: a further
+/// verified nonce takes the place of that user's own oldest tracked one.
+/// The replaced nonce, and any nonce issued up to the same second that the
+/// user has not used yet, is from then on answered `stale=true` for that
+/// user (one re-challenge), so dropping its nc state opens no replay
+/// (RFC 7616 §5.5). Nobody else's nonces are touched.
+pub const DEFAULT_MAX_TRACKED_NONCES_PER_USER: usize = 64;
 
 /// Domain separation label for the nonce MAC.
 const NONCE_LABEL: &[u8] = b"usg-digest-v1";
@@ -333,7 +349,9 @@ pub struct DigestRequestView<'a> {
 pub enum DigestSecret<'a> {
     /// Cleartext password.
     Password(&'a str),
-    /// Pre-computed `H(username:realm:password)` for the policy algorithm.
+    /// Pre-computed `H(username:realm:password)` for the policy algorithm,
+    /// as hex. Lower-case hex is used in place; a value with upper-case
+    /// digits is lower-cased into a temporary copy that is wiped on drop.
     Ha1(&'a str),
 }
 
@@ -423,13 +441,55 @@ struct NcEntry {
 ///
 /// Keying by username as well as nonce stops one user's verified use of a
 /// nonce from affecting another user's nc state for the same nonce.
+///
+/// Besides the global bound, one username may hold at most `max_per_user`
+/// entries. Entries exist only for verified responses, so the per-user
+/// count is spent by that user's own credentials and nobody else's. At the
+/// bound a newly verified nonce replaces that user's oldest entry (see
+/// [`UserNonces::floor_secs`] for why that opens no replay).
 #[derive(Debug)]
 struct NcTracker {
     entries: HashMap<String, NcEntry>,
-    /// Keys in insertion order. Every key in `entries` appears exactly once,
-    /// so expired entries are dropped from the front in amortised O(1)
-    /// rather than by scanning the map (NIST 800-53 Rev5: SC-5).
+    /// Keys in insertion order. Every key in `entries` appears in it, so
+    /// expired entries are dropped from the front in amortised O(1) rather
+    /// than by scanning the map (NIST 800-53 Rev5: SC-5). Keys of entries
+    /// replaced at the per-user bound stay behind until they reach the
+    /// front or the queue is compacted (see `commit`).
     order: VecDeque<String>,
+    /// Per-username state. A username is present while it has an entry or
+    /// a floor that still matters, so this map is bounded by `entries`
+    /// plus [`MAX_FLOOR_ONLY_USERS`].
+    per_user: HashMap<String, UserNonces>,
+    /// Bound on one username's entries (at least 1).
+    max_per_user: usize,
+    /// Floor for every username: taken over from per-user floors that
+    /// could not be kept (SC-5 bound on `per_user`). 0 when unused.
+    global_floor_secs: u64,
+}
+
+/// Bound on usernames kept in [`NcTracker::per_user`] for their floor
+/// alone (no entry left).
+const MAX_FLOOR_ONLY_USERS: usize = 4_096;
+
+/// One username's share of the tracker.
+#[derive(Debug, Default)]
+struct UserNonces {
+    /// This user's keys in `entries`, oldest first (a subsequence of
+    /// [`NcTracker::order`]).
+    keys: VecDeque<String>,
+    /// Newest issue time of an entry replaced at the per-user bound. A
+    /// nonce of this user issued at or before it and not in `entries` is
+    /// answered `stale=true`: the nc state of the replaced nonce is gone,
+    /// so accepting it again would allow a replay (RFC 7616 §5.5).
+    floor_secs: Option<u64>,
+}
+
+impl UserNonces {
+    /// Whether the floor can still refuse a nonce that is within its TTL.
+    fn floor_live(&self, ttl_secs: u64, now_secs: u64) -> bool {
+        self.floor_secs
+            .is_some_and(|f| now_secs.saturating_sub(f) <= ttl_secs)
+    }
 }
 
 /// Result of an nc pre-check.
@@ -446,11 +506,64 @@ fn tracker_key(nonce: &str, username: &str) -> String {
     key
 }
 
+/// The username of a [`tracker_key`] (`None` for a key not in that format).
+fn tracker_key_user(key: &str) -> Option<&str> {
+    let (len, rest) = key.split_once(':')?;
+    rest.get(..len.parse::<usize>().ok()?)
+}
+
 impl NcTracker {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
+            per_user: HashMap::new(),
+            max_per_user: DEFAULT_MAX_TRACKED_NONCES_PER_USER,
+            global_floor_secs: 0,
+        }
+    }
+
+    /// Gives back the per-user slot of an expired entry that was removed.
+    /// `swept` belongs to one `evict_expired` pass: the O(n) sweep of
+    /// floor-only records runs at most once in it.
+    fn release_user(&mut self, key: &str, ttl_secs: u64, now_secs: u64, swept: &mut bool) {
+        let Some(user) = tracker_key_user(key) else {
+            return;
+        };
+        let Some(u) = self.per_user.get_mut(user) else {
+            return;
+        };
+        // Entries expire from the front of `order`, and `keys` is a
+        // subsequence of it, so the key is this user's front one.
+        if u.keys.front().is_some_and(|k| k == key) {
+            u.keys.pop_front();
+        } else {
+            u.keys.retain(|k| k != key);
+        }
+        if !u.keys.is_empty() {
+            return;
+        }
+        if !u.floor_live(ttl_secs, now_secs) {
+            self.per_user.remove(user);
+            return;
+        }
+        // No entry left but a floor that still matters. That takes nonces
+        // used out of issue order; keep the record, within a bound.
+        if self.per_user.len() <= self.entries.len() + MAX_FLOOR_ONLY_USERS {
+            return;
+        }
+        if !*swept {
+            *swept = true;
+            self.per_user
+                .retain(|_, u| !u.keys.is_empty() || u.floor_live(ttl_secs, now_secs));
+        }
+        if self.per_user.len() > self.entries.len() + MAX_FLOOR_ONLY_USERS
+            && let Some(u) = self.per_user.remove(user)
+        {
+            // SC-5: never an unbounded map. The floor moves to the global
+            // one, which costs other users at most a re-challenge for an
+            // older nonce they have not used yet; no replay opens.
+            self.global_floor_secs = self.global_floor_secs.max(u.floor_secs.unwrap_or(0));
         }
     }
 
@@ -459,19 +572,34 @@ impl NcTracker {
     /// one; a live entry at the front can delay reclaiming later expired
     /// ones by at most one TTL, which only yields `Full` (a re-challenge).
     fn evict_expired(&mut self, ttl_secs: u64, now_secs: u64) {
+        let mut swept = false;
         while let Some(front) = self.order.front() {
             match self.entries.get(front) {
                 Some(e) if now_secs.saturating_sub(e.issued_secs) <= ttl_secs => break,
-                Some(_) => {
-                    self.entries.remove(front);
+                Some(_) => {}
+                None => {
+                    self.order.pop_front();
+                    continue;
                 }
-                None => {}
             }
-            self.order.pop_front();
+            if let Some(key) = self.order.pop_front() {
+                self.entries.remove(&key);
+                self.release_user(&key, ttl_secs, now_secs, &mut swept);
+            }
         }
     }
 
-    fn check(&mut self, key: &str, nc: u32, policy: &DigestPolicy, now_secs: u64) -> NcCheck {
+    /// Pre-check before the response is verified. It removes nothing but
+    /// expired entries: the caller is not authenticated yet.
+    fn check(
+        &mut self,
+        key: &str,
+        username: &str,
+        nc: u32,
+        issued_secs: u64,
+        policy: &DigestPolicy,
+        now_secs: u64,
+    ) -> NcCheck {
         if let Some(e) = self.entries.get(key) {
             return if nc > e.last_nc {
                 NcCheck::Ok
@@ -482,6 +610,17 @@ impl NcTracker {
         if nc == 0 {
             return NcCheck::Replay;
         }
+        // A nonce at or below the floor may be one whose nc state was
+        // dropped at the per-user bound: re-challenge, never accept.
+        if issued_secs <= self.global_floor_secs
+            || self
+                .per_user
+                .get(username)
+                .and_then(|u| u.floor_secs)
+                .is_some_and(|f| issued_secs <= f)
+        {
+            return NcCheck::Full;
+        }
         if self.entries.len() >= policy.max_tracked_nonces {
             self.evict_expired(policy.nonce_ttl.as_secs(), now_secs);
             // Live entries are never evicted: dropping one would reset its
@@ -490,13 +629,49 @@ impl NcTracker {
                 return NcCheck::Full;
             }
         }
+        // SC-5: one user's nonces may not use up the shared table. A user
+        // at the bound is let through here; `commit` then replaces that
+        // user's own oldest entry, once the response has verified.
+        if self
+            .per_user
+            .get(username)
+            .is_some_and(|u| u.keys.len() >= self.max_per_user)
+        {
+            self.evict_expired(policy.nonce_ttl.as_secs(), now_secs);
+        }
         NcCheck::Ok
     }
 
+    /// Records a verified use. A user at the per-user bound loses their
+    /// own oldest entry; its issue time becomes that user's floor.
     fn commit(&mut self, key: String, issued_secs: u64, nc: u32) {
         if let Some(e) = self.entries.get_mut(&key) {
             e.last_nc = e.last_nc.max(nc);
             return;
+        }
+        if let Some(user) = tracker_key_user(&key) {
+            if !self.per_user.contains_key(user) {
+                self.per_user
+                    .insert(user.to_string(), UserNonces::default());
+            }
+            if let Some(u) = self.per_user.get_mut(user) {
+                while u.keys.len() >= self.max_per_user {
+                    let Some(old) = u.keys.pop_front() else {
+                        break;
+                    };
+                    if let Some(e) = self.entries.remove(&old) {
+                        u.floor_secs =
+                            Some(u.floor_secs.map_or(e.issued_secs, |f| f.max(e.issued_secs)));
+                    }
+                }
+                u.keys.push_back(key.clone());
+            }
+            // Replaced keys stay in `order`. Compacting when they outnumber
+            // the entries keeps the queue bounded at amortised O(1).
+            if self.order.len() > self.entries.len().saturating_mul(2).saturating_add(16) {
+                let entries = &self.entries;
+                self.order.retain(|k| entries.contains_key(k));
+            }
         }
         self.order.push_back(key.clone());
         self.entries.insert(
@@ -532,6 +707,19 @@ impl DigestVerifier {
             issuer,
             tracker: NcTracker::new(),
         }
+    }
+
+    /// Sets the bound on live nonces tracked for one username (default
+    /// [`DEFAULT_MAX_TRACKED_NONCES_PER_USER`]; 0 is treated as 1). At the
+    /// bound a newly verified nonce replaces that user's own oldest tracked
+    /// one, which then gets [`DigestVerdict::Stale`]; other users are not
+    /// affected.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+    #[must_use]
+    pub fn with_max_tracked_nonces_per_user(mut self, max: usize) -> Self {
+        self.tracker.max_per_user = max.max(1);
+        self
     }
 
     /// Returns the policy.
@@ -622,13 +810,16 @@ impl DigestVerifier {
         let Some((_, _, nc)) = qop_params else {
             return DigestVerdict::Reject(DigestReject::QopMismatch);
         };
-        // RFC 7616 §3.4.5: nc strictly increasing per (nonce, username).
+        // RFC 7616 §3.4: nc strictly increasing per (nonce, username).
         let key = tracker_key(&creds.nonce, &creds.username);
         if !stale {
             if nc > policy.max_nc {
                 stale = true;
             } else {
-                match self.tracker.check(&key, nc, policy, now_secs) {
+                match self
+                    .tracker
+                    .check(&key, &creds.username, nc, issued_secs, policy, now_secs)
+                {
                     NcCheck::Ok => {}
                     NcCheck::Replay => return DigestVerdict::Reject(DigestReject::NonceReplay),
                     NcCheck::Full => stale = true,
@@ -675,28 +866,53 @@ fn expected_response(
     qop_params: Option<(Qop, &str, u32)>,
 ) -> Option<String> {
     let hasher = AlgorithmHasher::for_algorithm(policy.algorithm);
-    let base_ha1 = match secret {
+    // NIST 800-53 Rev5: IA-5(6) - an HA1 is a password equivalent. A
+    // lower-case HA1 is used in place (no copy); every temporary string
+    // made here that holds a password or an HA1 is wiped on drop.
+    let base_ha1: Cow<'_, str> = match secret {
         DigestSecret::Password(password) => {
-            let mut a1 = String::new();
+            let mut a1 = Zeroizing::new(String::new());
             let _ = write!(a1, "{}:{}:{password}", creds.username, policy.realm);
-            hasher.hash(a1.as_bytes())
+            Cow::Owned(hasher.hash(a1.as_bytes()))
         }
-        DigestSecret::Ha1(ha1) => ha1.to_ascii_lowercase(),
+        DigestSecret::Ha1(ha1) if ha1.bytes().any(|b| b.is_ascii_uppercase()) => {
+            Cow::Owned(ha1.to_ascii_lowercase())
+        }
+        DigestSecret::Ha1(ha1) => Cow::Borrowed(ha1),
     };
+    // Wipes the owned copy (computed or lower-cased); a borrow is untouched.
+    let base_ha1 = WipedCow(base_ha1);
     let cnonce = qop_params.map(|(_, c, _)| c);
     // RFC 7616 §3.4.2: -sess A1 = H(user:realm:pass):nonce:cnonce.
     let ha1 = if policy.algorithm.is_session() {
         let cnonce = cnonce?;
-        let mut a1 = String::new();
-        let _ = write!(a1, "{base_ha1}:{}:{cnonce}", creds.nonce);
-        hasher.hash(a1.as_bytes())
+        let mut a1 = Zeroizing::new(String::new());
+        let _ = write!(a1, "{}:{}:{cnonce}", base_ha1.as_str(), creds.nonce);
+        WipedCow(Cow::Owned(hasher.hash(a1.as_bytes())))
     } else {
         base_ha1
     };
     let qop = qop_params.map(|(q, _, _)| q);
     let nc = qop_params.map(|(_, _, n)| n);
     let ha2 = compute_ha2(&hasher, req.method, &creds.uri, qop, req.body).ok()?;
-    compute_response(&hasher, &ha1, &creds.nonce, nc, cnonce, qop, &ha2).ok()
+    compute_response(&hasher, ha1.as_str(), &creds.nonce, nc, cnonce, qop, &ha2).ok()
+}
+
+/// An HA1 that is wiped on drop when it is an owned copy.
+struct WipedCow<'a>(Cow<'a, str>);
+
+impl WipedCow<'_> {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for WipedCow<'_> {
+    fn drop(&mut self) {
+        if let Cow::Owned(s) = &mut self.0 {
+            s.zeroize();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -898,11 +1114,18 @@ mod tests {
         let mut tr = NcTracker::new();
         tr.commit(tracker_key("n1", "alice"), 1_000, 5);
         assert!(matches!(
-            tr.check(&tracker_key("n1", "alice"), 5, &policy, 1_001),
+            tr.check(
+                &tracker_key("n1", "alice"),
+                "alice",
+                5,
+                1_000,
+                &policy,
+                1_001
+            ),
             NcCheck::Replay
         ));
         assert!(matches!(
-            tr.check(&tracker_key("n1", "bob"), 1, &policy, 1_001),
+            tr.check(&tracker_key("n1", "bob"), "bob", 1, 1_000, &policy, 1_001),
             NcCheck::Ok
         ));
         // Length prefix keeps (nonce, user) splits distinct.
@@ -915,12 +1138,260 @@ mod tests {
         let mut tr = NcTracker::new();
         for i in 0..1_000u64 {
             let key = tracker_key(&format!("n{i}"), "alice");
-            if matches!(tr.check(&key, 1, &policy, 1_000 + i * 400), NcCheck::Ok) {
+            if matches!(
+                tr.check(&key, "alice", 1, 1_000 + i * 400, &policy, 1_000 + i * 400),
+                NcCheck::Ok
+            ) {
                 tr.commit(key, 1_000 + i * 400, 1);
             }
         }
         assert!(tr.entries.len() <= 4);
         assert_eq!(tr.entries.len(), tr.order.len());
+    }
+
+    /// Credentials of `user` (password `pw`) for `challenge`, `nc=1`.
+    fn creds_of(user: &str, challenge: &DigestChallenge) -> DigestCredentials {
+        let hasher = AlgorithmHasher::for_algorithm(DigestAlgorithm::Sha256);
+        let response = crate::auth::compute_digest_response(
+            &hasher,
+            user,
+            &challenge.realm,
+            "pw",
+            "REGISTER",
+            RURI,
+            &challenge.nonce,
+            DigestAlgorithm::Sha256,
+            Some(Qop::Auth),
+            Some(1),
+            Some("cn0nce"),
+            None,
+        )
+        .unwrap();
+        DigestCredentials::new(user, &challenge.realm, &challenge.nonce, RURI, response)
+            .with_algorithm(DigestAlgorithm::Sha256)
+            .with_qop(Qop::Auth, "cn0nce", 1)
+    }
+
+    /// SEC-002 / SEC-011: one authenticated user cannot fill the shared
+    /// tracker, and is not locked out at their bound either. A further
+    /// verified nonce replaces their own oldest one; the replaced nonce is
+    /// answered `stale`, never accepted again (no replay); another user is
+    /// not affected.
+    #[test]
+    fn per_user_cap_keeps_room_for_other_users() {
+        let mut v = verifier(DigestPolicy::new("example.com").with_max_tracked_nonces(4))
+            .with_max_tracked_nonces_per_user(2);
+        let pw = DigestSecret::Password("pw");
+        let mallory_ok = DigestVerdict::Ok {
+            username: "mallory".to_string(),
+        };
+        let first = v.challenge(t(1_000), false).unwrap();
+        let second = v.challenge(t(1_001), false).unwrap();
+        for ch in [&first, &second] {
+            assert_eq!(
+                v.verify(view(), &creds_of("mallory", ch), pw, t(1_002)),
+                mallory_ok
+            );
+        }
+        // However many nonces Mallory uses, she holds two entries.
+        for i in 0..20 {
+            let ch = v.challenge(t(1_010 + i), false).unwrap();
+            assert_eq!(
+                v.verify(view(), &creds_of("mallory", &ch), pw, t(1_010 + i)),
+                mallory_ok
+            );
+            assert_eq!(v.tracked_nonces(), 2);
+            assert!(v.tracker.order.len() <= 2 * 2 + 16 + 1);
+        }
+        assert_eq!(
+            v.tracker.per_user.get("mallory").map(|u| u.keys.len()),
+            Some(2)
+        );
+        // A replaced nonce is within its TTL but is not accepted again:
+        // the same request (a replay) gets `stale`.
+        assert_eq!(
+            v.verify(view(), &creds_of("mallory", &first), pw, t(1_040)),
+            DigestVerdict::Stale
+        );
+        assert_eq!(
+            v.verify(view(), &creds_of("mallory", &second), pw, t(1_040)),
+            DigestVerdict::Stale
+        );
+        assert_eq!(v.tracked_nonces(), 2);
+        // Alice is not affected: neither by Mallory's share nor her floor.
+        let old = v.challenge(t(1_005), false).unwrap();
+        assert_eq!(
+            v.verify(view(), &creds_of("alice", &old), pw, t(1_041)),
+            ok()
+        );
+        assert_eq!(v.tracked_nonces(), 3);
+        // Zero is treated as one, never as "no nonce at all".
+        let v = verifier(DigestPolicy::new("example.com")).with_max_tracked_nonces_per_user(0);
+        assert_eq!(v.tracker.max_per_user, 1);
+    }
+
+    /// SEC-011: the long-TTL case. A user who takes a fresh challenge for
+    /// every request keeps authenticating past the per-user bound, with
+    /// the tracker and its queues bounded throughout.
+    #[test]
+    fn per_user_cap_does_not_lock_out_at_a_long_ttl() {
+        let policy = DigestPolicy::new("example.com").with_nonce_ttl(Duration::from_secs(3_600));
+        let mut v = verifier(policy);
+        let pw = DigestSecret::Password("pw");
+        let cap = DEFAULT_MAX_TRACKED_NONCES_PER_USER;
+        for i in 0..(4 * cap as u64) {
+            // Two devices, one fresh challenge each per 60 s.
+            let at = 10_000 + i * 30;
+            let ch = v.challenge(t(at), false).unwrap();
+            assert_eq!(
+                v.verify(view(), &creds_of("alice", &ch), pw, t(at)),
+                ok(),
+                "{i}"
+            );
+            assert!(v.tracked_nonces() <= cap);
+            assert!(v.tracker.order.len() <= 2 * cap + 17);
+        }
+        let u = v.tracker.per_user.get("alice").unwrap();
+        assert!(u.keys.len() <= cap);
+        assert!(u.floor_secs.is_some());
+        assert_eq!(v.tracker.per_user.len(), 1);
+    }
+
+    /// The floor outlives the user's entries only while it matters, and
+    /// the record of a user with nothing left is dropped (SC-5).
+    #[test]
+    fn per_user_floor_is_kept_only_while_it_matters() {
+        let policy = DigestPolicy::new("example.com");
+        let ttl = policy.nonce_ttl.as_secs();
+        let mut tr = NcTracker::new();
+        tr.max_per_user = 1;
+        // Used out of issue order: the newer nonce first, then an older
+        // one, which replaces it and leaves a floor above its own issue.
+        tr.commit(tracker_key("new", "alice"), 1_200, 1);
+        tr.commit(tracker_key("old", "alice"), 1_000, 1);
+        assert_eq!(tr.entries.len(), 1);
+        assert_eq!(tr.per_user.get("alice").unwrap().floor_secs, Some(1_200));
+        // The replaced nonce and anything issued up to its second: stale.
+        for (nonce, issued) in [("new", 1_200), ("other", 1_100)] {
+            assert!(matches!(
+                tr.check(
+                    &tracker_key(nonce, "alice"),
+                    "alice",
+                    2,
+                    issued,
+                    &policy,
+                    1_201
+                ),
+                NcCheck::Full
+            ));
+        }
+        assert!(matches!(
+            tr.check(
+                &tracker_key("later", "alice"),
+                "alice",
+                1,
+                1_201,
+                &policy,
+                1_201
+            ),
+            NcCheck::Ok
+        ));
+        // Bob's nonce of the same second is his own business.
+        assert!(matches!(
+            tr.check(&tracker_key("new", "bob"), "bob", 1, 1_200, &policy, 1_201),
+            NcCheck::Ok
+        ));
+        // "old" expires first: no entry left, the floor still matters.
+        tr.evict_expired(ttl, 1_000 + ttl + 1);
+        assert!(tr.entries.is_empty());
+        assert!(tr.per_user.get("alice").unwrap().keys.is_empty());
+        assert!(matches!(
+            tr.check(
+                &tracker_key("new", "alice"),
+                "alice",
+                2,
+                1_200,
+                &policy,
+                1_000 + ttl + 1
+            ),
+            NcCheck::Full
+        ));
+        // Once the floor is older than the TTL the next expiry drops it.
+        tr.commit(tracker_key("n3", "alice"), 1_300, 1);
+        tr.evict_expired(ttl, 1_300 + ttl + 1);
+        assert!(tr.entries.is_empty());
+        assert!(tr.order.is_empty());
+        assert!(tr.per_user.is_empty());
+        assert_eq!(tr.global_floor_secs, 0);
+    }
+
+    /// The floor-only records are bounded: past the bound a floor moves to
+    /// the global one, which refuses older unused nonces for everyone.
+    #[test]
+    fn floor_only_users_are_bounded() {
+        let policy = DigestPolicy::new("example.com");
+        let ttl = policy.nonce_ttl.as_secs();
+        let mut tr = NcTracker::new();
+        tr.max_per_user = 1;
+        let users = MAX_FLOOR_ONLY_USERS + 8;
+        for i in 0..users {
+            let user = format!("u{i}");
+            tr.commit(tracker_key("new", &user), 1_200, 1);
+            tr.commit(tracker_key("old", &user), 1_000, 1);
+        }
+        assert_eq!(tr.per_user.len(), users);
+        tr.evict_expired(ttl, 1_000 + ttl + 1);
+        assert!(tr.entries.is_empty());
+        assert_eq!(tr.per_user.len(), MAX_FLOOR_ONLY_USERS);
+        assert_eq!(tr.global_floor_secs, 1_200);
+        let now = 1_000 + ttl + 1;
+        assert!(matches!(
+            tr.check(&tracker_key("new", "u0"), "u0", 2, 1_200, &policy, now),
+            NcCheck::Full
+        ));
+        assert!(matches!(
+            tr.check(&tracker_key("x", "zed"), "zed", 1, 1_200, &policy, now),
+            NcCheck::Full
+        ));
+        assert!(matches!(
+            tr.check(&tracker_key("y", "zed"), "zed", 1, 1_201, &policy, now),
+            NcCheck::Ok
+        ));
+    }
+
+    /// The per-user counts follow the entries exactly and the map does not
+    /// keep a username without entries (SC-5).
+    #[test]
+    fn per_user_counts_follow_entries() {
+        let policy = DigestPolicy::new("example.com").with_max_tracked_nonces(64);
+        let mut tr = NcTracker::new();
+        // Usernames that look like key syntax keep their own count.
+        for user in ["alice", "3:ab", "", "a:b:c"] {
+            for i in 0..3u64 {
+                let key = tracker_key(&format!("n{i}"), user);
+                assert_eq!(tracker_key_user(&key), Some(user));
+                assert!(matches!(
+                    tr.check(&key, user, 1, 1_000, &policy, 1_000),
+                    NcCheck::Ok
+                ));
+                tr.commit(key, 1_000, 1);
+            }
+            assert_eq!(tr.per_user.get(user).map(|u| u.keys.len()), Some(3));
+        }
+        // A repeated commit for a tracked nonce does not count twice.
+        tr.commit(tracker_key("n0", "alice"), 1_000, 2);
+        assert_eq!(tr.per_user.get("alice").map(|u| u.keys.len()), Some(3));
+        assert_eq!(
+            tr.per_user.values().map(|u| u.keys.len()).sum::<usize>(),
+            tr.entries.len()
+        );
+        tr.evict_expired(policy.nonce_ttl.as_secs(), 2_000);
+        assert!(tr.entries.is_empty());
+        assert!(tr.order.is_empty());
+        assert!(tr.per_user.is_empty());
+        assert_eq!(tracker_key_user("no-colon"), None);
+        assert_eq!(tracker_key_user("99:short"), None);
+        assert_eq!(tracker_key_user("x:abc"), None);
     }
 
     #[test]
@@ -1144,6 +1615,28 @@ mod tests {
         assert_eq!(
             v.verify(view(), &c, DigestSecret::Ha1(&ha1), t(1_001)),
             ok()
+        );
+    }
+
+    /// SEC-003: an upper-case HA1 verifies like its lower-case form (the
+    /// lower-case form is used in place, the other through a wiped copy).
+    #[test]
+    fn ha1_secret_is_case_insensitive() {
+        let ha1 = Sha256DigestHasherForTest::ha1("alice", "example.com", "pw");
+        for secret in [ha1.clone(), ha1.to_ascii_uppercase()] {
+            let (mut v, ch) = setup();
+            let c = creds_for(&ch, DigestAlgorithm::Sha256, Some(Qop::Auth), RURI, "pw", 1);
+            assert_eq!(
+                v.verify(view(), &c, DigestSecret::Ha1(&secret), t(1_001)),
+                ok()
+            );
+        }
+        let (mut v, ch) = setup();
+        let c = creds_for(&ch, DigestAlgorithm::Sha256, Some(Qop::Auth), RURI, "pw", 1);
+        let wrong = "0".repeat(64);
+        assert_eq!(
+            v.verify(view(), &c, DigestSecret::Ha1(&wrong), t(1_001)),
+            rej(DigestReject::BadResponse)
         );
     }
 

@@ -13,6 +13,7 @@ use crate::api_server::{ApiServer, ApiServerConfig, AppState};
 use crate::args::Args;
 #[cfg(feature = "cluster")]
 use crate::cluster::ClusterManager;
+use crate::digest_credentials::{DigestCredentialError, DigestCredentialStore, ReloadSummary};
 #[cfg(feature = "grpc")]
 use crate::grpc_server::GrpcServer;
 use crate::server::{Server, ServerError};
@@ -101,6 +102,11 @@ pub struct Runtime {
     reload_check_interval: Duration,
     /// Telemetry provider for distributed tracing.
     telemetry: Option<TelemetryProvider>,
+    /// `[digest_auth]` credential store, loaded before the server is built
+    /// and re-read on reload. `None` when digest is off.
+    ///
+    /// ## NIST 800-53 Rev5: IA-5
+    digest_credentials: Option<Arc<DigestCredentialStore>>,
     /// Cluster manager (when cluster feature is enabled).
     #[cfg(feature = "cluster")]
     cluster: Option<Arc<ClusterManager>>,
@@ -112,6 +118,13 @@ impl Runtime {
         // Load configuration
         let config = Self::load_config(&args)?;
         Self::init_audit(&config, &args)?;
+
+        // `[digest_auth]`: a credentials file that does not load stops
+        // startup (after audit init, so the load is audited).
+        let digest_credentials = Self::load_digest_credentials(
+            &config,
+            &std::env::var("SBC_AUTH_MODE").unwrap_or_default(),
+        )?;
 
         // Initialize telemetry provider
         let telemetry = Self::init_telemetry(&config)?;
@@ -145,9 +158,99 @@ impl Runtime {
             server: None,
             reload_check_interval: Duration::from_millis(500),
             telemetry,
+            digest_credentials,
             #[cfg(feature = "cluster")]
             cluster,
         })
+    }
+
+    /// Loads the `[digest_auth]` credential store, or `None` when
+    /// `require_auth` is off. `auth_mode` is `SBC_AUTH_MODE`.
+    ///
+    /// # Errors
+    /// [`RuntimeError::InitFailed`] (the daemon does not start) when the
+    /// credentials file does not load, and when bearer REGISTER auth is
+    /// also selected: with both set bearer would win and digest would be
+    /// skipped without notice.
+    ///
+    /// A refusal is audited with an explicit failure outcome (NIST-005); the
+    /// audited reason is the rule that failed, without the file path.
+    ///
+    /// ## NIST 800-53 Rev5: IA-2, IA-5, AU-2, AU-3, CM-6, SC-24 (fail closed)
+    fn load_digest_credentials(
+        config: &SbcConfig,
+        auth_mode: &str,
+    ) -> Result<Option<Arc<DigestCredentialStore>>, RuntimeError> {
+        let digest = &config.digest_auth;
+        if !digest.require_auth {
+            return Ok(None);
+        }
+        let algorithm = crate::server::digest_algorithm(digest.algorithm());
+        // `audit_reason` goes to the audit trail and must not carry a path.
+        let fail = |audit_reason: &str, reason: String| {
+            error!(error = %reason, "REGISTER digest authentication cannot start — SBC cannot start");
+            crate::digest_credentials::audit_load_failure(
+                uc_audit::event::KeyOperationType::Loaded,
+                algorithm,
+                audit_reason,
+            );
+            RuntimeError::InitFailed {
+                component: "digest_auth".to_string(),
+                reason,
+            }
+        };
+        if crate::server::bearer_mode_active(auth_mode) {
+            let reason = "digest_auth.require_auth = true cannot be combined with \
+                          SBC_AUTH_MODE=bearer; choose one REGISTER authentication method";
+            return Err(fail(reason, reason.to_string()));
+        }
+        // Config validation requires both with `require_auth`; a config
+        // built in code may still lack them.
+        let (Some(realm), Some(path)) = (digest.realm.as_deref(), digest.credentials_file.as_ref())
+        else {
+            let reason = "digest_auth.require_auth = true requires digest_auth.realm and \
+                          digest_auth.credentials_file";
+            return Err(fail(reason, reason.to_string()));
+        };
+        let store = DigestCredentialStore::load(path, realm, algorithm)
+            .map_err(|e| fail(&e.to_string(), format!("{} ({})", e, path.display())))?;
+        info!(
+            path = %path.display(),
+            users = store.users(),
+            algorithm = digest.algorithm().as_str(),
+            "digest credentials loaded; REGISTER requires digest authentication"
+        );
+        crate::digest_credentials::audit_loaded(&store);
+        Ok(Some(Arc::new(store)))
+    }
+
+    /// Folds a credential reload outcome into a reload result: counts on
+    /// success, and a failed reload (previous credentials kept) makes the
+    /// whole reload report failure so a rotation that did not happen is
+    /// never reported as done.
+    fn apply_credential_reload(
+        result: &mut ConfigReloadResult,
+        outcome: Option<Result<ReloadSummary, DigestCredentialError>>,
+    ) {
+        match outcome {
+            None => {}
+            Some(Ok(s)) => {
+                if result.success && result.changes.is_empty() {
+                    result.message = "Digest credentials reloaded".to_string();
+                }
+                result.changes.push(format!(
+                    "digest_auth.credentials (users={}, added={}, removed={})",
+                    s.users, s.added, s.removed
+                ));
+            }
+            Some(Err(e)) => {
+                result.success = false;
+                result.message = format!(
+                    "{}; digest credentials reload failed, previous credentials kept: {e}",
+                    result.message
+                );
+            }
+        }
     }
 
     /// Initializes the telemetry provider from configuration.
@@ -275,13 +378,23 @@ impl Runtime {
     pub async fn reload_config(&self) -> Result<ConfigReloadResult, RuntimeError> {
         let config_path = self.args.effective_config_path();
 
+        // NIST 800-53 Rev5: IA-5 - the credentials file is re-read on every
+        // reload, whatever happens to the config file; a file that fails
+        // keeps the previous credentials (audited in `reload_and_audit`).
+        let credentials = match self.digest_credentials {
+            Some(ref store) => Some(crate::digest_credentials::reload_and_audit(store).await),
+            None => None,
+        };
+
         if !Path::new(&config_path).exists() {
-            return Ok(ConfigReloadResult {
+            let mut result = ConfigReloadResult {
                 success: false,
                 changes: Vec::new(),
                 restart_required: Vec::new(),
                 message: "Config file not found".to_string(),
-            });
+            };
+            Self::apply_credential_reload(&mut result, credentials);
+            return Ok(result);
         }
 
         let new_config = load_from_file(&config_path).map_err(|e| RuntimeError::ConfigFailed {
@@ -297,12 +410,14 @@ impl Runtime {
         // Log what changed
         if changes.is_empty() {
             info!("Configuration reload requested, but no changes detected");
-            return Ok(ConfigReloadResult {
+            let mut result = ConfigReloadResult {
                 success: true,
                 changes: Vec::new(),
                 restart_required: Vec::new(),
                 message: "No changes detected".to_string(),
-            });
+            };
+            Self::apply_credential_reload(&mut result, credentials);
+            return Ok(result);
         }
 
         drop(current); // Release read lock before acquiring write lock
@@ -331,12 +446,14 @@ impl Runtime {
             )
         };
 
-        Ok(ConfigReloadResult {
+        let mut result = ConfigReloadResult {
             success: true,
             changes,
             restart_required,
             message,
-        })
+        };
+        Self::apply_credential_reload(&mut result, credentials);
+        Ok(result)
     }
 
     /// Changed settings a reload does not apply to the running SIP stack.
@@ -367,6 +484,13 @@ impl Runtime {
         if old.recording != new.recording {
             keys.push("recording".to_string());
         }
+        // NIST 800-53 Rev5: CM-6, IA-5 - `[digest_auth]` (require_auth,
+        // realm, algorithm, credentials_file path, nonce_ttl_secs) is read
+        // at startup only. The credentials file contents are re-read on
+        // every reload, from the path given at startup.
+        if old.digest_auth != new.digest_auth {
+            keys.push("digest_auth".to_string());
+        }
         keys
     }
 
@@ -388,6 +512,9 @@ impl Runtime {
         }
         if old.logging != new.logging {
             changes.push("logging".to_string());
+        }
+        if old.digest_auth != new.digest_auth {
+            changes.push("digest_auth".to_string());
         }
 
         changes
@@ -502,9 +629,14 @@ impl Runtime {
 
         // Pass cluster manager to server if available
         #[cfg(feature = "cluster")]
-        let mut server = Server::new_with_cluster(config, signal.clone(), self.cluster.clone());
+        let mut server = Server::new_with_cluster(
+            config,
+            signal.clone(),
+            self.cluster.clone(),
+            self.digest_credentials.clone(),
+        );
         #[cfg(not(feature = "cluster"))]
-        let mut server = Server::new(config, signal.clone());
+        let mut server = Server::new(config, signal.clone(), self.digest_credentials.clone());
 
         // Set zone registry on server (and its SipStack) before starting
         if let Some(ref registry) = zone_registry {
@@ -1229,6 +1361,7 @@ impl Runtime {
 
         let reload_cdr = cdr.clone();
         let reload_stir = stir.clone();
+        let reload_digest = self.digest_credentials.clone();
         let reload_handle = tokio::spawn(async move {
             Self::config_reload_loop(
                 reload_signal,
@@ -1237,6 +1370,7 @@ impl Runtime {
                 reload_interval,
                 reload_cdr,
                 reload_stir,
+                reload_digest,
             )
             .await;
         });
@@ -1360,6 +1494,7 @@ impl Runtime {
         poll_interval: Duration,
         cdr: Option<Arc<crate::cdr::CdrContext>>,
         stir: Option<Arc<crate::stir::StirService>>,
+        digest_credentials: Option<Arc<DigestCredentialStore>>,
     ) {
         let mut interval = tokio::time::interval(poll_interval);
 
@@ -1375,6 +1510,15 @@ impl Runtime {
                         if let Some(ref s) = stir {
                             s.reload_anchors().await;
                         }
+                        // SIGHUP also re-reads the digest credentials file
+                        // (off the runtime; logged and audited there). A
+                        // file that fails to load keeps the previous
+                        // credentials: never empty, never unauthenticated.
+                        //
+                        // NIST 800-53 Rev5: IA-5, CM-3, SC-24
+                        if let Some(ref store) = digest_credentials {
+                            let _ = crate::digest_credentials::reload_and_audit(store).await;
+                        }
 
                         if Path::new(&config_path).exists() {
                             match load_from_file(&config_path) {
@@ -1384,6 +1528,11 @@ impl Runtime {
                                         if old != new_config.cdr {
                                             crate::cdr::reload(c, &old, &new_config.cdr);
                                         }
+                                    }
+                                    if config.read().await.digest_auth != new_config.digest_auth {
+                                        warn!(
+                                            "[digest_auth] setting changes need a restart; only the credentials file contents are reloaded"
+                                        );
                                     }
                                     *config.write().await = new_config;
                                     info!("Configuration reloaded successfully");
@@ -1752,6 +1901,857 @@ mod tests {
             Runtime::detect_restart_required(&old, &new),
             vec!["recording".to_string()]
         );
+    }
+
+    // POA&M-270: `[digest_auth]` settings are restart-only; only the
+    // credentials file contents reload.
+    #[test]
+    fn reload_reports_digest_auth_as_restart_required() {
+        let old = SbcConfig::default();
+        let setters: [fn(&mut SbcConfig); 5] = [
+            |c| c.digest_auth.require_auth = true,
+            |c| c.digest_auth.realm = Some("sip.example.test".to_string()),
+            |c| c.digest_auth.algorithm = Some(sbc_config::DigestAuthAlgorithm::Sha512_256),
+            |c| c.digest_auth.credentials_file = Some("/etc/usg-sbc/digest.ha1".into()),
+            |c| c.digest_auth.nonce_ttl_secs = Some(60),
+        ];
+        for set in setters {
+            let mut new = old.clone();
+            set(&mut new);
+            assert_eq!(
+                Runtime::detect_restart_required(&old, &new),
+                vec!["digest_auth".to_string()]
+            );
+            assert_eq!(
+                Runtime::detect_config_changes(&old, &new),
+                vec!["digest_auth".to_string()]
+            );
+        }
+        assert_eq!(
+            Runtime::detect_restart_required(&old, &old.clone()),
+            Vec::<String>::new()
+        );
+    }
+
+    fn digest_config(path: &Path) -> SbcConfig {
+        load_from_str(&format!(
+            "[digest_auth]\nrequire_auth = true\nrealm = \"sip.example.test\"\n\
+             credentials_file = \"{}\"\n",
+            path.display()
+        ))
+        .unwrap()
+    }
+
+    fn init_reason(r: Result<Option<Arc<DigestCredentialStore>>, RuntimeError>) -> String {
+        let err = r.expect_err("startup must be refused");
+        assert!(
+            matches!(err, RuntimeError::InitFailed { ref component, .. } if component == "digest_auth"),
+            "{err:?}"
+        );
+        err.to_string()
+    }
+
+    // POA&M-270: digest off loads nothing; on, a file that does not load or
+    // a second REGISTER auth method stops startup.
+    #[test]
+    fn digest_credentials_startup_rules() {
+        use crate::digest_credentials::test_support::{line, write_file};
+        assert!(
+            Runtime::load_digest_credentials(&SbcConfig::default(), "")
+                .unwrap()
+                .is_none()
+        );
+        // Bearer alone (digest off) is not a conflict.
+        assert!(
+            Runtime::load_digest_credentials(&SbcConfig::default(), "bearer")
+                .unwrap()
+                .is_none()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.ha1");
+        let reason = init_reason(Runtime::load_digest_credentials(
+            &digest_config(&missing),
+            "",
+        ));
+        assert!(reason.contains("could not be read"), "{reason}");
+
+        let content = line("alice", "sip.example.test", "pw-for-test", "SHA-256");
+        #[cfg(unix)]
+        {
+            let open = write_file(dir.path(), "open.ha1", content.as_bytes(), 0o644);
+            let reason = init_reason(Runtime::load_digest_credentials(&digest_config(&open), ""));
+            assert!(reason.contains("group or other"), "{reason}");
+        }
+        // Wrong realm in the file: caught at load, not at the first REGISTER.
+        let other = line("alice", "other.example.test", "pw-for-test", "SHA-256");
+        let wrong = write_file(dir.path(), "wrong.ha1", other.as_bytes(), 0o600);
+        let reason = init_reason(Runtime::load_digest_credentials(&digest_config(&wrong), ""));
+        assert!(reason.contains("line 1"), "{reason}");
+        assert!(!reason.contains("alice"), "{reason}");
+
+        let good = write_file(dir.path(), "digest.ha1", content.as_bytes(), 0o600);
+        let config = digest_config(&good);
+        for mode in ["bearer", "Bearer", " BEARER "] {
+            let reason = init_reason(Runtime::load_digest_credentials(&config, mode));
+            assert!(reason.contains("SBC_AUTH_MODE=bearer"), "{reason}");
+        }
+        let capture = uc_audit::capture::start();
+        let store = Runtime::load_digest_credentials(&config, "")
+            .unwrap()
+            .expect("store");
+        assert_eq!(store.users(), 1);
+        assert!(capture.events().iter().any(|e| matches!(
+            e,
+            uc_audit::AuditEvent::ConfigurationChange(c)
+                if c.description.contains("credentials loaded: users=1")
+        )));
+
+        // A config built in code without the paired keys is refused too.
+        let mut bare = SbcConfig::default();
+        bare.digest_auth.require_auth = true;
+        let reason = init_reason(Runtime::load_digest_credentials(&bare, ""));
+        assert!(reason.contains("digest_auth.realm"), "{reason}");
+    }
+
+    /// NIST-005: every startup refusal is audited with an explicit failure
+    /// outcome and the rule that failed, without the path or file content;
+    /// a successful load adds no failure event.
+    #[test]
+    fn digest_startup_refusal_is_audited_as_a_failure() {
+        use crate::digest_credentials::test_support::{line, write_file};
+        use uc_audit::event::{KeyOperationOutcome, KeyOperationType};
+        let failures = |capture: &uc_audit::capture::CaptureGuard| -> Vec<_> {
+            capture
+                .events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    uc_audit::AuditEvent::CryptoKeyOperation(k) => Some(k),
+                    _ => None,
+                })
+                .collect()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let other = line("alice", "other.example.test", "pw-for-test", "SHA-256");
+        let wrong = write_file(dir.path(), "wrong-realm.ha1", other.as_bytes(), 0o600);
+        let good = write_file(
+            dir.path(),
+            "digest.ha1",
+            line("alice", "sip.example.test", "pw-for-test", "SHA-256").as_bytes(),
+            0o600,
+        );
+        let mut bare = SbcConfig::default();
+        bare.digest_auth.require_auth = true;
+        let missing = dir.path().join("absent.ha1");
+        for (config, mode, needle) in [
+            (digest_config(&wrong), "", "line 1: realm does not match"),
+            (digest_config(&missing), "", "could not be read"),
+            (digest_config(&good), " Bearer ", "SBC_AUTH_MODE=bearer"),
+            (bare, "", "requires digest_auth.realm"),
+        ] {
+            let capture = uc_audit::capture::start();
+            let _ = init_reason(Runtime::load_digest_credentials(&config, mode));
+            let events = failures(&capture);
+            assert_eq!(events.len(), 1, "{needle}: {events:?}");
+            let f = &events[0];
+            assert_eq!(f.key_id, crate::digest_credentials::AUDIT_KEY_ID);
+            assert_eq!(f.operation, KeyOperationType::Loaded);
+            assert_eq!(f.outcome, KeyOperationOutcome::Failure);
+            assert_eq!(f.algorithm, "SHA-256");
+            let reason = f.reason.as_deref().unwrap_or_default();
+            assert!(reason.contains(needle), "{reason}");
+            let dir_text = dir.path().display().to_string();
+            assert!(
+                !reason.contains(&dir_text)
+                    && !reason.contains(".ha1")
+                    && !reason.contains("alice"),
+                "{reason}"
+            );
+        }
+        let capture = uc_audit::capture::start();
+        assert!(
+            Runtime::load_digest_credentials(&digest_config(&good), "")
+                .unwrap()
+                .is_some()
+        );
+        // NIST-008: a load that succeeds is the success counterpart.
+        let events = failures(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].key_id, crate::digest_credentials::AUDIT_KEY_ID);
+        assert_eq!(events[0].operation, KeyOperationType::Loaded);
+        assert_eq!(events[0].outcome, KeyOperationOutcome::Success);
+        assert_eq!(events[0].reason, None);
+    }
+
+    /// POA&M-270 acceptance: digest REGISTER end to end from TOML. The
+    /// shipped-style section and a 0600 HA1 file are loaded the way startup
+    /// loads them, the server is built from them, and a REGISTER is
+    /// challenged with the configured realm and algorithm, accepted with
+    /// the right password and refused with a wrong one.
+    #[tokio::test]
+    async fn digest_register_end_to_end_from_toml() {
+        use crate::digest_credentials::test_support::{line, write_file};
+        use crate::sip_stack::ProcessResult;
+        use proto_sip::{HeaderName, SipMessage};
+        use uc_types::address::SbcSocketAddr;
+
+        let realm = "sip.example.test";
+        // Per-run test secret (not a hard-coded credential).
+        let password = format!(
+            "pw-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let content = format!(
+            "# users\n{}{}",
+            line("alice", realm, &password, "SHA-256"),
+            line("alice", realm, &password, "SHA-512-256")
+        );
+        let path = write_file(dir.path(), "digest.ha1", content.as_bytes(), 0o600);
+        let config = load_from_str(&format!(
+            "[general]\ninstance_name = \"sbc-e2e\"\n\
+             [digest_auth]\nrequire_auth = true\nrealm = \"{realm}\"\n\
+             algorithm = \"SHA-512-256\"\ncredentials_file = \"{}\"\n\
+             nonce_ttl_secs = 120\n",
+            path.display()
+        ))
+        .unwrap();
+        let store = Runtime::load_digest_credentials(&config, "").unwrap();
+        assert!(store.is_some());
+        let server = Server::new(config, ShutdownSignal::new(), store);
+        let stack = server.sip_stack();
+        assert!(stack.register_auth_enabled());
+
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        let register = |n: u32, auth: Option<&str>| {
+            let auth = auth.map_or_else(String::new, |a| format!("Authorization: {a}\r\n"));
+            bytes::Bytes::from(format!(
+                "REGISTER sip:sbc.example.test SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP client.example.test:5060;branch=z9hG4bK-e2e{n}\r\n\
+                 From: <sip:alice@{realm}>;tag=1234\r\n\
+                 To: <sip:alice@{realm}>\r\n\
+                 Call-ID: reg-e2e@example.test\r\n\
+                 CSeq: {n} REGISTER\r\n\
+                 Contact: <sip:alice@client.example.test:5060>\r\n\
+                 {auth}Content-Length: 0\r\n\r\n"
+            ))
+        };
+        let send = |msg: bytes::Bytes| async move {
+            match stack.process_message(&msg, src, None).await {
+                ProcessResult::Response {
+                    message: SipMessage::Response(resp),
+                    ..
+                } => Some(resp),
+                _ => None,
+            }
+        };
+        let authorization = |pw: &str, nonce: &str, nc: u32| {
+            let resp = proto_sip::compute_digest_response(
+                &proto_sip::Sha512_256DigestHasher,
+                "alice",
+                realm,
+                pw,
+                "REGISTER",
+                "sip:sbc.example.test",
+                nonce,
+                proto_sip::DigestAlgorithm::Sha512_256,
+                Some(proto_sip::Qop::Auth),
+                Some(nc),
+                Some("c0ffee"),
+                None,
+            )
+            .unwrap();
+            format!(
+                "Digest username=\"alice\", realm=\"{realm}\", nonce=\"{nonce}\", \
+                 uri=\"sip:sbc.example.test\", response=\"{resp}\", algorithm=SHA-512-256, \
+                 qop=auth, cnonce=\"c0ffee\", nc={nc:08x}"
+            )
+        };
+
+        let challenge = send(register(1, None)).await.expect("response");
+        assert_eq!(challenge.status.code(), 401);
+        let www = challenge
+            .headers
+            .get_value(&HeaderName::WwwAuthenticate)
+            .unwrap()
+            .to_string();
+        assert!(www.contains(&format!("realm=\"{realm}\"")), "{www}");
+        assert!(www.contains("algorithm=SHA-512-256"), "{www}");
+        assert!(!www.to_ascii_uppercase().contains("MD5"), "{www}");
+        let nonce = www
+            .split("nonce=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap()
+            .to_string();
+
+        let bad = send(register(
+            2,
+            Some(&authorization("wrong-password", &nonce, 1)),
+        ))
+        .await
+        .expect("response");
+        assert_eq!(bad.status.code(), 401);
+        let ok = send(register(3, Some(&authorization(&password, &nonce, 2))))
+            .await
+            .expect("response");
+        assert_eq!(ok.status.code(), 200);
+    }
+
+    #[test]
+    fn credential_reload_outcome_is_reported() {
+        let base = || ConfigReloadResult {
+            success: true,
+            changes: Vec::new(),
+            restart_required: Vec::new(),
+            message: "No changes detected".to_string(),
+        };
+        let mut r = base();
+        Runtime::apply_credential_reload(&mut r, None);
+        assert!(r.success && r.changes.is_empty());
+        assert_eq!(r.message, "No changes detected");
+
+        let mut r = base();
+        Runtime::apply_credential_reload(
+            &mut r,
+            Some(Ok(ReloadSummary {
+                users: 3,
+                added: 2,
+                removed: 1,
+            })),
+        );
+        assert!(r.success);
+        assert_eq!(
+            r.changes,
+            vec!["digest_auth.credentials (users=3, added=2, removed=1)".to_string()]
+        );
+        assert_eq!(r.message, "Digest credentials reloaded");
+
+        let mut r = base();
+        Runtime::apply_credential_reload(
+            &mut r,
+            Some(Err(DigestCredentialError::Line {
+                line: 7,
+                rule: "HA1 must be 64 hex characters",
+            })),
+        );
+        assert!(!r.success);
+        assert_eq!(r.changes, Vec::<String>::new());
+        assert!(
+            r.message.contains("previous credentials kept"),
+            "{}",
+            r.message
+        );
+        assert!(r.message.contains("line 7"), "{}", r.message);
+    }
+
+    // POA&M-270: SIGHUP re-reads the credentials file; a bad file keeps the
+    // previous credentials and is counted, a good one swaps.
+    #[tokio::test]
+    async fn sighup_reloads_digest_credentials_and_keeps_old_on_failure() {
+        use crate::digest_credentials::test_support::{line, write_file};
+        use proto_sip::DigestAlgorithm;
+        let dir = tempfile::tempdir().unwrap();
+        let realm = "sip.example.test";
+        let v1 = line("alice", realm, "pw-a", "SHA-256");
+        let path = write_file(dir.path(), "digest.ha1", v1.as_bytes(), 0o600);
+        let store =
+            Arc::new(DigestCredentialStore::load(&path, realm, DigestAlgorithm::Sha256).unwrap());
+        let signal = ShutdownSignal::new();
+        let args = Args {
+            config_path: Some(dir.path().join("absent.toml")),
+            ..Args::default()
+        };
+        let task = tokio::spawn(Runtime::config_reload_loop(
+            signal.clone(),
+            Arc::new(RwLock::new(SbcConfig::default())),
+            args,
+            Duration::from_millis(5),
+            None,
+            None,
+            Some(Arc::clone(&store)),
+        ));
+        // The reload runs on the loop task: wait for its effect.
+        let wait_until = |done: fn(&DigestCredentialStore) -> bool| {
+            let store = Arc::clone(&store);
+            async move {
+                for _ in 0..1000 {
+                    if done(&store) {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                false
+            }
+        };
+
+        write_file(dir.path(), "digest.ha1", b"alice:broken\n", 0o600);
+        signal.request_reload();
+        assert!(wait_until(|s| s.reload_failures() == 1).await);
+        assert!(
+            store
+                .snapshot()
+                .ha1("alice", DigestAlgorithm::Sha256)
+                .is_some()
+        );
+
+        let v2 = line("bob", realm, "pw-b", "SHA-256");
+        write_file(dir.path(), "digest.ha1", v2.as_bytes(), 0o600);
+        signal.request_reload();
+        assert!(wait_until(|s| s.snapshot().ha1("bob", DigestAlgorithm::Sha256).is_some()).await);
+        assert_eq!(store.reload_failures(), 1);
+        assert!(
+            store
+                .snapshot()
+                .ha1("alice", DigestAlgorithm::Sha256)
+                .is_none()
+        );
+        task.abort();
+    }
+
+    // ---- QA additions (POA&M-270) ----
+
+    /// One REGISTER through `stack`; the response, if any.
+    async fn qa_register(
+        stack: &crate::sip_stack::SipStack,
+        user: &str,
+        n: u32,
+        authorization: Option<&str>,
+    ) -> Option<proto_sip::message::SipResponse> {
+        let auth = authorization.map_or_else(String::new, |a| format!("Authorization: {a}\r\n"));
+        let msg = bytes::Bytes::from(format!(
+            "REGISTER sip:sbc.example.test SIP/2.0\r\n\
+             Via: SIP/2.0/UDP client.example.test:5060;branch=z9hG4bK-qa-{user}-{n}\r\n\
+             From: <sip:{user}@sip.example.test>;tag=1234\r\n\
+             To: <sip:{user}@sip.example.test>\r\n\
+             Call-ID: reg-qa-{user}@example.test\r\n\
+             CSeq: {n} REGISTER\r\n\
+             Contact: <sip:{user}@client.example.test:5060>\r\n\
+             {auth}Content-Length: 0\r\n\r\n"
+        ));
+        let src = uc_types::address::SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        match stack.process_message(&msg, src, None).await {
+            crate::sip_stack::ProcessResult::Response {
+                message: proto_sip::SipMessage::Response(resp),
+                ..
+            } => Some(resp),
+            _ => None,
+        }
+    }
+
+    fn qa_www(resp: &proto_sip::message::SipResponse) -> String {
+        resp.headers
+            .get_value(&proto_sip::HeaderName::WwwAuthenticate)
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    }
+
+    fn qa_nonce(www: &str) -> String {
+        www.split("nonce=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// SHA-256 `Authorization` for `user`/`pw` in realm `sip.example.test`.
+    fn qa_sha256_authorization(user: &str, pw: &str, nonce: &str, nc: u32) -> String {
+        let resp = proto_sip::compute_digest_response(
+            &proto_sip::Sha256DigestHasher,
+            user,
+            "sip.example.test",
+            pw,
+            "REGISTER",
+            "sip:sbc.example.test",
+            nonce,
+            proto_sip::DigestAlgorithm::Sha256,
+            Some(proto_sip::Qop::Auth),
+            Some(nc),
+            Some("c0ffee"),
+            None,
+        )
+        .unwrap();
+        format!(
+            "Digest username=\"{user}\", realm=\"sip.example.test\", nonce=\"{nonce}\", \
+             uri=\"sip:sbc.example.test\", response=\"{resp}\", algorithm=SHA-256, \
+             qop=auth, cnonce=\"c0ffee\", nc={nc:08x}"
+        )
+    }
+
+    fn qa_secret(tag: &str) -> String {
+        format!(
+            "pw-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )
+    }
+
+    fn qa_bad_response_count(stack: &crate::sip_stack::SipStack) -> u64 {
+        stack
+            .signaling_audit()
+            .digest_outcome_counts()
+            .find(|(l, _)| *l == "bad_response")
+            .map_or(0, |(_, n)| n)
+    }
+
+    /// POA&M-270 acceptance, default algorithm: `[digest_auth]` without an
+    /// `algorithm` key challenges with SHA-256 and authenticates from the
+    /// HA1 file. An unknown user gets the same answer as a wrong password
+    /// (IA-6), an MD5 response is refused, and a user removed from the file
+    /// by a reload can no longer authenticate while a bad reload changes
+    /// nothing.
+    #[tokio::test]
+    async fn qa_digest_register_from_toml_sha256_unknown_user_and_reload() {
+        use crate::digest_credentials::test_support::{line, write_file};
+        let realm = "sip.example.test";
+        let (alice_pw, bob_pw) = (qa_secret("a"), qa_secret("b"));
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = format!(
+            "{}{}",
+            line("alice", realm, &alice_pw, "SHA-256"),
+            line("bob", realm, &bob_pw, "SHA-256")
+        );
+        let path = write_file(dir.path(), "digest.ha1", v1.as_bytes(), 0o600);
+        let config = digest_config(&path);
+        assert_eq!(
+            config.digest_auth.algorithm(),
+            sbc_config::DigestAuthAlgorithm::Sha256
+        );
+        let store = Runtime::load_digest_credentials(&config, "")
+            .unwrap()
+            .expect("store");
+        let server = Server::new(config, ShutdownSignal::new(), Some(Arc::clone(&store)));
+        let stack = server.sip_stack();
+
+        let challenge = qa_register(stack, "alice", 1, None).await.expect("401");
+        assert_eq!(challenge.status.code(), 401);
+        let www = qa_www(&challenge);
+        assert!(www.contains(&format!("realm=\"{realm}\"")), "{www}");
+        assert!(www.contains("algorithm=SHA-256"), "{www}");
+        assert!(!www.to_ascii_uppercase().contains("MD5"), "{www}");
+        let nonce = qa_nonce(&www);
+
+        // Wrong password, and a user the file does not know: same status,
+        // same headers, same challenge apart from the nonce, same counter.
+        let wrong = qa_register(
+            stack,
+            "alice",
+            2,
+            Some(&qa_sha256_authorization(
+                "alice",
+                "wrong-password",
+                &nonce,
+                1,
+            )),
+        )
+        .await
+        .expect("401");
+        assert_eq!(qa_bad_response_count(stack), 1);
+        let unknown = qa_register(
+            stack,
+            "mallory",
+            3,
+            Some(&qa_sha256_authorization(
+                "mallory",
+                "any-password",
+                &nonce,
+                2,
+            )),
+        )
+        .await
+        .expect("401");
+        assert_eq!(qa_bad_response_count(stack), 2);
+        assert_eq!(wrong.status.code(), 401);
+        assert_eq!(unknown.status.code(), wrong.status.code());
+        assert_eq!(unknown.reason, wrong.reason);
+        let names = |r: &proto_sip::message::SipResponse| {
+            let mut v: Vec<String> = r.headers.iter().map(|h| h.name.to_string()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&unknown), names(&wrong));
+        let shape = |r: &proto_sip::message::SipResponse| {
+            let www = qa_www(r);
+            www.replace(&qa_nonce(&www), "N")
+        };
+        assert_eq!(shape(&unknown), shape(&wrong));
+        assert_eq!(unknown.body, wrong.body);
+
+        // An MD5 response to the SHA-256 challenge is refused.
+        let md5 = qa_sha256_authorization("alice", &alice_pw, &nonce, 3)
+            .replace("algorithm=SHA-256", "algorithm=MD5");
+        let r = qa_register(stack, "alice", 4, Some(&md5))
+            .await
+            .expect("401");
+        assert_eq!(r.status.code(), 401);
+
+        // The right password registers.
+        let ok = qa_register(
+            stack,
+            "alice",
+            5,
+            Some(&qa_sha256_authorization("alice", &alice_pw, &nonce, 4)),
+        )
+        .await
+        .expect("200");
+        assert_eq!(ok.status.code(), 200);
+
+        // A reload that fails (MD5 line) keeps alice.
+        let bad = format!("{v1}carol:{realm}:MD5:{}\n", "0".repeat(32));
+        write_file(dir.path(), "digest.ha1", bad.as_bytes(), 0o600);
+        assert!(
+            crate::digest_credentials::reload_and_audit(&store)
+                .await
+                .is_err()
+        );
+        let ok = qa_register(
+            stack,
+            "alice",
+            6,
+            Some(&qa_sha256_authorization("alice", &alice_pw, &nonce, 5)),
+        )
+        .await
+        .expect("200");
+        assert_eq!(ok.status.code(), 200);
+
+        // alice removed by a good reload: her correct password is now a
+        // 401 like any unknown user's; bob is unaffected.
+        let v2 = line("bob", realm, &bob_pw, "SHA-256");
+        write_file(dir.path(), "digest.ha1", v2.as_bytes(), 0o600);
+        let summary = crate::digest_credentials::reload_and_audit(&store)
+            .await
+            .unwrap();
+        assert_eq!((summary.users, summary.added, summary.removed), (1, 0, 1));
+        let before = qa_bad_response_count(stack);
+        let fresh = qa_nonce(&qa_www(
+            &qa_register(stack, "alice", 7, None).await.expect("401"),
+        ));
+        for (n, (nonce, nc)) in [(&nonce, 6), (&fresh, 1)].into_iter().enumerate() {
+            let cseq = 8 + u32::try_from(n).unwrap();
+            let gone = qa_register(
+                stack,
+                "alice",
+                cseq,
+                Some(&qa_sha256_authorization("alice", &alice_pw, nonce, nc)),
+            )
+            .await
+            .expect("401");
+            assert_eq!(gone.status.code(), 401, "removed user must not register");
+            assert_eq!(shape(&gone), shape(&wrong));
+        }
+        assert_eq!(qa_bad_response_count(stack), before + 2);
+        let bob = qa_register(
+            stack,
+            "bob",
+            10,
+            Some(&qa_sha256_authorization("bob", &bob_pw, &fresh, 2)),
+        )
+        .await
+        .expect("200");
+        assert_eq!(bob.status.code(), 200);
+    }
+
+    /// `require_auth = true` with a credentials file the daemon must not or
+    /// cannot use refuses startup, for every kind of bad file, and the
+    /// startup error names the path and rule but never file content.
+    #[cfg(unix)]
+    #[test]
+    fn qa_digest_startup_refused_for_every_unusable_file() {
+        use crate::digest_credentials::test_support::{line, write_file};
+        const HA1: &str = "5e471e15e471e15e471e15e471e15e471e15e471e15e471e15e471e15e471e1a";
+        let realm = "sip.example.test";
+        let dir = tempfile::tempdir().unwrap();
+        let good = line("very-secret-user", realm, "pw-for-test", "SHA-256");
+        let refuse = |path: &Path, needle: &str| {
+            let reason = init_reason(Runtime::load_digest_credentials(&digest_config(path), ""));
+            assert!(reason.contains(needle), "{needle}: {reason}");
+            assert!(
+                reason.contains(&path.display().to_string()),
+                "path named: {reason}"
+            );
+            assert!(!reason.contains(HA1), "{reason}");
+            assert!(!reason.contains("very-secret-user"), "{reason}");
+        };
+
+        // Not readable by the daemon (root reads anything; skip there).
+        if !nix::unistd::geteuid().is_root() {
+            let noread = write_file(dir.path(), "noread.ha1", good.as_bytes(), 0o000);
+            refuse(&noread, "could not be read");
+        }
+        // Symlink (the Kubernetes secret-volume shape), directory, FIFO.
+        let target = write_file(dir.path(), "target.ha1", good.as_bytes(), 0o600);
+        let link = dir.path().join("link.ha1");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        refuse(&link, "must not be a symlink");
+        refuse(dir.path(), "must be a regular file");
+        let fifo = dir.path().join("fifo.ha1");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        refuse(&fifo, "must be a regular file");
+        // Group-readable (fsGroup shape).
+        let group = write_file(dir.path(), "group.ha1", good.as_bytes(), 0o640);
+        refuse(&group, "group or other");
+
+        // Content the daemon will not hold or cannot use.
+        let cases: [(String, &str); 7] = [
+            (String::new(), "no entry for the configured"),
+            (
+                "# no users yet\n".to_string(),
+                "no entry for the configured",
+            ),
+            (
+                format!("very-secret-user:{realm}:SHA-512-256:{HA1}\n"),
+                "no entry for the configured",
+            ),
+            (
+                format!("{good}very-secret-user:{realm}:MD5:{}\n", &HA1[..32]),
+                "line 2: MD5",
+            ),
+            (
+                format!("{good}very-secret-user:{realm}:SHA-256-sess:{HA1}\n"),
+                "line 2: algorithm must be",
+            ),
+            (format!("{good}{good}"), "line 2: duplicate"),
+            (
+                format!("{good}very-secret-user2:{realm}:SHA-256:{}\n", &HA1[..40]),
+                "line 2: HA1 must be 64 hex",
+            ),
+        ];
+        for (content, needle) in cases {
+            let path = write_file(dir.path(), "content.ha1", content.as_bytes(), 0o600);
+            refuse(&path, needle);
+        }
+        // Bearer is refused before the file is looked at.
+        let reason = init_reason(Runtime::load_digest_credentials(
+            &digest_config(&dir.path().join("absent.ha1")),
+            "bearer",
+        ));
+        assert!(reason.contains("SBC_AUTH_MODE=bearer"), "{reason}");
+        // Other SBC_AUTH_MODE values are not bearer: digest starts.
+        for mode in ["", "digest", "none", "bearer-ish"] {
+            assert!(
+                Runtime::load_digest_credentials(&digest_config(&target), mode)
+                    .unwrap()
+                    .is_some(),
+                "{mode}"
+            );
+        }
+    }
+
+    /// Whole-runtime path: `Runtime::new` on a TOML file with
+    /// `[digest_auth]` refuses to start without the credentials file,
+    /// starts with it, and `reload_config` re-reads it: counts on success,
+    /// `success = false` with the old credentials kept on a bad file.
+    #[tokio::test]
+    async fn qa_runtime_new_and_reload_config_with_digest_auth() {
+        use crate::digest_credentials::test_support::{line, write_file};
+        use proto_sip::DigestAlgorithm;
+        // `Runtime::new` reads SBC_AUTH_MODE; this test needs it not to be
+        // bearer (the conflict has its own tests above).
+        if std::env::var("SBC_AUTH_MODE").is_ok_and(|m| m.trim().eq_ignore_ascii_case("bearer")) {
+            return;
+        }
+        let realm = "sip.example.test";
+        let dir = tempfile::tempdir().unwrap();
+        let ha1_path = dir.path().join("digest.ha1");
+        let toml_path = dir.path().join("sbc.toml");
+        std::fs::write(
+            &toml_path,
+            format!(
+                "[digest_auth]\nrequire_auth = true\nrealm = \"{realm}\"\n\
+                 credentials_file = \"{}\"\n",
+                ha1_path.display()
+            ),
+        )
+        .unwrap();
+        let args = || Args {
+            config_path: Some(toml_path.clone()),
+            ..Args::default()
+        };
+
+        // No credentials file: the daemon does not start.
+        let err = Runtime::new(args()).await.err().expect("startup refused");
+        assert!(
+            matches!(err, RuntimeError::InitFailed { ref component, .. } if component == "digest_auth"),
+            "{err:?}"
+        );
+
+        let v1 = line("alice", realm, "pw-a", "SHA-256");
+        write_file(dir.path(), "digest.ha1", v1.as_bytes(), 0o600);
+        let runtime = Runtime::new(args()).await.expect("starts with the file");
+        let store = runtime.digest_credentials.clone().expect("store loaded");
+        assert_eq!(store.users(), 1);
+
+        // Unchanged config, rotated credentials: reported with counts.
+        let v2 = format!("{v1}{}", line("bob", realm, "pw-b", "SHA-256"));
+        write_file(dir.path(), "digest.ha1", v2.as_bytes(), 0o600);
+        let result = runtime.reload_config().await.unwrap();
+        assert!(result.success, "{}", result.message);
+        assert_eq!(
+            result.changes,
+            vec!["digest_auth.credentials (users=2, added=1, removed=0)".to_string()]
+        );
+        assert_eq!(result.restart_required, Vec::<String>::new());
+
+        // A bad credentials file: the reload reports failure, is audited,
+        // counted, and both users still authenticate from the old table.
+        let capture = uc_audit::capture::start();
+        write_file(dir.path(), "digest.ha1", b"alice:broken\n", 0o600);
+        let result = runtime.reload_config().await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.message.contains("previous credentials kept"),
+            "{}",
+            result.message
+        );
+        assert!(result.message.contains("line 1"), "{}", result.message);
+        assert!(!result.message.contains("alice"), "{}", result.message);
+        assert!(result.changes.is_empty(), "{:?}", result.changes);
+        assert_eq!(store.reload_failures(), 1);
+        assert_eq!(store.users(), 2);
+        assert!(
+            store
+                .snapshot()
+                .ha1("bob", DigestAlgorithm::Sha256)
+                .is_some()
+        );
+        assert!(capture.events().iter().any(|e| matches!(
+            e,
+            uc_audit::AuditEvent::ConfigurationChange(c)
+                if c.description.contains("reload failed, previous credentials kept")
+        )));
+
+        // A `[digest_auth]` setting changed in the TOML is restart-only;
+        // the credentials are still re-read from the startup path.
+        write_file(dir.path(), "digest.ha1", v1.as_bytes(), 0o600);
+        std::fs::write(
+            &toml_path,
+            format!(
+                "[digest_auth]\nrequire_auth = true\nrealm = \"{realm}\"\n\
+                 credentials_file = \"{}\"\nnonce_ttl_secs = 60\n",
+                ha1_path.display()
+            ),
+        )
+        .unwrap();
+        let result = runtime.reload_config().await.unwrap();
+        assert!(result.success, "{}", result.message);
+        assert!(
+            result.restart_required.contains(&"digest_auth".to_string()),
+            "{:?}",
+            result.restart_required
+        );
+        assert!(
+            result
+                .changes
+                .contains(&"digest_auth.credentials (users=1, added=0, removed=1)".to_string()),
+            "{:?}",
+            result.changes
+        );
+        assert_eq!(store.users(), 1);
     }
 
     #[test]

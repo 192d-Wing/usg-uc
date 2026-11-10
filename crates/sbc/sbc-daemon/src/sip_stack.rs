@@ -190,11 +190,9 @@ pub struct SipStack {
     cdr: Option<Arc<crate::cdr::CdrContext>>,
     /// Daemon-side RFC 7616 digest verifier for REGISTER (POA&M-236). `Some`
     /// when `require_auth` is set; it then replaces the registrar's digest
-    /// check (the registrar runs with `require_auth = false`).
-    ///
-    /// POAM: POA&M-270 - not reachable from shipped configuration (no
-    /// `sbc-config` credential source); IA-2/IA-5(1) are not met in a
-    /// deployed SBC until it lands.
+    /// check (the registrar runs with `require_auth = false`). Configured
+    /// by `[digest_auth]`; credentials come from
+    /// `SipStackConfig::digest_credentials`.
     ///
     /// ## NIST 800-53 Rev5: IA-2, IA-2(8), IA-5(1), IA-6, SC-23
     digest: Option<DaemonDigest>,
@@ -241,10 +239,15 @@ struct DaemonDigest {
     /// Leaf lock, held only around `verify`/`challenge`, never across
     /// `.await`.
     verifier: std::sync::Mutex<DigestVerifier>,
-    /// Random per-process password verified for an unknown username, so
-    /// an unknown user costs the same and is audited as `bad_response`
-    /// (no user enumeration).
-    decoy: String,
+    /// Random per-process HA1 verified for an unknown username (and for a
+    /// user without an HA1 for the configured algorithm). It is an HA1,
+    /// like a real user's secret, so an unknown user takes the same code
+    /// path and costs the same hash count, and is audited as
+    /// `bad_response` (no user enumeration by timing or by response).
+    decoy: crate::digest_credentials::Ha1,
+    /// Per-username failure backoff (AC-7). Leaf lock, held only around
+    /// one table operation, never across `.await` or another lock.
+    throttle: std::sync::Mutex<crate::digest_throttle::DigestThrottle>,
     /// Test hook: seconds added to the wall clock (nonce expiry tests).
     #[cfg(test)]
     clock_skew_secs: AtomicU64,
@@ -341,13 +344,13 @@ pub struct SipStackConfig {
     pub auth_realm: String,
     /// Whether authentication is required for REGISTER.
     pub require_auth: bool,
-    /// Static credentials: username → password (for standalone deployment).
+    /// Digest credentials (`digest_auth.credentials_file`): HA1 per user,
+    /// never a password. `None` with `require_auth` set means every user is
+    /// unknown and every REGISTER is rejected (fail closed). Its `Debug` is
+    /// redacted, so this struct's derived `Debug` shows no secret.
     ///
-    /// POAM: POA&M-270 - no `sbc-config` digest credential source (HA1 file
-    /// or secret reference, realm, algorithm, nonce TTL) and no `server.rs`
-    /// wiring; digest REGISTER auth is reachable only through this in-crate
-    /// config (tests, embedders).
-    pub auth_credentials: HashMap<String, String>,
+    /// ## NIST 800-53 Rev5: IA-5, IA-5(6)
+    pub digest_credentials: Option<Arc<crate::digest_credentials::DigestCredentialStore>>,
     /// Maximum concurrent calls — INVITEs beyond this are rejected with
     /// 503 (admission control, `general.max_calls`).
     pub max_calls: u32,
@@ -387,7 +390,11 @@ pub struct SipStackConfig {
     /// default; SHA-512-256 is available.
     ///
     /// CNSA-EXCEPTION: RFC 7616 defines no SHA-384 digest; SIP digest runs
-    /// under the POA&M-110 exception, protected by CNSA TLS in deployment.
+    /// under the POA&M-110 exception. Its CNSA TLS condition is not
+    /// enforced by the stack.
+    ///
+    /// POAM: POA&M-314 - digest over a cleartext transport is warned about
+    /// at startup (`server::digest_cleartext_transports`), not refused.
     pub digest_algorithm: proto_sip::DigestAlgorithm,
     /// Digest nonce lifetime in seconds (RFC 7616 §3.3 `stale=true` after).
     pub digest_nonce_ttl_secs: u64,
@@ -410,7 +417,7 @@ impl Default for SipStackConfig {
             b2bua_enabled: true,
             auth_realm: "sbc.local".to_string(),
             require_auth: false,
-            auth_credentials: HashMap::new(),
+            digest_credentials: None,
             max_calls: 1000,
             emergency_reserve_calls: sbc_config::schema::default_emergency_reserve(1000),
             max_registrations: 50_000,
@@ -2394,15 +2401,20 @@ fn audit_route_blocked(req: &SipRequest, source: SbcSocketAddr, subject: String,
 /// Builds the daemon digest verifier when `require_auth` is set.
 ///
 /// `None` (logged) if the nonce key cannot be set up; the registrar then
-/// keeps enforcing auth itself, so REGISTER never runs unauthenticated.
-///
-/// POAM: POA&M-270 - `require_auth` with credentials is not reachable from
-/// shipped configuration (no `sbc-config` credential source).
+/// enforces auth itself with a lookup that knows no user, so every REGISTER
+/// is rejected (fail closed) and none runs unauthenticated.
 ///
 /// ## NIST 800-53 Rev5: IA-2, IA-5(1), SC-12, SC-23; RFC 7616 §3.3, §3.7
 fn build_daemon_digest(config: &SipStackConfig) -> Option<DaemonDigest> {
     if !config.require_auth {
         return None;
+    }
+    if config.digest_credentials.is_none() {
+        // IA-2: fail closed. Reachable only programmatically; `[digest_auth]`
+        // validation requires a credentials file with `require_auth`.
+        error!(
+            "REGISTER digest is required but no credential store is set; every REGISTER will be rejected"
+        );
     }
     let key = match config.digest_nonce_key.as_ref() {
         Some(k) => k.0,
@@ -2421,18 +2433,20 @@ fn build_daemon_digest(config: &SipStackConfig) -> Option<DaemonDigest> {
             return None;
         }
     };
-    let decoy = match uc_crypto::random::generate_random::<32>() {
-        Ok(b) => b.iter().fold(String::with_capacity(64), |mut acc, x| {
-            use std::fmt::Write as _;
-            let _ = write!(acc, "{x:02x}");
-            acc
-        }),
+    let decoy = match crate::digest_credentials::Ha1::random() {
+        Ok(d) => d,
         Err(e) => {
             error!(error = %e, "digest decoy secret generation failed; registrar digest kept");
             return None;
         }
     };
-    // SC-5: nc state is bounded; a full tracker answers `stale=true`.
+    // SC-5: nc state is bounded; a full tracker answers `stale=true`. One
+    // username may hold at most the verifier's per-user share of it
+    // (`DEFAULT_MAX_TRACKED_NONCES_PER_USER`), so an authenticated user
+    // cannot fill the tracker for everyone else. The share does not depend
+    // on `nonce_ttl_secs`: a user past it (many devices, or a fresh
+    // challenge per refresh with a long TTL) keeps registering, and only
+    // that user's own oldest nonce is retired early (answered `stale`).
     let max_tracked = usize::try_from(config.max_registrations)
         .unwrap_or(usize::MAX)
         .saturating_mul(2)
@@ -2446,6 +2460,7 @@ fn build_daemon_digest(config: &SipStackConfig) -> Option<DaemonDigest> {
     Some(DaemonDigest {
         verifier: std::sync::Mutex::new(DigestVerifier::new(policy, issuer)),
         decoy,
+        throttle: std::sync::Mutex::new(crate::digest_throttle::DigestThrottle::default()),
         #[cfg(test)]
         clock_skew_secs: AtomicU64::new(0),
     })
@@ -2916,10 +2931,11 @@ impl SipStack {
             std::time::Duration::from_secs(config.signaling_audit_window_secs.max(1)),
         ));
 
-        // Build authenticated registrar with password lookup from config
-        let credentials = config.auth_credentials.clone();
-        let registrar = AuthenticatedRegistrar::new(registrar_config)
-            .with_password_lookup(move |user, _| credentials.get(user).cloned());
+        // The registrar holds no credentials. Its own digest check runs
+        // only when the daemon verifier could not be built, and then knows
+        // no user: every REGISTER is rejected (IA-2, fail closed).
+        let registrar =
+            AuthenticatedRegistrar::new(registrar_config).with_password_lookup(|_, _| None);
 
         Self {
             transactions: RwLock::new(TransactionStore::default()),
@@ -3001,9 +3017,9 @@ impl SipStack {
             std::time::Duration::from_secs(config.signaling_audit_window_secs.max(1)),
         ));
 
-        let credentials = config.auth_credentials.clone();
-        let registrar = AuthenticatedRegistrar::new(registrar_config)
-            .with_password_lookup(move |user, _| credentials.get(user).cloned());
+        // No credentials in the registrar; see `SipStack::new`.
+        let registrar =
+            AuthenticatedRegistrar::new(registrar_config).with_password_lookup(|_, _| None);
 
         info!("SIP stack initialized with storage-backed location service");
 
@@ -6709,6 +6725,13 @@ impl SipStack {
         (out, Some(snapshot))
     }
 
+    /// The digest credential store (`[digest_auth]`), for metrics.
+    pub fn digest_credentials(
+        &self,
+    ) -> Option<&Arc<crate::digest_credentials::DigestCredentialStore>> {
+        self.config.digest_credentials.as_ref()
+    }
+
     /// The rate-limited signaling audit (flush task, metrics).
     pub fn signaling_audit(&self) -> &Arc<crate::signaling_audit::SignalingAudit> {
         &self.signaling_audit
@@ -7082,15 +7105,34 @@ impl SipStack {
     /// §10.3 step 3). Every non-ok outcome except a missing Authorization
     /// (the first challenge) is audited, rate limited.
     ///
-    /// POAM: POA&M-270 - the IA-2/IA-5(1) controls below are not reachable
-    /// from shipped configuration: `sbc-config` has no digest credential
-    /// source, so `auth_credentials` is only populated programmatically.
+    /// The user's secret is an HA1 from the `[digest_auth]` credentials
+    /// file (POA&M-270); the daemon never holds a password.
+    ///
+    /// AC-7: wrong responses for one digest username open a backoff window
+    /// (`crate::digest_throttle`). Inside it the request is verified
+    /// against the decoy instead of the user's HA1, so it fails exactly
+    /// like a wrong password: same status, headers, challenge and cost,
+    /// for known and unknown usernames alike (no username or throttle
+    /// oracle). It is counted and audited as `digest:throttled`, and the
+    /// opening of a window as `digest:throttle_tripped`. A source that
+    /// holds a live binding of its own AOR is verified normally, so a
+    /// registered phone keeps refreshing while its username is attacked
+    /// from elsewhere. The source must be the binding's exact address and
+    /// port. That exemption ends for the window after `EXEMPT_FAILURES`
+    /// wrong responses through it, so a sender at the phone's own address
+    /// and port (on the path, or a UDP spoofer that guessed the port and
+    /// cannot see the answer) gets a few extra guesses per window; the
+    /// request is then refused like any other throttled one (no oracle).
+    ///
+    /// POAM: POA&M-316 - AC-7 residuals (per-node state, the exemption,
+    /// reset on success, fixed thresholds); see `crate::digest_throttle`.
     ///
     /// POAM: POA&M-273 - RFC 7616 §3.4.4 `userhash` is not supported; such
     /// credentials are rejected (audited as `digest:malformed`/`bad_response`).
     ///
-    /// ## NIST 800-53 Rev5: IA-2, IA-2(8), IA-5(1), IA-6, AU-2;
-    /// RFC 7616 §3.3, §3.4.5, §3.7; RFC 3261 §22.2, §22.4
+    /// ## NIST 800-53 Rev5: IA-2, IA-2(8), IA-6, AC-7, AU-2;
+    /// RFC 7616 §3.3 (`stale`), §3.4 (`nc`), §3.4.2 (A1), §3.7;
+    /// RFC 3261 §22.2, §22.4
     fn verify_register_digest(
         &self,
         req: &SipRequest,
@@ -7123,6 +7165,10 @@ impl SipStack {
         };
 
         // RFC 3261 §22.1: no credentials → challenge (not audited, as before).
+        // POAM: POA&M-313 - only the first Authorization header is examined
+        // (RFC 3261 §22.3: a request may carry several, one per realm); a
+        // credential for this realm in a later header is not found and the
+        // request is challenged again.
         let Some(auth) = req.headers.get_value(&HeaderName::Authorization) else {
             return Err(challenge(false));
         };
@@ -7143,15 +7189,43 @@ impl SipStack {
                 )));
             }
         };
-        // IA-6: an unknown user is verified against a random decoy, so it
-        // costs the same and fails as `bad_response`.
-        let secret = self
+        // One table for the whole verification: a reload swaps the table
+        // whole, and the store's leaf lock is released before the verifier
+        // lock is taken.
+        let table = self
             .config
-            .auth_credentials
-            .get(&creds.username)
-            .map_or(DigestSecret::Password(&digest.decoy), |p| {
-                DigestSecret::Password(p.as_str())
-            });
+            .digest_credentials
+            .as_ref()
+            .map(|store| store.snapshot());
+        // IA-6: an unknown user, and a user without an HA1 for the
+        // challenged algorithm, is verified against a random decoy HA1 (the
+        // same `Ha1` branch a real user takes), so it costs the same and
+        // fails as `bad_response`.
+        let real = table
+            .as_ref()
+            .and_then(|t| t.ha1(&creds.username, self.config.digest_algorithm));
+        let known = real.is_some();
+        // AC-7: inside a backoff window the decoy stands in for the user's
+        // HA1. Everything else runs as usual, so the answer and its cost
+        // are those of a wrong password. The throttle lock is released
+        // before the location and verifier locks are taken.
+        let throttle_now = Instant::now();
+        let in_backoff =
+            lock_leaf(&digest.throttle).is_blocked(&creds.username, known, throttle_now);
+        // The exemption for the registered source, while its failure
+        // budget for this window lasts. A unit of the budget is taken
+        // here, in one lock section with the check, and given back below
+        // unless the response is wrong, so concurrent requests cannot
+        // overshoot it.
+        let exempt = in_backoff
+            && self.source_holds_own_binding(aor, &creds.username, source)
+            && lock_leaf(&digest.throttle).reserve_exemption(&creds.username, known);
+        let throttled = in_backoff && !exempt;
+        let secret = DigestSecret::Ha1(
+            real.filter(|_| !throttled)
+                .unwrap_or(&digest.decoy)
+                .expose(),
+        );
         let request_uri = req.uri.to_string();
         let view = DigestRequestView {
             method: "REGISTER",
@@ -7159,8 +7233,21 @@ impl SipStack {
             body: req.body.as_deref(),
         };
         let verdict = lock_leaf(&digest.verifier).verify(view, &creds, secret, now);
+        if exempt
+            && verdict
+                != DigestVerdict::Reject(proto_sip::digest_verifier::DigestReject::BadResponse)
+        {
+            lock_leaf(&digest.throttle).refund_exemption(&creds.username, known);
+        }
         match verdict {
             DigestVerdict::Ok { username } => {
+                // The password was right: forget this user's failures.
+                // Not when the request got here through the registered
+                // source exemption: a phone's refresh must not hand an
+                // attacker elsewhere a fresh set of free guesses.
+                if !in_backoff {
+                    lock_leaf(&digest.throttle).record_success(&username);
+                }
                 // RFC 3261 §10.3 step 4: users register only their own AOR.
                 if aor_user_strict(aor) != Some(username.as_str()) {
                     // RFC 3261 §10.3 step 3: the user authenticated but is
@@ -7183,19 +7270,113 @@ impl SipStack {
                     .digest(aor, source, DigestOutcome::Ok, Instant::now());
                 Ok(true)
             }
-            DigestVerdict::Stale => Err(reject(DigestOutcome::Stale)),
+            DigestVerdict::Stale => {
+                // A valid digest on an old nonce: the password was right.
+                if !in_backoff {
+                    lock_leaf(&digest.throttle).record_success(&creds.username);
+                }
+                Err(reject(DigestOutcome::Stale))
+            }
+            DigestVerdict::Reject(proto_sip::digest_verifier::DigestReject::BadResponse)
+                if throttled =>
+            {
+                // Not counted as a failure: attempts inside a window do
+                // not extend it (backoff, not lockout).
+                debug!(aor = %aor, "digest REGISTER refused inside a backoff window");
+                Err(reject(DigestOutcome::Throttled))
+            }
+            DigestVerdict::Reject(proto_sip::digest_verifier::DigestReject::BadResponse)
+                if exempt =>
+            {
+                // A wrong response through the registered-source
+                // exemption: it keeps the unit of the budget taken above
+                // and, like any attempt inside a window, does not extend
+                // the window. Answered and audited as the wrong password
+                // it is.
+                debug!(aor = %aor, "digest REGISTER rejected through the backoff exemption");
+                Err(reject(DigestOutcome::Reject(
+                    proto_sip::digest_verifier::DigestReject::BadResponse,
+                )))
+            }
             DigestVerdict::Reject(r) => {
                 debug!(aor = %aor, reason = r.as_str(), "digest REGISTER rejected");
+                // Only a wrong response is a guess; a bad nonce, URI or
+                // replay says nothing about the password.
+                if r == proto_sip::digest_verifier::DigestReject::BadResponse
+                    && let Some(tripped) = lock_leaf(&digest.throttle).record_failure(
+                        &creds.username,
+                        known,
+                        throttle_now,
+                    )
+                {
+                    debug!(
+                        aor = %aor,
+                        backoff_secs = tripped.backoff.as_secs(),
+                        shared = tripped.shared,
+                        "digest failure backoff started"
+                    );
+                    self.signaling_audit
+                        .digest_throttle_tripped(aor, source, Instant::now());
+                }
                 Err(reject(DigestOutcome::Reject(r)))
             }
         }
     }
 
+    /// Whether `source` already holds a live binding of `aor` and `aor` is
+    /// the digest user's own (the backoff exemption of
+    /// [`Self::verify_register_digest`]). `false` when the location lock
+    /// is busy: the request is then treated as throttled, never the other
+    /// way round. The binding must have been registered from exactly this
+    /// address and port: the IP address alone would let an off-path sender
+    /// spoof the phone and spend its exemption budget (POA&M-316 for what
+    /// remains).
+    ///
+    /// ## NIST 800-53 Rev5: AC-7 (exemption), SC-5 (no lockout of a
+    /// registered endpoint)
+    fn source_holds_own_binding(&self, aor: &str, username: &str, source: SbcSocketAddr) -> bool {
+        if aor_user_strict(aor) != Some(username) {
+            return false;
+        }
+        let Ok(loc) = self.location_service.try_read() else {
+            return false;
+        };
+        let (ip, port) = (source.ip().to_canonical(), source.port());
+        loc.lookup(aor).iter().any(|b| {
+            b.source_addr()
+                .is_some_and(|a| a.ip().to_canonical() == ip && a.port() == port)
+        })
+    }
+
     /// Enables RFC 8898 Bearer-token REGISTER authorization. When set,
     /// `handle_register` validates the OIDC access token and binds the `dn`
     /// claim to the AOR before accepting the registration.
+    ///
+    /// Refused, with an error log, when digest authentication is on
+    /// (`require_auth`): the two are alternatives, and `handle_register`
+    /// would otherwise accept either. Startup already refuses that
+    /// configuration (`Runtime::load_digest_credentials`); this keeps the
+    /// rule where the state is.
+    ///
+    /// ## NIST 800-53 Rev5: IA-2, CM-6
     pub fn set_bearer_authenticator(&mut self, bearer: Arc<BearerAuthenticator>) {
+        if self.config.require_auth {
+            error!(
+                "bearer REGISTER authentication not enabled: digest authentication \
+                 (digest_auth.require_auth) is on and the two cannot be combined"
+            );
+            return;
+        }
         self.bearer = Some(bearer);
+    }
+
+    /// Failures of known usernames counted in the digest backoff overflow
+    /// bucket (`sbc_digest_throttle_overflow_total`); `None` when the
+    /// daemon digest verifier is off.
+    pub fn digest_throttle_overflow(&self) -> Option<u64> {
+        self.digest
+            .as_ref()
+            .map(|d| lock_leaf(&d.throttle).overflow())
     }
 
     /// Whether REGISTER requests are authenticated at all (bearer token or
@@ -9171,8 +9352,10 @@ impl SipStack {
 
         // RFC 8898 Bearer-token authorization (when enabled). Validate the
         // OIDC access token and bind its `dn` claim to the AOR *before* any
-        // binding work. Digest auth (if configured) still runs in the
-        // registrar below; bearer is an alternative, not a replacement.
+        // binding work. Bearer and digest are alternatives: with bearer set
+        // the daemon digest verifier below is skipped, and the runtime
+        // refuses to start with both `SBC_AUTH_MODE=bearer` and
+        // `[digest_auth] require_auth = true`.
         if let Some(bearer) = &self.bearer {
             let auth_hdr = req.headers.get_value(&HeaderName::Authorization);
             let aor_user = aor_user_part(&aor);
@@ -13312,6 +13495,15 @@ fn extract_param<'a>(header_value: &'a str, name: &str) -> Option<&'a str> {
 pub mod tests {
     use super::*;
 
+    /// A digest credential store for tests, built from cleartext test
+    /// passwords (the stack itself only ever holds the HA1).
+    pub fn test_digest_store(
+        realm: &str,
+        users: &[(&str, &str)],
+    ) -> Arc<crate::digest_credentials::DigestCredentialStore> {
+        Arc::new(crate::digest_credentials::DigestCredentialStore::from_passwords(realm, users))
+    }
+
     // SIPREC recording session tests (sans-IO, with a mock media controller).
     mod recording;
     pub use recording::{rs_byes_queued_at_shutdown, rs_invite_for_server};
@@ -13597,14 +13789,15 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_register_with_auth() {
-        let mut config = SipStackConfig {
+        let config = SipStackConfig {
             require_auth: true,
             auth_realm: "example.com".to_string(),
+            digest_credentials: Some(test_digest_store(
+                "example.com",
+                &[("alice", "password123")],
+            )),
             ..Default::default()
         };
-        config
-            .auth_credentials
-            .insert("alice".to_string(), "password123".to_string());
 
         let stack = SipStack::new(config);
 
@@ -25034,14 +25227,15 @@ pub mod tests {
         let rr = register_request_for(&req, "sip:alice@example.com", Vec::new(), "r@test", 1);
         assert_eq!(rr.request_uri.as_deref(), Some("sip:sbc.local"));
 
-        let mut config = SipStackConfig {
+        let config = SipStackConfig {
             require_auth: true,
             auth_realm: "example.com".to_string(),
+            digest_credentials: Some(test_digest_store(
+                "example.com",
+                &[("alice", "password123")],
+            )),
             ..Default::default()
         };
-        config
-            .auth_credentials
-            .insert("alice".to_string(), "password123".to_string());
         let stack = SipStack::new(config);
         let base = "REGISTER sip:sbc.local SIP/2.0\r\n\
             Via: SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-{n}\r\n\
@@ -25098,20 +25292,21 @@ pub mod tests {
         use proto_sip::auth::{DigestAlgorithm, Qop};
         use proto_sip::{Sha256DigestHasher, compute_digest_response};
 
-        let mut config = SipStackConfig {
-            require_auth: true,
-            auth_realm: "example.com".to_string(),
-            ..Default::default()
-        };
         // Per-run test secret (not a hard-coded credential).
         let test_password = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
             .to_string();
-        config
-            .auth_credentials
-            .insert("alice".to_string(), test_password.clone());
+        let config = SipStackConfig {
+            require_auth: true,
+            auth_realm: "example.com".to_string(),
+            digest_credentials: Some(test_digest_store(
+                "example.com",
+                &[("alice", test_password.as_str())],
+            )),
+            ..Default::default()
+        };
         let stack = SipStack::new(config);
         let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
         let digest_uri = "sip:sbc.local";
@@ -25273,18 +25468,15 @@ pub mod tests {
     }
 
     fn digest_stack(alice_pw: &str, bob_pw: &str) -> SipStack {
-        let mut config = SipStackConfig {
+        SipStack::new(SipStackConfig {
             require_auth: true,
             auth_realm: "example.com".to_string(),
+            digest_credentials: Some(test_digest_store(
+                "example.com",
+                &[("alice", alice_pw), ("bob", bob_pw)],
+            )),
             ..Default::default()
-        };
-        config
-            .auth_credentials
-            .insert("alice".to_string(), alice_pw.to_string());
-        config
-            .auth_credentials
-            .insert("bob".to_string(), bob_pw.to_string());
-        SipStack::new(config)
+        })
     }
 
     /// REGISTER of `aor_user`@example.com with Request-URI `sip:sbc.local`.
@@ -25555,8 +25747,277 @@ pub mod tests {
         assert_eq!(auth_failure_reasons(&cap.events()), vec!["digest:stale"]);
     }
 
-    /// Plan 7: 50 bad REGISTERs from one IP → one audit event, then one
-    /// flushed event with `count=49`.
+    /// `Authorization` value for `user`/`pw` under `algorithm` (`SHA-256`
+    /// or `SHA-512-256`).
+    fn digest_auth_for(user: &str, pw: &str, nonce: &str, nc: u32, algorithm: &str) -> String {
+        let args = (
+            user,
+            "example.com",
+            pw,
+            "REGISTER",
+            "sip:sbc.local",
+            nonce,
+            Some(proto_sip::Qop::Auth),
+            Some(nc),
+            Some("c0ffee"),
+        );
+        let resp = if algorithm == "SHA-256" {
+            proto_sip::compute_digest_response(
+                &proto_sip::Sha256DigestHasher,
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                proto_sip::DigestAlgorithm::Sha256,
+                args.6,
+                args.7,
+                args.8,
+                None,
+            )
+        } else {
+            proto_sip::compute_digest_response(
+                &proto_sip::Sha512_256DigestHasher,
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                proto_sip::DigestAlgorithm::Sha512_256,
+                args.6,
+                args.7,
+                args.8,
+                None,
+            )
+        }
+        .unwrap();
+        format!(
+            "Digest username=\"{user}\", realm=\"example.com\", nonce=\"{nonce}\", \
+             uri=\"sip:sbc.local\", response=\"{resp}\", algorithm={algorithm}, qop=auth, \
+             cnonce=\"c0ffee\", nc={nc:08x}"
+        )
+    }
+
+    /// A stack whose credentials come from an HA1 file (0600) in `dir`.
+    fn ha1_file_stack(
+        dir: &std::path::Path,
+        content: &str,
+        algorithm: proto_sip::DigestAlgorithm,
+    ) -> (
+        SipStack,
+        Arc<crate::digest_credentials::DigestCredentialStore>,
+    ) {
+        let path = crate::digest_credentials::test_support::write_file(
+            dir,
+            "digest.ha1",
+            content.as_bytes(),
+            0o600,
+        );
+        let store = Arc::new(
+            crate::digest_credentials::DigestCredentialStore::load(&path, "example.com", algorithm)
+                .unwrap(),
+        );
+        let stack = SipStack::new(SipStackConfig {
+            require_auth: true,
+            auth_realm: "example.com".to_string(),
+            digest_algorithm: algorithm,
+            digest_credentials: Some(Arc::clone(&store)),
+            ..Default::default()
+        });
+        (stack, store)
+    }
+
+    fn bad_response_count(stack: &SipStack) -> u64 {
+        stack
+            .signaling_audit()
+            .digest_outcome_counts()
+            .find(|(l, _)| *l == "bad_response")
+            .unwrap()
+            .1
+    }
+
+    /// POA&M-270: REGISTER authenticates against an HA1 from the
+    /// credentials file, under SHA-256 and under SHA-512-256. A user with
+    /// no HA1 for the challenged algorithm is the same as an unknown user:
+    /// 401, `digest:bad_response` (IA-6).
+    #[tokio::test]
+    async fn digest_register_with_ha1_file_for_both_algorithms() {
+        use crate::digest_credentials::test_support::line;
+        let (alice_pw, bob_pw) = (test_secret("a"), test_secret("b"));
+        let content = format!(
+            "# alice has both, bob only SHA-256\n{}{}{}",
+            line("alice", "example.com", &alice_pw, "SHA-256"),
+            line("alice", "example.com", &alice_pw, "SHA-512-256"),
+            line("bob", "example.com", &bob_pw, "SHA-256"),
+        );
+        for (algorithm, name) in [
+            (proto_sip::DigestAlgorithm::Sha256, "SHA-256"),
+            (proto_sip::DigestAlgorithm::Sha512_256, "SHA-512-256"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (stack, _store) = ha1_file_stack(dir.path(), &content, algorithm);
+            let cap = uc_audit::capture::start();
+            let www = digest_challenge(&stack, "alice", 1).await;
+            assert!(www.contains(&format!("algorithm={name}")), "{www}");
+            assert!(www.contains("realm=\"example.com\""), "{www}");
+            let nonce = www_param(&www, "nonce").unwrap();
+            // Wrong password first, then the right one.
+            let r = register_with(
+                &stack,
+                "alice",
+                2,
+                &digest_auth_for("alice", "wrong-password", &nonce, 1, name),
+            )
+            .await;
+            assert!(responded(&r, 401).is_some(), "{name}: {r:?}");
+            let r = register_with(
+                &stack,
+                "alice",
+                3,
+                &digest_auth_for("alice", &alice_pw, &nonce, 2, name),
+            )
+            .await;
+            assert!(responded(&r, 200).is_some(), "{name}: {r:?}");
+
+            let www = digest_challenge(&stack, "bob", 4).await;
+            let nonce = www_param(&www, "nonce").unwrap();
+            let r = register_with(
+                &stack,
+                "bob",
+                5,
+                &digest_auth_for("bob", &bob_pw, &nonce, 1, name),
+            )
+            .await;
+            if name == "SHA-256" {
+                assert!(responded(&r, 200).is_some(), "{r:?}");
+                assert_eq!(bad_response_count(&stack), 1);
+            } else {
+                // No SHA-512-256 HA1 for bob: decoy, like an unknown user.
+                assert!(responded(&r, 401).is_some(), "{r:?}");
+                assert_eq!(bad_response_count(&stack), 2);
+                assert!(
+                    !stack
+                        .location_service
+                        .read()
+                        .await
+                        .has_bindings("sip:bob@example.com")
+                );
+            }
+            assert!(
+                auth_failure_reasons(&cap.events())
+                    .iter()
+                    .all(|a| a == "digest:bad_response"),
+                "{:?}",
+                auth_failure_reasons(&cap.events())
+            );
+        }
+    }
+
+    /// POA&M-270: a credential reload takes effect on the next REGISTER
+    /// with the same nonce issuer (no restart, nonces stay valid); a failed
+    /// reload keeps the previous credentials.
+    #[tokio::test]
+    async fn digest_register_follows_credential_reload() {
+        use crate::digest_credentials::test_support::{line, write_file};
+        let (alice_pw, carol_pw) = (test_secret("a"), test_secret("c"));
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = line("alice", "example.com", &alice_pw, "SHA-256");
+        let (stack, store) = ha1_file_stack(dir.path(), &v1, proto_sip::DigestAlgorithm::Sha256);
+
+        // carol is unknown before the reload.
+        let www = digest_challenge(&stack, "carol", 1).await;
+        let carol_nonce = www_param(&www, "nonce").unwrap();
+        let r = register_with(
+            &stack,
+            "carol",
+            2,
+            &digest_auth_for("carol", &carol_pw, &carol_nonce, 1, "SHA-256"),
+        )
+        .await;
+        assert!(responded(&r, 401).is_some(), "{r:?}");
+        let www = digest_challenge(&stack, "alice", 3).await;
+        let alice_nonce = www_param(&www, "nonce").unwrap();
+        let r = register_with(
+            &stack,
+            "alice",
+            4,
+            &digest_auth_for("alice", &alice_pw, &alice_nonce, 1, "SHA-256"),
+        )
+        .await;
+        assert!(responded(&r, 200).is_some(), "{r:?}");
+
+        // A bad file changes nothing: alice still authenticates.
+        write_file(dir.path(), "digest.ha1", b"not a credentials line\n", 0o600);
+        assert!(store.reload().is_err());
+        let r = register_with(
+            &stack,
+            "alice",
+            5,
+            &digest_auth_for("alice", &alice_pw, &alice_nonce, 2, "SHA-256"),
+        )
+        .await;
+        assert!(responded(&r, 200).is_some(), "{r:?}");
+
+        // alice removed, carol added.
+        let v2 = line("carol", "example.com", &carol_pw, "SHA-256");
+        write_file(dir.path(), "digest.ha1", v2.as_bytes(), 0o600);
+        let summary = store.reload().unwrap();
+        assert_eq!((summary.users, summary.added, summary.removed), (1, 1, 1));
+        let r = register_with(
+            &stack,
+            "alice",
+            6,
+            &digest_auth_for("alice", &alice_pw, &alice_nonce, 3, "SHA-256"),
+        )
+        .await;
+        assert!(responded(&r, 401).is_some(), "removed user: {r:?}");
+        // The nonce issued before the reload is still good for carol.
+        let r = register_with(
+            &stack,
+            "carol",
+            7,
+            &digest_auth_for("carol", &carol_pw, &carol_nonce, 2, "SHA-256"),
+        )
+        .await;
+        assert!(responded(&r, 200).is_some(), "added user: {r:?}");
+    }
+
+    /// IA-2 fail closed: `require_auth` without a credential store knows no
+    /// user, so every REGISTER is challenged and none is accepted.
+    #[tokio::test]
+    async fn digest_register_without_store_rejects_everyone() {
+        let stack = SipStack::new(SipStackConfig {
+            require_auth: true,
+            auth_realm: "example.com".to_string(),
+            ..Default::default()
+        });
+        assert!(stack.register_auth_enabled());
+        let www = digest_challenge(&stack, "alice", 1).await;
+        let nonce = www_param(&www, "nonce").unwrap();
+        let r = register_with(
+            &stack,
+            "alice",
+            2,
+            &digest_auth_for("alice", "any-password", &nonce, 1, "SHA-256"),
+        )
+        .await;
+        assert!(responded(&r, 401).is_some(), "{r:?}");
+        assert_eq!(bad_response_count(&stack), 1);
+        assert!(
+            !stack
+                .location_service
+                .read()
+                .await
+                .has_bindings("sip:alice@example.com")
+        );
+    }
+
+    /// Plan 7, with the SEC-001 backoff: 50 bad REGISTERs from one IP are
+    /// all accounted for by a handful of audit events. The first failures
+    /// are `bad_response`; the one that opens the backoff window is also
+    /// audited as `throttle_tripped`; the rest are `throttled`.
     #[tokio::test]
     async fn digest_register_failures_rate_limited() {
         let pw = test_secret("a");
@@ -25570,15 +26031,319 @@ pub mod tests {
         }
         assert_eq!(
             auth_failure_reasons(&cap.events()),
-            vec!["digest:bad_response"]
+            vec![
+                "digest:bad_response",
+                "digest:throttle_tripped",
+                "digest:throttled"
+            ]
         );
         stack
             .signaling_audit()
             .flush(Instant::now() + std::time::Duration::from_secs(61));
-        assert_eq!(
-            auth_failure_reasons(&cap.events()),
-            vec!["digest:bad_response", "digest:bad_response;count=49"]
+        // Every one of the 50 is in an immediate or a flushed event.
+        let accounted = |stem: &str| -> u64 {
+            auth_failure_reasons(&cap.events())
+                .iter()
+                .filter_map(|r| match r.strip_prefix(stem) {
+                    Some("") => Some(1),
+                    Some(rest) => rest.strip_prefix(";count=")?.parse::<u64>().ok(),
+                    None => None,
+                })
+                .sum()
+        };
+        let bad_responses = accounted("digest:bad_response");
+        let throttled = accounted("digest:throttled");
+        assert!(
+            bad_responses > u64::from(crate::digest_throttle::FREE_FAILURES),
+            "{bad_responses}"
         );
+        assert!(throttled >= 1);
+        assert_eq!(bad_responses + throttled, 50);
+        assert_eq!(digest_count(&stack, "bad_response"), bad_responses);
+        assert_eq!(digest_count(&stack, "throttled"), throttled);
+    }
+
+    /// `sbc_digest_verify_total{outcome}` of `stack`.
+    fn digest_count(stack: &SipStack, outcome: &str) -> u64 {
+        stack
+            .signaling_audit()
+            .digest_outcome_counts()
+            .find(|(l, _)| *l == outcome)
+            .map_or(0, |(_, n)| n)
+    }
+
+    /// What a client can see of a 401: status, reason, header names, body
+    /// and the challenge with its nonce masked.
+    fn visible_401(r: &[ProcessResult]) -> (u16, Option<String>, Vec<String>, String, bool) {
+        let (resp, _) = responded(r, 401).expect("401");
+        let mut names: Vec<String> = resp.headers.iter().map(|h| h.name.to_string()).collect();
+        names.sort();
+        let www = resp
+            .headers
+            .get_value(&HeaderName::WwwAuthenticate)
+            .expect("challenge")
+            .to_string();
+        let nonce = www_param(&www, "nonce").expect("nonce");
+        (
+            resp.status.code(),
+            resp.reason.clone(),
+            names,
+            www.replace(&nonce, "<nonce>"),
+            resp.body.is_some(),
+        )
+    }
+
+    /// Sends a REGISTER for `user` with `pw` on a fresh nonce from `src`.
+    async fn digest_attempt(
+        stack: &SipStack,
+        src: SbcSocketAddr,
+        user: &str,
+        pw: &str,
+        n: u32,
+    ) -> Vec<ProcessResult> {
+        let www = digest_challenge(stack, user, n).await;
+        let nonce = www_param(&www, "nonce").unwrap();
+        let auth = sha256_auth(user, pw, &nonce, "sip:sbc.local", 1);
+        flatten(
+            stack
+                .process_message(&digest_register(user, n + 1, Some(&auth)), src, None)
+                .await,
+        )
+    }
+
+    /// SEC-001 (AC-7): after the free failures a username is in backoff.
+    /// Inside the window even the right password is refused, and the
+    /// refusal is what a wrong password gets, for a known and an unknown
+    /// username alike (no throttle or username oracle). Unknown usernames
+    /// share one bucket and do not affect a real user. The window ends by
+    /// itself (backoff, not lockout), and the trip is audited.
+    #[tokio::test]
+    async fn digest_register_failure_backoff_is_invisible_and_ends() {
+        use crate::digest_throttle::{BASE_BACKOFF, FREE_FAILURES};
+        let pw = test_secret("a");
+        let bob_pw = test_secret("b");
+        let stack = digest_stack(&pw, &bob_pw);
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        let cap = uc_audit::capture::start();
+
+        // A wrong password before any backoff: the reference answer.
+        let reference = visible_401(&digest_attempt(&stack, src, "alice", "nope", 10).await);
+        for i in 1..=FREE_FAILURES {
+            let r = digest_attempt(&stack, src, "alice", "nope", 10 + i * 2).await;
+            assert_eq!(visible_401(&r), reference);
+        }
+        assert_eq!(
+            digest_count(&stack, "bad_response"),
+            u64::from(FREE_FAILURES) + 1
+        );
+        assert_eq!(digest_count(&stack, "throttled"), 0);
+        assert!(
+            auth_failure_reasons(&cap.events()).contains(&"digest:throttle_tripped".to_string()),
+            "the trip is audited"
+        );
+
+        // In backoff: the right password and a wrong one get the same 401
+        // as the reference, and neither is verified against alice's HA1.
+        let right = digest_attempt(&stack, src, "alice", &pw, 40).await;
+        assert!(responded(&right, 200).is_none(), "{right:?}");
+        assert_eq!(visible_401(&right), reference);
+        let wrong = digest_attempt(&stack, src, "alice", "nope", 42).await;
+        assert_eq!(visible_401(&wrong), reference);
+        assert_eq!(digest_count(&stack, "throttled"), 2);
+        assert_eq!(
+            digest_count(&stack, "bad_response"),
+            u64::from(FREE_FAILURES) + 1,
+            "attempts inside the window are not counted as failures"
+        );
+        assert!(
+            !stack
+                .location_service
+                .read()
+                .await
+                .has_bindings("sip:alice@example.com")
+        );
+
+        // Unknown usernames: same visible answer, one shared bucket, no
+        // entry per name.
+        for i in 0..=FREE_FAILURES {
+            let r = digest_attempt(&stack, src, &format!("ghost{i}"), "nope", 60 + i * 2).await;
+            assert_eq!(visible_401(&r), reference);
+        }
+        let ghost = digest_attempt(&stack, src, "another-ghost", "nope", 90).await;
+        assert_eq!(visible_401(&ghost), reference);
+        assert_eq!(digest_count(&stack, "throttled"), 3);
+        let digest = stack.digest.as_ref().unwrap();
+        assert_eq!(lock_leaf(&digest.throttle).tracked(), 1, "alice only");
+
+        // Bob is neither attacked nor affected by either bucket.
+        let bob = digest_attempt(&stack, src, "bob", &bob_pw, 100).await;
+        assert!(responded(&bob, 200).is_some(), "{bob:?}");
+
+        // The window ends by itself; the right password then registers and
+        // clears alice's count.
+        tokio::time::sleep(BASE_BACKOFF + std::time::Duration::from_millis(150)).await;
+        let after = digest_attempt(&stack, src, "alice", &pw, 110).await;
+        assert!(responded(&after, 200).is_some(), "{after:?}");
+        assert_eq!(lock_leaf(&digest.throttle).tracked(), 0);
+        let r = digest_attempt(&stack, src, "alice", "nope", 120).await;
+        assert_eq!(visible_401(&r), reference);
+        assert_eq!(
+            digest_count(&stack, "throttled"),
+            3,
+            "counted from zero again"
+        );
+    }
+
+    /// SEC-001: the backoff cannot be used to cut off a registered phone.
+    /// A source that holds a live binding of its own AOR is still verified
+    /// while the username is attacked from another address; the attacker's
+    /// address stays throttled even with the right password, and the
+    /// exemption does not extend to another user's AOR.
+    #[tokio::test]
+    async fn digest_register_backoff_exempts_the_registered_source() {
+        use crate::digest_throttle::FREE_FAILURES;
+        let pw = test_secret("a");
+        let bob_pw = test_secret("b");
+        let stack = digest_stack(&pw, &bob_pw);
+        let phone = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 0, 2, 10), 5060);
+        let bob_phone = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 0, 2, 11), 5060);
+        let attacker = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 7), 5060);
+
+        for (src, user, secret, n) in [(phone, "alice", &pw, 1), (bob_phone, "bob", &bob_pw, 3)] {
+            let r = digest_attempt(&stack, src, user, secret, n).await;
+            assert!(responded(&r, 200).is_some(), "{r:?}");
+        }
+        for i in 0..=FREE_FAILURES {
+            digest_attempt(&stack, attacker, "alice", "nope", 10 + i * 2).await;
+        }
+        let digest = stack.digest.as_ref().unwrap();
+        assert!(lock_leaf(&digest.throttle).is_blocked("alice", true, Instant::now()));
+        // Lengthen the window (the first one lasts 1 s) so that the rest
+        // of the test does not depend on timing.
+        for _ in 0..9 {
+            lock_leaf(&digest.throttle).record_failure("alice", true, Instant::now());
+        }
+
+        // The attacker's address: throttled even with the right password.
+        let r = digest_attempt(&stack, attacker, "alice", &pw, 40).await;
+        assert!(responded(&r, 200).is_none(), "{r:?}");
+        assert_eq!(digest_count(&stack, "throttled"), 1);
+        // Bob's phone holds a binding, but not of alice's AOR.
+        let r = digest_attempt(&stack, bob_phone, "alice", &pw, 42).await;
+        assert!(responded(&r, 200).is_none(), "{r:?}");
+        assert_eq!(digest_count(&stack, "throttled"), 2);
+        assert!(lock_leaf(&digest.throttle).is_blocked("alice", true, Instant::now()));
+        // SEC-013: the phone's IP address on another port is not the
+        // binding's source: not exempt, and it cannot spend the budget.
+        let same_ip = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 0, 2, 10), 5061);
+        for (n, secret) in [(60, pw.as_str()), (62, "nope"), (64, "nope"), (66, "nope")] {
+            let r = digest_attempt(&stack, same_ip, "alice", secret, n).await;
+            assert!(responded(&r, 200).is_none(), "{r:?}");
+        }
+        assert_eq!(digest_count(&stack, "throttled"), 6);
+        assert!(lock_leaf(&digest.throttle).exemption_open("alice", true));
+
+        // Alice's phone (exact address and port) refreshes during the
+        // attack.
+        let r = digest_attempt(&stack, phone, "alice", &pw, 44).await;
+        assert!(responded(&r, 200).is_some(), "{r:?}");
+        assert_eq!(digest_count(&stack, "throttled"), 6);
+        // Its success does not reopen the door for the attacker.
+        assert!(lock_leaf(&digest.throttle).is_blocked("alice", true, Instant::now()));
+        let r = digest_attempt(&stack, attacker, "alice", &pw, 46).await;
+        assert!(responded(&r, 200).is_none(), "{r:?}");
+        assert_eq!(digest_count(&stack, "throttled"), 7);
+    }
+
+    /// SEC-009: the registered-source exemption has a failure budget. Wrong
+    /// responses from the phone's own address (a guesser behind the same
+    /// NAT) are let through `EXEMPT_FAILURES` times in a window; after
+    /// that the address is throttled like any other, even with the right
+    /// password. Every answer is the wrong-password 401 (no oracle), and
+    /// the failures through the exemption do not move the window.
+    #[tokio::test]
+    async fn digest_register_backoff_exemption_has_a_failure_budget() {
+        use crate::digest_throttle::{EXEMPT_FAILURES, FREE_FAILURES};
+        let pw = test_secret("a");
+        let stack = digest_stack(&pw, &test_secret("b"));
+        let phone = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 0, 2, 10), 5060);
+        let attacker = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 7), 5060);
+        let digest = stack.digest.as_ref().unwrap();
+
+        let r = digest_attempt(&stack, phone, "alice", &pw, 1).await;
+        assert!(responded(&r, 200).is_some(), "{r:?}");
+        let reference = visible_401(&digest_attempt(&stack, attacker, "alice", "nope", 3).await);
+        // A window of minutes, opened directly (the first ones last 1 s).
+        let opened = Instant::now();
+        for _ in 0..(FREE_FAILURES + 9) {
+            lock_leaf(&digest.throttle).record_failure("alice", true, opened);
+        }
+        let far = opened + std::time::Duration::from_secs(120);
+        assert!(lock_leaf(&digest.throttle).is_blocked("alice", true, far));
+        let bad_before = digest_count(&stack, "bad_response");
+
+        // The phone still refreshes; that does not touch the budget.
+        let r = digest_attempt(&stack, phone, "alice", &pw, 10).await;
+        assert!(responded(&r, 200).is_some(), "{r:?}");
+        // Wrong responses from the phone's address use the budget up.
+        for i in 0..EXEMPT_FAILURES {
+            assert!(lock_leaf(&digest.throttle).exemption_open("alice", true));
+            let r = digest_attempt(&stack, phone, "alice", "nope", 20 + i * 2).await;
+            assert_eq!(visible_401(&r), reference);
+        }
+        assert!(!lock_leaf(&digest.throttle).exemption_open("alice", true));
+        assert_eq!(
+            digest_count(&stack, "bad_response"),
+            bad_before + u64::from(EXEMPT_FAILURES)
+        );
+        assert_eq!(digest_count(&stack, "throttled"), 0);
+
+        // Budget gone: the phone's address is refused like any other, with
+        // the right password and with a wrong one, by the same 401.
+        let right = digest_attempt(&stack, phone, "alice", &pw, 40).await;
+        assert!(responded(&right, 200).is_none(), "{right:?}");
+        assert_eq!(visible_401(&right), reference);
+        let wrong = digest_attempt(&stack, phone, "alice", "nope", 42).await;
+        assert_eq!(visible_401(&wrong), reference);
+        assert_eq!(digest_count(&stack, "throttled"), 2);
+        assert_eq!(
+            digest_count(&stack, "bad_response"),
+            bad_before + u64::from(EXEMPT_FAILURES)
+        );
+        // None of it extended the window or opened a new one.
+        assert!(lock_leaf(&digest.throttle).is_blocked("alice", true, far));
+        assert!(!lock_leaf(&digest.throttle).is_blocked(
+            "alice",
+            true,
+            opened + crate::digest_throttle::MAX_BACKOFF
+        ));
+    }
+
+    /// SEC-008: bearer and digest are alternatives; the setter refuses a
+    /// bearer authenticator on a stack with digest authentication on.
+    #[test]
+    fn bearer_authenticator_is_refused_while_digest_is_on() {
+        let bearer = || {
+            let issuer = "https://idp.example.test";
+            let jwks = Arc::new(proto_jwt::JwksCache::new(reqwest::Client::new(), issuer));
+            let validator = Arc::new(proto_jwt::Validator::new(
+                jwks,
+                proto_jwt::ValidatorConfig::new(issuer, vec!["sbc".to_string()]),
+            ));
+            Arc::new(BearerAuthenticator::new(
+                validator,
+                "example.com".to_string(),
+            ))
+        };
+        let mut digest = digest_stack(&test_secret("a"), &test_secret("b"));
+        digest.set_bearer_authenticator(bearer());
+        assert!(digest.bearer.is_none());
+        assert!(digest.register_auth_enabled());
+
+        let mut plain = SipStack::new(SipStackConfig::default());
+        assert!(!plain.register_auth_enabled());
+        plain.set_bearer_authenticator(bearer());
+        assert!(plain.bearer.is_some());
     }
 
     /// Replaces the start line of `msg`.

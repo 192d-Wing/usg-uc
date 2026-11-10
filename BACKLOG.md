@@ -342,16 +342,18 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
 - [ ] **MAJOR, PARTIAL (sbc-daemon wiring) — wire the POA&M-230..232 helpers**
   (POA&M-236). Wired 2026-11-08 (data-plane wiring):
   - [x] `DigestVerifier` on REGISTER with rate-limited uc-audit events for
-    every reject/stale outcome (`verify_register_digest`, `signaling_audit.rs`)
-    — but unreachable from shipped config (POA&M-270)
+    every reject/stale outcome (`verify_register_digest`, `signaling_audit.rs`);
+    reachable from `[digest_auth]` since 2026-11-10 (POA&M-270 closed), off by
+    default
   - [x] §16.4 route preprocessing before ACL/dial plan (`preprocess_initial_invite`)
   - [x] loop-hash B-leg branches (`loop_branch`, `own_via_loop`)
   - [x] `sanitize_inbound_identity` at ingress (per `trust_domain`) and egress
     `apply_privacy`
 
   Open residuals:
-  - [ ] split out: POA&M-270 (credential source), -271 (INVITE digest),
-    -272 (cluster-shared nc), -273 (`userhash`), -274 (other non-SDP bodies)
+  - [ ] split out: POA&M-270 (credential source, closed 2026-11-10), -271
+    (INVITE digest), -272 (cluster-shared nc), -273 (`userhash`), -274 (other
+    non-SDP bodies)
   - [ ] loops through `obfuscate_call_id`, or an outbound proxy that pops its
     Route (Route is in `compute_loop_hash`), look like spirals and are caught
     only by Max-Forwards (483)
@@ -361,15 +363,63 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   - [ ] SEC-6 (proto-sip follow-up): `DigestVerifier::verify` records nc in the
     tracker before the constant-time response check, so a holder of a
     server-issued nonce can fill the tracker and force `stale=true`
-    re-challenges for legitimate users
+    re-challenges for legitimate users. Re-check 2026-11-10: this no longer
+    matches the code. `verify` calls `NcTracker::check` (inserts nothing)
+    before the response comparison and `commit` after it, and one username
+    is limited to 64 tracked nonces (per-user cap added with POA&M-270).
+    Left open for the security reviewer to re-triage
   - [x] `[[trunk_groups]] trust_domain` default flipped to `false`
     (fail-closed); load warns for signing trunks in untrusted groups
-- [ ] **MAJOR, DORMANT (sbc-daemon) — no digest credential source** (POA&M-270):
-  `SipStackConfig.auth_credentials` / `require_auth` have no sbc-config (HA1
-  file or user store) source and no server wiring, so the REGISTER
-  `DigestVerifier` path runs only in tests.
+- [x] **MAJOR (sbc-daemon) — no digest credential source** (POA&M-270): fixed
+  2026-11-10. sbc-config `[digest_auth]` (`require_auth`, `realm`,
+  `algorithm`, `credentials_file`, `nonce_ttl_secs`; off by default; a
+  half-configured section fails the load) with an operator-managed HA1 file
+  (`sbc-daemon/src/digest_credentials.rs`): startup refused on a file error
+  or with `SBC_AUTH_MODE=bearer`; SIGHUP re-reads the file and a bad file
+  keeps the previous table. SHA-256 or SHA-512-256 only, no server-side MD5
+  (MD5-only phones cannot register with digest on). The plaintext
+  `SipStackConfig.auth_credentials` map is removed. Added with it:
+  per-username failure backoff (AC-7, `digest_throttle.rs`) and a per-user
+  nonce cap of 64 in proto-sip `DigestVerifier`. Tests
+  `digest_register_end_to_end_from_toml`,
+  `qa_digest_register_from_toml_sha256_unknown_user_and_reload`,
+  `digest_credentials_startup_rules`,
+  `sighup_reloads_digest_credentials_and_keeps_old_on_failure`,
+  `digest_register_failure_backoff_is_invisible_and_ends`. Not done: Helm
+  chart rendering of `[digest_auth]` and delivery of the credentials file
+  (a plain Secret mount is refused by the file checks; see the admin guide);
+  no bench for REGISTER digest verify. Follow-ups POA&M-310..316 below.
 - [ ] **MINOR (sbc-daemon) — no per-INVITE digest challenge** (POA&M-271):
-  UDP callers have no authenticated identity; caps STIR attestation.
+  UDP callers have no authenticated identity; caps STIR attestation. Deferred
+  from the POA&M-270 change; no code exists. Remaining: `invite` setting in
+  `[digest_auth]`; `Proxy-Authorization` check and 407 in `handle_invite` for
+  non-trunk sources through the INVITE server transaction; no challenge for
+  ACK, CANCEL, in-dialog requests, trunk sources and emergency calls; From
+  identity authorized against the digest user; authenticated caller passed
+  to STIR signing; verifier state separate from REGISTER nonces, with a
+  bench; audit and metrics per method; tests.
+- [ ] **MINOR (sbc-daemon) — digest credentials only from the HA1 file**
+  (POA&M-310): users in the sbc-api-server `uc-user-mgmt` store cannot
+  register with SIP digest until exported to the file. Needs a user-store
+  source or sync job, realm alignment, SHA-512-256 HA1, cluster distribution.
+- [ ] **MINOR (sbc-daemon) — no binding eviction when a credential is
+  removed** (POA&M-311): existing bindings and their INVITE source admission
+  last until registration expiry. No test pins this.
+- [ ] **MINOR (sbc-daemon) — HA1 credentials file not sealed at rest**
+  (POA&M-312, SC-28(1)): file type, mode and owner checks only.
+- [ ] **MINOR (sbc-daemon) — only the first `Authorization` header is
+  examined** (POA&M-313, RFC 3261 §22.3).
+- [ ] **MINOR (sbc-daemon) — digest over a cleartext SIP transport is warned
+  about, not refused** (POA&M-314): startup warning for `udp` / `tcp` / `ws`
+  listeners; the log line itself is not tested.
+- [ ] **NIT (sbc-daemon) — symlinked parent directory of the credentials file
+  not detected** (POA&M-315).
+- [ ] **MINOR (sbc-daemon) — AC-7 digest backoff residuals** (POA&M-316):
+  per-node state; the registered-source exemption (exact source address and
+  port, 3 wrong responses per window) can be spent by an on-path sender or a
+  spoofer that guesses the port, and is lost when a phone's NAT port mapping
+  changes; reset on success lets a guesser stay under 5 failures between the
+  victim's refreshes; thresholds are constants, not configuration.
 - [ ] **MINOR (sbc-daemon cluster) — shared nonce key needs cluster-shared nc
   state** (POA&M-272).
 - [ ] **MINOR — RFC 7616 `userhash` not supported** (POA&M-273).

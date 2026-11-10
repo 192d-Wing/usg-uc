@@ -9,6 +9,142 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, `SBC_AUTH_MODE` parsing, POA&M-270)
+
+- **SBC: `SBC_AUTH_MODE` is trimmed before it is compared.** (IA-2, CM-6)
+  A value with surrounding whitespace, such as `"bearer "` from an env
+  file, now selects bearer REGISTER authorization. Before, such a value
+  left REGISTER unauthenticated (with a startup warning). A deployment that
+  ran that way starts requiring tokens after the upgrade, and phones without
+  one are refused. Check the value before upgrading. The comparison was
+  already case-insensitive. The Helm chart sets exactly `bearer` and is not
+  affected.
+
+Nothing else in this batch is breaking. `[digest_auth]` is off by default
+and a config without the section behaves as before. No config key, CDR
+field, audit event type or gRPC/REST API is changed or removed.
+
+### Added (SBC, REGISTER digest credential source, POA&M-270)
+
+- **SBC: REGISTER digest authentication can be enabled from config.**
+  (RFC 7616, RFC 8760; IA-2, IA-5, IA-5(1) partial, IA-5(6), AC-7;
+  POA&M-270 closed) New `[digest_auth]` section, off by default. With
+  `require_auth = true` every REGISTER is challenged (401) and must carry a
+  valid digest for a user in `credentials_file`. The digest username must
+  equal the user part of the registered AOR, or the answer is 403. This
+  makes the `DigestVerifier` path from POA&M-236 reachable from shipped
+  config. Initial INVITEs are still not challenged (POA&M-271, open).
+- **Config keys:** `require_auth` (bool, default `false`), `realm`
+  (required when on; 1 to 255 printable ASCII bytes without `"`, `\`, `:`
+  or whitespace), `credentials_file` (required when on; absolute path),
+  `algorithm` (`"SHA-256"` default, or `"SHA-512-256"`, which is FIPS 180-4
+  SHA-512/256), `nonce_ttl_secs` (30..=3600, default 300). Unknown keys in
+  the section fail the load. While `require_auth = false`, setting any
+  other key of the section fails the load, so a half-configured section
+  cannot be mistaken for an active one. The section holds a path only,
+  never a secret. `deploy/config/config.toml` gains the section with
+  `require_auth = false` and the other keys commented out.
+- **Credentials file.** One `username:realm:algorithm:ha1hex` entry per
+  line (`#` comments allowed), `ha1hex` = 64 hex characters of
+  `H(username:realm:password)`. The SBC never holds a password. The realm
+  of every line must equal `digest_auth.realm`, and a user needs a line for
+  the configured algorithm. Usernames are ASCII in the RFC 3261 §25.1
+  `user` production (no `@`, space, quote or backslash; `%HH` escapes
+  allowed) and are matched byte for byte. The file must be plain UTF-8
+  without a byte order mark, at most 64 MiB and 1,000,000 entries. One bad
+  line fails the whole load; errors name the line number and the rule,
+  never the username or the HA1.
+- **File protection.** (IA-5(6), AC-3, AC-6) The file must be a regular
+  file, not a symlink, mode 0600 or 0400, owned by the daemon user or
+  root. HA1 values are wiped from memory on drop and never appear in logs
+  or `Debug` output. The file is not encrypted at rest (POA&M-312); keep
+  it on an encrypted volume.
+- **No server-side MD5.** (IA-5(1), SC-13) `algorithm = "MD5"`, any `-sess`
+  algorithm, and an MD5 or `-sess` line in the file are all refused. There
+  is no opt-in; `allow_md5_digest` (POA&M-255) is a client-side setting for
+  trunk registration and does not apply. Phones that support only MD5
+  digest cannot register once `require_auth` is on. Check the phone fleet
+  before enabling.
+- **Startup refusals when `require_auth = true`.** The daemon does not
+  start when the credentials file is missing, fails the protection checks
+  or does not parse, or when `SBC_AUTH_MODE=bearer` is also set. Bearer and
+  digest REGISTER authentication cannot be combined; the Helm chart sets
+  `SBC_AUTH_MODE=bearer` when `sbcDaemon.oidc.enabled` is true.
+- **Cleartext transports are warned about, not refused.** (SC-8;
+  POA&M-314) With `require_auth = true` and a `udp`, `tcp` or `ws` SIP
+  listener configured, the daemon logs a warning at startup and starts.
+  SIP digest runs under the POA&M-110 CNSA exception, whose condition is a
+  CNSA TLS transport. Use TLS / WSS listeners only with digest.
+- **Reload.** SIGHUP re-reads the contents of `credentials_file` and swaps
+  the whole table. A file that fails to load keeps the previous
+  credentials; the failure is logged, audited and counted. Changes
+  to the `[digest_auth]` keys themselves need a restart and are reported
+  as restart-required. Removing a user stops new REGISTERs at once; the
+  user's existing bindings stay until they expire (POA&M-311).
+- **Per-username failure backoff.** (AC-7, SC-5) After 5 wrong responses
+  for one username, each further failure opens a backoff window, 1 s
+  doubling to 5 minutes. Inside a window the request is answered like a
+  wrong password (401, new challenge). Failures are forgotten after 15
+  minutes without one, or on a success. A source that already holds a
+  binding for the AOR may still refresh during a window (3 failures per
+  window allowed). The values are fixed, and the state is per node
+  (POA&M-316). A sustained attack on one username can keep that user's
+  unregistered devices from registering while it lasts; alert on
+  `sbc_digest_verify_throttled_total`.
+- **Metrics:** `sbc_digest_credentials_users` (users in the loaded table),
+  `sbc_digest_credentials_reload_failures_total` (reloads that kept the
+  previous table), `sbc_digest_verify_throttled_total` (requests refused
+  inside a backoff window) and `sbc_digest_throttle_overflow_total`. None
+  carries a user label.
+- **Audit (SIEM parsers):** no new event type. `AuthenticationAttempt`
+  gains the failure reasons `digest:throttled` (a request refused inside a
+  backoff window, rate-limited and aggregated like the other
+  `digest:<reason>` values) and `digest:throttle_tripped` (a window
+  opened). Credential loads and reloads emit `ConfigurationChange` (user
+  counts only) and `CryptoKeyOperation` with
+  `key_id = "digest_auth.credentials"`: `Loaded` at startup, `Rotated` on a
+  reload, with outcome success or failure. A startup refusal, including
+  the bearer conflict, is a `Loaded` failure. Rules that enumerate
+  `digest:` reasons or treat every `CryptoKeyOperation` as a TLS or signing
+  key event must be updated before digest is enabled.
+- **Rollback and mixed versions.** SBC 0.10.0 and older ignore the
+  `[digest_auth]` section. A node rolled back, or not yet upgraded, with
+  `require_auth = true` in its config accepts REGISTER without
+  authentication. Enable digest only after every node runs this release.
+  Before rolling a node back, treat its REGISTER as unauthenticated and
+  restrict who can reach it.
+- **Kubernetes.** The Helm chart does not render `[digest_auth]` or mount
+  a credentials Secret yet. A Secret volume presents its files as symlinks
+  and, with the chart's `fsGroup`, as group-readable; the daemon refuses
+  both. A hand-written mount needs `subPath` (no symlink) and
+  `defaultMode: 0400`, and the file must end up with no group or other
+  permission bit and readable by the daemon uid. Under the chart's default
+  pod security context (uid 1000, `fsGroup: 1000`) that may not hold; the
+  chart copies its STIR signing key through an init container for this
+  reason. Not tested on a cluster in this change. A `subPath` mount does
+  not receive Secret updates, so a rotated Secret needs a pod restart, not
+  SIGHUP.
+- **Not included:** users of the API server's user store are not a digest
+  credential source (POA&M-310). Only the first `Authorization` header of
+  a REGISTER is examined (POA&M-313). A symlinked parent directory of the
+  credentials file is not detected (POA&M-315).
+
+### Changed (proto-sip, digest verifier, POA&M-270)
+
+- **proto-sip: `DigestVerifier` limits tracked nonces per username.**
+  (SC-5) Every `DigestVerifier` now keeps at most 64 live nonces per
+  username (`DEFAULT_MAX_TRACKED_NONCES_PER_USER`; change it with the new
+  `with_max_tracked_nonces_per_user`). At the limit, a newly verified nonce
+  replaces that user's oldest one. A request that still uses a replaced
+  nonce gets `stale=true` and one new challenge. One credential can no
+  longer fill the tracker and force re-challenges for other users. The
+  Rust API change is additive. In this repository only sbc-daemon uses the
+  verifier; the soft client does not.
+- **proto-sip: temporary strings that hold an HA1 or a password are wiped
+  on drop.** (IA-5(6)) Applies to digest response computation on the
+  client and the server. No behaviour change. `zeroize` (already in the
+  workspace) becomes a direct dependency of proto-sip.
+
 ### BREAKING (SBC, SIPREC phase 3 live recording, POA&M-300..309)
 
 - **SBC: `[recording] enabled = true` is now accepted and live.** (RFC 7866,

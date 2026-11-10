@@ -99,8 +99,8 @@ impl InDialogPolicy {
 }
 
 /// Number of digest outcomes counted (`ok`, `stale`, ten reject codes,
-/// `aor_mismatch`).
-const DIGEST_OUTCOMES: usize = 13;
+/// `aor_mismatch`, `throttled`).
+const DIGEST_OUTCOMES: usize = 14;
 
 /// Digest outcome labels (`sbc_digest_verify_total{outcome}`).
 pub const DIGEST_OUTCOME_LABELS: [&str; DIGEST_OUTCOMES] = [
@@ -117,6 +117,7 @@ pub const DIGEST_OUTCOME_LABELS: [&str; DIGEST_OUTCOMES] = [
     "bad_response",
     "malformed",
     "aor_mismatch",
+    "throttled",
 ];
 
 /// Gauge names, one per digest outcome (order of [`DIGEST_OUTCOME_LABELS`]).
@@ -134,6 +135,7 @@ pub const DIGEST_METRIC_NAMES: [&str; DIGEST_OUTCOMES] = [
     "sbc_digest_verify_bad_response_total",
     "sbc_digest_verify_malformed_total",
     "sbc_digest_verify_aor_mismatch_total",
+    "sbc_digest_verify_throttled_total",
 ];
 
 /// Gauge names, one per in-dialog policy (order of [`InDialogPolicy::ALL`]).
@@ -145,6 +147,9 @@ pub const IN_DIALOG_METRIC_NAMES: [&str; 6] = [
     "sbc_in_dialog_rejects_pending_relay_cap_total",
     "sbc_in_dialog_rejects_pending_relay_cap_race_total",
 ];
+
+/// Audit `failure_reason` of a digest failure backoff window opening.
+pub const THROTTLE_TRIPPED_REASON: &str = "digest:throttle_tripped";
 
 /// Gauge: signaling audit events dropped because a table was full.
 pub const METRIC_DROPPED: &str = "sbc_signaling_audit_dropped_total";
@@ -164,6 +169,9 @@ pub enum DigestOutcome {
     Reject(DigestReject),
     /// The digest username is not the AOR user (registration hijack).
     AorMismatch,
+    /// Refused inside a per-username failure backoff window (AC-7). On the
+    /// wire it is a `bad_response`.
+    Throttled,
 }
 
 impl DigestOutcome {
@@ -175,6 +183,7 @@ impl DigestOutcome {
             Self::Stale => "stale",
             Self::Reject(r) => r.as_str(),
             Self::AorMismatch => "aor_mismatch",
+            Self::Throttled => "throttled",
         }
     }
 
@@ -185,6 +194,7 @@ impl DigestOutcome {
             Self::Ok => "digest:ok",
             Self::Stale => "digest:stale",
             Self::AorMismatch => "digest:aor_mismatch",
+            Self::Throttled => "digest:throttled",
             Self::Reject(r) => match r {
                 DigestReject::RealmMismatch => "digest:realm_mismatch",
                 DigestReject::AlgorithmMismatch => "digest:algorithm_mismatch",
@@ -271,7 +281,7 @@ impl SignalingAudit {
     /// Every exported counter as `(gauge name, help, value)`. The uc-metrics
     /// gauges are refreshed through `&self`, which cannot set labels, so each
     /// bounded label value is its own gauge:
-    /// `sbc_digest_verify_<outcome>_total` (13),
+    /// `sbc_digest_verify_<outcome>_total` (14),
     /// `sbc_in_dialog_rejects_<policy>_total` (6) and
     /// `sbc_signaling_audit_dropped_total`.
     ///
@@ -319,7 +329,21 @@ impl SignalingAudit {
         if outcome == DigestOutcome::Ok {
             return;
         }
-        let reason = outcome.audit_reason();
+        self.auth_failure(aor, source, outcome.audit_reason(), now);
+    }
+
+    /// Audits the opening of a per-username digest failure backoff window
+    /// (`digest:throttle_tripped`) as a failed `AuthenticationAttempt`,
+    /// rate limited per source IP like every other digest failure.
+    ///
+    /// ## NIST 800-53 Rev5: AC-7, AU-2, AU-3
+    pub fn digest_throttle_tripped(&self, aor: &str, source: SbcSocketAddr, now: Instant) {
+        self.auth_failure(aor, source, THROTTLE_TRIPPED_REASON, now);
+    }
+
+    /// One failed digest `AuthenticationAttempt`, aggregated per (source
+    /// IP, reason).
+    fn auth_failure(&self, aor: &str, source: SbcSocketAddr, reason: &'static str, now: Instant) {
         let ip = source.ip();
         let key = ip.to_string();
         let aor = audit_field(aor);
@@ -663,6 +687,15 @@ mod tests {
             DIGEST_OUTCOME_LABELS[DigestOutcome::AorMismatch.index()],
             "aor_mismatch"
         );
+        assert_eq!(
+            DIGEST_OUTCOME_LABELS[DigestOutcome::Throttled.index()],
+            "throttled"
+        );
+        assert_eq!(
+            DIGEST_METRIC_NAMES[DigestOutcome::Throttled.index()],
+            "sbc_digest_verify_throttled_total"
+        );
+        assert_eq!(DigestOutcome::Throttled.audit_reason(), "digest:throttled");
     }
 
     /// QA: keys are (source IP, policy). Distinct policies from one IP are

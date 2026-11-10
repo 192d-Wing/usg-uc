@@ -12,6 +12,7 @@
 
 #[cfg(feature = "cluster")]
 use crate::cluster::ClusterManager;
+use crate::digest_credentials::DigestCredentialStore;
 use crate::flow::{Flow, LegFlow};
 use crate::flows::{FlowKey, FlowTable};
 use crate::shutdown::ShutdownSignal;
@@ -276,9 +277,70 @@ pub struct Server {
     cluster: Option<Arc<ClusterManager>>,
 }
 
+/// Maps `digest_auth.algorithm` to the verifier's algorithm. Only the two
+/// non-session SHA-2 algorithms exist in the config type, so no MD5 or
+/// `-sess` value can reach the verifier. `SHA-512-256` is FIPS 180-4
+/// SHA-512/256 (RFC 7616 §3.2), not a truncated SHA-512.
+///
+/// CNSA-EXCEPTION: RFC 7616 defines no SHA-384 digest (POA&M-110). What is
+/// enforced here is "no MD5, no `-sess`"; a CNSA TLS transport under the
+/// exchange is not enforced (see [`digest_cleartext_transports`]).
+///
+/// ## NIST 800-53 Rev5: IA-5(1) (no weaker algorithm than configured),
+/// SC-13; RFC 7616 §3.7, RFC 8760 §2.1
+pub const fn digest_algorithm(a: sbc_config::DigestAuthAlgorithm) -> proto_sip::DigestAlgorithm {
+    match a {
+        sbc_config::DigestAuthAlgorithm::Sha256 => proto_sip::DigestAlgorithm::Sha256,
+        sbc_config::DigestAuthAlgorithm::Sha512_256 => proto_sip::DigestAlgorithm::Sha512_256,
+    }
+}
+
+/// Whether `SBC_AUTH_MODE` (`auth_mode`) selects RFC 8898 bearer REGISTER
+/// authorization. The one definition of "bearer mode is active": the
+/// runtime's digest/bearer conflict check and the bearer authorizer setup
+/// both use it, so they cannot disagree about a value such as `" Bearer "`.
+///
+/// ## NIST 800-53 Rev5: IA-2, CM-6
+pub fn bearer_mode_active(auth_mode: &str) -> bool {
+    auth_mode.trim().eq_ignore_ascii_case("bearer")
+}
+
+/// The configured SIP listener transports that carry REGISTER in cleartext
+/// (`udp`, `tcp`, `ws`) while digest authentication is required; empty
+/// when digest is off or every SIP listener is TLS / WSS.
+///
+/// Digest over a cleartext transport exposes the username, the realm and a
+/// response an eavesdropper can attack offline (RFC 7616 §5.10, §5.11), and
+/// is outside the "protected by CNSA TLS" condition of the POA&M-110
+/// exception.
+///
+/// POAM: POA&M-314 - digest over a cleartext transport is warned about at
+/// startup, not refused.
+///
+/// ## NIST 800-53 Rev5: IA-5(1) (protected channel, not enforced), SC-8
+pub fn digest_cleartext_transports(config: &SbcConfig) -> Vec<&'static str> {
+    if !config.digest_auth.require_auth {
+        return Vec::new();
+    }
+    let t = &config.transport;
+    [
+        ("udp", !t.udp_listen.is_empty()),
+        ("tcp", !t.tcp_listen.is_empty()),
+        ("ws", !t.ws_listen.is_empty()),
+    ]
+    .into_iter()
+    .filter_map(|(name, configured)| configured.then_some(name))
+    .collect()
+}
+
 impl Server {
-    /// Creates a new server.
-    pub fn new(config: SbcConfig, shutdown: ShutdownSignal) -> Self {
+    /// Creates a new server. `digest_credentials` is the `[digest_auth]`
+    /// credential store the runtime loaded (`None` when digest is off).
+    pub fn new(
+        config: SbcConfig,
+        shutdown: ShutdownSignal,
+        digest_credentials: Option<Arc<DigestCredentialStore>>,
+    ) -> Self {
         // Use standard SBC metrics
         let metrics = SbcMetrics::standard();
 
@@ -291,7 +353,7 @@ impl Server {
         )));
         health.register(Box::new(uc_health::check::MemoryCheck::new()));
 
-        let sip_config = Self::build_sip_config(&config);
+        let sip_config = Self::build_sip_config(&config, digest_credentials);
         let mut sip_stack = SipStack::new(sip_config);
         let media_failure_rx = Self::init_sip_stack_from_config(&mut sip_stack, &config);
         Self::init_user_rate_limiter(&mut sip_stack, &config);
@@ -299,6 +361,7 @@ impl Server {
             sip_stack.set_bearer_authenticator(bearer);
         }
         Self::warn_if_register_unauthenticated(&sip_stack);
+        Self::warn_if_digest_over_cleartext(&config);
         let sip_stack = Arc::new(sip_stack);
         let rate_limiter = Self::build_rate_limiter(&config);
         let global_limiter = Self::build_global_limiter(&config);
@@ -394,6 +457,7 @@ impl Server {
         config: SbcConfig,
         shutdown: ShutdownSignal,
         cluster: Option<Arc<ClusterManager>>,
+        digest_credentials: Option<Arc<DigestCredentialStore>>,
     ) -> Self {
         let metrics = SbcMetrics::standard();
 
@@ -404,7 +468,7 @@ impl Server {
         )));
         health.register(Box::new(uc_health::check::MemoryCheck::new()));
 
-        let sip_config = Self::build_sip_config(&config);
+        let sip_config = Self::build_sip_config(&config, digest_credentials);
         let mut sip_stack = if let Some(ref cluster_mgr) = cluster {
             SipStack::new_with_location_service(
                 sip_config,
@@ -419,6 +483,7 @@ impl Server {
             sip_stack.set_bearer_authenticator(bearer);
         }
         Self::warn_if_register_unauthenticated(&sip_stack);
+        Self::warn_if_digest_over_cleartext(&config);
         let sip_stack = Arc::new(sip_stack);
 
         let rate_limiter = Self::build_rate_limiter(&config);
@@ -448,8 +513,12 @@ impl Server {
         }
     }
 
-    /// Builds `SipStackConfig` from `SbcConfig`.
-    fn build_sip_config(config: &SbcConfig) -> SipStackConfig {
+    /// Builds `SipStackConfig` from `SbcConfig`. `digest_credentials` is
+    /// the store loaded from `digest_auth.credentials_file`.
+    fn build_sip_config(
+        config: &SbcConfig,
+        digest_credentials: Option<Arc<DigestCredentialStore>>,
+    ) -> SipStackConfig {
         if config
             .vps
             .as_ref()
@@ -561,6 +630,17 @@ impl Server {
             // NIST 800-53 Rev5: AU-4, AU-5 — the signaling audit aggregation
             // window shares the rate-limit audit interval (1..=3600 s).
             signaling_audit_window_secs: config.rate_limit.audit_interval_secs,
+            // NIST 800-53 Rev5: IA-2, IA-5, CM-6 - `[digest_auth]`
+            // (POA&M-270). RFC 7616 §3.7: the server picks the algorithm.
+            require_auth: config.digest_auth.require_auth,
+            auth_realm: config
+                .digest_auth
+                .realm
+                .clone()
+                .unwrap_or_else(|| SipStackConfig::default().auth_realm),
+            digest_algorithm: digest_algorithm(config.digest_auth.algorithm()),
+            digest_nonce_ttl_secs: config.digest_auth.nonce_ttl_secs(),
+            digest_credentials,
             ..SipStackConfig::default()
         }
     }
@@ -571,7 +651,28 @@ impl Server {
         if !sip_stack.register_auth_enabled() {
             warn!(
                 "REGISTER is UNAUTHENTICATED: any peer can register any user. \
-                 Set SBC_AUTH_MODE=bearer (with SBC_OIDC_ISSUER) to require tokens."
+                 Set [digest_auth] require_auth = true (with realm and credentials_file) \
+                 to require digest, or SBC_AUTH_MODE=bearer (with SBC_OIDC_ISSUER) to \
+                 require tokens."
+            );
+        }
+    }
+
+    /// Warns when digest REGISTER authentication is required and a SIP
+    /// listener is not TLS (SEC-004 / NIST-002).
+    ///
+    /// POAM: POA&M-314 - warned, not refused.
+    ///
+    /// ## NIST 800-53 Rev5: IA-5(1), SC-8, CM-6
+    fn warn_if_digest_over_cleartext(config: &SbcConfig) {
+        let cleartext = digest_cleartext_transports(config);
+        if !cleartext.is_empty() {
+            warn!(
+                transports = %cleartext.join(","),
+                "[digest_auth] require_auth = true with cleartext SIP listeners: digest \
+                 REGISTER on these transports exposes usernames and responses that can \
+                 be attacked offline, and is outside the CNSA 2.0 exception for SIP \
+                 digest. Use TLS (transport.tls_listen / wss_listen) only."
             );
         }
     }
@@ -585,7 +686,7 @@ impl Server {
     /// work is needed here.
     fn build_bearer_authenticator(config: &SbcConfig) -> Option<Arc<BearerAuthenticator>> {
         let mode = std::env::var("SBC_AUTH_MODE").unwrap_or_default();
-        if !mode.eq_ignore_ascii_case("bearer") {
+        if !bearer_mode_active(&mode) {
             return None;
         }
 
@@ -3637,7 +3738,7 @@ mod tests {
     fn test_server_creation() {
         let config = SbcConfig::default();
         let shutdown = ShutdownSignal::new();
-        let server = Server::new(config, shutdown);
+        let server = Server::new(config, shutdown, None);
 
         assert_eq!(server.config().general.instance_name, "sbc-01");
     }
@@ -3646,7 +3747,7 @@ mod tests {
     async fn test_server_health() {
         let config = SbcConfig::default();
         let shutdown = ShutdownSignal::new();
-        let mut server = Server::new(config, shutdown);
+        let mut server = Server::new(config, shutdown, None);
 
         assert!(server.is_alive());
         assert!(server.is_ready());
@@ -3659,7 +3760,7 @@ mod tests {
     async fn test_server_stats() {
         let config = SbcConfig::default();
         let shutdown = ShutdownSignal::new();
-        let server = Server::new(config, shutdown);
+        let server = Server::new(config, shutdown, None);
 
         assert_eq!(server.stats().calls_total.load(Ordering::Relaxed), 0);
         assert_eq!(server.stats().messages_received.load(Ordering::Relaxed), 0);
@@ -4844,7 +4945,7 @@ mod tests {
              [cluster.auth]\nkey_file = \"/etc/sbc/cluster.key\"\nkey_id = 1\n",
         )
         .expect("config");
-        let sip = Server::build_sip_config(&config);
+        let sip = Server::build_sip_config(&config, None);
         assert_eq!(sip.max_calls, 333);
         assert_eq!(sip.max_registrations, 1000);
         assert_eq!(sip.admission_divisor, 3);
@@ -4852,10 +4953,93 @@ mod tests {
         assert_eq!(sip.emergency_reserve_calls, 100);
     }
 
+    // POA&M-270: `[digest_auth]` reaches the SIP stack config; absent, the
+    // stack keeps REGISTER digest off.
+    #[test]
+    fn build_sip_config_maps_digest_auth() {
+        let sip = Server::build_sip_config(&SbcConfig::default(), None);
+        assert!(!sip.require_auth);
+        assert!(sip.digest_credentials.is_none());
+        assert_eq!(sip.digest_algorithm, proto_sip::DigestAlgorithm::Sha256);
+        assert_eq!(sip.digest_nonce_ttl_secs, 300);
+
+        let config = sbc_config::load_from_str(
+            "[digest_auth]\nrequire_auth = true\nrealm = \"sip.example.test\"\n\
+             algorithm = \"SHA-512-256\"\ncredentials_file = \"/etc/usg-sbc/digest.ha1\"\n\
+             nonce_ttl_secs = 90\n",
+        )
+        .expect("config");
+        let store = crate::sip_stack::tests::test_digest_store("sip.example.test", &[]);
+        let sip = Server::build_sip_config(&config, Some(Arc::clone(&store)));
+        assert!(sip.require_auth);
+        assert_eq!(sip.auth_realm, "sip.example.test");
+        assert_eq!(sip.digest_algorithm, proto_sip::DigestAlgorithm::Sha512_256);
+        assert_eq!(sip.digest_nonce_ttl_secs, 90);
+        assert!(
+            sip.digest_credentials
+                .is_some_and(|s| Arc::ptr_eq(&s, &store))
+        );
+        // No "UNAUTHENTICATED" state once configured.
+        let server = Server::new(config, ShutdownSignal::new(), Some(store));
+        assert!(server.sip_stack().register_auth_enabled());
+        let off = Server::new(SbcConfig::default(), ShutdownSignal::new(), None);
+        assert!(!off.sip_stack().register_auth_enabled());
+    }
+
+    // SEC-008: one rule for "bearer mode is active", shared with the
+    // runtime's digest/bearer conflict check.
+    #[test]
+    fn bearer_mode_active_is_trimmed_and_case_insensitive() {
+        for on in ["bearer", "Bearer", "BEARER", " bearer ", "\tbearer\n"] {
+            assert!(bearer_mode_active(on), "{on:?}");
+        }
+        for off in [
+            "",
+            " ",
+            "digest",
+            "none",
+            "bearer2",
+            "be arer",
+            "bearer,digest",
+        ] {
+            assert!(!bearer_mode_active(off), "{off:?}");
+        }
+    }
+
+    // SEC-004 / NIST-002 (POA&M-314): digest with a non-TLS SIP listener is
+    // reported; digest off, or TLS-only listeners, is not.
+    #[test]
+    fn digest_cleartext_transports_lists_non_tls_listeners() {
+        let addr: std::net::SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let mut config = SbcConfig::default();
+        config.transport.udp_listen = vec![addr];
+        config.transport.tcp_listen = vec![addr];
+        config.transport.ws_listen = vec![addr];
+        config.transport.tls_listen = vec![addr];
+        assert!(
+            digest_cleartext_transports(&config).is_empty(),
+            "digest off"
+        );
+        config.digest_auth.require_auth = true;
+        assert_eq!(
+            digest_cleartext_transports(&config),
+            vec!["udp", "tcp", "ws"]
+        );
+        config.transport.tcp_listen.clear();
+        assert_eq!(digest_cleartext_transports(&config), vec!["udp", "ws"]);
+        config.transport.udp_listen.clear();
+        config.transport.ws_listen.clear();
+        config.transport.wss_listen = vec![addr];
+        assert!(
+            digest_cleartext_transports(&config).is_empty(),
+            "TLS and WSS only"
+        );
+    }
+
     #[test]
     fn default_admission_is_per_node() {
         let config = SbcConfig::default();
-        let sip = Server::build_sip_config(&config);
+        let sip = Server::build_sip_config(&config, None);
         assert_eq!(sip.max_calls, config.general.max_calls);
         assert_eq!(sip.max_registrations, config.general.max_registrations);
         assert_eq!(sip.admission_divisor, 1);
@@ -4910,7 +5094,7 @@ mod tests {
 
     #[tokio::test]
     async fn recording_off_wires_nothing() {
-        let mut server = Server::new(SbcConfig::default(), ShutdownSignal::new());
+        let mut server = Server::new(SbcConfig::default(), ShutdownSignal::new(), None);
         server.wire_recording().await.unwrap();
         assert!(!server.sip_stack().recording_enabled());
         assert!(
@@ -4952,7 +5136,7 @@ mod tests {
                 "key" => config.security.tls_key_path = None,
                 _ => config.transport.tls_listen.clear(),
             }
-            let mut server = Server::new(config, ShutdownSignal::new());
+            let mut server = Server::new(config, ShutdownSignal::new(), None);
             let err = startup_error(server.start().await);
             assert!(
                 err.contains("TLS listener with a certificate"),
@@ -4969,13 +5153,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ca = dir.path().join("sbc.crt");
         let config = recording_config(dir.path(), "sips:srs.recorder.invalid:5061", &ca);
-        let mut server = Server::new(config, ShutdownSignal::new());
+        let mut server = Server::new(config, ShutdownSignal::new(), None);
         let err = startup_error(server.wire_recording().await);
         assert!(err.contains("does not resolve"), "{err}");
         assert!(!server.sip_stack().recording_enabled());
         // Not a sips: URI (validation rejects it first; the daemon too).
         let config = recording_config(dir.path(), "sip:127.0.0.1:5060", &ca);
-        let mut server = Server::new(config, ShutdownSignal::new());
+        let mut server = Server::new(config, ShutdownSignal::new(), None);
         let err = startup_error(server.wire_recording().await);
         assert!(err.contains("sips:"), "{err}");
     }
@@ -4991,7 +5175,7 @@ mod tests {
         let missing = dir.path().join("missing.pem");
         for ca in [&empty, &missing] {
             let config = recording_config(dir.path(), "sips:127.0.0.1:5061", ca);
-            let mut server = Server::new(config, ShutdownSignal::new());
+            let mut server = Server::new(config, ShutdownSignal::new(), None);
             let err = startup_error(server.wire_recording().await);
             assert!(err.contains("recording.srs_tls_ca_file"), "{err}");
             assert!(!server.sip_stack().recording_enabled());
@@ -5007,7 +5191,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ca = dir.path().join("sbc.crt");
         let config = recording_config(dir.path(), "sips:127.0.0.1:59", &ca);
-        let mut server = Server::new(config, ShutdownSignal::new());
+        let mut server = Server::new(config, ShutdownSignal::new(), None);
         let capture = uc_audit::capture::start();
         server.wire_recording().await.unwrap();
         assert!(server.sip_stack().recording_enabled());

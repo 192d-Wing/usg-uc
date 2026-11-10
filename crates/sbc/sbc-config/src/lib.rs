@@ -79,12 +79,12 @@ pub use interface::{ResolvedZone, resolve_zones};
 #[cfg(feature = "telemetry")]
 pub use schema::TelemetryConfig;
 pub use schema::{
-    DialPlanConfig, DialPlanEntryConfig, HeaderManipulationConfig, ManipulationRuleConfig,
-    RecordingConfig, RecordingFailureAction, RecordprefPolicy, RoutingConfig, SbcConfig, SrtpMode,
-    StirAlgorithm, StirAttestation, StirAttestationConfig, StirAttestationRule, StirFailurePolicy,
-    StirKeySource, StirShakenConfig, StirSigningConfig, StirVerificationConfig, T38Config,
-    T38EcMode, TopologyHidingConfig, TrunkConfigSchema, TrunkGroupConfig,
-    TrunkManipulationRuleConfig, TrunkStirConfig, ZoneConfig,
+    DialPlanConfig, DialPlanEntryConfig, DigestAuthAlgorithm, DigestAuthConfig,
+    HeaderManipulationConfig, ManipulationRuleConfig, RecordingConfig, RecordingFailureAction,
+    RecordprefPolicy, RoutingConfig, SbcConfig, SrtpMode, StirAlgorithm, StirAttestation,
+    StirAttestationConfig, StirAttestationRule, StirFailurePolicy, StirKeySource, StirShakenConfig,
+    StirSigningConfig, StirVerificationConfig, T38Config, T38EcMode, TopologyHidingConfig,
+    TrunkConfigSchema, TrunkGroupConfig, TrunkManipulationRuleConfig, TrunkStirConfig, ZoneConfig,
 };
 
 use std::path::Path;

@@ -83,6 +83,7 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_topology_hiding(config)?;
     validate_cdr(&config.cdr)?;
     validate_recording(config)?;
+    validate_digest_auth(&config.digest_auth)?;
     validate_unimplemented(config)?;
     #[cfg(feature = "cluster")]
     validate_cluster_admission(config)?;
@@ -94,6 +95,87 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
         validate_grpc(grpc)?;
     }
 
+    Ok(())
+}
+
+/// `[digest_auth]`: REGISTER digest authentication (POA&M-270).
+///
+/// A half-configured section fails the load in both directions: auth on
+/// without a realm or credentials file, and any other key of the section
+/// (`realm`, `credentials_file`, `algorithm`, `nonce_ttl_secs`) named while
+/// auth is off (an operator must never believe auth is on because a file
+/// is named, and no accepted key is silently ignored). The credentials
+/// file is not opened here; the daemon loads it at startup, so the config
+/// validates where the secret is absent.
+///
+/// ## NIST 800-53 Rev5: CM-6, IA-5, SI-10; RFC 7616 §3.3
+fn validate_digest_auth(cfg: &crate::schema::DigestAuthConfig) -> ConfigResult<()> {
+    let err = |message: String| Err(ConfigError::Validation { message });
+    if let Some(ttl) = cfg.nonce_ttl_secs
+        && !(30..=3600).contains(&ttl)
+    {
+        return err(format!(
+            "digest_auth.nonce_ttl_secs ({ttl}) must be in 30..=3600"
+        ));
+    }
+    if let Some(realm) = &cfg.realm {
+        // SI-10: the realm is written into a quoted-string in
+        // WWW-Authenticate and is a field of the `:`-separated credentials
+        // file, so it may not carry a quote, backslash, colon, whitespace
+        // or control character.
+        if realm.is_empty() || realm.len() > 255 {
+            return err("digest_auth.realm must be 1..=255 bytes".to_string());
+        }
+        if !realm
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b'\\' | b':'))
+        {
+            return err(
+                "digest_auth.realm must be printable ASCII without '\"', '\\', ':' or whitespace"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(path) = &cfg.credentials_file
+        && !path.is_absolute()
+    {
+        return err("digest_auth.credentials_file must be an absolute path".to_string());
+    }
+    if cfg.require_auth {
+        if cfg.realm.is_none() {
+            return err("digest_auth.require_auth = true requires digest_auth.realm".to_string());
+        }
+        if cfg.credentials_file.is_none() {
+            return err(
+                "digest_auth.require_auth = true requires digest_auth.credentials_file".to_string(),
+            );
+        }
+    } else {
+        // Accepted keys must be enforced or rejected, never ignored.
+        if cfg.realm.is_some() {
+            return err(
+                "digest_auth.realm is only valid with digest_auth.require_auth = true".to_string(),
+            );
+        }
+        if cfg.credentials_file.is_some() {
+            return err(
+                "digest_auth.credentials_file is only valid with digest_auth.require_auth = true"
+                    .to_string(),
+            );
+        }
+        if cfg.algorithm.is_some() {
+            return err(
+                "digest_auth.algorithm is only valid with digest_auth.require_auth = true"
+                    .to_string(),
+            );
+        }
+        if cfg.nonce_ttl_secs.is_some() {
+            return err(
+                "digest_auth.nonce_ttl_secs is only valid with digest_auth.require_auth = true"
+                    .to_string(),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2336,6 +2418,328 @@ mod tests {
         assert!(r.is_err());
         let r: Result<SbcConfig, _> = toml::from_str("[recording]\non_failure = \"retry\"\n");
         assert!(r.is_err());
+    }
+
+    fn digest_cfg(realm: Option<&str>, file: Option<&str>, on: bool) -> SbcConfig {
+        let mut config = SbcConfig::default();
+        config.digest_auth.require_auth = on;
+        config.digest_auth.realm = realm.map(str::to_string);
+        config.digest_auth.credentials_file = file.map(Into::into);
+        config
+    }
+
+    #[test]
+    fn digest_auth_absent_is_off_and_valid() {
+        let config: SbcConfig = toml::from_str("").unwrap();
+        assert!(!config.digest_auth.require_auth);
+        assert_eq!(config.digest_auth.realm, None);
+        assert_eq!(config.digest_auth.credentials_file, None);
+        assert_eq!(config.digest_auth.nonce_ttl_secs, None);
+        assert_eq!(config.digest_auth.nonce_ttl_secs(), 300);
+        assert_eq!(config.digest_auth.algorithm, None);
+        assert_eq!(
+            config.digest_auth.algorithm(),
+            crate::schema::DigestAuthAlgorithm::Sha256
+        );
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn digest_auth_half_configured_is_rejected() {
+        let file = Some("/etc/usg-sbc/digest.ha1");
+        assert_rejected(&digest_cfg(None, file, true), "digest_auth.realm");
+        assert_rejected(
+            &digest_cfg(Some("sip.example.mil"), None, true),
+            "digest_auth.credentials_file",
+        );
+        assert_rejected(&digest_cfg(None, None, true), "digest_auth.realm");
+        // Auth off with a realm or a file named: rejected, not ignored.
+        assert_rejected(
+            &digest_cfg(Some("sip.example.mil"), None, false),
+            "digest_auth.realm is only valid",
+        );
+        assert_rejected(
+            &digest_cfg(None, file, false),
+            "digest_auth.credentials_file is only valid",
+        );
+        assert!(validate_config(&digest_cfg(Some("sip.example.mil"), file, true)).is_ok());
+    }
+
+    #[test]
+    fn digest_auth_realm_charset() {
+        let file = Some("/etc/usg-sbc/digest.ha1");
+        let long = "r".repeat(256);
+        for bad in [
+            "",
+            "a\"b",
+            "a\\b",
+            "a:b",
+            "a b",
+            "a\tb",
+            "a\u{7f}b",
+            "a\nb",
+            "r\u{e9}alm",
+            long.as_str(),
+        ] {
+            assert_rejected(&digest_cfg(Some(bad), file, true), "digest_auth.realm");
+        }
+        let max = "r".repeat(255);
+        assert!(validate_config(&digest_cfg(Some(&max), file, true)).is_ok());
+    }
+
+    #[test]
+    fn digest_auth_path_and_ttl_bounds() {
+        assert_rejected(
+            &digest_cfg(Some("sip.example.mil"), Some("digest.ha1"), true),
+            "digest_auth.credentials_file must be an absolute path",
+        );
+        let mut config = digest_cfg(
+            Some("sip.example.mil"),
+            Some("/etc/usg-sbc/digest.ha1"),
+            true,
+        );
+        for bad in [0, 29, 3601] {
+            config.digest_auth.nonce_ttl_secs = Some(bad);
+            assert_rejected(&config, "digest_auth.nonce_ttl_secs");
+        }
+        for ok in [30, 3600] {
+            config.digest_auth.nonce_ttl_secs = Some(ok);
+            assert!(validate_config(&config).is_ok());
+            assert_eq!(config.digest_auth.nonce_ttl_secs(), ok);
+        }
+        // With auth off the key is refused whatever its value (no silently
+        // ignored value).
+        for ttl in [5, 300] {
+            let mut off = SbcConfig::default();
+            off.digest_auth.nonce_ttl_secs = Some(ttl);
+            assert_rejected(&off, "digest_auth.nonce_ttl_secs");
+        }
+    }
+
+    #[test]
+    fn digest_auth_algorithm_policy() {
+        for (bad, needle) in [
+            ("MD5", "MD5 is not accepted"),
+            ("md5", "MD5 is not accepted"),
+            ("MD5-sess", "MD5 is not accepted"),
+            ("SHA-256-sess", "-sess algorithms are not accepted"),
+            ("SHA-512-256-sess", "-sess algorithms are not accepted"),
+            ("SHA-384", "must be \"SHA-256\" or \"SHA-512-256\""),
+            ("sha-256", "must be \"SHA-256\" or \"SHA-512-256\""),
+        ] {
+            let toml = format!("[digest_auth]\nalgorithm = \"{bad}\"\n");
+            let msg = crate::load_from_str(&toml).unwrap_err().to_string();
+            assert!(msg.contains(needle), "{bad}: {msg}");
+        }
+        for (ok, want) in [
+            ("SHA-256", crate::schema::DigestAuthAlgorithm::Sha256),
+            (
+                "SHA-512-256",
+                crate::schema::DigestAuthAlgorithm::Sha512_256,
+            ),
+        ] {
+            let toml = format!(
+                "[digest_auth]\nrequire_auth = true\nrealm = \"sip.example.mil\"\n\
+                 credentials_file = \"/etc/usg-sbc/digest.ha1\"\nalgorithm = \"{ok}\"\n"
+            );
+            assert_eq!(
+                crate::load_from_str(&toml).unwrap().digest_auth.algorithm(),
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn digest_auth_rejects_unknown_field_and_round_trips() {
+        let r: Result<SbcConfig, _> = toml::from_str("[digest_auth]\nrequire = true\n");
+        assert!(r.is_err());
+        let r: Result<SbcConfig, _> = toml::from_str("[digest_auth]\nallow_md5 = true\n");
+        assert!(r.is_err());
+
+        let toml = "[digest_auth]\n\
+                    require_auth = true\n\
+                    realm = \"sip.example.mil\"\n\
+                    algorithm = \"SHA-512-256\"\n\
+                    credentials_file = \"/etc/usg-sbc/digest.ha1\"\n\
+                    nonce_ttl_secs = 120\n";
+        let config = crate::load_from_str(toml).unwrap();
+        let d = &config.digest_auth;
+        assert!(d.require_auth);
+        assert_eq!(d.realm.as_deref(), Some("sip.example.mil"));
+        assert_eq!(
+            d.algorithm(),
+            crate::schema::DigestAuthAlgorithm::Sha512_256
+        );
+        assert_eq!(d.nonce_ttl_secs(), 120);
+        let back: SbcConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(back.digest_auth, config.digest_auth);
+        assert!(toml::to_string(&config).unwrap().contains("SHA-512-256"));
+    }
+
+    // QA POA&M-270: the three coupled keys in every combination, through
+    // the TOML loader an operator's file goes through. Only "all three" and
+    // "none" load; every other combination names a `digest_auth.` key.
+    #[test]
+    fn qa_digest_auth_toml_combination_matrix() {
+        for on in [None, Some(false), Some(true)] {
+            for realm in [false, true] {
+                for file in [false, true] {
+                    let mut toml = String::from("[digest_auth]\n");
+                    if let Some(on) = on {
+                        toml.push_str(if on {
+                            "require_auth = true\n"
+                        } else {
+                            "require_auth = false\n"
+                        });
+                    }
+                    if realm {
+                        toml.push_str("realm = \"sip.example.mil\"\n");
+                    }
+                    if file {
+                        toml.push_str("credentials_file = \"/etc/usg-sbc/digest.ha1\"\n");
+                    }
+                    let is_on = on == Some(true);
+                    let want_ok = (is_on && realm && file) || (!is_on && !realm && !file);
+                    match crate::load_from_str(&toml) {
+                        Ok(c) => {
+                            assert!(want_ok, "must be rejected:\n{toml}");
+                            assert_eq!(c.digest_auth.require_auth, is_on);
+                        }
+                        Err(e) => {
+                            assert!(!want_ok, "must load:\n{toml}\n{e}");
+                            let msg = e.to_string();
+                            let key = if is_on {
+                                if realm {
+                                    "digest_auth.credentials_file"
+                                } else {
+                                    "digest_auth.realm"
+                                }
+                            } else {
+                                "only valid with digest_auth.require_auth = true"
+                            };
+                            assert!(msg.contains(key), "{toml}: {msg}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // QA POA&M-270: no key outside the five documented ones is accepted in
+    // `[digest_auth]` (no inline secrets, no MD5 switch, no POA&M-271 key,
+    // no case variants), and a wrong value type fails the load.
+    #[test]
+    fn qa_digest_auth_unknown_keys_and_wrong_types_fail_load() {
+        for key in [
+            "password = \"x\"",
+            "credentials = \"alice:pw\"",
+            "users = [\"alice\"]",
+            "ha1 = \"00\"",
+            "allow_md5 = true",
+            "allow_md5_digest = true",
+            "invite = \"endpoints\"",
+            "Realm = \"sip.example.mil\"",
+            "require-auth = true",
+            "credentials_path = \"/etc/usg-sbc/digest.ha1\"",
+            "nonce_ttl = 300",
+        ] {
+            let toml = format!("[digest_auth]\n{key}\n");
+            assert!(crate::load_from_str(&toml).is_err(), "accepted: {key}");
+        }
+        assert!(crate::load_from_str("[digest_auth.users]\nalice = \"pw\"\n").is_err());
+        for bad in [
+            "require_auth = \"true\"",
+            "require_auth = 1",
+            "realm = 5",
+            "algorithm = 256",
+            "algorithm = \"\"",
+            "credentials_file = [\"/etc/usg-sbc/digest.ha1\"]",
+            "nonce_ttl_secs = -1",
+            "nonce_ttl_secs = \"300\"",
+            "nonce_ttl_secs = 300.0",
+        ] {
+            let toml = format!("[digest_auth]\n{bad}\n");
+            assert!(crate::load_from_str(&toml).is_err(), "accepted: {bad}");
+        }
+    }
+
+    // QA POA&M-270 (SI-10): a realm that could split the WWW-Authenticate
+    // header (CR, LF, CRLF + header, NUL) or a credentials line is refused,
+    // and so is a credentials path that is not absolute.
+    #[test]
+    fn qa_digest_auth_realm_injection_and_relative_paths() {
+        let file = Some("/etc/usg-sbc/digest.ha1");
+        for bad in [
+            "a\rb",
+            "a\r\nWWW-Authenticate: Digest realm=x",
+            "a\0b",
+            " sip.example.mil",
+            "sip.example.mil ",
+            "sip.example.mil\n",
+            "\"",
+        ] {
+            assert_rejected(&digest_cfg(Some(bad), file, true), "digest_auth.realm");
+        }
+        // The same realm rule holds through TOML escapes.
+        let toml = "[digest_auth]\nrequire_auth = true\nrealm = \"a\\r\\nb\"\n\
+                    credentials_file = \"/etc/usg-sbc/digest.ha1\"\n";
+        let msg = crate::load_from_str(toml).unwrap_err().to_string();
+        assert!(msg.contains("digest_auth.realm"), "{msg}");
+
+        for bad in ["", "./digest.ha1", "../digest.ha1", "~/digest.ha1", "etc/x"] {
+            assert_rejected(
+                &digest_cfg(Some("sip.example.mil"), Some(bad), true),
+                "digest_auth.credentials_file must be an absolute path",
+            );
+        }
+    }
+
+    // QA POA&M-270, changed in fix round 1 (F3 / NIST-004 / SEC-007):
+    // `algorithm` and `nonce_ttl_secs` follow the same half-configured rule
+    // as `realm` / `credentials_file`. Named while auth is off they fail the
+    // load, even with the default value, so no accepted key is ignored.
+    #[test]
+    fn qa_digest_auth_algorithm_and_ttl_are_rejected_while_off() {
+        for (toml, key) in [
+            ("algorithm = \"SHA-512-256\"\n", "digest_auth.algorithm"),
+            ("algorithm = \"SHA-256\"\n", "digest_auth.algorithm"),
+            ("nonce_ttl_secs = 60\n", "digest_auth.nonce_ttl_secs"),
+            ("nonce_ttl_secs = 300\n", "digest_auth.nonce_ttl_secs"),
+            (
+                "require_auth = false\nalgorithm = \"SHA-256\"\n",
+                "digest_auth.algorithm",
+            ),
+            (
+                "require_auth = false\nnonce_ttl_secs = 300\n",
+                "digest_auth.nonce_ttl_secs",
+            ),
+        ] {
+            let msg = crate::load_from_str(&format!("[digest_auth]\n{toml}"))
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains(key), "{toml}: {msg}");
+            assert!(msg.contains("only valid with"), "{toml}: {msg}");
+        }
+        // An MD5 algorithm is refused even while off, with the MD5 message.
+        let msg = crate::load_from_str("[digest_auth]\nalgorithm = \"MD5\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("MD5 is not accepted"), "{msg}");
+        // Off with nothing else, and on with both keys, load; a default
+        // (off) section serializes without the two keys.
+        let off = crate::load_from_str("[digest_auth]\nrequire_auth = false\n").unwrap();
+        assert!(!off.digest_auth.require_auth);
+        let out = toml::to_string(&off.digest_auth).unwrap();
+        assert_eq!(out.trim(), "require_auth = false");
+        let back = crate::load_from_str(&toml::to_string(&off).unwrap()).unwrap();
+        assert_eq!(back.digest_auth, off.digest_auth);
+        let on = crate::load_from_str(
+            "[digest_auth]\nrequire_auth = true\nrealm = \"sip.example.mil\"\n\
+             credentials_file = \"/etc/usg-sbc/digest.ha1\"\n\
+             algorithm = \"SHA-512-256\"\nnonce_ttl_secs = 60\n",
+        )
+        .unwrap();
+        assert_eq!(on.digest_auth.nonce_ttl_secs(), 60);
     }
 
     #[test]

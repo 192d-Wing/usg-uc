@@ -66,6 +66,35 @@ allowed_ec = ["t38UDPRedundancy", "t38UDPFEC", "t38UDPNoEC"]
 # key_path = "/etc/sbc/certs/dtls.key"
 fingerprint_hash = "Sha384"
 
+[digest_auth]
+# REGISTER digest authentication (RFC 7616). Off by default. With
+# require_auth = true every REGISTER is challenged and must match an entry in
+# credentials_file; realm and credentials_file are then required. While
+# require_auth = false, naming any other key of this section (realm,
+# credentials_file, algorithm, nonce_ttl_secs) fails the config load, so leave
+# them commented out. Restart-required, except the file contents, which are
+# re-read on SIGHUP (a bad file keeps the previous credentials). MD5 is never
+# accepted: MD5-only phones cannot register with this on. Cannot be combined
+# with SBC_AUTH_MODE=bearer. Repeated failures for one username are slowed
+# down (backoff). Use TLS listeners only with digest: a cleartext SIP listener
+# (udp/tcp/ws) is warned about at startup, not refused
+# (NIST 800-53 IA-2, IA-5, AC-7, CM-6; POA&M-270).
+require_auth = false
+# realm = "sip.example.mil"
+# "SHA-256" (default) or "SHA-512-256" (FIPS 180-4 SHA-512/256).
+# algorithm = "SHA-256"
+# One "username:realm:algorithm:ha1hex" entry per line, ha1hex =
+# H(username:realm:password). Plain UTF-8 without a byte order mark. Regular
+# file (no symlink), mode 0600 or 0400, owned by the daemon user or root. The
+# file is not encrypted at rest; keep it on an encrypted volume.
+# Memory: roughly 150-250 bytes per user while loaded; a reload briefly needs
+# about twice that plus the file size (old and new table, and the file).
+# username: ASCII letters, digits, -_.!~*'()&=+$,;?/ and %HH escapes (the
+# RFC 3261 "user" part); no "@", space, quote or backslash. It must equal the
+# user part of the AOR the phone registers, byte for byte.
+# credentials_file = "/etc/usg-sbc/digest.ha1"
+# nonce_ttl_secs = 300
+
 [recording]
 # SIPREC call recording (RFC 7866 session recording client). Off by default.
 # Restart-required. Enabling it needs transport.tls_listen, security

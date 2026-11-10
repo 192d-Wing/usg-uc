@@ -5,7 +5,7 @@
 The USG SBC is a SIP Session Border Controller that provides:
 
 - **B2BUA call control** — Back-to-back user agent with full call state management
-- **SIP registration** — Binding storage and location service; REGISTER authentication via OIDC Bearer tokens (`SBC_AUTH_MODE=bearer`). Digest auth is compiled in but not configurable from `sbc.toml`; REGISTER is unauthenticated unless bearer mode is enabled.
+- **SIP registration** — Binding storage and location service; REGISTER authentication via OIDC Bearer tokens (`SBC_AUTH_MODE=bearer`) or RFC 7616 digest (`[digest_auth]`, HA1 credentials file). Both are off by default and they cannot be combined; REGISTER is unauthenticated unless one of them is enabled.
 - **Call routing** — Dial plans with pattern matching, number transforms, trunk selection
 - **Media relay** — RTP/SRTP relay (anchored; no transcoding in the live relay path)
 - **Header manipulation** — Per-trunk and global SIP header rewriting
@@ -217,7 +217,7 @@ discarded (counted as a framing error) and never joined to the next.
 
 The SBC acts as a B2BUA registrar, storing user bindings in an in-memory location service. When clustering is enabled, bindings are replicated to Redis or PostgreSQL.
 
-Registration is automatic — any SIP UA that sends a REGISTER request will have its bindings stored. The only authentication mode that can be enabled on a running daemon is OIDC Bearer tokens (RFC 8898, `SBC_AUTH_MODE=bearer` plus `SBC_OIDC_ISSUER` — the mode used by the soft client's sign-in flow). Without it the daemon logs `REGISTER is UNAUTHENTICATED: any peer can register any user` at startup.
+Registration is automatic — any SIP UA that sends a REGISTER request will have its bindings stored. Two authentication modes exist, both off by default: OIDC Bearer tokens (RFC 8898, `SBC_AUTH_MODE=bearer` plus `SBC_OIDC_ISSUER` — the mode used by the soft client's sign-in flow) and RFC 7616 digest (`[digest_auth]`, see below). With neither, the daemon logs `REGISTER is UNAUTHENTICATED: any peer can register any user` at startup.
 
 ### Transport to registered phones
 
@@ -226,7 +226,104 @@ A REGISTER records the source address and the transport it actually arrived on (
 ### Authentication
 
 - **Bearer (wired)**: set `SBC_AUTH_MODE=bearer` and `SBC_OIDC_ISSUER` (optionally an extra CA for the internal IdP). Tokens are validated via `proto-jwt` (JWKS cache). Note: the validator currently accepts `RS256`, `PS256`, `ES256` and `ES384` tokens.
-- **Digest (not configurable)**: the `SipStackConfig` fields `require_auth`, `auth_realm` and `auth_credentials` exist in `sbc-daemon/src/sip_stack.rs`, but `build_sip_config` never populates them from `sbc.toml` or the environment, so digest REGISTER auth cannot be turned on without a code change (planned).
+- **Digest (wired, off by default)**: `[digest_auth]` in `sbc.toml` with an HA1 credentials file; see the next section.
+- The two cannot be combined. With `SBC_AUTH_MODE=bearer` and `digest_auth.require_auth = true` the daemon refuses to start. `SBC_AUTH_MODE` is compared trimmed and case-insensitively, so a whitespace-padded value such as `" bearer "` now enables bearer mode (it did not before this change).
+
+### Digest authentication (`[digest_auth]`)
+
+REGISTER digest authentication per RFC 7616 / RFC 8760. Off by default: without the section, or with `require_auth = false`, REGISTER behaves as before. With `require_auth = true` every REGISTER is challenged with 401 and must carry a valid digest for a user in the credentials file. Initial INVITEs are not challenged (no 407; POA&M-271).
+
+```toml
+[digest_auth]
+require_auth     = true
+realm            = "sip.example.mil"
+# algorithm      = "SHA-256"              # default; or "SHA-512-256"
+credentials_file = "/etc/usg-sbc/digest.ha1"
+# nonce_ttl_secs = 300                    # default 300, range 30..=3600
+```
+
+| Key | Default | Rule |
+|-----|---------|------|
+| `require_auth` | `false` | `true` requires `realm` and `credentials_file`. |
+| `realm` | none | 1..=255 bytes of printable ASCII without `"`, `\`, `:` or whitespace. Every line of the credentials file must carry the same realm. |
+| `algorithm` | `"SHA-256"` | `"SHA-256"` or `"SHA-512-256"`. `SHA-512-256` is FIPS 180-4 SHA-512/256, not SHA-512 truncated to 256 bits. `MD5` and `-sess` variants fail the config load. |
+| `credentials_file` | none | Absolute path. The config holds the path only; validation does not open the file, the daemon does at startup. |
+| `nonce_ttl_secs` | `300` | 30..=3600. After it a valid digest is re-challenged with `stale=true`. |
+
+Validation (the config load fails):
+
+- `require_auth = true` without `realm` or without `credentials_file`.
+- `require_auth = false` (or absent) with any of `realm`, `credentials_file`, `algorithm` or `nonce_ttl_secs` set, even to the default value. Leave them commented out while digest is off.
+- An unknown key in the section.
+
+The daemon refuses to start when `require_auth = true` and the credentials file cannot be loaded, or when bearer mode is also selected.
+
+**No MD5.** The SBC never accepts MD5 digest as a server and holds no MD5 HA1. Phones that can only do MD5 digest cannot register while `require_auth = true`; their attempts are audited as `digest:algorithm_mismatch`. One challenge is sent, for the configured algorithm only.
+
+**Use TLS.** Digest over `udp`, `tcp` or `ws` exposes usernames and responses that can be attacked offline, and is outside the CNSA exception for SIP digest (POA&M-110). The daemon logs a warning at startup when `require_auth = true` and such a listener is configured; it does not refuse to start (POA&M-314).
+
+#### Credentials file
+
+One entry per line; `#` comments and blank lines are allowed:
+
+```text
+# username:realm:algorithm:ha1hex
+alice:sip.example.mil:SHA-256:<64 hex characters>
+alice:sip.example.mil:SHA-512-256:<64 hex characters>
+```
+
+- `ha1hex` is `H(username:realm:password)` with the named algorithm, 64 hex characters for both algorithms (upper-case is accepted). The password itself is never stored.
+- `algorithm` is `SHA-256` or `SHA-512-256`. A user may have one line per algorithm; the daemon uses the one for `digest_auth.algorithm`, and a user without it is treated as unknown. An `MD5` or `-sess` line fails the whole load.
+- `username` is 1..=255 bytes of ASCII in the RFC 3261 `user` production: letters, digits, `-_.!~*'()`, `&=+$,;?/` and `%HH` escapes. No `@`, space, quote, backslash or non-ASCII character. It is compared byte for byte (case-sensitive) with the digest username and must equal the user part of the AOR the phone registers; a valid digest for another AOR gets 403.
+- Plain UTF-8 without a byte order mark (a BOM is a line 1 error).
+- One bad line, a duplicate (username, algorithm), a realm that differs from `digest_auth.realm`, or no entry at all for the configured algorithm fails the whole load. Errors name the line number and the rule, never the line, the username or the HA1.
+- File checks: a regular file, not a symlink, no group or other permission bit (mode `0600` or `0400`), owned by the daemon's user or root, at most 64 MiB and 1,000,000 entries. A symlinked parent directory is not detected (POA&M-315).
+- The file is not encrypted by the SBC (POA&M-312). An HA1 is password-equivalent for its realm; treat the file like a private key and keep it on an encrypted volume.
+- Memory: roughly 150-250 bytes per user while loaded (estimate, not measured); a reload briefly needs about twice that plus the file size.
+
+An HA1 can be computed without the password reaching the process list or the shell history (bash; `printf` is a shell builtin):
+
+```bash
+read -rs PW    # type the password; it is not echoed
+printf '%s:%s:%s' alice sip.example.mil "$PW" | openssl dgst -sha256 -r | cut -d' ' -f1
+# for SHA-512-256: openssl dgst -sha512-256 -r
+unset PW
+```
+
+#### Reloading credentials
+
+`SIGHUP` re-reads the credentials file and swaps the whole table at once; it is the only operator path for a credential reload. A file that fails to load keeps the previous credentials (never an empty table, never unauthenticated), is logged at error, audited and counted in `sbc_digest_credentials_reload_failures_total`. Nonces already issued stay valid across a reload.
+
+`require_auth`, `realm`, `algorithm`, `credentials_file` (the path) and `nonce_ttl_secs` are restart-only. A SIGHUP with any of them changed logs that a restart is needed and keeps running with the old values; only the file contents are reloaded.
+
+Removing a user from the file stops that user's new REGISTERs and refreshes from the next reload. Existing bindings are not removed: they, and call admission for their contact address, last until the registration expires (POA&M-311).
+
+Users created through `sbc-api-server` (`/users`) are not read by the daemon; only this file is a credential source (POA&M-310).
+
+#### Failure backoff
+
+Repeated wrong passwords for one username are slowed down, whatever address they come from. The thresholds are fixed, not configurable (POA&M-316):
+
+- 5 wrong responses are free. Each further one opens a backoff window: 1 s, doubling up to 5 minutes. The count is forgotten after 15 minutes without a failure, or on a correct response outside a window.
+- During a window, REGISTERs for that username get the same 401 as a wrong password, even with the right password. There is no `Retry-After`; a phone may prompt for the password. The window always ends by itself, and attempts inside it do not extend it.
+- A phone that is already registered keeps refreshing: a request from the exact source address and port of a live binding of that user's AOR is still verified, for up to 3 wrong responses per window. A phone whose NAT port mapping changed is not exempt until it registers again outside a window.
+- At the longest window, one wrong guess every 5 minutes keeps a username closed to every device that is not currently registered (a rebooted phone, a new device). Alert on `sbc_digest_verify_throttled_total`.
+- State is per node and is not shared in a cluster.
+
+Audit reasons (with `logging.audit_enabled`, rate limited per source): `digest:<reason>` for each reject, `digest:throttled` for a request refused inside a window, `digest:throttle_tripped` when a window opens. Credential loads and reloads are audited as `ConfigurationChange` (user counts only) and `CryptoKeyOperation` with `key_id = "digest_auth.credentials"` and a success or failure outcome.
+
+Metrics: `sbc_digest_verify_<outcome>_total` (including `throttled`), `sbc_digest_credentials_users`, `sbc_digest_credentials_reload_failures_total`, `sbc_digest_throttle_overflow_total`.
+
+Other limits: only the first `Authorization` header of a REGISTER is examined (POA&M-313). One username can hold 64 nonces at a time; past that, the user's oldest nonce is retired and the device using it is re-challenged once.
+
+#### Kubernetes
+
+The Helm chart does not yet render `[digest_auth]` or deliver the credentials file (chart follow-up). A plain Secret volume mount does not pass the file checks: Secret files are presented through symlinks, and with the chart's pod security context (uid 1000, `fsGroup: 1000`) they are root-owned and group-readable, which the loader refuses. `subPath` with `defaultMode: 0400` is not enough: it removes the symlink but not the group bit under `fsGroup`, and a `subPath` mount never sees Secret updates, so a SIGHUP could not pick up a rotation. The file has to be copied to a `0400` file owned by the daemon's uid, the way the chart's init container already copies the STIR/SHAKEN signing key. This has not been tested on a cluster.
+
+#### Clusters, upgrades and rollback
+
+- Every node needs the same file and realm; distributing it is the operator's job. A node with an older file rejects users the others accept. A nonce issued by one node is not valid on another, so the phone is challenged again there (POA&M-272).
+- A build without this change (0.10.0 and earlier) ignores the `[digest_auth]` section without an error. A node rolled back to such a build while the config says `require_auth = true` accepts REGISTER unauthenticated. Check for the `REGISTER is UNAUTHENTICATED` startup warning after a rollback, and do not run mixed versions with digest on.
 
 ---
 
@@ -1514,7 +1611,7 @@ pool_size = 10                   # cluster_mode = true is refused
 | Signal | Action |
 |--------|--------|
 | `SIGTERM` / `SIGINT` | Graceful shutdown (drain connections, flush state) |
-| `SIGHUP` | Re-reads `sbc.toml` into the daemon's shared config snapshot only. The running `Server` and `SipStack` keep their original settings (the daemon logs that a restart is required). TLS certificate reload is done via gRPC `SystemService.ReloadTls` or `sbc-api-server` `POST /api/v1/system/tls/reload`, not SIGHUP. |
+| `SIGHUP` | Re-reads `sbc.toml` into the daemon's shared config snapshot only. The running `Server` and `SipStack` keep their original settings (the daemon logs that a restart is required). With `[digest_auth] require_auth = true` it also re-reads the digest credentials file; a file that fails to load keeps the previous credentials. TLS certificate reload is done via gRPC `SystemService.ReloadTls` or `sbc-api-server` `POST /api/v1/system/tls/reload`, not SIGHUP. |
 
 ---
 
@@ -1538,7 +1635,8 @@ The SBC implements controls from NIST 800-53 Rev5 (wiring state in parentheses):
 - **AU-2/AU-3/AU-5**: Audit logging (wired, opt-in via `logging.audit_enabled`; non-blocking writer, drops counted and exposed in health and metrics)
 - **AU-14**: Call recording as a SIPREC recording client (wired, off by default, partial; fail closed by default; see "Call Recording (SIPREC)")
 - **CM-2/CM-6**: Configuration management (wired)
-- **IA-2**: REGISTER authentication (wired for OIDC Bearer via `SBC_AUTH_MODE=bearer`; digest not configurable; SIP mTLS planned)
+- **AC-7**: Per-username failure backoff for REGISTER digest (wired, partial, only with `[digest_auth]`; fixed thresholds, per node)
+- **IA-2**: REGISTER authentication (wired, off by default: OIDC Bearer via `SBC_AUTH_MODE=bearer`, or RFC 7616 digest via `[digest_auth]` with an HA1 credentials file; no per-INVITE challenge; SIP mTLS planned)
 - **SC-5**: DoS protection (rate limiting, `max_calls` admission, per-trunk `max_calls`, `per_callee_max_concurrent`, `max_registrations` — wired, per node; bounded emergency reserve)
 - **SC-7**: Boundary protection (topology hiding — wired)
 - **SC-8**: Transmission confidentiality (TLS 1.3 SIP listeners, AEAD SRTP — wired)
