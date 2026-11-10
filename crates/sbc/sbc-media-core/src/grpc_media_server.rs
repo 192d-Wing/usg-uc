@@ -150,6 +150,36 @@ fn parse_addr(value: &str) -> Result<SbcSocketAddr, Status> {
         .map_err(|e| Status::invalid_argument(format!("invalid address {value:?}: {e}")))
 }
 
+/// Leg remotes and kind decoded from an `UpdateRelayRequest`.
+type DecodedUpdate = ([Option<(bool, SbcSocketAddr)>; 2], Option<MediaKind>);
+
+/// Decodes an `UpdateRelayRequest` without touching any state: at most two
+/// remotes on distinct legs, each a parseable `ip:port`; kind UNSPECIFIED
+/// means unchanged, any other non-{AUDIO,IMAGE} value is refused.
+fn decode_update_relay(r: &pb::UpdateRelayRequest) -> Result<DecodedUpdate, Status> {
+    if r.remotes.len() > 2 {
+        return Err(Status::invalid_argument(format!(
+            "at most 2 remotes, got {}",
+            r.remotes.len()
+        )));
+    }
+    let mut remotes = [None, None];
+    for (slot, remote) in remotes.iter_mut().zip(&r.remotes) {
+        *slot = Some((remote.is_a_leg, parse_addr(&remote.address)?));
+    }
+    if let [Some((a, _)), Some((b, _))] = remotes
+        && a == b
+    {
+        return Err(Status::invalid_argument("duplicate leg in remotes"));
+    }
+    let kind = if r.kind == pb::MediaKind::Unspecified as i32 {
+        None
+    } else {
+        Some(from_proto_kind(r.kind)?)
+    };
+    Ok((remotes, kind))
+}
+
 #[tonic::async_trait]
 impl MediaControllerService for MediaControllerServer {
     async fn create_session(
@@ -199,6 +229,28 @@ impl MediaControllerService for MediaControllerServer {
             .set_media_kind(&r.call_id, kind)
             .await
             .map_err(|e| to_status(&e))?;
+        Ok(Response::new(()))
+    }
+
+    /// Validate every field, then apply under one session lock, then start
+    /// (rolled back if the start fails).
+    // NIST 800-53 Rev5: SI-10 (validate-all-then-apply), SC-24 (no partial update)
+    async fn update_relay(
+        &self,
+        req: Request<pb::UpdateRelayRequest>,
+    ) -> Result<Response<()>, Status> {
+        let r = req.into_inner();
+        let (remotes, kind) = decode_update_relay(&r)?;
+        // SEC-2: with start_relay the pipeline rolls the update back if the
+        // start fails, so an Err leaves no half-applied state.
+        let applied = if r.start_relay {
+            self.pipeline
+                .update_and_start_relay(&r.call_id, remotes, kind)
+                .await
+        } else {
+            self.pipeline.update_relay(&r.call_id, remotes, kind).await
+        };
+        applied.map_err(|e| to_status(&e))?;
         Ok(Response::new(()))
     }
 
@@ -334,6 +386,189 @@ mod tests {
             .await
             .unwrap();
         (client, failure_tx, pipeline)
+    }
+
+    async fn create(
+        client: &mut MediaControllerServiceClient<Channel>,
+        id: &str,
+    ) -> Result<(), Status> {
+        client
+            .create_session(pb::CreateSessionRequest {
+                call_id: id.to_string(),
+                mode: pb::MediaMode::Relay as i32,
+                a_leg_media_ip: None,
+                b_leg_media_ip: None,
+            })
+            .await?;
+        Ok(())
+    }
+
+    fn remote(is_a_leg: bool, address: &str) -> pb::LegRemote {
+        pb::LegRemote {
+            is_a_leg,
+            address: address.to_string(),
+        }
+    }
+
+    /// SI-10: a bad second address leaves kind and the first remote unchanged.
+    #[tokio::test]
+    async fn update_relay_rpc_applies_all_or_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, _tx, pipeline) = harness_with_pipeline().await;
+        create(&mut client, "u1").await?;
+        let err = client
+            .update_relay(pb::UpdateRelayRequest {
+                call_id: "u1".into(),
+                remotes: vec![remote(true, "192.0.2.1:5000"), remote(false, "not-an-addr")],
+                kind: pb::MediaKind::Image as i32,
+                start_relay: false,
+            })
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(pipeline.media_kind("u1").await, Some(MediaKind::Audio));
+        assert_eq!(pipeline.leg_remote("u1", true).await, None);
+
+        client
+            .update_relay(pb::UpdateRelayRequest {
+                call_id: "u1".into(),
+                remotes: vec![
+                    remote(true, "192.0.2.1:5000"),
+                    remote(false, "192.0.2.2:6000"),
+                ],
+                kind: pb::MediaKind::Image as i32,
+                start_relay: false,
+            })
+            .await?;
+        assert_eq!(pipeline.media_kind("u1").await, Some(MediaKind::Image));
+        assert_eq!(
+            pipeline.leg_remote("u1", false).await,
+            Some(SbcSocketAddr::from("192.0.2.2:6000".parse::<SocketAddr>()?))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_relay_rejects_three_remotes_and_duplicate_leg()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, _tx, pipeline) = harness_with_pipeline().await;
+        create(&mut client, "u2").await?;
+        for remotes in [
+            vec![
+                remote(true, "192.0.2.1:5000"),
+                remote(false, "192.0.2.2:5000"),
+                remote(true, "192.0.2.3:5000"),
+            ],
+            vec![
+                remote(true, "192.0.2.1:5000"),
+                remote(true, "192.0.2.3:5000"),
+            ],
+        ] {
+            let err = client
+                .update_relay(pb::UpdateRelayRequest {
+                    call_id: "u2".into(),
+                    remotes,
+                    kind: pb::MediaKind::Image as i32,
+                    start_relay: true,
+                })
+                .await
+                .err()
+                .ok_or("expected an error")?;
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+        assert_eq!(pipeline.media_kind("u2").await, Some(MediaKind::Audio));
+        assert_eq!(pipeline.leg_remote("u2", true).await, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_relay_unspecified_kind_is_noop_but_unknown_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, _tx, pipeline) = harness_with_pipeline().await;
+        create(&mut client, "u3").await?;
+        client
+            .update_relay(pb::UpdateRelayRequest {
+                call_id: "u3".into(),
+                remotes: vec![remote(true, "192.0.2.1:5000")],
+                kind: pb::MediaKind::Unspecified as i32,
+                start_relay: false,
+            })
+            .await?;
+        assert_eq!(pipeline.media_kind("u3").await, Some(MediaKind::Audio));
+        for bad in [-1, 3, i32::MAX] {
+            let err = client
+                .update_relay(pb::UpdateRelayRequest {
+                    call_id: "u3".into(),
+                    remotes: vec![remote(true, "192.0.2.9:5000")],
+                    kind: bad,
+                    start_relay: false,
+                })
+                .await
+                .err()
+                .ok_or("expected an error")?;
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{bad}");
+        }
+        assert_eq!(
+            pipeline.leg_remote("u3", true).await,
+            Some(SbcSocketAddr::from("192.0.2.1:5000".parse::<SocketAddr>()?))
+        );
+        let err = client
+            .update_relay(pb::UpdateRelayRequest {
+                call_id: "missing".into(),
+                ..Default::default()
+            })
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_relay_start_flag_starts_relay() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, _tx, pipeline) = harness_with_pipeline().await;
+        create(&mut client, "u4").await?;
+        client
+            .update_relay(pb::UpdateRelayRequest {
+                call_id: "u4".into(),
+                remotes: vec![
+                    remote(true, "127.0.0.1:5000"),
+                    remote(false, "127.0.0.1:6000"),
+                ],
+                kind: pb::MediaKind::Image as i32,
+                start_relay: true,
+            })
+            .await?;
+        assert_eq!(pipeline.media_kind("u4").await, Some(MediaKind::Image));
+        // Relay running: stopping it succeeds.
+        client
+            .stop_relay(pb::CallRef {
+                call_id: "u4".into(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// SEC-2: a start failure after the update rolls the update back.
+    #[tokio::test]
+    async fn update_relay_start_failure_rolls_back() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, _tx, pipeline) = harness_with_pipeline().await;
+        create(&mut client, "u5").await?;
+        // B-leg remote never set, so start_relay fails after the update.
+        let err = client
+            .update_relay(pb::UpdateRelayRequest {
+                call_id: "u5".into(),
+                remotes: vec![remote(true, "127.0.0.1:5000")],
+                kind: pb::MediaKind::Image as i32,
+                start_relay: true,
+            })
+            .await
+            .err()
+            .ok_or("start must fail")?;
+        assert!(!err.message().contains("start_relay after update"));
+        assert_eq!(pipeline.media_kind("u5").await, Some(MediaKind::Audio));
+        assert_eq!(pipeline.leg_remote("u5", true).await, None);
+        Ok(())
     }
 
     /// POA&M-294: SetMediaKind reaches the pipeline; UNSPECIFIED and unknown

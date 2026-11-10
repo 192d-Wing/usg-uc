@@ -24,4 +24,17 @@ ignore = [
     # feature reachability. No fixed rsa release exists to update to.
     # Re-evaluate if a MySQL backend is ever enabled.
     "RUSTSEC-2023-0071",
+    # libsqlite3-sys bundled C SQLite (CVE-2026-119375, medium), fixed in
+    # libsqlite3-sys >= 0.39. No upgrade resolves: sqlx-sqlite (an optional
+    # dependency of sqlx that no feature enables, but which stays in the
+    # lockfile) caps libsqlite3-sys below 0.38 in both sqlx 0.8 and 0.9.0,
+    # and only one crate may link `sqlite3`, so rusqlite cannot move to
+    # 0.41. The vulnerable code is compiled only through uc-user-mgmt's
+    # `sqlite` feature (rusqlite, bundled). No shipped binary links it:
+    # sbc-api-server depends on uc-user-mgmt with default-features = false
+    # and the postgres backend, enabling `sqlite` only as a dev-dependency
+    # for tests (`cargo tree -p sbc-api-server -e normal -i libsqlite3-sys`
+    # prints nothing). Re-evaluate when sqlx allows libsqlite3-sys >= 0.39,
+    # then bump rusqlite to >= 0.41 and remove this entry.
+    "RUSTSEC-2026-0459",
 ]

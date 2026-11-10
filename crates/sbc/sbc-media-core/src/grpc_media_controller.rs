@@ -49,6 +49,10 @@ pub struct GrpcMediaController {
     /// `SetMediaKind` came back UNIMPLEMENTED (media node older than this
     /// daemon) and was logged once.
     kind_unimplemented_logged: Arc<AtomicBool>,
+    /// `UpdateRelay` came back UNIMPLEMENTED (media node older than this
+    /// daemon). Cached per node so later updates skip the doomed RPC: a kind
+    /// change then fails closed, an audio-only update uses the legacy RPCs.
+    update_relay_unimplemented: Arc<AtomicBool>,
 }
 
 impl GrpcMediaController {
@@ -83,7 +87,70 @@ impl GrpcMediaController {
         Self {
             client,
             kind_unimplemented_logged: Arc::new(AtomicBool::new(false)),
+            update_relay_unimplemented: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Sends `UpdateRelay`, or, on a node that answered UNIMPLEMENTED,
+    /// falls back to the legacy per-field RPCs for an audio-only update.
+    ///
+    /// A kind change on such a node is refused without any RPC: there is no
+    /// fallback to `SetMediaKind`, so T.38 on an old node is declined
+    /// (`RelayUpdateFailed`) rather than half-applied.
+    // NIST 800-53 Rev5: SC-24 (fail closed), SI-10. POA&M-294.
+    async fn send_update_relay(
+        &self,
+        call_id: &str,
+        remotes: [Option<(bool, SbcSocketAddr)>; 2],
+        kind: Option<MediaKind>,
+        start_relay: bool,
+    ) -> Result<(), MediaPipelineError> {
+        if !self.update_relay_unimplemented.load(Ordering::Relaxed) {
+            let req = pb::UpdateRelayRequest {
+                call_id: call_id.to_string(),
+                remotes: remotes
+                    .iter()
+                    .flatten()
+                    .map(|(is_a_leg, address)| pb::LegRemote {
+                        is_a_leg: *is_a_leg,
+                        address: address.as_std().to_string(),
+                    })
+                    .collect(),
+                kind: kind.map_or(pb::MediaKind::Unspecified as i32, to_proto_kind),
+                start_relay,
+            };
+            let mut client = self.client.clone();
+            match client.update_relay(req).await {
+                Ok(_) => return Ok(()),
+                Err(status) if status.code() == tonic::Code::Unimplemented => {
+                    if !self
+                        .update_relay_unimplemented
+                        .swap(true, Ordering::Relaxed)
+                    {
+                        tracing::warn!(
+                            "media node does not implement UpdateRelay; T.38 on it fails \
+                             closed and audio updates use the legacy RPCs until it is upgraded"
+                        );
+                    }
+                }
+                Err(status) => return Err(map_status(status)),
+            }
+        }
+        if kind.is_some() {
+            return Err(MediaPipelineError::Rpc(
+                "media node does not implement UpdateRelay; media kind change refused".into(),
+            ));
+        }
+        let mut result = Ok(());
+        for (is_a_leg, address) in remotes.into_iter().flatten() {
+            if let Err(e) = self.set_remote_address(call_id, is_a_leg, address).await {
+                result = Err(e);
+            }
+        }
+        if start_relay {
+            self.start_relay(call_id).await?;
+        }
+        result
     }
 
     /// Fetches the SBC's current DTLS fingerprint (RFC 8122 form) from the media
@@ -265,25 +332,27 @@ impl MediaController for GrpcMediaController {
         }
     }
 
-    /// Remote relay update: the kind first, then the leg remotes, so a node
-    /// that refuses the kind (UNIMPLEMENTED) is left unchanged. Not atomic
-    /// across RPCs, unlike the in-process PERF-004 update.
+    /// Remote relay update as one `UpdateRelay` RPC (no relay start), so the
+    /// node applies the kind and both remotes under one session lock.
     async fn update_relay(
         &self,
         call_id: &str,
         remotes: [Option<(bool, SbcSocketAddr)>; 2],
         kind: Option<MediaKind>,
     ) -> Result<(), MediaPipelineError> {
-        if let Some(kind) = kind {
-            self.set_media_kind(call_id, kind).await?;
-        }
-        let mut result = Ok(());
-        for (is_a_leg, address) in remotes.into_iter().flatten() {
-            if let Err(e) = self.set_remote_address(call_id, is_a_leg, address).await {
-                result = Err(e);
-            }
-        }
-        result
+        self.send_update_relay(call_id, remotes, kind, false).await
+    }
+
+    /// One `UpdateRelay` RPC with `start_relay = true`: PERF-001 / SEC-1 from
+    /// the #200 gate. Replaces the SetMediaKind + SetRemoteAddress + StartRelay
+    /// sequence, during which the node could latch a half-applied state.
+    async fn update_and_start_relay(
+        &self,
+        call_id: &str,
+        remotes: [Option<(bool, SbcSocketAddr)>; 2],
+        kind: Option<MediaKind>,
+    ) -> Result<(), MediaPipelineError> {
+        self.send_update_relay(call_id, remotes, kind, true).await
     }
 
     async fn start_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
@@ -465,6 +534,29 @@ mod tests {
             }))
         }
 
+        async fn update_relay(
+            &self,
+            req: Request<pb::UpdateRelayRequest>,
+        ) -> Result<Response<()>, Status> {
+            let r = req.into_inner();
+            // "old" models a media node that predates UpdateRelay.
+            if r.call_id == "old" {
+                return Err(Status::unimplemented("UpdateRelay"));
+            }
+            if r.remotes.len() > 2
+                || r.remotes
+                    .iter()
+                    .any(|l| l.address.parse::<std::net::SocketAddr>().is_err())
+            {
+                return Err(Status::invalid_argument("bad remotes"));
+            }
+            // "nostart" models a start failure after a committed update.
+            if r.call_id == "nostart" && r.start_relay {
+                return Err(Status::internal("start failed"));
+            }
+            Ok(Response::new(()))
+        }
+
         async fn get_dtls_fingerprint(
             &self,
             _req: Request<()>,
@@ -587,6 +679,68 @@ mod tests {
         assert!(mc2.set_media_kind("old", MediaKind::Image).await.is_err());
         // Other calls on the same node are unaffected.
         mc2.set_media_kind("new", MediaKind::Image).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_relay_unimplemented_with_kind_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mc = connect().await;
+        let addr = SbcSocketAddr::new("192.0.2.1".parse()?, 5000);
+        // Every call, before and after the UNIMPLEMENTED answer is cached.
+        for _ in 0..3 {
+            assert!(
+                mc.update_and_start_relay(
+                    "old",
+                    [Some((false, addr)), None],
+                    Some(MediaKind::Image)
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                mc.update_relay("old", [None, None], Some(MediaKind::Audio))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(mc.update_relay_unimplemented.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_relay_unimplemented_without_kind_falls_back_to_legacy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mc = connect().await;
+        let addr = SbcSocketAddr::new("192.0.2.1".parse()?, 5000);
+        mc.update_and_start_relay("old", [Some((true, addr)), Some((false, addr))], None)
+            .await?;
+        assert!(mc.update_relay_unimplemented.load(Ordering::Relaxed));
+        mc.update_relay("old", [Some((true, addr)), None], None)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_and_start_relay_start_failure_is_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mc = connect().await;
+        let addr = SbcSocketAddr::new("192.0.2.1".parse()?, 5000);
+        mc.update_relay(
+            "nostart",
+            [Some((true, addr)), None],
+            Some(MediaKind::Image),
+        )
+        .await?;
+        assert!(
+            mc.update_and_start_relay(
+                "nostart",
+                [Some((true, addr)), None],
+                Some(MediaKind::Image)
+            )
+            .await
+            .is_err()
+        );
         Ok(())
     }
 

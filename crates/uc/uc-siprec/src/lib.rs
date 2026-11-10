@@ -46,13 +46,16 @@
 //! - **SC-8**: Transmission Confidentiality and Integrity (POA&M-304)
 //! - **SI-10 / SI-15**: metadata escaping, rejection and caps (`xml`, `metadata`)
 //!
-//! ## Phase 1 scope
+//! ## Scope
 //!
-//! Library-level conformance only: the RFC 7865 serializer and a pure RFC 7866
-//! RS INVITE body builder. Nothing in the SBC consumes this crate yet.
-//! POA&M-300..309 track the SRC wiring, media forking, config, recording
-//! indication, SRS transport security, snapshots, audit/CDR, cluster, inbound
-//! SRS requests, and the remaining scaffolding (`forking`, `session`).
+//! Library-level conformance: the RFC 7865 serializer and a pure RFC 7866
+//! RS INVITE body builder whose SDP offer is SRTP-only (SDES
+//! `AEAD_AES_256_GCM`, RFC 4568 / RFC 7714). The unwired scaffolding
+//! (`forking`, `session`, `config`) was removed (POA&M-309, CM-7); the SBC
+//! schema for recording lives in `sbc-config` (`[recording]`).
+//! POA&M-300, -301, -303..-308 track the SRC wiring, media forking, recording
+//! indication, SRS transport, snapshots, audit/CDR, cluster and inbound SRS
+//! requests.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -60,24 +63,16 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
-pub mod config;
 pub mod error;
-pub mod forking;
 pub mod metadata;
-pub mod session;
 pub mod src_request;
 pub mod xml;
 
-pub use config::{RecordingConfig, RecordingMode, RecordingTrigger, SrsEndpoint};
 pub use error::{SiprecError, SiprecResult};
-pub use forking::{ForkingMode, MediaForker, StreamFork};
 pub use metadata::{
     MediaStream, Participant, ParticipantRole, RecordingMetadata, SessionMetadata, StreamDirection,
 };
-pub use session::{
-    RecordingSession, RecordingSessionState, SessionRecordingClient, SessionRecordingEvent,
-};
-pub use src_request::{RsInviteParts, SrcHeaders, build_rs_offer};
+pub use src_request::{RsInviteParts, SdesKey, SrcHeaders, build_rs_offer};
 
 #[cfg(test)]
 mod tests {

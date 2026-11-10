@@ -13,6 +13,12 @@ BulkVS in the Simulator).
 - [ ] **GTK3 advisories** (RUSTSEC-2024-0429 glib, RUSTSEC-2024-0370
   proc-macro-error) clear themselves when `client-gui-tauri` is retired for
   the native clients.
+- [ ] **SQLite advisory** (RUSTSEC-2026-0459, bundled C SQLite in
+  `libsqlite3-sys` 0.30.1, medium) is ignored in `.cargo/audit.toml`. sqlx
+  0.8 and 0.9.0 cap `libsqlite3-sys` below 0.38 and the fix needs 0.39, so
+  `rusqlite` cannot move to 0.41. Only `uc-user-mgmt`'s `sqlite` feature
+  compiles it (tests and standalone builds; `sbc-api-server` ships on
+  Postgres). When sqlx lifts the cap: bump `rusqlite`, remove the ignore.
 
 ## iOS on-device
 
@@ -484,6 +490,23 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   deferred to POA&M-300..309 (RS origination, forking, config, recording
   indication, SRS TLS/SRTP, stable IDs/updates, audit/CDR, cluster,
   SRS-initiated requests, scaffolding review). No XSD validation in CI.
+  *Phase 2 subset done (2026-11-08):* scaffolding `forking.rs`, `session.rs`,
+  `config.rs` deleted (POA&M-309 closed); RS offer is SRTP-only with SDES
+  `AEAD_AES_256_GCM` (`SdesKey`, POA&M-304 offer side); `sbc-config`
+  `[recording]` schema and validation, default off, restart-required, and
+  `enabled = true` rejected until the SRC lands (POA&M-302, config-only).
+  SDES is library-only (no caller). proto-sdp `Display` now emits CRLF.
+  Still open: RS origination/teardown in sbc-daemon (POA&M-300), media fork
+  (301, incl. the `a=rtcp-mux` decision),
+  recording indication (303), TLS client to the SRS (304), snapshots (305),
+  audit/CDR/metrics (306), cluster (307), SRS-initiated requests (308).
+- [x] **PERF-001 / SEC-1 (#200 gate) — remote T.38 relay update took up to 3
+  RPCs.** Replaced by one atomic `UpdateRelay` RPC (`media_controller.proto`);
+  an old node answering UNIMPLEMENTED fails T.38 closed. The initial image
+  answer now fails closed on any kind, address or relay-start error (call
+  torn down, audited); a start failure inside `update_and_start_relay` rolls
+  back the prior remotes and kind (test `update_relay_start_failure_rolls_back`).
+  `SetMediaKind` is deprecated, kept one release.
 - [x] **MAJOR, DORMANT — WebRTC SDP munging:** only the first m-section gets
   `a=mid`; keeps `RTP/AVP` and adds no fingerprint/setup/ICE; data-channel
   removal changes the m-line count and orphans attributes

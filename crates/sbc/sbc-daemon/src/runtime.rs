@@ -358,6 +358,11 @@ impl Runtime {
         if old.media.t38 != new.media.t38 {
             keys.push("media.t38".to_string());
         }
+        // NIST 800-53 Rev5: CM-6 - `[recording]` is read at startup only
+        // (POA&M-302).
+        if old.recording != new.recording {
+            keys.push("recording".to_string());
+        }
         keys
     }
 
@@ -1721,6 +1726,17 @@ mod tests {
         assert_eq!(
             Runtime::detect_restart_required(&old, &new),
             vec!["media.t38".to_string()]
+        );
+    }
+
+    #[test]
+    fn reload_reports_recording_as_restart_required() {
+        let old = SbcConfig::default();
+        let mut new = old.clone();
+        new.recording.max_sessions = 10;
+        assert_eq!(
+            Runtime::detect_restart_required(&old, &new),
+            vec!["recording".to_string()]
         );
     }
 

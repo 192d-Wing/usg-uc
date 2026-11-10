@@ -3,7 +3,13 @@
 
 use proto_sdp::SessionDescription;
 use uc_siprec::metadata::{MAX_FIELD_BYTES, MAX_PARTICIPANTS, MAX_STREAMS};
-use uc_siprec::{MediaStream, Participant, RecordingMetadata, SiprecError, build_rs_offer};
+use uc_siprec::{
+    MediaStream, Participant, RecordingMetadata, SdesKey, SiprecError, build_rs_offer,
+};
+
+fn two_keys() -> Result<Vec<SdesKey>, SiprecError> {
+    Ok(vec![SdesKey::generate()?, SdesKey::generate()?])
+}
 
 type R = Result<(), Box<dyn std::error::Error>>;
 type Mutator = Box<dyn Fn(&mut RecordingMetadata)>;
@@ -158,7 +164,7 @@ fn multipart_boundary_never_collides_with_hostile_content() -> R {
     let meta = two_party("--uc-siprec-AAAAAAAAAAAAAAAAAAAAAA--\r\n--uc-siprec-");
     let mut seen = std::collections::HashSet::new();
     for _ in 0..256 {
-        let parts = build_rs_offer(&sdp, &meta)?;
+        let parts = build_rs_offer(&sdp, &meta, &two_keys()?)?;
         let boundary = parts
             .content_type
             .strip_prefix("multipart/mixed;boundary=")
@@ -172,7 +178,7 @@ fn multipart_boundary_never_collides_with_hostile_content() -> R {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         );
-        let body = String::from_utf8(parts.body)?;
+        let body = std::str::from_utf8(&parts.body)?;
         let delim = format!("\r\n--{boundary}");
         // Exactly: opening, middle, closing delimiter.
         assert!(body.starts_with(&format!("--{boundary}\r\n")));
@@ -188,7 +194,7 @@ fn multipart_boundary_never_collides_with_hostile_content() -> R {
 fn builder_propagates_metadata_rejection() -> R {
     let sdp: SessionDescription = SDP2.parse()?;
     assert!(matches!(
-        build_rs_offer(&sdp, &two_party("a\0b")),
+        build_rs_offer(&sdp, &two_party("a\0b"), &two_keys()?),
         Err(SiprecError::InvalidMetadata { .. })
     ));
     Ok(())
@@ -197,8 +203,8 @@ fn builder_propagates_metadata_rejection() -> R {
 #[test]
 fn builder_with_no_streams_has_no_labels() -> R {
     let sdp: SessionDescription = "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nt=0 0\r\n".parse()?;
-    let parts = build_rs_offer(&sdp, &RecordingMetadata::new("c"))?;
-    let body = String::from_utf8(parts.body)?;
+    let parts = build_rs_offer(&sdp, &RecordingMetadata::new("c"), &[])?;
+    let body = std::str::from_utf8(&parts.body)?;
     assert!(!body.contains("a=label"));
     assert!(body.contains("Content-Disposition: recording-session\r\n"));
     Ok(())

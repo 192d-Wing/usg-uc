@@ -82,6 +82,7 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_header_manipulation(config)?;
     validate_topology_hiding(config)?;
     validate_cdr(&config.cdr)?;
+    validate_recording(config)?;
     validate_unimplemented(config)?;
     #[cfg(feature = "cluster")]
     validate_cluster_admission(config)?;
@@ -530,6 +531,154 @@ fn validate_media_enforced(config: &crate::schema::MediaConfig) -> ConfigResult<
     }
 
     Ok(())
+}
+
+/// Validates `[recording]` (SIPREC SRC, POA&M-302).
+///
+/// Field rules apply whether or not recording is enabled; the enable-only
+/// rules (notice, SRS, CA, trigger) apply when `enabled = true`. Finally,
+/// `enabled = true` is rejected because the SRC is not wired yet
+/// (POA&M-300/-301): an accepted key must be enforced, never ignored.
+///
+/// ## NIST 800-53 Rev5: CM-6, CM-7, PT-5, SC-8; SC-5 and SC-23 prerequisite
+/// only (range / name syntax checks; enforcement POA&M-300/-301/-304)
+fn validate_recording(config: &SbcConfig) -> ConfigResult<()> {
+    let rec = &config.recording;
+    let err = |message: String| Err(ConfigError::Validation { message });
+    if !(1..=10_000).contains(&rec.max_sessions) {
+        return err(format!(
+            "recording.max_sessions ({}) must be in 1..=10000",
+            rec.max_sessions
+        ));
+    }
+    // RFC 3261 §17.1.1.2: Timer B (64*T1 = 32 s) is the INVITE ceiling.
+    if !(1000..=32_000).contains(&rec.rs_invite_timeout_ms) {
+        return err(format!(
+            "recording.rs_invite_timeout_ms ({}) must be in 1000..=32000",
+            rec.rs_invite_timeout_ms
+        ));
+    }
+    let uri_host = match rec.srs_uri.as_deref() {
+        Some(uri) => Some(srs_uri_host(uri).map_err(|why| ConfigError::Validation {
+            message: format!("recording.srs_uri {why}"),
+        })?),
+        None => None,
+    };
+    if let Some(name) = &rec.srs_tls_server_name
+        && (name.is_empty()
+            || name.len() > 253
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
+            || rustls_pki_types::ServerName::try_from(name.as_str()).is_err())
+    {
+        return err("recording.srs_tls_server_name must be a DNS name or IP address".to_string());
+    }
+    for tg in &rec.trunk_groups {
+        if !config.trunk_groups.iter().any(|g| &g.id == tg) {
+            return err(format!(
+                "recording.trunk_groups names unknown trunk group {tg:?}"
+            ));
+        }
+    }
+    for zone in &rec.zones {
+        if !config.zones.iter().any(|z| &z.name == zone) {
+            return err(format!("recording.zones names unknown zone {zone:?}"));
+        }
+    }
+    if !rec.enabled {
+        return Ok(());
+    }
+    if !rec.notice_acknowledged {
+        return err(
+            "recording.enabled = true requires recording.notice_acknowledged = true \
+             (operator confirms participants are notified of recording)"
+                .to_string(),
+        );
+    }
+    if uri_host.is_none() {
+        return err("recording.enabled = true requires recording.srs_uri".to_string());
+    }
+    match rec.srs_tls_ca_file.as_deref() {
+        None => {
+            return err("recording.enabled = true requires recording.srs_tls_ca_file".to_string());
+        }
+        Some(path) if !std::path::Path::new(path).is_file() => {
+            return err(format!(
+                "recording.srs_tls_ca_file {path:?} does not exist or is not a file"
+            ));
+        }
+        Some(_) => {}
+    }
+    if !rec.record_all && rec.trunk_groups.is_empty() && rec.zones.is_empty() {
+        return err(
+            "recording.enabled = true needs record_all = true or at least one entry in \
+             recording.trunk_groups or recording.zones"
+                .to_string(),
+        );
+    }
+    // POAM: POA&M-300/-301 - SRC origination and media fork not wired.
+    err(
+        "recording.enabled = true is not supported by this build yet (SIPREC SRC wiring is \
+         tracked as POA&M-300/-301); set recording.enabled = false"
+            .to_string(),
+    )
+}
+
+/// Returns the host of a `sips:` SRS URI, or why it is refused: not
+/// `sips:`, no host, a bad port, an `maddr` parameter (RFC 3261 §19.1.1,
+/// would steer the RS away from the configured host) or any `transport`
+/// parameter (RFC 5630 §3.2 deprecates `transport=tls`).
+// NIST 800-53 Rev5: SC-7 (RS only to the configured SRS), SC-8
+fn srs_uri_host(uri: &str) -> Result<String, &'static str> {
+    let rest = uri
+        .get(..5)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("sips:"))
+        .and_then(|_| uri.get(5..))
+        .ok_or("must use the sips: scheme")?;
+    if rest
+        .bytes()
+        .any(|b| b.is_ascii_control() || b == b' ' || b == b'?')
+    {
+        return Err("contains control characters, spaces or headers");
+    }
+    let mut parts = rest.split(';');
+    let hostport = parts.next().unwrap_or_default();
+    for param in parts {
+        let name = param.split_once('=').map_or(param, |(n, _)| n);
+        if name.eq_ignore_ascii_case("maddr") {
+            return Err("must not carry an maddr parameter");
+        }
+        // RFC 5630 §3.2: `transport=tls` is deprecated and `sips:` already
+        // mandates TLS, so any transport parameter is refused.
+        if name.eq_ignore_ascii_case("transport") {
+            return Err("must not carry a transport parameter (sips: implies TLS, RFC 5630)");
+        }
+    }
+    let hostport = hostport.rsplit_once('@').map_or(hostport, |(_, h)| h);
+    let (host, port) = if let Some(v6) = hostport.strip_prefix('[') {
+        let (host, after) = v6
+            .split_once(']')
+            .ok_or("has an unterminated IPv6 literal")?;
+        (host, after.strip_prefix(':'))
+    } else {
+        match hostport.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hostport, None),
+        }
+    };
+    if host.is_empty() {
+        return Err("must name a host");
+    }
+    if let Some(port) = port
+        && port.parse::<u16>().ok().is_none_or(|p| p == 0)
+    {
+        return Err("has an invalid port");
+    }
+    if rustls_pki_types::ServerName::try_from(host).is_err() {
+        return Err("host must be a DNS name or IP address");
+    }
+    Ok(host.to_string())
 }
 
 /// Validates `[media.t38]`.
@@ -1805,6 +1954,210 @@ mod tests {
         TrunkManipulationRuleConfig, ZoneConfig,
     };
     use uc_types::media::MediaMode;
+
+    fn recording_enabled_config(ca: &str) -> SbcConfig {
+        let mut c = SbcConfig::default();
+        c.recording.enabled = true;
+        c.recording.notice_acknowledged = true;
+        c.recording.srs_uri = Some("sips:srs.example.net:5061".to_string());
+        c.recording.srs_tls_ca_file = Some(ca.to_string());
+        c.recording.record_all = true;
+        c
+    }
+
+    fn recording_err(c: &SbcConfig) -> String {
+        validate_config(c).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn recording_defaults_off() {
+        let c = SbcConfig::default();
+        assert!(!c.recording.enabled);
+        assert!(!c.recording.notice_acknowledged);
+        assert_eq!(
+            c.recording.recordpref_never,
+            crate::schema::RecordprefPolicy::Honour
+        );
+        assert_eq!(
+            c.recording.on_failure,
+            crate::schema::RecordingFailureAction::Continue
+        );
+        assert!(validate_config(&c).is_ok());
+        let parsed: SbcConfig = toml::from_str("[recording]\n").unwrap();
+        assert_eq!(parsed.recording, c.recording);
+    }
+
+    #[test]
+    fn recording_enabled_rules() {
+        // A file that exists stands in for the CA bundle.
+        let ca = env!("CARGO_MANIFEST_PATH");
+        let full = recording_enabled_config(ca);
+        // Every rule satisfied: still refused until the SRC is wired.
+        assert!(recording_err(&full).contains("POA&M-300"));
+
+        let mut c = full.clone();
+        c.recording.notice_acknowledged = false;
+        assert!(recording_err(&c).contains("notice_acknowledged"));
+
+        let mut c = full.clone();
+        c.recording.srs_uri = None;
+        assert!(recording_err(&c).contains("requires recording.srs_uri"));
+
+        let mut c = full.clone();
+        c.recording.srs_tls_ca_file = None;
+        assert!(recording_err(&c).contains("srs_tls_ca_file"));
+        c.recording.srs_tls_ca_file = Some("/nonexistent/srs-ca.pem".to_string());
+        assert!(recording_err(&c).contains("does not exist"));
+
+        let mut c = full;
+        c.recording.record_all = false;
+        assert!(recording_err(&c).contains("record_all"));
+    }
+
+    #[test]
+    fn recording_field_rules_apply_when_disabled() {
+        for (uri, why) in [
+            ("sip:srs.example.net", "sips:"),
+            ("sips:srs.example.net;transport=tcp", "transport"),
+            ("sips:srs.example.net;transport=udp", "transport"),
+            ("sips:srs.example.net;transport=tls", "transport"),
+            ("sips:srs.example.net;TRANSPORT=TLS", "transport"),
+            ("sips:srs.example.net;maddr=192.0.2.9", "maddr"),
+            ("sips:", "host"),
+            ("sips:srs.example.net:0", "port"),
+            ("sips:srs.example.net:99999", "port"),
+            ("sips:srs.example.net\r\nVia: x", "control"),
+        ] {
+            let mut c = SbcConfig::default();
+            c.recording.srs_uri = Some(uri.to_string());
+            let e = recording_err(&c);
+            assert!(e.contains(why), "{uri}: {e}");
+        }
+        for ok in [
+            "sips:srs.example.net",
+            "sips:rec@srs.example.net:5061",
+            "sips:[2001:db8::1]:5061",
+        ] {
+            let mut c = SbcConfig::default();
+            c.recording.srs_uri = Some(ok.to_string());
+            assert!(validate_config(&c).is_ok(), "{ok}");
+        }
+
+        for (n, ok) in [(0, false), (1, true), (10_000, true), (10_001, false)] {
+            let mut c = SbcConfig::default();
+            c.recording.max_sessions = n;
+            assert_eq!(validate_config(&c).is_ok(), ok, "max_sessions {n}");
+        }
+        for (ms, ok) in [(999, false), (1000, true), (32_000, true), (32_001, false)] {
+            let mut c = SbcConfig::default();
+            c.recording.rs_invite_timeout_ms = ms;
+            assert_eq!(validate_config(&c).is_ok(), ok, "timeout {ms}");
+        }
+
+        let mut c = SbcConfig::default();
+        c.recording.trunk_groups = vec!["nope".to_string()];
+        assert!(recording_err(&c).contains("unknown trunk group"));
+        let mut c = SbcConfig::default();
+        c.recording.zones = vec!["nope".to_string()];
+        assert!(recording_err(&c).contains("unknown zone"));
+        let mut c = SbcConfig::default();
+        c.recording.srs_tls_server_name = Some("bad\r\nname".to_string());
+        assert!(recording_err(&c).contains("srs_tls_server_name"));
+    }
+
+    /// QA: a zone trigger (no `record_all`) satisfies the trigger rule; a
+    /// known zone is accepted when disabled; enabled still fails closed on
+    /// the POA&M-300 gate, never silently accepted.
+    #[test]
+    fn recording_zone_trigger_and_known_refs_accepted() {
+        let ca = env!("CARGO_MANIFEST_PATH");
+        let mut c = recording_enabled_config(ca);
+        c.zones = vec![zone("inside")];
+        c.recording.record_all = false;
+        c.recording.zones = vec!["inside".to_string()];
+        let e = recording_err(&c);
+        assert!(e.contains("POA&M-300"), "{e}");
+        assert!(!e.contains("record_all"), "{e}");
+        c.recording.enabled = false;
+        assert!(validate_config(&c).is_ok());
+    }
+
+    /// QA: `srs_tls_server_name` accepts DNS names and IP literals and
+    /// rejects empty, oversized and non-hostname values.
+    #[test]
+    fn recording_srs_tls_server_name_rules() {
+        for (name, ok) in [
+            ("srs.example.net", true),
+            ("192.0.2.10", true),
+            ("2001:db8::1", true),
+            ("", false),
+            ("srs example", false),
+            ("srs_example!", false),
+            (&"a".repeat(254) as &str, false),
+        ] {
+            let mut c = SbcConfig::default();
+            c.recording.srs_tls_server_name = Some(name.to_string());
+            assert_eq!(validate_config(&c).is_ok(), ok, "{name:?}");
+        }
+    }
+
+    /// QA: every enum key parses its documented tokens and rejects others;
+    /// a full TOML table round-trips.
+    #[test]
+    fn recording_toml_keys_parse() {
+        let t = "[recording]\nenabled = false\nnotice_acknowledged = true\n\
+            srs_uri = \"sips:srs.example.net:5061\"\nsrs_tls_ca_file = \"/x.pem\"\n\
+            srs_tls_server_name = \"srs.example.net\"\nrecord_all = true\n\
+            trunk_groups = []\nzones = []\nmax_sessions = 7\n\
+            rs_invite_timeout_ms = 2000\non_failure = \"reject\"\n\
+            recordpref_never = \"ignore\"\n";
+        let c: SbcConfig = toml::from_str(t).unwrap();
+        assert_eq!(c.recording.max_sessions, 7);
+        assert_eq!(c.recording.rs_invite_timeout_ms, 2000);
+        assert_eq!(
+            c.recording.on_failure,
+            crate::schema::RecordingFailureAction::Reject
+        );
+        assert_eq!(
+            c.recording.recordpref_never,
+            crate::schema::RecordprefPolicy::Ignore
+        );
+        assert!(validate_config(&c).is_ok());
+        for bad in [
+            "[recording]\nrecordpref_never = \"maybe\"\n",
+            "[recording]\nhonour_recordpref_never = true\n",
+            "[recording]\nmax_sessions = -1\n",
+            "[recording]\nenabled = \"yes\"\n",
+        ] {
+            assert!(toml::from_str::<SbcConfig>(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// QA: scheme check is case-insensitive but exact; lookalikes refused.
+    #[test]
+    fn recording_srs_uri_scheme_lookalikes() {
+        for (uri, ok) in [
+            ("SIPS:srs.example.net", true),
+            ("sipss:srs.example.net", false),
+            ("tel:+15551234", false),
+            ("sips:srs.example.net?Route=x", false),
+            ("sips:srs.example.net;MADDR=1.2.3.4", false),
+            ("sips:[2001:db8::1", false),
+            ("sips:srs.example.net:abc", false),
+        ] {
+            let mut c = SbcConfig::default();
+            c.recording.srs_uri = Some(uri.to_string());
+            assert_eq!(validate_config(&c).is_ok(), ok, "{uri}");
+        }
+    }
+
+    #[test]
+    fn recording_rejects_unknown_field() {
+        let r: Result<SbcConfig, _> = toml::from_str("[recording]\nenable = true\n");
+        assert!(r.is_err());
+        let r: Result<SbcConfig, _> = toml::from_str("[recording]\non_failure = \"retry\"\n");
+        assert!(r.is_err());
+    }
 
     #[test]
     fn t38_defaults_fail_closed_and_validate() {

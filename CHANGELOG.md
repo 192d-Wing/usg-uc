@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, media gRPC UpdateRelay and SIPREC phase 2 subset)
+- **Media gRPC: one atomic `UpdateRelay` RPC.** The daemon applies a relay
+  update (media kind, leg remotes, optional relay start) on a remote
+  `sbc-media` node with one `UpdateRelay` call instead of up to three.
+  `SetMediaKind` is deprecated and no longer sent. Upgrade media nodes
+  first: a node without `UpdateRelay` declines T.38 (the switch fails
+  closed); audio calls keep working through the legacy RPCs.
+- **T.38 initial image answer fails closed on every relay error** (kind,
+  address or start), not only on a kind error: the call is torn down.
+- **uc-siprec API.** `build_rs_offer` takes one `SdesKey` per stream and
+  emits an `RTP/SAVP` offer with `a=crypto` `AEAD_AES_256_GCM`. The unwired
+  `forking`, `session` and `config` modules and their re-exports are removed
+  (POA&M-309).
+- **sbc-config: new `[recording]` table** (`deny_unknown_fields`, default
+  off, restart-required). `enabled = true` is rejected until SIPREC SRC
+  wiring lands (POA&M-300/-301).
+
 ### BREAKING (SBC, CDR schema v3 and media gRPC, POA&M-294)
 
 - **SBC: CDR schema version 2 -> 3.** (AU-3, AU-12) Records carry a new

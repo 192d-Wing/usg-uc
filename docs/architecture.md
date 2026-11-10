@@ -31,7 +31,7 @@ flowchart TB
 | 3 — Media engine | `uc-codecs`, `uc-media-engine` | Codec encode/decode (G.711 et al.), transcoding, media relay |
 | 4 — Security | `uc-acl`, `uc-auth`, `uc-dos-protection` | Access control, digest auth, rate limiting |
 | 5 — Orchestration | `uc-policy`, `uc-routing`, `uc-cdr`, `uc-sti` | Policy, dial-plan routing, call detail records, STIR/SHAKEN services (x5u cert cache, trust anchors, attestation policy, signing key) |
-| 6 — Recording | `uc-siprec` | SIPREC call recording (partial, dormant, no caller: RFC 7865 metadata serializer with escaping and caps and an RFC 7866 RS-offer body builder exist; no SRC signalling, media forking or config in any binary; POA&M-300..309) |
+| 6 — Recording | `uc-siprec` | SIPREC call recording (partial, dormant, no caller: RFC 7865 metadata serializer with escaping and caps and an RFC 7866 SRTP/SDES RS-offer body builder exist; `sbc-config` `[recording]` is validated but `enabled = true` is rejected; no SRC signalling, media forking or config in any binary; POA&M-300..309) |
 | 7 — Management | `uc-api`, `uc-metrics`, `uc-health`, `uc-telemetry` | Management APIs and observability |
 | 8 — HA & clustering | `uc-cluster`, `uc-discovery`, `uc-storage`, `uc-state-sync`, `uc-aaa`, `uc-user-mgmt`, `uc-phone-mgmt`, `uc-snmp`, `uc-syslog` | Cluster membership, state replication, user/phone management |
 | 9 — WebRTC | `uc-webrtc` | WebRTC interop |

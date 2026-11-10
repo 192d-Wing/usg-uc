@@ -500,11 +500,13 @@ This is **by design** for security compliance.
 |------|--------|--------|-------|
 | RFC 7865 metadata (complete snapshot) | Partial | Library-only | `metadata.rs` `to_rfc7865_xml`; §9 element order; escaping and caps (`xml.rs`). Tests `test_rfc7865_golden`, `tests/hostile_metadata.rs`. No XSD validation; IDs not stable across serializations (POA&M-305) |
 | RFC 7865 partial updates (`datamode` partial) | Not implemented | — | POA&M-305 |
-| RFC 7866 §6.1.1 / §8.1.1 / §9.1 RS offer body | Partial | Library-only | `src_request.rs` `build_rs_offer`, `SrcHeaders`. Tests `builds_multipart_with_labels_and_disposition`, `forces_sendonly_direction` |
+| RFC 7866 §6.1.1 / §8.1.1 / §9.1 RS offer body | Partial | Library-only | `src_request.rs` `build_rs_offer`, `SrcHeaders`. Tests `builds_multipart_with_labels_and_disposition`, `forces_sendonly_direction`. proto-sdp `Display` now emits CRLF line endings (RFC 8866 §5; test `display_uses_crlf_line_endings`) |
+| RFC 4568 / RFC 7714 SDES in the RS offer | Implemented (library-only; unusable until the POA&M-304 TLS client to the SRS exists, RFC 4568 §8.3) | Library-only | `RTP/SAVP` plus one `a=crypto:1 AEAD_AES_256_GCM` per stream (`SdesKey`); `RsInviteParts.body` zeroized with redacted `Debug`. Only AEAD_AES_256_GCM is offered (CNSA 2.0), so an AES_CM_128-only SRS answers 488 (`on_failure` applies). Tests `offer_is_srtp_with_one_sdes_line_per_stream`, `rejects_key_count_mismatch`, `sdes_key_debug_is_redacted_and_split`, `rs_invite_parts_debug_does_not_leak_key` |
 | RFC 7866 §6 RS origination, media forking | Not implemented | — | POA&M-300, POA&M-301 |
 | RFC 7866 §6.1.2 recording indication | Not implemented | — | POA&M-303 |
 | RFC 7866 §6.2 SRS-initiated requests | Not implemented | — | POA&M-308 |
-| Transport security to SRS | Not implemented | — | POA&M-304 |
+| Transport security to SRS | Partial | Config only | `[recording].srs_uri` must be `sips:` (no `maddr`, no non-TLS `transport`); TLS client not wired (POA&M-304) |
+| `[recording]` configuration | Partial | Wired (sbc-config, sbc-daemon reload) | Validated, default off, restart-required; `enabled = true` rejected until POA&M-300/-301 (POA&M-302) |
 
 ---
 
