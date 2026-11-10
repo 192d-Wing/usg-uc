@@ -278,6 +278,12 @@ pub struct CdrDraft {
     pub stir_x5u_host: Option<String>,
     /// Media kinds used, set-like and bounded (schema v3, POA&M-294).
     pub media_kinds: Vec<uc_cdr::MediaKindTag>,
+    /// SIPREC recording outcome (schema v4, POA&M-306). `None` when the
+    /// call did not match the recording trigger or was never answered.
+    pub recording: Option<uc_cdr::RecordingTag>,
+    /// RFC 7865 session identifier sent to the recorder (a UUID), when a
+    /// recording session INVITE was built.
+    pub recording_session_id: Option<String>,
 }
 
 impl CdrDraft {
@@ -381,6 +387,8 @@ impl CdrDraft {
             stir_inbound_attestation: self.stir_inbound_attestation,
             stir_x5u_host: self.stir_x5u_host,
             media_kinds: self.media_kinds,
+            recording: self.recording,
+            recording_session_id: self.recording_session_id,
             ..CallRecord::default()
         };
         r.compute_durations();
@@ -504,6 +512,20 @@ impl CdrEnd {
         )
     }
 
+    /// The SBC tore an answered call down because it could not be recorded
+    /// (`recording.on_failure = reject`). The BYE is the SBC's; 503 is the
+    /// status a pre-answer refusal for the same cause carries.
+    ///
+    /// ## NIST 800-53 Rev5: AU-5, SC-24
+    pub const fn recording_failure() -> Self {
+        Self::new(
+            Disposition::RecordingFailure,
+            ReleaseCause::RecordingFailure,
+            ReleaseSide::Sbc,
+            503,
+        )
+    }
+
     /// The SBC released the dialog because a leg went away (2xx never ACKed,
     /// relayed re-INVITE timed out or got 481).
     pub const fn dialog_lost(answered: bool, status: u16) -> Self {
@@ -570,6 +592,9 @@ pub struct Rejection<'a> {
     pub status: u16,
     /// Cause.
     pub cause: ReleaseCause,
+    /// Recording outcome, when the INVITE matched the recording trigger and
+    /// was refused because the call could not be recorded (AU-14).
+    pub recording: Option<uc_cdr::RecordingTag>,
 }
 
 /// Call-IDs remembered for reject-CDR de-duplication (SC-5 bound).
@@ -685,7 +710,15 @@ impl CdrContext {
             return;
         }
         let mut end = *end;
-        if answered && end.disposition != Disposition::MediaFailure {
+        // An answered call the SBC tore down for a media or recording
+        // failure keeps that disposition; every other answered call is
+        // `answered` however it was released.
+        if answered
+            && !matches!(
+                end.disposition,
+                Disposition::MediaFailure | Disposition::RecordingFailure
+            )
+        {
             end.disposition = Disposition::Answered;
         }
         self.emitter.emit(draft.into_record(&end));
@@ -727,6 +760,7 @@ impl CdrContext {
             release_side: ReleaseSide::Sbc,
             release_cause: r.cause,
             emergency: r.emergency,
+            recording: r.recording,
             ..CallRecord::default()
         };
         rec.compute_durations();
@@ -1105,6 +1139,44 @@ mod tests {
             r.media_kinds,
             vec![uc_cdr::MediaKindTag::Audio, uc_cdr::MediaKindTag::Image]
         );
+    }
+
+    /// POA&M-306: the recording outcome and session id reach the record
+    /// (schema v4); an unmatched call carries neither.
+    #[test]
+    fn draft_recording_fields_reach_the_record() {
+        let mut d = CdrDraft::default();
+        let r = d.clone().into_record(&CdrEnd::bye(true, true));
+        assert_eq!(r.recording, None);
+        assert_eq!(r.recording_session_id, None);
+        d.recording = Some(uc_cdr::RecordingTag::Recorded);
+        d.recording_session_id = Some("0b0e7f8c-6c0c-4d53-9f0a-2a1d2c3b4e5f".to_string());
+        let r = d.into_record(&CdrEnd::bye(true, true));
+        assert_eq!(r.recording, Some(uc_cdr::RecordingTag::Recorded));
+        assert_eq!(
+            r.recording_session_id.as_deref(),
+            Some("0b0e7f8c-6c0c-4d53-9f0a-2a1d2c3b4e5f")
+        );
+    }
+
+    /// AU-5: a call torn down by `recording.on_failure = reject` is released
+    /// by the SBC with the recording-failure disposition and cause.
+    #[test]
+    fn recording_failure_end_is_sbc_released() {
+        let e = CdrEnd::recording_failure();
+        assert_eq!(e.disposition, Disposition::RecordingFailure);
+        assert_eq!(e.cause, ReleaseCause::RecordingFailure);
+        assert_eq!(e.side, ReleaseSide::Sbc);
+        assert_eq!(e.status, 503);
+        let d = CdrDraft {
+            answer_ms: Some(now_ms()),
+            recording: Some(uc_cdr::RecordingTag::Failed),
+            ..CdrDraft::default()
+        };
+        let r = d.into_record(&e);
+        assert_eq!(r.disposition, Disposition::RecordingFailure);
+        assert_eq!(r.release_cause, ReleaseCause::RecordingFailure);
+        assert_eq!(r.recording, Some(uc_cdr::RecordingTag::Failed));
     }
 
     #[test]

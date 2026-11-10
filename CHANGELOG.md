@@ -9,6 +9,153 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, SIPREC phase 3 live recording, POA&M-300..309)
+
+- **SBC: `[recording] enabled = true` is now accepted and live.** (RFC 7866,
+  RFC 7865; AU-14, AU-5, CM-7, SC-8) The SBC records matched calls as a
+  session recording client. Recording stays off by default. The load-time
+  refusal from the previous release is removed. Before enabling, read the
+  default changes, startup refusals and known limits below.
+- **Config default: `recording.on_failure` `continue` -> `reject`** (fail
+  closed; AU-5, SC-24). A matched call that cannot be recorded is refused or
+  ended. Set `on_failure = "continue"` to keep such calls up unrecorded
+  (audited). No deployed config changes behaviour, because `enabled = true`
+  was rejected until now.
+- **Config default: `recording.recordpref_never` `honour` -> `ignore`.**
+  (AU-14) A party's `a=recordpref:off` no longer switches recording off
+  unless the operator sets `honour`. `off` is the RFC 7866 §7.1.3 token;
+  `never` is accepted as a non-standard alias. A media-level value on the
+  recorded audio stream overrides the session-level one.
+- **Calls can now be refused or ended for recording.** Under `reject`, a
+  matched call that the INVITE already shows to be unrecordable gets 488 with
+  `Warning: 399` (or 503 with `Retry-After` when no `max_sessions` slot is
+  free) and the B-leg is not dialled. One that the callee's answer shows to
+  be unrecordable gets 488 or 503; the callee's 2xx is not relayed and the
+  callee gets ACK + BYE. A recording session that fails after the call is
+  connected ends the call with a BYE to both legs. Recording starts after
+  the call's 200 OK, so media can flow unrecorded for up to
+  `rs_invite_timeout_ms` (default 5 s) before a failure ends the call.
+- **Emergency calls are exempt.** They are never refused or ended for a
+  recording failure. They continue unrecorded and are audited with action
+  `emergency_continued`.
+- **T.38 on a recorded call.** Under `reject` a T.38 re-INVITE on a recorded
+  call gets a local 488 with `Warning: 304`. Under `continue` the switch is
+  relayed and the recording session ends (CDR `partial`); a later switch
+  back to audio is not recorded.
+- **New startup refusals when `enabled = true`.** Config load fails without
+  a `transport.tls_listen` address or when `srs_zone` names an unknown zone.
+  The daemon refuses to start when `SBC_MEDIA_CONTROLLER_URL(S)` is set
+  (remote media nodes cannot record), when `security.tls_cert_path` /
+  `tls_key_path` are missing or do not load, when the `srs_uri` host does
+  not resolve (resolved once at startup, 5 s bound, then pinned), when
+  `srs_tls_ca_file` does not load, or when no local media address toward the
+  recorder is found. The Helm chart's `mediaSplit.enabled` sets
+  `SBC_MEDIA_CONTROLLER_URL`, so recording cannot be enabled with it.
+- **SBC: CDR schema version 3 -> 4.** (AU-3, AU-12, AU-14) Records of calls
+  that matched the recording trigger carry `recording` (`recorded`,
+  `partial`, `failed`, `not_recordable`, `opt_out`) and, when a recording
+  session existed, `recording_session_id` (the RFC 7865 session ID as a
+  UUID, not the recording session's SIP Call-ID). Both are omitted from
+  JSONL when not applicable and are inside the hash chain. `disposition`
+  and `release_cause` gain the value `recording_failure` (release side
+  `sbc`). CSV output gains two columns, `recording` and
+  `recording_session_id`, after `media_kinds` and before `prev_hash` /
+  `hash` (46 -> 48 columns). The gRPC `cdr.proto` `CdrRecord` gains
+  `recording = 47` and `recording_session_id = 48` (additive; empty = not
+  applicable). Readers still accept v1 and up. Downstream SIEM and billing
+  parsers that pin the CSV column count or position, reject unknown JSONL
+  keys, or enumerate `disposition` / `release_cause` values must be updated
+  before the upgrade. `recorded` means the recording session was up until
+  the call ended; it does not cover the setup window after answer.
+- **uc-audit: new `SwitchoverReason::RecordingActive`** (`recording_active`),
+  used for the T.38 refusal above. SIEM rules that enumerate
+  `media_switchover` reasons must add it.
+- **sbc-media-core API (library consumers).** `MediaPipelineConfig` gains a
+  `recording: RecordingMode` field (breaks struct literals). The
+  `MediaController` trait gains `prepare_recording_fork`,
+  `activate_recording_fork` and `stop_recording_fork`. Their default
+  implementations return `MediaPipelineError::RecordingUnsupported` (a new
+  error variant), so existing implementations compile; only the in-process
+  `MediaPipeline` overrides them. The media gRPC API is unchanged.
+
+### Added (SBC, SIPREC phase 3 live recording, POA&M-300..309)
+
+- **SBC: live SIPREC recording.** (RFC 7866, RFC 7865, RFC 7714, RFC 4568)
+  When an answered two-party audio call matches the trigger (`record_all`,
+  or a leg on a listed trunk group or zone; a trunk-group trigger also
+  matches the route's failover trunks), the SBC sends a recording INVITE
+  with RFC 7865 metadata to `srs_uri` over a certificate-verified TLS 1.3
+  connection used only for the recorder. It forks both directions to the
+  recorder as send-only SRTP (`AEAD_AES_256_GCM` SDES, SBC-owned SSRC and
+  sequence numbers) and sends BYE on the recording session when the call
+  ends. `max_sessions` is enforced; a slot is held from the INVITE of a
+  matched call. A recorded call uses four RTP port pairs instead of two.
+- **Config:** new optional key `recording.srs_zone` (must name a configured
+  zone): the zone whose media address the fork sockets bind to and that
+  goes in the recording session's SDP and Contact. Unset: the SBC's source
+  address toward the recorder. `[recording]` stays restart-required.
+  `deploy/config/config.toml` gains a commented `[recording]` example
+  (disabled).
+- **Config warnings (logged at startup when enabled):**
+  `media.srtp.mode = passthrough` (only cleartext-RTP calls can be
+  recorded); `on_failure = reject` with `recordpref_never = honour` (any
+  party can keep its call unrecorded); `record_all` with `max_sessions`
+  below this node's `general.max_calls`. The defaults (`max_sessions = 256`,
+  `max_calls = 10000`) raise the third as soon as `record_all = true`.
+- **Audit (SIEM parsers):** four new events of type `Call`:
+  `recording_started` (`call_id`, `recording_session_id`,
+  `start_offset_ms`, `relay`), `recording_stopped` (`reason`,
+  `duration_ms`), `recording_failed` (`reason`, `action`, `sip_status`) and
+  `recording_skipped` (`reason` `participant_opt_out`). Enum and numeric
+  values and internal IDs only. `recording_failed` reasons:
+  `no_session_slot`, `media_not_recordable`, `fork_setup`,
+  `srs_unreachable`, `srs_tls`, `srs_rejected`, `srs_not_acceptable_488`,
+  `srs_timeout`, `srs_bad_answer`, `srs_bye`, `remote_media_unsupported`,
+  `call_ended_during_setup`. Actions: `call_rejected`,
+  `continued_unrecorded`, `emergency_continued`, `call_already_ended`. A
+  call ended by the policy also emits `CallTerminated` with
+  `PolicyTerminated`. An active recording that fails emits both
+  `recording_stopped` and `recording_failed`.
+- **Metrics:** gauges `sbc_recording_sessions_active` (held slots, including
+  sessions still being set up), `sbc_recording_started_total`,
+  `sbc_recording_stopped_total`, `sbc_recording_skipped_total`,
+  `sbc_recording_calls_rejected_total`,
+  `sbc_recording_rs_bye_dropped_total`, `sbc_recording_fork_packets_total`,
+  `sbc_recording_fork_dropped_total`, and one
+  `sbc_recording_failed_<reason>_total` per `recording_failed` reason (12).
+  Fixed names, no labels.
+- **Crates (API, workspace-internal):** `uc-crypto` adds
+  `CachedAeadKey::seal_in_place` (detached tag, no allocation).
+  `proto-srtp` adds `SrtpProtect::protect_rtp_in_place` (caller-supplied
+  48-bit index). `uc-siprec` adds `parse_rs_answer`, `RsAnswerStream` and
+  `has_recordpref_never`; `build_rs_offer` now adds `a=rtcp-mux` to each
+  stream, and RFC 7865 IDs are version 4 UUIDs. `uc-audit` adds the four
+  events and their enums. `uc-cdr` adds `RecordingTag`. `sbc-media-core`
+  adds the `recording_fork` module, `RecordingForkPorts` and
+  `recording_fork_packets()` / `recording_fork_dropped()`. No new
+  third-party dependencies: `sbc-daemon` now depends directly on
+  `uc-siprec` and `zeroize`, `sbc-media-core` on `socket2`, all already in
+  the workspace. `Cargo.lock` gains no package.
+- **Known limits (tracked under POA&M-300..309).** Only calls whose media
+  the in-process pipeline can read are recorded: cleartext RTP on the
+  opaque relay, or DTLS-SRTP terminated calls. SDES / DTLS passthrough
+  calls, late-offer calls (INVITE without SDP), calls that announce ZRTP
+  and calls on remote media nodes are not recordable and follow
+  `on_failure` (POA&M-301). Early media is not recorded and no RTCP is sent
+  to the recorder (POA&M-301). No metadata update is sent on re-INVITE,
+  hold or the T.38 switch (POA&M-305). No in-band recording indication
+  (`a=record`) is sent to participants; `notice_acknowledged` is the only
+  control (POA&M-303). A recorder that dies silently mid-call is not
+  detected (POA&M-300). The recorder is reached by address lookup of the
+  `srs_uri` host only, with no NAPTR/SRV and no failover to a second
+  recorder (POA&M-304). Recording state is not replicated across the
+  cluster (POA&M-307). A re-INVITE from the recorder gets 488 and an UPDATE
+  405 (POA&M-308). The recorder must accept TLS 1.3 and SDES
+  `AEAD_AES_256_GCM`: one that offers only `AES_CM_128_HMAC_SHA1_80`
+  answers 488 and the call follows `on_failure`. Recording has been tested
+  against an in-tree fake recorder only; no interop run against a real SRS
+  has been done yet.
+
 ### BREAKING (SBC, media gRPC UpdateRelay and SIPREC phase 2 subset)
 - **Media gRPC: one atomic `UpdateRelay` RPC.** The daemon applies a relay
   update (media kind, leg remotes, optional relay start) on a remote

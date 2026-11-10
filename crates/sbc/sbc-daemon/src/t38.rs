@@ -247,17 +247,23 @@ pub const fn reason_policy(reason: SwitchoverReason) -> &'static str {
         SwitchoverReason::RemoteRejected => "t38:remote_rejected",
         SwitchoverReason::RemotePort0 => "t38:remote_port0",
         SwitchoverReason::RelayUpdateFailed => "t38:relay_update_failed",
+        SwitchoverReason::RecordingActive => "t38:recording_active",
     }
 }
 
 /// `Warning` header value for a local 488 (RFC 3261 §20.43). The code
-/// tells the offerer whether to retry: 304 "Media type not available" only
-/// when T.38 is disabled; 305 "Incompatible media format" when image/t38 is
-/// available but the transport, EC mode or leg security is not; 399 for a
-/// malformed T.38 SDP (and, defensively, any reason not raised locally).
+/// tells the offerer whether to retry: 304 "Media type not available" when
+/// the image media type cannot be had at all, either because T.38 is
+/// disabled or because the call is being recorded (the recording fork
+/// carries audio only, so no T.38 parameter set would be accepted); 305
+/// "Incompatible media format" when image/t38 is available but the
+/// transport, EC mode or leg security is not; 399 for a malformed T.38 SDP
+/// (and, defensively, any reason not raised locally).
 pub fn warning_for(reason: SwitchoverReason, host: &str) -> String {
     match reason {
-        SwitchoverReason::T38Disabled => format!("304 {host} \"Media type not available\""),
+        SwitchoverReason::T38Disabled | SwitchoverReason::RecordingActive => {
+            format!("304 {host} \"Media type not available\"")
+        }
         SwitchoverReason::UnsupportedTransport
         | SwitchoverReason::EcNotAllowed
         | SwitchoverReason::SrtpTerminate => {
@@ -669,6 +675,16 @@ mod tests {
             assert!(warning_for(r, "h").starts_with("305 h "), "{r:?}");
         }
         assert!(warning_for(SwitchoverReason::MalformedT38Sdp, "h").starts_with("399 h "));
+        // A recorded call cannot take T.38 at all (the fork is audio only):
+        // the media type is unavailable, not a format mismatch to retry.
+        assert_eq!(
+            warning_for(SwitchoverReason::RecordingActive, "h"),
+            "304 h \"Media type not available\""
+        );
+        assert_eq!(
+            reason_policy(SwitchoverReason::RecordingActive),
+            "t38:recording_active"
+        );
         for r in [
             SwitchoverReason::T38Disabled,
             SwitchoverReason::SrtpTerminate,

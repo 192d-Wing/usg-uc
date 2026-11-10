@@ -98,6 +98,10 @@ fn to_status(err: &MediaPipelineError) -> Status {
         // Rpc shouldn't originate server-side (the pipeline never produces it),
         // but map it to Internal for completeness.
         | E::Rpc(_) => Status::internal(msg),
+        // No recording RPC exists (POA&M-301); mapped for completeness so a
+        // future one reports "cannot record", never success.
+        E::RecordingUnsupported => Status::unimplemented(msg),
+        E::RecordingFork(_) => Status::failed_precondition(msg),
     }
 }
 

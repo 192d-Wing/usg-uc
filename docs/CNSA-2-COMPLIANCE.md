@@ -118,6 +118,16 @@ Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_ver
 - **KDF**: standard **RFC 3711 §4.3 AES-CM KDF** (AES-256-CM PRF), as required for interoperability with every other SRTP stack. An earlier HKDF-SHA384 derivation was removed because it produced non-interoperable session keys (`proto-srtp/src/key.rs`).
 - **Implementation**: `proto-srtp` crate, used by `sbc-media-core` (`srtp_relay.rs`, `media_pipeline.rs`).
 
+### SIPREC recording session (sbc-daemon, sbc-media-core)
+
+Wired since SIPREC phase 3, off by default (`[recording]`). Tested against a fake recorder only; no interoperability run against a real SRS.
+
+- **Signaling to the recorder (SRS)**: `sips:` only. The recorder TLS client is built with `uc_transport::tls::create_client_config_with` over `cnsa_provider()` with `MinTlsVersion::V1_3`, whatever `security.min_tls_version` says (`sbc-daemon/src/server.rs` `wire_recording`). Trust anchors come from `recording.srs_tls_ca_file` only; the server name is always verified. Suites and groups are those of the provider (see SIP/TLS above). A recorder limited to TLS 1.2 cannot be used.
+- **Recorded media**: each forked stream is SRTP `AEAD_AES_256_GCM` (RFC 7714) with its own 256-bit master key and 96-bit salt from the `uc-crypto` CSPRNG, an SBC-chosen SSRC and an SBC-owned packet counter, so a call party cannot force nonce reuse (`sbc-media-core/src/recording_fork.rs`, `proto-srtp` `protect_rtp_in_place`, `uc-crypto` `seal_in_place`).
+- **Key transport**: SDES (`a=crypto:1 AEAD_AES_256_GCM inline:`) inside the recording INVITE. Its confidentiality rests entirely on the TLS 1.3 session to the recorder (RFC 4568 §8.3). No AES-128 or HMAC-SHA1 suite is offered: a recorder that supports only `AES_CM_128_HMAC_SHA1_80` answers 488 (audit reason `srs_not_acceptable_488`) and the call is handled per `recording.on_failure`.
+- **Open (NIST POA&M-304)**: ML-KEM hybrid key exchange is not offered toward the recorder; no RFC 3263 NAPTR / SRV resolution. The recorder certificate type is not restricted to P-384 (same as the other TLS clients).
+- Tests: `recorder_flow_dials_with_the_srs_ca_and_name`, `recorder_flow_rejects_trunk_ca_certificate_and_wrong_name` (`sbc-daemon/src/flows.rs`), `recording_wires_settings_and_the_recorder_tls_profile` (`server.rs`), `offer_is_srtp_with_one_sdes_line_per_stream` (`uc-siprec`), `hostile_endpoint_cannot_force_a_repeated_ssrc_and_index` (`sbc-integration-tests/tests/siprec_fork.rs`), `test_seal_in_place_known_answer` (`uc-crypto/src/aead.rs`), `in_place_equals_allocating_protect` (`proto-srtp/src/protect.rs`). No test asserts the negotiated TLS version, suite or group of the recorder connection itself; that rests on the shared `cnsa_provider()` tests. There is no RFC 7714 packet-level known-answer test in `proto-srtp`.
+
 ### DTLS-SRTP
 
 - **DTLS Version**: **1.2** (RFC 6347). `proto-dtls` implements the DTLS 1.2 record layer only (`proto-dtls/src/record.rs`, `DTLS_1_2_VERSION`). DTLS 1.3 is Planned.
@@ -193,7 +203,7 @@ CNSA 2.0 mandates migration to post-quantum algorithms by 2033:
 Current state of the migration path:
 
 - `uc-crypto` declares a `pqc` feature flag, but it is **empty** (`pqc = []`, no code behind it).
-- SBC TLS (SIP-TLS, trunk TLS, CDR syslog, x5u fetch) offers ML-KEM-1024 first through `uc_transport::tls::cnsa_provider()`. DTLS-SRTP and `uc-crypto` do not use ML-KEM yet.
+- SBC TLS (SIP-TLS, trunk TLS, SIPREC recorder TLS, CDR syslog, x5u fetch) offers ML-KEM-1024 first through `uc_transport::tls::cnsa_provider()`. DTLS-SRTP and `uc-crypto` do not use ML-KEM yet.
 - Key exchange abstractions in `uc-crypto` support algorithm agility (Library-only).
 
 ## Verification

@@ -135,6 +135,35 @@ fn enumerate_interfaces() -> Result<HashMap<String, Vec<IpAddr>>, ConfigError> {
     Ok(map)
 }
 
+/// Upper bound on the addresses [`local_addresses`] returns (SC-5).
+pub const MAX_LOCAL_ADDRESSES: usize = 4096;
+
+/// Every address (IPv4 and IPv6) assigned to a local interface.
+///
+/// Sorted and de-duplicated, at most [`MAX_LOCAL_ADDRESSES`]. One
+/// `getifaddrs` call: meant for a one-time startup probe, not for a
+/// per-message path. Empty when the interfaces cannot be enumerated.
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
+#[must_use]
+pub fn local_addresses() -> Vec<IpAddr> {
+    let Ok(ifaddrs) = nix::ifaddrs::getifaddrs() else {
+        return Vec::new();
+    };
+    let mut out: Vec<IpAddr> = ifaddrs
+        .filter_map(|ifaddr| {
+            let addr = ifaddr.address?;
+            addr.as_sockaddr_in()
+                .map(|a| IpAddr::V4(a.ip()))
+                .or_else(|| addr.as_sockaddr_in6().map(|a| IpAddr::V6(a.ip())))
+        })
+        .take(MAX_LOCAL_ADDRESSES)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Returns a list of all available interface names on the system.
 /// Useful for error messages and diagnostics.
 #[must_use]
@@ -161,6 +190,20 @@ mod tests {
             map.contains_key("lo0") || map.contains_key("lo"),
             "Expected loopback interface, got: {:?}",
             map.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn local_addresses_include_loopback_sorted_and_bounded() {
+        let addrs = local_addresses();
+        assert!(
+            addrs.iter().any(IpAddr::is_loopback),
+            "expected a loopback address, got: {addrs:?}"
+        );
+        assert!(addrs.len() <= MAX_LOCAL_ADDRESSES);
+        assert!(
+            addrs.windows(2).all(|w| w[0] < w[1]),
+            "sorted, no duplicates"
         );
     }
 

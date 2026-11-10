@@ -443,13 +443,15 @@ _`uc-webrtc` is not a dependency of any shipped sbc binary._
 - ✅ Header insertion/deletion policies
 - ✅ Per-trunk header manipulation
 
-**Call Recording & Forking** (RFC 7865/7866) [library-only]
+**Call Recording & Forking** (RFC 7865/7866) [wired in sbc-daemon, off by default, partial]
 
-_`uc-siprec` is not a dependency of any shipped sbc binary._
+_Since SIPREC phase 3 `sbc-daemon` uses `uc-siprec` to record calls as a session recording client. Tested against a fake recorder only; no real SRS interoperability run. Open items: POA&M-300, -301, -303, -304, -305, -307, -308._
 
-- ⚠️ SIPREC support for call recording (`uc-siprec` crate): partial; metadata not RFC 7865 schema, no RFC 7866 SRC signalling (POA&M-206)
-- ✅ Media forking to recording server
-- ⚠️ Metadata generation for recordings: does not follow the RFC 7865 schema, values unescaped (POA&M-206)
+- ⚠️ SIPREC session recording client (`[recording]`): partial; answered two-party audio calls whose media the SBC can read (cleartext RTP, or DTLS-SRTP it terminates); `sips:` / TLS 1.3 to the recorder only
+- ⚠️ Media forking to the recording server: partial; in-process relay only, send-only SRTP `AEAD_AES_256_GCM`, no RTCP, not on remote media nodes, not for SDES / DTLS passthrough or early media (POA&M-301)
+- ⚠️ Metadata generation for recordings: RFC 7865 complete snapshot in the recording INVITE, values escaped; no updates on re-INVITE / hold / T.38 (POA&M-305)
+- ❌ Recording indication to participants (`a=record`) (POA&M-303)
+- ❌ Recorder-initiated requests, pause / resume, snapshot requests (POA&M-308); recording-session failover (POA&M-307); recorder liveness detection (POA&M-300)
 
 **QoS & Traffic Management** [library-only]
 
@@ -1812,8 +1814,8 @@ not the per-packet crypto state). This item is the heavier tier above that.
 | RFC 6665 | SIP Events | ✅ Enhanced (event package validation) | library |
 | RFC 7092 | B2BUA Taxonomy | ✅ Implemented | sbc-daemon |
 | RFC 7675 | STUN Consent | ✅ Enhanced (consent revocation) | library |
-| RFC 7865 | SIPREC Metadata | ⚠️ Partial (metadata XML does not follow the RFC 7865 schema; POA&M-206) | library |
-| RFC 7866 | SIPREC Protocol | ⚠️ Partial (no SRC signalling; POA&M-206) | library |
+| RFC 7865 | SIPREC Metadata | ⚠️ Partial (complete snapshot in the recording INVITE; no updates, POA&M-305) | sbc-daemon (off by default) |
+| RFC 7866 | SIPREC Protocol | ⚠️ Partial (SRC for two-party audio; no RTCP, no `a=record`, no SRS-initiated requests; POA&M-300..308) | sbc-daemon, sbc-media-core (off by default) |
 | RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) | soft client (checks + nomination); consent/keepalives library |
 | RFC 8224 | STIR | ✅ Implemented (ES384) | library (no shipped consumer of proto-stir-shaken) |
 | RFC 8225 | PASSporT | ✅ Implemented (ES384) | library (no shipped consumer of proto-stir-shaken) |

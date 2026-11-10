@@ -479,27 +479,67 @@ fuzzing, RFC 4475 tests) is in PR #167. Remaining:
   Annex D negotiation, `sip.fax`, HA, reload; still open). CDR fax flag
   (schema v3 `media_kinds`) and gRPC `SetMediaKind` (fail closed against older
   media nodes) done in SIPREC phase 1; POA&M-294 itself is not closed.
-- [ ] **MAJOR, DORMANT — SIPREC metadata doesn't follow the RFC 7865 schema**,
-  no RFC 7866 SRC signalling, and display names/AORs are written into the XML
-  unescaped (injection into recorder evidence) (`uc-siprec/src/metadata.rs:474-532`).
-  *Phase 1 done (library-only, crate still has no caller):* RFC 7865 serializer
-  `to_rfc7865_xml` (replaces `to_xml`) with XML escaping, rejection of
-  XML-illegal code points and size caps (`uc-siprec/src/xml.rs`, `metadata.rs`);
-  RFC 7866 RS-offer body builder `build_rs_offer` + `SrcHeaders`
-  (`src_request.rs`). Open: SBC wiring and the rest of RFC 7865/7866,
-  deferred to POA&M-300..309 (RS origination, forking, config, recording
-  indication, SRS TLS/SRTP, stable IDs/updates, audit/CDR, cluster,
-  SRS-initiated requests, scaffolding review). No XSD validation in CI.
-  *Phase 2 subset done (2026-11-08):* scaffolding `forking.rs`, `session.rs`,
-  `config.rs` deleted (POA&M-309 closed); RS offer is SRTP-only with SDES
-  `AEAD_AES_256_GCM` (`SdesKey`, POA&M-304 offer side); `sbc-config`
-  `[recording]` schema and validation, default off, restart-required, and
-  `enabled = true` rejected until the SRC lands (POA&M-302, config-only).
-  SDES is library-only (no caller). proto-sdp `Display` now emits CRLF.
-  Still open: RS origination/teardown in sbc-daemon (POA&M-300), media fork
-  (301, incl. the `a=rtcp-mux` decision),
-  recording indication (303), TLS client to the SRS (304), snapshots (305),
-  audit/CDR/metrics (306), cluster (307), SRS-initiated requests (308).
+- [ ] **MAJOR — SIPREC (RFC 7865 / RFC 7866): live as a subset, remainder
+  open under POA&M-300..308.** Original finding (metadata not RFC 7865, no SRC
+  signalling, unescaped display names / AORs in the XML): fixed in phases 1-3.
+  *Phase 1 (library):* RFC 7865 serializer `to_rfc7865_xml` with XML escaping,
+  rejection of XML-illegal code points and size caps (`uc-siprec/src/xml.rs`,
+  `metadata.rs`); RS-offer body builder `build_rs_offer` + `SrcHeaders`
+  (`src_request.rs`).
+  *Phase 2 subset (2026-11-08):* scaffolding `forking.rs`, `session.rs`,
+  `config.rs` deleted (POA&M-309 closed); RS offer SRTP-only with SDES
+  `AEAD_AES_256_GCM` (`SdesKey`); `sbc-config` `[recording]` schema.
+  *Phase 3 (2026-11-09), wired in sbc-daemon, off by default:* the SBC records
+  answered two-party audio calls as an SRC on the in-process media relay
+  (opaque cleartext RTP, or DTLS-SRTP the SBC terminates). RS INVITE to a
+  `sips:` SRS over TLS 1.3 with its own CA and a pinned address; both legs
+  forked as send-only SRTP with per-stream keys; RS BYE on every call-end
+  path; `on_failure` policy, default `reject` (refusal with 488 / 503 before
+  the call connects where possible, BYE held until the ACK otherwise;
+  emergency calls exempt); `recordpref_never` policy, default `ignore`;
+  `max_sessions` enforced; audit events `recording_started / stopped /
+  failed / skipped`; CDR schema v4 `recording` and `recording_session_id`;
+  `sbc_recording_*` metrics (`sbc-daemon/src/recording.rs`,
+  `sip_stack/recording_session.rs`, `sbc-media-core/src/recording_fork.rs`,
+  `uc-siprec/src/rs_answer.rs`). Tested against a fake SRS only: no real SRS
+  interop run, and no single-process TLS + SIP + media run. No XSD validation
+  in CI.
+  Status by POA&M ID:
+  - **POA&M-300, open (narrowed).** Delivered: RS origination, response /
+    timeout handling, teardown. Open: RS liveness (a recorder that dies
+    silently mid-call is not detected); no per-session fork packet counts
+    behind CDR `recorded` / `recording_stopped`; RS BYEs at shutdown (and
+    under a full wind-down queue or recorder lane) are best effort.
+  - **POA&M-301, open (narrowed).** Delivered: in-process fork, `a=rtcp-mux`
+    offered, `max_sessions` enforced. Open: remote gRPC media nodes (control
+    channel is plaintext, so no fork RPC; the daemon refuses to start with
+    recording and remote media URLs); no RTCP on the RS; SDES / DTLS
+    passthrough legs not recordable; early media not recorded; fork SSRC
+    continuity when the call party changes SSRC; the SRS may name a
+    third-host media address (accepted risk).
+  - **POA&M-302, closed.** `enabled = true` accepted; `on_failure` default
+    `reject`; `srs_zone`; three load-time warnings; startup refusals.
+  - **POA&M-303, open.** No `a=record` indication to participants;
+    `notice_acknowledged` is the only control. `recordpref` policy is wired
+    (default `ignore`).
+  - **POA&M-304, open (narrowed).** Delivered: TLS 1.3 client to the SRS with
+    certificate and name validation; AES-256-GCM fork contexts. Open: RFC 3263
+    NAPTR / SRV for the SRS; ML-KEM hybrid key exchange.
+  - **POA&M-305, open.** No metadata update on re-INVITE, hold or T.38
+    switch; IDs not stable across serializations. Interim: a T.38 switch on a
+    recorded call gets 488 + Warning 304 under `reject` and ends the RS under
+    `continue`.
+  - **POA&M-306, closed.** Audit events, CDR v4 fields, metrics.
+  - **POA&M-307, open.** RS state is node-local, not replicated.
+  - **POA&M-308, open.** SRS re-INVITE gets 488, UPDATE 405; a metadata
+    snapshot request is not served; SRS answer with `a=inactive` refused.
+  - **POA&M-309, closed** (phase 2).
+  Other follow-ups from the phase 3 reviews (no POA&M ID): no bench for the
+  fork / `protect_rtp_in_place` hot path (PERF-005); no RFC 7714 packet-level
+  known-answer test in proto-srtp; 2xx Contact not checked for `+sip.srs`
+  (RFC-012); a released pending RS INVITE is not CANCELled on a late 1xx
+  (RFC-014); the direct-T.38 teardown still sends the caller's BYE right
+  after the 200 (RFC 3261 §15; not a recording path).
 - [x] **PERF-001 / SEC-1 (#200 gate) — remote T.38 relay update took up to 3
   RPCs.** Replaced by one atomic `UpdateRelay` RPC (`media_controller.proto`);
   an old node answering UNIMPLEMENTED fails T.38 closed. The initial image

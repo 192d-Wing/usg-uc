@@ -50,6 +50,26 @@ pub struct LegFlow {
     ///
     /// ## NIST 800-53 Rev5: IA-3
     pub client_cert: bool,
+    /// The SIPREC recorder (SRS) flow: dialled with the recorder TLS client
+    /// profile (trust anchors from `recording.srs_tls_ca_file` only, TLS
+    /// 1.3) and keyed apart from every trunk flow, so the connection that
+    /// carries SDES keys is never shared with a trunk at the same address.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-12, SC-23
+    pub recorder: bool,
+}
+
+/// TLS client profile of a stream connection, part of its flow-table key.
+///
+/// ## NIST 800-53 Rev5: IA-3, SC-23 (authenticated sessions are not shared)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FlowProfile {
+    /// Accepted connections, TCP, and TLS trunks without a client certificate.
+    Plain,
+    /// TLS trunk with the SBC client certificate (`tls_client_cert`).
+    ClientCert,
+    /// The SIPREC recorder (`[recording]`), verified against the SRS CA.
+    Recorder,
 }
 
 impl LegFlow {
@@ -58,6 +78,7 @@ impl LegFlow {
         transport: AddrTransport::Udp,
         dial: None,
         client_cert: false,
+        recorder: false,
     };
 
     /// The flow of a message that arrived on `transport`: replies and
@@ -67,6 +88,32 @@ impl LegFlow {
             transport,
             dial: None,
             client_cert: false,
+            recorder: false,
+        }
+    }
+
+    /// The flow toward the SIPREC recorder: TLS only, dialled on demand and
+    /// verified against `tls_name` with the recorder profile. There is no
+    /// TCP or UDP form (RFC 4568 §8.3: SDES keys need a secured channel).
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-23; RFC 7866 §12
+    pub fn recorder(tls_name: &Arc<str>) -> Self {
+        Self {
+            transport: AddrTransport::Tls,
+            dial: Some(Arc::clone(tls_name)),
+            client_cert: false,
+            recorder: true,
+        }
+    }
+
+    /// The TLS client profile this flow's connection is keyed by.
+    pub const fn profile(&self) -> FlowProfile {
+        if self.recorder {
+            FlowProfile::Recorder
+        } else if self.client_cert {
+            FlowProfile::ClientCert
+        } else {
+            FlowProfile::Plain
         }
     }
 
@@ -86,11 +133,13 @@ impl LegFlow {
                 transport: AddrTransport::Tcp,
                 dial: Some(Arc::clone(tls_name)),
                 client_cert: false,
+                recorder: false,
             },
             TrunkProtocol::Tls => Self {
                 transport: AddrTransport::Tls,
                 dial: Some(Arc::clone(tls_name)),
                 client_cert,
+                recorder: false,
             },
         }
     }
@@ -179,6 +228,23 @@ mod tests {
         let tls = LegFlow::trunk(TrunkProtocol::Tls, "sip.example.net", false);
         assert_eq!(tls.transport, AddrTransport::Tls);
         assert_eq!(tls.dial.as_deref(), Some("sip.example.net"));
+    }
+
+    // NIST 800-53 Rev5: SC-23 - the recorder flow is TLS, dialled, and has
+    // its own profile, distinct from a trunk flow to the same name.
+    #[test]
+    fn recorder_flow_is_tls_with_its_own_profile() {
+        let name: Arc<str> = Arc::from("srs.example.test");
+        let rec = LegFlow::recorder(&name);
+        assert_eq!(rec.transport, AddrTransport::Tls);
+        assert_eq!(rec.dial.as_deref(), Some("srs.example.test"));
+        assert_eq!(rec.profile(), FlowProfile::Recorder);
+        assert_eq!(rec.via_token(), "TLS");
+        let trunk = LegFlow::trunk(TrunkProtocol::Tls, "srs.example.test", false);
+        assert_eq!(trunk.profile(), FlowProfile::Plain);
+        assert_ne!(rec, trunk);
+        let mtls = LegFlow::trunk(TrunkProtocol::Tls, "srs.example.test", true);
+        assert_eq!(mtls.profile(), FlowProfile::ClientCert);
     }
 
     #[test]

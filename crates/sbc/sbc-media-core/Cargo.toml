@@ -35,6 +35,8 @@ thiserror.workspace = true
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 # SSRC / test-key generation.
 rand = "0.8"
+# SO_RCVBUF on the never-read recording fork sockets (SC-5).
+socket2.workspace = true
 
 # gRPC dependencies (optional; enabled by the `grpc` feature).
 sbc-grpc-api = { workspace = true, optional = true }

@@ -23,7 +23,7 @@
 //!
 //! ## RFC 3261 §18.1.1, §18.2.2, §26.2; RFC 3263 §4.3
 
-use crate::flow::LegFlow;
+use crate::flow::{FlowProfile, LegFlow};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -67,11 +67,11 @@ pub const DEFAULT_MAX_EGRESS_CONNECTIONS: usize = 1024;
 
 /// Key of one live stream connection: transport, remote address and, for an
 /// egress connection, the configured trunk name it was verified against and
-/// whether the SBC client certificate was presented. The client-cert flag is
-/// part of the key so an mTLS and a plain flow to the same host:port/name
-/// never share a connection.
+/// the TLS client profile it was dialled with. The profile is part of the
+/// key so an mTLS flow, a plain flow and the SIPREC recorder flow to the
+/// same host:port/name never share a connection.
 // NIST 800-53 Rev5: IA-3, SC-23 (authenticated sessions are not shared)
-pub type FlowKey = (AddrTransport, SbcSocketAddr, Option<Arc<str>>, bool);
+pub type FlowKey = (AddrTransport, SbcSocketAddr, Option<Arc<str>>, FlowProfile);
 
 /// Spawns the reader task for a dialled connection. Set by the server so
 /// trunk responses enter the SIP stack like any received message.
@@ -211,6 +211,8 @@ pub struct FlowTable {
     default_udp: OnceLock<Arc<UdpTransport>>,
     tls_client: OnceLock<Arc<rustls::ClientConfig>>,
     tls_client_mtls: OnceLock<Arc<rustls::ClientConfig>>,
+    /// Client config for the SIPREC recorder (SRS CA only, TLS 1.3).
+    tls_client_recorder: OnceLock<Arc<rustls::ClientConfig>>,
     reader: OnceLock<ReaderSpawner>,
     conns: RwLock<HashMap<FlowKey, Arc<dyn Transport>>>,
     pending: Mutex<HashMap<FlowKey, PendingConnect>>,
@@ -242,6 +244,7 @@ impl FlowTable {
             default_udp: OnceLock::new(),
             tls_client: OnceLock::new(),
             tls_client_mtls: OnceLock::new(),
+            tls_client_recorder: OnceLock::new(),
             reader: OnceLock::new(),
             conns: RwLock::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
@@ -287,6 +290,25 @@ impl FlowTable {
         }
     }
 
+    /// Sets the TLS client config of the SIPREC recorder flow: trust anchors
+    /// from `recording.srs_tls_ca_file` only. First call wins. Without it a
+    /// recorder flow fails closed ([`FlowError::NoTlsClient`]); it never
+    /// falls back to the trunk client configs.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-12, SC-23
+    pub fn set_recorder_tls_client(&self, cfg: Arc<rustls::ClientConfig>) {
+        let _ = self.tls_client_recorder.set(cfg);
+    }
+
+    /// True when the last dial of `flow` to `dest` failed in the TLS
+    /// handshake (certificate or name verification included) and is still
+    /// inside its backoff window. Lets the caller tell a TLS failure from an
+    /// unreachable peer after a failed send.
+    pub fn dial_failed_in_handshake(&self, flow: &LegFlow, dest: &SbcSocketAddr) -> bool {
+        let key: FlowKey = (flow.transport, *dest, flow.dial.clone(), flow.profile());
+        matches!(self.recent_failure(&key), Some(FlowError::Handshake(_)))
+    }
+
     /// Sets the reader spawner for dialled connections. First call wins.
     pub fn set_reader(&self, spawner: ReaderSpawner) {
         let _ = self.reader.set(spawner);
@@ -300,7 +322,7 @@ impl FlowTable {
         conn: Arc<dyn Transport>,
     ) {
         if let Ok(mut c) = self.conns.write() {
-            c.insert((transport, peer, None, false), conn);
+            c.insert((transport, peer, None, FlowProfile::Plain), conn);
         }
     }
 
@@ -352,7 +374,7 @@ impl FlowTable {
                 .await
                 .map_err(|e| FlowError::Send(e.to_string()));
         }
-        let key: FlowKey = (flow.transport, *dest, flow.dial.clone(), flow.client_cert);
+        let key: FlowKey = (flow.transport, *dest, flow.dial.clone(), flow.profile());
         let conn = match &flow.dial {
             None => self.lookup(&key).ok_or_else(|| {
                 self.stats
@@ -593,7 +615,7 @@ impl FlowTable {
     }
 
     async fn dial(&self, key: FlowKey) -> ConnectResult {
-        let (transport, dest, Some(name), client_cert) = key.clone() else {
+        let (transport, dest, Some(name), profile) = key.clone() else {
             return Err(FlowError::NoConnection);
         };
         if let Some(c) = self.lookup(&key) {
@@ -620,10 +642,12 @@ impl FlowTable {
         let connected = tokio::time::timeout(EGRESS_CONNECT_TIMEOUT, async {
             match transport {
                 AddrTransport::Tls => {
-                    let cfg = if client_cert {
-                        self.tls_client_mtls.get()
-                    } else {
-                        self.tls_client.get()
+                    // NIST 800-53 Rev5: SC-23 - one client config per
+                    // profile; a missing one fails closed, never another's.
+                    let cfg = match profile {
+                        FlowProfile::Plain => self.tls_client.get(),
+                        FlowProfile::ClientCert => self.tls_client_mtls.get(),
+                        FlowProfile::Recorder => self.tls_client_recorder.get(),
                     }
                     .ok_or(FlowError::NoTlsClient)?;
                     TlsTransport::connect(dest, &name, Arc::clone(cfg))
@@ -763,12 +787,7 @@ mod tests {
         // Second send reuses the cached connection.
         assert!(
             table
-                .lookup(&(
-                    AddrTransport::Tls,
-                    dest,
-                    flow.dial.clone(),
-                    flow.client_cert
-                ))
+                .lookup(&(AddrTransport::Tls, dest, flow.dial.clone(), flow.profile()))
                 .is_some()
         );
     }
@@ -855,7 +874,7 @@ mod tests {
         let flow = LegFlow::inbound(AddrTransport::Tcp);
         table.send(&flow, &peer, b"408", None).await.unwrap();
         assert_eq!(&client.recv().await.unwrap().data[..], b"408");
-        table.remove(&(AddrTransport::Tcp, peer, None, false), &conn);
+        table.remove(&(AddrTransport::Tcp, peer, None, FlowProfile::Plain), &conn);
         assert_eq!(
             table.send(&flow, &peer, b"x", None).await.unwrap_err(),
             FlowError::NoConnection
@@ -1111,6 +1130,192 @@ mod tests {
         assert_eq!(table.stats.egress_connections.load(Ordering::Relaxed), 0);
     }
 
+    // ------------------------------------------------------------------
+    // SIPREC recorder profile (POA&M-304): its own trust anchors and key.
+    // ------------------------------------------------------------------
+
+    /// A TLS listener that forwards every received chunk (or the error that
+    /// ended a connection) to the returned channel.
+    async fn echo_listener(
+        p: &TestPki,
+    ) -> (
+        SbcSocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
+    ) {
+        let listener = tls_listener(p).await;
+        let dest = *listener.local_addr();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((c, _)) => {
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                let r = c.recv().await.map(|m| m.data.to_vec());
+                                let done = r.is_err();
+                                let _ = tx.send(r.map_err(|e| e.to_string()));
+                                if done {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("accept: {e}")));
+                    }
+                }
+            }
+        });
+        (dest, rx)
+    }
+
+    // NIST 800-53 Rev5: SC-8, SC-23 - the recorder flow dials with the SRS
+    // CA and the configured name, and the bytes arrive over TLS.
+    #[tokio::test]
+    async fn recorder_flow_dials_with_the_srs_ca_and_name() {
+        let srs = pki(&["srs.example.test"]);
+        let trunk_ca = pki(&["trunk.example.test"]);
+        let (dest, mut rx) = echo_listener(&srs).await;
+        let table = FlowTable::new(4);
+        // The trunk configs trust another CA: only the recorder profile can
+        // verify this peer.
+        table.set_tls_clients(client(trunk_ca.ca), None);
+        table.set_recorder_tls_client(client(srs.ca));
+        let name: Arc<str> = Arc::from("srs.example.test");
+        let flow = LegFlow::recorder(&name);
+        table.send(&flow, &dest, b"INVITE", None).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.unwrap(), b"INVITE".to_vec());
+        assert!(
+            table
+                .lookup(&(
+                    AddrTransport::Tls,
+                    dest,
+                    flow.dial.clone(),
+                    FlowProfile::Recorder
+                ))
+                .is_some()
+        );
+        assert!(!table.dial_failed_in_handshake(&flow, &dest));
+    }
+
+    // NIST 800-53 Rev5: SC-8, SC-23 - a recorder whose certificate chains
+    // only to the trunk CA, or does not carry the configured name, is
+    // refused; nothing falls back to UDP or to the trunk client config.
+    #[tokio::test]
+    async fn recorder_flow_rejects_trunk_ca_certificate_and_wrong_name() {
+        let srs_ca = pki(&["srs.example.test"]);
+        let trunk_ca = pki(&["srs.example.test"]);
+        let (sbc_udp, watcher) = udp_pair().await;
+        for (cert, name) in [
+            // Certificate issued by the trunk CA, not the SRS CA.
+            (&trunk_ca, "srs.example.test"),
+            // Right CA, wrong name.
+            (&srs_ca, "other.example.test"),
+        ] {
+            let listener = tls_listener(cert).await;
+            let dest = *listener.local_addr();
+            tokio::spawn(async move {
+                let _ = listener.accept().await;
+            });
+            let table = FlowTable::new(4);
+            table.set_default_udp(Arc::clone(&sbc_udp));
+            table.set_tls_clients(client(trunk_ca.ca.clone()), None);
+            table.set_recorder_tls_client(client(srs_ca.ca.clone()));
+            let name: Arc<str> = Arc::from(name);
+            let flow = LegFlow::recorder(&name);
+            let err = table
+                .send(&flow, &dest, b"INVITE", Some(&sbc_udp))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, FlowError::Handshake(_)), "{err:?}");
+            assert!(
+                table.dial_failed_in_handshake(&flow, &dest),
+                "a TLS failure is told apart from an unreachable recorder"
+            );
+            assert_eq!(table.stats.egress_connections.load(Ordering::Relaxed), 0);
+        }
+        let none =
+            tokio::time::timeout(std::time::Duration::from_millis(100), watcher.recv()).await;
+        assert!(none.is_err(), "no UDP datagram for a recorder flow");
+    }
+
+    // Without the recorder client config the flow fails closed; the trunk
+    // client configs are never used for it.
+    #[tokio::test]
+    async fn recorder_flow_without_recorder_config_fails_closed() {
+        let p = pki(&["srs.example.test"]);
+        let table = FlowTable::new(4);
+        table.set_tls_clients(client(p.ca.clone()), Some(mtls_client(p.ca.clone(), &p)));
+        let name: Arc<str> = Arc::from("srs.example.test");
+        let dest = SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 9);
+        assert_eq!(
+            table
+                .send(&LegFlow::recorder(&name), &dest, b"x", None)
+                .await
+                .unwrap_err(),
+            FlowError::NoTlsClient
+        );
+        assert_eq!(table.stats.egress_connections.load(Ordering::Relaxed), 0);
+    }
+
+    // NIST 800-53 Rev5: SC-23 - a trunk flow and the recorder flow to the
+    // same address and name never share a connection: the second dial opens
+    // its own, so RS traffic (SDES keys) cannot ride a trunk connection.
+    #[tokio::test]
+    async fn recorder_and_trunk_flows_to_same_address_do_not_share_a_connection() {
+        let p = pki(&["srs.example.test"]);
+        let (dest, mut rx) = echo_listener(&p).await;
+        let table = FlowTable::new(4);
+        table.set_tls_clients(client(p.ca.clone()), None);
+        table.set_recorder_tls_client(client(p.ca.clone()));
+        let wait = std::time::Duration::from_secs(5);
+
+        let trunk = LegFlow::trunk(TrunkProtocol::Tls, "srs.example.test", false);
+        table.send(&trunk, &dest, b"TRUNK", None).await.unwrap();
+        let got = tokio::time::timeout(wait, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.unwrap(), b"TRUNK".to_vec());
+        assert_eq!(table.stats.egress_connections.load(Ordering::Relaxed), 1);
+
+        let name: Arc<str> = Arc::from("srs.example.test");
+        let rec = LegFlow::recorder(&name);
+        table.send(&rec, &dest, b"RS", None).await.unwrap();
+        let got = tokio::time::timeout(wait, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.unwrap(), b"RS".to_vec());
+        assert_eq!(
+            table.stats.egress_connections.load(Ordering::Relaxed),
+            2,
+            "the recorder flow dialled its own connection"
+        );
+        let trunk_conn = table
+            .lookup(&(
+                AddrTransport::Tls,
+                dest,
+                trunk.dial.clone(),
+                FlowProfile::Plain,
+            ))
+            .unwrap();
+        let rec_conn = table
+            .lookup(&(
+                AddrTransport::Tls,
+                dest,
+                rec.dial.clone(),
+                FlowProfile::Recorder,
+            ))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&trunk_conn, &rec_conn));
+    }
+
     // User decision (f): an IP-literal trunk is verified against an IP SAN.
     #[tokio::test]
     async fn ip_literal_trunk_verified_against_ip_san() {
@@ -1188,7 +1393,7 @@ mod tests {
             FlowError::EgressLimit
         );
         // Removing with a stale handle leaves the live entry and count alone.
-        let key_a: FlowKey = (AddrTransport::Tcp, a, flow.dial.clone(), flow.client_cert);
+        let key_a: FlowKey = (AddrTransport::Tcp, a, flow.dial.clone(), flow.profile());
         let stale: Arc<dyn Transport> = Arc::new(TcpTransport::connect(a).await.unwrap());
         table.remove(&key_a, &stale);
         assert_eq!(table.stats.egress_connections.load(Ordering::Relaxed), 1);
@@ -1271,12 +1476,7 @@ mod tests {
         assert_eq!(table.stats.egress_connections.load(Ordering::Relaxed), 0);
         assert!(
             table
-                .lookup(&(
-                    AddrTransport::Tls,
-                    dest,
-                    flow.dial.clone(),
-                    flow.client_cert
-                ))
+                .lookup(&(AddrTransport::Tls, dest, flow.dial.clone(), flow.profile()))
                 .is_none()
         );
 
@@ -1305,12 +1505,7 @@ mod tests {
         let table = FlowTable::new(4);
         let flow = LegFlow::trunk(TrunkProtocol::Tcp, "trunk", false);
         table.send(&flow, &dest, b"x", None).await.unwrap();
-        let key: FlowKey = (
-            AddrTransport::Tcp,
-            dest,
-            flow.dial.clone(),
-            flow.client_cert,
-        );
+        let key: FlowKey = (AddrTransport::Tcp, dest, flow.dial.clone(), flow.profile());
         // Simulate the connection dying under us.
         table.lookup(&key).unwrap().close().await.unwrap();
         assert!(matches!(
@@ -1400,7 +1595,12 @@ mod tests {
             .with_timeouts(std::time::Duration::from_millis(200), DIAL_FAILURE_BACKOFF);
         let flow = LegFlow::trunk(TrunkProtocol::Tcp, "trunk", false);
         table.send(&flow, &dest, b"INVITE", None).await.unwrap();
-        let key: FlowKey = (AddrTransport::Tcp, dest, flow.dial.clone(), false);
+        let key: FlowKey = (
+            AddrTransport::Tcp,
+            dest,
+            flow.dial.clone(),
+            FlowProfile::Plain,
+        );
         let conn = table.lookup(&key).unwrap();
         fill_window(&conn, &dest).await;
 

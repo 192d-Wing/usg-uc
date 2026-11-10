@@ -44,18 +44,21 @@
 //! - **AU-4**: Audit Storage Capacity (recording storage)
 //! - **AU-9**: Protection of Audit Information
 //! - **SC-8**: Transmission Confidentiality and Integrity (POA&M-304)
-//! - **SI-10 / SI-15**: metadata escaping, rejection and caps (`xml`, `metadata`)
+//! - **SI-10 / SI-15**: metadata escaping, rejection and caps (`xml`, `metadata`);
+//!   SRS answer validation (`rs_answer`)
 //!
 //! ## Scope
 //!
-//! Library-level conformance: the RFC 7865 serializer and a pure RFC 7866
-//! RS INVITE body builder whose SDP offer is SRTP-only (SDES
-//! `AEAD_AES_256_GCM`, RFC 4568 / RFC 7714). The unwired scaffolding
+//! This crate is the library half of the SRC: the RFC 7865 serializer, a pure
+//! RFC 7866 RS INVITE body builder whose SDP offer is SRTP-only (SDES
+//! `AEAD_AES_256_GCM`, RFC 4568 / RFC 7714) and the RS answer validator.
+//! `sbc-daemon` originates the recording session and forks media with it
+//! (POA&M-300 origination, -302 and -306 closed). The unwired scaffolding
 //! (`forking`, `session`, `config`) was removed (POA&M-309, CM-7); the SBC
 //! schema for recording lives in `sbc-config` (`[recording]`).
-//! POA&M-300, -301, -303..-308 track the SRC wiring, media forking, recording
-//! indication, SRS transport, snapshots, audit/CDR, cluster and inbound SRS
-//! requests.
+//! Still open: POA&M-300 (RS liveness), -301 (remote media nodes, RTCP),
+//! -303 (recording indication), -304 (NAPTR/SRV, ML-KEM), -305 (metadata
+//! updates), -307 (cluster) and -308 (inbound SRS requests).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -65,6 +68,7 @@
 
 pub mod error;
 pub mod metadata;
+pub mod rs_answer;
 pub mod src_request;
 pub mod xml;
 
@@ -72,6 +76,7 @@ pub use error::{SiprecError, SiprecResult};
 pub use metadata::{
     MediaStream, Participant, ParticipantRole, RecordingMetadata, SessionMetadata, StreamDirection,
 };
+pub use rs_answer::{RsAnswerStream, has_recordpref_never, parse_rs_answer};
 pub use src_request::{RsInviteParts, SdesKey, SrcHeaders, build_rs_offer};
 
 #[cfg(test)]

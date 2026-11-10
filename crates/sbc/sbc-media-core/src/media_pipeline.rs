@@ -18,6 +18,10 @@ use proto_rtp::{RtpHeader, RtpPacket, SequenceTracker};
 
 use crate::dtls_relay::{EstablishedLeg, establish_srtp_leg};
 use crate::dtls_sidecar::{Role, SidecarReader, SidecarWriter};
+use crate::recording_fork::{ForkStream, ForkTap, SessionFork, fork_changed};
+pub use crate::recording_fork::{
+    RecordingForkPorts, recording_fork_dropped, recording_fork_packets,
+};
 use crate::srtp_relay::{TerminateRelayLeg, forward_dtls_to_sidecar, pump_sidecar_dtls_to_peer};
 use proto_srtp::{
     SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile, SrtpProtect, SrtpUnprotect,
@@ -72,6 +76,40 @@ pub struct MediaPipelineConfig {
     /// media IP; a standalone `sbc-media` node sets it (e.g. from
     /// `SBC_MEDIA_ADVERTISED_IP`).
     pub advertised_media_ip: Option<std::net::IpAddr>,
+    /// Whether calls on this pipeline may be forked to a SIPREC recorder
+    /// (RFC 7866). [`RecordingMode::Disabled`] (the default): no fork tap is
+    /// created for any relay, and the `*_recording_fork` calls return
+    /// [`MediaPipelineError::RecordingUnsupported`].
+    // NIST 800-53 Rev5: CM-7 (least functionality: off unless configured)
+    pub recording: RecordingMode,
+}
+
+/// Whether a [`MediaPipeline`] can fork media to a SIPREC recorder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecordingMode {
+    /// No fork exists: relay tasks are started without a tap.
+    #[default]
+    Disabled,
+    /// Relay tasks carry an idle tap that a recorded call can activate.
+    Enabled,
+}
+
+impl RecordingMode {
+    /// `Enabled` when `enabled` is true (for callers holding a config flag).
+    #[must_use]
+    pub const fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    /// Whether the fork is available.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
 }
 
 impl Default for MediaPipelineConfig {
@@ -93,6 +131,7 @@ impl Default for MediaPipelineConfig {
             dtls_fingerprint: None,
             media_failure_tx: None,
             advertised_media_ip: None,
+            recording: RecordingMode::Disabled,
         }
     }
 }
@@ -261,6 +300,10 @@ struct MediaSessionContext {
     /// `start_relay_terminate` ran for this session: media on both legs is
     /// DTLS-SRTP terminated and cannot carry UDPTL.
     terminated: bool,
+    /// SIPREC fork control for this session. `None` unless the pipeline has
+    /// recording enabled; then present from session creation so the relay
+    /// tasks can be given their taps whenever they start.
+    recording: Option<SessionFork>,
 }
 
 /// What a call's anchored stream carries. Used for metrics attribution; the
@@ -274,7 +317,7 @@ pub enum MediaKind {
 }
 
 impl MediaKind {
-    const fn as_u8(self) -> u8 {
+    pub(crate) const fn as_u8(self) -> u8 {
         match self {
             Self::Audio => 0,
             Self::Image => 1,
@@ -462,6 +505,48 @@ pub trait MediaController: Send + Sync {
         self.update_relay(call_id, remotes, kind).await?;
         self.start_relay(call_id).await
     }
+
+    /// Binds the two send-only fork sockets for a recorded call and installs
+    /// one SRTP master key per stream (`keys[0]`: the caller's sent media,
+    /// `keys[1]`: the callee's). Nothing is sent until
+    /// [`MediaController::activate_recording_fork`]. Returns the local ports
+    /// for the recording session SDP (RFC 7866 §7.1.1).
+    ///
+    /// Default: [`MediaPipelineError::RecordingUnsupported`]. Only the
+    /// in-process [`MediaPipeline`] implements the fork; a controller that
+    /// cannot record must say so, so the caller's failure policy runs.
+    // NIST 800-53 Rev5: SC-24 (fail to a known state), AU-14
+    // POAM: POA&M-301 - no fork on remote gRPC media nodes: the media control
+    // channel is not authenticated or encrypted, and this call carries keys.
+    async fn prepare_recording_fork(
+        &self,
+        _call_id: &str,
+        _keys: [SrtpKeyMaterial; 2],
+        _bind_ip: Option<std::net::IpAddr>,
+    ) -> Result<RecordingForkPorts, MediaPipelineError> {
+        Err(MediaPipelineError::RecordingUnsupported)
+    }
+
+    /// Starts forking a prepared call to the recorder's media addresses
+    /// (`remotes[0]` receives the caller's stream, `remotes[1]` the
+    /// callee's). On error the fork is torn down completely.
+    ///
+    /// Default: [`MediaPipelineError::RecordingUnsupported`].
+    async fn activate_recording_fork(
+        &self,
+        _call_id: &str,
+        _remotes: [std::net::SocketAddr; 2],
+    ) -> Result<(), MediaPipelineError> {
+        Err(MediaPipelineError::RecordingUnsupported)
+    }
+
+    /// Stops a call's fork, drops its keys and releases its ports.
+    /// Idempotent; also implied by `stop_relay` and `remove_session`.
+    ///
+    /// Default: [`MediaPipelineError::RecordingUnsupported`].
+    async fn stop_recording_fork(&self, _call_id: &str) -> Result<(), MediaPipelineError> {
+        Err(MediaPipelineError::RecordingUnsupported)
+    }
 }
 
 #[async_trait::async_trait]
@@ -535,6 +620,27 @@ impl MediaController for MediaPipeline {
         kind: Option<MediaKind>,
     ) -> Result<(), MediaPipelineError> {
         Self::update_and_start_relay(self, call_id, remotes, kind).await
+    }
+
+    async fn prepare_recording_fork(
+        &self,
+        call_id: &str,
+        keys: [SrtpKeyMaterial; 2],
+        bind_ip: Option<std::net::IpAddr>,
+    ) -> Result<RecordingForkPorts, MediaPipelineError> {
+        Self::prepare_recording_fork(self, call_id, keys, bind_ip).await
+    }
+
+    async fn activate_recording_fork(
+        &self,
+        call_id: &str,
+        remotes: [std::net::SocketAddr; 2],
+    ) -> Result<(), MediaPipelineError> {
+        Self::activate_recording_fork(self, call_id, remotes).await
+    }
+
+    async fn stop_recording_fork(&self, call_id: &str) -> Result<(), MediaPipelineError> {
+        Self::stop_recording_fork(self, call_id).await
     }
 }
 
@@ -926,6 +1032,7 @@ impl MediaPipeline {
             b_leg_remote_ctl: None,
             media_kind: Arc::new(std::sync::atomic::AtomicU8::new(MediaKind::Audio.as_u8())),
             terminated: false,
+            recording: self.config.recording.is_enabled().then(SessionFork::new),
         };
 
         let mut sessions = self.sessions.write().await;
@@ -1659,6 +1766,9 @@ impl MediaPipeline {
                 media_kind: Arc::clone(&ctx.media_kind),
             },
             shutdown_rx.clone(),
+            ctx.recording
+                .as_ref()
+                .map(|fork| fork.tap(true, &ctx.media_kind)),
         ));
 
         // Spawn B→A RTP relay task
@@ -1676,6 +1786,9 @@ impl MediaPipeline {
                 media_kind: Arc::clone(&ctx.media_kind),
             },
             shutdown_rx.clone(),
+            ctx.recording
+                .as_ref()
+                .map(|fork| fork.tap(false, &ctx.media_kind)),
         ));
 
         let mut relay_handles = vec![handle_ab, handle_ba];
@@ -1713,6 +1826,7 @@ impl MediaPipeline {
                         RelayKind::Rtcp,
                         no_relatch.clone(),
                         shutdown_rx.clone(),
+                        None,
                     )));
                     relay_handles.push(tokio::spawn(relay_leg(
                         b_rtcp_sock,
@@ -1725,6 +1839,7 @@ impl MediaPipeline {
                         RelayKind::Rtcp,
                         no_relatch,
                         shutdown_rx,
+                        None,
                     )));
                     true
                 }
@@ -1884,6 +1999,14 @@ impl MediaPipeline {
             shutdown: shutdown_rx,
             media_failure_tx: self.config.media_failure_tx.clone(),
             rtcp,
+            a_fork: ctx
+                .recording
+                .as_ref()
+                .map(|fork| fork.tap(true, &ctx.media_kind)),
+            b_fork: ctx
+                .recording
+                .as_ref()
+                .map(|fork| fork.tap(false, &ctx.media_kind)),
         }));
 
         // The supervisor handle stands in for the relay tasks it spawns; those
@@ -1915,6 +2038,9 @@ impl MediaPipeline {
             handle.abort();
         }
 
+        // The recording fork ends with the relay (keys dropped, ports freed).
+        self.end_recording_fork(ctx).await;
+
         // Release ports and zero them so remove_session won't double-release
         self.port_allocator.release_pair(ctx.a_leg_local_port).await;
         self.port_allocator.release_pair(ctx.b_leg_local_port).await;
@@ -1937,6 +2063,7 @@ impl MediaPipeline {
             for handle in ctx.relay_handles.drain(..) {
                 handle.abort();
             }
+            self.end_recording_fork(&mut ctx).await;
 
             // Release allocated port pairs (skip if already released by stop_relay)
             if ctx.a_leg_local_port != 0 {
@@ -1958,6 +2085,183 @@ impl MediaPipeline {
         } else {
             Err(MediaPipelineError::SessionNotFound)
         }
+    }
+
+    /// Stops a session's recording fork, if any, and returns its ports to
+    /// the allocator. Idempotent.
+    // NIST 800-53 Rev5: SC-12 / SI-12 - the fork keys do not outlive the fork.
+    async fn end_recording_fork(&self, ctx: &mut MediaSessionContext) {
+        let Some(ports) = ctx.recording.as_mut().and_then(SessionFork::stop) else {
+            return;
+        };
+        for port in ports {
+            self.port_allocator.release_pair(port).await;
+        }
+    }
+
+    /// Binds the two send-only fork sockets for a recorded call and installs
+    /// one SRTP master key per stream (`keys[0]`: the caller's sent media,
+    /// `keys[1]`: the callee's). Each stream gets its own SBC-chosen SSRC.
+    /// The fork is idle until [`Self::activate_recording_fork`].
+    ///
+    /// `bind_ip` is the local address the fork sends from (and the address
+    /// to put in the recording session SDP); `None` binds the wildcard IPv4
+    /// address, as an unzoned leg does. It must be of the same address family
+    /// as the recorder's media address, or activation fails.
+    ///
+    /// The caller's `keys` are consumed and wiped when this returns; the
+    /// pipeline keeps only the derived SRTP contexts.
+    ///
+    /// ## NIST 800-53 Rev5: AU-14, SC-8, SC-12, SC-13, SC-5 (ports come from
+    /// the bounded RTP port range)
+    ///
+    /// # Errors
+    /// - [`MediaPipelineError::RecordingUnsupported`]: recording is not
+    ///   enabled on this pipeline.
+    /// - [`MediaPipelineError::SessionNotFound`]: unknown call.
+    /// - [`MediaPipelineError::RecordingFork`]: a fork already exists for the
+    ///   call, or its relay has been stopped.
+    /// - [`MediaPipelineError::PortExhausted`], `BindFailed`,
+    ///   `SrtpContextCreationFailed`: nothing is left allocated.
+    pub async fn prepare_recording_fork(
+        &self,
+        call_id: &str,
+        keys: [SrtpKeyMaterial; 2],
+        bind_ip: Option<std::net::IpAddr>,
+    ) -> Result<RecordingForkPorts, MediaPipelineError> {
+        if !self.config.recording.is_enabled() {
+            return Err(MediaPipelineError::RecordingUnsupported);
+        }
+        let mut sessions = self.sessions.write().await;
+        let ctx = sessions
+            .get_mut(call_id)
+            .ok_or(MediaPipelineError::SessionNotFound)?;
+        let fork = ctx
+            .recording
+            .as_mut()
+            .ok_or(MediaPipelineError::RecordingUnsupported)?;
+        if fork.exists() {
+            return Err(MediaPipelineError::RecordingFork(
+                "recording fork already prepared".into(),
+            ));
+        }
+        if ctx.a_leg_local_port == 0 {
+            return Err(MediaPipelineError::RecordingFork(
+                "media relay already stopped".into(),
+            ));
+        }
+
+        let bind_ip = bind_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let [a_key, b_key] = &keys;
+        // Distinct SSRCs per stream (RFC 3550 §8.1); each stream also has its
+        // own key, so the nonce spaces are separate either way.
+        let a_ssrc = generate_ssrc();
+        let b_ssrc = loop {
+            let candidate = generate_ssrc();
+            if candidate != a_ssrc {
+                break candidate;
+            }
+        };
+
+        // The RTCP port of each pair stays reserved and unused: the recording
+        // session offers `a=rtcp-mux` (RFC 5761) and no RTCP is sent yet.
+        let (a_port, _) = self.port_allocator.allocate_pair().await?;
+        let (b_port, _) = match self.port_allocator.allocate_pair().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.port_allocator.release_pair(a_port).await;
+                return Err(e);
+            }
+        };
+        let bound = ForkStream::bind(a_key, std::net::SocketAddr::new(bind_ip, a_port), a_ssrc)
+            .and_then(|a| {
+                ForkStream::bind(b_key, std::net::SocketAddr::new(bind_ip, b_port), b_ssrc)
+                    .map(|b| [a, b])
+            });
+        let streams = match bound {
+            Ok(streams) => streams,
+            Err(e) => {
+                self.port_allocator.release_pair(a_port).await;
+                self.port_allocator.release_pair(b_port).await;
+                return Err(e);
+            }
+        };
+        fork.set_prepared(streams, [a_port, b_port]);
+
+        info!(
+            call_id = %call_id,
+            a_leg_port = a_port,
+            b_leg_port = b_port,
+            "Recording fork prepared"
+        );
+        Ok(RecordingForkPorts {
+            a_leg_port: a_port,
+            b_leg_port: b_port,
+        })
+    }
+
+    /// Starts forking a prepared call: `remotes[0]` receives the caller's
+    /// sent media, `remotes[1]` the callee's. The relay tasks pick the
+    /// streams up on their next packet.
+    ///
+    /// On any error the fork is torn down completely (keys dropped, ports
+    /// released); a new `prepare_recording_fork` is needed to try again.
+    ///
+    /// ## NIST 800-53 Rev5: SC-24 (never a half-recorded call), SC-7
+    ///
+    /// # Errors
+    /// - [`MediaPipelineError::RecordingUnsupported`]: recording is not
+    ///   enabled on this pipeline.
+    /// - [`MediaPipelineError::SessionNotFound`]: unknown call.
+    /// - [`MediaPipelineError::RecordingFork`]: not prepared (or already
+    ///   active), or a recorder address that is not a usable unicast
+    ///   destination for the fork socket.
+    pub async fn activate_recording_fork(
+        &self,
+        call_id: &str,
+        remotes: [std::net::SocketAddr; 2],
+    ) -> Result<(), MediaPipelineError> {
+        if !self.config.recording.is_enabled() {
+            return Err(MediaPipelineError::RecordingUnsupported);
+        }
+        let mut sessions = self.sessions.write().await;
+        let ctx = sessions
+            .get_mut(call_id)
+            .ok_or(MediaPipelineError::SessionNotFound)?;
+        let result = ctx
+            .recording
+            .as_mut()
+            .ok_or(MediaPipelineError::RecordingUnsupported)?
+            .activate(remotes);
+        if let Err(e) = result {
+            self.end_recording_fork(ctx).await;
+            return Err(e);
+        }
+        info!(call_id = %call_id, "Recording fork active");
+        Ok(())
+    }
+
+    /// Stops a call's recording fork: nothing more is sent, the SRTP keys are
+    /// dropped (and wiped) and the fork ports go back to the allocator.
+    /// Idempotent: a call with no fork, or a call that is already gone (the
+    /// fork ended with its session), is `Ok`.
+    ///
+    /// # Errors
+    /// [`MediaPipelineError::RecordingUnsupported`] if recording is not
+    /// enabled on this pipeline.
+    pub async fn stop_recording_fork(&self, call_id: &str) -> Result<(), MediaPipelineError> {
+        if !self.config.recording.is_enabled() {
+            return Err(MediaPipelineError::RecordingUnsupported);
+        }
+        let mut sessions = self.sessions.write().await;
+        if let Some(ctx) = sessions.get_mut(call_id) {
+            let had_fork = ctx.recording.as_ref().is_some_and(SessionFork::exists);
+            self.end_recording_fork(ctx).await;
+            if had_fork {
+                info!(call_id = %call_id, "Recording fork stopped");
+            }
+        }
+        Ok(())
     }
 
     /// Returns session statistics.
@@ -2123,6 +2427,11 @@ struct TerminateSetup {
     /// Separate-port SRTCP relay for non-muxed endpoints. `None` when the RTCP
     /// sockets could not be bound (audio is unaffected; only non-muxed RTCP is).
     rtcp: Option<TerminateRtcp>,
+    /// SIPREC fork tap for media received from the A-leg (`None` when
+    /// recording is disabled on the pipeline).
+    a_fork: Option<ForkTap>,
+    /// SIPREC fork tap for media received from the B-leg.
+    b_fork: Option<ForkTap>,
 }
 
 /// Drives both legs' DTLS handshakes concurrently, then spawns the bidirectional
@@ -2213,6 +2522,7 @@ async fn terminate_supervisor(s: TerminateSetup) {
             dtls_out: Some(a_dtls_tx),
             call_id: s.call_id.clone(),
             direction: "A→B",
+            fork: s.a_fork,
         }
         .run(s.shutdown.clone()),
     );
@@ -2229,6 +2539,7 @@ async fn terminate_supervisor(s: TerminateSetup) {
             dtls_out: Some(b_dtls_tx),
             call_id: s.call_id.clone(),
             direction: "B→A",
+            fork: s.b_fork,
         }
         .run(s.shutdown.clone()),
     );
@@ -2282,6 +2593,7 @@ async fn terminate_supervisor(s: TerminateSetup) {
                     dtls_out: None,
                     call_id: s.call_id.clone(),
                     direction: "A→B RTCP",
+                    fork: None,
                 }
                 .run(s.shutdown.clone()),
             );
@@ -2297,6 +2609,7 @@ async fn terminate_supervisor(s: TerminateSetup) {
                     dtls_out: None,
                     call_id: s.call_id.clone(),
                     direction: "B→A RTCP",
+                    fork: None,
                 }
                 .run(s.shutdown.clone()),
             );
@@ -2335,6 +2648,8 @@ async fn relay_leg(
     kind: RelayKind,
     control: LegRelayControl,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    // SIPREC fork tap (RTP legs of a pipeline with recording enabled only).
+    mut fork: Option<ForkTap>,
 ) {
     // POAM: POA&M-290 - tokio truncates datagrams over 2048 bytes silently;
     // UDPTL is relayed opaquely with no IFP validation or truncation check.
@@ -2347,6 +2662,7 @@ async fn relay_leg(
     let mut relatch_fallback_at: Option<tokio::time::Instant> = None;
     let mut dropped: u64 = 0;
     let mut forwarded: u64 = 0;
+    let has_fork = fork.is_some();
 
     loop {
         tokio::select! {
@@ -2438,6 +2754,14 @@ async fn relay_leg(
                                     RelayKind::Rtp => {
                                         RTP_PACKETS_RELAYED
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        // RFC 7866 §8: copy to the recorder
+                                        // after the call's own packet is
+                                        // out. Never blocks, never allocates.
+                                        if let Some(tap) = fork.as_mut()
+                                            && let Some(pkt) = buf.get(..n)
+                                        {
+                                            tap.on_rtp(pkt);
+                                        }
                                         if forwarded == 1 {
                                             info!(
                                                 call_id = %call_id,
@@ -2470,6 +2794,9 @@ async fn relay_leg(
                     }
                 }
             }
+            // Recording fork activated or stopped: applied inside the tap, so
+            // a stopped stream is released even when no media is arriving.
+            () = fork_changed(&mut fork), if has_fork => {}
             _ = shutdown.changed() => {
                 debug!(call_id = %call_id, direction, "Relay shutdown");
                 break;
@@ -2542,6 +2869,13 @@ pub enum MediaPipelineError {
     /// Only produced by the gRPC [`MediaController`] client; the in-process
     /// [`MediaPipeline`] never returns it.
     Rpc(String),
+    /// This media controller cannot fork media to a recorder: recording is
+    /// not enabled on the pipeline, or the controller is a remote media node
+    /// (POA&M-301). The caller's recording failure policy applies.
+    RecordingUnsupported,
+    /// A recording fork request was invalid for the call's current state, or
+    /// the recorder's media address was unusable.
+    RecordingFork(String),
 }
 
 impl std::fmt::Display for MediaPipelineError {
@@ -2558,6 +2892,10 @@ impl std::fmt::Display for MediaPipelineError {
             Self::PortExhausted => write!(f, "RTP port range exhausted"),
             Self::BindFailed(e) => write!(f, "Failed to bind UDP socket: {e}"),
             Self::Rpc(e) => write!(f, "Media controller RPC failed: {e}"),
+            Self::RecordingUnsupported => {
+                write!(f, "Recording fork not supported by this media controller")
+            }
+            Self::RecordingFork(e) => write!(f, "Recording fork failed: {e}"),
         }
     }
 }
@@ -2599,6 +2937,7 @@ mod tests {
                 media_kind: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             },
             shutdown_rx,
+            None,
         ));
 
         let mut buf = [0u8; 64];
@@ -2671,6 +3010,7 @@ mod tests {
                 media_kind: Arc::clone(&kind),
             },
             shutdown_rx,
+            None,
         ));
 
         rtp_src.send_to(b"rtp", relay_addr).await.unwrap();
@@ -2739,6 +3079,7 @@ mod tests {
                 media_kind: Arc::clone(&kind),
             },
             shutdown_rx,
+            None,
         ));
 
         rtp_src.send_to(b"a1", relay_addr).await.unwrap();
@@ -2809,6 +3150,7 @@ mod tests {
                 media_kind: Arc::new(std::sync::atomic::AtomicU8::new(MediaKind::Audio.as_u8())),
             },
             shutdown_rx,
+            None,
         ));
 
         rtp_src.send_to(b"a1", relay_addr).await.unwrap();
@@ -3779,7 +4121,7 @@ mod tests {
         eprintln!("srtp-audio gate: A rtp={rtp_a} rtcp={rtcp_a}, B rtp={rtp_b} rtcp={rtcp_b}");
         assert!(rtp_a > 0, "peer A recovered no relayed audio");
         assert!(rtp_b > 0, "peer B recovered no relayed audio");
-        // SRTCP interop (RFC 7714 §9.4): the SBC re-protected muxed SRTCP and the
+        // SRTCP interop (RFC 7714 §9.2): the SBC re-protected muxed SRTCP and the
         // far peer's pion/srtp decrypted it — the H6 path the unit tests can't cover.
         assert!(rtcp_a > 0, "peer A recovered no relayed SRTCP");
         assert!(rtcp_b > 0, "peer B recovered no relayed SRTCP");
@@ -3917,5 +4259,524 @@ mod tests {
         assert!(rtp_b > 0, "peer B recovered no relayed audio (split)");
         assert!(rtcp_a > 0, "peer A recovered no relayed SRTCP (split)");
         assert!(rtcp_b > 0, "peer B recovered no relayed SRTCP (split)");
+    }
+}
+
+/// SIPREC recording fork through the pipeline (RFC 7866 §8).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod recording_fork_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    fn material() -> (Vec<u8>, Vec<u8>) {
+        // Generated per test, never hard-coded.
+        let key: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+        let salt: Vec<u8> = (0..12).map(|_| rand::random::<u8>()).collect();
+        (key, salt)
+    }
+
+    fn keys(m: &(Vec<u8>, Vec<u8>)) -> SrtpKeyMaterial {
+        SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, m.0.clone(), m.1.clone()).unwrap()
+    }
+
+    fn pipeline(recording_enabled: bool) -> MediaPipeline {
+        // Unique range per test so parallel tests do not collide on bind.
+        let port_base = 33_000_u16 + (rand::random::<u16>() % 14_000) * 2;
+        MediaPipeline::new(MediaPipelineConfig {
+            srtp_required: false,
+            rtp_port_min: port_base,
+            rtp_port_max: port_base + 40,
+            recording: RecordingMode::from_enabled(recording_enabled),
+            ..Default::default()
+        })
+    }
+
+    struct Call {
+        pipeline: MediaPipeline,
+        a: UdpSocket,
+        b: UdpSocket,
+        sbc_a: SocketAddr,
+        sbc_b: SocketAddr,
+    }
+
+    /// A relaying two-party call on loopback with latched endpoints.
+    async fn call(recording_enabled: bool) -> Call {
+        let pipeline = pipeline(recording_enabled);
+        let ports = pipeline
+            .create_session_with_zones("rec", None, Some(LOOPBACK), Some(LOOPBACK))
+            .await
+            .unwrap();
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        pipeline
+            .set_remote_address("rec", true, a.local_addr().unwrap().into())
+            .await
+            .unwrap();
+        pipeline
+            .set_remote_address("rec", false, b.local_addr().unwrap().into())
+            .await
+            .unwrap();
+        pipeline.start_relay("rec").await.unwrap();
+        Call {
+            pipeline,
+            a,
+            b,
+            sbc_a: SocketAddr::new(LOOPBACK, ports.a_leg_rtp_port),
+            sbc_b: SocketAddr::new(LOOPBACK, ports.b_leg_rtp_port),
+        }
+    }
+
+    fn rtp(seq: u16, ssrc: u32, payload: &[u8]) -> Vec<u8> {
+        RtpPacket::new(
+            RtpHeader::new(0, seq, u32::from(seq) * 160, ssrc),
+            payload.to_vec(),
+        )
+        .to_bytes()
+        .to_vec()
+    }
+
+    async fn recv(sock: &UdpSocket, wait: Duration) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 2100];
+        tokio::time::timeout(wait, sock.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()
+            .map(|(n, _)| buf[..n].to_vec())
+    }
+
+    async fn allocated_ports(pipeline: &MediaPipeline) -> usize {
+        pipeline.port_allocator.allocated.read().await.len()
+    }
+
+    /// Polls until `port` can be bound again (the relay task drops a stopped
+    /// stream asynchronously).
+    async fn port_is_freed(port: u16) -> bool {
+        for _ in 0..100 {
+            if std::net::UdpSocket::bind((LOOPBACK, port)).is_ok() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn disabled_pipeline_has_no_fork_at_all() {
+        let c = call(false).await;
+        let (m1, m2) = (material(), material());
+        assert!(matches!(
+            c.pipeline
+                .prepare_recording_fork("rec", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+                .await,
+            Err(MediaPipelineError::RecordingUnsupported)
+        ));
+        let remote: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert!(matches!(
+            c.pipeline
+                .activate_recording_fork("rec", [remote, remote])
+                .await,
+            Err(MediaPipelineError::RecordingUnsupported)
+        ));
+        assert!(matches!(
+            c.pipeline.stop_recording_fork("rec").await,
+            Err(MediaPipelineError::RecordingUnsupported)
+        ));
+        assert!(
+            c.pipeline
+                .sessions
+                .read()
+                .await
+                .get("rec")
+                .unwrap()
+                .recording
+                .is_none()
+        );
+        // Two leg pairs only; the relay itself is unaffected.
+        assert_eq!(allocated_ports(&c.pipeline).await, 4);
+        c.a.send_to(&rtp(1, 1, &[7; 160]), c.sbc_a).await.unwrap();
+        assert!(recv(&c.b, Duration::from_secs(2)).await.is_some());
+    }
+
+    /// The trait default (what a remote media controller inherits) refuses
+    /// every fork call.
+    #[tokio::test]
+    async fn trait_default_reports_recording_unsupported() {
+        struct Remote;
+        #[async_trait::async_trait]
+        impl MediaController for Remote {
+            async fn create_session_with_zones(
+                &self,
+                _: &str,
+                _: Option<MediaMode>,
+                _: Option<IpAddr>,
+                _: Option<IpAddr>,
+            ) -> Result<AllocatedPorts, MediaPipelineError> {
+                Err(MediaPipelineError::SessionNotFound)
+            }
+            async fn set_remote_address(
+                &self,
+                _: &str,
+                _: bool,
+                _: SbcSocketAddr,
+            ) -> Result<(), MediaPipelineError> {
+                Ok(())
+            }
+            async fn start_relay(&self, _: &str) -> Result<(), MediaPipelineError> {
+                Ok(())
+            }
+            async fn start_relay_terminate(
+                &self,
+                _: &str,
+                _: LegDtlsParams,
+                _: LegDtlsParams,
+            ) -> Result<(), MediaPipelineError> {
+                Ok(())
+            }
+            async fn stop_relay(&self, _: &str) -> Result<(), MediaPipelineError> {
+                Ok(())
+            }
+            async fn remove_session(&self, _: &str) -> Result<(), MediaPipelineError> {
+                Ok(())
+            }
+            async fn allocate_ports(&self) -> Result<(u16, u16), MediaPipelineError> {
+                Err(MediaPipelineError::PortExhausted)
+            }
+        }
+        let remote: &dyn MediaController = &Remote;
+        let (m1, m2) = (material(), material());
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert!(matches!(
+            remote
+                .prepare_recording_fork("c", [keys(&m1), keys(&m2)], None)
+                .await,
+            Err(MediaPipelineError::RecordingUnsupported)
+        ));
+        assert!(matches!(
+            remote.activate_recording_fork("c", [addr, addr]).await,
+            Err(MediaPipelineError::RecordingUnsupported)
+        ));
+        assert!(matches!(
+            remote.stop_recording_fork("c").await,
+            Err(MediaPipelineError::RecordingUnsupported)
+        ));
+    }
+
+    #[tokio::test]
+    async fn state_errors() {
+        let c = call(true).await;
+        let (m1, m2) = (material(), material());
+        let srs: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        // Unknown call.
+        assert!(matches!(
+            c.pipeline
+                .prepare_recording_fork("nope", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+                .await,
+            Err(MediaPipelineError::SessionNotFound)
+        ));
+        assert!(matches!(
+            c.pipeline.activate_recording_fork("nope", [srs, srs]).await,
+            Err(MediaPipelineError::SessionNotFound)
+        ));
+        // Stop is idempotent: unknown call and never-prepared call are fine.
+        c.pipeline.stop_recording_fork("nope").await.unwrap();
+        c.pipeline.stop_recording_fork("rec").await.unwrap();
+
+        // Activate without prepare.
+        assert!(matches!(
+            c.pipeline.activate_recording_fork("rec", [srs, srs]).await,
+            Err(MediaPipelineError::RecordingFork(_))
+        ));
+        assert_eq!(allocated_ports(&c.pipeline).await, 4);
+
+        // Prepare twice.
+        let ports = c
+            .pipeline
+            .prepare_recording_fork("rec", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+            .await
+            .unwrap();
+        assert_ne!(ports.a_leg_port, ports.b_leg_port);
+        assert_eq!(allocated_ports(&c.pipeline).await, 8);
+        assert!(matches!(
+            c.pipeline
+                .prepare_recording_fork("rec", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+                .await,
+            Err(MediaPipelineError::RecordingFork(_))
+        ));
+        assert_eq!(allocated_ports(&c.pipeline).await, 8, "no leak on refusal");
+
+        // A bad recorder address tears the whole fork down.
+        let bad: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        assert!(matches!(
+            c.pipeline.activate_recording_fork("rec", [srs, bad]).await,
+            Err(MediaPipelineError::RecordingFork(_))
+        ));
+        assert_eq!(allocated_ports(&c.pipeline).await, 4);
+        assert!(port_is_freed(ports.a_leg_port).await);
+        assert!(port_is_freed(ports.b_leg_port).await);
+        // Activate twice: the second finds nothing prepared.
+        c.pipeline
+            .prepare_recording_fork("rec", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+            .await
+            .unwrap();
+        c.pipeline
+            .activate_recording_fork("rec", [srs, srs])
+            .await
+            .unwrap();
+        assert!(matches!(
+            c.pipeline.activate_recording_fork("rec", [srs, srs]).await,
+            Err(MediaPipelineError::RecordingFork(_))
+        ));
+        assert_eq!(
+            allocated_ports(&c.pipeline).await,
+            4,
+            "failed re-activate ends the fork"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_without_free_ports_leaks_nothing() {
+        let pipeline = MediaPipeline::new(MediaPipelineConfig {
+            srtp_required: false,
+            // Exactly three pairs: two for the legs, one left for the fork.
+            rtp_port_min: 61_000,
+            rtp_port_max: 61_006,
+            recording: RecordingMode::Enabled,
+            ..Default::default()
+        });
+        pipeline.create_session("rec", None).await.unwrap();
+        let (m1, m2) = (material(), material());
+        assert!(matches!(
+            pipeline
+                .prepare_recording_fork("rec", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+                .await,
+            Err(MediaPipelineError::PortExhausted)
+        ));
+        assert_eq!(allocated_ports(&pipeline).await, 4);
+    }
+
+    /// Both directions are forked under their own key and SSRC; the fork
+    /// stops with `stop_recording_fork`, and the call's media keeps flowing.
+    #[tokio::test]
+    async fn forks_both_directions_and_stops() {
+        let c = call(true).await;
+        let (m1, m2) = (material(), material());
+        let srs_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srs_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let ports = c
+            .pipeline
+            .prepare_recording_fork("rec", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+            .await
+            .unwrap();
+
+        // Prepared, not active: relayed, not forked.
+        c.a.send_to(&rtp(1, 0xAAAA, &[1; 160]), c.sbc_a)
+            .await
+            .unwrap();
+        c.b.send_to(&rtp(1, 0xBBBB, &[2; 160]), c.sbc_b)
+            .await
+            .unwrap();
+        assert!(recv(&c.b, Duration::from_secs(2)).await.is_some());
+        assert!(recv(&c.a, Duration::from_secs(2)).await.is_some());
+        assert!(recv(&srs_a, Duration::from_millis(200)).await.is_none());
+        assert!(recv(&srs_b, Duration::from_millis(50)).await.is_none());
+
+        c.pipeline
+            .activate_recording_fork(
+                "rec",
+                [srs_a.local_addr().unwrap(), srs_b.local_addr().unwrap()],
+            )
+            .await
+            .unwrap();
+
+        let forked_before = recording_fork_packets();
+        c.a.send_to(&rtp(2, 0xAAAA, &[3; 160]), c.sbc_a)
+            .await
+            .unwrap();
+        c.b.send_to(&rtp(2, 0xBBBB, &[4; 160]), c.sbc_b)
+            .await
+            .unwrap();
+        assert!(recv(&c.b, Duration::from_secs(2)).await.is_some());
+        assert!(recv(&c.a, Duration::from_secs(2)).await.is_some());
+
+        let mut buf = [0u8; 2100];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), srs_a.recv_from(&mut buf))
+            .await
+            .expect("caller stream forked")
+            .unwrap();
+        assert_eq!(from.port(), ports.a_leg_port, "sent from the SDP port");
+        let ctx_a = SrtpContext::new(&keys(&m1), SrtpDirection::Inbound, 0).unwrap();
+        let got_a = SrtpUnprotect::new(&ctx_a).unprotect_rtp(&buf[..n]).unwrap();
+        assert_eq!(got_a.payload.as_ref(), [3u8; 160].as_slice());
+
+        let from_b = recv(&srs_b, Duration::from_secs(2))
+            .await
+            .expect("callee stream forked");
+        let ctx_b = SrtpContext::new(&keys(&m2), SrtpDirection::Inbound, 0).unwrap();
+        let got_b = SrtpUnprotect::new(&ctx_b).unprotect_rtp(&from_b).unwrap();
+        assert_eq!(got_b.payload.as_ref(), [4u8; 160].as_slice());
+        // The caller's key does not open the callee's stream.
+        assert!(SrtpUnprotect::new(&ctx_a).unprotect_rtp(&from_b).is_err());
+
+        assert_ne!(got_a.header.ssrc, got_b.header.ssrc);
+        assert_ne!(got_a.header.ssrc, 0xAAAA);
+        assert_ne!(got_b.header.ssrc, 0xBBBB);
+        assert!(recording_fork_packets() - forked_before >= 2);
+
+        // Anything the recorder sends back is never relayed to a call party.
+        srs_a
+            .send_to(&rtp(9, 9, &[9; 160]), (LOOPBACK, ports.a_leg_port))
+            .await
+            .unwrap();
+        assert!(recv(&c.a, Duration::from_millis(150)).await.is_none());
+        assert!(recv(&c.b, Duration::from_millis(50)).await.is_none());
+
+        c.pipeline.stop_recording_fork("rec").await.unwrap();
+        assert_eq!(allocated_ports(&c.pipeline).await, 4);
+        assert!(port_is_freed(ports.a_leg_port).await, "idle task drops it");
+        assert!(port_is_freed(ports.b_leg_port).await);
+        c.a.send_to(&rtp(3, 0xAAAA, &[5; 160]), c.sbc_a)
+            .await
+            .unwrap();
+        assert!(recv(&c.b, Duration::from_secs(2)).await.is_some());
+        assert!(recv(&srs_a, Duration::from_millis(200)).await.is_none());
+        c.pipeline.stop_recording_fork("rec").await.unwrap();
+    }
+
+    /// A recorder that is not there costs the call nothing.
+    #[tokio::test]
+    async fn dead_recorder_does_not_disturb_the_relay() {
+        let c = call(true).await;
+        let (m1, m2) = (material(), material());
+        c.pipeline
+            .prepare_recording_fork("rec", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+            .await
+            .unwrap();
+        let dead = {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.local_addr().unwrap()
+        };
+        c.pipeline
+            .activate_recording_fork("rec", [dead, dead])
+            .await
+            .unwrap();
+        for seq in 0..50u16 {
+            let payload = [seq as u8; 160];
+            c.a.send_to(&rtp(seq, 0xAAAA, &payload), c.sbc_a)
+                .await
+                .unwrap();
+            let got = recv(&c.b, Duration::from_secs(2)).await.expect("relayed");
+            assert_eq!(&got[12..], payload.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_relay_and_remove_session_end_the_fork() {
+        for remove in [false, true] {
+            let c = call(true).await;
+            let (m1, m2) = (material(), material());
+            let srs = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let ports = c
+                .pipeline
+                .prepare_recording_fork("rec", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+                .await
+                .unwrap();
+            let addr = srs.local_addr().unwrap();
+            c.pipeline
+                .activate_recording_fork("rec", [addr, addr])
+                .await
+                .unwrap();
+            c.a.send_to(&rtp(1, 1, &[1; 160]), c.sbc_a).await.unwrap();
+            assert!(recv(&srs, Duration::from_secs(2)).await.is_some());
+
+            if remove {
+                c.pipeline.remove_session("rec").await.unwrap();
+            } else {
+                c.pipeline.stop_relay("rec").await.unwrap();
+            }
+            assert_eq!(allocated_ports(&c.pipeline).await, 0, "remove={remove}");
+            assert!(port_is_freed(ports.a_leg_port).await);
+            assert!(port_is_freed(ports.b_leg_port).await);
+            if !remove {
+                // A stopped relay cannot be given a new fork.
+                assert!(matches!(
+                    c.pipeline
+                        .prepare_recording_fork("rec", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+                        .await,
+                    Err(MediaPipelineError::RecordingFork(_))
+                ));
+                assert_eq!(allocated_ports(&c.pipeline).await, 0);
+            }
+        }
+    }
+
+    /// The fork may be prepared and activated before the relay starts.
+    #[tokio::test]
+    async fn fork_activated_before_start_relay_is_picked_up() {
+        let pipeline = pipeline(true);
+        let ports = pipeline
+            .create_session_with_zones("rec", None, Some(LOOPBACK), Some(LOOPBACK))
+            .await
+            .unwrap();
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srs = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (m1, m2) = (material(), material());
+        pipeline
+            .prepare_recording_fork("rec", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+            .await
+            .unwrap();
+        let addr = srs.local_addr().unwrap();
+        pipeline
+            .activate_recording_fork("rec", [addr, addr])
+            .await
+            .unwrap();
+        pipeline
+            .set_remote_address("rec", true, a.local_addr().unwrap().into())
+            .await
+            .unwrap();
+        pipeline
+            .set_remote_address("rec", false, b.local_addr().unwrap().into())
+            .await
+            .unwrap();
+        pipeline.start_relay("rec").await.unwrap();
+        a.send_to(
+            &rtp(1, 1, &[1; 160]),
+            SocketAddr::new(LOOPBACK, ports.a_leg_rtp_port),
+        )
+        .await
+        .unwrap();
+        assert!(recv(&b, Duration::from_secs(2)).await.is_some());
+        assert!(recv(&srs, Duration::from_secs(2)).await.is_some());
+    }
+
+    /// T.38: once the call is image, UDPTL is relayed but not forked.
+    #[tokio::test]
+    async fn image_kind_is_not_forked() {
+        let c = call(true).await;
+        let (m1, m2) = (material(), material());
+        let srs = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        c.pipeline
+            .prepare_recording_fork("rec", [keys(&m1), keys(&m2)], Some(LOOPBACK))
+            .await
+            .unwrap();
+        let addr = srs.local_addr().unwrap();
+        c.pipeline
+            .activate_recording_fork("rec", [addr, addr])
+            .await
+            .unwrap();
+        c.pipeline
+            .set_media_kind("rec", MediaKind::Image)
+            .await
+            .unwrap();
+        // A UDPTL datagram that happens to look like RTP version 2.
+        c.a.send_to(&rtp(1, 1, &[1; 40]), c.sbc_a).await.unwrap();
+        assert!(recv(&c.b, Duration::from_secs(2)).await.is_some());
+        assert!(recv(&srs, Duration::from_millis(200)).await.is_none());
     }
 }

@@ -3,8 +3,9 @@
 //! Pure functions, no I/O: given the RS SDP offer and the recording metadata,
 //! produce the `multipart/mixed` body and the header values an SRC needs for
 //! the initial RS INVITE to the SRS.
-// POAM: POA&M-300 - nothing in sbc-daemon originates the RS INVITE yet
-// (sbc-config rejects `[recording].enabled = true` until it does).
+// The RS INVITE itself (headers, dialog, transport) is originated by
+// sbc-daemon (`recording.rs`, `sip_stack/recording_session.rs`).
+// POAM: POA&M-301 - the offer is send-only RTP; no RTCP is sent on the RS.
 // POAM: POA&M-308 - inbound multipart/mixed (SRS-initiated requests) is not
 // parsed.
 
@@ -23,8 +24,8 @@ const CONTACT_FEATURE_SRC: &str = "+sip.src";
 /// RFC 7866 §9: metadata media type.
 pub const METADATA_CONTENT_TYPE: &str = "application/rs-metadata+xml";
 
-/// RFC 7714 §12: the only SDES crypto suite the RS offer uses (CNSA 2.0:
-/// AES-256, no SHA-1 authentication tag).
+/// RFC 7714 §14.1 (SDES name; key and salt sizes §12): the only SDES crypto
+/// suite the RS offer uses (CNSA 2.0: AES-256, no SHA-1 authentication tag).
 pub const SDES_SUITE: &str = "AEAD_AES_256_GCM";
 /// RFC 7714 §12: 256-bit master key followed by a 96-bit master salt.
 const SDES_KEY_LEN: usize = 32;
@@ -88,7 +89,7 @@ impl std::fmt::Debug for SdesKey {
 /// Parts of an RS INVITE produced by [`build_rs_offer`].
 ///
 /// RFC 7866 §6.1.1 header MUSTs are carried in [`RsInviteParts::headers`] so
-/// the INVITE builder (POA&M-300) takes them from here rather than from loose
+/// the INVITE builder in `sbc-daemon` takes them from here rather than from loose
 /// constants.
 ///
 /// `body` carries the SDES `inline:` key material, so it is zeroized on drop
@@ -144,18 +145,21 @@ impl SrcHeaders {
 }
 
 /// Builds the RS INVITE body: the SDP offer with one `a=label` per media
-/// stream (RFC 7866 §8.1.1) and the RFC 7865 metadata with
+/// stream (RFC 7866 §7.1.1) and the RFC 7865 metadata with
 /// `Content-Disposition: recording-session` (RFC 7866 §9.1).
 ///
 /// The `n`-th m-line of `sdp` gets the label of the `n`-th
 /// [`RecordingMetadata::streams`] entry; an existing `a=label` is replaced.
-/// RFC 7866 §8.1.1: the SRC sends the recorded media, so every m-line is
+/// RFC 7866 §7.1.1: the SRC sends the recorded media, so every m-line is
 /// forced to `a=sendonly` (any other direction attribute is replaced).
 ///
-/// RFC 7866 §11 / POA&M-304: the RS media is SRTP only. Every m-line is
+/// RFC 7866 §12.2 / POA&M-304: the RS media is SRTP only. Every m-line is
 /// forced to `RTP/SAVP` and carries exactly one `a=crypto` for the `n`-th
 /// entry of `keys` (any existing `a=crypto` is replaced). The body thus
 /// holds key material: it MUST only be sent over TLS (RFC 4568 §8.3).
+///
+/// Every m-line also offers `a=rtcp-mux` (RFC 5761 §5.1.1). No RTCP is sent
+/// on the RS yet (POA&M-301).
 ///
 /// # Errors
 ///
@@ -201,6 +205,11 @@ pub fn build_rs_offer(
         m.attributes
             .retain(|a| a.name != label_name && a.name != crypto_name && !a.is_direction());
         m.attributes.push(Attribute::flag(AttributeName::Sendonly));
+        // RFC 5761 §5.1.1: offer RTP/RTCP multiplexing so the SRS answer
+        // settles one port per stream before RTCP is sent (POA&M-301).
+        if !m.has_rtcp_mux() {
+            m.attributes.push(Attribute::flag(AttributeName::RtcpMux));
+        }
         m.attributes
             .push(Attribute::new(label_name.clone(), stream.id.clone()));
         m.attributes.push(Attribute::new(
@@ -371,6 +380,17 @@ mod tests {
         let k2 = base64_encode(&[0x22; 44]);
         assert!(body.contains(&format!("a=crypto:1 AEAD_AES_256_GCM inline:{k1}\r\n")));
         assert!(body.contains(&format!("a=crypto:1 AEAD_AES_256_GCM inline:{k2}\r\n")));
+        Ok(())
+    }
+
+    #[test]
+    fn offers_rtcp_mux_once_per_stream() -> Result<(), Box<dyn std::error::Error>> {
+        // First m-line already carries it: not duplicated.
+        let with_mux = SDP.replace("a=label:old\r\n", "a=label:old\r\na=rtcp-mux\r\n");
+        let sdp: SessionDescription = with_mux.parse()?;
+        let parts = build_rs_offer(&sdp, &meta(), &keys())?;
+        let body = std::str::from_utf8(&parts.body)?;
+        assert_eq!(body.matches("a=rtcp-mux\r\n").count(), 2, "{body}");
         Ok(())
     }
 

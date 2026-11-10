@@ -38,6 +38,7 @@ pub mod dtls_identity;
 pub mod dtls_relay;
 pub mod dtls_sidecar;
 pub mod media_pipeline;
+pub mod recording_fork;
 pub mod srtp_relay;
 
 #[cfg(feature = "grpc")]

@@ -533,15 +533,15 @@ fn validate_media_enforced(config: &crate::schema::MediaConfig) -> ConfigResult<
     Ok(())
 }
 
-/// Validates `[recording]` (SIPREC SRC, POA&M-302).
+/// Validates `[recording]` (SIPREC SRC, RFC 7866).
 ///
 /// Field rules apply whether or not recording is enabled; the enable-only
-/// rules (notice, SRS, CA, trigger) apply when `enabled = true`. Finally,
-/// `enabled = true` is rejected because the SRC is not wired yet
-/// (POA&M-300/-301): an accepted key must be enforced, never ignored.
+/// rules (notice, SRS, CA, trigger, TLS listener) apply when
+/// `enabled = true`. Rules that depend on the environment (remote media
+/// controller URLs, SRS host resolution, SRS CA parsing) are daemon startup
+/// errors, not checked here.
 ///
-/// ## NIST 800-53 Rev5: CM-6, CM-7, PT-5, SC-8; SC-5 and SC-23 prerequisite
-/// only (range / name syntax checks; enforcement POA&M-300/-301/-304)
+/// ## NIST 800-53 Rev5: AU-14, CM-6, CM-7, PT-5, SC-5, SC-8, SC-23
 fn validate_recording(config: &SbcConfig) -> ConfigResult<()> {
     let rec = &config.recording;
     let err = |message: String| Err(ConfigError::Validation { message });
@@ -586,6 +586,11 @@ fn validate_recording(config: &SbcConfig) -> ConfigResult<()> {
             return err(format!("recording.zones names unknown zone {zone:?}"));
         }
     }
+    if let Some(zone) = &rec.srs_zone
+        && !config.zones.iter().any(|z| &z.name == zone)
+    {
+        return err(format!("recording.srs_zone names unknown zone {zone:?}"));
+    }
     if !rec.enabled {
         return Ok(());
     }
@@ -617,12 +622,75 @@ fn validate_recording(config: &SbcConfig) -> ConfigResult<()> {
                 .to_string(),
         );
     }
-    // POAM: POA&M-300/-301 - SRC origination and media fork not wired.
-    err(
-        "recording.enabled = true is not supported by this build yet (SIPREC SRC wiring is \
-         tracked as POA&M-300/-301); set recording.enabled = false"
-            .to_string(),
-    )
+    // RFC 3261 §8.1.1.8, §18.2.2 / RFC 7866 §6.1.1: the RS Via sent-by and
+    // Contact name the SBC's TLS listener (same rule as a TLS trunk).
+    if config.transport.tls_listen.is_empty() {
+        return err(
+            "recording.enabled = true needs a transport.tls_listen address (the recording \
+             session is signalled over TLS only)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Non-fatal `[recording]` problems, for the daemon to log at load. All
+/// apply only when recording is enabled.
+///
+/// - `media.srtp.mode = passthrough`: only calls whose media is cleartext
+///   RTP are recorded; SRTP calls are "not recordable" and are handled per
+///   `recording.on_failure` (POA&M-301).
+/// - `on_failure = reject` with `recordpref_never = honour`: the fail-closed
+///   policy can be bypassed by any call party sending `a=recordpref:off`.
+/// - `record_all` with `max_sessions` below this node's `general.max_calls`
+///   share: a slot is held from the INVITE, so calls past `max_sessions`
+///   (ringing ones included) are refused or left unrecorded.
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings), AU-14, AU-5, SC-5
+#[must_use]
+pub fn recording_warnings(config: &SbcConfig) -> Vec<String> {
+    use crate::schema::{RecordingFailureAction, RecordprefPolicy};
+    let rec = &config.recording;
+    let mut out = Vec::new();
+    if !rec.enabled {
+        return out;
+    }
+    let reject = rec.on_failure == RecordingFailureAction::Reject;
+    if config.media.srtp.mode == crate::schema::SrtpMode::Passthrough {
+        let outcome = if reject {
+            "refused or torn down"
+        } else {
+            "left unrecorded"
+        };
+        out.push(format!(
+            "recording.enabled with media.srtp.mode = passthrough: only cleartext-RTP calls \
+             can be recorded; SRTP calls matching the recording trigger are {outcome} \
+             (recording.on_failure)"
+        ));
+    }
+    if reject && rec.recordpref_never == RecordprefPolicy::Honour {
+        out.push(
+            "recording.on_failure = reject with recording.recordpref_never = honour: any call \
+             party can keep its call unrecorded by sending a=recordpref:off; the call stays up \
+             and is audited as recording_skipped"
+                .to_string(),
+        );
+    }
+    let max_calls = config.effective_max_calls();
+    if rec.record_all && rec.max_sessions < max_calls {
+        let outcome = if reject {
+            "refused with 503"
+        } else {
+            "left unrecorded"
+        };
+        out.push(format!(
+            "recording.record_all with recording.max_sessions ({}) below general.max_calls \
+             ({max_calls} on this node): a session slot is held from the INVITE, so calls \
+             beyond max_sessions (ringing calls count) are {outcome}",
+            rec.max_sessions
+        ));
+    }
+    out
 }
 
 /// Returns the host of a `sips:` SRS URI, or why it is refused: not
@@ -1974,17 +2042,26 @@ mod tests {
         let c = SbcConfig::default();
         assert!(!c.recording.enabled);
         assert!(!c.recording.notice_acknowledged);
+        // AU-14: a participant opt-out is honoured only by explicit choice.
         assert_eq!(
             c.recording.recordpref_never,
-            crate::schema::RecordprefPolicy::Honour
+            crate::schema::RecordprefPolicy::Ignore
         );
         assert_eq!(
             c.recording.on_failure,
-            crate::schema::RecordingFailureAction::Continue
+            crate::schema::RecordingFailureAction::Reject
         );
+        assert_eq!(c.recording.srs_zone, None);
         assert!(validate_config(&c).is_ok());
+        assert_eq!(recording_warnings(&c), Vec::<String>::new());
         let parsed: SbcConfig = toml::from_str("[recording]\n").unwrap();
         assert_eq!(parsed.recording, c.recording);
+        // AU-5: an enabled table that does not name a policy fails closed.
+        let parsed: SbcConfig = toml::from_str("[recording]\nenabled = true\n").unwrap();
+        assert_eq!(
+            parsed.recording.on_failure,
+            crate::schema::RecordingFailureAction::Reject
+        );
     }
 
     #[test]
@@ -1992,8 +2069,12 @@ mod tests {
         // A file that exists stands in for the CA bundle.
         let ca = env!("CARGO_MANIFEST_PATH");
         let full = recording_enabled_config(ca);
-        // Every rule satisfied: still refused until the SRC is wired.
-        assert!(recording_err(&full).contains("POA&M-300"));
+        // Every rule satisfied: loads (POA&M-300 gate removed).
+        assert!(
+            validate_config(&full).is_ok(),
+            "{:?}",
+            validate_config(&full)
+        );
 
         let mut c = full.clone();
         c.recording.notice_acknowledged = false;
@@ -2009,9 +2090,94 @@ mod tests {
         c.recording.srs_tls_ca_file = Some("/nonexistent/srs-ca.pem".to_string());
         assert!(recording_err(&c).contains("does not exist"));
 
-        let mut c = full;
+        let mut c = full.clone();
         c.recording.record_all = false;
         assert!(recording_err(&c).contains("record_all"));
+
+        // The RS Via/Contact need a TLS sent-by.
+        let mut c = full;
+        c.transport.tls_listen.clear();
+        assert!(recording_err(&c).contains("transport.tls_listen"));
+        c.recording.enabled = false;
+        assert!(validate_config(&c).is_ok());
+    }
+
+    #[test]
+    fn recording_srs_zone_must_name_a_zone() {
+        let ca = env!("CARGO_MANIFEST_PATH");
+        // Checked whether or not recording is enabled.
+        for enabled in [false, true] {
+            let mut c = recording_enabled_config(ca);
+            c.recording.enabled = enabled;
+            c.zones = vec![zone("inside")];
+            c.recording.srs_zone = Some("nope".to_string());
+            let e = recording_err(&c);
+            assert!(e.contains("recording.srs_zone names unknown zone"), "{e}");
+            c.recording.srs_zone = Some("inside".to_string());
+            assert!(validate_config(&c).is_ok());
+        }
+    }
+
+    #[test]
+    fn recording_passthrough_srtp_is_a_warning_not_an_error() {
+        let ca = env!("CARGO_MANIFEST_PATH");
+        let mut c = recording_enabled_config(ca);
+        c.recording.max_sessions = 10_000;
+        c.media.srtp.mode = crate::schema::SrtpMode::Passthrough;
+        assert!(validate_config(&c).is_ok());
+        let w = recording_warnings(&c);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("refused or torn down"), "{}", w[0]);
+        c.recording.on_failure = crate::schema::RecordingFailureAction::Continue;
+        assert!(recording_warnings(&c)[0].contains("left unrecorded"));
+        c.media.srtp.mode = crate::schema::SrtpMode::Terminate;
+        assert_eq!(recording_warnings(&c), Vec::<String>::new());
+        c.media.srtp.mode = crate::schema::SrtpMode::Passthrough;
+        c.recording.enabled = false;
+        assert_eq!(recording_warnings(&c), Vec::<String>::new());
+    }
+
+    // SEC-002: `honour` under `reject` lets a call party bypass the
+    // fail-closed policy; SEC-003: a slot is held from the INVITE, so a
+    // broad trigger needs `max_sessions` sized to `max_calls`.
+    #[test]
+    fn recording_policy_bypass_and_capacity_warnings() {
+        use crate::schema::{RecordingFailureAction, RecordprefPolicy};
+        let ca = env!("CARGO_MANIFEST_PATH");
+        let mut c = recording_enabled_config(ca);
+        c.media.srtp.mode = crate::schema::SrtpMode::Terminate;
+        c.recording.max_sessions = 10_000;
+        assert_eq!(recording_warnings(&c), Vec::<String>::new());
+
+        c.recording.recordpref_never = RecordprefPolicy::Honour;
+        let w = recording_warnings(&c);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("recordpref_never = honour"), "{}", w[0]);
+        assert!(w[0].contains("a=recordpref:off"), "{}", w[0]);
+        c.recording.on_failure = RecordingFailureAction::Continue;
+        assert_eq!(recording_warnings(&c), Vec::<String>::new());
+        c.recording.on_failure = RecordingFailureAction::Reject;
+        c.recording.recordpref_never = RecordprefPolicy::Ignore;
+
+        c.recording.max_sessions = 256;
+        let w = recording_warnings(&c);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("max_sessions (256)"), "{}", w[0]);
+        assert!(w[0].contains("refused with 503"), "{}", w[0]);
+        c.recording.on_failure = RecordingFailureAction::Continue;
+        assert!(recording_warnings(&c)[0].contains("left unrecorded"));
+        // The bound is this node's share of max_calls.
+        c.general.max_calls = 256;
+        assert_eq!(recording_warnings(&c), Vec::<String>::new());
+        // A narrow trigger is not judged.
+        c.general.max_calls = 10_000;
+        c.trunk_groups = vec![trunk_group("carriers")];
+        c.recording.record_all = false;
+        c.recording.trunk_groups = vec!["carriers".to_string()];
+        assert_eq!(recording_warnings(&c), Vec::<String>::new());
+        c.recording.record_all = true;
+        c.recording.enabled = false;
+        assert_eq!(recording_warnings(&c), Vec::<String>::new());
     }
 
     #[test]
@@ -2066,8 +2232,7 @@ mod tests {
     }
 
     /// QA: a zone trigger (no `record_all`) satisfies the trigger rule; a
-    /// known zone is accepted when disabled; enabled still fails closed on
-    /// the POA&M-300 gate, never silently accepted.
+    /// known zone is accepted enabled or disabled.
     #[test]
     fn recording_zone_trigger_and_known_refs_accepted() {
         let ca = env!("CARGO_MANIFEST_PATH");
@@ -2075,9 +2240,10 @@ mod tests {
         c.zones = vec![zone("inside")];
         c.recording.record_all = false;
         c.recording.zones = vec!["inside".to_string()];
-        let e = recording_err(&c);
-        assert!(e.contains("POA&M-300"), "{e}");
-        assert!(!e.contains("record_all"), "{e}");
+        assert!(validate_config(&c).is_ok());
+        c.recording.zones.clear();
+        assert!(recording_err(&c).contains("record_all"));
+        c.recording.zones = vec!["inside".to_string()];
         c.recording.enabled = false;
         assert!(validate_config(&c).is_ok());
     }
@@ -2110,8 +2276,20 @@ mod tests {
             srs_tls_server_name = \"srs.example.net\"\nrecord_all = true\n\
             trunk_groups = []\nzones = []\nmax_sessions = 7\n\
             rs_invite_timeout_ms = 2000\non_failure = \"reject\"\n\
-            recordpref_never = \"ignore\"\n";
+            recordpref_never = \"ignore\"\nsrs_zone = \"inside\"\n\
+            [[zones]]\nname = \"inside\"\nsignaling_interface = \"eth0\"\n\
+            media_interface = \"eth1\"\n";
         let c: SbcConfig = toml::from_str(t).unwrap();
+        assert_eq!(c.recording.srs_zone.as_deref(), Some("inside"));
+        // Round trip: serialize and parse back to the same table.
+        let back: SbcConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.recording, c.recording);
+        let t = "[recording]\non_failure = \"continue\"\n";
+        let cont: SbcConfig = toml::from_str(t).unwrap();
+        assert_eq!(
+            cont.recording.on_failure,
+            crate::schema::RecordingFailureAction::Continue
+        );
         assert_eq!(c.recording.max_sessions, 7);
         assert_eq!(c.recording.rs_invite_timeout_ms, 2000);
         assert_eq!(
@@ -2128,6 +2306,7 @@ mod tests {
             "[recording]\nhonour_recordpref_never = true\n",
             "[recording]\nmax_sessions = -1\n",
             "[recording]\nenabled = \"yes\"\n",
+            "[recording]\nsrs_zone = 3\n",
         ] {
             assert!(toml::from_str::<SbcConfig>(bad).is_err(), "{bad}");
         }

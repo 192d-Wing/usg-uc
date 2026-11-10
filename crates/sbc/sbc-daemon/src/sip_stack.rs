@@ -69,6 +69,10 @@ use uc_routing::{
 use uc_types::address::SbcSocketAddr;
 use uc_types::address::TransportType as AddrTransport;
 
+// SIPREC recording session glue (RFC 7866 SRC): the stack-side half of
+// `crate::recording`, kept out of this file.
+mod recording_session;
+
 /// SIP stack for processing SIP messages.
 pub struct SipStack {
     /// Transaction store.
@@ -211,6 +215,22 @@ pub struct SipStack {
     t38: sbc_config::T38Config,
     /// T.38 switchover counters and active-call gauge (SI-4).
     t38_counters: crate::t38::T38Counters,
+    /// `[recording]` SIPREC SRC settings; `None` when recording is off (the
+    /// default). Set once at startup, restart-required on reload.
+    ///
+    /// ## NIST 800-53 Rev5: AU-14, AU-5, CM-6, CM-7, SC-8
+    recording: Option<crate::recording::RecordingSettings>,
+    /// Recording counters and the `recording.max_sessions` slot count (SI-4,
+    /// SC-5).
+    recording_counters: crate::recording::RecordingCounters,
+    /// RS INVITE deadlines (`recording.rs_invite_timeout_ms`), in deadline
+    /// order (the timeout is constant). Leaf lock, never held across
+    /// `.await`; bounded by the slot count (SC-5).
+    rs_deadlines: std::sync::Mutex<std::collections::VecDeque<recording_session::RsDeadline>>,
+    /// RS BYE / CANCEL waiting for the timer loop, which hands them to the
+    /// recorder flow a bounded number per tick. Leaf lock, never held
+    /// across `.await`; bounded by `recording.max_sessions` (SC-5).
+    rs_wind_down: std::sync::Mutex<std::collections::VecDeque<SipRequest>>,
 }
 
 /// The daemon digest verifier and the decoy secret used for unknown users.
@@ -932,6 +952,10 @@ struct CallCorrelation {
     b_leg: HashMap<String, CallId>,
     /// Maps internal CallId → call addressing info.
     addresses: HashMap<CallId, CallAddresses>,
+    /// Maps a recording session (RS) Call-ID → the internal CallId of the
+    /// call being recorded. SBC-generated random keys; at most one entry per
+    /// held `recording.max_sessions` slot (SC-5).
+    rs_leg: HashMap<String, CallId>,
 }
 
 /// Addressing info for both legs of a B2BUA call.
@@ -1090,6 +1114,11 @@ struct CallAddresses {
     /// Kind of the initial INVITE's anchored stream; `Image` for a direct
     /// fax call, checked against the callee's 2xx.
     initial_offer_kind: crate::t38::CallMediaKind,
+    /// SIPREC recording state (trigger match, slot, RS dialog, outcome).
+    /// Holds no key material.
+    ///
+    /// ## NIST 800-53 Rev5: AU-14, SC-5, SC-12
+    recording: crate::recording::CallRecording,
 }
 
 /// Which legs of a call get topology-hidden egress.
@@ -1590,7 +1619,7 @@ fn topology_policy(e: &proto_sip::SipError) -> String {
 
 /// Per-call topology-hiding decision, captured before a handler runs (the
 /// handler may already have removed the call record, e.g. on BYE).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct LegHiding {
     a_call_id: String,
     b_call_id: String,
@@ -2721,13 +2750,50 @@ struct Pending2xx {
     interval: std::time::Duration,
     next_at: Instant,
     deadline: Instant,
+    /// A BYE the SBC owes the peer this 2xx went to, held until the 2xx is
+    /// ACKed or its retransmission gives up (RFC 3261 §15: a UAS MUST NOT
+    /// send a BYE on a confirmed dialog until it has received the ACK for
+    /// its 2xx or the server transaction timed out). The call's own state
+    /// is already gone; the entry outlives it for this.
+    held_bye: Option<HeldBye>,
+}
+
+/// Upper bound on teardown BYEs held for an ACK at one time (each lives at
+/// most 64*T1 past its call). Beyond it a BYE is sent at once: bounded
+/// state comes before RFC 3261 §15 ordering (NIST 800-53 Rev5: SC-5).
+const MAX_HELD_BYES: usize = 1024;
+
+/// A teardown BYE waiting for the peer's ACK (see
+/// [`Pending2xx::held_bye`]). Not yet topology-hidden; `hiding` is the
+/// released call's decision.
+struct HeldBye {
+    request: SipRequest,
+    destination: SbcSocketAddr,
+    flow: LegFlow,
+    hiding: LegHiding,
+}
+
+impl HeldBye {
+    /// The BYE on its leg's flow, not yet topology-hidden.
+    fn into_result(self) -> ProcessResult {
+        ProcessResult::Forward {
+            message: SipMessage::Request(self.request),
+            destination: self.destination,
+            flow: self.flow.into(),
+        }
+    }
 }
 
 /// Methods the SBC accepts (OPTIONS `Allow` and 405 responses).
 const ALLOWED_METHODS: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, UPDATE";
 
 /// Result of processing a SIP message.
-#[derive(Debug)]
+///
+/// `Debug` prints a summary of each message (start line, Call-ID, CSeq,
+/// body length), never its headers or body: a recording session INVITE
+/// carries SDES SRTP keys in its SDP.
+///
+/// ## NIST 800-53 Rev5: SC-12, SI-12 (key material is never logged)
 pub enum ProcessResult {
     /// Message was processed, send response.
     Response {
@@ -2759,6 +2825,62 @@ pub enum ProcessResult {
         /// Error description.
         reason: String,
     },
+}
+
+/// Redacted `Debug` form of a wire message (see [`ProcessResult`]).
+struct WireSummary<'a>(&'a SipMessage);
+
+impl std::fmt::Debug for WireSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, body) = match self.0 {
+            SipMessage::Request(r) => {
+                write!(f, "{} {}", r.method, r.uri)?;
+                ("request", r.body.as_ref())
+            }
+            SipMessage::Response(r) => {
+                write!(f, "{}", r.status.code())?;
+                ("response", r.body.as_ref())
+            }
+        };
+        let headers = self.0.headers();
+        write!(
+            f,
+            " [{kind}; call-id {}; cseq {}; body {} bytes]",
+            headers.call_id().unwrap_or("-"),
+            headers.cseq().unwrap_or("-"),
+            body.map_or(0, Bytes::len)
+        )
+    }
+}
+
+impl std::fmt::Debug for ProcessResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Response {
+                message,
+                destination,
+                flow,
+            } => f
+                .debug_struct("Response")
+                .field("message", &WireSummary(message))
+                .field("destination", destination)
+                .field("flow", flow)
+                .finish(),
+            Self::Forward {
+                message,
+                destination,
+                flow,
+            } => f
+                .debug_struct("Forward")
+                .field("message", &WireSummary(message))
+                .field("destination", destination)
+                .field("flow", flow)
+                .finish(),
+            Self::Multiple(v) => f.debug_tuple("Multiple").field(v).finish(),
+            Self::NoAction => f.write_str("NoAction"),
+            Self::Error { reason } => f.debug_struct("Error").field("reason", reason).finish(),
+        }
+    }
 }
 
 /// Where announcement media for a failed call is produced: a locally
@@ -2849,6 +2971,10 @@ impl SipStack {
             trusted_trunk_groups: RwLock::new(HashSet::new()),
             t38: sbc_config::T38Config::default(),
             t38_counters: crate::t38::T38Counters::default(),
+            recording: None,
+            recording_counters: crate::recording::RecordingCounters::default(),
+            rs_deadlines: std::sync::Mutex::default(),
+            rs_wind_down: std::sync::Mutex::default(),
         }
     }
 
@@ -2930,6 +3056,10 @@ impl SipStack {
             trusted_trunk_groups: RwLock::new(HashSet::new()),
             t38: sbc_config::T38Config::default(),
             t38_counters: crate::t38::T38Counters::default(),
+            recording: None,
+            recording_counters: crate::recording::RecordingCounters::default(),
+            rs_deadlines: std::sync::Mutex::default(),
+            rs_wind_down: std::sync::Mutex::default(),
         }
     }
 
@@ -3435,7 +3565,12 @@ impl SipStack {
         let call = {
             let corr = self.call_correlation.read().await;
             let id = req.headers.call_id().unwrap_or("");
-            corr.b_leg.get(id).or_else(|| corr.a_leg.get(id)).cloned()
+            // A recording session request belongs to the recorded call.
+            corr.b_leg
+                .get(id)
+                .or_else(|| corr.a_leg.get(id))
+                .or_else(|| corr.rs_leg.get(id))
+                .cloned()
         };
         let key = TransactionKey::client(&branch, req.method.to_string());
         let now = Instant::now();
@@ -3527,6 +3662,7 @@ impl SipStack {
                 interval: t1,
                 next_at: now + t1,
                 deadline: now + t1 * 64,
+                held_bye: None,
             },
         );
     }
@@ -3629,6 +3765,13 @@ impl SipStack {
             self.track_result(r).await;
         }
         out.extend(timeouts);
+        // `recording.rs_invite_timeout_ms`: RS INVITEs the SRS has not
+        // answered in time go through the failure policy (AU-5).
+        let recording = self.recording_poll().await;
+        for r in &recording {
+            self.track_result(r).await;
+        }
+        out.extend(recording);
         out.extend(self.retransmit_pending_2xx().await);
         out
     }
@@ -3646,6 +3789,25 @@ impl SipStack {
             }
         };
         let timeout = StatusCode::REQUEST_TIMEOUT;
+
+        // RFC 3261 §17.1.1.2: Timer B on the recording session INVITE is a
+        // recording failure, handled by `recording.on_failure` (AU-5).
+        if addrs
+            .recording
+            .leg
+            .as_ref()
+            .is_some_and(|l| l.branch == branch)
+        {
+            return self
+                .recording_failure(
+                    call,
+                    uc_audit::event::RecordingFailReason::SrsTimeout,
+                    None,
+                    // A 2xx may still cross: it gets ACK + BYE (§13.2.2.4).
+                    recording_session::LegEnd::WindDown,
+                )
+                .await;
+        }
 
         if let Some(p) = addrs
             .pending_reinvite
@@ -4007,8 +4169,19 @@ impl SipStack {
                                     |c| corr.addresses.get(c).map(|a| a.hidden.a_leg),
                                 )
                             })
+                            // Recording session messages carry SBC-built
+                            // headers only and go to the configured,
+                            // authenticated recorder: never rewritten.
+                            .or_else(|| corr.rs_leg.contains_key(id).then_some(false))
                     });
-                decisions.push(d);
+                // Anything on the recorder flow is a recording session
+                // request, whether or not its dialog is still known (a
+                // re-sent ACK, a BYE after the call ended).
+                let on_recorder_flow = matches!(
+                    el,
+                    ProcessResult::Forward { flow: Flow::Leg(l), .. } if l.recorder
+                );
+                decisions.push(if on_recorder_flow { Some(false) } else { d });
             });
         }
         let mut trunk_dest = vec![false; decisions.len()];
@@ -4220,6 +4393,22 @@ impl SipStack {
     ///
     /// ## NIST 800-53 Rev5: CP-8 (Telecommunications Services), SI-17
     pub async fn on_invite_sent(&self, message: &SipMessage, sent: bool) -> Vec<ProcessResult> {
+        self.on_invite_sent_with(message, sent, false).await
+    }
+
+    /// [`Self::on_invite_sent`] with the failure detail the flow table has:
+    /// `tls_handshake_failed` tells a TLS / certificate failure from an
+    /// unreachable peer. Only the recording session INVITE uses it
+    /// (`srs_tls` vs `srs_unreachable`); a failed RS INVITE has no failover
+    /// (one SRS) and goes through `recording.on_failure`.
+    ///
+    /// ## NIST 800-53 Rev5: AU-5, CP-8, SI-17
+    pub async fn on_invite_sent_with(
+        &self,
+        message: &SipMessage,
+        sent: bool,
+        tls_handshake_failed: bool,
+    ) -> Vec<ProcessResult> {
         let SipMessage::Request(req) = message else {
             return Vec::new();
         };
@@ -4234,6 +4423,12 @@ impl SipStack {
         if sent {
             self.first_send_ok.record(&branch);
             return Vec::new();
+        }
+        if let Some(out) = self
+            .recording_invite_send_failed(req, &branch, tls_handshake_failed)
+            .await
+        {
+            return out;
         }
         let key = TransactionKey::client(&branch, Method::Invite.to_string());
         let call = {
@@ -4311,17 +4506,21 @@ impl SipStack {
 
     /// Re-sends 2xx responses whose ACK has not arrived; a 2xx still
     /// un-ACKed after 64*T1 ends the call with a BYE to both legs (RFC 3261
-    /// §13.3.1.4).
+    /// §13.3.1.4). A BYE held for the ACK ([`Pending2xx::held_bye`]) goes
+    /// out at that point too (§15: "or until the server transaction times
+    /// out").
     async fn retransmit_pending_2xx(&self) -> Vec<ProcessResult> {
         let now = Instant::now();
         let t2 = proto_transaction::DEFAULT_T2;
         let mut out = Vec::new();
         let mut expired = Vec::new();
+        let mut held = Vec::new();
         {
             let mut pending = self.pending_2xx.write().await;
             for (leg_call_id, p) in pending.iter_mut() {
                 if now >= p.deadline {
                     expired.push((leg_call_id.clone(), p.call.clone()));
+                    held.extend(p.held_bye.take());
                 } else if now >= p.next_at {
                     out.push(ProcessResult::Response {
                         message: p.response.clone(),
@@ -4335,6 +4534,11 @@ impl SipStack {
             for (id, _) in &expired {
                 pending.remove(id);
             }
+        }
+        for bye in held {
+            let bye = self.release_held_bye(bye).await;
+            self.track_result(&bye).await;
+            out.push(bye);
         }
         for (leg_call_id, call) in expired {
             let addrs = {
@@ -4394,6 +4598,34 @@ impl SipStack {
             };
         }
         self.handle_in_dialog_request(req, source).await
+    }
+
+    /// A held teardown BYE whose 2xx retransmission gave up (64*T1): hidden
+    /// with the released call's own decision and ready for the wire. The
+    /// caller tracks it. (A BYE released by the ACK is hidden by the egress
+    /// pass of the ACK's own `process_message`, see
+    /// [`Self::held_bye_hiding`].)
+    async fn release_held_bye(&self, held: HeldBye) -> ProcessResult {
+        let hiding = held.hiding.clone();
+        let mut bye = held.into_result();
+        self.apply_egress_topology(&mut bye, None, std::slice::from_ref(&hiding))
+            .await;
+        bye
+    }
+
+    /// The hiding decision of a teardown BYE parked on the un-ACKed 2xx of
+    /// leg dialog `leg_call_id`, for the egress pass of the ACK that
+    /// releases it: the BYE is hidden exactly once, by that pass, with the
+    /// released call's own decision (the call record is already gone).
+    ///
+    /// ## NIST 800-53 Rev5: SC-7
+    async fn held_bye_hiding(&self, leg_call_id: &str) -> Option<LegHiding> {
+        self.pending_2xx
+            .read()
+            .await
+            .get(leg_call_id)
+            .and_then(|p| p.held_bye.as_ref())
+            .map(|h| h.hiding.clone())
     }
 
     /// Reserves the next CSeq toward one leg of a live call under the
@@ -4580,7 +4812,21 @@ impl SipStack {
             &self.t38,
             addrs.media_terminated == crate::t38::RelaySecurity::DtlsTerminated,
             false,
-        ) {
+        )
+        // A switch to T.38 would end the recording (the fork carries audio
+        // only): under `recording.on_failure = reject` it is refused and
+        // the session stays as it was (RFC 3261 §14.2; AU-5, SC-24).
+        .and_then(|c| {
+            let to_image = c
+                .as_ref()
+                .is_some_and(|c| c.kind == crate::t38::CallMediaKind::Image)
+                && addrs.media_kind == crate::t38::CallMediaKind::Audio;
+            if to_image && self.recording_refuses_switch(&addrs) {
+                Err(SwitchoverReason::RecordingActive)
+            } else {
+                Ok(c)
+            }
+        }) {
             Ok(c) => c,
             Err(reason) => {
                 info!(method = %method, call_id = %sip_call_id, ?reason, "T.38 offer refused, 488");
@@ -5244,6 +5490,12 @@ impl SipStack {
         }
         self.finish_t38_answer(&session_key, pending, &t38, &mut results)
             .await;
+        // A recorded call whose media was re-negotiated to something the
+        // SBC cannot read stops being recordable (AU-14, SC-24).
+        results.extend(
+            self.recording_media_changed(internal_id, addrs, resp.body.as_deref())
+                .await,
+        );
 
         info!(
             call_id = %addrs.a_leg_sip_call_id,
@@ -5557,6 +5809,12 @@ impl SipStack {
             }
             event(SwitchoverOutcome::Accepted, None, rate, t38.remote_media);
             info!(call_id = %session_key, ?kind, "Media switchover accepted");
+            // The fork carries audio only: a recorded call that switched
+            // to T.38 (`on_failure = continue`, or an emergency call) stops
+            // being recorded (AU-14, AU-12).
+            if kind == crate::t38::CallMediaKind::Image {
+                results.extend(self.recording_media_switched(session_key).await);
+            }
         } else if t38.declined {
             event(
                 SwitchoverOutcome::RejectedRemote,
@@ -5634,10 +5892,12 @@ impl SipStack {
             .await;
         // INVITE transactions are left to run out (Timer D/H/I) so late
         // retransmissions are still absorbed; `poll_timers` prunes them.
+        // A 2xx that carries a held BYE keeps being retransmitted until the
+        // caller ACKs it (RFC 3261 §15, §13.3.1.4).
         self.pending_2xx
             .write()
             .await
-            .retain(|_, p| &p.call != internal_id);
+            .retain(|_, p| &p.call != internal_id || p.held_bye.is_some());
         if let Some(ref pipeline) = self.media_pipeline {
             let key = internal_id.to_string();
             let _ = pipeline.stop_relay(&key).await;
@@ -5675,8 +5935,15 @@ impl SipStack {
             };
             corr.a_leg.remove(&removed.a_leg_sip_call_id);
             corr.b_leg.remove(&removed.b_leg_sip_call_id);
+            if let Some(leg) = &removed.recording.leg {
+                corr.rs_leg.remove(&leg.call_id);
+            }
             removed
         };
+        // The single end-of-call hook for the recording session: BYE (or
+        // CANCEL) to the SRS, slot release, audit and the CDR fields, on
+        // every teardown path (AU-12, SC-5).
+        self.recording_call_ended(internal_id, &mut removed, &end);
         // RFC 3261 §13.2.2.4: a 2xx can still cross the release of an
         // unanswered call (CANCEL, Timer B, failover exhaustion, ...); keep
         // the attempt so it gets ACK+BYE. Answered calls tear down normally.
@@ -6290,13 +6557,64 @@ impl SipStack {
     /// (neither peer sends one). Returns the BYEs, each on its leg's flow, for
     /// the caller to send; the call state is removed here.
     /// Empty if the call is already gone or the dialog never confirmed.
+    ///
+    /// RFC 3261 §15: a leg that has not ACKed the SBC's 2xx yet (the caller
+    /// of a direct T.38 call whose answer cannot be anchored) gets its BYE
+    /// when the ACK arrives or after 64*T1, not in the returned batch.
     pub async fn terminate_call_on_media_failure(&self, call_id: &str) -> Vec<ProcessResult> {
+        let (mut out, snapshot) = self
+            .terminate_call(
+                call_id,
+                crate::cdr::CdrEnd::media_failure(),
+                uc_audit::event::TerminationReason::Failed,
+                "media failed after answer",
+                true,
+            )
+            .await;
+        // C4 (POA&M-155): server.rs sends these directly; hide here.
+        if let Some(snapshot) = snapshot {
+            for r in &mut out {
+                self.apply_egress_topology(r, None, std::slice::from_ref(&snapshot))
+                    .await;
+            }
+        }
+        out
+    }
+
+    /// Tears down a confirmed call on the SBC's initiative: BYE to **both**
+    /// legs (neither peer sends one), call state removed, CDR emitted with
+    /// `end`, `CallTerminated` audited with `reason`. Returns the BYEs, each
+    /// on its leg's flow and not yet topology-hidden, with the call's hiding
+    /// snapshot for the caller's egress pass. Empty if the call is already
+    /// gone or the dialog never confirmed.
+    ///
+    /// Used for a runtime media failure and for a recording failure under
+    /// `recording.on_failure = reject`.
+    ///
+    /// `hold_until_ack`: a leg that has not yet ACKed a 2xx the SBC sent it
+    /// as UAS (the caller for the initial INVITE; either leg for a
+    /// re-INVITE it sent) does not get its BYE now. The BYE is parked on
+    /// the pending 2xx, which keeps being retransmitted, and goes out when
+    /// the ACK arrives or the retransmission gives up after 64*T1
+    /// (RFC 3261 §15: a UAS MUST NOT send a BYE on a confirmed dialog
+    /// before that; §13.3.1.4). A leg with no un-ACKed 2xx gets its BYE at
+    /// once. Either way the call's state, media and CDR end here.
+    ///
+    /// ## NIST 800-53 Rev5: SC-24 (Fail in Known State), AU-12
+    async fn terminate_call(
+        &self,
+        call_id: &str,
+        end: crate::cdr::CdrEnd,
+        reason: uc_audit::event::TerminationReason,
+        why: &'static str,
+        hold_until_ack: bool,
+    ) -> (Vec<ProcessResult>, Option<LegHiding>) {
         let internal_id = CallId::from(call_id);
         let addrs = {
             let corr = self.call_correlation.read().await;
             match corr.addresses.get(&internal_id) {
                 Some(a) => a.clone(),
-                None => return Vec::new(),
+                None => return (Vec::new(), None),
             }
         };
 
@@ -6306,44 +6624,65 @@ impl SipStack {
         if addrs.dialog_to_tag.is_none() {
             warn!(
                 call_id,
-                "media failure before dialog confirmed; cleaning up without BYE"
+                why, "SBC teardown before dialog confirmed; cleaning up without BYE"
             );
-            self.cleanup_terminated_call(&internal_id, false, crate::cdr::CdrEnd::media_failure())
-                .await;
-            return Vec::new();
+            self.cleanup_terminated_call(&internal_id, false, end).await;
+            return (Vec::new(), None);
         }
 
         let a_bye = self.reserved_leg_bye(&internal_id, &addrs, false).await;
         let b_bye = self.reserved_leg_bye(&internal_id, &addrs, true).await;
-        self.cleanup_terminated_call(&internal_id, false, crate::cdr::CdrEnd::media_failure())
-            .await;
+        let snapshot = LegHiding::of(&addrs);
+        // Each BYE on its own leg's flow (NIST 800-53 Rev5: SC-8).
+        // RFC 3261 §15: a BYE toward a leg with an un-ACKed 2xx is parked on
+        // that 2xx. Done before the cleanup, which leaves such entries in
+        // place.
+        let mut out = Vec::with_capacity(2);
+        let mut held = 0usize;
+        {
+            let mut pending = self.pending_2xx.write().await;
+            // Rare path (an SBC-initiated teardown): the scan is bounded by
+            // the calls in setup or re-negotiation.
+            let room = hold_until_ack
+                && pending.values().filter(|p| p.held_bye.is_some()).count() < MAX_HELD_BYES;
+            for (target_b_leg, bye) in [(false, a_bye), (true, b_bye)] {
+                let (destination, flow) = addrs.leg_target(target_b_leg);
+                let leg_call_id = if target_b_leg {
+                    &addrs.b_leg_sip_call_id
+                } else {
+                    &addrs.a_leg_sip_call_id
+                };
+                match pending
+                    .get_mut(leg_call_id)
+                    .filter(|p| room && p.call == internal_id)
+                {
+                    Some(p) => {
+                        p.held_bye = Some(HeldBye {
+                            request: bye,
+                            destination,
+                            flow,
+                            hiding: snapshot.clone(),
+                        });
+                        held += 1;
+                    }
+                    None => out.push(ProcessResult::Forward {
+                        message: SipMessage::Request(bye),
+                        destination,
+                        flow: flow.into(),
+                    }),
+                }
+            }
+        }
+        self.cleanup_terminated_call(&internal_id, false, end).await;
 
         warn!(
             call_id,
-            "DTLS-SRTP media failed after answer; tearing down call (BYE both legs)"
+            why,
+            byes_held_for_ack = held,
+            "Tearing down call (BYE both legs)"
         );
-        audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Failed);
-
-        // Each BYE on its own leg's flow (NIST 800-53 Rev5: SC-8).
-        let mut out = vec![
-            ProcessResult::Forward {
-                message: SipMessage::Request(a_bye),
-                destination: addrs.a_leg_source,
-                flow: addrs.a_leg_flow.clone().into(),
-            },
-            ProcessResult::Forward {
-                message: SipMessage::Request(b_bye),
-                destination: addrs.b_leg_destination,
-                flow: addrs.b_leg_flow.clone().into(),
-            },
-        ];
-        // C4 (POA&M-155): server.rs sends these directly; hide here.
-        let snapshot = LegHiding::of(&addrs);
-        for r in &mut out {
-            self.apply_egress_topology(r, None, std::slice::from_ref(&snapshot))
-                .await;
-        }
-        out
+        audit_call_terminated(&addrs, reason);
+        (out, Some(snapshot))
     }
 
     /// The rate-limited signaling audit (flush task, metrics).
@@ -7769,29 +8108,48 @@ impl SipStack {
         // POA&M-155: the call's hiding decision is captured before the
         // handler runs (BYE/CANCEL remove the record). Skipped entirely when
         // topology hiding is off.
-        let hiding_snapshot = match (&self.topology_hider, message.call_id()) {
-            // POA&M-185: a late 2xx's ACK/BYE use the released call's own
-            // hiding decision, not the destination fallback.
-            (Some(_), Some(id)) => self
-                .leg_hiding_for(id)
-                .await
-                .or_else(|| lock_leaf(&self.released_invites).hiding_for(id)),
-            _ => None,
-        };
+        // At most two snapshots, kept on the stack (no per-message `Vec`).
+        let (hiding, hiding_len): ([LegHiding; 2], usize) =
+            match (&self.topology_hider, message.call_id()) {
+                // POA&M-185: a late 2xx's ACK/BYE use the released call's own
+                // hiding decision, not the destination fallback.
+                (Some(_), Some(id)) => {
+                    let mut known = self
+                        .leg_hiding_for(id)
+                        .await
+                        .or_else(|| lock_leaf(&self.released_invites).hiding_for(id));
+                    // RFC 3261 §15: an ACK may release a teardown BYE parked
+                    // on its 2xx; that BYE is hidden below with the released
+                    // call's decision, like the one sent after 64*T1.
+                    if known.is_none()
+                        && matches!(&message, SipMessage::Request(r) if r.method == Method::Ack)
+                    {
+                        known = self.held_bye_hiding(id).await;
+                    }
+                    match known {
+                        Some(h) => ([h, LegHiding::default()], 1),
+                        // A recording session message: its dialog is never
+                        // hidden, the recorded call keeps its own decision.
+                        None => self.recording_hiding(id).await,
+                    }
+                }
+                _ => (<[LegHiding; 2]>::default(), 0),
+            };
+        let hiding_snapshot = hiding.get(..hiding_len).unwrap_or_default();
         let is_request = message.is_request();
         let mut result = match message {
             SipMessage::Request(_) => {
                 self.process_request(message, source, receiving_zone, transport, conn)
                     .await
             }
-            SipMessage::Response(_) => self.process_response(message, source).await,
+            SipMessage::Response(_) => self.process_response(message, source, transport).await,
         };
         // C1: egress chokepoint, before tracking so retransmissions resend
         // hidden bytes (NIST 800-53 Rev5: SC-7).
         self.apply_egress_topology(
             &mut result,
             is_request.then_some((data, source)),
-            hiding_snapshot.as_slice(),
+            hiding_snapshot,
         )
         .await;
         // Everything a handler puts on the wire rides a transaction: responses
@@ -7843,6 +8201,12 @@ impl SipStack {
             self.open_server_transaction(req, source, transport).await;
         }
 
+        // A request inside a recording session dialog (from the SRS) never
+        // reaches the B2BUA handlers (NIST 800-53 Rev5: SC-23, AC-4).
+        if let Some(result) = self.handle_rs_request(req, source, transport).await {
+            return result;
+        }
+
         match method {
             Method::Register => self.handle_register(message, source, transport, conn).await,
             Method::Invite => {
@@ -7866,7 +8230,12 @@ impl SipStack {
     /// finals (§17.1.1.3). What passes is handed to the B2BUA: the initial
     /// INVITE's responses are relayed to the A-leg; responses to a relayed
     /// re-INVITE/UPDATE go back to whichever leg originated it.
-    async fn process_response(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
+    async fn process_response(
+        &self,
+        message: SipMessage,
+        source: SbcSocketAddr,
+        transport: AddrTransport,
+    ) -> ProcessResult {
         let SipMessage::Response(ref resp) = message else {
             return ProcessResult::Error {
                 reason: "Expected response".to_string(),
@@ -7891,6 +8260,21 @@ impl SipStack {
             debug!(call_id = %sip_call_id, "Response without CSeq, ignoring");
             return ProcessResult::NoAction;
         };
+
+        // 0. A recording session response is taken only from the SRS over
+        //    TLS; anything else is dropped before it can touch the client
+        //    transaction (NIST 800-53 Rev5: SC-8, SC-23).
+        if self
+            .rs_response_refused(&sip_call_id, source, transport)
+            .await
+        {
+            warn!(
+                source = %source,
+                ?transport,
+                "Recording session response not from the SRS over TLS, ignored"
+            );
+            return ProcessResult::NoAction;
+        }
 
         // 1. Transaction layer. Matching on Call-ID alone would let anyone who
         //    learned a Call-ID inject a forged 200 OK; the branch must match a
@@ -7963,6 +8347,13 @@ impl SipStack {
 
         // 2. Transaction user: find the call this leg belongs to.
         let corr = self.call_correlation.read().await;
+        // 2-RS. A response in a recording session dialog (from the SRS).
+        if let Some(id) = corr.rs_leg.get(&sip_call_id).cloned() {
+            drop(corr);
+            return self
+                .handle_rs_response(resp, (source, transport), &id, &branch, &cseq, ack_action)
+                .await;
+        }
         let (internal_id, is_b_leg) = if let Some(id) = corr.b_leg.get(&sip_call_id) {
             (id.clone(), true)
         } else if let Some(id) = corr.a_leg.get(&sip_call_id) {
@@ -8299,7 +8690,16 @@ impl SipStack {
         // A retransmitted 200 (our ACK was lost): re-ACK only (RFC 3261
         // §13.2.2.4). The A-leg 200 is retransmitted by the 2xx timer, and
         // the media relay must not be started twice.
-        if addrs.b_leg_answered {
+        //
+        // The same holds for a second copy of the 200 handled while the
+        // first is still awaiting the media controller (`b_leg_answered` is
+        // not set yet): for a call matching the recording trigger the first
+        // copy claims the answer under the write lock, so a duplicate can
+        // neither start a second recording session nor fail the first
+        // (NIST 800-53 Rev5: SC-24, SC-5).
+        if addrs.b_leg_answered
+            || (addrs.recording.matched && !self.recording_claim_answer(internal_id).await)
+        {
             debug!(call_id = %addrs.a_leg_sip_call_id, "Retransmitted 200 OK from B-leg, re-sending ACK");
             let ack = Self::build_leg_in_dialog_request(addrs, true, &Method::Ack, 1, None);
             return ProcessResult::Forward {
@@ -8307,14 +8707,6 @@ impl SipStack {
                 destination: addrs.b_leg_destination,
                 flow: addrs.b_leg_flow.clone().into(),
             };
-        }
-
-        // Activate the call
-        {
-            let mut calls = self.calls.write().await;
-            if let Some(call) = calls.get_mut(internal_id) {
-                let _ = call.activate();
-            }
         }
 
         // Build 200 OK for A-leg with rewritten SDP, carrying the A-leg
@@ -8387,6 +8779,42 @@ impl SipStack {
             }
         }
 
+        // SIPREC (RFC 7866 §6.1.1): a call matching the recording trigger
+        // gets its recording session started now; the RS INVITE rides the
+        // recorder's own lane and delays neither the caller's 200 nor the
+        // callee's ACK. This is decided before the 200 is relayed: when the
+        // answer makes the call unrecordable (SRTP the SBC only passes
+        // through, no usable audio, the fork cannot be prepared) and
+        // `recording.on_failure = reject`, the call is refused, not
+        // answered and then cut (RFC 3261 §15).
+        //
+        // ## NIST 800-53 Rev5: AU-14, AU-5, SC-24
+        let t38_unusable = kind_failed.is_some()
+            || matches!(initial_t38, Some(crate::t38::AnswerCheck::Failed(_)));
+        let recording_results = if addrs.recording.matched && !t38_unusable {
+            match self
+                .recording_on_answer(internal_id, addrs, resp.body.as_deref(), terminated)
+                .await
+            {
+                recording_session::AnswerRecording::Proceed(results) => results,
+                recording_session::AnswerRecording::Refuse(reason) => {
+                    return self
+                        .refuse_unrecordable_answer(resp, internal_id, addrs, reason)
+                        .await;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Activate the call
+        {
+            let mut calls = self.calls.write().await;
+            if let Some(call) = calls.get_mut(internal_id) {
+                let _ = call.activate();
+            }
+        }
+
         // Remember the answer for body-less refreshes, and that the B-leg
         // has answered (later 2xx are retransmissions).
         {
@@ -8420,6 +8848,67 @@ impl SipStack {
             },
         ));
 
+        let ack_request = Self::initial_invite_ack(resp, addrs);
+
+        info!(
+            call_id = %addrs.a_leg_sip_call_id,
+            "Call connected: 200 OK → A-leg, ACK → B-leg"
+        );
+
+        // The 200 toward the caller is retransmitted until ACKed (§13.3.1.4).
+        let a_message = SipMessage::Response(a_response);
+        self.arm_2xx_retransmit(
+            &addrs.a_leg_sip_call_id,
+            internal_id,
+            &a_message,
+            addrs.a_leg_source,
+            addrs.a_leg_flow.clone(),
+            cseq_number(&addrs.a_leg_cseq),
+        )
+        .await;
+
+        let mut results = vec![
+            ProcessResult::Response {
+                message: a_message,
+                destination: addrs.a_leg_source,
+                flow: addrs.a_leg_flow.clone().into(),
+            },
+            ProcessResult::Forward {
+                message: SipMessage::Request(ack_request),
+                destination: addrs.b_leg_destination,
+                flow: addrs.b_leg_flow.clone().into(),
+            },
+        ];
+        // The RS INVITE (decided above), after the 200 and the ACK.
+        results.extend(recording_results);
+        // A malformed T.38 answer on a direct fax call: the dialog is
+        // committed, so BYE both legs (an unvalidated image stream is never
+        // anchored). NIST 800-53 Rev5: SI-10, AU-2.
+        if let Some(reason) = t38_failed {
+            let key = internal_id.to_string();
+            warn!(call_id = %addrs.a_leg_sip_call_id, ?reason, "T.38 answer cannot be anchored; tearing down call");
+            self.t38_counters
+                .record(crate::t38::CallMediaKind::Image, SwitchoverOutcome::Failed);
+            audit(crate::t38::audit_event(
+                &key,
+                crate::t38::CallMediaKind::Image,
+                crate::t38::CallMediaKind::Image,
+                // The caller (A-leg) made the offer.
+                true,
+                SwitchoverOutcome::Failed,
+                Some(reason),
+                None,
+            ));
+            results.extend(self.terminate_call_on_media_failure(&key).await);
+        }
+        ProcessResult::Multiple(results)
+    }
+
+    /// The ACK for the callee's 2xx to the initial INVITE. It belongs to the
+    /// B-leg dialog: the INVITE's From (our tag), the To with the callee's
+    /// tag, and the INVITE's CSeq number with method ACK (RFC 3261
+    /// §13.2.2.4).
+    fn initial_invite_ack(resp: &SipResponse, addrs: &CallAddresses) -> SipRequest {
         // Build ACK for B-leg. The ACK belongs to the B-leg dialog: it
         // must carry the INVITE's From (our tag), the To with the callee's
         // tag, and the INVITE's CSeq number with method ACK (RFC 3261
@@ -8451,57 +8940,63 @@ impl SipStack {
             crate::flow::via_for(&addrs.b_leg_flow, &addrs.local_addr, &branch),
         ));
         ack_request.headers.set(HeaderName::ContentLength, "0");
+        ack_request
+    }
 
-        info!(
+    /// The callee answered 2xx but the call matches the recording trigger,
+    /// cannot be recorded and `recording.on_failure = reject`: the 2xx is
+    /// not relayed. The caller gets a final error on its INVITE transaction
+    /// (488 with a `Warning`, or 503), the callee's dialog is confirmed
+    /// with an ACK and ended with a BYE (RFC 3261 §13.2.2.4, §15), and the
+    /// call is released with the `recording_failure` CDR cause. The
+    /// recording failure itself is already audited, counted and tagged.
+    ///
+    /// The caller never sees a 2xx, so no BYE toward it is needed (§15: a
+    /// BYE before the caller's ACK is not allowed).
+    ///
+    /// ## NIST 800-53 Rev5: AU-5, SC-24 (Fail in Known State), AU-12
+    async fn refuse_unrecordable_answer(
+        &self,
+        resp: &SipResponse,
+        internal_id: &CallId,
+        addrs: &CallAddresses,
+        reason: uc_audit::event::RecordingFailReason,
+    ) -> ProcessResult {
+        let (status, warning) = recording_session::refusal_response(reason, &self.config.domain);
+        let mut a_response = build_a_leg_response(status, addrs);
+        if let Some(w) = warning {
+            a_response.headers.set(HeaderName::Warning, w);
+        }
+        let ack = Self::initial_invite_ack(resp, addrs);
+        let bye = self.reserved_leg_bye(internal_id, addrs, true).await;
+        let mut end = crate::cdr::CdrEnd::recording_failure();
+        end.status = status.code();
+        // Stops the relay the answer just started and removes the call.
+        self.cleanup_terminated_call(internal_id, false, end).await;
+        warn!(
             call_id = %addrs.a_leg_sip_call_id,
-            "Call connected: 200 OK → A-leg, ACK → B-leg"
+            reason = reason.as_str(),
+            status = status.code(),
+            "Answered call cannot be recorded; refused (recording.on_failure = reject)"
         );
-
-        // The 200 toward the caller is retransmitted until ACKed (§13.3.1.4).
-        let a_message = SipMessage::Response(a_response);
-        self.arm_2xx_retransmit(
-            &addrs.a_leg_sip_call_id,
-            internal_id,
-            &a_message,
-            addrs.a_leg_source,
-            addrs.a_leg_flow.clone(),
-            cseq_number(&addrs.a_leg_cseq),
-        )
-        .await;
-
-        let mut results = vec![
+        audit_call_terminated(addrs, uc_audit::event::TerminationReason::PolicyTerminated);
+        ProcessResult::Multiple(vec![
             ProcessResult::Response {
-                message: a_message,
+                message: SipMessage::Response(a_response),
                 destination: addrs.a_leg_source,
                 flow: addrs.a_leg_flow.clone().into(),
             },
             ProcessResult::Forward {
-                message: SipMessage::Request(ack_request),
+                message: SipMessage::Request(ack),
                 destination: addrs.b_leg_destination,
                 flow: addrs.b_leg_flow.clone().into(),
             },
-        ];
-        // A malformed T.38 answer on a direct fax call: the dialog is
-        // committed, so BYE both legs (an unvalidated image stream is never
-        // anchored). NIST 800-53 Rev5: SI-10, AU-2.
-        if let Some(reason) = t38_failed {
-            let key = internal_id.to_string();
-            warn!(call_id = %addrs.a_leg_sip_call_id, ?reason, "T.38 answer cannot be anchored; tearing down call");
-            self.t38_counters
-                .record(crate::t38::CallMediaKind::Image, SwitchoverOutcome::Failed);
-            audit(crate::t38::audit_event(
-                &key,
-                crate::t38::CallMediaKind::Image,
-                crate::t38::CallMediaKind::Image,
-                // The caller (A-leg) made the offer.
-                true,
-                SwitchoverOutcome::Failed,
-                Some(reason),
-                None,
-            ));
-            results.extend(self.terminate_call_on_media_failure(&key).await);
-        }
-        ProcessResult::Multiple(results)
+            ProcessResult::Forward {
+                message: SipMessage::Request(bye),
+                destination: addrs.b_leg_destination,
+                flow: addrs.b_leg_flow.clone().into(),
+            },
+        ])
     }
 
     /// Handles 4xx/5xx/6xx error response from B-leg.
@@ -9137,18 +9632,47 @@ impl SipStack {
         // ## NIST 800-53 Rev5: AU-2, AU-12
         let from_header = req.headers.get_value(&HeaderName::From).unwrap_or("");
         let from_uri = extract_uri_from_header(from_header);
-        let reject_cdr = |status: u16, cause: uc_cdr::ReleaseCause| {
-            self.cdr_reject(&crate::cdr::Rejection {
-                a_call_id: &a_leg_call_id,
-                from: &from_uri,
-                callee: req.uri.user.as_deref().unwrap_or(""),
-                source,
-                transport,
-                zone: receiving_zone,
-                emergency,
-                status,
-                cause,
-            });
+        let reject_cdr_tagged =
+            |status: u16, cause: uc_cdr::ReleaseCause, recording: Option<uc_cdr::RecordingTag>| {
+                self.cdr_reject(&crate::cdr::Rejection {
+                    a_call_id: &a_leg_call_id,
+                    from: &from_uri,
+                    callee: req.uri.user.as_deref().unwrap_or(""),
+                    source,
+                    transport,
+                    zone: receiving_zone,
+                    emergency,
+                    status,
+                    cause,
+                    recording,
+                });
+            };
+        let reject_cdr =
+            |status: u16, cause: uc_cdr::ReleaseCause| reject_cdr_tagged(status, cause, None);
+        // A matched call refused because it cannot be recorded: the CDR
+        // carries the recording outcome (AU-3, AU-14).
+        let recording_refusal = |reason: uc_audit::event::RecordingFailReason| {
+            let (status, warning) =
+                recording_session::refusal_response(reason, &self.config.domain);
+            reject_cdr_tagged(
+                status.code(),
+                uc_cdr::ReleaseCause::RecordingFailure,
+                Some(crate::recording::failure_tag(reason, false)),
+            );
+            let mut refused = create_response_from_request(req, status);
+            match warning {
+                // RFC 3261 §20.43: why the session description is refused.
+                Some(w) => refused.headers.set(HeaderName::Warning, w),
+                None => refused.headers.set(
+                    HeaderName::RetryAfter,
+                    TRUNK_UNAVAILABLE_RETRY_AFTER_SECS.to_string(),
+                ),
+            }
+            ProcessResult::Response {
+                message: SipMessage::Response(refused),
+                destination: source,
+                flow: Flow::Reply,
+            }
         };
 
         // Check for INVITE retransmit — if we already know this Call-ID,
@@ -9761,6 +10285,57 @@ impl SipStack {
 
         // 4. Create B2BUA call
         let internal_call_id = CallId::generate();
+
+        // SIPREC: evaluate the recording trigger against both legs (the
+        // egress leg being every trunk the route may use, failover targets
+        // included), check what the offer alone decides and take a
+        // `recording.max_sessions` slot. A matched call that cannot be
+        // recorded (no free slot, no SDP offer, direct T.38, SRTP the SBC
+        // only passes through, no in-process relay) is refused here, before
+        // the B-leg is dialled, under `on_failure = reject`; emergency
+        // calls and `continue` proceed unrecorded (audited).
+        //
+        // ## NIST 800-53 Rev5: AU-14, AU-5, SC-5, SC-24; 47 CFR 9.16;
+        // RFC 3261 §15 (no call is answered only to be cut)
+        let mut recording = if self.recording.is_some() {
+            let ingress_group = self.lookup_inbound_trunk(source.ip()).await.map(|(g, _)| g);
+            let egress_zone = self.egress_media_zone(receiving_zone, b_leg_external);
+            let may_terminate = self.dtls_fingerprint_source.is_some()
+                && req.body.as_ref().is_some_and(|body| {
+                    crate::sdp_dtls::parse_peer_dtls(&String::from_utf8_lossy(body)).is_some()
+                });
+            let admitted = self.recording_admit(
+                &internal_call_id,
+                &crate::recording::Trigger {
+                    ingress_trunk_group: ingress_group.as_deref(),
+                    egress_trunk_group: trunk_lease.as_ref().map(|l| l.group_id.as_str()),
+                    ingress_zone: receiving_zone,
+                    egress_zone: egress_zone.as_deref(),
+                    failover_targets: &failover_targets,
+                },
+                emergency,
+                req.body.as_deref(),
+                t38_offer
+                    .as_ref()
+                    .is_some_and(|c| c.kind == crate::t38::CallMediaKind::Image),
+                may_terminate,
+            );
+            match admitted {
+                Ok(plan) => plan,
+                Err(reason) => {
+                    self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                    self.release_slots(
+                        trunk_lease.as_ref(),
+                        vps_callee.as_deref(),
+                        TrunkOutcome::Abandoned,
+                    )
+                    .await;
+                    return recording_refusal(reason);
+                }
+            }
+        } else {
+            crate::recording::CallRecording::default()
+        };
         let a_leg_from = req
             .headers
             .get_value(&HeaderName::From)
@@ -9852,6 +10427,22 @@ impl SipStack {
         } else {
             (self.allocate_rtp_port(), None)
         };
+        // SIPREC: a call that is to be recorded but got no relay cannot be
+        // recorded; refused here under `on_failure = reject`, like the
+        // offer-determined cases above (AU-5, SC-24).
+        if media_a_leg_port.is_none()
+            && let Err(reason) = self.recording_admit_unanchored(&internal_call_id, &mut recording)
+        {
+            self.in_flight_invites.write().await.remove(&a_leg_call_id);
+            self.release_slots(
+                trunk_lease.as_ref(),
+                vps_callee.as_deref(),
+                TrunkOutcome::Abandoned,
+            )
+            .await;
+            self.release_rtp_port(b_leg_rtp_port);
+            return recording_refusal(reason);
+        }
         // DTLS-SRTP termination (when `srtp.mode = terminate`, i.e.
         // `dtls_identity` is set): learn the caller's offered DTLS params (its
         // `a=setup` picks the SBC's answering role for the A-leg 183/200), and
@@ -10367,6 +10958,7 @@ impl SipStack {
                     initial_offer_kind: t38_offer
                         .as_ref()
                         .map_or(crate::t38::CallMediaKind::Audio, |c| c.kind),
+                    recording,
                 },
             );
         }
@@ -10429,16 +11021,32 @@ impl SipStack {
             }
         }
 
+        // An ACK for a 2xx that reuses the INVITE's Via branch (a UAC not
+        // following RFC 3261 §13.2.2.4) is absorbed above while that server
+        // transaction is still in the table (until the next timer tick
+        // prunes it); the 2xx retransmission then draws another ACK, which
+        // lands here.
         let cseq = req.headers.cseq_parsed().map(|c| c.sequence);
-        let mut pending = self.pending_2xx.write().await;
-        if pending
-            .get(&call_id)
-            .is_some_and(|p| cseq.is_none_or(|n| n == p.cseq))
-        {
-            pending.remove(&call_id);
-            debug!(call_id = %call_id, "ACK received for 2xx; retransmission stopped");
-        }
-        ProcessResult::NoAction
+        let held = {
+            let mut pending = self.pending_2xx.write().await;
+            if pending
+                .get(&call_id)
+                .is_some_and(|p| cseq.is_none_or(|n| n == p.cseq))
+            {
+                debug!(call_id = %call_id, "ACK received for 2xx; retransmission stopped");
+                pending.remove(&call_id).and_then(|p| p.held_bye)
+            } else {
+                None
+            }
+        };
+        // RFC 3261 §15: the dialog is confirmed now, so a teardown BYE that
+        // was waiting for this ACK may go out. Not hidden here: the egress
+        // pass of this ACK's `process_message` hides it, once, with the
+        // call's own decision (`held_bye_hiding`).
+        held.map_or(ProcessResult::NoAction, |bye| {
+            info!(call_id = %call_id, "ACK received; sending the held teardown BYE");
+            bye.into_result()
+        })
     }
 
     /// Handles BYE request.
@@ -12654,6 +13262,10 @@ fn extract_param<'a>(header_value: &'a str, name: &str) -> Option<&'a str> {
 pub mod tests {
     use super::*;
 
+    // SIPREC recording session tests (sans-IO, with a mock media controller).
+    mod recording;
+    pub use recording::{rs_byes_queued_at_shutdown, rs_invite_for_server};
+
     /// For server tests: a stack with trunks t1 (127.0.0.2:5061) and t2
     /// (127.0.0.3:5061), both TLS, and a placed call's primary B-leg INVITE
     /// result (to t1).
@@ -14004,6 +14616,7 @@ pub mod tests {
             anchored_index: 0,
             media_terminated: crate::t38::RelaySecurity::Opaque,
             initial_offer_kind: crate::t38::CallMediaKind::Audio,
+            recording: crate::recording::CallRecording::default(),
         }
     }
 
@@ -18517,6 +19130,9 @@ pub mod tests {
         let inv = forwarded(&r, &Method::Invite).unwrap().0.clone();
         answer(&stack, &inv, t1()).await;
         let id = internal_id(&stack, "mf@cdr").await;
+        // The caller ACKed its 200 (an un-ACKed leg's BYE would be held,
+        // RFC 3261 §15).
+        stack.pending_2xx.write().await.clear();
         let byes = stack.terminate_call_on_media_failure(&id.to_string()).await;
         assert_eq!(byes.len(), 2);
         assert_eq!(
@@ -20483,6 +21099,9 @@ pub mod tests {
             .get(&internal)
             .cloned()
             .unwrap();
+        // The caller ACKed its 200 (an un-ACKed leg's BYE would be held,
+        // RFC 3261 §15).
+        stack.pending_2xx.write().await.clear();
         // SBC-initiated teardown: each BYE on its own leg's flow and Via.
         let byes = stack
             .terminate_call_on_media_failure(&internal.to_string())
@@ -20974,6 +21593,9 @@ pub mod tests {
         let inv = inv.clone();
         answer(&stack, &inv, dest).await;
         let internal = internal_id(&stack, "qa-bye@test").await;
+        // The caller ACKed its 200 (an un-ACKed leg's BYE would be held,
+        // RFC 3261 §15).
+        stack.pending_2xx.write().await.clear();
         let byes = stack
             .terminate_call_on_media_failure(&internal.to_string())
             .await;
@@ -26318,8 +26940,23 @@ pub mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(byes.len(), 2, "BYE both legs");
-        assert!(byes.contains(&alice()) && byes.contains(&bob()));
+        // RFC 3261 §15: the caller has not ACKed the 200 to its re-INVITE
+        // yet, so its BYE goes out with that ACK.
+        assert_eq!(byes, vec![bob()], "callee BYE'd at once");
+        let ack = alice_request("ACK", 2, Some("bobtag"), None);
+        let released = flatten(stack.process_message(&ack, alice(), None).await);
+        let byes: Vec<_> = released
+            .iter()
+            .filter_map(|r| match r {
+                ProcessResult::Forward {
+                    message: SipMessage::Request(q),
+                    destination,
+                    ..
+                } if q.method == Method::Bye => Some(*destination),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(byes, vec![alice()], "caller BYE'd on its ACK");
         assert_eq!(stack.call_count().await, 0);
         let ev = switchovers(&capture.events());
         assert_eq!(ev[0].outcome, SwitchoverOutcome::Failed);
@@ -26510,6 +27147,24 @@ pub mod tests {
             .collect()
     }
 
+    /// RFC 3261 §15 (RFC-001): a direct T.38 call torn down at the answer.
+    /// The callee's BYE is in the answer's batch; the caller has not ACKed
+    /// the 200 yet, so its BYE goes out with that ACK, once.
+    async fn assert_both_legs_byed_caller_after_ack(
+        stack: &SipStack,
+        results: &[ProcessResult],
+        ctx: &str,
+    ) {
+        let byes = bye_destinations(results);
+        assert_eq!(byes, vec![bob()], "{ctx}: callee BYE'd at once: {byes:?}");
+        let ack = alice_request("ACK", 1, Some("bobtag"), None);
+        let released = flatten(stack.process_message(&ack, alice(), None).await);
+        let byes = bye_destinations(&released);
+        assert_eq!(byes, vec![alice()], "{ctx}: caller BYE'd on its ACK");
+        let again = flatten(stack.process_message(&ack, alice(), None).await);
+        assert!(bye_destinations(&again).is_empty(), "{ctx}: sent once");
+    }
+
     #[tokio::test]
     async fn t38_initial_image_answer_set_media_kind_failure_tears_down() {
         let capture = uc_audit::capture::start();
@@ -26518,9 +27173,7 @@ pub mod tests {
             media.take().iter().any(|l| l == "kind Image"),
             "set_media_kind was attempted"
         );
-        let byes = bye_destinations(&results);
-        assert_eq!(byes.len(), 2, "BYE both legs: {byes:?}");
-        assert!(byes.contains(&alice()) && byes.contains(&bob()));
+        assert_both_legs_byed_caller_after_ack(&stack, &results, "kind").await;
         assert_eq!(stack.call_count().await, 0);
         let ev = switchovers(&capture.events());
         let failed: Vec<_> = ev
@@ -26555,8 +27208,7 @@ pub mod tests {
                 !log.iter().any(|l| l == "start"),
                 "{bad}: no relay: {log:?}"
             );
-            let byes = bye_destinations(&results);
-            assert_eq!(byes.len(), 2, "{bad}: BYE both legs: {byes:?}");
+            assert_both_legs_byed_caller_after_ack(&stack, &results, bad).await;
             assert_eq!(stack.call_count().await, 0, "{bad}");
             let ev = switchovers(&capture.events());
             assert!(
@@ -26584,9 +27236,7 @@ pub mod tests {
                 !media.take().iter().any(|l| l == "start"),
                 "{which}: no relay started"
             );
-            let byes = bye_destinations(&results);
-            assert_eq!(byes.len(), 2, "{which}: BYE both legs: {byes:?}");
-            assert!(byes.contains(&alice()) && byes.contains(&bob()));
+            assert_both_legs_byed_caller_after_ack(&stack, &results, which).await;
             assert_eq!(stack.call_count().await, 0, "{which}");
             let ev = switchovers(&capture.events());
             assert!(

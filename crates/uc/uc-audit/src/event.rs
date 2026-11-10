@@ -134,6 +134,20 @@ pub enum AuditEvent {
     /// A call's anchored media switched between audio and T.38 fax (image),
     /// or the switchover was refused or failed.
     MediaSwitchover(MediaSwitchover),
+
+    /// A SIPREC recording session (RFC 7866) became active for a call.
+    RecordingStarted(RecordingStarted),
+
+    /// An active recording session ended.
+    RecordingStopped(RecordingStopped),
+
+    /// A call that matched the recording trigger could not be recorded, or
+    /// its recording session failed; carries the policy action taken.
+    RecordingFailed(RecordingFailed),
+
+    /// A call that matched the recording trigger was deliberately not
+    /// recorded (participant opt-out).
+    RecordingSkipped(RecordingSkipped),
 }
 
 impl AuditEvent {
@@ -144,7 +158,11 @@ impl AuditEvent {
             Self::CallAttempt(_)
             | Self::CallEstablished(_)
             | Self::CallTerminated(_)
-            | Self::MediaSwitchover(_) => AuditEventType::Call,
+            | Self::MediaSwitchover(_)
+            | Self::RecordingStarted(_)
+            | Self::RecordingStopped(_)
+            | Self::RecordingFailed(_)
+            | Self::RecordingSkipped(_) => AuditEventType::Call,
             Self::AuthenticationAttempt(_) => AuditEventType::Authentication,
             Self::AuthorizationDecision(_) | Self::CdrExport(_) => AuditEventType::Authorization,
             Self::CryptoKeyOperation(_) | Self::StirSignFailure(_) | Self::StirKeyLoaded(_) => {
@@ -810,6 +828,10 @@ pub enum SwitchoverReason {
     RemotePort0,
     /// The media relay could not be updated.
     RelayUpdateFailed,
+    /// The call has an active recording session and
+    /// `recording.on_failure = reject`: T.38 cannot be recorded, so the
+    /// switch is refused locally (488) rather than ending the recording.
+    RecordingActive,
 }
 
 /// Transport of the switched-to stream.
@@ -851,6 +873,201 @@ pub struct MediaSwitchover {
     pub remote_media: Option<std::net::SocketAddr>,
 }
 
+/// How the SBC relays the recorded call's media (which tap feeds the
+/// recording fork).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingRelay {
+    /// Opaque relay of cleartext RTP.
+    Opaque,
+    /// DTLS-SRTP terminated at the SBC on each leg.
+    DtlsTerminated,
+}
+
+/// Why an active recording session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingStopReason {
+    /// The recorded call ended (RFC 3261 §15: the SRC sends BYE on the RS).
+    CallEnded,
+    /// The SRS ended the recording session with a BYE.
+    SrsBye,
+    /// The call's media changed to a kind the SBC cannot record (T.38
+    /// switch under `on_failure = continue`).
+    MediaNotRecordable,
+    /// The SBC is shutting down.
+    Shutdown,
+}
+
+/// Why a call that matched the recording trigger was not (or is no longer)
+/// recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingFailReason {
+    /// `recording.max_sessions` reached (SC-5).
+    NoSessionSlot,
+    /// The SBC cannot read the call's media (SRTP passthrough, direct T.38,
+    /// no in-process media pipeline).
+    MediaNotRecordable,
+    /// The media fork could not be prepared or activated.
+    ForkSetup,
+    /// The RS INVITE could not be sent to the SRS (connect failure).
+    SrsUnreachable,
+    /// The TLS handshake with the SRS failed (certificate or name check).
+    SrsTls,
+    /// The SRS answered the RS INVITE with a non-2xx final response other
+    /// than 488.
+    SrsRejected,
+    /// The SRS answered 488 Not Acceptable Here (typically an SRS without
+    /// `AEAD_AES_256_GCM` SRTP).
+    #[serde(rename = "srs_not_acceptable_488")]
+    SrsNotAcceptable488,
+    /// No final response within `recording.rs_invite_timeout_ms` or Timer B
+    /// (RFC 3261 §17.1.1.2).
+    SrsTimeout,
+    /// The SRS 2xx carried no usable SDP answer (RFC 4568 §6, RFC 7866 §7).
+    SrsBadAnswer,
+    /// The SRS ended the recording session before the call ended.
+    SrsBye,
+    /// The media controller does not implement the recording fork (remote
+    /// media node).
+    RemoteMediaUnsupported,
+    /// The call ended on its own before the recording session was
+    /// established (the RS INVITE was still unanswered, or the fork was not
+    /// active yet). Not an SRS failure; nothing was recorded.
+    CallEndedDuringSetup,
+}
+
+impl RecordingFailReason {
+    /// Every reason, in declaration order (for fixed-name metric export).
+    pub const ALL: [Self; 12] = [
+        Self::NoSessionSlot,
+        Self::MediaNotRecordable,
+        Self::ForkSetup,
+        Self::SrsUnreachable,
+        Self::SrsTls,
+        Self::SrsRejected,
+        Self::SrsNotAcceptable488,
+        Self::SrsTimeout,
+        Self::SrsBadAnswer,
+        Self::SrsBye,
+        Self::RemoteMediaUnsupported,
+        Self::CallEndedDuringSetup,
+    ];
+
+    /// The serialized token (identical to the serde form).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSessionSlot => "no_session_slot",
+            Self::MediaNotRecordable => "media_not_recordable",
+            Self::ForkSetup => "fork_setup",
+            Self::SrsUnreachable => "srs_unreachable",
+            Self::SrsTls => "srs_tls",
+            Self::SrsRejected => "srs_rejected",
+            Self::SrsNotAcceptable488 => "srs_not_acceptable_488",
+            Self::SrsTimeout => "srs_timeout",
+            Self::SrsBadAnswer => "srs_bad_answer",
+            Self::SrsBye => "srs_bye",
+            Self::RemoteMediaUnsupported => "remote_media_unsupported",
+            Self::CallEndedDuringSetup => "call_ended_during_setup",
+        }
+    }
+}
+
+/// What `recording.on_failure` did with the call after a recording failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingFailAction {
+    /// The call was refused or torn down (`on_failure = reject`).
+    CallRejected,
+    /// The call continues unrecorded (`on_failure = continue`).
+    ContinuedUnrecorded,
+    /// An emergency call continues unrecorded regardless of policy.
+    EmergencyContinued,
+    /// The call had already ended when the failure was recorded: the policy
+    /// had nothing to act on.
+    CallAlreadyEnded,
+}
+
+/// Why a matched call was deliberately not recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingSkipReason {
+    /// A participant's SDP carried `a=recordpref:off` (RFC 7866 §7.1.3; or
+    /// the non-standard alias `never`) and
+    /// `recording.recordpref_never = honour`.
+    ParticipantOptOut,
+}
+
+/// Recording session started.
+///
+/// Every field is an SBC-chosen enum, number or internal identifier; no
+/// SIP-supplied string is written to the record (audit-injection safe).
+///
+/// ## NIST 800-53 Rev5: AU-14 (Session Audit), AU-2, AU-3, AU-12
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingStarted {
+    /// Internal SBC session identifier (as in `media_switchover`; not the
+    /// raw SIP Call-ID).
+    pub call_id: String,
+    /// RFC 7865 recording session identifier (SBC-generated; not the RS
+    /// Call-ID).
+    pub recording_session_id: String,
+    /// Milliseconds between the call's answer and the recording session
+    /// becoming active (the unrecorded window at call start).
+    pub start_offset_ms: u64,
+    /// Relay mode feeding the fork.
+    pub relay: RecordingRelay,
+}
+
+/// Recording session stopped.
+///
+/// ## NIST 800-53 Rev5: AU-14, AU-2, AU-3, AU-12
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingStopped {
+    /// Internal SBC session identifier.
+    pub call_id: String,
+    /// RFC 7865 recording session identifier.
+    pub recording_session_id: String,
+    /// Why the recording ended.
+    pub reason: RecordingStopReason,
+    /// How long the recording session was active, in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Recording failed; `action` is what the failure policy did with the call.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures),
+/// AU-14, AU-2, AU-3, AU-12, SC-24
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingFailed {
+    /// Internal SBC session identifier.
+    pub call_id: String,
+    /// RFC 7865 recording session identifier, when one was allocated
+    /// before the failure.
+    #[serde(default)]
+    pub recording_session_id: Option<String>,
+    /// Why recording failed.
+    pub reason: RecordingFailReason,
+    /// What happened to the call.
+    pub action: RecordingFailAction,
+    /// Final SIP status from the SRS, when the failure was a response.
+    #[serde(default)]
+    pub sip_status: Option<u16>,
+}
+
+/// Recording skipped for a matched call.
+///
+/// ## NIST 800-53 Rev5: AU-14, AU-2, AU-3, AU-12; PT-5
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingSkipped {
+    /// Internal SBC session identifier.
+    pub call_id: String,
+    /// Why recording was skipped.
+    pub reason: RecordingSkipReason,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -884,6 +1101,139 @@ mod tests {
         assert_eq!(r, r#""remote_port0""#);
         let r = serde_json::to_string(&SwitchoverReason::MalformedT38Sdp).unwrap();
         assert_eq!(r, r#""malformed_t38_sdp""#);
+        let r = serde_json::to_string(&SwitchoverReason::RecordingActive).unwrap();
+        assert_eq!(r, r#""recording_active""#);
+    }
+
+    #[test]
+    fn recording_started_serializes_enums_only() {
+        let e = AuditEvent::RecordingStarted(RecordingStarted {
+            call_id: "sess-1".into(),
+            recording_session_id: "rs-1".into(),
+            start_offset_ms: 42,
+            relay: RecordingRelay::DtlsTerminated,
+        });
+        assert_eq!(e.event_type(), AuditEventType::Call);
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"type":"recording_started","call_id":"sess-1","recording_session_id":"rs-1","start_offset_ms":42,"relay":"dtls_terminated"}"#
+        );
+        let r = serde_json::to_string(&RecordingRelay::Opaque).unwrap();
+        assert_eq!(r, r#""opaque""#);
+    }
+
+    #[test]
+    fn recording_stopped_serializes_enums_only() {
+        let e = AuditEvent::RecordingStopped(RecordingStopped {
+            call_id: "sess-1".into(),
+            recording_session_id: "rs-1".into(),
+            reason: RecordingStopReason::CallEnded,
+            duration_ms: 9000,
+        });
+        assert_eq!(e.event_type(), AuditEventType::Call);
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"type":"recording_stopped","call_id":"sess-1","recording_session_id":"rs-1","reason":"call_ended","duration_ms":9000}"#
+        );
+        for (reason, token) in [
+            (RecordingStopReason::CallEnded, "call_ended"),
+            (RecordingStopReason::SrsBye, "srs_bye"),
+            (
+                RecordingStopReason::MediaNotRecordable,
+                "media_not_recordable",
+            ),
+            (RecordingStopReason::Shutdown, "shutdown"),
+        ] {
+            let json = serde_json::to_string(&reason).unwrap();
+            assert_eq!(json, format!("\"{token}\""));
+        }
+    }
+
+    #[test]
+    fn recording_failed_serializes_enums_only() {
+        let e = AuditEvent::RecordingFailed(RecordingFailed {
+            call_id: "sess-1".into(),
+            recording_session_id: Some("rs-1".into()),
+            reason: RecordingFailReason::SrsNotAcceptable488,
+            action: RecordingFailAction::CallRejected,
+            sip_status: Some(488),
+        });
+        assert_eq!(e.event_type(), AuditEventType::Call);
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"type":"recording_failed","call_id":"sess-1","recording_session_id":"rs-1","reason":"srs_not_acceptable_488","action":"call_rejected","sip_status":488}"#
+        );
+        // Failure before any RS exists: no session ID, no status.
+        let e = AuditEvent::RecordingFailed(RecordingFailed {
+            call_id: "sess-2".into(),
+            recording_session_id: None,
+            reason: RecordingFailReason::NoSessionSlot,
+            action: RecordingFailAction::EmergencyContinued,
+            sip_status: None,
+        });
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"type":"recording_failed","call_id":"sess-2","recording_session_id":null,"reason":"no_session_slot","action":"emergency_continued","sip_status":null}"#
+        );
+        let a = serde_json::to_string(&RecordingFailAction::ContinuedUnrecorded).unwrap();
+        assert_eq!(a, r#""continued_unrecorded""#);
+        let a = serde_json::to_string(&RecordingFailAction::CallAlreadyEnded).unwrap();
+        assert_eq!(a, r#""call_already_ended""#);
+        // The optional fields may be absent on read.
+        let back: AuditEvent = serde_json::from_str(
+            r#"{"type":"recording_failed","call_id":"s","reason":"srs_tls","action":"call_rejected"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            back,
+            AuditEvent::RecordingFailed(RecordingFailed {
+                recording_session_id: None,
+                reason: RecordingFailReason::SrsTls,
+                sip_status: None,
+                ..
+            })
+        ));
+    }
+
+    /// The metric-name token of every failure reason is its serde token,
+    /// and `ALL` lists each reason once.
+    #[test]
+    fn recording_fail_reason_tokens_match_serde() {
+        let expected = [
+            "no_session_slot",
+            "media_not_recordable",
+            "fork_setup",
+            "srs_unreachable",
+            "srs_tls",
+            "srs_rejected",
+            "srs_not_acceptable_488",
+            "srs_timeout",
+            "srs_bad_answer",
+            "srs_bye",
+            "remote_media_unsupported",
+            "call_ended_during_setup",
+        ];
+        assert_eq!(RecordingFailReason::ALL.len(), expected.len());
+        for (reason, token) in RecordingFailReason::ALL.into_iter().zip(expected) {
+            assert_eq!(reason.as_str(), token);
+            let json = serde_json::to_string(&reason).unwrap();
+            assert_eq!(json, format!("\"{token}\""));
+            let back: RecordingFailReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, reason);
+        }
+    }
+
+    #[test]
+    fn recording_skipped_serializes_enums_only() {
+        let e = AuditEvent::RecordingSkipped(RecordingSkipped {
+            call_id: "sess-1".into(),
+            reason: RecordingSkipReason::ParticipantOptOut,
+        });
+        assert_eq!(e.event_type(), AuditEventType::Call);
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"type":"recording_skipped","call_id":"sess-1","reason":"participant_opt_out"}"#
+        );
     }
 
     #[test]

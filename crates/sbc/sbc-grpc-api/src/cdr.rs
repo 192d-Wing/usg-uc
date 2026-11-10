@@ -74,6 +74,12 @@ pub fn to_proto(r: &CallRecord) -> CdrRecord {
             .iter()
             .map(|k| k.as_str().to_string())
             .collect(),
+        // Schema v4: empty string = unset.
+        recording: r
+            .recording
+            .map(|t| t.as_str().to_string())
+            .unwrap_or_default(),
+        recording_session_id: r.recording_session_id.clone().unwrap_or_default(),
         failover_takeover: r.failover_takeover,
         prev_hash: r.prev_hash.clone(),
         hash: r.hash.clone(),
@@ -170,6 +176,23 @@ pub fn from_proto(p: &CdrRecord) -> Result<CallRecord, String> {
             ));
         }
         obj.insert("media_kinds".into(), serde_json::json!(p.media_kinds));
+        // Schema v4. Empty = unset (key omitted, as the writer does, so the
+        // record's chain hash is reproducible). An unknown token is rejected
+        // by the RecordingTag deserializer below; the session ID is bounded
+        // like every stored string.
+        // NIST 800-53 Rev5: SI-10 (Information Input Validation), SC-5
+        if !p.recording.is_empty() {
+            obj.insert("recording".into(), serde_json::json!(p.recording));
+        }
+        if p.recording_session_id.len() > uc_cdr::record::MAX_FIELD_LEN {
+            return Err("invalid CDR record: recording_session_id too long".to_string());
+        }
+        if !p.recording_session_id.is_empty() {
+            obj.insert(
+                "recording_session_id".into(),
+                serde_json::json!(p.recording_session_id),
+            );
+        }
     }
     serde_json::from_value(v).map_err(|e| format!("invalid CDR record: {e}"))
 }
@@ -218,6 +241,63 @@ mod tests {
         assert_eq!(from_proto(&p).unwrap(), r);
     }
 
+    /// Schema v4: the recording fields survive the proto round trip, unset
+    /// maps to empty strings and back, and the hash chain value computed
+    /// from the converted record is unchanged.
+    #[test]
+    fn recording_fields_round_trip() {
+        let mut r = CallRecord {
+            schema_version: uc_cdr::SCHEMA_VERSION,
+            record_id: "n-2".into(),
+            node_id: "n".into(),
+            disposition: Disposition::RecordingFailure,
+            release_cause: ReleaseCause::RecordingFailure,
+            final_sip_status: 503,
+            recording: Some(uc_cdr::RecordingTag::Failed),
+            recording_session_id: Some("7d0c8a52-1f0e-4a43-9c58-0f3a5b6c7d8e".into()),
+            ..Default::default()
+        };
+        uc_cdr::chain::seal(&mut r, &uc_cdr::chain::GENESIS).unwrap();
+        let p = to_proto(&r);
+        assert_eq!(p.recording, "failed");
+        assert_eq!(
+            p.recording_session_id,
+            "7d0c8a52-1f0e-4a43-9c58-0f3a5b6c7d8e"
+        );
+        assert_eq!(p.disposition, "recording_failure");
+        assert_eq!(p.release_cause, "recording_failure");
+        let back = from_proto(&p).unwrap();
+        assert_eq!(back, r);
+        let h = uc_cdr::chain::compute_hash(&uc_cdr::chain::GENESIS, &back).unwrap();
+        assert_eq!(uc_cdr::chain::to_hex(&h), r.hash);
+
+        for tag in [
+            uc_cdr::RecordingTag::Recorded,
+            uc_cdr::RecordingTag::Partial,
+            uc_cdr::RecordingTag::Failed,
+            uc_cdr::RecordingTag::NotRecordable,
+            uc_cdr::RecordingTag::OptOut,
+        ] {
+            let r = CallRecord {
+                recording: Some(tag),
+                ..Default::default()
+            };
+            let p = to_proto(&r);
+            assert_eq!(p.recording, tag.as_str());
+            assert_eq!(p.recording_session_id, "");
+            assert_eq!(from_proto(&p).unwrap(), r);
+        }
+
+        // Not applicable: empty on the wire, None in the record.
+        let p = to_proto(&CallRecord::default());
+        assert_eq!(
+            (p.recording.as_str(), p.recording_session_id.as_str()),
+            ("", "")
+        );
+        let back = from_proto(&p).unwrap();
+        assert_eq!((back.recording, back.recording_session_id), (None, None));
+    }
+
     #[test]
     fn rejects_bad_enums() {
         let mut p = to_proto(&CallRecord::default());
@@ -238,5 +318,15 @@ mod tests {
         let mut p = to_proto(&CallRecord::default());
         p.media_kinds = vec!["audio".into(), "image".into(), "audio".into()];
         assert!(from_proto(&p).is_err());
+        for bad in ["yes", "Recorded", "recorded ", "true"] {
+            let mut p = to_proto(&CallRecord::default());
+            p.recording = bad.into();
+            assert!(from_proto(&p).is_err(), "{bad:?}");
+        }
+        let mut p = to_proto(&CallRecord::default());
+        p.recording_session_id = "x".repeat(uc_cdr::record::MAX_FIELD_LEN + 1);
+        assert!(from_proto(&p).is_err());
+        p.recording_session_id = "x".repeat(uc_cdr::record::MAX_FIELD_LEN);
+        assert!(from_proto(&p).is_ok());
     }
 }

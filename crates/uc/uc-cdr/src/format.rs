@@ -41,13 +41,15 @@ pub fn header_json_line(header: &FileHeader) -> CdrResult<String> {
     Ok(serde_json::to_string(header)?)
 }
 
-/// Fixed v3 CSV columns, in order. `sequence` is the second column and
+/// Fixed v4 CSV columns, in order. `sequence` is the second column and
 /// `hash` the last so the writer can resume from a file's last row.
 ///
 /// v2 inserts the four `stir_*` verification columns after
 /// `failover_takeover` (before the hash pair, which must stay last).
 /// v3 inserts `media_kinds` (`;`-separated tokens, empty when unset) after
 /// `stir_x5u_host`.
+/// v4 inserts `recording` and `recording_session_id` (empty when unset)
+/// after `media_kinds`.
 pub const CSV_COLUMNS: &[&str] = &[
     "schema_version",
     "sequence",
@@ -93,6 +95,8 @@ pub const CSV_COLUMNS: &[&str] = &[
     "stir_inbound_attestation",
     "stir_x5u_host",
     "media_kinds",
+    "recording",
+    "recording_session_id",
     "prev_hash",
     "hash",
 ];
@@ -102,6 +106,9 @@ pub const CSV_COLUMNS_V1: usize = 41;
 
 /// Number of CSV columns in schema v2.
 pub const CSV_COLUMNS_V2: usize = 45;
+
+/// Number of CSV columns in schema v3.
+pub const CSV_COLUMNS_V3: usize = 46;
 
 /// CSV header row (no trailing newline).
 pub fn csv_header() -> String {
@@ -250,6 +257,11 @@ pub fn to_csv_row(r: &CallRecord) -> CdrResult<String> {
         }
         out.push_str(k.as_str());
     });
+    col!(push_opt(
+        r.recording.map(crate::record::RecordingTag::as_str),
+        &mut out
+    ));
+    col!(push_opt(r.recording_session_id.as_deref(), &mut out));
     col!(out.push_str(&r.prev_hash));
     col!(out.push_str(&r.hash));
     Ok(out)
@@ -390,5 +402,50 @@ mod tests {
         let ids: Vec<String> = serde_json::from_str(&fields[5]).unwrap();
         assert_eq!(ids, r.b_call_ids);
         assert_eq!(csv_header().split(',').count(), CSV_COLUMNS.len());
+    }
+
+    /// v4: `recording` and `recording_session_id` sit after `media_kinds`
+    /// and before the hash pair, which stays last (the writer resumes from
+    /// the last column). Earlier columns keep their positions.
+    #[test]
+    fn csv_v4_recording_columns_order() {
+        let n = CSV_COLUMNS.len();
+        assert_eq!(n, CSV_COLUMNS_V3 + 2);
+        assert_eq!(
+            &CSV_COLUMNS[n - 5..],
+            &[
+                "media_kinds",
+                "recording",
+                "recording_session_id",
+                "prev_hash",
+                "hash"
+            ]
+        );
+        assert_eq!(CSV_COLUMNS[CSV_COLUMNS_V3 - 3], "media_kinds");
+        assert_eq!(&CSV_COLUMNS[..2], &["schema_version", "sequence"]);
+
+        let mut r = CallRecord {
+            recording: Some(crate::record::RecordingTag::Partial),
+            recording_session_id: Some("=rs,1".to_string()),
+            prev_hash: "aa".into(),
+            hash: "bb".into(),
+            ..Default::default()
+        };
+        let fields = parse_csv_row(&to_csv_row(&r).unwrap());
+        assert_eq!(fields.len(), n);
+        assert_eq!(fields[n - 4], "partial");
+        // Guarded and quoted like every other string column (CWE-1236).
+        assert_eq!(fields[n - 3], "'=rs,1");
+        assert_eq!(
+            (fields[n - 2].as_str(), fields[n - 1].as_str()),
+            ("aa", "bb")
+        );
+
+        // Unset: both columns are present and empty.
+        r.recording = None;
+        r.recording_session_id = None;
+        let fields = parse_csv_row(&to_csv_row(&r).unwrap());
+        assert_eq!(fields.len(), n);
+        assert_eq!((fields[n - 4].as_str(), fields[n - 3].as_str()), ("", ""));
     }
 }
