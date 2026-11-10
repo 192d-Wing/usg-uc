@@ -394,7 +394,7 @@ GET /api/v1/cdrs
 | `end` | integer | Exclusive upper bound on `setup_ms` (epoch ms); must be after `start` |
 | `caller` | string | Exact match on `caller` (as stored) |
 | `callee` | string | Exact match on `callee_dialed` or `callee_translated` |
-| `disposition` | string | `answered`, `failed`, `cancelled`, `rejected`, `busy`, `no_answer`, `media_failure` or `operator_terminated` |
+| `disposition` | string | `answered`, `failed`, `cancelled`, `rejected`, `busy`, `no_answer`, `media_failure`, `operator_terminated` or `recording_failure` |
 | `trunk` | string | Matches `final_trunk` or any `trunks_tried` entry |
 | `page_token` | string | Opaque (digits) token from a previous response |
 | `page_size` | integer | Default 100, capped at 500 |
@@ -411,6 +411,8 @@ GET /api/v1/cdrs
 ```
 
 `next_page_token` is `null` on the last page. `total` is the number of records in the node's ring.
+
+Records written since CDR schema v4 can carry `recording` (`recorded`, `partial`, `failed`, `not_recordable`, `opt_out`; absent when the call did not match the `[recording]` trigger) and `recording_session_id` (RFC 7865 session UUID). The gRPC-to-REST conversion is tested (`recording_fields_round_trip`); the REST endpoint itself is not tested with these fields. See "Call Recording (SIPREC)" in [SBC-ADMIN-GUIDE.md](SBC-ADMIN-GUIDE.md).
 
 ### Get CDR
 

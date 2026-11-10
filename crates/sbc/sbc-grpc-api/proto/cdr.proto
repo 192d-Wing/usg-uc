@@ -72,14 +72,14 @@ message CdrRecord {
     uint64 duration_ms = 26;
     optional uint64 pdd_ms = 27;
     // answered | failed | cancelled | rejected | busy | no_answer |
-    // media_failure | operator_terminated
+    // media_failure | operator_terminated | recording_failure (v4)
     string disposition = 28;
     uint32 final_sip_status = 29;
     // caller | callee | sbc
     string release_side = 30;
     // normal | cancel | timer_b | transport_error | trunk_error |
     // admission_max_calls | draining | policy_denied | no_route |
-    // media_failure | operator | shutdown
+    // media_failure | operator | shutdown | recording_failure (v4)
     string release_cause = 31;
     optional uint32 q850_cause = 32;
     optional string media_node = 33;
@@ -109,6 +109,17 @@ message CdrRecord {
     // actually relayed: an image answer whose media-node switch failed (the
     // call is then torn down) still lists "image".
     repeated string media_kinds = 46;
+    // Schema v4 (POA&M-306, RFC 7866 SRC). Additive. Recording outcome of a
+    // call that matched the recording trigger:
+    // recorded | partial | failed | not_recordable | opt_out.
+    // Empty = not applicable (no trigger match, or a pre-v4 record).
+    // "recorded" means the recording session was up, with no failure
+    // signalled by the recorder, until the call ended; it does not cover the
+    // setup window after answer.
+    string recording = 47;
+    // RFC 7865 recording session identifier (SBC-generated; not the
+    // recording session's SIP Call-ID). Empty = none.
+    string recording_session_id = 48;
 }
 
 // Filter for ListCdrs. Unset/empty fields match everything.

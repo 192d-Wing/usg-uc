@@ -266,20 +266,30 @@ pub struct SbcConfig {
 
     /// SIPREC call recording (RFC 7866 SRC) policy. Default off.
     ///
-    /// ## NIST 800-53 Rev5: CM-6, CM-7, PT-5, SC-8 (POA&M-302)
+    /// ## NIST 800-53 Rev5: AU-14, AU-5, CM-6, CM-7, PT-5, SC-8
     pub recording: RecordingConfig,
 }
 
 /// What to do with the communication session when its recording session
-/// cannot be set up.
+/// cannot be set up, or fails mid-call.
+///
+/// Default `reject` (fail closed). Emergency calls are never torn down for
+/// a recording failure; they continue unrecorded and are audited.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures),
+/// SC-24 (Fail in Known State), CM-6
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingFailureAction {
     /// Keep the call up, unrecorded (audited).
-    #[default]
     Continue,
-    /// BYE both legs of the call (audited). The RS is attempted after the
-    /// call's 200 OK, so this cannot avoid a short unrecorded window.
+    /// Refuse or end the call (audited). A call the INVITE or the callee's
+    /// answer already shows to be unrecordable is refused before it is
+    /// connected (488 / 503); a recording session that fails after the
+    /// call's 200 OK ends the call with a BYE to both legs. The RS is
+    /// attempted after the 200 OK, so this cannot avoid a short unrecorded
+    /// window.
+    #[default]
     Reject,
 }
 
@@ -290,20 +300,39 @@ pub enum RecordingFailureAction {
 /// `srs_tls_ca_file`) because the RS SDP carries SDES SRTP keys
 /// (RFC 4568 §8.3).
 ///
-/// Interop (RFC 4568 §6 / RFC 7866 §11): the RS offer carries only
+/// Interop (RFC 4568 §6 / RFC 7866 §12.2): the RS offer carries only
 /// `AEAD_AES_256_GCM` SDES (RFC 7714; CNSA 2.0, no AES-128 / HMAC-SHA1).
 /// An SRS that implements only `AES_CM_128_HMAC_SHA1_80` answers 488 and
-/// the call is handled per `on_failure` (`continue`: unrecorded; `reject`:
-/// BYE both legs). Confirm the SRS supports `AEAD_AES_256_GCM` before
-/// enabling.
+/// the call is handled per `on_failure` (`reject`, the default: BYE both
+/// legs; `continue`: unrecorded). Confirm the SRS supports
+/// `AEAD_AES_256_GCM` before enabling.
 ///
-/// POAM: POA&M-300/-301 - the SRC (RS INVITE origination and media fork)
-/// is not wired yet, so `enabled = true` is rejected at load even when every
-/// other field is valid. The schema and its validation ship first so the
-/// accepted key set is final.
+/// A recorded call uses four RTP port pairs instead of two; size
+/// `media.rtp_port_min..max` accordingly. `max_sessions` is per node, and a
+/// slot is held from the INVITE of a matched call (ringing calls count):
+/// with a broad trigger size it to `general.max_calls`, or calls beyond it
+/// are handled per `on_failure`.
 ///
-/// ## NIST 800-53 Rev5: CM-6, CM-7 (default off), PT-5 (notice), SC-8;
-/// SC-23 prerequisite only (POA&M-304)
+/// Trunk failover: a trunk-group trigger matches when the route's first
+/// trunk or any of its failover trunks is in a listed group, so a call
+/// cannot leave on a listed group unrecorded.
+///
+/// Media encrypted above RTP (ZRTP, payload-level encryption) cannot be
+/// detected in general; an SDP that announces ZRTP (`a=zrtp-hash`) is
+/// treated as not recordable.
+///
+/// POAM: POA&M-301 - only calls whose media the SBC can read are recorded
+/// (cleartext RTP on the opaque relay, or DTLS-SRTP terminated calls);
+/// SDES / DTLS passthrough calls and calls on remote media nodes are "not
+/// recordable" and handled per `on_failure`.
+/// POAM: POA&M-301 - early media (before the call's 200 OK) is not recorded,
+/// and no RTCP is sent on the recording session.
+/// POAM: POA&M-303 - no in-band recording indication to participants (no
+/// `a=record`, RFC 7866 §7.1.2); `notice_acknowledged` is the only control.
+/// POAM: POA&M-305 - no metadata update on re-INVITE / hold / T.38 switch.
+///
+/// ## NIST 800-53 Rev5: AU-14 (Session Audit), AU-5 (failure policy), CM-6,
+/// CM-7 (default off), PT-5 (notice), SC-5 (`max_sessions`), SC-8, SC-23
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RecordingConfig {
@@ -327,28 +356,46 @@ pub struct RecordingConfig {
     pub trunk_groups: Vec<String>,
     /// Record calls with either leg in one of these zones.
     pub zones: Vec<String>,
-    /// Concurrent recording sessions cap (1..=10000). SC-5 prerequisite
-    /// (range-checked only; enforced by the fork, POA&M-301).
+    /// Concurrent recording sessions cap on this node (1..=10000). A matched
+    /// call that finds no free slot is handled per `on_failure` (SC-5).
     pub max_sessions: u32,
     /// RS INVITE final-response timeout in ms (1000..=32000, RFC 3261
     /// Timer B ceiling).
     pub rs_invite_timeout_ms: u32,
-    /// Action when the RS cannot be set up.
+    /// Action when the RS cannot be set up or fails. Default `reject`.
     pub on_failure: RecordingFailureAction,
-    /// What to do when either leg's SDP carries `a=recordpref:never`
-    /// (RFC 7866 §6.1.2). Default: honour it (skip recording).
+    /// What to do when either leg's SDP asks not to be recorded:
+    /// `a=recordpref:off` (RFC 7866 §7.1.3, ABNF §7.3.2). `never` is not an
+    /// RFC 7866 value; it is accepted as a non-standard alias of `off` and
+    /// gives this key its name. Default: `ignore` (record anyway).
+    /// `honour` lets any call party switch recording off for its call and
+    /// must be an explicit operator choice.
     pub recordpref_never: RecordprefPolicy,
+    /// Zone whose media address the recording fork sockets bind to and
+    /// whose address goes in the RS SDP and Contact. Must name a configured
+    /// zone. Unset: same rule as an internal B-leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub srs_zone: Option<String>,
 }
 
-/// Policy for a participant's `a=recordpref:never` (RFC 7866 §6.1.2).
-/// Participants can only suppress recording, never enable it.
+/// Policy for a participant's `a=recordpref:off` (RFC 7866 §7.1.3).
+///
+/// `never` is a non-standard alias of `off`. Participants can only suppress
+/// recording, never enable it. A media-level value overrides the
+/// session-level one for the recorded audio stream.
+///
+/// Default `ignore`: under `honour` every call party can opt its calls out
+/// of recording with one SDP line, whatever `on_failure` says, so honouring
+/// it is the operator's explicit decision.
+///
+/// ## NIST 800-53 Rev5: AU-14, CM-6, CM-7 (least functionality), PT-5
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordprefPolicy {
     /// Skip recording the call (audited as a participant opt-out).
-    #[default]
     Honour,
     /// Record anyway (operator policy overrides the preference).
+    #[default]
     Ignore,
 }
 
@@ -365,8 +412,12 @@ impl Default for RecordingConfig {
             zones: Vec::new(),
             max_sessions: 256,
             rs_invite_timeout_ms: 5000,
-            on_failure: RecordingFailureAction::Continue,
-            recordpref_never: RecordprefPolicy::Honour,
+            // AU-5 / SC-24: fail closed unless the operator opts out.
+            on_failure: RecordingFailureAction::Reject,
+            // AU-14: a participant cannot switch recording off unless the
+            // operator says so.
+            recordpref_never: RecordprefPolicy::Ignore,
+            srs_zone: None,
         }
     }
 }

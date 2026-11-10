@@ -283,6 +283,39 @@ impl CachedAeadKey {
         Ok(())
     }
 
+    /// Encrypts `in_out` in place and returns the detached authentication tag.
+    ///
+    /// No heap allocation: the ciphertext overwrites the plaintext (same
+    /// length) and the 16-byte tag is returned by value, for the caller to
+    /// place where its wire format needs it. This is the per-packet path for
+    /// fixed-buffer SRTP senders (RFC 7714 §8.2: ciphertext then tag).
+    ///
+    /// The caller is responsible for nonce uniqueness under this key
+    /// (RFC 7714 §8.4 / NIST SP 800-38D §8: a repeated nonce breaks both
+    /// confidentiality and authenticity).
+    ///
+    /// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection), SC-5 (no
+    /// per-packet allocation)
+    ///
+    /// # Errors
+    /// Returns an error if encryption fails. The contents of `in_out` are
+    /// then unspecified and must not be sent.
+    pub fn seal_in_place(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        in_out: &mut [u8],
+    ) -> CryptoResult<[u8; TAG_LEN]> {
+        let nonce = Nonce::assume_unique_for_key(*nonce);
+        let tag = self
+            .inner
+            .seal_in_place_separate_tag(nonce, Aad::from(aad), in_out)
+            .map_err(|_| CryptoError::SealFailed)?;
+        // AES-256-GCM always yields a 16-byte tag; fail closed rather than
+        // truncate or pad if the backend ever reports another length.
+        <[u8; TAG_LEN]>::try_from(tag.as_ref()).map_err(|_| CryptoError::SealFailed)
+    }
+
     /// Decrypts ciphertext into a caller-provided buffer, avoiding allocation.
     ///
     /// The buffer is cleared and filled with ciphertext, then decrypted
@@ -483,6 +516,77 @@ mod tests {
         assert!(pt.capacity() >= ct.len());
         ct[0] ^= 1;
         assert!(ck.open(&nonce, b"a", &ct).is_err());
+    }
+
+    // Known answer: NIST GCM test case 16 (AES-256, 60-byte plaintext,
+    // 20-byte AAD) from the McGrew/Viega GCM specification.
+    #[test]
+    fn test_seal_in_place_known_answer() {
+        fn hex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+        let key: [u8; KEY_LEN] =
+            hex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308")
+                .try_into()
+                .unwrap();
+        let nonce: [u8; NONCE_LEN] = hex("cafebabefacedbaddecaf888").try_into().unwrap();
+        let aad = hex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+        let mut buf = hex(concat!(
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72",
+            "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39"
+        ));
+        let expected_ct = hex(concat!(
+            "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa",
+            "8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662"
+        ));
+        let expected_tag = hex("76fc6ece0f4e1768cddf8853bb2d551b");
+
+        let ck = CachedAeadKey::new(&key).unwrap();
+        let tag = ck.seal_in_place(&nonce, &aad, &mut buf).unwrap();
+        assert_eq!(buf, expected_ct);
+        assert_eq!(tag.as_slice(), expected_tag.as_slice());
+    }
+
+    // `seal_in_place` must be byte-identical to `seal` (ciphertext || tag)
+    // for every length across several AES block boundaries, including empty.
+    #[test]
+    fn test_seal_in_place_equals_seal_over_lengths() {
+        let ck = CachedAeadKey::new(&[0x42; KEY_LEN]).unwrap();
+        for len in 0..=300usize {
+            let plaintext: Vec<u8> = (0..len).map(|i| (i * 7 + len) as u8).collect();
+            let aad: Vec<u8> = (0..(len % 73)).map(|i| i as u8).collect();
+            let nonce = random::generate_nonce().unwrap();
+
+            let expected = ck.seal(&nonce, &aad, &plaintext).unwrap();
+
+            let mut in_out = plaintext.clone();
+            let tag = ck.seal_in_place(&nonce, &aad, &mut in_out).unwrap();
+            assert_eq!(in_out.len(), len);
+            assert_eq!(&expected[..len], in_out.as_slice(), "ciphertext, len {len}");
+            assert_eq!(&expected[len..], tag.as_slice(), "tag, len {len}");
+
+            // And the detached form opens with the existing `open`.
+            in_out.extend_from_slice(&tag);
+            assert_eq!(ck.open(&nonce, &aad, &in_out).unwrap(), plaintext);
+        }
+    }
+
+    #[test]
+    fn test_seal_in_place_tag_binds_aad_and_nonce() {
+        let ck = CachedAeadKey::new(&[0x11; KEY_LEN]).unwrap();
+        let nonce = random::generate_nonce().unwrap();
+        let mut other_nonce = nonce;
+        other_nonce[0] ^= 1;
+        let mut buf = *b"payload bytes";
+        let tag = ck.seal_in_place(&nonce, b"hdr", &mut buf).unwrap();
+        let mut wire = buf.to_vec();
+        wire.extend_from_slice(&tag);
+        assert!(ck.open(&nonce, b"hdX", &wire).is_err());
+        assert!(ck.open(&other_nonce, b"hdr", &wire).is_err());
+        assert_eq!(ck.open(&nonce, b"hdr", &wire).unwrap(), b"payload bytes");
     }
 
     #[test]

@@ -20,7 +20,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// v3 (T.38 fax, POA&M-294) adds `media_kinds`, also omitted when empty so
 /// v1/v2 records keep verifying.
-pub const SCHEMA_VERSION: u16 = 3;
+///
+/// v4 (SIPREC recording, POA&M-306) adds `recording` and
+/// `recording_session_id`, omitted when unset so v1..v3 records keep
+/// verifying, and the `recording_failure` disposition / release cause.
+pub const SCHEMA_VERSION: u16 = 4;
 
 /// Oldest schema version readers accept.
 pub const MIN_READ_SCHEMA_VERSION: u16 = 1;
@@ -93,6 +97,9 @@ pub enum Disposition {
     MediaFailure,
     /// Terminated by an operator through the management API.
     OperatorTerminated,
+    /// Refused or torn down because the call had to be recorded and could
+    /// not be (`recording.on_failure = reject`) (v4).
+    RecordingFailure,
 }
 
 impl Disposition {
@@ -107,6 +114,7 @@ impl Disposition {
             Self::NoAnswer => "no_answer",
             Self::MediaFailure => "media_failure",
             Self::OperatorTerminated => "operator_terminated",
+            Self::RecordingFailure => "recording_failure",
         }
     }
 
@@ -121,6 +129,7 @@ impl Disposition {
             "no_answer" => Self::NoAnswer,
             "media_failure" => Self::MediaFailure,
             "operator_terminated" => Self::OperatorTerminated,
+            "recording_failure" => Self::RecordingFailure,
             _ => return None,
         })
     }
@@ -179,6 +188,8 @@ pub enum ReleaseCause {
     Operator,
     /// SBC shutdown.
     Shutdown,
+    /// Recording failure under `recording.on_failure = reject` (v4).
+    RecordingFailure,
 }
 
 impl ReleaseCause {
@@ -197,6 +208,7 @@ impl ReleaseCause {
             Self::MediaFailure => "media_failure",
             Self::Operator => "operator",
             Self::Shutdown => "shutdown",
+            Self::RecordingFailure => "recording_failure",
         }
     }
 }
@@ -376,6 +388,54 @@ impl MediaKindTag {
     }
 }
 
+/// Recording outcome of a call that matched the recording trigger
+/// (schema v4, RFC 7866 SRC).
+///
+/// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records), AU-14
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingTag {
+    /// The recording session was active until the call ended (no failure
+    /// signalled by the SRS; excludes the setup window after answer).
+    Recorded,
+    /// The recording session ended before the call did
+    /// (`on_failure = continue`).
+    Partial,
+    /// The recording session could not be set up.
+    Failed,
+    /// The SBC could not read the call's media, or had no recording slot.
+    NotRecordable,
+    /// A participant opted out (`a=recordpref:off`, honoured by policy).
+    OptOut,
+}
+
+impl RecordingTag {
+    /// Snake-case token, as serialised.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::NotRecordable => "not_recordable",
+            Self::OptOut => "opt_out",
+        }
+    }
+
+    /// Parses a token produced by [`Self::as_str`].
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "recorded" => Some(Self::Recorded),
+            "partial" => Some(Self::Partial),
+            "failed" => Some(Self::Failed),
+            "not_recordable" => Some(Self::NotRecordable),
+            "opt_out" => Some(Self::OptOut),
+            _ => None,
+        }
+    }
+}
+
 /// Upper bound on `CallRecord::media_kinds` (one entry per [`MediaKindTag`]).
 pub const MAX_MEDIA_KINDS: usize = 2;
 
@@ -491,6 +551,17 @@ pub struct CallRecord {
     // distinguishable in the record (POA&M-294).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media_kinds: Vec<MediaKindTag>,
+    /// Recording outcome (v4). Unset when the call did not match the
+    /// recording trigger (and in v1..v3 records).
+    // NIST 800-53 Rev5: AU-3, AU-14 - whether a call was recorded is part
+    // of its record and inside the hash chain (POA&M-306).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<RecordingTag>,
+    /// RFC 7865 recording session identifier (SBC-generated UUID; not the
+    /// RS Call-ID) (v4). Correlates the record with the SRS and with the
+    /// `recording_*` audit events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_session_id: Option<String>,
     /// This node took the dialog over from a failed peer; timing is partial.
     pub failover_takeover: bool,
     /// Hex SHA-384 of the previous record (empty when chaining is off).
@@ -536,6 +607,7 @@ impl CallRecord {
             &mut self.srtp,
             &mut self.stir_verify_reason,
             &mut self.stir_x5u_host,
+            &mut self.recording_session_id,
         ]
         .into_iter()
         .flatten()
@@ -651,6 +723,67 @@ mod tests {
     }
 
     #[test]
+    fn recording_fields_serde_and_omission() {
+        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(MIN_READ_SCHEMA_VERSION, 1);
+        assert!((1..=4).all(is_readable_schema));
+        assert!(!is_readable_schema(0) && !is_readable_schema(5));
+
+        // Unset: both keys are omitted, so v1..v3 records re-serialise
+        // byte-identically.
+        let json = serde_json::to_string(&CallRecord::default()).unwrap();
+        assert!(!json.contains("recording"), "{json}");
+
+        let r = CallRecord {
+            recording: Some(RecordingTag::NotRecordable),
+            recording_session_id: Some("0b0e7f8c-6c0c-4d53-9f0a-2a1d2c3b4e5f".into()),
+            disposition: Disposition::RecordingFailure,
+            release_cause: ReleaseCause::RecordingFailure,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        for needle in [
+            r#""recording":"not_recordable""#,
+            r#""recording_session_id":"0b0e7f8c-6c0c-4d53-9f0a-2a1d2c3b4e5f""#,
+            r#""disposition":"recording_failure""#,
+            r#""release_cause":"recording_failure""#,
+        ] {
+            assert!(json.contains(needle), "{json}");
+        }
+        // Canonical order: after media_kinds' slot, before failover_takeover.
+        assert!(json.find("\"recording\"").unwrap() < json.find("failover_takeover").unwrap());
+        let back: CallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+
+        for t in [
+            RecordingTag::Recorded,
+            RecordingTag::Partial,
+            RecordingTag::Failed,
+            RecordingTag::NotRecordable,
+            RecordingTag::OptOut,
+        ] {
+            assert_eq!(RecordingTag::parse(t.as_str()), Some(t));
+            assert_eq!(
+                serde_json::to_string(&t).unwrap(),
+                format!("\"{}\"", t.as_str())
+            );
+        }
+        assert_eq!(RecordingTag::parse("yes"), None);
+        assert!(serde_json::from_str::<RecordingTag>(r#""yes""#).is_err());
+        assert_eq!(ReleaseCause::RecordingFailure.as_str(), "recording_failure");
+
+        let mut long = CallRecord {
+            recording_session_id: Some("x".repeat(10_000)),
+            ..Default::default()
+        };
+        long.sanitize();
+        assert_eq!(
+            long.recording_session_id.as_deref().map(str::len),
+            Some(MAX_FIELD_LEN)
+        );
+    }
+
+    #[test]
     fn durations() {
         let mut r = CallRecord {
             setup_ms: 1000,
@@ -734,6 +867,7 @@ mod tests {
             Disposition::NoAnswer,
             Disposition::MediaFailure,
             Disposition::OperatorTerminated,
+            Disposition::RecordingFailure,
         ] {
             assert_eq!(Disposition::parse(d.as_str()), Some(d));
             assert_eq!(

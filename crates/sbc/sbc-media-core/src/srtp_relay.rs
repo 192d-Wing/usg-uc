@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::dtls_relay::is_dtls_record;
 use crate::dtls_sidecar::{SidecarEvent, SidecarReader, SidecarWriter};
+use crate::recording_fork::{ForkTap, fork_changed};
 
 /// Re-protects one RTP packet crossing the SBC: unprotect with the ingress
 /// leg's context (decrypt what the arriving peer sent), then protect with the
@@ -93,12 +94,18 @@ pub struct TerminateRelayLeg {
     pub call_id: String,
     /// Direction label for logging ("A→B" / "B→A").
     pub direction: &'static str,
+    /// SIPREC fork tap for the media this leg decrypts (RFC 7866 §8). `None`
+    /// when recording is disabled on the pipeline, and on the separate-port
+    /// RTCP legs.
+    pub fork: Option<ForkTap>,
 }
 
 impl TerminateRelayLeg {
     /// Runs the relay loop until `shutdown` fires or the socket errors.
-    pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
+    pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         let mut buf = [0u8; 2048];
+        let mut fork = self.fork.take();
+        let has_fork = fork.is_some();
         let mut latched: Option<SocketAddr> = None;
         let mut forwarded: u64 = 0;
         // Kept separate so an off-path spoofing attempt (SC-7 boundary event) is
@@ -165,8 +172,19 @@ impl TerminateRelayLeg {
                     }
 
                     let is_rtcp = is_rtcp_packet(&buf[..n]);
+                    // Decrypted media kept for the recording fork (the same
+                    // steps as `reprotect_rtp`, with the plaintext retained).
+                    let mut decrypted = None;
                     let reprotected = if is_rtcp {
                         reprotect_rtcp(&self.ingress, &self.egress, &buf[..n]).await
+                    } else if has_fork {
+                        SrtpUnprotect::new(&self.ingress)
+                            .unprotect_rtp(&buf[..n])
+                            .and_then(|rtp| {
+                                let out = SrtpProtect::new(&self.egress).protect_rtp(&rtp);
+                                decrypted = Some(rtp.payload);
+                                out
+                            })
                     } else {
                         reprotect_rtp(&self.ingress, &self.egress, &buf[..n])
                     };
@@ -199,6 +217,14 @@ impl TerminateRelayLeg {
                                 // calls aren't reported as mute when audio flows.
                                 crate::media_pipeline::record_rtp_relayed();
                                 forwarded += 1;
+                                // RFC 7866 §8: copy the decrypted media to the
+                                // recorder under the fork's own key, after the
+                                // call's packet is out. The tap adds no
+                                // allocation and never blocks.
+                                // NIST 800-53 Rev5: AU-14, SC-8
+                                if let (Some(tap), Some(payload)) = (fork.as_mut(), &decrypted) {
+                                    tap.on_decrypted_rtp(&buf[..n], payload);
+                                }
                                 if forwarded == 1 {
                                     info!(call_id = %self.call_id, direction = self.direction, "SRTP relay forwarding media");
                                 }
@@ -209,6 +235,8 @@ impl TerminateRelayLeg {
                         }
                     }
                 }
+                // Recording fork activated or stopped (applied inside the tap).
+                () = fork_changed(&mut fork), if has_fork => {}
                 _ = shutdown.changed() => {
                     debug!(call_id = %self.call_id, direction = self.direction, "SRTP relay shutdown");
                     break;
@@ -379,6 +407,7 @@ mod tests {
             dtls_out: None,
             call_id: "call".into(),
             direction: "A→B",
+            fork: None,
         };
         let handle = tokio::spawn(leg.run(sd_rx));
 
@@ -397,6 +426,155 @@ mod tests {
             .unprotect_rtp(&buf[..n])
             .unwrap();
         assert_eq!(out.payload.as_ref(), payload.as_slice());
+
+        let _ = sd_tx.send(true);
+        let _ = handle.await;
+    }
+
+    // SIPREC (RFC 7866 §8): with a fork tap, the decrypted media is also sent
+    // to the recorder under the fork's own key, SSRC and sequence; the far
+    // peer still gets the normally re-protected packet. SRTCP is not forked.
+    #[tokio::test]
+    async fn terminate_relay_leg_forks_decrypted_media() {
+        use crate::recording_fork::{ForkControl, ForkStream};
+
+        let relay_recv = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_send = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let far = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srs = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_recv_addr = relay_recv.local_addr().unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let far_addr = far.local_addr().unwrap();
+
+        let ssrc = 0x6666_u32;
+        let fork_ssrc = 0x0F0F_0001_u32;
+        let (key_a, salt_a) = random_material();
+        let (key_b, salt_b) = random_material();
+        let (key_r, salt_r) = random_material();
+        let peer_send = ctx(&key_a, &salt_a, SrtpDirection::Outbound, ssrc);
+        let far_recv = ctx(&key_b, &salt_b, SrtpDirection::Inbound, ssrc);
+        let srs_recv = ctx(&key_r, &salt_r, SrtpDirection::Inbound, fork_ssrc);
+
+        let fork_key =
+            SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, key_r.clone(), salt_r.clone())
+                .unwrap();
+        let stream =
+            ForkStream::bind(&fork_key, "127.0.0.1:0".parse().unwrap(), fork_ssrc).unwrap();
+        let control = ForkControl::new();
+        let tap = control.tap();
+
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let leg = TerminateRelayLeg {
+            recv_sock: Arc::clone(&relay_recv),
+            send_sock: Arc::clone(&relay_send),
+            ingress: ctx(&key_a, &salt_a, SrtpDirection::Inbound, ssrc),
+            egress: ctx(&key_b, &salt_b, SrtpDirection::Outbound, ssrc),
+            expected_remote: peer_addr,
+            recv_target: Arc::new(RwLock::new(peer_addr)),
+            forward_target: Arc::new(RwLock::new(far_addr)),
+            dtls_out: None,
+            call_id: "call".into(),
+            direction: "A→B",
+            fork: Some(tap),
+        };
+        let handle = tokio::spawn(leg.run(sd_rx));
+        let wait = std::time::Duration::from_secs(2);
+        let mut buf = [0u8; 512];
+
+        // Before activation: relayed, not forked.
+        let pkt = RtpPacket::new(RtpHeader::new(0, 7, 700, ssrc), vec![0x5Au8; 160]);
+        let srtp = SrtpProtect::new(&peer_send).protect_rtp(&pkt).unwrap();
+        peer.send_to(&srtp, relay_recv_addr).await.unwrap();
+        tokio::time::timeout(wait, far.recv_from(&mut buf))
+            .await
+            .expect("far recv timed out")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                srs.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+
+        control.activate(stream, srs.local_addr().unwrap()).unwrap();
+
+        let payload = vec![0xA5u8; 160];
+        let pkt = RtpPacket::new(
+            RtpHeader::new(8, 8, 860, ssrc).with_marker(true),
+            payload.clone(),
+        );
+        let srtp = SrtpProtect::new(&peer_send).protect_rtp(&pkt).unwrap();
+        peer.send_to(&srtp, relay_recv_addr).await.unwrap();
+
+        let (n, _) = tokio::time::timeout(wait, far.recv_from(&mut buf))
+            .await
+            .expect("far recv timed out")
+            .unwrap();
+        let out = SrtpUnprotect::new(&far_recv)
+            .unprotect_rtp(&buf[..n])
+            .unwrap();
+        assert_eq!(out.payload.as_ref(), payload.as_slice());
+        assert_eq!(out.header.ssrc, ssrc, "the call's own packet is unchanged");
+
+        let (n, _) = tokio::time::timeout(wait, srs.recv_from(&mut buf))
+            .await
+            .expect("recorder recv timed out")
+            .unwrap();
+        // Neither leg's key opens the recorder's copy.
+        assert!(
+            SrtpUnprotect::new(&far_recv)
+                .unprotect_rtp(&buf[..n])
+                .is_err()
+        );
+        let rec = SrtpUnprotect::new(&srs_recv)
+            .unprotect_rtp(&buf[..n])
+            .unwrap();
+        assert_eq!(rec.payload.as_ref(), payload.as_slice());
+        assert_eq!(rec.header.ssrc, fork_ssrc);
+        assert_eq!(rec.header.payload_type, 8);
+        assert!(rec.header.marker);
+        assert_eq!(rec.header.timestamp, 860);
+
+        // Muxed SRTCP is relayed but not forked.
+        let rtcp = vec![
+            0x80, 201, 0x00, 0x02, 0x00, 0x00, 0x66, 0x66, 0x01, 0x02, 0x03, 0x04,
+        ];
+        let muxed = SrtpProtect::new(&peer_send).protect_rtcp(&rtcp).unwrap();
+        peer.send_to(&muxed, relay_recv_addr).await.unwrap();
+        tokio::time::timeout(wait, far.recv_from(&mut buf))
+            .await
+            .expect("far recv timed out")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                srs.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+
+        // A packet that fails authentication is neither relayed nor forked.
+        let mut forged = SrtpProtect::new(&peer_send)
+            .protect_rtp(&RtpPacket::new(
+                RtpHeader::new(0, 9, 900, ssrc),
+                vec![1u8; 160],
+            ))
+            .unwrap()
+            .to_vec();
+        forged[20] ^= 0xFF;
+        peer.send_to(&forged, relay_recv_addr).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                srs.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
 
         let _ = sd_tx.send(true);
         let _ = handle.await;
@@ -430,6 +608,7 @@ mod tests {
             dtls_out: Some(dtls_tx),
             call_id: "call".into(),
             direction: "A→B",
+            fork: None,
         };
         let handle = tokio::spawn(leg.run(sd_rx));
 
@@ -520,6 +699,7 @@ mod tests {
             dtls_out: None,
             call_id: "call".into(),
             direction: "A→B",
+            fork: None,
         };
         let handle = tokio::spawn(leg.run(sd_rx));
 

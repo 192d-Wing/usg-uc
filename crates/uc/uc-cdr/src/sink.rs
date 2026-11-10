@@ -652,6 +652,7 @@ fn csv_resume_from(rec: &[String]) -> Option<ResumePoint> {
     }
     if ![
         format::CSV_COLUMNS.len(),
+        format::CSV_COLUMNS_V3,
         format::CSV_COLUMNS_V2,
         format::CSV_COLUMNS_V1,
     ]
@@ -1090,8 +1091,9 @@ mod tests {
         assert_eq!(resume.last_hash, prev);
     }
 
-    /// QA: resume accepts exactly the v1/v2/v3 CSV widths. A v2-width row
-    /// (no `media_kinds` column) resumes; any other width is treated as torn.
+    /// QA: resume accepts exactly the v1..v4 CSV widths. A v3-width row (no
+    /// `recording` columns) and a v2-width row (no `media_kinds` column
+    /// either) resume; any other width is treated as torn.
     #[test]
     fn csv_resume_accepts_only_known_widths() {
         let mut r = CallRecord {
@@ -1111,13 +1113,19 @@ mod tests {
             .iter()
             .position(|c| *c == "media_kinds")
             .unwrap();
+        // Drop `recording` and `recording_session_id`: v3 width.
+        fields.drain(mk + 1..mk + 3);
+        assert_eq!(fields.len(), format::CSV_COLUMNS_V3);
+        let v3 = fields.join(",");
+        let p = super::resume_csv(&format!("{v3}\n"), false).unwrap();
+        assert_eq!((p.next_sequence, p.last_hash), (42, h));
         fields.remove(mk);
         assert_eq!(fields.len(), format::CSV_COLUMNS_V2);
         let v2 = fields.join(",");
         let p = super::resume_csv(&format!("{v2}\n"), false).unwrap();
         assert_eq!((p.next_sequence, p.last_hash), (42, h));
 
-        // 44 and 47 columns: not a known width.
+        // 44, 47 and 49 columns: not a known width.
         let short = fields[..fields.len() - 2]
             .iter()
             .chain(fields.last())
@@ -1127,6 +1135,9 @@ mod tests {
         assert!(super::resume_csv(&format!("{short}\n"), false).is_none());
         let long = format!("{row},x");
         assert!(super::resume_csv(&format!("{long}\n"), false).is_none());
+        let mid = format!("{v3},{}", to_hex(&h));
+        assert_eq!(mid.split(',').count(), format::CSV_COLUMNS_V3 + 1);
+        assert!(super::resume_csv(&format!("{mid}\n"), false).is_none());
     }
 
     #[test]

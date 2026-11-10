@@ -65,6 +65,7 @@ mod flow;
 mod flows;
 #[cfg(feature = "grpc")]
 mod grpc_server;
+mod recording;
 mod runtime;
 mod sdp_dtls;
 mod server;

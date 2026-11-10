@@ -187,13 +187,47 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 
 ## Additional Related RFCs
 
-### RFC 4568 - SDP Security Descriptions ❌ NOT IMPLEMENTED (by design)
+### RFC 4568 - SDP Security Descriptions ❌ NOT IMPLEMENTED for call legs (by design)
 
-**Status**: Not implemented (using DTLS-SRTP instead)
+**Status**: Not implemented for call legs (using DTLS-SRTP instead). Used only on the SIPREC recording session, see below.
 **Priority**: LOW
 **Link**: <https://datatracker.ietf.org/doc/html/rfc4568>
 
 **Decision**: Not implementing `a=crypto` (SDES) as we use DTLS-SRTP which is more secure. SDES sends keying material in the signaling path which is a known security concern.
+
+---
+
+**Exception (SIPREC recording session, 2026-11-09)**: the recording session toward the recorder (SRS) offers SDES, because that is what recorders accept. The offer is built by `uc-siprec` `build_rs_offer` and sent only over the recorder TLS 1.3 connection (RFC 4568 §8.3). Call legs are unchanged: `a=crypto` on a call leg is passed through, never generated or consumed by the SBC, and such a call is not recordable.
+
+### RFC 7866 / RFC 4574 - SDP on the SIPREC recording session ⚠️ PARTIAL
+
+**Status**: Wired in `sbc-daemon` (off by default); tested against a fake recorder only
+**Link**: <https://datatracker.ietf.org/doc/html/rfc7866>
+
+Recording session offer (`sbc-daemon/src/recording.rs` `build_rs_sdp`, `uc-siprec/src/src_request.rs` `build_rs_offer`):
+
+- Two `m=audio <port> RTP/SAVP` lines, one per call leg, each with `a=label` (RFC 4574; `1` = caller's sent media, `2` = callee's) and `a=sendonly` (RFC 7866 §7.1.1).
+- One `a=crypto:1 AEAD_AES_256_GCM inline:...` per m-line (RFC 4568, RFC 7714 §14.1). No other suite is offered.
+- `a=rtcp-mux` (RFC 5761). No RTCP is sent (POA&M-301).
+- Payload formats, `a=rtpmap`, `a=fmtp` and `a=ptime` are copied from the call's negotiated SDP (bounded: 32 formats, 64 attributes of at most 256 bytes per m-line). Stream 2 uses the payload types of the offer the SBC sent to the callee, restricted to the codecs in the answer.
+- `c=` is the `recording.srs_zone` media address, or the SBC's source address toward the recorder.
+
+Recording session answer rules (`uc-siprec/src/rs_answer.rs` `parse_rs_answer`, `recording.rs` `validate_rs_answer`); any violation fails the recording (`srs_bad_answer`):
+
+- Same number of m-lines, each `audio`, non-zero port, `RTP/SAVP`.
+- Exactly one `a=crypto` with tag 1 and `AEAD_AES_256_GCM`, no negotiated session parameter.
+- Direction `recvonly` (RFC 7866 §7.2); `a=inactive` is refused (POA&M-308).
+- Literal `IN IP4` / `IN IP6` unicast connection address, not loopback, unspecified or an SBC socket.
+- Exactly the offered payload formats per m-line (stricter than RFC 3264 §6.1).
+- Body of at most 16 KiB.
+
+Attributes on call legs:
+
+- `a=recordpref` (RFC 7866 §7.1.3, ABNF §7.3.2): only `off` (and the non-standard alias `never`) is acted on, per `recording.recordpref_never` (default `ignore`). A media-level value on the first active `m=audio` overrides the session-level one (`has_recordpref_never`).
+- `a=record` (RFC 7866 §7.1.2): **not sent** to call participants (POA&M-303).
+- `a=zrtp-hash`, a keying attribute or SRTP profile on a call whose SRTP the SBC does not terminate (SDES or DTLS passthrough), or no usable audio m-line make the call "not recordable" (`recording.rs` `offer_recordable`, `classify`, `still_recordable`).
+
+Tests: `rs_sdp_carries_ports_family_and_formats`, `offer_is_srtp_with_one_sdes_line_per_stream`, `rs_answer_defects_are_refused`, `rs_answer_must_accept_every_offered_format`, `recordpref_media_level_overrides_session_level`, `zrtp_is_not_recordable`, `offer_recordable_rules_out_what_no_answer_can_fix`, `uc-siprec/tests/hostile_rs_answer.rs`.
 
 ---
 
@@ -417,7 +451,8 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 | RFC 5245 | ICE | ⚠️ Partial (external lib) | 70% |
 | RFC 8122 | DTLS in SDP | ✅ Compliant | 95% |
 | RFC 7587 | RTP Payload for Opus | ⚠️ Partial (POA&M-141, POA&M-142) | n/a |
-| RFC 4568 | SDP Security Descriptions | ❌ Not Implemented | 0% (by design) |
+| RFC 4568 | SDP Security Descriptions | ❌ Not implemented for call legs (by design); used on the SIPREC recording session only | n/a |
+| RFC 7866 | SIPREC SDP (`a=label`, `a=recordpref`, `a=record`) | ⚠️ Partial (no `a=record`, POA&M-303) | n/a |
 
 **Overall Compliance**: ~98% for all actionable SDP-related RFCs
 
@@ -465,6 +500,7 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 | 2026-02-07 | **FIXED**: proto-sdp: Added b=/z=/k= line parsing and media-level i= support | Claude Sonnet 4.5 |
 | 2026-02-07 | **FIXED**: proto-sdp: Replaced weak PRNG with OS CSPRNG for SRTP keying material | Claude Sonnet 4.5 |
 | 2026-11-07 | sbc-daemon: `o=` rewritten toward hidden legs (POA&M-181); `c=` residual recorded as POA&M-215 | compliance-scribe |
+| 2026-11-09 | SIPREC phase 3: recording session SDP (SDES offer, `a=label`, answer rules, `a=recordpref` handling; no `a=record`) | compliance-scribe |
 | 2026-02-07 | **FIXED**: proto-sdp: Updated RFC 4566 references to RFC 8866 | Claude Sonnet 4.5 |
 | 2026-02-07 | **FIXED**: proto-sdp: Removed duplicate doc comments, exported BandwidthInfo | Claude Sonnet 4.5 |
 

@@ -744,6 +744,40 @@ mod tests {
         Ok(())
     }
 
+    // POA&M-301: there is no recording RPC. The gRPC controller inherits the
+    // trait defaults, so every fork call fails closed without touching the
+    // media node (the fake server has no such method to call), and the
+    // caller's recording failure policy runs.
+    // NIST 800-53 Rev5: SC-24, SC-8 (no key ever crosses the cleartext channel)
+    #[tokio::test]
+    async fn recording_fork_is_unsupported_on_remote_media()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use proto_srtp::{SrtpKeyMaterial, SrtpProfile};
+        let key = || {
+            SrtpKeyMaterial::new(
+                SrtpProfile::AeadAes256Gcm,
+                (0..32).map(|_| rand::random::<u8>()).collect(),
+                (0..12).map(|_| rand::random::<u8>()).collect(),
+            )
+        };
+        let ctl = connect().await;
+        let addr: std::net::SocketAddr = "127.0.0.1:9".parse()?;
+        assert!(matches!(
+            ctl.prepare_recording_fork("call", [key()?, key()?], None)
+                .await,
+            Err(MediaPipelineError::RecordingUnsupported)
+        ));
+        assert!(matches!(
+            ctl.activate_recording_fork("call", [addr, addr]).await,
+            Err(MediaPipelineError::RecordingUnsupported)
+        ));
+        assert!(matches!(
+            ctl.stop_recording_fork("call").await,
+            Err(MediaPipelineError::RecordingUnsupported)
+        ));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn create_session_maps_ports() {
         let mc = connect().await;

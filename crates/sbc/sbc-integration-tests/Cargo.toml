@@ -54,6 +54,10 @@ prost-types = { version = "0.14", optional = true }
 # net feature: TcpListenerStream for in-process gRPC server round-trip tests.
 tokio-stream = { version = "0.1", features = ["net"], optional = true }
 
+[dev-dependencies]
+# SIPREC fork test: the fake recorder's SRTP contexts (siprec_fork).
+proto-srtp.workspace = true
+
 [lib]
 name = "sbc_integration_tests"
 path = "src/lib.rs"

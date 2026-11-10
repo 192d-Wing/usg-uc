@@ -680,6 +680,12 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
     ]) {
         metrics.register_gauge(*name, crate::t38::METRIC_HELP);
     }
+    // NIST 800-53 Rev5: SI-4, AU-5 - SIPREC recording: slots held, sessions
+    // started / stopped / skipped, failures by reason (11 fixed series),
+    // calls rejected by the failure policy, forked RTP packets.
+    for name in crate::recording::metric_names() {
+        metrics.register_gauge(name, crate::recording::METRIC_HELP);
+    }
 }
 
 /// Health of the CDR pipeline (component `cdr`): unhealthy when the writer
@@ -817,6 +823,11 @@ impl AppState {
                 }
             }
             for (name, v) in stack.t38_counters().metric_values() {
+                if let Some(g) = self.metrics.gauge(name) {
+                    g.set(as_gauge(v));
+                }
+            }
+            for (name, v) in stack.recording_counters().metric_values() {
                 if let Some(g) = self.metrics.gauge(name) {
                     g.set(as_gauge(v));
                 }
@@ -2407,6 +2418,49 @@ mod tests {
         ] {
             let want = format!("{name} {v}");
             assert!(text.lines().any(|l| l.ends_with(&want)), "{want}: {text}");
+        }
+    }
+
+    // POA&M-306: the recording counters reach the metrics endpoint under
+    // fixed names (one series per failure reason, no labels).
+    #[test]
+    fn metrics_export_recording_counters() {
+        use uc_audit::event::{RecordingFailAction, RecordingFailReason};
+        let stack = crate::sip_stack::SipStack::new(crate::sip_stack::SipStackConfig::default());
+        let c = stack.recording_counters();
+        c.note_started();
+        c.note_started();
+        c.note_stopped();
+        c.note_skipped();
+        c.note_failed(
+            RecordingFailReason::SrsNotAcceptable488,
+            RecordingFailAction::CallRejected,
+        );
+        c.note_failed(
+            RecordingFailReason::SrsBye,
+            RecordingFailAction::EmergencyContinued,
+        );
+        let _slot = c.try_reserve(8);
+        let mut state = AppState::new(SbcMetrics::standard(), Arc::new(ServerStats::default()));
+        state.sip_stack = Some(Arc::new(stack));
+        state.refresh_daemon_metrics();
+        let text = state.metrics.export();
+        for (name, v) in [
+            ("sbc_recording_sessions_active", 1),
+            ("sbc_recording_started_total", 2),
+            ("sbc_recording_stopped_total", 1),
+            ("sbc_recording_skipped_total", 1),
+            ("sbc_recording_calls_rejected_total", 1),
+            ("sbc_recording_failed_srs_not_acceptable_488_total", 1),
+            ("sbc_recording_failed_srs_bye_total", 1),
+            ("sbc_recording_failed_srs_timeout_total", 0),
+            ("sbc_recording_rs_bye_dropped_total", 0),
+        ] {
+            let want = format!("{name} {v}");
+            assert!(text.lines().any(|l| l.ends_with(&want)), "{want}: {text}");
+        }
+        for name in crate::recording::metric_names() {
+            assert!(text.contains(name), "{name} is exported");
         }
     }
 

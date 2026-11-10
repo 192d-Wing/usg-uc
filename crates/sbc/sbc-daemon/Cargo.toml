@@ -35,6 +35,10 @@ uc-cdr.workspace = true
 proto-stir-shaken.workspace = true
 uc-sti.workspace = true
 uc-crypto.workspace = true
+# SIPREC SRC (RFC 7865 metadata, RS offer builder, SRS answer validation).
+uc-siprec.workspace = true
+# Wipes the serialized RS INVITE (it carries SDES keys) after the send.
+zeroize.workspace = true
 chrono.workspace = true
 uc-telemetry.workspace = true
 proto-sip = { workspace = true, features = ["digest-auth"] }

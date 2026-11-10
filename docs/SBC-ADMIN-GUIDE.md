@@ -661,7 +661,8 @@ allowed_ec = ["t38UDPRedundancy", "t38UDPFEC", "t38UDPNoEC"]  # non-empty, no du
   media is DTLS-SRTP terminated refuse T.38 with 488.
 - `udptl` is the only transport; `TCP`/`TCPTL` image offers get 488.
 - An offer the SBC refuses gets 488 locally and is not forwarded. The
-  Warning code is 304 when T.38 is disabled, 305 for an unsupported
+  Warning code is 304 when T.38 is disabled or the call is being recorded
+  (`recording.on_failure = "reject"`), 305 for an unsupported
   transport, a disallowed `T38FaxUdpEC` or a DTLS-terminated leg, and 399
   for malformed T.38 SDP. If the far
   side refuses (non-2xx or port 0), the call stays on audio. If the far side
@@ -672,7 +673,7 @@ allowed_ec = ["t38UDPRedundancy", "t38UDPFEC", "t38UDPNoEC"]  # non-empty, no du
   (`accepted`, `rejected_local`, `rejected_remote`, `failed`), `reason`
   (`t38_disabled`, `srtp_terminate`, `unsupported_transport`,
   `malformed_t38_sdp`, `ec_not_allowed`, `remote_488`, `remote_port0`,
-  `relay_update_failed`, or null), `transport` (`udptl` or null),
+  `relay_update_failed`, `recording_active`, or null), `transport` (`udptl` or null),
   `max_bit_rate` (after clamping, or null) and `remote_media` (the
   answering leg's new `ip:port`, set only on `accepted`). A refused
   image-only initial INVITE is recorded as an `AuthorizationDecision` with
@@ -993,9 +994,264 @@ Per-trunk `sign`/`verify` require the global switch; validation rejects them oth
 
 ---
 
+## Call Recording (SIPREC)
+
+The SBC can record calls by acting as a SIPREC session recording client (SRC, RFC 7866). For each call that matches the recording trigger it opens a second SIP session, the recording session (RS), to a recorder (session recording server, SRS) and sends the recorder a copy of both parties' audio as two send-only SRTP streams, with RFC 7865 metadata naming the two participants. Recording is **off by default**.
+
+What has been verified: unit and integration tests in which the test itself plays the recorder. **No interoperability run against a real recorder product has been made.** Run your own acceptance test against your recorder before relying on it.
+
+### Enabling recording
+
+```toml
+[recording]
+enabled = true
+notice_acknowledged = true            # you attest that call parties are told about recording
+srs_uri = "sips:srs.example.net:5061" # sips: only; no maddr, no transport parameter
+srs_tls_ca_file = "/etc/sbc/certs/srs-ca.pem"
+# srs_tls_server_name = "srs.example.net"  # default: the srs_uri host
+
+record_all = false                    # trigger: every call, or ...
+trunk_groups = ["carriers"]           # ... calls with a leg on a listed trunk group
+zones = []                            # ... or in a listed zone
+
+max_sessions = 256                    # 1..=10000, per node
+rs_invite_timeout_ms = 5000           # 1000..=32000
+on_failure = "reject"                 # reject (default) | continue
+recordpref_never = "ignore"           # ignore (default) | honour
+# srs_zone = "internal"               # zone whose media address the recorder streams use
+```
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `false` | Turns recording on. |
+| `notice_acknowledged` | `false` | Must be `true` to enable. The SBC gives call parties **no in-band recording indication** (no `a=record`; POA&M-303), so notifying them is your responsibility. |
+| `srs_uri` | none | The recorder. `sips:` only, with a host; `maddr` and any `transport` parameter are rejected. |
+| `srs_tls_ca_file` | none | PEM CA bundle used to verify the recorder's certificate. Only this bundle is trusted for the recorder. Must exist. |
+| `srs_tls_server_name` | `srs_uri` host | Name checked against the recorder's certificate. |
+| `record_all`, `trunk_groups`, `zones` | `false`, `[]`, `[]` | The trigger. At least one is required. Names must exist in the configuration. |
+| `max_sessions` | `256` | Concurrent recording sessions on this node. |
+| `rs_invite_timeout_ms` | `5000` | How long the SBC waits for the recorder's final answer to the recording INVITE. |
+| `on_failure` | `reject` | What happens to a matched call that cannot be recorded. See "Failure policy". |
+| `recordpref_never` | `ignore` | What to do when a call party's SDP carries `a=recordpref:off`. See "Participant opt-out". |
+| `srs_zone` | unset | Zone whose media address the recorder streams are sent from and advertised in the recording session. Must name a configured zone. Unset: the SBC's source address toward the recorder. |
+
+The table rejects unknown keys. Field rules are checked even when `enabled = false`. The section is read at startup: a configuration reload reports a change as restart-required and does not apply it.
+
+**Breaking defaults.** `on_failure` now defaults to `reject` (the schema shipped earlier defaulted to `continue`; no deployed configuration could have enabled recording before this release). `recordpref_never` defaults to `ignore`.
+
+**The trigger.** A call matches when `record_all = true`, or when its ingress or egress leg is on a listed trunk group or in a listed zone. The trigger is evaluated once, when the INVITE arrives. For trunk groups it matches if the route's first trunk **or any of its failover targets** is in a listed group. A call on such a route is therefore recorded even when it completes on a trunk whose group is not listed. Calls that do not match are not affected by anything in this section.
+
+**Startup warnings.** With recording enabled the daemon logs a warning at load for each of these:
+
+1. `media.srtp.mode = passthrough`: only cleartext-RTP calls can be recorded; SRTP calls that match the trigger are refused or torn down (`reject`) or left unrecorded (`continue`).
+2. `on_failure = reject` with `recordpref_never = honour`: any call party can keep its call unrecorded by sending `a=recordpref:off`.
+3. `record_all = true` with `max_sessions` below this node's `general.max_calls`: calls beyond `max_sessions` are refused with 503 (`reject`) or left unrecorded (`continue`). The defaults (`max_sessions = 256`, `max_calls = 10000`) raise this warning as soon as `record_all = true`.
+
+**Startup refusals.** With recording enabled the daemon refuses to start when:
+
+- a remote media plane is configured (`SBC_MEDIA_CONTROLLER_URL` or `SBC_MEDIA_CONTROLLER_URLS`). The media control channel is plaintext and cannot carry SRTP keys, so recording works only with the in-process media relay (POA&M-301);
+- there is no SIP TLS listener with a certificate (`transport.tls_listen`, `security.tls_cert_path`, `security.tls_key_path`). The recording session advertises that listener;
+- the `srs_uri` host does not resolve within 5 seconds;
+- `srs_tls_ca_file`, or the SBC certificate or key, cannot be loaded;
+- the SBC has no local media address toward the recorder (no route, and `srs_zone` has no media address).
+
+Configuration validation separately rejects `enabled = true` without `notice_acknowledged = true`, `srs_uri`, `srs_tls_ca_file`, a trigger, or `transport.tls_listen`.
+
+### Which calls can be recorded
+
+The SBC records answered two-party audio calls whose media it can read:
+
+- cleartext RTP (`RTP/AVP`, `RTP/AVPF`) on the relay, or
+- DTLS-SRTP that the SBC terminates (`media.srtp.mode = "Terminate"`).
+
+A matched call is **not recordable** when the SBC has no plaintext audio to copy:
+
+- **SDES or DTLS-SRTP passthrough**: the call parties key SRTP end to end and the SBC only relays ciphertext;
+- **ZRTP**: an SDP that announces it (`a=zrtp-hash`). Encryption above RTP that the SDP does not announce cannot be detected, and such a call is recorded as ciphertext;
+- **late offer**: an INVITE without SDP;
+- **T.38 fax**: an image-only call, or a switch to T.38 during a recorded call;
+- no usable audio stream, or no codec in common between offer and answer.
+
+Not recorded on any call: **early media** (the recording session starts when the call is answered), RTCP, and anything before the recorder has answered. The time from call answer to recorder answer is reported as `start_offset_ms` in the `recording_started` audit event.
+
+A call re-negotiated mid-call (re-INVITE or UPDATE) to media the SBC cannot read stops being recorded, and the failure policy applies.
+
+### Failure policy
+
+`on_failure` decides what happens to a matched call that cannot be recorded or whose recording fails.
+
+With `on_failure = "reject"` (default, fail closed):
+
+| When the problem is known | What the SBC does |
+|---------------------------|-------------------|
+| At the INVITE: the offer is not recordable | `488 Not Acceptable Here` with `Warning: 399 <host> "Session cannot be recorded"`. The callee is not dialled. |
+| At the INVITE: no free `max_sessions` slot | `503 Service Unavailable` with `Retry-After: 5`. The callee is not dialled. |
+| At the callee's answer: the answer makes the call not recordable | The 200 is not relayed. The caller gets 488 with the Warning; the callee gets ACK then BYE. |
+| At the callee's answer: the recorder streams cannot be prepared | The 200 is not relayed. The caller gets 503; the callee gets ACK then BYE. |
+| After the call is connected: the recorder is unreachable, fails TLS, rejects or does not answer the recording INVITE, sends a bad answer, or hangs up mid-call; or the call is re-negotiated to unreadable media | BYE to both parties. CDR disposition and release cause `recording_failure`. |
+
+In the last row the call carries unrecorded audio from answer until the failure is known, at most `rs_invite_timeout_ms` (default 5 s) for a recorder that does not answer. The SBC does not hold back media until the recorder is up.
+
+With `on_failure = "continue"` the call proceeds or stays up unrecorded in every case above, and the failure is audited.
+
+**Emergency calls are never refused or torn down for recording**, whatever `on_failure` says. They continue unrecorded and the failure is audited with action `emergency_continued`.
+
+**T.38 on a recorded call.** Under `reject` a re-INVITE to T.38 is refused locally with 488 and `Warning: 304` and the call stays on audio. Under `continue` the switch is relayed and the recording session is ended; if the call later returns to audio it is not recorded again (POA&M-305).
+
+### Participant opt-out (`recordpref_never`)
+
+RFC 7866 lets a call party ask not to be recorded with `a=recordpref:off` in its SDP. The SBC also accepts `a=recordpref:never`, which is not an RFC value, as an alias.
+
+- `ignore` (default): the request is ignored and the call is recorded.
+- `honour`: the call is not recorded and stays up. It is audited as `recording_skipped` and its CDR says `recording = "opt_out"`. **Any party to any matched call, including an external caller, can switch recording off for that call with one SDP line, and `on_failure = reject` does not prevent it.** Choose `honour` only when your recording policy requires the SBC to respect participant preference.
+
+Other `recordpref` values (`on`, `pause`, `nopreference`) have no effect.
+
+### Recorder requirements and interoperability limits
+
+- **TLS 1.3 only.** The SBC connects to the recorder with TLS 1.3 regardless of `security.min_tls_version`. The recorder's certificate must chain to `srs_tls_ca_file` and match the server name. If the recorder asks for a client certificate the SBC presents its SIP TLS certificate (this path is not covered by a test).
+- **SRTP with SDES `AEAD_AES_256_GCM` only.** The recording offer carries one `a=crypto:1 AEAD_AES_256_GCM` line per stream and nothing else. A recorder that supports only `AES_CM_128_HMAC_SHA1_80` answers 488 and every matched call fails recording (`srs_not_acceptable_488`). Confirm AES-256-GCM support before enabling.
+- **The recorder must accept both streams and every offered payload format.** Its answer must keep both `m=audio` lines (`RTP/SAVP`, `a=recvonly`, a unicast address) and list exactly the payload formats the SBC offered. A recorder that drops a codec, declines a stream or answers `a=inactive` fails the recording (`srs_bad_answer`).
+- **No RTCP.** The SBC sends RTP only on the recording session: no sender reports and no CNAME (POA&M-301). The offer carries `a=rtcp-mux`. A recorder that requires RTCP for synchronisation or liveness will not work correctly.
+- **Stream identity.** Each recorder stream has an SSRC and sequence numbers chosen by the SBC, not the call party's. Packet loss on the call shows as a timestamp gap, not a sequence gap.
+- **Recorder address.** The recorder's signaling address is resolved once at startup and pinned; a DNS change needs a restart. NAPTR / SRV records are not used (POA&M-304). The recorder's media address may differ from its signaling address.
+- **Recorder-initiated requests.** The SBC answers the recorder's BYE and OPTIONS. A re-INVITE from the recorder gets 488 and an UPDATE gets 405, so pause / resume and metadata snapshot requests are not supported (POA&M-308).
+- **No metadata updates.** The recorder receives one metadata snapshot, in the recording INVITE. Holds, transfers and re-INVITEs are not reported (POA&M-305).
+- **No liveness check.** A recorder that stops silently mid-call, without sending BYE, is not detected: the call continues and its CDR still says `recorded` (POA&M-300).
+- **Recording session Call-ID.** Recording sessions use the Call-ID form `rs-<32 hex digits>@<general.instance_name>`, which can be used to tell them apart in traces. The `recording_session_id` in audit events and CDRs is a different value (the RFC 7865 session UUID).
+- **Cluster.** Recording-session state is per node and not replicated (POA&M-307).
+
+### Sizing
+
+- **`max_sessions` is per node.** A slot is taken when the INVITE of a matched call arrives and held until the call ends, so ringing calls count. With `record_all = true` set `max_sessions` to the node's `general.max_calls`.
+- **RTP ports.** A recorded call uses four RTP port pairs from `media.rtp_port_min..rtp_port_max` instead of two (four RTP ports, each with its reserved RTCP port). Size the range for `4 * recorded calls + 2 * other calls` pairs.
+- **Teardown rate.** BYEs to the recorder are sent at most 64 per 100 ms (640 per second). After a mass teardown of N recorded calls the recorder sees the last BYE about N / 640 seconds later. The queue holds `max_sessions + 64` entries. A BYE that does not fit, or that the recorder connection cannot take, is dropped and counted in `sbc_recording_rs_bye_dropped_total`; the recorder then ends that session by its own media timeout. At shutdown, queued BYEs are sent only while the daemon's timer loop is still running, so some may be lost.
+- **Recorder outage.** Sending to the recorder never delays the call's own media. Copies that cannot be sent are dropped and counted (`sbc_recording_fork_dropped_total`).
+
+### Audit events
+
+With `logging.audit_enabled`, recording produces these events (type `Call`). `call_id` is the SBC's internal session id; `recording_session_id` is the RFC 7865 session UUID that the recorder also receives.
+
+| Event | Fields |
+|-------|--------|
+| `recording_started` | `call_id`, `recording_session_id`, `start_offset_ms`, `relay` (`opaque`, `dtls_terminated`) |
+| `recording_stopped` | `call_id`, `recording_session_id`, `reason` (`call_ended`, `srs_bye`, `media_not_recordable`, `shutdown`), `duration_ms` |
+| `recording_failed` | `call_id`, `recording_session_id` (when one exists), `reason`, `action`, `sip_status` (when the recorder sent one) |
+| `recording_skipped` | `call_id`, `reason` (`participant_opt_out`) |
+
+`recording_failed` reasons: `no_session_slot`, `media_not_recordable`, `fork_setup`, `srs_unreachable`, `srs_tls`, `srs_rejected`, `srs_not_acceptable_488`, `srs_timeout`, `srs_bad_answer`, `srs_bye`, `remote_media_unsupported`, `call_ended_during_setup`.
+
+`recording_failed` actions: `call_rejected` (refused or torn down by `reject`), `continued_unrecorded`, `emergency_continued`, `call_already_ended` (the call ended on its own while the recording was being set up).
+
+A recording that was active and then fails produces both `recording_stopped` and `recording_failed`. A call ended by the policy also produces `CallTerminated` with `PolicyTerminated`. A refused T.38 switch is a `media_switchover` event with reason `recording_active`.
+
+### CDR fields (schema v4)
+
+CDR schema v4 adds two fields. Readers and `sbc-cli cdrs verify` still accept v1 to v3 files, and the hash chain covers the new fields.
+
+| Field | Values |
+|-------|--------|
+| `recording` | Absent when the call did not match the trigger. `recorded`: the recording session was up until the call ended. `partial`: it ended before the call did. `failed`: it could not be set up. `not_recordable`: the SBC could not read the media or had no free slot. `opt_out`: a participant opted out and `recordpref_never = "honour"`. |
+| `recording_session_id` | The RFC 7865 session UUID (not the recording session's SIP Call-ID). Use it to find the recording at the recorder. |
+
+Calls refused or ended by the policy have `disposition = "recording_failure"` and `release_cause = "recording_failure"`; the reject CDR of a call refused at the INVITE carries the `recording` tag as well.
+
+`recorded` means the recording session was established and no failure was signalled before the call ended. It does **not** prove that audio reached the recorder: there are no per-call packet counts behind it (POA&M-300). Reconcile CDRs against the recorder's own records when completeness matters.
+
+In CSV output the two columns are inserted after `media_kinds`, so later columns move by two. Consumers that read CSV by position must be updated; read by header name instead. The gRPC `CdrRecord` carries them as `recording` (47) and `recording_session_id` (48).
+
+### Metrics and alerting
+
+Exported with the daemon's other metrics. All are numeric series without labels; the `_total` series only increase while the process runs.
+
+| Metric | Meaning |
+|--------|---------|
+| `sbc_recording_sessions_active` | `max_sessions` slots held (includes ringing calls and sessions being set up) |
+| `sbc_recording_started_total`, `sbc_recording_stopped_total` | Recording sessions started / stopped |
+| `sbc_recording_skipped_total` | Calls not recorded because of a participant opt-out |
+| `sbc_recording_calls_rejected_total` | Calls refused or torn down by `on_failure = reject` |
+| `sbc_recording_failed_<reason>_total` | One per `recording_failed` reason listed above |
+| `sbc_recording_rs_bye_dropped_total` | BYE / CANCEL / ACK to the recorder that could not be queued or sent |
+| `sbc_recording_fork_packets_total`, `sbc_recording_fork_dropped_total` | RTP packets sent to the recorder / copies dropped (whole process, not per call) |
+
+The SBC does not send alerts itself. Recorder failure must be alerted on from these metrics or from the audit events (NIST AU-5; SRG-NET-000088-VVSM-00101). The rules below are **examples** for Prometheus: they are not shipped with the SBC and have not been tested against a running system. Adjust thresholds, windows and the `max_sessions` figure to your deployment.
+
+```yaml
+groups:
+  - name: sbc-recording
+    rules:
+      # A recorder-side failure: unreachable, TLS, rejected, timeout, bad answer, hung up.
+      - alert: SbcRecorderFailing
+        expr: >
+          sum by (instance) (increase({__name__=~"sbc_recording_failed_srs_.+_total"}[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Recorder failures on {{ $labels.instance }}; matched calls are being refused or left unrecorded"
+
+      # Calls refused or torn down because they could not be recorded.
+      - alert: SbcRecordingCallsRejected
+        expr: increase(sbc_recording_calls_rejected_total[5m]) > 0
+        labels:
+          severity: critical
+
+      # Calls that matched the trigger but were not recorded for a local reason.
+      - alert: SbcRecordingNotRecordable
+        expr: >
+          increase(sbc_recording_failed_media_not_recordable_total[15m])
+          + increase(sbc_recording_failed_no_session_slot_total[15m])
+          + increase(sbc_recording_failed_fork_setup_total[15m]) > 0
+        labels:
+          severity: warning
+
+      # Audio copies to the recorder are being dropped.
+      - alert: SbcRecordingForkDropping
+        expr: increase(sbc_recording_fork_dropped_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+
+      # Sessions are held but nothing is being sent to the recorder.
+      # Can also fire when every matched call is still ringing or on hold.
+      - alert: SbcRecordingNoMedia
+        expr: sbc_recording_sessions_active > 0 and increase(sbc_recording_fork_packets_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+
+      # Close to max_sessions (256 here).
+      - alert: SbcRecordingSlotsNearLimit
+        expr: sbc_recording_sessions_active > 0.9 * 256
+        for: 5m
+        labels:
+          severity: warning
+
+      # The recorder was not told that sessions ended.
+      - alert: SbcRecordingByeDropped
+        expr: increase(sbc_recording_rs_bye_dropped_total[15m]) > 0
+        labels:
+          severity: warning
+```
+
+When audit logs are forwarded to a SIEM, alert there on `recording_failed` with any action, and treat `action = "continued_unrecorded"` or `"emergency_continued"` as calls that took place without a recording.
+
+### Known gaps (POA&M)
+
+- POA&M-300: no recorder liveness check; `recorded` not backed by per-call packet counts; BYEs to the recorder at shutdown are best effort.
+- POA&M-301: no recording on remote media nodes; no RTCP to the recorder; SDES / DTLS passthrough calls not recordable; early media not recorded; the recorder stream keeps one SSRC across a call-party SSRC change; the recorder may name a media address on another host.
+- POA&M-303: no `a=record` indication to participants.
+- POA&M-304: no NAPTR / SRV for the recorder; no ML-KEM hybrid key exchange.
+- POA&M-305: no metadata updates; a T.38 switch ends or is refused on a recorded call.
+- POA&M-307: recording-session state is not replicated.
+- POA&M-308: recorder re-INVITE (488), UPDATE (405) and snapshot requests are not supported.
+
+See [NIST-800-53-CONTROLS.md](NIST-800-53-CONTROLS.md) ("SIPREC call recording") and [RFC_COMPLIANCE_GAPS.md](RFC_COMPLIANCE_GAPS.md).
+
+---
+
 ## Call Detail Records
 
-Each call attempt that passes source admission produces one Call Detail Record (CDR, schema v2; readers and `sbc-cli cdrs verify` accept v1 files) when it ends: answered, cancelled, failed, rejected at admission, by policy or for lack of a route, or rejected by the trunk with a 4xx/5xx/6xx. INVITEs that only draw a 401/407 challenge produce no CDR unless `record_auth_challenges = true`. Traffic dropped by the ACL or DoS protection, and INVITEs refused by source admission (403, neither a trunk nor registered; audited as an `AuthorizationDecision`), produce no CDR. A retransmitted INVITE that is rejected again within 32 s does not produce a second CDR.
+Each call attempt that passes source admission produces one Call Detail Record (CDR, schema v4; readers and `sbc-cli cdrs verify` accept v1 to v3 files) when it ends: answered, cancelled, failed, rejected at admission, by policy or for lack of a route, or rejected by the trunk with a 4xx/5xx/6xx. INVITEs that only draw a 401/407 challenge produce no CDR unless `record_auth_challenges = true`. Traffic dropped by the ACL or DoS protection, and INVITEs refused by source admission (403, neither a trunk nor registered; audited as an `AuthorizationDecision`), produce no CDR. A retransmitted INVITE that is rejected again within 32 s does not produce a second CDR.
 
 ```toml
 [cdr]
@@ -1033,6 +1289,8 @@ The table rejects unknown keys. Validation also rejects a relative `directory` o
 **PII.** By default numbers are stored as received. `mask_caller` replaces all but the last four characters of the caller fields with `*`. `hash` replaces caller and callee fields with hex HMAC-SHA-384 under the key file, which must hold at least 48 bytes and must not be a symlink or readable by group or other (mode 0600 or 0400); the daemon refuses to start otherwise. The file is opened with `O_NOFOLLOW` and its type and mode are checked on the open handle. A Kubernetes Secret volume fails this check, because Secret files are `..data/` symlinks with mode 0644 (or 0440) by default. Mount the key with `subPath` (a regular file, not a symlink) and `defaultMode: 0400`, or copy it in an initContainer (`install -m 0400 /secret/key /var/lib/sbc/keys/cdr-hmac.key`) and point `pii_hash_key_file` at the copy. The Helm chart has no PII key option and mounts no key; add the volume to the daemon Deployment as described. A symlinked parent directory is not detected. CDR content is never written to the tracing log. Hot reload applies changes to `pii`, `record_unanswered` and the retention keys. Changes to sinks, the directory or the format need a restart.
 
 **Failure handling.** Emitting a CDR never blocks call handling. If the queue is full or the writer has stopped, the record is dropped and counted. The health component `cdr` reports unhealthy when the writer has exited or a file write failed in the last 60 s, and degraded when a record was dropped or the syslog sink failed in the last 5 minutes. The syslog sink runs on its own thread with its own queue (4096 records, DNS resolution capped at 5 s, at most one lookup in flight, and the last good collector address reused while the resolver fails): a slow or unreachable collector never delays file writes; records it cannot take are counted in `sbc_cdr_syslog_dropped_total` and kept in the file. With `on_failure = "reject_new_calls"`, new non-emergency INVITEs get `503` (with `Retry-After`) while the `cdr` health component is unhealthy, and each refusal is audited as an `AuthorizationDecision` with policy `cdr-unavailable`. Emergency calls are always admitted. Writer failures, drops and file rotations are also recorded on the audit trail (`CdrSinkFailure`, `CdrFileRotated`).
+
+**Recording fields (schema v4).** `recording` and `recording_session_id` say whether a call that matched the `[recording]` trigger was recorded; calls refused or ended by the recording policy have disposition and release cause `recording_failure`. In CSV the two columns are inserted after `media_kinds`. See "Call Recording (SIPREC)".
 
 **Metrics.** `sbc_cdr_emitted_total`, `sbc_cdr_dropped_queue_full_total`, `sbc_cdr_dropped_writer_dead_total`, `sbc_cdr_write_errors_total`, `sbc_cdr_syslog_dropped_total`, `sbc_cdr_queue_depth`, `sbc_cdr_rotations_total`, `sbc_cdr_writer_alive` and `sbc_cdr_last_write_timestamp_seconds`.
 
@@ -1278,6 +1536,7 @@ The SBC implements controls from NIST 800-53 Rev5 (wiring state in parentheses):
 
 - **AC-3/AC-4**: Source admission (trunk IP or active registration) and routing / topology hiding (wired)
 - **AU-2/AU-3/AU-5**: Audit logging (wired, opt-in via `logging.audit_enabled`; non-blocking writer, drops counted and exposed in health and metrics)
+- **AU-14**: Call recording as a SIPREC recording client (wired, off by default, partial; fail closed by default; see "Call Recording (SIPREC)")
 - **CM-2/CM-6**: Configuration management (wired)
 - **IA-2**: REGISTER authentication (wired for OIDC Bearer via `SBC_AUTH_MODE=bearer`; digest not configurable; SIP mTLS planned)
 - **SC-5**: DoS protection (rate limiting, `max_calls` admission, per-trunk `max_calls`, `per_callee_max_concurrent`, `max_registrations` — wired, per node; bounded emergency reserve)
@@ -1291,6 +1550,6 @@ See [NIST-800-53-CONTROLS.md](NIST-800-53-CONTROLS.md) for details.
 ### Performance Considerations
 
 - Each active call uses 2 RTP relay tasks (A→B and B→A)
-- RTP port range should be sized for `2 * max_concurrent_calls` ports
+- RTP port range should be sized for `2 * max_concurrent_calls` ports; a recorded call (`[recording]`) uses four port pairs instead of two
 - The jitter buffer and codec state are per-session (no shared state contention)
 - Rate limiter uses per-IP token buckets with O(1) check time

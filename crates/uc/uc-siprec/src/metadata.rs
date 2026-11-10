@@ -477,11 +477,11 @@ impl RecordingMetadata {
     ///
     /// Element IDs (`session_id`, `participant_id`, `stream_id`) are fresh
     /// base64-encoded 128-bit values from the `uc-crypto` RNG on every call.
-    /// RFC 7865 §6.1: IDs MUST be globally unique.
+    /// RFC 7865 §6.10: IDs MUST be globally unique.
     ///
     /// Codec, SSRC, payload type and role are internal model fields that are
     /// not part of the RFC 7865 schema and are not emitted; the SRS learns them
-    /// from the RS SDP (`a=label`, RFC 7866 §8.1.1).
+    /// from the RS SDP (`a=label`, RFC 7866 §7.1.1).
     ///
     /// # Errors
     ///
@@ -541,7 +541,7 @@ impl RecordingMetadata {
         let mut out = String::with_capacity(1024);
         out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         out.push_str("<recording xmlns=\"urn:ietf:params:xml:ns:recording:1\">\n");
-        // RFC 7865 §6.2 / §9: the schema element is `datamode`.
+        // RFC 7865 §5.1.2 / §9: the schema element is `datamode`.
         out.push_str("  <datamode>complete</datamode>\n");
 
         // RFC 7865 §6.3 Communication Session.
@@ -569,7 +569,7 @@ impl RecordingMetadata {
             out.push_str("  </participant>\n");
         }
 
-        // RFC 7865 §6.6 Media Stream; label matches the RS SDP a=label.
+        // RFC 7865 §6.7 Media Stream; label matches the RS SDP a=label.
         for (s, sid) in self.streams.iter().zip(&stream_ids) {
             let _ = writeln!(
                 out,
@@ -579,7 +579,7 @@ impl RecordingMetadata {
             out.push_str("  </stream>\n");
         }
 
-        // RFC 7865 §6.8 association of the CS with the RS.
+        // RFC 7865 §6.4 association of the CS with the RS.
         let _ = writeln!(out, "  <sessionrecordingassoc session_id=\"{session_id}\">");
         write_assoc_times(
             &mut out,
@@ -600,7 +600,7 @@ impl RecordingMetadata {
         }
 
         for (idx, pid) in participant_ids.iter().enumerate() {
-            // RFC 7865 §6.9: a participant sends the streams it owns and
+            // RFC 7865 §6.8: a participant sends the streams it owns and
             // receives the streams owned by the other participants.
             let _ = writeln!(out, "  <participantstreamassoc participant_id=\"{pid}\">");
             for (owner, sid) in owners.iter().zip(&stream_ids) {
@@ -700,13 +700,18 @@ fn write_assoc_times(out: &mut String, start: Option<SystemTime>, stop: Option<S
     }
 }
 
-/// RFC 7865 §6.1: a UUID-sized (128-bit) random value, base64 encoded.
+/// RFC 7865 §6.10: a random (version 4) UUID, base64 encoded. The version
+/// and variant bits are set as RFC 9562 §5.4 requires, leaving 122 random
+/// bits.
 fn random_id() -> SiprecResult<String> {
     // NIST 800-53 Rev5: SC-13 - randomness via uc-crypto (aws-lc-rs).
-    let bytes: [u8; 16] =
+    let mut bytes: [u8; 16] =
         uc_crypto::random::generate_random().map_err(|e| SiprecError::MetadataError {
             reason: format!("RNG failure: {e}"),
         })?;
+    let [.., version, _, variant, _, _, _, _, _, _, _] = &mut bytes;
+    *version = (*version & 0x0F) | 0x40;
+    *variant = (*variant & 0x3F) | 0x80;
     Ok(base64_encode(&bytes))
 }
 

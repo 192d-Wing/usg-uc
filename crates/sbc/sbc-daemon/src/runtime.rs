@@ -28,6 +28,10 @@ use tracing::{debug, error, info, warn};
 use uc_metrics::SbcMetrics;
 use uc_telemetry::TelemetryProvider;
 
+/// How long shutdown waits for the queued recording session BYEs to be
+/// sent to the recorder before counting the rest as dropped.
+const RS_WIND_DOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Retry a Postgres-store constructor with bounded backoff.
 ///
 /// The four `Postgres*Store::new(&dsn)` calls during daemon startup
@@ -1279,6 +1283,16 @@ impl Runtime {
                 warn!("CDR queue not drained before shutdown");
             }
         }
+
+        // The recordings of the calls ended above (and of calls that ended
+        // while draining) still have their RS BYE queued, and the timer
+        // loop that sends them stopped with `server.run()`: send them now,
+        // bounded, and count what could not be sent (RFC 3261 §15).
+        //
+        // ## NIST 800-53 Rev5: AU-5, SC-5
+        server
+            .flush_recording_wind_down(RS_WIND_DOWN_FLUSH_TIMEOUT)
+            .await;
 
         uc_audit::log_event(uc_audit::AuditEvent::SystemShutdown(
             uc_audit::event::SystemShutdown {

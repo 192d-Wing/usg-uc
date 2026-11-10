@@ -135,6 +135,18 @@ fn load_tls_key_audited(
     result
 }
 
+/// Zeroizes the serialized form of a message that carried key material (a
+/// recording session INVITE holds SDES SRTP keys). A buffer that is still
+/// shared cannot be wiped and is left to its other owner.
+///
+/// ## NIST 800-53 Rev5: SC-12, SI-12
+fn wipe_wire_bytes(bytes: bytes::Bytes) {
+    use zeroize::Zeroize;
+    if let Ok(mut owned) = bytes.try_into_mut() {
+        owned[..].zeroize();
+    }
+}
+
 /// Stream connection deadlines from `[transport]`.
 #[derive(Clone, Copy, Debug)]
 struct StreamTimeouts {
@@ -748,6 +760,13 @@ impl Server {
         for w in sbc_config::validate::t38_warnings(config) {
             warn!(event = "config.t38_warning", "{w}");
         }
+        // NIST 800-53 Rev5: CM-6, AU-14 - non-fatal `[recording]` problems
+        // (e.g. SRTP passthrough: only cleartext-RTP calls can be recorded).
+        // The settings themselves are attached in `start` (they need the
+        // SRS address and CA; see `wire_recording`).
+        for w in sbc_config::validate::recording_warnings(config) {
+            warn!(event = "config.recording_warning", "{w}");
+        }
 
         // Initialize router from config (if routing section present)
         if let Some(ref routing) = config.routing {
@@ -850,6 +869,11 @@ impl Server {
                 dtls_sidecar_socket: config.media.dtls.sidecar_socket.clone(),
                 dtls_fingerprint: dtls_fingerprint.clone(),
                 media_failure_tx,
+                // SIPREC: the fork tap exists only when recording is enabled
+                // (CM-7: no tap at all by default).
+                recording: sbc_media_core::media_pipeline::RecordingMode::from_enabled(
+                    config.recording.enabled,
+                ),
                 ..Default::default()
             };
             sip_stack.set_media_pipeline(Arc::new(
@@ -1097,6 +1121,10 @@ impl Server {
             SipStack::topology_config_from(topo)
                 .map_err(|message| ServerError::ConfigError { message })?;
         }
+        // NIST 800-53 Rev5: CM-6, SC-24 - `[recording]` either works or the
+        // daemon does not start (remote media plane, no TLS certificate,
+        // unresolvable SRS, unloadable SRS CA).
+        Box::pin(self.wire_recording()).await?;
         info!(
             version = env!("CARGO_PKG_VERSION"),
             instance = %self.config.general.instance_name,
@@ -1219,6 +1247,185 @@ impl Server {
             .live_transports
             .store(bound as u64, Ordering::SeqCst);
 
+        Ok(())
+    }
+
+    /// Startup rules for `[recording]` that depend on the environment, so
+    /// `sbc-config` validation cannot check them. `remote_media` is the
+    /// configured remote media node list (`SBC_MEDIA_CONTROLLER_URL[S]`).
+    ///
+    /// - Remote media nodes cannot fork to a recorder: the media control
+    ///   channel is plaintext and would carry SRTP master keys (POA&M-301).
+    ///   A recorder that can never record is a misconfiguration, so the
+    ///   daemon refuses to start rather than fail every matched call.
+    /// - The RS Via / Contact advertise the TLS listener, and the daemon
+    ///   binds it only with `security.tls_cert_path` / `tls_key_path`.
+    ///
+    /// # Errors
+    ///
+    /// The startup error message.
+    ///
+    /// ## NIST 800-53 Rev5: CM-6, SC-8, SC-12, SC-24
+    fn recording_startup_check(config: &SbcConfig, remote_media: &[String]) -> Result<(), String> {
+        if !config.recording.enabled {
+            return Ok(());
+        }
+        if !remote_media.is_empty() {
+            return Err(
+                "recording.enabled = true cannot be used with a remote media plane \
+                 (SBC_MEDIA_CONTROLLER_URL / SBC_MEDIA_CONTROLLER_URLS): the media control \
+                 channel cannot carry SRTP keys (POA&M-301)"
+                    .to_string(),
+            );
+        }
+        if config.transport.tls_listen.is_empty()
+            || config.security.tls_cert_path.is_none()
+            || config.security.tls_key_path.is_none()
+        {
+            return Err(
+                "recording.enabled = true requires a SIP TLS listener with a certificate \
+                 (transport.tls_listen, security.tls_cert_path, security.tls_key_path): the \
+                 recording session advertises it in Via and Contact"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Resolves and attaches `[recording]` (SIPREC SRC, RFC 7866). A no-op
+    /// when recording is off. Runs at the top of [`Self::start`], while the
+    /// `sip_stack` `Arc` is still uniquely held.
+    ///
+    /// The SRS host is resolved once, here, and pinned (the section is
+    /// restart-required); the signaling path never does DNS for it. The
+    /// recorder TLS client profile trusts `recording.srs_tls_ca_file` only,
+    /// offers TLS 1.3 only whatever `security.min_tls_version` says, and
+    /// presents the SBC certificate if the SRS asks for one.
+    ///
+    /// # Errors
+    ///
+    /// Fail-closed: [`Self::recording_startup_check`] failures, an SRS host
+    /// that does not resolve, an SRS CA or SBC certificate that does not
+    /// load, or no usable local media address toward the SRS.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-8(1), SC-13, SC-23, IA-3, CM-6, SC-24
+    // POAM: POA&M-304 - no RFC 3263 NAPTR/SRV for the SRS (one A/AAAA
+    // lookup at startup); ML-KEM hybrid key exchange is not offered.
+    async fn wire_recording(&mut self) -> Result<(), ServerError> {
+        let refuse = |message: String| ServerError::ConfigError { message };
+        Self::recording_startup_check(&self.config, &Self::remote_media_urls()).map_err(refuse)?;
+        let rec = &self.config.recording;
+        if !rec.enabled {
+            return Ok(());
+        }
+        let sec = &self.config.security;
+        let srs_uri = crate::recording::parse_srs_uri(rec.srs_uri.as_deref()).map_err(refuse)?;
+        let host = crate::recording::bare_host(&srs_uri.host).to_string();
+        let port = srs_uri.effective_port();
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|mut addrs| addrs.next());
+        let Some(srs) = resolved else {
+            return Err(refuse(format!(
+                "recording.srs_uri host {host:?} does not resolve"
+            )));
+        };
+        let srs_addr = SbcSocketAddr::from(srs);
+
+        let ca_path = rec
+            .srs_tls_ca_file
+            .as_deref()
+            .map(std::path::Path::new)
+            .ok_or_else(|| refuse("recording.srs_tls_ca_file is not set".to_string()))?;
+        let roots = uc_transport::tls::load_root_store(ca_path).map_err(|e| {
+            refuse(format!(
+                "recording.srs_tls_ca_file {}: {e}",
+                ca_path.display()
+            ))
+        })?;
+        // Q4: the SBC certificate is presented only if the SRS requests one.
+        let client_auth = match (&sec.tls_cert_path, &sec.tls_key_path) {
+            (Some(cert), Some(key)) => {
+                let chain = uc_transport::tls::load_certs(cert)
+                    .map_err(|e| refuse(format!("loading {}: {e}", cert.display())))?;
+                // POA&M-166: key must be on security.curve; outcome audited.
+                let key = load_tls_key_audited("recorder-tls-client", key, sec.curve)
+                    .map_err(|e| refuse(format!("loading {}: {e}", key.display())))?;
+                Some((chain, key))
+            }
+            _ => None,
+        };
+        let tls =
+            uc_transport::tls::create_client_config_with(uc_transport::tls::TlsClientOptions {
+                roots,
+                // CNSA 2.0: TLS 1.3 only toward the recorder.
+                min_version: uc_transport::tls::MinTlsVersion::V1_3,
+                client_auth,
+            })
+            .map_err(|e| refuse(format!("building the recorder TLS client config: {e}")))?;
+
+        // The fork's address when no zone media address applies: the SBC's
+        // source address toward the SRS, from the kernel's route lookup (a
+        // connected UDP socket sends nothing).
+        let zone_media = rec
+            .srs_zone
+            .as_deref()
+            .zip(self.zone_registry.as_ref())
+            .and_then(|(zone, reg)| reg.media_ip(zone));
+        let local_media_ip = {
+            let wildcard: std::net::SocketAddr = if srs.is_ipv4() {
+                (Ipv4Addr::UNSPECIFIED, 0).into()
+            } else {
+                (Ipv6Addr::UNSPECIFIED, 0).into()
+            };
+            std::net::UdpSocket::bind(wildcard)
+                .and_then(|sock| sock.connect(srs).and_then(|()| sock.local_addr()))
+                .ok()
+                .map(|a| a.ip())
+                .filter(|ip| !ip.is_unspecified())
+        };
+        if zone_media.is_none() && local_media_ip.is_none() {
+            return Err(refuse(format!(
+                "recording: no local media address toward the SRS {srs_addr} \
+                 (no route, and recording.srs_zone has no media address)"
+            )));
+        }
+        let mut settings =
+            crate::recording::RecordingSettings::from_config(rec, srs_addr, local_media_ip)
+                .map_err(refuse)?;
+        // SC-7: the ports the SBC itself uses for RTP; an SRS answer must
+        // not aim the fork at them.
+        settings.media_ports = self.config.media.rtp_port_min..=self.config.media.rtp_port_max;
+        // SC-7: an unzoned relay binds the wildcard address, so every local
+        // interface address is one of the SBC's own. Enumerated once here
+        // (one `getifaddrs`), never on the signaling task.
+        settings.local_addrs = sbc_config::interface::local_addresses();
+        if settings.local_addrs.is_empty() {
+            warn!(
+                "recording: local interface addresses could not be enumerated; \
+                 SRS answer addresses are checked against configured addresses only"
+            );
+        }
+        let tls_name = settings.flow.dial.clone().unwrap_or_default();
+        let stack =
+            Arc::get_mut(&mut self.sip_stack).ok_or_else(|| ServerError::InternalError {
+                message: "cannot attach recording: sip_stack Arc already shared".to_string(),
+            })?;
+        stack.set_recording(settings);
+        self.flows.set_recorder_tls_client(Arc::new(tls));
+        info!(
+            srs = %srs_addr,
+            server_name = %tls_name,
+            ca = %ca_path.display(),
+            on_failure = ?rec.on_failure,
+            max_sessions = rec.max_sessions,
+            "SIPREC recording enabled (TLS 1.3 to the recorder, certificate verification on)"
+        );
         Ok(())
     }
 
@@ -2113,7 +2320,12 @@ impl Server {
         let key = egress.unwrap_or_else(|| {
             ctx.flows
                 .register_accepted(transport.transport_type(), peer, Arc::clone(&transport));
-            (transport.transport_type(), peer, None, false)
+            (
+                transport.transport_type(),
+                peer,
+                None,
+                crate::flow::FlowProfile::Plain,
+            )
         });
         // NIST 800-53 Rev5: IA-3, SC-23 — a process-unique id for this
         // connection binds STIR endpoint attestation to it, not to the
@@ -2432,6 +2644,14 @@ impl Server {
                         } if r.method == Method::Invite => Some(m.clone()),
                         _ => None,
                     };
+                    // A recording session request (BYE / CANCEL / ACK) lost
+                    // to a full recorder lane is a recording drop: TLS has
+                    // no retransmission, so the SRS keeps the session until
+                    // its own timeout (NIST 800-53 Rev5: SC-5, AU-5).
+                    let recorder = matches!(
+                        &result,
+                        ProcessResult::Forward { flow: Flow::Leg(l), .. } if l.recorder
+                    );
                     let job_ctx = ctx.clone();
                     let queued = ctx.flows.enqueue(
                         key,
@@ -2439,6 +2659,9 @@ impl Server {
                             Self::handle_result(result, &job_ctx).await;
                         }),
                     );
+                    if !queued && recorder && invite.is_none() {
+                        ctx.sip_stack.recording_counters().note_rs_bye_dropped();
+                    }
                     if !queued && let Some(invite) = invite {
                         for follow_up in ctx.sip_stack.on_invite_sent(&invite, false).await {
                             Self::dispatch(follow_up, ctx).await;
@@ -2508,6 +2731,8 @@ impl Server {
                 destination,
                 flow,
             } => {
+                // A recording session request (it may carry SDES keys).
+                let recorder = matches!(&flow, Flow::Leg(l) if l.recorder);
                 let request_bytes = message.to_bytes();
                 let sent = match tokio::time::timeout(
                     std::time::Duration::from_secs(30),
@@ -2534,8 +2759,22 @@ impl Server {
                 //
                 // NIST 800-53 Rev5: SC-5 — the failover follow-up (already
                 // decided exactly once by on_invite_sent) goes to its lane.
+                // NIST 800-53 Rev5: SC-12, SI-12 - the serialized RS request
+                // is wiped once written (the TLS layer has its own copy).
+                if recorder {
+                    wipe_wire_bytes(request_bytes);
+                }
                 if matches!(&message, SipMessage::Request(r) if r.method == Method::Invite) {
-                    for follow_up in ctx.sip_stack.on_invite_sent(&message, sent).await {
+                    // AU-5: a failed RS INVITE is audited as a TLS failure or
+                    // an unreachable recorder.
+                    let tls_failed = !sent
+                        && matches!(&flow, Flow::Leg(l)
+                            if l.recorder && ctx.flows.dial_failed_in_handshake(l, &destination));
+                    let follow_ups = ctx
+                        .sip_stack
+                        .on_invite_sent_with(&message, sent, tls_failed)
+                        .await;
+                    for follow_up in follow_ups {
                         Self::dispatch(follow_up, ctx).await;
                     }
                 }
@@ -2589,6 +2828,65 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Shutdown, after the remaining calls were ended: sends the RS BYE /
+    /// CANCEL still on the recording wind-down queue on the recorder flow,
+    /// for at most `bound`. The timer loop that normally paces them was
+    /// aborted when [`Self::run`] returned, so without this they would
+    /// never leave the queue. What is not handed to the recorder's lane in
+    /// time is counted in `sbc_recording_rs_bye_dropped_total` and logged
+    /// once. Returns the number dropped.
+    ///
+    /// ## NIST 800-53 Rev5: AU-5, SC-5; RFC 3261 §15
+    pub async fn flush_recording_wind_down(&self, bound: std::time::Duration) -> usize {
+        Self::flush_rs_wind_down(&self.send_ctx(Origin::None), bound).await
+    }
+
+    async fn flush_rs_wind_down(ctx: &SendCtx, bound: std::time::Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + bound;
+        let poll = tokio::time::Duration::from_millis(10);
+        let mut lane_stalled = false;
+        loop {
+            let batch = ctx.sip_stack.recording_shutdown_batch();
+            if batch.is_empty() {
+                break;
+            }
+            // The recorder flow is one TLS connection, so one lane.
+            let lane = batch.iter().find_map(|r| match r {
+                ProcessResult::Forward {
+                    destination,
+                    flow: Flow::Leg(l),
+                    ..
+                } => Some((l.transport, *destination)),
+                _ => None,
+            });
+            for r in batch {
+                // Queued on the lane (returns at once); a full lane counts
+                // the drop itself.
+                Self::dispatch(r, ctx).await;
+            }
+            // The lane sends in order; the next batch (and the return) waits
+            // for it to empty so the lane depth is never exceeded.
+            let Some(lane) = lane else { continue };
+            while ctx.flows.lane_busy(&lane) {
+                if tokio::time::Instant::now() >= deadline {
+                    lane_stalled = true;
+                    break;
+                }
+                tokio::time::sleep(poll).await;
+            }
+            if lane_stalled {
+                break;
+            }
+        }
+        if lane_stalled {
+            warn!(
+                bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+                "Recorder send lane still busy at shutdown; queued recording session BYEs may not be sent"
+            );
+        }
+        ctx.sip_stack.recording_shutdown_abandon()
     }
 
     /// Stops the server gracefully.
@@ -4478,7 +4776,7 @@ mod tests {
         let (conn, peer) = listener.accept().await.unwrap();
         let conn: Arc<dyn Transport> = Arc::new(conn);
         flows.register_accepted(T::Tcp, peer, Arc::clone(&conn));
-        let key: FlowKey = (T::Tcp, peer, None, false);
+        let key: FlowKey = (T::Tcp, peer, None, crate::flow::FlowProfile::Plain);
 
         assert!(!flows.lane_busy(&(T::Tcp, peer)));
         let (go, wait) = tokio::sync::oneshot::channel::<()>();
@@ -4561,5 +4859,431 @@ mod tests {
         assert_eq!(sip.max_calls, config.general.max_calls);
         assert_eq!(sip.max_registrations, config.general.max_registrations);
         assert_eq!(sip.admission_divisor, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // SIPREC recording startup (POA&M-300, -301, -304): it works or the
+    // daemon does not start.
+    // ------------------------------------------------------------------
+
+    /// A self-signed P-384 certificate and its key (mode 0600) in `dir`.
+    #[cfg(unix)]
+    fn write_cert_and_key(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["sbc.example.test".to_string()])
+            .unwrap()
+            .self_signed(&kp)
+            .unwrap();
+        let cert_path = dir.join("sbc.crt");
+        let key_path = dir.join("sbc.key");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, kp.serialize_pem()).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (cert_path, key_path)
+    }
+
+    /// A config with recording enabled toward `srs_uri`, the SBC TLS
+    /// certificate in place, and `ca` as the SRS CA bundle.
+    #[cfg(unix)]
+    fn recording_config(dir: &std::path::Path, srs_uri: &str, ca: &std::path::Path) -> SbcConfig {
+        let (cert, key) = write_cert_and_key(dir);
+        let mut config = SbcConfig::default();
+        config.security.tls_cert_path = Some(cert);
+        config.security.tls_key_path = Some(key);
+        config.recording.enabled = true;
+        config.recording.notice_acknowledged = true;
+        config.recording.record_all = true;
+        config.recording.srs_uri = Some(srs_uri.to_string());
+        config.recording.srs_tls_ca_file = Some(ca.to_string_lossy().into_owned());
+        config
+    }
+
+    /// The configuration error message of a refused startup (any other
+    /// outcome yields a text no assertion matches).
+    fn startup_error(r: Result<(), ServerError>) -> String {
+        match r {
+            Err(ServerError::ConfigError { message }) => message,
+            other => format!("not a configuration error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_off_wires_nothing() {
+        let mut server = Server::new(SbcConfig::default(), ShutdownSignal::new());
+        server.wire_recording().await.unwrap();
+        assert!(!server.sip_stack().recording_enabled());
+        assert!(
+            Server::recording_startup_check(
+                &SbcConfig::default(),
+                &["http://media-1:50051".to_string()]
+            )
+            .is_ok(),
+            "remote media is fine while recording is off"
+        );
+    }
+
+    // Q2 / POA&M-301: recording with remote media nodes refuses to start
+    // (the media control channel would carry SRTP keys in the clear).
+    #[cfg(unix)]
+    #[test]
+    fn recording_with_remote_media_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("sbc.crt");
+        let config = recording_config(dir.path(), "sips:127.0.0.1:5061", &ca);
+        assert!(Server::recording_startup_check(&config, &[]).is_ok());
+        let err = Server::recording_startup_check(&config, &["http://media-1:50051".to_string()])
+            .unwrap_err();
+        assert!(err.contains("remote media plane"), "{err}");
+    }
+
+    // The RS Via / Contact advertise the TLS listener, which is bound only
+    // with a certificate: recording without one refuses to start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recording_without_tls_certificate_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("sbc.crt");
+        let full = recording_config(dir.path(), "sips:127.0.0.1:5061", &ca);
+        for strip in ["cert", "key", "listener"] {
+            let mut config = full.clone();
+            match strip {
+                "cert" => config.security.tls_cert_path = None,
+                "key" => config.security.tls_key_path = None,
+                _ => config.transport.tls_listen.clear(),
+            }
+            let mut server = Server::new(config, ShutdownSignal::new());
+            let err = startup_error(server.start().await);
+            assert!(
+                err.contains("TLS listener with a certificate"),
+                "{strip}: {err}"
+            );
+            assert!(!server.sip_stack().recording_enabled(), "{strip}");
+        }
+    }
+
+    // The SRS host is resolved once at startup; failure is a startup error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recording_with_unresolvable_srs_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("sbc.crt");
+        let config = recording_config(dir.path(), "sips:srs.recorder.invalid:5061", &ca);
+        let mut server = Server::new(config, ShutdownSignal::new());
+        let err = startup_error(server.wire_recording().await);
+        assert!(err.contains("does not resolve"), "{err}");
+        assert!(!server.sip_stack().recording_enabled());
+        // Not a sips: URI (validation rejects it first; the daemon too).
+        let config = recording_config(dir.path(), "sip:127.0.0.1:5060", &ca);
+        let mut server = Server::new(config, ShutdownSignal::new());
+        let err = startup_error(server.wire_recording().await);
+        assert!(err.contains("sips:"), "{err}");
+    }
+
+    // An SRS CA bundle that is missing or holds no certificate is a
+    // startup error: the recorder is never dialled unverified.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recording_with_unloadable_srs_ca_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "not a certificate\n").unwrap();
+        let missing = dir.path().join("missing.pem");
+        for ca in [&empty, &missing] {
+            let config = recording_config(dir.path(), "sips:127.0.0.1:5061", ca);
+            let mut server = Server::new(config, ShutdownSignal::new());
+            let err = startup_error(server.wire_recording().await);
+            assert!(err.contains("recording.srs_tls_ca_file"), "{err}");
+            assert!(!server.sip_stack().recording_enabled());
+        }
+    }
+
+    // With a resolvable SRS, a loadable CA and the SBC certificate, the
+    // settings are attached and the recorder TLS profile is loaded (a
+    // recorder flow no longer fails for want of a client config).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recording_wires_settings_and_the_recorder_tls_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("sbc.crt");
+        let config = recording_config(dir.path(), "sips:127.0.0.1:59", &ca);
+        let mut server = Server::new(config, ShutdownSignal::new());
+        let capture = uc_audit::capture::start();
+        server.wire_recording().await.unwrap();
+        assert!(server.sip_stack().recording_enabled());
+        // POA&M-166: the client key load is audited.
+        assert!(
+            key_ops(&capture.events())
+                .iter()
+                .any(|k| k.key_id == "recorder-tls-client:sbc.key"),
+            "recorder client key load audited"
+        );
+        let name: Arc<str> = Arc::from("127.0.0.1");
+        let flow = LegFlow::recorder(&name);
+        let dest = SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 59);
+        let err = server
+            .flows()
+            .send(&flow, &dest, b"x", None)
+            .await
+            .unwrap_err();
+        assert_ne!(
+            err,
+            crate::flows::FlowError::NoTlsClient,
+            "the recorder profile is loaded (the dial itself fails: nothing listens)"
+        );
+        // The trunk profiles were not loaded by this: a trunk TLS flow to
+        // the same address still has no client config (separate profiles).
+        let trunk = LegFlow::trunk_shared(uc_routing::TrunkProtocol::Tls, &name, false);
+        assert_eq!(
+            server
+                .flows()
+                .send(&trunk, &dest, b"x", None)
+                .await
+                .unwrap_err(),
+            crate::flows::FlowError::NoTlsClient
+        );
+    }
+
+    // AU-5: a failed RS INVITE send comes back to the stack with its cause:
+    // a TLS / certificate failure is `srs_tls`, a refused connection is
+    // `srs_unreachable`. Nothing is retried on another transport.
+    #[tokio::test]
+    async fn failed_rs_invite_send_reports_tls_or_unreachable() {
+        use crate::sip_stack::tests::rs_invite_for_server;
+        use sbc_config::schema::RecordingFailureAction;
+        use uc_audit::event::RecordingFailReason;
+
+        let self_signed = || {
+            let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+            let cert = rcgen::CertificateParams::new(vec!["srs.example.test".to_string()])
+                .unwrap()
+                .self_signed(&kp)
+                .unwrap();
+            (cert.der().clone(), kp.serialize_der())
+        };
+        // The recorder client trusts another certificate than the one the
+        // "SRS" presents.
+        let (trusted, _) = self_signed();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(trusted).unwrap();
+        let recorder_client = Arc::new(
+            uc_transport::tls::create_client_config_with(uc_transport::tls::TlsClientOptions {
+                roots,
+                min_version: uc_transport::tls::MinTlsVersion::V1_3,
+                client_auth: None,
+            })
+            .unwrap(),
+        );
+        let (presented, key) = self_signed();
+        let server_cfg = uc_transport::tls::create_server_config(
+            vec![presented],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(key)),
+        )
+        .unwrap();
+        let listener = TlsListener::bind(
+            ListenerConfig::new(
+                SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0),
+                TransportType::Tls,
+            ),
+            Arc::new(server_cfg),
+        )
+        .await
+        .unwrap();
+        let untrusted_srs = *listener.local_addr();
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        // A port nothing listens on.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            SbcSocketAddr::from(l.local_addr().unwrap())
+        };
+
+        for (srs, reason) in [
+            (untrusted_srs, RecordingFailReason::SrsTls),
+            (closed, RecordingFailReason::SrsUnreachable),
+        ] {
+            let (stack, invite) =
+                Box::pin(rs_invite_for_server(srs, RecordingFailureAction::Continue)).await;
+            let stack = Arc::new(stack);
+            let flows = Arc::new(FlowTable::new(4));
+            flows.set_recorder_tls_client(Arc::clone(&recorder_client));
+            let ctx = none_ctx(&stack, &flows);
+            Server::dispatch(invite, &ctx).await;
+            let reported = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while stack.recording_counters().failed(reason) != 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            assert!(
+                reported,
+                "{reason:?} not reported: {:?}",
+                stack.recording_counters().metric_values()
+            );
+            assert_eq!(stack.recording_counters().slots_held(), 0);
+            assert_eq!(
+                flows.stats.egress_connections.load(Ordering::Relaxed),
+                0,
+                "no connection kept"
+            );
+        }
+    }
+
+    // PERF-001 (SC-5, AU-5): an RS BYE / CANCEL / ACK refused by a full
+    // recorder lane is a recording drop and is counted as one (TLS has no
+    // retransmission: the SRS keeps the session until its own timeout). A
+    // dropped RS INVITE is not counted here; it is reported as a failed
+    // send and goes through the failure policy.
+    #[tokio::test]
+    async fn rs_bye_dropped_by_a_full_recorder_lane_is_counted() {
+        use crate::sip_stack::tests::rs_invite_for_server;
+        use sbc_config::schema::RecordingFailureAction;
+        use uc_audit::event::RecordingFailReason;
+
+        let srs = SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, 50), 5061);
+        let (stack, invite) =
+            Box::pin(rs_invite_for_server(srs, RecordingFailureAction::Continue)).await;
+        let stack = Arc::new(stack);
+        let flows = Arc::new(FlowTable::new(4));
+        let lane = (TransportType::Tls, srs);
+        while flows.enqueue(lane, Box::pin(std::future::pending())) {}
+        let lane_dropped = flows.stats.lane_dropped.load(Ordering::Relaxed);
+        let ctx = none_ctx(&stack, &flows);
+        let dropped = || {
+            stack
+                .recording_counters()
+                .metric_values()
+                .into_iter()
+                .find(|(name, _)| *name == crate::recording::METRIC_RS_BYE_DROPPED)
+                .map(|(_, v)| v)
+        };
+        assert_eq!(dropped(), Some(0));
+
+        let forwarded = match invite {
+            ProcessResult::Forward {
+                message: SipMessage::Request(request),
+                destination,
+                flow,
+            } => Some((request, destination, flow)),
+            _ => None,
+        };
+        let (request, destination, flow) = forwarded.expect("RS INVITE is a forwarded request");
+        for (n, method) in [Method::Bye, Method::Cancel, Method::Ack]
+            .into_iter()
+            .enumerate()
+        {
+            let mut wind_down = request.clone();
+            wind_down.method = method;
+            Server::dispatch(
+                ProcessResult::Forward {
+                    message: SipMessage::Request(wind_down),
+                    destination,
+                    flow: flow.clone(),
+                },
+                &ctx,
+            )
+            .await;
+            assert_eq!(dropped(), Some(n as u64 + 1));
+        }
+        assert_eq!(
+            flows.stats.lane_dropped.load(Ordering::Relaxed),
+            lane_dropped + 3,
+            "still counted as lane drops too"
+        );
+
+        // The INVITE itself: a failed send, not a BYE drop.
+        Server::dispatch(
+            ProcessResult::Forward {
+                message: SipMessage::Request(request),
+                destination,
+                flow,
+            },
+            &ctx,
+        )
+        .await;
+        assert_eq!(dropped(), Some(3));
+        assert_eq!(
+            stack
+                .recording_counters()
+                .failed(RecordingFailReason::SrsUnreachable),
+            1
+        );
+    }
+
+    // PERF-008 (fix round 2), AU-5 / SC-5: the RS BYEs of the calls ended
+    // at shutdown are queued after the timer loop is gone. The shutdown
+    // flush hands them to the recorder's lane in paced batches; what the
+    // bound does not allow is counted as dropped, and the queue ends empty.
+    #[tokio::test]
+    async fn shutdown_flush_sends_queued_rs_byes_or_counts_them() {
+        use crate::sip_stack::tests::rs_byes_queued_at_shutdown;
+        use std::sync::atomic::AtomicUsize;
+
+        let dropped = |stack: &SipStack| {
+            stack
+                .recording_counters()
+                .metric_values()
+                .into_iter()
+                .find(|(name, _)| *name == crate::recording::METRIC_RS_BYE_DROPPED)
+                .map(|(_, v)| v)
+        };
+        let bound = std::time::Duration::from_secs(5);
+
+        // The lane is free: every BYE is handed to it (the send itself
+        // fails here, no recorder TLS client is configured) and nothing is
+        // counted as dropped.
+        let (stack, srs) = Box::pin(rs_byes_queued_at_shutdown(2)).await;
+        let stack = Arc::new(stack);
+        let flows = Arc::new(FlowTable::new(4));
+        let ctx = none_ctx(&stack, &flows);
+        assert_eq!(Server::flush_rs_wind_down(&ctx, bound).await, 0);
+        assert_eq!(dropped(&stack), Some(0));
+        assert!(stack.recording_shutdown_batch().is_empty(), "queue empty");
+        assert!(!flows.lane_busy(&(TransportType::Tls, srs)), "lane drained");
+        assert_eq!(flows.stats.lane_dropped.load(Ordering::Relaxed), 0);
+
+        // More BYEs than one batch, and a recorder lane that never drains:
+        // the first batch is queued behind the stuck send, the bound
+        // expires, and the BYEs still on the wind-down queue are counted.
+        let per_batch = crate::flows::LANE_DEPTH / 4;
+        let (stack, srs) = Box::pin(rs_byes_queued_at_shutdown(per_batch + 2)).await;
+        let stack = Arc::new(stack);
+        let flows = Arc::new(FlowTable::new(4));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let started = Arc::clone(&ran);
+        assert!(flows.enqueue(
+            (TransportType::Tls, srs),
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::Relaxed);
+                std::future::pending::<()>().await;
+            }),
+        ));
+        let ctx = none_ctx(&stack, &flows);
+        let begun = tokio::time::Instant::now();
+        let left = Server::flush_rs_wind_down(&ctx, std::time::Duration::from_millis(50)).await;
+        assert!(begun.elapsed() < bound, "bounded");
+        assert_eq!(left, 2, "the second batch never left the queue");
+        assert_eq!(dropped(&stack), Some(2));
+        assert!(stack.recording_shutdown_batch().is_empty(), "queue empty");
+        assert_eq!(
+            flows.stats.lane_dropped.load(Ordering::Relaxed),
+            0,
+            "the first batch fits the lane"
+        );
+        assert_eq!(ran.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn wire_bytes_are_wiped_when_uniquely_owned() {
+        // A shared buffer is left alone (no panic); a unique one is consumed.
+        let shared = bytes::Bytes::from(vec![7u8; 32]);
+        let other = shared.clone();
+        wipe_wire_bytes(shared);
+        assert_eq!(&other[..], &[7u8; 32][..]);
+        wipe_wire_bytes(other);
     }
 }
