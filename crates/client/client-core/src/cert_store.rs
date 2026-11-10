@@ -1583,13 +1583,15 @@ impl CertificateStore {
         pin: Option<&SmartCardPin>,
     ) -> CertStoreResult<Vec<u8>> {
         use windows::Win32::Security::Cryptography::{
-            BCRYPT_PAD_PKCS1, CERT_CONTEXT, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
-            CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER, CRYPT_ACQUIRE_SILENT_FLAG,
-            CertCloseStore, CertEnumCertificatesInStore, CertOpenStore,
-            CryptAcquireCertificatePrivateKey, NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG,
+            BCRYPT_PAD_PKCS1, CERT_CONTEXT, CERT_KEY_SPEC, CERT_NCRYPT_KEY_SPEC,
+            CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W,
+            CERT_SYSTEM_STORE_CURRENT_USER, CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG,
+            CRYPT_ACQUIRE_SILENT_FLAG, CertCloseStore, CertEnumCertificatesInStore, CertOpenStore,
+            CryptAcquireCertificatePrivateKey, CryptReleaseContext,
+            HCRYPTPROV_OR_NCRYPT_KEY_HANDLE, NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG,
             NCryptFreeObject, NCryptSignHash, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
         };
-        use windows::core::PCWSTR;
+        use windows::core::{BOOL, PCWSTR};
 
         let store_name_wide: Vec<u16> = self
             .store_name
@@ -1631,10 +1633,16 @@ impl CertificateStore {
                 CertStoreError::CertificateNotFound(thumbprint.to_string())
             })?;
 
-            // Acquire private key handle
-            let mut key_handle = NCRYPT_KEY_HANDLE::default();
-            let mut key_spec = 0u32;
-            let mut caller_free_key = false;
+            // Acquire private key handle. The out-parameters have the exact
+            // types of the Win32 prototype, with no pointer casts:
+            // `pfCallerFreeProvOrNCryptKey` is a 4-byte BOOL (through a
+            // pointer to a 1-byte Rust `bool` the API wrote 3 bytes past the
+            // variable), and `pdwKeySpec` says which kind of handle came back.
+            // CWE-787 / CWE-843: out-parameters use the prototype's exact
+            // types. Only CNG (NCrypt) keys are accepted.
+            let mut acquired = HCRYPTPROV_OR_NCRYPT_KEY_HANDLE::default();
+            let mut key_spec = CERT_KEY_SPEC::default();
+            let mut caller_free_key = BOOL(0);
 
             // Set flags - try silent first, which may trigger PIN dialog
             let acquire_flags = if pin.is_some() {
@@ -1645,13 +1653,18 @@ impl CertificateStore {
                 windows::Win32::Security::Cryptography::CRYPT_ACQUIRE_FLAGS(0u32)
             };
 
+            // SAFETY: `cert_ctx` is a live context from the store opened
+            // above; each out-pointer refers to a local of the prototype's
+            // exact pointee type that outlives the call.
             let result = CryptAcquireCertificatePrivateKey(
                 cert_ctx,
-                acquire_flags,
+                // CNG keys only: a legacy CSP handle (HCRYPTPROV) must never
+                // reach the NCrypt* calls below.
+                acquire_flags | CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG,
                 None,
-                &mut key_handle.0 as *mut usize as *mut _,
-                Some(&mut key_spec as *mut u32 as *mut _),
-                Some(&mut caller_free_key as *mut bool as *mut _),
+                &raw mut acquired,
+                Some(&raw mut key_spec),
+                Some(&raw mut caller_free_key),
             );
 
             if result.is_err() {
@@ -1672,6 +1685,22 @@ impl CertificateStore {
                     err
                 )));
             }
+
+            // Only an NCrypt key handle is accepted. The flag above already
+            // makes the API fail for CSP keys; the key spec is checked as
+            // well before the handle is used as an NCRYPT_KEY_HANDLE.
+            let caller_free_key = caller_free_key.as_bool();
+            if key_spec != CERT_NCRYPT_KEY_SPEC || acquired.is_invalid() {
+                if caller_free_key && !acquired.is_invalid() {
+                    // Not an NCrypt object: release it as a CSP provider.
+                    let _ = CryptReleaseContext(acquired.0, 0);
+                }
+                let _ = CertCloseStore(Some(store), 0);
+                return Err(CertStoreError::WindowsError(
+                    "Private key is not a CNG (NCrypt) key".to_string(),
+                ));
+            }
+            let key_handle = NCRYPT_KEY_HANDLE(acquired.0);
 
             // If PIN was provided, set it on the key (for NCrypt keys)
             if let Some(pin_value) = pin {
@@ -1836,13 +1865,15 @@ impl CertificateStore {
     #[cfg(windows)]
     fn verify_pin_windows(&self, thumbprint: &str, pin: &SmartCardPin) -> CertStoreResult<bool> {
         use windows::Win32::Security::Cryptography::{
-            CERT_CONTEXT, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
-            CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER, CRYPT_ACQUIRE_SILENT_FLAG,
-            CertCloseStore, CertEnumCertificatesInStore, CertOpenStore,
-            CryptAcquireCertificatePrivateKey, NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG,
-            NCryptFreeObject, NCryptSetProperty, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+            CERT_CONTEXT, CERT_KEY_SPEC, CERT_NCRYPT_KEY_SPEC, CERT_OPEN_STORE_FLAGS,
+            CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER,
+            CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG, CRYPT_ACQUIRE_SILENT_FLAG, CertCloseStore,
+            CertEnumCertificatesInStore, CertOpenStore, CryptAcquireCertificatePrivateKey,
+            CryptReleaseContext, HCRYPTPROV_OR_NCRYPT_KEY_HANDLE, NCRYPT_KEY_HANDLE,
+            NCRYPT_SILENT_FLAG, NCryptFreeObject, NCryptSetProperty, PKCS_7_ASN_ENCODING,
+            X509_ASN_ENCODING,
         };
-        use windows::core::PCWSTR;
+        use windows::core::{BOOL, PCWSTR};
 
         let store_name_wide: Vec<u16> = self
             .store_name
@@ -1882,23 +1913,51 @@ impl CertificateStore {
                 CertStoreError::CertificateNotFound(thumbprint.to_string())
             })?;
 
-            let mut key_handle = NCRYPT_KEY_HANDLE::default();
-            let mut key_spec = 0u32;
-            let mut caller_free_key = false;
+            // Out-parameters have the exact types of the Win32 prototype,
+            // with no pointer casts: `pfCallerFreeProvOrNCryptKey` is a
+            // 4-byte BOOL (through a pointer to a 1-byte Rust `bool` the API
+            // wrote 3 bytes past the variable, in the process holding the
+            // PIN), and `pdwKeySpec` says which kind of handle came back.
+            // CWE-787 / CWE-843: out-parameters use the prototype's exact
+            // types. Only CNG (NCrypt) keys are accepted.
+            let mut acquired = HCRYPTPROV_OR_NCRYPT_KEY_HANDLE::default();
+            let mut key_spec = CERT_KEY_SPEC::default();
+            let mut caller_free_key = BOOL(0);
 
+            // SAFETY: `cert_ctx` is a live context from the store opened
+            // above; each out-pointer refers to a local of the prototype's
+            // exact pointee type that outlives the call.
             let result = CryptAcquireCertificatePrivateKey(
                 cert_ctx,
-                CRYPT_ACQUIRE_SILENT_FLAG,
+                // CNG keys only: a legacy CSP handle (HCRYPTPROV) must never
+                // reach the NCrypt* calls below.
+                CRYPT_ACQUIRE_SILENT_FLAG | CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG,
                 None,
-                &mut key_handle.0 as *mut usize as *mut _,
-                Some(&mut key_spec as *mut u32 as *mut _),
-                Some(&mut caller_free_key as *mut bool as *mut _),
+                &raw mut acquired,
+                Some(&raw mut key_spec),
+                Some(&raw mut caller_free_key),
             );
 
             if result.is_err() {
                 let _ = CertCloseStore(Some(store), 0);
                 return Err(CertStoreError::SmartCardNotPresent);
             }
+
+            // Only an NCrypt key handle is accepted. The flag above already
+            // makes the API fail for CSP keys; the key spec is checked as
+            // well before the handle is used as an NCRYPT_KEY_HANDLE.
+            let caller_free_key = caller_free_key.as_bool();
+            if key_spec != CERT_NCRYPT_KEY_SPEC || acquired.is_invalid() {
+                if caller_free_key && !acquired.is_invalid() {
+                    // Not an NCrypt object: release it as a CSP provider.
+                    let _ = CryptReleaseContext(acquired.0, 0);
+                }
+                let _ = CertCloseStore(Some(store), 0);
+                return Err(CertStoreError::WindowsError(
+                    "Private key is not a CNG (NCrypt) key".to_string(),
+                ));
+            }
+            let key_handle = NCRYPT_KEY_HANDLE(acquired.0);
 
             // Set PIN
             let pin_wide: Vec<u16> = pin

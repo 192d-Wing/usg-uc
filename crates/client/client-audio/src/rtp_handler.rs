@@ -1203,6 +1203,10 @@ pub fn parse_rfc2198(
 /// an intermediate `RtpHeader` or `RtpPacket`.
 ///
 /// Returns `(payload_type, sequence_number, timestamp, ssrc, payload_start, payload_end)`.
+/// The payload range always satisfies `payload_start <= payload_end <= data.len()`;
+/// a header-extension or padding length that runs past the packet is an error.
+// RFC 3550 §5.1 (padding count), §5.3.1 (extension length in 32-bit words).
+// NIST 800-53 Rev5: SI-10 (lengths from the wire are checked before use).
 #[inline]
 pub fn parse_rtp_fields(data: &[u8]) -> AudioResult<(u8, u16, u32, u32, usize, usize)> {
     if data.len() < RTP_HEADER_SIZE {
@@ -1236,14 +1240,24 @@ pub fn parse_rtp_fields(data: &[u8]) -> AudioResult<(u8, u16, u32, u32, usize, u
         #[allow(clippy::cast_possible_truncation)]
         let ext_len = u16::from_be_bytes([data[header_end + 2], data[header_end + 3]]) as usize * 4;
         header_end += 4 + ext_len;
+        // The length field is attacker-controlled (up to 262140 bytes): it
+        // must not move the payload start past the end of the packet.
+        if data.len() < header_end {
+            return Err(AudioError::RtpError(
+                "extension length exceeds packet".into(),
+            ));
+        }
     }
 
     let mut payload_end = data.len();
     if has_padding {
         let pad_len = data[data.len() - 1] as usize;
-        if pad_len > 0 && pad_len <= data.len() - header_end {
-            payload_end -= pad_len;
+        // header_end <= data.len() is established above, so this cannot
+        // underflow. A count larger than what follows the header is invalid.
+        if pad_len > data.len() - header_end {
+            return Err(AudioError::RtpError("padding length exceeds packet".into()));
         }
+        payload_end -= pad_len;
     }
 
     Ok((
@@ -1343,6 +1357,716 @@ mod tests {
         let mut data = [0u8; 12];
         data[0] = 0xC0; // Version 3
         assert!(parse_rtp_fields(&data).is_err());
+    }
+
+    /// A 16-byte datagram: fixed header plus a 4-byte extension header whose
+    /// length field claims `ext_words` 32-bit words. `first` is byte 0.
+    fn rtp_with_extension(first: u8, ext_words: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; RTP_HEADER_SIZE + 4];
+        pkt[0] = first;
+        pkt[2..4].copy_from_slice(&1u16.to_be_bytes());
+        pkt[4..8].copy_from_slice(&160u32.to_be_bytes());
+        pkt[8..12].copy_from_slice(&0x1122_3344u32.to_be_bytes());
+        pkt[12..14].copy_from_slice(&0xBEDEu16.to_be_bytes());
+        pkt[14..16].copy_from_slice(&ext_words.to_be_bytes());
+        pkt
+    }
+
+    /// SEC-N-002: extension bit set and a length field larger than the bytes
+    /// present. The parser used to return a payload start beyond the packet.
+    #[test]
+    fn test_parse_rtp_fields_extension_length_exceeds_packet() {
+        // V=2, X=1, no padding.
+        for ext_words in [1u16, 2, 0x7FFF, 0xFFFF] {
+            let pkt = rtp_with_extension(0x90, ext_words);
+            assert!(
+                parse_rtp_fields(&pkt).is_err(),
+                "ext_words={ext_words} must be rejected"
+            );
+        }
+    }
+
+    /// SEC-N-002: the same datagram with the padding bit set used to
+    /// underflow `data.len() - header_end`.
+    #[test]
+    fn test_parse_rtp_fields_extension_length_exceeds_packet_with_padding() {
+        // V=2, P=1, X=1.
+        for ext_words in [1u16, 2, 0x7FFF, 0xFFFF] {
+            let pkt = rtp_with_extension(0xB0, ext_words);
+            assert!(
+                parse_rtp_fields(&pkt).is_err(),
+                "ext_words={ext_words} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_rtp_fields_extension_that_fits() {
+        // Extension of one word followed by an 8-byte payload.
+        let mut pkt = rtp_with_extension(0x90, 1);
+        pkt.extend_from_slice(&[0u8; 4]); // extension data
+        pkt.extend_from_slice(&[0x55u8; 8]); // payload
+        let (_, _, _, _, start, end) = parse_rtp_fields(&pkt).unwrap();
+        assert_eq!((start, end), (20, 28));
+
+        // Extension that ends exactly at the end of the packet: empty payload.
+        let pkt = rtp_with_extension(0x90, 0);
+        let (_, _, _, _, start, end) = parse_rtp_fields(&pkt).unwrap();
+        assert_eq!((start, end), (16, 16));
+    }
+
+    #[test]
+    fn test_parse_rtp_fields_padding_length() {
+        // V=2, P=1, 8 bytes after the header.
+        let mut pkt = vec![0u8; RTP_HEADER_SIZE + 8];
+        pkt[0] = 0xA0;
+
+        // Count larger than what follows the header: rejected.
+        pkt[RTP_HEADER_SIZE + 7] = 9;
+        assert!(parse_rtp_fields(&pkt).is_err());
+        pkt[RTP_HEADER_SIZE + 7] = 255;
+        assert!(parse_rtp_fields(&pkt).is_err());
+
+        // Count equal to what follows the header: empty payload.
+        pkt[RTP_HEADER_SIZE + 7] = 8;
+        let (_, _, _, _, start, end) = parse_rtp_fields(&pkt).unwrap();
+        assert_eq!((start, end), (12, 12));
+
+        // Ordinary padding is trimmed.
+        pkt[RTP_HEADER_SIZE + 7] = 3;
+        let (_, _, _, _, start, end) = parse_rtp_fields(&pkt).unwrap();
+        assert_eq!((start, end), (12, 17));
+    }
+
+    /// Whatever the header claims, an accepted packet yields a payload range
+    /// inside the packet: `start <= end <= len`.
+    #[test]
+    fn test_parse_rtp_fields_payload_range_is_always_in_bounds() {
+        for len in RTP_HEADER_SIZE..=48 {
+            for first in [0x80u8, 0x90, 0xA0, 0xB0, 0x8F, 0x9F, 0xBF] {
+                for ext_words in [0u16, 1, 2, 3, 8, 0x7FFF, 0xFFFF] {
+                    for last in [0u8, 1, 2, 4, 36, 37, 255] {
+                        let mut pkt = vec![0u8; len];
+                        pkt[0] = first;
+                        // Wherever the extension header lands for this CSRC
+                        // count, give it the hostile length.
+                        let ext_at = RTP_HEADER_SIZE + usize::from(first & 0x0F) * 4;
+                        if let Some(field) = pkt.get_mut(ext_at + 2..ext_at + 4) {
+                            field.copy_from_slice(&ext_words.to_be_bytes());
+                        }
+                        pkt[len - 1] = last;
+
+                        if let Ok((_, _, _, _, start, end)) = parse_rtp_fields(&pkt) {
+                            assert!(
+                                start <= end && end <= pkt.len(),
+                                "len={len} first={first:#04x} ext={ext_words} last={last}: \
+                                 {start}..{end}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// SEC-N-002 at the caller: the hostile datagram is an error from
+    /// `process_packet`, not a `data[start..end]` panic on the I/O thread.
+    #[test]
+    fn test_process_packet_rejects_oversized_extension_length() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::new(socket), jb.clone());
+
+        for first in [0x90u8, 0xB0] {
+            let pkt = rtp_with_extension(first, 0xFFFF);
+            rx.process_buffer[..pkt.len()].copy_from_slice(&pkt);
+            assert!(rx.process_packet(pkt.len()).is_err());
+        }
+        assert!(jb.is_empty(), "rejected packets must not be buffered");
+    }
+
+    // ---- QA round 1 (B4/B3): hostile RTP through the real receive path ----
+
+    /// Independent model of the RTP fixed header layout: where the payload
+    /// of `pkt` is, or `None` when the header claims more than the datagram
+    /// holds. Written with checked arithmetic only, so it cannot share an
+    /// overflow with the parser under test.
+    // RFC 3550 §5.1 (CC, P and the padding count), §5.3.1 (X and the
+    // extension length in 32-bit words).
+    fn qa_model_payload_range(pkt: &[u8]) -> Option<(usize, usize)> {
+        let first = *pkt.first()?;
+        if pkt.len() < RTP_HEADER_SIZE || first >> 6 != 2 {
+            return None;
+        }
+        let mut start = RTP_HEADER_SIZE.checked_add(usize::from(first & 0x0F).checked_mul(4)?)?;
+        if start > pkt.len() {
+            return None;
+        }
+        if first & 0x10 != 0 {
+            let words = pkt.get(start.checked_add(2)?..start.checked_add(4)?)?;
+            let ext_bytes = usize::from(u16::from_be_bytes([words[0], words[1]])).checked_mul(4)?;
+            start = start.checked_add(4)?.checked_add(ext_bytes)?;
+            if start > pkt.len() {
+                return None;
+            }
+        }
+        let mut end = pkt.len();
+        if first & 0x20 != 0 {
+            end = end.checked_sub(usize::from(*pkt.last()?))?;
+            if end < start {
+                return None;
+            }
+        }
+        Some((start, end))
+    }
+
+    /// Runs `pkt` through a fresh receiver's `process_packet` (the function
+    /// the I/O thread calls for every datagram) and checks the outcome
+    /// against the model: accepted packets are buffered exactly once with a
+    /// payload range inside the datagram, rejected ones are an `Err` and
+    /// leave no trace. A panic anywhere fails the test.
+    fn qa_assert_process_packet_matches_model(socket: &Arc<UdpSocket>, pkt: &[u8], what: &str) {
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::clone(socket), jb.clone());
+        rx.process_buffer[..pkt.len()].copy_from_slice(pkt);
+        let result = rx.process_packet(pkt.len());
+
+        if let Some((start, end)) = qa_model_payload_range(pkt) {
+            assert!(result.is_ok(), "{what}: valid packet rejected: {result:?}");
+            let (_, _, _, _, got_start, got_end) = parse_rtp_fields(pkt).unwrap();
+            assert_eq!((got_start, got_end), (start, end), "{what}");
+            assert!(got_start <= got_end && got_end <= pkt.len(), "{what}");
+            assert_eq!(jb.len(), 1, "{what}: accepted packet buffered once");
+            assert_eq!(rx.stats().packets_received, 1, "{what}");
+        } else {
+            assert!(result.is_err(), "{what}: hostile packet accepted");
+            assert!(parse_rtp_fields(pkt).is_err(), "{what}");
+            assert!(jb.is_empty(), "{what}: rejected packet was buffered");
+            assert_eq!(rx.stats().packets_received, 0, "{what}");
+        }
+    }
+
+    /// An RTP datagram with the given X/CC/P bits: `cc` CSRC words, an
+    /// extension header declaring `ext_words` (with `ext_present` bytes of
+    /// extension data actually present) when `x`, then `payload_len` bytes.
+    /// The last byte of the datagram is `last` (the padding count when P).
+    fn qa_rtp_datagram(
+        x: bool,
+        cc: u8,
+        p: bool,
+        ext_words: u16,
+        ext_present: usize,
+        payload_len: usize,
+        last: u8,
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; RTP_HEADER_SIZE];
+        pkt[0] = 0x80 | (u8::from(p) << 5) | (u8::from(x) << 4) | (cc & 0x0F);
+        pkt[2..4].copy_from_slice(&7u16.to_be_bytes());
+        pkt[4..8].copy_from_slice(&1120u32.to_be_bytes());
+        pkt[8..12].copy_from_slice(&0x5151_0001u32.to_be_bytes());
+        pkt.resize(pkt.len() + usize::from(cc & 0x0F) * 4, 0xC5);
+        if x {
+            pkt.extend_from_slice(&0xBEDEu16.to_be_bytes());
+            pkt.extend_from_slice(&ext_words.to_be_bytes());
+            pkt.resize(pkt.len() + ext_present, 0xE7);
+        }
+        pkt.resize(pkt.len() + payload_len, 0x5A);
+        if let Some(byte) = pkt.last_mut() {
+            *byte = last;
+        }
+        pkt
+    }
+
+    /// B4: every combination of X, CSRC count and P, with the declared
+    /// extension length and the padding count each set at, one below and one
+    /// above the end of the datagram (plus zero, the true value and the
+    /// maximum), for an empty and a non-empty payload. Driven through
+    /// `process_packet`, not only `parse_rtp_fields`.
+    #[test]
+    fn test_qa_process_packet_hostile_header_matrix() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let mut cases = 0_u32;
+        let mut rejected = 0_u32;
+
+        for x in [false, true] {
+            for cc in 0..=15_u8 {
+                for p in [false, true] {
+                    for payload_len in [0_usize, 24] {
+                        // Two words of extension data are really present.
+                        let ext_present = if x { 8 } else { 0 };
+                        let fixed = RTP_HEADER_SIZE + usize::from(cc) * 4;
+                        let total = fixed + if x { 4 + ext_present } else { 0 } + payload_len;
+
+                        // Declared extension words that put the payload start
+                        // one word before the end, at the end, one word past
+                        // it; plus none, the true count and the maximum.
+                        let ext_candidates: Vec<u16> = if x {
+                            let at_end = u16::try_from((total - fixed - 4) / 4).unwrap();
+                            let mut v =
+                                vec![0, 2, at_end.saturating_sub(1), at_end, at_end + 1, 0xFFFF];
+                            v.sort_unstable();
+                            v.dedup();
+                            v
+                        } else {
+                            vec![0]
+                        };
+
+                        for ext_words in ext_candidates {
+                            let after_header = if x {
+                                fixed + 4 + usize::from(ext_words) * 4
+                            } else {
+                                fixed
+                            };
+                            // Padding counts around what follows the header
+                            // (when the header itself still fits).
+                            let remaining = total.saturating_sub(after_header);
+                            let mut last_candidates: Vec<u8> = vec![0, 1, 255];
+                            for count in [remaining.saturating_sub(1), remaining, remaining + 1] {
+                                if let Ok(count) = u8::try_from(count) {
+                                    last_candidates.push(count);
+                                }
+                            }
+                            last_candidates.sort_unstable();
+                            last_candidates.dedup();
+
+                            for last in last_candidates {
+                                let pkt = qa_rtp_datagram(
+                                    x,
+                                    cc,
+                                    p,
+                                    ext_words,
+                                    ext_present,
+                                    payload_len,
+                                    last,
+                                );
+                                assert_eq!(pkt.len(), total);
+                                let what = format!(
+                                    "x={x} cc={cc} p={p} payload={payload_len} \
+                                     ext_words={ext_words} last={last} len={total}"
+                                );
+
+                                // The verdict is known from how the case was
+                                // built; the model must agree before it is
+                                // used as the oracle. A zero padding count
+                                // with P set is left to the model: RFC 3550
+                                // calls it invalid, the parser treats it as
+                                // "no padding", and neither is in scope here.
+                                let header_fits = after_header <= total;
+                                let padding_fits = !p || usize::from(last) <= remaining;
+                                assert_eq!(
+                                    qa_model_payload_range(&pkt).is_some(),
+                                    header_fits && padding_fits,
+                                    "model disagrees with construction: {what}"
+                                );
+
+                                qa_assert_process_packet_matches_model(&socket, &pkt, &what);
+                                cases += 1;
+                                if !(header_fits && padding_fits) {
+                                    rejected += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // The matrix must contain both verdicts in quantity, or it proves
+        // nothing.
+        assert!(cases > 1000, "matrix too small: {cases}");
+        assert!(rejected > 300, "too few hostile cases: {rejected}");
+        assert!(cases - rejected > 300, "too few valid cases");
+    }
+
+    /// B4: a well-formed packet for every X/CC/P combination, truncated at
+    /// every byte boundary (a datagram cut short, or a header that claims
+    /// more CSRCs / extension / padding than arrived). No prefix may panic
+    /// `process_packet` or be buffered with an out-of-range payload.
+    #[test]
+    fn test_qa_process_packet_truncated_at_every_byte() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        for x in [false, true] {
+            for cc in 0..=15_u8 {
+                for p in [false, true] {
+                    let mut pkt = qa_rtp_datagram(x, cc, p, 2, 8, 24, 4);
+                    // Vary the bytes a truncated packet ends on, so the
+                    // "padding count" read from a cut-off packet is not
+                    // always the same value.
+                    let from = RTP_HEADER_SIZE + usize::from(cc) * 4 + if x { 4 } else { 0 };
+                    let until = pkt.len() - 1;
+                    for (i, byte) in pkt.iter_mut().enumerate().take(until).skip(from) {
+                        *byte = u8::try_from((i * 7 + 1) % 64).unwrap();
+                    }
+                    for cut in 0..=pkt.len() {
+                        let what = format!("x={x} cc={cc} p={p} cut={cut}/{}", pkt.len());
+                        qa_assert_process_packet_matches_model(&socket, &pkt[..cut], &what);
+                    }
+                }
+            }
+        }
+    }
+
+    /// B4/B3 through the public API: hostile datagrams sent to the RTP
+    /// socket are an `Err` from `RtpReceiver::receive()`, the receiver keeps
+    /// working, and payloads of any length that fits a datagram (0 bytes up
+    /// to the receive buffer, and beyond it) are handed to the jitter buffer
+    /// without a panic.
+    #[test]
+    fn test_qa_receive_survives_hostile_datagrams_then_accepts_valid() {
+        let rx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        rx_socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let dest = rx_socket.local_addr().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::clone(&rx_socket), jb.clone());
+
+        // The exact datagrams from SEC-N-002, a padding count past the
+        // header, CSRC and extension claims past the end, a bare header with
+        // P set, wrong version, a runt and an empty datagram.
+        let hostile: Vec<Vec<u8>> = vec![
+            rtp_with_extension(0x90, 0xFFFF),
+            rtp_with_extension(0xB0, 0xFFFF),
+            rtp_with_extension(0x90, 1),
+            qa_rtp_datagram(false, 0, true, 0, 0, 8, 9),
+            qa_rtp_datagram(false, 0, true, 0, 0, 8, 255),
+            qa_rtp_datagram(false, 15, false, 0, 0, 0, 0)[..RTP_HEADER_SIZE + 59].to_vec(),
+            qa_rtp_datagram(true, 15, true, 3, 8, 24, 200),
+            vec![0xA0, 0, 0, 1, 0, 0, 0, 160, 1, 2, 3, 4],
+            vec![0x40; 64],
+            vec![0x80; RTP_HEADER_SIZE - 1],
+            Vec::new(),
+        ];
+        for pkt in &hostile {
+            assert!(qa_model_payload_range(pkt).is_none(), "{pkt:02x?}");
+            peer.send_to(pkt, dest).unwrap();
+            let result = rx.receive();
+            assert!(result.is_err(), "hostile datagram accepted: {pkt:02x?}");
+        }
+        assert!(
+            jb.is_empty(),
+            "a hostile datagram reached the jitter buffer"
+        );
+        assert_eq!(rx.stats().packets_received, 0);
+
+        // Valid packets with payloads at the codec frame boundaries and at
+        // the limits of the receive buffer are all accepted and buffered.
+        let max_payload = MAX_RTP_PACKET_SIZE - RTP_HEADER_SIZE;
+        let lengths = [
+            0_usize,
+            1,
+            159,
+            160,
+            161,
+            319,
+            320,
+            321,
+            1439,
+            1440,
+            1441,
+            max_payload,
+        ];
+        for (i, len) in lengths.iter().enumerate() {
+            let seq = u16::try_from(i).unwrap();
+            let mut pkt = vec![0u8; RTP_HEADER_SIZE + len];
+            pkt[0] = 0x80;
+            pkt[2..4].copy_from_slice(&seq.to_be_bytes());
+            pkt[4..8].copy_from_slice(&(u32::from(seq) * 160).to_be_bytes());
+            pkt[8..12].copy_from_slice(&0x5151_0002u32.to_be_bytes());
+            peer.send_to(&pkt, dest).unwrap();
+            assert!(
+                matches!(rx.receive(), Ok(true)),
+                "valid packet with a {len}-byte payload not accepted"
+            );
+        }
+        assert_eq!(jb.len(), lengths.len());
+        assert_eq!(
+            rx.stats().packets_received,
+            u64::try_from(lengths.len()).unwrap()
+        );
+
+        // A datagram larger than the receive buffer (2880 payload bytes and
+        // more cannot arrive whole): the OS truncates it or reports an
+        // error; either way `receive()` returns instead of panicking.
+        for len in [2880_usize, 4000, 8000] {
+            let mut pkt = vec![0u8; RTP_HEADER_SIZE + len];
+            pkt[0] = 0x80;
+            pkt[2..4].copy_from_slice(&100u16.to_be_bytes());
+            pkt[8..12].copy_from_slice(&0x5151_0002u32.to_be_bytes());
+            peer.send_to(&pkt, dest).unwrap();
+            let _ = rx.receive();
+        }
+        assert!(jb.len() <= lengths.len() + 3);
+    }
+
+    /// One RFC 2198 redundant-block header: F=1, block PT 0, timestamp
+    /// offset 160, declaring `block_len` bytes.
+    fn qa_red_header(block_len: u16) -> [u8; 4] {
+        let ts_offset: u16 = 160;
+        [
+            0x80,
+            u8::try_from(ts_offset >> 6).unwrap(),
+            u8::try_from(((ts_offset & 0x3F) << 2) | (block_len >> 8)).unwrap(),
+            u8::try_from(block_len & 0xFF).unwrap(),
+        ]
+    }
+
+    /// A RED payload: `redundant_headers` copies of a header declaring
+    /// `block_len`, the primary header (F=0, PT 0), then `data_len` bytes.
+    fn qa_red_payload(redundant_headers: usize, block_len: u16, data_len: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for _ in 0..redundant_headers {
+            payload.extend_from_slice(&qa_red_header(block_len));
+        }
+        payload.push(0x00);
+        payload.resize(payload.len() + data_len, 0xFF);
+        payload
+    }
+
+    /// B3/B4 on the RFC 2198 redundancy path: hostile RED payloads (block
+    /// lengths past the end, the 1023-byte maximum, more headers than
+    /// supported, a header cut short, empty blocks) never panic
+    /// `process_packet`, and only blocks that lie inside the datagram are
+    /// buffered.
+    #[test]
+    fn test_qa_process_packet_hostile_rfc2198_payloads() {
+        const RED_PT: u8 = 121;
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let max_payload = MAX_RTP_PACKET_SIZE - RTP_HEADER_SIZE;
+
+        // (description, RED payload, packets expected in the jitter buffer)
+        let cases: Vec<(&str, Vec<u8>, usize)> = vec![
+            ("empty RED payload", Vec::new(), 0),
+            ("primary header only, empty primary", vec![0x00], 1),
+            ("redundant header cut short", vec![0x80, 0x02], 0),
+            (
+                "redundant header, no primary header",
+                qa_red_header(0).to_vec(),
+                0,
+            ),
+            (
+                "block length 1023 with 10 bytes present",
+                qa_red_payload(1, 1023, 10),
+                0,
+            ),
+            (
+                "block length one above the data",
+                qa_red_payload(1, 11, 10),
+                0,
+            ),
+            (
+                "block length exactly the data, empty primary",
+                qa_red_payload(1, 10, 10),
+                2,
+            ),
+            (
+                "block length one below the data",
+                qa_red_payload(1, 9, 10),
+                2,
+            ),
+            ("empty redundant block", qa_red_payload(1, 0, 160), 2),
+            // The largest block a RED header can declare, really present,
+            // with the largest primary that still fits the receive buffer.
+            (
+                "1023-byte block and a maximal primary",
+                qa_red_payload(1, 1023, max_payload - 5),
+                2,
+            ),
+            // One more redundant header than the parser supports.
+            (
+                "too many redundant headers",
+                qa_red_payload(MAX_REDUNDANT_BLOCKS + 1, 1, 16),
+                0,
+            ),
+            // Only F=1 bytes: no primary header ever appears.
+            ("all F bits set", vec![0x80; 64], 0),
+        ];
+
+        for (what, red_payload, expected_buffered) in cases {
+            let mut pkt = vec![0u8; RTP_HEADER_SIZE];
+            pkt[0] = 0x80;
+            pkt[1] = RED_PT;
+            pkt[2..4].copy_from_slice(&500u16.to_be_bytes());
+            pkt[4..8].copy_from_slice(&80_000u32.to_be_bytes());
+            pkt[8..12].copy_from_slice(&0x5151_0003u32.to_be_bytes());
+            pkt.extend_from_slice(&red_payload);
+            assert!(pkt.len() <= MAX_RTP_PACKET_SIZE, "{what}");
+
+            let jb = SharedJitterBuffer::new(8000, 160, 60);
+            let mut rx = RtpReceiver::new(Arc::clone(&socket), jb.clone());
+            rx.set_redundancy_pt(RED_PT);
+            rx.process_buffer[..pkt.len()].copy_from_slice(&pkt);
+
+            // An unparsable RED payload is dropped with a warning, not an
+            // error: the RTP header itself was valid.
+            assert!(rx.process_packet(pkt.len()).is_ok(), "{what}");
+            assert_eq!(jb.len(), expected_buffered, "{what}");
+        }
+    }
+
+    /// Playback handle with no audio device behind it.
+    struct QaNullPlayback;
+
+    impl crate::backend::PlaybackHandle for QaNullPlayback {
+        fn sample_rate(&self) -> u32 {
+            48000
+        }
+        fn is_running(&self) -> bool {
+            true
+        }
+        fn has_error(&self) -> bool {
+            false
+        }
+        fn stop(&self) {}
+    }
+
+    /// Runs a decode thread for `codec` over `jb` until the buffer is empty
+    /// (or ten seconds pass), playing its output out. Returns the number of
+    /// oversized frames it dropped and the number of samples it produced.
+    fn qa_decode_and_play_out(
+        codec: client_types::CodecPreference,
+        jb: &SharedJitterBuffer,
+    ) -> (u64, usize) {
+        use crate::decode_thread::{DecodeMetrics, DecodeThreadConfig, spawn};
+        use ringbuf::traits::{Consumer, Split};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let (producer, mut consumer) = ringbuf::HeapRb::<crate::stream::Sample>::new(96000).split();
+        let metrics = DecodeMetrics::new();
+        let mut handle = spawn(
+            DecodeThreadConfig {
+                codec,
+                device_rate: 48000,
+                dtmf_payload_type: 101,
+                aec_ref: None,
+                drift: crate::drift_compensator::DriftConfig::default(),
+                postfilter: crate::postfilter::PostfilterConfig::default(),
+                comfort_noise: crate::comfort_noise::ComfortNoiseConfig::default(),
+                dtmf_rx_tx: None,
+                dtmf_queue: None,
+            },
+            producer,
+            Box::new(QaNullPlayback),
+            jb.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU64::new(0)),
+            metrics.clone(),
+        );
+
+        let mut played = 0_usize;
+        let mut sink = vec![0i16; 4800];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !jb.is_empty() && Instant::now() < deadline {
+            played += consumer.pop_slice(&mut sink);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        played += consumer.pop_slice(&mut sink);
+        handle.stop();
+
+        (
+            metrics.oversized_frames_dropped.load(Ordering::Relaxed),
+            played,
+        )
+    }
+
+    /// B4 + B3 end to end, per codec: datagrams on a real socket, through
+    /// `RtpReceiver::receive()`, the jitter buffer and a running decode
+    /// thread. Hostile headers are rejected at the receiver; payloads of
+    /// every length a datagram can carry reach the decoder, where oversized
+    /// frames are dropped and counted; the normal frames sent last are still
+    /// decoded and played, which they would not be had either thread died.
+    #[test]
+    fn test_qa_wire_to_decode_thread_survives_hostile_stream() {
+        use client_types::CodecPreference;
+
+        let max_payload = MAX_RTP_PACKET_SIZE - RTP_HEADER_SIZE;
+
+        for (codec, payload_type, samples_per_byte) in [
+            (CodecPreference::G711Ulaw, 0_u8, 1_usize),
+            (CodecPreference::G711Alaw, 8, 1),
+            (CodecPreference::G722, 9, 2),
+        ] {
+            let frame_samples = crate::codec::CodecPipeline::new(codec)
+                .unwrap()
+                .samples_per_frame();
+
+            let rx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+            rx_socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let dest = rx_socket.local_addr().unwrap();
+            let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let jb = SharedJitterBuffer::new(8000, 160, 60);
+            let mut rx = RtpReceiver::new(Arc::clone(&rx_socket), jb.clone());
+
+            // Hostile headers first: rejected, nothing buffered.
+            for pkt in [
+                rtp_with_extension(0x90, 0xFFFF),
+                rtp_with_extension(0xB0, 0xFFFF),
+                qa_rtp_datagram(false, 0, true, 0, 0, 160, 161),
+                qa_rtp_datagram(true, 15, true, 0x4000, 8, 160, 0),
+            ] {
+                peer.send_to(&pkt, dest).unwrap();
+                assert!(rx.receive().is_err(), "{codec:?}: {pkt:02x?}");
+            }
+            assert!(jb.is_empty());
+
+            // Then every payload length of interest, then normal frames.
+            let mut lengths = vec![
+                0_usize,
+                1,
+                159,
+                160,
+                161,
+                319,
+                320,
+                321,
+                1439,
+                1440,
+                1441,
+                max_payload,
+            ];
+            lengths.extend([160_usize; 8]);
+            for (i, len) in lengths.iter().enumerate() {
+                let seq = u16::try_from(i).unwrap();
+                let mut pkt = vec![0xD5_u8; RTP_HEADER_SIZE + len];
+                pkt[0] = 0x80;
+                pkt[1] = payload_type;
+                pkt[2..4].copy_from_slice(&seq.to_be_bytes());
+                pkt[4..8].copy_from_slice(&(u32::from(seq) * 160).to_be_bytes());
+                pkt[8..12].copy_from_slice(&0x5151_0004u32.to_be_bytes());
+                peer.send_to(&pkt, dest).unwrap();
+                assert!(matches!(rx.receive(), Ok(true)), "{codec:?}: {len} bytes");
+            }
+            assert_eq!(jb.len(), lengths.len());
+
+            let expected_dropped = lengths
+                .iter()
+                .map(|len| len * samples_per_byte)
+                .filter(|samples| {
+                    *samples > frame_samples && *samples <= crate::codec::MAX_DECODED_SAMPLES
+                })
+                .count();
+
+            let (dropped, played) = qa_decode_and_play_out(codec, &jb);
+            assert!(
+                jb.is_empty(),
+                "{codec:?}: decode thread stopped consuming packets"
+            );
+            assert_eq!(
+                dropped,
+                u64::try_from(expected_dropped).unwrap(),
+                "{codec:?}: oversized decoded frames dropped and counted"
+            );
+            assert!(
+                played > 0,
+                "{codec:?}: frames after the hostile ones were not played out"
+            );
+        }
     }
 
     #[test]

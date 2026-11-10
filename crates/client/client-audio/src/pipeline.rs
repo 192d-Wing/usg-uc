@@ -283,6 +283,8 @@ pub struct PipelineStats {
     pub dtmf_events_sent: u64,
     /// Malformed DTMF packets (invalid event code, duration, or impossible jumps).
     pub dtmf_malformed: u64,
+    /// Decoded frames dropped because the RTP payload was longer than one ptime.
+    pub oversized_frames_dropped: u64,
     /// Current AGC gain (linear, 1.0 = unity).
     pub agc_current_gain: f32,
     /// AEC ERLE estimate in dB (Echo Return Loss Enhancement).
@@ -838,6 +840,7 @@ impl AudioPipeline {
             stats.plc_generated_frames = m.plc_generated.load(Ordering::Relaxed);
             stats.dtmf_events_received = m.dtmf_received.load(Ordering::Relaxed);
             stats.dtmf_malformed = m.dtmf_malformed.load(Ordering::Relaxed);
+            stats.oversized_frames_dropped = m.oversized_frames_dropped.load(Ordering::Relaxed);
         }
         stats
     }

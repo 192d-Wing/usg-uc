@@ -9,6 +9,75 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (client, soft-client review blockers)
+
+Released separately from the SBC (`release-client.yml`). None of these
+changes were verified against the SBC or a live registrar.
+
+- **client-core: UDP SIP items need the `insecure-transports` feature.**
+  (SC-8, CM-7) Default builds no longer have `run_udp_receive_loop`,
+  `run_udp_receive_loop_async`, `start_udp_receive_thread`,
+  `SipTransport::get_or_create_udp_socket`, `SipTransport::send_request_udp`,
+  `SipTransport::send_response_udp`, `SipTransport::event_sender` or
+  `ClientApp::get_udp_socket_for_receive`.
+- **client-core: new `SipTransportKind { Tls, Udp }`**, re-exported at the
+  crate root. `Udp` exists only with `insecure-transports`.
+- **client-core: new `transport: SipTransportKind` field** on
+  `TransportEvent::RequestReceived`, `CallManagerEvent::SendResponse` and
+  `IncomingCallInfo`. `CallManager::handle_sip_request_from` and
+  `CallManager::handle_incoming_invite_from` take a third argument,
+  `transport: SipTransportKind`.
+- **client-ffi: new cargo feature `insecure-transports`, and `digest-auth`
+  now implies it.** The UDP socket and receive loop exist only with that
+  feature. The UniFFI surface is unchanged. `ClientConfig.prefer_ipv6` has no
+  effect in default builds.
+- **client-gui-tauri: `digest-auth` now implies `insecure-transports`**, so
+  `is_insecure_transports_enabled` reports `true` in such a build.
+- **client-audio: new public fields** `DecodeMetrics::oversized_frames_dropped`
+  and `PipelineStats::oversized_frames_dropped` (this breaks struct-literal
+  construction). `parse_rtp_fields` returns `Err` when an extension length or
+  padding count is larger than the packet.
+
+### Changed (client, SIP wire behaviour; operators should read this)
+
+- **Default builds open no UDP SIP socket.** They are TLS-only. Responses go
+  out on the transport the request came in on, whatever the Via says.
+- **REGISTER Via/Contact port** is the configured port (FFI shells pass
+  5060), or 5061 if the shell passes 0. It used to be the ephemeral UDP
+  socket port.
+- **REGISTER Contact gains `;rinstance=<32 hex>`.**
+- **Un-REGISTER sends the client's own Contact with `Expires: 0`** instead
+  of `Contact: *`. Other bindings for the same AOR are no longer removed.
+- **An INVITE whose Contact is not a SIP/SIPS URI, or whose From has no
+  SIP/SIPS/`tel:` URI, gets 400** (with a To tag), and no call is created.
+- `poll_events` handles at most 64 transport events per call.
+- Windows: `sign_data` and `verify_pin` accept only CNG (NCrypt) private
+  keys. Legacy CSP keys are refused.
+
+Effects for SBC operators:
+
+- Registrations from updated clients arrive over TLS only. Their Contact
+  port is the configured port or 5061, and the Contact carries `rinstance`.
+  Location-service, binding-match and any Contact-rewrite rules must accept
+  both.
+- A logout removes only that device's binding, so other devices on the same
+  AOR stay registered.
+- 400 responses from clients can show up in call logs and CDRs where calls
+  used to be set up. These are INVITEs with a malformed From or Contact.
+- Lab clients built with `digest-auth` now also enable UDP/TCP.
+
+### Fixed (client)
+
+- `CallManager::hangup_call` releases local call state even when sending
+  the signaling fails. Before, a failed BYE could leave a stuck call.
+- RTP packets whose extension length or padding is larger than the packet
+  are dropped instead of panicking the receive path (SI-10).
+- Decoded audio frames longer than one ptime (20 ms) are dropped and counted
+  instead of panicking the decode thread.
+- Hostile From/Contact values no longer panic the header parser. The
+  transport receiver survives handler errors and cancelled passes. The TLS
+  reader delivers every SIP message buffered by a single read.
+
 ### BREAKING (SBC, SIPREC phase 3 live recording, POA&M-300..309)
 
 - **SBC: `[recording] enabled = true` is now accepted and live.** (RFC 7866,

@@ -41,9 +41,13 @@ pub use settings::{
     SettingsManager, UiSettings,
 };
 pub use sip_transport::{
-    CertVerificationMode, SipTransport, TransportConfig, TransportEvent,
-    build_response_from_request, generate_tag, load_certs_from_pem_file, run_udp_receive_loop,
-    run_udp_receive_loop_async, start_udp_receive_thread,
+    CertVerificationMode, SipTransport, SipTransportKind, TransportConfig, TransportEvent,
+    build_response_from_request, generate_tag, load_certs_from_pem_file,
+};
+// NIST 800-53 Rev5: SC-8, CM-7 (cleartext UDP SIP only with `insecure-transports`).
+#[cfg(feature = "insecure-transports")]
+pub use sip_transport::{
+    run_udp_receive_loop, run_udp_receive_loop_async, start_udp_receive_thread,
 };
 
 use thiserror::Error;
