@@ -36,7 +36,7 @@ This document provides a comprehensive summary of RFCs required for implementing
 - **Transport Layer:** Must support UDP, TCP, and TLS transports
 - **Dialog Management:** Must properly maintain dialog state for INVITE-initiated sessions
 - **Header Processing:** Must correctly parse and generate all mandatory SIP headers (Via, From, To, Call-ID, CSeq, Contact, Max-Forwards)
-- **Authentication:** Must support Digest authentication (RFC 2617) for both client and server roles
+- **Authentication:** Must support Digest authentication (RFC 2617; RFC 7616 and RFC 8760 for SHA-256 and SHA-512-256) for both client and server roles
 - **Registration:** Must handle REGISTER requests and maintain binding tables
 - **Response Handling:** Must generate and process all response classes (1xx, 2xx, 3xx, 4xx, 5xx, 6xx)
 

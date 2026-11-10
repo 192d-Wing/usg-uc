@@ -268,7 +268,167 @@ pub struct SbcConfig {
     ///
     /// ## NIST 800-53 Rev5: AU-14, AU-5, CM-6, CM-7, PT-5, SC-8
     pub recording: RecordingConfig,
+
+    /// SIP digest authentication of REGISTER (RFC 7616). Default off.
+    ///
+    /// ## NIST 800-53 Rev5: IA-2, IA-5, CM-6
+    pub digest_auth: DigestAuthConfig,
 }
+
+/// Digest algorithm the SBC challenges with as a server
+/// (`digest_auth.algorithm`).
+///
+/// Only `SHA-256` and `SHA-512-256` exist. The token `SHA-512-256` names
+/// FIPS 180-4 SHA-512/256 (RFC 7616 §3.2, RFC 8760 §2.1), not SHA-512
+/// truncated to 256 bits. MD5 and the `-sess` variants are refused at
+/// config load with a message naming the policy: as the server the SBC
+/// picks the algorithm (RFC 7616 §3.7), and holding an MD5 HA1 would store
+/// a password-equivalent secret under a broken hash. (The UAC-side
+/// `allow_md5_digest` exception of POA&M-255 does not apply here.)
+///
+/// CNSA-EXCEPTION: RFC 7616 defines no SHA-384 digest; SIP digest runs
+/// under the POA&M-110 exception, whose condition is a CNSA TLS transport.
+/// That condition is not enforced: the daemon warns at startup when digest
+/// is required and a SIP listener is not TLS, and starts anyway.
+///
+/// POAM: POA&M-314 - digest over a cleartext transport is warned about,
+/// not refused.
+///
+/// ## NIST 800-53 Rev5: IA-5(1) (no MD5; the algorithm is the server's
+/// choice), SC-13, CM-6; RFC 7616 §3.2, §3.7; RFC 8760 §2.1
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum DigestAuthAlgorithm {
+    /// `SHA-256` (default).
+    #[default]
+    Sha256,
+    /// `SHA-512-256`.
+    Sha512_256,
+}
+
+impl DigestAuthAlgorithm {
+    /// The RFC 7616 algorithm token, as written in the config and in the
+    /// credentials file.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha256 => "SHA-256",
+            Self::Sha512_256 => "SHA-512-256",
+        }
+    }
+}
+
+impl From<DigestAuthAlgorithm> for String {
+    fn from(a: DigestAuthAlgorithm) -> Self {
+        a.as_str().to_string()
+    }
+}
+
+impl TryFrom<String> for DigestAuthAlgorithm {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "SHA-256" => Ok(Self::Sha256),
+            "SHA-512-256" => Ok(Self::Sha512_256),
+            _ => {
+                let upper = value.to_ascii_uppercase();
+                if upper.starts_with("MD5") {
+                    Err(
+                        "digest_auth.algorithm: MD5 is not accepted for server-side digest \
+                         (policy: SHA-256 or SHA-512-256 only, RFC 7616 §3.7)"
+                            .to_string(),
+                    )
+                } else if upper.ends_with("-SESS") {
+                    Err("digest_auth.algorithm: -sess algorithms are not accepted \
+                         (policy: SHA-256 or SHA-512-256 only)"
+                        .to_string())
+                } else {
+                    Err("digest_auth.algorithm must be \"SHA-256\" or \"SHA-512-256\"".to_string())
+                }
+            }
+        }
+    }
+}
+
+/// REGISTER digest authentication (`[digest_auth]`, RFC 7616).
+///
+/// Off by default: with the section absent REGISTER behaves as before.
+/// With `require_auth = true` every REGISTER is challenged (401) and must
+/// carry a valid digest for a user in `credentials_file`. Restart-required
+/// on reload, except the contents of `credentials_file`, which are re-read
+/// on SIGHUP (a file that fails to load keeps the previous credentials).
+///
+/// The section holds a path only, never a secret. The file has one
+/// `username:realm:algorithm:ha1hex` entry per line and must be a regular
+/// file readable only by its owner; it is opened by the daemon, not by
+/// config validation.
+///
+/// MD5-only phones cannot register while `require_auth` is on.
+///
+/// POAM: POA&M-271 - initial INVITEs are not challenged (no 407).
+/// POAM: POA&M-310 - users of the API server's user store are not a
+/// credential source; only this file is.
+///
+/// With `require_auth = false` no other key of the section may be set
+/// (`realm`, `credentials_file`, `algorithm`, `nonce_ttl_secs`): the load
+/// fails instead of ignoring them.
+///
+/// Usernames in the file are ASCII in the RFC 3261 §25.1 `user` production
+/// (no `@`, space, quote or backslash); they are matched byte for byte.
+///
+/// POAM: POA&M-312 - the credentials file is not sealed at rest
+/// (SC-28(1)); it is protected by file mode and owner only.
+/// POAM: POA&M-314 - digest over a cleartext SIP transport is warned
+/// about at startup, not refused.
+///
+/// ## NIST 800-53 Rev5: IA-2, IA-2(8), IA-5, IA-5(1) (partial: no plaintext
+/// password stored or sent; a protected transport is not enforced), AC-7
+/// (per-user failure backoff in the daemon), CM-6 (off by default; a
+/// half-configured section fails the load); RFC 7616 §3.3, §3.7;
+/// RFC 3261 §22.1
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DigestAuthConfig {
+    /// Challenge and verify every REGISTER. Default `false` (CM-6: off
+    /// unless the operator supplies a realm and credentials).
+    pub require_auth: bool,
+    /// Digest realm. Required when `require_auth`; every line of
+    /// `credentials_file` must carry the same realm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
+    /// Algorithm of the challenge; a user needs an HA1 for it. Unset means
+    /// SHA-256 (see [`Self::algorithm`]). Only valid with `require_auth`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub algorithm: Option<DigestAuthAlgorithm>,
+    /// Absolute path of the HA1 credentials file. Required when
+    /// `require_auth`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials_file: Option<PathBuf>,
+    /// Nonce lifetime in seconds, 30..=3600 (RFC 7616 §3.3 `stale=true`
+    /// after). Unset means [`DEFAULT_DIGEST_NONCE_TTL_SECS`] (see
+    /// [`Self::nonce_ttl_secs`]). Only valid with `require_auth`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce_ttl_secs: Option<u64>,
+}
+
+impl DigestAuthConfig {
+    /// The challenge algorithm in force: the configured one, else SHA-256.
+    #[must_use]
+    pub fn algorithm(&self) -> DigestAuthAlgorithm {
+        self.algorithm.unwrap_or(DigestAuthAlgorithm::Sha256)
+    }
+
+    /// The nonce lifetime in force: the configured one, else
+    /// [`DEFAULT_DIGEST_NONCE_TTL_SECS`].
+    #[must_use]
+    pub fn nonce_ttl_secs(&self) -> u64 {
+        self.nonce_ttl_secs.unwrap_or(DEFAULT_DIGEST_NONCE_TTL_SECS)
+    }
+}
+
+/// Default `digest_auth.nonce_ttl_secs`.
+pub const DEFAULT_DIGEST_NONCE_TTL_SECS: u64 = 300;
 
 /// What to do with the communication session when its recording session
 /// cannot be set up, or fails mid-call.
