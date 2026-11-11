@@ -423,7 +423,7 @@ pub fn spawn(
 // RFC 3551 §4.2: a receiver SHOULD accept packets of 0 to 200 ms of audio.
 // Dropping frames longer than one ptime is a deliberate limit that does NOT
 // meet that SHOULD (the SDP still offers a=maxptime:120).
-// POAM: POA&M-310 — decode frames longer than one ptime (play them out as consecutive
+// POAM: POA&M-317 — decode frames longer than one ptime (play them out as consecutive
 // ptime chunks) or advertise a=maxptime matching the receive limit.
 // NIST 800-53 Rev5: SI-10 (length checked before the copy), SC-5 (no panic).
 fn copy_decoded_frame<'a>(

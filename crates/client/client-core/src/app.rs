@@ -1167,7 +1167,7 @@ impl ClientApp {
         // NIST 800-53 Rev5: SC-5 (at most MAX_TRANSPORT_EVENTS_PER_POLL
         // transport events per pass; receiver retained across errors and
         // cancellation). The pump still awaits the shell event channel.
-        // POAM: POA&M-314 — awaited app_event_tx sends park the pump while the shell does
+        // POAM: POA&M-321 — awaited app_event_tx sends park the pump while the shell does
         // not drain its event channel.
         for _ in 0..MAX_TRANSPORT_EVENTS_PER_POLL {
             let Some(event) = self.next_transport_event() else {

@@ -63,15 +63,15 @@ tests only; no live SBC or registrar run.
 
 | Change or gap | RFC § | Where | Tests / tracking |
 |---|---|---|---|
-| Responses go out on the transport the request arrived on, not the Via text; default-feature builds have no UDP SIP socket | 3261 §18.2.2 | `client-core/src/app.rs` (`SipTransportKind`), `sip_transport.rs` | `test_response_follows_receive_transport_not_via_text`, `test_tls_only_build_never_answers_over_udp` (not run by CI, POA&M-315), `client-core/tests/tls_only_surface.rs` |
-| `insecure-transports` / `digest-auth` builds bind a UDP SIP listener for every account, including TLS accounts (open) | 3261 §18 | `client-core/src/app.rs` | POA&M-311 |
+| Responses go out on the transport the request arrived on, not the Via text; default-feature builds have no UDP SIP socket | 3261 §18.2.2 | `client-core/src/app.rs` (`SipTransportKind`), `sip_transport.rs` | `test_response_follows_receive_transport_not_via_text`, `test_tls_only_build_never_answers_over_udp` (not run by CI, POA&M-322), `client-core/tests/tls_only_surface.rs` |
+| `insecure-transports` / `digest-auth` builds bind a UDP SIP listener for every account, including TLS accounts (open) | 3261 §18 | `client-core/src/app.rs` | POA&M-318 |
 | TLS reader delivers every complete buffered message before reading again; leading CRLF still a framing error (RFC-013) | 3261 §18.3 | `client-core/src/sip_transport.rs` `TlsReader::recv` | `test_tls_reader_delivers_two_messages_from_one_read`, `test_tls_reader_delivers_three_messages_from_one_read`, `test_tls_reader_reassembles_message_split_across_reads` |
 | INVITE with an unsplittable From/Contact, a non-SIP/SIPS Contact, or a From with no SIP/SIPS/`tel:` URI gets 400 with a To tag; no call created | 3261 §21.4.1, §8.2.6.2 | `client-core/src/call_manager.rs` (`reject_malformed_invite`, `contact_target_uri`, `is_usable_caller_uri`) | `test_incoming_invite_with_unparsable_from_or_contact_gets_400`, `test_incoming_invite_with_non_sip_contact_or_uriless_from_gets_400`, `test_split_name_addr_never_panics` |
 | `hangup_call` releases local call state (audio, media session, dialog, active slot) and emits `CallEnded` even when the BYE/CANCEL send fails; still returns the error | 3261 §15 | `client-core/src/call_manager.rs` `hangup_call` | `test_hangup_releases_local_state_when_signaling_fails` |
 | RTP extension and padding lengths are bounds-checked on the non-SRTP path; a padding count of 0 with P set is still accepted | 3550 §5.1, §5.3.1 | `client-audio/src/rtp_handler.rs` `parse_rtp_fields` | `test_parse_rtp_fields_*`, `test_process_packet_rejects_oversized_extension_length` |
-| Received frames longer than one ptime (20 ms) are dropped while `a=maxptime:120` is offered (open) | 3551 §4.2 | `client-audio/src/decode_thread.rs` | POA&M-310 |
-| REGISTER responses not matched to the transaction (open) | 3261 §17.1.3 | `client-sip-ua/src/registration.rs` | POA&M-312 |
-| Refresh interval taken from the first Contact in the 200, not this instance's binding (open, RFC-R2-003) | 3261 §10.2.4 | `client-sip-ua/src/registration.rs` `extract_expires` | POA&M-313 |
+| Received frames longer than one ptime (20 ms) are dropped while `a=maxptime:120` is offered (open) | 3551 §4.2 | `client-audio/src/decode_thread.rs` | POA&M-317 |
+| REGISTER responses not matched to the transaction (open) | 3261 §17.1.3 | `client-sip-ua/src/registration.rs` | POA&M-319 |
+| Refresh interval taken from the first Contact in the 200, not this instance's binding (open, RFC-R2-003) | 3261 §10.2.4 | `client-sip-ua/src/registration.rs` `extract_expires` | POA&M-320 |
 
 ## Verified compliant (spot checks)
 
