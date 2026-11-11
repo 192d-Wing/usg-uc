@@ -23,6 +23,8 @@ bytes = "1.12"
 md5 = { version = "0.7", optional = true }
 aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"], optional = true }
 getrandom = "0.4.3"
+# Wipes the temporary strings that hold an HA1 (NIST 800-53 Rev5: IA-5(6)).
+zeroize.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

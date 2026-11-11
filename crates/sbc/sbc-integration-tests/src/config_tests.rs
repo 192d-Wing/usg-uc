@@ -228,6 +228,93 @@ fn qa_repo_deploy_configs_validate() {
 /// SEC-8: with grpcMtls the chart allow-lists its own sbc-api client
 /// certificate CN by default, so another certificate from the same issuer
 /// cannot call the daemon.
+/// POA&M-270: the shipped config carries `[digest_auth]` switched off, and
+/// the same file with its commented keys enabled loads with REGISTER digest
+/// on. A half-enabled section fails the load. (The daemon is a binary
+/// crate, so the REGISTER round trip from TOML is tested there:
+/// `runtime::tests::digest_register_end_to_end_from_toml`.)
+#[test]
+fn qa_shipped_digest_auth_section_loads_off_and_on() {
+    let shipped = std::fs::read_to_string(repo_path("deploy/config/config.toml")).unwrap();
+    let off = load_from_str(&shipped).unwrap();
+    assert!(!off.digest_auth.require_auth);
+    assert_eq!(off.digest_auth.realm, None);
+    assert_eq!(off.digest_auth.credentials_file, None);
+
+    let section = shipped
+        .split("[digest_auth]")
+        .nth(1)
+        .and_then(|rest| rest.split("\n[").next())
+        .expect("[digest_auth] section in the shipped config");
+    for key in [
+        "# realm = ",
+        "# algorithm = ",
+        "# credentials_file = ",
+        "# nonce_ttl_secs = ",
+    ] {
+        assert!(section.contains(key), "shipped section documents {key}");
+    }
+    let enable = |keys: &[&str]| {
+        let mut on = section.replace("require_auth = false", "require_auth = true");
+        for key in keys {
+            on = on.replace(&format!("# {key} = "), &format!("{key} = "));
+        }
+        shipped.replace(section, &on)
+    };
+
+    let on = load_from_str(&enable(&[
+        "realm",
+        "algorithm",
+        "credentials_file",
+        "nonce_ttl_secs",
+    ]))
+    .unwrap();
+    assert!(on.digest_auth.require_auth);
+    assert_eq!(on.digest_auth.realm.as_deref(), Some("sip.example.mil"));
+    assert_eq!(
+        on.digest_auth.algorithm(),
+        sbc_config::DigestAuthAlgorithm::Sha256
+    );
+    assert_eq!(
+        on.digest_auth.credentials_file.as_deref(),
+        Some(std::path::Path::new("/etc/usg-sbc/digest.ha1"))
+    );
+    assert_eq!(on.digest_auth.nonce_ttl_secs(), 300);
+
+    // F3 / NIST-004 / SEC-007: while require_auth = false, uncommenting any
+    // other key of the shipped section fails the load (never ignored).
+    for key in ["realm", "algorithm", "credentials_file", "nonce_ttl_secs"] {
+        let toml = shipped.replace(
+            section,
+            &section.replace(&format!("# {key} = "), &format!("{key} = ")),
+        );
+        let err = load_from_str(&toml).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("digest_auth.{key} is only valid with")),
+            "{key}: {err}"
+        );
+    }
+
+    for (keys, missing) in [
+        (&["realm"][..], "digest_auth.credentials_file"),
+        (&["credentials_file"][..], "digest_auth.realm"),
+        (&[][..], "digest_auth.realm"),
+    ] {
+        let err = load_from_str(&enable(keys)).unwrap_err().to_string();
+        assert!(err.contains(missing), "{err}");
+    }
+    // A file named while auth is off is rejected, not ignored.
+    let staged = shipped.replace(
+        "# credentials_file = \"/etc/usg-sbc/digest.ha1\"",
+        "credentials_file = \"/etc/usg-sbc/digest.ha1\"",
+    );
+    let err = load_from_str(&staged).unwrap_err().to_string();
+    assert!(
+        err.contains("only valid with digest_auth.require_auth = true"),
+        "{err}"
+    );
+}
+
 #[test]
 fn qa_helm_grpc_allow_list_defaults_to_sbc_api_cert() {
     let helpers =

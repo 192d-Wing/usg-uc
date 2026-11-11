@@ -1255,14 +1255,19 @@ pub fn compute_response(
             reason: "cnonce required when qop is set".to_string(),
         })?;
         let qop_str = qop.as_str();
-        let mut s = String::with_capacity(
+        // NIST 800-53 Rev5: IA-5(6) - this string holds the HA1 (a
+        // password equivalent); it is wiped on drop. The capacity is exact
+        // (nc is 8 hex digits), so it is never reallocated.
+        let mut s = zeroize::Zeroizing::new(String::with_capacity(
             ha1.len() + nonce.len() + 8 + cnonce.len() + qop_str.len() + ha2.len() + 5,
-        );
+        ));
 
         let _ = write!(s, "{ha1}:{nonce}:{nc:08x}:{cnonce}:{qop_str}:{ha2}");
         s
     } else {
-        let mut s = String::with_capacity(ha1.len() + nonce.len() + ha2.len() + 2);
+        let mut s = zeroize::Zeroizing::new(String::with_capacity(
+            ha1.len() + nonce.len() + ha2.len() + 2,
+        ));
 
         let _ = write!(s, "{ha1}:{nonce}:{ha2}");
         s

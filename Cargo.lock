@@ -5442,6 +5442,7 @@ dependencies = [
  "md5 0.7.0",
  "proptest",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]
@@ -6304,6 +6305,7 @@ dependencies = [
  "chrono",
  "hyper",
  "hyper-util",
+ "nix 0.31.3",
  "prost",
  "prost-types",
  "proto-b2bua",

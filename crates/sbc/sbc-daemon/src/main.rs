@@ -61,6 +61,8 @@ mod cdr;
 #[cfg(feature = "cluster")]
 mod cluster;
 mod conn_limit;
+mod digest_credentials;
+mod digest_throttle;
 mod flow;
 mod flows;
 #[cfg(feature = "grpc")]
