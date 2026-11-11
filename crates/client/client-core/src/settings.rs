@@ -483,6 +483,21 @@ impl SettingsManager {
         })
     }
 
+    /// Default settings at `path` with no credential store attached.
+    ///
+    /// Unlike [`Self::with_path`], this never probes the OS keychain, so
+    /// tests built with `digest-auth` / `oidc` stay hermetic.
+    #[cfg(test)]
+    pub(crate) fn without_credential_store(path: PathBuf) -> Self {
+        Self {
+            settings: Settings::default(),
+            settings_path: path,
+            dirty: false,
+            #[cfg(any(feature = "digest-auth", feature = "oidc"))]
+            credential_store: None,
+        }
+    }
+
     /// Gets the platform-specific settings file path.
     fn settings_file_path() -> AppResult<PathBuf> {
         let proj_dirs = ProjectDirs::from("com", "usg", "sip-client").ok_or_else(|| {

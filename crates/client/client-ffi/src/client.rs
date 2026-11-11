@@ -9,7 +9,9 @@ use crate::types::{
     AppEvent, AudioDevice, AudioSettings, CallHistoryEntry, CallInfo, ClassificationBanner,
     ClientError, Contact, PhoneNumber, RegistrationState, SipAccountConfig,
 };
-use client_core::{ClientApp, StoragePaths, run_udp_receive_loop_async};
+#[cfg(feature = "insecure-transports")]
+use client_core::run_udp_receive_loop_async;
+use client_core::{ClientApp, StoragePaths};
 use client_types::DtmfDigit;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -47,7 +49,9 @@ pub struct ClientConfig {
     pub config_dir: Option<String>,
     /// Data directory override (contacts, call history). See `config_dir`.
     pub data_dir: Option<String>,
-    /// Prefer IPv6 for the SIP UDP socket.
+    /// Prefer IPv6 for the SIP UDP socket. Has no effect in default
+    /// (TLS-only) builds, which bind no UDP SIP socket; UDP exists only with
+    /// the `insecure-transports` feature.
     pub prefer_ipv6: bool,
 }
 
@@ -65,6 +69,8 @@ pub struct SipClient {
     /// Background tasks aborted on shutdown.
     tasks: StdMutex<Vec<JoinHandle<()>>>,
     initialized: AtomicBool,
+    /// Address family of the UDP SIP socket (`insecure-transports` only).
+    #[cfg(feature = "insecure-transports")]
     prefer_ipv6: bool,
 }
 
@@ -127,6 +133,7 @@ impl SipClient {
             event_rx: StdMutex::new(Some(event_rx)),
             tasks: StdMutex::new(Vec::new()),
             initialized: AtomicBool::new(false),
+            #[cfg(feature = "insecure-transports")]
             prefer_ipv6: config.prefer_ipv6,
         }))
     }
@@ -151,8 +158,10 @@ impl SipClient {
         Ok(())
     }
 
-    /// Starts the client: binds the SIP socket, spawns the receive loop and
-    /// event pump, and auto-registers the default account if configured.
+    /// Starts the client: spawns the event pump and auto-registers the
+    /// default account if configured. With the `insecure-transports` feature
+    /// it also binds the UDP SIP socket and spawns its receive loop; default
+    /// (TLS-only) builds bind no UDP SIP socket.
     pub fn initialize(&self) -> Result<(), ClientError> {
         if self.initialized.swap(true, Ordering::SeqCst) {
             return Err(ClientError::InvalidArgument {
@@ -161,26 +170,39 @@ impl SipClient {
         }
 
         let app = Arc::clone(&self.app);
-        let prefer_ipv6 = self.prefer_ipv6;
+
+        // NIST 800-53 Rev5: SC-8, CM-7 - a default (TLS-only) build never
+        // binds a UDP SIP socket or reads cleartext SIP; the socket and its
+        // receive loop exist only with `insecure-transports`.
+        #[cfg(not(feature = "insecure-transports"))]
+        self.runtime
+            .block_on(async { app.lock().await.initialize().await })?;
 
         // Bind the UDP socket *before* initialize(): auto-registration builds
         // its REGISTER from the agent's local address, which the socket
         // acquisition updates to the actually-bound port.
-        let udp = self.runtime.block_on(async {
-            let mut guard = app.lock().await;
-            let udp = guard.get_udp_socket_for_receive(prefer_ipv6).await;
-            guard.initialize().await.map(|()| udp)
-        })?;
+        #[cfg(feature = "insecure-transports")]
+        let udp = {
+            let prefer_ipv6 = self.prefer_ipv6;
+            self.runtime.block_on(async {
+                let mut guard = app.lock().await;
+                let udp = guard.get_udp_socket_for_receive(prefer_ipv6).await;
+                guard.initialize().await.map(|()| udp)
+            })?
+        };
 
         let mut tasks = self.tasks.lock().map_err(|_| lock_err())?;
 
-        if let Some((socket, transport_event_tx)) = udp {
-            // Must be the async (abortable) loop: the blocking-pool variant
-            // cannot be aborted and would wedge runtime shutdown.
-            tasks.push(
-                self.runtime
-                    .spawn(run_udp_receive_loop_async(socket, transport_event_tx)),
-            );
+        #[cfg(feature = "insecure-transports")]
+        {
+            if let Some((socket, transport_event_tx)) = udp {
+                // Must be the async (abortable) loop: the blocking-pool variant
+                // cannot be aborted and would wedge runtime shutdown.
+                tasks.push(
+                    self.runtime
+                        .spawn(run_udp_receive_loop_async(socket, transport_event_tx)),
+                );
+            }
         }
 
         // Event pump: drives the core's internal channel processing that the

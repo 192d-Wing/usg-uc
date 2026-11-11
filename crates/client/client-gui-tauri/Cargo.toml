@@ -9,7 +9,9 @@ description = "USG SIP Soft Client - Modern Tauri-based GUI"
 default = []
 # UDP/TCP SIP transports for lab testing; default builds are TLS-only.
 insecure-transports = ["client-core/insecure-transports"]
-digest-auth = ["client-core/digest-auth", "client-types/digest-auth"]
+# Implies insecure-transports, as it does in client-core (the digest test
+# providers are UDP): the UDP receive loop only starts with that feature.
+digest-auth = ["client-core/digest-auth", "client-types/digest-auth", "insecure-transports"]
 
 [dependencies]
 # Tauri for desktop app framework

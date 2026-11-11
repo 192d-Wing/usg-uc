@@ -312,6 +312,9 @@ pub struct DecodeMetrics {
     pub dtmf_received: AtomicU64,
     /// Malformed DTMF packets (invalid duration, impossible jumps).
     pub dtmf_malformed: AtomicU64,
+    /// Decoded frames dropped because they were longer than one ptime
+    /// (RTP payload larger than the negotiated frame).
+    pub oversized_frames_dropped: AtomicU64,
 }
 
 impl DecodeMetrics {
@@ -322,6 +325,7 @@ impl DecodeMetrics {
             plc_generated: AtomicU64::new(0),
             dtmf_received: AtomicU64::new(0),
             dtmf_malformed: AtomicU64::new(0),
+            oversized_frames_dropped: AtomicU64::new(0),
         })
     }
 }
@@ -407,6 +411,38 @@ pub fn spawn(
         running,
         cmd_tx,
     }
+}
+
+/// Copies one decoded frame into the one-ptime scratch buffer and returns
+/// the copied prefix for in-place processing.
+///
+/// The frame length comes from the RTP payload length, which the sender
+/// controls: a G.711 payload of 161..=2880 bytes (ptime 30/40, or hostile)
+/// decodes to more samples than `scratch` holds. Such a frame is dropped and
+/// counted, never copied; `None` tells the caller to skip the packet.
+// RFC 3551 §4.2: a receiver SHOULD accept packets of 0 to 200 ms of audio.
+// Dropping frames longer than one ptime is a deliberate limit that does NOT
+// meet that SHOULD (the SDP still offers a=maxptime:120).
+// POAM: POA&M-317 — decode frames longer than one ptime (play them out as consecutive
+// ptime chunks) or advertise a=maxptime matching the receive limit.
+// NIST 800-53 Rev5: SI-10 (length checked before the copy), SC-5 (no panic).
+fn copy_decoded_frame<'a>(
+    codec_pcm: &[i16],
+    scratch: &'a mut [i16],
+    metrics: &DecodeMetrics,
+) -> Option<&'a mut [i16]> {
+    let Some(frame) = scratch.get_mut(..codec_pcm.len()) else {
+        metrics
+            .oversized_frames_dropped
+            .fetch_add(1, Ordering::Relaxed);
+        trace!(
+            "Dropping oversized decoded frame: {} samples",
+            codec_pcm.len()
+        );
+        return None;
+    };
+    frame.copy_from_slice(codec_pcm);
+    Some(frame)
 }
 
 /// Main decode loop.
@@ -836,10 +872,13 @@ fn decode_loop(
 
                         // Copy to pre-allocated buffer (codec returns a borrow
                         // of its internal buffer; we need a mutable copy for
-                        // PLC cross-fade and postfilter).
-                        let decoded_len = codec_pcm.len();
-                        codec_scratch[..decoded_len].copy_from_slice(codec_pcm);
-                        let codec_buf = &mut codec_scratch[..decoded_len];
+                        // PLC cross-fade and postfilter). A frame longer than
+                        // one ptime is dropped and counted, not copied.
+                        let Some(codec_buf) =
+                            copy_decoded_frame(codec_pcm, &mut codec_scratch, metrics)
+                        else {
+                            continue;
+                        };
 
                         // If recovering from loss, cross-fade for smooth transition
                         if plc.consecutive_losses() > 0 {
@@ -1564,6 +1603,452 @@ mod tests {
         // Duration over max: 40001 should be rejected by decode loop
         let event = DtmfEvent::decode(&[5, 0x80, 0x9C, 0x41]).unwrap();
         assert!(event.duration > DTMF_MAX_DURATION);
+    }
+
+    /// SEC-N-001: a G.711 payload longer than one 20 ms frame decodes to
+    /// more samples than the one-ptime scratch buffer holds. The frame is
+    /// dropped and counted; the copy used to index past the buffer and panic.
+    #[test]
+    fn test_oversized_decoded_frame_is_dropped_and_counted() {
+        let mut codec = CodecPipeline::new(CodecPreference::G711Ulaw).unwrap();
+        let spf = codec.samples_per_frame();
+        let mut scratch = vec![0i16; spf];
+        let metrics = DecodeMetrics::new();
+
+        // 161 bytes (one over), 320 bytes (ptime 40) and 2880 bytes (the
+        // codec's own decode-buffer limit).
+        for (dropped, len) in [(1_u64, spf + 1), (2, 320), (3, 2880)] {
+            let payload = vec![0xFF_u8; len];
+            let pcm = codec.decode(&payload).unwrap();
+            assert_eq!(pcm.len(), len);
+            assert!(copy_decoded_frame(pcm, &mut scratch, &metrics).is_none());
+            assert_eq!(
+                metrics.oversized_frames_dropped.load(Ordering::Relaxed),
+                dropped
+            );
+        }
+
+        // One frame and shorter frames (including empty) are still copied.
+        for len in [spf, spf - 1, 1, 0] {
+            let payload = vec![0xFF_u8; len];
+            let pcm = codec.decode(&payload).unwrap();
+            let frame = copy_decoded_frame(pcm, &mut scratch, &metrics).unwrap();
+            assert_eq!(frame.len(), len);
+        }
+        assert_eq!(metrics.oversized_frames_dropped.load(Ordering::Relaxed), 3);
+    }
+
+    /// Playback handle with no audio device behind it.
+    struct NullPlayback;
+
+    impl PlaybackHandle for NullPlayback {
+        fn sample_rate(&self) -> u32 {
+            48000
+        }
+        fn is_running(&self) -> bool {
+            true
+        }
+        fn has_error(&self) -> bool {
+            false
+        }
+        fn stop(&self) {}
+    }
+
+    /// SEC-N-001 end to end: no RTP payload length may panic the decode
+    /// thread. Hostile lengths are fed through the jitter buffer into the
+    /// running decode loop, followed by normal frames that must still play.
+    #[test]
+    fn test_decode_thread_survives_any_payload_length() {
+        use crate::jitter_buffer::BufferedPacket;
+        use bytes::Bytes;
+        use ringbuf::traits::{Consumer, Split};
+
+        let (producer, mut consumer) = ringbuf::HeapRb::<Sample>::new(48000).split();
+        let running = Arc::new(AtomicBool::new(true));
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let metrics = DecodeMetrics::new();
+
+        // 40 ms, one-over, decode-buffer limit, beyond it, empty, one byte;
+        // then ordinary 20 ms frames.
+        let lengths = [320_usize, 161, 2880, 4000, 0, 1, 160, 160, 160, 160];
+        for (i, len) in lengths.iter().enumerate() {
+            let seq = u16::try_from(i).unwrap();
+            let ts = u32::from(seq) * 160;
+            assert!(jb.push(BufferedPacket::new(
+                seq,
+                ts,
+                0,
+                Bytes::from(vec![0xFF_u8; *len])
+            )));
+        }
+
+        let config = DecodeThreadConfig {
+            codec: CodecPreference::G711Ulaw,
+            device_rate: 48000,
+            dtmf_payload_type: 101,
+            aec_ref: None,
+            drift: DriftConfig::default(),
+            postfilter: PostfilterConfig::default(),
+            comfort_noise: ComfortNoiseConfig::default(),
+            dtmf_rx_tx: None,
+            dtmf_queue: None,
+        };
+        let mut handle = spawn(
+            config,
+            producer,
+            Box::new(NullPlayback),
+            jb.clone(),
+            running,
+            Arc::new(AtomicU64::new(0)),
+            metrics.clone(),
+        );
+
+        // Play out like the device callback would, until the loop has
+        // worked through every queued packet.
+        let mut played = 0_usize;
+        let mut sink = vec![0i16; 4800];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !jb.is_empty() && Instant::now() < deadline {
+            played += consumer.pop_slice(&mut sink);
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(50));
+        played += consumer.pop_slice(&mut sink);
+
+        assert!(jb.is_empty(), "decode loop stopped consuming packets");
+        assert!(
+            handle.thread.as_ref().is_some_and(|t| !t.is_finished()),
+            "decode thread died on a hostile payload length"
+        );
+        assert_eq!(
+            metrics.oversized_frames_dropped.load(Ordering::Relaxed),
+            3,
+            "320-, 161- and 2880-sample frames are dropped and counted"
+        );
+        assert!(
+            played > 0,
+            "frames after the hostile ones were not played out"
+        );
+
+        handle.stop();
+    }
+
+    // ---- QA round 1 (B3): payload-length table per codec ----
+
+    /// What the running decode thread did with a sequence of RTP payloads.
+    struct QaDecodeRun {
+        /// `DecodeMetrics::oversized_frames_dropped` at the end.
+        oversized_dropped: u64,
+        /// Samples that reached the playback ring buffer.
+        played: usize,
+        /// Whether the decode thread was still running at the end.
+        alive: bool,
+        /// Whether every queued packet was consumed.
+        drained: bool,
+    }
+
+    /// Feeds `payloads` (one RTP packet each, payload type `payload_type`,
+    /// timestamps `ts_step` apart) through the jitter buffer into a running
+    /// decode thread for `codec`, the way the I/O thread hands over what
+    /// `RtpReceiver` accepted, and plays the output out.
+    fn qa_run_decode_thread(
+        codec: CodecPreference,
+        payload_type: u8,
+        ts_step: u32,
+        payloads: Vec<Vec<u8>>,
+    ) -> QaDecodeRun {
+        use crate::jitter_buffer::BufferedPacket;
+        use bytes::Bytes;
+        use ringbuf::traits::{Consumer, Split};
+
+        let (producer, mut consumer) = ringbuf::HeapRb::<Sample>::new(96000).split();
+        let running = Arc::new(AtomicBool::new(true));
+        let jb = SharedJitterBuffer::new(ts_step * 50, ts_step, 60);
+        let metrics = DecodeMetrics::new();
+
+        for (i, payload) in payloads.into_iter().enumerate() {
+            let seq = u16::try_from(i).unwrap();
+            assert!(jb.push(BufferedPacket::new(
+                seq,
+                u32::from(seq) * ts_step,
+                payload_type,
+                Bytes::from(payload)
+            )));
+        }
+
+        let config = DecodeThreadConfig {
+            codec,
+            device_rate: 48000,
+            dtmf_payload_type: 101,
+            aec_ref: None,
+            drift: DriftConfig::default(),
+            postfilter: PostfilterConfig::default(),
+            comfort_noise: ComfortNoiseConfig::default(),
+            dtmf_rx_tx: None,
+            dtmf_queue: None,
+        };
+        let mut handle = spawn(
+            config,
+            producer,
+            Box::new(NullPlayback),
+            jb.clone(),
+            running,
+            Arc::new(AtomicU64::new(0)),
+            metrics.clone(),
+        );
+
+        let mut played = 0_usize;
+        let mut sink = vec![0i16; 4800];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !jb.is_empty() && Instant::now() < deadline {
+            played += consumer.pop_slice(&mut sink);
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(60));
+        played += consumer.pop_slice(&mut sink);
+
+        let run = QaDecodeRun {
+            oversized_dropped: metrics.oversized_frames_dropped.load(Ordering::Relaxed),
+            played,
+            alive: handle.thread.as_ref().is_some_and(|t| !t.is_finished()),
+            drained: jb.is_empty(),
+        };
+        handle.stop();
+        run
+    }
+
+    /// Payload lengths around every boundary on the decode path: empty, one
+    /// byte, one G.711 frame (160) and one over (161), 40 ms (320) and its
+    /// neighbours, the G.722 decode-buffer limit in bytes (1440) and its
+    /// neighbours, the largest payload a 1500-byte datagram carries (1488),
+    /// the codec decode-buffer limit in samples (2880) and its neighbours,
+    /// and well beyond it. The I/O path cannot deliver more than 1488 bytes
+    /// in one packet; the larger ones show the decode thread does not depend
+    /// on that. Normal frames follow and must still be played.
+    const QA_HOSTILE_PAYLOAD_LENGTHS: [usize; 20] = [
+        0, 1, 159, 160, 161, 319, 320, 321, 1439, 1440, 1441, 1488, 2879, 2880, 2881, 4000, 5760,
+        5761, 65_535, 2,
+    ];
+
+    /// Runs the hostile lengths followed by eight normal frames of
+    /// `frame_bytes` and checks the outcome. `samples_per_byte` is the
+    /// codec's expansion (1 for G.711, 2 for G.722); `frame_samples` is one
+    /// ptime of decoded audio.
+    fn qa_assert_codec_survives_payload_lengths(
+        codec: CodecPreference,
+        payload_type: u8,
+        fill: u8,
+        frame_bytes: usize,
+        samples_per_byte: usize,
+    ) {
+        let frame_samples = CodecPipeline::new(codec).unwrap().samples_per_frame();
+        assert_eq!(frame_bytes * samples_per_byte, frame_samples);
+
+        let mut lengths = QA_HOSTILE_PAYLOAD_LENGTHS.to_vec();
+        lengths.extend([frame_bytes; 8]);
+
+        // A decoded frame longer than one ptime that still fits the codec's
+        // own decode buffer must be dropped and counted; a longer payload is
+        // refused by the codec (an error, not a drop) and a shorter one is
+        // played.
+        let expected_dropped = lengths
+            .iter()
+            .map(|len| len * samples_per_byte)
+            .filter(|samples| {
+                *samples > frame_samples && *samples <= crate::codec::MAX_DECODED_SAMPLES
+            })
+            .count();
+        assert!(expected_dropped >= 5, "table lost its oversized cases");
+
+        let payloads = lengths.iter().map(|len| vec![fill; *len]).collect();
+        let run = qa_run_decode_thread(codec, payload_type, 160, payloads);
+        assert!(
+            run.alive,
+            "{codec:?}: decode thread died on a hostile payload length"
+        );
+        assert!(
+            run.drained,
+            "{codec:?}: decode thread stopped consuming packets"
+        );
+        assert_eq!(
+            run.oversized_dropped,
+            u64::try_from(expected_dropped).unwrap(),
+            "{codec:?}: every oversized decoded frame is dropped and counted, nothing else is"
+        );
+        assert!(
+            run.played > 0,
+            "{codec:?}: frames after the hostile ones were not played out"
+        );
+    }
+
+    #[test]
+    fn test_qa_decode_thread_payload_length_table_pcmu() {
+        qa_assert_codec_survives_payload_lengths(CodecPreference::G711Ulaw, 0, 0xFF, 160, 1);
+    }
+
+    #[test]
+    fn test_qa_decode_thread_payload_length_table_pcma() {
+        qa_assert_codec_survives_payload_lengths(CodecPreference::G711Alaw, 8, 0xD5, 160, 1);
+    }
+
+    #[test]
+    fn test_qa_decode_thread_payload_length_table_g722() {
+        qa_assert_codec_survives_payload_lengths(CodecPreference::G722, 9, 0xFA, 160, 2);
+    }
+
+    /// B3 at the copy itself, for each G.711/G.722 codec: decoded lengths
+    /// at, one below and one above the scratch buffer, and at the codec's
+    /// decode-buffer limit.
+    #[test]
+    fn test_qa_copy_decoded_frame_boundaries_per_codec() {
+        for (codec, samples_per_byte) in [
+            (CodecPreference::G711Ulaw, 1_usize),
+            (CodecPreference::G711Alaw, 1),
+            (CodecPreference::G722, 2),
+        ] {
+            let mut pipeline = CodecPipeline::new(codec).unwrap();
+            let spf = pipeline.samples_per_frame();
+            let frame_bytes = spf / samples_per_byte;
+            let limit_bytes = crate::codec::MAX_DECODED_SAMPLES / samples_per_byte;
+            let mut scratch = vec![0i16; spf];
+            let metrics = DecodeMetrics::new();
+            let mut dropped = 0_u64;
+
+            for bytes in [
+                0,
+                1,
+                frame_bytes - 1,
+                frame_bytes,
+                frame_bytes + 1,
+                2 * frame_bytes,
+                limit_bytes - 1,
+                limit_bytes,
+            ] {
+                let payload = vec![0x55_u8; bytes];
+                let pcm = pipeline.decode(&payload).unwrap();
+                assert_eq!(pcm.len(), bytes * samples_per_byte, "{codec:?} {bytes}");
+                let fits = pcm.len() <= spf;
+                let copied = copy_decoded_frame(pcm, &mut scratch, &metrics);
+                assert_eq!(copied.is_some(), fits, "{codec:?} {bytes} bytes");
+                if let Some(frame) = copied {
+                    assert_eq!(frame.len(), bytes * samples_per_byte);
+                } else {
+                    dropped += 1;
+                }
+                assert_eq!(
+                    metrics.oversized_frames_dropped.load(Ordering::Relaxed),
+                    dropped,
+                    "{codec:?} {bytes} bytes"
+                );
+            }
+
+            // One byte past the codec's decode buffer: refused by the codec,
+            // so nothing reaches the copy.
+            assert!(pipeline.decode(&vec![0x55_u8; limit_bytes + 1]).is_err());
+            assert_eq!(dropped, 4, "{codec:?}");
+        }
+    }
+
+    /// The loss-concealment path shares the one-ptime scratch buffer. With a
+    /// hostile "next packet" of any length as the FEC source, it never
+    /// returns (or copies) more than one ptime, for every codec.
+    #[test]
+    fn test_qa_conceal_lost_frame_hostile_fec_source_lengths() {
+        for codec in [
+            CodecPreference::G711Ulaw,
+            CodecPreference::G711Alaw,
+            CodecPreference::G722,
+            CodecPreference::Opus,
+        ] {
+            let mut pipeline = CodecPipeline::new(codec).unwrap();
+            let spf = pipeline.samples_per_frame();
+            let mut plc = WsolaPlc::new(spf);
+            let mut scratch = vec![0i16; spf];
+            let metrics = DecodeMetrics::new();
+
+            for len in [0_usize, 1, 2, 160, 161, 320, 1275, 1488, 2880, 2881, 65_535] {
+                for fill in [0x00_u8, 0x18, 0x7F, 0xFF] {
+                    let next = vec![fill; len];
+                    // A frame size larger than the scratch buffer is clamped.
+                    for frame_samples in [spf, spf + 1, 2880, 5760] {
+                        let out = conceal_lost_frame(
+                            &mut pipeline,
+                            &mut plc,
+                            &mut scratch,
+                            Some(&next),
+                            frame_samples,
+                            &metrics,
+                        );
+                        assert!(
+                            out.len() <= spf,
+                            "{codec:?}: {} samples from a {len}-byte FEC source",
+                            out.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// With the real Opus decoder, one packet can legitimately decode to
+    /// more than the 20 ms scratch buffer (40/60 ms frames, or several
+    /// frames in one packet). Such packets must be dropped and counted, and
+    /// packets whose duration exceeds the decode buffer refused, without a
+    /// panic. TOC-only packets are valid Opus (RFC 6716 §3.1): the decoder
+    /// conceals the frame duration the TOC declares.
+    #[cfg(feature = "opus-ffi")]
+    #[test]
+    fn test_qa_decode_thread_opus_long_frames_are_dropped_not_copied() {
+        let mut codec = CodecPipeline::new(CodecPreference::Opus).unwrap();
+        let spf = codec.samples_per_frame();
+        let mut scratch = vec![0i16; spf];
+        let metrics = DecodeMetrics::new();
+        let mut dropped = 0_u64;
+
+        // (TOC-led packet, what it declares)
+        let packets: [(&[u8], &str); 8] = [
+            (&[0x08], "SILK NB 20 ms, one frame"),
+            (&[0x10], "SILK NB 40 ms, one frame"),
+            (&[0x18], "SILK NB 60 ms, one frame"),
+            (&[0x09], "SILK NB 2 x 20 ms, code 1"),
+            (&[0x19], "SILK NB 2 x 60 ms, code 1 (120 ms)"),
+            (&[0x1B, 0x02], "SILK NB 60 ms, code 3, two frames (120 ms)"),
+            (
+                &[0xFB, 0x30],
+                "CELT FB 20 ms, code 3, 48 frames (960 ms, invalid)",
+            ),
+            (&[0x1B, 0x00], "code 3 with zero frames (invalid)"),
+        ];
+        for (packet, what) in packets {
+            // A packet the decoder refuses leaves nothing to copy.
+            if let Ok(pcm) = codec.decode(packet) {
+                let len = pcm.len();
+                let copied = copy_decoded_frame(pcm, &mut scratch, &metrics);
+                assert_eq!(copied.is_some(), len <= spf, "{what}: {len} samples");
+                if copied.is_none() {
+                    dropped += 1;
+                }
+            }
+            assert_eq!(
+                metrics.oversized_frames_dropped.load(Ordering::Relaxed),
+                dropped,
+                "{what}"
+            );
+        }
+        assert!(
+            dropped >= 2,
+            "the 40 ms and 60 ms packets decode to more than one 20 ms frame"
+        );
+
+        // The same packets through the running decode thread, followed by
+        // TOC-only 20 ms packets that must still be played.
+        let mut payloads: Vec<Vec<u8>> = packets.iter().map(|(p, _)| p.to_vec()).collect();
+        payloads.extend(std::iter::repeat_n(vec![0x08_u8], 8));
+        let run = qa_run_decode_thread(CodecPreference::Opus, 111, 960, payloads);
+        assert!(run.alive, "decode thread died on a long Opus packet");
+        assert!(run.drained, "decode thread stopped consuming packets");
+        assert!(run.oversized_dropped >= 2);
+        assert!(run.played > 0, "frames after the long ones were not played");
     }
 
     #[test]

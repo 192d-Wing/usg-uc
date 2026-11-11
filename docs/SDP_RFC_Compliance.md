@@ -40,6 +40,7 @@ The client implements comprehensive SDP functionality for audio-only calls with 
     - Added to all SDP templates
 - **Section 5.13 (Attributes - maxptime)**: `a=maxptime:120` - **FIXED 2026-02-07**
     - Added to all SDP templates (Opus supports up to 120ms frames)
+    - Receive limit (fix/client-review-blockers): the soft client decodes only frames up to one ptime (20 ms); longer received frames are dropped and counted in `oversized_frames_dropped` (`client-audio/src/decode_thread.rs`). The offered `a=maxptime:120` is therefore not honoured on receive, and RFC 3551 §4.2 (accept 0-200 ms) is not met (POA&M-317)
 - **Section 5.14 (Media Descriptions)**: `m=audio <port> <proto> <fmt-list>` - Implemented
     - Plain RTP: `m=audio <port> RTP/AVP 0 8 101`
     - Secure RTP: `m=audio <port> UDP/TLS/RTP/SAVPF 111 0 8 101`
@@ -254,7 +255,7 @@ Tests: `rs_sdp_carries_ports_family_and_formats`, `offer_is_srtp_with_one_sdes_l
     - `minptime=20`: Minimum packet time (matches `a=ptime:20`)
     - `useinbandfec=1`: Advertises Opus in-band FEC; receiver-side recovery is limited as described above (POA&M-141)
     - `stereo=1`: Enables stereo decoding capability
-- `a=maxptime:120` - Maximum packet time for Opus (up to 120ms frames)
+- `a=maxptime:120` - Maximum packet time for Opus (offered; the receiver drops frames longer than 20 ms, POA&M-317)
 
 ---
 
@@ -396,6 +397,7 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 5. ✅ **maxptime Attribute** (RFC 8866 Section 5.13) - **COMPLETED 2026-02-07**
     - Fix: Added `a=maxptime:120` to all four SDP templates
     - Result: Maximum packet time declared for Opus compatibility
+    - Limit: declared only; received frames over one ptime (20 ms) are dropped (POA&M-317)
 
 ### LOW Priority 🟢 - **ALL COMPLETED** ✅
 

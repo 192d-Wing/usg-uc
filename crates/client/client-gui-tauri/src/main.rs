@@ -11,9 +11,11 @@
 )]
 
 use client_audio::DeviceManager;
+#[cfg(feature = "insecure-transports")]
+use client_core::run_udp_receive_loop;
 use client_core::{
-    run_udp_receive_loop, AppEvent, AppState as CoreAppState, CertificateStore, ClientApp,
-    ContactManager, SettingsManager,
+    AppEvent, AppState as CoreAppState, CertificateStore, ClientApp, ContactManager,
+    SettingsManager,
 };
 use client_types::{CallHistoryEntry, CertificateInfo, Contact, SipAccount, SmartCardPin};
 use serde::{Deserialize, Serialize};
@@ -200,11 +202,17 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
 
     trust_extra_ca_for_sip(&mut client, &state.settings_manager).await;
 
+    // UDP SIP exists only in `insecure-transports` builds (lab testing). A
+    // default (TLS-only) build binds no UDP SIP socket and starts no UDP
+    // receive loop: all signaling uses the TLS connection to the registrar.
+    // NIST 800-53 Rev5: SC-8, CM-7.
+    //
     // Resolve registrar DNS to determine if we need IPv4 or IPv6 socket.
     // Check the configured registrar hostname — if it resolves to AAAA (IPv6),
     // we bind the UDP socket to [::]:0, otherwise 0.0.0.0:0.
     // Resolve registrar DNS to determine if we need IPv4 or IPv6 socket.
     // If the registrar only has AAAA records (no A records), use IPv6.
+    #[cfg(feature = "insecure-transports")]
     let use_ipv6 = {
         let settings = state.settings_manager.read().await;
         let registrar_uri = settings
@@ -245,17 +253,20 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
 
     // Get UDP socket and event sender for the receive loop BEFORE initialize
     // This ensures the receive loop is running before any registration sends
-    if let Some((udp_socket, transport_event_tx)) =
-        client.get_udp_socket_for_receive(use_ipv6).await
+    #[cfg(feature = "insecure-transports")]
     {
-        info!("Spawning UDP receive loop using Tauri async runtime");
-        tauri::async_runtime::spawn(async move {
-            run_udp_receive_loop(udp_socket, transport_event_tx).await;
-        });
-        // Give the receive loop a moment to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    } else {
-        warn!("Could not get UDP socket for receive loop");
+        if let Some((udp_socket, transport_event_tx)) =
+            client.get_udp_socket_for_receive(use_ipv6).await
+        {
+            info!("Spawning UDP receive loop using Tauri async runtime");
+            tauri::async_runtime::spawn(async move {
+                run_udp_receive_loop(udp_socket, transport_event_tx).await;
+            });
+            // Give the receive loop a moment to start
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        } else {
+            warn!("Could not get UDP socket for receive loop");
+        }
     }
 
     // Initialize the client (this triggers auto-registration)

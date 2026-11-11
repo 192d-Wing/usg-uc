@@ -25,8 +25,12 @@ required-features = ["digest-auth"]
 default = []
 # Enables the bundled `uniffi-bindgen` CLI used to generate Swift/Kotlin sources.
 bindgen = ["uniffi/cli"]
+# UDP/TCP SIP transports for lab testing; default builds are TLS-only and
+# never bind a UDP SIP socket or start the UDP receive loop.
+insecure-transports = ["client-core/insecure-transports"]
 # Password-based SIP auth (commercial VoIP testing only; production is mTLS).
-digest-auth = ["client-core/digest-auth"]
+# Implies insecure-transports, as it does in client-core.
+digest-auth = ["client-core/digest-auth", "insecure-transports"]
 
 [dependencies]
 client-core.workspace = true

@@ -8,7 +8,7 @@
 //! - Media session coordination
 
 use crate::test_utils::{allocate_test_addr, init_test_tracing, test_account};
-use client_core::{CallManager, CallManagerEvent};
+use client_core::{CallManager, CallManagerEvent, SipTransportKind};
 use client_types::CallState;
 use proto_ice::IceConfig;
 use tokio::sync::mpsc;
@@ -423,7 +423,7 @@ mod incoming_call_tests {
 
         // Handle the incoming INVITE
         let result = manager
-            .handle_incoming_invite_from(&invite, source_addr)
+            .handle_incoming_invite_from(&invite, source_addr, SipTransportKind::Tls)
             .await;
         assert!(
             result.is_ok(),
@@ -488,7 +488,7 @@ mod incoming_call_tests {
 
         let invite = parse_invite(&invite_str);
         manager
-            .handle_incoming_invite_from(&invite, source_addr)
+            .handle_incoming_invite_from(&invite, source_addr, SipTransportKind::Tls)
             .await
             .unwrap();
 
@@ -574,7 +574,7 @@ mod incoming_call_tests {
 
         let invite = parse_invite(&invite_str);
         manager
-            .handle_incoming_invite_from(&invite, source_addr)
+            .handle_incoming_invite_from(&invite, source_addr, SipTransportKind::Tls)
             .await
             .unwrap();
 
@@ -683,7 +683,7 @@ mod incoming_call_tests {
 
         let invite = parse_invite(&invite_str);
         let _ = manager
-            .handle_incoming_invite_from(&invite, source_addr)
+            .handle_incoming_invite_from(&invite, source_addr, SipTransportKind::Tls)
             .await;
 
         // Should have one incoming call

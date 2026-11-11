@@ -8,6 +8,7 @@
 
 use crate::audio_session::{AudioSession, AudioSessionConfig, AudioSessionEvent};
 use crate::contact_manager::ContactManager;
+use crate::sip_transport::SipTransportKind;
 use crate::{AppError, AppResult};
 use chrono::Utc;
 use client_audio::PipelineStats;
@@ -41,6 +42,8 @@ pub struct IncomingCallInfo {
     pub remote_display_name: Option<String>,
     /// Source address of the INVITE.
     pub source_addr: SocketAddr,
+    /// Transport the INVITE arrived on; its responses are sent on it.
+    pub transport: SipTransportKind,
     /// The original INVITE request (for building responses).
     pub invite_request: SipRequest,
     /// Our local tag for the dialog.
@@ -185,6 +188,9 @@ pub enum CallManagerEvent {
         response: SipResponse,
         /// Destination address.
         destination: SocketAddr,
+        /// Transport the request arrived on (RFC 3261 §18.2.2): the
+        /// response goes back on it, never on one read from Via text.
+        transport: SipTransportKind,
     },
     /// Transfer progress update (RFC 3515 REFER NOTIFY).
     TransferProgress {
@@ -531,11 +537,26 @@ impl CallManager {
         let call_info = self.call_agent.get_call_info(call_id);
         debug!(call_id = %call_id, call_info = ?call_info, "Call info before hangup");
 
-        // Send hangup via SIP UA
-        self.call_agent
+        // Send hangup via SIP UA. A failure to build or send the BYE/CANCEL
+        // must not leave the call holding audio, media and an active-call
+        // slot: local state is released below either way and the error is
+        // returned afterwards. Otherwise a call whose BYE cannot be built
+        // could never be ended locally and would pin `max_concurrent_calls`.
+        // NIST 800-53 Rev5: SC-5 (a failed hang-up cannot leak a call slot).
+        let signal_result = self
+            .call_agent
             .hangup(call_id)
             .await
-            .map_err(|e| AppError::Sip(e.to_string()))?;
+            .map_err(|e| AppError::Sip(e.to_string()));
+        if let Err(e) = &signal_result {
+            warn!(call_id = %call_id, error = %e, "Hang-up signaling failed; releasing local call state");
+        }
+
+        // Stop audio (normally done on the Terminated state change, which a
+        // failed hang-up never produces).
+        if let Err(e) = self.stop_audio_session(call_id).await {
+            warn!(call_id = %call_id, error = %e, "Failed to stop audio session");
+        }
 
         // Close media session
         if let Some(mut session) = self.media_sessions.remove(call_id) {
@@ -544,6 +565,7 @@ impl CallManager {
 
         // Clean up negotiated codec and dialog tracking
         self.negotiated_codecs.remove(call_id);
+        self.effective_media_addrs.remove(call_id);
         self.active_call_dialogs.remove(call_id);
 
         // Record in call history
@@ -571,7 +593,7 @@ impl CallManager {
             })
             .await;
 
-        Ok(())
+        signal_result
     }
 
     /// Handles a call event from the SIP UA.
@@ -669,16 +691,20 @@ impl CallManager {
     pub async fn handle_sip_request(&mut self, request: &SipRequest) -> AppResult<()> {
         // Default to localhost if source not known
         let default_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 5060));
-        self.handle_sip_request_from(request, default_addr).await
+        self.handle_sip_request_from(request, default_addr, SipTransportKind::Tls)
+            .await
     }
 
     /// Routes an incoming SIP request with source address for response routing.
     ///
     /// This handles incoming calls and in-dialog requests (INVITE, BYE, CANCEL, etc.).
+    /// `transport` is the transport the request arrived on; every response to
+    /// it is queued for that same transport (RFC 3261 §18.2.2).
     pub async fn handle_sip_request_from(
         &mut self,
         request: &SipRequest,
         source: SocketAddr,
+        transport: SipTransportKind,
     ) -> AppResult<()> {
         let method = request.method.as_str();
         debug!(method = %method, source = %source, "Received incoming SIP request");
@@ -706,19 +732,21 @@ impl CallManager {
                     });
 
                 if let Some((call_id, local_tag)) = reinvite_match {
-                    self.handle_incoming_reinvite(request, source, &call_id, &local_tag)
+                    self.handle_incoming_reinvite(request, source, transport, &call_id, &local_tag)
                         .await?;
                 } else {
-                    self.handle_incoming_invite_from(request, source).await?;
+                    self.handle_incoming_invite_from(request, source, transport)
+                        .await?;
                 }
             }
             "BYE" => {
                 // Remote party hanging up
-                self.handle_incoming_bye(request, source).await?;
+                self.handle_incoming_bye(request, source, transport).await?;
             }
             "CANCEL" => {
                 // Remote party cancelling
-                self.handle_incoming_cancel(request, source).await?;
+                self.handle_incoming_cancel(request, source, transport)
+                    .await?;
             }
             "ACK" => {
                 // Acknowledgement (normally handled by transaction layer)
@@ -726,7 +754,8 @@ impl CallManager {
             }
             "INFO" => {
                 // In-dialog INFO (e.g. SIP INFO DTMF relay)
-                self.handle_incoming_info(request, source).await?;
+                self.handle_incoming_info(request, source, transport)
+                    .await?;
             }
             _ => {
                 debug!(method = %method, "Ignoring unsupported request method");
@@ -772,6 +801,7 @@ impl CallManager {
         &mut self,
         request: &SipRequest,
         source: SocketAddr,
+        transport: SipTransportKind,
         call_id: &str,
         local_tag: &str,
     ) -> AppResult<()> {
@@ -794,6 +824,7 @@ impl CallManager {
                 .send(CallManagerEvent::SendResponse {
                     response,
                     destination: source,
+                    transport,
                 })
                 .await;
             return Ok(());
@@ -958,6 +989,7 @@ impl CallManager {
             .send(CallManagerEvent::SendResponse {
                 response: ok_response,
                 destination: source,
+                transport,
             })
             .await;
 
@@ -973,18 +1005,19 @@ impl CallManager {
     pub async fn handle_incoming_invite(&mut self, request: &SipRequest) -> AppResult<()> {
         // Default to localhost if source not known (shouldn't happen in real usage)
         let default_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 5060));
-        self.handle_incoming_invite_from(request, default_addr)
+        self.handle_incoming_invite_from(request, default_addr, SipTransportKind::Tls)
             .await
     }
 
     /// Handles an incoming INVITE request from a known source.
     ///
     /// This is the preferred method as it includes the source address
-    /// needed for sending responses.
+    /// and the receive transport needed for sending responses.
     pub async fn handle_incoming_invite_from(
         &mut self,
         request: &SipRequest,
         source: SocketAddr,
+        transport: SipTransportKind,
     ) -> AppResult<()> {
         use crate::sip_transport::{build_response_from_request, generate_tag};
 
@@ -1004,6 +1037,7 @@ impl CallManager {
                 .send(CallManagerEvent::SendResponse {
                     response,
                     destination: source,
+                    transport,
                 })
                 .await;
             return Ok(());
@@ -1023,8 +1057,30 @@ impl CallManager {
             .get_value(&HeaderName::From)
             .map_or_else(|| "unknown".to_string(), std::string::ToString::to_string);
 
-        // Parse display name and URI from From header
-        let (remote_display_name, remote_uri) = parse_from_header(&from_value);
+        // Parse display name and URI from From header. The value is
+        // peer-controlled and proto-sip does not grammar-check it, so an
+        // unparsable name-addr is answered with 400 instead of being sliced.
+        // RFC 3261 §20.20, §21.4.1. NIST 800-53 Rev5: SI-10.
+        let Some((remote_display_name, remote_uri)) = parse_from_header(&from_value) else {
+            return self
+                .reject_malformed_invite(request, source, transport, "From")
+                .await;
+        };
+
+        // The Contact becomes the dialog's remote target when the call is
+        // accepted; reject one that cannot be split now, before any state.
+        // RFC 3261 §8.1.1.8, §20.10. NIST 800-53 Rev5: SI-10.
+        // The URI must also parse as a SIP/SIPS URI: the BYE is built from
+        // it, and a call that cannot be hung up would hold a call slot.
+        if request
+            .headers
+            .get_value(&HeaderName::Contact)
+            .is_some_and(|contact| contact_target_uri(contact).is_none())
+        {
+            return self
+                .reject_malformed_invite(request, source, transport, "Contact")
+                .await;
+        }
 
         // Extract SIP Call-ID
         let sip_call_id = request.headers.get_value(&HeaderName::CallId).map_or_else(
@@ -1045,6 +1101,7 @@ impl CallManager {
             remote_uri: remote_uri.clone(),
             remote_display_name: remote_display_name.clone(),
             source_addr: source,
+            transport,
             invite_request: request.clone(),
             local_tag: local_tag.clone(),
         };
@@ -1057,6 +1114,7 @@ impl CallManager {
             .send(CallManagerEvent::SendResponse {
                 response: trying_response,
                 destination: source,
+                transport,
             })
             .await;
 
@@ -1068,6 +1126,7 @@ impl CallManager {
             .send(CallManagerEvent::SendResponse {
                 response: ringing_response,
                 destination: source,
+                transport,
             })
             .await;
 
@@ -1082,6 +1141,38 @@ impl CallManager {
             .await;
 
         Ok(())
+    }
+
+    /// Answers an INVITE whose `header` cannot be parsed with 400 Bad Request
+    /// and reports the rejection to the caller. No call state is created.
+    // RFC 3261 §21.4.1: 400 for a request with malformed syntax.
+    // NIST 800-53 Rev5: SI-10 (malformed peer input is rejected, never sliced).
+    async fn reject_malformed_invite(
+        &self,
+        request: &SipRequest,
+        source: SocketAddr,
+        transport: SipTransportKind,
+        header: &str,
+    ) -> AppResult<()> {
+        use crate::sip_transport::{build_response_from_request, generate_tag};
+
+        // The header value is peer-controlled: log its name only.
+        warn!(source = %source, header = header, "Rejecting INVITE with unparsable header (400)");
+        // RFC 3261 §8.2.6.2: a final response to a request without a To tag
+        // carries a tag added by the UAS.
+        let response =
+            build_response_from_request(request, StatusCode::BAD_REQUEST, Some(&generate_tag()));
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::SendResponse {
+                response,
+                destination: source,
+                transport,
+            })
+            .await;
+        Err(AppError::Sip(format!(
+            "Malformed {header} header in incoming INVITE"
+        )))
     }
 
     /// Accepts an incoming call.
@@ -1202,6 +1293,7 @@ impl CallManager {
             .send(CallManagerEvent::SendResponse {
                 response: ok_response,
                 destination: incoming.source_addr,
+                transport: incoming.transport,
             })
             .await;
 
@@ -1246,19 +1338,18 @@ impl CallManager {
         // Register the inbound call in the call agent so hangup (BYE) works.
         // For BYE routing, use the Contact header from the INVITE if available,
         // otherwise fall back to the source address.
+        // NIST 800-53 Rev5: SI-10 - the Contact is peer-controlled; it is
+        // split with checked searches only (a `>` before the `<` used to
+        // panic here). An unsplittable value is rejected with 400 when the
+        // INVITE arrives, so the fallback is only reached without a Contact.
         let bye_target = incoming
             .invite_request
             .headers
             .get_value(&proto_sip::header::HeaderName::Contact)
+            .and_then(contact_target_uri)
             .map_or_else(
                 || format!("sip:{}:{}", source_addr.ip(), source_addr.port()),
-                |c| {
-                    // Extract URI from Contact: <sip:...>
-                    let s = c.to_string();
-                    let start = s.find('<').map_or(0, |i| i + 1);
-                    let end = s.find('>').unwrap_or(s.len());
-                    s[start..end].to_string()
-                },
+                str::to_string,
             );
 
         // Record-Route values of the INVITE, in received order: for a UAS
@@ -1363,6 +1454,7 @@ impl CallManager {
             .send(CallManagerEvent::SendResponse {
                 response,
                 destination: incoming.source_addr,
+                transport: incoming.transport,
             })
             .await;
 
@@ -1398,6 +1490,7 @@ impl CallManager {
         &mut self,
         request: &SipRequest,
         source: SocketAddr,
+        transport: SipTransportKind,
     ) -> AppResult<()> {
         use crate::sip_transport::build_response_from_request;
 
@@ -1421,6 +1514,7 @@ impl CallManager {
                 .send(CallManagerEvent::SendResponse {
                     response,
                     destination: source,
+                    transport,
                 })
                 .await;
             return Ok(());
@@ -1434,6 +1528,7 @@ impl CallManager {
             .send(CallManagerEvent::SendResponse {
                 response: ok_response,
                 destination: source,
+                transport,
             })
             .await
         {
@@ -1458,6 +1553,7 @@ impl CallManager {
         &mut self,
         request: &SipRequest,
         source: SocketAddr,
+        transport: SipTransportKind,
     ) -> AppResult<()> {
         use crate::sip_transport::build_response_from_request;
 
@@ -1488,6 +1584,7 @@ impl CallManager {
                 .send(CallManagerEvent::SendResponse {
                     response,
                     destination: source,
+                    transport,
                 })
                 .await;
             return Ok(());
@@ -1500,6 +1597,7 @@ impl CallManager {
             .send(CallManagerEvent::SendResponse {
                 response: ok_response,
                 destination: source,
+                transport,
             })
             .await;
 
@@ -1530,6 +1628,7 @@ impl CallManager {
         &self,
         request: &SipRequest,
         source: SocketAddr,
+        transport: SipTransportKind,
     ) -> AppResult<()> {
         use crate::sip_transport::build_response_from_request;
 
@@ -1540,6 +1639,7 @@ impl CallManager {
             .send(CallManagerEvent::SendResponse {
                 response: ok_response,
                 destination: source,
+                transport,
             })
             .await;
 
@@ -2013,6 +2113,13 @@ impl CallManager {
     /// Returns all active call IDs (including held calls).
     pub fn all_call_ids(&self) -> &[String] {
         &self.active_calls
+    }
+
+    /// A sender on the call-manager event queue, for tests that need it
+    /// full.
+    #[cfg(test)]
+    pub(crate) fn event_sender_for_test(&self) -> mpsc::Sender<CallManagerEvent> {
+        self.app_event_tx.clone()
     }
 
     /// Returns info for all active calls.
@@ -2959,47 +3066,137 @@ fn extract_username_from_sip_uri(uri: &str) -> Option<String> {
     None
 }
 
+/// A name-addr or addr-spec header value split into its parts.
+struct NameAddrParts<'a> {
+    /// Display name, unescaped when it was a quoted-string.
+    display_name: Option<String>,
+    /// The URI: the text between `<` and `>`, or the whole value in
+    /// addr-spec form (header parameters included).
+    uri: &'a str,
+    /// Whether the URI was enclosed in angle brackets (name-addr form).
+    bracketed: bool,
+}
+
+/// Splits a name-addr / addr-spec header value (From, Contact) into display
+/// name and URI.
+///
+/// Returns `None` when the value cannot be split: an unterminated
+/// quoted-string, a quoted display name with no `<`, a `<` with no later
+/// `>`, or an empty URI. The value is peer-controlled, so every offset comes
+/// from a checked search and no range can start after it ends.
+// RFC 3261 §20.10, §25.1: inside a quoted display name `<`, `>` and `\"`
+// are literal; the addr-spec is delimited by the first `<` after it and the
+// first `>` after that `<`.
+// NIST 800-53 Rev5: SI-10 (untrusted header text; no input may panic).
+fn split_name_addr(value: &str) -> Option<NameAddrParts<'_>> {
+    let trimmed = value.trim();
+
+    // Quoted display name: find the closing quote, honouring quoted-pairs.
+    let (quoted_name, rest) = if let Some(inner) = trimmed.strip_prefix('"') {
+        let mut name = String::new();
+        let mut close = None;
+        let mut chars = inner.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => {
+                    if let Some((_, escaped)) = chars.next() {
+                        name.push(escaped);
+                    }
+                }
+                '"' => {
+                    close = Some(i);
+                    break;
+                }
+                _ => name.push(c),
+            }
+        }
+        (Some(name), inner.get(close? + 1..)?)
+    } else {
+        (None, trimmed)
+    };
+
+    let Some(open) = rest.find('<') else {
+        // addr-spec form. A quoted display name requires name-addr form.
+        if quoted_name.is_some() || rest.is_empty() {
+            return None;
+        }
+        return Some(NameAddrParts {
+            display_name: None,
+            uri: rest,
+            bracketed: false,
+        });
+    };
+
+    // Search for `>` only after the `<`.
+    let after_open = rest.get(open + 1..)?;
+    let uri = after_open.get(..after_open.find('>')?)?.trim();
+    if uri.is_empty() {
+        return None;
+    }
+
+    let display_name = quoted_name.or_else(|| {
+        let before = rest.get(..open)?.trim();
+        (!before.is_empty()).then(|| before.to_string())
+    });
+
+    Some(NameAddrParts {
+        display_name,
+        uri,
+        bracketed: true,
+    })
+}
+
+/// Returns the URI of a Contact value when it is usable as a dialog remote
+/// target: the value splits (see [`split_name_addr`]) and its URI parses as a
+/// SIP or SIPS URI. In addr-spec form, everything after the first `;` is a
+/// header parameter and is not part of the URI.
+// RFC 3261 §8.1.1.8: the Contact of a dialog-creating request is a single
+// SIP or SIPS URI; §20.10 (addr-spec form parameters belong to the header).
+// NIST 800-53 Rev5: SI-10.
+fn contact_target_uri(value: &str) -> Option<&str> {
+    let parts = split_name_addr(value)?;
+    let uri = if parts.bracketed {
+        parts.uri
+    } else {
+        parts.uri.split(';').next().unwrap_or(parts.uri).trim()
+    };
+    uri.parse::<proto_sip::uri::SipUri>().ok()?;
+    Some(uri)
+}
+
+/// Whether a From URI identifies a caller: a SIP/SIPS URI that parses, or a
+/// `tel:` URI with a non-empty number (POA&M-153: `tel:` From is accepted).
+// RFC 3261 §20.20; RFC 3966 §3. NIST 800-53 Rev5: SI-10.
+fn is_usable_caller_uri(uri: &str) -> bool {
+    if let Some((scheme, rest)) = uri.split_once(':')
+        && scheme.eq_ignore_ascii_case("tel")
+    {
+        return !rest.trim().is_empty() && !rest.contains(['<', '>', '"']);
+    }
+    uri.parse::<proto_sip::uri::SipUri>().is_ok()
+}
+
 /// Parses a From header value to extract display name and URI.
 ///
 /// From header format: `"Display Name" <sip:user@host>` or `<sip:user@host>`
 ///
-/// Returns (`display_name`, uri) where `display_name` is None if not present.
-fn parse_from_header(from_value: &str) -> (Option<String>, String) {
-    let trimmed = from_value.trim();
+/// Returns (`display_name`, uri) where `display_name` is None if not present,
+/// or `None` when the value cannot be parsed (see [`split_name_addr`]).
+fn parse_from_header(from_value: &str) -> Option<(Option<String>, String)> {
+    let parts = split_name_addr(from_value)?;
 
-    // Check for display name in quotes
-    if let Some(quote_end) = trimmed.strip_prefix('"').and_then(|s| s.find('"')) {
-        let display_name = trimmed[1..=quote_end].to_string();
-        let rest = &trimmed[quote_end + 2..];
-
-        // Extract URI from angle brackets
-        if let (Some(start), Some(end)) = (rest.find('<'), rest.find('>')) {
-            let uri = rest[start + 1..end].to_string();
-            return (Some(display_name), uri);
-        }
+    let uri = if parts.bracketed {
+        parts.uri
+    } else {
+        // No angle brackets: everything after the first `;` is a header
+        // parameter such as the tag (RFC 3261 §20.10).
+        parts.uri.split(';').next().unwrap_or(parts.uri).trim()
+    };
+    if uri.is_empty() || !is_usable_caller_uri(uri) {
+        return None;
     }
 
-    // Check for URI in angle brackets without display name
-    if let (Some(start), Some(end)) = (trimmed.find('<'), trimmed.find('>')) {
-        // Check if there's a display name before the <
-        let before = trimmed[..start].trim();
-        let display_name = if before.is_empty() {
-            None
-        } else {
-            Some(before.to_string())
-        };
-        let uri = trimmed[start + 1..end].to_string();
-        return (display_name, uri);
-    }
-
-    // No angle brackets, use the whole thing as URI (minus tag)
-    let uri = trimmed
-        .split(';')
-        .next()
-        .unwrap_or(trimmed)
-        .trim()
-        .to_string();
-    (None, uri)
+    Some((parts.display_name, uri.to_string()))
 }
 
 /// Parses ICE credentials from SDP.
@@ -3542,30 +3739,1096 @@ mod tests {
 
     #[test]
     fn test_parse_from_header_with_display_name() {
-        let (display, uri) = parse_from_header("\"Alice Smith\" <sip:alice@example.com>;tag=123");
+        let (display, uri) =
+            parse_from_header("\"Alice Smith\" <sip:alice@example.com>;tag=123").unwrap();
         assert_eq!(display, Some("Alice Smith".to_string()));
         assert_eq!(uri, "sip:alice@example.com");
     }
 
     #[test]
     fn test_parse_from_header_no_display_name() {
-        let (display, uri) = parse_from_header("<sip:bob@example.com>;tag=456");
+        let (display, uri) = parse_from_header("<sip:bob@example.com>;tag=456").unwrap();
         assert_eq!(display, None);
         assert_eq!(uri, "sip:bob@example.com");
     }
 
     #[test]
     fn test_parse_from_header_plain_uri() {
-        let (display, uri) = parse_from_header("sip:charlie@example.com;tag=789");
+        let (display, uri) = parse_from_header("sip:charlie@example.com;tag=789").unwrap();
         assert_eq!(display, None);
         assert_eq!(uri, "sip:charlie@example.com");
     }
 
     #[test]
     fn test_parse_from_header_unquoted_display_name() {
-        let (display, uri) = parse_from_header("Dave <sip:dave@example.com>");
+        let (display, uri) = parse_from_header("Dave <sip:dave@example.com>").unwrap();
         assert_eq!(display, Some("Dave".to_string()));
         assert_eq!(uri, "sip:dave@example.com");
+    }
+
+    /// SEC-S-002 / QA-001: `>` before `<`, alone or inside a quoted display
+    /// name, used to slice `[start + 1..end]` with `end < start` and panic.
+    #[test]
+    fn test_parse_from_header_gt_before_lt() {
+        let (display, uri) = parse_from_header(">a<sips:caller@example.com>;tag=1").unwrap();
+        assert_eq!(display.as_deref(), Some(">a"));
+        assert_eq!(uri, "sips:caller@example.com");
+
+        let (display, uri) = parse_from_header("><sip:a@b>;tag=1").unwrap();
+        assert_eq!(display.as_deref(), Some(">"));
+        assert_eq!(uri, "sip:a@b");
+
+        // The `>` after the URI is the one that closes it.
+        let (_, uri) = parse_from_header("a > b <sip:c@d>;x=\">\"").unwrap();
+        assert_eq!(uri, "sip:c@d");
+    }
+
+    /// RFC 3261 §25.1: `\"` inside a quoted display name does not end it,
+    /// and `<` / `>` inside the quotes are literal.
+    #[test]
+    fn test_parse_from_header_escaped_quotes() {
+        let (display, uri) =
+            parse_from_header(r#""a\"> x" <sips:caller@example.com>;tag=1"#).unwrap();
+        assert_eq!(display.as_deref(), Some(r#"a"> x"#));
+        assert_eq!(uri, "sips:caller@example.com");
+
+        let (display, uri) =
+            parse_from_header(r#""Bob \"The > Man\"" <sip:bob@example.com>;tag=abc"#).unwrap();
+        assert_eq!(display.as_deref(), Some(r#"Bob "The > Man""#));
+        assert_eq!(uri, "sip:bob@example.com");
+
+        let (display, uri) = parse_from_header(r#""<sip:evil@x>" <sip:real@y>"#).unwrap();
+        assert_eq!(display.as_deref(), Some("<sip:evil@x>"));
+        assert_eq!(uri, "sip:real@y");
+
+        let (display, uri) = parse_from_header(r#""back\\slash" <sip:a@b>"#).unwrap();
+        assert_eq!(display.as_deref(), Some(r"back\slash"));
+        assert_eq!(uri, "sip:a@b");
+
+        let (display, uri) =
+            parse_from_header("\"Zo\u{eb} \u{260e}\" <sip:z@example.com>").unwrap();
+        assert_eq!(display.as_deref(), Some("Zo\u{eb} \u{260e}"));
+        assert_eq!(uri, "sip:z@example.com");
+    }
+
+    #[test]
+    fn test_parse_from_header_rejects_unparsable_values() {
+        for value in [
+            "",
+            "   ",
+            "<",
+            "<>",
+            "< >",
+            "<sip:a@b",
+            "Bob <sip:a@b",
+            "\"unterminated <sip:a@b>",
+            "\"trailing escape\\",
+            "\"quoted\" sip:a@b",
+            "\"quoted\"",
+            ";tag=1",
+        ] {
+            assert!(parse_from_header(value).is_none(), "{value:?}");
+        }
+    }
+
+    /// No header text may panic the splitter, and whatever it accepts has a
+    /// non-empty URI. Every string of up to six characters over the
+    /// characters the parser treats specially (plus a multi-byte one).
+    #[test]
+    fn test_split_name_addr_never_panics() {
+        const ALPHABET: [char; 8] = ['<', '>', '"', '\\', ';', ' ', 'a', '\u{e9}'];
+        let mut value = String::new();
+        for len in 0..=6_u32 {
+            for mut n in 0..ALPHABET.len().pow(len) {
+                value.clear();
+                for _ in 0..len {
+                    value.push(ALPHABET[n % ALPHABET.len()]);
+                    n /= ALPHABET.len();
+                }
+                if let Some(parts) = split_name_addr(&value) {
+                    assert!(!parts.uri.is_empty(), "{value:?}");
+                }
+                if let Some((_, uri)) = parse_from_header(&value) {
+                    assert!(!uri.is_empty(), "{value:?}");
+                }
+            }
+        }
+    }
+
+    /// Parses an INVITE from wire text, as the transport would deliver it.
+    fn parse_invite(from: &str, contact: &str) -> SipRequest {
+        let text = format!(
+            "INVITE sips:testuser@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bKhostile\r\n\
+             Max-Forwards: 70\r\n\
+             From: {from}\r\n\
+             To: <sips:testuser@example.com>\r\n\
+             Call-ID: hostile-headers@192.0.2.50\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: {contact}\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        );
+        match proto_sip::message::SipMessage::parse(text.as_bytes()).unwrap() {
+            proto_sip::message::SipMessage::Request(request) => request,
+            proto_sip::message::SipMessage::Response(_) => panic!("expected a request"),
+        }
+    }
+
+    fn manager_with_account() -> (CallManager, mpsc::Receiver<CallManagerEvent>) {
+        let (tx, rx) = mpsc::channel(32);
+        let sip_addr: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+        let media_addr: SocketAddr = "127.0.0.1:16390".parse().unwrap();
+        let mut manager = CallManager::new(sip_addr, media_addr, tx);
+        manager.configure_account(&SipAccount::new(
+            "test-account",
+            "Test User",
+            "sips:testuser@example.com",
+            "sips:192.0.2.1:5061",
+        ));
+        (manager, rx)
+    }
+
+    /// Status codes of the responses queued so far, and whether the
+    /// application was told about an incoming call.
+    fn drain_responses(rx: &mut mpsc::Receiver<CallManagerEvent>) -> (Vec<u16>, bool) {
+        let mut statuses = Vec::new();
+        let mut rang = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                CallManagerEvent::SendResponse { response, .. } => {
+                    statuses.push(response.status.code());
+                }
+                CallManagerEvent::IncomingCall { .. } => rang = true,
+                _ => {}
+            }
+        }
+        (statuses, rang)
+    }
+
+    /// SEC-S-002 / QA-001 through the public API: the From values that
+    /// panicked `handle_incoming_invite_from` now ring normally, because
+    /// they do contain a URI.
+    #[tokio::test]
+    async fn test_incoming_invite_with_hostile_from_does_not_panic() {
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        for (from, display, uri) in [
+            (
+                ">a<sips:caller@example.com>;tag=1",
+                ">a",
+                "sips:caller@example.com",
+            ),
+            (
+                r#""a\"> x" <sips:caller@example.com>;tag=1"#,
+                r#"a"> x"#,
+                "sips:caller@example.com",
+            ),
+            (
+                r#""Bob \"The > Man\"" <sip:bob@example.com>;tag=abc"#,
+                r#"Bob "The > Man""#,
+                "sip:bob@example.com",
+            ),
+            ("><sip:a@b>;tag=1", ">", "sip:a@b"),
+        ] {
+            let (mut manager, mut rx) = manager_with_account();
+            let invite = parse_invite(from, "<sips:caller@192.0.2.50:5061>");
+            manager
+                .handle_incoming_invite_from(&invite, source, SipTransportKind::Tls)
+                .await
+                .unwrap();
+
+            let incoming = manager.incoming_calls();
+            assert_eq!(incoming.len(), 1, "{from:?}");
+            assert_eq!(incoming[0].remote_display_name.as_deref(), Some(display));
+            assert_eq!(incoming[0].remote_uri, uri);
+            assert_eq!(drain_responses(&mut rx), (vec![100, 180], true), "{from:?}");
+        }
+    }
+
+    /// A From or Contact that cannot be split is answered with 400 and
+    /// creates no call; the handler reports an error instead of panicking.
+    #[tokio::test]
+    async fn test_incoming_invite_with_unparsable_from_or_contact_gets_400() {
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let good_from = "<sips:caller@example.com>;tag=1";
+        let good_contact = "<sips:caller@192.0.2.50:5061>";
+        for (from, contact) in [
+            ("Bob <sips:caller@example.com;tag=1", good_contact),
+            (
+                "\"unterminated <sips:caller@example.com>;tag=1",
+                good_contact,
+            ),
+            ("<>;tag=1", good_contact),
+            (good_from, "<sips:caller@192.0.2.50:5061"),
+            (good_from, "\"a>b <sips:caller@192.0.2.50:5061>"),
+            (good_from, "\"quoted\" sips:caller@192.0.2.50:5061"),
+        ] {
+            let (mut manager, mut rx) = manager_with_account();
+            let invite = parse_invite(from, contact);
+            let result = manager
+                .handle_incoming_invite_from(&invite, source, SipTransportKind::Tls)
+                .await;
+
+            assert!(result.is_err(), "from={from:?} contact={contact:?}");
+            assert!(!manager.has_incoming_call());
+            assert_eq!(
+                drain_tagged_responses(&mut rx),
+                (vec![(400, true)], false),
+                "from={from:?} contact={contact:?}"
+            );
+        }
+    }
+
+    /// Like [`drain_responses`], with whether each response's To carries a
+    /// tag (RFC 3261 §8.2.6.2).
+    fn drain_tagged_responses(
+        rx: &mut mpsc::Receiver<CallManagerEvent>,
+    ) -> (Vec<(u16, bool)>, bool) {
+        let mut statuses = Vec::new();
+        let mut rang = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                CallManagerEvent::SendResponse { response, .. } => {
+                    let tagged = response
+                        .headers
+                        .get_value(&HeaderName::To)
+                        .is_some_and(|to| to.contains(";tag="));
+                    statuses.push((response.status.code(), tagged));
+                }
+                CallManagerEvent::IncomingCall { .. } => rang = true,
+                _ => {}
+            }
+        }
+        (statuses, rang)
+    }
+
+    /// R2-3: a Contact that splits but is not a SIP/SIPS URI cannot be a
+    /// BYE target, so it is answered 400 (with a To tag) and creates no
+    /// call. A `tel:` From is still accepted; a From with no URI is not.
+    #[tokio::test]
+    async fn test_incoming_invite_with_non_sip_contact_or_uriless_from_gets_400() {
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let good_from = "<sips:caller@example.com>;tag=1";
+        let good_contact = "<sips:caller@192.0.2.50:5061>";
+        for (from, contact) in [
+            (good_from, ">"),
+            (good_from, "<<>"),
+            (good_from, "<tel:+15550100>"),
+            (good_from, "sips:caller@192.0.2.50:5061>"),
+            (good_from, ";tag=1"),
+            (">>>>;tag=1", good_contact),
+            ("<\u{e9}>;tag=1", good_contact),
+        ] {
+            let (mut manager, mut rx) = manager_with_account();
+            let invite = parse_invite(from, contact);
+            let result = manager
+                .handle_incoming_invite_from(&invite, source, SipTransportKind::Tls)
+                .await;
+            assert!(result.is_err(), "from={from:?} contact={contact:?}");
+            assert!(!manager.has_incoming_call());
+            assert_eq!(
+                drain_tagged_responses(&mut rx),
+                (vec![(400, true)], false),
+                "from={from:?} contact={contact:?}"
+            );
+        }
+
+        // tel: From and addr-spec Contact with header parameters still ring.
+        for (from, contact) in [
+            ("<tel:+15550100>;tag=1", good_contact),
+            (good_from, "sips:caller@192.0.2.50:5061;expires=60"),
+        ] {
+            let (mut manager, mut rx) = manager_with_account();
+            let invite = parse_invite(from, contact);
+            manager
+                .handle_incoming_invite_from(&invite, source, SipTransportKind::Tls)
+                .await
+                .unwrap();
+            assert_eq!(drain_responses(&mut rx), (vec![100, 180], true), "{from:?}");
+        }
+    }
+
+    /// R2-3: `hangup_call` releases the active-call slot and reports
+    /// `CallEnded` even when the call agent cannot signal the hang-up, and
+    /// still returns the error.
+    #[tokio::test]
+    async fn test_hangup_releases_local_state_when_signaling_fails() {
+        let (mut manager, mut rx) = manager_with_account();
+        // A call the call agent does not know: its hang-up cannot be sent.
+        manager.active_calls.push("ghost".to_string());
+        manager.focused_call_id = Some("ghost".to_string());
+
+        let result = manager.hangup_call("ghost").await;
+
+        assert!(result.is_err());
+        assert_eq!(manager.all_call_ids(), &[] as &[String]);
+        assert_eq!(manager.focused_call_id, None);
+        let mut ended = false;
+        while let Ok(event) = rx.try_recv() {
+            if let CallManagerEvent::CallEnded { call_id, .. } = event {
+                ended = call_id == "ghost";
+            }
+        }
+        assert!(ended);
+    }
+
+    /// SEC-S-002 / QA-001: a Contact with `>` before `<` used to panic in
+    /// `accept_incoming_call`, after the call was already half set up.
+    #[tokio::test]
+    async fn test_accept_incoming_call_with_hostile_contact_does_not_panic() {
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        for contact in [
+            ">a<sips:caller@192.0.2.50:5061>",
+            r#""a>b" <sips:caller@192.0.2.50:5061>"#,
+            r#""a\"> x" <sips:caller@192.0.2.50:5061>"#,
+        ] {
+            let (mut manager, mut rx) = manager_with_account();
+            let invite = parse_invite("<sips:caller@example.com>;tag=1", contact);
+            manager
+                .handle_incoming_invite_from(&invite, source, SipTransportKind::Tls)
+                .await
+                .unwrap();
+            let call_id = manager.incoming_calls()[0].call_id.clone();
+            assert_eq!(drain_responses(&mut rx).0, vec![100, 180]);
+
+            manager.accept_incoming_call(&call_id).await.unwrap();
+
+            assert_eq!(drain_responses(&mut rx).0, vec![200], "{contact:?}");
+            assert_eq!(manager.all_call_ids(), std::slice::from_ref(&call_id));
+            // The call agent knows the call, so it can be hung up again.
+            assert_eq!(
+                manager.get_call_state(&call_id),
+                Some(CallState::Connected),
+                "{contact:?}"
+            );
+        }
+    }
+
+    // ---- QA round 1 (B5): From / Contact table through the UAS path ----
+
+    /// What the call manager must do with an INVITE carrying a given From
+    /// or Contact value.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum QaExpect {
+        /// 100 and 180 are queued, the application is told, a pending call
+        /// exists, the handler returns `Ok`.
+        Rings,
+        /// 400 is queued, nothing else; no call state; the handler returns
+        /// `Err`.
+        Rejected,
+        /// Neither the brief nor the coder's notes pin the response for this
+        /// value. It must still be exactly one of the two outcomes above,
+        /// and never a panic.
+        Unspecified,
+    }
+
+    /// What the call manager actually did.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum QaOutcome {
+        Rang,
+        Rejected400,
+    }
+
+    const QA_LONG: usize = 4000;
+
+    /// Hostile name-addr values around `<uri>`: `>` before `<`, unbalanced
+    /// brackets, quoted-pairs, lone brackets, multi-byte UTF-8 next to every
+    /// delimiter, and values close to proto-sip's header length limit.
+    /// The expectation follows the rule documented with the fix: a value
+    /// with a URI between a `<` and a later `>` (after any quoted display
+    /// name) is usable; an unterminated quoted-string, a `<` with no later
+    /// `>`, an empty URI and a quoted name without angle brackets are 400.
+    fn qa_hostile_name_addr_values(uri: &str) -> Vec<(String, QaExpect)> {
+        use QaExpect::{Rejected, Rings, Unspecified};
+
+        let mut table: Vec<(String, QaExpect)> = vec![
+            // `>` before `<`.
+            (format!(">a<{uri}>"), Rings),
+            (format!("><{uri}>"), Rings),
+            (format!(">>>> <{uri}>"), Rings),
+            (format!("a > b <{uri}>;x=\">\""), Rings),
+            // Quoted display names with quoted-pairs (RFC 3261 §25.1).
+            (format!(r#""a\"> x" <{uri}>"#), Rings),
+            (format!(r#""Bob \"The > Man\"" <{uri}>"#), Rings),
+            (format!(r#""<sip:evil@x>" <{uri}>"#), Rings),
+            (format!(r#""back\\slash" <{uri}>"#), Rings),
+            (
+                format!(r#""ends with an escaped backslash\\" <{uri}>"#),
+                Rings,
+            ),
+            (format!(r#""\\\"" <{uri}>"#), Rings),
+            (format!(r#""\>\<\"" <{uri}>"#), Rings),
+            (format!(r#""" <{uri}>"#), Rings),
+            (format!(r#""a"<{uri}>"#), Rings),
+            // Multi-byte UTF-8 next to every delimiter.
+            (format!("\"\u{e9}\"<{uri}>"), Rings),
+            (format!("\u{e9}<{uri}>\u{e9}"), Rings),
+            (format!("\"\u{260e}>\" <{uri}>"), Rings),
+            (format!("\u{1f600}>\u{1f600}<{uri}>\u{1f600}"), Rings),
+            (format!("\"\\\u{e9}\" <{uri}>"), Rings),
+            (format!("\"\u{e9}\\\"\u{1f600}\"\u{2028}<{uri}>"), Rings),
+            // Trailing garbage after a closed name-addr.
+            (format!("<{uri}>>"), Rings),
+            (format!("<{uri}>><<"), Rings),
+            (format!("<{uri}>\""), Rings),
+            // Unbalanced or lone delimiters with no usable URI.
+            ("<".to_string(), Rejected),
+            ("<>".to_string(), Rejected),
+            ("< >".to_string(), Rejected),
+            ("<<<<".to_string(), Rejected),
+            (format!("<{uri}"), Rejected),
+            (format!("Bob <{uri}"), Rejected),
+            (format!(">Bob< <{uri}"), Rejected),
+            (format!("\"unterminated <{uri}>"), Rejected),
+            (format!(r#""escaped closing quote\" <{uri}>"#), Rejected),
+            (format!(r#""a\\\" <{uri}>"#), Rejected),
+            (r#""trailing escape\"#.to_string(), Rejected),
+            ("\"".to_string(), Rejected),
+            (format!("\"quoted\" {uri}"), Rejected),
+            ("\"quoted\"".to_string(), Rejected),
+            ("<\u{e9}".to_string(), Rejected),
+            ("\u{e9}<".to_string(), Rejected),
+            ("\"\u{e9}".to_string(), Rejected),
+            ("\u{1f600}<\u{1f600}".to_string(), Rejected),
+            // Close to the 8192-byte header limit.
+            (format!("{}<{uri}>", "A".repeat(QA_LONG)), Rings),
+            (format!("{}<{uri}>", ">".repeat(QA_LONG)), Rings),
+            (format!("\"{}\" <{uri}>", "\\\"".repeat(QA_LONG / 2)), Rings),
+            (
+                format!("\"{}\" <{uri}>", "\u{e9}>".repeat(QA_LONG / 3)),
+                Rings,
+            ),
+            ("<".repeat(QA_LONG), Rejected),
+            ("\"".repeat(QA_LONG), Rejected),
+            (format!("\"{}", "\\".repeat(QA_LONG)), Rejected),
+            (format!("\"{}", "\\\"".repeat(QA_LONG / 2)), Rejected),
+            // Not pinned: values the lenient splitter takes as an addr-spec
+            // or as a name-addr with a nonsense URI.
+            (">".to_string(), Unspecified),
+            (">>>>".to_string(), Unspecified),
+            (format!("{uri}>"), Unspecified),
+            (format!("<<{uri}>"), Unspecified),
+            ("<<>".to_string(), Unspecified),
+            ("<\u{e9}>".to_string(), Unspecified),
+            ("\\\"".to_string(), Unspecified),
+            (">".repeat(QA_LONG), Unspecified),
+            (format!("<{}>", "a".repeat(QA_LONG)), Unspecified),
+            // Empty / blank values: 400 if the wire parser lets them through.
+            (String::new(), Rejected),
+            (" ".to_string(), Rejected),
+        ];
+        // A From with only a header parameter has no URI.
+        table.push((";tag=1".to_string(), Unspecified));
+        table
+    }
+
+    /// Parses an INVITE from wire text; `None` when proto-sip itself refuses
+    /// the message, in which case it never reaches the call manager.
+    fn qa_try_parse_invite(from: &str, contact: &str, call_id: &str) -> Option<SipRequest> {
+        let text = format!(
+            "INVITE sips:testuser@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bK{call_id}\r\n\
+             Max-Forwards: 70\r\n\
+             From: {from}\r\n\
+             To: <sips:testuser@example.com>\r\n\
+             Call-ID: {call_id}@192.0.2.50\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: {contact}\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        );
+        match proto_sip::message::SipMessage::parse(text.as_bytes()) {
+            Ok(proto_sip::message::SipMessage::Request(request)) => Some(request),
+            Ok(proto_sip::message::SipMessage::Response(_)) => panic!("expected a request"),
+            Err(_) => None,
+        }
+    }
+
+    /// Hands `invite` to the call manager and classifies what it did,
+    /// checking that the result, the queued responses, the application
+    /// notification and the call state all tell the same story.
+    async fn qa_deliver_invite(
+        manager: &mut CallManager,
+        rx: &mut mpsc::Receiver<CallManagerEvent>,
+        invite: &SipRequest,
+        what: &str,
+    ) -> QaOutcome {
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let pending_before = manager.incoming_calls().len();
+        let result = manager
+            .handle_incoming_invite_from(invite, source, SipTransportKind::Tls)
+            .await;
+        let (statuses, rang) = drain_responses(rx);
+        let pending_after = manager.incoming_calls().len();
+
+        if result.is_ok() {
+            assert_eq!(statuses, vec![100, 180], "{what}");
+            assert!(rang, "{what}: 180 sent but the application was not told");
+            assert_eq!(pending_after, pending_before + 1, "{what}");
+            QaOutcome::Rang
+        } else {
+            assert_eq!(statuses, vec![400], "{what}");
+            assert!(!rang, "{what}: rejected INVITE reported as incoming");
+            assert_eq!(pending_after, pending_before, "{what}: 400 left call state");
+            QaOutcome::Rejected400
+        }
+    }
+
+    /// Runs every table value as the From (`as_from`) or the Contact of an
+    /// INVITE through ONE call manager, with a well-formed INVITE after each
+    /// hostile one. Returns `(value, expectation, outcome)` for the values
+    /// the wire parser delivered.
+    async fn qa_run_invite_table(as_from: bool) -> Vec<(String, QaExpect, QaOutcome)> {
+        let good_from = "<sips:caller@example.com>;tag=1";
+        let good_contact = "<sips:caller@192.0.2.50:5061>";
+        let (mut manager, mut rx) = manager_with_account();
+        let mut observed = Vec::new();
+
+        let uri = if as_from {
+            "sips:caller@example.com"
+        } else {
+            "sips:caller@192.0.2.50:5061"
+        };
+        for (n, (value, expect)) in qa_hostile_name_addr_values(uri).into_iter().enumerate() {
+            let shown: String = value.chars().take(60).collect();
+            let what = format!(
+                "{} #{n} {shown:?} ({} bytes)",
+                if as_from { "From" } else { "Contact" },
+                value.len()
+            );
+            let (from, contact) = if as_from {
+                (value.as_str(), good_contact)
+            } else {
+                (good_from, value.as_str())
+            };
+            let Some(invite) = qa_try_parse_invite(from, contact, &format!("hostile{n}")) else {
+                // Refused by the SIP parser: cannot reach the call manager.
+                println!("QA not deliverable (proto-sip refuses the message): {what}");
+                continue;
+            };
+
+            let outcome = qa_deliver_invite(&mut manager, &mut rx, &invite, &what).await;
+            match expect {
+                QaExpect::Rings => assert_eq!(outcome, QaOutcome::Rang, "{what}"),
+                QaExpect::Rejected => assert_eq!(outcome, QaOutcome::Rejected400, "{what}"),
+                QaExpect::Unspecified => {
+                    // Recorded for the QA report (`--nocapture`).
+                    println!("QA unspecified: {what} -> {outcome:?}");
+                }
+            }
+            observed.push((value, expect, outcome));
+
+            // The next well-formed INVITE is still processed by the same
+            // call manager.
+            let valid = qa_try_parse_invite(good_from, good_contact, &format!("valid{n}")).unwrap();
+            let after = qa_deliver_invite(&mut manager, &mut rx, &valid, &what).await;
+            assert_eq!(
+                after,
+                QaOutcome::Rang,
+                "valid INVITE not processed after {what}"
+            );
+
+            // Decline what is ringing so pending calls do not pile up.
+            let ringing: Vec<String> = manager
+                .incoming_calls()
+                .iter()
+                .map(|call| call.call_id.clone())
+                .collect();
+            for call_id in ringing {
+                manager.reject_incoming_call(&call_id, true).await.unwrap();
+            }
+            let _ = drain_responses(&mut rx);
+            assert!(!manager.has_incoming_call());
+        }
+        observed
+    }
+
+    /// Fails unless the table really exercised the interesting classes: the
+    /// SIP parser must not have filtered them out before the call manager.
+    fn qa_assert_table_was_delivered(observed: &[(String, QaExpect, QaOutcome)]) {
+        let delivered = |needle: &dyn Fn(&str) -> bool| observed.iter().any(|(v, _, _)| needle(v));
+        assert!(
+            observed.len() >= 45,
+            "only {} values reached the call manager",
+            observed.len()
+        );
+        assert!(delivered(&|v| v.starts_with(">a<")), "`>` before `<`");
+        assert!(delivered(&|v| v == "<"), "only `<`");
+        assert!(delivered(&|v| v == ">"), "only `>`");
+        assert!(delivered(&|v| v.contains("\\\"")), "escaped quote");
+        assert!(delivered(&|v| v.contains("\\\\")), "escaped backslash");
+        assert!(delivered(&|v| v.contains('\u{1f600}')), "4-byte UTF-8");
+        assert!(delivered(&|v| v.len() >= QA_LONG), "very long value");
+    }
+
+    /// B5: the From table through `handle_incoming_invite_from`. No value
+    /// panics, each gets the documented response, and the call manager goes
+    /// on processing well-formed INVITEs afterwards.
+    #[tokio::test]
+    async fn test_qa_incoming_invite_from_table() {
+        let observed = qa_run_invite_table(true).await;
+        qa_assert_table_was_delivered(&observed);
+
+        // A From is the caller identity shown to the user: whatever rings
+        // must have produced a non-empty remote URI (checked per value in
+        // `qa_run_invite_table` via the 180), and the two QA-001 reproducers
+        // ring instead of panicking.
+        for reproducer in [
+            ">a<sips:caller@example.com>",
+            r#""a\"> x" <sips:caller@example.com>"#,
+        ] {
+            assert!(
+                observed
+                    .iter()
+                    .any(|(v, _, o)| v == reproducer && *o == QaOutcome::Rang),
+                "{reproducer:?}"
+            );
+        }
+    }
+
+    /// B5: the same table as the Contact of an otherwise well-formed INVITE.
+    #[tokio::test]
+    async fn test_qa_incoming_invite_contact_table() {
+        let observed = qa_run_invite_table(false).await;
+        qa_assert_table_was_delivered(&observed);
+    }
+
+    /// B5: every Contact value the call manager lets ring is then accepted
+    /// by the user. `accept_incoming_call` must not panic (it did, at the
+    /// Contact slice) and must answer 200; a hang-up attempt must not panic
+    /// either; and the same call manager then still rings and answers a
+    /// well-formed call.
+    #[tokio::test]
+    async fn test_qa_accept_incoming_call_contact_table() {
+        let good_from = "<sips:caller@example.com>;tag=1";
+        let good_contact = "<sips:caller@192.0.2.50:5061>";
+        let mut accepted = 0_usize;
+
+        let table = qa_hostile_name_addr_values("sips:caller@192.0.2.50:5061");
+        for (n, (contact, _)) in table.into_iter().enumerate() {
+            let shown: String = contact.chars().take(60).collect();
+            let what = format!("Contact #{n} {shown:?} ({} bytes)", contact.len());
+            let Some(invite) = qa_try_parse_invite(good_from, &contact, &format!("accept{n}"))
+            else {
+                continue;
+            };
+            let (mut manager, mut rx) = manager_with_account();
+            if qa_deliver_invite(&mut manager, &mut rx, &invite, &what).await != QaOutcome::Rang {
+                continue;
+            }
+
+            let call_id = manager.incoming_calls()[0].call_id.clone();
+            manager
+                .accept_incoming_call(&call_id)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: accept failed: {e}"));
+            assert_eq!(drain_responses(&mut rx).0, vec![200], "{what}");
+            assert_eq!(
+                manager.get_call_state(&call_id),
+                Some(CallState::Connected),
+                "{what}"
+            );
+            accepted += 1;
+
+            // Hanging up builds a BYE towards the Contact-derived target.
+            // Whether it succeeds for every value is asserted separately in
+            // `test_qa_call_accepted_with_any_ringing_contact_can_be_hung_up`;
+            // here it only has to return.
+            let _ = manager.hangup_call(&call_id).await;
+            let _ = manager.poll_call_events();
+            let _ = drain_responses(&mut rx);
+
+            // The next well-formed call still rings and can be answered and
+            // ended on the same call manager.
+            let valid =
+                qa_try_parse_invite(good_from, good_contact, &format!("valid-accept{n}")).unwrap();
+            assert_eq!(
+                qa_deliver_invite(&mut manager, &mut rx, &valid, &what).await,
+                QaOutcome::Rang,
+                "valid INVITE not processed after {what}"
+            );
+            let valid_id = manager
+                .incoming_calls()
+                .iter()
+                .map(|call| call.call_id.clone())
+                .next()
+                .unwrap();
+            manager
+                .accept_incoming_call(&valid_id)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: well-formed call not answerable: {e}"));
+            let _ = manager.poll_call_events();
+            let _ = drain_responses(&mut rx);
+            manager
+                .hangup_call(&valid_id)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: well-formed call could not be ended: {e}"));
+        }
+
+        assert!(
+            accepted >= 20,
+            "only {accepted} Contact values were accepted"
+        );
+    }
+
+    /// QA FINDING (round 1), EXPECTED TO FAIL until the Contact gate is
+    /// tightened. Goes beyond the brief's "cannot panic" outcome.
+    ///
+    /// The fix answers 400 to an INVITE whose Contact "cannot be split",
+    /// with the stated purpose of rejecting it "before any state" because
+    /// the Contact "becomes the dialog's remote target". The splitter is
+    /// lenient, though: values with no usable URI (`>`, `<<>`, `<e-acute>`,
+    /// a bare header parameter) pass the gate and ring. Once the user
+    /// answers such a call, the BYE cannot be built, `hangup_call` returns
+    /// `Err` before any clean-up, and the call stays in `active_calls`
+    /// with no way to end it locally. Two of them reach
+    /// `max_concurrent_calls`, after which every INVITE is answered 486
+    /// until the client restarts.
+    ///
+    /// Property asserted: every call that was allowed to ring and was
+    /// answered can be hung up, so a peer cannot pin the call manager at its
+    /// concurrent-call limit.
+    #[tokio::test]
+    async fn test_qa_call_accepted_with_any_ringing_contact_can_be_hung_up() {
+        let good_from = "<sips:caller@example.com>;tag=1";
+        let good_contact = "<sips:caller@192.0.2.50:5061>";
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+
+        // Rings, is answered, then cannot be hung up: one entry per value.
+        let mut stuck: Vec<(String, String)> = Vec::new();
+        let table = qa_hostile_name_addr_values("sips:caller@192.0.2.50:5061");
+        for (n, (contact, _)) in table.into_iter().enumerate() {
+            let Some(invite) = qa_try_parse_invite(good_from, &contact, &format!("hangup{n}"))
+            else {
+                continue;
+            };
+            let (mut manager, mut rx) = manager_with_account();
+            if manager
+                .handle_incoming_invite_from(&invite, source, SipTransportKind::Tls)
+                .await
+                .is_err()
+            {
+                continue; // 400 at the gate: no call, nothing to hang up.
+            }
+            let call_id = manager.incoming_calls()[0].call_id.clone();
+            let _ = drain_responses(&mut rx);
+            if manager.accept_incoming_call(&call_id).await.is_err() {
+                continue;
+            }
+            let _ = drain_responses(&mut rx);
+            if let Err(e) = manager.hangup_call(&call_id).await {
+                assert_eq!(manager.all_call_ids(), std::slice::from_ref(&call_id));
+                stuck.push((contact, e.to_string()));
+            }
+        }
+
+        // The consequence, on one call manager: answer two such calls, then
+        // send a well-formed INVITE.
+        let busy_after_two = if stuck.len() >= 2 {
+            let (mut manager, mut rx) = manager_with_account();
+            for (n, (contact, _)) in stuck.iter().take(2).enumerate() {
+                let invite = qa_try_parse_invite(good_from, contact, &format!("pin{n}")).unwrap();
+                manager
+                    .handle_incoming_invite_from(&invite, source, SipTransportKind::Tls)
+                    .await
+                    .unwrap();
+                let call_id = manager.incoming_calls()[0].call_id.clone();
+                manager.accept_incoming_call(&call_id).await.unwrap();
+                let _ = manager.hangup_call(&call_id).await;
+                let _ = manager.poll_call_events();
+                let _ = drain_responses(&mut rx);
+            }
+            let valid = qa_try_parse_invite(good_from, good_contact, "after-pin").unwrap();
+            manager
+                .handle_incoming_invite_from(&valid, source, SipTransportKind::Tls)
+                .await
+                .unwrap();
+            drain_responses(&mut rx) == (vec![486], false)
+        } else {
+            false
+        };
+
+        let listing: Vec<String> = stuck
+            .iter()
+            .map(|(contact, error)| {
+                let shown: String = contact.chars().take(40).collect();
+                format!("Contact {shown:?} ({} bytes): {error}", contact.len())
+            })
+            .collect();
+        assert!(
+            stuck.is_empty(),
+            "{} Contact value(s) pass the 400 gate, ring, are answered with 200 and then \
+             cannot be hung up:\n  {}\n\
+             after two such calls a well-formed INVITE is answered 486: {busy_after_two}",
+            stuck.len(),
+            listing.join("\n  "),
+        );
+    }
+
+    // ---- QA round 1 (B1): every response carries the receive transport ----
+
+    /// A request as it appears on the wire. `via_transport` is the text the
+    /// peer wrote into its Via; `to_tag` is empty for dialog-creating
+    /// requests.
+    fn qa_wire_request(
+        method: &str,
+        via_transport: &str,
+        sip_call_id: &str,
+        to_tag: &str,
+        cseq: u32,
+        from: &str,
+        body: &str,
+    ) -> SipRequest {
+        let to_tag = if to_tag.is_empty() {
+            String::new()
+        } else {
+            format!(";tag={to_tag}")
+        };
+        let content_type = if method == "INFO" {
+            "Content-Type: application/dtmf-relay\r\n"
+        } else if body.is_empty() {
+            ""
+        } else {
+            "Content-Type: application/sdp\r\n"
+        };
+        let text = format!(
+            "{method} sips:testuser@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/{via_transport} 192.0.2.50:5061;branch=z9hG4bK{sip_call_id}{cseq}{method}\r\n\
+             Max-Forwards: 70\r\n\
+             From: {from}\r\n\
+             To: <sips:testuser@example.com>{to_tag}\r\n\
+             Call-ID: {sip_call_id}\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Contact: <sips:caller@192.0.2.50:5061>\r\n\
+             {content_type}\
+             Content-Length: {}\r\n\
+             \r\n\
+             {body}",
+            body.len()
+        );
+        match proto_sip::message::SipMessage::parse(text.as_bytes()).unwrap() {
+            proto_sip::message::SipMessage::Request(request) => request,
+            proto_sip::message::SipMessage::Response(_) => panic!("expected a request"),
+        }
+    }
+
+    /// Status code and transport of every response queued so far.
+    fn qa_drain_response_transports(
+        rx: &mut mpsc::Receiver<CallManagerEvent>,
+    ) -> Vec<(u16, SipTransportKind)> {
+        let mut responses = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let CallManagerEvent::SendResponse {
+                response,
+                transport,
+                ..
+            } = event
+            {
+                responses.push((response.status.code(), transport));
+            }
+        }
+        responses
+    }
+
+    /// Collects the responses of a scenario and checks each one is queued
+    /// for the transport the requests arrived on.
+    struct QaTransportCheck {
+        received_on: SipTransportKind,
+        via_text: &'static str,
+        source: SocketAddr,
+        statuses_seen: Vec<u16>,
+    }
+
+    impl QaTransportCheck {
+        const FROM: &'static str = "<sips:caller@example.com>;tag=remote";
+
+        fn request(&self, method: &str, sip_call_id: &str, to_tag: &str, cseq: u32) -> SipRequest {
+            qa_wire_request(
+                method,
+                self.via_text,
+                sip_call_id,
+                to_tag,
+                cseq,
+                Self::FROM,
+                "",
+            )
+        }
+
+        /// Every response queued since the last step goes to `received_on`,
+        /// and there is at least one.
+        fn step(&mut self, step: &str, rx: &mut mpsc::Receiver<CallManagerEvent>) {
+            let responses = qa_drain_response_transports(rx);
+            assert!(!responses.is_empty(), "{step}: no response was queued");
+            for (status, transport) in &responses {
+                assert_eq!(
+                    *transport, self.received_on,
+                    "{step}: {status} queued for {transport:?}, request arrived on {:?} \
+                     (Via says {})",
+                    self.received_on, self.via_text
+                );
+            }
+            self.statuses_seen
+                .extend(responses.into_iter().map(|(status, _)| status));
+        }
+    }
+
+    /// INVITEs that never become a dialog: cancelled while ringing,
+    /// declined by the user, and one with an unparsable From.
+    async fn qa_responses_before_answer(
+        check: &mut QaTransportCheck,
+        manager: &mut CallManager,
+        rx: &mut mpsc::Receiver<CallManagerEvent>,
+    ) {
+        let (source, received_on) = (check.source, check.received_on);
+
+        let invite = check.request("INVITE", "qa-cancelled", "", 1);
+        manager
+            .handle_sip_request_from(&invite, source, received_on)
+            .await
+            .unwrap();
+        check.step("INVITE (100/180)", rx);
+        let cancel = check.request("CANCEL", "qa-cancelled", "", 1);
+        manager
+            .handle_sip_request_from(&cancel, source, received_on)
+            .await
+            .unwrap();
+        check.step("CANCEL of a ringing call", rx);
+
+        let invite = check.request("INVITE", "qa-declined", "", 1);
+        manager
+            .handle_sip_request_from(&invite, source, received_on)
+            .await
+            .unwrap();
+        let _ = qa_drain_response_transports(rx);
+        let call_id = manager.incoming_calls()[0].call_id.clone();
+        manager.reject_incoming_call(&call_id, false).await.unwrap();
+        check.step("486 on reject", rx);
+
+        let invite = qa_wire_request("INVITE", check.via_text, "qa-malformed", "", 1, "<", "");
+        assert!(
+            manager
+                .handle_sip_request_from(&invite, source, received_on)
+                .await
+                .is_err()
+        );
+        check.step("400 for a malformed From", rx);
+    }
+
+    /// An answered INVITE, then INFO, re-INVITE and BYE in its dialog, then
+    /// BYE and CANCEL for a dialog that does not exist.
+    async fn qa_responses_in_and_out_of_dialog(
+        check: &mut QaTransportCheck,
+        manager: &mut CallManager,
+        rx: &mut mpsc::Receiver<CallManagerEvent>,
+    ) {
+        let (source, received_on) = (check.source, check.received_on);
+
+        let invite = check.request("INVITE", "qa-answered", "", 1);
+        manager
+            .handle_sip_request_from(&invite, source, received_on)
+            .await
+            .unwrap();
+        let _ = qa_drain_response_transports(rx);
+        let (call_id, local_tag) = {
+            let incoming = manager.incoming_calls()[0];
+            (incoming.call_id.clone(), incoming.local_tag.clone())
+        };
+        manager.accept_incoming_call(&call_id).await.unwrap();
+        check.step("200 on accept", rx);
+
+        let info = qa_wire_request(
+            "INFO",
+            check.via_text,
+            "qa-answered",
+            &local_tag,
+            2,
+            QaTransportCheck::FROM,
+            "Signal=5\r\nDuration=160\r\n",
+        );
+        manager
+            .handle_sip_request_from(&info, source, received_on)
+            .await
+            .unwrap();
+        check.step("200 for INFO", rx);
+
+        let sdp = "v=0\r\n\
+                   o=- 1 2 IN IP4 192.0.2.50\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.0.2.50\r\n\
+                   t=0 0\r\n\
+                   m=audio 40000 RTP/AVP 0\r\n\
+                   a=sendonly\r\n";
+        let reinvite = qa_wire_request(
+            "INVITE",
+            check.via_text,
+            "qa-answered",
+            &local_tag,
+            3,
+            QaTransportCheck::FROM,
+            sdp,
+        );
+        let _ = manager
+            .handle_sip_request_from(&reinvite, source, received_on)
+            .await;
+        check.step("re-INVITE", rx);
+
+        let bye = check.request("BYE", "qa-answered", &local_tag, 4);
+        manager
+            .handle_sip_request_from(&bye, source, received_on)
+            .await
+            .unwrap();
+        check.step("200 for BYE", rx);
+
+        for method in ["BYE", "CANCEL"] {
+            let request = check.request(method, "qa-unknown", "stale", 9);
+            manager
+                .handle_sip_request_from(&request, source, received_on)
+                .await
+                .unwrap();
+            check.step("481", rx);
+        }
+    }
+
+    /// Drives every response-producing path of the UAS (provisional and
+    /// final INVITE responses, 400, 486, CANCEL, INFO, re-INVITE, BYE and
+    /// the 481s) with requests received on `received_on` whose Via names
+    /// `via_text`, and checks that each queued response is addressed to
+    /// `received_on`.
+    async fn qa_assert_all_responses_follow(received_on: SipTransportKind, via_text: &'static str) {
+        let (mut manager, mut rx) = manager_with_account();
+        let mut check = QaTransportCheck {
+            received_on,
+            via_text,
+            source: "192.0.2.50:5061".parse().unwrap(),
+            statuses_seen: Vec::new(),
+        };
+
+        qa_responses_before_answer(&mut check, &mut manager, &mut rx).await;
+        qa_responses_in_and_out_of_dialog(&mut check, &mut manager, &mut rx).await;
+
+        // The scenario really went through the distinct response sites.
+        for status in [100, 180, 200, 400, 481, 486] {
+            assert!(
+                check.statuses_seen.contains(&status),
+                "no {status} was produced: {:?}",
+                check.statuses_seen
+            );
+        }
+    }
+
+    /// B1: a request that arrived over TLS is answered over TLS at every
+    /// response site, although its Via says `UDP`.
+    #[tokio::test]
+    async fn test_qa_every_response_site_answers_on_tls_despite_udp_via() {
+        qa_assert_all_responses_follow(SipTransportKind::Tls, "UDP").await;
+    }
+
+    /// B1, `insecure-transports` builds: the same holds the other way
+    /// round. The transport comes from the event, not from the Via text.
+    #[cfg(feature = "insecure-transports")]
+    #[tokio::test]
+    async fn test_qa_every_response_site_answers_on_udp_despite_tls_via() {
+        qa_assert_all_responses_follow(SipTransportKind::Udp, "TLS").await;
     }
 
     /// Builds an in-dialog request (BYE/CANCEL) for an unknown dialog.
@@ -3611,7 +4874,7 @@ mod tests {
         let request = build_unmatched_request(proto_sip::method::Method::Bye);
         let source: SocketAddr = "192.168.1.50:5060".parse().unwrap();
         manager
-            .handle_sip_request_from(&request, source)
+            .handle_sip_request_from(&request, source, SipTransportKind::Tls)
             .await
             .unwrap();
 
@@ -3620,6 +4883,7 @@ mod tests {
             CallManagerEvent::SendResponse {
                 response,
                 destination,
+                transport,
             } => {
                 assert_eq!(
                     response.status.code(),
@@ -3627,6 +4891,9 @@ mod tests {
                     "unmatched BYE must get 481 Call/Transaction Does Not Exist"
                 );
                 assert_eq!(destination, source);
+                // The request's Via says UDP; the response still goes back
+                // on the transport the request arrived on.
+                assert_eq!(transport, SipTransportKind::Tls);
                 // The 481 belongs to the BYE's transaction: Via/CSeq copied
                 assert_eq!(response.headers.get_value(&HeaderName::CSeq), Some("2 BYE"));
                 assert!(
@@ -3655,7 +4922,7 @@ mod tests {
         let request = build_unmatched_request(proto_sip::method::Method::Cancel);
         let source: SocketAddr = "192.168.1.50:5060".parse().unwrap();
         manager
-            .handle_sip_request_from(&request, source)
+            .handle_sip_request_from(&request, source, SipTransportKind::Tls)
             .await
             .unwrap();
 

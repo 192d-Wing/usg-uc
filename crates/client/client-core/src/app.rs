@@ -9,18 +9,37 @@
 use crate::call_manager::{CallManager, CallManagerEvent};
 use crate::contact_manager::ContactManager;
 use crate::settings::SettingsManager;
-use crate::sip_transport::{CertVerificationMode, SipTransport, TransportEvent};
+use crate::sip_transport::{CertVerificationMode, SipTransport, SipTransportKind, TransportEvent};
 use crate::{AppError, AppResult};
 use client_sip_ua::{RegistrationAgent, RegistrationEvent};
 use client_types::audio::CodecPreference;
 use client_types::{
     CallInfo, CallQualityMetrics, CallState, DtmfDigit, RegistrationState, SipAccount,
 };
+#[cfg(feature = "insecure-transports")]
 use proto_sip::header::HeaderName;
+use proto_sip::message::SipRequest;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
+
+/// Most transport events handled in one [`ClientApp::poll_events`] pass.
+///
+/// The receive tasks refill the transport queue while the pump drains it, so
+/// without a bound a sustained inbound burst would keep one pass (and the
+/// client lock its caller holds) running indefinitely. Events beyond the
+/// bound stay queued for the next pass.
+const MAX_TRANSPORT_EVENTS_PER_POLL: usize = 64;
+
+/// Port advertised in Via and Contact when the shell supplies none.
+///
+/// A TLS-only client has no SIP listening socket (responses and in-dialog
+/// requests use the connection it opened to the registrar), so the port is
+/// nominal. Port 0 is not a valid SIP port and a registrar rejects it;
+/// 5061 is the SIP-over-TLS default (RFC 3261 §19.1.1, §18.1.1), i.e. what a URI
+/// with no port means.
+const DEFAULT_SIP_TLS_PORT: u16 = 5061;
 
 /// Application events broadcast to the GUI.
 #[derive(Debug, Clone)]
@@ -265,6 +284,10 @@ impl ClientApp {
 
         let contact_manager = Arc::new(RwLock::new(contact_manager));
 
+        // Without a UDP SIP socket nothing replaces an unset port with a
+        // bound one, so make sure Via/Contact never carry `:0`.
+        let local_sip_addr = advertised_sip_addr(local_sip_addr);
+
         // Create registration agent channel
         let (reg_event_tx, reg_event_rx) = mpsc::channel(32);
         let registration_agent = RegistrationAgent::new(local_sip_addr, reg_event_tx);
@@ -480,6 +503,11 @@ impl ClientApp {
     /// to use the actual bound UDP port for correct Via/Contact headers.
     ///
     /// Returns `None` if the transport is not initialized.
+    ///
+    /// Only in `insecure-transports` builds: a TLS-only build never binds a
+    /// UDP SIP socket.
+    // NIST 800-53 Rev5: SC-8, CM-7 (no cleartext SIP listener by default).
+    #[cfg(feature = "insecure-transports")]
     pub async fn get_udp_socket_for_receive(
         &mut self,
         use_ipv6: bool,
@@ -835,21 +863,8 @@ impl ClientApp {
 
                 // Send via SIP transport
                 if let Some(ref transport) = self.sip_transport {
-                    // Detect transport type from Via header (e.g., "SIP/2.0/UDP" or "SIP/2.0/TLS")
-                    let via_header = request.headers.get_value(&HeaderName::Via);
-                    let use_udp = via_header.as_ref().is_some_and(|via| via.contains("/UDP"));
-
-                    debug!(
-                        via = ?via_header,
-                        use_udp = use_udp,
-                        "Detected transport type"
-                    );
-
-                    let result = if use_udp {
-                        transport.send_request_udp(&request, destination).await
-                    } else {
-                        transport.send_request(&request, destination).await
-                    };
+                    let result =
+                        send_request_on_account_transport(transport, &request, destination).await;
 
                     if let Err(e) = result {
                         error!(error = %e, "Failed to send SIP request");
@@ -964,27 +979,31 @@ impl ClientApp {
             CallManagerEvent::SendResponse {
                 response,
                 destination,
+                transport: received_on,
             } => {
-                // Forward response to transport layer
-                // Detect transport type from Via header
-                let via_header = response
-                    .headers
-                    .get_value(&proto_sip::header::HeaderName::Via);
-                let use_udp = via_header.as_ref().is_some_and(|via| via.contains("/UDP"));
-
+                // Forward response to transport layer on the transport the
+                // request arrived on (RFC 3261 §18.2.2). The Via text is
+                // peer-controlled and is never used to pick the transport: a
+                // request received over TLS is answered over TLS only.
+                // NIST 800-53 Rev5: SC-8, SC-8(1); SC-23 (response bound to the
+                // receiving connection only; REGISTER responses are not yet
+                // matched to their transaction).
                 info!(
                     status = response.status.code(),
                     destination = %destination,
-                    via = ?via_header,
-                    use_udp = use_udp,
+                    transport = ?received_on,
                     "Sending SIP response"
                 );
 
                 if let Some(transport) = &self.sip_transport {
-                    let result = if use_udp {
-                        transport.send_response_udp(&response, destination).await
-                    } else {
-                        transport.send_response(&response, destination).await
+                    let result = match received_on {
+                        SipTransportKind::Tls => {
+                            transport.send_response(&response, destination).await
+                        }
+                        #[cfg(feature = "insecure-transports")]
+                        SipTransportKind::Udp => {
+                            transport.send_response_udp(&response, destination).await
+                        }
                     };
 
                     match &result {
@@ -1083,7 +1102,11 @@ impl ClientApp {
                     }
                 }
             }
-            TransportEvent::RequestReceived { request, source } => {
+            TransportEvent::RequestReceived {
+                request,
+                source,
+                transport,
+            } => {
                 info!(
                     source = %source,
                     method = %request.method,
@@ -1093,7 +1116,7 @@ impl ClientApp {
                 // Route to call manager for handling (INVITE, BYE, CANCEL, etc.)
                 if let Err(e) = self
                     .call_manager
-                    .handle_sip_request_from(&request, source)
+                    .handle_sip_request_from(&request, source, transport)
                     .await
                 {
                     warn!(error = %e, "Failed to handle incoming SIP request");
@@ -1134,32 +1157,27 @@ impl ClientApp {
     pub async fn poll_events(&mut self) -> AppResult<()> {
         trace!("poll_events called");
 
-        // Process registration events inline (NLL allows the temporary
-        // borrow on reg_event_rx to expire before handle borrows &mut self).
-        while let Ok(event) = self.reg_event_rx.try_recv() {
-            self.handle_registration_event(event).await?;
-        }
+        // Events queued since the last pass (UI commands, timers).
+        self.drain_internal_events().await?;
 
-        // Process transport events inline (take receiver to release borrow on self)
-        if let Some(mut rx) = self.transport_event_rx.take() {
-            while let Ok(event) = rx.try_recv() {
-                self.handle_transport_event(event).await?;
-            }
-            self.transport_event_rx = Some(rx);
-        }
-
-        // Poll call events and send requests via transport
-        let call_events = self.call_manager.poll_call_events();
-        if !call_events.is_empty() {
-            info!(count = call_events.len(), "Processing call agent events");
-        }
-        for event in call_events {
-            self.handle_call_agent_event(event).await?;
-        }
-
-        // Process call manager events inline (state changes, responses to send)
-        while let Ok(event) = self.call_event_rx.try_recv() {
-            self.handle_call_event(event).await?;
+        // Transport events, one at a time, bounded per pass. The receiver
+        // stays in `self` for the whole pass (the borrow ends when
+        // `try_recv` returns), so no error, early return or unwind in a
+        // handler can lose it and silence inbound SIP.
+        // NIST 800-53 Rev5: SC-5 (at most MAX_TRANSPORT_EVENTS_PER_POLL
+        // transport events per pass; receiver retained across errors and
+        // cancellation). The pump still awaits the shell event channel.
+        // POAM: POA&M-321 — awaited app_event_tx sends park the pump while the shell does
+        // not drain its event channel.
+        for _ in 0..MAX_TRANSPORT_EVENTS_PER_POLL {
+            let Some(event) = self.next_transport_event() else {
+                break;
+            };
+            self.handle_transport_event(event).await?;
+            // Everything this event produced is sent (requests, responses)
+            // or forwarded before the next one is taken: see
+            // `drain_internal_events`.
+            self.drain_internal_events().await?;
         }
 
         // Drive call-agent timers (491 glare re-INVITE retry, RFC 3261 §14.1)
@@ -1171,6 +1189,56 @@ impl ClientApp {
             .await
             .map_err(|e| AppError::Sip(e.to_string()))?;
 
+        Ok(())
+    }
+
+    /// Takes the next queued transport event, if any.
+    fn next_transport_event(&mut self) -> Option<TransportEvent> {
+        self.transport_event_rx.as_mut()?.try_recv().ok()
+    }
+
+    /// Drains the registration, call-agent and call-manager queues.
+    ///
+    /// These are bounded channels whose only reader is this pump, while
+    /// their writers (`RegistrationAgent`, `CallAgent`, `CallManager`) run
+    /// inside the pump's own handlers and await capacity. They are therefore
+    /// drained after every single input event, and the call-manager queue
+    /// after every call-agent event, so the depth of each queue is bounded
+    /// by what one event can emit (a handful) and not by how many events
+    /// arrive in a pass. Draining only after all transport events had been
+    /// handled let 33 queued responses park the pump on its own channel.
+    // NIST 800-53 Rev5: SC-5 (bounded queues; no self-deadlock under a burst).
+    async fn drain_internal_events(&mut self) -> AppResult<()> {
+        // Empty the call-manager queue first: commands may have left it
+        // full, and each call-agent event below can add to it with an
+        // awaited send (PERF-R1-001).
+        // NIST 800-53 Rev5: SC-5 (no self-deadlock on a queue left full by commands).
+        self.drain_call_manager_events().await?;
+
+        // Registration events (NLL lets the temporary borrow on
+        // reg_event_rx expire before the handler borrows &mut self).
+        while let Ok(event) = self.reg_event_rx.try_recv() {
+            self.handle_registration_event(event).await?;
+        }
+
+        // Call agent events: send requests via transport, track state
+        let call_events = self.call_manager.poll_call_events();
+        if !call_events.is_empty() {
+            info!(count = call_events.len(), "Processing call agent events");
+        }
+        for event in call_events {
+            self.handle_call_agent_event(event).await?;
+            self.drain_call_manager_events().await?;
+        }
+
+        self.drain_call_manager_events().await
+    }
+
+    /// Processes queued call manager events (state changes, responses to send).
+    async fn drain_call_manager_events(&mut self) -> AppResult<()> {
+        while let Ok(event) = self.call_event_rx.try_recv() {
+            self.handle_call_event(event).await?;
+        }
         Ok(())
     }
 
@@ -1192,21 +1260,8 @@ impl ClientApp {
                 );
 
                 if let Some(ref transport) = self.sip_transport {
-                    // Detect transport type from Via header
-                    let via_header = request.headers.get_value(&HeaderName::Via);
-                    let use_udp = via_header.as_ref().is_some_and(|via| via.contains("/UDP"));
-
-                    info!(
-                        via = ?via_header,
-                        use_udp = use_udp,
-                        "Sending call request via transport"
-                    );
-
-                    let result = if use_udp {
-                        transport.send_request_udp(&request, destination).await
-                    } else {
-                        transport.send_request(&request, destination).await
-                    };
+                    let result =
+                        send_request_on_account_transport(transport, &request, destination).await;
 
                     match &result {
                         Ok(()) => info!(method = %request.method, "Call request sent successfully"),
@@ -1339,6 +1394,42 @@ impl ClientApp {
     }
 }
 
+/// Returns the signaling address to advertise in Via and Contact: the
+/// configured one, with [`DEFAULT_SIP_TLS_PORT`] in place of an unset port.
+// RFC 3261 §19.1.1, §18.1.1: no port means the transport default. proto-sip
+// rejects port 0, so an unset port is never advertised as 0.
+const fn advertised_sip_addr(configured: SocketAddr) -> SocketAddr {
+    if configured.port() == 0 {
+        SocketAddr::new(configured.ip(), DEFAULT_SIP_TLS_PORT)
+    } else {
+        configured
+    }
+}
+
+/// Sends a locally built request on the account's signaling transport.
+///
+/// Default builds are TLS-only: there is no other send path to select. With
+/// `insecure-transports`, UDP is used when this client wrote `UDP` into the
+/// top Via of the request it built from the account's transport preference;
+/// that text is ours, not a peer's.
+// NIST 800-53 Rev5: SC-8, SC-8(1) (TLS-only signaling in default builds).
+async fn send_request_on_account_transport(
+    transport: &SipTransport,
+    request: &SipRequest,
+    destination: SocketAddr,
+) -> AppResult<()> {
+    #[cfg(feature = "insecure-transports")]
+    if request
+        .headers
+        .get_value(&HeaderName::Via)
+        .is_some_and(|via| via.contains("/UDP"))
+    {
+        return transport.send_request_udp(request, destination).await;
+    }
+
+    transport.send_request(request, destination).await
+}
+
 /// Builds the ICE configuration from the persisted network settings.
 ///
 /// `stun_server` accepts `stun:host[:port]` or `host[:port]` (default port
@@ -1427,5 +1518,986 @@ mod tests {
         let result = ClientApp::new(sip_addr, media_addr, tx);
         // Just verify it doesn't panic during construction
         let _ = result;
+    }
+
+    use proto_sip::message::SipMessage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A `ClientApp` over `dir` with default settings and no account. It
+    /// never reads the user profile or the OS keychain, in any feature set.
+    fn hermetic_app(dir: &std::path::Path, app_event_tx: mpsc::Sender<AppEvent>) -> ClientApp {
+        let settings = SettingsManager::without_credential_store(dir.join("settings.toml"));
+        let contacts = ContactManager::with_path(dir.join("contacts.json")).unwrap();
+        ClientApp::from_parts(
+            "127.0.0.1:5061".parse().unwrap(),
+            "127.0.0.1:16384".parse().unwrap(),
+            app_event_tx,
+            settings,
+            contacts,
+        )
+        .unwrap()
+    }
+
+    fn peer() -> SocketAddr {
+        "192.0.2.50:5061".parse().unwrap()
+    }
+
+    fn parse_request(text: &str) -> SipRequest {
+        match SipMessage::parse(text.as_bytes()).unwrap() {
+            SipMessage::Request(request) => request,
+            SipMessage::Response(_) => panic!("expected a request"),
+        }
+    }
+
+    /// A transport event for `text` as received from `source` over TLS.
+    fn tls_request(text: &str, source: SocketAddr) -> TransportEvent {
+        TransportEvent::RequestReceived {
+            request: parse_request(text),
+            source,
+            transport: SipTransportKind::Tls,
+        }
+    }
+
+    fn invite(from: &str, call_id: &str) -> String {
+        format!(
+            "INVITE sips:testuser@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bK{call_id}\r\n\
+             Max-Forwards: 70\r\n\
+             From: {from}\r\n\
+             To: <sips:testuser@example.com>\r\n\
+             Call-ID: {call_id}@192.0.2.50\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: <sips:caller@192.0.2.50:5061>\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        )
+    }
+
+    /// An INFO carrying one DTMF digit: the call manager answers it (one
+    /// queued response) and reports the digit (one queued event).
+    fn dtmf_info(n: usize) -> String {
+        let body = "Signal=5\r\nDuration=160\r\n";
+        format!(
+            "INFO sips:testuser@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bKinfo{n}\r\n\
+             Max-Forwards: 70\r\n\
+             From: <sips:caller@example.com>;tag=remote\r\n\
+             To: <sips:testuser@example.com>;tag=local\r\n\
+             Call-ID: burst@192.0.2.50\r\n\
+             CSeq: {cseq} INFO\r\n\
+             Content-Type: application/dtmf-relay\r\n\
+             Content-Length: {len}\r\n\
+             \r\n\
+             {body}",
+            cseq = n + 1,
+            len = body.len()
+        )
+    }
+
+    /// A BYE for a dialog that does not exist (answered with 481) whose Via
+    /// names `via_transport` and `via_addr`.
+    fn unmatched_bye(via_transport: &str, via_addr: SocketAddr) -> String {
+        format!(
+            "BYE sips:testuser@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/{via_transport} {via_addr};branch=z9hG4bKnodialog\r\n\
+             Max-Forwards: 70\r\n\
+             From: <sips:caller@example.com>;tag=remote\r\n\
+             To: <sips:testuser@example.com>;tag=stale\r\n\
+             Call-ID: no-such-dialog@192.0.2.50\r\n\
+             CSeq: 2 BYE\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        )
+    }
+
+    fn transport_sender(app: &ClientApp) -> mpsc::Sender<TransportEvent> {
+        app.sip_transport.as_ref().unwrap().event_sender()
+    }
+
+    /// NIST-001 / SEC-S-001: in a TLS-only build a request whose Via says
+    /// `UDP` is still answered on the transport it arrived on. Nothing is
+    /// sent to the peer over UDP (the old code bound a UDP socket here and
+    /// sent the response in cleartext).
+    #[cfg(not(feature = "insecure-transports"))]
+    #[tokio::test]
+    async fn test_tls_only_build_never_answers_over_udp() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+
+        // The "peer": where a cleartext response would land.
+        let observer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let observer_addr = observer.local_addr().unwrap();
+
+        transport_sender(&app)
+            .send(tls_request(
+                &unmatched_bye("UDP", observer_addr),
+                observer_addr,
+            ))
+            .await
+            .unwrap();
+        app.poll_events().await.unwrap();
+
+        let mut buf = [0u8; 2048];
+        let leaked =
+            tokio::time::timeout(Duration::from_millis(300), observer.recv_from(&mut buf)).await;
+        assert!(
+            leaked.is_err(),
+            "TLS-only build sent a SIP response over UDP"
+        );
+    }
+
+    /// With `insecure-transports`, the response goes back on the transport
+    /// carried by the event, whatever the request's Via text says.
+    #[cfg(feature = "insecure-transports")]
+    #[tokio::test]
+    async fn test_response_follows_receive_transport_not_via_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+
+        let observer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let observer_addr = observer.local_addr().unwrap();
+        let mut buf = [0u8; 2048];
+
+        // Received over TLS, Via says UDP: nothing leaves over UDP.
+        transport_sender(&app)
+            .send(tls_request(
+                &unmatched_bye("UDP", observer_addr),
+                observer_addr,
+            ))
+            .await
+            .unwrap();
+        app.poll_events().await.unwrap();
+        let leaked =
+            tokio::time::timeout(Duration::from_millis(300), observer.recv_from(&mut buf)).await;
+        assert!(
+            leaked.is_err(),
+            "request received over TLS answered over UDP"
+        );
+
+        // Received over UDP, Via says TLS: answered over UDP to the source.
+        transport_sender(&app)
+            .send(TransportEvent::RequestReceived {
+                request: parse_request(&unmatched_bye("TLS", observer_addr)),
+                source: observer_addr,
+                transport: SipTransportKind::Udp,
+            })
+            .await
+            .unwrap();
+        app.poll_events().await.unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), observer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(buf[..n].starts_with(b"SIP/2.0 481"));
+    }
+
+    /// With no UDP SIP socket, nothing supplies a local signaling port. A
+    /// shell that passes port 0 (the desktop GUI does) must not make the
+    /// REGISTER advertise `:0`, which is not a valid SIP port: the Via and
+    /// Contact have to survive the parser a registrar uses.
+    #[tokio::test]
+    async fn test_register_without_udp_socket_advertises_valid_port() {
+        use proto_sip::header_params::{NameAddr, ViaHeader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let settings = SettingsManager::without_credential_store(dir.path().join("settings.toml"));
+        let contacts = ContactManager::with_path(dir.path().join("contacts.json")).unwrap();
+        let unspecified: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut app =
+            ClientApp::from_parts(unspecified, unspecified, app_tx, settings, contacts).unwrap();
+
+        let account = SipAccount::new(
+            "test-account",
+            "Test User",
+            "sips:testuser@example.com",
+            "sips:192.0.2.1:5061",
+        );
+        app.register_account(&account).await.unwrap();
+
+        // The REGISTER is queued for the pump; inspect it without sending.
+        let register = std::iter::from_fn(|| app.reg_event_rx.try_recv().ok())
+            .find_map(|event| match event {
+                RegistrationEvent::SendRequest { request, .. } => Some(request),
+                _ => None,
+            })
+            .unwrap();
+
+        let via: ViaHeader = register
+            .headers
+            .get_value(&proto_sip::header::HeaderName::Via)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(via.port, Some(DEFAULT_SIP_TLS_PORT));
+
+        let contact: NameAddr = register
+            .headers
+            .get_value(&proto_sip::header::HeaderName::Contact)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(contact.uri.port, Some(DEFAULT_SIP_TLS_PORT));
+    }
+
+    /// SEC-S-002 / QA-001: a From with `>` before `<` used to panic inside
+    /// the pump with the transport receiver taken out of `self`. The
+    /// receiver stays in place across that message, across a handler error
+    /// (unparsable From, answered 400), and inbound SIP keeps flowing.
+    #[tokio::test]
+    async fn test_transport_receiver_survives_handler_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, mut app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let transport_tx = transport_sender(&app);
+
+        for (from, call_id) in [
+            (">a<sips:first@example.com>;tag=1", "gtlt"),
+            ("Bob <sips:broken@example.com;tag=1", "unclosed"),
+            ("<sips:second@example.com>;tag=1", "valid"),
+        ] {
+            transport_tx
+                .send(tls_request(&invite(from, call_id), peer()))
+                .await
+                .unwrap();
+            app.poll_events().await.unwrap();
+            assert!(
+                app.transport_event_rx.is_some(),
+                "receiver lost after {from:?}"
+            );
+        }
+
+        let mut ringing = Vec::new();
+        while let Ok(event) = app_rx.try_recv() {
+            if let AppEvent::IncomingCall { remote_uri, .. } = event {
+                ringing.push(remote_uri);
+            }
+        }
+        assert_eq!(
+            ringing,
+            ["sips:first@example.com", "sips:second@example.com"]
+        );
+    }
+
+    /// The pump can be cancelled mid-handler (a caller-side timeout, a task
+    /// abort). The receiver used to live in a local for the duration of the
+    /// pass and was dropped with the future; it must stay in `self`.
+    #[tokio::test]
+    async fn test_transport_receiver_survives_cancelled_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        // One slot: the second forwarded event parks the handler.
+        let (app_tx, mut app_rx) = mpsc::channel(1);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let transport_tx = transport_sender(&app);
+
+        for n in 0..2 {
+            transport_tx
+                .send(TransportEvent::Error {
+                    message: format!("error {n}"),
+                })
+                .await
+                .unwrap();
+        }
+        let cancelled = tokio::time::timeout(Duration::from_millis(100), app.poll_events()).await;
+        assert!(cancelled.is_err(), "the pass should have been parked");
+        assert!(
+            app.transport_event_rx.is_some(),
+            "receiver lost when the pass was cancelled"
+        );
+
+        // Inbound SIP still works afterwards.
+        while app_rx.try_recv().is_ok() {}
+        transport_tx
+            .send(tls_request(
+                &invite("<sips:caller@example.com>;tag=1", "after-cancel"),
+                peer(),
+            ))
+            .await
+            .unwrap();
+        app.poll_events().await.unwrap();
+        assert!(matches!(
+            app_rx.try_recv(),
+            Ok(AppEvent::IncomingCall { .. })
+        ));
+    }
+
+    /// Runs exactly one `poll_events()` pass while `requests` DTMF INFO
+    /// requests are fed into the 32-slot transport queue as fast as it
+    /// accepts them (the receive task's role). Returns how many had been
+    /// fully handled when the pass returned, and how many were left queued.
+    async fn handled_in_one_pass(requests: usize) -> (usize, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        // One slot, drained by another task: the pump yields at every
+        // forwarded event, which lets the feeder refill the transport queue
+        // while the pass is still running.
+        let (app_tx, mut app_rx) = mpsc::channel(1);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let transport_tx = transport_sender(&app);
+        let probe = transport_tx.clone();
+
+        let handled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&handled);
+        let drainer = tokio::spawn(async move {
+            while let Some(event) = app_rx.recv().await {
+                if matches!(event, AppEvent::DtmfReceived { .. }) {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        let feeder = tokio::spawn(async move {
+            for n in 0..requests {
+                let event = tls_request(&dtmf_info(n), peer());
+                if transport_tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        // Start the pass with the transport queue full.
+        while probe.capacity() > 0 && !feeder.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let pass = tokio::time::timeout(Duration::from_secs(5), app.poll_events()).await;
+        assert!(
+            pass.is_ok(),
+            "poll_events blocked on a queue that only it drains"
+        );
+        pass.unwrap().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), feeder)
+            .await
+            .unwrap()
+            .unwrap();
+        // Let the drainer take the last forwarded event.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drainer.abort();
+
+        let left = std::iter::from_fn(|| app.next_transport_event()).count();
+        (handled.load(Ordering::SeqCst), left)
+    }
+
+    /// PERF-001: more than 32 response-producing requests in one pump pass.
+    /// Each INFO queues two call-manager events, so the old order (handle
+    /// every transport event, then drain) filled the 32-slot channel at the
+    /// 17th request and the pump waited forever for capacity only it frees.
+    #[tokio::test]
+    async fn test_pump_handles_more_than_32_requests_in_one_pass() {
+        const REQUESTS: usize = 40;
+        const { assert!(REQUESTS > 32 && REQUESTS <= MAX_TRANSPORT_EVENTS_PER_POLL) };
+
+        let (handled, left) = handled_in_one_pass(REQUESTS).await;
+        assert_eq!(handled, REQUESTS, "every request answered in the one pass");
+        assert_eq!(left, 0);
+    }
+
+    /// A pass is bounded: under a sustained burst it handles
+    /// `MAX_TRANSPORT_EVENTS_PER_POLL` events and returns, leaving the rest
+    /// queued for the next pass.
+    #[tokio::test]
+    async fn test_pump_pass_is_bounded() {
+        let requests = MAX_TRANSPORT_EVENTS_PER_POLL + 10;
+
+        let (handled, left) = handled_in_one_pass(requests).await;
+        assert_eq!(handled, MAX_TRANSPORT_EVENTS_PER_POLL);
+        assert_eq!(left, 10);
+    }
+
+    // ---- QA round 1 ----
+
+    fn qa_invite(from: &str, contact: &str, call_id: &str) -> String {
+        format!(
+            "INVITE sips:testuser@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bK{call_id}\r\n\
+             Max-Forwards: 70\r\n\
+             From: {from}\r\n\
+             To: <sips:testuser@example.com>\r\n\
+             Call-ID: {call_id}@192.0.2.50\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: {contact}\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        )
+    }
+
+    /// An INFO whose DTMF duration is `duration`, so deliveries can be told
+    /// apart and their order checked.
+    fn qa_dtmf_info(n: usize, duration: u16) -> String {
+        let body = format!("Signal=7\r\nDuration={duration}\r\n");
+        format!(
+            "INFO sips:testuser@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bKqainfo{n}\r\n\
+             Max-Forwards: 70\r\n\
+             From: <sips:caller@example.com>;tag=remote\r\n\
+             To: <sips:testuser@example.com>;tag=local\r\n\
+             Call-ID: qa-burst@192.0.2.50\r\n\
+             CSeq: {cseq} INFO\r\n\
+             Content-Type: application/dtmf-relay\r\n\
+             Content-Length: {len}\r\n\
+             \r\n\
+             {body}",
+            cseq = n + 1,
+            len = body.len()
+        )
+    }
+
+    /// One pump pass under a timeout: a pass that blocks on a queue only
+    /// the pump drains never returns, and the timeout turns that into a
+    /// test failure instead of a hung test run.
+    async fn qa_poll(app: &mut ClientApp, what: &str) {
+        tokio::time::timeout(Duration::from_secs(5), app.poll_events())
+            .await
+            .unwrap_or_else(|_| panic!("poll_events blocked: {what}"))
+            .unwrap_or_else(|e| panic!("poll_events failed: {what}: {e}"));
+    }
+
+    /// The application events forwarded so far, in order.
+    fn qa_drain_app_events(app_rx: &mut mpsc::Receiver<AppEvent>) -> Vec<AppEvent> {
+        std::iter::from_fn(|| app_rx.try_recv().ok()).collect()
+    }
+
+    /// B1 / QA-002: a TLS-only build refuses UDP and TCP accounts. Nothing
+    /// is queued or sent for them, no datagram reaches the "registrar", the
+    /// application state does not move, and a TLS account still registers
+    /// afterwards.
+    #[cfg(not(feature = "insecure-transports"))]
+    #[tokio::test]
+    async fn test_qa_tls_only_build_rejects_udp_and_tcp_accounts() {
+        use client_types::TransportPreference;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, mut app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let state_before = app.state;
+
+        // Where a cleartext REGISTER would land.
+        let registrar = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let registrar_addr = registrar.local_addr().unwrap();
+
+        for transport in [TransportPreference::Udp, TransportPreference::Tcp] {
+            let mut account = SipAccount::new(
+                "lab-account",
+                "Lab User",
+                "sip:lab@example.com",
+                format!("sip:{registrar_addr}"),
+            );
+            account.transport = transport;
+
+            let error = app.register_account(&account).await.unwrap_err();
+            assert!(
+                matches!(&error, AppError::Settings(message) if message.contains("TLS only")),
+                "{transport}: {error}"
+            );
+            assert!(
+                app.reg_event_rx.try_recv().is_err(),
+                "{transport}: a REGISTER was queued for a refused account"
+            );
+            assert_eq!(app.state, state_before, "{transport}");
+            assert!(app.current_account_id.is_none(), "{transport}");
+            qa_poll(&mut app, "after a refused account").await;
+        }
+
+        let mut buf = [0u8; 2048];
+        let leaked =
+            tokio::time::timeout(Duration::from_millis(300), registrar.recv_from(&mut buf)).await;
+        assert!(leaked.is_err(), "a refused account sent SIP over UDP");
+        assert!(
+            qa_drain_app_events(&mut app_rx).is_empty(),
+            "a refused account produced application events"
+        );
+
+        // The refusal is not sticky: a TLS account is accepted and its
+        // REGISTER is built for TLS.
+        let account = SipAccount::new(
+            "tls-account",
+            "TLS User",
+            "sips:testuser@example.com",
+            "sips:192.0.2.1:5061",
+        );
+        assert_eq!(account.transport, TransportPreference::TlsOnly);
+        app.register_account(&account).await.unwrap();
+        let register = std::iter::from_fn(|| app.reg_event_rx.try_recv().ok())
+            .find_map(|event| match event {
+                RegistrationEvent::SendRequest { request, .. } => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        let via = register
+            .headers
+            .get_value(&proto_sip::header::HeaderName::Via)
+            .unwrap();
+        assert!(via.starts_with("SIP/2.0/TLS "), "{via}");
+    }
+
+    /// B1, request side, both feature sets: the REGISTER of a TLS account
+    /// leaves as a TLS handshake on a TCP connection to the registrar, and
+    /// nothing is sent to the registrar's address over UDP. (The coder's
+    /// tests cover the response side.)
+    #[tokio::test]
+    async fn test_qa_tls_account_registers_over_tls_and_never_over_udp() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+
+        // A "registrar" listening on the same port for TCP and UDP.
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registrar_addr = tcp.local_addr().unwrap();
+        let udp = tokio::net::UdpSocket::bind(registrar_addr).await.unwrap();
+
+        // It reads the first bytes the client sends, then closes, which
+        // fails the handshake and lets the pump pass return.
+        let first_bytes = tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let mut head = [0u8; 3];
+            stream.read_exact(&mut head).await.unwrap();
+            head
+        });
+
+        let account = SipAccount::new(
+            "tls-account",
+            "TLS User",
+            "sips:testuser@example.com",
+            format!("sips:{registrar_addr}"),
+        );
+        app.register_account(&account).await.unwrap();
+        qa_poll(
+            &mut app,
+            "REGISTER towards a registrar that drops the handshake",
+        )
+        .await;
+
+        let head = tokio::time::timeout(Duration::from_secs(5), first_bytes)
+            .await
+            .unwrap_or_else(|_| panic!("the client never connected to the registrar over TCP"))
+            .unwrap();
+        // TLS record header: handshake (22), legacy record version 3.x.
+        assert_eq!(
+            head[0], 0x16,
+            "first byte on the wire is not a TLS handshake"
+        );
+        assert_eq!(head[1], 0x03, "not a TLS record: {head:02x?}");
+
+        let mut buf = [0u8; 2048];
+        let leaked =
+            tokio::time::timeout(Duration::from_millis(300), udp.recv_from(&mut buf)).await;
+        assert!(
+            leaked.is_err(),
+            "the REGISTER (or anything) was sent over UDP"
+        );
+    }
+
+    /// B5 through the pump: hostile From and Contact values arrive as
+    /// transport events, one pass each. No pass panics or errors, the
+    /// transport receiver stays in place, unparsable values raise no
+    /// incoming call, and a well-formed INVITE sent after each one rings.
+    #[tokio::test]
+    async fn test_qa_pump_survives_hostile_from_and_contact_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, mut app_rx) = mpsc::channel(256);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let transport_tx = transport_sender(&app);
+
+        let good_from = "<sips:caller@example.com>;tag=1";
+        let good_contact = "<sips:caller@192.0.2.50:5061>";
+        let many_closers = ">".repeat(4000);
+        let many_openers = "<".repeat(4000);
+        let many_quotes = "\"".repeat(4000);
+        // (value, whether an INVITE carrying it rings)
+        let values: [(&str, bool); 22] = [
+            (">a<sips:x@example.com>", true),
+            ("><sips:x@example.com>", true),
+            (r#""a\"> x" <sips:x@example.com>"#, true),
+            (r#""back\\slash\\" <sips:x@example.com>"#, true),
+            ("\u{1f600}>\u{1f600}<sips:x@example.com>\u{1f600}", true),
+            ("\"\u{e9}\\\"\" <sips:x@example.com>", true),
+            ("<sips:x@example.com>>", true),
+            // Round 2 (R2-3): no usable SIP/SIPS URI, so 400 and no call.
+            (&many_closers, false),
+            ("<", false),
+            ("<>", false),
+            ("<<<<", false),
+            ("<sips:x@example.com", false),
+            ("Bob <sips:x@example.com", false),
+            ("\"unterminated <sips:x@example.com>", false),
+            (r#""escaped closing quote\" <sips:x@example.com>"#, false),
+            (r#""trailing escape\"#, false),
+            ("\"quoted\" sips:x@example.com", false),
+            ("<\u{e9}", false),
+            ("\u{1f600}<\u{1f600}", false),
+            (&many_openers, false),
+            (&many_quotes, false),
+            ("", false),
+        ];
+
+        let mut n = 0_usize;
+        for as_from in [true, false] {
+            for (value, rings) in values {
+                n += 1;
+                let header = if as_from { "From" } else { "Contact" };
+                let shown: String = value.chars().take(50).collect();
+                let what = format!("{header} {shown:?} ({} bytes)", value.len());
+                let (from, contact) = if as_from {
+                    (value, good_contact)
+                } else {
+                    (good_from, value)
+                };
+
+                transport_tx
+                    .send(tls_request(
+                        &qa_invite(from, contact, &format!("hostile{n}")),
+                        peer(),
+                    ))
+                    .await
+                    .unwrap();
+                qa_poll(&mut app, &what).await;
+                assert!(app.transport_event_rx.is_some(), "receiver lost: {what}");
+                let incoming = qa_drain_app_events(&mut app_rx)
+                    .into_iter()
+                    .filter(|event| matches!(event, AppEvent::IncomingCall { .. }))
+                    .count();
+                assert_eq!(incoming, usize::from(rings), "{what}");
+
+                // The next well-formed INVITE is still processed.
+                let valid_from = format!("<sips:valid{n}@example.com>;tag=1");
+                transport_tx
+                    .send(tls_request(
+                        &qa_invite(&valid_from, good_contact, &format!("valid{n}")),
+                        peer(),
+                    ))
+                    .await
+                    .unwrap();
+                qa_poll(&mut app, &what).await;
+                let rang: Vec<String> = qa_drain_app_events(&mut app_rx)
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        AppEvent::IncomingCall { remote_uri, .. } => Some(remote_uri),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    rang,
+                    [format!("sips:valid{n}@example.com")],
+                    "valid INVITE not processed after {what}"
+                );
+            }
+        }
+    }
+
+    /// PERF-R1-001 scenario 2: a command leaves a call-agent `StateChanged`
+    /// first in its queue while the call-manager queue is full. The next
+    /// pass must empty the call-manager queue before handling it: its
+    /// handler adds to that queue with an awaited send.
+    #[tokio::test]
+    async fn test_pump_drains_full_call_manager_queue_before_call_agent_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(256);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        app.call_manager.configure_account(&SipAccount::new(
+            "test-account",
+            "Test User",
+            "sips:testuser@example.com",
+            "sips:192.0.2.1:5061",
+        ));
+        // INVITE target with no listener: the connect is refused at once.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+
+        // Command with no pass after it: `make_call` queues StateChanged
+        // (first) and the INVITE on the call-agent queue. Then the
+        // call-manager queue is filled by other commands.
+        app.call_manager
+            .make_call(&format!("sips:bob@{closed}"))
+            .await
+            .unwrap();
+        let filler = app.call_manager.event_sender_for_test();
+        let mut queued = 0;
+        while filler
+            .try_send(CallManagerEvent::CallEnded {
+                call_id: "filler".to_string(),
+                reason: client_types::CallEndReason::LocalHangup,
+                duration_secs: None,
+            })
+            .is_ok()
+        {
+            queued += 1;
+        }
+        assert!(queued > 0);
+
+        qa_poll(&mut app, "pass after a full call-manager queue").await;
+    }
+
+    /// B5 through the application API: the QA-001 Contact reproducer rings,
+    /// is answered through `ClientApp::accept_incoming_call` (which used to
+    /// panic inside the call manager), the pump keeps running, and a later
+    /// call still rings.
+    #[tokio::test]
+    async fn test_qa_app_accepts_call_with_hostile_contact_and_keeps_pumping() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, mut app_rx) = mpsc::channel(256);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let transport_tx = transport_sender(&app);
+        app.call_manager.configure_account(&SipAccount::new(
+            "test-account",
+            "Test User",
+            "sips:testuser@example.com",
+            "sips:192.0.2.1:5061",
+        ));
+
+        // The BYE sent at hang-up goes to the Contact address over a new
+        // TLS connection. Point it at a loopback port with no listener so
+        // the connect is refused at once; an unroutable address would hold
+        // the pump for the OS connect timeout (no timeout in `connect()`,
+        // outside this round's scope).
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let contacts = [
+            format!(">a<sips:caller@{closed}>"),
+            format!(r#""a\"> x" <sips:caller@{closed}>"#),
+            format!("\u{1f600}>\u{1f600}<sips:caller@{closed}>"),
+        ];
+
+        for (n, contact) in contacts.iter().map(String::as_str).enumerate() {
+            transport_tx
+                .send(tls_request(
+                    &qa_invite(
+                        "<sips:caller@example.com>;tag=1",
+                        contact,
+                        &format!("accept{n}"),
+                    ),
+                    peer(),
+                ))
+                .await
+                .unwrap();
+            qa_poll(&mut app, contact).await;
+            let call_id = qa_drain_app_events(&mut app_rx)
+                .into_iter()
+                .find_map(|event| match event {
+                    AppEvent::IncomingCall { call_id, .. } => Some(call_id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{contact:?} did not ring"));
+
+            app.accept_incoming_call(&call_id).await.unwrap();
+            qa_poll(&mut app, contact).await;
+            assert_eq!(app.state, AppState::InCall, "{contact:?}");
+            assert!(app.transport_event_rx.is_some());
+
+            app.hangup().await.unwrap();
+            qa_poll(&mut app, contact).await;
+            let _ = qa_drain_app_events(&mut app_rx);
+        }
+
+        transport_tx
+            .send(tls_request(
+                &qa_invite(
+                    "<sips:later@example.com>;tag=1",
+                    "<sips:later@192.0.2.50:5061>",
+                    "later",
+                ),
+                peer(),
+            ))
+            .await
+            .unwrap();
+        qa_poll(&mut app, "INVITE after the hostile calls").await;
+        assert!(
+            qa_drain_app_events(&mut app_rx)
+                .iter()
+                .any(|event| matches!(event, AppEvent::IncomingCall { .. })),
+            "no incoming call after the hostile ones"
+        );
+    }
+
+    /// Runs pump passes while `requests` are fed into the 32-slot transport
+    /// queue by another task (the receive task's role) and the application
+    /// events are taken off a one-slot channel by a third (the shell's
+    /// role, which also makes the pump yield so the feeder can refill the
+    /// queue during a pass). `max_passes` bounds the run. Returns the
+    /// application events in delivery order and, per pass, how many
+    /// transport events it consumed.
+    async fn qa_pump_burst(
+        requests: Vec<String>,
+        max_passes: usize,
+    ) -> (Vec<AppEvent>, Vec<usize>) {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, mut app_rx) = mpsc::channel(1);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let transport_tx = transport_sender(&app);
+        let probe = transport_tx.clone();
+
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&delivered);
+        let drainer = tokio::spawn(async move {
+            while let Some(event) = app_rx.recv().await {
+                sink.lock().unwrap().push(event);
+            }
+        });
+
+        let sent = Arc::new(AtomicUsize::new(0));
+        let sent_by_feeder = Arc::clone(&sent);
+        let feeder = tokio::spawn(async move {
+            for text in requests {
+                if transport_tx.send(tls_request(&text, peer())).await.is_err() {
+                    return;
+                }
+                sent_by_feeder.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        // Start with the transport queue full.
+        while probe.capacity() > 0 && !feeder.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let mut per_pass = Vec::new();
+        let mut consumed_before = 0_usize;
+        for pass in 0..max_passes {
+            qa_poll(&mut app, &format!("burst pass {pass}")).await;
+            // Let the feeder top the queue up before counting.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            let queued = probe.max_capacity() - probe.capacity();
+            let consumed = sent.load(Ordering::SeqCst) - queued;
+            per_pass.push(consumed - consumed_before);
+            consumed_before = consumed;
+            if feeder.is_finished() && queued == 0 {
+                break;
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), feeder)
+            .await
+            .unwrap_or_else(|_| panic!("requests were left unfed: the pump stopped draining"))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drainer.abort();
+        let events = delivered.lock().unwrap().clone();
+        (events, per_pass)
+    }
+
+    /// B12: more than three times the per-pass cap of response-producing
+    /// requests. No pass blocks, no pass handles more than the cap, and
+    /// every request is eventually handled, in the order it arrived.
+    #[tokio::test]
+    async fn test_qa_pump_delivers_large_burst_across_passes_in_order() {
+        const REQUESTS: usize = 3 * MAX_TRANSPORT_EVENTS_PER_POLL + 17;
+
+        let requests = (0..REQUESTS)
+            .map(|n| qa_dtmf_info(n, 1000 + u16::try_from(n).unwrap()))
+            .collect();
+        let (events, per_pass) = qa_pump_burst(requests, 64).await;
+
+        let durations: Vec<u16> = events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::DtmfReceived { duration, .. } => Some(*duration),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<u16> = (0..REQUESTS)
+            .map(|n| 1000 + u16::try_from(n).unwrap())
+            .collect();
+        assert_eq!(
+            durations, expected,
+            "every request handled exactly once, in order"
+        );
+
+        assert_eq!(per_pass.iter().sum::<usize>(), REQUESTS, "{per_pass:?}");
+        assert!(
+            per_pass.iter().all(|n| *n <= MAX_TRANSPORT_EVENTS_PER_POLL),
+            "a pass exceeded the per-pass cap: {per_pass:?}"
+        );
+        assert!(
+            per_pass.len() >= REQUESTS.div_ceil(MAX_TRANSPORT_EVENTS_PER_POLL),
+            "{per_pass:?}"
+        );
+    }
+
+    /// B12: 40 INVITEs in one pass. Each queues three call-manager events
+    /// (100, 180, incoming call), so the old drain order filled the 32-slot
+    /// queue at the 11th INVITE. All 40 ring, in order, in a single pass.
+    #[tokio::test]
+    async fn test_qa_pump_handles_invite_burst_in_one_pass() {
+        const INVITES: usize = 40;
+        const { assert!(INVITES > 32 && INVITES <= MAX_TRANSPORT_EVENTS_PER_POLL) };
+
+        let requests = (0..INVITES)
+            .map(|n| {
+                qa_invite(
+                    &format!("<sips:caller{n}@example.com>;tag=1"),
+                    "<sips:caller@192.0.2.50:5061>",
+                    &format!("burst{n}"),
+                )
+            })
+            .collect();
+        let (events, per_pass) = qa_pump_burst(requests, 1).await;
+
+        let ringing: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::IncomingCall { remote_uri, .. } => Some(remote_uri.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<String> = (0..INVITES)
+            .map(|n| format!("sips:caller{n}@example.com"))
+            .collect();
+        assert_eq!(ringing, expected);
+        assert_eq!(per_pass, [INVITES], "handled in a single pass");
+    }
+
+    /// B12: a mixed burst (INVITE, INFO, unmatched BYE answered 481, an
+    /// INVITE answered 400) longer than the per-pass cap. Requests that
+    /// produce only a response and requests that also notify the
+    /// application are interleaved; everything is delivered in order.
+    #[tokio::test]
+    async fn test_qa_pump_delivers_mixed_burst_in_order() {
+        const ROUNDS: usize = 30;
+
+        let mut requests = Vec::new();
+        let mut expected = Vec::new();
+        for n in 0..ROUNDS {
+            requests.push(qa_invite(
+                &format!("<sips:mixed{n}@example.com>;tag=1"),
+                "<sips:caller@192.0.2.50:5061>",
+                &format!("mixed{n}"),
+            ));
+            expected.push(format!("ring sips:mixed{n}@example.com"));
+            requests.push(unmatched_bye("TLS", peer()));
+            requests.push(qa_dtmf_info(n, 2000 + u16::try_from(n).unwrap()));
+            expected.push(format!("dtmf {}", 2000 + n));
+            requests.push(qa_invite(
+                "Bob <sips:broken@example.com;tag=1",
+                "<sips:caller@192.0.2.50:5061>",
+                &format!("broken{n}"),
+            ));
+        }
+        let total = requests.len();
+        assert!(total > MAX_TRANSPORT_EVENTS_PER_POLL);
+
+        let (events, per_pass) = qa_pump_burst(requests, 64).await;
+        let seen: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::IncomingCall { remote_uri, .. } => Some(format!("ring {remote_uri}")),
+                AppEvent::DtmfReceived { duration, .. } => Some(format!("dtmf {duration}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seen, expected);
+        assert_eq!(per_pass.iter().sum::<usize>(), total, "{per_pass:?}");
+        assert!(
+            per_pass.iter().all(|n| *n <= MAX_TRANSPORT_EVENTS_PER_POLL),
+            "{per_pass:?}"
+        );
     }
 }

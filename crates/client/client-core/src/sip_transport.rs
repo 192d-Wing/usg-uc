@@ -41,8 +41,10 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+#[cfg(feature = "insecure-transports")]
+use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::{debug, error, info, trace, warn};
@@ -188,6 +190,8 @@ const MAX_SIP_MESSAGE_SIZE: usize = 65536;
 ///
 /// # Returns
 /// A `JoinHandle` for the spawned thread (can be ignored if you don't need to join).
+// NIST 800-53 Rev5: SC-8, CM-7 (no cleartext SIP listener in TLS-only builds).
+#[cfg(feature = "insecure-transports")]
 pub fn start_udp_receive_thread(
     local_addr: std::net::SocketAddr,
     event_tx: mpsc::Sender<TransportEvent>,
@@ -220,9 +224,11 @@ pub fn start_udp_receive_thread(
                             debug!(source = %source, "UDP receive thread: parsed SIP message");
                             trace!(source = %source, "\n{message}");
                             let event = match message {
-                                SipMessage::Request(request) => {
-                                    TransportEvent::RequestReceived { request, source }
-                                }
+                                SipMessage::Request(request) => TransportEvent::RequestReceived {
+                                    request,
+                                    source,
+                                    transport: SipTransportKind::Udp,
+                                },
                                 SipMessage::Response(response) => {
                                     debug!(status = %response.status, "UDP receive thread: SIP response");
                                     TransportEvent::ResponseReceived { response, source }
@@ -265,6 +271,8 @@ pub fn start_udp_receive_thread(
 /// # Arguments
 /// * `socket` - The UDP socket to receive from (will be converted to blocking)
 /// * `event_tx` - Channel to send transport events to
+// NIST 800-53 Rev5: SC-8, CM-7 (no cleartext SIP listener in TLS-only builds).
+#[cfg(feature = "insecure-transports")]
 pub async fn run_udp_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender<TransportEvent>) {
     // Log socket info for debugging
     let local_addr = socket.local_addr().ok();
@@ -302,7 +310,11 @@ pub async fn run_udp_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender
                             let event = match message {
                                 SipMessage::Request(request) => {
                                     debug!(method = %request.method, "Received SIP request via UDP");
-                                    TransportEvent::RequestReceived { request, source }
+                                    TransportEvent::RequestReceived {
+                                        request,
+                                        source,
+                                        transport: SipTransportKind::Udp,
+                                    }
                                 }
                                 SipMessage::Response(response) => {
                                     debug!(status = %response.status, "Received SIP response via UDP");
@@ -344,11 +356,16 @@ pub async fn run_udp_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender
 }
 
 /// Parses a received UDP datagram into a transport event, logging failures.
+#[cfg(feature = "insecure-transports")]
 fn parse_udp_datagram(buf: &[u8], source: SocketAddr) -> Option<TransportEvent> {
     match SipMessage::parse(buf) {
         Ok(SipMessage::Request(request)) => {
             debug!(method = %request.method, source = %source, "Received SIP request via UDP");
-            Some(TransportEvent::RequestReceived { request, source })
+            Some(TransportEvent::RequestReceived {
+                request,
+                source,
+                transport: SipTransportKind::Udp,
+            })
         }
         Ok(SipMessage::Response(response)) => {
             debug!(status = %response.status, source = %source, "Received SIP response via UDP");
@@ -371,6 +388,8 @@ fn parse_udp_datagram(buf: &[u8], source: SocketAddr) -> Option<TransportEvent> 
 /// is therefore cancellable via `JoinHandle::abort()`. The FFI layer requires
 /// that: blocking-pool tasks cannot be aborted, so they wedge the owned
 /// runtime's shutdown (`Runtime::drop` waits on the blocking pool).
+// NIST 800-53 Rev5: SC-8, CM-7 (no cleartext SIP listener in TLS-only builds).
+#[cfg(feature = "insecure-transports")]
 pub async fn run_udp_receive_loop_async(
     socket: Arc<UdpSocket>,
     event_tx: mpsc::Sender<TransportEvent>,
@@ -397,6 +416,22 @@ pub async fn run_udp_receive_loop_async(
     }
 }
 
+/// Transport a SIP request was received on.
+///
+/// Carried on [`TransportEvent::RequestReceived`] so the response goes back
+/// on the transport the request arrived on (RFC 3261 §18.2.2) instead of one
+/// inferred from peer-controlled Via text. Default (TLS-only) builds have no
+/// `Udp` variant, so a cleartext response path cannot be selected at all.
+// NIST 800-53 Rev5: SC-8, SC-8(1) (signaling stays on the protected transport).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SipTransportKind {
+    /// The TLS connection to the peer.
+    Tls,
+    /// The connectionless UDP socket (lab / commercial-provider testing).
+    #[cfg(feature = "insecure-transports")]
+    Udp,
+}
+
 /// Events from the transport layer.
 #[derive(Debug, Clone)]
 pub enum TransportEvent {
@@ -413,6 +448,8 @@ pub enum TransportEvent {
         request: SipRequest,
         /// Source address.
         source: SocketAddr,
+        /// Transport the request arrived on; the response is sent on it.
+        transport: SipTransportKind,
     },
     /// Connection established to a peer.
     Connected {
@@ -475,18 +512,21 @@ impl TlsConnection {
 
 /// Read half of a TLS connection plus its reassembly buffer, owned
 /// exclusively by the connection's receive task.
-struct TlsReader {
+///
+/// Generic over the byte source only so the framing can be exercised
+/// without a TLS peer; production code uses the default.
+struct TlsReader<R = tokio::io::ReadHalf<TlsStream<TcpStream>>> {
     /// TLS stream read half.
-    read_half: tokio::io::ReadHalf<TlsStream<TcpStream>>,
+    read_half: R,
     /// Peer address.
     peer_addr: SocketAddr,
     /// Read buffer for partial messages.
     read_buffer: BytesMut,
 }
 
-impl TlsReader {
+impl<R: AsyncRead + Unpin> TlsReader<R> {
     /// Creates a reader over the read half of a split stream.
-    fn new(read_half: tokio::io::ReadHalf<TlsStream<TcpStream>>, peer_addr: SocketAddr) -> Self {
+    fn new(read_half: R, peer_addr: SocketAddr) -> Self {
         Self {
             read_half,
             peer_addr,
@@ -494,8 +534,22 @@ impl TlsReader {
         }
     }
 
-    /// Reads data from the connection and returns any complete SIP messages.
+    /// Returns the next complete SIP message, reading from the connection
+    /// only when the reassembly buffer does not already hold one.
+    ///
+    /// `Ok(None)` means the bytes read so far end in a partial message.
     async fn recv(&mut self) -> AppResult<Option<SipMessage>> {
+        // RFC 3261 §18.3: a stream carries back-to-back messages delimited by
+        // Content-Length, and one read may return several. Deliver every
+        // message already buffered before blocking on the socket again;
+        // otherwise a coalesced message (180 + 200, NOTIFY + BYE) waits for
+        // unrelated later bytes and the stream stays one message behind.
+        if !self.read_buffer.is_empty()
+            && let Some(message) = self.try_parse_message()?
+        {
+            return Ok(Some(message));
+        }
+
         let mut buf = [0u8; 4096];
         let peer = self.peer_addr;
         let n = self
@@ -512,11 +566,7 @@ impl TlsReader {
 
         // Try to parse a complete SIP message
         // SIP messages end with \r\n\r\n for headers, then Content-Length bytes
-        if let Some(message) = self.try_parse_message()? {
-            return Ok(Some(message));
-        }
-
-        Ok(None)
+        self.try_parse_message()
     }
 
     /// Tries to parse a complete SIP message from the read buffer.
@@ -613,7 +663,9 @@ impl TransportConfig {
 /// SIP Transport manager.
 ///
 /// Manages TLS connections to SIP peers and handles message routing.
-/// Also supports UDP transport for testing with non-TLS providers.
+/// UDP transport for testing with non-TLS providers exists only in builds
+/// with the `insecure-transports` feature; default builds never bind, read
+/// or write a UDP SIP socket.
 pub struct SipTransport {
     /// TLS client configuration (can be rebuilt when certs change).
     tls_config: Arc<RwLock<Arc<ClientConfig>>>,
@@ -621,6 +673,7 @@ pub struct SipTransport {
     connections: Arc<Mutex<HashMap<SocketAddr, TlsConnection>>>,
     /// UDP socket for connectionless transport.
     /// Uses `RwLock` so receive task can access socket without blocking sends.
+    #[cfg(feature = "insecure-transports")]
     udp_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
     /// Event sender.
     event_tx: mpsc::Sender<TransportEvent>,
@@ -647,6 +700,7 @@ impl SipTransport {
         Ok(Self {
             tls_config: Arc::new(RwLock::new(Arc::new(tls_config))),
             connections: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "insecure-transports")]
             udp_socket: Arc::new(RwLock::new(None)),
             event_tx,
             config: Arc::new(RwLock::new(config)),
@@ -906,6 +960,8 @@ impl SipTransport {
     /// # Arguments
     /// * `use_ipv6` - If true, bind to `[::]:0` for IPv6; otherwise `0.0.0.0:0` for IPv4.
     ///   Determined by resolving the registrar address first (AAAA → true, A → false).
+    // NIST 800-53 Rev5: SC-8, CM-7 (no UDP SIP socket in TLS-only builds).
+    #[cfg(feature = "insecure-transports")]
     pub async fn get_or_create_udp_socket(
         &self,
         use_ipv6: bool,
@@ -959,7 +1015,9 @@ impl SipTransport {
 
     /// Returns the event sender for transport events.
     ///
-    /// Use this to send events from an external UDP receive loop.
+    /// Use this to send events from an external UDP receive loop. Not part
+    /// of TLS-only builds: nothing outside the transport feeds its events.
+    #[cfg(any(test, feature = "insecure-transports"))]
     pub fn event_sender(&self) -> mpsc::Sender<TransportEvent> {
         self.event_tx.clone()
     }
@@ -969,6 +1027,8 @@ impl SipTransport {
     /// For testing with non-TLS providers like `BulkVS`.
     /// NOTE: The caller is responsible for starting the UDP receive loop.
     /// In Tauri context, use `tauri::async_runtime::spawn` with `run_udp_receive_loop`.
+    // NIST 800-53 Rev5: SC-8, CM-7 (no cleartext SIP send in TLS-only builds).
+    #[cfg(feature = "insecure-transports")]
     pub async fn send_request_udp(
         &self,
         request: &SipRequest,
@@ -1013,6 +1073,8 @@ impl SipTransport {
     /// Sends a SIP response via UDP (connectionless).
     ///
     /// Used for responding to requests received via UDP (e.g., BYE, CANCEL).
+    // NIST 800-53 Rev5: SC-8, CM-7 (no cleartext SIP send in TLS-only builds).
+    #[cfg(feature = "insecure-transports")]
     pub async fn send_response_udp(
         &self,
         response: &SipResponse,
@@ -1101,8 +1163,17 @@ impl SipTransport {
             connections.insert(peer, TlsConnection::new(write_half, peer));
         }
 
-        // Notify connected
-        let _ = self.event_tx.send(TransportEvent::Connected { peer }).await;
+        // Notify connected. `connect()` runs inside the event pump, which
+        // is the only reader of this channel: an awaited send on a full
+        // channel would wait for capacity only the waiting task can free.
+        // The event is informational (logged), so it is dropped when full.
+        if self
+            .event_tx
+            .try_send(TransportEvent::Connected { peer })
+            .is_err()
+        {
+            debug!(peer = %peer, "Transport event queue full; Connected notification dropped");
+        }
 
         // Spawn receive task for this connection
         self.spawn_receive_task(TlsReader::new(read_half, peer));
@@ -1133,6 +1204,7 @@ impl SipTransport {
                                     .send(TransportEvent::RequestReceived {
                                         request,
                                         source: peer,
+                                        transport: SipTransportKind::Tls,
                                     })
                                     .await;
                             }
@@ -1147,8 +1219,8 @@ impl SipTransport {
                         }
                     }
                     Ok(None) => {
-                        // No complete message yet, continue
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                        // Partial message: the next recv() blocks on the
+                        // socket for the rest (no timer needed).
                     }
                     Err(e) => {
                         error!(peer = %peer, error = %e, "Connection error");
@@ -1549,6 +1621,392 @@ mod tests {
         ] {
             assert_eq!(framed_body_len(head), None, "{head:?}");
         }
+    }
+
+    /// A response as it appears on a stream, with an optional body.
+    fn stream_response(status_line: &str, body: &str) -> String {
+        format!(
+            "SIP/2.0 {status_line}\r\n\
+             Via: SIP/2.0/TLS client.example.com:5061;branch=z9hG4bKframing\r\n\
+             From: <sip:alice@example.com>;tag=from-tag\r\n\
+             To: <sip:bob@example.com>;tag=to-tag\r\n\
+             Call-ID: framing@client.example.com\r\n\
+             CSeq: 1 INVITE\r\n\
+             Content-Length: {}\r\n\
+             \r\n\
+             {body}",
+            body.len()
+        )
+    }
+
+    /// An in-dialog BYE as it appears on a stream.
+    fn stream_bye() -> String {
+        "BYE sip:alice@client.example.com SIP/2.0\r\n\
+         Via: SIP/2.0/TLS sbc.example.com:5061;branch=z9hG4bKbye\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:bob@example.com>;tag=to-tag\r\n\
+         To: <sip:alice@example.com>;tag=from-tag\r\n\
+         Call-ID: framing@client.example.com\r\n\
+         CSeq: 2 BYE\r\n\
+         Content-Length: 0\r\n\
+         \r\n"
+            .to_string()
+    }
+
+    /// Reader over an in-memory stream plus the peer's write end.
+    fn framing_reader() -> (TlsReader<tokio::io::DuplexStream>, tokio::io::DuplexStream) {
+        let (peer_end, client_end) = tokio::io::duplex(MAX_SIP_MESSAGE_SIZE);
+        let reader = TlsReader::new(client_end, "192.0.2.1:5061".parse().unwrap());
+        (reader, peer_end)
+    }
+
+    /// The next message from `reader`, failing if it would block on the
+    /// stream (which the peer keeps open and idle).
+    async fn next_buffered<R: AsyncRead + Unpin>(reader: &mut TlsReader<R>) -> SipMessage {
+        tokio::time::timeout(std::time::Duration::from_secs(2), reader.recv())
+            .await
+            .unwrap_or_else(|_| panic!("reader blocked with a complete message buffered"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("a complete message was buffered"))
+    }
+
+    fn status_of(message: &SipMessage) -> u16 {
+        match message {
+            SipMessage::Response(response) => response.status.code(),
+            SipMessage::Request(request) => panic!("expected a response, got {}", request.method),
+        }
+    }
+
+    /// RFC 3261 §18.3: `180` and `200` written back to back arrive in one
+    /// read; both are delivered without waiting for more bytes.
+    #[tokio::test]
+    async fn test_tls_reader_delivers_two_messages_from_one_read() {
+        let (mut reader, mut peer) = framing_reader();
+        let sdp = "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\n";
+        let wire = stream_response("180 Ringing", "") + &stream_response("200 OK", sdp);
+        peer.write_all(wire.as_bytes()).await.unwrap();
+
+        assert_eq!(status_of(&next_buffered(&mut reader).await), 180);
+        let ok = next_buffered(&mut reader).await;
+        assert_eq!(status_of(&ok), 200);
+        match ok {
+            SipMessage::Response(response) => {
+                assert_eq!(response.body.as_deref(), Some(sdp.as_bytes()));
+            }
+            SipMessage::Request(_) => panic!("expected a response"),
+        }
+    }
+
+    /// Three messages in one read, the last one a BYE (never retransmitted
+    /// on a reliable transport): all three are delivered, then the reader
+    /// waits for the socket.
+    #[tokio::test]
+    async fn test_tls_reader_delivers_three_messages_from_one_read() {
+        let (mut reader, mut peer) = framing_reader();
+        let wire =
+            stream_response("180 Ringing", "") + &stream_response("200 OK", "") + &stream_bye();
+        peer.write_all(wire.as_bytes()).await.unwrap();
+
+        assert_eq!(status_of(&next_buffered(&mut reader).await), 180);
+        assert_eq!(status_of(&next_buffered(&mut reader).await), 200);
+        match next_buffered(&mut reader).await {
+            SipMessage::Request(request) => assert_eq!(request.method.as_str(), "BYE"),
+            SipMessage::Response(_) => panic!("expected the BYE"),
+        }
+
+        // Nothing left: the reader now blocks on the (idle) stream.
+        let idle = tokio::time::timeout(std::time::Duration::from_millis(50), reader.recv()).await;
+        assert!(idle.is_err(), "no fourth message exists");
+    }
+
+    /// A message split across reads is reassembled, and a message that
+    /// arrives in the same read as the tail of the previous one is not held
+    /// back.
+    #[tokio::test]
+    async fn test_tls_reader_reassembles_message_split_across_reads() {
+        let (mut reader, mut peer) = framing_reader();
+        let first = stream_response("180 Ringing", "");
+        let second = stream_response("200 OK", "v=0\r\ns=split\r\n");
+        let third = stream_bye();
+
+        // Read 1: half of the first message's headers.
+        let (head, tail) = first.split_at(first.len() / 2);
+        peer.write_all(head.as_bytes()).await.unwrap();
+        let partial = tokio::time::timeout(std::time::Duration::from_secs(2), reader.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(partial.is_none(), "half a message is not a message");
+
+        // Read 2: the rest of the first message and the second one up to
+        // the middle of its body.
+        let cut = second.len() - 5;
+        peer.write_all(tail.as_bytes()).await.unwrap();
+        peer.write_all(&second.as_bytes()[..cut]).await.unwrap();
+        assert_eq!(status_of(&next_buffered(&mut reader).await), 180);
+
+        // Read 3: the rest of the body together with a whole third message.
+        peer.write_all(&second.as_bytes()[cut..]).await.unwrap();
+        peer.write_all(third.as_bytes()).await.unwrap();
+        assert_eq!(status_of(&next_buffered(&mut reader).await), 200);
+        match next_buffered(&mut reader).await {
+            SipMessage::Request(request) => assert_eq!(request.method.as_str(), "BYE"),
+            SipMessage::Response(_) => panic!("expected the BYE"),
+        }
+    }
+
+    // ---- QA round 1 (B7): stream framing table ----
+
+    /// A distinguishable message for position `n` in a stream: responses
+    /// with and without a body, and a request.
+    fn qa_stream_message(n: usize) -> String {
+        match n % 3 {
+            0 => stream_response(&format!("{} Trying", 100 + n % 90), ""),
+            1 => stream_response(
+                "200 OK",
+                &format!("v=0\r\no=- {n} {n} IN IP4 192.0.2.1\r\ns=qa-{n}\r\n\r\nt=0 0\r\n"),
+            ),
+            _ => stream_bye().replace("CSeq: 2 BYE", &format!("CSeq: {} BYE", 1000 + n)),
+        }
+    }
+
+    /// The wire form `message` must have had, for comparing what was
+    /// delivered with what was sent.
+    fn qa_fingerprint(message: &SipMessage) -> String {
+        match message {
+            SipMessage::Response(response) => format!(
+                "{} body={:?}",
+                response.status.code(),
+                response
+                    .body
+                    .as_deref()
+                    .map(|body| String::from_utf8_lossy(body).into_owned())
+            ),
+            SipMessage::Request(request) => format!(
+                "{} cseq={:?}",
+                request.method,
+                request
+                    .headers
+                    .get_value(&proto_sip::header::HeaderName::CSeq)
+            ),
+        }
+    }
+
+    fn qa_expected_fingerprint(n: usize) -> String {
+        qa_fingerprint(&SipMessage::parse(qa_stream_message(n).as_bytes()).unwrap())
+    }
+
+    /// The next message, however many reads it takes, failing if the
+    /// reader blocks while the bytes for it have already been written.
+    async fn qa_next_message<R: AsyncRead + Unpin>(
+        reader: &mut TlsReader<R>,
+        what: &str,
+    ) -> SipMessage {
+        let deadline = std::time::Duration::from_secs(2);
+        tokio::time::timeout(deadline, async {
+            loop {
+                if let Some(message) = reader.recv().await.unwrap() {
+                    return message;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}: reader blocked with a complete message written"))
+    }
+
+    /// Asserts the reader has nothing more to deliver: `recv()` waits on
+    /// the (open, idle) stream.
+    async fn qa_assert_idle<R: AsyncRead + Unpin>(reader: &mut TlsReader<R>, what: &str) {
+        // A buffered message is returned without any I/O, so a few
+        // milliseconds are enough to tell "waiting" from "had one ready".
+        let idle = tokio::time::timeout(std::time::Duration::from_millis(4), reader.recv()).await;
+        assert!(
+            idle.is_err(),
+            "{what}: reader produced {idle:?} from an idle stream"
+        );
+    }
+
+    /// B7: 1, 2, 3 and N messages written back to back before the first
+    /// read. Every one is delivered, in order and intact, without waiting
+    /// for further bytes; then the reader waits. Up to 3 messages fit one
+    /// 4096-byte read; the larger counts also cross read boundaries at
+    /// arbitrary offsets.
+    #[tokio::test]
+    async fn test_qa_tls_reader_delivers_n_messages_written_at_once() {
+        for count in [1_usize, 2, 3, 4, 7, 16, 40, 120] {
+            let (mut reader, mut peer) = framing_reader();
+            let wire: String = (0..count).map(qa_stream_message).collect();
+            if count <= 3 {
+                assert!(wire.len() <= 4096, "{count} messages must fit one read");
+            }
+            assert!(wire.len() <= MAX_SIP_MESSAGE_SIZE, "fits the duplex buffer");
+            peer.write_all(wire.as_bytes()).await.unwrap();
+
+            for n in 0..count {
+                let what = format!("message {n} of {count}");
+                let message = qa_next_message(&mut reader, &what).await;
+                assert_eq!(
+                    qa_fingerprint(&message),
+                    qa_expected_fingerprint(n),
+                    "{what}"
+                );
+            }
+            qa_assert_idle(&mut reader, &format!("after {count} messages")).await;
+        }
+    }
+
+    /// B7: a message with a body, split across two reads at every byte
+    /// boundary (inside the start line, the headers, the blank line and the
+    /// body). The first read yields nothing; the second, which also carries
+    /// a whole following message, yields both.
+    #[tokio::test]
+    async fn test_qa_tls_reader_message_split_at_every_byte_boundary() {
+        let first = qa_stream_message(1);
+        let second = qa_stream_message(2);
+        let body_at = first.find("\r\n\r\n").unwrap() + 4;
+        assert!(first.len() > body_at + 20, "the message has a body");
+        let mut cuts_inside_body = 0_usize;
+
+        for cut in 1..first.len() {
+            let what = format!("cut at byte {cut} of {}", first.len());
+            let (mut reader, mut peer) = framing_reader();
+
+            peer.write_all(&first.as_bytes()[..cut]).await.unwrap();
+            let partial = tokio::time::timeout(std::time::Duration::from_secs(2), reader.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{what}: first read blocked"))
+                .unwrap();
+            assert!(partial.is_none(), "{what}: a partial message was delivered");
+
+            let mut rest = first.as_bytes()[cut..].to_vec();
+            rest.extend_from_slice(second.as_bytes());
+            peer.write_all(&rest).await.unwrap();
+
+            let message = qa_next_message(&mut reader, &what).await;
+            assert_eq!(
+                qa_fingerprint(&message),
+                qa_expected_fingerprint(1),
+                "{what}"
+            );
+            let message = qa_next_message(&mut reader, &what).await;
+            assert_eq!(
+                qa_fingerprint(&message),
+                qa_expected_fingerprint(2),
+                "{what}"
+            );
+            qa_assert_idle(&mut reader, &what).await;
+
+            if cut > body_at {
+                cuts_inside_body += 1;
+            }
+        }
+        assert!(
+            cuts_inside_body >= 20,
+            "the body was split {cuts_inside_body} times"
+        );
+    }
+
+    /// B7: complete messages followed by the first part of another one, in
+    /// a single read. The complete ones are delivered at once; the partial
+    /// one is held (the reader waits, it does not error or deliver a
+    /// fragment) and is delivered when its remainder arrives, together with
+    /// a message that follows it. The partial message is cut in its
+    /// headers and inside its body.
+    #[tokio::test]
+    async fn test_qa_tls_reader_trailing_partial_after_complete_messages() {
+        let with_body = qa_stream_message(4);
+        let body_at = with_body.find("\r\n\r\n").unwrap() + 4;
+
+        for complete in [1_usize, 2, 3] {
+            for cut in [
+                1,
+                12,
+                body_at - 2,
+                body_at,
+                body_at + 1,
+                with_body.len() - 1,
+            ] {
+                let what = format!("{complete} complete then {cut} bytes of the next");
+                let (mut reader, mut peer) = framing_reader();
+
+                let mut wire: String = (0..complete).map(qa_stream_message).collect();
+                wire.push_str(&with_body[..cut]);
+                assert!(wire.len() <= 4096, "{what}: must arrive in one read");
+                peer.write_all(wire.as_bytes()).await.unwrap();
+
+                for n in 0..complete {
+                    let message = qa_next_message(&mut reader, &what).await;
+                    assert_eq!(
+                        qa_fingerprint(&message),
+                        qa_expected_fingerprint(n),
+                        "{what}"
+                    );
+                }
+                qa_assert_idle(&mut reader, &what).await;
+
+                let mut rest = with_body.as_bytes()[cut..].to_vec();
+                rest.extend_from_slice(qa_stream_message(5).as_bytes());
+                peer.write_all(&rest).await.unwrap();
+                let message = qa_next_message(&mut reader, &what).await;
+                assert_eq!(
+                    qa_fingerprint(&message),
+                    qa_expected_fingerprint(4),
+                    "{what}"
+                );
+                let message = qa_next_message(&mut reader, &what).await;
+                assert_eq!(
+                    qa_fingerprint(&message),
+                    qa_expected_fingerprint(5),
+                    "{what}"
+                );
+                qa_assert_idle(&mut reader, &what).await;
+            }
+        }
+    }
+
+    /// B7: a stream of messages delivered one byte per read. One `recv()`
+    /// per byte is enough: nothing is ever left waiting in the buffer
+    /// behind a message that was just returned.
+    #[tokio::test]
+    async fn test_qa_tls_reader_one_byte_per_read() {
+        let (mut reader, mut peer) = framing_reader();
+        let count = 6_usize;
+        let wire: String = (0..count).map(qa_stream_message).collect();
+        let mut delivered = Vec::new();
+
+        for byte in wire.as_bytes() {
+            peer.write_all(std::slice::from_ref(byte)).await.unwrap();
+            let step = tokio::time::timeout(std::time::Duration::from_secs(2), reader.recv())
+                .await
+                .unwrap_or_else(|_| panic!("reader blocked with a byte available"))
+                .unwrap();
+            if let Some(message) = step {
+                delivered.push(qa_fingerprint(&message));
+            }
+        }
+
+        let expected: Vec<String> = (0..count).map(qa_expected_fingerprint).collect();
+        assert_eq!(delivered, expected);
+        qa_assert_idle(&mut reader, "after the last byte").await;
+    }
+
+    /// B7: a stream that ends (EOF) while complete messages are still
+    /// buffered. They are delivered before the close is reported.
+    #[tokio::test]
+    async fn test_qa_tls_reader_delivers_buffered_messages_before_eof() {
+        let (mut reader, mut peer) = framing_reader();
+        let wire: String = (0..3).map(qa_stream_message).collect();
+        peer.write_all(wire.as_bytes()).await.unwrap();
+        drop(peer);
+
+        for n in 0..3 {
+            let message = qa_next_message(&mut reader, "before EOF").await;
+            assert_eq!(qa_fingerprint(&message), qa_expected_fingerprint(n));
+        }
+        assert!(
+            reader.recv().await.is_err(),
+            "EOF is reported after the last message"
+        );
     }
 
     #[tokio::test]

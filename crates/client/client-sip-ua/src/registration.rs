@@ -87,8 +87,16 @@ struct AccountRegistration {
     retry_at: Option<Instant>,
     /// Number of 503 Retry-After retries in the current registration cycle.
     service_retry_count: u32,
-    /// Whether the in-flight REGISTER is an unregistration (Contact: *, Expires: 0).
+    /// Whether the in-flight REGISTER is an unregistration (Expires: 0).
     unregistering: bool,
+    /// Random per-registration token carried as the `rinstance` Contact URI
+    /// parameter, so two client instances of one AOR never present the same
+    /// Contact URI even when host and port are equal. Fixed for the life of
+    /// this registration so REGISTER, refreshes and the un-REGISTER all name
+    /// the same binding.
+    // RFC 3261 §10.3 step 7: a registrar identifies a binding by its Contact
+    // URI; a shared URI would let one instance overwrite or remove another's.
+    contact_instance: String,
     /// Nonce count for digest auth retries.
     #[cfg(feature = "digest-auth")]
     nonce_count: u32,
@@ -277,6 +285,7 @@ impl RegistrationAgent {
                 retry_at: None,
                 service_retry_count: 0,
                 unregistering: false,
+                contact_instance: format!("{}{}", generate_tag(), generate_tag()),
                 #[cfg(feature = "digest-auth")]
                 nonce_count: 0,
                 #[cfg(feature = "digest-auth")]
@@ -374,7 +383,7 @@ impl RegistrationAgent {
             registration.last_challenges.clear();
         }
 
-        // Build unregister request (Contact: *, Expires: 0)
+        // Build unregister request (own Contact, Expires: 0)
         let request = Self::build_unregister_request(registration, self.local_addr)?;
         let branch = registration.last_branch.clone().unwrap_or_default();
 
@@ -809,12 +818,6 @@ impl RegistrationAgent {
             client_types::TransportPreference::Tcp => "TCP",
             client_types::TransportPreference::Udp => "UDP",
         };
-        let transport_param = match account.transport {
-            client_types::TransportPreference::TlsOnly => "tls",
-            client_types::TransportPreference::Tcp => "tcp",
-            client_types::TransportPreference::Udp => "udp",
-        };
-
         // Use the resolved local IP for Via/Contact headers instead of 0.0.0.0.
         // This ensures BulkVS (and other registrars) can route incoming INVITEs
         // back to the correct address.
@@ -847,13 +850,7 @@ impl RegistrationAgent {
         let to = NameAddr::new(aor_uri.clone()).with_display_name(&account.display_name);
 
         // Build Contact header - use resolved IP for correct incoming call routing
-        let mut contact_uri = SipUri::new(effective_ip.to_string())
-            .with_port(local_addr.port())
-            .with_param("transport", Some(transport_param.to_string()));
-        if let Some(user) = &aor_uri.user {
-            contact_uri = contact_uri.with_user(user.clone());
-        }
-        let contact = NameAddr::new(contact_uri);
+        let contact = Self::binding_contact(registration, &aor_uri, effective_ip, local_addr);
 
         // Honor a Min-Expires demand from a previous 423 response by clamping
         // our requested expiry up to it (RFC 3261 §10.2.8)
@@ -917,6 +914,29 @@ impl RegistrationAgent {
         Ok((request, destination))
     }
 
+    /// Builds the Contact this registration binds: the same URI for
+    /// REGISTER, refresh and un-REGISTER.
+    fn binding_contact(
+        registration: &AccountRegistration,
+        aor_uri: &SipUri,
+        effective_ip: std::net::IpAddr,
+        local_addr: SocketAddr,
+    ) -> NameAddr {
+        let transport_param = match registration.account.transport {
+            client_types::TransportPreference::TlsOnly => "tls",
+            client_types::TransportPreference::Tcp => "tcp",
+            client_types::TransportPreference::Udp => "udp",
+        };
+        let mut contact_uri = SipUri::new(effective_ip.to_string())
+            .with_port(local_addr.port())
+            .with_param("transport", Some(transport_param.to_string()))
+            .with_param("rinstance", Some(registration.contact_instance.clone()));
+        if let Some(user) = &aor_uri.user {
+            contact_uri = contact_uri.with_user(user.clone());
+        }
+        NameAddr::new(contact_uri)
+    }
+
     /// Builds an unregister request (Expires: 0).
     fn build_unregister_request(
         registration: &mut AccountRegistration,
@@ -967,10 +987,12 @@ impl RegistrationAgent {
             .with_display_name(&account.display_name)
             .with_tag(registration.from_tag.clone());
 
-        let to = NameAddr::new(aor_uri).with_display_name(&account.display_name);
+        let to = NameAddr::new(aor_uri.clone()).with_display_name(&account.display_name);
 
-        // Contact: * with Expires: 0 removes all bindings for the AOR,
-        // including stale ones from other client instances (RFC 3261 §10.2.2)
+        // RFC 3261 §10.2.2: Expires: 0 on this instance's own Contact removes
+        // only its binding. `Contact: *` would also remove the bindings of
+        // every other client instance signed in to the same AOR.
+        let contact = Self::binding_contact(registration, &aor_uri, effective_ip, local_addr);
         let mut request = RequestBuilder::register(registrar_uri)
             .via(&via)
             .from(&from)
@@ -978,7 +1000,7 @@ impl RegistrationAgent {
             .call_id(&registration.call_id)
             .cseq(registration.cseq)
             .max_forwards(70)
-            .header(HeaderName::Contact, "*")
+            .contact(&contact)
             .expires(0) // Unregister
             .user_agent(USER_AGENT)
             .build()
@@ -1030,7 +1052,7 @@ impl RegistrationAgent {
 
         // Build base REGISTER request (this mutates registration).
         // On the unregister path, rebuild the unregister form
-        // (Contact: *, Expires: 0) so re-auth doesn't re-register.
+        // (own Contact, Expires: 0) so re-auth doesn't re-register.
         let mut request = if registration.unregistering {
             Self::build_unregister_request(registration, local_addr)?
         } else {
@@ -1533,22 +1555,60 @@ mod tests {
         assert_eq!(agent.get_state("test"), Some(RegistrationState::Failed));
     }
 
-    /// RFC 3261 §10.2.2: unregistering must clear all bindings for the AOR
-    /// with `Contact: *` and `Expires: 0`.
+    /// RFC 3261 §10.2.2: unregistering removes this instance's own binding
+    /// (the same Contact it registered) with `Expires: 0`, not `Contact: *`,
+    /// which would also remove other instances of the same AOR.
     #[tokio::test]
-    async fn test_unregister_sends_contact_star_expires_zero() {
+    async fn test_unregister_sends_own_contact_expires_zero() {
         let (tx, mut rx) = mpsc::channel(10);
         let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
         let mut agent = RegistrationAgent::new(local_addr, tx);
-        registered_agent(&mut rx, &mut agent).await;
+        agent.register(&test_account()).await.unwrap();
+        let _ = rx.recv().await.unwrap(); // StateChanged
+        let register = sent_request(rx.recv().await.unwrap());
+        let registered_contact = register
+            .headers
+            .get_value(&HeaderName::Contact)
+            .unwrap()
+            .to_string();
 
         agent.unregister("test").await.unwrap();
         let request = sent_request(rx.recv().await.unwrap());
 
         let contact = request.headers.get(&HeaderName::Contact).unwrap();
-        assert_eq!(contact.value, "*");
+        assert_ne!(contact.value, "*");
+        assert_eq!(contact.value, registered_contact);
+        assert!(contact.value.contains(";rinstance="));
         let expires = request.headers.get(&HeaderName::Expires).unwrap();
         assert_eq!(expires.value, "0");
+    }
+
+    /// SEC-R1-001 / RFC-R1-003: two client instances of one AOR with the same
+    /// local address and port register different Contact URIs, so a
+    /// registrar keyed by Contact URI keeps two bindings.
+    #[tokio::test]
+    async fn test_two_instances_register_distinct_contacts() {
+        let local_addr: SocketAddr = "192.168.1.100:5061".parse().unwrap();
+        let mut contacts = Vec::new();
+        for _ in 0..2 {
+            let (tx, mut rx) = mpsc::channel(10);
+            let mut agent = RegistrationAgent::new(local_addr, tx);
+            agent.register(&test_account()).await.unwrap();
+            let _ = rx.recv().await.unwrap(); // StateChanged
+            let request = sent_request(rx.recv().await.unwrap());
+            contacts.push(
+                request
+                    .headers
+                    .get_value(&HeaderName::Contact)
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_ne!(contacts[0], contacts[1]);
+        // Host and port are equal; only the instance token differs.
+        for c in &contacts {
+            assert!(c.contains("192.168.1.100:5061"), "{c}");
+        }
     }
 
     /// RFC 3261 §21.5.2: a 503 with Retry-After schedules a delayed retry
