@@ -162,6 +162,11 @@ jobs:
         with:
           shared-key: ci
       - run: cargo clippy --workspace --all-targets --all-features ${{ needs.changes.outputs.exclude }}
+      # Default features (TLS-only client surface, POA&M-322): the step above
+      # uses --all-features, which compiles out the not(insecure-transports) code.
+      - name: Clippy client crates (default features)
+        if: needs.changes.outputs.client == 'true'
+        run: cargo clippy -p client-types -p client-sip-ua -p client-core -p client-ffi -p client-gui-tauri --all-targets -- -D warnings
 
   test:
     name: Test
@@ -189,6 +194,11 @@ jobs:
       # separately. Compiling the tests here also covers the "does it build"
       # signal the old standalone build job provided.
       - run: cargo nextest run --workspace --all-features ${{ needs.changes.outputs.exclude }}
+      # Default features: runs tls_only_surface.rs and the
+      # not(insecure-transports) tests (POA&M-322).
+      - name: Test client crates (default features)
+        if: needs.changes.outputs.client == 'true'
+        run: cargo nextest run -p client-types -p client-sip-ua -p client-core -p client-ffi -p client-gui-tauri
       - run: cargo test --workspace --all-features --doc ${{ needs.changes.outputs.exclude }}
 
   # NOTE: the client cross-target portability job lives in its own
