@@ -204,6 +204,12 @@ Effects for SBC operators:
 
 ### Fixed (client)
 
+- The registration refresh interval comes from the `expires` of this
+  client's own Contact (matched by `rinstance`) in the 200 OK, not the
+  first Contact listed, which was often another device's binding
+  (RFC 3261 §10.2.4, POA&M-320).
+- CI now runs clippy and tests for the client crates with default features
+  too, so the TLS-only build is tested (POA&M-322).
 - `CallManager::hangup_call` releases local call state even when sending
   the signaling fails. Before, a failed BYE could leave a stuck call.
 - RTP packets whose extension length or padding is larger than the packet

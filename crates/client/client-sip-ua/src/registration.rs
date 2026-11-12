@@ -30,6 +30,37 @@ const MAX_SERVICE_RETRIES: u32 = 2;
 /// Upper bound on the Retry-After delay we honor, in seconds.
 const MAX_RETRY_AFTER_SECS: u32 = 1800;
 
+/// Splits one Contact header value into its comma-separated entries,
+/// ignoring commas inside `<...>` or quoted display names (RFC 3261 §7.3.1).
+fn split_contact_list(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut in_quotes, mut in_angle, mut escaped) = (false, false, false);
+    let mut start = 0;
+    for (i, c) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quotes => escaped = true,
+            '"' if !in_angle => in_quotes = !in_quotes,
+            '<' if !in_quotes => in_angle = true,
+            '>' if !in_quotes => in_angle = false,
+            ',' if !in_quotes && !in_angle => {
+                if let Some(entry) = value.get(start..i) {
+                    out.push(entry);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if let Some(entry) = value.get(start..) {
+        out.push(entry);
+    }
+    out
+}
+
 /// Resolves the local IP address that would be used to reach a given destination.
 ///
 /// Creates a temporary UDP socket, "connects" it to the destination (no actual traffic),
@@ -446,7 +477,7 @@ impl RegistrationAgent {
                 }
 
                 // Success - extract expiry from response
-                let expires = Self::extract_expires(response);
+                let expires = Self::extract_expires(response, &registration.contact_instance);
                 registration.state = RegistrationState::Registered;
                 registration.expires_at =
                     Some(Instant::now() + Duration::from_secs(u64::from(expires)));
@@ -1157,31 +1188,67 @@ impl RegistrationAgent {
         value.get(..digits_end)?.parse::<u32>().ok()
     }
 
-    /// Extracts expiry from response (Contact header or Expires header).
-    fn extract_expires(response: &SipResponse) -> u32 {
-        // Try Contact header expires parameter first
-        if let Some(contact) = response.headers.get(&HeaderName::Contact) {
-            let contact_value = contact.value.to_lowercase();
-            if let Some(expires_pos) = contact_value.find("expires=") {
-                let start = expires_pos + 8;
-                let end = contact_value[start..]
-                    .find(|c: char| !c.is_ascii_digit())
-                    .map_or(contact_value.len(), |i| start + i);
-                if let Ok(expires) = contact_value[start..end].parse::<u32>() {
-                    return expires;
-                }
+    /// Extracts the granted expiry for this registration's own binding.
+    ///
+    /// RFC 3261 §10.2.4: the 200 OK lists every binding of the AOR; the UA
+    /// uses the `expires` parameter of the Contact that matches its own
+    /// binding. Ours is the Contact whose URI carries this registration's
+    /// `rinstance`. If no Contact matches (or its `expires` is missing or
+    /// not a valid `u32`), the `Expires` header is used, then 3600.
+    fn extract_expires(response: &SipResponse, instance: &str) -> u32 {
+        for contact in response.headers.get_all(&HeaderName::Contact) {
+            if let Some(expires) = Self::own_contact_expires(&contact.value, instance) {
+                return expires;
             }
         }
 
         // Fall back to Expires header
         if let Some(expires_header) = response.headers.get(&HeaderName::Expires)
-            && let Ok(expires) = expires_header.value.parse::<u32>()
+            && let Ok(expires) = expires_header.value.trim().parse::<u32>()
         {
             return expires;
         }
 
         // Default
         3600
+    }
+
+    /// Returns the `expires` of the Contact in `value` (one header value,
+    /// possibly a comma-separated list) whose URI has `rinstance=<instance>`.
+    fn own_contact_expires(value: &str, instance: &str) -> Option<u32> {
+        split_contact_list(value).into_iter().find_map(|entry| {
+            let entry = entry.trim();
+            // name-addr form: URI inside <>, header params after '>'.
+            // addr-spec form: everything after the first ';' is a header
+            // param (RFC 3261 §20.10), so rinstance would appear there.
+            let (uri_params, header_params) = match entry.find('<') {
+                Some(lt) => {
+                    let rest = entry.get(lt + 1..)?;
+                    let gt = rest.find('>')?;
+                    let uri = rest.get(..gt)?;
+                    let uri = uri.split('?').next().unwrap_or(uri);
+                    (uri, rest.get(gt + 1..)?)
+                }
+                None => ("", entry),
+            };
+            let is_ours = |params: &str| {
+                params.split(';').skip(1).any(|p| {
+                    let (name, val) = p.split_once('=').unwrap_or((p, ""));
+                    name.trim().eq_ignore_ascii_case("rinstance") && val.trim() == instance
+                })
+            };
+            if !(is_ours(uri_params) || is_ours(header_params)) {
+                return None;
+            }
+            header_params.split(';').skip(1).find_map(|p| {
+                let (name, val) = p.split_once('=')?;
+                if name.trim().eq_ignore_ascii_case("expires") {
+                    val.trim().trim_matches('"').parse::<u32>().ok()
+                } else {
+                    None
+                }
+            })
+        })
     }
 
     /// Notifies listeners of state change.
@@ -1690,5 +1757,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(addr.port(), 5061);
+    }
+
+    /// Builds a 200 OK carrying the given Contact header values.
+    fn ok_with_contacts(contacts: &[&str], expires: Option<&str>) -> SipResponse {
+        let mut response = SipResponse::new(proto_sip::StatusCode::OK);
+        for c in contacts {
+            response
+                .headers
+                .add(proto_sip::Header::new(HeaderName::Contact, *c));
+        }
+        if let Some(e) = expires {
+            response.headers.set(HeaderName::Expires, e);
+        }
+        response
+    }
+
+    /// RFC 3261 §10.2.4: another device's binding listed first must not set
+    /// our refresh interval.
+    #[test]
+    fn test_extract_expires_uses_own_contact_when_second() {
+        let response = ok_with_contacts(
+            &[
+                "<sip:alice@192.0.2.20:5061;transport=tls;rinstance=other>;expires=3600",
+                "<sip:alice@192.0.2.10:5061;transport=tls;rinstance=mine>;expires=120",
+            ],
+            Some("900"),
+        );
+        assert_eq!(RegistrationAgent::extract_expires(&response, "mine"), 120);
+    }
+
+    #[test]
+    fn test_extract_expires_own_contact_in_comma_list() {
+        let response = ok_with_contacts(
+            &[
+                "\"B, Bob\" <sip:alice@192.0.2.20;rinstance=other>;expires=3600, <sip:alice@192.0.2.10;RInstance=mine>;q=0.5;EXPIRES=300",
+            ],
+            None,
+        );
+        assert_eq!(RegistrationAgent::extract_expires(&response, "mine"), 300);
+    }
+
+    #[test]
+    fn test_extract_expires_no_match_falls_back_to_expires_header() {
+        let response = ok_with_contacts(
+            &["<sip:alice@192.0.2.20;rinstance=other>;expires=3600"],
+            Some("600"),
+        );
+        assert_eq!(RegistrationAgent::extract_expires(&response, "mine"), 600);
+        // A substring of another instance's token is not a match.
+        let response = ok_with_contacts(
+            &["<sip:alice@192.0.2.20;rinstance=mine2>;expires=3600"],
+            None,
+        );
+        assert_eq!(RegistrationAgent::extract_expires(&response, "mine"), 3600);
+    }
+
+    #[test]
+    fn test_extract_expires_hostile_values_do_not_panic() {
+        for c in [
+            "<sip:a@192.0.2.1;rinstance=mine>",
+            "<sip:a@192.0.2.1;rinstance=mine>;expires=",
+            "<sip:a@192.0.2.1;rinstance=mine>;expires=abc",
+            "<sip:a@192.0.2.1;rinstance=mine>;expires=99999999999999999999",
+            "<sip:a@192.0.2.1;rinstance=mine>;expires=-1",
+            "<sip:a@192.0.2.1;rinstance=mine;expires=5",
+            "<<<,,,>>>;;;==;expires",
+            "\u{e9}\u{e9};expires=\u{e9}",
+            "",
+        ] {
+            let response = ok_with_contacts(&[c], Some("700"));
+            assert_eq!(
+                RegistrationAgent::extract_expires(&response, "mine"),
+                700,
+                "{c}"
+            );
+        }
+        // Unterminated quote: only must not panic.
+        let response = ok_with_contacts(
+            &["\"unterminated <sip:a@192.0.2.1;rinstance=mine>;expires=5"],
+            None,
+        );
+        let _ = RegistrationAgent::extract_expires(&response, "mine");
+        let response = ok_with_contacts(&["sip:a@192.0.2.1;rinstance=mine;expires=45"], Some("x"));
+        assert_eq!(RegistrationAgent::extract_expires(&response, "mine"), 45);
+        let response = ok_with_contacts(&["<sip:a@192.0.2.1;rinstance=mine>"], Some("99999999999"));
+        assert_eq!(RegistrationAgent::extract_expires(&response, "mine"), 3600);
     }
 }
