@@ -193,11 +193,7 @@ impl ClusterService for ClusterServiceImpl {
                 }
 
                 // Include offline filter
-                if !req.include_offline && !m.state.is_healthy() {
-                    return false;
-                }
-
-                true
+                req.include_offline || m.state.is_healthy()
             })
             .map(|m| self.node_summary_to_info(m))
             .collect();
