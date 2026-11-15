@@ -117,6 +117,7 @@ Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_ver
 - **Key Size**: 256-bit master key, 96-bit master salt.
 - **KDF**: standard **RFC 3711 §4.3 AES-CM KDF** (AES-256-CM PRF), as required for interoperability with every other SRTP stack. An earlier HKDF-SHA384 derivation was removed because it produced non-interoperable session keys (`proto-srtp/src/key.rs`).
 - **Implementation**: `proto-srtp` crate, used by `sbc-media-core` (`srtp_relay.rs`, `media_pipeline.rs`).
+- **Soft client (fix/client-srtp-b2)**: Partial, fail closed. The client's SRTP key type accepts `AEAD_AES_256_GCM` only, with a 32-byte key and 12-byte salt per direction (`client-audio/src/media_security.rs` `SrtpSessionKeys::validate`, test `wrong_lengths_rejected`), and RTP and RTCP are protected with `proto-srtp` when keys are present (tests `srtp_loopback_no_plaintext_on_wire`, `srtcp_round_trip_and_no_plaintext_on_wire`, with test-made keys). No keys are ever present in a default build today, because the client has no DTLS handshake (NIST POA&M-324): a call on a TLS account ends after connect with no audio. Default-feature builds have no plaintext RTP path; `insecure-transports` builds can send plaintext RTP on UDP/TCP accounts.
 
 ### SIPREC recording session (sbc-daemon, sbc-media-core)
 
@@ -136,6 +137,11 @@ Wired since SIPREC phase 3, off by default (`[recording]`). Tested against a fak
 - **SBC Identity**: Wired (sbc-media-core). The self-signed DTLS certificate is generated with rcgen `PKCS_ECDSA_P384_SHA384` (`dtls_identity.rs`).
 - **Key Exchange / Handshake**: in the shipped SBC the DTLS handshake is performed by an external **Go DTLS-SRTP terminator sidecar** reached over a Unix socket (`sbc-media-core/src/dtls_sidecar.rs`); the Rust relay demuxes records and verifies the negotiated profile and fingerprint. The ECDH curve used inside the sidecar is not verified by Rust code. There is no `webrtc-dtls` dependency.
 - **Implementation**: `proto-dtls` (types, fingerprint, 1.2 record layer) + Go sidecar.
+- **Soft client (fix/client-srtp-b2)**: handshake Planned (NIST POA&M-324). `proto-dtls` `DtlsSession::new` returns `HandshakeFailed`; no cipher suite, curve or SRTP profile is negotiated with any peer. The four items below are what exists.
+- **Soft client identity**: one ephemeral self-signed ECDSA P-384 / SHA-384 certificate per process (rcgen `PKCS_ECDSA_P384_SHA384`, `client-sip-ua/src/dtls_identity.rs`), or a user certificate when its exportable PKCS#8 key is P-384, matches the leaf public key, and the certificate is signed with ecdsa-with-SHA384. Tests `generate_p384_identity_with_single_prefix_fingerprint`, `from_user_der_accepts_p384_only`, `from_user_der_requires_matching_key_and_sha384_signature`.
+- **Soft client fingerprint hash**: `sha-384` advertised; only `sha-384` / `sha-512` accepted from the peer (`proto-dtls` `from_sdp_strict`). `sha-256` is refused, which is stricter than RFC 8122 and costs interoperability with `sha-256`-only peers. No peer certificate is verified against a fingerprint until the handshake exists.
+- **Soft client key custody**: the identity key and SRTP key buffers are `Zeroizing`. The identity key is also copied per call into `proto_dtls::DtlsConfig.private_key` (plain `Vec`, `Debug` / `Clone`) and into an rcgen `KeyPair`, neither of which is zeroized (NIST POA&M-330).
+- **Soft client test-only keying**: the `proto-dtls` feature `test-placeholder-keying` (random keys, no handshake) is compiled only into proto-dtls's own unit tests and is a `compile_error!` without `debug_assertions`.
 
 ### STIR/SHAKEN
 

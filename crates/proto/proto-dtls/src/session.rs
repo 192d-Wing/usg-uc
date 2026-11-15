@@ -6,8 +6,10 @@
 //! ## Current Implementation Status
 //!
 //! This implementation provides the framework for DTLS integration with
-//! webrtc-dtls. The current version uses placeholder keying material
-//! generation for testing purposes. Full integration requires:
+//! webrtc-dtls. No network handshake is performed yet, so
+//! [`DtlsSession::new`] fails closed except in this crate's own unit tests
+//! built with the `test-placeholder-keying` feature (POA&M-324). Full
+//! integration requires:
 //! 1. Proper certificate handling for P-384 ECDSA
 //! 2. webrtc-dtls cipher suite support (currently lacks AES-256-GCM)
 //! 3. `KeyingMaterialExporter` trait integration
@@ -18,9 +20,12 @@
 //! - **SC-12**: Cryptographic Key Establishment
 //! - **SC-13**: Cryptographic Protection
 
+#[cfg(all(test, feature = "test-placeholder-keying"))]
+use crate::SrtpProfile;
 use crate::config::DtlsConfig;
 use crate::error::{DtlsError, DtlsResult};
-use crate::{DtlsRole, SrtpKeyingMaterial, SrtpProfile};
+use crate::fingerprint::CertificateFingerprint;
+use crate::{DtlsRole, SrtpKeyingMaterial};
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -58,22 +63,40 @@ impl DtlsSession {
     /// * `config` - DTLS configuration
     /// * `socket` - UDP socket for transport
     /// * `is_client` - Whether this is the client (initiator) role
+    /// * `expected_fingerprints` - peer fingerprints signalled in SDP; the
+    ///   peer certificate must match at least one (RFC 8122 §5). An empty set
+    ///   is rejected (fail closed).
     ///
     /// ## Current Implementation
     ///
-    /// This creates a session with placeholder keying material.
-    /// Full webrtc-dtls integration is planned for a future phase.
+    /// No network handshake is implemented. Without the
+    /// `test-placeholder-keying` feature this returns
+    /// [`DtlsError::HandshakeFailed`]: returning locally generated keys the
+    /// peer never learns would report a "secure" session that cannot carry
+    /// media (NIST 800-53 Rev5: SC-8(1), SC-12 fail closed).
+    ///
+    /// POAM: POA&M-324 drive `handshake.rs` over the network (retransmission,
+    /// cookies, alerts, fingerprint verification) and export real keys.
     ///
     /// ## Errors
     ///
     /// Returns an error if the handshake fails or configuration is invalid.
-    #[instrument(skip(config, socket))]
+    #[instrument(skip(config, socket, expected_fingerprints))]
     pub async fn new(
         config: &DtlsConfig,
         socket: Arc<UdpSocket>,
         is_client: bool,
+        expected_fingerprints: &[CertificateFingerprint],
     ) -> DtlsResult<Self> {
         config.validate()?;
+
+        // RFC 5763 §6.7.1: the peer certificate MUST be checked against the
+        // SDP fingerprint; with nothing to check against, refuse.
+        if expected_fingerprints.is_empty() {
+            return Err(DtlsError::HandshakeFailed {
+                reason: "no remote fingerprint signalled".to_string(),
+            });
+        }
 
         let role = if is_client {
             DtlsRole::Client
@@ -86,30 +109,43 @@ impl DtlsSession {
             "Creating DTLS session"
         );
 
-        // Generate keying material
-        // In full implementation, this would come from the DTLS handshake
-        let keying_material = Self::generate_keying_material(config)?;
+        #[cfg(all(test, feature = "test-placeholder-keying"))]
+        {
+            // Test-only placeholder: random keys that the peer never learns.
+            let keying_material = Self::generate_keying_material(config)?;
 
-        debug!(
-            role = ?role,
-            "DTLS session created"
-        );
+            debug!(
+                role = ?role,
+                "DTLS session created (placeholder keying)"
+            );
 
-        Ok(Self {
-            socket,
-            role,
-            established: true,
-            keying_material: Some(keying_material),
-        })
+            Ok(Self {
+                socket,
+                role,
+                established: true,
+                keying_material: Some(keying_material),
+            })
+        }
+
+        #[cfg(not(all(test, feature = "test-placeholder-keying")))]
+        {
+            let _ = socket;
+            Err(DtlsError::HandshakeFailed {
+                reason: "DTLS handshake not implemented (POA&M-324)".to_string(),
+            })
+        }
     }
 
     /// Generates keying material for SRTP.
+    ///
+    /// Test-only (`test-placeholder-keying`).
     ///
     /// ## Current Implementation
     ///
     /// Uses secure random generation for placeholder keys.
     /// In full implementation, this would be exported from the DTLS
     /// handshake using the RFC 5764 exporter.
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     fn generate_keying_material(config: &DtlsConfig) -> DtlsResult<SrtpKeyingMaterial> {
         let profile = config
             .srtp_profiles
@@ -294,6 +330,27 @@ mod tests {
         assert_eq!(SRTP_EXPORTER_LABEL, "EXTRACTOR-dtls_srtp");
     }
 
+    fn fps() -> Vec<CertificateFingerprint> {
+        vec![CertificateFingerprint::from_certificate_sha384(b"peer")]
+    }
+
+    #[cfg(not(all(test, feature = "test-placeholder-keying")))]
+    #[tokio::test]
+    async fn session_new_fails_closed_without_handshake() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = create_test_config();
+        let result = DtlsSession::new(&config, Arc::new(socket), true, &fps()).await;
+        assert!(matches!(result, Err(DtlsError::HandshakeFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn session_new_rejects_empty_fingerprint_set() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = create_test_config();
+        let result = DtlsSession::new(&config, Arc::new(socket), true, &[]).await;
+        assert!(matches!(result, Err(DtlsError::HandshakeFailed { .. })));
+    }
+
     fn create_test_config() -> DtlsConfig {
         DtlsConfig {
             certificate_chain: vec![vec![0u8; 100]],
@@ -307,12 +364,13 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[tokio::test]
     async fn test_session_new_client() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let config = create_test_config();
 
-        let session = DtlsSession::new(&config, Arc::new(socket), true).await;
+        let session = DtlsSession::new(&config, Arc::new(socket), true, &fps()).await;
         assert!(session.is_ok());
 
         let session = session.unwrap();
@@ -320,13 +378,14 @@ mod tests {
         assert_eq!(session.role(), DtlsRole::Client);
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[tokio::test]
     async fn test_session_new_server() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut config = create_test_config();
         config.role = DtlsRole::Server;
 
-        let session = DtlsSession::new(&config, Arc::new(socket), false).await;
+        let session = DtlsSession::new(&config, Arc::new(socket), false, &fps()).await;
         assert!(session.is_ok());
 
         let session = session.unwrap();
@@ -348,16 +407,17 @@ mod tests {
             replay_protection: true,
         };
 
-        let result = DtlsSession::new(&config, Arc::new(socket), true).await;
+        let result = DtlsSession::new(&config, Arc::new(socket), true, &fps()).await;
         assert!(result.is_err());
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[tokio::test]
     async fn test_export_srtp_keying_material() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let config = create_test_config();
 
-        let session = DtlsSession::new(&config, Arc::new(socket), true)
+        let session = DtlsSession::new(&config, Arc::new(socket), true, &fps())
             .await
             .unwrap();
 
@@ -384,12 +444,13 @@ mod tests {
         );
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[tokio::test]
     async fn test_export_srtp_keying_material_not_connected() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let config = create_test_config();
 
-        let mut session = DtlsSession::new(&config, Arc::new(socket), true)
+        let mut session = DtlsSession::new(&config, Arc::new(socket), true, &fps())
             .await
             .unwrap();
 
@@ -402,12 +463,13 @@ mod tests {
         assert!(matches!(result, Err(DtlsError::NotConnected)));
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[tokio::test]
     async fn test_session_close() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let config = create_test_config();
 
-        let mut session = DtlsSession::new(&config, Arc::new(socket), true)
+        let mut session = DtlsSession::new(&config, Arc::new(socket), true, &fps())
             .await
             .unwrap();
 
@@ -418,12 +480,13 @@ mod tests {
         assert!(!session.is_established());
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[tokio::test]
     async fn test_session_close_twice() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let config = create_test_config();
 
-        let mut session = DtlsSession::new(&config, Arc::new(socket), true)
+        let mut session = DtlsSession::new(&config, Arc::new(socket), true, &fps())
             .await
             .unwrap();
 
@@ -437,12 +500,13 @@ mod tests {
         assert!(matches!(result, Err(DtlsError::AlreadyClosed)));
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[tokio::test]
     async fn test_send_not_connected() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let config = create_test_config();
 
-        let mut session = DtlsSession::new(&config, Arc::new(socket), true)
+        let mut session = DtlsSession::new(&config, Arc::new(socket), true, &fps())
             .await
             .unwrap();
 
@@ -453,12 +517,13 @@ mod tests {
         assert!(matches!(result, Err(DtlsError::NotConnected)));
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[tokio::test]
     async fn test_recv_not_connected() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let config = create_test_config();
 
-        let mut session = DtlsSession::new(&config, Arc::new(socket), true)
+        let mut session = DtlsSession::new(&config, Arc::new(socket), true, &fps())
             .await
             .unwrap();
 
@@ -469,12 +534,13 @@ mod tests {
         assert!(matches!(result, Err(DtlsError::NotConnected)));
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[tokio::test]
     async fn test_session_debug() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let config = create_test_config();
 
-        let session = DtlsSession::new(&config, Arc::new(socket), true)
+        let session = DtlsSession::new(&config, Arc::new(socket), true, &fps())
             .await
             .unwrap();
 
@@ -484,6 +550,7 @@ mod tests {
         assert!(debug_str.contains("established"));
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[test]
     fn test_generate_keying_material() {
         let config = create_test_config();
@@ -496,6 +563,7 @@ mod tests {
         assert!(km.server_write_key.iter().any(|&b| b != 0));
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[test]
     fn test_generate_keying_material_uses_first_profile() {
         let mut config = create_test_config();
@@ -505,6 +573,7 @@ mod tests {
         assert_eq!(km.profile, SrtpProfile::AeadAes256Gcm);
     }
 
+    #[cfg(all(test, feature = "test-placeholder-keying"))]
     #[test]
     fn test_generate_keying_material_empty_profiles_uses_default() {
         let mut config = create_test_config();

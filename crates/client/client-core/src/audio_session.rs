@@ -9,9 +9,9 @@
 
 use crate::{AppError, AppResult};
 use client_audio::{
-    AudioPipeline, AudioProcessingConfig, PipelineConfig, PipelineState, PipelineStats,
+    AudioPipeline, AudioProcessingConfig, MediaSecurity, PipelineConfig, PipelineState,
+    PipelineStats,
 };
-use client_sip_ua::{MediaSession, MediaSessionState};
 use client_types::DtmfDigit;
 use client_types::audio::CodecPreference;
 use std::net::SocketAddr;
@@ -19,7 +19,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 /// Configuration for an audio session.
-#[derive(Debug, Clone)]
+///
+/// No `Default`/`Clone`: the media security mode must be stated (see
+/// [`AudioSessionConfig::new`]), so a new call site cannot silently get
+/// plaintext RTP. NIST 800-53 Rev5: SC-8(1).
+#[derive(Debug)]
 pub struct AudioSessionConfig {
     /// Local RTP port (0 for auto-assign).
     pub local_port: u16,
@@ -29,10 +33,12 @@ pub struct AudioSessionConfig {
     pub codec: CodecPreference,
     /// Jitter buffer depth in milliseconds.
     pub jitter_buffer_ms: u32,
-    /// SRTP master key.
-    pub srtp_key: Option<Vec<u8>>,
-    /// SRTP master salt.
-    pub srtp_salt: Option<Vec<u8>>,
+    /// Media security (SRTP keys; plaintext only in insecure builds).
+    pub security: MediaSecurity,
+    /// Per-call media socket shared with signalling/DTLS (RFC 5764 §5.1.2).
+    pub socket: Option<std::net::UdpSocket>,
+    /// RTCP multiplexed on the RTP port (RFC 5761).
+    pub rtcp_mux: bool,
     /// Music on Hold file path (optional).
     pub moh_file_path: Option<String>,
     /// DTMF telephone-event payload type from SDP (`None` = use default 101).
@@ -47,15 +53,18 @@ pub struct AudioSessionConfig {
     pub extension_ids: Vec<(u8, String)>,
 }
 
-impl Default for AudioSessionConfig {
-    fn default() -> Self {
+impl AudioSessionConfig {
+    /// Creates a configuration with default media settings and the given
+    /// security mode.
+    pub fn new(security: MediaSecurity) -> Self {
         Self {
             local_port: 0,
             remote_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             codec: CodecPreference::G711Ulaw,
             jitter_buffer_ms: 40,
-            srtp_key: None,
-            srtp_salt: None,
+            security,
+            socket: None,
+            rtcp_mux: false,
             moh_file_path: None,
             dtmf_payload_type: None,
             dtmf_volume: 10,
@@ -103,44 +112,6 @@ impl AudioSession {
         }
     }
 
-    /// Starts the audio session from media session SRTP keys.
-    ///
-    /// This extracts the SRTP keys from the established media session
-    /// and configures the audio pipeline.
-    pub async fn start_from_media_session(
-        &mut self,
-        media_session: &MediaSession,
-        remote_addr: SocketAddr,
-        codec: CodecPreference,
-    ) -> AppResult<u16> {
-        if media_session.state() != MediaSessionState::Active {
-            return Err(AppError::Audio("Media session not active".to_string()));
-        }
-
-        info!(
-            remote = %remote_addr,
-            codec = ?codec,
-            "Starting audio session from media session"
-        );
-
-        let config = AudioSessionConfig {
-            local_port: 0,
-            remote_addr,
-            codec,
-            jitter_buffer_ms: 40,
-            srtp_key: None,
-            srtp_salt: None,
-            moh_file_path: None,
-            dtmf_payload_type: None,
-            dtmf_volume: 10,
-            dtmf_inter_digit_pause_ms: 100,
-            redundancy_pt: None,
-            extension_ids: Vec::new(),
-        };
-
-        self.start(config).await
-    }
-
     /// Starts the audio session with the given configuration.
     pub async fn start(&mut self, config: AudioSessionConfig) -> AppResult<u16> {
         if self.pipeline.is_running() {
@@ -159,8 +130,9 @@ impl AudioSession {
             local_port: config.local_port,
             remote_addr: config.remote_addr,
             jitter_buffer_ms: config.jitter_buffer_ms,
-            srtp_master_key: config.srtp_key,
-            srtp_master_salt: config.srtp_salt,
+            security: config.security,
+            socket: config.socket,
+            rtcp_mux: config.rtcp_mux,
             muted: self.pipeline.is_muted(),
             moh_file_path: config.moh_file_path,
             dtmf_payload_type: config.dtmf_payload_type,
@@ -322,10 +294,11 @@ pub struct AudioSessionConfigBuilder {
 }
 
 impl AudioSessionConfigBuilder {
-    /// Creates a new builder with default configuration.
-    pub fn new() -> Self {
+    /// Creates a new builder with default configuration and the given
+    /// media security mode.
+    pub fn new(security: MediaSecurity) -> Self {
         Self {
-            config: AudioSessionConfig::default(),
+            config: AudioSessionConfig::new(security),
         }
     }
 
@@ -357,17 +330,10 @@ impl AudioSessionConfigBuilder {
         self
     }
 
-    /// Sets the SRTP master key.
+    /// Enables RTCP multiplexing on the RTP port (RFC 5761).
     #[must_use]
-    pub fn srtp_key(mut self, key: Vec<u8>) -> Self {
-        self.config.srtp_key = Some(key);
-        self
-    }
-
-    /// Sets the SRTP master salt.
-    #[must_use]
-    pub fn srtp_salt(mut self, salt: Vec<u8>) -> Self {
-        self.config.srtp_salt = Some(salt);
+    pub const fn rtcp_mux(mut self, enabled: bool) -> Self {
+        self.config.rtcp_mux = enabled;
         self
     }
 
@@ -397,15 +363,21 @@ impl AudioSessionConfigBuilder {
     }
 }
 
-impl Default for AudioSessionConfigBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use client_audio::{SrtpProfile, SrtpSessionKeys};
+    use zeroize::Zeroizing;
+
+    fn keys() -> MediaSecurity {
+        MediaSecurity::Srtp(SrtpSessionKeys::new(
+            SrtpProfile::AeadAes256Gcm,
+            Zeroizing::new(vec![0x42; 32]),
+            Zeroizing::new(vec![0x24; 12]),
+            Zeroizing::new(vec![0x43; 32]),
+            Zeroizing::new(vec![0x25; 12]),
+        ))
+    }
 
     #[tokio::test]
     async fn test_audio_session_creation() {
@@ -430,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_audio_session_config_default() {
-        let config = AudioSessionConfig::default();
+        let config = AudioSessionConfig::new(keys());
         assert_eq!(config.local_port, 0);
         assert_eq!(config.jitter_buffer_ms, 40);
         assert_eq!(config.codec, CodecPreference::G711Ulaw);
@@ -440,20 +412,19 @@ mod tests {
     fn test_audio_session_config_builder() {
         let remote: SocketAddr = "192.168.1.100:16000".parse().unwrap();
 
-        let config = AudioSessionConfigBuilder::new()
+        let config = AudioSessionConfigBuilder::new(keys())
             .local_port(16384)
             .remote_addr(remote)
             .codec(CodecPreference::Opus)
             .jitter_buffer_ms(80)
-            .srtp_key(vec![0x42; 32])
-            .srtp_salt(vec![0x24; 12])
+            .rtcp_mux(true)
             .build();
 
         assert_eq!(config.local_port, 16384);
         assert_eq!(config.remote_addr, remote);
         assert_eq!(config.codec, CodecPreference::Opus);
         assert_eq!(config.jitter_buffer_ms, 80);
-        assert!(config.srtp_key.is_some());
-        assert!(config.srtp_salt.is_some());
+        assert!(config.rtcp_mux);
+        assert!(matches!(config.security, MediaSecurity::Srtp(_)));
     }
 }

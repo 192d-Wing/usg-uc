@@ -398,6 +398,19 @@ impl<'a> SrtpUnprotect<'a> {
         reason = "async kept for API stability with the RTP path"
     )]
     pub async fn unprotect_rtcp(&self, data: &[u8]) -> SrtpResult<Bytes> {
+        self.unprotect_rtcp_sync(data)
+    }
+
+    /// Synchronous form of [`Self::unprotect_rtcp`] for non-async callers
+    /// (e.g. the client `audio-io` std thread). Nothing in the AEAD SRTCP
+    /// path awaits, so both forms share this implementation.
+    ///
+    /// RFC 3711 §3.4: SRTCP authentication is mandatory; a packet whose tag
+    /// does not verify is rejected and never surfaced as plaintext.
+    ///
+    /// # Errors
+    /// Returns an error if decryption or authentication fails.
+    pub fn unprotect_rtcp_sync(&self, data: &[u8]) -> SrtpResult<Bytes> {
         let auth_tag_len = self.context.profile().auth_tag_len();
 
         // header(8) + ciphertext(>=tag) + E+SRTCP-index(4).
@@ -509,6 +522,65 @@ mod tests {
 
         let result = SrtpUnprotect::new(&receiver).unprotect_rtp(&tampered);
         assert!(matches!(result, Err(SrtpError::AuthenticationFailed)));
+    }
+
+    fn rtcp_sr() -> Vec<u8> {
+        // RTCP SR header (V=2, PT=200, length=6) + SSRC + 20-byte sender info.
+        let mut pkt = vec![0x80, 200, 0x00, 0x06, 0xDE, 0xAD, 0xBE, 0xEF];
+        pkt.extend_from_slice(&[0x11u8; 20]);
+        pkt
+    }
+
+    #[test]
+    fn unprotect_rtcp_sync_round_trip_and_tamper() {
+        let (sender, receiver) = test_contexts();
+        let plain = rtcp_sr();
+        let protected = SrtpProtect::new(&sender).protect_rtcp(&plain).unwrap();
+        assert!(!protected.windows(20).any(|w| w == &plain[8..]));
+
+        let mut tampered = protected.to_vec();
+        tampered[10] ^= 0x01;
+        assert!(matches!(
+            SrtpUnprotect::new(&receiver).unprotect_rtcp_sync(&tampered),
+            Err(SrtpError::AuthenticationFailed)
+        ));
+
+        let out = SrtpUnprotect::new(&receiver)
+            .unprotect_rtcp_sync(&protected)
+            .unwrap();
+        assert_eq!(out.as_ref(), plain.as_slice());
+
+        // Replay of the same SRTCP index is rejected.
+        assert!(
+            SrtpUnprotect::new(&receiver)
+                .unprotect_rtcp_sync(&protected)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unprotect_rtcp_async_matches_sync() {
+        let (sender, _) = test_contexts();
+        let (_, rx_sync) = test_contexts();
+        let (_, rx_async) = test_contexts();
+        let protected = SrtpProtect::new(&sender).protect_rtcp(&rtcp_sr()).unwrap();
+
+        let sync_out = SrtpUnprotect::new(&rx_sync)
+            .unprotect_rtcp_sync(&protected)
+            .unwrap();
+
+        // The async form never awaits, so a single poll completes it.
+        let unprotect = SrtpUnprotect::new(&rx_async);
+        let mut fut = std::pin::pin!(unprotect.unprotect_rtcp(&protected));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let poll = fut.as_mut().poll(&mut cx);
+        assert!(
+            poll.is_ready(),
+            "unprotect_rtcp must complete on first poll"
+        );
+        if let std::task::Poll::Ready(async_out) = poll {
+            assert_eq!(async_out.unwrap(), sync_out);
+        }
     }
 
     #[test]

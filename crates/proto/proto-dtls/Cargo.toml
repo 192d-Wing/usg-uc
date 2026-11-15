@@ -20,5 +20,17 @@ bytes.workspace = true
 # Async support
 async-trait = "0.1"
 
+[dev-dependencies]
+# Real self-signed certificates for the fingerprint-binding tests.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
+
+[features]
+# Test-only: proto-dtls's OWN unit tests use random local keys instead of
+# failing closed. The placeholder is compiled only under `cfg(test)`, so
+# feature unification (e.g. workspace `--all-features`) never puts it into a
+# dependent crate; release builds with the feature fail to compile
+# (POA&M-324).
+test-placeholder-keying = []
+
 [lints]
 workspace = true

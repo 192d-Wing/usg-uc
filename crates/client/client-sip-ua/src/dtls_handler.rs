@@ -130,18 +130,37 @@ impl DtlsHandler {
     /// This will be verified during the handshake.
     /// Note: This is a no-op if no connection exists yet; fingerprint
     /// will be set when `handshake()` is called.
-    #[allow(clippy::unused_async)]
-    pub async fn set_remote_fingerprint(&self, fingerprint: &str) {
-        if let Some(conn) = &self.connection
-            && let Ok(fp) = CertificateFingerprint::from_sdp(fingerprint)
-        {
+    ///
+    /// # Errors
+    /// Returns [`SipUaError::DtlsError`] if the value does not parse as a
+    /// CNSA (sha-384/sha-512) fingerprint; it is never silently dropped.
+    pub async fn set_remote_fingerprint(&self, fingerprint: &str) -> SipUaResult<()> {
+        let fp = CertificateFingerprint::from_sdp_strict(fingerprint)
+            .map_err(|e| SipUaError::DtlsError(format!("invalid remote fingerprint: {e}")))?;
+        if let Some(conn) = &self.connection {
             conn.set_remote_fingerprint(fp).await;
         }
+        Ok(())
     }
 
     /// Gets the DTLS role.
     pub const fn role(&self) -> DtlsRole {
         self.config.role
+    }
+
+    /// Sets the DTLS role negotiated by `a=setup` (RFC 5763 §5). The role is
+    /// not fixed by call direction.
+    ///
+    /// # Errors
+    /// Returns [`SipUaError::InvalidState`] once a handshake has started.
+    pub fn set_role(&mut self, role: DtlsRole) -> SipUaResult<()> {
+        if self.connection.is_some() || self.remote_addr.is_some() {
+            return Err(SipUaError::InvalidState(
+                "DTLS role cannot change after the handshake started".to_string(),
+            ));
+        }
+        self.config.role = role;
+        Ok(())
     }
 
     /// Gets the current DTLS state.
@@ -158,19 +177,32 @@ impl DtlsHandler {
         self.socket = Some(socket);
     }
 
+    /// Drops this handler's reference to the media socket (handoff to the
+    /// audio pipeline).
+    pub fn clear_socket(&mut self) {
+        self.socket = None;
+    }
+
     /// Performs the DTLS handshake.
     ///
     /// # Arguments
     /// * `remote_addr` - Remote address to connect to
-    /// * `remote_fingerprint` - Expected fingerprint from SDP (optional)
+    /// * `remote_fingerprints` - Fingerprints from the remote SDP; the peer
+    ///   certificate must match at least one (RFC 8122 §5). Empty is an error.
     ///
     /// # Returns
     /// SRTP keying material on success.
     pub async fn handshake(
         &mut self,
         remote_addr: SocketAddr,
-        remote_fingerprint: Option<&str>,
+        remote_fingerprints: &[CertificateFingerprint],
     ) -> SipUaResult<SrtpKeyingMaterial> {
+        // RFC 5763 §6.7.1: never handshake without a fingerprint to verify.
+        if remote_fingerprints.is_empty() {
+            return Err(SipUaError::DtlsError(
+                "no remote fingerprint signalled".to_string(),
+            ));
+        }
         info!(
             local = %self.local_addr,
             remote = %remote_addr,
@@ -192,12 +224,9 @@ impl DtlsHandler {
                 .map_err(|e| SipUaError::DtlsError(e.to_string()))?
         };
 
-        // Set remote fingerprint if provided
-        if let Some(fp_str) = remote_fingerprint
-            && let Ok(fp) = CertificateFingerprint::from_sdp(fp_str)
-        {
-            connection.set_remote_fingerprint(fp).await;
-        }
+        connection
+            .set_remote_fingerprints(remote_fingerprints.to_vec())
+            .await;
 
         // Notify state change
         let _ = self
@@ -304,7 +333,7 @@ impl DtlsHandler {
 
     /// Formats the DTLS setup attribute for SDP.
     ///
-    /// Returns: `a=setup:actpass`, `a=setup:active`, or `a=setup:passive`
+    /// Returns: `a=setup:active` or `a=setup:passive`
     pub fn format_sdp_setup(&self) -> String {
         match self.config.role {
             DtlsRole::Client => "a=setup:active".to_string(),
@@ -312,15 +341,18 @@ impl DtlsHandler {
         }
     }
 
-    /// Parses the remote setup attribute from SDP.
+    /// Parses the remote setup attribute from SDP and returns our role.
     ///
-    /// Returns the role we should use based on their setup.
-    pub fn parse_remote_setup(setup: &str) -> DtlsRole {
-        match setup.to_lowercase().as_str() {
-            "active" => DtlsRole::Server, // They're active, we're passive
-            // They're passive, we're active; "actpass" = they support both, we choose active
-            _ => DtlsRole::Client,
-        }
+    /// RFC 4145 §4 / RFC 5763 §5: they are `active` → we are passive
+    /// (Server); they are `passive` or `actpass` → we are active (Client).
+    ///
+    /// # Errors
+    /// Returns [`SipUaError::DtlsError`] for `holdconn` or an unknown value;
+    /// garbage is never mapped to a role.
+    pub fn parse_remote_setup(setup: &str) -> SipUaResult<DtlsRole> {
+        crate::sdp_dtls::Setup::parse(setup)?
+            .answer_to_offer()?
+            .local_role()
     }
 }
 
@@ -354,9 +386,63 @@ mod tests {
 
     #[test]
     fn test_parse_remote_setup() {
-        assert_eq!(DtlsHandler::parse_remote_setup("active"), DtlsRole::Server);
-        assert_eq!(DtlsHandler::parse_remote_setup("passive"), DtlsRole::Client);
-        assert_eq!(DtlsHandler::parse_remote_setup("actpass"), DtlsRole::Client);
+        assert_eq!(
+            DtlsHandler::parse_remote_setup("active").unwrap(),
+            DtlsRole::Server
+        );
+        assert_eq!(
+            DtlsHandler::parse_remote_setup("passive").unwrap(),
+            DtlsRole::Client
+        );
+        assert_eq!(
+            DtlsHandler::parse_remote_setup("ACTPASS").unwrap(),
+            DtlsRole::Client
+        );
+        assert!(DtlsHandler::parse_remote_setup("holdconn").is_err());
+        assert!(DtlsHandler::parse_remote_setup("garbage").is_err());
+    }
+
+    #[tokio::test]
+    async fn handshake_requires_fingerprint_and_locks_role() {
+        let (tx, _rx) = mpsc::channel(10);
+        let id = crate::DtlsIdentity::generate().unwrap();
+        let config = DtlsConfig::new(DtlsRole::Client)
+            .with_identity(id.cert_chain_der().to_vec(), id.key_der().to_vec());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let local = sock.local_addr().unwrap();
+        let mut handler = DtlsHandler::new(config, local, tx);
+        handler.set_socket(sock);
+        handler.set_role(DtlsRole::Server).unwrap();
+        assert_eq!(handler.role(), DtlsRole::Server);
+
+        let remote: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert!(handler.handshake(remote, &[]).await.is_err());
+
+        // No DTLS handshake exists yet (POA&M-324): with a fingerprint the
+        // handshake still fails closed, and the role is now locked.
+        let fp = CertificateFingerprint::from_certificate_sha384(b"peer");
+        assert!(handler.handshake(remote, &[fp]).await.is_err());
+        assert!(handler.set_role(DtlsRole::Client).is_err());
+        assert!(handler.get_keying_material().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn set_remote_fingerprint_rejects_bad_values() {
+        let (tx, _rx) = mpsc::channel(10);
+        let handler = DtlsHandler::new(
+            DtlsConfig::new(DtlsRole::Client),
+            "127.0.0.1:0".parse().unwrap(),
+            tx,
+        );
+        assert!(
+            handler
+                .set_remote_fingerprint("sha-256 AA:BB")
+                .await
+                .is_err()
+        );
+        assert!(handler.set_remote_fingerprint("garbage").await.is_err());
+        let fp = CertificateFingerprint::from_certificate_sha384(b"x").to_sdp();
+        handler.set_remote_fingerprint(&fp).await.unwrap();
     }
 
     #[test]

@@ -11,6 +11,10 @@ repository.workspace = true
 default = []
 # Enable Opus FFI codec (requires libopus: brew install opus)
 opus-ffi = ["uc-codecs/opus-ffi"]
+# Allows `MediaSecurity::Plaintext` (unencrypted RTP/RTCP). Only for lab /
+# UDP-TCP accounts; enabled by client-core's `insecure-transports`.
+# NIST 800-53 Rev5: CM-7 (plaintext media is an explicit build choice).
+insecure-rtp = []
 
 [dependencies]
 client-types = { path = "../client-types" }
@@ -20,6 +24,7 @@ proto-srtp.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
+zeroize.workspace = true
 
 # Audio
 cpal.workspace = true

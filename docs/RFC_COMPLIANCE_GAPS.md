@@ -325,7 +325,7 @@ The soft client gathers candidates, exchanges them in SDP and runs connectivity 
 
 ## proto-dtls (RFC 6347 + RFC 5764)
 
-**Entire section Library-only.** `DtlsConnection::handshake` delegates to `session.rs`, which produces placeholder keying material and never drives `handshake.rs`/`record.rs`/`verify.rs`/`srtp_export.rs`; SBC DTLS-SRTP termination is performed by the Go sidecar (`sbc-media-core/src/dtls_sidecar.rs`, `dtls_relay.rs`). The only proto-dtls code on a shipped path is `fingerprint.rs` (`CertificateFingerprint`, used by `sbc-media-core/src/dtls_identity.rs` and the soft client). The soft client's `dtls_handler.rs` does call `DtlsConnection::handshake` and therefore derives SRTP keys from placeholder material.
+**Entire section Library-only.** `DtlsConnection::handshake` delegates to `session.rs`, which never drives `handshake.rs`/`record.rs`/`verify.rs`/`srtp_export.rs`: since fix/client-srtp-b2 `DtlsSession::new` returns `HandshakeFailed("DTLS handshake not implemented (POA&M-324)")`, and it rejects an empty fingerprint set. The former placeholder keying (random keys, no handshake) now exists only under `cfg(all(test, feature = "test-placeholder-keying"))`, that is in proto-dtls's own unit tests, and the feature is a `compile_error!` without `debug_assertions`; SBC DTLS-SRTP termination is performed by the Go sidecar (`sbc-media-core/src/dtls_sidecar.rs`, `dtls_relay.rs`). The only proto-dtls code on a shipped path is `fingerprint.rs` (`CertificateFingerprint`, used by `sbc-media-core/src/dtls_identity.rs` and the soft client). The soft client's `dtls_handler.rs` calls `DtlsConnection::handshake`, which now always fails, so the client derives no SRTP keys and its TLS calls fail closed with no audio (NIST POA&M-324); see "Soft client DTLS-SRTP signalling and media gate" below. New in `fingerprint.rs`: `from_sdp_strict` and `verify_any` (RFC 8122 §5); `handshake.rs` `process_certificate` checks the peer leaf with `verify_any`, reachable only once a handshake is driven.
 
 ### RFC 6347 Section Mapping (DTLS 1.2)
 
@@ -348,6 +348,29 @@ The soft client gathers candidates, exchanges them in SDP and runs connectivity 
 | §4.1.2 | Profile Negotiation | Complete | Library-only | AES-256-GCM only in proto-dtls; sbc-media-core pins the sidecar to AEAD_AES_256_GCM in `dtls_relay.rs` |
 | §4.2 | Key Export | Complete | Library-only | HKDF-SHA384 in proto-dtls; production keys are exported by the sidecar |
 | §5 | Security Considerations | Partial | Library-only | CNSA 2.0 only |
+| §5.1.2 | Demultiplexing STUN / DTLS / SRTP | Partial | Wired (soft client), not proto-dtls code | `client-audio/src/rtp_handler.rs` `classify`; DTLS and STUN are dropped, not serviced (see below) |
+
+### Soft client DTLS-SRTP signalling and media gate (RFC 5763, 5764, 8122, 4145, 5761, 7983, 3711; fix/client-srtp-b2)
+
+Added 2026-11-15. The soft client no longer has a plaintext RTP path in default-feature (TLS) builds, but it has no DTLS handshake either (NIST POA&M-324). Every call on a TLS account therefore ends after connect with no audio. The rows below say what the code does today. Statuses are from unit and gate tests only (`client-core/tests/media_security_gate.rs` unless another file is named); there has been no run against the SBC, its Go DTLS sidecar or any other peer, and no test uses a real DTLS handshake.
+
+| Behaviour | Status | Wiring | Notes |
+|-----------|--------|--------|-------|
+| RFC 5764 §4.1: media on a `UDP/TLS/RTP/SAVP(F)` stream is SRTP or nothing | Partial (fail closed) | Wired (soft client) | `client-core/src/call_manager.rs` `media_security_for`: no DTLS-SRTP keys, no audio; the call is ended (BYE or CANCEL). Because no handshake exists, this is the outcome of every TLS call. Tests `outbound_establish_error_ends_call_with_bye`, `inbound_accept_then_ack_fails_closed`, `test_media_security_for_by_account_and_build` |
+| RFC 6347 handshake; RFC 5764 §4.1.2 profile negotiation and §4.2 key export on the media socket | Gap | Not wired | `proto-dtls` `DtlsSession::new` returns `HandshakeFailed`; `MediaSession::establish` fails (test `establish_fails_closed_and_never_rebinds`). NIST POA&M-324 |
+| RFC 5764 §5.1.2 / RFC 7983 §7 demultiplexing of STUN, DTLS and RTP/RTCP by first byte | Partial | Wired (soft client) | `client-audio/src/rtp_handler.rs` `classify` runs before the source filter and RTP parsing. RTP (and RTCP under rtcp-mux) is processed. DTLS records and STUN are dropped and counted (`dtls_dropped`, `non_media_dropped`), not passed to a DTLS or ICE handler, so there is no post-handshake DTLS servicing and no consent freshness (NIST POA&M-325). First bytes outside the three ranges (ZRTP, TURN channel data) are dropped. Tests `classify_exhaustive_rfc7983`, `receive_drops_dtls_and_stun_and_unmuxed_rtcp` |
+| RFC 5761 §4 / §5.1.1 rtcp-mux | Partial | Wired (soft client) | Our offers carry `a=rtcp-mux`; an answer echoes it only when the offer had it. On a DTLS-SRTP call rtcp-mux is required, because there is no separate DTLS association for RTCP: a remote offer without it gets 488, a remote answer without it ends the call with BYE (NIST POA&M-326; stricter than RFC 5761 §5.1.1, under which an offerer whose peer does not answer `a=rtcp-mux` falls back to a separate RTCP port). With mux, RTCP is sent and received on the RTP socket; a datagram whose second byte has its low 7 bits in 64..=95 is treated as RTCP on every call, so RTP payload types 64-95 cannot be received (the client offers 111, 9, 0, 8, 13, 101, 121). Without mux (plaintext calls in `insecure-transports` builds) RTCP uses port+1. Not exercised against a peer. Tests `rejects_missing_rtcp_mux_and_insecure_second_stream`, no-`rtcp-mux` cases in `inbound_insecure_offer_gets_488` and `outbound_insecure_answers_end_call` |
+| RFC 8122 §5 `a=fingerprint` (parse and generate) | Partial, with a deviation | Wired (soft client) | Generated: one `sha-384` fingerprint of the DTLS identity certificate, full value, one hash prefix (test `offer_carries_one_full_sha384_fingerprint`). Parsed: `client-sip-ua/src/sdp_dtls.rs` `parse_dtls_params` with `proto-dtls` `CertificateFingerprint::from_sdp_strict`; several fingerprints are allowed (at most 8 per level, 256 bytes each). **Deviation (CNSA 2.0):** only `sha-384` and `sha-512` are accepted. `sha-256`, which RFC 8122 §5 makes the interoperable default, and `sha-1`, `sha-224`, `md5` are ignored, and a peer that offers none of the accepted hashes gets 488 or BYE. Tests `sha256_only_rejected_mixed_keeps_cnsa`, `qa_hostile_fingerprint_and_setup_rejected`, `qa_mixed_lists_precedence_and_order`, `strict_parse_rejects_bad_input` |
+| RFC 8122 §5 / RFC 5763 §5: the certificate the peer presents must match a signalled fingerprint | Gap | Not wired | `CertificateFingerprint::verify_any` exists and is called from `proto-dtls/src/handshake.rs` `process_certificate`, which nothing drives over the network. No peer certificate is received or checked (NIST POA&M-324). Tested only by direct calls: `verify_any_matches_one_of_set`, `test_process_certificate_empty_fingerprint_set_fails`, `verify_any_accepts_own_cert_rejects_other` |
+| RFC 4145 §4 / RFC 5763 §5 `a=setup` | Partial | Wired (soft client) | Offers carry `actpass`; an answer to `actpass` is `active`, to `active` is `passive`, to `passive` is `active`; `holdconn`, unknown values, a conflicting duplicate and `actpass` in a remote answer are rejected (488 or BYE). An absent `a=setup` is read as `active`. A re-INVITE answer keeps the established role; an offerless re-INVITE is answered with an `actpass` offer. The role is computed and stored but drives no handshake yet. Tests `role_table`, `setup_values`, `duplicate_and_long_setup`, `offer_actpass_answers_active_client`, `offerless_reinvite_200_offers_actpass`, `inbound_accept_then_ack_fails_closed` |
+| RFC 5763 §6.6 / RFC 8842: new DTLS association when a re-INVITE changes fingerprint or setup | Gap | Not wired | The re-offer passes the preflight and the old role and keys are kept; no new handshake (NIST POA&M-327) |
+| RFC 3264 §5.1 / §6: profile mismatch | Complete (reject only) | Wired (soft client) | On a TLS account every active `m=` section of the remote SDP must be `UDP/TLS/RTP/SAVP(F)`; `RTP/AVP`, `RTP/SAVP` (SDES) or a second non-DTLS stream gives 488 for an offer and BYE for an answer. On a non-TLS account an offer asking for `SAVP`/`SAVPF` gets 488 rather than a plaintext answer. A section with port 0 is ignored. Tests `inbound_insecure_offer_gets_488`, `qa_inbound_hostile_dtls_attrs_get_488_no_ring`, `outbound_insecure_answers_end_call`, `reinvite_insecure_reoffer_gets_488`, `all_active_media_checked`, `udp_account::*` (`insecure-transports` builds) |
+| RFC 3264 §5 / RFC 3261 §13.2.1 delayed offer (INVITE without SDP) | Gap | Wired (soft client) | Rejected with 488 on DTLS-SRTP accounts; offer in the 200 and answer in the ACK are not implemented (NIST POA&M-329) |
+| RFC 3264 §6: answer mirrors the offer's m-lines | Gap (not changed here) | Wired (soft client) | The answer is still built from a template with one audio m-line, whatever the offer contains (baseline finding RFC-006, open). Codec negotiation and remote-address parsing may also read a different audio section than the preflight when the first audio section is disabled |
+| RFC 3711 §3.4 SRTCP, RFC 7714 §6 | Partial | Call site in the soft client; not reachable in a default build until keys exist (NIST POA&M-324) | `client-audio/src/rtcp_session.rs`: with keys set, compound RTCP is protected before sending and never sent in clear; received RTCP is authenticated before parsing, and unauthenticated or tampered RTCP is dropped and counted. `proto-srtp` gained `SrtpUnprotect::unprotect_rtcp_sync`. Receive allocates one buffer per datagram (NIST POA&M-328). Tests with test-made keys: `srtcp_round_trip_and_no_plaintext_on_wire`, `srtcp_tampered_and_plaintext_dropped`, `unprotect_rtcp_sync_round_trip_and_tamper`, `unprotect_rtcp_async_matches_sync` |
+| RFC 3711 §3.3 / RFC 7714 §5 SRTP on the audio path | Partial | Call site in the soft client; not reachable in a default build until keys exist (NIST POA&M-324) | `client-audio/src/rtp_handler.rs`: audio, RFC 2198 redundancy, comfort noise and DTMF all leave as SRTP on a keyed session; the RFC 4961 source latch moves only after a packet authenticates. Tests with test-made keys: `srtp_loopback_no_plaintext_on_wire`, `qa_srtp_every_tx_path_encrypted_role_swapped`, `keyed_latch_moves_only_after_srtp_auth` |
+| RFC 3261 §13.3.1.4: UAS retransmits the 2xx until the ACK; session not established before the ACK | Gap | Wired (soft client) | No 2xx retransmission; an inbound call is reported Connected at the 200. Implemented for TLS calls: with no ACK after 64*T1 (32 s) the client sends BYE and starts no audio (test `test_unacked_tls_call_is_ended_after_64_t1`). NIST POA&M-331 |
+| RFC 3261 §21.4.26 / §20.43: 488 with Warning | Complete | Wired (soft client) | `Warning: 399 usg-client "SRTP/DTLS required"`, fixed text (`client-core/src/media_security.rs` `WARNING_SRTP_REQUIRED`); sent before any 180. Test `inbound_insecure_offer_gets_488` |
 
 ---
 
@@ -392,6 +415,8 @@ The soft client gathers candidates, exchanges them in SDP and runs connectivity 
 
 ### RFC 3711 Section Mapping
 
+Soft-client wiring note (fix/client-srtp-b2): where a row says "soft client", the call site exists in `client-audio`, but a default-feature (TLS) build reaches it only with DTLS-SRTP keys, and the client has no DTLS handshake to produce them (NIST POA&M-324). No soft-client call is protected by SRTP today. Before this change the soft client sent plaintext RTP on streams signalled as SAVPF (review BLOCKER B2); it now ends the call instead.
+
 | Section | Title | Status | Wiring | Notes |
 |---------|-------|--------|--------|-------|
 | §3.1 | SRTP Context | Complete | Wired (sbc-media-core, soft client) | `context.rs` (`media_pipeline.rs`, `client-audio/src/pipeline.rs`) |
@@ -400,9 +425,9 @@ The soft client gathers candidates, exchanges them in SDP and runs connectivity 
 | §4.1 | Packet Processing | Complete | Wired (sbc-media-core, soft client) | `protect.rs` (`srtp_relay.rs`, `client-audio/src/rtp_handler.rs`) |
 | §4.2 | Replay Protection | Complete | Wired (sbc-media-core, soft client) | 64-bit window, checked inside unprotect |
 | §6 | Default Transforms | Partial | Wired (sbc-media-core, soft client) | No AES-CM, HMAC-SHA1 |
-| §8 | Key Management | Partial | Wired (sbc-media-core) | DTLS-SRTP only; keys from the sidecar |
+| §8 | Key Management | Partial | Wired (sbc-media-core) | DTLS-SRTP only; keys from the sidecar. Soft client: no key management yet (NIST POA&M-324) |
 | §9.1 | Key Derivation | Complete | Wired (sbc-media-core, soft client) | HKDF-SHA384 |
-| §9.2 | SRTCP Index | Complete | Wired (sbc-media-core) | Index management (`srtp_relay.rs` `reprotect_rtcp`) |
+| §9.2 | SRTCP Index | Complete | Wired (sbc-media-core); soft client call site not reachable until NIST POA&M-324 | Index management (`srtp_relay.rs` `reprotect_rtcp`; `client-audio/src/rtcp_session.rs`) |
 
 ### RFC 7714 Section Mapping (AES-GCM)
 
@@ -411,7 +436,7 @@ The soft client gathers candidates, exchanges them in SDP and runs connectivity 
 | §3 | AES-GCM Cipher | Complete | Wired (sbc-media-core, soft client) | 256-bit only |
 | §4 | Nonce Formation | Complete | Wired (sbc-media-core, soft client) | 12-byte nonce |
 | §5 | SRTP AEAD | Complete | Wired (sbc-media-core, soft client) | Protection/unprotection |
-| §6 | SRTCP AEAD | Complete | Wired (sbc-media-core) | RTCP protection |
+| §6 | SRTCP AEAD | Complete | Wired (sbc-media-core); soft client call site not reachable until NIST POA&M-324 | RTCP protection; `unprotect_rtcp_sync` added for the soft client's audio thread (tests `unprotect_rtcp_sync_round_trip_and_tamper`, `unprotect_rtcp_async_matches_sync`) |
 
 ### Gap: RFC 3711 §6 - Default Transforms
 
@@ -567,7 +592,7 @@ Wired since SIPREC phase 3 (2026-11-09), off by default (`[recording]`). The SBC
 | Item | Status | Wired | Notes |
 |------|--------|-------|-------|
 | ITU-T G.722 conformance vectors (G.191 / App. II) | Gap | uc-codecs (soft client) | Only a self-generated regression vector (`g722_adpcm.rs` `test_self_generated_regression_vector`) and level tests (`test_level_1khz`, `test_level_lower_and_upper_band`). Official vectors not run (POA&M-140) |
-| RFC 5761 §4 PT range under rtcp-mux | Deviation | Library-only (negotiation not wired, POA&M-142) | `payload_types::is_dynamic` adopts PTs 64-71/77-95 even with rtcp-mux; only 72-76 are rejected (tests `test_is_dynamic_ranges`, `test_negotiate_rejects_rtcp_colliding_pt`). POA&M-143 |
+| RFC 5761 §4 PT range under rtcp-mux | Deviation | Library-only (negotiation not wired, POA&M-142) | `payload_types::is_dynamic` adopts PTs 64-71/77-95 even with rtcp-mux; only 72-76 are rejected (tests `test_is_dynamic_ranges`, `test_negotiate_rejects_rtcp_colliding_pt`). POA&M-143. Since fix/client-srtp-b2 the soft client's receive demux (`client-audio/src/rtp_handler.rs` `classify`) treats any packet with PT 64-95 as RTCP, so such a payload type would not be received as audio if it were ever negotiated |
 
 ---
 
@@ -589,7 +614,9 @@ Neither feature (`uc-transport` `sctp`, `uc-aaa` `radius`) is enabled by any shi
 | RFC 2865 Identifier | Partial | Library-only | 8-bit, wraps, no in-flight tracking (POA&M-281). |
 | RFC 6614 RadSec | Gap | Library-only | Not implemented; RADIUS/UDP MD5 is not CNSA (POA&M-280). |
 
-Last Updated: 2026-11-06
+Last Updated: 2026-11-15
+
+2026-11-15: fix/client-srtp-b2: soft client DTLS-SRTP signalling and media gate section; proto-dtls intro (handshake fails closed, POA&M-324); proto-srtp soft-client wiring note.
 
 2026-11-06: added the uc-codecs media section (G.722 vectors, RFC 5761 deviation).
 

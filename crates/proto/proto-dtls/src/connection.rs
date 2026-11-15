@@ -56,7 +56,7 @@ pub struct DtlsConnection {
     remote_addr: SbcSocketAddr,
     state: AtomicU8,
     local_fingerprint: CertificateFingerprint,
-    remote_fingerprint: Mutex<Option<CertificateFingerprint>>,
+    remote_fingerprints: Mutex<Vec<CertificateFingerprint>>,
     keying_material: Mutex<Option<SrtpKeyingMaterial>>,
     session: Mutex<Option<DtlsSession>>,
     socket: Mutex<Option<Arc<UdpSocket>>>,
@@ -97,7 +97,7 @@ impl DtlsConnection {
             remote_addr,
             state: AtomicU8::new(DtlsState::New as u8),
             local_fingerprint,
-            remote_fingerprint: Mutex::new(None),
+            remote_fingerprints: Mutex::new(Vec::new()),
             keying_material: Mutex::new(None),
             session: Mutex::new(None),
             socket: Mutex::new(None),
@@ -118,16 +118,10 @@ impl DtlsConnection {
         remote_addr: SbcSocketAddr,
         socket: Arc<UdpSocket>,
     ) -> DtlsResult<Self> {
-        let conn = Self::new(config, local_addr, remote_addr)?;
-        {
-            let rt = tokio::runtime::Handle::try_current();
-            if let Ok(handle) = rt {
-                handle.block_on(async {
-                    let mut sock = conn.socket.lock().await;
-                    *sock = Some(socket);
-                });
-            }
-        }
+        let mut conn = Self::new(config, local_addr, remote_addr)?;
+        // No `block_on` here: this is called from async contexts, where
+        // `Handle::block_on` panics. We own `conn`, so set the field directly.
+        *conn.socket.get_mut() = Some(socket);
         Ok(conn)
     }
 
@@ -178,8 +172,16 @@ impl DtlsConnection {
     /// This should be called before handshake with the fingerprint
     /// received from SDP signaling.
     pub async fn set_remote_fingerprint(&self, fingerprint: CertificateFingerprint) {
-        let mut remote = self.remote_fingerprint.lock().await;
-        *remote = Some(fingerprint);
+        self.set_remote_fingerprints(vec![fingerprint]).await;
+    }
+
+    /// Sets the full set of fingerprints signalled by the peer in SDP.
+    ///
+    /// RFC 8122 §5: the peer certificate MUST match at least one of them.
+    /// The set replaces any previously configured fingerprints.
+    pub async fn set_remote_fingerprints(&self, fingerprints: Vec<CertificateFingerprint>) {
+        let mut remote = self.remote_fingerprints.lock().await;
+        *remote = fingerprints;
     }
 
     /// Creates and binds a UDP socket for the connection.
@@ -259,9 +261,10 @@ impl DtlsConnection {
 
         // Perform handshake with timeout
         let is_client = self.config.role.is_client();
+        let expected = self.remote_fingerprints.lock().await.clone();
         let handshake_result = timeout(
             self.config.handshake_timeout,
-            DtlsSession::new(&self.config, socket, is_client),
+            DtlsSession::new(&self.config, socket, is_client, &expected),
         )
         .await;
 
@@ -489,7 +492,7 @@ impl Clone for DtlsConnection {
             remote_addr: self.remote_addr,
             state: AtomicU8::new(self.state.load(Ordering::Acquire)),
             local_fingerprint: self.local_fingerprint.clone(),
-            remote_fingerprint: Mutex::new(None),
+            remote_fingerprints: Mutex::new(Vec::new()),
             keying_material: Mutex::new(None),
             session: Mutex::new(None),
             socket: Mutex::new(None),
@@ -516,6 +519,47 @@ mod tests {
         let conn = DtlsConnection::new(config, local, remote).unwrap();
         assert_eq!(conn.state(), DtlsState::New);
         assert_eq!(conn.role(), DtlsRole::Server);
+    }
+
+    // Regression: `with_socket` used `Handle::block_on`, which panics inside a
+    // runtime. It must construct cleanly from async code.
+    #[tokio::test]
+    async fn with_socket_in_async_context_does_not_panic() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let local: SbcSocketAddr = socket.local_addr().unwrap().into();
+        let remote = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 9);
+        let conn = DtlsConnection::with_socket(test_config(), local, remote, socket).unwrap();
+        assert!(conn.socket.lock().await.is_some());
+    }
+
+    // Fail closed: no remote fingerprint -> handshake fails, no keys.
+    #[tokio::test]
+    async fn handshake_without_remote_fingerprint_fails() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let local: SbcSocketAddr = socket.local_addr().unwrap().into();
+        let remote = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 9);
+        let conn = DtlsConnection::with_socket(test_config(), local, remote, socket).unwrap();
+        assert!(conn.handshake().await.is_err());
+        assert_eq!(conn.state(), DtlsState::Failed);
+        assert!(conn.export_srtp_keying_material().await.is_err());
+    }
+
+    // POA&M-324: without the test feature there is no handshake, so even a
+    // fully configured connection fails closed instead of inventing keys.
+    #[cfg(not(all(test, feature = "test-placeholder-keying")))]
+    #[tokio::test]
+    async fn handshake_fails_closed_without_implementation() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let local: SbcSocketAddr = socket.local_addr().unwrap().into();
+        let remote = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 9);
+        let conn = DtlsConnection::with_socket(test_config(), local, remote, socket).unwrap();
+        conn.set_remote_fingerprint(CertificateFingerprint::from_certificate_sha384(b"peer"))
+            .await;
+        assert!(matches!(
+            conn.handshake().await,
+            Err(DtlsError::HandshakeFailed { .. })
+        ));
+        assert!(conn.export_srtp_keying_material().await.is_err());
     }
 
     #[tokio::test]

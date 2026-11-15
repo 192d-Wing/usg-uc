@@ -29,6 +29,11 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+// NIST 800-53 Rev5: CM-7 -- placeholder DTLS keying (random keys, no
+// handshake) must never reach an optimized/release build (POA&M-324).
+#[cfg(all(feature = "test-placeholder-keying", not(debug_assertions)))]
+compile_error!("feature `test-placeholder-keying` is test-only and not allowed in release builds");
+
 pub mod cipher_suite;
 pub mod config;
 pub mod connection;

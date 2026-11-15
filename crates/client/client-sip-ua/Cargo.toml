@@ -34,6 +34,9 @@ tracing.workspace = true
 bytes.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+zeroize.workspace = true
+# Ephemeral self-signed P-384 DTLS identity (same spec as sbc-media-core).
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
