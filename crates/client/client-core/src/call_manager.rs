@@ -1177,6 +1177,61 @@ impl CallManager {
             .map(|(id, d)| (id.clone(), d))
     }
 
+    /// Returns why a mid-dialog re-offer must be refused with 488, if it must.
+    ///
+    /// NIST 800-53 Rev5: SC-8(1) -- a re-offer never downgrades media security.
+    fn reoffer_rejection(&self, call_id: &str, remote_sdp: &str) -> Option<&'static str> {
+        if !self.is_secure_account() {
+            // A non-TLS account cannot run DTLS-SRTP: a re-offer that asks
+            // for SAVP(F) is refused rather than answered in plaintext.
+            return media_security::sdp_requests_srtp(remote_sdp)
+                .then_some("re-offer requires SRTP; account media is not DTLS-SRTP");
+        }
+        if remote_sdp.trim().is_empty() {
+            return None;
+        }
+        // A TLS call's re-offer must stay DTLS-SRTP with a usable fingerprint.
+        // POAM: POA&M-327 a changed fingerprint/setup must trigger a new DTLS
+        // handshake.
+        if let Err(cause) = media_security::preflight(Some(remote_sdp), RemoteSdp::Offer) {
+            return Some(cause);
+        }
+        // RFC 5763 §5: our answer must keep the established DTLS role. With
+        // no DTLS parameters recorded for the call there is no role to keep
+        // and the answer would carry `actpass`.
+        (!self.dtls_preflight.contains_key(call_id))
+            .then_some("no established DTLS parameters for re-offer")
+    }
+
+    /// Records the codec, DTMF, redundancy and header-extension parameters
+    /// negotiated from an initial SDP offer.
+    fn note_offer_capabilities(&mut self, call_id: &str, remote_sdp: &str) {
+        // Negotiate best codec from intersection of offer and our capabilities
+        if let Some(codec) = negotiate_codec_from_sdp_offer(remote_sdp, self.preferred_codec) {
+            info!(call_id = %call_id, codec = ?codec, "Negotiated codec from incoming SDP offer");
+            self.negotiated_codecs.insert(call_id.to_string(), codec);
+        }
+        // Parse DTMF telephone-event PT from remote offer
+        let dtmf_pt = parse_telephone_event_pt(remote_sdp);
+        self.telephone_event_pt.insert(call_id.to_string(), dtmf_pt);
+        if let Some(pt) = dtmf_pt {
+            info!(call_id = %call_id, pt = pt, "Remote offer supports telephone-event PT={pt}");
+        }
+        // Parse RFC 2198 redundancy PT from remote offer
+        let red_pt = parse_redundancy_pt(remote_sdp);
+        self.redundancy_pt.insert(call_id.to_string(), red_pt);
+        if let Some(pt) = red_pt {
+            info!(call_id = %call_id, pt = pt, "Remote offer supports redundancy PT={pt}");
+        }
+        // Parse RTP header extensions from remote offer (RFC 5285)
+        let ext_ids = parse_extmap_attributes(remote_sdp);
+        if !ext_ids.is_empty() {
+            info!(call_id = %call_id, count = ext_ids.len(), "Remote offer supports RTP extensions");
+        }
+        self.negotiated_extension_ids
+            .insert(call_id.to_string(), ext_ids);
+    }
+
     /// Handles an incoming mid-dialog re-INVITE (e.g. session timer refresh, hold).
     ///
     /// Unlike an initial INVITE, a re-INVITE targets an existing dialog identified
@@ -1223,47 +1278,11 @@ impl CallManager {
             .and_then(|b| std::str::from_utf8(b).ok())
             .unwrap_or("");
 
-        // A TLS call's re-offer must stay DTLS-SRTP with a usable
-        // fingerprint; otherwise 488 and the session is unchanged
-        // (RFC 3264 §8, RFC 3261 §14.2). POAM: POA&M-327 a changed
-        // fingerprint/setup must trigger a new DTLS handshake.
-        if self.is_secure_account()
-            && !remote_sdp.trim().is_empty()
-            && let Err(cause) = media_security::preflight(Some(remote_sdp), RemoteSdp::Offer)
-        {
+        // A re-offer that fails the media-security rules gets 488 and the
+        // session is unchanged (RFC 3264 §8, RFC 3261 §14.2).
+        if let Some(cause) = self.reoffer_rejection(call_id, remote_sdp) {
             self.reject_insecure_offer(request, source, transport, local_tag, cause)
                 .await;
-            return Ok(());
-        }
-        // RFC 5763 §5: our answer must keep the established DTLS role. With
-        // no DTLS parameters recorded for the call there is no role to keep
-        // and the answer would carry `actpass`, so the re-offer gets 488.
-        if self.is_secure_account()
-            && !remote_sdp.trim().is_empty()
-            && !self.dtls_preflight.contains_key(call_id)
-        {
-            self.reject_insecure_offer(
-                request,
-                source,
-                transport,
-                local_tag,
-                "no established DTLS parameters for re-offer",
-            )
-            .await;
-            return Ok(());
-        }
-        // A non-TLS account cannot run DTLS-SRTP: a re-offer that asks for
-        // SAVP(F) gets 488 rather than a plaintext answer, and the session
-        // is unchanged (RFC 3264 §8; NIST 800-53 Rev5: SC-8(1)).
-        if !self.is_secure_account() && media_security::sdp_requests_srtp(remote_sdp) {
-            self.reject_insecure_offer(
-                request,
-                source,
-                transport,
-                local_tag,
-                "re-offer requires SRTP; account media is not DTLS-SRTP",
-            )
-            .await;
             return Ok(());
         }
 
@@ -1694,38 +1713,8 @@ impl CallManager {
             media_session.set_remote_addr(addr);
         }
 
-        // Parse the remote's SDP offer from the INVITE body to negotiate
-        // codec, DTMF PT, and redundancy PT.
-        if let Some(remote_sdp) = incoming
-            .invite_request
-            .body
-            .as_ref()
-            .and_then(|b| std::str::from_utf8(b).ok())
-        {
-            // Negotiate best codec from intersection of offer and our capabilities
-            if let Some(codec) = negotiate_codec_from_sdp_offer(remote_sdp, self.preferred_codec) {
-                info!(call_id = %call_id, codec = ?codec, "Negotiated codec from incoming SDP offer");
-                self.negotiated_codecs.insert(call_id.to_string(), codec);
-            }
-            // Parse DTMF telephone-event PT from remote offer
-            let dtmf_pt = parse_telephone_event_pt(remote_sdp);
-            self.telephone_event_pt.insert(call_id.to_string(), dtmf_pt);
-            if let Some(pt) = dtmf_pt {
-                info!(call_id = %call_id, pt = pt, "Remote offer supports telephone-event PT={pt}");
-            }
-            // Parse RFC 2198 redundancy PT from remote offer
-            let red_pt = parse_redundancy_pt(remote_sdp);
-            self.redundancy_pt.insert(call_id.to_string(), red_pt);
-            if let Some(pt) = red_pt {
-                info!(call_id = %call_id, pt = pt, "Remote offer supports redundancy PT={pt}");
-            }
-            // Parse RTP header extensions from remote offer (RFC 5285)
-            let ext_ids = parse_extmap_attributes(remote_sdp);
-            if !ext_ids.is_empty() {
-                info!(call_id = %call_id, count = ext_ids.len(), "Remote offer supports RTP extensions");
-            }
-            self.negotiated_extension_ids
-                .insert(call_id.to_string(), ext_ids);
+        if let Some(remote_sdp) = offer_sdp {
+            self.note_offer_capabilities(call_id, remote_sdp);
         }
 
         // Generate SDP answer using the call's address
