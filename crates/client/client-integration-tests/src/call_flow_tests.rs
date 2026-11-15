@@ -375,6 +375,31 @@ mod incoming_call_tests {
     use proto_sip::{SipMessage, SipRequest};
     use std::net::SocketAddr;
 
+    /// Appends a DTLS-SRTP audio offer (UDP/TLS/RTP/SAVPF, one sha-384
+    /// fingerprint, `a=setup:actpass`) and its Content-Length to an INVITE
+    /// head. A TLS account answers a body-less or insecure offer with 488
+    /// (RFC 5764 §4.1, B2 fail-closed gate), so incoming-call fixtures must
+    /// carry a secure offer to reach 180/200.
+    fn with_dtls_srtp_offer(head: &str) -> String {
+        let fingerprint = (0..48u8)
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let body = format!(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 192.168.1.100\r\n\
+             s=-\r\n\
+             c=IN IP4 192.168.1.100\r\n\
+             t=0 0\r\n\
+             m=audio 40000 UDP/TLS/RTP/SAVPF 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=fingerprint:sha-384 {fingerprint}\r\n\
+             a=setup:actpass\r\n\
+             a=rtcp-mux\r\n"
+        );
+        format!("{head}Content-Length: {}\r\n\r\n{body}", body.len())
+    }
+
     /// Helper to parse an INVITE request from string.
     fn parse_invite(text: &str) -> SipRequest {
         let msg: SipMessage = text.parse().expect("Failed to parse SIP message");
@@ -414,12 +439,10 @@ mod incoming_call_tests {
              Call-ID: {call_id}\r\n\
              CSeq: 1 INVITE\r\n\
              Contact: <{caller_uri}>\r\n\
-             Content-Type: application/sdp\r\n\
-             Content-Length: 0\r\n\
-             \r\n"
+             Content-Type: application/sdp\r\n"
         );
 
-        let invite = parse_invite(&invite_str);
+        let invite = parse_invite(&with_dtls_srtp_offer(&invite_str));
 
         // Handle the incoming INVITE
         let result = manager
@@ -481,12 +504,10 @@ mod incoming_call_tests {
              Call-ID: {call_id}\r\n\
              CSeq: 1 INVITE\r\n\
              Contact: <sips:alice@192.168.1.100:5061>\r\n\
-             Content-Type: application/sdp\r\n\
-             Content-Length: 0\r\n\
-             \r\n"
+             Content-Type: application/sdp\r\n"
         );
 
-        let invite = parse_invite(&invite_str);
+        let invite = parse_invite(&with_dtls_srtp_offer(&invite_str));
         manager
             .handle_incoming_invite_from(&invite, source_addr, SipTransportKind::Tls)
             .await
@@ -568,11 +589,10 @@ mod incoming_call_tests {
              Call-ID: {call_id}\r\n\
              CSeq: 1 INVITE\r\n\
              Contact: <sips:bob@192.168.1.100:5061>\r\n\
-             Content-Length: 0\r\n\
-             \r\n"
+             Content-Type: application/sdp\r\n"
         );
 
-        let invite = parse_invite(&invite_str);
+        let invite = parse_invite(&with_dtls_srtp_offer(&invite_str));
         manager
             .handle_incoming_invite_from(&invite, source_addr, SipTransportKind::Tls)
             .await
@@ -677,11 +697,10 @@ mod incoming_call_tests {
              To: <sips:testuser@example.com>\r\n\
              Call-ID: iter-test-call@example.com\r\n\
              CSeq: 1 INVITE\r\n\
-             Content-Length: 0\r\n\
-             \r\n"
+             Content-Type: application/sdp\r\n"
         );
 
-        let invite = parse_invite(&invite_str);
+        let invite = parse_invite(&with_dtls_srtp_offer(&invite_str));
         let _ = manager
             .handle_incoming_invite_from(&invite, source_addr, SipTransportKind::Tls)
             .await;

@@ -48,7 +48,7 @@ wave 2 = b79893b0.
 ## P3 — hardening
 
 - ✅ fixed (56000e43) — No RTCP BYE on session end (3550 §6.6).
-- 📋 documented limitation — SRTP ROC not preserved across DTLS renegotiation (3711 §3.2.1); replay window resets on renegotiation. Accepted until DTLS rekey support is revisited.
+- 📋 documented limitation — SRTP ROC not preserved across DTLS renegotiation (3711 §3.2.1); replay window resets on renegotiation. Accepted until DTLS rekey support is revisited. (2026-11-15: the client has no DTLS handshake at all, NIST POA&M-324, so this does not arise yet.)
 - ✅ implemented (56000e43) — Symmetric RTP source filtering (4961), **default OFF**: carriers commonly source media from a different IP than the SDP c-line, so this is opt-in deployment hardening, not a safe default.
 - ✅ fixed (b79893b0) — To-tag no longer silently mutable across 1xx responses; differing tag on a later 1xx is warned and ignored, only a 2xx finalizes a different tag (3261 §12.1.2).
 - 📋 documented limitation — Early media on 183+SDP not started until 200 (3960); deliberate functional choice (no audio before answer).
@@ -73,6 +73,34 @@ tests only; no live SBC or registrar run.
 | REGISTER responses not matched to the transaction (open) | 3261 §17.1.3 | `client-sip-ua/src/registration.rs` | POA&M-319 |
 | Refresh interval taken from the Contact carrying this instance's `rinstance`, falling back to `Expires` (RFC-R2-003 fixed) | 3261 §10.2.4 | `client-sip-ua/src/registration.rs` `extract_expires` | `test_extract_expires_uses_own_contact_when_second`, `test_extract_expires_own_contact_in_comma_list`, `test_extract_expires_no_match_falls_back_to_expires_header`, `test_extract_expires_hostile_values_do_not_panic` (POA&M-320 closed) |
 
+## fix/client-srtp-b2 (2026-11-15)
+
+Review BLOCKER B2 (finding RFC-005 of the 2026-11-10 client review: media
+was never SRTP although the SDP said `UDP/TLS/RTP/SAVPF`). The plaintext
+path is closed; secure media is not delivered. `proto-dtls` has no network
+DTLS handshake, so **every call on a TLS account ends after connect with no
+audio** until NIST POA&M-324 is closed. Statuses are from unit and gate
+tests only (`client-core/tests/media_security_gate.rs` unless another file
+is named). No test uses a real DTLS handshake, and there was no run against
+the SBC, its Go DTLS sidecar or any other peer.
+
+| Change or gap | RFC § | Where | Tests / tracking |
+|---|---|---|---|
+| No audio without DTLS-SRTP keys on a `UDP/TLS/RTP/SAVP(F)` stream; the call is ended (BYE or CANCEL), never downgraded to RTP | 5764 §4.1 | `client-core/src/call_manager.rs` (`media_security_for`, `fail_call_media_security`) | `outbound_establish_error_ends_call_with_bye`, `inbound_accept_then_ack_fails_closed`, `test_media_security_for_by_account_and_build` |
+| No DTLS handshake, profile negotiation or key export on the media socket (open) | 6347; 5764 §4.1.2, §4.2 | `proto-dtls/src/session.rs` (`DtlsSession::new` returns `HandshakeFailed`), `client-sip-ua/src/media_session.rs` (`establish`) | `establish_fails_closed_and_never_rebinds`; POA&M-324 |
+| Remote offer that cannot be secured gets 488 with `Warning: 399` before ringing; remote answer with the same defect ends the call with BYE; re-offer gets 488, session unchanged | 3264 §5.1, §6, §8; 3261 §20.43 | `client-core/src/media_security.rs` (`preflight`), `call_manager.rs` (`admit_incoming_offer`, `reject_insecure_offer`, `handle_incoming_reinvite`) | `inbound_insecure_offer_gets_488`, `qa_inbound_hostile_dtls_attrs_get_488_no_ring`, `outbound_insecure_answers_end_call`, `qa_outbound_hostile_answers_end_call`, `reinvite_insecure_reoffer_gets_488`, `qa_reinvite_downgraded_dtls_attrs_get_488`, `test_reinvite_offer_without_dtls_preflight_gets_488` |
+| `a=fingerprint`: one full `sha-384` value sent; remote values parsed strictly, several allowed. Deviation: only `sha-384` / `sha-512` accepted (CNSA 2.0), so a `sha-256`-only peer is refused | 8122 §5 | `client-sip-ua/src/dtls_identity.rs`, `sdp_dtls.rs`; `proto-dtls/src/fingerprint.rs` (`from_sdp_strict`) | `offer_carries_one_full_sha384_fingerprint`, `sha256_only_rejected_mixed_keeps_cnsa`, `qa_hostile_fingerprint_and_setup_rejected`, `qa_mixed_lists_precedence_and_order`, `strict_parse_rejects_bad_input` |
+| Peer certificate is not verified against the signalled fingerprint (open); `verify_any` exists, reached by no network path | 8122 §5; 5763 §5 | `proto-dtls/src/fingerprint.rs`, `handshake.rs` (`process_certificate`) | direct-call tests only: `verify_any_matches_one_of_set`, `test_process_certificate_empty_fingerprint_set_fails`; POA&M-324 |
+| `a=setup`: `actpass` in offers, `active`/`passive` in answers by the offer's value, `actpass` in a remote answer is an error, absent means `active`; role kept across re-INVITE; offerless re-INVITE answered with an `actpass` offer | 4145 §4; 5763 §5 | `client-sip-ua/src/sdp_dtls.rs` (`Setup`), `client-core/src/call_manager.rs` | `role_table`, `setup_values`, `duplicate_and_long_setup`, `offer_actpass_answers_active_client`, `offerless_reinvite_200_offers_actpass` |
+| Re-INVITE that changes fingerprint or setup does not start a new handshake (open) | 5763 §6.6 | `call_manager.rs` (`handle_incoming_reinvite`) | POA&M-327 |
+| Datagrams on the media socket are classified by first byte before any parsing; DTLS and STUN are dropped and counted, not serviced (open: no post-handshake DTLS, no STUN handoff to ICE, no consent freshness) | 7983 §7; 5764 §5.1.2; 7675 | `client-audio/src/rtp_handler.rs` (`classify`, `receive_one`) | `classify_exhaustive_rfc7983`, `receive_drops_dtls_and_stun_and_unmuxed_rtcp`, `receive_consumes_dropped_burst_then_rtp`, `receive_is_time_bounded_under_paced_junk`; POA&M-325 |
+| rtcp-mux: offered always, echoed only when offered, required from the peer on DTLS-SRTP calls (488 / BYE without it) because there is no separate RTCP DTLS association; RTCP sent and received on the RTP socket when negotiated. Not exercised against a peer (open pending interop). Packets with payload type 64-95 are treated as RTCP | 5761 §4, §5.1.1 | `client-core/src/media_security.rs`, `client-audio/src/rtp_handler.rs`, `rtcp_session.rs`, `io_thread.rs` | `rejects_missing_rtcp_mux_and_insecure_second_stream`, no-`rtcp-mux` cases in `inbound_insecure_offer_gets_488` / `outbound_insecure_answers_end_call`; POA&M-326 |
+| SRTCP: with keys, RTCP is protected before sending and authenticated before parsing; tampered or plaintext RTCP is dropped and counted. Reachable in a default build only once keys exist. Receive allocates per datagram (open) | 3711 §3.4; 7714 §6 | `client-audio/src/rtcp_session.rs` (`set_srtcp`, `ingest`, `transmit`), `proto-srtp/src/protect.rs` (`unprotect_rtcp_sync`) | test-made keys: `srtcp_round_trip_and_no_plaintext_on_wire`, `srtcp_tampered_and_plaintext_dropped`, `unprotect_rtcp_sync_round_trip_and_tamper`; POA&M-328 |
+| SRTP on every transmit path (audio, RFC 2198 redundancy, CN, DTMF) of a keyed session; symmetric-RTP latch moves only after a packet authenticates. Reachable in a default build only once keys exist | 3711 §3.3; 7714 §5; 4961 | `client-audio/src/rtp_handler.rs` | test-made keys: `srtp_loopback_no_plaintext_on_wire`, `qa_srtp_every_tx_path_encrypted_role_swapped`, `keyed_latch_moves_only_after_srtp_auth`, `keyed_auth_failure_is_counted_drop_and_does_not_mark_source_seen` |
+| Delayed-offer INVITE (no SDP) rejected with 488 on DTLS-SRTP accounts; offer in 200 / answer in ACK not implemented (open) | 3264 §5; 3261 §13.2.1; 5763 §6.4 | `client-core/src/media_security.rs` (`preflight`) | no-body case in `inbound_insecure_offer_gets_488`; POA&M-329 |
+| Inbound call reported Connected at the 200, before ACK and media security; no UAS 2xx retransmission (open). Implemented for TLS calls: BYE when no ACK arrives within 64*T1 | 3261 §13.3.1.4 | `client-core/src/call_manager.rs` (`ACK_WAIT_SECURE_MEDIA`, `expire_unacked_secure_calls`) | `test_unacked_tls_call_is_ended_after_64_t1`; POA&M-331 |
+| SDP answer still built from a template with one audio m-line, whatever the offer contains (open, not changed here) | 3264 §6 | `client-core/src/call_manager.rs` (SDP templates) | baseline finding RFC-006 (open BLOCKER series) |
+
 ## Verified compliant (spot checks)
 
 - CANCEL/200 glare ACK+BYE (§15) — fixed and tested this session.
@@ -93,4 +121,4 @@ tests only; no live SBC or registrar run.
 3. ✅ **Registration robustness (#5, #11)** and **NAT (#6)** — small, high value.
 4. ✅ **RTP DTX timestamp + marker (#8, #9)** — small fixes in io_thread/rtp_handler.
 5. ✅ **RFC 3263 DNS (#4)** — resolved via `uc-dns` (NAPTR/SRV, `resolver` feature). Before fix/client-cnsa-tls-dns the resolver had no DNS backend, so NAPTR/SRV were never queried. It now uses the system DNS configuration, with RFC 2782 weighted SRV order. No DNSSEC (NIST POA&M-172).
-6. ✅ All findings are now fixed or accepted as documented limitations (SRTP ROC across DTLS rekey, early-media start, ICE trickling).
+6. ✅ All findings of the 2026-06-11 audit are fixed or accepted as documented limitations (SRTP ROC across DTLS rekey, early-media start, ICE trickling). Later reviews added open items: see "fix/client-review-blockers" and "fix/client-srtp-b2" above (no DTLS handshake, so no audio on TLS calls, NIST POA&M-324).

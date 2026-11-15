@@ -21,6 +21,7 @@ use crate::rtcp_session::RtcpSession;
 use crate::rtp_handler::{RtpReceiver, RtpTransmitter};
 use crate::vad::{VadConfig, VadDecision, VoiceActivityDetector};
 use client_types::{CodecPreference, DtmfDigit};
+use proto_srtp::SrtpContext;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -108,8 +109,14 @@ pub struct IoThreadConfig {
     pub capture_rate: u32,
     /// RTCP socket (bound to local port, for sending RTCP reports).
     pub rtcp_socket: Option<Arc<UdpSocket>>,
-    /// Remote RTCP address (remote RTP port + 1).
+    /// Remote RTCP address (remote RTP port + 1, or the RTP address when
+    /// RTCP is multiplexed).
     pub rtcp_remote_addr: Option<SocketAddr>,
+    /// SRTCP (transmit, receive) contexts. `Some` on every secure stream;
+    /// only `None` for plaintext (insecure-rtp) pipelines.
+    pub rtcp_srtp: Option<(SrtpContext, SrtpContext)>,
+    /// RTCP is multiplexed on the RTP socket (RFC 5761).
+    pub rtcp_mux: bool,
     /// Local SSRC (for RTCP reports).
     pub local_ssrc: u32,
     /// DTMF volume level for RFC 4733 packets (0-63, default 10).
@@ -273,19 +280,26 @@ fn io_loop(
     };
 
     // RTCP session (optional — created if RTCP socket is provided)
+    let rtcp_mux = config.rtcp_mux;
+    let rtcp_srtp = config.rtcp_srtp;
     let mut rtcp_session =
         config
             .rtcp_socket
             .zip(config.rtcp_remote_addr)
             .map(|(socket, remote_addr)| {
                 let cname = format!("usg-uc-{}", config.local_ssrc);
-                RtcpSession::new(
+                let mut session = RtcpSession::new(
                     socket,
                     remote_addr,
                     config.local_ssrc,
                     codec_clock_rate,
                     cname,
-                )
+                );
+                session.set_rtcp_mux(rtcp_mux);
+                if let Some((tx, rx)) = rtcp_srtp {
+                    session.set_srtcp(tx, rx);
+                }
+                session
             });
 
     // Acoustic echo cancellation (AEC) processor
@@ -349,6 +363,13 @@ fn io_loop(
             Err(e) => {
                 trace!("RTP receive error: {e}");
             }
+        }
+        // RFC 5761 §4: RTCP demultiplexed from the RTP socket goes to the
+        // RTCP session, which authenticates it (SRTCP) before parsing.
+        if let Some((data, from)) = receiver.take_muxed_rtcp()
+            && let Some(ref mut rtcp) = rtcp_session
+        {
+            rtcp.handle_packet(data, from);
         }
 
         // SSRC collision handling (RFC 3550 §8.2): if the receiver (RTP) or
@@ -778,6 +799,8 @@ fn update_stats(
         s.rx_stats = receiver.stats();
         s.jitter_stats = receiver.jitter_buffer_stats();
         s.rtt_ms = rtcp_session.and_then(RtcpSession::rtt_ms);
+        s.rx_stats.srtcp_errors = rtcp_session.map_or(0, RtcpSession::srtcp_errors);
+        s.rx_stats.rtcp_dropped = rtcp_session.map_or(0, RtcpSession::rtcp_dropped);
     }
 }
 

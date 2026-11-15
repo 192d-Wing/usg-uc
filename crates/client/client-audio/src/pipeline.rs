@@ -20,6 +20,7 @@ use crate::drift_compensator::DriftConfig;
 use crate::file_source::FileAudioSource;
 use crate::io_thread::{self, IoThreadConfig, IoThreadHandle};
 use crate::jitter_buffer::{JitterBufferConfig, SharedJitterBuffer};
+use crate::media_security::{MediaSecurity, build_srtp_contexts};
 use crate::noise_shaper::NoiseShaperConfig;
 use crate::postfilter::PostfilterConfig;
 use crate::rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
@@ -27,7 +28,6 @@ use crate::vad::VadConfig;
 use crate::{AudioError, AudioResult};
 use client_types::DtmfDigit;
 use client_types::audio::CodecPreference;
-use proto_srtp::{SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -194,7 +194,12 @@ impl AudioProcessingConfig {
 }
 
 /// Configuration for the audio pipeline.
-#[derive(Debug, Clone)]
+///
+/// There is no `Default`: every pipeline must state its [`MediaSecurity`]
+/// (see [`PipelineConfig::new`]), so a forgotten field at a new call site
+/// cannot silently select plaintext RTP. Not `Clone` (owns key material and
+/// optionally the media socket).
+#[derive(Debug)]
 pub struct PipelineConfig {
     /// Codec preference.
     pub codec: CodecPreference,
@@ -204,10 +209,16 @@ pub struct PipelineConfig {
     pub remote_addr: SocketAddr,
     /// Jitter buffer depth in milliseconds.
     pub jitter_buffer_ms: u32,
-    /// SRTP master key (32 bytes for AES-256).
-    pub srtp_master_key: Option<Vec<u8>>,
-    /// SRTP master salt (12 bytes).
-    pub srtp_master_salt: Option<Vec<u8>>,
+    /// Media security mode (SRTP keys, or plaintext in insecure builds only).
+    ///
+    /// NIST 800-53 Rev5: SC-8(1) (type-level fail-closed media gate)
+    pub security: MediaSecurity,
+    /// Pre-bound media socket handed over from signalling/DTLS (one socket
+    /// per call; RFC 5764 §5.1.2). When `None`, the pipeline binds
+    /// `local_port` itself.
+    pub socket: Option<UdpSocket>,
+    /// RTCP is multiplexed on the RTP port (RFC 5761, `a=rtcp-mux` agreed).
+    pub rtcp_mux: bool,
     /// Whether transmit is muted.
     pub muted: bool,
     /// Music on Hold file path (optional).
@@ -232,15 +243,18 @@ pub struct PipelineConfig {
     pub extension_ids: Vec<(u8, String)>,
 }
 
-impl Default for PipelineConfig {
-    fn default() -> Self {
+impl PipelineConfig {
+    /// Creates a configuration with default media settings and the given
+    /// security mode.
+    pub fn new(security: MediaSecurity) -> Self {
         Self {
             codec: CodecPreference::G711Ulaw,
             local_port: 0, // Auto-assign
             remote_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             jitter_buffer_ms: 40,
-            srtp_master_key: None,
-            srtp_master_salt: None,
+            security,
+            socket: None,
+            rtcp_mux: false,
             muted: false,
             moh_file_path: None,
             dtmf_payload_type: None,
@@ -428,8 +442,12 @@ impl AudioPipeline {
     ///
     /// Creates the UDP socket, CPAL streams, jitter buffer, and spawns
     /// the I/O and decode threads. Returns the local RTP port.
+    ///
+    /// # Errors
+    /// Fails before any socket or device is touched if the SRTP keys are
+    /// invalid; otherwise on socket, codec or device errors.
     #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
-    pub fn start(&mut self, config: PipelineConfig) -> AudioResult<u16> {
+    pub fn start(&mut self, mut config: PipelineConfig) -> AudioResult<u16> {
         use ringbuf::traits::Producer;
 
         if self.state != PipelineState::Stopped {
@@ -438,36 +456,58 @@ impl AudioPipeline {
             ));
         }
 
+        // Generate the SSRC and build every SRTP/SRTCP context BEFORE any
+        // socket or device is touched: invalid keys fail here with nothing
+        // bound and nothing sent (RFC 5764 §4.1; NIST 800-53 Rev5: SC-8(1)).
+        let ssrc = generate_ssrc();
+        let srtp = match &config.security {
+            MediaSecurity::Srtp(keys) => Some(build_srtp_contexts(keys, ssrc)?),
+            #[cfg(feature = "insecure-rtp")]
+            MediaSecurity::Plaintext => {
+                warn!("Audio pipeline starting WITHOUT SRTP (insecure-rtp build)");
+                None
+            }
+        };
+
         self.state = PipelineState::Starting;
         info!("Starting audio pipeline: codec={:?}", config.codec);
 
         // Create a temporary codec to query parameters
-        let temp_codec = CodecPipeline::new(config.codec)?;
+        let temp_codec = match CodecPipeline::new(config.codec) {
+            Ok(c) => c,
+            Err(e) => {
+                self.state = PipelineState::Stopped;
+                return Err(e);
+            }
+        };
         let clock_rate = temp_codec.clock_rate();
         #[allow(clippy::cast_possible_truncation)]
         let samples_per_frame = temp_codec.samples_per_frame() as u32;
         let payload_type = temp_codec.payload_type();
         drop(temp_codec);
 
-        // Bind std::net::UdpSocket (blocking)
-        let local_port_cfg = config.local_port;
-        let bind_addr = format!("0.0.0.0:{local_port_cfg}");
-        let socket = UdpSocket::bind(bind_addr)
-            .map_err(|e| AudioError::StreamError(format!("Failed to bind socket: {e}")))?;
+        // Use the per-call socket handed over by signalling (single owner of
+        // the media port, no rebind window), or bind one ourselves.
+        let socket = if let Some(sock) = config.socket.take() {
+            sock
+        } else {
+            let local_port_cfg = config.local_port;
+            let bind_addr = format!("0.0.0.0:{local_port_cfg}");
+            UdpSocket::bind(bind_addr)
+                .map_err(|e| AudioError::StreamError(format!("Failed to bind socket: {e}")))?
+        };
 
         let local_port = socket
             .local_addr()
             .map_err(|e| AudioError::StreamError(format!("Failed to get local address: {e}")))?
             .port();
 
-        // Set recv_timeout for the I/O thread (5ms — quick return if no packet)
-        socket
-            .set_read_timeout(Some(std::time::Duration::from_millis(5)))
-            .map_err(|e| AudioError::StreamError(format!("Failed to set recv timeout: {e}")))?;
+        prepare_media_socket(&socket)?;
 
         debug!("Bound RTP socket to port {}", local_port);
 
         let socket = Arc::new(socket);
+        let shared_media_socket = Arc::clone(&socket);
 
         // Create shared jitter buffer (used by I/O thread and decode thread)
         let jitter_buffer = SharedJitterBuffer::with_config(
@@ -478,7 +518,6 @@ impl AudioPipeline {
         );
 
         // Create transmitter
-        let ssrc = generate_ssrc();
         let mut transmitter = RtpTransmitter::new(
             socket.clone(),
             config.remote_addr,
@@ -528,28 +567,16 @@ impl AudioPipeline {
             receiver.set_extension_map(config.extension_ids.clone());
         }
 
-        // Set up SRTP if keys are provided
-        if let (Some(key), Some(salt)) = (&config.srtp_master_key, &config.srtp_master_salt) {
-            let key_material =
-                SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, key.clone(), salt.clone())
-                    .map_err(|e| {
-                        AudioError::SrtpError(format!("Failed to create SRTP key material: {e}"))
-                    })?;
+        // RFC 5761 §4: demultiplex RTCP on the RTP socket when agreed.
+        receiver.set_rtcp_mux(config.rtcp_mux);
 
-            let tx_context = SrtpContext::new(&key_material, SrtpDirection::Outbound, ssrc)
-                .map_err(|e| {
-                    AudioError::SrtpError(format!("Failed to create TX SRTP context: {e}"))
-                })?;
-            transmitter.set_srtp(tx_context);
-
-            let rx_context =
-                SrtpContext::new(&key_material, SrtpDirection::Inbound, 0).map_err(|e| {
-                    AudioError::SrtpError(format!("Failed to create RX SRTP context: {e}"))
-                })?;
-            receiver.set_srtp(rx_context);
-
-            debug!("SRTP enabled for audio pipeline");
-        }
+        // Install the per-direction SRTP contexts built above.
+        let rtcp_srtp = srtp.map(|set| {
+            transmitter.set_srtp(set.rtp_tx);
+            receiver.set_srtp(set.rtp_rx);
+            debug!("SRTP/SRTCP enabled for audio pipeline");
+            (set.rtcp_tx, set.rtcp_rx)
+        });
 
         // Start capture stream (platform backend behind the CaptureSource trait)
         let capture = create_capture(&self.device_manager)?;
@@ -646,20 +673,25 @@ impl AudioPipeline {
             decode_metrics.clone(),
         );
 
-        // Create RTCP socket (bound to any available port)
-        let rtcp_socket = UdpSocket::bind("0.0.0.0:0")
-            .map(|s| {
-                // Non-blocking is fine — we only send, never recv
-                let _ = s.set_nonblocking(true);
-                Arc::new(s)
-            })
-            .ok();
-
-        // Remote RTCP address: remote RTP port + 1 (RFC 3550 §11)
-        let rtcp_remote_addr = Some(SocketAddr::new(
-            config.remote_addr.ip(),
-            config.remote_addr.port() + 1,
-        ));
+        let (rtcp_socket, rtcp_remote_addr) = if config.rtcp_mux {
+            // RFC 5761 §4: send and receive RTCP on the RTP socket/port.
+            (Some(shared_media_socket), Some(config.remote_addr))
+        } else {
+            // Create RTCP socket (bound to any available port)
+            let rtcp_socket = UdpSocket::bind("0.0.0.0:0")
+                .map(|s| {
+                    // Non-blocking: try_receive must never stall the I/O loop.
+                    let _ = s.set_nonblocking(true);
+                    Arc::new(s)
+                })
+                .ok();
+            // Remote RTCP address: remote RTP port + 1 (RFC 3550 §11)
+            let rtcp_remote_addr = Some(SocketAddr::new(
+                config.remote_addr.ip(),
+                config.remote_addr.port().wrapping_add(1),
+            ));
+            (rtcp_socket, rtcp_remote_addr)
+        };
 
         if rtcp_socket.is_some() {
             debug!("RTCP socket created for reports to {:?}", rtcp_remote_addr);
@@ -671,6 +703,8 @@ impl AudioPipeline {
             capture_rate,
             rtcp_socket,
             rtcp_remote_addr,
+            rtcp_srtp,
+            rtcp_mux: config.rtcp_mux,
             local_ssrc: ssrc,
             dtmf_volume: config.dtmf_volume,
             dtmf_inter_digit_pause_ms: config.dtmf_inter_digit_pause_ms,
@@ -800,8 +834,7 @@ impl AudioPipeline {
         self.dtmf_rx
             .as_ref()
             .and_then(|m| m.lock().ok())
-            .map(|rx| rx.try_iter().collect())
-            .unwrap_or_default()
+            .map_or_else(Vec::new, |rx| rx.try_iter().collect())
     }
 
     /// Returns whether Music on Hold is currently active.
@@ -904,6 +937,20 @@ impl Drop for AudioPipeline {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Configures a media socket for the I/O thread's blocking 5 ms receive.
+///
+/// A socket handed over from a tokio clone shares its file description, and
+/// tokio sets `O_NONBLOCK` on it. Order matters: clear nonblocking first,
+/// then set the read timeout, otherwise `recv_from` spins on `WouldBlock`.
+pub(crate) fn prepare_media_socket(socket: &UdpSocket) -> AudioResult<()> {
+    socket
+        .set_nonblocking(false)
+        .map_err(|e| AudioError::StreamError(format!("Failed to clear nonblocking: {e}")))?;
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_millis(5)))
+        .map_err(|e| AudioError::StreamError(format!("Failed to set recv timeout: {e}")))
 }
 
 /// Resample audio using linear interpolation with cross-frame continuity.
@@ -1010,12 +1057,68 @@ pub(crate) fn resample_into(input: &[i16], output: &mut [i16], prev_sample: i16)
 mod tests {
     use super::*;
 
+    use crate::media_security::SrtpSessionKeys;
+    use crate::media_security::tests::keys;
+    use zeroize::Zeroizing;
+
     #[test]
     fn test_pipeline_config_default() {
-        let config = PipelineConfig::default();
+        let config = PipelineConfig::new(MediaSecurity::Srtp(keys(1, 2)));
         assert_eq!(config.codec, CodecPreference::G711Ulaw);
         assert_eq!(config.jitter_buffer_ms, 40);
         assert!(!config.muted);
+        assert!(!config.rtcp_mux);
+    }
+
+    #[test]
+    fn start_with_bad_keys_fails_before_binding() {
+        // Find a free port, release it, and hand it to the pipeline.
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let good = keys(1, 2);
+        let bad = SrtpSessionKeys::new(
+            good.profile(),
+            Zeroizing::new(vec![0; 16]),
+            Zeroizing::new(good.tx_salt().to_vec()),
+            Zeroizing::new(good.rx_key().to_vec()),
+            Zeroizing::new(good.rx_salt().to_vec()),
+        );
+        let mut config = PipelineConfig::new(MediaSecurity::Srtp(bad));
+        config.local_port = port;
+        config.remote_addr = "127.0.0.1:9".parse().unwrap();
+
+        let mut pipeline = AudioPipeline::new();
+        assert!(matches!(
+            pipeline.start(config),
+            Err(AudioError::SrtpError(_))
+        ));
+        assert_eq!(pipeline.state(), PipelineState::Stopped);
+        // The port was never bound by the pipeline.
+        UdpSocket::bind(("0.0.0.0", port)).unwrap();
+    }
+
+    #[test]
+    fn handed_over_nonblocking_socket_blocks_with_timeout() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Simulate the tokio clone having set O_NONBLOCK on the shared fd.
+        let clone = sock.try_clone().unwrap();
+        clone.set_nonblocking(true).unwrap();
+
+        prepare_media_socket(&sock).unwrap();
+        let mut buf = [0u8; 16];
+        let start = std::time::Instant::now();
+        let err = sock.recv_from(&mut buf).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        assert!(
+            elapsed >= std::time::Duration::from_millis(3),
+            "recv returned after {elapsed:?}; socket still nonblocking"
+        );
     }
 
     #[test]

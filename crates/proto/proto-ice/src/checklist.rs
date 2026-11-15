@@ -256,8 +256,9 @@ impl CheckList {
     pub fn pairs_for_component(&self, component: u16) -> Vec<&CandidatePair> {
         self.by_component
             .get(&component)
-            .map(|indices| indices.iter().map(|&i| &self.pairs[i]).collect())
-            .unwrap_or_default()
+            .map_or_else(Vec::new, |indices| {
+                indices.iter().map(|&i| &self.pairs[i]).collect()
+            })
     }
 
     /// Returns the number of pairs.

@@ -166,7 +166,7 @@ jobs:
       # uses --all-features, which compiles out the not(insecure-transports) code.
       - name: Clippy client crates (default features)
         if: needs.changes.outputs.client == 'true'
-        run: cargo clippy -p client-types -p client-sip-ua -p client-core -p client-ffi -p client-gui-tauri --all-targets -- -D warnings
+        run: cargo clippy -p proto-dtls -p client-types -p client-audio -p client-sip-ua -p client-core -p client-ffi -p client-gui-tauri --all-targets -- -D warnings
 
   test:
     name: Test
@@ -198,7 +198,12 @@ jobs:
       # not(insecure-transports) tests (POA&M-322).
       - name: Test client crates (default features)
         if: needs.changes.outputs.client == 'true'
-        run: cargo nextest run -p client-types -p client-sip-ua -p client-core -p client-ffi -p client-gui-tauri
+        run: cargo nextest run -p proto-dtls -p client-types -p client-audio -p client-sip-ua -p client-core -p client-ffi -p client-gui-tauri
+      # The compile_fail doctest for MediaSecurity::Plaintext only proves the
+      # variant is absent when insecure-rtp is off, i.e. with default features.
+      - name: Doctest client-audio (default features)
+        if: needs.changes.outputs.client == 'true'
+        run: cargo test -p client-audio --doc
       - run: cargo test --workspace --all-features --doc ${{ needs.changes.outputs.exclude }}
 
   # NOTE: the client cross-target portability job lives in its own

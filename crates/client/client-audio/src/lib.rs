@@ -83,6 +83,7 @@ pub mod io_thread;
 #[cfg(target_os = "ios")]
 pub mod ios_vpio;
 pub mod jitter_buffer;
+pub mod media_security;
 pub mod noise_shaper;
 pub mod pipeline;
 pub mod plc;
@@ -113,14 +114,18 @@ pub use io_thread::IoThreadHandle;
 pub use jitter_buffer::{
     BufferedPacket, JitterBuffer, JitterBufferResult, JitterBufferStats, SharedJitterBuffer,
 };
+pub use media_security::{MediaSecurity, SrtpSessionKeys, build_srtp_contexts};
 pub use pipeline::{
     AudioPipeline, AudioProcessingConfig, PipelineConfig, PipelineState, PipelineStats,
     RtpTransportConfig,
 };
 pub use plc::PacketLossConcealer;
+pub use proto_srtp::SrtpProfile;
 pub use ringtone::RingtonePlayer;
 pub use rtcp_session::RtcpSession;
-pub use rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
+pub use rtp_handler::{
+    PacketClass, RtpReceiver, RtpStats, RtpTransmitter, classify, generate_ssrc,
+};
 pub use sinc_resampler::{FractionalSincResampler, Resampler, SincResampler};
 pub use stream::{CaptureStream, PlaybackStream, PlaybackStreamHandle, Sample};
 pub use vad::{VadDecision, VoiceActivityDetector};

@@ -24,6 +24,7 @@ pub mod cert_store;
 pub mod contact_manager;
 #[cfg(any(feature = "digest-auth", feature = "oidc"))]
 pub mod credential_store;
+pub(crate) mod media_security;
 pub mod settings;
 pub mod sip_transport;
 
@@ -82,6 +83,11 @@ pub enum AppError {
     /// Serialization error.
     #[error("Serialization error: {0}")]
     Serialization(String),
+
+    /// Media security negotiation failed (fail closed: no plaintext media).
+    /// The message is a fixed cause, never peer-supplied text.
+    #[error("media-security: {0}")]
+    MediaSecurity(String),
 }
 
 /// Result type for application operations.

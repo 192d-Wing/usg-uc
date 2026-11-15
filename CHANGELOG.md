@@ -145,6 +145,131 @@ field, audit event type or gRPC/REST API is changed or removed.
   client and the server. No behaviour change. `zeroize` (already in the
   workspace) becomes a direct dependency of proto-sip.
 
+### BREAKING (client, media security: no plaintext RTP on TLS accounts, POA&M-324..331)
+
+Released separately from the SBC (`release-client.yml`). Closes soft-client
+review blocker B2 in its fail-closed form. None of this was verified against
+the SBC or a live peer; no successful DTLS-SRTP call is possible yet.
+
+- **Default (TLS) client builds cannot carry audio until POA&M-324.**
+  (SC-8, SC-8(1), SC-13; RFC 5764 §4.1) A call on a TLS account starts
+  audio only with DTLS-SRTP keys, and the DTLS handshake is not implemented
+  (POA&M-324, open). Every such call is therefore ended by the client right
+  after it connects: an outbound call gets a BYE after the 200 OK and is
+  never reported Connected; an accepted inbound call gets a BYE after the
+  ACK, or after 32 s (64*T1) if no ACK arrives. No RTP or RTCP is sent or
+  accepted. Before this change the same calls ran with plaintext RTP on a
+  stream signalled as `UDP/TLS/RTP/SAVPF`. Do not ship a default-feature
+  client build to users who need audio until POA&M-324 is closed. There is
+  no SDES fallback.
+- **Inbound offers that cannot be secured get 488** with
+  `Warning: 399 usg-client "SRTP/DTLS required"`, before 180, so the user
+  is not rung. On a TLS account this applies to an INVITE or re-INVITE
+  offer that has no SDP body (initial INVITE), has an active `m=` section
+  that is not `UDP/TLS/RTP/SAVP(F)`, has no active audio section, lacks
+  `a=rtcp-mux`, has no sha-384 or sha-512 `a=fingerprint` (sha-256, sha-1,
+  sha-224 and md5 are refused; CNSA 2.0), or has an invalid, conflicting or
+  `holdconn` `a=setup`. A rejected re-INVITE leaves the session unchanged.
+  An offerless re-INVITE is still answered, with an `actpass` offer. The
+  same checks on the answer to an outbound call end the call with BYE.
+- **Lab builds (`insecure-transports`) refuse SRTP offers instead of
+  answering in plaintext.** On a UDP/TCP account an INVITE or re-INVITE
+  whose SDP asks for `SAVP`/`SAVPF` gets 488 with the same Warning.
+  Plaintext media is possible only when both sides use `RTP/AVP(F)`.
+- **Failure reporting.** A media-security failure surfaces as
+  `CallManagerEvent::Error { message: "media-security: <cause>" }` followed
+  by `CallManagerEvent::CallEnded { reason: CallEndReason::Failed }`. New
+  `AppError::MediaSecurity(String)` (breaks exhaustive matches on
+  `AppError`). client-ffi maps it to the existing `ClientError::Sip`; the
+  UniFFI surface is unchanged. An accepted inbound call is still reported
+  Connected at the 200 OK and then ends (POA&M-331).
+- **client-audio: new feature `insecure-rtp`; `MediaSecurity::Plaintext`
+  exists only with it.** (CM-7) client-core's `insecure-transports` enables
+  it, so `digest-auth` builds of client-core, client-ffi and
+  client-gui-tauri get it too. Release builds use default features and do
+  not.
+- **client-audio API.** `PipelineConfig` no longer implements `Default` or
+  `Clone`; build it with `PipelineConfig::new(security)`. New fields
+  `security`, `socket` and `rtcp_mux`. New `MediaSecurity`,
+  `SrtpSessionKeys` (private fields, no `Clone`, AES-256-GCM only),
+  `build_srtp_contexts`, `PacketClass` and `classify`. `RtpStats` gains
+  `dtls_dropped`, `non_media_dropped`, `srtcp_errors` and `rtcp_dropped`
+  (breaks struct-literal construction). `IoThreadConfig` gains `rtcp_srtp`
+  and `rtcp_mux`. On a keyed session a packet that fails SRTP
+  authentication is counted in `srtp_errors` and dropped; it is no longer
+  returned as an error.
+- **client-core API.** `AudioSessionConfig` no longer implements `Default`
+  or `Clone`; use `AudioSessionConfig::new(security)`.
+  `AudioSessionConfigBuilder::new(security)` replaces the `Default` builder,
+  and its `srtp_key`/`srtp_salt` setters are replaced by `rtcp_mux`.
+  `start_from_media_session` is removed. `generate_sdp_offer_with_addr`
+  returns `AppResult`.
+- **client-sip-ua API.** `MediaSession::new` takes the call's
+  `std::net::UdpSocket` and a `&DtlsIdentity`; `establish` takes
+  `&DtlsSdpParams`. `protect_rtp`, `unprotect_rtp`, `send_rtp`, `recv_rtp`
+  and `srtp_contexts` are removed; use `negotiated_srtp_keys()` with the
+  client-audio pipeline. `DtlsHandler::set_role`, `set_remote_fingerprint`
+  and `parse_remote_setup` return `Result`, and `handshake` takes the
+  expected fingerprints and rejects an empty set. New modules
+  `dtls_identity` and `sdp_dtls`.
+- **proto-dtls: `DtlsSession::new` no longer returns placeholder keys.**
+  (SC-12, SC-23) It takes the expected peer fingerprints, rejects an empty
+  set, and otherwise returns
+  `HandshakeFailed("DTLS handshake not implemented (POA&M-324)")`.
+  `DtlsConnection` gains `set_remote_fingerprints`; the handshake checks the
+  peer certificate against them (RFC 8122 §5). New
+  `CertificateFingerprint::from_sdp_strict` and `verify_any`. New feature
+  `test-placeholder-keying`, for proto-dtls's own unit tests only: any
+  non-debug build with it is a compile error, so
+  `cargo build|test --release --all-features` on proto-dtls, or on a
+  workspace selection that includes it, fails by design. The SBC does not
+  call the handshake and is not affected; no SBC config, API, audit or CDR
+  schema changes.
+
+Effects for SBC operators and SIEM/billing parsers:
+
+- Calls to or from updated default-build clients show up as answered calls
+  that end within seconds with a client BYE and no media, or as 488
+  responses from the client. CDRs will show short or zero-duration calls
+  and 488 final responses where calls used to be set up.
+- An SBC that offers these clients `RTP/AVP`, SDES `RTP/SAVP`, a sha-256
+  fingerprint, or no `a=rtcp-mux` gets 488. The client's own offers carry
+  one sha-384 fingerprint, `a=setup:actpass` and `a=rtcp-mux`.
+
+### Changed (client, media path)
+
+- **One media socket per call.** The call manager binds it once and keeps
+  it until the call ends; the configured port falls back to an ephemeral
+  port when it is in use (call waiting). The probe-then-rebind step is gone.
+- **DTLS identity.** One ephemeral self-signed P-384 / SHA-384 certificate
+  per process, made at startup. A user certificate is used instead only
+  when its key is P-384 PKCS#8, matches the leaf, and the leaf is signed
+  ecdsa-with-SHA384; smart-card keys keep the ephemeral identity
+  (POA&M-330).
+- **SDP.** `a=fingerprint` is emitted once with its hash name (the doubled
+  `sha-384` prefix is fixed). An answer uses `a=setup:active` or `passive`
+  and echoes `a=rtcp-mux` only when the offer had it.
+- **RTP/RTCP receive.** Datagrams are classified per RFC 7983 before
+  parsing; DTLS, STUN and unknown ones are dropped and counted. With
+  rtcp-mux, RTCP shares the RTP socket (POA&M-326). On a keyed session RTCP
+  is sent as SRTCP and unauthenticated RTCP is never parsed, and the remote
+  address latch moves only after a packet authenticates. One receive call
+  handles at most 32 dropped datagrams and at most one read timeout.
+- **proto-srtp:** new `SrtpUnprotect::unprotect_rtcp_sync`. Additive.
+- **Dependencies.** (SR-3, SC-13) `rcgen` 0.13 (`aws_lc_rs` backend, no
+  default features) becomes a dependency of client-sip-ua, for the DTLS
+  identity, and a dev-dependency of proto-dtls. It is the version and
+  feature set the SBC crates already use; `Cargo.lock` gains no new
+  package. `zeroize` (already in the workspace) becomes a direct dependency
+  of client-audio and client-sip-ua.
+
+Open items recorded by this change: POA&M-324 (DTLS handshake), 325
+(DTLS/STUN demux to the handshake while media runs), 326 (rtcp-mux
+required; no separate RTCP association), 327 (re-INVITE re-keying), 328
+(in-place SRTCP unprotect), 329 (delayed-offer INVITE without SDP gets
+488), 330 (user-certificate DTLS identity) and 331 (no 2xx retransmission;
+inbound Connected reported at the 200).
+
 ### BREAKING (client, soft-client review blockers)
 
 Released separately from the SBC (`release-client.yml`). None of these

@@ -309,10 +309,9 @@ impl FromStr for DigestChallenge {
             .transpose()?
             .unwrap_or_default();
 
-        let qop: Vec<Qop> = params
-            .get("qop")
-            .map(|s| s.split(',').filter_map(|q| q.trim().parse().ok()).collect())
-            .unwrap_or_default();
+        let qop: Vec<Qop> = params.get("qop").map_or_else(Vec::new, |s| {
+            s.split(',').filter_map(|q| q.trim().parse().ok()).collect()
+        });
 
         let extra_params = filter_extra_params(
             params.clone(),

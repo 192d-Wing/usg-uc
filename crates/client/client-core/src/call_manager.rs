@@ -8,12 +8,14 @@
 
 use crate::audio_session::{AudioSession, AudioSessionConfig, AudioSessionEvent};
 use crate::contact_manager::ContactManager;
+use crate::media_security::{self, Preflight, RemoteSdp};
 use crate::sip_transport::SipTransportKind;
 use crate::{AppError, AppResult};
 use chrono::Utc;
-use client_audio::PipelineStats;
+use client_audio::{MediaSecurity, PipelineStats};
 use client_sip_ua::{
-    CallAgent, CallEvent, MediaSession, MediaSessionEvent, MediaSessionState, ReferStatus,
+    CallAgent, CallEvent, DtlsIdentity, MediaSession, MediaSessionEvent, MediaSessionState,
+    ReferStatus, Setup,
 };
 use client_types::audio::CodecPreference;
 use client_types::{
@@ -23,11 +25,19 @@ use proto_ice::IceConfig;
 use proto_sip::header::HeaderName;
 use proto_sip::message::{SipRequest, SipResponse};
 use proto_sip::response::StatusCode;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
+
+/// How long an answered TLS call waits for its ACK before media security is
+/// abandoned and the call ended: 64*T1 with T1 = 500 ms (RFC 3261 §13.3.1.4,
+/// §17.1.1.1).
+// POAM: POA&M-331 -- the UAS does not retransmit the 2xx until the ACK
+// arrives (RFC 3261 §13.3.1.4), and an inbound TLS call is reported
+// Connected at the 200 rather than after ACK + media security.
+const ACK_WAIT_SECURE_MEDIA: std::time::Duration = std::time::Duration::from_secs(32);
 
 /// Information about an incoming call that hasn't been answered yet.
 #[derive(Debug, Clone)]
@@ -74,10 +84,9 @@ pub struct CallManager {
     local_media_addr: SocketAddr,
     /// ICE configuration.
     ice_config: IceConfig,
-    /// DTLS certificate chain (from smart card or file).
-    dtls_cert_chain: Vec<Vec<u8>>,
-    /// DTLS private key.
-    dtls_private_key: Vec<u8>,
+    /// DTLS-SRTP identity: ephemeral self-signed P-384 per process, or the
+    /// user's exportable P-384 key (RFC 5763 §5; NIST 800-53 Rev5: SC-12).
+    dtls_identity: Option<DtlsIdentity>,
     /// Event sender for application events.
     app_event_tx: mpsc::Sender<CallManagerEvent>,
     /// Audio event sender.
@@ -118,6 +127,22 @@ pub struct CallManager {
     sdp_session_ids: HashMap<String, u64>,
     /// SDP session version per call (RFC 8866 - increments on modifications).
     sdp_session_versions: HashMap<String, u64>,
+    /// The single media socket bound per call (RFC 5764 §5.1.2: ICE, DTLS
+    /// and RTP share one port; it stays open until the call ends).
+    /// Bounded by `max_concurrent_calls` (SC-5).
+    media_sockets: HashMap<String, std::net::UdpSocket>,
+    /// Accepted remote DTLS parameters and our DTLS role per TLS call.
+    dtls_preflight: HashMap<String, Preflight>,
+    /// Preflight failure cause per outbound TLS call (fixed text).
+    media_preflight_errors: HashMap<String, &'static str>,
+    /// Inbound TLS calls answered with 200 whose media is set up on ACK
+    /// (a UAS must not send BYE before the ACK, RFC 3261 §15), with the
+    /// deadline after which the call is ended for want of an ACK.
+    pending_secure_media: HashMap<String, std::time::Instant>,
+    /// Calls whose remote SDP asked for a secure RTP profile (SAVP/SAVPF):
+    /// SRTP is then mandatory whatever the account transport (SC-8(1)).
+    /// Cleared in `forget_call_media` (SC-5).
+    remote_requires_srtp: HashSet<String>,
     /// Selected input device name (persists across calls).
     selected_input_device: Option<String>,
     /// Selected output device name (persists across calls).
@@ -241,6 +266,16 @@ impl CallManager {
             call_event_tx,
         );
 
+        // Once per process (~1 ms P-384 keygen at startup, never per packet).
+        // A failure leaves TLS calls failing closed at SDP generation.
+        let dtls_identity = match DtlsIdentity::generate() {
+            Ok(identity) => Some(identity),
+            Err(e) => {
+                error!(error = %e, "Failed to generate DTLS identity; TLS calls will fail closed");
+                None
+            }
+        };
+
         Self {
             call_agent,
             call_event_rx,
@@ -249,8 +284,7 @@ impl CallManager {
             incoming_calls: HashMap::new(),
             local_media_addr,
             ice_config: IceConfig::default(),
-            dtls_cert_chain: Vec::new(),
-            dtls_private_key: Vec::new(),
+            dtls_identity,
             app_event_tx,
             audio_event_tx,
             contact_manager: None,
@@ -271,6 +305,11 @@ impl CallManager {
             active_call_dialogs: HashMap::new(),
             sdp_session_ids: HashMap::new(),
             sdp_session_versions: HashMap::new(),
+            media_sockets: HashMap::new(),
+            dtls_preflight: HashMap::new(),
+            media_preflight_errors: HashMap::new(),
+            pending_secure_media: HashMap::new(),
+            remote_requires_srtp: HashSet::new(),
             selected_input_device: None,
             selected_output_device: None,
         }
@@ -309,10 +348,327 @@ impl CallManager {
     }
 
     /// Sets the DTLS credentials.
+    ///
+    /// The user's certificate becomes the DTLS-SRTP identity only when its
+    /// private key is exportable and P-384 (CNSA 2.0). On the smart-card path
+    /// the key is empty (it never leaves the card), so the per-process
+    /// ephemeral identity is kept: DTLS-SRTP binds the peer by the signalled
+    /// fingerprint (RFC 5763 §5, RFC 8122), not by PKI.
     pub fn set_dtls_credentials(&mut self, cert_chain: Vec<Vec<u8>>, private_key: Vec<u8>) {
-        self.dtls_cert_chain = cert_chain;
-        self.dtls_private_key = private_key;
-        info!("DTLS credentials configured");
+        if private_key.is_empty() {
+            info!("No exportable DTLS key (smart card); keeping ephemeral DTLS identity");
+            return;
+        }
+        match DtlsIdentity::from_user_der(cert_chain, zeroize::Zeroizing::new(private_key)) {
+            Ok(identity) => {
+                self.dtls_identity = Some(identity);
+                info!("DTLS identity set from user certificate");
+            }
+            Err(e) => {
+                // Fixed text: needs a matching P-384 key + ecdsa-with-SHA384 leaf.
+                debug!(error = %e, "User DTLS identity rejected");
+                warn!(
+                    "User certificate/key unusable for DTLS (need matching P-384 key, \
+                     ecdsa-with-SHA384); keeping ephemeral DTLS identity"
+                );
+            }
+        }
+    }
+
+    /// Whether the configured account signals media as DTLS-SRTP
+    /// (`UDP/TLS/RTP/SAVPF`), which makes SRTP mandatory for its calls.
+    fn is_secure_account(&self) -> bool {
+        self.account
+            .as_ref()
+            .is_none_or(|a| matches!(a.transport, client_types::TransportPreference::TlsOnly))
+    }
+
+    /// Creates the media session for a call over a clone of its media socket.
+    fn new_media_session(
+        &self,
+        effective_media_addr: SocketAddr,
+        is_outbound: bool,
+        socket: &std::net::UdpSocket,
+    ) -> AppResult<MediaSession> {
+        let identity = self
+            .dtls_identity
+            .as_ref()
+            .ok_or_else(|| AppError::MediaSecurity("no DTLS identity".to_string()))?;
+        let (media_tx, _media_rx) = mpsc::channel(32);
+        Ok(MediaSession::new(
+            effective_media_addr,
+            is_outbound,
+            self.ice_config.clone(),
+            socket.try_clone()?,
+            identity,
+            media_tx,
+        ))
+    }
+
+    /// Binds the one media socket for a call and returns it with the address
+    /// advertised in SDP. Replaces the old probe-then-rebind sequence, so no
+    /// other process can take the port between SDP and media.
+    fn bind_call_media_socket(&self) -> AppResult<(std::net::UdpSocket, SocketAddr)> {
+        let configured = self.local_media_addr;
+        let advertised_ip = if configured.ip().is_unspecified() {
+            self.get_effective_media_addr()?.ip()
+        } else {
+            configured.ip()
+        };
+        let socket = match std::net::UdpSocket::bind(configured) {
+            Ok(socket) => socket,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && configured.port() != 0 => {
+                // A second concurrent call (call waiting) cannot share the
+                // configured port; use an ephemeral one.
+                warn!(
+                    port = configured.port(),
+                    "Configured media port in use; using an ephemeral port"
+                );
+                std::net::UdpSocket::bind(SocketAddr::new(configured.ip(), 0))?
+            }
+            Err(e) => return Err(AppError::Io(e)),
+        };
+        let port = socket.local_addr()?.port();
+        Ok((socket, SocketAddr::new(advertised_ip, port)))
+    }
+
+    /// Ends a call whose media security cannot be established. Never starts
+    /// audio. The cause is a fixed string (no peer text is reflected).
+    ///
+    /// NIST 800-53 Rev5: SC-8(1) (fail closed), AU-2 (event surfaced to the
+    /// application; the client has no audit sink).
+    async fn fail_call_media_security(&mut self, call_id: &str, cause: &str) {
+        warn!(call_id = %call_id, cause = cause, "Media security negotiation failed; ending call (fail closed)");
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::Error {
+                call_id: Some(call_id.to_string()),
+                message: format!("media-security: {cause}"),
+            })
+            .await;
+        if let Err(e) = self.end_call(call_id, CallEndReason::Failed).await {
+            warn!(call_id = %call_id, error = %e, "BYE after media-security failure could not be sent");
+        }
+    }
+
+    /// Drops the per-call media state (sockets, DTLS parameters). SC-5:
+    /// every per-call table is cleaned up when the call ends.
+    fn forget_call_media(&mut self, call_id: &str) {
+        self.effective_media_addrs.remove(call_id);
+        self.media_sockets.remove(call_id);
+        self.dtls_preflight.remove(call_id);
+        self.media_preflight_errors.remove(call_id);
+        self.pending_secure_media.remove(call_id);
+        self.remote_requires_srtp.remove(call_id);
+    }
+
+    /// Records whether a remote SDP for `call_id` asked for SRTP. Sticky:
+    /// once a remote has signalled SAVP(F), the call never drops to
+    /// plaintext on a later re-offer.
+    fn note_remote_profile(&mut self, call_id: &str, sdp: &str) {
+        if media_security::sdp_requests_srtp(sdp) {
+            self.remote_requires_srtp.insert(call_id.to_string());
+        }
+    }
+
+    /// Returns the security mode for the call's audio. The single choke
+    /// point every audio start goes through.
+    ///
+    /// On a TLS account the stream is DTLS-SRTP, so keys from a completed
+    /// handshake are required (RFC 5764 §4.1). Plaintext exists only in
+    /// `insecure-transports` builds; in a default build that arm does not
+    /// compile.
+    ///
+    /// SRTP is also required when the remote SDP signalled SAVP/SAVPF on a
+    /// non-TLS account; plaintext needs RTP/AVP(F) on both sides.
+    fn media_security_for(&self, call_id: &str) -> AppResult<MediaSecurity> {
+        if self.is_secure_account() || self.remote_requires_srtp.contains(call_id) {
+            let session = self
+                .media_sessions
+                .get(call_id)
+                .ok_or_else(|| AppError::MediaSecurity("no media session".to_string()))?;
+            let keys = session.negotiated_srtp_keys().ok_or_else(|| {
+                AppError::MediaSecurity("DTLS-SRTP keys not established".to_string())
+            })?;
+            return Ok(MediaSecurity::Srtp(media_security::srtp_session_keys(keys)));
+        }
+        #[cfg(feature = "insecure-transports")]
+        {
+            Ok(MediaSecurity::Plaintext)
+        }
+        #[cfg(not(feature = "insecure-transports"))]
+        {
+            Err(AppError::MediaSecurity(
+                "plaintext media is not permitted in this build".to_string(),
+            ))
+        }
+    }
+
+    /// Runs ICE + DTLS for a TLS call using the preflighted remote
+    /// parameters. Returns a fixed cause on failure.
+    async fn establish_secure_media(&mut self, call_id: &str) -> Result<(), &'static str> {
+        if let Some(cause) = self.media_preflight_errors.get(call_id) {
+            return Err(cause);
+        }
+        let preflight = self
+            .dtls_preflight
+            .get(call_id)
+            .cloned()
+            .ok_or("no DTLS parameters from remote SDP")?;
+        let session = self
+            .media_sessions
+            .get_mut(call_id)
+            .ok_or("no media session")?;
+        session
+            .set_dtls_role(preflight.role)
+            .map_err(|_| "DTLS role already fixed")?;
+        // POAM: POA&M-324 no network DTLS handshake exists yet, so this
+        // always fails and TLS calls end here with no audio (fail closed).
+        session.establish(&preflight.params).await.map_err(|e| {
+            warn!(call_id = %call_id, error = %e, "DTLS-SRTP establishment failed");
+            "DTLS-SRTP handshake failed"
+        })
+    }
+
+    /// Establishes media security (TLS calls) and starts audio. Any
+    /// media-security failure ends the call; audio is never started without
+    /// keys. Returns `Err` when the call was ended.
+    async fn secure_media_and_start_audio(&mut self, call_id: &str) -> AppResult<()> {
+        let already_keyed = self
+            .media_sessions
+            .get(call_id)
+            .is_some_and(MediaSession::is_ready);
+        if self.is_secure_account()
+            && !already_keyed
+            && let Err(cause) = self.establish_secure_media(call_id).await
+        {
+            self.fail_call_media_security(call_id, cause).await;
+            return Err(AppError::MediaSecurity(cause.to_string()));
+        }
+        let remote_addr = self
+            .media_sessions
+            .get(call_id)
+            .and_then(MediaSession::remote_addr);
+        let Some(addr) = remote_addr else {
+            error!(call_id = %call_id, "Cannot start audio: no remote address");
+            return Ok(());
+        };
+        self.start_audio_or_fail(call_id, addr).await
+    }
+
+    /// Starts audio; a media-security refusal ends the call, other audio
+    /// errors (devices) are logged as before.
+    async fn start_audio_or_fail(&mut self, call_id: &str, addr: SocketAddr) -> AppResult<()> {
+        match self.start_audio_session(call_id, addr).await {
+            Ok(()) => Ok(()),
+            Err(AppError::MediaSecurity(cause)) => {
+                self.fail_call_media_security(call_id, &cause).await;
+                Err(AppError::MediaSecurity(cause))
+            }
+            Err(e) => {
+                warn!(call_id = %call_id, error = %e, "Failed to start audio");
+                Ok(())
+            }
+        }
+    }
+
+    /// Media-security preflight of a new INVITE's offer on a TLS account.
+    /// Returns `false` after answering 488 when the offer is refused.
+    async fn admit_incoming_offer(
+        &self,
+        request: &SipRequest,
+        source: SocketAddr,
+        transport: SipTransportKind,
+    ) -> bool {
+        let offer = request
+            .body
+            .as_ref()
+            .and_then(|b| std::str::from_utf8(b).ok());
+        if !self.is_secure_account() {
+            // A non-TLS account cannot run DTLS-SRTP; an offer that asks
+            // for SAVP(F) gets 488 rather than a plaintext answer.
+            if offer.is_some_and(media_security::sdp_requests_srtp) {
+                let tag = crate::sip_transport::generate_tag();
+                self.reject_insecure_offer(
+                    request,
+                    source,
+                    transport,
+                    &tag,
+                    "offer requires SRTP; account media is not DTLS-SRTP",
+                )
+                .await;
+                return false;
+            }
+            return true;
+        }
+        match media_security::preflight(offer, RemoteSdp::Offer) {
+            Ok(_) => true,
+            Err(cause) => {
+                let tag = crate::sip_transport::generate_tag();
+                self.reject_insecure_offer(request, source, transport, &tag, cause)
+                    .await;
+                false
+            }
+        }
+    }
+
+    /// Records the media-security preflight of an SDP answer (TLS calls).
+    /// Returns whether the answer is acceptable for DTLS-SRTP.
+    fn record_answer_preflight(&mut self, call_id: &str, sdp: &str) -> bool {
+        if !self.is_secure_account() {
+            return false;
+        }
+        match media_security::preflight(Some(sdp), RemoteSdp::Answer) {
+            Ok(p) => {
+                self.media_preflight_errors.remove(call_id);
+                self.dtls_preflight.insert(call_id.to_string(), p);
+                true
+            }
+            Err(cause) => {
+                warn!(call_id = %call_id, cause = cause, "SDP answer failed media-security preflight");
+                self.dtls_preflight.remove(call_id);
+                self.media_preflight_errors
+                    .insert(call_id.to_string(), cause);
+                false
+            }
+        }
+    }
+
+    /// Answers an INVITE whose SDP fails the media-security preflight with
+    /// 488 Not Acceptable Here before any 200 (RFC 3264 §6, RFC 3261
+    /// §21.4.26). Fixed Warning text; nothing from the peer is reflected.
+    async fn reject_insecure_offer(
+        &self,
+        request: &SipRequest,
+        source: SocketAddr,
+        transport: SipTransportKind,
+        local_tag: &str,
+        cause: &'static str,
+    ) {
+        use crate::sip_transport::build_response_from_request;
+
+        warn!(source = %source, cause = cause, "Rejecting INVITE: media security preflight failed (488)");
+        let mut response =
+            build_response_from_request(request, StatusCode::NOT_ACCEPTABLE_HERE, Some(local_tag));
+        response.add_header(proto_sip::header::Header::new(
+            HeaderName::Warning,
+            media_security::WARNING_SRTP_REQUIRED,
+        ));
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::SendResponse {
+                response,
+                destination: source,
+                transport,
+            })
+            .await;
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::Error {
+                call_id: None,
+                message: format!("media-security: {cause}"),
+            })
+            .await;
     }
 
     /// Sets the preferred codec for calls.
@@ -413,22 +769,12 @@ impl CallManager {
 
         info!(remote_uri = %full_remote_uri, "Making outbound call");
 
-        // Get the effective local media address (this creates and binds a UDP socket)
-        // We must use this SAME address for SDP and for the audio session
-        let effective_media_addr = self.get_effective_media_addr()?;
+        // Bind the call's single media socket; the SAME address goes into
+        // SDP, ICE/DTLS and the audio pipeline (RFC 5764 §5.1.2).
+        let (media_socket, effective_media_addr) = self.bind_call_media_socket()?;
 
-        // Create media session channel
-        let (media_tx, _media_rx) = mpsc::channel(32);
-
-        // Create media session for this call using the effective address
-        let media_session = MediaSession::new(
-            effective_media_addr,
-            true, // outbound = controlling
-            self.ice_config.clone(),
-            self.dtls_cert_chain.clone(),
-            self.dtls_private_key.clone(),
-            media_tx,
-        );
+        // Create media session for this call (outbound = ICE controlling)
+        let media_session = self.new_media_session(effective_media_addr, true, &media_socket)?;
 
         // Generate session ID for this call (version starts at 1)
         let sdp_session_id = session_id();
@@ -441,7 +787,8 @@ impl CallManager {
             effective_media_addr,
             sdp_session_id,
             sdp_session_version,
-        );
+            None,
+        )?;
 
         // Make the call via SIP UA
         let call_id = self
@@ -453,6 +800,7 @@ impl CallManager {
         // Store the effective media address for this call (used when starting audio session)
         self.effective_media_addrs
             .insert(call_id.clone(), effective_media_addr);
+        self.media_sockets.insert(call_id.clone(), media_socket);
 
         // Store SDP session ID and version for this call
         self.sdp_session_ids.insert(call_id.clone(), sdp_session_id);
@@ -531,6 +879,11 @@ impl CallManager {
 
     /// Hangs up a specific call.
     pub async fn hangup_call(&mut self, call_id: &str) -> AppResult<()> {
+        self.end_call(call_id, CallEndReason::LocalHangup).await
+    }
+
+    /// Ends a call locally (BYE/CANCEL) and reports `reason`.
+    async fn end_call(&mut self, call_id: &str, reason: CallEndReason) -> AppResult<()> {
         info!(call_id = %call_id, "hangup_call() called");
 
         // Get call info before hangup
@@ -565,13 +918,12 @@ impl CallManager {
 
         // Clean up negotiated codec and dialog tracking
         self.negotiated_codecs.remove(call_id);
-        self.effective_media_addrs.remove(call_id);
+        self.forget_call_media(call_id);
         self.active_call_dialogs.remove(call_id);
 
         // Record in call history
         if let Some(info) = call_info {
-            self.record_call_history(&info, CallEndReason::LocalHangup)
-                .await;
+            self.record_call_history(&info, reason.clone()).await;
         }
 
         // Remove from active calls list
@@ -588,7 +940,7 @@ impl CallManager {
             .app_event_tx
             .send(CallManagerEvent::CallEnded {
                 call_id: call_id.to_string(),
-                reason: CallEndReason::LocalHangup,
+                reason,
                 duration_secs: None,
             })
             .await;
@@ -641,10 +993,29 @@ impl CallManager {
     /// re-INVITE retry after 491 glare, RFC 3261 §14.1). Call periodically
     /// from the app event pump.
     pub async fn process_timers(&mut self) -> AppResult<()> {
+        self.expire_unacked_secure_calls(std::time::Instant::now())
+            .await;
         self.call_agent
             .process_timers()
             .await
             .map_err(|e| AppError::Sip(e.to_string()))
+    }
+
+    /// Ends answered TLS calls whose ACK never arrived (RFC 3261 §13.3.1.4:
+    /// after 64*T1 the UAS SHOULD send BYE). Media was never started for
+    /// them, so this only releases the call (fail closed).
+    async fn expire_unacked_secure_calls(&mut self, now: std::time::Instant) {
+        let expired: Vec<String> = self
+            .pending_secure_media
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(call_id, _)| call_id.clone())
+            .collect();
+        for call_id in expired {
+            self.pending_secure_media.remove(&call_id);
+            self.fail_call_media_security(&call_id, "no ACK for 2xx within 64*T1")
+                .await;
+        }
     }
 
     /// Routes an incoming SIP response to the appropriate call.
@@ -749,8 +1120,23 @@ impl CallManager {
                     .await?;
             }
             "ACK" => {
-                // Acknowledgement (normally handled by transaction layer)
+                // Acknowledgement (normally handled by transaction layer).
+                // For an answered TLS call this is where media security is
+                // set up: a UAS must not send BYE before the ACK (RFC 3261
+                // §15), so a failure can only end the call from here on.
                 debug!("Received ACK");
+                let to_tag = request.headers.to_tag();
+                let acked = request
+                    .headers
+                    .get_value(&HeaderName::CallId)
+                    .and_then(|id| self.find_active_call_by_sip_call_id(id))
+                    .filter(|(_, dialog)| to_tag.as_deref() == Some(dialog.local_tag.as_str()))
+                    .map(|(call_id, _)| call_id);
+                if let Some(call_id) = acked
+                    && self.pending_secure_media.remove(&call_id).is_some()
+                {
+                    let _ = self.secure_media_and_start_audio(&call_id).await;
+                }
             }
             "INFO" => {
                 // In-dialog INFO (e.g. SIP INFO DTMF relay)
@@ -789,6 +1175,61 @@ impl CallManager {
             .iter()
             .find(|(_, d)| d.sip_call_id == sip_call_id)
             .map(|(id, d)| (id.clone(), d))
+    }
+
+    /// Returns why a mid-dialog re-offer must be refused with 488, if it must.
+    ///
+    /// NIST 800-53 Rev5: SC-8(1) -- a re-offer never downgrades media security.
+    fn reoffer_rejection(&self, call_id: &str, remote_sdp: &str) -> Option<&'static str> {
+        if !self.is_secure_account() {
+            // A non-TLS account cannot run DTLS-SRTP: a re-offer that asks
+            // for SAVP(F) is refused rather than answered in plaintext.
+            return media_security::sdp_requests_srtp(remote_sdp)
+                .then_some("re-offer requires SRTP; account media is not DTLS-SRTP");
+        }
+        if remote_sdp.trim().is_empty() {
+            return None;
+        }
+        // A TLS call's re-offer must stay DTLS-SRTP with a usable fingerprint.
+        // POAM: POA&M-327 a changed fingerprint/setup must trigger a new DTLS
+        // handshake.
+        if let Err(cause) = media_security::preflight(Some(remote_sdp), RemoteSdp::Offer) {
+            return Some(cause);
+        }
+        // RFC 5763 §5: our answer must keep the established DTLS role. With
+        // no DTLS parameters recorded for the call there is no role to keep
+        // and the answer would carry `actpass`.
+        (!self.dtls_preflight.contains_key(call_id))
+            .then_some("no established DTLS parameters for re-offer")
+    }
+
+    /// Records the codec, DTMF, redundancy and header-extension parameters
+    /// negotiated from an initial SDP offer.
+    fn note_offer_capabilities(&mut self, call_id: &str, remote_sdp: &str) {
+        // Negotiate best codec from intersection of offer and our capabilities
+        if let Some(codec) = negotiate_codec_from_sdp_offer(remote_sdp, self.preferred_codec) {
+            info!(call_id = %call_id, codec = ?codec, "Negotiated codec from incoming SDP offer");
+            self.negotiated_codecs.insert(call_id.to_string(), codec);
+        }
+        // Parse DTMF telephone-event PT from remote offer
+        let dtmf_pt = parse_telephone_event_pt(remote_sdp);
+        self.telephone_event_pt.insert(call_id.to_string(), dtmf_pt);
+        if let Some(pt) = dtmf_pt {
+            info!(call_id = %call_id, pt = pt, "Remote offer supports telephone-event PT={pt}");
+        }
+        // Parse RFC 2198 redundancy PT from remote offer
+        let red_pt = parse_redundancy_pt(remote_sdp);
+        self.redundancy_pt.insert(call_id.to_string(), red_pt);
+        if let Some(pt) = red_pt {
+            info!(call_id = %call_id, pt = pt, "Remote offer supports redundancy PT={pt}");
+        }
+        // Parse RTP header extensions from remote offer (RFC 5285)
+        let ext_ids = parse_extmap_attributes(remote_sdp);
+        if !ext_ids.is_empty() {
+            info!(call_id = %call_id, count = ext_ids.len(), "Remote offer supports RTP extensions");
+        }
+        self.negotiated_extension_ids
+            .insert(call_id.to_string(), ext_ids);
     }
 
     /// Handles an incoming mid-dialog re-INVITE (e.g. session timer refresh, hold).
@@ -836,6 +1277,16 @@ impl CallManager {
             .as_ref()
             .and_then(|b| std::str::from_utf8(b).ok())
             .unwrap_or("");
+
+        // A re-offer that fails the media-security rules gets 488 and the
+        // session is unchanged (RFC 3264 §8, RFC 3261 §14.2).
+        if let Some(cause) = self.reoffer_rejection(call_id, remote_sdp) {
+            self.reject_insecure_offer(request, source, transport, local_tag, cause)
+                .await;
+            return Ok(());
+        }
+
+        self.note_remote_profile(call_id, remote_sdp);
 
         // Parse media direction from remote SDP
         let remote_direction = parse_media_direction(remote_sdp);
@@ -903,8 +1354,10 @@ impl CallManager {
                 .media_sessions
                 .get(call_id)
                 .and_then(MediaSession::remote_addr)
+                && self.start_audio_or_fail(call_id, addr).await.is_err()
             {
-                let _ = self.start_audio_session(call_id, addr).await;
+                // Media security refused the restart; the call was ended.
+                return Ok(());
             }
         }
 
@@ -927,8 +1380,19 @@ impl CallManager {
             _ => {}
         }
 
-        // Generate SDP answer with reciprocal direction
-        let sdp_answer = self.generate_sdp_with_direction(call_id, our_direction)?;
+        // Generate SDP answer with reciprocal direction. RFC 5763 §5: an
+        // answer keeps our established DTLS role (never actpass). An
+        // offerless re-INVITE makes our SDP in the 200 an offer
+        // (RFC 3261 §14.2), which carries `actpass` and `a=rtcp-mux`.
+        let answer = if remote_sdp.trim().is_empty() {
+            None
+        } else {
+            self.dtls_preflight.get(call_id).map(|p| DtlsAnswer {
+                setup: media_security::setup_for_role(p.role),
+                rtcp_mux: p.rtcp_mux,
+            })
+        };
+        let sdp_answer = self.generate_sdp_with_direction(call_id, our_direction, answer)?;
 
         let account = self
             .account
@@ -1082,6 +1546,14 @@ impl CallManager {
                 .await;
         }
 
+        // Media-security preflight before ringing: on a TLS account the
+        // offer must be DTLS-SRTP with a CNSA fingerprint and usable setup,
+        // otherwise 488 before any answer (RFC 3264 §6; NIST 800-53 Rev5:
+        // SC-8(1), SI-10).
+        if !self.admit_incoming_offer(request, source, transport).await {
+            return Ok(());
+        }
+
         // Extract SIP Call-ID
         let sip_call_id = request.headers.get_value(&HeaderName::CallId).map_or_else(
             || format!("unknown-{}", generate_tag()),
@@ -1196,57 +1668,56 @@ impl CallManager {
             .ok_or_else(|| AppError::Sip("No account configured".to_string()))?
             .clone();
 
-        // Create media session for this call
-        let (media_tx, _media_rx) = mpsc::channel(32);
-        let media_session = MediaSession::new(
-            self.local_media_addr,
-            false, // incoming = controlled
-            self.ice_config.clone(),
-            self.dtls_cert_chain.clone(),
-            self.dtls_private_key.clone(),
-            media_tx,
-        );
-
-        // Parse the remote's SDP offer from the INVITE body to negotiate
-        // codec, DTMF PT, and redundancy PT.
-        if let Some(remote_sdp) = incoming
+        // Re-check the offer (cheap): a TLS call is never answered 200
+        // unless its offer passes the media-security preflight.
+        let offer_sdp = incoming
             .invite_request
             .body
             .as_ref()
-            .and_then(|b| std::str::from_utf8(b).ok())
-        {
-            // Negotiate best codec from intersection of offer and our capabilities
-            if let Some(codec) = negotiate_codec_from_sdp_offer(remote_sdp, self.preferred_codec) {
-                info!(call_id = %call_id, codec = ?codec, "Negotiated codec from incoming SDP offer");
-                self.negotiated_codecs.insert(call_id.to_string(), codec);
+            .and_then(|b| std::str::from_utf8(b).ok());
+        let preflight = if self.is_secure_account() {
+            match media_security::preflight(offer_sdp, RemoteSdp::Offer) {
+                Ok(p) => Some(p),
+                Err(cause) => {
+                    self.reject_insecure_offer(
+                        &incoming.invite_request,
+                        incoming.source_addr,
+                        incoming.transport,
+                        &incoming.local_tag,
+                        cause,
+                    )
+                    .await;
+                    return Err(AppError::MediaSecurity(cause.to_string()));
+                }
             }
-            // Parse DTMF telephone-event PT from remote offer
-            let dtmf_pt = parse_telephone_event_pt(remote_sdp);
-            self.telephone_event_pt.insert(call_id.to_string(), dtmf_pt);
-            if let Some(pt) = dtmf_pt {
-                info!(call_id = %call_id, pt = pt, "Remote offer supports telephone-event PT={pt}");
-            }
-            // Parse RFC 2198 redundancy PT from remote offer
-            let red_pt = parse_redundancy_pt(remote_sdp);
-            self.redundancy_pt.insert(call_id.to_string(), red_pt);
-            if let Some(pt) = red_pt {
-                info!(call_id = %call_id, pt = pt, "Remote offer supports redundancy PT={pt}");
-            }
-            // Parse RTP header extensions from remote offer (RFC 5285)
-            let ext_ids = parse_extmap_attributes(remote_sdp);
-            if !ext_ids.is_empty() {
-                info!(call_id = %call_id, count = ext_ids.len(), "Remote offer supports RTP extensions");
-            }
-            self.negotiated_extension_ids
-                .insert(call_id.to_string(), ext_ids);
+        } else {
+            None
+        };
+
+        if let Some(sdp) = offer_sdp {
+            self.note_remote_profile(call_id, sdp);
         }
 
-        // Discover and store the effective media address for this inbound call
-        let effective_media_addr = self.get_effective_media_addr()?;
-        self.effective_media_addrs
-            .insert(call_id.to_string(), effective_media_addr);
+        // Bind the call's single media socket and create its media session
+        // (incoming = ICE controlled) on the advertised address.
+        let (media_socket, effective_media_addr) = self.bind_call_media_socket()?;
+        let mut media_session =
+            self.new_media_session(effective_media_addr, false, &media_socket)?;
+        if let Some(ref p) = preflight {
+            // RFC 5763 §5: the role follows a=setup, not call direction.
+            media_session
+                .set_dtls_role(p.role)
+                .map_err(|e| AppError::MediaSecurity(e.to_string()))?;
+        }
+        if let Some(addr) = offer_sdp.and_then(parse_remote_media_addr_from_sdp) {
+            media_session.set_remote_addr(addr);
+        }
 
-        // Generate SDP answer using the stored address
+        if let Some(remote_sdp) = offer_sdp {
+            self.note_offer_capabilities(call_id, remote_sdp);
+        }
+
+        // Generate SDP answer using the call's address
         let sdp_session_id = self.get_or_create_sdp_session_id(call_id);
         let sdp_session_version = self.get_sdp_session_version(call_id);
         let sdp_answer = self.generate_sdp_offer_with_addr(
@@ -1255,7 +1726,11 @@ impl CallManager {
             effective_media_addr,
             sdp_session_id,
             sdp_session_version,
-        );
+            preflight.as_ref().and_then(DtlsAnswer::from_preflight),
+        )?;
+        self.effective_media_addrs
+            .insert(call_id.to_string(), effective_media_addr);
+        self.media_sockets.insert(call_id.to_string(), media_socket);
 
         // Build 200 OK with SDP body
         let mut ok_response = build_response_from_request(
@@ -1373,8 +1848,15 @@ impl CallManager {
             &record_routes,
         );
 
-        // Start audio session using remote media address from INVITE SDP
-        if let Some(ref sdp) = remote_sdp_str {
+        // TLS call: media security (ICE + DTLS) and audio start on ACK.
+        // Insecure builds only: plain RTP starts now, as before.
+        if let Some(p) = preflight {
+            self.dtls_preflight.insert(call_id.to_string(), p);
+            self.pending_secure_media.insert(
+                call_id.to_string(),
+                std::time::Instant::now() + ACK_WAIT_SECURE_MEDIA,
+            );
+        } else if let Some(ref sdp) = remote_sdp_str {
             if let Some(remote_media_addr) = parse_remote_media_addr_from_sdp(sdp) {
                 info!(
                     call_id = %call_id,
@@ -1383,6 +1865,10 @@ impl CallManager {
                 );
                 if let Err(e) = self.start_audio_session(call_id, remote_media_addr).await {
                     error!(call_id = %call_id, error = %e, "Failed to start audio for incoming call");
+                    if matches!(e, AppError::MediaSecurity(_)) {
+                        let _ = self.end_call(call_id, CallEndReason::Failed).await;
+                        return Err(e);
+                    }
                 }
             } else {
                 warn!(call_id = %call_id, "No remote media address in incoming SDP");
@@ -2200,6 +2686,23 @@ impl CallManager {
     ) -> AppResult<()> {
         info!(call_id = %call_id, remote = %remote_addr, "Starting audio session");
 
+        // Single choke point: no keys on a DTLS-SRTP stream -> no audio.
+        // NIST 800-53 Rev5: SC-8(1). RFC 5764 §4.1.
+        let security = self.media_security_for(call_id)?;
+
+        // Hand the call's socket to the pipeline: the media session drops
+        // its tokio clone first so the audio thread is the sole reader.
+        // POAM: POA&M-325 post-handshake DTLS servicing on this socket.
+        if let Some(session) = self.media_sessions.get_mut(call_id) {
+            session.release_socket();
+        }
+        let socket = self
+            .media_sockets
+            .get(call_id)
+            .map(std::net::UdpSocket::try_clone)
+            .transpose()?;
+        let rtcp_mux = self.dtls_preflight.get(call_id).is_some_and(|p| p.rtcp_mux);
+
         // Create audio session and apply stored device preferences
         let mut audio_session = AudioSession::new(self.audio_event_tx.clone());
 
@@ -2245,9 +2748,9 @@ impl CallManager {
             remote_addr,
             codec,
             jitter_buffer_ms: 40,
-            // SRTP keys will be obtained from media session in production
-            srtp_key: None,
-            srtp_salt: None,
+            security,
+            socket,
+            rtcp_mux,
             moh_file_path: self.moh_file_path.clone(),
             dtmf_payload_type,
             dtmf_volume: self.dtmf_volume,
@@ -2316,47 +2819,12 @@ impl CallManager {
                 if self.audio_sessions.contains_key(call_id) {
                     info!(call_id = %call_id, "Audio session already active, skipping start");
                 } else {
-                    // Start media session establishment (ICE + DTLS) — only
-                    // for TLS transport. Plain RTP calls (UDP/TCP) don't use
-                    // ICE and establish() would always fail with "No ICE candidates".
-                    let use_ice = self.account.as_ref().is_some_and(|a| {
-                        matches!(a.transport, client_types::TransportPreference::TlsOnly)
-                    });
-                    if use_ice {
-                        if let Some(session) = self.media_sessions.get_mut(call_id) {
-                            info!(call_id = %call_id, "Found media session, attempting to establish");
-                            if let Err(e) = session.establish(None).await {
-                                warn!(call_id = %call_id, error = %e, "Failed to establish media");
-                            }
-                        } else {
-                            warn!(call_id = %call_id, "No media session found for call");
-                        }
-                    } else {
-                        debug!(call_id = %call_id, "Skipping ICE/DTLS for plain RTP call");
-                    }
-
-                    // Start audio session when call connects
-                    // Get remote address from media session - either from ICE or from SDP parsing
-                    let remote_addr = self.media_sessions.get(call_id).and_then(|session| {
-                        // For non-ICE calls, remote_addr is set from SDP c=/m= lines
-                        // For ICE calls, it's set after ICE connectivity check completes
-                        let addr = session.remote_addr();
-                        if addr.is_none() {
-                            warn!(
-                                call_id = %call_id,
-                                "No remote media address available"
-                            );
-                        }
-                        addr
-                    });
-
-                    if let Some(addr) = remote_addr {
-                        info!(call_id = %call_id, remote_addr = %addr, "Starting audio session");
-                        if let Err(e) = self.start_audio_session(call_id, addr).await {
-                            warn!(call_id = %call_id, error = %e, "Failed to start audio");
-                        }
-                    } else {
-                        error!(call_id = %call_id, "Cannot start audio: no remote address");
+                    // TLS calls: ICE + DTLS-SRTP must succeed before any
+                    // audio; a failure ends the call (BYE) and the call is
+                    // never reported Connected. Plain RTP (insecure builds)
+                    // starts directly. NIST 800-53 Rev5: SC-8(1).
+                    if self.secure_media_and_start_audio(call_id).await.is_err() {
+                        return Ok(());
                     }
                 }
             }
@@ -2371,9 +2839,9 @@ impl CallManager {
                     let _ = session.close().await;
                 }
 
-                // Clean up negotiated codec, effective media address, and dialog tracking
+                // Clean up negotiated codec, media state, and dialog tracking
                 self.negotiated_codecs.remove(call_id);
-                self.effective_media_addrs.remove(call_id);
+                self.forget_call_media(call_id);
                 self.active_call_dialogs.remove(call_id);
 
                 // Record in call history
@@ -2496,6 +2964,12 @@ impl CallManager {
             info!(call_id = %call_id, remote_addr = %addr, "Parsed remote media address from SDP");
         }
 
+        // Media-security preflight of the answer (TLS calls): the result is
+        // enforced when the call connects, so a downgrade (RTP/AVP, missing
+        // or sha-256 fingerprint, answer actpass) ends the call.
+        let secure_ok = self.record_answer_preflight(call_id, sdp);
+        self.note_remote_profile(call_id, sdp);
+
         // Parse SDP and configure media session
         if let Some(session) = self.media_sessions.get_mut(call_id) {
             // Set the remote media address for non-ICE calls
@@ -2508,7 +2982,7 @@ impl CallManager {
             let ice_creds = parse_ice_credentials_from_sdp(sdp);
             let has_ice = ice_creds.is_some();
 
-            if let Some(creds) = ice_creds {
+            if let Some(creds) = ice_creds.filter(|_| secure_ok) {
                 session.set_remote_ice_credentials(creds);
 
                 // Extract ICE candidates from SDP
@@ -2641,15 +3115,22 @@ impl CallManager {
         let effective_media_addr = self.get_effective_media_addr()?;
         let sdp_session_id = self.get_or_create_sdp_session_id(call_id);
         let sdp_session_version = self.get_sdp_session_version(call_id);
-        Ok(self.generate_sdp_offer_with_addr(
+        self.generate_sdp_offer_with_addr(
             session,
             account,
             effective_media_addr,
             sdp_session_id,
             sdp_session_version,
-        ))
+            None,
+        )
     }
 
+    /// Generates our SDP offer, or our answer when `answer_setup` is set
+    /// (RFC 5763 §5: offers use `actpass`, answers `active`/`passive`).
+    ///
+    /// # Errors
+    /// On a TLS account, fails if there is no local DTLS fingerprint: an
+    /// empty `a=fingerprint` is never emitted.
     #[allow(clippy::unused_self)]
     fn generate_sdp_offer_with_addr(
         &self,
@@ -2658,7 +3139,8 @@ impl CallManager {
         effective_media_addr: SocketAddr,
         sdp_session_id: u64,
         sdp_session_version: u64,
-    ) -> String {
+        answer: Option<DtlsAnswer>,
+    ) -> AppResult<String> {
         let ssrc = session.local_ssrc();
 
         // Check if we're using TLS/secure transport
@@ -2671,10 +3153,10 @@ impl CallManager {
         if use_srtp {
             // Secure RTP with ICE and DTLS fingerprint
             let creds = session.local_ice_credentials();
-            let fingerprint = session.local_dtls_fingerprint();
+            let (fingerprint, setup, rtcp_mux) = dtls_sdp_attrs(session, answer)?;
 
             let addr_type = sdp_addr_type(&effective_media_addr);
-            format!(
+            Ok(format!(
                 "v=0\r\n\
                  o=- {session_id} {session_version} IN {addr_type} {ip}\r\n\
                  s=USG SIP Client\r\n\
@@ -2697,11 +3179,11 @@ impl CallManager {
                  a=maxptime:120\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
-                 a=fingerprint:sha-384 {fingerprint}\r\n\
-                 a=setup:actpass\r\n\
+                 a=fingerprint:{fingerprint}\r\n\
+                 a=setup:{setup}\r\n\
                  a=mid:audio\r\n\
                  a=sendrecv\r\n\
-                 a=rtcp-mux\r\n\
+                 {rtcp_mux}\
                  a=ssrc:{ssrc} cname:{cname}\r\n",
                 session_id = sdp_session_id,
                 session_version = sdp_session_version,
@@ -2711,13 +3193,14 @@ impl CallManager {
                 ufrag = creds.ufrag,
                 pwd = creds.pwd,
                 fingerprint = fingerprint,
+                setup = setup,
                 ssrc = ssrc,
                 cname = account.id,
-            )
+            ))
         } else {
             // Plain RTP (no SRTP, no ICE, no DTLS)
             let addr_type = sdp_addr_type(&effective_media_addr);
-            format!(
+            Ok(format!(
                 "v=0\r\n\
                  o=- {session_id} {session_version} IN {addr_type} {ip}\r\n\
                  s=USG SIP Client\r\n\
@@ -2745,7 +3228,7 @@ impl CallManager {
                 port = effective_media_addr.port(),
                 ssrc = ssrc,
                 cname = account.id,
-            )
+            ))
         }
     }
 
@@ -2784,12 +3267,12 @@ impl CallManager {
 
     /// Generates SDP for putting a call on hold (sendonly direction).
     fn generate_hold_sdp(&mut self, call_id: &str) -> AppResult<String> {
-        self.generate_sdp_with_direction(call_id, "sendonly")
+        self.generate_sdp_with_direction(call_id, "sendonly", None)
     }
 
     /// Generates SDP for resuming a call (sendrecv direction).
     fn generate_resume_sdp(&mut self, call_id: &str) -> AppResult<String> {
-        self.generate_sdp_with_direction(call_id, "sendrecv")
+        self.generate_sdp_with_direction(call_id, "sendrecv", None)
     }
 
     /// Generates SDP for a codec change re-INVITE.
@@ -2883,12 +3366,12 @@ impl CallManager {
         if use_srtp {
             use std::fmt::Write as _;
             let creds = session.local_ice_credentials();
-            let fingerprint = session.local_dtls_fingerprint();
+            let fingerprint = sdp_fingerprint(session)?;
             let _ = write!(
                 sdp,
                 "a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
-                 a=fingerprint:sha-384 {fingerprint}\r\n\
+                 a=fingerprint:{fingerprint}\r\n\
                  a=setup:actpass\r\n\
                  a=mid:audio\r\n\
                  a=rtcp-mux\r\n",
@@ -2906,8 +3389,15 @@ impl CallManager {
         Ok(sdp)
     }
 
-    /// Generates SDP with the specified media direction.
-    fn generate_sdp_with_direction(&mut self, call_id: &str, direction: &str) -> AppResult<String> {
+    /// Generates SDP with the specified media direction. `answer_setup` is
+    /// our `a=setup` when this SDP answers a re-offer; `None` for our own
+    /// offers (`actpass`).
+    fn generate_sdp_with_direction(
+        &mut self,
+        call_id: &str,
+        direction: &str,
+        answer: Option<DtlsAnswer>,
+    ) -> AppResult<String> {
         // Get session ID and increment version for re-INVITE (RFC 8866 Section 5.2)
         // MUST do this before borrowing session to avoid borrow checker issues
         let sdp_session_id = self.get_or_create_sdp_session_id(call_id);
@@ -2945,7 +3435,7 @@ impl CallManager {
         let sdp = if use_srtp {
             // Secure RTP with ICE and DTLS fingerprint
             let creds = session.local_ice_credentials();
-            let fingerprint = session.local_dtls_fingerprint();
+            let (fingerprint, setup, rtcp_mux) = dtls_sdp_attrs(session, answer)?;
 
             format!(
                 "v=0\r\n\
@@ -2970,11 +3460,11 @@ impl CallManager {
                  a=maxptime:120\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
-                 a=fingerprint:sha-384 {fingerprint}\r\n\
-                 a=setup:actpass\r\n\
+                 a=fingerprint:{fingerprint}\r\n\
+                 a=setup:{setup}\r\n\
                  a=mid:audio\r\n\
                  a={direction}\r\n\
-                 a=rtcp-mux\r\n\
+                 {rtcp_mux}\
                  a=ssrc:{ssrc} cname:{cname}\r\n",
                 session_id = sdp_session_id,
                 session_version = sdp_session_version,
@@ -2984,6 +3474,7 @@ impl CallManager {
                 ufrag = creds.ufrag,
                 pwd = creds.pwd,
                 fingerprint = fingerprint,
+                setup = setup,
                 direction = direction,
                 ssrc = ssrc,
                 cname = account.id,
@@ -3625,6 +4116,55 @@ fn session_id() -> u64 {
     (secs << 32) | u64::from(frac)
 }
 
+/// DTLS parameters of an SDP answer we generate.
+#[derive(Debug, Clone, Copy)]
+struct DtlsAnswer {
+    /// Our resolved `a=setup` (never `actpass`, RFC 5763 §5).
+    setup: Setup,
+    /// The offer carried `a=rtcp-mux`; only then is it echoed
+    /// (RFC 5761 §5.1.1: an answerer MUST NOT add it unilaterally).
+    rtcp_mux: bool,
+}
+
+impl DtlsAnswer {
+    fn from_preflight(p: &Preflight) -> Option<Self> {
+        p.local_setup.map(|setup| Self {
+            setup,
+            rtcp_mux: p.rtcp_mux,
+        })
+    }
+}
+
+/// Our `a=fingerprint` value, `a=setup` value (`actpass` for offers) and
+/// `a=rtcp-mux` line (always in offers, echoed in answers).
+fn dtls_sdp_attrs(
+    session: &MediaSession,
+    answer: Option<DtlsAnswer>,
+) -> AppResult<(String, &'static str, &'static str)> {
+    let (setup, mux) = answer.map_or(("actpass", true), |a| (a.setup.as_str(), a.rtcp_mux));
+    Ok((
+        sdp_fingerprint(session)?,
+        setup,
+        if mux { "a=rtcp-mux\r\n" } else { "" },
+    ))
+}
+
+/// Our `a=fingerprint` value (`sha-384 XX:..`, exactly one hash prefix).
+///
+/// # Errors
+/// Fails closed if no local DTLS fingerprint exists: an empty or malformed
+/// `a=fingerprint` is never emitted (RFC 8122 §5).
+fn sdp_fingerprint(session: &MediaSession) -> AppResult<String> {
+    let fingerprint = session.local_dtls_fingerprint();
+    if fingerprint.starts_with("sha-384 ") || fingerprint.starts_with("sha-512 ") {
+        Ok(fingerprint)
+    } else {
+        Err(AppError::MediaSecurity(
+            "no local DTLS fingerprint".to_string(),
+        ))
+    }
+}
+
 /// Returns SDP address type string for a socket address (RFC 8866 Section 5.7).
 ///
 /// Returns `"IP4"` for IPv4 addresses or `"IP6"` for IPv6 addresses.
@@ -3857,6 +4397,7 @@ mod tests {
 
     /// Parses an INVITE from wire text, as the transport would deliver it.
     fn parse_invite(from: &str, contact: &str) -> SipRequest {
+        let sdp = crate::media_security::test_offer_sdp();
         let text = format!(
             "INVITE sips:testuser@example.com SIP/2.0\r\n\
              Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bKhostile\r\n\
@@ -3866,8 +4407,11 @@ mod tests {
              Call-ID: hostile-headers@192.0.2.50\r\n\
              CSeq: 1 INVITE\r\n\
              Contact: {contact}\r\n\
-             Content-Length: 0\r\n\
-             \r\n"
+             Content-Type: application/sdp\r\n\
+             Content-Length: {sdp_len}\r\n\
+             \r\n\
+             {sdp}",
+            sdp_len = sdp.len()
         );
         match proto_sip::message::SipMessage::parse(text.as_bytes()).unwrap() {
             proto_sip::message::SipMessage::Request(request) => request,
@@ -3887,6 +4431,96 @@ mod tests {
             "sips:192.0.2.1:5061",
         ));
         (manager, rx)
+    }
+
+    /// B2: TLS offer generation without a DTLS identity fails closed; an
+    /// empty `a=fingerprint` is never emitted.
+    #[tokio::test]
+    async fn test_tls_call_without_dtls_identity_fails_closed() {
+        let (tx, _rx) = mpsc::channel(32);
+        let mut manager = CallManager::new(
+            "127.0.0.1:5061".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            tx,
+        );
+        manager.configure_account(&SipAccount::new(
+            "test-account",
+            "Test User",
+            "sips:testuser@example.com",
+            "sips:192.0.2.1:5061",
+        ));
+        manager.dtls_identity = None;
+        let result = manager.make_call("sips:bob@192.0.2.50:5061").await;
+        assert!(
+            matches!(result, Err(AppError::MediaSecurity(_))),
+            "{result:?}"
+        );
+        assert_eq!(manager.all_call_ids(), &[] as &[String]);
+    }
+
+    /// B2: a smart-card certificate (no exportable key) keeps the ephemeral
+    /// DTLS identity; a non-P-384 key is refused.
+    #[test]
+    fn test_set_dtls_credentials_keeps_ephemeral_identity() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut manager = CallManager::new(
+            "127.0.0.1:5061".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            tx,
+        );
+        let before = manager.dtls_identity.as_ref().unwrap().sdp_fingerprint();
+        manager.set_dtls_credentials(vec![vec![0x30, 0x82]], Vec::new());
+        assert_eq!(
+            manager.dtls_identity.as_ref().unwrap().sdp_fingerprint(),
+            before
+        );
+        manager.set_dtls_credentials(vec![vec![0x30, 0x82]], vec![1, 2, 3]);
+        assert_eq!(
+            manager.dtls_identity.as_ref().unwrap().sdp_fingerprint(),
+            before
+        );
+    }
+
+    /// B2: plaintext media exists only in `insecure-transports` builds. A
+    /// UDP account gets plaintext there (no regression) and is refused in a
+    /// default build; a TLS account without keys is always refused.
+    #[test]
+    fn test_media_security_for_by_account_and_build() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut manager = CallManager::new(
+            "127.0.0.1:5061".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            tx,
+        );
+        let mut account = SipAccount::new(
+            "test-account",
+            "Test User",
+            "sips:testuser@example.com",
+            "sips:192.0.2.1:5061",
+        );
+        manager.configure_account(&account);
+        assert!(matches!(
+            manager.media_security_for("no-call"),
+            Err(AppError::MediaSecurity(_))
+        ));
+
+        account.transport = client_types::TransportPreference::Udp;
+        manager.configure_account(&account);
+        let plain = manager.media_security_for("no-call");
+        #[cfg(feature = "insecure-transports")]
+        assert!(matches!(plain, Ok(MediaSecurity::Plaintext)));
+        #[cfg(not(feature = "insecure-transports"))]
+        assert!(matches!(plain, Err(AppError::MediaSecurity(_))));
+
+        // SEC-002: a remote that signalled SAVP(F) makes SRTP mandatory
+        // even on a UDP account, in every build.
+        manager.note_remote_profile("savp-call", "v=0\r\nm=audio 4000 RTP/SAVP 0\r\n");
+        assert!(matches!(
+            manager.media_security_for("savp-call"),
+            Err(AppError::MediaSecurity(_))
+        ));
+        manager.forget_call_media("savp-call");
+        assert!(!manager.remote_requires_srtp.contains("savp-call"));
     }
 
     /// Status codes of the responses queued so far, and whether the
@@ -4072,6 +4706,59 @@ mod tests {
         assert!(ended);
     }
 
+    /// RFC-B2-003: an answered TLS call that never gets its ACK is ended
+    /// with BYE after 64*T1 and never starts audio.
+    #[tokio::test]
+    async fn test_unacked_tls_call_is_ended_after_64_t1() {
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let (mut manager, mut rx) = manager_with_account();
+        let invite = parse_invite(
+            "<sips:caller@example.com>;tag=1",
+            "<sips:caller@192.0.2.50:5061>",
+        );
+        manager
+            .handle_incoming_invite_from(&invite, source, SipTransportKind::Tls)
+            .await
+            .unwrap();
+        let call_id = manager.incoming_calls()[0].call_id.clone();
+        manager.accept_incoming_call(&call_id).await.unwrap();
+        while rx.try_recv().is_ok() {}
+        let deadline = *manager.pending_secure_media.get(&call_id).unwrap();
+
+        // Before the deadline nothing happens.
+        manager
+            .expire_unacked_secure_calls(
+                deadline
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(manager.all_call_ids(), std::slice::from_ref(&call_id));
+
+        manager.expire_unacked_secure_calls(deadline).await;
+        assert_eq!(manager.all_call_ids(), &[] as &[String]);
+        assert!(!manager.pending_secure_media.contains_key(&call_id));
+        assert!(manager.get_audio_session(&call_id).is_none());
+        let mut ended = false;
+        let mut errored = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                CallManagerEvent::CallEnded {
+                    call_id: id,
+                    reason,
+                    ..
+                } => {
+                    ended = id == call_id && reason == CallEndReason::Failed;
+                }
+                CallManagerEvent::Error { message, .. } => {
+                    errored = message.starts_with("media-security:");
+                }
+                _ => {}
+            }
+        }
+        assert!(ended && errored);
+    }
+
     /// SEC-S-002 / QA-001: a Contact with `>` before `<` used to panic in
     /// `accept_incoming_call`, after the call was already half set up.
     #[tokio::test]
@@ -4222,9 +4909,73 @@ mod tests {
         table
     }
 
+    /// RFC-R1-005: a re-INVITE with an offer on a TLS call that has no
+    /// recorded DTLS parameters gets 488; our answer never carries
+    /// `actpass` (RFC 5763 §5).
+    #[tokio::test]
+    async fn test_reinvite_offer_without_dtls_preflight_gets_488() {
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let (mut manager, mut rx) = manager_with_account();
+        let invite = parse_invite(
+            "<sips:caller@example.com>;tag=remote",
+            "<sips:caller@192.0.2.50:5061>",
+        );
+        manager
+            .handle_sip_request_from(&invite, source, SipTransportKind::Tls)
+            .await
+            .unwrap();
+        let (call_id, local_tag) = {
+            let incoming = manager.incoming_calls()[0];
+            (incoming.call_id.clone(), incoming.local_tag.clone())
+        };
+        manager.accept_incoming_call(&call_id).await.unwrap();
+        let _ = drain_responses(&mut rx);
+        assert!(manager.dtls_preflight.remove(&call_id).is_some());
+
+        let sdp = crate::media_security::test_offer_sdp();
+        let text = format!(
+            "INVITE sips:testuser@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bKreinvite\r\n\
+             Max-Forwards: 70\r\n\
+             From: <sips:caller@example.com>;tag=remote\r\n\
+             To: <sips:testuser@example.com>;tag={local_tag}\r\n\
+             Call-ID: hostile-headers@192.0.2.50\r\n\
+             CSeq: 2 INVITE\r\n\
+             Contact: <sips:caller@192.0.2.50:5061>\r\n\
+             Content-Type: application/sdp\r\n\
+             Content-Length: {sdp_len}\r\n\
+             \r\n\
+             {sdp}",
+            sdp_len = sdp.len()
+        );
+        let reinvite = match proto_sip::message::SipMessage::parse(text.as_bytes()).unwrap() {
+            proto_sip::message::SipMessage::Request(request) => request,
+            proto_sip::message::SipMessage::Response(_) => panic!("expected a request"),
+        };
+        manager
+            .handle_sip_request_from(&reinvite, source, SipTransportKind::Tls)
+            .await
+            .unwrap();
+        let mut statuses = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let CallManagerEvent::SendResponse { response, .. } = event {
+                assert!(
+                    response
+                        .body
+                        .as_ref()
+                        .is_none_or(|b| !String::from_utf8_lossy(b).contains("actpass"))
+                );
+                statuses.push(response.status.code());
+            }
+        }
+        assert_eq!(statuses, vec![488]);
+        assert!(manager.get_audio_session(&call_id).is_none());
+    }
+
     /// Parses an INVITE from wire text; `None` when proto-sip itself refuses
     /// the message, in which case it never reaches the call manager.
     fn qa_try_parse_invite(from: &str, contact: &str, call_id: &str) -> Option<SipRequest> {
+        let sdp = crate::media_security::test_offer_sdp();
         let text = format!(
             "INVITE sips:testuser@example.com SIP/2.0\r\n\
              Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bK{call_id}\r\n\
@@ -4234,8 +4985,11 @@ mod tests {
              Call-ID: {call_id}@192.0.2.50\r\n\
              CSeq: 1 INVITE\r\n\
              Contact: {contact}\r\n\
-             Content-Length: 0\r\n\
-             \r\n"
+             Content-Type: application/sdp\r\n\
+             Content-Length: {sdp_len}\r\n\
+             \r\n\
+             {sdp}",
+            sdp_len = sdp.len()
         );
         match proto_sip::message::SipMessage::parse(text.as_bytes()) {
             Ok(proto_sip::message::SipMessage::Request(request)) => Some(request),
@@ -4579,6 +5333,15 @@ mod tests {
         from: &str,
         body: &str,
     ) -> SipRequest {
+        // A dialog-creating INVITE on a TLS account must carry a DTLS-SRTP
+        // offer, or it is answered 488 before ringing.
+        let offer;
+        let body = if method == "INVITE" && to_tag.is_empty() && body.is_empty() {
+            offer = crate::media_security::test_offer_sdp();
+            offer.as_str()
+        } else {
+            body
+        };
         let to_tag = if to_tag.is_empty() {
             String::new()
         } else {

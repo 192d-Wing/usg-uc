@@ -11,6 +11,12 @@
 
 use crate::error::{DtlsError, DtlsResult};
 
+/// Maximum accepted length of one SDP `a=fingerprint` value (bounded parsing).
+///
+/// A sha-512 fingerprint is `sha-512 ` plus 64 * 3 - 1 = 199 bytes, so 256
+/// leaves headroom for whitespace while bounding hostile input.
+pub const MAX_SDP_FINGERPRINT_LEN: usize = 256;
+
 /// Hash algorithm for certificate fingerprints.
 ///
 /// ## CNSA 2.0 Compliance
@@ -146,6 +152,78 @@ impl CertificateFingerprint {
         Self::new(algorithm, bytes)
     }
 
+    /// Parses an SDP `a=fingerprint` value strictly (RFC 8122 §5 grammar).
+    ///
+    /// Unlike [`Self::from_sdp`] this enforces the wire grammar on hostile
+    /// input: the value is capped at [`MAX_SDP_FINGERPRINT_LEN`] bytes, the hash
+    /// name is matched case-insensitively and must be `sha-384` or `sha-512`
+    /// (CNSA 2.0; RFC 8122 §5 permits rejecting unsupported hash functions, so
+    /// `sha-1`, `sha-224`, `sha-256` and `md5` are refused), and the
+    /// fingerprint must be colon-separated pairs of hex digits with exactly the
+    /// algorithm's output length.
+    ///
+    /// NIST 800-53 Rev5: SI-10 (input validation), SC-13 (CNSA 2.0 hashes only)
+    ///
+    /// # Errors
+    /// Returns [`DtlsError::InvalidConfig`] on any grammar, length or
+    /// algorithm violation.
+    pub fn from_sdp_strict(value: &str) -> DtlsResult<Self> {
+        let invalid = |reason: &str| DtlsError::InvalidConfig {
+            reason: reason.to_string(),
+        };
+        if value.len() > MAX_SDP_FINGERPRINT_LEN {
+            return Err(invalid("fingerprint attribute too long"));
+        }
+        let value = value.trim();
+        let (hash_name, hex) = value
+            .split_once(' ')
+            .ok_or_else(|| invalid("invalid fingerprint format"))?;
+        let algorithm = if hash_name.eq_ignore_ascii_case("sha-384") {
+            FingerprintAlgorithm::Sha384
+        } else if hash_name.eq_ignore_ascii_case("sha-512") {
+            FingerprintAlgorithm::Sha512
+        } else {
+            return Err(invalid("unsupported fingerprint algorithm (CNSA 2.0)"));
+        };
+
+        let mut bytes = Vec::with_capacity(algorithm.output_len());
+        for group in hex.trim().split(':') {
+            let g = group.as_bytes();
+            if g.len() != 2 || !g.iter().all(u8::is_ascii_hexdigit) {
+                return Err(invalid("invalid fingerprint hex"));
+            }
+            if bytes.len() == algorithm.output_len() {
+                return Err(invalid("fingerprint too long for algorithm"));
+            }
+            let byte =
+                u8::from_str_radix(group, 16).map_err(|_| invalid("invalid fingerprint hex"))?;
+            bytes.push(byte);
+        }
+        Self::new(algorithm, bytes)
+    }
+
+    /// Verifies that a certificate matches at least one of `expected`.
+    ///
+    /// RFC 8122 §5: when several fingerprints are signalled, the certificate
+    /// MUST match at least one of them. An empty set never matches (fail
+    /// closed).
+    ///
+    /// NIST 800-53 Rev5: SC-23 (session authenticity)
+    ///
+    /// # Errors
+    /// Returns [`DtlsError::FingerprintMismatch`] if no fingerprint matches.
+    pub fn verify_any(expected: &[Self], cert_der: &[u8]) -> DtlsResult<()> {
+        if expected.iter().any(|fp| fp.verify(cert_der).is_ok()) {
+            return Ok(());
+        }
+        Err(DtlsError::FingerprintMismatch {
+            expected: expected
+                .first()
+                .map_or_else(|| "<none signalled>".to_string(), Self::to_sdp),
+            actual: Self::from_certificate_sha384(cert_der).to_sdp(),
+        })
+    }
+
     /// Returns the hash algorithm.
     #[must_use]
     pub const fn algorithm(&self) -> FingerprintAlgorithm {
@@ -274,6 +352,62 @@ mod tests {
         assert_eq!(FingerprintAlgorithm::Sha384.output_len(), 48);
         assert_eq!(FingerprintAlgorithm::Sha512.sdp_name(), "sha-512");
         assert_eq!(FingerprintAlgorithm::Sha512.output_len(), 64);
+    }
+
+    #[test]
+    fn strict_parse_round_trip_and_case() {
+        for fp in [
+            CertificateFingerprint::from_certificate_sha384(b"a"),
+            CertificateFingerprint::from_certificate_sha512(b"b"),
+        ] {
+            let sdp = fp.to_sdp();
+            assert_eq!(CertificateFingerprint::from_sdp_strict(&sdp).unwrap(), fp);
+            assert_eq!(
+                CertificateFingerprint::from_sdp_strict(&sdp.to_lowercase()).unwrap(),
+                fp
+            );
+            assert_eq!(
+                CertificateFingerprint::from_sdp_strict(&sdp.to_uppercase()).unwrap(),
+                fp
+            );
+        }
+    }
+
+    #[test]
+    fn strict_parse_rejects_bad_input() {
+        let good = CertificateFingerprint::from_certificate_sha384(b"a").to_sdp();
+        let hex = good.trim_start_matches("sha-384 ");
+        for bad in [
+            format!("sha-256 {hex}"),
+            format!("sha-1 {hex}"),
+            format!("md5 {hex}"),
+            "sha-384".to_string(),
+            "sha-384 AA:BB".to_string(),
+            format!("sha-384 {hex}:AA"),
+            format!("sha-384 {}", hex.replace(':', "")),
+            format!("sha-384 +{}", &hex[1..]),
+            format!("sha-384 {}G", &hex[..hex.len() - 1]),
+            format!("sha-384 {hex}{}", " ".repeat(300)),
+        ] {
+            assert!(
+                CertificateFingerprint::from_sdp_strict(&bad).is_err(),
+                "accepted {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_any_matches_one_of_set() {
+        let a = CertificateFingerprint::from_certificate_sha384(b"cert-a");
+        let b = CertificateFingerprint::from_certificate_sha512(b"cert-b");
+        let set = [a, b];
+        CertificateFingerprint::verify_any(&set, b"cert-a").unwrap();
+        CertificateFingerprint::verify_any(&set, b"cert-b").unwrap();
+        assert!(matches!(
+            CertificateFingerprint::verify_any(&set, b"cert-c"),
+            Err(DtlsError::FingerprintMismatch { .. })
+        ));
+        assert!(CertificateFingerprint::verify_any(&[], b"cert-a").is_err());
     }
 
     #[test]

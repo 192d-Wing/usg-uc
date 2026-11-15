@@ -120,16 +120,12 @@ impl LocationService {
     ///
     /// Returns bindings sorted by q-value (highest first).
     pub fn lookup(&self, aor: &str) -> Vec<&Binding> {
-        let mut result: Vec<&Binding> = self
-            .bindings
-            .get(aor)
-            .map(|bindings| {
-                bindings
-                    .iter()
-                    .filter(|b| b.state() == BindingState::Active && !b.is_expired())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut result: Vec<&Binding> = self.bindings.get(aor).map_or_else(Vec::new, |bindings| {
+            bindings
+                .iter()
+                .filter(|b| b.state() == BindingState::Active && !b.is_expired())
+                .collect()
+        });
 
         // Sort by q-value (highest first)
         result.sort_by(|a, b| {
@@ -173,16 +169,12 @@ impl LocationService {
     /// This is useful for finding all flows from a single UA instance.
     /// Returns bindings sorted by reg-id.
     pub fn get_bindings_by_instance(&self, aor: &str, instance_id: &str) -> Vec<&Binding> {
-        let mut result: Vec<&Binding> = self
-            .bindings
-            .get(aor)
-            .map(|bindings| {
-                bindings
-                    .iter()
-                    .filter(|b| b.instance_id() == Some(instance_id))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut result: Vec<&Binding> = self.bindings.get(aor).map_or_else(Vec::new, |bindings| {
+            bindings
+                .iter()
+                .filter(|b| b.instance_id() == Some(instance_id))
+                .collect()
+        });
 
         // Sort by reg-id
         result.sort_by_key(|b| b.reg_id());

@@ -1560,6 +1560,7 @@ mod tests {
     }
 
     fn invite(from: &str, call_id: &str) -> String {
+        let sdp = crate::media_security::test_offer_sdp();
         format!(
             "INVITE sips:testuser@example.com SIP/2.0\r\n\
              Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bK{call_id}\r\n\
@@ -1569,8 +1570,11 @@ mod tests {
              Call-ID: {call_id}@192.0.2.50\r\n\
              CSeq: 1 INVITE\r\n\
              Contact: <sips:caller@192.0.2.50:5061>\r\n\
-             Content-Length: 0\r\n\
-             \r\n"
+             Content-Type: application/sdp\r\n\
+             Content-Length: {sdp_len}\r\n\
+             \r\n\
+             {sdp}",
+            sdp_len = sdp.len()
         )
     }
 
@@ -1909,6 +1913,7 @@ mod tests {
     // ---- QA round 1 ----
 
     fn qa_invite(from: &str, contact: &str, call_id: &str) -> String {
+        let sdp = crate::media_security::test_offer_sdp();
         format!(
             "INVITE sips:testuser@example.com SIP/2.0\r\n\
              Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bK{call_id}\r\n\
@@ -1918,8 +1923,11 @@ mod tests {
              Call-ID: {call_id}@192.0.2.50\r\n\
              CSeq: 1 INVITE\r\n\
              Contact: {contact}\r\n\
-             Content-Length: 0\r\n\
-             \r\n"
+             Content-Type: application/sdp\r\n\
+             Content-Length: {sdp_len}\r\n\
+             \r\n\
+             {sdp}",
+            sdp_len = sdp.len()
         )
     }
 

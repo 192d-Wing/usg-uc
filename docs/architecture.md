@@ -150,9 +150,9 @@ Operational details live in the [Administrator Guide](SBC-ADMIN-GUIDE.md),
 One Rust core serves all platforms:
 
 - `client-types` — shared types
-- `client-sip-ua` — SIP user agent (INVITE/BYE/CANCEL/ACK, registration)
-- `client-audio` — capture/playback, resampling, jitter buffer, RTP
-- `client-core` — call lifecycle, SDP handling, audio session management
+- `client-sip-ua` — SIP user agent (INVITE/BYE/CANCEL/ACK, registration); DTLS-SRTP signalling (`sdp_dtls.rs`: `a=fingerprint` / `a=setup` parsing; `dtls_identity.rs`: P-384 DTLS identity). The DTLS handshake itself is not implemented (NIST POA&M-324)
+- `client-audio` — capture/playback, resampling, jitter buffer, RTP; SRTP/SRTCP when keys are supplied (`media_security.rs`: `MediaSecurity`, the only way to build a pipeline; plaintext exists only with the `insecure-rtp` feature)
+- `client-core` — call lifecycle, SDP handling, audio session management; the media-security gate (`media_security.rs` preflight, `call_manager.rs` `media_security_for`). One UDP media socket per call, owned by the call manager and handed to the media session and then the audio pipeline as clones. TLS-account calls currently end after connect with no audio, because no DTLS-SRTP keys can be established (NIST POA&M-324)
 - `client-ffi` — C FFI surface for the native mobile apps
 - `client-gui-tauri` — Tauri 2.0 desktop app
 

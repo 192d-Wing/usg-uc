@@ -119,6 +119,12 @@ impl IceHandler {
         self.socket = Some(socket);
     }
 
+    /// Drops the handler's reference to the media socket (handoff to the
+    /// audio pipeline).
+    pub fn clear_socket(&mut self) {
+        self.socket = None;
+    }
+
     /// Overrides the connectivity-check phase timeout.
     pub const fn set_check_phase_timeout(&mut self, timeout: Duration) {
         self.check_phase_timeout = timeout;

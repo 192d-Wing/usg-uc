@@ -20,6 +20,7 @@ use crate::jitter_buffer::JitterBufferStats;
 use crate::rtp_handler::RtpStats;
 use bytes::{BufMut, BytesMut};
 use proto_rtp::{ReceptionReport, RtcpHeader, RtcpType, SenderInfo};
+use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +37,16 @@ const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 
 /// SDES item type: CNAME (Canonical Name).
 const SDES_CNAME: u8 = 1;
+
+/// Receive buffer size: one Ethernet MTU covers muxed SRTCP from any peer.
+const RTCP_RECV_BUFFER: usize = 1500;
+
+/// SRTCP contexts for one session (RFC 3711 §3.4). Separate instances from
+/// the RTP contexts, so the SRTCP index and replay window are not shared.
+struct SrtcpContexts {
+    tx: SrtpContext,
+    rx: SrtpContext,
+}
 
 /// RTCP session state.
 pub struct RtcpSession {
@@ -76,6 +87,18 @@ pub struct RtcpSession {
     ssrc_collision: bool,
     /// Whether an RTCP BYE has been sent (session ended).
     bye_sent: bool,
+    /// SRTCP contexts. When set, every RTCP packet is protected before send
+    /// and must authenticate on receive (RFC 3711 §3.4: SRTCP auth is
+    /// mandatory). When unset the session is plaintext (insecure builds only).
+    srtcp: Option<SrtcpContexts>,
+    /// Whether RTCP is multiplexed on the RTP socket (RFC 5761). When set,
+    /// [`Self::try_receive`] does not read the socket (the RTP receiver
+    /// demultiplexes and hands packets to [`Self::handle_packet`]).
+    rtcp_mux: bool,
+    /// SRTCP protect/unprotect failures.
+    srtcp_errors: u64,
+    /// Packets dropped by the source check or for being malformed.
+    rtcp_dropped: u64,
 }
 
 impl RtcpSession {
@@ -122,12 +145,16 @@ impl RtcpSession {
             last_received_sr_time: None,
             prev_packets_received: 0,
             prev_cumulative_lost: 0,
-            recv_buffer: vec![0u8; 512],
+            recv_buffer: vec![0u8; RTCP_RECV_BUFFER],
             rtt_ms: None,
             report_interval: Duration::from_secs_f64(RTCP_BASE_INTERVAL_SECS),
             interval_rng: seed,
             ssrc_collision: false,
             bye_sent: false,
+            srtcp: None,
+            rtcp_mux: false,
+            srtcp_errors: 0,
+            rtcp_dropped: 0,
         };
         session.report_interval = session.next_report_interval();
         session
@@ -145,6 +172,35 @@ impl RtcpSession {
         let frac = f64::from(self.interval_rng >> 8) / f64::from(1u32 << 24);
         let factor = 0.5 + frac; // [0.5, 1.5)
         Duration::from_secs_f64(RTCP_BASE_INTERVAL_SECS * factor)
+    }
+
+    /// Enables SRTCP with independent transmit / receive contexts.
+    ///
+    /// NIST 800-53 Rev5: SC-8(1) (RTCP confidentiality and integrity).
+    pub fn set_srtcp(&mut self, tx: SrtpContext, rx: SrtpContext) {
+        self.srtcp = Some(SrtcpContexts { tx, rx });
+        debug!("SRTCP enabled for RTCP session");
+    }
+
+    /// Returns whether SRTCP is enabled.
+    pub const fn is_secure(&self) -> bool {
+        self.srtcp.is_some()
+    }
+
+    /// Marks RTCP as multiplexed on the RTP socket (RFC 5761).
+    pub const fn set_rtcp_mux(&mut self, enabled: bool) {
+        self.rtcp_mux = enabled;
+    }
+
+    /// Returns the number of SRTCP protect/unprotect failures.
+    pub const fn srtcp_errors(&self) -> u64 {
+        self.srtcp_errors
+    }
+
+    /// Returns the number of RTCP packets dropped (source check, runt,
+    /// oversize).
+    pub const fn rtcp_dropped(&self) -> u64 {
+        self.rtcp_dropped
     }
 
     /// Updates the local SSRC (used after SSRC collision resolution).
@@ -204,11 +260,94 @@ impl RtcpSession {
     /// Parses Sender Report headers from the remote to enable DLSR
     /// calculation in our outgoing Receiver Reports.
     pub fn try_receive(&mut self) {
-        let result = self.socket.recv_from(&mut self.recv_buffer);
+        if self.rtcp_mux {
+            // RFC 5761: the RTP receiver owns the shared socket and
+            // demultiplexes RTCP to `handle_packet`.
+            return;
+        }
+        // No packet (timeout / would-block) is not an error.
+        if let Ok((len, addr)) = self.socket.recv_from(&mut self.recv_buffer) {
+            self.ingest(len, addr);
+        }
+    }
+
+    /// Processes one RTCP datagram demultiplexed from the RTP socket
+    /// (RFC 5761 §4). Oversize datagrams are dropped.
+    pub fn handle_packet(&mut self, data: &[u8], from: SocketAddr) {
+        let Some(dst) = self.recv_buffer.get_mut(..data.len()) else {
+            self.rtcp_dropped += 1;
+            return;
+        };
+        dst.copy_from_slice(data);
+        self.ingest(data.len(), from);
+    }
+
+    /// Validates source, authenticates (SRTCP) and processes
+    /// `self.recv_buffer[..len]`. Unauthenticated RTCP is never parsed on a
+    /// secure session, so SSRC-collision and RTT inputs are authenticated.
+    fn ingest(&mut self, len: usize, from: SocketAddr) {
+        if len < 8 {
+            self.rtcp_dropped += 1;
+            return;
+        }
+        // Cheap source check: RTCP must come from the negotiated remote host.
+        if from.ip() != self.remote_addr.ip() {
+            self.rtcp_dropped += 1;
+            trace!("Dropping RTCP from unexpected source {from}");
+            return;
+        }
+        let plain_len = if let Some(ref srtcp) = self.srtcp {
+            // RFC 3711 §3.4: authenticate before parsing.
+            // POAM: POA&M-328 unprotect_rtcp_sync returns an owned buffer (one
+            // allocation per received RTCP datagram, including forged ones
+            // in a flood); add an in-place SRTCP unprotect to proto-srtp.
+            match SrtpUnprotect::new(&srtcp.rx).unprotect_rtcp_sync(&self.recv_buffer[..len]) {
+                Ok(plain) => {
+                    let n = plain.len();
+                    // Plaintext is never longer than the SRTCP packet.
+                    let Some(dst) = self.recv_buffer.get_mut(..n) else {
+                        self.rtcp_dropped += 1;
+                        return;
+                    };
+                    dst.copy_from_slice(&plain);
+                    n
+                }
+                Err(e) => {
+                    self.srtcp_errors += 1;
+                    trace!("SRTCP unprotect failed: {e}");
+                    return;
+                }
+            }
+        } else {
+            len
+        };
+        if plain_len >= 8 {
+            self.process_rtcp_packet(plain_len);
+        }
+    }
+
+    /// Sends a compound packet, protecting it as SRTCP when keyed. On a
+    /// secure session a protect failure drops the packet; plaintext RTCP is
+    /// never sent in its place.
+    fn transmit(&mut self, compound: &[u8]) -> Option<usize> {
+        let result = if let Some(ref srtcp) = self.srtcp {
+            match SrtpProtect::new(&srtcp.tx).protect_rtcp(compound) {
+                Ok(protected) => self.socket.send_to(&protected, self.remote_addr),
+                Err(e) => {
+                    self.srtcp_errors += 1;
+                    trace!("SRTCP protect failed: {e}");
+                    return None;
+                }
+            }
+        } else {
+            self.socket.send_to(compound, self.remote_addr)
+        };
         match result {
-            Ok((len, _addr)) if len >= 8 => self.process_rtcp_packet(len),
-            Ok(_) | Err(_) => {
-                // No packet or too short — ignore
+            Ok(sent) => Some(sent),
+            Err(e) => {
+                // Non-fatal — RTCP failure shouldn't affect audio
+                trace!("RTCP send failed: {e}");
+                None
             }
         }
     }
@@ -348,17 +487,11 @@ impl RtcpSession {
         self.build_sdes(&mut compound);
 
         // Send
-        match self.socket.send_to(&compound, self.remote_addr) {
-            Ok(sent) => {
-                trace!(
-                    "Sent RTCP compound packet: {} bytes to {}",
-                    sent, self.remote_addr
-                );
-            }
-            Err(e) => {
-                trace!("RTCP send failed: {e}");
-                // Non-fatal — RTCP failure shouldn't affect audio
-            }
+        if let Some(sent) = self.transmit(&compound) {
+            trace!(
+                "Sent RTCP compound packet: {} bytes to {}",
+                sent, self.remote_addr
+            );
         }
     }
 
@@ -383,16 +516,11 @@ impl RtcpSession {
         self.build_sdes(&mut compound);
         self.build_bye(&mut compound);
 
-        match self.socket.send_to(&compound, self.remote_addr) {
-            Ok(sent) => {
-                debug!(
-                    "Sent RTCP BYE compound packet: {} bytes to {}",
-                    sent, self.remote_addr
-                );
-            }
-            Err(e) => {
-                trace!("RTCP BYE send failed: {e}");
-            }
+        if let Some(sent) = self.transmit(&compound) {
+            debug!(
+                "Sent RTCP BYE compound packet: {} bytes to {}",
+                sent, self.remote_addr
+            );
         }
     }
 
@@ -835,6 +963,89 @@ mod tests {
         session.process_rtcp_packet(12);
 
         assert!(session.ssrc_collision_detected());
+    }
+
+    fn keyed_pair() -> (RtcpSession, RtcpSession, UdpSocket) {
+        use crate::media_security::{build_srtp_contexts, tests::keys};
+        let a_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let b_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        b_sock
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let a_addr = a_sock.local_addr().unwrap();
+        let b_addr = b_sock.local_addr().unwrap();
+        // DTLS-SRTP shaped: A's tx half is B's rx half and vice versa.
+        let a_ctx = build_srtp_contexts(&keys(1, 2), 0xA).unwrap();
+        let b_ctx = build_srtp_contexts(&keys(2, 1), 0xB).unwrap();
+        let mut a = RtcpSession::new(a_sock, b_addr, 0xA, 8000, "a@h".to_string());
+        a.set_srtcp(a_ctx.rtcp_tx, a_ctx.rtcp_rx);
+        let mut b = RtcpSession::new(
+            Arc::new(b_sock.try_clone().unwrap()),
+            a_addr,
+            0xB,
+            8000,
+            "b@h".to_string(),
+        );
+        b.set_srtcp(b_ctx.rtcp_tx, b_ctx.rtcp_rx);
+        (a, b, b_sock)
+    }
+
+    #[test]
+    fn srtcp_round_trip_and_no_plaintext_on_wire() {
+        let (mut a, mut b, b_sock) = keyed_pair();
+        let tx_stats = RtpStats {
+            packets_sent: 5,
+            ..RtpStats::default()
+        };
+        a.send_compound_report(&tx_stats, &JitterBufferStats::default());
+
+        let mut buf = [0u8; 1500];
+        let (len, from) = b_sock.recv_from(&mut buf).unwrap();
+        // SRTCP trailer: E flag set in the last 4 bytes, CNAME not in clear.
+        assert_ne!(buf[len - 4] & 0x80, 0, "E flag must be set");
+        assert!(!buf[..len].windows(3).any(|w| w == b"a@h"));
+
+        assert!(b.last_received_sr_time.is_none());
+        b.handle_packet(&buf[..len], from);
+        assert_eq!(b.srtcp_errors(), 0);
+        assert!(b.last_received_sr_time.is_some(), "SR must be processed");
+    }
+
+    #[test]
+    fn srtcp_tampered_and_plaintext_dropped() {
+        let (mut a, mut b, b_sock) = keyed_pair();
+        a.send_compound_report(&RtpStats::default(), &JitterBufferStats::default());
+        let mut buf = [0u8; 1500];
+        let (len, from) = b_sock.recv_from(&mut buf).unwrap();
+
+        let mut tampered = buf[..len].to_vec();
+        tampered[9] ^= 0x01;
+        b.handle_packet(&tampered, from);
+        assert_eq!(b.srtcp_errors(), 1);
+
+        // Plaintext RR carrying B's own SSRC: must not be parsed (no
+        // collision flag) because it does not authenticate.
+        let mut rr = [0u8; 8];
+        rr[0] = 0x80;
+        rr[1] = 201;
+        rr[2..4].copy_from_slice(&1u16.to_be_bytes());
+        rr[4..8].copy_from_slice(&0xBu32.to_be_bytes());
+        b.handle_packet(&rr, from);
+        assert_eq!(b.srtcp_errors(), 2);
+        assert!(!b.ssrc_collision_detected());
+    }
+
+    #[test]
+    fn rtcp_from_wrong_source_dropped() {
+        let (_a, mut b, _b_sock) = keyed_pair();
+        let mut rr = [0u8; 8];
+        rr[0] = 0x80;
+        rr[1] = 201;
+        rr[4..8].copy_from_slice(&0xBu32.to_be_bytes());
+        b.handle_packet(&rr, "192.0.2.7:5005".parse().unwrap());
+        assert_eq!(b.rtcp_dropped(), 1);
+        assert_eq!(b.srtcp_errors(), 0);
+        assert!(!b.ssrc_collision_detected());
     }
 
     #[test]

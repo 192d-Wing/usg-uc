@@ -17,6 +17,7 @@
 //! - **SC-13**: Cryptographic Protection
 
 use crate::error::{DtlsError, DtlsResult};
+use crate::fingerprint::CertificateFingerprint;
 use crate::record::{ContentType, DTLS_1_2_VERSION, RECORD_HEADER_LEN, RecordLayer};
 use crate::verify::{
     CertificateValidationResult, CertificateValidator, FinishedVerifier, ServerKeyExchangeVerifier,
@@ -213,8 +214,9 @@ pub struct Handshake {
     peer_public_key: Option<Vec<u8>>,
     /// ECDH params (for signature verification).
     ecdh_params: Option<Vec<u8>>,
-    /// Expected certificate fingerprint (for DTLS-SRTP).
-    expected_fingerprint: Option<[u8; 48]>,
+    /// Expected certificate fingerprints from SDP (for DTLS-SRTP). The peer
+    /// leaf certificate must match at least one (RFC 8122 §5).
+    expected_fingerprints: Vec<CertificateFingerprint>,
     /// Whether to allow self-signed certificates.
     allow_self_signed: bool,
 }
@@ -273,9 +275,15 @@ impl Handshake {
             peer_cert_chain: Vec::new(),
             peer_public_key: None,
             ecdh_params: None,
-            expected_fingerprint: None,
+            expected_fingerprints: Vec::new(),
             allow_self_signed: true, // Default for DTLS-SRTP
         })
+    }
+
+    /// Sets the fingerprints signalled by the peer in SDP; the peer leaf
+    /// certificate must match at least one of them.
+    pub fn set_expected_fingerprints(&mut self, fingerprints: Vec<CertificateFingerprint>) {
+        self.expected_fingerprints = fingerprints;
     }
 
     /// Returns the current state.
@@ -940,8 +948,13 @@ impl Handshake {
         if self.allow_self_signed {
             validator = validator.allow_self_signed();
         }
-        if let Some(fp) = self.expected_fingerprint {
-            validator = validator.with_fingerprint(fp);
+        // RFC 8122 §5 / RFC 5763 §6.7.1: the peer certificate MUST match at
+        // least one fingerprint signalled in SDP. A self-signed peer has no
+        // other binding, so the check always runs and an empty set fails
+        // (`verify_any` never matches an empty set).
+        // NIST 800-53 Rev5: SC-23 (session authenticity) (reachable once POA&M-324 lands)
+        if self.allow_self_signed || !self.expected_fingerprints.is_empty() {
+            CertificateFingerprint::verify_any(&self.expected_fingerprints, &certs[0])?;
         }
 
         // Validate certificate chain
@@ -1584,6 +1597,54 @@ mod tests {
         assert_eq!(hs.state, HandshakeState::Start);
         // Client random should be non-zero
         assert!(hs.client_random.iter().any(|&b| b != 0));
+    }
+
+    /// NIST-004: with self-signed peers allowed, an empty expected
+    /// fingerprint set rejects the peer certificate (no silent skip).
+    ///
+    /// The peer certificate is a real self-signed P-384 one that the
+    /// validator accepts (shown by the matching-fingerprint case), so with
+    /// an empty set only `verify_any` can be what rejects it.
+    #[test]
+    fn test_process_certificate_empty_fingerprint_set_fails() {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["peer".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let cert = cert.der().to_vec();
+        let len = u32::try_from(cert.len()).unwrap().to_be_bytes();
+        let list_len = u32::try_from(cert.len() + 3).unwrap().to_be_bytes();
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&list_len[1..]);
+        msg.extend_from_slice(&len[1..]);
+        msg.extend_from_slice(&cert);
+
+        let mut hs = Handshake::new(true, vec![vec![0u8; 100]], vec![0u8; 48]).unwrap();
+        assert!(hs.allow_self_signed);
+        assert_eq!(hs.expected_fingerprints, [] as [CertificateFingerprint; 0]);
+        let err = hs.process_certificate(&msg).unwrap_err();
+        assert_eq!(
+            format!("{err:?}"),
+            format!(
+                "{:?}",
+                CertificateFingerprint::verify_any(&[], &cert).unwrap_err()
+            )
+        );
+        assert!(hs.peer_public_key.is_none());
+
+        // A mismatching fingerprint also fails.
+        hs.set_expected_fingerprints(vec![CertificateFingerprint::from_certificate_sha384(
+            b"other",
+        )]);
+        assert!(hs.process_certificate(&msg).is_err());
+        assert!(hs.peer_public_key.is_none());
+
+        // The same message passes once the fingerprint matches: nothing
+        // but the fingerprint check rejected it above.
+        hs.set_expected_fingerprints(vec![CertificateFingerprint::from_certificate_sha384(&cert)]);
+        hs.process_certificate(&msg).unwrap();
+        assert!(hs.peer_public_key.is_some());
     }
 
     #[test]

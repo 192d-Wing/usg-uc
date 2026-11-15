@@ -16,7 +16,7 @@ use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
 /// Environment variable to enable RTP packet capture.
@@ -106,6 +106,54 @@ pub struct RtpStats {
     pub packets_dropped: u64,
     /// SRTP protection errors.
     pub srtp_errors: u64,
+    /// DTLS-range datagrams (RFC 7983 first byte 20..=63) dropped on the
+    /// media socket. POAM: POA&M-325 route these to a DTLS servicing task.
+    pub dtls_dropped: u64,
+    /// STUN, unknown-range, runt, and un-negotiated muxed RTCP datagrams
+    /// dropped before RTP parsing.
+    pub non_media_dropped: u64,
+    /// SRTCP protect/unprotect failures (auth failures, replays, malformed).
+    pub srtcp_errors: u64,
+    /// RTCP datagrams dropped before authentication or parsing (runts,
+    /// unexpected source, oversized).
+    pub rtcp_dropped: u64,
+}
+
+/// Classification of a datagram arriving on the shared media socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketClass {
+    /// STUN (first byte 0..=3).
+    Stun,
+    /// DTLS record (first byte 20..=63).
+    Dtls,
+    /// RTP (first byte 128..=191, not an RTCP packet type).
+    Rtp,
+    /// RTCP multiplexed on the RTP port (RFC 5761 §4).
+    Rtcp,
+    /// Anything else (ZRTP, TURN channel, reserved): dropped.
+    Other,
+}
+
+/// Classifies a datagram by its first two bytes before any parsing.
+///
+/// RFC 7983 §7 / RFC 5764 §5.1.2: first byte 0..=3 is STUN, 20..=63 is DTLS,
+/// 128..=191 is RTP/RTCP. RFC 5761 §4: within the RTP range, a second byte
+/// whose low 7 bits fall in 64..=95 (RTCP packet types 192..=223) is RTCP.
+/// O(1), no allocation; safe on hostile input.
+#[must_use]
+pub const fn classify(first: u8, second: u8) -> PacketClass {
+    match first {
+        0..=3 => PacketClass::Stun,
+        20..=63 => PacketClass::Dtls,
+        128..=191 => {
+            if matches!(second & 0x7F, 64..=95) {
+                PacketClass::Rtcp
+            } else {
+                PacketClass::Rtp
+            }
+        }
+        _ => PacketClass::Other,
+    }
 }
 
 /// Lock-free atomic counters for RTP statistics.
@@ -126,6 +174,10 @@ pub(crate) struct AtomicRtpStats {
     packets_dropped: AtomicU64,
     /// SRTP protection errors.
     srtp_errors: AtomicU64,
+    /// DTLS-range datagrams dropped.
+    dtls_dropped: AtomicU64,
+    /// Non-media datagrams dropped.
+    non_media_dropped: AtomicU64,
 }
 
 impl AtomicRtpStats {
@@ -138,6 +190,8 @@ impl AtomicRtpStats {
             bytes_received: AtomicU64::new(0),
             packets_dropped: AtomicU64::new(0),
             srtp_errors: AtomicU64::new(0),
+            dtls_dropped: AtomicU64::new(0),
+            non_media_dropped: AtomicU64::new(0),
         }
     }
 
@@ -150,6 +204,10 @@ impl AtomicRtpStats {
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
             packets_dropped: self.packets_dropped.load(Ordering::Relaxed),
             srtp_errors: self.srtp_errors.load(Ordering::Relaxed),
+            dtls_dropped: self.dtls_dropped.load(Ordering::Relaxed),
+            non_media_dropped: self.non_media_dropped.load(Ordering::Relaxed),
+            srtcp_errors: 0,
+            rtcp_dropped: 0,
         }
     }
 }
@@ -638,6 +696,33 @@ impl RtpTransmitter {
     }
 }
 
+/// Maximum dropped (non-media or filtered) datagrams consumed by one
+/// [`RtpReceiver::receive`] call before it yields to the I/O loop.
+pub const MAX_DROPPED_PER_RECEIVE: usize = 32;
+
+/// Smallest read timeout worth arming for another read after a drop; with
+/// less than this left of the time budget, [`RtpReceiver::receive`] yields.
+const MIN_DROP_READ_TIMEOUT: Duration = Duration::from_micros(100);
+
+/// Source-filter verdict for one datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceDecision {
+    Accept,
+    /// Same IP as the silent negotiated remote; latch only once genuine.
+    LatchCandidate,
+    Drop,
+}
+
+/// Outcome of reading one datagram.
+enum Received {
+    /// RTP buffered.
+    Media,
+    /// Timeout, or a muxed RTCP datagram is pending.
+    Nothing,
+    /// Datagram consumed and counted; read the next one.
+    Dropped,
+}
+
 /// RTP receiver for receiving audio packets.
 ///
 /// Receives RTP packets from a `std::net::UdpSocket` (blocking with
@@ -687,6 +772,11 @@ pub struct RtpReceiver {
     pcap_dump: Option<std::io::BufWriter<std::fs::File>>,
     /// Start time for pcap timestamps.
     pcap_start: Instant,
+    /// Whether RTCP is multiplexed on this socket (RFC 5761, `a=rtcp-mux`).
+    rtcp_mux: bool,
+    /// Pending muxed RTCP datagram in `process_buffer[..len]` and its source,
+    /// to be drained by the I/O thread via [`Self::take_muxed_rtcp`].
+    muxed_rtcp: Option<(usize, SocketAddr)>,
 }
 
 impl RtpReceiver {
@@ -749,6 +839,8 @@ impl RtpReceiver {
             dtmf_queue: None,
             pcap_dump,
             pcap_start: Instant::now(),
+            rtcp_mux: false,
+            muxed_rtcp: None,
         }
     }
 
@@ -783,33 +875,28 @@ impl RtpReceiver {
     /// Decides whether a packet from `addr` should be accepted, applying
     /// the RFC 4961 source filter and symmetric-NAT latching rules.
     ///
-    /// Returns `true` to accept the packet. May update `expected_remote`
-    /// (latching) and internal one-time-warning state.
-    fn accept_source(&mut self, addr: SocketAddr) -> bool {
+    /// A latch candidate is only returned, never committed here: the caller
+    /// commits it with [`Self::commit_latch`] once the packet is known to be
+    /// genuine (SRTP-authenticated on a keyed session). Likewise the
+    /// negotiated remote is only marked as seen by
+    /// [`Self::note_expected_source`], under the same rule.
+    fn accept_source(&mut self, addr: SocketAddr) -> SourceDecision {
         let Some(expected) = self.expected_remote else {
-            return true; // No negotiated remote — accept everything.
+            return SourceDecision::Accept; // No negotiated remote — accept everything.
         };
 
         if addr == expected {
-            self.seen_expected_source = true;
-            return true;
+            return SourceDecision::Accept;
         }
 
         if !self.filter_source {
-            return true;
+            return SourceDecision::Accept;
         }
 
         // Symmetric-NAT latching: the negotiated remote has not sent yet
-        // and this source matches its IP (port rewritten by NAT). Latch on.
+        // and this source matches its IP (port rewritten by NAT).
         if !self.seen_expected_source && addr.ip() == expected.ip() {
-            warn!(
-                "Symmetric RTP latch: negotiated remote {} silent, \
-                 latching onto source {} (same IP, NAT port rewrite)",
-                expected, addr
-            );
-            self.expected_remote = Some(addr);
-            self.seen_expected_source = true;
-            return true;
+            return SourceDecision::LatchCandidate;
         }
 
         if !self.warned_unexpected_source {
@@ -821,13 +908,47 @@ impl RtpReceiver {
             );
         }
         trace!("Ignoring packet from unexpected address: {addr}");
-        false
+        SourceDecision::Drop
+    }
+
+    /// Records that the negotiated remote has sent a genuine packet, which
+    /// closes the symmetric-NAT latching window.
+    fn note_expected_source(&mut self, addr: SocketAddr) {
+        if self.expected_remote == Some(addr) {
+            self.seen_expected_source = true;
+        }
+    }
+
+    /// Moves the expected remote to `addr` (symmetric-NAT latch).
+    fn commit_latch(&mut self, addr: SocketAddr) {
+        warn!(
+            "Symmetric RTP latch: negotiated remote {:?} silent, \
+             latching onto source {} (same IP, NAT port rewrite)",
+            self.expected_remote, addr
+        );
+        self.expected_remote = Some(addr);
+        self.seen_expected_source = true;
     }
 
     /// Sets the SRTP context for decryption.
     pub fn set_srtp(&mut self, context: SrtpContext) {
         self.srtp = Some(context);
         debug!("SRTP decryption enabled for receiver");
+    }
+
+    /// Enables RTCP-mux demultiplexing on the RTP socket (RFC 5761 §4).
+    ///
+    /// When enabled, RTCP datagrams are held for [`Self::take_muxed_rtcp`];
+    /// when disabled they are dropped and counted as non-media.
+    pub const fn set_rtcp_mux(&mut self, enabled: bool) {
+        self.rtcp_mux = enabled;
+    }
+
+    /// Takes the muxed RTCP datagram received by the last [`Self::receive`]
+    /// call, if any. Valid only until the next `receive`.
+    pub fn take_muxed_rtcp(&mut self) -> Option<(&[u8], SocketAddr)> {
+        let (len, from) = self.muxed_rtcp.take()?;
+        self.process_buffer.get(..len).map(|data| (data, from))
     }
 
     /// Sets the local SSRC for collision detection (RFC 3550 §8.2).
@@ -866,17 +987,137 @@ impl RtpReceiver {
 
     /// Receives an RTP packet (blocking, respects socket `recv_timeout`).
     ///
+    /// Datagrams that are dropped (DTLS, STUN, unknown, filtered source,
+    /// failed SRTP authentication) do not end the call: up to
+    /// [`MAX_DROPPED_PER_RECEIVE`] are consumed per call so a burst of
+    /// non-media cannot starve RTP reception.
+    ///
+    /// The whole call is also bounded by time: once a datagram has been
+    /// dropped, later reads only wait for what is left of one socket read
+    /// timeout measured from entry, so paced junk cannot hold the I/O loop
+    /// for longer than a single read would. The socket's read timeout is
+    /// restored before returning.
+    ///
     /// Returns `Ok(true)` if a packet was received and buffered,
-    /// `Ok(false)` if no packet was available (timeout/would-block),
-    /// or `Err` on socket/protocol error.
+    /// `Ok(false)` if no packet was available (timeout/would-block), a
+    /// muxed RTCP datagram is pending, or the drop budget (count or time)
+    /// was used up, or `Err` on socket/protocol error.
     pub fn receive(&mut self) -> AudioResult<bool> {
+        self.muxed_rtcp = None;
+        let entry = Instant::now();
+        // Read timeout to restore; set once the first drop shortens it.
+        let mut shortened: Option<Duration> = None;
+        let result = self.receive_bounded(entry, &mut shortened);
+        if let Some(original) = shortened
+            && let Err(e) = self.socket.set_read_timeout(Some(original))
+        {
+            // Keep an earlier error; otherwise surface the failed restore.
+            return result.and_then(|_| {
+                Err(AudioError::RtpError(format!(
+                    "Failed to restore read timeout: {e}"
+                )))
+            });
+        }
+        result
+    }
+
+    /// Drop loop of [`Self::receive`]. Sets `shortened` to the socket's
+    /// original read timeout as soon as it lowers it; the caller restores.
+    fn receive_bounded(
+        &mut self,
+        entry: Instant,
+        shortened: &mut Option<Duration>,
+    ) -> AudioResult<bool> {
+        // `None`: the socket has no read timeout (non-blocking, where every
+        // read returns at once, or blocking forever), nothing to shorten.
+        let mut timeout: Option<Duration> = None;
+        for dropped in 0..MAX_DROPPED_PER_RECEIVE {
+            if dropped == 1 {
+                timeout = self
+                    .socket
+                    .read_timeout()
+                    .map_err(|e| AudioError::RtpError(format!("Read timeout query failed: {e}")))?;
+            }
+            if dropped > 0
+                && let Some(total) = timeout
+            {
+                // NIST 800-53 Rev5: SC-5 -- the time spent on dropped
+                // datagrams is bounded by one read timeout from entry.
+                let remaining = total.saturating_sub(entry.elapsed());
+                if remaining < MIN_DROP_READ_TIMEOUT {
+                    return Ok(false);
+                }
+                *shortened = Some(total);
+                self.socket.set_read_timeout(Some(remaining)).map_err(|e| {
+                    AudioError::RtpError(format!("Failed to shorten read timeout: {e}"))
+                })?;
+            }
+            match self.receive_one()? {
+                Received::Dropped => {}
+                Received::Media => return Ok(true),
+                Received::Nothing => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Reads and handles one datagram.
+    fn receive_one(&mut self) -> AudioResult<Received> {
         let result = self.socket.recv_from(&mut self.recv_buffer);
 
         match result {
             Ok((len, addr)) => {
+                // RFC 7983 §7 / RFC 5764 §5.1.2: demultiplex by first byte
+                // BEFORE any RTP parsing. STUN/DTLS/unknown never reach the
+                // RTP parser.
+                let class = match self.recv_buffer.get(..len) {
+                    Some([first, second, ..]) => classify(*first, *second),
+                    _ => PacketClass::Other,
+                };
+                match class {
+                    PacketClass::Rtp => {}
+                    PacketClass::Rtcp if self.rtcp_mux => {}
+                    PacketClass::Dtls => {
+                        // POAM: POA&M-325 post-handshake DTLS servicing; hand
+                        // off via a bounded sync_channel instead of dropping.
+                        self.stats.dtls_dropped.fetch_add(1, Ordering::Relaxed);
+                        return Ok(Received::Dropped);
+                    }
+                    // POAM: POA&M-325 -- STUN is dropped here instead of being
+                    // handed off to ICE (consent freshness, RFC 7675).
+                    PacketClass::Stun | PacketClass::Rtcp | PacketClass::Other => {
+                        self.stats.non_media_dropped.fetch_add(1, Ordering::Relaxed);
+                        return Ok(Received::Dropped);
+                    }
+                }
+
                 // RFC 4961 source filter (with symmetric-NAT latching)
-                if !self.accept_source(addr) {
-                    return Ok(false);
+                let latch = match self.accept_source(addr) {
+                    SourceDecision::Accept => false,
+                    SourceDecision::LatchCandidate => true,
+                    SourceDecision::Drop => return Ok(Received::Dropped),
+                };
+                // NIST 800-53 Rev5: SC-23 -- on a keyed session the latch
+                // moves only after SRTP authentication of a packet from the
+                // new source; an unkeyed session latches on first packet.
+                // The same rule governs marking the negotiated remote as
+                // seen (which closes the latching window): a forged packet
+                // with a spoofed source must not close it.
+                let keyed = self.srtp.is_some();
+                if !keyed {
+                    if latch {
+                        self.commit_latch(addr);
+                    } else {
+                        self.note_expected_source(addr);
+                    }
+                }
+
+                if class == PacketClass::Rtcp {
+                    // Hold for the RTCP session (SRTCP unprotect happens
+                    // there). RTCP never moves the RTP latch when keyed.
+                    self.process_buffer[..len].copy_from_slice(&self.recv_buffer[..len]);
+                    self.muxed_rtcp = Some((len, addr));
+                    return Ok(Received::Nothing);
                 }
 
                 // Copy into process_buffer to break the self-borrow on recv_buffer.
@@ -899,15 +1140,26 @@ impl RtpReceiver {
                     let _ = pcap.flush();
                 }
 
-                self.process_packet(len)?;
-                Ok(true)
+                if !self.process_packet(len)? {
+                    // SRTP authentication failed (counted in srtp_errors):
+                    // a drop like any other, bounded by the caller's loop.
+                    return Ok(Received::Dropped);
+                }
+                if keyed {
+                    if latch {
+                        self.commit_latch(addr);
+                    } else {
+                        self.note_expected_source(addr);
+                    }
+                }
+                Ok(Received::Media)
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 // No packet available within timeout
-                Ok(false)
+                Ok(Received::Nothing)
             }
             Err(e) => Err(AudioError::RtpError(format!("Receive failed: {e}"))),
         }
@@ -921,8 +1173,11 @@ impl RtpReceiver {
     ///
     /// SRTP path: delegates to `unprotect_rtp` which must construct the full
     /// header for AAD computation, then extracts the same 4 fields.
+    ///
+    /// Returns `Ok(false)` when SRTP unprotect fails: the packet is counted
+    /// in `srtp_errors` and discarded without allocating an error.
     #[allow(clippy::needless_pass_by_ref_mut)]
-    fn process_packet(&mut self, len: usize) -> AudioResult<()> {
+    fn process_packet(&mut self, len: usize) -> AudioResult<bool> {
         let data = &self.process_buffer[..len];
 
         // Extract the 4 fields + payload, choosing the right path.
@@ -939,7 +1194,8 @@ impl RtpReceiver {
                     ),
                     Err(e) => {
                         self.stats.srtp_errors.fetch_add(1, Ordering::Relaxed);
-                        return Err(AudioError::SrtpError(format!("SRTP unprotect failed: {e}")));
+                        trace!("SRTP unprotect failed: {e}");
+                        return Ok(false);
                     }
                 }
             } else {
@@ -1034,7 +1290,7 @@ impl RtpReceiver {
             .bytes_received
             .fetch_add(len as u64, Ordering::Relaxed);
 
-        Ok(())
+        Ok(true)
     }
 
     /// Returns whether the jitter buffer is ready for playback.
@@ -1273,6 +1529,356 @@ pub fn parse_rtp_fields(data: &[u8]) -> AudioResult<(u8, u16, u32, u32, usize, u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RFC 7983 §7 ranges: disjoint and exhaustive over every (u8, u8).
+    #[test]
+    fn classify_exhaustive_rfc7983() {
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let class = classify(first, second);
+                let expected = match first {
+                    0..=3 => PacketClass::Stun,
+                    20..=63 => PacketClass::Dtls,
+                    128..=191 if (192..=223).contains(&(second | 0x80)) => PacketClass::Rtcp,
+                    128..=191 => PacketClass::Rtp,
+                    _ => PacketClass::Other,
+                };
+                assert_eq!(class, expected, "first={first} second={second}");
+            }
+        }
+        // RTCP-mux packet types 192..=223 (SR=200, RR=201) are RTCP.
+        assert_eq!(classify(0x80, 200), PacketClass::Rtcp);
+        assert_eq!(classify(0x81, 201), PacketClass::Rtcp);
+        // PCMU with marker bit is RTP.
+        assert_eq!(classify(0x80, 0x80), PacketClass::Rtp);
+        // DTLS handshake content type 22 is never RTP.
+        assert_eq!(classify(22, 0xFE), PacketClass::Dtls);
+    }
+
+    #[test]
+    fn receive_drops_dtls_and_stun_and_unmuxed_rtcp() {
+        let rx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        rx_socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let dest = rx_socket.local_addr().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::clone(&rx_socket), jb.clone());
+
+        // DTLS ClientHello-shaped record.
+        peer.send_to(&[22, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dest)
+            .unwrap();
+        assert!(!rx.receive().unwrap());
+        // STUN binding request header.
+        peer.send_to(&[0x00, 0x01, 0, 0, 0x21, 0x12, 0xA4, 0x42], dest)
+            .unwrap();
+        assert!(!rx.receive().unwrap());
+        // RTCP RR without rtcp-mux negotiated.
+        let rr = [0x80, 201, 0, 1, 0, 0, 0, 1];
+        peer.send_to(&rr, dest).unwrap();
+        assert!(!rx.receive().unwrap());
+        assert!(rx.take_muxed_rtcp().is_none());
+
+        let stats = rx.stats();
+        assert_eq!(stats.dtls_dropped, 1);
+        assert_eq!(stats.non_media_dropped, 2);
+        assert!(jb.is_empty());
+
+        // With rtcp-mux, the RR is held for the RTCP session.
+        rx.set_rtcp_mux(true);
+        peer.send_to(&rr, dest).unwrap();
+        assert!(!rx.receive().unwrap());
+        let (data, from) = rx.take_muxed_rtcp().unwrap();
+        assert_eq!(data, rr);
+        assert_eq!(from, peer.local_addr().unwrap());
+        assert!(rx.take_muxed_rtcp().is_none());
+    }
+
+    /// PERF-003: a burst of dropped datagrams is consumed in one call and
+    /// the RTP packet behind it is still delivered.
+    #[test]
+    fn receive_consumes_dropped_burst_then_rtp() {
+        let rx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        rx_socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let dest = rx_socket.local_addr().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::clone(&rx_socket), jb.clone());
+
+        for _ in 0..10 {
+            peer.send_to(&[22, 0xFE, 0xFD, 0, 0], dest).unwrap();
+        }
+        let mut rtp = vec![0x80, 0x00, 0, 1, 0, 0, 0, 160, 0, 0, 0, 7];
+        rtp.extend_from_slice(&[0xFF; 160]);
+        peer.send_to(&rtp, dest).unwrap();
+        assert!(rx.receive().unwrap());
+        assert_eq!(rx.stats().dtls_dropped, 10);
+        assert!(!jb.is_empty());
+
+        // More than the budget: the call yields with `false` after 32.
+        for _ in 0..(MAX_DROPPED_PER_RECEIVE + 3) {
+            peer.send_to(&[0x00, 0x01, 0, 0], dest).unwrap();
+        }
+        assert!(!rx.receive().unwrap());
+        assert_eq!(rx.stats().non_media_dropped, MAX_DROPPED_PER_RECEIVE as u64);
+    }
+
+    /// SEC-007: junk paced just under the read timeout (each datagram
+    /// arrives before the previous read times out) cannot hold `receive()`
+    /// for the whole drop budget; the call yields within about one read
+    /// timeout and leaves the socket's timeout as it found it.
+    #[test]
+    fn receive_is_time_bounded_under_paced_junk() {
+        let timeout = Duration::from_millis(100);
+        let pace = Duration::from_millis(40);
+        let rx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        rx_socket.set_read_timeout(Some(timeout)).unwrap();
+        let dest = rx_socket.local_addr().unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::clone(&rx_socket), jb.clone());
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sender = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    peer.send_to(&[0x00, 0x01, 0, 0], dest).unwrap();
+                    std::thread::sleep(pace);
+                }
+            })
+        };
+
+        // Unbounded, 32 drops at this pace would take over a second.
+        let mut worst = Duration::ZERO;
+        for _ in 0..5 {
+            let start = Instant::now();
+            assert!(!rx.receive().unwrap());
+            worst = worst.max(start.elapsed());
+            assert_eq!(rx_socket.read_timeout().unwrap(), Some(timeout));
+        }
+        stop.store(true, Ordering::Relaxed);
+        sender.join().unwrap();
+
+        assert!(rx.stats().non_media_dropped >= 5);
+        assert!(
+            worst < timeout * 3,
+            "receive() held for {worst:?} with a {timeout:?} read timeout"
+        );
+        assert!(jb.is_empty());
+    }
+
+    /// SEC-009: SRTP that fails authentication from the accepted source is
+    /// a counted drop inside the bounded loop; genuine SRTP queued behind
+    /// it is delivered by the same call. SEC-010: only the authenticated
+    /// packet marks the negotiated remote as seen.
+    #[test]
+    fn keyed_auth_failure_is_counted_drop_and_does_not_mark_source_seen() {
+        use crate::media_security::{build_srtp_contexts, tests::keys};
+
+        let rx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        rx_socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let dest = rx_socket.local_addr().unwrap();
+        let remote = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::clone(&rx_socket), jb.clone());
+        let ours = build_srtp_contexts(&keys(2, 1), 0x2222).unwrap();
+        rx.set_srtp(ours.rtp_rx);
+        rx.set_expected_remote(remote.local_addr().unwrap());
+
+        let mut forged = vec![0x80, 0x00, 0, 1, 0, 0, 0, 160, 0, 0, 0, 7];
+        forged.extend_from_slice(&[0xAA; 176]);
+        remote.send_to(&forged, dest).unwrap();
+        assert!(!rx.receive().unwrap());
+        assert_eq!(rx.stats().srtp_errors, 1);
+        assert!(!rx.seen_expected_source, "forged packet closed the latch");
+        assert!(jb.is_empty());
+
+        for _ in 0..3 {
+            remote.send_to(&forged, dest).unwrap();
+        }
+        let peer = build_srtp_contexts(&keys(1, 2), 0x1111).unwrap();
+        let mut tx = RtpTransmitter::new(Arc::clone(&remote), dest, 0x1111, 0, 160);
+        tx.set_srtp(peer.rtp_tx);
+        tx.send(&[0x5A; 160]).unwrap();
+        assert!(rx.receive().unwrap());
+        assert_eq!(rx.stats().srtp_errors, 4);
+        assert!(rx.seen_expected_source);
+        assert_eq!(jb.len(), 1);
+    }
+
+    /// SEC-001: on a keyed session a forged same-IP packet does not move
+    /// the symmetric-RTP latch; an authenticated one from that source does.
+    #[test]
+    fn keyed_latch_moves_only_after_srtp_auth() {
+        use crate::media_security::{build_srtp_contexts, tests::keys};
+
+        let rx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        rx_socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let dest = rx_socket.local_addr().unwrap();
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let nat = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::clone(&rx_socket), jb.clone());
+        let ours = build_srtp_contexts(&keys(2, 1), 0x2222).unwrap();
+        rx.set_srtp(ours.rtp_rx);
+        rx.set_expected_remote(silent.local_addr().unwrap());
+
+        // Forged plaintext RTP from the same IP, different port.
+        let mut forged = vec![0x80, 0x00, 0, 1, 0, 0, 0, 160, 0, 0, 0, 7];
+        forged.extend_from_slice(&[0xAA; 176]);
+        nat.send_to(&forged, dest).unwrap();
+        // SEC-009: an authentication failure is a counted drop, not `Err`.
+        assert!(!rx.receive().unwrap());
+        assert_eq!(rx.stats().srtp_errors, 1);
+        assert_eq!(rx.expected_remote, Some(silent.local_addr().unwrap()));
+        assert!(!rx.seen_expected_source);
+        assert!(jb.is_empty());
+
+        // Genuine SRTP from the NAT-rewritten port latches.
+        let peer = build_srtp_contexts(&keys(1, 2), 0x1111).unwrap();
+        let mut tx = RtpTransmitter::new(Arc::clone(&nat), dest, 0x1111, 0, 160);
+        tx.set_srtp(peer.rtp_tx);
+        tx.send(&[0x5A; 160]).unwrap();
+        assert!(rx.receive().unwrap());
+        assert_eq!(rx.expected_remote, Some(nat.local_addr().unwrap()));
+    }
+
+    /// SRTP round trip with DTLS-export-shaped keys (tx/rx halves swapped
+    /// between endpoints): no plaintext payload on the wire, tag overhead
+    /// present, a wrong key fails, and the mirrored receiver decodes.
+    #[test]
+    fn srtp_loopback_no_plaintext_on_wire() {
+        use crate::media_security::{build_srtp_contexts, tests::keys};
+
+        let wire = UdpSocket::bind("127.0.0.1:0").unwrap();
+        wire.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let wire_addr = wire.local_addr().unwrap();
+
+        let a = build_srtp_contexts(&keys(1, 2), 0x1111).unwrap();
+        let mut tx = RtpTransmitter::new(
+            Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            wire_addr,
+            0x1111,
+            0,
+            160,
+        );
+        tx.set_srtp(a.rtp_tx);
+        let payload = [0x5Au8; 160];
+        tx.send(&payload).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let (len, _) = wire.recv_from(&mut buf).unwrap();
+        let datagram = &buf[..len];
+        assert_eq!(len, RTP_HEADER_SIZE + payload.len() + 16, "GCM tag missing");
+        assert!(
+            !datagram.windows(16).any(|w| w == &payload[..16]),
+            "plaintext payload on the wire"
+        );
+
+        // Wrong keys: authentication fails.
+        let wrong = build_srtp_contexts(&keys(9, 9), 0x2222).unwrap();
+        assert!(
+            SrtpUnprotect::new(&wrong.rtp_rx)
+                .unprotect_rtp(datagram)
+                .is_err()
+        );
+
+        // Mirrored endpoint (its rx half is A's tx half) decodes.
+        let b = build_srtp_contexts(&keys(2, 1), 0x2222).unwrap();
+        let pkt = SrtpUnprotect::new(&b.rtp_rx)
+            .unprotect_rtp(datagram)
+            .unwrap();
+        assert_eq!(pkt.payload.as_ref(), &payload[..]);
+    }
+
+    /// QA (B2): every keyed TX path (audio, RFC 2198 redundancy, CN,
+    /// RFC 4733 DTMF) leaves as SRTP. No datagram carries its plaintext
+    /// body, each has the 16-byte GCM tag, the endpoint's own tx half
+    /// cannot open it (direction separation), and the role-swapped peer
+    /// decodes every one with sequence numbers in order.
+    #[test]
+    fn qa_srtp_every_tx_path_encrypted_role_swapped() {
+        use crate::media_security::{build_srtp_contexts, tests::keys};
+        use client_types::DtmfDigit;
+
+        let wire = UdpSocket::bind("127.0.0.1:0").unwrap();
+        wire.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        // Client half = 0xC1, server half = 0x5E (DTLS export shaped).
+        let client = build_srtp_contexts(&keys(0xC1, 0x5E), 0xAAAA_0001).unwrap();
+        let server = build_srtp_contexts(&keys(0x5E, 0xC1), 0xBBBB_0002).unwrap();
+        let mut tx = RtpTransmitter::new(
+            Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            wire.local_addr().unwrap(),
+            0xAAAA_0001,
+            0,
+            160,
+        );
+        tx.set_srtp(client.rtp_tx);
+        tx.enable_redundancy(REDUNDANCY_PAYLOAD_TYPE);
+
+        let frame1 = [0x11u8; 160];
+        let frame2 = [0x22u8; 160];
+        let cn = [0x40u8; 11];
+        tx.send(&frame1).unwrap();
+        tx.send(&frame2).unwrap(); // carries frame1 as redundancy
+        tx.send_cn(&cn).unwrap();
+        let event = DtmfEvent::new(DtmfDigit::Five, DtmfEvent::duration_from_ms(100));
+        tx.send_dtmf(&event, true).unwrap();
+
+        let mut buf = [0u8; 1500];
+        let mut last_seq = None;
+        for (name, plain) in [
+            ("audio", &frame1[..]),
+            ("red", &frame2[..]),
+            ("cn", &cn[..]),
+            ("dtmf", &[][..]),
+        ] {
+            let (len, _) = wire.recv_from(&mut buf).unwrap();
+            let datagram = &buf[..len];
+            if plain.len() >= 8 {
+                assert!(
+                    !datagram.windows(8).any(|w| w == &plain[..8]),
+                    "{name}: plaintext on the wire"
+                );
+            }
+            // Own-direction key never opens own traffic.
+            assert!(
+                SrtpUnprotect::new(&client.rtp_rx)
+                    .unprotect_rtp(datagram)
+                    .is_err(),
+                "{name}: opened with wrong-direction key"
+            );
+            let pkt = SrtpUnprotect::new(&server.rtp_rx)
+                .unprotect_rtp(datagram)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                pkt.payload.len() + RTP_HEADER_SIZE + 16,
+                len,
+                "{name}: no GCM tag"
+            );
+            if name == "audio" || name == "cn" {
+                assert_eq!(pkt.payload.as_ref(), plain, "{name}");
+            }
+            if name == "red" {
+                assert!(pkt.payload.ends_with(&frame2), "red: primary frame missing");
+            }
+            let seq = pkt.header.sequence_number;
+            if let Some(prev) = last_seq {
+                assert_eq!(seq, u16::wrapping_add(prev, 1), "{name}: seq gap");
+            }
+            last_seq = Some(seq);
+        }
+    }
 
     #[test]
     fn test_generate_ssrc() {
@@ -1742,8 +2348,15 @@ mod tests {
             assert!(qa_model_payload_range(pkt).is_none(), "{pkt:02x?}");
             peer.send_to(pkt, dest).unwrap();
             let result = rx.receive();
-            assert!(result.is_err(), "hostile datagram accepted: {pkt:02x?}");
+            // Rejected by the RTP parser (Err) or, for non-RTP first bytes
+            // and runts, dropped by the RFC 7983 demux before parsing.
+            assert!(
+                !matches!(result, Ok(true)),
+                "hostile datagram accepted: {pkt:02x?}"
+            );
         }
+        // Wrong version (0x40) and the empty datagram never reach the parser.
+        assert_eq!(rx.stats().non_media_dropped, 2);
         assert!(
             jb.is_empty(),
             "a hostile datagram reached the jitter buffer"
@@ -2366,6 +2979,21 @@ mod tests {
 
     // ── RFC 4961 source-address filtering ───────────────────────
 
+    /// Unkeyed-session admission: a latch candidate commits immediately.
+    fn admits(rx: &mut RtpReceiver, addr: SocketAddr) -> bool {
+        match rx.accept_source(addr) {
+            SourceDecision::Accept => {
+                rx.note_expected_source(addr);
+                true
+            }
+            SourceDecision::LatchCandidate => {
+                rx.commit_latch(addr);
+                true
+            }
+            SourceDecision::Drop => false,
+        }
+    }
+
     #[test]
     fn test_source_filter_drops_unexpected_ip() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2376,11 +3004,11 @@ mod tests {
         rx.set_expected_remote(expected);
 
         // Negotiated source accepted
-        assert!(rx.accept_source(expected));
+        assert!(admits(&mut rx, expected));
         // Different IP dropped (even before latching window: IP must match)
-        assert!(!rx.accept_source("198.51.100.7:5000".parse().unwrap()));
+        assert!(!admits(&mut rx, "198.51.100.7:5000".parse().unwrap()));
         // Different port after expected source seen: dropped
-        assert!(!rx.accept_source("192.0.2.10:6000".parse().unwrap()));
+        assert!(!admits(&mut rx, "192.0.2.10:6000".parse().unwrap()));
     }
 
     #[test]
@@ -2394,13 +3022,13 @@ mod tests {
         // No packet from the negotiated remote yet — same IP, different
         // port latches (NAT port rewrite).
         let latched: SocketAddr = "192.0.2.10:31337".parse().unwrap();
-        assert!(rx.accept_source(latched));
+        assert!(admits(&mut rx, latched));
         assert_eq!(rx.expected_remote, Some(latched));
 
         // After latching, the *original* negotiated port is now unexpected.
-        assert!(!rx.accept_source("192.0.2.10:5000".parse().unwrap()));
+        assert!(!admits(&mut rx, "192.0.2.10:5000".parse().unwrap()));
         // Different IP never accepted.
-        assert!(!rx.accept_source("198.51.100.7:31337".parse().unwrap()));
+        assert!(!admits(&mut rx, "198.51.100.7:31337".parse().unwrap()));
     }
 
     #[test]
@@ -2412,8 +3040,8 @@ mod tests {
         rx.set_expected_remote("192.0.2.10:5000".parse().unwrap());
         rx.set_source_filter(false);
 
-        assert!(rx.accept_source("198.51.100.7:5000".parse().unwrap()));
-        assert!(rx.accept_source("203.0.113.99:1234".parse().unwrap()));
+        assert!(admits(&mut rx, "198.51.100.7:5000".parse().unwrap()));
+        assert!(admits(&mut rx, "203.0.113.99:1234".parse().unwrap()));
     }
 
     // ── RTP header extension tests ──────────────────────────────

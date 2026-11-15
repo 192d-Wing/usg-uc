@@ -1047,6 +1047,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uc-codecs",
+ "zeroize",
 ]
 
 [[package]]
@@ -1177,6 +1178,7 @@ dependencies = [
  "proto-stun",
  "proto-transaction",
  "proto-turn",
+ "rcgen",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -1185,6 +1187,7 @@ dependencies = [
  "uc-transport",
  "uc-types",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -5355,6 +5358,7 @@ version = "0.10.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "rcgen",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

@@ -264,8 +264,7 @@ pub fn compute_loop_hash(request: &SipRequest) -> u64 {
     let cseq_num = request
         .headers
         .cseq_parsed()
-        .map(|c| c.sequence.to_string())
-        .unwrap_or_default();
+        .map_or_else(String::new, |c| c.sequence.to_string());
     feed(cseq_num.as_bytes());
     for name in [
         HeaderName::Route,

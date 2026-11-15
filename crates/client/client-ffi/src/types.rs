@@ -880,6 +880,9 @@ impl From<AppError> for ClientError {
             | AppError::Contact(message)
             | AppError::Serialization(message) => Self::Storage { message },
             AppError::SmartCard(message) => Self::SmartCard { message },
+            AppError::MediaSecurity(message) => Self::Sip {
+                message: format!("media-security: {message}"),
+            },
             AppError::Io(e) => Self::Storage {
                 message: e.to_string(),
             },

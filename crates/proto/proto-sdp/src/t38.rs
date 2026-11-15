@@ -196,7 +196,7 @@ fn invalid(name: &str, reason: &str) -> SdpError {
 /// Parses a decimal value made only of ASCII digits (SI-10: no sign, no
 /// whitespace inside, no non-ASCII).
 fn parse_uint<T: std::str::FromStr>(name: &str, value: Option<&str>) -> SdpResult<T> {
-    let v = value.map(str::trim).unwrap_or_default();
+    let v = value.map_or("", str::trim);
     if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
         return Err(invalid(name, "expected unsigned decimal value"));
     }
@@ -265,7 +265,7 @@ impl T38Params {
                 Key::TranscodingMmr => params.transcoding_mmr = parse_flag(name, value)?,
                 Key::TranscodingJbig => params.transcoding_jbig = parse_flag(name, value)?,
                 Key::RateManagement => {
-                    let v = value.map(str::trim).unwrap_or_default();
+                    let v = value.map_or("", str::trim);
                     params.rate_management = Some(
                         T38RateManagement::parse(v)
                             .ok_or_else(|| invalid(name, "unknown rate management"))?,
@@ -274,7 +274,7 @@ impl T38Params {
                 Key::MaxBuffer => params.max_buffer = Some(parse_uint(name, value)?),
                 Key::MaxDatagram => params.max_datagram = Some(parse_uint(name, value)?),
                 Key::UdpEc => {
-                    let v = value.map(str::trim).unwrap_or_default();
+                    let v = value.map_or("", str::trim);
                     params.udp_ec = Some(
                         T38UdpEc::parse(v)
                             .ok_or_else(|| invalid(name, "unknown error correction"))?,

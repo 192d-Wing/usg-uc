@@ -187,8 +187,7 @@ impl MediaModificationValidator {
                 });
             }
 
-            for index in original.media.len()..modified.media.len() {
-                let mod_media = &modified.media[index];
+            for (index, mod_media) in modified.media.iter().enumerate().skip(original.media.len()) {
                 modifications.push(MediaModification {
                     index,
                     modification_type: MediaModificationType::Added,

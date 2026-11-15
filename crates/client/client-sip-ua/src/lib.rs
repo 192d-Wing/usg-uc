@@ -21,15 +21,22 @@
 
 pub mod call_agent;
 pub mod dtls_handler;
+pub mod dtls_identity;
 pub mod ice_handler;
 pub mod media_session;
 pub mod registration;
+pub mod sdp_dtls;
 
 pub use call_agent::{CallAgent, CallEvent};
 pub use dtls_handler::{DtlsEvent, DtlsHandler};
+pub use dtls_identity::DtlsIdentity;
 pub use ice_handler::{IceEvent, IceHandler};
-pub use media_session::{MediaSession, MediaSessionEvent, MediaSessionState};
+pub use media_session::{MediaSession, MediaSessionEvent, MediaSessionState, NegotiatedSrtpKeys};
 pub use registration::{RegistrationAgent, RegistrationEvent};
+pub use sdp_dtls::{DtlsSdpParams, Setup, parse_dtls_params};
+
+// Re-export the DTLS role so callers can hold the role resolved from a=setup.
+pub use proto_dtls::{DtlsRole, SrtpProfile as DtlsSrtpProfile};
 
 // Re-export ReferStatus for transfer progress handling (RFC 3515)
 pub use proto_dialog::refer::ReferStatus;

@@ -12,7 +12,7 @@ default = []
 # UDP/TCP SIP transports, for lab and commercial-provider testing.
 # Default builds are TLS-only: accounts with a UDP or TCP transport
 # preference are rejected at registration time.
-insecure-transports = []
+insecure-transports = ["client-audio/insecure-rtp"]
 # Digest authentication with optional credential persistence. Implies
 # insecure-transports (the digest test providers are UDP).
 digest-auth = [
