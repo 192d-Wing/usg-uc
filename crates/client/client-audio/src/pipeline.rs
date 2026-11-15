@@ -834,8 +834,7 @@ impl AudioPipeline {
         self.dtmf_rx
             .as_ref()
             .and_then(|m| m.lock().ok())
-            .map(|rx| rx.try_iter().collect())
-            .unwrap_or_default()
+            .map_or_else(Vec::new, |rx| rx.try_iter().collect())
     }
 
     /// Returns whether Music on Hold is currently active.

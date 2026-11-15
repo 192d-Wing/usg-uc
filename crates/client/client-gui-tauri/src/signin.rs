@@ -224,7 +224,7 @@ pub async fn get_session_state(state: State<'_, TauriAppState>) -> Result<Sessio
         .as_ref()
         .is_some_and(|p| p.refresh_token_persisted && !p.service_domain.is_empty());
     let service_domain = if session.service_domain.is_empty() {
-        persisted.map(|p| p.service_domain).unwrap_or_default()
+        persisted.map_or_else(String::new, |p| p.service_domain)
     } else {
         session.service_domain.clone()
     };
@@ -382,8 +382,7 @@ pub async fn sign_out(app: AppHandle, state: State<'_, TauriAppState>) -> Result
             .settings()
             .provisioning
             .as_ref()
-            .map(|p| p.service_domain.clone())
-            .unwrap_or_default();
+            .map_or_else(String::new, |p| p.service_domain.clone());
         if !domain.is_empty() {
             if let Err(e) = sm.delete_refresh_token(&domain) {
                 warn!(error = %e, "failed to delete refresh token from keychain");

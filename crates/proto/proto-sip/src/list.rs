@@ -96,7 +96,7 @@ impl<'a> Iterator for ListSplit<'a> {
 
             // `i` is either bytes.len() or the index of an ASCII ',' so both
             // slice bounds are char boundaries.
-            let elem = self.value.get(start..i).map(trim_lws).unwrap_or_default();
+            let elem = self.value.get(start..i).map_or("", trim_lws);
             if i >= bytes.len() {
                 self.done = true;
             } else {

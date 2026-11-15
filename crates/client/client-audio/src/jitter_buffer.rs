@@ -715,7 +715,9 @@ impl SharedJitterBuffer {
 
     /// Returns the current statistics (Copy — no heap allocation).
     pub fn stats(&self) -> JitterBufferStats {
-        self.inner.lock().map(|jb| *jb.stats()).unwrap_or_default()
+        self.inner
+            .lock()
+            .map_or_else(|_| JitterBufferStats::default(), |jb| *jb.stats())
     }
 
     /// Returns the buffered duration in milliseconds.
