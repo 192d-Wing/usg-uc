@@ -5,7 +5,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
-	"runtime/debug"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -458,23 +459,29 @@ const pionReviewedVersion = "v3.1.5"
 //
 // After the review, update pionReviewedVersion.
 func TestPionReassemblyAssumptions(t *testing.T) {
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		t.Fatal("no build info: cannot tell which pion/dtls this is")
+	// The version is read from go.mod (the test runs in the module root):
+	// build info of a test binary lists no dependencies before Go 1.27.
+	gomod, err := os.ReadFile("go.mod")
+	if err != nil {
+		t.Fatalf("cannot tell which pion/dtls this is: %v", err)
 	}
-	found := false
-	for _, dep := range info.Deps {
-		if dep.Path != "github.com/pion/dtls/v3" {
-			continue
-		}
-		found = true
-		if dep.Version != pionReviewedVersion || dep.Replace != nil {
-			t.Fatalf("pion/dtls is %s (replace: %v), groupGuard was reviewed against %s: re-read the files named above, then update pionReviewedVersion",
-				dep.Version, dep.Replace != nil, pionReviewedVersion)
+	const pionPath = "github.com/pion/dtls/v3"
+	version, replaced := "", false
+	for _, line := range strings.Split(string(gomod), "\n") {
+		fields := strings.Fields(strings.TrimPrefix(strings.TrimSpace(line), "require "))
+		switch {
+		case len(fields) >= 2 && fields[0] == pionPath && fields[1] != "=>":
+			version = fields[1]
+		case strings.Contains(line, pionPath) && strings.Contains(line, "=>"):
+			replaced = true
 		}
 	}
-	if !found {
-		t.Fatal("github.com/pion/dtls/v3 is not among the build dependencies")
+	if version == "" {
+		t.Fatalf("%s is not required by go.mod", pionPath)
+	}
+	if version != pionReviewedVersion || replaced {
+		t.Fatalf("pion/dtls is %s (replace: %v), groupGuard was reviewed against %s: re-read the files named above, then update pionReviewedVersion",
+			version, replaced, pionReviewedVersion)
 	}
 
 	// Behaviour, seen from outside: a pion server answers a ClientHello
