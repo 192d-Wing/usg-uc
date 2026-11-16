@@ -1,19 +1,22 @@
-//! DTLS connection handling.
+//! DTLS connection handling (legacy wrapper).
 //!
-//! ## CNSA 2.0 Compliance
+//! ## Status
 //!
-//! Connections use CNSA 2.0 compliant cipher suites only.
+//! [`DtlsConnection`] wraps the legacy [`crate::session::DtlsSession`],
+//! which performs no network handshake and fails closed (POA&M-324). The
+//! working DTLS 1.2 (RFC 6347) / DTLS-SRTP (RFC 5764) implementation is the
+//! sans-I/O [`crate::association::DtlsAssociation`]; this wrapper stays
+//! until the soft client is wired to it (stage 2 of POA&M-324).
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-8**: Transmission Confidentiality and Integrity
-//! - **SC-12**: Cryptographic Key Establishment
-//! - **SC-13**: Cryptographic Protection
-//!
-//! ## RFC Compliance
-//!
-//! - RFC 6347: DTLS 1.2
-//! - RFC 5764: DTLS-SRTP
+//! No control is implemented by this module; see
+//! [`crate::association`] (POA&M-324). What it does do is fail closed
+//! (SC-8(1)): it never reports a connection it could not key.
+
+// This legacy wrapper is built on the deprecated legacy `DtlsSession`
+// (SEC-004); no behaviour change here.
+#![allow(deprecated)]
 
 use crate::config::DtlsConfig;
 use crate::error::{DtlsError, DtlsResult};
@@ -44,12 +47,9 @@ use uc_types::address::SbcSocketAddr;
 /// let keying_material = conn.export_srtp_keying_material()?;
 /// ```
 ///
-/// ## CNSA 2.0 Compliance
-///
-/// All cryptographic operations use CNSA 2.0 compliant algorithms:
-/// - `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` cipher suite
-/// - P-384 ECDHE key exchange
-/// - P-384 ECDSA certificates
+/// Legacy wrapper: the underlying [`DtlsSession`] performs no handshake
+/// and applies no record protection (see the module documentation); it
+/// makes no CNSA 2.0 claim of its own. See [`crate::association`].
 pub struct DtlsConnection {
     config: DtlsConfig,
     local_addr: SbcSocketAddr,
@@ -231,11 +231,9 @@ impl DtlsConnection {
 
     /// Performs the DTLS handshake.
     ///
-    /// ## CNSA 2.0 Compliance
-    ///
-    /// The handshake enforces CNSA 2.0 cipher suite negotiation.
-    /// If the peer doesn't support `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`,
-    /// the handshake will fail.
+    /// Legacy wrapper: the underlying [`DtlsSession`] performs no network
+    /// handshake and fails closed (see the module documentation); this
+    /// method makes no CNSA 2.0 claim of its own. See [`crate::association`].
     ///
     /// ## Errors
     ///

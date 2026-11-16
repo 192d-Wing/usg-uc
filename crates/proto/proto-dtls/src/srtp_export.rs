@@ -173,22 +173,20 @@ impl SrtpKeyExporter {
         })
     }
 
-    /// Derives keying material using the TLS PRF.
+    /// Derives keying material with the TLS 1.2 exporter (RFC 5705 §4,
+    /// RFC 5764 §4.2): `PRF(master_secret, "EXTRACTOR-dtls_srtp",
+    /// client_random || server_random)` with `P_SHA384`, computed by the
+    /// FIPS module's TLS 1.2 KDF.
     ///
-    /// This implements the key derivation per RFC 5705 (TLS Exporters)
-    /// using HKDF with SHA-384 for CNSA 2.0 compliance.
+    /// NIST 800-53 Rev5: SC-12, SC-13. The module's approved-service
+    /// indicator is not set for the exporter label; see [`uc_crypto::tls12`]
+    /// (POA&M-332).
     ///
     /// ## Arguments
     ///
     /// * `master_secret` - The DTLS master secret
     /// * `client_random` - Client random from handshake
     /// * `server_random` - Server random from handshake
-    ///
-    /// ## Note
-    ///
-    /// In a full implementation, this would be called by the DTLS
-    /// handshake layer with the actual secrets. For now, this provides
-    /// the interface for integration.
     ///
     /// # Errors
     ///
@@ -199,54 +197,25 @@ impl SrtpKeyExporter {
         client_random: &[u8; 32],
         server_random: &[u8; 32],
     ) -> DtlsResult<SrtpKeyingMaterial> {
-        let output_len = self.keying_material_length();
+        // For SRTP export the context is absent per RFC 5764 §4.2.
+        let mut seed = [0u8; 64];
+        let (head, tail) = seed.split_at_mut(32);
+        head.copy_from_slice(client_random);
+        tail.copy_from_slice(server_random);
 
-        // Construct the seed: label + context
-        // For SRTP export, the context is empty per RFC 5764
-        let mut seed = Vec::with_capacity(SRTP_EXPORTER_LABEL.len() + 64);
-        seed.extend_from_slice(SRTP_EXPORTER_LABEL);
-        seed.extend_from_slice(client_random);
-        seed.extend_from_slice(server_random);
-
-        // Use HKDF-SHA384 for CNSA 2.0 compliance
-        let exported = prf_sha384(master_secret, &seed, output_len);
+        let mut exported = zeroize::Zeroizing::new(vec![0u8; self.keying_material_length()]);
+        uc_crypto::tls12::prf_sha384(
+            master_secret,
+            uc_crypto::tls12::Tls12Label::ExporterDtlsSrtp,
+            &seed,
+            &mut exported,
+        )
+        .map_err(|_| DtlsError::SrtpKeyExportFailed {
+            reason: "TLS exporter failed".to_string(),
+        })?;
 
         self.parse_keying_material(&exported)
     }
-}
-
-/// TLS PRF using HKDF-SHA384 for CNSA 2.0 compliance.
-///
-/// This is a simplified PRF that uses HKDF instead of the traditional
-/// TLS PRF. A full implementation would match the exact TLS 1.2 PRF.
-fn prf_sha384(secret: &[u8], seed: &[u8], output_len: usize) -> Vec<u8> {
-    // Use HKDF-Expand with SHA-384
-    // Note: Full TLS 1.2 PRF is P_SHA384 which is more complex
-
-    let mut output = Vec::with_capacity(output_len);
-    let mut counter = 1u8;
-    let mut a = seed.to_vec(); // A(1) = HMAC_hash(secret, seed)
-
-    while output.len() < output_len {
-        // A(i) = HMAC_hash(secret, A(i-1))
-        a = uc_crypto::hash::hmac_sha384(secret, &a).to_vec();
-
-        // P_hash = HMAC_hash(secret, A(i) + seed)
-        let mut input = a.clone();
-        input.extend_from_slice(seed);
-        let p = uc_crypto::hash::hmac_sha384(secret, &input);
-
-        output.extend_from_slice(&p[..p.len().min(output_len - output.len())]);
-        counter += 1;
-
-        // Safety check to avoid infinite loop
-        if counter > 10 {
-            break;
-        }
-    }
-
-    output.truncate(output_len);
-    output
 }
 
 /// SRTP protection profile extension for `use_srtp`.
@@ -343,14 +312,18 @@ impl UseSrtpExtension {
             // Silently ignore non-CNSA profiles
         }
 
-        let mki_len = data[2 + profiles_len] as usize;
-        let mki = if mki_len > 0 && data.len() >= 2 + profiles_len + 1 + mki_len {
-            data[2 + profiles_len + 1..2 + profiles_len + 1 + mki_len].to_vec()
-        } else {
-            Vec::new()
-        };
+        // RFC 5764 §4.1.1 / plan §2.2: this profile never uses an MKI, so a
+        // peer that sends one is refused instead of being silently ignored.
+        if data[2 + profiles_len] != 0 {
+            return Err(DtlsError::HandshakeFailed {
+                reason: "use_srtp MKI is not supported".to_string(),
+            });
+        }
 
-        Ok(Self { profiles, mki })
+        Ok(Self {
+            profiles,
+            mki: Vec::new(),
+        })
     }
 }
 
@@ -452,6 +425,36 @@ mod tests {
 
         // MKI length = 0
         assert_eq!(encoded[4], 0);
+    }
+
+    #[test]
+    fn test_use_srtp_extension_rejects_mki() {
+        let mut encoded = UseSrtpExtension::cnsa_compliant().encode();
+        *encoded.last_mut().unwrap() = 1;
+        encoded.push(0xAA);
+        assert!(UseSrtpExtension::decode(&encoded).is_err());
+    }
+
+    /// The exporter is the RFC 5705 construction: `P_SHA384` over
+    /// `label || client_random || server_random`.
+    #[test]
+    fn test_derive_keying_material_matches_rfc5705() {
+        use uc_crypto::hkdf::hmac_sha384_multi as hmac;
+        let master_secret = [0xABu8; 48];
+        let (cr, sr) = ([0x01u8; 32], [0x02u8; 32]);
+        let mut expected = Vec::new();
+        let mut a = hmac(&master_secret, &[SRTP_EXPORTER_LABEL, &cr, &sr]);
+        while expected.len() < 88 {
+            expected.extend_from_slice(&hmac(&master_secret, &[&a, SRTP_EXPORTER_LABEL, &cr, &sr]));
+            a = hmac(&master_secret, &[&a]);
+        }
+        let material = SrtpKeyExporter::new(SrtpProfile::AeadAes256Gcm)
+            .derive_keying_material(&master_secret, &cr, &sr)
+            .unwrap();
+        assert_eq!(material.client_write_key, &expected[..32]);
+        assert_eq!(material.server_write_key, &expected[32..64]);
+        assert_eq!(material.client_write_salt, &expected[64..76]);
+        assert_eq!(material.server_write_salt, &expected[76..88]);
     }
 
     #[test]

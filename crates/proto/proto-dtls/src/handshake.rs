@@ -10,11 +10,25 @@
 //! - AES-256-GCM for encryption
 //! - SHA-384 for PRF
 //!
+//! ## Status: legacy, not interoperable
+//!
+//! Nothing drives [`Handshake::perform`] over a network and it cannot
+//! complete against a real peer (no extensions, flights, retransmission,
+//! reassembly or client authentication; the epoch and `Finished` transcript
+//! handling are wrong). It is kept only so existing public items do not
+//! disappear. The working implementation is
+//! [`crate::association::DtlsAssociation`]; new code must use that.
+//!
+//! POAM: POA&M-324 -- remove this module once nothing references it.
+//!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-8**: Transmission Confidentiality and Integrity
-//! - **SC-12**: Cryptographic Key Establishment
-//! - **SC-13**: Cryptographic Protection
+//! No control is implemented by this module; see
+//! [`crate::association`] (POA&M-324).
+
+// The legacy items below are deprecated for users of the crate (SEC-004);
+// this module is where they are defined and still refer to each other.
+#![allow(deprecated)]
 
 use crate::error::{DtlsError, DtlsResult};
 use crate::fingerprint::CertificateFingerprint;
@@ -177,6 +191,7 @@ impl HandshakeHeader {
 }
 
 /// DTLS handshake context.
+#[deprecated(note = "use association::DtlsAssociation (POA&M-324)")]
 pub struct Handshake {
     /// Whether we are the client.
     is_client: bool,
@@ -952,7 +967,8 @@ impl Handshake {
         // least one fingerprint signalled in SDP. A self-signed peer has no
         // other binding, so the check always runs and an empty set fails
         // (`verify_any` never matches an empty set).
-        // NIST 800-53 Rev5: SC-23 (session authenticity) (reachable once POA&M-324 lands)
+        // Legacy path, driven by nothing: session authenticity (SC-23) is
+        // implemented by `association.rs`, not here (POA&M-324).
         if self.allow_self_signed || !self.expected_fingerprints.is_empty() {
             CertificateFingerprint::verify_any(&self.expected_fingerprints, &certs[0])?;
         }

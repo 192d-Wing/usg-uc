@@ -2,8 +2,11 @@
 //!
 //! ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection)
 //!
-//! Uses the system's cryptographically secure random number generator
-//! via aws-lc-rs, which uses the OS CSPRNG.
+//! Random bytes come from the aws-lc module's deterministic random bit
+//! generator (CTR-DRBG) through `aws_lc_rs::rand::SystemRandom`. How that
+//! generator is seeded and reseeded is the module's business and is
+//! described in its Security Policy, not here; this crate adds no entropy
+//! handling of its own.
 
 use crate::error::{CryptoError, CryptoResult};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};

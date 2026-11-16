@@ -9,10 +9,22 @@
 //!
 //! Only P-384 ECDSA signatures are accepted.
 //!
+//! ## Status: legacy
+//!
+//! These helpers belong to the legacy [`crate::handshake`] path. Their
+//! certificate handling is a byte-pattern search, not a DER parser, and must
+//! not be used on untrusted input. [`crate::association::DtlsAssociation`]
+//! does not use this module: it takes the peer key with [`crate::spki`] and
+//! derives `Finished` with [`crate::key_schedule`].
+//!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-8**: Transmission Confidentiality and Integrity
-//! - **SC-13**: Cryptographic Protection
+//! No control is implemented by this module; see
+//! [`crate::association`] (POA&M-324).
+
+// The legacy items below are deprecated for users of the crate (SEC-004);
+// this module is where they are defined and still refer to each other.
+#![allow(deprecated)]
 
 use crate::error::{DtlsError, DtlsResult};
 
@@ -31,6 +43,7 @@ pub enum CertificateValidationResult {
 ///
 /// Per RFC 6347 §4.2.4, the server MUST validate the client's certificate
 /// if client authentication is requested.
+#[deprecated(note = "use association::DtlsAssociation (POA&M-324)")]
 pub struct CertificateValidator {
     /// Whether to allow self-signed certificates.
     /// For DTLS-SRTP, self-signed with fingerprint verification is common.
@@ -225,6 +238,7 @@ impl Default for CertificateValidator {
 /// Where:
 /// - `finished_label` is "client finished" or "server finished"
 /// - `Hash` is SHA-384 for `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`
+#[deprecated(note = "use association::DtlsAssociation (POA&M-324)")]
 pub struct FinishedVerifier;
 
 impl FinishedVerifier {
@@ -310,6 +324,7 @@ impl FinishedVerifier {
 /// ```text
 /// signed_params = SHA384(client_random + server_random + ServerECDHParams)
 /// ```
+#[deprecated(note = "use association::DtlsAssociation (POA&M-324)")]
 pub struct ServerKeyExchangeVerifier;
 
 impl ServerKeyExchangeVerifier {

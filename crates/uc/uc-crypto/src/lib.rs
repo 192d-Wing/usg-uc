@@ -89,6 +89,7 @@
 
 pub mod aead;
 pub mod cipher;
+pub mod constant_time;
 pub mod ecdh;
 pub mod ecdsa;
 pub mod error;
@@ -96,6 +97,7 @@ pub mod hash;
 pub mod hkdf;
 pub mod interop;
 pub mod random;
+pub mod tls12;
 #[cfg(feature = "stir-shaken-es256")]
 pub mod x509;
 

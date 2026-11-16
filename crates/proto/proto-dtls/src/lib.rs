@@ -6,10 +6,21 @@
 //! ## CNSA 2.0 Compliance
 //!
 //! DTLS is configured with CNSA 2.0 compliant settings:
-//! - **DTLS 1.2/1.3** with approved cipher suites
+//! - **DTLS 1.2** only
 //! - **Cipher Suite**: `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`
 //! - **Key Exchange**: P-384 ECDHE
 //! - **Certificates**: P-384 ECDSA
+//! - **SRTP profile**: `AEAD_AES_256_GCM` (RFC 7714)
+//! - **Extended master secret** (RFC 7627) required
+//!
+//! ## Where the handshake lives
+//!
+//! [`association::DtlsAssociation`] is the DTLS 1.2 handshake: a sans-I/O
+//! state machine built on `uc-crypto`. [`DtlsSession`], [`DtlsConnection`]
+//! and [`Handshake`] are the older surface; they perform no handshake and
+//! fail closed (POA&M-324). `DtlsSession`, `Handshake` and the `verify`
+//! helpers are deprecated; `DtlsConnection` follows once its remaining
+//! callers have moved to the association (stage 2).
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
@@ -34,26 +45,42 @@
 #[cfg(all(feature = "test-placeholder-keying", not(debug_assertions)))]
 compile_error!("feature `test-placeholder-keying` is test-only and not allowed in release builds");
 
+pub mod association;
 pub mod cipher_suite;
 pub mod config;
 pub mod connection;
 pub mod error;
 pub mod fingerprint;
+pub mod flight;
 pub mod handshake;
+pub mod key_schedule;
+pub mod reassembly;
 pub mod record;
 pub mod session;
+pub mod spki;
 pub mod srtp_export;
 pub mod verify;
+pub mod wire;
+
+pub use association::{
+    AssociationConfig, AssociationEvent, AssociationStats, DtlsAssociation, DtlsCredentials,
+    FailureCause,
+};
 
 pub use cipher_suite::{cnsa_cipher_suites, is_cnsa_compliant};
 pub use config::DtlsConfig;
 pub use connection::{DtlsConnection, DtlsConnectionManager};
 pub use error::{DtlsError, DtlsResult};
 pub use fingerprint::CertificateFingerprint;
+// Deprecated legacy items stay re-exported so existing paths keep resolving
+// (SEC-004); using them warns.
+#[allow(deprecated)]
 pub use handshake::{Handshake, HandshakeState};
-pub use record::{RecordHeader, RecordLayer};
+pub use record::{AssociationRecordLayer, RecordHeader, RecordLayer};
+#[allow(deprecated)]
 pub use session::DtlsSession;
 pub use srtp_export::{SRTP_EXPORTER_LABEL, SrtpKeyExporter, UseSrtpExtension};
+#[allow(deprecated)]
 pub use verify::{
     CertificateValidationResult, CertificateValidator, FinishedVerifier, ServerKeyExchangeVerifier,
 };
@@ -167,6 +194,15 @@ impl SrtpProfile {
 ///
 /// This contains the master key and salt derived via DTLS-SRTP
 /// for use with SRTP encryption.
+///
+/// ## NIST 800-53 Rev5: SC-12 (key material lifecycle)
+///
+/// The four buffers are wiped when the value is dropped. The type is
+/// `Clone` and its fields are public: every clone wipes itself, but bytes a
+/// consumer copies out of the fields are that consumer's to wipe.
+///
+/// POAM: POA&M-330 -- key copies held outside zeroizing types (soft client
+/// key custody) are tracked there.
 #[derive(Clone)]
 pub struct SrtpKeyingMaterial {
     /// Client write master key.
@@ -233,11 +269,13 @@ impl std::fmt::Debug for SrtpKeyingMaterial {
 
 impl Drop for SrtpKeyingMaterial {
     fn drop(&mut self) {
-        // Zeroize sensitive material
-        self.client_write_key.fill(0);
-        self.server_write_key.fill(0);
-        self.client_write_salt.fill(0);
-        self.server_write_salt.fill(0);
+        // NIST 800-53 Rev5: SC-12 / SC-4 -- wipe with `zeroize` (volatile
+        // writes over the whole capacity), which the optimizer may not elide.
+        use zeroize::Zeroize;
+        self.client_write_key.zeroize();
+        self.server_write_key.zeroize();
+        self.client_write_salt.zeroize();
+        self.server_write_salt.zeroize();
     }
 }
 

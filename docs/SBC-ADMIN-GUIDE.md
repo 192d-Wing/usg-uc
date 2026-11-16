@@ -735,6 +735,28 @@ sidecar_socket = "/run/sbc/dtls-sidecar.sock"
 fingerprint_file = "/run/sbc/dtls-fingerprint"
 ```
 
+**DTLS peer requirements in `Terminate` mode (changed 2026-11-16).** The DTLS
+sidecar accepts only peers on the CNSA 2.0 profile. There is no setting to
+relax it. A peer must:
+
+- negotiate DTLS 1.2 with `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` and the
+  SRTP profile `AEAD_AES_256_GCM`;
+- present a certificate with an ECDSA P-384 key and signal its `sha-384`
+  fingerprint in SDP;
+- sign its handshake with ECDSA P-384/SHA-384 (a P-384 peer that signs with
+  SHA-256, as stock pion does, is refused);
+- use ECDHE on secp384r1 and, **if it sends `supported_groups`, list secp384r1
+  first** (a peer that supports the group but lists X25519 or P-256 first is
+  refused with a fatal `handshake_failure` alert; NIST POA&M-336);
+- support the extended master secret (RFC 7627).
+
+Before this change only the cipher suite, the SRTP profile and the
+fingerprint hash were restricted, so endpoints that connected before may now
+be refused. When the SBC is the DTLS client and the far end insists on
+another ECDHE group, the handshake fails when its deadline expires and the
+far end receives no alert. Only pion-based peers were tested. Details:
+`sidecar/dtls-terminator/README.md`, `docs/CNSA-2-COMPLIANCE.md` (DTLS-SRTP).
+
 ### T.38 fax relay (`[media.t38]`)
 
 The SBC can carry T.38 fax (RFC 3362 `m=image ... udptl t38`) after an

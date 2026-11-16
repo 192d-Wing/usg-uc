@@ -11,6 +11,7 @@ on:
   push:
     branches: [main]
     paths:
+      - 'crates/proto/proto-dtls/**'
       - 'crates/proto/proto-srtp/**'
       - 'crates/uc/uc-crypto/**'
       - 'crates/sbc/sbc-media-core/**'
@@ -20,6 +21,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - 'crates/proto/proto-dtls/**'
       - 'crates/proto/proto-srtp/**'
       - 'crates/uc/uc-crypto/**'
       - 'crates/sbc/sbc-media-core/**'
@@ -76,3 +78,13 @@ jobs:
           SIDECAR_BIN: ${{ runner.temp }}/bin/sidecar
           PEER_BIN: ${{ runner.temp }}/bin/peer
         run: cargo test -p sbc-media-core --features grpc srtp_audio_end_to_end -- --ignored --nocapture
+
+      # proto-dtls DtlsAssociation (the soft client's DTLS 1.2 handshake)
+      # against pion/dtls through the same peer binary, in both DTLS roles,
+      # with SRTP/SRTCP checked in both directions under the exported keys.
+      # #[ignore]d like the gates above (needs PEER_BIN). Default features on
+      # purpose: that is the feature set the client ships with.
+      - name: Run the proto-dtls pion interop (client + server role)
+        env:
+          PEER_BIN: ${{ runner.temp }}/bin/peer
+        run: cargo test -p proto-dtls --test interop_pion -- --ignored --nocapture
