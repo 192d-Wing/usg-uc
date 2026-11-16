@@ -16,6 +16,7 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
+zeroize.workspace = true
 
 # Async support
 async-trait = "0.1"
@@ -23,6 +24,12 @@ async-trait = "0.1"
 [dev-dependencies]
 # Real self-signed certificates for the fingerprint-binding tests.
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
+# Loopback test: protect/unprotect RTP with the keys the association exports.
+proto-srtp.workspace = true
+proto-rtp.workspace = true
+# Property tests: codecs, arbitrary input in every state, and arbitrary
+# fragmentation / reordering / duplication / loss of a real handshake.
+proptest.workspace = true
 
 [features]
 # Test-only: proto-dtls's OWN unit tests use random local keys instead of

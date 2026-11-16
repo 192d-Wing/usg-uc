@@ -9,6 +9,149 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, DTLS-SRTP termination pinned to the CNSA profile, POA&M-335, 336)
+
+Affects only SBCs that terminate DTLS-SRTP (`sbcDaemon.dtlsTerminate.enabled`,
+off by default). Relay mode, which passes SRTP through, is not affected.
+Operators with third-party DTLS-SRTP peers (WebRTC gateways, browsers, other
+vendors' phones) must read this before upgrading the `dtls-terminator`
+sidecar. Tested against pion/dtls v3.1.5 and the in-tree Rust stack only; no
+third-party peer was tested.
+
+- **SBC: the DTLS endpoint refuses every peer outside one profile.** (SC-8,
+  SC-12, SC-13, SC-23, IA-3; CNSA 2.0) The sidecar now completes a
+  handshake only with all of: ECDHE on secp384r1, ECDSA P-384/SHA-384
+  handshake signatures in both directions, the extended master secret
+  (RFC 7627), and a peer certificate whose key is ECDSA P-384. Suite
+  `ECDHE-ECDSA-AES256-GCM-SHA384`, SRTP profile `AEAD_AES_256_GCM` and the
+  sha-384 SDP fingerprint match were already required. Before this change a
+  peer that met those three connected whatever its signature hash, ECDHE
+  group, certificate key or extended-master-secret support. There is no
+  setting to relax the profile.
+- **Peers that are now refused.** A peer that signs with ECDSA/SHA-256 over
+  a P-384 key (the pion/dtls default; stock pion peers fail), a peer with a
+  P-256 or RSA certificate, a peer that negotiates X25519 or P-256 ECDHE, a
+  peer without the extended master secret, and a server that asks for a
+  CertificateVerify scheme other than ECDSA P-384/SHA-384 first in its
+  CertificateRequest.
+- **Peers must list secp384r1 first in `supported_groups`.** (POA&M-336,
+  open) When the SBC is the DTLS server, a client that supports P-384 but
+  lists another group first is refused as well. pion/dtls takes the
+  client's first group and cannot be configured otherwise; the sidecar
+  checks the resulting ServerKeyExchange on the wire and withholds it.
+  Browsers and many WebRTC stacks typically list X25519 or P-256 first;
+  such a peer fails against a terminating SBC until POA&M-336 is closed.
+  Check each peer's group order before upgrading.
+- **How a refusal looks.** The sidecar returns an error to the media relay
+  instead of keys, so the leg has no media. When the SBC is the DTLS
+  server, the peer gets a fatal `handshake_failure` (40) alert at once.
+  When the SBC is the DTLS client, a server on another ECDHE group is
+  refused by dropping its ServerKeyExchange: the handshake ends only at the
+  sidecar's 30 s handshake timeout and the server gets no alert
+  (POA&M-335). The sidecar's error text names the cause (`key exchange
+  group outside the profile`, `CertificateVerify scheme outside the
+  profile`, `ServerKeyExchange on a group outside the profile`, `peer
+  certificate key is not on P-384`).
+- **New code on the media path.** The ECDHE group and the scheme of the
+  sidecar's own CertificateVerify are enforced by a wire guard
+  (`groupguard.go`) around the socket handed to pion, because pion/dtls
+  v3.1.5 cannot enforce either by configuration. It reads plaintext
+  epoch-0 handshake records only and is switched off once the handshake
+  ends. Its fragment handling relies on pion v3.1.5 reassembly behaviour;
+  a test fails if the pion version changes.
+- **Go API: `dtlssession.Run` requires a context with a deadline** and
+  returns an error without one. Both in-tree callers already pass one.
+- **Rebuild and redeploy the sidecar image.** `release-sbc.yml` does not
+  build `usg-dtls-terminator`; an `sbc-v*` tag alone does not ship this
+  change. Build it from `sidecar/dtls-terminator/Dockerfile` (Go 1.26,
+  `GOFIPS140=v1.26.0`) and roll it out with the SBC images. The Helm
+  values, `deploy/config/config.toml` and the Ansible roles hold no DTLS
+  signature, group or extended-master-secret setting and do not change.
+- **Order of upgrade for the soft client.** The Stage 2 soft client will
+  accept only this profile. A sidecar built before this change signs with
+  ECDSA/SHA-256 and will be refused by it. Upgrade the sidecar before any
+  client that performs the handshake is released.
+
+No SBC config key, CDR field, audit event type, metric or gRPC/REST API is
+changed. The sidecar's IPC framing is unchanged. `go.mod` and `go.sum` are
+unchanged.
+
+Known limits of the SBC DTLS endpoint recorded by this change: during the
+handshake, forged plaintext alerts or fragments sent from the peer's
+address can make pion abort or stall the handshake, and a server refused in
+the client role gets no alert (POA&M-335, SC-5); proper server-side
+selection of secp384r1 needs a pion change (POA&M-336, SC-13).
+
+### Added (proto-dtls and uc-crypto, DTLS 1.2 handshake library, POA&M-324 stage 1)
+
+Library only. No client crate uses it yet. **Client behaviour is unchanged:
+a default (TLS) client build still has no audio**, every call on a TLS
+account is still ended right after it connects, and POA&M-324 stays open
+until the client is wired to the handshake (Stage 2). Do not cut a
+`client-v*` tag for this change.
+
+- **proto-dtls: `DtlsAssociation`, a sans-I/O DTLS 1.2 handshake in both
+  roles.** (RFC 6347, RFC 5764, RFC 7627, RFC 7714, RFC 8122; SC-8, SC-12,
+  SC-13, SC-23, IA-3) The caller owns the socket and the clock and drives
+  it with `handle_datagram`, `handle_timeout`, `poll_transmit`,
+  `poll_event` and `poll_timeout`. One profile, no fallback: ECDHE
+  secp384r1, ECDSA P-384/SHA-384, AES-256-GCM, extended master secret
+  required, SRTP profile `AEAD_AES_256_GCM`, no MKI. The peer certificate
+  must match an expected SDP fingerprint and carry a P-384 key, and the
+  peer must prove possession, before any key is exported. No chain,
+  self-signature or expiry check is made. The server role always sends a
+  HelloVerifyRequest. Retransmission starts at 1 s and doubles to 8 s
+  within a 10 s handshake budget; MTU 576 to 1500, default 1200.
+- **New public items in proto-dtls.** `AssociationConfig`,
+  `AssociationEvent`, `AssociationStats`, `DtlsCredentials` and
+  `FailureCause` (re-exported at the crate root), `AssociationRecordLayer`,
+  and the modules `association`, `flight`, `key_schedule`, `reassembly`,
+  `spki` and `wire`. `record` gains `DatagramRecords`, `RecordView`,
+  `RecordDiscard`, `encode_plaintext_record` and `ContentType::from_u8`.
+- **New public items in uc-crypto.** `tls12::prf_sha384` with the closed
+  label set `Tls12Label`, `tls12::Tls12GcmSealer` (AES-256-GCM TLS 1.2
+  record sealing) and `constant_time::eq`. All run in the aws-lc FIPS
+  module. The module's approved-service indicator is set for the TLS 1.2
+  KDF only with the `extended master secret` label; evidence for key
+  expansion, Finished and the RFC 5705 exporter is still to be collected
+  (POA&M-332, SC-13).
+- **Interop evidence.** Handshake in both roles against pion/dtls v3.1.5,
+  with SRTP and SRTCP opened in both directions under the exported keys.
+  This now runs in the `SRTP audio gate` workflow. Not tested: any non-pion
+  peer, the SBC relay path with this stack, a full client-to-SBC call.
+
+### Deprecated (proto-dtls)
+
+- `DtlsSession`, `Handshake`, `CertificateValidator`, `FinishedVerifier`
+  and `ServerKeyExchangeVerifier` are `#[deprecated]` in favour of
+  `association::DtlsAssociation`. They still compile and still perform no
+  handshake. `DtlsConnection` and `DtlsConnectionManager` are not
+  deprecated yet because client-sip-ua and the SBC crates use them; they
+  follow in Stage 2. Builds with `-D warnings` that name the deprecated
+  items now fail.
+
+### Changed (proto-dtls)
+
+- **`UseSrtpExtension::decode` rejects a non-empty MKI** instead of
+  returning it. (RFC 5764 §4.1.1)
+- **`SrtpKeyingMaterial` is wiped with `zeroize` on drop.** (SC-12) No API
+  change; the type stays `Clone` with public fields (POA&M-330).
+  `derive_keying_material` now uses the uc-crypto PRF and gives the same
+  output as before.
+- **Dependencies.** (SR-3) `zeroize` (already in the workspace) becomes a
+  direct dependency of proto-dtls; `proto-srtp`, `proto-rtp` and `proptest`
+  become dev-dependencies. `Cargo.lock` gains no new package.
+
+Open items recorded by this change: POA&M-332 (SC-13: FIPS approved-service
+evidence for the TLS 1.2 PRF labels other than the extended master secret),
+333 (SC-23: RFC 8844 `external_id_hash` unknown-key-share protection not
+implemented), 334 (SC-5: forged plaintext handshake messages from the
+peer's address can still end a soft-client handshake in a few residual
+cases; always fail closed), 335 (SC-5: the same exposure in pion on the SBC
+sidecar, and no alert to a server refused in the client role) and 336
+(SC-13: peers of the SBC must list secp384r1 first until pion can select
+it). POA&M-324 stays open.
+
 ### BREAKING (SBC, `SBC_AUTH_MODE` parsing, POA&M-270)
 
 - **SBC: `SBC_AUTH_MODE` is trimmed before it is compared.** (IA-2, CM-6)

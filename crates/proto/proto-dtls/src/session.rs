@@ -1,24 +1,26 @@
-//! DTLS session management.
+//! DTLS session management (legacy wrapper).
 //!
-//! This module provides a wrapper around webrtc-dtls for managing DTLS sessions
-//! with CNSA 2.0 compliant configuration.
+//! ## Status
 //!
-//! ## Current Implementation Status
+//! [`DtlsSession`] performs no network handshake: [`DtlsSession::new`] fails
+//! closed, except in this crate's own unit tests built with the
+//! `test-placeholder-keying` feature (POA&M-324). Its `send` / `recv` do not
+//! apply DTLS record protection and must not be used to carry data.
 //!
-//! This implementation provides the framework for DTLS integration with
-//! webrtc-dtls. No network handshake is performed yet, so
-//! [`DtlsSession::new`] fails closed except in this crate's own unit tests
-//! built with the `test-placeholder-keying` feature (POA&M-324). Full
-//! integration requires:
-//! 1. Proper certificate handling for P-384 ECDSA
-//! 2. webrtc-dtls cipher suite support (currently lacks AES-256-GCM)
-//! 3. `KeyingMaterialExporter` trait integration
+//! The real DTLS 1.2 handshake is the sans-I/O
+//! [`crate::association::DtlsAssociation`]. `DtlsSession` keeps failing
+//! closed until the soft client is wired to the association (stage 2 of
+//! POA&M-324); nothing here calls it.
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-8**: Transmission Confidentiality and Integrity
-//! - **SC-12**: Cryptographic Key Establishment
-//! - **SC-13**: Cryptographic Protection
+//! No control is implemented by this module; see
+//! [`crate::association`] (POA&M-324). What it does do is fail closed
+//! (SC-8(1)): it never reports a session it could not key.
+
+// The legacy items below are deprecated for users of the crate (SEC-004);
+// this module is where they are defined and still refer to each other.
+#![allow(deprecated)]
 
 #[cfg(all(test, feature = "test-placeholder-keying"))]
 use crate::SrtpProfile;
@@ -40,10 +42,11 @@ const SRTP_EXPORTER_LABEL: &str = "EXTRACTOR-dtls_srtp";
 #[allow(dead_code)]
 const SRTP_KEYING_MATERIAL_LEN: usize = 88;
 
-/// DTLS session wrapper providing CNSA 2.0 compliant DTLS operations.
+/// Legacy DTLS session wrapper.
 ///
-/// This struct wraps the DTLS connection and ensures all cryptographic
-/// operations meet CNSA 2.0 requirements where possible.
+/// It performs no handshake and applies no record protection (see the
+/// module documentation); it makes no CNSA 2.0 claim of its own.
+#[deprecated(note = "use association::DtlsAssociation (POA&M-324)")]
 pub struct DtlsSession {
     /// UDP socket for transport.
     socket: Arc<UdpSocket>,
@@ -75,8 +78,10 @@ impl DtlsSession {
     /// peer never learns would report a "secure" session that cannot carry
     /// media (NIST 800-53 Rev5: SC-8(1), SC-12 fail closed).
     ///
-    /// POAM: POA&M-324 drive `handshake.rs` over the network (retransmission,
-    /// cookies, alerts, fingerprint verification) and export real keys.
+    /// POAM: POA&M-324 -- the handshake is
+    /// [`crate::association::DtlsAssociation`]; this constructor keeps
+    /// failing closed until the soft client drives the association on the
+    /// media socket (stage 2), and is then removed.
     ///
     /// ## Errors
     ///
@@ -156,7 +161,7 @@ impl DtlsSession {
         let key_len = profile.key_len();
         let salt_len = profile.salt_len();
 
-        // Generate random keys using CNSA 2.0 compliant random
+        // Test-only placeholder keys from the uc-crypto random generator.
         let mut client_key = vec![0u8; key_len];
         let mut server_key = vec![0u8; key_len];
         let mut client_salt = vec![0u8; salt_len];

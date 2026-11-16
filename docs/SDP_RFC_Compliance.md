@@ -195,7 +195,7 @@ The client implements SDP for audio-only calls in two modes: plain RTP (`RTP/AVP
 
 #### Not Implemented
 
-- **Verification**: the certificate presented by the peer is not compared with the signalled fingerprints, since no DTLS handshake runs. `CertificateFingerprint::verify_any` exists in `proto-dtls` and is tested by direct calls only (NIST POA&M-324)
+- **Verification**: the certificate presented by the peer is not compared with the signalled fingerprints, since the client runs no DTLS handshake. `CertificateFingerprint::verify_any` exists in `proto-dtls`; since 2026-11-16 the library `DtlsAssociation` in `proto-dtls` checks a peer's leaf certificate against the fingerprint set in its own tests, but the client does not use it (NIST POA&M-324)
 - **Fingerprint change in a re-INVITE** does not start a new DTLS association (NIST POA&M-327)
 
 ---
@@ -539,6 +539,7 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 | 2026-11-07 | sbc-daemon: `o=` rewritten toward hidden legs (POA&M-181); `c=` residual recorded as POA&M-215 | compliance-scribe |
 | 2026-11-09 | SIPREC phase 3: recording session SDP (SDES offer, `a=label`, answer rules, `a=recordpref` handling; no `a=record`) | compliance-scribe |
 | 2026-11-15 | fix/client-srtp-b2: status correction (DTLS-SRTP is signalling only, POA&M-324); RFC 8122 lowered to Partial (sha-384/512 only, no verification); RFC 3264 lowered to Partial (RFC-006, POA&M-329); added RFC 5763 / 4145 / 5761 section; m-line examples corrected | compliance-scribe |
+| 2026-11-16 | feat/client-dtls-handshake Stage 1: no SDP behaviour change and no status change; RFC 8122 verification note updated (library `DtlsAssociation` exists, client not wired, POA&M-324) | compliance-scribe |
 | 2026-02-07 | **FIXED**: proto-sdp: Updated RFC 4566 references to RFC 8866 | Claude Sonnet 4.5 |
 | 2026-02-07 | **FIXED**: proto-sdp: Removed duplicate doc comments, exported BandwidthInfo | Claude Sonnet 4.5 |
 

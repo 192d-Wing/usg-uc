@@ -1,7 +1,7 @@
 # Proto-* Crates RFC/Standards Compliance Report
 
 **Generated:** 2026-02-07
-**Last Updated:** 2026-11-15 (fix/client-srtp-b2: proto-dtls handshake is not wired anywhere, soft-client DTLS-SRTP fails closed; earlier: 2026-10-11 wiring reconciliation, issue #118)
+**Last Updated:** 2026-11-16 (feat/client-dtls-handshake Stage 1: proto-dtls gained a library DTLS 1.2 association, used by no binary; SBC Go sidecar pinned to the full CNSA profile; earlier: 2026-11-15 fix/client-srtp-b2: soft-client DTLS-SRTP fails closed; 2026-10-11 wiring reconciliation, issue #118)
 **Crates Audited:** 13
 **Unique RFCs Referenced:** 45+
 
@@ -304,30 +304,42 @@
 
 **Primary Standard:** RFC 6347
 
+**Stage 1 note (2026-11-16, feat/client-dtls-handshake):** the crate now contains a DTLS 1.2 handshake, `src/association.rs` `DtlsAssociation`: sans-I/O, both roles, one CNSA profile (`TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`, secp384r1, `ecdsa_secp384r1_sha384`, `SRTP_AEAD_AES_256_GCM`, extended master secret required), all cryptography from `uc-crypto`. It is **Library-only**: no shipped binary and no client crate calls it, and NIST POA&M-324 stays open until Stage 2 wires it into the soft client. Tested by unit, loopback, negative, property and UDP tests (`crates/proto/proto-dtls/tests/`) and against pion/dtls v3.1.5 in both roles (`tests/interop_pion.rs`, `#[ignore]`); all results are local runs, and no other peer was tested. The per-section mapping, the deviations and the Stage 2 obligations are in `docs/RFC_COMPLIANCE_GAPS.md` (proto-dtls section). The older surface (`DtlsSession`, `Handshake`, the `verify` helpers: deprecated; `DtlsConnection`: not yet) performs no handshake, as the next note says.
+
 **Wiring note (corrected 2026-11-15, fix/client-srtp-b2):** the proto-dtls handshake does not run in any shipped binary. The soft client calls `DtlsConnection::handshake` (`client-sip-ua/dtls_handler.rs`), but `session.rs` `DtlsSession::new` returns `HandshakeFailed("DTLS handshake not implemented (POA&M-324)")` and nothing drives `handshake.rs` / `record.rs` over a socket, so the client exports no SRTP keys and its TLS calls fail closed with no audio (NIST POA&M-324). Before this change `session.rs` returned random placeholder keys without a handshake; that code now exists only under `cfg(all(test, feature = "test-placeholder-keying"))` (proto-dtls's own unit tests; `compile_error!` without `debug_assertions`). The statuses below are crate-level capability, exercised by unit tests only. The SBC terminates DTLS-SRTP through the **Go terminator sidecar** (`sbc-media-core/src/dtls_sidecar.rs`, `media_pipeline.rs` `terminate_leg_dtls` / `start_relay_terminate`); the proto-dtls `start_dtls_handshake`/`complete_dtls_handshake` paths in `media_pipeline.rs` have no callers. sbc-media-core uses proto-dtls only for PEM parsing (`dtls_identity.rs`) and certificate fingerprints.
 
 ### RFCs Referenced
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| **RFC 6347** | DTLS 1.2 | **Full** — record layer (§4.1), handshake (§4.2), certificate validation (§4.2.4), Finished message verification (§4.2.6), replay protection, version 0xFEFD. **Library-only**: message and record code is unit-tested but is not driven over a network by any binary (soft client: NIST POA&M-324; SBC: the Go sidecar terminates DTLS) |
-| **RFC 5763** | DTLS-SRTP Framework | Referenced — `a=setup` handled by sbc-daemon `sdp_dtls.rs`, and in the soft client by `client-sip-ua/src/sdp_dtls.rs` (`Setup`: role from offer/answer, §5; tests `role_table`, `setup_values`). Neither is proto-dtls code. In the soft client the role drives no handshake yet (NIST POA&M-324) |
-| **RFC 5764** | DTLS-SRTP Key Export | **Full** (crate level) — exporter label, key material layout (§4.2), `use_srtp` extension. **Library-only**: no handshake runs, so nothing is exported (NIST POA&M-324); SBC receives SRTP keys from the sidecar. §5.1.2 demultiplexing is done in the soft client by `client-audio/src/rtp_handler.rs` `classify`, not in this crate |
-| **RFC 5705** | TLS Exporters | Key derivation implementation. Library-only (NIST POA&M-324) |
-| **RFC 5288** | AES-GCM for TLS | Nonce construction for record encryption. Library-only (NIST POA&M-324) |
-| **RFC 4572** / **RFC 8122** | Fingerprint Attribute | Certificate fingerprint module, SHA-384 / SHA-512 only. **Wired (sbc-media-core `dtls_identity.rs`, sbc-daemon `sdp_dtls.rs`; soft client)**. Soft client (fix/client-srtp-b2): generates its `sha-384` fingerprint (`client-sip-ua/src/dtls_identity.rs`) and parses remote ones with `from_sdp_strict` (strict `XX:XX` grammar, exact digest length, at most 256 bytes; tests `strict_parse_round_trip_and_case`, `strict_parse_rejects_bad_input`). `sha-256` is refused, a deliberate CNSA 2.0 deviation from RFC 8122 §5 interoperability. `verify_any` (RFC 8122 §5: match any one of the signalled fingerprints; an empty set never matches; test `verify_any_matches_one_of_set`) is Library-only: no peer certificate is received to verify (NIST POA&M-324) |
-| **RFC 7627** | Extended Master Secret | Config option. Library-only (NIST POA&M-324) |
-| **RFC 7714** | AES-GCM Cipher Suite | `AEAD_AES_256_GCM` support. Library-only (NIST POA&M-324) |
+| **RFC 6347** | DTLS 1.2 | **Implemented for one profile, with documented deviations** (`association.rs`) — record layer and replay window (§4.1), cookie exchange (§4.2.1), fragmentation and reassembly (§4.2.3), timeout and retransmission with the final flight kept 240 s (§4.2.4), CertificateVerify and Finished (§4.2.6), version 0xFEFD. Deviations (deferred handling of plaintext failures during the handshake, 8 s timer cap, no fragmented first ClientHello, early CCS / Finished not buffered, and others) are listed in `docs/RFC_COMPLIANCE_GAPS.md`. An earlier revision of this row cited §4.2.4 for certificate validation; §4.2.4 is timeout and retransmission. **Library-only**: tested over loopback, real UDP sockets and against pion v3.1.5 (local runs), but driven by no binary (soft client: NIST POA&M-324; SBC: the Go sidecar terminates DTLS) |
+| **RFC 5763** | DTLS-SRTP Framework | Referenced — `a=setup` handled by sbc-daemon `sdp_dtls.rs`, and in the soft client by `client-sip-ua/src/sdp_dtls.rs` (`Setup`: role from offer/answer, §5; tests `role_table`, `setup_values`). Neither is proto-dtls code. In the soft client the role drives no handshake yet (NIST POA&M-324). In proto-dtls, `DtlsAssociation` implements §5 / §6.7.1 fingerprint verification of the peer's leaf certificate against the set given at construction (tests `client_rejects_server_certificate_with_wrong_fingerprint`, `server_rejects_client_certificate_with_wrong_fingerprint`), Library-only; the SDP offerer's readiness for an early `ClientHello` (§5) is a Stage 2 driver obligation |
+| **RFC 5764** | DTLS-SRTP Key Export | **Full** (crate level) — exporter label, key material layout (§4.2), `use_srtp` extension with `SRTP_AEAD_AES_256_GCM` only, MKI never used (§4.1.3: an offered MKI is ignored by the server role, a non-empty MKI from a server is refused with `illegal_parameter`). The export is the RFC 5705 exporter over the TLS 1.2 PRF with SHA-384, not HKDF. **Library-only**: `DtlsAssociation` exports keys in tests and against pion (local runs), but no binary runs it, so nothing is exported in a shipped path (NIST POA&M-324); SBC receives SRTP keys from the sidecar. §5.1.2 demultiplexing is done in the soft client by `client-audio/src/rtp_handler.rs` `classify`, not in this crate |
+| **RFC 5705** | TLS Exporters | Exporter with label `EXTRACTOR-dtls_srtp` and no context, computed by `uc_crypto::tls12::prf_sha384` (the aws-lc module's TLS 1.2 KDF; the module's approved-service indicator does not flag this label, NIST POA&M-332). Library-only (NIST POA&M-324) |
+| **RFC 5246** | TLS 1.2 (handshake messages, PRF, alerts) | As used by DTLS 1.2 for the one profile. `unsupported_extension` on an unoffered `ServerHello` extension (§7.4.1.4). Deviation from §7.2.2: failures seen in plaintext during the handshake are deferred by up to one retransmission interval (NIST POA&M-334). Library-only |
+| **RFC 8422** / **RFC 5289** | ECC for TLS; ECDHE-ECDSA AES-256-GCM-SHA384 | secp384r1 named curve and uncompressed points only; suite 0xC02C only. Library-only |
+| **RFC 5746** | Renegotiation Indication | Extension / SCSV exchanged; renegotiation itself is not supported. Library-only |
+| **RFC 8844** | Unknown Key-Share Attacks on DTLS-SRTP | **Not implemented** (NIST POA&M-333) |
+| **RFC 5288** | AES-GCM for TLS | Nonce construction for record encryption; sealing through `uc_crypto::tls12::Tls12GcmSealer` (the module's TLS 1.2 GCM construction, which refuses a non-increasing explicit nonce). Library-only (NIST POA&M-324) |
+| **RFC 4572** / **RFC 8122** | Fingerprint Attribute | Certificate fingerprint module, SHA-384 / SHA-512 only. **Wired (sbc-media-core `dtls_identity.rs`, sbc-daemon `sdp_dtls.rs`; soft client)**. Soft client (fix/client-srtp-b2): generates its `sha-384` fingerprint (`client-sip-ua/src/dtls_identity.rs`) and parses remote ones with `from_sdp_strict` (strict `XX:XX` grammar, exact digest length, at most 256 bytes; tests `strict_parse_round_trip_and_case`, `strict_parse_rejects_bad_input`). `sha-256` is refused, a deliberate CNSA 2.0 deviation from RFC 8122 §5 interoperability. `verify_any` (RFC 8122 §5: match any one of the signalled fingerprints; an empty set never matches; test `verify_any_matches_one_of_set`) is Library-only: `DtlsAssociation` verifies the peer's leaf certificate against the fingerprint set, but no shipped binary runs it, so in the soft client no peer certificate is received to verify (NIST POA&M-324) |
+| **RFC 7627** | Extended Master Secret | Mandatory in `DtlsAssociation`, both roles; a peer without it fails the handshake (stricter than the RFC, which lets it be negotiated). The `config.rs` option belongs to the legacy surface. Library-only (NIST POA&M-324). The SBC Go sidecar requires it as well since 2026-11-16 |
+| **RFC 7714** | AES-GCM Cipher Suite | `SRTP_AEAD_AES_256_GCM` is the only `use_srtp` profile offered or accepted. Library-only (NIST POA&M-324) |
 
 ### Key Files
 - `src/lib.rs` — cipher suites, SRTP profile negotiation (RFC 5764)
-- `src/record.rs` — record format per §4.1, replay protection, nonce per RFC 5288
-- `src/handshake.rs` — full handshake per §4.2, certificate validation (§4.2.4), Finished (§4.2.6)
-- `src/srtp_export.rs` — RFC 5764 §4.2 key export, RFC 5705 exporter
-- `src/verify.rs` — certificate chain validation (§4.2.4), Finished verification (§4.2.6), ServerKeyExchange
+- `src/association.rs` — `DtlsAssociation`: the DTLS 1.2 handshake state machine (sans-I/O, both roles); module doc states the profile, the driver contract and POA&M-324, -333, -334
+- `src/record.rs` — record format per §4.1, replay protection, nonce per RFC 5288; `AssociationRecordLayer` for the association, legacy `RecordLayer` unchanged
+- `src/reassembly.rs` — handshake fragment reassembly with bounds (§4.2.3)
+- `src/flight.rs` — flight fragmentation to the MTU, retransmission timer (§4.2.4)
+- `src/key_schedule.rs` — transcript, extended master secret, key block, `verify_data`, exporter, cookie
+- `src/spki.rs` — strict DER walk to the P-384 public key of the peer certificate
+- `src/wire/` — bounds-checked codecs for handshake messages, extensions and alerts
+- `src/handshake.rs` — legacy handshake message code, deprecated, driven by nothing
+- `src/srtp_export.rs` — RFC 5764 §4.2 key export, RFC 5705 exporter (TLS 1.2 PRF via `uc-crypto`)
+- `src/verify.rs` — legacy certificate, Finished and ServerKeyExchange helpers, deprecated
 - `src/fingerprint.rs` — RFC 4572 / RFC 8122 certificate fingerprints (`from_sdp_strict`, `verify_any`)
 - `src/session.rs` — DTLS session; `DtlsSession::new` fails closed (no handshake, NIST POA&M-324); test-only placeholder keying
-- `src/connection.rs` — connection management
+- `src/connection.rs` — legacy connection wrapper over `DtlsSession` (no handshake; not yet deprecated)
 - `src/config.rs` — extended master secret (RFC 7627); PEM loading reused by sbc-media-core
 
 ---
@@ -490,7 +502,7 @@
 - **proto-sdp**, **proto-turn** — entire crates library-only (proto-stir-shaken is now wired in sbc-daemon)
 - **proto-dialog** — only `refer.rs` reaches a binary (soft client); dialog store, session timer, subscriptions, forking unused
 - **proto-ice** — soft client only (checks, nomination; STUN via settings); the SBC does not run ICE; RFC 7675 consent and §10 keepalives unused
-- **proto-dtls** — the handshake is reached by no binary: the soft client calls it and it fails closed (NIST POA&M-324); SBC DTLS termination is the Go sidecar. Only `fingerprint.rs` and PEM loading are on shipped paths
+- **proto-dtls** — `DtlsAssociation` (the handshake added 2026-11-16) is used by no binary; the soft client still calls the legacy `DtlsConnection`, which fails closed (NIST POA&M-324); SBC DTLS termination is the Go sidecar. Only `fingerprint.rs` and PEM loading are on shipped paths
 - **proto-sip** proxy/routing/redirect/options modules, Path header; **proto-transaction** PRACK; **proto-registrar** GRUU/Path/Service-Route/flow manager; **proto-b2bua** early-media module; **proto-rtp** translator/mixer/scheduler/collision detector
 - **sbc-daemon** relays only REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE; REFER, SUBSCRIBE/NOTIFY, PRACK, MESSAGE, INFO, PUBLISH receive 405
 
@@ -583,7 +595,7 @@ Since SIPREC phase 3 (2026-11-09) `sbc-daemon` calls `uc-siprec` to record calls
 | RFC 5626 | SIP Outbound | proto-registrar | sbc-daemon (instance-id/reg-id, CRLF ping); flow manager: library |
 | RFC 5627 | GRUU | proto-registrar | library |
 | RFC 5628 | Media Description Changes | proto-dialog | library |
-| RFC 5705 | TLS Exporters | proto-dtls | library (NIST POA&M-324) |
+| RFC 5705 | TLS Exporters | proto-dtls, uc-crypto (`tls12.rs`, TLS 1.2 PRF) | library (NIST POA&M-324, POA&M-332) |
 | RFC 5761 | Multiplexing RTP/RTCP | proto-rtp; client-audio (`classify`) | sbc-media-core (config flag); soft client (demux and required `a=rtcp-mux` on DTLS-SRTP calls, NIST POA&M-326) |
 | RFC 5763 | DTLS-SRTP Framework | proto-dtls; client-sip-ua `sdp_dtls.rs` | sbc-daemon (`sdp_dtls.rs` a=setup); soft client (a=setup / a=fingerprint signalling only; no handshake, NIST POA&M-324) |
 | RFC 5764 | DTLS-SRTP Key Export | proto-srtp, proto-dtls | sbc-media-core (profile/keys from sidecar); soft client: no export (NIST POA&M-324), §4.1 fail-closed gate and §5.1.2 demux in client-core / client-audio |
@@ -594,7 +606,7 @@ Since SIPREC phase 3 (2026-11-09) `sbc-daemon` calls `uc-siprec` to record calls
 | RFC 6086 | INFO Method | proto-sip | library |
 | RFC 6156 | TURN IPv6 | proto-turn | library |
 | RFC 6188 | AES-256-CM | proto-sdp | library |
-| RFC 6347 | DTLS 1.2 | proto-dtls | library (soft client handshake not implemented, NIST POA&M-324; SBC uses Go sidecar) |
+| RFC 6347 | DTLS 1.2 | proto-dtls (`association.rs`) | library (handshake implemented in the crate since 2026-11-16, not wired into the soft client, NIST POA&M-324; SBC uses Go sidecar) |
 | RFC 6446 | Session Recording | proto-dialog | library |
 | RFC 6587 | Syslog over TCP (octet-counting framing) | uc-cdr; uc-syslog (octet counting on TLS, LF on plain TCP) | sbc-daemon (CDR syslog sink; octet counting only); uc-syslog: library |
 | RFC 6665 | SIP Events | proto-sip, proto-dialog | library |
@@ -603,11 +615,12 @@ Since SIPREC phase 3 (2026-11-09) `sbc-daemon` calls `uc-siprec` to record calls
 | RFC 7118 | WebSocket Transport for SIP | proto-sip, uc-transport | sbc-daemon (ws); wss library |
 | RFC 7614 | Location Conveyance | proto-dialog | library |
 | RFC 7616 | HTTP Digest (SHA-256, SHA-512-256) | proto-sip, proto-registrar | sbc-daemon REGISTER via proto-sip `DigestVerifier`, enabled by `[digest_auth]` (off by default); one challenge for the configured algorithm, SHA-256 or SHA-512-256; HA1 file credentials; no INVITE challenge (POA&M-271) |
-| RFC 7627 | Extended Master Secret | proto-dtls | library (NIST POA&M-324) |
+| RFC 7627 | Extended Master Secret | proto-dtls (mandatory in `DtlsAssociation`) | library (NIST POA&M-324); required by the SBC Go sidecar |
 | RFC 7675 | Consent Freshness | proto-ice | library |
 | RFC 7714 | AES-GCM for SRTP | proto-srtp, proto-sdp, proto-dtls | sbc-media-core; soft client (call sites only, no keys until NIST POA&M-324) |
 | RFC 7983 | Multiplexing Scheme Updates for DTLS-SRTP | client-audio (`rtp_handler.rs` `classify`) | soft client (classification; DTLS and STUN dropped, NIST POA&M-325) |
-| RFC 8122 | Connection-Oriented Media over TLS in SDP (fingerprint) | proto-dtls `fingerprint.rs`; client-sip-ua `sdp_dtls.rs` | soft client (generate and strict parse, sha-384/512 only; no verification against a peer certificate, NIST POA&M-324); sbc-daemon, sbc-media-core |
+| RFC 8122 | Connection-Oriented Media over TLS in SDP (fingerprint) | proto-dtls `fingerprint.rs`, `association.rs` (verification, library); client-sip-ua `sdp_dtls.rs` | soft client (generate and strict parse, sha-384/512 only; no verification against a peer certificate, NIST POA&M-324); sbc-daemon, sbc-media-core |
+| RFC 8844 | Unknown Key-Share Attacks on DTLS-SRTP | none | not implemented (NIST POA&M-333) |
 | RFC 7865 | SIPREC Metadata Model | uc-siprec | sbc-daemon (Partial; complete snapshot in the RS INVITE only; off by default) |
 | RFC 7866 | SIPREC Protocol | uc-siprec | sbc-daemon, sbc-media-core (Partial; SRC for two-party audio calls; off by default; no RTCP, no `a=record`, no SRS-initiated requests) |
 | RFC 7840 | Multiple Phone Numbers | proto-dialog | library |

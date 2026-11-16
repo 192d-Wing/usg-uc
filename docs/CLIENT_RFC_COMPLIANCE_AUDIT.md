@@ -101,6 +101,34 @@ the SBC, its Go DTLS sidecar or any other peer.
 | Inbound call reported Connected at the 200, before ACK and media security; no UAS 2xx retransmission (open). Implemented for TLS calls: BYE when no ACK arrives within 64*T1 | 3261 §13.3.1.4 | `client-core/src/call_manager.rs` (`ACK_WAIT_SECURE_MEDIA`, `expire_unacked_secure_calls`) | `test_unacked_tls_call_is_ended_after_64_t1`; POA&M-331 |
 | SDP answer still built from a template with one audio m-line, whatever the offer contains (open, not changed here) | 3264 §6 | `client-core/src/call_manager.rs` (SDP templates) | baseline finding RFC-006 (open BLOCKER series) |
 
+## feat/client-dtls-handshake, Stage 1 (2026-11-16)
+
+Library only. `proto-dtls` gained a DTLS 1.2 handshake, `DtlsAssociation`
+(`crates/proto/proto-dtls/src/association.rs`): sans-I/O, both roles, CNSA
+profile only, tested over loopback, real UDP sockets and against pion/dtls
+v3.1.5 in both roles (local runs; `tests/interop_pion.rs` is `#[ignore]`).
+**Nothing in `crates/client/*` changed and nothing in the client uses it.**
+Every row of the fix/client-srtp-b2 table above still describes the client:
+TLS-account calls end after connect with no audio, and NIST POA&M-324 stays
+open until Stage 2. There was no soft-client run against the SBC, its Go
+DTLS sidecar or any other peer.
+
+What the library does per RFC section, and where it deviates, is in
+`RFC_COMPLIANCE_GAPS.md` (proto-dtls section). What Stage 2 has to do in the
+client, from the Stage 1 reviews:
+
+| Stage 2 obligation or library behaviour the client will inherit | RFC § | Source / tracking |
+|---|---|---|
+| The SDP offerer must be ready for a `ClientHello` before the answer arrives: buffer a bounded number of DTLS datagrams, create the association when the answer supplies the fingerprints, then replay them. The handshake budget starts when the association is constructed | 5763 §5 | RFC-006 (open) |
+| Feed the association only datagrams from the one negotiated remote address and set `AssociationConfig::peer_binding`, so the cookie covers the address; one association per call | 6347 §4.2.1 | RFC-007 (library part done; driver part open) |
+| Route first bytes 20-63 on the media socket to the association through a bounded queue instead of dropping them; keep servicing it after `Connected` (the server role answers a retransmitted client `Finished` for 240 s) and call `close()` at call end | 7983 §7; 5764 §5.1.2; 6347 §4.2.4 | POA&M-324, POA&M-325 |
+| No media before `Connected`; SRTP key direction from the negotiated role; every `Failed` / `Closed` event goes to the existing fail-closed path | 5764 §4.1, §4.2 | security review, Stage 2 requirements |
+| A genuine failure in the plaintext part of the handshake (alert, wrong message, bad certificate or signature) is reported up to one retransmission interval late, and the reported `FailureCause` is the first one remembered, which a spoofed datagram can set. `presented_fingerprint()` is the most recently presented certificate, also unauthenticated before the peer's `Finished`. Logs and audit records must not present either as proof of what the peer sent | 5246 §7.2.2 (deviation) | NIST POA&M-334; AU-2 / AU-3 obligation under POA&M-324 |
+| As DTLS client the handshake completes when the server sends no `CertificateRequest`; the client is then not authenticated to the server (`client_certificate_requested()` tells). The audit record must not claim mutual authentication unconditionally | 5246 §7.4.4 | security review |
+| `sha-256`-only peers stay refused; extended master secret is required; no MKI; no RFC 8844 | 8122 §5; 7627; 5764 §4.1.3; 8844 | deviations in `RFC_COMPLIANCE_GAPS.md`; POA&M-333 |
+| Toward our own SBC: its DTLS endpoint now accepts only this same profile and, as DTLS server, only a client that lists secp384r1 first in `supported_groups`. `DtlsAssociation` offers secp384r1 only. Not yet run end to end | 8422 §5.1.1 | NIST POA&M-336 |
+| Still open in the client and not touched: new association on a changed fingerprint or setup (POA&M-327), delayed offer (POA&M-329), STUN handoff and consent freshness (POA&M-325), separate RTCP association (POA&M-326) | 5763 §6.6, §6.4; 7675; 5761 | as listed |
+
 ## Verified compliant (spot checks)
 
 - CANCEL/200 glare ACK+BYE (§15) — fixed and tested this session.
@@ -121,4 +149,4 @@ the SBC, its Go DTLS sidecar or any other peer.
 3. ✅ **Registration robustness (#5, #11)** and **NAT (#6)** — small, high value.
 4. ✅ **RTP DTX timestamp + marker (#8, #9)** — small fixes in io_thread/rtp_handler.
 5. ✅ **RFC 3263 DNS (#4)** — resolved via `uc-dns` (NAPTR/SRV, `resolver` feature). Before fix/client-cnsa-tls-dns the resolver had no DNS backend, so NAPTR/SRV were never queried. It now uses the system DNS configuration, with RFC 2782 weighted SRV order. No DNSSEC (NIST POA&M-172).
-6. ✅ All findings of the 2026-06-11 audit are fixed or accepted as documented limitations (SRTP ROC across DTLS rekey, early-media start, ICE trickling). Later reviews added open items: see "fix/client-review-blockers" and "fix/client-srtp-b2" above (no DTLS handshake, so no audio on TLS calls, NIST POA&M-324).
+6. ✅ All findings of the 2026-06-11 audit are fixed or accepted as documented limitations (SRTP ROC across DTLS rekey, early-media start, ICE trickling). Later reviews added open items: see "fix/client-review-blockers" and "fix/client-srtp-b2" above (the client drives no DTLS handshake, so no audio on TLS calls, NIST POA&M-324; Stage 1 of feat/client-dtls-handshake added the handshake to `proto-dtls` as a library only).

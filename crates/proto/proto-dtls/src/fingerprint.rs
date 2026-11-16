@@ -156,11 +156,15 @@ impl CertificateFingerprint {
     ///
     /// Unlike [`Self::from_sdp`] this enforces the wire grammar on hostile
     /// input: the value is capped at [`MAX_SDP_FINGERPRINT_LEN`] bytes, the hash
-    /// name is matched case-insensitively and must be `sha-384` or `sha-512`
-    /// (CNSA 2.0; RFC 8122 §5 permits rejecting unsupported hash functions, so
-    /// `sha-1`, `sha-224`, `sha-256` and `md5` are refused), and the
-    /// fingerprint must be colon-separated pairs of hex digits with exactly the
-    /// algorithm's output length.
+    /// name is matched case-insensitively and must be `sha-384` or `sha-512`,
+    /// and the fingerprint must be colon-separated pairs of hex digits with
+    /// exactly the algorithm's output length.
+    ///
+    /// Refusing `sha-256` is a deliberate deviation from RFC 8122 §5, which
+    /// requires every endpoint to be able to verify `sha-256` fingerprints.
+    /// CNSA 2.0 policy does not allow SHA-256 here, so a peer that signals
+    /// only `sha-256` (or `sha-1`, `sha-224`, `md5`) cannot be authenticated
+    /// and the call fails closed.
     ///
     /// NIST 800-53 Rev5: SI-10 (input validation), SC-13 (CNSA 2.0 hashes only)
     ///
