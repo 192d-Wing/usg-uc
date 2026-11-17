@@ -34,16 +34,34 @@ pub enum CaTrust {
 ///
 /// TLS is a preconfigured rustls `ClientConfig` on the shared CNSA 2.0
 /// provider (TLS 1.3, AES-256-GCM, ML-KEM-1024 / P-384) rather than reqwest's
-/// built-in default provider.
+/// built-in default provider. Only `https` URLs are accepted and redirects
+/// are never followed, so a bearer token is only sent to the URL that was
+/// validated.
+///
+/// NIST 800-53 Rev5: SC-8 (https only), IA-5, AC-4 (no redirects).
 ///
 /// # Errors
 /// [`ProvisioningError::Http`] if the extra CA file cannot be read/parsed or
 /// the client fails to build.
 pub fn build_http_client(trust: &CaTrust) -> Result<reqwest::Client, ProvisioningError> {
+    build_http_client_with(trust, true)
+}
+
+/// Same as [`build_http_client`] with `https_only` selectable so the
+/// redirect policy can be exercised against a plaintext local listener in
+/// tests. [`build_http_client`] calls this with `https_only = true`.
+pub(crate) fn build_http_client_with(
+    trust: &CaTrust,
+    https_only: bool,
+) -> Result<reqwest::Client, ProvisioningError> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
-        .user_agent(concat!("usg-uc-softclient/", env!("CARGO_PKG_VERSION")));
+        .user_agent(concat!("usg-uc-softclient/", env!("CARGO_PKG_VERSION")))
+        .https_only(https_only)
+        // Every endpoint is validated before use; a 3xx surfaces as an error
+        // status instead of being followed to an unvalidated location.
+        .redirect(reqwest::redirect::Policy::none());
 
     match trust {
         CaTrust::System => {
@@ -158,6 +176,106 @@ mod tests {
     fn extra_pem_corrupt_cert_block_is_rejected() {
         let pem = b"-----BEGIN CERTIFICATE-----\n!!!not-base64!!!\n-----END CERTIFICATE-----\n";
         assert!(build_tls_config(Some(pem)).is_err());
+    }
+
+    /// Reads one HTTP request head (up to the blank line) and answers with
+    /// `response`, then closes.
+    async fn serve_once(listener: tokio::net::TcpListener, response: String) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let _ = sock.write_all(response.as_bytes()).await;
+        let _ = sock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn http_client_refuses_plain_http_without_connecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| unreachable!("bind: {e}"));
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|e| unreachable!("addr: {e}"))
+            .port();
+        let client =
+            build_http_client(&CaTrust::System).unwrap_or_else(|e| unreachable!("client: {e}"));
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get(format!("http://127.0.0.1:{port}/")).send(),
+        )
+        .await;
+        assert!(
+            matches!(res, Ok(Err(_))),
+            "plain-http request must fail fast: {res:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "no connection may be made for an http:// URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_client_does_not_follow_cross_host_redirect() {
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| unreachable!("bind: {e}"));
+        let origin_port = origin
+            .local_addr()
+            .unwrap_or_else(|e| unreachable!("addr: {e}"))
+            .port();
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| unreachable!("bind: {e}"));
+        let target_port = target
+            .local_addr()
+            .unwrap_or_else(|e| unreachable!("addr: {e}"))
+            .port();
+
+        let location = format!("http://localhost:{target_port}/v1/client-config");
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let server = tokio::spawn(serve_once(origin, response));
+
+        // Plaintext only so the redirect policy can be observed without a
+        // TLS fixture; production uses `https_only = true`.
+        let client = build_http_client_with(&CaTrust::System, false)
+            .unwrap_or_else(|e| unreachable!("client: {e}"));
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .get(format!("http://127.0.0.1:{origin_port}/v1/client-config"))
+                .bearer_auth("tok")
+                .send(),
+        )
+        .await
+        .unwrap_or_else(|_| unreachable!("request timed out"))
+        .unwrap_or_else(|e| unreachable!("request failed: {e}"));
+        assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
+        let _ = server.await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), target.accept())
+                .await
+                .is_err(),
+            "redirect to another host must not be followed"
+        );
+    }
+
+    #[test]
+    fn build_http_client_with_https_only_builds() {
+        assert!(build_http_client_with(&CaTrust::System, true).is_ok());
     }
 
     #[test]
