@@ -10,14 +10,16 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use proto_srtp::{SrtpKeyMaterial, SrtpProfile};
 use tokio::net::UdpSocket;
+use tracing::debug;
 
 use crate::dtls_sidecar::{
     Role, SidecarClient, SidecarError, SidecarEvent, SidecarReader, SidecarWriter,
 };
+use crate::srtp_relay::DtlsForwardBucket;
 
 /// RFC 5764 SRTP protection profile value for `SRTP_AEAD_AES_256_GCM` — the
 /// only profile the sidecar offers (CNSA 2.0).
@@ -51,6 +53,269 @@ pub struct HandshakeKeys {
     pub profile: u16,
     /// Exported SRTP keying material for `proto-srtp`.
     pub srtp_keys: Vec<u8>,
+    /// The source the handshake most likely completed with: the SDP address
+    /// once it has sent DTLS, otherwise the last source whose DTLS was
+    /// forwarded (the SDP address if none was). A hint only: DTLS does not
+    /// bind transport addresses and the sidecar does not report which
+    /// datagram completed the handshake. The terminate relay leg moves its
+    /// latch away from it on the first packet that authenticates under the
+    /// leg's SRTP key.
+    pub peer_addr: SocketAddr,
+    /// Every source whose DTLS the pump forwarded. Until the leg's first
+    /// authenticated SRTP/SRTCP packet, post-handshake DTLS (a retransmitted
+    /// final flight) is accepted from, and the sidecar's answer sent to,
+    /// each of them (see [`crate::srtp_relay::TerminateRelayLeg`]).
+    pub peers: HandshakePeers,
+}
+
+/// Per-handshake source counters of [`run_handshake_pump`], for the
+/// caller's log line (the pump itself has no call id). The caller owns them,
+/// so they survive a failed or timed-out handshake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HandshakeSourceStats {
+    /// DTLS-class datagrams that failed the record-header plausibility walk.
+    pub dropped_implausible: u64,
+    /// Plausible DTLS from a new same-IP port while the source set was full.
+    pub dropped_overflow: u64,
+    /// Plausible DTLS from a new port after the SDP address had spoken.
+    pub dropped_after_exact: u64,
+    /// Plausible DTLS from an accepted source over the forward rate limit.
+    pub dropped_rate_limited: u64,
+    /// Flight sends to one target that failed (the others were still sent).
+    pub send_failures: u64,
+    /// Non-SDP same-IP sources kept (at most [`MAX_HANDSHAKE_SOURCES`]).
+    pub sources: usize,
+}
+
+impl HandshakeSourceStats {
+    /// Whether anything was dropped or failed to send.
+    #[must_use]
+    pub const fn any_dropped(&self) -> bool {
+        self.dropped_implausible > 0
+            || self.dropped_overflow > 0
+            || self.dropped_after_exact > 0
+            || self.dropped_rate_limited > 0
+            || self.send_failures > 0
+    }
+}
+
+/// Most other same-IP ports the handshake pump accepts DTLS from.
+///
+/// New ports are accepted while the SDP address has not spoken (behind NAT
+/// the peer's source port is unknown). Filled in arrival order and never
+/// evicted, so a sender that arrives first cannot push the genuine peer out,
+/// and a flood cannot grow the set.
+pub const MAX_HANDSHAKE_SOURCES: usize = 4;
+
+/// The sources a handshake pump forwarded DTLS from: the SDP address (when it
+/// spoke) and up to [`MAX_HANDSHAKE_SOURCES`] other same-IP ports. Fixed size,
+/// no allocation.
+// NIST 800-53 Rev5: SC-5 (bounded), SC-7
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HandshakePeers {
+    addrs: [Option<SocketAddr>; MAX_HANDSHAKE_SOURCES + 1],
+}
+
+impl HandshakePeers {
+    /// A set of the given addresses; anything past the capacity is ignored.
+    #[must_use]
+    pub fn from_addrs(addrs: &[SocketAddr]) -> Self {
+        let mut set = Self::default();
+        for addr in addrs {
+            set.insert(*addr);
+        }
+        set
+    }
+
+    /// Adds `addr` if it is new and there is room.
+    fn insert(&mut self, addr: SocketAddr) {
+        if self.contains(addr) {
+            return;
+        }
+        if let Some(slot) = self.addrs.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(addr);
+        }
+    }
+
+    /// Whether `addr` is in the set.
+    #[must_use]
+    pub fn contains(&self, addr: SocketAddr) -> bool {
+        self.addrs.contains(&Some(addr))
+    }
+
+    /// The addresses, in the order they were added.
+    pub fn iter(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.addrs.iter().flatten().copied()
+    }
+}
+
+/// DTLS record header length (RFC 6347 §4.1): type(1) version(2) epoch(2)
+/// sequence(6) length(2).
+const DTLS_RECORD_HEADER_LEN: usize = 13;
+
+/// Record-header plausibility walk over one datagram (RFC 6347 §4.1): every
+/// record has a full 13-byte header, a content type in 20..=24
+/// (change_cipher_spec, alert, handshake, application_data, heartbeat),
+/// version DTLS 1.0 (`0xFEFF`) or 1.2 (`0xFEFD`), and a length that fits in
+/// what is left of the datagram; nothing trails the last record. Not
+/// authentication; it keeps a datagram that only has a DTLS-class first byte
+/// away from the sidecar. No allocation.
+///
+/// Content type 25 (`tls12_cid`, RFC 9146) has a longer header and is not
+/// negotiated by the sidecar. DTLS 1.3 unified headers (RFC 9147 §4, first
+/// byte `0b001xxxxx`) are rejected too, while the sidecar is pinned to
+/// DTLS 1.2.
+// NIST 800-53 Rev5: SI-10 (input validation before the sidecar parses it)
+#[must_use]
+fn is_plausible_dtls(datagram: &[u8]) -> bool {
+    let mut rest = datagram;
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some((header, body)) = rest.split_first_chunk::<DTLS_RECORD_HEADER_LEN>() else {
+            return false;
+        };
+        let [content_type, v_hi, v_lo, _, _, _, _, _, _, _, _, l_hi, l_lo] = *header;
+        if !(20..=24).contains(&content_type) {
+            return false;
+        }
+        if !matches!(u16::from_be_bytes([v_hi, v_lo]), 0xFEFF | 0xFEFD) {
+            return false;
+        }
+        let len = usize::from(u16::from_be_bytes([l_hi, l_lo]));
+        let Some(next) = body.get(len..) else {
+            return false;
+        };
+        rest = next;
+    }
+    true
+}
+
+/// Which same-IP sources the handshake pump forwards DTLS from and sends the
+/// sidecar's flights to. Fixed size; nothing is evicted. The counters live
+/// with the caller (`stats`), so a handshake that fails or times out still
+/// reports them.
+// NIST 800-53 Rev5: SC-7, SC-5
+// POAM: POA&M-344 -- a sender on the peer's IP that knows the media port and
+// fills every slot with plausible DTLS before the peer's first flight, while
+// the peer does not send from its SDP port, gets the peer's datagrams
+// dropped (`dropped_overflow`); one datagram spoofed from the SDP address
+// closes the set to new ports (`dropped_after_exact`) before a NAT'd peer's
+// first flight arrives; and a flood from an accepted source empties the
+// forward bucket (`dropped_rate_limited`). In each case the handshake times
+// out and the call ends (fail closed).
+#[derive(Debug)]
+struct HandshakeSources<'a> {
+    /// The SDP (signalled) address.
+    sdp: SocketAddr,
+    /// The SDP address has sent plausible DTLS.
+    exact_seen: bool,
+    /// Other same-IP ports, in arrival order.
+    others: [Option<SocketAddr>; MAX_HANDSHAKE_SOURCES],
+    /// The last source whose DTLS was forwarded.
+    last_src: Option<SocketAddr>,
+    /// Token bucket in front of the sidecar, shared by every source.
+    bucket: DtlsForwardBucket,
+    stats: &'a mut HandshakeSourceStats,
+}
+
+impl<'a> HandshakeSources<'a> {
+    fn new(sdp: SocketAddr, now: Instant, stats: &'a mut HandshakeSourceStats) -> Self {
+        *stats = HandshakeSourceStats::default();
+        Self {
+            sdp,
+            exact_seen: false,
+            others: [None; MAX_HANDSHAKE_SOURCES],
+            last_src: None,
+            bucket: DtlsForwardBucket::new(now),
+            stats,
+        }
+    }
+
+    /// Decides whether a datagram from `src` goes to the sidecar, recording
+    /// the source when it does.
+    fn admit(&mut self, src: SocketAddr, datagram: &[u8], now: Instant) -> bool {
+        // Wrong IP or not DTLS-class: no SRTP flows before the handshake, and
+        // these are not counted (they are not handshake candidates).
+        if src.ip() != self.sdp.ip() || !datagram.first().is_some_and(|b| is_dtls_record(*b)) {
+            return false;
+        }
+        if !is_plausible_dtls(datagram) {
+            self.stats.dropped_implausible += 1;
+            return false;
+        }
+        // The slot a new port would take; `None` for the SDP address and for
+        // a port already kept.
+        let new_slot = if src == self.sdp || self.others.contains(&Some(src)) {
+            None
+        } else if self.exact_seen {
+            // The signalled endpoint has spoken: no new ports. Ports kept
+            // before it spoke stay, so one datagram spoofed from the SDP
+            // address does not cut off a NAT'd peer already in the set.
+            self.stats.dropped_after_exact += 1;
+            return false;
+        } else if let Some(i) = self.others.iter().position(Option::is_none) {
+            Some(i)
+        } else {
+            self.stats.dropped_overflow += 1;
+            return false;
+        };
+        // NIST 800-53 Rev5: SC-5 -- the sidecar is shared by every call on
+        // the node. Charged after the cheap checks and before any state
+        // change, so a rate-limited datagram does not claim a slot.
+        if !self.bucket.try_take(now) {
+            self.stats.dropped_rate_limited += 1;
+            return false;
+        }
+        if src == self.sdp {
+            self.exact_seen = true;
+        }
+        if let Some(slot) = new_slot.and_then(|i| self.others.get_mut(i)) {
+            *slot = Some(src);
+            self.stats.sources += 1;
+        }
+        self.last_src = Some(src);
+        true
+    }
+
+    /// Where a sidecar flight goes: the SDP address and every kept source
+    /// (all on the peer's IP). A copy, so the counters can be updated while
+    /// sending.
+    fn flight_targets(&self) -> [Option<SocketAddr>; MAX_HANDSHAKE_SOURCES + 1] {
+        let mut targets = [None; MAX_HANDSHAKE_SOURCES + 1];
+        for (slot, addr) in targets
+            .iter_mut()
+            .zip(std::iter::once(Some(self.sdp)).chain(self.others.iter().copied()))
+        {
+            *slot = addr;
+        }
+        targets
+    }
+
+    /// The source to seed the media latch with (see [`HandshakeKeys::peer_addr`]).
+    const fn completed_from(&self) -> SocketAddr {
+        if self.exact_seen {
+            self.sdp
+        } else {
+            match self.last_src {
+                Some(src) => src,
+                None => self.sdp,
+            }
+        }
+    }
+
+    /// Every source whose DTLS was forwarded (see [`HandshakeKeys::peers`]).
+    fn peers(&self) -> HandshakePeers {
+        let mut set = HandshakePeers::default();
+        if self.exact_seen {
+            set.insert(self.sdp);
+        }
+        for src in self.others.iter().flatten() {
+            set.insert(*src);
+        }
+        set
+    }
 }
 
 /// Errors driving the media-side handshake pump.
@@ -81,13 +346,31 @@ const RECV_BUF: usize = 4096;
 /// Pumps DTLS handshake records between the media socket and the sidecar until
 /// the sidecar reports `Ready`, returning the exported SRTP keys.
 ///
-/// - Inbound DTLS records from the media socket are forwarded to the sidecar;
-///   non-DTLS packets (no SRTP flows before the handshake completes) are
-///   dropped.
-/// - The sidecar's outbound DTLS records are sent to the address the last DTLS
-///   record was received from (symmetric latching, so replies reach a peer
-///   behind NAT), falling back to `signaling_peer` before the first record —
-///   needed when the SBC is the DTLS client and sends the first flight.
+/// - Inbound datagrams are forwarded to the sidecar only when they come from
+///   the SDP peer's IP and pass the record-header plausibility walk
+///   (see `is_plausible_dtls`); non-DTLS packets (no SRTP flows before the
+///   handshake completes) are dropped.
+/// - The SDP address (`signaling_peer`) is always accepted. Until it has
+///   spoken, up to [`MAX_HANDSHAKE_SOURCES`] other ports on its IP are
+///   accepted too (a peer behind NAT), in arrival order and never evicted.
+///   Once it has spoken no new port is accepted; ports already kept stay.
+/// - Forwards to the sidecar pass a token bucket
+///   ([`crate::srtp_relay::DTLS_FORWARD_BURST`] /
+///   [`crate::srtp_relay::DTLS_FORWARD_PER_SECOND`]) shared by all sources.
+/// - The sidecar's outbound records go to the SDP address and to every kept
+///   source, so the genuine peer receives each flight whoever else spoke
+///   first (at most five sends per record, all to the peer's IP; RFC 6347
+///   §4.2.1 does not tie a flight to one transport address). A failed send
+///   to one target is counted and the others are still sent. The SDP address
+///   is the target before any record arrives, which the SBC needs as DTLS
+///   client to send the first flight.
+/// - No single datagram can redirect the pump. The returned
+///   [`HandshakeKeys::peer_addr`] is a hint for the media latch, which SRTP
+///   authentication then confirms or corrects.
+///
+/// `stats` is reset on entry and updated as datagrams arrive, so the caller
+/// still has the counters when the handshake fails or a timeout around this
+/// future fires.
 ///
 /// The caller should bound this with a timeout and own the socket's lifetime.
 ///
@@ -98,41 +381,40 @@ pub async fn run_handshake_pump(
     signaling_peer: SocketAddr,
     reader: &mut SidecarReader,
     writer: &mut SidecarWriter,
+    stats: &mut HandshakeSourceStats,
 ) -> Result<HandshakeKeys, DtlsRelayError> {
     let mut buf = [0u8; RECV_BUF];
-    // Where to send the sidecar's outbound records: the latched source of the
-    // peer's DTLS, or the signaling address until we've seen one.
-    let mut latched: Option<SocketAddr> = None;
+    // NIST 800-53 Rev5: SC-7, SI-10, SC-5 -- plausibility filter, exact SDP
+    // source first, bounded never-evicted source set, rate limit.
+    let mut sources = HandshakeSources::new(signaling_peer, Instant::now(), stats);
     loop {
         tokio::select! {
             // Media socket -> demux -> sidecar (inbound DTLS records).
             recv = media.recv_from(&mut buf) => {
                 let (n, src) = recv?;
-                // Source filter: before latching accept only the SDP peer's IP;
-                // after, only the exact latched source (symmetric). Without this
-                // an off-path attacker who knows the published media address could
-                // spray byte-20..63 datagrams to re-latch the outbound flight away
-                // from the real peer and stall the handshake (DoS). Mirrors the
-                // filter the terminate relay leg applies post-handshake.
-                let acceptable = latched.map_or_else(
-                    || src.ip() == signaling_peer.ip(),
-                    |latched_src| src == latched_src,
-                );
-                if n > 0 && acceptable && is_dtls_record(buf[0]) {
-                    latched = Some(src);
-                    writer.send_dtls(&buf[..n]).await?;
+                let datagram = buf.get(..n).unwrap_or_default();
+                if sources.admit(src, datagram, Instant::now()) {
+                    writer.send_dtls(datagram).await?;
                 }
-                // Non-DTLS or unexpected source: no SRTP flows before the
-                // handshake; drop.
             }
             // Sidecar -> media socket (outbound DTLS records) / Ready / Error.
             event = reader.read() => {
                 match event? {
                     SidecarEvent::Dtls(record) => {
-                        media.send_to(&record, latched.unwrap_or(signaling_peer)).await?;
+                        for dest in sources.flight_targets().into_iter().flatten() {
+                            if let Err(e) = media.send_to(&record, dest).await {
+                                sources.stats.send_failures += 1;
+                                debug!(error = %e, dest = %dest, "DTLS flight send failed; sending to the other targets");
+                            }
+                        }
                     }
                     SidecarEvent::Ready { profile, srtp_keys } => {
-                        return Ok(HandshakeKeys { profile, srtp_keys });
+                        return Ok(HandshakeKeys {
+                            profile,
+                            srtp_keys,
+                            peer_addr: sources.completed_from(),
+                            peers: sources.peers(),
+                        });
                     }
                     SidecarEvent::Error(msg) => {
                         return Err(DtlsRelayError::Sidecar(msg));
@@ -217,6 +499,12 @@ pub struct EstablishedLeg {
     pub reader: SidecarReader,
     /// Live write half of the sidecar session (post-handshake DTLS out).
     pub writer: SidecarWriter,
+    /// The source the handshake completed with, a hint for the media latch
+    /// (see [`HandshakeKeys::peer_addr`]).
+    pub peer_addr: SocketAddr,
+    /// The sources the handshake pump forwarded DTLS from (see
+    /// [`HandshakeKeys::peers`]).
+    pub handshake_peers: HandshakePeers,
 }
 
 /// Drives a full terminate-mode DTLS-SRTP handshake for one leg: connects to
@@ -226,7 +514,8 @@ pub struct EstablishedLeg {
 ///
 /// `signaling_peer` is the peer's SDP media address, used to send the first
 /// outbound flight before the peer's source is latched (see
-/// [`run_handshake_pump`]).
+/// [`run_handshake_pump`]). `stats` receives the pump's source counters,
+/// also when the handshake fails or times out.
 ///
 /// # Errors
 /// Sidecar connect/fingerprint failure, a handshake error, a negotiated
@@ -238,6 +527,7 @@ pub async fn establish_srtp_leg(
     own_fingerprint: &str,
     peer_fingerprint: &str,
     role: Role,
+    stats: &mut HandshakeSourceStats,
 ) -> Result<EstablishedLeg, DtlsRelayError> {
     let mut client = SidecarClient::connect(sidecar_socket, own_fingerprint).await?;
     client.start(role, peer_fingerprint).await?;
@@ -245,7 +535,7 @@ pub async fn establish_srtp_leg(
 
     let keys = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        run_handshake_pump(media, signaling_peer, &mut reader, &mut writer),
+        run_handshake_pump(media, signaling_peer, &mut reader, &mut writer, stats),
     )
     .await
     .map_err(|_| DtlsRelayError::Sidecar("DTLS handshake timed out".into()))??;
@@ -266,6 +556,8 @@ pub async fn establish_srtp_leg(
         inbound,
         reader,
         writer,
+        peer_addr: keys.peer_addr,
+        handshake_peers: keys.peers,
     })
 }
 
@@ -377,7 +669,7 @@ mod tests {
             assert_eq!(t, MSG_START);
             let (t, rec) = read_typed(&mut r).await; // forwarded peer DTLS record
             assert_eq!(t, MSG_DTLS);
-            assert_eq!(rec, &[22u8, 1, 2, 3]);
+            assert_eq!(rec, record(22, 1, b"hello"));
             write_typed(&mut w, MSG_DTLS, b"sidecar-record").await;
             let mut ready = vec![0u8, 8];
             ready.extend_from_slice(&[9u8; 88]);
@@ -389,12 +681,15 @@ mod tests {
         client.start(Role::Server, "sha-384 PEER").await.unwrap();
         let (mut reader, mut writer) = client.into_split();
 
-        // Peer sends a DTLS handshake record (first byte 22).
-        peer.send_to(&[22u8, 1, 2, 3], relay_addr).await.unwrap();
+        // Peer sends a DTLS handshake record (13-byte header, type 22).
+        peer.send_to(&record(22, 1, b"hello"), relay_addr)
+            .await
+            .unwrap();
 
+        let mut stats = HandshakeSourceStats::default();
         let keys = tokio::time::timeout(
             Duration::from_secs(5),
-            run_handshake_pump(&relay, peer_addr, &mut reader, &mut writer),
+            run_handshake_pump(&relay, peer_addr, &mut reader, &mut writer, &mut stats),
         )
         .await
         .expect("pump timed out")
@@ -402,6 +697,10 @@ mod tests {
 
         assert_eq!(keys.profile, 8);
         assert_eq!(keys.srtp_keys.len(), 88);
+        // The SDP address spoke: it is the handshake source, nothing dropped.
+        assert_eq!(keys.peer_addr, peer_addr);
+        assert_eq!(keys.peers, HandshakePeers::from_addrs(&[peer_addr]));
+        assert_eq!(stats, HandshakeSourceStats::default());
 
         // The sidecar's outbound record reached the peer.
         let mut buf = [0u8; 64];
@@ -450,8 +749,11 @@ mod tests {
             let _ = std::fs::remove_file(&sock2);
         });
 
-        peer.send_to(&[22u8, 9, 9], relay_addr).await.unwrap();
+        peer.send_to(&record(22, 9, &[9]), relay_addr)
+            .await
+            .unwrap();
 
+        let mut stats = HandshakeSourceStats::default();
         let leg = tokio::time::timeout(
             Duration::from_secs(5),
             establish_srtp_leg(
@@ -461,6 +763,7 @@ mod tests {
                 own_fp,
                 "sha-384 PEER",
                 Role::Server,
+                &mut stats,
             ),
         )
         .await
@@ -475,7 +778,431 @@ mod tests {
         assert_eq!(leg.inbound.master_salt(), [0x33u8; SRTP_MASTER_SALT_LEN]);
         // reader/writer are returned live (typed fields) rather than dropped at
         // key export — deferred finding #2.
+        assert_eq!(leg.peer_addr, peer_addr);
+        assert_eq!(
+            leg.handshake_peers,
+            HandshakePeers::from_addrs(&[peer_addr])
+        );
+        assert_eq!(stats, HandshakeSourceStats::default());
 
         sidecar.await.unwrap();
+    }
+
+    // ---- SR-12: handshake pump source handling ------------------------------
+    //
+    // No single datagram may redirect the pump. Inbound DTLS must pass a
+    // record-header plausibility walk; up to MAX_HANDSHAKE_SOURCES other
+    // same-IP ports are kept (never evicted) until the exact SDP source
+    // speaks, after which no new port is taken but kept ones stay; every
+    // sidecar flight goes to the SDP address and each kept source; forwards
+    // to the sidecar are rate-limited.
+
+    /// One DTLS 1.2 record: 13-byte header (RFC 6347 §4.1) + `body`.
+    fn record(content_type: u8, seq: u8, body: &[u8]) -> Vec<u8> {
+        let len = u16::try_from(body.len()).unwrap().to_be_bytes();
+        let mut r = vec![
+            content_type,
+            0xFE,
+            0xFD,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            seq,
+            len[0],
+            len[1],
+        ];
+        r.extend_from_slice(body);
+        r
+    }
+
+    /// Mock sidecar for one session: Hello, Start, then every DTLS record the
+    /// pump forwards up to and including `last`, then one outbound DTLS
+    /// record (`b"sidecar-flight"`) and `Ready`. With `last = None` it never
+    /// answers. Returns the client halves and a handle yielding the
+    /// forwarded records. Ends on a signal (the expected record), not on an
+    /// idle timer.
+    async fn mock_sidecar(
+        name: &str,
+        last: Option<Vec<u8>>,
+    ) -> (
+        SidecarReader,
+        SidecarWriter,
+        tokio::task::JoinHandle<Vec<Vec<u8>>>,
+    ) {
+        let path =
+            std::env::temp_dir().join(format!("usg-sr12-{name}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let fp = "sha-384 SIDECAR";
+        let path2 = path.clone();
+        let sidecar = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = stream.into_split();
+            write_typed(&mut w, MSG_HELLO, fp.as_bytes()).await;
+            let (t, _) = read_typed(&mut r).await;
+            assert_eq!(t, MSG_START);
+            let _ = std::fs::remove_file(&path2);
+            let mut forwarded = Vec::new();
+            let Some(last) = last else {
+                // Never answers; read until the client goes away.
+                while let Ok(Ok(_)) =
+                    tokio::time::timeout(Duration::from_secs(10), r.read_u8()).await
+                {
+                }
+                return forwarded;
+            };
+            loop {
+                let (t, rec) = tokio::time::timeout(Duration::from_secs(5), read_typed(&mut r))
+                    .await
+                    .expect("the expected last record never reached the sidecar");
+                assert_eq!(t, MSG_DTLS);
+                let done = rec == last;
+                forwarded.push(rec);
+                if done {
+                    break;
+                }
+            }
+            write_typed(&mut w, MSG_DTLS, b"sidecar-flight").await;
+            let mut ready = vec![0u8, 8];
+            ready.extend_from_slice(&[9u8; 88]);
+            write_typed(&mut w, MSG_READY, &ready).await;
+            // Keep the connection until the test is done reading.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            forwarded
+        });
+        let mut client = SidecarClient::connect(&path, fp).await.unwrap();
+        client.start(Role::Server, "sha-384 PEER").await.unwrap();
+        let (reader, writer) = client.into_split();
+        (reader, writer, sidecar)
+    }
+
+    /// Whether `sock` receives the sidecar's flight within `ms`. The flight
+    /// is sent before `Ready`, so by the time the pump has returned it is
+    /// already queued wherever it was sent.
+    async fn got_flight(sock: &UdpSocket, ms: u64) -> bool {
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(Duration::from_millis(ms), sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => &buf[..n] == b"sidecar-flight",
+            _ => false,
+        }
+    }
+
+    /// Runs the pump to `Ready` (5 s bound) and returns the keys and stats.
+    async fn pump(
+        relay: &UdpSocket,
+        sdp: SocketAddr,
+        reader: &mut SidecarReader,
+        writer: &mut SidecarWriter,
+    ) -> (HandshakeKeys, HandshakeSourceStats) {
+        let mut stats = HandshakeSourceStats::default();
+        let keys = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_handshake_pump(relay, sdp, reader, writer, &mut stats),
+        )
+        .await
+        .expect("pump timed out")
+        .expect("pump failed");
+        (keys, stats)
+    }
+
+    // A forged but plausible record from P2 does not pin the pump: the
+    // peer's record from P1 (neither is the SDP port) is forwarded too, the
+    // sidecar's flight reaches P1, P2 and the SDP address, and the handshake
+    // completes with P1 (the last source).
+    // NIST 800-53 Rev5: SC-7, SI-10, SC-5
+    #[tokio::test]
+    async fn pump_is_not_pinned_by_one_forged_datagram() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sdp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let p1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let p2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let forged = record(22, 1, b"forged");
+        let genuine = record(22, 1, b"client-hello");
+        let (mut reader, mut writer, sidecar) = mock_sidecar("pinned", Some(genuine.clone())).await;
+
+        p2.send_to(&forged, relay_addr).await.unwrap();
+        p1.send_to(&genuine, relay_addr).await.unwrap();
+
+        let (keys, stats) = pump(&relay, sdp.local_addr().unwrap(), &mut reader, &mut writer).await;
+        assert_eq!(keys.profile, 8);
+
+        let forwarded = sidecar.await.unwrap();
+        assert_eq!(
+            forwarded,
+            vec![forged, genuine],
+            "both same-IP sources must reach the sidecar"
+        );
+        assert!(got_flight(&p1, 2000).await, "flight did not reach P1");
+        assert!(got_flight(&p2, 2000).await, "flight did not reach P2");
+        assert!(
+            got_flight(&sdp, 2000).await,
+            "flight did not reach the SDP address"
+        );
+        let (p1, p2) = (p1.local_addr().unwrap(), p2.local_addr().unwrap());
+        assert_eq!(keys.peer_addr, p1);
+        assert_eq!(keys.peers, HandshakePeers::from_addrs(&[p2, p1]));
+        assert_eq!(stats.sources, 2);
+        assert!(!stats.any_dropped());
+    }
+
+    // SI-10 plausibility filter: a DTLS-class first byte is not enough. Too
+    // short for a header, a wrong version, a content type outside 20..=24
+    // (30, and 25 = tls12_cid), a DTLS 1.3 unified header, a length past the
+    // datagram, and a valid record followed by a truncated header are all
+    // dropped. A valid record and a datagram of two valid records are
+    // forwarded.
+    #[tokio::test]
+    async fn pump_drops_implausible_dtls() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+
+        let short = vec![22u8, 1, 2, 3];
+        let mut bad_version = record(22, 1, b"x");
+        bad_version[1] = 0x03;
+        bad_version[2] = 0x03;
+        let bad_type = record(30, 1, b"x");
+        let cid = record(25, 1, b"x");
+        // RFC 9147 §4: 001CSLEE, epoch bits, 16-bit sequence, 16-bit length.
+        let unified = vec![0x2Cu8, 0x00, 0x01, 0x00, 0x03, 1, 2, 3];
+        let mut overlong = record(22, 1, b"abc");
+        overlong[12] = 200;
+        let mut truncated_tail = record(22, 1, b"ok");
+        truncated_tail.extend_from_slice(&[22, 0xFE, 0xFD, 0]);
+        let valid = record(22, 2, b"client-hello");
+        let mut two = record(22, 3, b"first");
+        two.extend_from_slice(&record(20, 4, &[1]));
+        let (mut reader, mut writer, sidecar) =
+            mock_sidecar("implausible", Some(two.clone())).await;
+
+        for d in [
+            &short,
+            &bad_version,
+            &bad_type,
+            &cid,
+            &unified,
+            &overlong,
+            &truncated_tail,
+        ] {
+            peer.send_to(d, relay_addr).await.unwrap();
+        }
+        peer.send_to(&valid, relay_addr).await.unwrap();
+        peer.send_to(&two, relay_addr).await.unwrap();
+
+        let (keys, stats) =
+            pump(&relay, peer.local_addr().unwrap(), &mut reader, &mut writer).await;
+
+        let forwarded = sidecar.await.unwrap();
+        assert_eq!(
+            forwarded,
+            vec![valid, two],
+            "only plausible DTLS datagrams may reach the sidecar"
+        );
+        assert_eq!(stats.dropped_implausible, 7);
+        assert_eq!(keys.peer_addr, peer.local_addr().unwrap());
+    }
+
+    // Once the exact SDP source has spoken no new port is taken (P3 is
+    // dropped and gets no flight), but a port kept before it spoke (P2)
+    // stays: its later record is forwarded and it gets the flight, so one
+    // datagram spoofed from the SDP address cannot cut off a NAT'd peer
+    // already in the set.
+    #[tokio::test]
+    async fn pump_exact_source_closes_the_set_but_keeps_admitted_ports() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sdp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let p2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let p3 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+
+        let early = record(22, 1, b"other-first");
+        let genuine = record(22, 1, b"client-hello");
+        let late = record(22, 2, b"other-late");
+        let newcomer = record(22, 1, b"new-after-exact");
+        let last = record(22, 3, b"last");
+        let (mut reader, mut writer, sidecar) = mock_sidecar("exact", Some(last.clone())).await;
+        p2.send_to(&early, relay_addr).await.unwrap();
+        sdp.send_to(&genuine, relay_addr).await.unwrap();
+        p2.send_to(&late, relay_addr).await.unwrap();
+        p3.send_to(&newcomer, relay_addr).await.unwrap();
+        sdp.send_to(&last, relay_addr).await.unwrap();
+
+        let (keys, stats) = pump(&relay, sdp.local_addr().unwrap(), &mut reader, &mut writer).await;
+
+        let forwarded = sidecar.await.unwrap();
+        assert_eq!(
+            forwarded,
+            vec![early, genuine, late, last],
+            "the SDP source and the kept port are forwarded; a new port after the SDP source is not"
+        );
+        assert!(
+            got_flight(&sdp, 2000).await,
+            "flight did not reach the SDP address"
+        );
+        assert!(
+            got_flight(&p2, 2000).await,
+            "flight did not reach the kept P2"
+        );
+        assert!(
+            !got_flight(&p3, 200).await,
+            "flight sent to a port first heard after the SDP source spoke"
+        );
+        let (sdp, p2) = (sdp.local_addr().unwrap(), p2.local_addr().unwrap());
+        assert_eq!(keys.peer_addr, sdp);
+        assert_eq!(keys.peers, HandshakePeers::from_addrs(&[sdp, p2]));
+        assert_eq!(stats.dropped_after_exact, 1);
+        assert_eq!(stats.dropped_overflow, 0);
+    }
+
+    // While the SDP source is silent, at most four other same-IP ports are
+    // kept, in arrival order and never evicted: a fifth is dropped and gets
+    // no flight; the first four and the SDP address all get it.
+    #[tokio::test]
+    async fn pump_source_set_is_bounded_and_not_evicted() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sdp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let mut ports = Vec::new();
+        for _ in 0..5 {
+            ports.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        }
+        let last = record(22, 2, b"last-from-source-0");
+        let (mut reader, mut writer, sidecar) = mock_sidecar("bounded", Some(last.clone())).await;
+
+        let mut sent = Vec::new();
+        for (i, p) in ports.iter().enumerate() {
+            let rec = record(22, 1, format!("source-{i}").as_bytes());
+            p.send_to(&rec, relay_addr).await.unwrap();
+            sent.push(rec);
+        }
+        ports[0].send_to(&last, relay_addr).await.unwrap();
+
+        let (keys, stats) = pump(&relay, sdp.local_addr().unwrap(), &mut reader, &mut writer).await;
+
+        let forwarded = sidecar.await.unwrap();
+        let mut want = sent[..4].to_vec();
+        want.push(last);
+        assert_eq!(
+            forwarded, want,
+            "first four sources forwarded, fifth dropped"
+        );
+        for (i, p) in ports.iter().enumerate().take(4) {
+            assert!(got_flight(p, 2000).await, "flight did not reach source {i}");
+        }
+        assert!(
+            got_flight(&sdp, 2000).await,
+            "flight did not reach the SDP address"
+        );
+        assert!(
+            !got_flight(&ports[4], 200).await,
+            "flight sent to the dropped fifth source"
+        );
+        assert_eq!(keys.peer_addr, ports[0].local_addr().unwrap());
+        assert_eq!(stats.dropped_overflow, 1);
+        assert_eq!(stats.sources, MAX_HANDSHAKE_SOURCES);
+    }
+
+    // SC-5: forwards to the sidecar pass a token bucket shared by all
+    // sources (burst DTLS_FORWARD_BURST, then DTLS_FORWARD_PER_SECOND). A
+    // rate-limited datagram from a new port does not take a slot; once a
+    // token has refilled the same port is taken.
+    #[test]
+    fn handshake_sources_rate_limit_forwards() {
+        use crate::srtp_relay::{DTLS_FORWARD_BURST, DTLS_FORWARD_PER_SECOND};
+        let ip = std::net::Ipv4Addr::LOCALHOST;
+        let sdp = SocketAddr::from((ip, 5000));
+        let p1 = SocketAddr::from((ip, 5002));
+        let p2 = SocketAddr::from((ip, 5004));
+        let rec = record(22, 1, b"x");
+        let now = Instant::now();
+        let mut stats = HandshakeSourceStats::default();
+        {
+            let mut sources = HandshakeSources::new(sdp, now, &mut stats);
+            let burst = usize::try_from(DTLS_FORWARD_BURST).unwrap();
+            let admitted = (0..burst + 4)
+                .filter(|_| sources.admit(p1, &rec, now))
+                .count();
+            assert_eq!(admitted, burst, "burst forwarded, the rest dropped");
+            assert!(!sources.admit(p2, &rec, now), "over the limit");
+            assert!(sources.others[1].is_none(), "rate-limited port took a slot");
+            let refill = now + Duration::from_millis(1000 / u64::from(DTLS_FORWARD_PER_SECOND));
+            assert!(
+                sources.admit(p2, &rec, refill),
+                "a refilled token admits P2"
+            );
+            assert_eq!(sources.others[1], Some(p2));
+        }
+        assert_eq!(stats.dropped_rate_limited, 5);
+        assert_eq!(stats.sources, 2);
+    }
+
+    // The caller owns the counters, so a handshake that times out still
+    // reports what the pump dropped.
+    #[tokio::test]
+    async fn pump_stats_survive_a_timeout() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let (mut reader, mut writer, _sidecar) = mock_sidecar("timeout", None).await;
+        peer.send_to(&[22u8, 1, 2, 3], relay_addr).await.unwrap();
+        peer.send_to(&record(30, 1, b"x"), relay_addr)
+            .await
+            .unwrap();
+
+        let mut stats = HandshakeSourceStats::default();
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            run_handshake_pump(
+                &relay,
+                peer.local_addr().unwrap(),
+                &mut reader,
+                &mut writer,
+                &mut stats,
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "the mock sidecar never answers");
+        assert_eq!(stats.dropped_implausible, 2);
+        assert!(stats.any_dropped());
+    }
+
+    // SI-10: the plausibility walk never panics, and accepting a datagram
+    // means every record header and body lies inside it.
+    proptest::proptest! {
+        #[test]
+        fn plausibility_walk_never_panics(data in proptest::collection::vec(proptest::num::u8::ANY, 0..256)) {
+            if is_plausible_dtls(&data) {
+                let mut rest = &data[..];
+                while !rest.is_empty() {
+                    proptest::prop_assert!(rest.len() >= DTLS_RECORD_HEADER_LEN);
+                    proptest::prop_assert!((20..=24).contains(&rest[0]));
+                    let len = usize::from(u16::from_be_bytes([rest[11], rest[12]]));
+                    proptest::prop_assert!(rest.len() >= DTLS_RECORD_HEADER_LEN + len);
+                    rest = &rest[DTLS_RECORD_HEADER_LEN + len..];
+                }
+            }
+        }
+
+        #[test]
+        fn plausibility_walk_accepts_concatenated_records(
+            bodies in proptest::collection::vec(
+                (20u8..=24, proptest::collection::vec(proptest::num::u8::ANY, 0..64)),
+                1..6,
+            ),
+        ) {
+            let mut datagram = Vec::new();
+            for (seq, (content_type, body)) in bodies.iter().enumerate() {
+                datagram.extend_from_slice(&record(*content_type, u8::try_from(seq).unwrap(), body));
+            }
+            proptest::prop_assert!(is_plausible_dtls(&datagram));
+            // One byte short of the last record's body is rejected.
+            datagram.pop();
+            proptest::prop_assert!(!is_plausible_dtls(&datagram));
+        }
     }
 }
