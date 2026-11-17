@@ -715,13 +715,15 @@ rtp_port_min = 16384
 rtp_port_max = 32768
 
 [media.srtp]
-# Require SRTP encryption (CNSA 2.0: AEAD_AES_256_GCM is the only profile)
+# Require SRTP encryption (CNSA 2.0: AEAD_AES_256_GCM is the only profile).
+# Not enforced on call-leg SDP: cleartext RTP/AVP offers are still relayed.
 required = true
 profile = "AeadAes256Gcm"        # only value; the relay rejects any other profile
-# "Relay" passes DTLS-SRTP through end-to-end; "Terminate" has the SBC
-# terminate DTLS-SRTP on each leg (requires [media.dtls] sidecar_socket
-# and fingerprint_file — the daemon aborts at startup otherwise).
-mode = "Relay"
+# "Passthrough" (default) relays SRTP/DTLS opaquely, end to end; "Terminate"
+# has the SBC terminate DTLS-SRTP on each leg (requires [media.dtls]
+# sidecar_socket and fingerprint_file — the daemon aborts at startup
+# otherwise). Any other value fails to load. See "Call-leg SRTP keying (SDES)".
+mode = "Passthrough"
 
 [media.dtls]
 # Optional operator-provided DTLS identity; when unset the SBC generates a
@@ -893,6 +895,124 @@ by signalling only (NIST POA&M-335).
   shutdown. Nothing is logged for a normal call end.
 - `session: N datagram(s) ... dropped after the handshake`, once per
   session, when forged unprotected DTLS records were dropped.
+
+### Call-leg SRTP keying (SDES)
+
+The SBC checks the SRTP keying in every SDP body that crosses it: the
+initial INVITE offer, the callee's 18x/2xx answer (or offer, when the INVITE
+had no SDP), re-INVITE and UPDATE offers and answers, and PRACK and other
+in-dialog bodies it relays. There is no setting for this policy; it follows
+`media.srtp.mode`. Tested in local runs on macOS (2026-11-17).
+
+**Rules in `Passthrough` mode (the default).**
+
+- An SDES key (`a=crypto`, RFC 4568) carries the SRTP master key in clear
+  text inside the SDP. It crosses only when the hop it arrived on **and**
+  the hop it is sent on are both SIP over TLS. UDP, TCP and WS hops do not
+  count, whatever their network. When a key crosses on an initial INVITE,
+  failover for that call uses TLS trunks only.
+- Only `AEAD_AES_256_GCM` crosses (CNSA 2.0), with exactly one `inline:`
+  key of 44 octets (256-bit key and 96-bit salt), a tag of 1-9 digits, an
+  optional lifetime of at most 2^48 and an optional MKI (`value:length`,
+  length 1-128). Session parameters other than `KDR` (0-24), `WSH` (at
+  least 64) and `FEC_ORDER`, each at most once, make a line unacceptable;
+  this includes `FEC_KEY`, `UNENCRYPTED_SRTP`, `UNENCRYPTED_SRTCP`,
+  `UNAUTHENTICATED_SRTP` and `-` extension parameters.
+- **Offers are stripped, then refused if nothing is left.** Unacceptable
+  `a=crypto` lines are removed from an offer. When a section has no
+  acceptable line left, the whole offer is refused with 488; streams are
+  not declined one by one.
+- **Answers are never stripped.** An answer must carry exactly one
+  acceptable `a=crypto` line on each active SDES section, else it is
+  refused.
+- `a=crypto` on a DTLS m-line (`UDP/TLS/RTP/SAVP(F)`,
+  `TCP/DTLS/RTP/SAVP(F)`, `TCP/TLS/RTP/SAVP(F)`) or on a declined (port 0)
+  section is always removed. Session-level `a=crypto` is removed from
+  offers and refused in answers.
+- MIKEY (`a=key-mgmt`, RFC 4567) is not supported: removed from offers,
+  refused in answers and refused when it is the only keying of a section.
+- Cleartext `RTP/AVP` is not refused by this policy, and
+  `media.srtp.required` is not enforced on call-leg SDP.
+- In passthrough the endpoints negotiate DTLS-SRTP end to end; the SBC does
+  not check the profile they agree on.
+
+**Rules in `Terminate` mode.** The SBC keys each leg with DTLS-SRTP, so
+every `a=crypto` line is removed, from answers too. A section left with no
+DTLS keying is refused.
+
+**Bodies the SBC does not parse.** In-dialog bodies relayed opaquely
+(PRACK, INFO, MESSAGE, NOTIFY and their responses) are refused when they
+have a `Content-Encoding` other than `identity`, when they are `multipart/*`
+and contain an `application/sdp` or a nested multipart part, or when they
+are not `application/sdp` and contain `a=crypto` or `a=key-mgmt`. INVITE,
+re-INVITE, UPDATE, 18x and 2xx bodies are checked whole, whatever their
+`Content-Type`. A body with a NUL, a bare CR, invalid UTF-8 or an m-line
+that does not parse is refused as malformed.
+
+**What a refusal does.**
+
+| Refused body | Result |
+| ------------ | ------ |
+| Initial INVITE offer | 488 to the caller; nothing is sent to a trunk; CDR `PolicyDenied`, 488 |
+| 183 answer | CANCEL to the callee, 488 to the caller |
+| 2xx to the initial INVITE | ACK and BYE to the callee, 488 to the caller (who never sees the 2xx); no media relay is started. A retransmitted 2xx is re-ACKed only. When the 2xx carried an offer, the ACK carries an answer that declines every stream |
+| re-INVITE, UPDATE or relayed in-dialog request | 488 to the sender; the request is not forwarded and the session stays as it was |
+| 2xx to a re-INVITE or UPDATE on an answered call | ACK (re-INVITE), 488 to the offerer, BYE on both legs |
+| 2xx to an UPDATE before the call is answered | 488 to the UPDATE, CANCEL to the callee, 488 on the caller's INVITE |
+| Response to a relayed request (PRACK 200 and the like) | 488 to the originator; the call ends (BYE on both legs once answered, else CANCEL and 488) |
+
+A refused answer that ends the call writes a CDR with disposition `Failed`,
+release cause `PolicyDenied`, release side `Sbc` and status 488, also when
+the call had been answered. A re-INVITE whose 2xx was refused is not
+re-ACKed if the 2xx is retransmitted (POA&M-350).
+
+**`Warning` header.** Each 488 carries `Warning: <code> <host> "<text>"`
+(RFC 3261 §20.43). `<host>` is `general.instance_name` for an initial
+INVITE and the SBC's local address on that leg otherwise. When topology
+hiding applies toward the leg, the SBC removes `Warning` (see "Topology
+Hiding"), so the peer sees a 488 without it.
+
+| Audit label | Code | Text |
+| ----------- | ---- | ---- |
+| `malformed_sdp` | 399 | `Malformed session description` |
+| `no_acceptable_crypto_suite` | 306 | `No acceptable SRTP keying` |
+| `sdes_over_insecure_signalling` | 399 | `SDES keying requires TLS on every hop` |
+| `sdes_not_terminable` | 399 | `SDES keying cannot be terminated` |
+| `unsupported_key_management` | 306 | `Key management method not supported` |
+| `sdp_in_multipart` | 399 | `SDP in a multipart body is not relayed` |
+| `unpoliced_body` | 399 | `Encoded or non-SDP keying body is not relayed` |
+
+**Audit and logs.** With `logging.audit_enabled`, each refusal is an
+`AuthorizationDecision` with `granted = false` and policy
+`media_security:<label>`; the action is the SIP method, or `answer` for a
+response. A refusal that ends a call also records `CallTerminated` with
+reason `PolicyTerminated`. Refused offers, 183 answers and initial 2xx
+answers are also logged at `warn` with the Call-ID and label. No log line, audit record or `Warning` carries SDP, key
+material or fingerprints. An offer the SBC rewrote is logged only at
+`debug`, with counts of removed lines. There are no metrics for this policy
+and refusals are not aggregated per source (POA&M-347).
+
+**Limits.** The TLS check covers the two hops the SBC terminates, not hops
+beyond its peers (POA&M-348). When the callee's 2xx to an INVITE without SDP
+carries an offer and is accepted, the SBC ACKs it without an answer
+(POA&M-349, pre-existing).
+
+**Upgrading (behaviour change).** Calls that worked before may now be
+refused or changed:
+
+- SDES keys to or from a UDP or TCP hop: before, `a=crypto` crossed
+  unread. Now the call or re-INVITE is refused with 488 `Warning: 399`.
+  Use SIP over TLS on both sides, or DTLS-SRTP.
+- `AES_CM_128_HMAC_SHA1_80` / `_32`, `AES_256_CM_*` and other non-GCM
+  suites: removed from offers; an offer or answer with only those suites
+  gets 488 `Warning: 306`.
+- `a=crypto` lines with more than one `inline:` key, or with `FEC_KEY`,
+  `UNENCRYPTED_*`, `UNAUTHENTICATED_SRTP` or unknown session parameters:
+  removed from offers, refused in answers.
+- Relayed in-dialog bodies that are compressed (`Content-Encoding`),
+  `multipart/*` with SDP, or non-SDP bodies with `a=crypto` / `a=key-mgmt`:
+  refused with 488 `Warning: 399`; a refused response ends the call.
+- `a=key-mgmt` (MIKEY) is no longer relayed.
 
 ### T.38 fax relay (`[media.t38]`)
 

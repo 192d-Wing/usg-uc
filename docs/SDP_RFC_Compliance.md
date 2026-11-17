@@ -221,17 +221,27 @@ The client implements SDP for audio-only calls in two modes: plain RTP (`RTP/AVP
 
 ## Additional Related RFCs
 
-### RFC 4568 - SDP Security Descriptions ❌ NOT IMPLEMENTED for call legs (by design)
+### RFC 4568 - SDP Security Descriptions ⚠️ POLICED on call legs (SBC); not generated or consumed
 
-**Status**: Not implemented for call legs (using DTLS-SRTP instead). Used only on the SIPREC recording session, see below.
+**Status**: The SBC does not generate or consume SDES keys on call legs (it uses DTLS-SRTP when it keys media itself). Since fix/sdes-key-policy (local macOS run, 2026-11-17) it polices the `a=crypto` lines that cross it; see "Call-leg SDES policy (sbc-daemon)" below. SDES is generated only on the SIPREC recording session.
 **Priority**: LOW
 **Link**: <https://datatracker.ietf.org/doc/html/rfc4568>
 
-**Decision**: Not implementing `a=crypto` (SDES) as we use DTLS-SRTP which is more secure. SDES sends keying material in the signaling path which is a known security concern.
+**Decision**: The SBC does not terminate SDES (`a=crypto`); DTLS-SRTP is used where the SBC keys media. SDES sends keying material in the signaling path, so a relayed SDES key is allowed only between TLS hops and only for `AEAD_AES_256_GCM`.
 
 ---
 
-**Exception (SIPREC recording session, 2026-11-09)**: the recording session toward the recorder (SRS) offers SDES, because that is what recorders accept. The offer is built by `uc-siprec` `build_rs_offer` and sent only over the recorder TLS 1.3 connection (RFC 4568 §8.3). Call legs are unchanged: `a=crypto` on a call leg is passed through, never generated or consumed by the SBC, and such a call is not recordable.
+**Exception (SIPREC recording session, 2026-11-09)**: the recording session toward the recorder (SRS) offers SDES, because that is what recorders accept. The offer is built by `uc-siprec` `build_rs_offer` and sent only over the recorder TLS 1.3 connection (RFC 4568 §8.3). On call legs `a=crypto` is never generated or consumed by the SBC, and a call keyed by SDES is not recordable.
+
+**Call-leg SDES policy (sbc-daemon, fix/sdes-key-policy; local macOS run, 2026-11-17)**: `proto-b2bua/src/media_policy.rs` `apply_media_security`, called from `sbc-daemon/src/sip_stack/media_security.rs` for every SDP body that crosses the B2BUA.
+
+- §8 / §8.3: an `a=crypto` key on an active non-DTLS section crosses only when both signalling hops are SIP over TLS; otherwise 488 `Warning: 399`. The check is hop by hop (NIST POA&M-348).
+- §5.1 / §7.1.2: offers keep only acceptable lines (`AEAD_AES_256_GCM`, RFC 7714 §14.1; one 44-octet `inline:` key; tag 1-9 digits); an answer must carry exactly one acceptable line per active SDES section. Stricter than RFC 4568: suites other than `AEAD_AES_256_GCM` are never relayed (CNSA 2.0), and answer tags are not cross-checked against the offer.
+- §6.3: session parameters are an allow-list (`KDR` 0-24, `WSH` at least 64, `FEC_ORDER`); `FEC_KEY`, `UNENCRYPTED_SRTP`, `UNENCRYPTED_SRTCP`, `UNAUTHENTICATED_SRTP`, extensions and unknown parameters make a line unacceptable. Lifetime at most 2^48; MKI length 1-128 (§9.2).
+- §9.1: session-level `a=crypto` is stripped from offers and refused in answers. `a=crypto` on declined (port 0) sections and on DTLS m-lines is stripped.
+- A section with no acceptable line refuses the whole offer (488 `Warning: 306`); streams are not declined one by one.
+- RFC 4567 (`a=key-mgmt`, MIKEY): not supported; stripped from offers, refused in answers and when it is the only keying.
+- Tests: `crates/proto/proto-b2bua/tests/media_policy_tests.rs`, `crates/sbc/sbc-daemon/src/sip_stack/tests/media_security.rs`. Operator behaviour: `docs/SBC-ADMIN-GUIDE.md` "Call-leg SRTP keying (SDES)".
 
 ### RFC 7866 / RFC 4574 - SDP on the SIPREC recording session ⚠️ PARTIAL
 
@@ -482,14 +492,15 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 | RFC | Title | Status | Compliance % |
 |-----|-------|--------|--------------|
 | RFC 8866 | SDP: Session Description Protocol | ✅ Compliant | 100% |
-| RFC 3264 | Offer/Answer Model with SDP | ⚠️ Partial (answer from template, RFC-006; delayed offer rejected, POA&M-329) | n/a |
+| RFC 3264 | Offer/Answer Model with SDP | ⚠️ Partial (answer from template, RFC-006; delayed offer rejected, POA&M-329; SBC ACKs a 2xx that carries an offer without an answer, POA&M-349) | n/a |
 | RFC 4733 | RTP Payload for DTMF | ⚠️ Partial (SBC negotiation not wired, POA&M-142) | n/a |
 | RFC 3550 | RTP Transport Protocol | ✅ Compliant | 98% |
 | RFC 5245 | ICE | ⚠️ Partial (external lib) | 70% |
 | RFC 8122 | DTLS in SDP | ⚠️ Partial (sha-384/512 only; peer certificate verified against the fingerprint since 2026-11-17, local test runs and CI; no new association on a changed fingerprint, POA&M-327; no RFC 8844, POA&M-333) | n/a |
 | RFC 5763 / 4145 / 5761 | DTLS-SRTP setup role, rtcp-mux | ⚠️ Partial (role drives the handshake since 2026-11-17; handshake starts at 200 / ACK, POA&M-331; no new association on re-INVITE, POA&M-327; delayed offer rejected, POA&M-329) | n/a |
 | RFC 7587 | RTP Payload for Opus | ⚠️ Partial (POA&M-141, POA&M-142) | n/a |
-| RFC 4568 | SDP Security Descriptions | ❌ Not implemented for call legs (by design); used on the SIPREC recording session only | n/a |
+| RFC 4568 | SDP Security Descriptions | ⚠️ Call legs: policed by the SBC (TLS hops only, `AEAD_AES_256_GCM` only; hop by hop, POA&M-348), not generated or consumed; SIPREC recording session: generated | n/a |
+| RFC 4567 | Key Management Extensions for SDP (`a=key-mgmt`) | ❌ Not supported; stripped from offers, refused in answers (SBC) | n/a |
 | RFC 7866 | SIPREC SDP (`a=label`, `a=recordpref`, `a=record`) | ⚠️ Partial (no `a=record`, POA&M-303) | n/a |
 
 **Overall Compliance**: no single figure is given since 2026-11-15. The earlier "~98%" predates the fix/client-srtp-b2 review, which found that the DTLS-SRTP path carried no secured media; see the status correction at the top. Since 2026-11-17 the DTLS-SRTP path carries secured media (local test runs and CI).
