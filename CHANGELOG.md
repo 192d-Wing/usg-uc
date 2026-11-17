@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (soft client, smart-card login and provisioning trust, POA&M-370, 371)
+
+Tested locally on macOS arm64; Windows covered by the CI cross-target build only.
+
+- **Soft client: mTLS accounts need a usable client key.** (IA-2, IA-3,
+  IA-5(2)) An mTLS account registers only when a P-384 client key that
+  matches the certificate's leaf is installed. The check runs on the first
+  REGISTER, on refresh and on every outbound REGISTER. A certificate chain
+  without a key no longer connects without client authentication.
+- **Smart-card login is not available.** (IA-2(2), IA-2(12)) No platform has
+  a card-backed TLS signer yet (POA&M-371). The PIN, signature and
+  certificate stubs that accepted any PIN off Windows are test-only now;
+  off Windows the card operations return "not supported". Shipped
+  registration uses OIDC bearer tokens.
+- **Soft client provisioning: discovery is bound to the service domain.**
+  (SC-23, IA-5, AC-4) The pinned IdP issuer only applies to its own service
+  domain. OIDC endpoints, the client-config endpoint and the provisioned
+  registrar and SIP URIs must sit in the service domain's trust scope.
+  HTTPS only, redirects are not followed, and response bodies are capped.
+  The trust scope uses a built-in suffix list, not the full Public Suffix
+  List (POA&M-370).
+
 ### BREAKING (SBC, DTLS-SRTP sidecar keeps the association for the whole call, POA&M-335, 340, 341, 342)
 
 Affects only SBCs that terminate DTLS-SRTP (`sbcDaemon.dtlsTerminate.enabled`,
