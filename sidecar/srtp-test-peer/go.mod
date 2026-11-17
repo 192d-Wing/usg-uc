@@ -13,7 +13,7 @@ require (
 	github.com/pion/srtp/v3 v3.0.12
 )
 
-require github.com/pion/rtcp v1.2.16
+require github.com/pion/rtcp v1.2.20
 
 require (
 	github.com/pion/logging v0.2.4 // indirect
