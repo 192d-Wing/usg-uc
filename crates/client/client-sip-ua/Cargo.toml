@@ -42,8 +42,10 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 
 # `sendto(MSG_DONTWAIT)` for the DTLS driver's sends after the media socket
 # was handed to the audio thread (no blocking call on a runtime worker).
+# socket2 and libc (not nix: its `net` feature does not build for iOS).
 [target.'cfg(unix)'.dependencies]
-nix.workspace = true
+socket2.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

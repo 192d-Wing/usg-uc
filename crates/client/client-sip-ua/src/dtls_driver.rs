@@ -1407,16 +1407,8 @@ fn send_nonblocking(
     datagram: &[u8],
     remote: SocketAddr,
 ) -> std::io::Result<usize> {
-    use nix::sys::socket::{MsgFlags, SockaddrStorage, sendto};
-    use std::os::fd::AsRawFd;
     // `MSG_DONTWAIT` applies to this one call only.
-    sendto(
-        socket.as_raw_fd(),
-        datagram,
-        &SockaddrStorage::from(remote),
-        MsgFlags::MSG_DONTWAIT,
-    )
-    .map_err(std::io::Error::from)
+    socket2::SockRef::from(socket).send_to_with_flags(datagram, &remote.into(), libc::MSG_DONTWAIT)
 }
 
 /// On targets without `MSG_DONTWAIT` the send is a plain one: a UDP send
