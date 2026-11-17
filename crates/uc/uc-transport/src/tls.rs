@@ -28,7 +28,7 @@
 
 use crate::error::{TransportError, TransportResult};
 use crate::listener::ListenerConfig;
-use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
+use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport, canonical_peer};
 use bytes::BytesMut;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, ServerConfig};
@@ -548,9 +548,10 @@ impl TlsTransport {
             reason: format!("failed to get local address: {e}"),
         })?;
 
-        let peer_addr = io.peer_addr().map_err(|e| TransportError::Io {
+        // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 - IPv4-mapped peers reported as plain IPv4.
+        let peer_addr = canonical_peer(io.peer_addr().map_err(|e| TransportError::Io {
             reason: format!("failed to get peer address: {e}"),
-        })?;
+        })?);
 
         debug!(
             local = %local_addr,
@@ -896,6 +897,8 @@ impl TlsListener {
                     reason: format!("accept failed: {e}"),
                 })?;
 
+        // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 - IPv4-mapped peers reported as plain IPv4.
+        let peer_addr = canonical_peer(peer_addr);
         debug!(peer = %peer_addr, "accepted TCP connection, starting TLS handshake");
 
         let tls_stream = self.acceptor.accept(tcp_stream).await.map_err(|e| {
@@ -934,6 +937,8 @@ impl TlsListener {
                     reason: format!("accept failed: {e}"),
                 })?;
 
+        // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 - IPv4-mapped peers reported as plain IPv4.
+        let peer_addr = canonical_peer(peer_addr);
         debug!(peer = %peer_addr, "accepted TCP connection for TLS (handshake deferred)");
         Ok((tcp_stream, peer_addr.into()))
     }
@@ -1426,5 +1431,101 @@ mod tests {
             let p = write_key(d.path(), "junk.pem", "not a key", 0o600);
             assert!(load_private_key(&p).is_err());
         }
+    }
+
+    // ---- Dual-stack peer canonicalisation ----
+    // NIST 800-53 Rev5: SC-7, SI-10
+    // An IPv4 client on a dual-stack `[::]` listener is reported with its
+    // plain IPv4 address (not `::ffff:a.b.c.d`).
+
+    /// Binds a TLS listener on `[::]:0`; `None` when the host has no IPv6.
+    async fn dual_stack_listener(pki: &Pki) -> Option<TlsListener> {
+        let server = create_server_config(pki.chain.clone(), pki.key.clone_key()).unwrap();
+        let cfg = ListenerConfig::new(
+            SbcSocketAddr::new_v6(std::net::Ipv6Addr::UNSPECIFIED, 0),
+            TransportType::Tls,
+        );
+        match TlsListener::bind(cfg, Arc::new(server)).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                crate::skip_dual_stack(&format!("cannot bind [::]:0 ({e})"));
+                None
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_dual_stack_accept_tcp_reports_plain_ipv4_peer() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let pki = pki();
+        let Some(listener) = dual_stack_listener(&pki).await else {
+            return;
+        };
+        let port = listener.local_addr().port();
+        let accept = tokio::spawn(async move { listener.accept_tcp().await });
+        let connect = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+        )
+        .await;
+        let Ok(Ok(_client)) = connect else {
+            crate::skip_dual_stack("127.0.0.1 cannot reach a [::] listener (no dual-stack)");
+            accept.abort();
+            return;
+        };
+        let (_stream, peer) = accept.await.unwrap().unwrap();
+        assert!(
+            peer.is_ipv4(),
+            "accept_tcp peer must be plain IPv4, got {peer}"
+        );
+        assert_eq!(peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[tokio::test]
+    async fn tls_dual_stack_accept_reports_plain_ipv4_peer() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let pki = pki();
+        let Some(listener) = dual_stack_listener(&pki).await else {
+            return;
+        };
+        let port = listener.local_addr().port();
+        let accept = tokio::spawn(async move { listener.accept().await });
+        // Probe dual-stack reachability with the real client; a refused
+        // connection means the host maps no IPv4 onto `[::]`.
+        let client_cfg = Arc::new(create_client_config(roots(&pki)).unwrap());
+        let v4 = SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, port);
+        let connect = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TlsTransport::connect(v4, "localhost", client_cfg),
+        )
+        .await;
+        let client = match connect {
+            Ok(Ok(c)) => c,
+            Ok(Err(TransportError::ConnectFailed { reason, .. })) => {
+                crate::skip_dual_stack(&format!(
+                    "127.0.0.1 cannot reach a [::] listener ({reason})"
+                ));
+                accept.abort();
+                return;
+            }
+            other => other
+                .expect("TLS connect timed out")
+                .expect("TLS connect failed"),
+        };
+        let (server, peer) = accept.await.unwrap().unwrap();
+        assert!(peer.is_ipv4(), "accept peer must be plain IPv4, got {peer}");
+        assert_eq!(peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let transport_peer = *server.peer_addr();
+        assert!(
+            transport_peer.is_ipv4(),
+            "transport peer_addr must be plain IPv4, got {transport_peer}"
+        );
+        client.send(b"x", &v4).await.unwrap();
+        let msg = server.recv().await.unwrap();
+        assert!(
+            msg.source.is_ipv4(),
+            "received message source must be plain IPv4, got {}",
+            msg.source
+        );
     }
 }
