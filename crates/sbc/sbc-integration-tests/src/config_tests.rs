@@ -533,32 +533,39 @@ fn qa_helm_rendered_sbc_config_validates() {
             out.contains("listen_addr = \"0.0.0.0:9091\"") && out.contains("require_mtls = true"),
             "rendered [grpc] (if-bodies={keep_if_bodies}):\n{out}"
         );
-        match load_from_str(&out) {
-            Ok(cfg) => {
-                assert!(
-                    keep_if_bodies,
-                    "require_mtls without TLS paths must not load:\n{out}"
-                );
-                assert_eq!(cfg.media.default_mode, MediaMode::Relay);
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                // Without the if-bodies the [grpc] TLS paths are absent, so
-                // the only acceptable failure is the require_mtls check.
-                // With them rendered, cert files do not exist on the test
-                // host; only TLS-file failures are tolerated.
-                let tolerated = if keep_if_bodies {
-                    !msg.contains("media.")
-                        && !msg.contains("max_registrations")
-                        && !msg.contains("grpc.listen_addr")
-                } else {
-                    msg.contains("require_mtls")
-                };
-                assert!(
-                    tolerated,
-                    "helm config (if-bodies={keep_if_bodies}) failed: {msg}\n{out}"
-                );
-            }
+        check_rendered_sbc_config_load(&out, keep_if_bodies);
+    }
+}
+
+/// Loads one rendering of the `sbc.config` helper and checks the outcome:
+/// without the if-bodies only the `require_mtls` check may fail; with them
+/// only missing TLS files on the test host are tolerated.
+fn check_rendered_sbc_config_load(out: &str, keep_if_bodies: bool) {
+    match load_from_str(out) {
+        Ok(cfg) => {
+            assert!(
+                keep_if_bodies,
+                "require_mtls without TLS paths must not load:\n{out}"
+            );
+            assert_eq!(cfg.media.default_mode, MediaMode::Relay);
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            // Without the if-bodies the [grpc] TLS paths are absent, so
+            // the only acceptable failure is the require_mtls check.
+            // With them rendered, cert files do not exist on the test
+            // host; only TLS-file failures are tolerated.
+            let tolerated = if keep_if_bodies {
+                !msg.contains("media.")
+                    && !msg.contains("max_registrations")
+                    && !msg.contains("grpc.listen_addr")
+            } else {
+                msg.contains("require_mtls")
+            };
+            assert!(
+                tolerated,
+                "helm config (if-bodies={keep_if_bodies}) failed: {msg}\n{out}"
+            );
         }
     }
 }

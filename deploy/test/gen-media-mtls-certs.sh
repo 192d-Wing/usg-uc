@@ -29,7 +29,8 @@ done
 rm -f -- "${files[@]}"
 
 key() {
-  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "$1"
+  local key_file=$1
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "$key_file"
 }
 
 # Test CA.
