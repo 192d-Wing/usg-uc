@@ -4057,6 +4057,52 @@ mod tests {
         }
     }
 
+    // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4
+    /// An IPv4 client on a dual-stack `[::]` TCP listener reaches the
+    /// daemon's flow table as plain IPv4, the form trunk, blocklist and
+    /// CDR lookups compare against. Skips without dual-stack unless
+    /// `UC_REQUIRE_DUAL_STACK=1`.
+    #[tokio::test]
+    async fn dual_stack_tcp_accept_registers_plain_ipv4_peer() {
+        use uc_types::address::TransportType as T;
+        let required = std::env::var("UC_REQUIRE_DUAL_STACK").as_deref() == Ok("1");
+        let skip = |why: &str| {
+            assert!(!required, "UC_REQUIRE_DUAL_STACK=1 but {why}");
+            eprintln!("skipping: {why}");
+        };
+        let Ok(listener) = TcpListener::bind(SbcSocketAddr::new_v6(Ipv6Addr::UNSPECIFIED, 0)).await
+        else {
+            return skip("cannot bind [::]:0 (no IPv6)");
+        };
+        let port = listener.local_addr().port();
+        let ctx = stream_test_ctx(short_timeouts());
+        let flows = Arc::clone(&ctx.flows);
+        let accept = tokio::spawn(Server::tcp_accept_loop(Arc::new(listener), ctx));
+        let Ok(mut client) = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await
+        else {
+            accept.abort();
+            return skip("127.0.0.1 cannot reach a [::] listener (no dual-stack)");
+        };
+        let local = client.local_addr().unwrap();
+        let peer = SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, local.port());
+        let flow = LegFlow::inbound(T::Tcp);
+        let mut sent = false;
+        for _ in 0..200 {
+            if flows.send(&flow, &peer, b"ping", None).await.is_ok() {
+                sent = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(sent, "accepted flow not registered under plain-IPv4 peer");
+        let mut buf = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+        accept.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn crlf_only_connection_closed_at_first_message_timeout() {
         let (tx, fake, task) = spawn_stream(stream_test_ctx(short_timeouts()));

@@ -53,7 +53,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --package sbc-provision-server \
     && cp target/release/sbc-provision-server /tmp/sbc-provision-server
 
-FROM alpine:3.21 AS runtime
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
 
 RUN apk add --no-cache ca-certificates libcap \
     && addgroup -g 1000 sbc \

@@ -234,7 +234,7 @@ impl Transport for UdpTransport {
             // (::ffff:a.b.c.d). Canonicalize so SIP-layer consumers (Via
             // `received=`, trunk-peer matching, registration bindings) see
             // the same plain-IPv4 addresses they would from a v4 socket.
-            let source = SocketAddr::new(source.ip().to_canonical(), source.port());
+            let source = crate::canonical_peer(source);
 
             Ok(ReceivedMessage {
                 data: Bytes::copy_from_slice(&buffer[..len]),
