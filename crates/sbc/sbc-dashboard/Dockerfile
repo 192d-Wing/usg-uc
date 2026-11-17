@@ -12,7 +12,7 @@
 # =============================================================================
 # Stage 1: Build the SPA bundle.
 # =============================================================================
-FROM docker.io/library/node:22-alpine AS build
+FROM docker.io/library/node:26-alpine AS build
 
 WORKDIR /app
 COPY package.json package-lock.json* ./
