@@ -34,6 +34,17 @@ tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+# tests/dtls_sbc_sidecar.rs: two soft-client media stacks on one call through
+# the SBC's terminating media relay and the DTLS sidecar. The SBC crate is a
+# dependency of that test only; no client crate links SBC code. It lives in
+# this crate, not in client-core, because CI lints the client crates with
+# `-D warnings`, which cargo applies to workspace dependencies as well, and
+# sbc-media-core is linted without it.
+sbc-media-core.workspace = true
+proto-dtls.workspace = true
+tokio = { workspace = true, features = ["process"] }
+
 [lib]
 name = "client_integration_tests"
 path = "src/lib.rs"

@@ -13,6 +13,7 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use proto_srtp::{SrtpContext, SrtpProtect, SrtpResult, SrtpUnprotect};
@@ -21,7 +22,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::dtls_relay::is_dtls_record;
-use crate::dtls_sidecar::{SidecarEvent, SidecarReader, SidecarWriter};
+use crate::dtls_sidecar::{SidecarError, SidecarEvent, SidecarReader, SidecarWriter};
 use crate::recording_fork::{ForkTap, fork_changed};
 
 /// Re-protects one RTP packet crossing the SBC: unprotect with the ingress
@@ -67,10 +68,92 @@ fn is_rtcp_packet(pkt: &[u8]) -> bool {
     pkt.len() >= 2 && (64..=95).contains(&(pkt[1] & 0x7f))
 }
 
-/// One direction of a terminated media relay: reads SRTP from `recv_sock`,
-/// re-protects it for the far leg, and sends it on `send_sock`. Post-handshake
-/// DTLS records (rekey/alerts, first byte 20..=63) are forwarded to the sidecar
-/// via `dtls_out` rather than treated as media.
+/// Post-handshake DTLS-class datagrams one leg forwards to the sidecar at
+/// once (token-bucket depth). Same numbers as the soft client's forward path.
+pub const DTLS_FORWARD_BURST: u32 = 8;
+/// Sustained post-handshake DTLS-class forwards per second and leg.
+pub const DTLS_FORWARD_PER_SECOND: u32 = 4;
+
+/// Token bucket in front of the sidecar for one leg's post-handshake DTLS, in
+/// thousandths of a token.
+///
+/// NIST 800-53 Rev5: SC-5 -- the sidecar is one process for every call on the
+/// node and keeps each association for the whole call. Without a limit here
+/// anyone able to send from one leg's latched source could make it spend a
+/// whole core on DTLS-class datagrams (about 40 us each for handshake-type
+/// records) and starve the handshakes of new calls. With the bucket a flood
+/// costs the relay loop one clock read and one compare per datagram, and at
+/// most [`DTLS_FORWARD_PER_SECOND`] per second reach the sidecar (no
+/// allocation for the rest).
+///
+/// A genuine peer sends, after the handshake, a retransmitted final flight
+/// (a handful of datagrams per retransmission, at intervals of a second or
+/// more: RFC 6347 §4.2.4.1) and one alert; both fit the burst.
+///
+/// The handshake itself does not pass through here: a [`TerminateRelayLeg`]
+/// is only started once both legs' handshakes have completed and their keys
+/// are exported ([`crate::dtls_relay::establish_srtp_leg`] reads the socket
+/// until then).
+// POAM: POA&M-335 -- residual: the bucket is charged before authentication
+// (the relay cannot tell a forged DTLS-class datagram from a genuine one),
+// and forged and genuine datagrams share it. A sender spoofing the leg's
+// latched source at DTLS_FORWARD_PER_SECOND or more keeps the bucket empty
+// for as long as it sends, with no time limit, so the genuine peer's
+// `close_notify`, alert or retransmitted final flight is dropped here and
+// never reaches the sidecar. Fail closed in every case: nothing forged is
+// accepted, media is not affected, and the call then ends by signalling
+// only (or that peer's handshake fails at its own timeout); the drops are
+// counted and logged with the call id.
+#[derive(Debug, Clone, Copy)]
+struct DtlsForwardBucket {
+    /// Thousandths of a token available.
+    millitokens: u32,
+    /// When the bucket was last refilled.
+    refilled: Instant,
+}
+
+impl DtlsForwardBucket {
+    const CAPACITY: u32 = DTLS_FORWARD_BURST * 1000;
+
+    const fn new(now: Instant) -> Self {
+        Self {
+            millitokens: Self::CAPACITY,
+            refilled: now,
+        }
+    }
+
+    /// Takes one token if there is one.
+    fn try_take(&mut self, now: Instant) -> bool {
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.refilled).as_millis())
+            .unwrap_or(u64::MAX);
+        if elapsed_ms > 0 {
+            // One millisecond adds DTLS_FORWARD_PER_SECOND thousandths.
+            let added = u32::try_from(elapsed_ms)
+                .unwrap_or(u32::MAX)
+                .saturating_mul(DTLS_FORWARD_PER_SECOND);
+            self.millitokens = self.millitokens.saturating_add(added).min(Self::CAPACITY);
+            // Advance by the whole milliseconds credited, so the rest of a
+            // millisecond counts towards the next refill.
+            self.refilled = self
+                .refilled
+                .checked_add(Duration::from_millis(elapsed_ms))
+                .unwrap_or(now);
+        }
+        if self.millitokens >= 1000 {
+            self.millitokens -= 1000;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// One direction of a terminated media relay.
+///
+/// Reads SRTP from `recv_sock`, re-protects it for the far leg, and sends it
+/// on `send_sock`. Post-handshake DTLS records (a retransmitted final flight,
+/// alerts; first byte 20..=63) are forwarded to the sidecar via `dtls_out`,
+/// rate-limited, rather than treated as media.
 pub struct TerminateRelayLeg {
     /// Socket this leg receives the near peer's SRTP/DTLS on.
     pub recv_sock: Arc<UdpSocket>,
@@ -88,7 +171,7 @@ pub struct TerminateRelayLeg {
     /// Where to send re-protected media — the far leg's latched address.
     pub forward_target: Arc<RwLock<SocketAddr>>,
     /// Post-handshake DTLS records demuxed off `recv_sock` go here (to the
-    /// sidecar). `None` drops them (e.g. in tests / if rekey is unsupported).
+    /// sidecar). `None` drops them (the separate-port RTCP legs, tests).
     pub dtls_out: Option<mpsc::Sender<Vec<u8>>>,
     /// Call id for logging.
     pub call_id: String,
@@ -113,6 +196,8 @@ impl TerminateRelayLeg {
         let mut dropped_source: u64 = 0;
         let mut dropped_auth: u64 = 0;
         let mut dropped_dtls: u64 = 0;
+        let mut dtls_rate_limited: u64 = 0;
+        let mut dtls_bucket = DtlsForwardBucket::new(Instant::now());
 
         loop {
             tokio::select! {
@@ -152,20 +237,39 @@ impl TerminateRelayLeg {
                         }
                     }
 
-                    // Demux (RFC 7983 + RFC 5761): post-handshake DTLS (rekey/
-                    // alert) → sidecar; otherwise SRTP media or muxed SRTCP →
-                    // reprotect for the far leg and forward.
+                    // Demux (RFC 7983 + RFC 5761): post-handshake DTLS (a
+                    // retransmitted final flight, an alert) → sidecar;
+                    // otherwise SRTP media or muxed SRTCP → reprotect for the
+                    // far leg and forward.
                     if is_dtls_record(buf[0]) {
-                        // Non-blocking send: awaiting on this bounded channel would
-                        // let sidecar backpressure head-of-line block all media
-                        // forwarding on this leg. A dropped rekey record is
-                        // retransmitted by DTLS, so dropping is safe.
-                        if let Some(tx) = &self.dtls_out
-                            && tx.try_send(buf[..n].to_vec()).is_err()
-                        {
-                            dropped_dtls += 1;
-                            if dropped_dtls == 1 || dropped_dtls.is_multiple_of(1000) {
-                                warn!(call_id = %self.call_id, direction = self.direction, dropped_dtls, "sidecar DTLS channel full/closed; dropping rekey record");
+                        if let Some(tx) = &self.dtls_out {
+                            // NIST 800-53 Rev5: SC-5 -- the bucket comes before
+                            // the copy, so a flood allocates nothing and the
+                            // shared sidecar sees at most burst + rate. The
+                            // clock is read for DTLS-class datagrams only.
+                            // POAM: POA&M-335 -- charged before authentication:
+                            // a spoofed source at the rate or above starves the
+                            // genuine peer's post-handshake DTLS for the call
+                            // (see `DtlsForwardBucket`).
+                            let admitted = dtls_bucket.try_take(Instant::now());
+                            if !admitted {
+                                dtls_rate_limited += 1;
+                            }
+                            // Non-blocking send: awaiting on this bounded
+                            // channel would let sidecar backpressure
+                            // head-of-line block all media forwarding on this
+                            // leg. A dropped handshake record is retransmitted
+                            // by DTLS; a dropped alert leaves the call to end
+                            // by signalling.
+                            if !admitted || tx.try_send(buf[..n].to_vec()).is_err() {
+                                dropped_dtls += 1;
+                                if dropped_dtls == 1 || dropped_dtls.is_multiple_of(1000) {
+                                    warn!(
+                                        call_id = %self.call_id, direction = self.direction,
+                                        dropped_dtls, dtls_rate_limited,
+                                        "post-handshake DTLS from the peer dropped (rate limit, or sidecar channel full/closed)"
+                                    );
+                                }
                             }
                         }
                         continue;
@@ -246,11 +350,29 @@ impl TerminateRelayLeg {
     }
 }
 
-/// Forwards post-handshake DTLS records (peer-initiated rekey/alerts, demuxed
-/// off the media socket by [`TerminateRelayLeg`]) to the sidecar. Owns the
-/// [`SidecarWriter`] so the sidecar connection stays open for the whole call
-/// (the DTLS association must outlive key export); ends on shutdown, a closed
-/// channel, or a sidecar write error.
+/// How long [`pump_sidecar_dtls_to_peer`] keeps relaying after the call has
+/// ended, for the sidecar's `close_notify` to reach the peer. The sidecar
+/// answers the closed connection at once; this only bounds a sidecar that
+/// does not.
+// POAM: POA&M-341 -- for this long after `stop_relay` the pump still holds
+// the leg's media socket although its port pair is already released: with a
+// sidecar that does not answer, a new call handed the same ports inside the
+// window fails to bind (it cannot receive another call's media: the socket
+// is bound exclusively).
+const SIDECAR_CLOSE_GRACE: Duration = Duration::from_millis(500);
+
+/// Forwards post-handshake DTLS records from the peer to the sidecar.
+///
+/// The records (a retransmitted final flight, alerts) are demuxed off the
+/// media socket by [`TerminateRelayLeg`]. Owns the [`SidecarWriter`] so the
+/// sidecar connection stays open for the whole call (the DTLS association
+/// must outlive key export); ends on shutdown, a closed channel, or a sidecar
+/// write error.
+///
+/// Returning drops the writer, which shuts down the sending half of the
+/// connection. That is how the sidecar learns the call is over: it then sends
+/// `close_notify` for the peer and closes its end, which
+/// [`pump_sidecar_dtls_to_peer`] relays.
 pub async fn forward_dtls_to_sidecar(
     mut records: mpsc::Receiver<Vec<u8>>,
     mut writer: SidecarWriter,
@@ -272,33 +394,191 @@ pub async fn forward_dtls_to_sidecar(
     }
 }
 
-/// Pumps DTLS records the sidecar emits *after* the handshake (sidecar-initiated
-/// rekey) back to the peer on the media socket. Owns the [`SidecarReader`] so the
-/// connection stays open for the call; ends on shutdown or a reader error. A
-/// terminal `Ready`/`Error` (unexpected post-handshake) also ends it.
+/// Pumps DTLS records the sidecar emits *after* the handshake back to the peer.
+///
+/// Those are its final flight again when the peer retransmits its own
+/// (RFC 6347 §4.2.4), the answer to the peer's `close_notify`, and its own
+/// `close_notify` when the call ends. Owns the [`SidecarReader`] so the
+/// connection stays open for the call.
+///
+/// Ends when the sidecar reports the end of the association (`Error`, e.g. the
+/// peer closed it) or closes the connection. On shutdown it does not stop at
+/// once: [`forward_dtls_to_sidecar`] closes the sending half at the same
+/// moment, the sidecar answers with `close_notify` and closes, and the pump
+/// relays that record first, for at most [`SIDECAR_CLOSE_GRACE`].
+///
+/// However the association ends, one `dtls.association.closed` record is
+/// written with the call id, the leg and the peer's address (`assoc`): at
+/// info when the call ended, at warn for everything else.
+// RFC 5246 §7.2.1 / RFC 5764 §5.1.2: the association is closed with
+// close_notify when the SRTP session it keyed ends.
+// NIST 800-53 Rev5: AU-2, AU-3 (attributable record of the end of a DTLS
+// association), SC-10.
 pub async fn pump_sidecar_dtls_to_peer(
     mut reader: SidecarReader,
     sock: Arc<UdpSocket>,
     peer: Arc<RwLock<SocketAddr>>,
     mut shutdown: watch::Receiver<bool>,
+    assoc: AssociationLabel,
 ) {
     loop {
         tokio::select! {
-            event = reader.read() => match event {
-                Ok(SidecarEvent::Dtls(record)) => {
-                    let dest = match peer.read() {
-                        Ok(g) => *g,
-                        Err(_) => break,
-                    };
-                    let _ = sock.send_to(&record, dest).await;
+            event = reader.read() => {
+                if let Some(end) = relay_sidecar_event(event, &sock, &peer).await {
+                    // POAM: POA&M-340 -- the association is gone but the call
+                    // is not ended here: the relay legs keep this leg's SRTP
+                    // keys and keep relaying until signalling ends the call.
+                    assoc.record_closed(&peer, end.reason_mid_call(), end.detail());
+                    return;
                 }
-                Ok(_) => break,
-                Err(e) => {
-                    debug!(error = %e, "sidecar reader ended");
-                    break;
-                }
-            },
+            }
             _ = shutdown.changed() => break,
+        }
+    }
+    // The call is over. The sidecar closing its end is the expected answer.
+    let drain = async {
+        loop {
+            if let Some(end) = relay_sidecar_event(reader.read().await, &sock, &peer).await {
+                return end;
+            }
+        }
+    };
+    match tokio::time::timeout(SIDECAR_CLOSE_GRACE, drain).await {
+        Ok(end) => assoc.record_closed(&peer, end.reason_at_call_end(), end.detail()),
+        Err(_) => assoc.record_closed(&peer, CLOSED_SIDECAR_TIMEOUT, ""),
+    }
+}
+
+/// Which association a [`pump_sidecar_dtls_to_peer`] task serves, for its
+/// `dtls.association.closed` record.
+#[derive(Debug, Clone)]
+pub struct AssociationLabel {
+    /// Call id.
+    pub call_id: String,
+    /// Leg of the call ("A" / "B").
+    pub leg: &'static str,
+}
+
+// Reason tokens of the `dtls.association.closed` record. Fixed strings, so
+// that the record can be matched on without parsing free text.
+/// The call ended and the sidecar closed the association (`close_notify`).
+const CLOSED_CALL_ENDED: &str = "call-ended";
+/// The call ended and the sidecar did not close within the grace.
+const CLOSED_SIDECAR_TIMEOUT: &str = "sidecar-close-timeout";
+/// The peer sent `close_notify` during the call, as inferred by the
+/// sidecar (pion reports both peer-initiated ends as end-of-stream; the
+/// sidecar tells them apart by whether an alert of its own went out).
+const CLOSED_PEER_CLOSE_NOTIFY: &str = "peer-close-notify";
+/// The peer sent a fatal alert during the call, as inferred by the
+/// sidecar (see [`CLOSED_PEER_CLOSE_NOTIFY`]).
+const CLOSED_PEER_FATAL_ALERT: &str = "peer-fatal-alert";
+/// The sidecar is stopping.
+const CLOSED_SIDECAR_SHUTDOWN: &str = "sidecar-shutdown";
+/// The sidecar reported an end this relay has no token for.
+const CLOSED_SIDECAR_ERROR: &str = "sidecar-error";
+/// The sidecar connection ended during the call (sidecar crash or kill).
+const CLOSED_SIDECAR_LOST: &str = "sidecar-connection-lost";
+
+impl AssociationLabel {
+    /// Writes the one `dtls.association.closed` record of the association.
+    /// `remote` is the bare address, as in the soft client's record.
+    fn record_closed(&self, peer: &RwLock<SocketAddr>, reason: &'static str, detail: &str) {
+        // A poisoned lock still holds a whole address.
+        let remote = *peer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reason == CLOSED_CALL_ENDED {
+            info!(
+                event = "dtls.association.closed",
+                call_id = %self.call_id, leg = self.leg, remote = %remote, reason,
+                "DTLS association closed with the call"
+            );
+        } else {
+            warn!(
+                event = "dtls.association.closed",
+                call_id = %self.call_id, leg = self.leg, remote = %remote, reason, detail,
+                "DTLS association ended; SRTP relaying on this leg continues until signalling ends the call"
+            );
+        }
+    }
+}
+
+/// How the sidecar's side of a session ended.
+#[derive(Debug)]
+enum SidecarEnd {
+    /// The sidecar sent `Error` with this text.
+    Reported(String),
+    /// The connection ended (closed by the sidecar, or broken).
+    Disconnected,
+    /// The peer's address could not be read or the sidecar broke protocol.
+    Fault(&'static str),
+}
+
+impl SidecarEnd {
+    /// The reason token when this happens while the call is up.
+    fn reason_mid_call(&self) -> &'static str {
+        match self {
+            Self::Reported(text) => sidecar_reason(text),
+            Self::Disconnected => CLOSED_SIDECAR_LOST,
+            Self::Fault(_) => CLOSED_SIDECAR_ERROR,
+        }
+    }
+
+    /// The reason token when this happens after the call has ended: the
+    /// sidecar closing its end is then the normal close.
+    fn reason_at_call_end(&self) -> &'static str {
+        match self {
+            Self::Disconnected => CLOSED_CALL_ENDED,
+            other => other.reason_mid_call(),
+        }
+    }
+
+    /// What the sidecar said, for a reason this relay has no token for.
+    fn detail(&self) -> &str {
+        match self {
+            Self::Reported(text) if sidecar_reason(text) == CLOSED_SIDECAR_ERROR => text,
+            Self::Fault(what) => what,
+            _ => "",
+        }
+    }
+}
+
+/// Maps the sidecar's `Error` text after `Ready` to a reason token. The text
+/// starts with the token, up to a colon (`sidecar/dtls-terminator`,
+/// `service/session.go`).
+fn sidecar_reason(text: &str) -> &'static str {
+    match text.split(':').next().map_or("", str::trim) {
+        "peer-close-notify" => CLOSED_PEER_CLOSE_NOTIFY,
+        "peer-fatal-alert" => CLOSED_PEER_FATAL_ALERT,
+        "sidecar-shutdown" => CLOSED_SIDECAR_SHUTDOWN,
+        _ => CLOSED_SIDECAR_ERROR,
+    }
+}
+
+/// Sends one post-handshake DTLS record from the sidecar to the peer. Returns
+/// how the sidecar's side of the session ended, or `None` while it goes on.
+async fn relay_sidecar_event(
+    event: Result<SidecarEvent, SidecarError>,
+    sock: &UdpSocket,
+    peer: &RwLock<SocketAddr>,
+) -> Option<SidecarEnd> {
+    match event {
+        Ok(SidecarEvent::Dtls(record)) => {
+            let Ok(dest) = peer.read().map(|g| *g) else {
+                return Some(SidecarEnd::Fault("peer address unavailable"));
+            };
+            let _ = sock.send_to(&record, dest).await;
+            None
+        }
+        // After the handshake an `Error` is the sidecar's report that the
+        // association ended (the peer closed it, or the sidecar is stopping).
+        Ok(SidecarEvent::Error(reason)) => Some(SidecarEnd::Reported(reason)),
+        Ok(SidecarEvent::Ready { .. }) => Some(SidecarEnd::Fault(
+            "unexpected Ready from the sidecar after the handshake",
+        )),
+        Err(e) => {
+            debug!(error = %e, "sidecar reader ended");
+            Some(SidecarEnd::Disconnected)
         }
     }
 }
@@ -633,6 +913,292 @@ mod tests {
 
         let _ = sd_tx.send(true);
         let _ = handle.await;
+    }
+
+    // PERF-011 (SC-5): a flood of DTLS-class datagrams from the latched peer
+    // reaches the sidecar channel at the bucket's burst plus its refill, not
+    // at the flood's rate; media on the leg is not affected; and after a
+    // pause the peer's records pass again.
+    #[tokio::test]
+    async fn terminate_relay_leg_rate_limits_post_handshake_dtls() {
+        let relay_recv = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_send = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let far = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_recv_addr = relay_recv.local_addr().unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let ssrc = 0x4444_u32;
+        let (key_a, salt_a) = random_material();
+        let (key_b, salt_b) = random_material();
+        // Room for the whole flood: only the bucket limits what arrives.
+        let (dtls_tx, mut dtls_rx) = mpsc::channel::<Vec<u8>>(4096);
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let leg = TerminateRelayLeg {
+            recv_sock: Arc::clone(&relay_recv),
+            send_sock: Arc::clone(&relay_send),
+            ingress: ctx(&key_a, &salt_a, SrtpDirection::Inbound, ssrc),
+            egress: ctx(&key_b, &salt_b, SrtpDirection::Outbound, ssrc),
+            expected_remote: peer_addr,
+            recv_target: Arc::new(RwLock::new(peer_addr)),
+            forward_target: Arc::new(RwLock::new(far.local_addr().unwrap())),
+            dtls_out: Some(dtls_tx),
+            call_id: "call".into(),
+            direction: "A→B",
+            fork: None,
+        };
+        let handle = tokio::spawn(leg.run(sd_rx));
+
+        // 2000 handshake-type datagrams, paced so that none is lost in the
+        // socket buffer, then one SRTP packet as the end marker.
+        let record = [22u8, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0];
+        let started = Instant::now();
+        for i in 0..2000 {
+            peer.send_to(&record, relay_recv_addr).await.unwrap();
+            if i % 50 == 49 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let peer_tx = ctx(&key_a, &salt_a, SrtpDirection::Outbound, ssrc);
+        let rtp = RtpPacket::new(
+            RtpHeader::new(0, 1, 160, ssrc),
+            Bytes::from_static(&[7; 160]),
+        );
+        let srtp = SrtpProtect::new(&peer_tx).protect_rtp(&rtp).unwrap();
+        peer.send_to(&srtp, relay_recv_addr).await.unwrap();
+        // Media is relayed, and by then the leg has seen the whole flood.
+        let mut buf = [0u8; 512];
+        tokio::time::timeout(Duration::from_secs(5), far.recv_from(&mut buf))
+            .await
+            .expect("media not relayed during a DTLS flood")
+            .unwrap();
+        let elapsed_secs = u32::try_from(started.elapsed().as_secs()).unwrap() + 1;
+
+        let mut forwarded = 0_u32;
+        while dtls_rx.try_recv().is_ok() {
+            forwarded += 1;
+        }
+        let limit = DTLS_FORWARD_BURST + DTLS_FORWARD_PER_SECOND * elapsed_secs;
+        assert!(
+            forwarded >= DTLS_FORWARD_BURST && forwarded <= limit,
+            "{forwarded} of 2000 flood datagrams reached the sidecar channel, limit {limit}"
+        );
+
+        // After a pause a genuine record passes again (a refilled token).
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        peer.send_to(&record, relay_recv_addr).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), dtls_rx.recv())
+            .await
+            .expect("record after the flood was not forwarded")
+            .unwrap();
+        assert_eq!(got, record);
+
+        let _ = sd_tx.send(true);
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn dtls_forward_bucket_allows_burst_then_rate() {
+        let start = Instant::now();
+        let mut bucket = DtlsForwardBucket::new(start);
+        let taken = (0..100).filter(|_| bucket.try_take(start)).count();
+        assert_eq!(taken, DTLS_FORWARD_BURST as usize);
+        // One second later: the rate's worth, no more.
+        let later = start + Duration::from_secs(1);
+        let taken = (0..100).filter(|_| bucket.try_take(later)).count();
+        assert_eq!(taken, DTLS_FORWARD_PER_SECOND as usize);
+        // A long pause refills to the burst, not beyond.
+        let much_later = later + Duration::from_secs(3600);
+        let taken = (0..100).filter(|_| bucket.try_take(much_later)).count();
+        assert_eq!(taken, DTLS_FORWARD_BURST as usize);
+    }
+
+    #[test]
+    fn sidecar_error_text_maps_to_fixed_reason_tokens() {
+        for (text, reason) in [
+            (
+                "peer-close-notify: the peer ended the DTLS association with close_notify",
+                CLOSED_PEER_CLOSE_NOTIFY,
+            ),
+            ("peer-fatal-alert: anything", CLOSED_PEER_FATAL_ALERT),
+            (
+                "sidecar-shutdown: the DTLS terminator is stopping",
+                CLOSED_SIDECAR_SHUTDOWN,
+            ),
+            (
+                "peer ended the DTLS association (close_notify or fatal alert)",
+                CLOSED_SIDECAR_ERROR,
+            ),
+            ("", CLOSED_SIDECAR_ERROR),
+        ] {
+            let end = SidecarEnd::Reported(text.to_string());
+            assert_eq!(end.reason_mid_call(), reason, "{text:?}");
+            // Free text is only carried for a reason without a token.
+            assert_eq!(
+                end.detail().is_empty(),
+                reason != CLOSED_SIDECAR_ERROR || text.is_empty()
+            );
+        }
+        assert_eq!(
+            SidecarEnd::Disconnected.reason_mid_call(),
+            CLOSED_SIDECAR_LOST
+        );
+        assert_eq!(
+            SidecarEnd::Disconnected.reason_at_call_end(),
+            CLOSED_CALL_ENDED
+        );
+        assert_eq!(
+            SidecarEnd::Reported("sidecar-shutdown: x".into()).reason_at_call_end(),
+            CLOSED_SIDECAR_SHUTDOWN
+        );
+    }
+
+    // ---- post-handshake sidecar pumps (association lifetime) ----------------
+
+    const MSG_HELLO: u8 = 1;
+    const MSG_DTLS: u8 = 3;
+    const MSG_ERROR: u8 = 5;
+
+    async fn write_typed(w: &mut tokio::net::unix::OwnedWriteHalf, t: u8, body: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let n = 1 + body.len();
+        let mut f = Vec::with_capacity(2 + n);
+        f.extend_from_slice(&(u16::try_from(n).unwrap()).to_be_bytes());
+        f.push(t);
+        f.extend_from_slice(body);
+        w.write_all(&f).await.unwrap();
+    }
+
+    /// A mock sidecar session after `Ready`, both pumps running against it,
+    /// and the peer's socket.
+    struct Pumps {
+        sidecar_r: tokio::net::unix::OwnedReadHalf,
+        sidecar_w: tokio::net::unix::OwnedWriteHalf,
+        peer: UdpSocket,
+        dtls_tx: mpsc::Sender<Vec<u8>>,
+        shutdown: watch::Sender<bool>,
+        pump: tokio::task::JoinHandle<()>,
+    }
+
+    async fn pumps(name: &str) -> Pumps {
+        let path =
+            std::env::temp_dir().join(format!("usg-pump-{name}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let fp = "sha-384 SIDECAR";
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            write_typed(&mut w, MSG_HELLO, fp.as_bytes()).await;
+            (r, w)
+        });
+        let client = crate::dtls_sidecar::SidecarClient::connect(&path, fp)
+            .await
+            .unwrap();
+        let (sidecar_r, sidecar_w) = accept.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+        let (reader, writer) = client.into_split();
+
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = Arc::new(RwLock::new(peer.local_addr().unwrap()));
+        let (dtls_tx, dtls_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (shutdown, sd_rx) = watch::channel(false);
+        tokio::spawn(forward_dtls_to_sidecar(dtls_rx, writer, sd_rx.clone()));
+        let pump = tokio::spawn(pump_sidecar_dtls_to_peer(
+            reader,
+            relay,
+            target,
+            sd_rx,
+            AssociationLabel {
+                call_id: format!("call-{name}"),
+                leg: "A",
+            },
+        ));
+        Pumps {
+            sidecar_r,
+            sidecar_w,
+            peer,
+            dtls_tx,
+            shutdown,
+            pump,
+        }
+    }
+
+    async fn peer_recv(peer: &UdpSocket) -> Vec<u8> {
+        let mut buf = [0u8; 64];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("peer recv timed out")
+            .unwrap();
+        buf[..n].to_vec()
+    }
+
+    // The call ends: the sidecar sees its receiving side closed (and only
+    // that side), and the close_notify it then sends still reaches the peer.
+    #[tokio::test]
+    async fn call_end_half_closes_the_sidecar_and_relays_its_close_notify() {
+        use tokio::io::AsyncReadExt;
+        let mut p = pumps("close").await;
+
+        // During the call records cross in both directions.
+        p.dtls_tx.send(vec![22, 1, 2, 3]).await.unwrap();
+        let mut frame = [0u8; 7];
+        p.sidecar_r.read_exact(&mut frame).await.unwrap();
+        assert_eq!(frame, [0, 5, MSG_DTLS, 22, 1, 2, 3]);
+        write_typed(&mut p.sidecar_w, MSG_DTLS, b"final-flight").await;
+        assert_eq!(peer_recv(&p.peer).await, b"final-flight");
+
+        p.shutdown.send(true).unwrap();
+        // End of stream from the relay: the call is over.
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), p.sidecar_r.read_to_end(&mut rest))
+            .await
+            .expect("sidecar never saw the connection closed")
+            .unwrap();
+        assert_eq!(rest, [] as [u8; 0]);
+        // The sidecar can still write: close_notify, then it closes.
+        write_typed(&mut p.sidecar_w, MSG_DTLS, b"close-notify").await;
+        drop(p.sidecar_w);
+        assert_eq!(peer_recv(&p.peer).await, b"close-notify");
+        tokio::time::timeout(Duration::from_secs(2), p.pump)
+            .await
+            .expect("pump did not end")
+            .unwrap();
+    }
+
+    // A sidecar that does not answer the closed connection cannot keep the
+    // pump (and the media socket it holds) alive.
+    #[tokio::test]
+    async fn call_end_is_bounded_when_the_sidecar_does_not_close() {
+        let p = pumps("wedged").await;
+        let started = std::time::Instant::now();
+        p.shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), p.pump)
+            .await
+            .expect("pump did not end")
+            .unwrap();
+        assert!(started.elapsed() >= SIDECAR_CLOSE_GRACE);
+        drop((p.sidecar_r, p.sidecar_w));
+    }
+
+    // The sidecar reports that the peer ended the association: the record
+    // before the report is relayed, then the pump ends.
+    #[tokio::test]
+    async fn sidecar_error_after_the_handshake_ends_the_pump() {
+        let mut p = pumps("error").await;
+        write_typed(&mut p.sidecar_w, MSG_DTLS, b"close-notify-reply").await;
+        write_typed(
+            &mut p.sidecar_w,
+            MSG_ERROR,
+            b"peer-close-notify: the peer ended the DTLS association with close_notify",
+        )
+        .await;
+        assert_eq!(peer_recv(&p.peer).await, b"close-notify-reply");
+        tokio::time::timeout(Duration::from_secs(2), p.pump)
+            .await
+            .expect("pump did not end")
+            .unwrap();
     }
 
     // SBC bridges SRTCP across two associations (mirror of the RTP test): peer-A

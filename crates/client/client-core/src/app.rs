@@ -1157,6 +1157,25 @@ impl ClientApp {
     pub async fn poll_events(&mut self) -> AppResult<()> {
         trace!("poll_events called");
 
+        // NIST 800-53 Rev5: SC-8(1), SC-5 -- media security first. What
+        // the calls' DTLS drivers have reported (handshake failed, peer
+        // closed the association or sent a fatal alert) is acted on before
+        // any step of this pass that can fail or take long, so the audio
+        // of such a call is stopped at the start of the next pass whatever
+        // else is queued. Infallible, and it does not wait on the network.
+        // It can block all the same: when a handshake has completed it
+        // starts the call's audio (opens the audio devices), and when an
+        // association has ended it stops it (joins the audio thread), so
+        // that cost now falls at the head of the pass (PERF-006). The BYE
+        // it may queue goes out with the drain right below.
+        // `process_timers` further down runs the same checks again for
+        // what this pass produced, and ends the waits that only time ends.
+        // POAM: POA&M-321 -- like every other step of the pump, this one
+        // awaits `app_event_tx` sends for the events it reports, and it
+        // cannot run at all while an earlier pass is parked in such a
+        // send because the shell does not drain its event channel.
+        self.call_manager.poll_media_security().await;
+
         // Events queued since the last pass (UI commands, timers).
         self.drain_internal_events().await?;
 

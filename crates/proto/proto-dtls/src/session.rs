@@ -8,9 +8,9 @@
 //! apply DTLS record protection and must not be used to carry data.
 //!
 //! The real DTLS 1.2 handshake is the sans-I/O
-//! [`crate::association::DtlsAssociation`]. `DtlsSession` keeps failing
-//! closed until the soft client is wired to the association (stage 2 of
-//! POA&M-324); nothing here calls it.
+//! [`crate::association::DtlsAssociation`], which the soft client drives
+//! on its media socket. `DtlsSession` keeps failing closed until it is
+//! removed (stage 3); nothing here calls the association.
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
@@ -46,7 +46,10 @@ const SRTP_KEYING_MATERIAL_LEN: usize = 88;
 ///
 /// It performs no handshake and applies no record protection (see the
 /// module documentation); it makes no CNSA 2.0 claim of its own.
-#[deprecated(note = "use association::DtlsAssociation (POA&M-324)")]
+#[deprecated(
+    since = "0.10.0",
+    note = "use association::DtlsAssociation; the legacy surface is removed under POA&M-337"
+)]
 pub struct DtlsSession {
     /// UDP socket for transport.
     socket: Arc<UdpSocket>,
@@ -78,10 +81,10 @@ impl DtlsSession {
     /// peer never learns would report a "secure" session that cannot carry
     /// media (NIST 800-53 Rev5: SC-8(1), SC-12 fail closed).
     ///
-    /// POAM: POA&M-324 -- the handshake is
-    /// [`crate::association::DtlsAssociation`]; this constructor keeps
-    /// failing closed until the soft client drives the association on the
-    /// media socket (stage 2), and is then removed.
+    /// POAM: POA&M-337 -- the handshake is
+    /// [`crate::association::DtlsAssociation`], which the soft client now
+    /// drives on its media socket; this constructor keeps failing closed
+    /// until the legacy surface is removed (stage 3).
     ///
     /// ## Errors
     ///
@@ -136,7 +139,9 @@ impl DtlsSession {
         {
             let _ = socket;
             Err(DtlsError::HandshakeFailed {
-                reason: "DTLS handshake not implemented (POA&M-324)".to_string(),
+                reason:
+                    "DTLS handshake not implemented by the legacy DtlsSession; use DtlsAssociation"
+                        .to_string(),
             })
         }
     }

@@ -48,7 +48,7 @@ wave 2 = b79893b0.
 ## P3 — hardening
 
 - ✅ fixed (56000e43) — No RTCP BYE on session end (3550 §6.6).
-- 📋 documented limitation — SRTP ROC not preserved across DTLS renegotiation (3711 §3.2.1); replay window resets on renegotiation. Accepted until DTLS rekey support is revisited. (2026-11-15: the client has no DTLS handshake at all, NIST POA&M-324, so this does not arise yet.)
+- 📋 documented limitation — SRTP ROC not preserved across DTLS renegotiation (3711 §3.2.1); replay window resets on renegotiation. Accepted until DTLS rekey support is revisited. (2026-11-17: the client now performs one DTLS handshake per call and never renegotiates or rekeys, so a new association mid-call does not arise; a re-INVITE that should start one is NIST POA&M-327. Within one association the rollover counter and replay window are now kept across audio pipeline restarts, see "feat/client-dtls-wiring, Stage 2".)
 - ✅ implemented (56000e43) — Symmetric RTP source filtering (4961), **default OFF**: carriers commonly source media from a different IP than the SDP c-line, so this is opt-in deployment hardening, not a safe default.
 - ✅ fixed (b79893b0) — To-tag no longer silently mutable across 1xx responses; differing tag on a later 1xx is warned and ignored, only a 2xx finalizes a different tag (3261 §12.1.2).
 - 📋 documented limitation — Early media on 183+SDP not started until 200 (3960); deliberate functional choice (no audio before answer).
@@ -84,6 +84,14 @@ tests only (`client-core/tests/media_security_gate.rs` unless another file
 is named). No test uses a real DTLS handshake, and there was no run against
 the SBC, its Go DTLS sidecar or any other peer.
 
+**Superseded in part (2026-11-17).** This section records the state after
+fix/client-srtp-b2. Since feat/client-dtls-wiring the client performs the
+handshake: the rows below on the missing handshake, the unverified peer
+certificate, dropped DTLS records, rtcp-mux "not exercised against a peer",
+SRTCP reachability and "Connected at the 200" no longer describe the client.
+Their current state is in "feat/client-dtls-wiring, Stage 2" below. The
+other rows still hold.
+
 | Change or gap | RFC § | Where | Tests / tracking |
 |---|---|---|---|
 | No audio without DTLS-SRTP keys on a `UDP/TLS/RTP/SAVP(F)` stream; the call is ended (BYE or CANCEL), never downgraded to RTP | 5764 §4.1 | `client-core/src/call_manager.rs` (`media_security_for`, `fail_call_media_security`) | `outbound_establish_error_ends_call_with_bye`, `inbound_accept_then_ack_fails_closed`, `test_media_security_for_by_account_and_build` |
@@ -107,10 +115,11 @@ Library only. `proto-dtls` gained a DTLS 1.2 handshake, `DtlsAssociation`
 (`crates/proto/proto-dtls/src/association.rs`): sans-I/O, both roles, CNSA
 profile only, tested over loopback, real UDP sockets and against pion/dtls
 v3.1.5 in both roles (local runs; `tests/interop_pion.rs` is `#[ignore]`).
-**Nothing in `crates/client/*` changed and nothing in the client uses it.**
-Every row of the fix/client-srtp-b2 table above still describes the client:
-TLS-account calls end after connect with no audio, and NIST POA&M-324 stays
-open until Stage 2. There was no soft-client run against the SBC, its Go
+**Nothing in `crates/client/*` changed in Stage 1 and nothing in the client
+used it then.** (Superseded 2026-11-17: Stage 2 wired it into the client, see
+the next section.) At the time, every row of the fix/client-srtp-b2 table
+above still described the client: TLS-account calls ended after connect with
+no audio, and NIST POA&M-324 stayed open until Stage 2. There was no soft-client run against the SBC, its Go
 DTLS sidecar or any other peer.
 
 What the library does per RFC section, and where it deviates, is in
@@ -128,6 +137,44 @@ client, from the Stage 1 reviews:
 | `sha-256`-only peers stay refused; extended master secret is required; no MKI; no RFC 8844 | 8122 §5; 7627; 5764 §4.1.3; 8844 | deviations in `RFC_COMPLIANCE_GAPS.md`; POA&M-333 |
 | Toward our own SBC: its DTLS endpoint now accepts only this same profile and, as DTLS server, only a client that lists secp384r1 first in `supported_groups`. `DtlsAssociation` offers secp384r1 only. Not yet run end to end | 8422 §5.1.1 | NIST POA&M-336 |
 | Still open in the client and not touched: new association on a changed fingerprint or setup (POA&M-327), delayed offer (POA&M-329), STUN handoff and consent freshness (POA&M-325), separate RTCP association (POA&M-326) | 5763 §6.6, §6.4; 7675; 5761 | as listed |
+
+## feat/client-dtls-wiring, Stage 2 (2026-11-17)
+
+The soft client performs DTLS-SRTP. `client-sip-ua/src/dtls_driver.rs` drives
+the Stage 1 `DtlsAssociation` on each call's media socket; a call on a TLS
+account is reported Connected, and audio starts, only after the handshake has
+verified the peer against the SDP fingerprint and exported SRTP keys. Every
+other outcome ends the call with no audio. Evidence: the client test suites
+and two `#[ignore]` interoperability tests (pion/dtls v3.1.5 in both roles;
+two client media stacks through the SBC relay and its Go DTLS sidecar), **in
+local runs on macOS arm64 only**. Nothing has run on Linux or in CI on this
+change. Not shown: a call set up by SIP through `sbc-daemon`, the audio
+pipeline with devices, any other peer, Windows (NIST POA&M-339). The RFC
+reviewer cited RFC 7160 §4.1 from memory; the section number was not
+re-checked against the RFC text.
+
+| Change, deviation or gap | RFC § | Where | Tests / tracking |
+|---|---|---|---|
+| DTLS 1.2 handshake on the media socket in either role, one association per call; profile negotiation and key export; key direction by negotiated role | 6347; 5764 §4.1.2, §4.2 | `client-sip-ua/src/dtls_driver.rs`, `media_session.rs` (`begin_secure`, `poll_secure`) | `both_roles_reach_ready_with_mirrored_keys`, `negotiated_keys_follow_role`, `outbound_call_connects_only_after_the_handshake_in_both_roles`, `inbound_call_connects_only_after_ack_and_handshake_in_both_roles`; interop `pion_as_server_we_are_client`, `pion_as_client_we_are_server`, `call_through_the_sbc_stays_up_and_ends_with_close_notify` |
+| Peer certificate must match a fingerprint of this dialog's SDP, with proof of possession, before keys are exported; mismatch ends the call | 8122 §5; 5763 §5 | `proto-dtls/src/association.rs`; `client-core/src/call_manager.rs` (`begin_secure_media`) | `fingerprint_mismatch_fails_closed_in_both_roles`, `fingerprint_mismatch_ends_the_call_and_is_never_connected`. No RFC 8844: POA&M-333 |
+| Deviation (RFC-005 of the Stage 2 review): the handshake starts at the 200 OK (outbound) or the ACK (inbound), not when a 183 answer makes the fingerprint known. The application is told `Connecting` until it completes | 5763 §5, §6.2 | `client-core/src/call_manager.rs` | recorded deviation; POA&M-331 |
+| The offerer accepts a `ClientHello` that arrives before the SDP answer: up to 4 DTLS datagrams read during the ICE checks are kept and replayed once the fingerprint and address are known. The stash is filled before the source is known; only datagrams from the negotiated address are replayed | 5763 §5 | `client-sip-ua/src/ice_handler.rs`, `dtls_driver.rs` (`EarlyDtls`) | `early_client_hello_is_answered_without_retransmission`, `early_client_hello_read_by_the_ice_loop_reaches_the_driver`, `early_dtls_from_another_source_is_not_fed_to_the_driver`; Stage 1 RFC-006 closed; POA&M-334 |
+| Demultiplexing on the one media socket (rtcp-mux): the driver reads during the handshake; afterwards the audio thread reads, and forwards DTLS records from the peer's address to the driver (burst 8, then 4 per second) | 7983 §7; 5764 §5.1.2 | `client-sip-ua/src/dtls_driver.rs`, `dtls_forward.rs`; `client-audio/src/rtp_handler.rs` | `demux_table`, `classify_exhaustive_rfc7983`, `flood_from_the_dtls_remote_is_rate_limited_and_never_blocks`, `dtls_from_a_non_negotiated_source_is_dropped_before_the_association` |
+| Deviation (RFC-008): DTLS is accepted only from the exact negotiated address. No latching, so a peer behind a symmetric NAT whose DTLS source differs cannot complete the handshake; no normalisation of IPv4-mapped IPv6 addresses, so on a dual-stack socket such a peer is treated as a wrong source (the handshake ends at its budget, fail closed) | 5763 §6.7.1; 7983 | `client-sip-ua/src/dtls_driver.rs` (residual list) | `wrong_source_and_non_dtls_datagrams_do_not_disturb_the_handshake` |
+| Gap (RFC-006): STUN on the media socket is dropped and counted during the handshake and after it; no handoff to ICE, no consent freshness. A peer that needs a STUN answer on this 5-tuple before or during DTLS gets none | 8445 §7.3; 7675; 5763 §6.7.1 | `client-sip-ua/src/dtls_driver.rs`, `client-audio/src/rtp_handler.rs` | `receive_drops_dtls_and_stun_and_unmuxed_rtcp`; POA&M-325 |
+| Retransmission: 1 s initial timer, doubling; 10 s handshake budget; a due timer is handled before the socket is read, so a datagram flood cannot stop it. After the handshake a retransmitted final flight of the peer is answered | 6347 §4.2.4 | `client-sip-ua/src/dtls_driver.rs` | `handshake_timers_keep_running_under_a_wrong_source_flood`, `silent_peer_times_out_at_the_default_budget`, `lost_final_flight_is_resent_after_the_handoff`, `lost_final_flight_is_answered_through_the_audio_receiver` |
+| Closing: one `close_notify` at local hang-up. Peer's authenticated fatal alert mid-call: audio stops, call fails at once. Peer's `close_notify` mid-call: audio stops at once, the call waits up to 1 s for the BYE (then a normal hang-up) and otherwise ends as a media-security failure | 5246 §7.2.1; 5764 §5.1.2 | `client-sip-ua/src/dtls_driver.rs`; `client-core/src/call_manager.rs` (`poll_security_closed`, `CLOSE_NOTIFY_BYE_GRACE`) | `local_close_after_connect_sends_one_close_notify`, `close_notify_without_bye_ends_the_call_after_the_grace_time`, `close_notify_followed_by_bye_is_a_normal_hangup`, `authenticated_fatal_alert_mid_call_ends_the_call_at_once` |
+| Gap: a call with no audio thread (no audio device, or audio start failed) has no reader on the socket after the handshake, so post-handshake DTLS is not serviced; a warning is logged | 6347 §4.2.4; 5764 §5.1.2 | `client-core/src/call_manager.rs` (`warn_if_dtls_unserviced`) | POA&M-325 |
+| Gap (RFC-004): a re-INVITE that changes fingerprint, setup or the remote transport address starts no new association; for a changed address SRTP is re-pointed under the old keys | 5763 §6.6 | `client-core/src/call_manager.rs` (`reoffer_rejection`) | POA&M-327 |
+| SRTP across audio pipeline restarts (re-INVITE, hold and resume) under the same keys: one context per direction is kept for the call. Receive: rollover counter and replay window continue. Transmit: same SSRC, next sequence number, marker bit, continued timestamp; SRTCP index continues. One live transmitter per call is enforced, so no (SSRC, index) pair is sealed twice | 3711 §3.2.3, §3.3.1, §3.3.2; 7714 §8.4 | `client-audio/src/media_security.rs` (`SrtpCallState`, `TransmitClaim`), `rtp_handler.rs` | `srtp_transmit_survives_pipeline_restarts_for_a_single_context_receiver`, `srtp_receive_survives_a_pipeline_restart_after_a_sequence_wrap`, `srtp_replay_across_a_pipeline_restart_is_refused`, `srtcp_replay_across_a_restart_is_refused`, `second_transmitter_is_refused_while_the_first_lives`; through the SBC: `dtls_sbc_sidecar` |
+| Deviation: one receive context per call, not per remote SSRC. A peer that restarts its stream with a new SSRC after a sequence wrap is not followed (silent audio; nothing wrongly accepted) | 3711 §3.2.3 | `proto-srtp/src/context.rs`; `client-audio/src/media_security.rs` | POA&M-338 (1) |
+| After an SSRC collision the new SSRC gets a new outbound context at rollover 0 (as required), and an RTCP BYE is sent for the abandoned SSRC. A receiver with one context per association (the SBC) that has counted a rollover does not follow the new stream | 3550 §8.2; 3711 §3.2.3 | `client-audio/src/io_thread.rs`, `media_security.rs` (`ssrc_after_collision`) | `ssrc_collision_starts_a_new_outbound_srtp_context`, `bye_for_the_ssrc_abandoned_after_a_collision`; POA&M-338 (2) |
+| Deliberate deviation (RFC-014, user decision): a restart that changes the RTP clock rate (8000 to or from 48000) keeps the SSRC; the timestamp continues at the new rate with the marker bit. Reason: a new SSRC would not be followed by the SBC's single-context leg after a rollover | 7160 §4.1 | `client-audio/src/media_security.rs`, `rtp_handler.rs` | `clock_rate_change_keeps_the_ssrc`; POA&M-338 (5) |
+| RTCP BYE (RFC-013, fixed): no BYE when a pipeline stops for a restart whose stream continues; BYE at call end. If the restart's start then fails, the call is ended by signalling and no BYE is sent for that SSRC | 3550 §6.3.7, §6.6 | `client-audio/src/rtcp_session.rs` (`finish`), `io_thread.rs` | `no_bye_when_the_stream_continues_after_a_restart`; the I/O-thread wiring has no test (needs audio devices) |
+| Sender and receiver report statistics restart in each pipeline although the SSRC continues | 3550 §6.4.1, §6.4.2 | `client-audio/src/rtcp_session.rs` | POA&M-338 (3) |
+| rtcp-mux stays required on DTLS-SRTP calls (by design; no separate RTCP association). SRTCP on the RTP socket was exchanged with pion and through the SBC | 5761 §5.1.1; 3711 §3.4 | `client-core/src/media_security.rs` (`preflight`) | `dtls_interop_pion`, `dtls_sbc_sidecar` (local runs); POA&M-326 closing |
+| Inbound TLS call: `Connecting` at accept, `Connected` only after the ACK and a completed handshake; BYE when no ACK arrives within 64*T1. Still no UAS 2xx retransmission | 3261 §13.3.1.4 | `client-core/src/call_manager.rs` (`ACK_WAIT_SECURE_MEDIA`) | `inbound_call_connects_only_after_ack_and_handshake_in_both_roles`, `test_unacked_tls_call_is_ended_after_64_t1`; POA&M-331 |
+| Toward our own SBC: the client needs the DTLS sidecar of the same change, which keeps the association open for the call; the older sidecar sent `close_notify` after the handshake, which ends a Stage 2 client's call after about 1 s | 5764 §5.1.2 | `sidecar/dtls-terminator/service/session.go` | `dtls_sbc_sidecar`; upgrade order in `docs/SBC-ADMIN-GUIDE.md` |
 
 ## Verified compliant (spot checks)
 
@@ -149,4 +196,4 @@ client, from the Stage 1 reviews:
 3. ✅ **Registration robustness (#5, #11)** and **NAT (#6)** — small, high value.
 4. ✅ **RTP DTX timestamp + marker (#8, #9)** — small fixes in io_thread/rtp_handler.
 5. ✅ **RFC 3263 DNS (#4)** — resolved via `uc-dns` (NAPTR/SRV, `resolver` feature). Before fix/client-cnsa-tls-dns the resolver had no DNS backend, so NAPTR/SRV were never queried. It now uses the system DNS configuration, with RFC 2782 weighted SRV order. No DNSSEC (NIST POA&M-172).
-6. ✅ All findings of the 2026-06-11 audit are fixed or accepted as documented limitations (SRTP ROC across DTLS rekey, early-media start, ICE trickling). Later reviews added open items: see "fix/client-review-blockers" and "fix/client-srtp-b2" above (the client drives no DTLS handshake, so no audio on TLS calls, NIST POA&M-324; Stage 1 of feat/client-dtls-handshake added the handshake to `proto-dtls` as a library only).
+6. ✅ All findings of the 2026-06-11 audit are fixed or accepted as documented limitations (SRTP ROC across DTLS rekey, early-media start, ICE trickling). Later reviews added open items: see "fix/client-review-blockers" and "fix/client-srtp-b2" above (fix/client-srtp-b2 closed the plaintext path; Stage 1 of feat/client-dtls-handshake added the handshake to `proto-dtls` as a library; Stage 2, feat/client-dtls-wiring, wired it into the client on 2026-11-17, with the open items listed in that section).

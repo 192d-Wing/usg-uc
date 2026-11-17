@@ -172,6 +172,7 @@ sbcDaemon:
 | `auth` | Mgmt-plane admin | Fail-closed: `sbc-api`/`sbc-provision` won't start without a credential. Prefer `adminPasswordHash` (argon2 PHC) to keep plaintext out of values |
 | `sbcPostgres` | Config store | `enabled: true` for the in-chart StatefulSet (set `password`), or `enabled: false` + `existingSecret.name` (key `dsn`) for managed Postgres |
 | `sbcDaemon.config` | SIP tuning | `max_calls`, `max_registrations`, `media_mode`, `srtp_required`, listen addrs (`metrics_listen` is reserved and not rendered; the daemon rejects a `[monitoring]` table). The `-metrics` Service (`services.metrics`, port 9090) is off by default and has no listener behind it: no metrics exporter exists (POA&M-195) |
+| `sbcDaemon.dtlsTerminate` | DTLS-SRTP termination (off by default) | `enabled` adds the Go DTLS sidecar to the daemon pod and sets `media.srtp.mode = Terminate`. `maxSessions` (`0` = 2 x `config.max_calls`) is the sidecar's session limit; `goMemLimit` (default `920MiB`) sets its `GOMEMLIMIT`; `resources.limits.memory` defaults to `1Gi`. Size the memory limit with `max_calls`: see "Upgrading to the client DTLS-SRTP release" in section 8 |
 | `sbcDaemon.sipTls` | SIP-over-TLS | `secretName` of a `kubernetes.io/tls` Secret covering the registrar domain; empty = UDP/TCP only |
 | `sbcDaemon.oidc` | REGISTER authz | RFC 8898 bearer-token REGISTER; requires an IdP (see `sbcClientConfig.oidc`) |
 | `gateway` | Edge HTTPS | Opt-in Gateway API + cert-manager termination; needs the Gateway API CRDs + cert-manager |
@@ -359,6 +360,63 @@ This upgrade has breaking changes. Check each point before you upgrade.
   apply without a restart. A failed reload keeps the old certificate in use;
   watch `sbc_api_tls_cert_reload_failures_total`.
 
+### Upgrading to the client DTLS-SRTP release (feat/client-dtls-wiring)
+
+Applies only to sites with `sbcDaemon.dtlsTerminate.enabled: true`. The
+figures below come from local runs on macOS; nothing here has been measured
+or run on Linux yet (NIST POA&M-339, POA&M-342). Details and the log records
+are in [docs/SBC-ADMIN-GUIDE.md](../../../docs/SBC-ADMIN-GUIDE.md), "DTLS
+sidecar operation".
+
+- **Upgrade the SBC (and with it the sidecar image) before any soft client
+  that performs DTLS-SRTP.** The older sidecar sent `close_notify` right
+  after the handshake; such a soft client then ends every call after about
+  one second (`media-security: dtls-closed-by-peer`). Set
+  `sbcDaemon.dtlsTerminate.image.tag` to the sidecar image built from this
+  release in the same upgrade as the daemon image.
+- **The sidecar now holds each call's DTLS association for the whole call.**
+  Restarting the sidecar container (on purpose, by its liveness probe, or by
+  an out-of-memory kill) ends the DTLS association of every call in
+  progress. The SBC keeps relaying media on those calls and does not end
+  them; a peer that honours `close_notify` (the soft client does) ends its
+  side. Drain first: restart the sidecar only when no terminated call is up.
+  A `helm upgrade` restarts the whole daemon pod, as before.
+- **New values under `sbcDaemon.dtlsTerminate`:**
+  - `maxSessions` (default `0`): the sidecar's `-max-sessions`. `0` renders
+    2 x `sbcDaemon.config.max_calls` (two sessions per terminated call). At
+    the limit a new call fails to set up; calls in progress are not touched.
+  - `goMemLimit` (default `"920MiB"`): `GOMEMLIMIT` for the sidecar, about
+    90 % of `resources.limits.memory`. Empty leaves the variable unset.
+- **Sidecar memory default raised:** limit `256Mi` -> `1Gi`, request `64Mi`
+  -> `128Mi`. A site values file that overrides
+  `sbcDaemon.dtlsTerminate.resources` keeps its own numbers: check them
+  against the formula.
+- **Sizing formula:** memory limit >= `16 MiB + max_calls x 150 KiB`, plus
+  headroom for the Go collector; `goMemLimit` about 90 % of the limit.
+  `max_calls: 5000` gives 749 MiB, hence `1Gi` / `920MiB`. `max_calls: 10000`
+  gives about 1.5 GiB: use `2Gi` / `1840MiB`. If you raise `max_calls`,
+  raise both. Caveats:
+  - 150 KiB per call was measured once, on macOS arm64; the 16 MiB base is
+    assumed. **Measure the sidecar's resident memory on Linux at your
+    `max_calls` before enabling termination at scale.**
+  - Not included: up to about 64 KiB per session that a session's own peer
+    can pin with unauthenticated handshake datagrams after the handshake.
+    For hostile peers size with `16 MiB + max_calls x 278 KiB`.
+  - If the limit is hit, the kernel kills the sidecar and every call loses
+    its DTLS association at once.
+- **New SBC log record `dtls.association.closed`** (one per terminated leg,
+  with `call_id`, `leg`, `remote`, `reason`): info for `call-ended`, warn
+  for `peer-close-notify`, `peer-fatal-alert`, `sidecar-shutdown`,
+  `sidecar-connection-lost`, `sidecar-close-timeout`, `sidecar-error`. A
+  sidecar restart with N terminated calls up writes 2N warnings. The
+  `close_notify` / fatal-alert distinction is inferred by the sidecar and is
+  advisory.
+- **Post-handshake DTLS is rate limited** on each terminated leg (burst 8,
+  then 4 per second); drops are counted and logged with the call id.
+- **Session count:** the sidecar logs
+  `sessions: active=N peak=N max=N refused=N` once a minute while it has
+  sessions. There is no metric for it.
+
 ### Upgrading to the data-plane wiring release (pr/data-plane-wiring-b403f0)
 
 Applies only to daemons built with the `cluster` feature that set `[cluster]`
@@ -409,6 +467,9 @@ podman `--network=host`, stale CNI IPAM) live in
 | Phones don't resolve `sbc.<site>` | ExternalDNS disabled, or the DNS server usg-dora hands phones is wrong | Enable `externalDns` (or pre-create A records); fix the DNS option in the usg-dora scope |
 | Soft client REGISTER hangs after DNS returns AAAA | `sbc_lb_ip6` published but not actually routed | Allocate + BGP-advertise a real v6 VIP, or clear `site.*6` for v4-only |
 | SIP-TLS listener logs a warning and only UDP/TCP serve | `sbcDaemon.sipTls.secretName` empty or cert missing | Create the `kubernetes.io/tls` Secret covering the registrar domain and set the name |
+| Soft-client calls through a terminating SBC drop about 1 s after answer with `media-security: dtls-closed-by-peer` | Sidecar image older than the client DTLS-SRTP release (it closes the DTLS association right after the handshake). Not reproduced on a deployed site; with this release's daemon the SBC log is expected, from the code, to show `dtls.association.closed` with `reason="sidecar-connection-lost"` shortly after setup | Upgrade `sbcDaemon.dtlsTerminate.image.tag` to this release |
+| New terminated calls fail to set up; sidecar logs `session limit reached` | Sidecar at `-max-sessions` | Check `sbcDaemon.dtlsTerminate.maxSessions` against 2 x `config.max_calls`; look for leaked sessions in the once-a-minute `sessions:` line |
+| Many `dtls.association.closed` warnings at once with `sidecar-shutdown` or `sidecar-connection-lost` | The sidecar container was restarted or killed (liveness probe, OOM kill) | Check the container's last state; if OOM-killed, resize the memory limit and `goMemLimit` with the formula in section 8 |
 | Daemon can't reach Postgres | `sbcPostgres.password` unset, or external `existingSecret` DSN wrong | Set a password (in-chart) or fix the `dsn` key in the referenced Secret |
 
 ---

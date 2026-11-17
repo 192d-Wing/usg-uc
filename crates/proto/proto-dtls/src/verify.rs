@@ -43,7 +43,10 @@ pub enum CertificateValidationResult {
 ///
 /// Per RFC 6347 §4.2.4, the server MUST validate the client's certificate
 /// if client authentication is requested.
-#[deprecated(note = "use association::DtlsAssociation (POA&M-324)")]
+#[deprecated(
+    since = "0.10.0",
+    note = "use association::DtlsAssociation; the legacy surface is removed under POA&M-337"
+)]
 pub struct CertificateValidator {
     /// Whether to allow self-signed certificates.
     /// For DTLS-SRTP, self-signed with fingerprint verification is common.
@@ -238,7 +241,10 @@ impl Default for CertificateValidator {
 /// Where:
 /// - `finished_label` is "client finished" or "server finished"
 /// - `Hash` is SHA-384 for `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`
-#[deprecated(note = "use association::DtlsAssociation (POA&M-324)")]
+#[deprecated(
+    since = "0.10.0",
+    note = "use association::DtlsAssociation; the legacy surface is removed under POA&M-337"
+)]
 pub struct FinishedVerifier;
 
 impl FinishedVerifier {
@@ -324,7 +330,10 @@ impl FinishedVerifier {
 /// ```text
 /// signed_params = SHA384(client_random + server_random + ServerECDHParams)
 /// ```
-#[deprecated(note = "use association::DtlsAssociation (POA&M-324)")]
+#[deprecated(
+    since = "0.10.0",
+    note = "use association::DtlsAssociation; the legacy surface is removed under POA&M-337"
+)]
 pub struct ServerKeyExchangeVerifier;
 
 impl ServerKeyExchangeVerifier {

@@ -33,6 +33,13 @@ oidc = [
     "whoami",
 ]
 
+# Test seams (`CallManager::set_audio_devices_enabled`). Enabled only by
+# this crate's own dev-dependency on itself, that is, when its integration
+# tests are built. No other crate may enable it; default and release
+# builds do not contain the seam.
+# NIST 800-53 Rev5: CM-7 (least functionality).
+test-util = []
+
 [dependencies]
 client-types = { path = "../client-types" }
 client-sip-ua = { path = "../client-sip-ua" }
@@ -88,8 +95,22 @@ keyring = { version = "3", features = ["linux-native-sync-persistent", "crypto-r
 cryptoki = "0.12"
 
 [dev-dependencies]
+# Turns on the `test-util` seam for this crate's integration tests only
+# (dev-dependencies are not part of a normal build of the library).
+client-core = { path = ".", features = ["test-util"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile.workspace = true
+# Captures log records in the media-security tests (call_manager.rs).
+tracing-subscriber.workspace = true
+# In-process DTLS peer and SRTP checks for the DTLS-SRTP call tests, and the
+# pion interop test (tests/dtls_srtp_call.rs, tests/dtls_interop_pion.rs).
+proto-dtls.workspace = true
+proto-srtp.workspace = true
+proto-rtp.workspace = true
+uc-crypto.workspace = true
+# The proto-dtls test harness these tests include by path builds its test
+# identities with rcgen (same spec as client-sip-ua).
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 
 [lints]
 workspace = true

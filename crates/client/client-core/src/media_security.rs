@@ -11,9 +11,10 @@
 //! ## NIST 800-53 Rev5 Controls
 //! - **SC-8 / SC-8(1)**: no plaintext media on a DTLS-SRTP stream
 //! - **SC-23**: fingerprint and setup role bound to the signalled session.
-//!   POAM: POA&M-324 -- the fingerprint is verified against the peer
-//!   certificate only once the DTLS handshake lands; until then the binding
-//!   is not enforced and every TLS-account call fails closed instead.
+//!   The fingerprints accepted here are the only ones the call's DTLS
+//!   association verifies the peer's certificate against (RFC 5763 §5,
+//!   RFC 8122 §5);
+//!   a mismatch, like every other handshake failure, ends the call.
 //! - **SI-10**: SDP preflight validation
 //!
 //! ## RFC Compliance
@@ -24,7 +25,7 @@
 
 use client_audio::{SrtpProfile, SrtpSessionKeys};
 use client_sip_ua::sdp_dtls::{self, DtlsSdpParams, Setup};
-use client_sip_ua::{DtlsRole, DtlsSrtpProfile, NegotiatedSrtpKeys};
+use client_sip_ua::{DtlsRole, DtlsSrtpProfile, NegotiatedSrtpKeys, SecurityCause};
 
 /// `Warning` header value on a 488 for a media-security failure
 /// (RFC 3261 §20.43; warn-agent is a fixed pseudonym, text is fixed).
@@ -72,7 +73,9 @@ pub fn preflight(sdp: Option<&str>, remote: RemoteSdp) -> Result<Preflight, &'st
     }
     // RFC 5761 §5.1.1 / RFC 5764 §5.1.2: RTCP is secured only over the
     // RTP DTLS association; with no RTCP association, rtcp-mux is required.
-    // POAM: POA&M-326 -- separate RTCP DTLS association not implemented.
+    // Design note: there is no separate DTLS association for RTCP, by
+    // design. RTCP is carried as SRTCP on the RTP association, so a
+    // stream without rtcp-mux is refused.
     if !sdp_dtls::media_has_rtcp_mux(sdp, idx) {
         return Err("remote media lacks a=rtcp-mux");
     }
@@ -128,6 +131,19 @@ pub const fn setup_for_role(role: DtlsRole) -> Setup {
         DtlsRole::Client => Setup::Active,
         DtlsRole::Server => Setup::Passive,
     }
+}
+
+/// The fixed text of a DTLS-SRTP failure for `media-security: <cause>`
+/// application events and logs: `dtls-timeout`,
+/// `dtls-fingerprint-mismatch`, `dtls-peer-authentication`,
+/// `dtls-unsupported-parameters`, `dtls-no-srtp-profile`, `dtls-alert`,
+/// `dtls-protocol-violation`, `dtls-closed-by-peer`, `dtls-internal`.
+///
+/// NIST 800-53 Rev5: SI-11 -- nothing the peer chose is in the text; the
+/// alert number of `dtls-alert` goes to the DTLS driver's log record only.
+#[must_use]
+pub const fn cause_text(cause: SecurityCause) -> &'static str {
+    cause.as_str()
 }
 
 /// Maps negotiated DTLS-SRTP keys into the audio pipeline's key type.

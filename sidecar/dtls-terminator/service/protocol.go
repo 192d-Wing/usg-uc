@@ -7,14 +7,23 @@
 //
 //	sidecar → relay : Hello{fingerprint}        (once, on connect)
 //	relay → sidecar : Start{role, peerFP}       (begin the leg)
-//	both            : Dtls{record}              (DTLS handshake records)
+//	both            : Dtls{record}              (DTLS records, whole session)
 //	sidecar → relay : Ready{profile, srtpKeys}  (handshake complete)
-//	sidecar → relay : Error{message}            (on failure)
+//	sidecar → relay : Error{message}            (handshake failed, or the
+//	                                             association ended after Ready)
+//
+// Ready does not end the session. The DTLS association lives until the relay
+// closes the connection (the call is over), and Dtls frames keep flowing in
+// both directions until then: see HandleSession.
 package service
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	dtlssession "github.com/192d-Wing/usg-uc/sidecar/dtls-terminator"
@@ -22,6 +31,9 @@ import (
 )
 
 type msgType byte
+
+// contentTypeAlert is the DTLS record type of an alert (RFC 6347 §4.1).
+const contentTypeAlert = 21
 
 const (
 	msgHello msgType = 1 // sidecar→relay: our SDP fingerprint
@@ -62,12 +74,14 @@ func decodeStart(body []byte) (dtlssession.Role, string, error) {
 	return dtlssession.Role(body[0]), string(body[1:]), nil
 }
 
-// Ready body: profile(2, big-endian) + SRTP keying material.
+// Ready body: profile(2, big-endian) + SRTP keying material. Built in one
+// buffer, so that the caller can wipe the only copy made here.
 func encodeReady(profile uint16, keys []byte) []byte {
-	body := make([]byte, 2+len(keys))
-	binary.BigEndian.PutUint16(body[:2], profile)
-	copy(body[2:], keys)
-	return frame(msgReady, body)
+	f := make([]byte, 3+len(keys))
+	f[0] = byte(msgReady)
+	binary.BigEndian.PutUint16(f[1:3], profile)
+	copy(f[3:], keys)
+	return f
 }
 
 func decodeReady(body []byte) (uint16, []byte, error) {
@@ -80,13 +94,38 @@ func decodeReady(body []byte) (uint16, []byte, error) {
 func encodeError(msg string) []byte { return frame(msgError, []byte(msg)) }
 
 // dtlsChannel adapts an ipc.FrameTransport to carry ONLY DTLS records, so
-// ipc.NewPacketConn(dtlsChannel{ft}) drives the handshake over the same
+// ipc.NewPacketConn(&dtlsChannel{inner: ft}) drives DTLS over the same
 // connection the control messages use: RecvFrame unwraps the next Dtls frame
-// (a non-Dtls frame mid-handshake is a protocol error), SendFrame wraps a
-// record as a Dtls frame. It implements ipc.FrameTransport.
-type dtlsChannel struct{ inner ipc.FrameTransport }
+// (any other frame from the relay after Start is a protocol error), SendFrame
+// wraps a record as a Dtls frame. It implements ipc.FrameTransport.
+//
+// It also remembers that the relay's side of the connection ended, which is
+// how the session tells "the relay closed the connection" from "the peer
+// closed the association" (pion reports both as io.EOF).
+type dtlsChannel struct {
+	inner ipc.FrameTransport
 
-func (d dtlsChannel) RecvFrame() ([]byte, error) {
+	mu      sync.Mutex
+	recvErr error // first error of RecvFrame other than a deadline
+
+	// alerts counts the alert records sent (the content type is readable in
+	// the record header also when the record is protected).
+	alerts atomic.Uint64
+}
+
+func (d *dtlsChannel) RecvFrame() ([]byte, error) {
+	body, err := d.recvDtls()
+	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		d.mu.Lock()
+		if d.recvErr == nil {
+			d.recvErr = err
+		}
+		d.mu.Unlock()
+	}
+	return body, err
+}
+
+func (d *dtlsChannel) recvDtls() ([]byte, error) {
 	raw, err := d.inner.RecvFrame()
 	if err != nil {
 		return nil, err
@@ -101,7 +140,30 @@ func (d dtlsChannel) RecvFrame() ([]byte, error) {
 	return body, nil
 }
 
-func (d dtlsChannel) SendFrame(p []byte) error           { return d.inner.SendFrame(frame(msgDtls, p)) }
-func (d dtlsChannel) SetReadDeadline(t time.Time) error  { return d.inner.SetReadDeadline(t) }
-func (d dtlsChannel) SetWriteDeadline(t time.Time) error { return d.inner.SetWriteDeadline(t) }
-func (d dtlsChannel) Close() error                       { return d.inner.Close() }
+// relayEnded returns the error that ended the relay's side of the connection
+// (io.EOF when the relay closed it), or nil while it is still readable.
+func (d *dtlsChannel) relayEnded() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.recvErr
+}
+
+func (d *dtlsChannel) SendFrame(p []byte) error {
+	if len(p) > 0 && p[0] == contentTypeAlert {
+		d.alerts.Add(1)
+	}
+	return d.inner.SendFrame(frame(msgDtls, p))
+}
+
+// alertsSent returns how many alert records the DTLS endpoint has sent.
+func (d *dtlsChannel) alertsSent() uint64 { return d.alerts.Load() }
+
+func (d *dtlsChannel) SetReadDeadline(t time.Time) error  { return d.inner.SetReadDeadline(t) }
+func (d *dtlsChannel) SetWriteDeadline(t time.Time) error { return d.inner.SetWriteDeadline(t) }
+
+// Close does nothing: the connection belongs to the session (HandleSession
+// closes it on return), not to the DTLS endpoint. pion closes its transport
+// when a handshake fails and when the peer ends the association; in both
+// cases the session still has a frame to send to the relay (Error), and at
+// the end of a call the close_notify.
+func (d *dtlsChannel) Close() error { return nil }

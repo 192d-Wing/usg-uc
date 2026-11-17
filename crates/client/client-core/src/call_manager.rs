@@ -12,10 +12,10 @@ use crate::media_security::{self, Preflight, RemoteSdp};
 use crate::sip_transport::SipTransportKind;
 use crate::{AppError, AppResult};
 use chrono::Utc;
-use client_audio::{MediaSecurity, PipelineStats};
+use client_audio::{DtlsForward, MediaSecurity, PipelineStats, SrtpCallState};
 use client_sip_ua::{
-    CallAgent, CallEvent, DtlsIdentity, MediaSession, MediaSessionEvent, MediaSessionState,
-    ReferStatus, Setup,
+    CallAgent, CallEvent, CauseBasis, DriverTimings, DtlsIdentity, MediaSession, MediaSessionEvent,
+    MediaSessionState, ReferStatus, SecureProgress, SecurityCause, Setup,
 };
 use client_types::audio::CodecPreference;
 use client_types::{
@@ -35,9 +35,45 @@ use tracing::{debug, error, info, warn};
 /// abandoned and the call ended: 64*T1 with T1 = 500 ms (RFC 3261 §13.3.1.4,
 /// §17.1.1.1).
 // POAM: POA&M-331 -- the UAS does not retransmit the 2xx until the ACK
-// arrives (RFC 3261 §13.3.1.4), and an inbound TLS call is reported
-// Connected at the 200 rather than after ACK + media security.
+// arrives (RFC 3261 §13.3.1.4), and the SIP layer holds an inbound TLS call
+// as Connected from the 200 on. The application is told `Connecting` until
+// the ACK has arrived and DTLS-SRTP has completed.
 const ACK_WAIT_SECURE_MEDIA: std::time::Duration = std::time::Duration::from_secs(32);
+
+/// Smallest and largest DTLS handshake budget the call manager accepts
+/// (`CallManager::set_dtls_handshake_budget`).
+const MIN_DTLS_HANDSHAKE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_DTLS_HANDSHAKE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long after the handshake budget the call manager itself ends a call
+/// whose DTLS driver has reported nothing. The driver's own watchdog fires
+/// one second earlier; this one also covers a driver task that died.
+///
+/// NIST 800-53 Rev5: SC-5 (no call waits for media security without bound).
+const SECURING_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a call whose peer closed the DTLS association (`close_notify`)
+/// waits for that peer's BYE before it is ended as a media-security
+/// failure. A peer that hangs up closes DTLS (UDP) and sends BYE (TLS)
+/// at about the same time, in either order. Audio is stopped at once in
+/// either case.
+const CLOSE_NOTIFY_BYE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `cause_basis` of a media-security failure that was decided from the
+/// remote SDP (transport profile, fingerprint, setup, rtcp-mux): taken
+/// from the remote SDP as delivered by the signalling path; as trustworthy
+/// as that path (POA&M-333). It is neither a local condition nor
+/// unauthenticated datagram input, and it is not a statement that the SDP
+/// was authenticated end to end.
+const BASIS_SIGNALLING: &str = "signalling";
+
+/// A TLS call whose DTLS-SRTP handshake is running.
+struct SecuringCall {
+    /// When the call manager gives up on the driver.
+    deadline: std::time::Instant,
+    /// What is reported with `Connected` once the handshake completes.
+    info: CallInfo,
+}
 
 /// Information about an incoming call that hasn't been answered yet.
 #[derive(Debug, Clone)]
@@ -139,6 +175,26 @@ pub struct CallManager {
     /// (a UAS must not send BYE before the ACK, RFC 3261 §15), with the
     /// deadline after which the call is ended for want of an ACK.
     pending_secure_media: HashMap<String, std::time::Instant>,
+    /// TLS calls whose DTLS-SRTP handshake is running; polled from
+    /// `process_timers`. Bounded by `max_concurrent_calls`, cleared in
+    /// `forget_call_media` (SC-5).
+    securing: HashMap<String, SecuringCall>,
+    /// Calls whose peer closed DTLS mid-call, with the time until which
+    /// the peer's BYE is awaited. Bounded and cleared like `securing`.
+    dtls_closed_by_peer: HashMap<String, std::time::Instant>,
+    /// SRTP state per call that outlives one audio pipeline: the receive
+    /// side's rollover counter and replay windows, and the transmit SSRCs
+    /// already used under the call's keys (RFC 3711 §3.3.1 / §3.3.2,
+    /// RFC 7714 §8.4). Created at the call's first secure audio start,
+    /// bounded and cleared like `securing`.
+    srtp_call_states: HashMap<String, SrtpCallState>,
+    /// Total time allowed for a call's DTLS handshake.
+    dtls_handshake_budget: std::time::Duration,
+    /// Test seam, absent from default and release builds: when false, no
+    /// audio device is opened. See
+    /// [`CallManager::set_audio_devices_enabled`].
+    #[cfg(any(test, feature = "test-util"))]
+    audio_devices_enabled: bool,
     /// Calls whose remote SDP asked for a secure RTP profile (SAVP/SAVPF):
     /// SRTP is then mandatory whatever the account transport (SC-8(1)).
     /// Cleared in `forget_call_media` (SC-5).
@@ -309,6 +365,12 @@ impl CallManager {
             dtls_preflight: HashMap::new(),
             media_preflight_errors: HashMap::new(),
             pending_secure_media: HashMap::new(),
+            securing: HashMap::new(),
+            dtls_closed_by_peer: HashMap::new(),
+            dtls_handshake_budget: DriverTimings::default().handshake_budget,
+            srtp_call_states: HashMap::new(),
+            #[cfg(any(test, feature = "test-util"))]
+            audio_devices_enabled: true,
             remote_requires_srtp: HashSet::new(),
             selected_input_device: None,
             selected_output_device: None,
@@ -375,6 +437,35 @@ impl CallManager {
         }
     }
 
+    /// Sets the total time allowed for a call's DTLS-SRTP handshake,
+    /// clamped to 1..=15 s (default 10 s). The retransmission interval is
+    /// not settable: it stays at the RFC 6347 §4.2.4.1 value of 1 s.
+    ///
+    /// NIST 800-53 Rev5: SC-5 (the bound cannot be configured away).
+    pub fn set_dtls_handshake_budget(&mut self, budget: std::time::Duration) {
+        self.dtls_handshake_budget =
+            budget.clamp(MIN_DTLS_HANDSHAKE_BUDGET, MAX_DTLS_HANDSHAKE_BUDGET);
+    }
+
+    /// Test seam: with `false`, calls are set up as usual (signalling,
+    /// media-security gate, DTLS-SRTP) but no audio device is opened and no
+    /// audio thread is started, which is what happens on a host without
+    /// audio devices. It cannot make a call less secure: the gate in
+    /// `media_security_for` runs first either way, and nothing is sent.
+    ///
+    /// Integration tests use it so that a connected call does not open the
+    /// developer's microphone.
+    ///
+    /// NIST 800-53 Rev5: CM-7 -- compiled only into this crate's own unit
+    /// tests and into builds with the `test-util` feature, which nothing
+    /// but this crate's tests enables. Default and release builds contain
+    /// neither the setter nor the field nor the branch that reads it.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub const fn set_audio_devices_enabled(&mut self, enabled: bool) {
+        self.audio_devices_enabled = enabled;
+    }
+
     /// Whether the configured account signals media as DTLS-SRTP
     /// (`UDP/TLS/RTP/SAVPF`), which makes SRTP mandatory for its calls.
     fn is_secure_account(&self) -> bool {
@@ -435,10 +526,27 @@ impl CallManager {
     /// Ends a call whose media security cannot be established. Never starts
     /// audio. The cause is a fixed string (no peer text is reflected).
     ///
-    /// NIST 800-53 Rev5: SC-8(1) (fail closed), AU-2 (event surfaced to the
-    /// application; the client has no audit sink).
-    async fn fail_call_media_security(&mut self, call_id: &str, cause: &str) {
-        warn!(call_id = %call_id, cause = cause, "Media security negotiation failed; ending call (fail closed)");
+    /// `cause_basis` says what the cause rests on, as in the DTLS driver's
+    /// records: `local`, `peer-authenticated`, `unauthenticated-input`
+    /// ([`CauseBasis`]) or, for a cause taken from the remote SDP,
+    /// `signalling`.
+    ///
+    /// NIST 800-53 Rev5: SC-8(1) (fail closed), AU-2 / AU-3 (event
+    /// surfaced to the application; the log line states what the cause
+    /// rests on, so that a cause derived from forgeable input is not read
+    /// as proof of what the peer did; the client has no audit sink).
+    async fn fail_call_media_security(
+        &mut self,
+        call_id: &str,
+        cause: &str,
+        cause_basis: &'static str,
+    ) {
+        warn!(
+            call_id = %call_id,
+            cause = cause,
+            cause_basis = cause_basis,
+            "Media security negotiation failed; ending call (fail closed)"
+        );
         let _ = self
             .app_event_tx
             .send(CallManagerEvent::Error {
@@ -459,7 +567,53 @@ impl CallManager {
         self.dtls_preflight.remove(call_id);
         self.media_preflight_errors.remove(call_id);
         self.pending_secure_media.remove(call_id);
+        self.securing.remove(call_id);
+        self.dtls_closed_by_peer.remove(call_id);
+        self.srtp_call_states.remove(call_id);
         self.remote_requires_srtp.remove(call_id);
+    }
+
+    /// Attaches the call's SRTP state to the keys of a secure audio start,
+    /// creating the state at the call's first one.
+    ///
+    /// RFC 3711 §3.3.1 / §3.3.2, RFC 7714 §8.4; NIST 800-53 Rev5: SC-13,
+    /// SC-23 -- the audio pipeline is restarted during a call (re-INVITE
+    /// with a new codec or remote address, hold and resume) under the same
+    /// master keys. Without this every restart would begin with an empty
+    /// replay window and a rollover counter of zero in both directions,
+    /// and with a new transmit SSRC and sequence space that a peer with
+    /// one SRTP context for the association (the SBC) cannot follow once
+    /// the stream has wrapped (RFC 3711 §3.2.3).
+    // POAM: POA&M-338 -- see `client_audio::SrtpCallState` for what is left
+    // (one receive context per call, not per remote SSRC; a new outbound
+    // context after an SSRC collision; RTCP sender and receiver report
+    // counters restart per pipeline; the SSRC is kept across a clock-rate
+    // change, a deliberate deviation from RFC 7160 §4.1).
+    fn with_srtp_call_state(
+        &mut self,
+        call_id: &str,
+        security: MediaSecurity,
+    ) -> AppResult<MediaSecurity> {
+        match security {
+            MediaSecurity::Srtp(keys) => {
+                let state = if let Some(state) = self.srtp_call_states.get(call_id) {
+                    state.clone()
+                } else {
+                    // Fixed text; fail closed if the DRBG fails.
+                    let state = SrtpCallState::new().map_err(|_| {
+                        AppError::MediaSecurity("SRTP state could not be created".to_string())
+                    })?;
+                    // NIST 800-53 Rev5: SC-5 -- one entry per call that has
+                    // a media session; removed in `forget_call_media`.
+                    self.srtp_call_states
+                        .insert(call_id.to_string(), state.clone());
+                    state
+                };
+                Ok(MediaSecurity::Srtp(keys.with_call_state(state)))
+            }
+            #[cfg(feature = "insecure-transports")]
+            MediaSecurity::Plaintext => Ok(MediaSecurity::Plaintext),
+        }
     }
 
     /// Records whether a remote SDP for `call_id` asked for SRTP. Sticky:
@@ -504,47 +658,222 @@ impl CallManager {
         }
     }
 
-    /// Runs ICE + DTLS for a TLS call using the preflighted remote
-    /// parameters. Returns a fixed cause on failure.
-    async fn establish_secure_media(&mut self, call_id: &str) -> Result<(), &'static str> {
+    /// Starts DTLS-SRTP for a TLS call with the preflighted parameters of
+    /// this dialog's remote SDP (ICE checks, when ICE applies, run inline;
+    /// the handshake itself runs in the call's driver task and is polled
+    /// from `process_timers`). Returns a fixed cause on failure.
+    ///
+    /// `info` is what the application is told with `Connected` once the
+    /// handshake has completed; until then the call is `Connecting`.
+    ///
+    /// NIST 800-53 Rev5: SC-8(1), SC-23 -- fingerprints come only from the
+    /// preflight of this dialog's SDP (strict parser), the role from its
+    /// `a=setup`; one handshake per call.
+    async fn begin_secure_media(
+        &mut self,
+        call_id: &str,
+        info: CallInfo,
+    ) -> Result<(), (&'static str, &'static str)> {
+        let local = CauseBasis::Local.as_str();
         if let Some(cause) = self.media_preflight_errors.get(call_id) {
-            return Err(cause);
+            // The preflight of the remote SDP refused it.
+            return Err((cause, BASIS_SIGNALLING));
         }
         let preflight = self
             .dtls_preflight
             .get(call_id)
             .cloned()
-            .ok_or("no DTLS parameters from remote SDP")?;
+            .ok_or(("no DTLS parameters from remote SDP", BASIS_SIGNALLING))?;
+        // NIST 800-53 Rev5: SC-5 -- the table cannot outgrow the call limit.
+        if self.securing.len() >= self.max_concurrent_calls {
+            return Err(("too many DTLS-SRTP handshakes in progress", local));
+        }
+        // RFC 6347 §4.2.4.1: the retransmission interval stays at 1 s.
+        let timings = DriverTimings {
+            handshake_budget: self.dtls_handshake_budget,
+            ..DriverTimings::default()
+        };
         let session = self
             .media_sessions
             .get_mut(call_id)
-            .ok_or("no media session")?;
+            .ok_or(("no media session", local))?;
         session
             .set_dtls_role(preflight.role)
-            .map_err(|_| "DTLS role already fixed")?;
-        // POAM: POA&M-324 no network DTLS handshake exists yet, so this
-        // always fails and TLS calls end here with no audio (fail closed).
-        session.establish(&preflight.params).await.map_err(|e| {
-            warn!(call_id = %call_id, error = %e, "DTLS-SRTP establishment failed");
-            "DTLS-SRTP handshake failed"
-        })
+            .map_err(|_| ("DTLS role already fixed", local))?;
+        session
+            .begin_secure(call_id, &preflight.params, timings)
+            .await
+            .map_err(|e| {
+                warn!(call_id = %call_id, error = %e, "DTLS-SRTP could not be started");
+                ("DTLS-SRTP could not be started", local)
+            })?;
+        // The handshake budget started when `begin_secure` started the
+        // driver, after any ICE checks.
+        let deadline =
+            std::time::Instant::now() + self.dtls_handshake_budget + SECURING_DEADLINE_MARGIN;
+        self.securing
+            .insert(call_id.to_string(), SecuringCall { deadline, info });
+        Ok(())
     }
 
-    /// Establishes media security (TLS calls) and starts audio. Any
-    /// media-security failure ends the call; audio is never started without
-    /// keys. Returns `Err` when the call was ended.
-    async fn secure_media_and_start_audio(&mut self, call_id: &str) -> AppResult<()> {
-        let already_keyed = self
+    /// Polls the DTLS-SRTP handshakes in progress. Never waits.
+    ///
+    /// On success audio is started with the exported keys and only then is
+    /// the call reported `Connected`. Every other outcome, and a driver
+    /// that reports nothing by the deadline, ends the call through
+    /// [`Self::fail_call_media_security`].
+    ///
+    /// NIST 800-53 Rev5: SC-8(1) (fail closed), SC-5 (deadline).
+    async fn poll_secure_media(&mut self, now: std::time::Instant) {
+        if self.securing.is_empty() {
+            return;
+        }
+        let call_ids: Vec<String> = self.securing.keys().cloned().collect();
+        for call_id in call_ids {
+            let mut progress = self.media_sessions.get_mut(&call_id).map_or(
+                SecureProgress::Failed(SecurityCause::Internal, CauseBasis::Local),
+                MediaSession::poll_secure,
+            );
+            let expired = self
+                .securing
+                .get(&call_id)
+                .is_none_or(|entry| entry.deadline <= now);
+            if expired && progress == SecureProgress::Pending {
+                // Our own deadline, with the driver still silent.
+                // NIST 800-53 Rev5: AU-2 / AU-3 -- the session writes the
+                // `dtls.handshake.failed` record for this
+                // (`origin="call-manager-deadline"`); the driver, closed
+                // by it, then writes no `cancelled` record.
+                let timed_out = SecureProgress::Failed(SecurityCause::Timeout, CauseBasis::Local);
+                progress = self
+                    .media_sessions
+                    .get_mut(&call_id)
+                    .map_or(timed_out, MediaSession::abandon_secure);
+                if progress == SecureProgress::Pending {
+                    // Past the deadline nothing stays pending.
+                    progress = timed_out;
+                }
+            }
+            match progress {
+                SecureProgress::Pending => {}
+                SecureProgress::Failed(cause, basis) => {
+                    self.securing.remove(&call_id);
+                    self.fail_call_media_security(
+                        &call_id,
+                        media_security::cause_text(cause),
+                        basis.as_str(),
+                    )
+                    .await;
+                }
+                SecureProgress::Ready => {
+                    if let Some(entry) = self.securing.remove(&call_id) {
+                        self.finish_secure_media(&call_id, entry.info).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The handshake completed: start audio with the SRTP keys, then tell
+    /// the application the call is connected.
+    async fn finish_secure_media(&mut self, call_id: &str, mut info: CallInfo) {
+        let remote_addr = self
             .media_sessions
             .get(call_id)
-            .is_some_and(MediaSession::is_ready);
-        if self.is_secure_account()
-            && !already_keyed
-            && let Err(cause) = self.establish_secure_media(call_id).await
-        {
-            self.fail_call_media_security(call_id, cause).await;
-            return Err(AppError::MediaSecurity(cause.to_string()));
+            .and_then(MediaSession::remote_addr);
+        let Some(addr) = remote_addr else {
+            self.fail_call_media_security(
+                call_id,
+                media_security::cause_text(SecurityCause::Internal),
+                CauseBasis::Local.as_str(),
+            )
+            .await;
+            return;
+        };
+        if self.start_audio_or_fail(call_id, addr).await.is_err() {
+            // Media security refused the start; the call was ended.
+            return;
         }
+        info.state = CallState::Connected;
+        info.connect_time = Some(Utc::now());
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::CallStateChanged {
+                call_id: call_id.to_string(),
+                state: CallState::Connected,
+                info,
+            })
+            .await;
+    }
+
+    /// Watches the DTLS associations of connected calls. Never waits.
+    ///
+    /// A fatal alert from the peer ends the call at once as a
+    /// media-security failure. On the peer's `close_notify` audio is
+    /// stopped at once (no SRTP is sent or accepted on a closed
+    /// association) and the call waits up to [`CLOSE_NOTIFY_BYE_GRACE`]
+    /// for the peer's BYE: with it the call ends as a normal remote
+    /// hang-up, without it as a media-security failure.
+    ///
+    /// With `expire_grace` false only what the DTLS drivers reported is
+    /// handled; the wait for a BYE is not ended (see
+    /// [`Self::poll_media_security`]).
+    ///
+    /// NIST 800-53 Rev5: SC-8(1), SC-23 (records of epoch 1 are
+    /// authenticated by the association before they are reported).
+    async fn poll_security_closed(&mut self, now: std::time::Instant, expire_grace: bool) {
+        let closed: Vec<(String, SecurityCause)> = self
+            .media_sessions
+            .iter_mut()
+            .filter_map(|(call_id, session)| {
+                session
+                    .poll_security_closed()
+                    .map(|cause| (call_id.clone(), cause))
+            })
+            .collect();
+        for (call_id, cause) in closed {
+            if let Err(e) = self.stop_audio_session(&call_id).await {
+                warn!(call_id = %call_id, error = %e, "Failed to stop audio session");
+            }
+            if cause == SecurityCause::ClosedByPeer {
+                info!(call_id = %call_id, "Peer closed DTLS; audio stopped, waiting for BYE");
+                self.dtls_closed_by_peer
+                    .insert(call_id, now + CLOSE_NOTIFY_BYE_GRACE);
+            } else {
+                self.fail_call_media_security(
+                    &call_id,
+                    media_security::cause_text(cause),
+                    CauseBasis::of_termination(cause).as_str(),
+                )
+                .await;
+            }
+        }
+        if !expire_grace {
+            return;
+        }
+
+        let overdue: Vec<String> = self
+            .dtls_closed_by_peer
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(call_id, _)| call_id.clone())
+            .collect();
+        for call_id in overdue {
+            self.dtls_closed_by_peer.remove(&call_id);
+            self.fail_call_media_security(
+                &call_id,
+                media_security::cause_text(SecurityCause::ClosedByPeer),
+                CauseBasis::of_termination(SecurityCause::ClosedByPeer).as_str(),
+            )
+            .await;
+        }
+    }
+
+    /// Starts audio for a call that needs no DTLS handshake now: plain RTP
+    /// (insecure builds only), or a call whose keys already exist. The
+    /// choke point in [`Self::media_security_for`] still decides.
+    /// Returns `Err` when the call was ended.
+    async fn start_audio_for_connected_call(&mut self, call_id: &str) -> AppResult<()> {
         let remote_addr = self
             .media_sessions
             .get(call_id)
@@ -556,17 +885,57 @@ impl CallManager {
         self.start_audio_or_fail(call_id, addr).await
     }
 
+    /// The call's info as the SIP layer has it, for application events.
+    fn call_info_for_event(&self, call_id: &str, state: CallState) -> CallInfo {
+        self.call_agent
+            .get_call_info(call_id)
+            .unwrap_or_else(|| CallInfo {
+                id: call_id.to_string(),
+                state,
+                direction: CallDirection::Outbound,
+                remote_uri: String::new(),
+                remote_display_name: None,
+                start_time: Utc::now(),
+                connect_time: None,
+                is_muted: self.is_muted,
+                is_on_hold: false,
+                failure_reason: None,
+            })
+    }
+
+    /// Logs that a DTLS-SRTP call is up without an audio thread. Nothing
+    /// then reads the media socket, so the DTLS records the peer still
+    /// sends (`close_notify`, a fatal alert, a retransmitted final flight)
+    /// are not seen; the call ends by SIP only.
+    // POAM: POA&M-325 (SC-10 / AC-12) -- no reader on the media socket
+    // without an audio thread; post-handshake DTLS is then not serviced.
+    fn warn_if_dtls_unserviced(&self, call_id: &str) {
+        let is_dtls_call = self
+            .media_sessions
+            .get(call_id)
+            .is_some_and(|session| session.dtls_remote().is_some());
+        if is_dtls_call && !self.audio_sessions.contains_key(call_id) {
+            warn!(
+                call_id = %call_id,
+                "DTLS-SRTP call has no audio thread: DTLS records from the peer \
+                 (close_notify, alerts) are not serviced on this call"
+            );
+        }
+    }
+
     /// Starts audio; a media-security refusal ends the call, other audio
     /// errors (devices) are logged as before.
     async fn start_audio_or_fail(&mut self, call_id: &str, addr: SocketAddr) -> AppResult<()> {
         match self.start_audio_session(call_id, addr).await {
             Ok(()) => Ok(()),
             Err(AppError::MediaSecurity(cause)) => {
-                self.fail_call_media_security(call_id, &cause).await;
+                self.fail_call_media_security(call_id, &cause, CauseBasis::Local.as_str())
+                    .await;
                 Err(AppError::MediaSecurity(cause))
             }
             Err(e) => {
                 warn!(call_id = %call_id, error = %e, "Failed to start audio");
+                self.warn_if_dtls_unserviced(call_id);
                 Ok(())
             }
         }
@@ -993,12 +1362,39 @@ impl CallManager {
     /// re-INVITE retry after 491 glare, RFC 3261 §14.1). Call periodically
     /// from the app event pump.
     pub async fn process_timers(&mut self) -> AppResult<()> {
-        self.expire_unacked_secure_calls(std::time::Instant::now())
-            .await;
+        let now = std::time::Instant::now();
+        self.expire_unacked_secure_calls(now).await;
+        // DTLS-SRTP: handshakes in progress, then associations of
+        // connected calls. Neither waits on the network.
+        self.poll_secure_media(now).await;
+        self.poll_security_closed(now, true).await;
         self.call_agent
             .process_timers()
             .await
             .map_err(|e| AppError::Sip(e.to_string()))
+    }
+
+    /// Acts on what the calls' DTLS drivers have reported: a completed
+    /// handshake (audio starts, the call is reported `Connected`), a
+    /// failed one, and the end of a connected call's association (audio
+    /// stops at once; a fatal alert ends the call). Never waits on the
+    /// network.
+    ///
+    /// The application's event pump calls this at the start of each pass,
+    /// before it handles transport events, so that a failing or slow step
+    /// later in the pass cannot delay stopping the audio of a call whose
+    /// media security has ended. [`Self::process_timers`] runs the same
+    /// checks again at the end of the pass, and is the only place where
+    /// time alone ends something: the wait for an ACK, and the wait for a
+    /// BYE after the peer's `close_notify`. Those two stay behind the
+    /// transport events on purpose, so that an ACK or BYE that is already
+    /// queued is handled before its wait is declared over.
+    ///
+    /// NIST 800-53 Rev5: SC-8(1), SC-5.
+    pub async fn poll_media_security(&mut self) {
+        let now = std::time::Instant::now();
+        self.poll_secure_media(now).await;
+        self.poll_security_closed(now, false).await;
     }
 
     /// Ends answered TLS calls whose ACK never arrived (RFC 3261 §13.3.1.4:
@@ -1013,8 +1409,12 @@ impl CallManager {
             .collect();
         for call_id in expired {
             self.pending_secure_media.remove(&call_id);
-            self.fail_call_media_security(&call_id, "no ACK for 2xx within 64*T1")
-                .await;
+            self.fail_call_media_security(
+                &call_id,
+                "no ACK for 2xx within 64*T1",
+                CauseBasis::Local.as_str(),
+            )
+            .await;
         }
     }
 
@@ -1122,8 +1522,10 @@ impl CallManager {
             "ACK" => {
                 // Acknowledgement (normally handled by transaction layer).
                 // For an answered TLS call this is where media security is
-                // set up: a UAS must not send BYE before the ACK (RFC 3261
+                // started: a UAS must not send BYE before the ACK (RFC 3261
                 // §15), so a failure can only end the call from here on.
+                // The handshake itself does not run here: its result is
+                // polled from `process_timers`, so the SIP pump stays free.
                 debug!("Received ACK");
                 let to_tag = request.headers.to_tag();
                 let acked = request
@@ -1135,7 +1537,10 @@ impl CallManager {
                 if let Some(call_id) = acked
                     && self.pending_secure_media.remove(&call_id).is_some()
                 {
-                    let _ = self.secure_media_and_start_audio(&call_id).await;
+                    let info = self.call_info_for_event(&call_id, CallState::Connecting);
+                    if let Err((cause, basis)) = self.begin_secure_media(&call_id, info).await {
+                        self.fail_call_media_security(&call_id, cause, basis).await;
+                    }
                 }
             }
             "INFO" => {
@@ -1191,8 +1596,10 @@ impl CallManager {
             return None;
         }
         // A TLS call's re-offer must stay DTLS-SRTP with a usable fingerprint.
-        // POAM: POA&M-327 a changed fingerprint/setup must trigger a new DTLS
-        // handshake.
+        // POAM: POA&M-327 a changed fingerprint, setup or transport address
+        // must trigger a new DTLS handshake (RFC 5763 §6.6). Today the
+        // existing association and its keys are kept, also when the
+        // re-offer moves the remote media address.
         if let Err(cause) = media_security::preflight(Some(remote_sdp), RemoteSdp::Offer) {
             return Some(cause);
         }
@@ -1349,7 +1756,7 @@ impl CallManager {
         // Restart audio session if codec or remote address changed
         if audio_restart_needed {
             info!(call_id = %call_id, "Restarting audio session for re-INVITE parameter change");
-            let _ = self.stop_audio_session(call_id).await;
+            let _ = self.stop_audio_session_for_restart(call_id).await;
             if let Some(addr) = self
                 .media_sessions
                 .get(call_id)
@@ -1848,8 +2255,12 @@ impl CallManager {
             &record_routes,
         );
 
-        // TLS call: media security (ICE + DTLS) and audio start on ACK.
+        // TLS call: media security (ICE + DTLS) starts on ACK, audio once
+        // the handshake has completed. Until then the application is told
+        // `Connecting`, never `Connected` (RFC 5764 §4.1: no media and no
+        // "connected" before keys).
         // Insecure builds only: plain RTP starts now, as before.
+        let awaits_media_security = preflight.is_some();
         if let Some(p) = preflight {
             self.dtls_preflight.insert(call_id.to_string(), p);
             self.pending_secure_media.insert(
@@ -1878,14 +2289,19 @@ impl CallManager {
         }
 
         // Notify application of state change
+        let state = if awaits_media_security {
+            CallState::Connecting
+        } else {
+            CallState::Connected
+        };
         let info = CallInfo {
             id: call_id.to_string(),
-            state: CallState::Connected,
+            state,
             direction: CallDirection::Inbound,
             remote_uri: remote_uri_str,
             remote_display_name: remote_display,
             start_time: Utc::now(),
-            connect_time: Some(Utc::now()),
+            connect_time: (!awaits_media_security).then(Utc::now),
             is_muted: false,
             is_on_hold: false,
             failure_reason: None,
@@ -1895,7 +2311,7 @@ impl CallManager {
             .app_event_tx
             .send(CallManagerEvent::CallStateChanged {
                 call_id: call_id.to_string(),
-                state: CallState::Connected,
+                state,
                 info,
             })
             .await;
@@ -2678,7 +3094,8 @@ impl CallManager {
         Ok(())
     }
 
-    /// Starts the audio session for a connected call.
+    /// Starts the audio session for a connected call. An audio session
+    /// the call still has is stopped first.
     async fn start_audio_session(
         &mut self,
         call_id: &str,
@@ -2686,15 +3103,59 @@ impl CallManager {
     ) -> AppResult<()> {
         info!(call_id = %call_id, remote = %remote_addr, "Starting audio session");
 
+        // Stop before start. This order is load-bearing for AES-GCM nonce
+        // uniqueness (RFC 7714 §8.4, §9; NIST 800-53 Rev5: SC-13): the new
+        // pipeline continues the call's transmit SSRC and SRTP context at
+        // the highest sequence number sent plus one, so the old
+        // transmitter must have sent its last packet before the new one
+        // reads that number. `AudioSession::stop` returns only after the
+        // pipeline has joined its I/O thread, which owns the transmitter.
+        // Every caller already stops first (or skips the start when a
+        // session exists); this makes it hold for any later call site,
+        // and `client_audio::SrtpCallState` refuses a second live
+        // transmitter should one be attempted all the same (fail closed,
+        // no audio start). A stop that fails starts nothing.
+        self.stop_audio_session_for_restart(call_id).await?;
+
         // Single choke point: no keys on a DTLS-SRTP stream -> no audio.
         // NIST 800-53 Rev5: SC-8(1). RFC 5764 §4.1.
         let security = self.media_security_for(call_id)?;
+        // The call's SRTP state: receive state and used SSRCs survive a
+        // restart of the pipeline under the same keys.
+        let security = self.with_srtp_call_state(call_id, security)?;
 
         // Hand the call's socket to the pipeline: the media session drops
-        // its tokio clone first so the audio thread is the sole reader.
-        // POAM: POA&M-325 post-handshake DTLS servicing on this socket.
+        // its tokio clone first so the audio thread is the sole reader (on
+        // a DTLS-SRTP call the driver gave up its view before it reported
+        // the keys).
+        //
+        // RFC 5764 §5.1.2 / RFC 7983 §7: DTLS records that still arrive on
+        // the socket (retransmitted final flight, alerts, close_notify) go
+        // from the audio thread to the call's DTLS driver through a fresh
+        // bounded ring; the forward is try-push only. `None` on plain RTP.
+        // NIST 800-53 Rev5: SC-23 -- only from the address the handshake
+        // ran with.
+        let mut dtls_sink = None;
         if let Some(session) = self.media_sessions.get_mut(call_id) {
             session.release_socket();
+            if let Some(remote) = session.dtls_remote() {
+                if let Some(mut forward) = session.dtls_forward_tx() {
+                    dtls_sink = Some(DtlsForward::new(
+                        Box::new(move |datagram: &[u8]| forward.try_forward(datagram)),
+                        remote,
+                    ));
+                } else {
+                    // The driver takes any number of rings, so this means
+                    // it is no longer running; `poll_security_closed` ends
+                    // the call on its next pass. Not silent in the
+                    // meantime (NIST 800-53 Rev5: AU-2).
+                    warn!(
+                        call_id = %call_id,
+                        "DTLS-SRTP call starts audio without a DTLS forward sink: \
+                         DTLS records from the peer are not serviced"
+                    );
+                }
+            }
         }
         let socket = self
             .media_sockets
@@ -2702,6 +3163,14 @@ impl CallManager {
             .map(std::net::UdpSocket::try_clone)
             .transpose()?;
         let rtcp_mux = self.dtls_preflight.get(call_id).is_some_and(|p| p.rtcp_mux);
+
+        #[cfg(any(test, feature = "test-util"))]
+        if !self.audio_devices_enabled {
+            // Same outcome as a host without audio devices: the call stays
+            // up with no audio thread (and so no reader on the socket).
+            info!(call_id = %call_id, "Audio devices disabled; call carries no audio");
+            return Ok(());
+        }
 
         // Create audio session and apply stored device preferences
         let mut audio_session = AudioSession::new(self.audio_event_tx.clone());
@@ -2751,6 +3220,7 @@ impl CallManager {
             security,
             socket,
             rtcp_mux,
+            dtls_sink,
             moh_file_path: self.moh_file_path.clone(),
             dtmf_payload_type,
             dtmf_volume: self.dtmf_volume,
@@ -2774,7 +3244,21 @@ impl CallManager {
         }
     }
 
-    /// Stops the audio session for a call.
+    /// Stops the audio session of a call that goes on, ahead of a new
+    /// one (re-INVITE with another codec or remote address): the call's
+    /// stream continues with the same SSRC where the call has SRTP state,
+    /// so no RTCP BYE is sent for it (RFC 3550 §6.3.7, §6.6). The BYE goes
+    /// out from [`Self::stop_audio_session`] when the call ends.
+    async fn stop_audio_session_for_restart(&mut self, call_id: &str) -> AppResult<()> {
+        if let Some(mut session) = self.audio_sessions.remove(call_id) {
+            info!(call_id = %call_id, "Stopping audio session for a restart");
+            session.stop_for_restart().await?;
+        }
+        Ok(())
+    }
+
+    /// Stops the audio session for a call whose media ends (hang-up,
+    /// termination, DTLS association closed).
     async fn stop_audio_session(&mut self, call_id: &str) -> AppResult<()> {
         if let Some(mut session) = self.audio_sessions.remove(call_id) {
             info!(call_id = %call_id, "Stopping audio session");
@@ -2793,22 +3277,11 @@ impl CallManager {
     ) -> AppResult<()> {
         info!(call_id = %call_id, state = ?state, "Call state changed");
 
-        let call_info = info.unwrap_or_else(|| {
-            self.call_agent
-                .get_call_info(call_id)
-                .unwrap_or_else(|| CallInfo {
-                    id: call_id.to_string(),
-                    state,
-                    direction: CallDirection::Outbound,
-                    remote_uri: String::new(),
-                    remote_display_name: None,
-                    start_time: Utc::now(),
-                    connect_time: None,
-                    is_muted: self.is_muted,
-                    is_on_hold: false,
-                    failure_reason: None,
-                })
-        });
+        let mut call_info = info.unwrap_or_else(|| self.call_info_for_event(call_id, state));
+        // What the application is told. A TLS call whose DTLS-SRTP
+        // handshake has not completed is `Connecting`, whatever the SIP
+        // layer says.
+        let mut reported = state;
 
         match state {
             CallState::Connected => {
@@ -2816,16 +3289,41 @@ impl CallManager {
 
                 // If audio session already exists (e.g. resume from hold),
                 // skip starting a new one — the existing pipeline is still running.
+                let already_keyed = self
+                    .media_sessions
+                    .get(call_id)
+                    .is_some_and(MediaSession::is_ready);
                 if self.audio_sessions.contains_key(call_id) {
                     info!(call_id = %call_id, "Audio session already active, skipping start");
-                } else {
-                    // TLS calls: ICE + DTLS-SRTP must succeed before any
-                    // audio; a failure ends the call (BYE) and the call is
-                    // never reported Connected. Plain RTP (insecure builds)
-                    // starts directly. NIST 800-53 Rev5: SC-8(1).
-                    if self.secure_media_and_start_audio(call_id).await.is_err() {
+                } else if self.securing.contains_key(call_id)
+                    || self.pending_secure_media.contains_key(call_id)
+                {
+                    // The handshake is running (or waits for the ACK): no
+                    // second one is started, and the call is not connected
+                    // yet as far as the application is concerned.
+                    reported = CallState::Connecting;
+                } else if self.is_secure_account() && !already_keyed {
+                    // TLS calls: DTLS-SRTP must complete before any audio
+                    // and before the call is reported Connected; a failure
+                    // ends the call (BYE). The handshake runs in the
+                    // call's driver task; `process_timers` reports
+                    // Connected when the keys arrive.
+                    // NIST 800-53 Rev5: SC-8(1). RFC 5764 §4.1.
+                    if let Err((cause, basis)) =
+                        self.begin_secure_media(call_id, call_info.clone()).await
+                    {
+                        self.fail_call_media_security(call_id, cause, basis).await;
                         return Ok(());
                     }
+                    reported = CallState::Connecting;
+                } else if self.start_audio_for_connected_call(call_id).await.is_err() {
+                    // Plain RTP (insecure builds) or keys already there;
+                    // media security refused the start and ended the call.
+                    return Ok(());
+                }
+                if reported == CallState::Connecting {
+                    call_info.state = CallState::Connecting;
+                    call_info.connect_time = None;
                 }
             }
             CallState::Terminated => {
@@ -2865,12 +3363,12 @@ impl CallManager {
         }
 
         // Notify application
-        info!(call_id = %call_id, state = ?state, "Queueing CallStateChanged event");
+        info!(call_id = %call_id, state = ?reported, "Queueing CallStateChanged event");
         if let Err(e) = self
             .app_event_tx
             .send(CallManagerEvent::CallStateChanged {
                 call_id: call_id.to_string(),
-                state,
+                state: reported,
                 info: call_info,
             })
             .await
@@ -2917,7 +3415,7 @@ impl CallManager {
                     to = ?codec,
                     "Codec changed via re-INVITE, restarting audio session"
                 );
-                if let Err(e) = self.stop_audio_session(call_id).await {
+                if let Err(e) = self.stop_audio_session_for_restart(call_id).await {
                     warn!(call_id = %call_id, error = %e, "Failed to stop audio session for codec change");
                 }
             }
@@ -4706,6 +5204,36 @@ mod tests {
         assert!(ended);
     }
 
+    /// SC-5: the DTLS handshake budget cannot be configured away or made
+    /// longer than the SIP layer would wait.
+    #[tokio::test]
+    async fn test_dtls_handshake_budget_is_clamped() {
+        use std::time::Duration;
+        let (mut manager, _rx) = manager_with_account();
+        assert_eq!(manager.dtls_handshake_budget, Duration::from_secs(10));
+        manager.set_dtls_handshake_budget(Duration::ZERO);
+        assert_eq!(manager.dtls_handshake_budget, Duration::from_secs(1));
+        manager.set_dtls_handshake_budget(Duration::from_hours(1));
+        assert_eq!(manager.dtls_handshake_budget, Duration::from_secs(15));
+        manager.set_dtls_handshake_budget(Duration::from_secs(5));
+        assert_eq!(manager.dtls_handshake_budget, Duration::from_secs(5));
+    }
+
+    /// A TLS call cannot start its handshake without the preflighted
+    /// parameters of its own dialog, and a failed start leaves nothing in
+    /// the securing table.
+    #[tokio::test]
+    async fn test_begin_secure_media_needs_this_dialogs_preflight() {
+        let (mut manager, _rx) = manager_with_account();
+        let info = manager.call_info_for_event("nobody", CallState::Connecting);
+        assert_eq!(
+            manager.begin_secure_media("nobody", info).await,
+            Err(("no DTLS parameters from remote SDP", BASIS_SIGNALLING))
+        );
+        assert!(manager.securing.is_empty());
+        assert!(manager.dtls_closed_by_peer.is_empty());
+    }
+
     /// RFC-B2-003: an answered TLS call that never gets its ACK is ended
     /// with BYE after 64*T1 and never starts audio.
     #[tokio::test]
@@ -6190,5 +6718,505 @@ a=rtpmap:0 PCMU/8000\r\n";
 
         let exts = parse_extmap_attributes(sdp);
         assert_eq!(exts.len(), 0);
+    }
+
+    // ----- QA: DTLS-SRTP tables, deadline and the audio test seam ---------
+    // (POA&M-324 stage 2; see qa-report.md of the run.)
+
+    /// An inbound TLS call that was answered (200 sent) and whose ACK has
+    /// not arrived yet, plus that ACK. The remote media address of
+    /// `test_offer_sdp` is 192.0.2.50 (TEST-NET-1): nothing answers DTLS.
+    /// No audio device is opened.
+    async fn qa_answered_tls_call() -> (
+        CallManager,
+        mpsc::Receiver<CallManagerEvent>,
+        String,
+        SipRequest,
+    ) {
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let (mut manager, mut rx) = manager_with_account();
+        manager.set_audio_devices_enabled(false);
+        let invite = parse_invite(
+            "<sips:caller@example.com>;tag=1",
+            "<sips:caller@192.0.2.50:5061>",
+        );
+        manager
+            .handle_incoming_invite_from(&invite, source, SipTransportKind::Tls)
+            .await
+            .unwrap();
+        let (call_id, local_tag) = {
+            let incoming = manager.incoming_calls()[0];
+            (incoming.call_id.clone(), incoming.local_tag.clone())
+        };
+        manager.accept_incoming_call(&call_id).await.unwrap();
+        while rx.try_recv().is_ok() {}
+        let text = format!(
+            "ACK sips:testuser@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 192.0.2.50:5061;branch=z9hG4bKqaack\r\n\
+             Max-Forwards: 70\r\n\
+             From: <sips:caller@example.com>;tag=1\r\n\
+             To: <sips:testuser@example.com>;tag={local_tag}\r\n\
+             Call-ID: hostile-headers@192.0.2.50\r\n\
+             CSeq: 1 ACK\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        );
+        let ack = match proto_sip::message::SipMessage::parse(text.as_bytes()).unwrap() {
+            proto_sip::message::SipMessage::Request(request) => request,
+            proto_sip::message::SipMessage::Response(_) => panic!("expected a request"),
+        };
+        (manager, rx, call_id, ack)
+    }
+
+    /// Error messages, `CallEnded` reasons and whether `Connected` was
+    /// reported, from the queued application events.
+    fn qa_drain(
+        rx: &mut mpsc::Receiver<CallManagerEvent>,
+    ) -> (Vec<String>, Vec<CallEndReason>, bool) {
+        let (mut errors, mut ends, mut connected) = (Vec::new(), Vec::new(), false);
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                CallManagerEvent::Error { message, .. } => errors.push(message),
+                CallManagerEvent::CallEnded { reason, .. } => ends.push(reason),
+                CallManagerEvent::CallStateChanged {
+                    state: CallState::Connected,
+                    ..
+                } => connected = true,
+                _ => {}
+            }
+        }
+        (errors, ends, connected)
+    }
+
+    /// Every per-call table of the media-security path is empty.
+    fn qa_assert_media_tables_empty(manager: &CallManager) {
+        assert!(manager.securing.is_empty(), "securing");
+        assert!(
+            manager.dtls_closed_by_peer.is_empty(),
+            "dtls_closed_by_peer"
+        );
+        assert!(
+            manager.pending_secure_media.is_empty(),
+            "pending_secure_media"
+        );
+        assert!(manager.dtls_preflight.is_empty(), "dtls_preflight");
+        assert!(
+            manager.media_preflight_errors.is_empty(),
+            "preflight errors"
+        );
+        assert!(manager.media_sockets.is_empty(), "media_sockets");
+        assert!(manager.media_sessions.is_empty(), "media_sessions");
+        assert!(manager.effective_media_addrs.is_empty(), "media addrs");
+        assert!(
+            manager.remote_requires_srtp.is_empty(),
+            "remote_requires_srtp"
+        );
+        assert!(manager.audio_sessions.is_empty(), "audio_sessions");
+        assert!(manager.srtp_call_states.is_empty(), "srtp_call_states");
+        assert_eq!(manager.all_call_ids(), &[] as &[String]);
+    }
+
+    /// The fields of one log record, rendered as text.
+    type QaRecordFields = std::collections::BTreeMap<String, String>;
+
+    /// Log records as `(target, fields)`, captured on the test's thread.
+    #[derive(Clone, Default)]
+    struct QaCapture(Arc<std::sync::Mutex<Vec<(String, QaRecordFields)>>>);
+
+    struct QaFields(QaRecordFields);
+
+    impl tracing::field::Visit for QaFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for QaCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = QaFields(QaRecordFields::new());
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .unwrap()
+                .push((event.metadata().target().to_string(), fields.0));
+        }
+    }
+
+    impl QaCapture {
+        fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+            use tracing_subscriber::layer::SubscriberExt;
+            let capture = Self::default();
+            let subscriber = tracing_subscriber::registry().with(capture.clone());
+            (capture, tracing::subscriber::set_default(subscriber))
+        }
+
+        /// The DTLS driver's records with this `event` field.
+        fn driver(&self, event: &str) -> Vec<QaRecordFields> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(target, fields)| {
+                    target == "client_sip_ua::dtls_driver"
+                        && fields.get("event").map(String::as_str) == Some(event)
+                })
+                .map(|(_, fields)| fields.clone())
+                .collect()
+        }
+
+        /// The call manager's "ending call (fail closed)" lines.
+        fn call_level(&self) -> Vec<QaRecordFields> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, fields)| {
+                    fields
+                        .get("message")
+                        .is_some_and(|m| m.contains("Media security negotiation failed"))
+                })
+                .map(|(_, fields)| fields.clone())
+                .collect()
+        }
+    }
+
+    /// NIST-016: a media-security failure decided from the remote SDP is
+    /// logged with `cause_basis="signalling"` on the call-level line: the
+    /// basis is what the signalling path delivered, no more (POA&M-333).
+    #[tokio::test]
+    async fn test_sdp_decided_failure_is_logged_with_the_signalling_basis() {
+        let (capture, _guard) = QaCapture::install();
+        let (mut manager, _rx) = manager_with_account();
+        let info = manager.call_info_for_event("nobody", CallState::Connecting);
+        // The failure path of a call whose remote SDP gave no usable DTLS
+        // parameters, as `handle_dialog_event` and the ACK handler run it.
+        let Err((cause, basis)) = manager.begin_secure_media("nobody", info).await else {
+            panic!("a dialog without DTLS parameters started its handshake");
+        };
+        manager
+            .fail_call_media_security("nobody", cause, basis)
+            .await;
+
+        let lines = capture.call_level();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            lines[0].get("cause_basis").map(String::as_str),
+            Some("signalling")
+        );
+        assert_eq!(
+            lines[0].get("cause").map(String::as_str),
+            Some("no DTLS parameters from remote SDP")
+        );
+        assert_eq!(lines[0].get("call_id").map(String::as_str), Some("nobody"));
+    }
+
+    /// NIST-002 / NIST-003 / QA D6: when the call manager's own deadline
+    /// ends a handshake, the log holds exactly one handshake outcome
+    /// record, and it is a `dtls.handshake.failed` with a local basis and
+    /// `origin="call-manager-deadline"`, not the driver's info-level
+    /// `cancelled`. The call-level line states the basis as well.
+    #[tokio::test]
+    async fn test_call_manager_deadline_leaves_one_failed_record_with_its_origin() {
+        use std::time::Duration;
+        let (capture, _guard) = QaCapture::install();
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let (mut manager, mut rx, call_id, ack) = qa_answered_tls_call().await;
+        manager
+            .handle_sip_request_from(&ack, source, SipTransportKind::Tls)
+            .await
+            .unwrap();
+        let deadline = manager.securing.get(&call_id).unwrap().deadline;
+        manager.poll_secure_media(deadline).await;
+        let (errors, ends, connected) = qa_drain(&mut rx);
+        assert_eq!(errors, ["media-security: dtls-timeout"]);
+        assert_eq!(ends, [CallEndReason::Failed]);
+        assert!(!connected);
+        // Let the closed driver task run to its end.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let failed = capture.driver("dtls.handshake.failed");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        let field = |name: &str| failed[0].get(name).map(String::as_str);
+        assert_eq!(field("origin"), Some("call-manager-deadline"));
+        assert_eq!(field("cause"), Some("dtls-timeout"));
+        assert_eq!(field("cause_basis"), Some("local"));
+        assert_eq!(field("call_id"), Some(call_id.as_str()));
+        assert_eq!(capture.driver("dtls.handshake.cancelled"), Vec::new());
+        assert_eq!(capture.driver("dtls.handshake.connected"), Vec::new());
+        assert_eq!(capture.driver("dtls.association.closed"), Vec::new());
+
+        let call_level = capture.call_level();
+        assert_eq!(call_level.len(), 1, "{call_level:?}");
+        let field = |name: &str| call_level[0].get(name).map(String::as_str);
+        assert_eq!(field("cause"), Some("dtls-timeout"));
+        assert_eq!(field("cause_basis"), Some("local"));
+    }
+
+    /// A hang-up during the handshake is not a security failure: the one
+    /// outcome record is the driver's `cancelled`, and no call-level
+    /// media-security line is written.
+    #[tokio::test]
+    async fn test_hangup_during_handshake_leaves_one_cancelled_record() {
+        use std::time::Duration;
+        let (capture, _guard) = QaCapture::install();
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let (mut manager, _rx, call_id, ack) = qa_answered_tls_call().await;
+        manager
+            .handle_sip_request_from(&ack, source, SipTransportKind::Tls)
+            .await
+            .unwrap();
+        assert!(manager.securing.contains_key(&call_id));
+        manager.hangup_call(&call_id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(capture.driver("dtls.handshake.cancelled").len(), 1);
+        assert_eq!(capture.driver("dtls.handshake.failed"), Vec::new());
+        assert_eq!(capture.call_level(), Vec::new());
+    }
+
+    /// SEC-006: `poll_media_security`, which the application pump runs
+    /// first in each pass, acts on what the drivers reported but does not
+    /// end the wait for a BYE after the peer's `close_notify`: a BYE that
+    /// is already queued behind it must be handled first. `process_timers`
+    /// ends that wait.
+    #[tokio::test]
+    async fn test_poll_media_security_does_not_expire_the_bye_grace() {
+        use std::time::{Duration, Instant};
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let (mut manager, mut rx, call_id, ack) = qa_answered_tls_call().await;
+        manager
+            .handle_sip_request_from(&ack, source, SipTransportKind::Tls)
+            .await
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+        // As if the peer's close_notify had been seen over a second ago.
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(10))
+            .unwrap();
+        manager.dtls_closed_by_peer.insert(call_id.clone(), past);
+
+        manager.poll_media_security().await;
+        assert!(manager.dtls_closed_by_peer.contains_key(&call_id));
+        assert_eq!(manager.all_call_ids(), std::slice::from_ref(&call_id));
+        assert_eq!(qa_drain(&mut rx), (Vec::new(), Vec::new(), false));
+
+        manager.poll_security_closed(Instant::now(), true).await;
+        let (errors, ends, connected) = qa_drain(&mut rx);
+        assert_eq!(errors, ["media-security: dtls-closed-by-peer"]);
+        assert_eq!(ends, [CallEndReason::Failed]);
+        assert!(!connected);
+        qa_assert_media_tables_empty(&manager);
+    }
+
+    /// SC-5: the `securing` table cannot outgrow the call limit. With the
+    /// table full a further handshake is refused before anything is
+    /// started, the refusal does not use up the call's one association,
+    /// and through the SIP path (ACK) the call ends as a media-security
+    /// failure with the fixed cause, never `Connected`.
+    #[tokio::test]
+    async fn test_qa_securing_table_bound_refuses_and_fails_closed() {
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let (mut manager, mut rx, call_id, ack) = qa_answered_tls_call().await;
+        let fill = |manager: &mut CallManager| {
+            for n in 0..manager.max_concurrent_calls {
+                let other = format!("other-{n}");
+                let info = manager.call_info_for_event(&other, CallState::Connecting);
+                manager.securing.insert(
+                    other,
+                    SecuringCall {
+                        deadline: std::time::Instant::now() + std::time::Duration::from_mins(1),
+                        info,
+                    },
+                );
+            }
+        };
+
+        // Directly: refused with the fixed cause, nothing recorded.
+        fill(&mut manager);
+        let info = manager.call_info_for_event(&call_id, CallState::Connecting);
+        assert_eq!(
+            manager.begin_secure_media(&call_id, info.clone()).await,
+            Err(("too many DTLS-SRTP handshakes in progress", "local"))
+        );
+        assert_eq!(manager.securing.len(), manager.max_concurrent_calls);
+        assert!(!manager.securing.contains_key(&call_id));
+        // The refusal came before the session was touched: with room in
+        // the table the same call can still start its one handshake.
+        manager.securing.clear();
+        assert_eq!(manager.begin_secure_media(&call_id, info).await, Ok(()));
+        assert!(manager.securing.contains_key(&call_id));
+        manager.hangup_call(&call_id).await.unwrap();
+        let _ = qa_drain(&mut rx);
+
+        // Through the SIP path: the ACK of a second call meets a full table.
+        let (mut manager, mut rx, call_id, ack2) = {
+            drop(ack);
+            qa_answered_tls_call().await
+        };
+        fill(&mut manager);
+        manager
+            .handle_sip_request_from(&ack2, source, SipTransportKind::Tls)
+            .await
+            .unwrap();
+        let (errors, ends, connected) = qa_drain(&mut rx);
+        assert_eq!(
+            errors,
+            ["media-security: too many DTLS-SRTP handshakes in progress"]
+        );
+        assert_eq!(ends, [CallEndReason::Failed]);
+        assert!(!connected);
+        assert!(!manager.securing.contains_key(&call_id));
+        assert!(!manager.media_sessions.contains_key(&call_id));
+        assert!(manager.get_audio_session(&call_id).is_none());
+        assert_eq!(manager.all_call_ids(), &[] as &[String]);
+    }
+
+    /// SC-5: the call manager's own deadline. The driver stays silent (the
+    /// peer never answers and the driver's 15 s budget is far away); the
+    /// deadline is budget + 2 s after the handshake started, nothing
+    /// happens before it, and at it the call ends as `dtls-timeout`, never
+    /// `Connected`, with every table empty.
+    #[tokio::test]
+    async fn test_qa_call_manager_deadline_ends_a_silent_handshake() {
+        use std::time::{Duration, Instant};
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let (mut manager, mut rx, call_id, ack) = qa_answered_tls_call().await;
+        manager.set_dtls_handshake_budget(Duration::from_secs(15));
+        let before = Instant::now();
+        manager
+            .handle_sip_request_from(&ack, source, SipTransportKind::Tls)
+            .await
+            .unwrap();
+        let after = Instant::now();
+        assert!(manager.pending_secure_media.is_empty());
+        let deadline = manager.securing.get(&call_id).unwrap().deadline;
+        let margin = Duration::from_secs(15) + SECURING_DEADLINE_MARGIN;
+        assert!(deadline >= before + margin && deadline <= after + margin);
+
+        // One instant before the deadline: still waiting, nothing reported.
+        manager
+            .poll_secure_media(deadline.checked_sub(Duration::from_millis(1)).unwrap())
+            .await;
+        assert!(manager.securing.contains_key(&call_id));
+        assert_eq!(manager.all_call_ids(), std::slice::from_ref(&call_id));
+        assert_eq!(qa_drain(&mut rx), (Vec::new(), Vec::new(), false));
+
+        // At the deadline the driver has still reported nothing.
+        manager.poll_secure_media(deadline).await;
+        let (errors, ends, connected) = qa_drain(&mut rx);
+        assert_eq!(errors, ["media-security: dtls-timeout"]);
+        assert_eq!(ends, [CallEndReason::Failed]);
+        assert!(!connected);
+        qa_assert_media_tables_empty(&manager);
+
+        // Nothing is reported a second time.
+        manager
+            .poll_secure_media(deadline + Duration::from_secs(60))
+            .await;
+        manager
+            .poll_security_closed(deadline + Duration::from_secs(60), true)
+            .await;
+        assert_eq!(qa_drain(&mut rx), (Vec::new(), Vec::new(), false));
+    }
+
+    /// Criterion 5: a hang-up while the handshake runs leaves no entry in
+    /// any media-security table, and later timer passes report nothing.
+    #[tokio::test]
+    async fn test_qa_hangup_during_handshake_leaves_all_tables_empty() {
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let (mut manager, mut rx, call_id, ack) = qa_answered_tls_call().await;
+        manager
+            .handle_sip_request_from(&ack, source, SipTransportKind::Tls)
+            .await
+            .unwrap();
+        assert!(manager.securing.contains_key(&call_id));
+        assert!(manager.media_sessions.contains_key(&call_id));
+        manager.process_timers().await.unwrap();
+        assert!(manager.securing.contains_key(&call_id), "handshake pending");
+
+        manager.hangup_call(&call_id).await.unwrap();
+        qa_assert_media_tables_empty(&manager);
+        let (errors, ends, connected) = qa_drain(&mut rx);
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(ends, [CallEndReason::LocalHangup]);
+        assert!(!connected);
+
+        let later = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        manager.poll_secure_media(later).await;
+        manager.poll_security_closed(later, true).await;
+        assert_eq!(qa_drain(&mut rx), (Vec::new(), Vec::new(), false));
+        qa_assert_media_tables_empty(&manager);
+    }
+
+    /// The `set_audio_devices_enabled(false)` test seam sits behind the
+    /// media-security gate: with it off, an audio start for a TLS call
+    /// without DTLS-SRTP keys (handshake still running) is refused exactly
+    /// as with it on, before the call's socket is released, and an unknown
+    /// call is refused too. The seam can only make a call carry no audio;
+    /// it cannot make `start_audio_session` succeed where the gate fails.
+    #[tokio::test]
+    async fn test_qa_audio_seam_does_not_bypass_the_media_security_gate() {
+        let source: SocketAddr = "192.0.2.50:5061".parse().unwrap();
+        let remote: SocketAddr = "192.0.2.50:40000".parse().unwrap();
+        let (mut manager, _rx, call_id, ack) = qa_answered_tls_call().await;
+        manager
+            .handle_sip_request_from(&ack, source, SipTransportKind::Tls)
+            .await
+            .unwrap();
+        for enabled in [false, true] {
+            manager.set_audio_devices_enabled(enabled);
+            let result = manager.start_audio_session(&call_id, remote).await;
+            assert!(
+                matches!(result, Err(AppError::MediaSecurity(_))),
+                "seam {enabled}: {result:?}"
+            );
+            // Refused before anything was handed over.
+            assert!(
+                manager.media_sockets.contains_key(&call_id),
+                "seam {enabled}"
+            );
+            assert!(manager.audio_sessions.is_empty());
+            let unknown = manager.start_audio_session("no-such-call", remote).await;
+            assert!(matches!(unknown, Err(AppError::MediaSecurity(_))));
+        }
+        manager.set_audio_devices_enabled(false);
+        manager.hangup_call(&call_id).await.unwrap();
+    }
+
+    /// The same for a non-TLS account in a default build: plaintext media
+    /// does not exist there, and the seam does not create it.
+    #[cfg(not(feature = "insecure-transports"))]
+    #[tokio::test]
+    async fn test_qa_audio_seam_does_not_permit_plaintext_in_a_default_build() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut manager = CallManager::new(
+            "127.0.0.1:5061".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            tx,
+        );
+        let mut account = SipAccount::new(
+            "test-account",
+            "Test User",
+            "sips:testuser@example.com",
+            "sips:192.0.2.1:5061",
+        );
+        account.transport = client_types::TransportPreference::Udp;
+        manager.configure_account(&account);
+        manager.set_audio_devices_enabled(false);
+        let result = manager
+            .start_audio_session("any-call", "192.0.2.50:40000".parse().unwrap())
+            .await;
+        assert!(
+            matches!(result, Err(AppError::MediaSecurity(_))),
+            "{result:?}"
+        );
     }
 }

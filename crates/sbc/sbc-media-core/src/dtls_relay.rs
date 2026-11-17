@@ -5,6 +5,8 @@
 //! pumped to the sidecar and its responses sent back to the peer; SRTP/RTCP
 //! (128..=191) does not flow yet. On the sidecar's `Ready` the exported SRTP
 //! keys are returned and the caller switches to the SRTP relay (next phase).
+//! `Ready` does not end the sidecar session: the association stays open in the
+//! sidecar, and the connection to it stays open, until the call ends.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -197,11 +199,14 @@ pub fn srtp_key_material(
 /// material for each direction plus the live sidecar connection halves.
 ///
 /// The `reader`/`writer` are intentionally handed back rather than dropped: the
-/// DTLS association must live for the whole call (deferred review finding #2 —
-/// dropping it right after key export makes pion emit `close_notify`, which a
-/// peer may treat as teardown). The caller keeps them in the session and pumps
-/// any post-handshake DTLS (rekey/alerts) demuxed off the media socket, closing
-/// them only at call end.
+/// DTLS association must live for the whole call. The sidecar keeps it open for
+/// as long as this connection is open and ends it, with `close_notify`, when
+/// the connection (or its sending half) is closed; a peer that reads
+/// `close_notify` treats it as teardown. The caller keeps both halves in the
+/// session, pumps any post-handshake DTLS (a retransmitted final flight,
+/// alerts) between the media socket and the sidecar, and closes them only at
+/// call end (see `forward_dtls_to_sidecar` / `pump_sidecar_dtls_to_peer` in
+/// `srtp_relay`).
 #[derive(Debug)]
 pub struct EstablishedLeg {
     /// SRTP master key material the SBC uses to protect its outbound media.

@@ -16,7 +16,9 @@ use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 
 use client_audio::jitter_buffer::{BufferedPacket, SharedJitterBuffer};
-use client_audio::rtp_handler::{RTP_HEADER_SIZE, parse_rfc2198, parse_rtp_fields};
+use client_audio::rtp_handler::{
+    DtlsSink, RTP_HEADER_SIZE, RtpReceiver, parse_rfc2198, parse_rtp_fields,
+};
 use client_audio::sinc_resampler::Resampler;
 use uc_codecs::AudioCodec;
 use uc_codecs::g711::G711Ulaw;
@@ -127,6 +129,86 @@ fn bench_jitter_buffer_push_pop(c: &mut Criterion) {
     });
 }
 
+/// Cost of the DTLS arm of `RtpReceiver::receive` (RFC 7983 demux), one
+/// datagram per iteration: sent on loopback, then read and classified. The
+/// send and the read are system calls and dominate; the three cases differ
+/// only in what the arm does after classification, so the difference
+/// between "no sink" and the other two is the cost the sink path adds.
+/// The source matches in all cases; the rate limit lets only the first
+/// few reach the sink, so "accepting" mostly measures the bucket refusal,
+/// which is the steady state under a flood.
+fn bench_dtls_arm(c: &mut Criterion) {
+    use std::net::UdpSocket;
+    use std::sync::Arc;
+
+    let record = [22u8, 0xFE, 0xFD, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+    let cases: [(&str, Option<bool>); 3] = [
+        ("receive DTLS-class datagram, no sink", None),
+        ("receive DTLS-class datagram, refusing sink", Some(false)),
+        ("receive DTLS-class datagram, accepting sink", Some(true)),
+    ];
+    for (name, accept) in cases {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        socket.set_nonblocking(true).unwrap();
+        let dest = socket.local_addr().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::clone(&socket), jb);
+        if let Some(accept) = accept {
+            let sink: DtlsSink = Box::new(move |datagram: &[u8]| {
+                black_box(datagram);
+                accept
+            });
+            rx.set_dtls_sink(sink, peer.local_addr().unwrap());
+        }
+        c.bench_function(name, |b| {
+            b.iter(|| {
+                peer.send_to(&record, dest).unwrap();
+                black_box(rx.receive().unwrap())
+            });
+        });
+    }
+}
+
+/// The RTP arm of `RtpReceiver::receive`, one packet per iteration: sent on
+/// loopback, read, classified (RFC 7983), parsed and put into the jitter
+/// buffer, then popped again. No DTLS sink is installed; this is the path
+/// every media packet takes, and the bench exists so that a change to the
+/// receive loop (such as the DTLS forward arm) can be compared against the
+/// previous commit. The send and the read are system calls and dominate.
+fn bench_rtp_receive(c: &mut Criterion) {
+    use std::net::UdpSocket;
+    use std::sync::Arc;
+
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+    // Blocking with a read timeout, as the audio I/O thread reads it. (On a
+    // non-blocking socket a read straight after the send can find nothing
+    // yet, and the iteration would measure `WouldBlock`.)
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+        .unwrap();
+    let dest = socket.local_addr().unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let jb = SharedJitterBuffer::new(8000, 160, 60);
+    let mut rx = RtpReceiver::new(Arc::clone(&socket), jb.clone());
+    let mut seq = 0u16;
+    let mut ts = 0u32;
+    // The path measured is the accepting one: a packet is buffered.
+    peer.send_to(&make_rtp_packet(seq, ts), dest).unwrap();
+    assert!(rx.receive().unwrap(), "RTP packet was not accepted");
+    let _ = jb.pop();
+    c.bench_function("receive RTP datagram (loopback, 160B payload)", |b| {
+        b.iter(|| {
+            seq = seq.wrapping_add(1);
+            ts = ts.wrapping_add(160);
+            peer.send_to(&make_rtp_packet(seq, ts), dest).unwrap();
+            let received = rx.receive().unwrap();
+            assert!(received, "RTP packet was not accepted");
+            black_box(jb.pop())
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_parse_rtp_fields,
@@ -137,5 +219,7 @@ criterion_group!(
     bench_resample_48k_to_8k,
     bench_resample_8k_to_48k_10frames,
     bench_jitter_buffer_push_pop,
+    bench_dtls_arm,
+    bench_rtp_receive,
 );
 criterion_main!(benches);

@@ -21,6 +21,9 @@ client-types = { path = "../client-types" }
 uc-codecs.workspace = true
 proto-rtp.workspace = true
 proto-srtp.workspace = true
+# DRBG for the SRTP transmit SSRC and constant-time comparison of session
+# keys (media_security::SrtpCallState). Already a dependency of proto-srtp.
+uc-crypto.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true

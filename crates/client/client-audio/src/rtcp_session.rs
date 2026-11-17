@@ -44,8 +44,12 @@ const RTCP_RECV_BUFFER: usize = 1500;
 /// SRTCP contexts for one session (RFC 3711 §3.4). Separate instances from
 /// the RTP contexts, so the SRTCP index and replay window are not shared.
 struct SrtcpContexts {
-    tx: SrtpContext,
-    rx: SrtpContext,
+    /// The call's outbound SRTCP context: its index goes on counting in
+    /// the next session of the call (RFC 3711 §3.2.3).
+    tx: Arc<SrtpContext>,
+    /// The call's inbound SRTCP context: its replay window outlives this
+    /// session (RFC 3711 §3.3.2).
+    rx: Arc<SrtpContext>,
 }
 
 /// RTCP session state.
@@ -177,7 +181,7 @@ impl RtcpSession {
     /// Enables SRTCP with independent transmit / receive contexts.
     ///
     /// NIST 800-53 Rev5: SC-8(1) (RTCP confidentiality and integrity).
-    pub fn set_srtcp(&mut self, tx: SrtpContext, rx: SrtpContext) {
+    pub fn set_srtcp(&mut self, tx: Arc<SrtpContext>, rx: Arc<SrtpContext>) {
         self.srtcp = Some(SrtcpContexts { tx, rx });
         debug!("SRTCP enabled for RTCP session");
     }
@@ -218,6 +222,15 @@ impl RtcpSession {
         if self.last_send_time.elapsed() < self.report_interval {
             return;
         }
+        self.send_report(tx_stats, jb_stats);
+    }
+
+    /// Sends a compound report (SR or RR, plus SDES) now and restarts the
+    /// report interval. [`Self::maybe_send_report`] is the timed form the
+    /// I/O thread uses; this one is for callers that must not wait for the
+    /// interval (the interoperability tests, which need more than one
+    /// SRTCP packet inside a short exchange).
+    pub fn send_report(&mut self, tx_stats: &RtpStats, jb_stats: &JitterBufferStats) {
         self.last_send_time = Instant::now();
         self.report_interval = self.next_report_interval();
 
@@ -505,7 +518,53 @@ impl RtcpSession {
             return;
         }
         self.bye_sent = true;
+        self.transmit_bye(tx_stats, jb_stats);
+    }
 
+    /// Ends this pipeline's RTCP session when its I/O thread stops.
+    ///
+    /// RFC 3550 §6.3.7, §6.6: a BYE says that the source leaves. With
+    /// `stream_continues` set the pipeline stops for a restart within a
+    /// call whose next pipeline goes on with the same SSRC (the call's
+    /// SRTP state keeps it), so no BYE is sent: a receiver would drop the
+    /// source's state, or take the BYE for the end of the stream.
+    /// Otherwise (the call ends, or the next pipeline takes a new SSRC)
+    /// the BYE is sent as by [`Self::send_bye`].
+    pub fn finish(
+        &mut self,
+        tx_stats: &RtpStats,
+        jb_stats: &JitterBufferStats,
+        stream_continues: bool,
+    ) {
+        if stream_continues {
+            debug!("RTCP BYE not sent: the call's stream continues with this SSRC");
+            return;
+        }
+        self.send_bye(tx_stats, jb_stats);
+    }
+
+    /// Changes the local SSRC after a collision and tells the peer that
+    /// the old one is gone.
+    ///
+    /// RFC 3550 §8.2: a participant that finds its own SSRC in use by
+    /// another sends an RTCP BYE for the old identifier and chooses a new
+    /// one. The session goes on, so this BYE does not count as the one of
+    /// [`Self::send_bye`]. Once per collision, never per packet.
+    pub fn abandon_local_ssrc(
+        &mut self,
+        new_ssrc: u32,
+        tx_stats: &RtpStats,
+        jb_stats: &JitterBufferStats,
+    ) {
+        if !self.bye_sent {
+            self.transmit_bye(tx_stats, jb_stats);
+        }
+        self.set_local_ssrc(new_ssrc);
+    }
+
+    /// Sends the compound packet that ends with a BYE for the current
+    /// local SSRC.
+    fn transmit_bye(&mut self, tx_stats: &RtpStats, jb_stats: &JitterBufferStats) {
         let mut compound = BytesMut::with_capacity(256);
 
         if tx_stats.packets_sent > 0 {
@@ -1106,5 +1165,102 @@ mod tests {
         session.send_bye(&tx_stats, &jb_stats);
         let res = rx_socket.recv_from(&mut buf);
         assert!(res.is_err(), "second send_bye must not transmit");
+    }
+
+    /// The SSRCs of the BYE packets (PT 203) in one compound RTCP packet.
+    fn bye_ssrcs(compound: &[u8]) -> Vec<u32> {
+        let mut found = Vec::new();
+        let mut offset = 0;
+        while let Some(header) = compound.get(offset..offset + 8) {
+            if header[1] == 203 {
+                found.push(u32::from_be_bytes([
+                    header[4], header[5], header[6], header[7],
+                ]));
+            }
+            let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+            offset += 4 * (length + 1);
+        }
+        found
+    }
+
+    /// RFC-013 (RFC 3550 §6.3.7, §6.6): a pipeline that stops for a
+    /// restart on a call whose stream continues with the same SSRC sends
+    /// no BYE; the pipeline that stops when the call ends does.
+    #[test]
+    fn no_bye_when_the_stream_continues_after_a_restart() {
+        let rx_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx_socket
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let remote = rx_socket.local_addr().unwrap();
+        let tx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let local_ssrc = 0xABCD_0123;
+        let session = || {
+            RtcpSession::new(
+                Arc::clone(&tx_socket),
+                remote,
+                local_ssrc,
+                8000,
+                "test@host".to_string(),
+            )
+        };
+        let tx_stats = RtpStats {
+            packets_sent: 50,
+            bytes_sent: 8000,
+            ..RtpStats::default()
+        };
+        let jb_stats = JitterBufferStats::default();
+        let mut buf = [0u8; 512];
+
+        // First pipeline of the call: stopped for a restart.
+        let mut first = session();
+        first.finish(&tx_stats, &jb_stats, true);
+        assert!(
+            rx_socket.recv_from(&mut buf).is_err(),
+            "RTCP sent at a restart although the SSRC continues"
+        );
+        drop(first);
+
+        // Second pipeline, same SSRC: stopped because the call ended.
+        let mut second = session();
+        second.finish(&tx_stats, &jb_stats, false);
+        let (len, _) = rx_socket.recv_from(&mut buf).unwrap();
+        assert_eq!(bye_ssrcs(&buf[..len]), [local_ssrc]);
+    }
+
+    /// RFC-013 (RFC 3550 §8.2): after an SSRC collision the abandoned
+    /// SSRC is said goodbye to, the session goes on with the new one, and
+    /// the new one gets its own BYE when the call ends, but not when the
+    /// pipeline only restarts.
+    #[test]
+    fn bye_for_the_ssrc_abandoned_after_a_collision() {
+        let rx_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx_socket
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let remote = rx_socket.local_addr().unwrap();
+        let tx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let (old_ssrc, new_ssrc) = (0xABCD_0123, 0xABCD_0124);
+        let mut session =
+            RtcpSession::new(tx_socket, remote, old_ssrc, 8000, "test@host".to_string());
+        let tx_stats = RtpStats {
+            packets_sent: 50,
+            bytes_sent: 8000,
+            ..RtpStats::default()
+        };
+        let jb_stats = JitterBufferStats::default();
+        let mut buf = [0u8; 512];
+
+        session.abandon_local_ssrc(new_ssrc, &tx_stats, &jb_stats);
+        let (len, _) = rx_socket.recv_from(&mut buf).unwrap();
+        assert_eq!(bye_ssrcs(&buf[..len]), [old_ssrc]);
+
+        // A restart: the new SSRC continues, nothing is sent.
+        session.finish(&tx_stats, &jb_stats, true);
+        assert!(rx_socket.recv_from(&mut buf).is_err());
+        // The call ends: a BYE for the new SSRC.
+        session.finish(&tx_stats, &jb_stats, false);
+        let (len, _) = rx_socket.recv_from(&mut buf).unwrap();
+        assert_eq!(bye_ssrcs(&buf[..len]), [new_ssrc]);
     }
 }

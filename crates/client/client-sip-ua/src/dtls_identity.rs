@@ -14,38 +14,45 @@
 //!
 //! ## NIST 800-53 Rev5 Controls
 //! - **SC-12**: Cryptographic Key Establishment and Management (DTLS-SRTP
-//!   identity; the copy held here is zeroized on drop via `Zeroizing`, with
-//!   redacted `Debug` and no `Clone`).
-//!   POAM: POA&M-330 -- per-call copies go into
-//!   `proto_dtls::DtlsConfig.private_key` (a plain `Vec` with `Debug` and
-//!   `Clone`), and the `rcgen::KeyPair` copy made while generating or
-//!   checking the identity is not zeroized.
+//!   identity; redacted `Debug`, no `Clone`). The signing key is loaded
+//!   into one `uc_crypto` key pair per identity and shared with every
+//!   call's DTLS association by reference count
+//!   ([`DtlsIdentity::credentials`]): no per-call copy of the key is made.
+//!   The PKCS#8 encoding the identity is built from is not kept: it is
+//!   wiped (`Zeroizing`) when construction returns, so the only copy of
+//!   the private key the identity holds is the one inside that key pair.
+//!   POAM: POA&M-330 -- the `rcgen::KeyPair` copy made while generating or
+//!   checking the identity is not zeroized, and the key inside the
+//!   `uc_crypto` key pair stays in memory for the life of the process.
 //! - **SC-13**: Cryptographic Protection (P-384 / SHA-384, CNSA 2.0)
 //! - **SI-10**: a user certificate is used only if its SPKI matches the key
 //!   and it is signed with ecdsa-with-SHA384
 
 use crate::{SipUaError, SipUaResult};
-use proto_dtls::CertificateFingerprint;
+use proto_dtls::{CertificateFingerprint, DtlsCredentials};
+use std::sync::Arc;
+use uc_crypto::ecdsa::P384KeyPair;
 use zeroize::Zeroizing;
 
 /// Subject CN of the ephemeral self-signed certificate.
 const IDENTITY_CN: &str = "usg-client";
 
-/// DTLS-SRTP identity (DER certificate chain, PKCS#8 key, fingerprint).
+/// DTLS-SRTP identity (DER certificate chain, signing key, fingerprint).
 pub struct DtlsIdentity {
     /// DER-encoded certificate chain (leaf first).
     cert_chain_der: Vec<Vec<u8>>,
-    /// DER-encoded PKCS#8 private key.
-    key_der: Zeroizing<Vec<u8>>,
     /// SHA-384 fingerprint of the leaf certificate.
     fingerprint: CertificateFingerprint,
+    /// Chain and signing key in the form the DTLS association takes; the
+    /// key pair is built once here and shared by reference count.
+    credentials: DtlsCredentials,
 }
 
 impl std::fmt::Debug for DtlsIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DtlsIdentity")
             .field("fingerprint", &self.fingerprint)
-            .field("key_der", &"<redacted>")
+            .field("key", &"<redacted>")
             .finish_non_exhaustive()
     }
 }
@@ -61,6 +68,12 @@ impl DtlsIdentity {
     /// Returns [`SipUaError::CertificateError`] if key generation or
     /// self-signing fails.
     pub fn generate() -> SipUaResult<Self> {
+        let (cert_der, key_der) = Self::generate_der()?;
+        Self::from_der(vec![cert_der], key_der)
+    }
+
+    /// The certificate and PKCS#8 key of a new ephemeral identity.
+    fn generate_der() -> SipUaResult<(Vec<u8>, Zeroizing<Vec<u8>>)> {
         use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P384_SHA384};
 
         let err = |e: rcgen::Error| SipUaError::CertificateError(e.to_string());
@@ -70,13 +83,19 @@ impl DtlsIdentity {
 
         let cert_der = cert.der().to_vec();
         let key_der = Zeroizing::new(key_pair.serialize_der());
-        Self::from_der(vec![cert_der], key_der)
+        Ok((cert_der, key_der))
     }
 
     /// Builds an identity from a DER certificate chain and PKCS#8 key.
     ///
+    /// NIST 800-53 Rev5: SC-12 -- `key_der` is consumed: it is loaded into
+    /// the key pair and wiped when this function returns. The identity
+    /// keeps no encoding of the private key.
+    ///
     /// # Errors
-    /// Returns [`SipUaError::CertificateError`] if the chain or key is empty.
+    /// Returns [`SipUaError::CertificateError`] if the chain or key is
+    /// empty, the key is not a PKCS#8 P-384 key, or the leaf certificate
+    /// does not hold that key.
     pub fn from_der(
         cert_chain_der: Vec<Vec<u8>>,
         key_der: Zeroizing<Vec<u8>>,
@@ -91,10 +110,25 @@ impl DtlsIdentity {
             ));
         }
         let fingerprint = CertificateFingerprint::from_certificate_sha384(leaf);
+        // NIST 800-53 Rev5: SC-12 / SC-13 -- the key is loaded into the
+        // FIPS module once per identity; associations share it. Fixed error
+        // text: nothing of the key or the parser's message is reflected.
+        let key_pair = P384KeyPair::from_pkcs8(&key_der).map_err(|_| {
+            SipUaError::CertificateError("DTLS key is not a PKCS#8 P-384 key (CNSA 2.0)".into())
+        })?;
+        // NIST 800-53 Rev5: SC-12 -- the PKCS#8 encoding is not needed
+        // any more; wipe it now rather than keep it with the identity.
+        drop(key_der);
+        let credentials = DtlsCredentials::new(cert_chain_der.clone(), Arc::new(key_pair))
+            .map_err(|_| {
+                SipUaError::CertificateError(
+                    "DTLS certificate does not match the private key".into(),
+                )
+            })?;
         Ok(Self {
             cert_chain_der,
-            key_der,
             fingerprint,
+            credentials,
         })
     }
 
@@ -151,16 +185,18 @@ impl DtlsIdentity {
         &self.fingerprint
     }
 
+    /// Certificate chain and signing key for a DTLS association
+    /// (`proto_dtls::AssociationConfig::credentials`). Cloning shares the
+    /// key; it does not copy it.
+    #[must_use]
+    pub const fn credentials(&self) -> &DtlsCredentials {
+        &self.credentials
+    }
+
     /// DER-encoded certificate chain (leaf first).
     #[must_use]
     pub fn cert_chain_der(&self) -> &[Vec<u8>] {
         &self.cert_chain_der
-    }
-
-    /// DER-encoded PKCS#8 private key.
-    #[must_use]
-    pub fn key_der(&self) -> &[u8] {
-        &self.key_der
     }
 }
 
@@ -266,16 +302,43 @@ mod tests {
     use super::*;
     use proto_dtls::fingerprint::FingerprintAlgorithm;
 
+    /// A generated identity together with its PKCS#8 key, which the
+    /// identity itself no longer gives out (SEC-009).
+    struct Generated {
+        id: DtlsIdentity,
+        key_der: Zeroizing<Vec<u8>>,
+    }
+
+    impl Generated {
+        fn new() -> Self {
+            let (cert_der, key_der) = DtlsIdentity::generate_der().unwrap();
+            let id = DtlsIdentity::from_der(vec![cert_der], key_der.clone()).unwrap();
+            Self { id, key_der }
+        }
+
+        fn key_der(&self) -> &[u8] {
+            &self.key_der
+        }
+    }
+
+    impl std::ops::Deref for Generated {
+        type Target = DtlsIdentity;
+
+        fn deref(&self) -> &DtlsIdentity {
+            &self.id
+        }
+    }
+
     #[test]
     fn generate_p384_identity_with_single_prefix_fingerprint() {
-        let id = DtlsIdentity::generate().unwrap();
+        let id = Generated::new();
         assert_eq!(id.fingerprint().algorithm(), FingerprintAlgorithm::Sha384);
         assert_eq!(id.fingerprint().bytes().len(), 48);
         let sdp = id.sdp_fingerprint();
         assert!(sdp.starts_with("sha-384 "));
         assert_eq!(sdp.matches("sha-384").count(), 1, "{sdp}");
         assert!(id.key_der().len() > 48);
-        assert!(!format!("{id:?}").contains(&format!("{:?}", id.key_der())));
+        assert!(!format!("{:?}", id.id).contains(&format!("{:?}", id.key_der())));
     }
 
     // Fingerprint mismatch at the verify layer (RFC 8122 §5).
@@ -290,7 +353,7 @@ mod tests {
 
     #[test]
     fn from_user_der_accepts_p384_only() {
-        let id = DtlsIdentity::generate().unwrap();
+        let id = Generated::new();
         let reused = DtlsIdentity::from_user_der(
             id.cert_chain_der().to_vec(),
             Zeroizing::new(id.key_der().to_vec()),
@@ -315,7 +378,7 @@ mod tests {
     #[test]
     fn from_user_der_requires_matching_key_and_sha384_signature() {
         use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P384_SHA384};
-        let id = DtlsIdentity::generate().unwrap();
+        let id = Generated::new();
         // Same algorithm, different key: SPKI mismatch.
         let other = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap();
         assert!(
@@ -358,7 +421,7 @@ mod tests {
     /// length encodings are refused.
     #[test]
     fn from_user_der_rejects_trailing_data_and_non_minimal_lengths() {
-        let id = DtlsIdentity::generate().unwrap();
+        let id = Generated::new();
         let key = || Zeroizing::new(id.key_der().to_vec());
         let cert = id.cert_chain_der()[0].clone();
         assert!(DtlsIdentity::from_user_der(vec![cert.clone()], key()).is_ok());
@@ -386,6 +449,46 @@ mod tests {
         let mut long = vec![0x04, 0x81, 0x80];
         long.extend_from_slice(&[7; 0x80]);
         assert_eq!(der_tlv(&long).map(|t| t.content.len()), Some(0x80));
+    }
+
+    /// The credentials handed to the association are for the certificate
+    /// whose fingerprint goes into SDP.
+    #[test]
+    fn credentials_match_sdp_fingerprint() {
+        let id = DtlsIdentity::generate().unwrap();
+        assert_eq!(id.credentials().fingerprint(), id.fingerprint());
+        assert_eq!(
+            id.credentials().fingerprint().to_sdp(),
+            id.sdp_fingerprint()
+        );
+        assert_eq!(id.credentials().certificate_chain(), id.cert_chain_der());
+        assert!(!format!("{:?}", id.credentials()).contains("key_der"));
+    }
+
+    /// `from_der` itself now refuses a key that is not the certificate's.
+    #[test]
+    fn from_der_requires_matching_p384_key() {
+        let a = DtlsIdentity::generate().unwrap();
+        let b = Generated::new();
+        assert!(
+            DtlsIdentity::from_der(
+                a.cert_chain_der().to_vec(),
+                Zeroizing::new(b.key_der().to_vec())
+            )
+            .is_err()
+        );
+        assert!(
+            DtlsIdentity::from_der(a.cert_chain_der().to_vec(), Zeroizing::new(vec![1, 2, 3]))
+                .is_err()
+        );
+        let p256 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        assert!(
+            DtlsIdentity::from_der(
+                a.cert_chain_der().to_vec(),
+                Zeroizing::new(p256.serialize_der())
+            )
+            .is_err()
+        );
     }
 
     #[test]

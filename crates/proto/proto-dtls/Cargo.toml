@@ -30,6 +30,12 @@ proto-rtp.workspace = true
 # Property tests: codecs, arbitrary input in every state, and arbitrary
 # fragmentation / reordering / duplication / loss of a real handshake.
 proptest.workspace = true
+# PERF-009: handshake and connected-state discard benchmarks.
+criterion.workspace = true
+
+[[bench]]
+name = "association"
+harness = false
 
 [features]
 # Test-only: proto-dtls's OWN unit tests use random local keys instead of

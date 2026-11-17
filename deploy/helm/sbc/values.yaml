@@ -561,9 +561,37 @@ sbcDaemon:
       repository: localhost/usg-dtls-terminator
       tag: local
       pullPolicy: Never
+    # The sidecar holds one DTLS session per terminated media leg (two per
+    # call) for the whole call: about 150 KiB per call (two legs, 5
+    # goroutines each; measured on macOS arm64, not yet on Linux), plus an
+    # allowance of 16 MiB for the process itself (assumed).
+    #
+    # maxSessions: the sidecar's -max-sessions. 0 = 2 x config.max_calls
+    # (every call terminated on both legs). At the limit new legs are refused
+    # (that call fails to set up); calls in progress are not touched.
+    maxSessions: 0
+    # Sizing the memory limit: 16 MiB + max_calls x 150 KiB, plus headroom
+    # for the Go garbage collector. For the default max_calls of 5000 that is
+    # 16 + 733 = 749 MiB, hence 1Gi. If you raise max_calls, raise the limit
+    # and goMemLimit with it (10000 calls: about 1.5 GiB live, limit 2Gi,
+    # goMemLimit 1840MiB); if the limit is hit the kernel kills the sidecar
+    # and every call loses its DTLS association at once.
+    #
+    # Not in the 150 KiB figure: after its handshake each session accepts up
+    # to 32 unauthenticated handshake datagrams (the sidecar's plaintext-gate
+    # budget), which a session's own peer can send without spoofing and which
+    # stay in memory until the call ends: up to about 64 KiB per session
+    # (32 x the relay's 2048-byte read), about 128 KiB per call. When sizing
+    # for hostile peers add that to the per-call figure (16 MiB + max_calls x
+    # 278 KiB; with the defaults goMemLimit is reached at roughly 2,700
+    # sessions abused this way at full load).
+    #
+    # goMemLimit: GOMEMLIMIT for the sidecar, about 90% of limits.memory, so
+    # the collector works harder before the kernel OOM-kills the container.
+    goMemLimit: "920MiB"
     resources:
-      requests: { cpu: "100m", memory: "64Mi" }
-      limits:   { cpu: "1",    memory: "256Mi" }
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits:   { cpu: "1",    memory: "1Gi" }
   config:
     max_calls: 5000
     max_registrations: 10000

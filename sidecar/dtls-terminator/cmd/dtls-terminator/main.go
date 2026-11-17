@@ -11,14 +11,13 @@ package main
 import (
 	"context"
 	"crypto/fips140"
-	"errors"
 	"flag"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"sync"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -33,6 +32,26 @@ const maxFrame = 4096
 // service/protocol.go msgHello). Duplicated here so the health probe stays a
 // standalone client that does not import the session internals.
 const msgHelloType = 1
+
+// maxSessionsEnv is the environment variable that sets the default of
+// -max-sessions.
+const maxSessionsEnv = "DTLS_TERMINATOR_MAX_SESSIONS"
+
+// envInt returns the integer value of the environment variable name, or def
+// if it is unset or empty. A value that is set but is not an integer is a
+// configuration error: the process refuses to start rather than run with a
+// limit other than the one asked for.
+func envInt(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Fatalf("refusing to start: $%s=%q is not an integer", name, v)
+	}
+	return n
+}
 
 // runHealthcheck connects to the sidecar socket and reads the Hello frame it
 // sends on every accepted connection. Success proves the accept loop is live and
@@ -74,6 +93,9 @@ func main() {
 		"Unix-domain socket to accept relay sessions on")
 	fpFile := flag.String("fingerprint-file", "/run/usg/dtls-terminator.fp",
 		"file to publish the SDP fingerprint to (read by the SBC at signaling time)")
+	maxSessions := flag.Int("max-sessions", envInt(maxSessionsEnv, service.DefaultMaxSessions),
+		"limit on concurrent sessions (one per terminated media leg, two per call); at the limit "+
+			"new legs are refused. Size it to 2 x the SBC's max_calls. Default from $"+maxSessionsEnv)
 	healthcheck := flag.Bool("healthcheck", false,
 		"probe mode: connect to -socket, verify the sidecar is serving, and exit 0/1")
 	flag.Parse()
@@ -82,6 +104,11 @@ func main() {
 	// does not need the FIPS module or an identity of its own.
 	if *healthcheck {
 		os.Exit(runHealthcheck(*sockPath))
+	}
+
+	// A limit that is accepted is enforced; one that cannot be is refused.
+	if *maxSessions < 1 {
+		log.Fatalf("refusing to start: -max-sessions must be at least 1, got %d", *maxSessions)
 	}
 
 	// Refuse to run outside the FIPS module — the entire reason this sidecar
@@ -120,39 +147,30 @@ func main() {
 	}
 	log.Printf("dtls-terminator listening on %s (FIPS module %s)", *sockPath, fips140.Version())
 
-	// Graceful shutdown: on SIGINT/SIGTERM stop accepting and drain in-flight
-	// sessions (closing the listener unblocks Accept with net.ErrClosed and
-	// removes the socket file).
+	// Shutdown: on SIGINT/SIGTERM stop accepting (closing the listener
+	// unblocks Accept with net.ErrClosed and removes the socket file) and end
+	// every session: ctx is the sessions' context. A session holds its DTLS
+	// association for the whole call, so there is nothing to wait out; each
+	// one sends close_notify towards its peer and returns.
+	// POAM: POA&M-341 -- stopping or restarting the sidecar (SIGTERM, image
+	// upgrade, a liveness-probe restart) therefore ends the DTLS association
+	// of every call in progress: a peer that honours close_notify (the soft
+	// client does) ends its call, while the relay keeps its keys and keeps
+	// relaying. A crash sends nothing. All outcomes are fail-secure (no
+	// plaintext, no key change). Drain calls before restarting the sidecar.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
 		<-ctx.Done()
-		log.Print("shutdown signal received: closing listener and draining sessions")
+		log.Print("shutdown signal received: closing listener and ending sessions")
 		_ = ln.Close()
 	}()
 
-	var wg sync.WaitGroup
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				break // listener closed by shutdown
-			}
-			// Transient error (e.g. fd exhaustion): back off instead of
-			// spinning at 100% CPU retrying immediately.
-			log.Printf("accept: %v", err)
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := service.HandleSession(conn, identity); err != nil {
-				log.Printf("session error: %v", err)
-			}
-		}()
-	}
-
-	wg.Wait()
-	log.Print("all sessions drained; exiting")
+	// NIST 800-53 Rev5: SC-5. Sessions are capped (-max-sessions); at the
+	// cap a new leg is refused with an Error frame and the calls in progress
+	// are not touched. Serve returns when the sessions have ended, or a few
+	// seconds after the listener closed if one cannot finish.
+	srv := &service.Server{Identity: identity, MaxSessions: *maxSessions}
+	log.Printf("session limit: %d concurrent sessions (two per terminated call)", srv.Stats().Max)
+	srv.Serve(ctx, ln)
 }

@@ -106,9 +106,13 @@ pub struct RtpStats {
     pub packets_dropped: u64,
     /// SRTP protection errors.
     pub srtp_errors: u64,
-    /// DTLS-range datagrams (RFC 7983 first byte 20..=63) dropped on the
-    /// media socket. POAM: POA&M-325 route these to a DTLS servicing task.
+    /// DTLS-range datagrams (RFC 7983 first byte 20..=63) received on the
+    /// media socket and not forwarded: no sink installed, wrong source,
+    /// rate limit, or the sink refused (queue full).
     pub dtls_dropped: u64,
+    /// DTLS-range datagrams handed to the DTLS sink
+    /// ([`RtpReceiver::set_dtls_sink`]).
+    pub dtls_forwarded: u64,
     /// STUN, unknown-range, runt, and un-negotiated muxed RTCP datagrams
     /// dropped before RTP parsing.
     pub non_media_dropped: u64,
@@ -176,6 +180,8 @@ pub(crate) struct AtomicRtpStats {
     srtp_errors: AtomicU64,
     /// DTLS-range datagrams dropped.
     dtls_dropped: AtomicU64,
+    /// DTLS-range datagrams forwarded to the DTLS sink.
+    dtls_forwarded: AtomicU64,
     /// Non-media datagrams dropped.
     non_media_dropped: AtomicU64,
 }
@@ -191,6 +197,7 @@ impl AtomicRtpStats {
             packets_dropped: AtomicU64::new(0),
             srtp_errors: AtomicU64::new(0),
             dtls_dropped: AtomicU64::new(0),
+            dtls_forwarded: AtomicU64::new(0),
             non_media_dropped: AtomicU64::new(0),
         }
     }
@@ -205,6 +212,7 @@ impl AtomicRtpStats {
             packets_dropped: self.packets_dropped.load(Ordering::Relaxed),
             srtp_errors: self.srtp_errors.load(Ordering::Relaxed),
             dtls_dropped: self.dtls_dropped.load(Ordering::Relaxed),
+            dtls_forwarded: self.dtls_forwarded.load(Ordering::Relaxed),
             non_media_dropped: self.non_media_dropped.load(Ordering::Relaxed),
             srtcp_errors: 0,
             rtcp_dropped: 0,
@@ -229,7 +237,18 @@ pub struct RtpTransmitter {
     /// Timestamp increment per packet.
     timestamp_increment: u32,
     /// SRTP context for encryption (no Mutex needed — interior mutability).
-    srtp: Option<SrtpContext>,
+    /// Shared with the call's SRTP state, which hands the same context to
+    /// the next transmitter of the call (RFC 3711 §3.2.3); borrowed per
+    /// packet, never cloned.
+    srtp: Option<Arc<SrtpContext>>,
+    /// The call's SRTP state, told where this transmitter stopped when it
+    /// is dropped (not per packet).
+    call_state: Option<crate::media_security::SrtpCallState>,
+    /// The claim on the call's outbound SRTP stream: while this
+    /// transmitter lives no second one can be started on the same SSRC
+    /// and context (RFC 7714 §8.4). Released when the transmitter is
+    /// dropped, after `Drop` below has run; not touched per packet.
+    tx_claim: Option<crate::media_security::TransmitClaim>,
     /// Statistics (lock-free atomic counters).
     stats: Arc<AtomicRtpStats>,
     /// DTMF payload type (telephone-event).
@@ -266,6 +285,15 @@ pub struct RtpTransmitter {
     talkspurt_pending: bool,
 }
 
+impl Drop for RtpTransmitter {
+    fn drop(&mut self) {
+        // Once per transmitter, off the packet path.
+        if let Some(state) = &self.call_state {
+            state.note_transmit_stopped(self.timestamp.load(Ordering::Relaxed));
+        }
+    }
+}
+
 impl RtpTransmitter {
     /// Creates a new RTP transmitter.
     pub fn new(
@@ -289,6 +317,8 @@ impl RtpTransmitter {
             payload_type,
             timestamp_increment,
             srtp: None,
+            call_state: None,
+            tx_claim: None,
             stats: Arc::new(AtomicRtpStats::new()),
             dtmf_payload_type: DTMF_PAYLOAD_TYPE,
             dtmf_event_timestamp: AtomicU32::new(0),
@@ -325,6 +355,63 @@ impl RtpTransmitter {
         debug!("RFC 2198 redundancy enabled, PT={}", pt);
     }
 
+    /// Continues a stream that an earlier transmitter sent with the same
+    /// SSRC and SRTP context (an audio pipeline restart under unchanged
+    /// keys): the first packet takes `sequence`, which must be the highest
+    /// sequence number sent so far plus one
+    /// ([`crate::media_security::SrtpContextSet::tx_resume`]), so that
+    /// the rollover counter kept in the context and estimated by the peer
+    /// stays right (RFC 3711 §3.3.1). `timestamp`, when known, replaces
+    /// the random start (RFC 3550 §5.1). The first packet carries the
+    /// marker bit: for the peer it follows a gap (RFC 3550 §4.4, RFC 3551
+    /// §4.1).
+    pub fn continue_stream(&mut self, sequence: u16, timestamp: Option<u32>) {
+        self.sequence.store(sequence, Ordering::Relaxed);
+        if let Some(timestamp) = timestamp {
+            self.timestamp.store(timestamp, Ordering::Relaxed);
+        }
+        self.talkspurt_pending = true;
+        debug!("RTP transmitter continues the call's stream at seq={sequence}");
+    }
+
+    /// Installs the outbound SRTP context at a pipeline start, as built by
+    /// [`crate::media_security::build_srtp_contexts`]: `context` is the
+    /// set's `rtp_tx` and `tx_resume` its field of that name. With
+    /// `tx_resume` set the transmitter continues the call's stream
+    /// ([`Self::continue_stream`]), at the timestamp `call_state` gives
+    /// for `clock_rate`; with a call state it reports where it stopped
+    /// when dropped. `tx_claim` is the set's field of that name: the
+    /// transmitter keeps the claim on the call's outbound stream for as
+    /// long as it lives, so that no second transmitter can be started on
+    /// the same SSRC and context (RFC 7714 §8.4).
+    ///
+    /// RFC 3711 §3.2.3, §3.3.1; NIST 800-53 Rev5: SC-13, SC-23.
+    pub fn start_srtp(
+        &mut self,
+        context: Arc<SrtpContext>,
+        tx_resume: Option<u16>,
+        tx_claim: Option<crate::media_security::TransmitClaim>,
+        call_state: Option<&crate::media_security::SrtpCallState>,
+        clock_rate: u32,
+    ) {
+        self.tx_claim = tx_claim;
+        if let Some(sequence) = tx_resume {
+            let timestamp = call_state.and_then(|call| call.resume_timestamp(clock_rate));
+            self.continue_stream(sequence, timestamp);
+        }
+        if let Some(call) = call_state {
+            self.set_call_state(call.clone());
+        }
+        self.set_srtp(context);
+    }
+
+    /// Attaches the call's SRTP state: when this transmitter is dropped
+    /// it records the RTP timestamp it would have used next, for the
+    /// transmitter that continues the stream.
+    pub fn set_call_state(&mut self, state: crate::media_security::SrtpCallState) {
+        self.call_state = Some(state);
+    }
+
     /// Changes the local SSRC (used after collision detection per RFC 3550 §8.2).
     pub fn change_ssrc(&mut self, new_ssrc: u32) {
         info!(
@@ -341,7 +428,7 @@ impl RtpTransmitter {
     }
 
     /// Sets the SRTP context for encryption.
-    pub fn set_srtp(&mut self, context: SrtpContext) {
+    pub fn set_srtp(&mut self, context: Arc<SrtpContext>) {
         self.srtp = Some(context);
         debug!("SRTP encryption enabled for transmitter");
     }
@@ -704,6 +791,103 @@ pub const MAX_DROPPED_PER_RECEIVE: usize = 32;
 /// less than this left of the time budget, [`RtpReceiver::receive`] yields.
 const MIN_DROP_READ_TIMEOUT: Duration = Duration::from_micros(100);
 
+/// Receives one DTLS-class datagram from the audio I/O thread and returns
+/// whether it was taken.
+///
+/// Called on the audio I/O thread: it must not wait for its consumer or
+/// allocate, and returns `false` when its queue is full (the datagram is
+/// then counted as dropped; the DTLS peer retransmits). Waking the
+/// consumer is allowed to cost what waking a task costs (for the DTLS
+/// driver: two short mutexes and possibly one unpark system call), because
+/// the receiver calls the sink at most [`DTLS_FORWARD_PER_SECOND`] times
+/// per second after a burst of [`DTLS_FORWARD_BURST`], and never for an
+/// RTP or RTCP packet.
+pub type DtlsSink = Box<dyn FnMut(&[u8]) -> bool + Send>;
+
+/// A [`DtlsSink`] together with the one remote address whose DTLS-class
+/// datagrams it may be given (the address the DTLS handshake ran with).
+pub struct DtlsForward {
+    /// Where accepted datagrams go.
+    pub sink: DtlsSink,
+    /// The DTLS peer's transport address. Fixed: unlike the RTP source it
+    /// never latches to another port.
+    pub remote: SocketAddr,
+}
+
+impl DtlsForward {
+    /// Pairs a sink with the DTLS peer's address.
+    #[must_use]
+    pub fn new(sink: DtlsSink, remote: SocketAddr) -> Self {
+        Self { sink, remote }
+    }
+}
+
+impl std::fmt::Debug for DtlsForward {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DtlsForward")
+            .field("remote", &self.remote)
+            .finish_non_exhaustive()
+    }
+}
+
+/// DTLS-class datagrams forwarded in one burst (token-bucket capacity).
+pub const DTLS_FORWARD_BURST: u32 = 8;
+/// Sustained DTLS-class forwards per second (token-bucket refill).
+pub const DTLS_FORWARD_PER_SECOND: u32 = 4;
+
+/// Token bucket for the DTLS forward path, in thousandths of a token.
+///
+/// NIST 800-53 Rev5: SC-5 -- a flood of DTLS-class datagrams from the
+/// peer's address costs the audio thread one compare and one counter per
+/// datagram once the bucket is empty; at most
+/// [`DTLS_FORWARD_PER_SECOND`] per second reach the sink. A genuine peer
+/// sends a retransmitted final flight (one or two datagrams per
+/// retransmission interval) and one alert.
+#[derive(Debug, Clone, Copy)]
+struct DtlsForwardBucket {
+    /// Thousandths of a token available.
+    millitokens: u32,
+    /// When the bucket was last refilled.
+    refilled: Instant,
+}
+
+impl DtlsForwardBucket {
+    const CAPACITY: u32 = DTLS_FORWARD_BURST * 1000;
+
+    const fn new(now: Instant) -> Self {
+        Self {
+            millitokens: Self::CAPACITY,
+            refilled: now,
+        }
+    }
+
+    /// Takes one token if there is one.
+    fn try_take(&mut self, now: Instant) -> bool {
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.refilled).as_millis())
+            .unwrap_or(u64::MAX);
+        if elapsed_ms > 0 {
+            // One millisecond adds DTLS_FORWARD_PER_SECOND thousandths.
+            let added = u32::try_from(elapsed_ms)
+                .unwrap_or(u32::MAX)
+                .saturating_mul(DTLS_FORWARD_PER_SECOND);
+            self.millitokens = self.millitokens.saturating_add(added).min(Self::CAPACITY);
+            // Advance by the whole milliseconds that were credited, not to
+            // `now`: the part of a millisecond left over counts towards
+            // the next refill, so frequent calls do not under-refill.
+            self.refilled = self
+                .refilled
+                .checked_add(Duration::from_millis(elapsed_ms))
+                .unwrap_or(now);
+        }
+        if self.millitokens >= 1000 {
+            self.millitokens -= 1000;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Source-filter verdict for one datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceDecision {
@@ -744,7 +928,10 @@ pub struct RtpReceiver {
     /// One-time warning flag for dropped packets from unexpected sources.
     warned_unexpected_source: bool,
     /// SRTP context for decryption (no Mutex needed — interior mutability).
-    srtp: Option<SrtpContext>,
+    /// Reference-counted because it belongs to the call, not to this
+    /// receiver: the next pipeline of the call goes on with its rollover
+    /// counter and replay window (RFC 3711 §3.3.1, §3.3.2).
+    srtp: Option<Arc<SrtpContext>>,
     /// Shared jitter buffer (also read by decode thread).
     jitter_buffer: SharedJitterBuffer,
     /// Statistics (lock-free atomic counters).
@@ -777,6 +964,11 @@ pub struct RtpReceiver {
     /// Pending muxed RTCP datagram in `process_buffer[..len]` and its source,
     /// to be drained by the I/O thread via [`Self::take_muxed_rtcp`].
     muxed_rtcp: Option<(usize, SocketAddr)>,
+    /// Where DTLS-class datagrams from the DTLS peer go (post-handshake
+    /// servicing by the DTLS driver). `None`: they are counted and dropped.
+    dtls_forward: Option<DtlsForward>,
+    /// Rate limit of the DTLS forward path.
+    dtls_bucket: DtlsForwardBucket,
 }
 
 impl RtpReceiver {
@@ -841,7 +1033,22 @@ impl RtpReceiver {
             pcap_start: Instant::now(),
             rtcp_mux: false,
             muxed_rtcp: None,
+            dtls_forward: None,
+            dtls_bucket: DtlsForwardBucket::new(Instant::now()),
         }
+    }
+
+    /// Installs the sink for DTLS-class datagrams (RFC 7983 §7, first byte
+    /// 20..=63) arriving from `remote`, the fixed address the DTLS
+    /// handshake ran with.
+    ///
+    /// Only datagrams from exactly that address are offered to the sink,
+    /// rate-limited ([`DTLS_FORWARD_BURST`], [`DTLS_FORWARD_PER_SECOND`]);
+    /// everything else of that class is counted in
+    /// [`RtpStats::dtls_dropped`]. RTP and RTCP handling is not affected.
+    pub fn set_dtls_sink(&mut self, sink: DtlsSink, remote: SocketAddr) {
+        self.dtls_forward = Some(DtlsForward::new(sink, remote));
+        self.dtls_bucket = DtlsForwardBucket::new(Instant::now());
     }
 
     /// Configures DTMF jitter buffer bypass.
@@ -930,8 +1137,10 @@ impl RtpReceiver {
         self.seen_expected_source = true;
     }
 
-    /// Sets the SRTP context for decryption.
-    pub fn set_srtp(&mut self, context: SrtpContext) {
+    /// Sets the SRTP context for decryption. The context may be shared
+    /// with the call's `SrtpCallState`, which keeps its receive state for
+    /// the next pipeline; only one receiver uses it at a time.
+    pub fn set_srtp(&mut self, context: Arc<SrtpContext>) {
         self.srtp = Some(context);
         debug!("SRTP decryption enabled for receiver");
     }
@@ -1061,6 +1270,36 @@ impl RtpReceiver {
         Ok(false)
     }
 
+    /// Offers the DTLS-class datagram in `recv_buffer[..len]` to the sink.
+    /// Returns whether the sink took it.
+    ///
+    /// No allocation, and up to the sink no lock or system call: one
+    /// address compare, the token bucket (a clock read and integer
+    /// arithmetic), then the sink's copy into its preallocated queue. The
+    /// sink's wake-up of its consumer may take two short mutexes and one
+    /// unpark system call (see [`DtlsSink`]); the bucket limits that to
+    /// [`DTLS_FORWARD_PER_SECOND`] per second, and it is never paid for an
+    /// RTP or RTCP packet. The clock is read only for datagrams that
+    /// passed the source check.
+    fn forward_dtls(&mut self, len: usize, from: SocketAddr) -> bool {
+        let Some(forward) = self.dtls_forward.as_mut() else {
+            return false;
+        };
+        // NIST 800-53 Rev5: SC-23 -- only the address the handshake
+        // authenticated; never the RTP latch. Checked before the rate
+        // limit so other sources cannot use up the peer's tokens.
+        if from != forward.remote {
+            return false;
+        }
+        // NIST 800-53 Rev5: SC-5 (PERF-006).
+        if !self.dtls_bucket.try_take(Instant::now()) {
+            return false;
+        }
+        self.recv_buffer
+            .get(..len)
+            .is_some_and(|datagram| (forward.sink)(datagram))
+    }
+
     /// Reads and handles one datagram.
     fn receive_one(&mut self) -> AudioResult<Received> {
         let result = self.socket.recv_from(&mut self.recv_buffer);
@@ -1078,9 +1317,17 @@ impl RtpReceiver {
                     PacketClass::Rtp => {}
                     PacketClass::Rtcp if self.rtcp_mux => {}
                     PacketClass::Dtls => {
-                        // POAM: POA&M-325 post-handshake DTLS servicing; hand
-                        // off via a bounded sync_channel instead of dropping.
-                        self.stats.dtls_dropped.fetch_add(1, Ordering::Relaxed);
+                        // RFC 5764 §5.1.2: DTLS records after the handshake
+                        // (retransmitted final flight, alerts) go to the
+                        // DTLS driver. Always a counted drop for the loop
+                        // above, so its count and time bounds still apply.
+                        let forwarded = self.forward_dtls(len, addr);
+                        let counter = if forwarded {
+                            &self.stats.dtls_forwarded
+                        } else {
+                            &self.stats.dtls_dropped
+                        };
+                        counter.fetch_add(1, Ordering::Relaxed);
                         return Ok(Received::Dropped);
                     }
                     // POAM: POA&M-325 -- STUN is dropped here instead of being
@@ -1595,6 +1842,201 @@ mod tests {
         assert!(rx.take_muxed_rtcp().is_none());
     }
 
+    fn dtls_test_receiver() -> (RtpReceiver, Arc<UdpSocket>, UdpSocket, SharedJitterBuffer) {
+        let rx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        rx_socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let rx = RtpReceiver::new(Arc::clone(&rx_socket), jb.clone());
+        (rx, rx_socket, peer, jb)
+    }
+
+    /// A sink that records what it was given and answers `accept`.
+    fn recording_sink(accept: bool) -> (DtlsSink, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: DtlsSink = Box::new(move |datagram: &[u8]| {
+            sink_seen.lock().unwrap().push(datagram.to_vec());
+            accept
+        });
+        (sink, seen)
+    }
+
+    const DTLS_RECORD: [u8; 13] = [22, 0xFE, 0xFD, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    /// RFC 7983 §7: a DTLS-class datagram from the DTLS peer reaches the
+    /// sink once, unchanged; one from any other source does not.
+    #[test]
+    fn dtls_from_remote_is_forwarded_and_other_sources_are_dropped() {
+        let (mut rx, rx_socket, peer, jb) = dtls_test_receiver();
+        let dest = rx_socket.local_addr().unwrap();
+        let (sink, seen) = recording_sink(true);
+        rx.set_dtls_sink(sink, peer.local_addr().unwrap());
+
+        peer.send_to(&DTLS_RECORD, dest).unwrap();
+        assert!(!rx.receive().unwrap());
+        assert_eq!(seen.lock().unwrap().as_slice(), &[DTLS_RECORD.to_vec()]);
+        let stats = rx.stats();
+        assert_eq!((stats.dtls_forwarded, stats.dtls_dropped), (1, 0));
+
+        let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+        stranger.send_to(&DTLS_RECORD, dest).unwrap();
+        assert!(!rx.receive().unwrap());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let stats = rx.stats();
+        assert_eq!((stats.dtls_forwarded, stats.dtls_dropped), (1, 1));
+        assert!(jb.is_empty());
+    }
+
+    /// A sink that refuses (queue full) makes the datagram a counted drop.
+    #[test]
+    fn dtls_refused_by_sink_is_counted_dropped() {
+        let (mut rx, rx_socket, peer, _jb) = dtls_test_receiver();
+        let dest = rx_socket.local_addr().unwrap();
+        let (sink, seen) = recording_sink(false);
+        rx.set_dtls_sink(sink, peer.local_addr().unwrap());
+        peer.send_to(&DTLS_RECORD, dest).unwrap();
+        assert!(!rx.receive().unwrap());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let stats = rx.stats();
+        assert_eq!((stats.dtls_forwarded, stats.dtls_dropped), (0, 1));
+    }
+
+    /// PERF-006: a burst from the peer's own address reaches the sink at
+    /// most `DTLS_FORWARD_BURST` times, then about
+    /// `DTLS_FORWARD_PER_SECOND` times per second; a wrong-source flood
+    /// does not use up the peer's tokens.
+    #[test]
+    fn dtls_forward_is_rate_limited_after_the_source_check() {
+        let (mut rx, rx_socket, peer, _jb) = dtls_test_receiver();
+        let dest = rx_socket.local_addr().unwrap();
+        let (sink, seen) = recording_sink(true);
+        rx.set_dtls_sink(sink, peer.local_addr().unwrap());
+
+        let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..20 {
+            stranger.send_to(&DTLS_RECORD, dest).unwrap();
+        }
+        while rx.stats().dtls_dropped < 20 {
+            assert!(!rx.receive().unwrap());
+        }
+        assert_eq!(seen.lock().unwrap().len(), 0);
+
+        for _ in 0..100 {
+            peer.send_to(&DTLS_RECORD, dest).unwrap();
+        }
+        let handled = |rx: &RtpReceiver| rx.stats().dtls_forwarded + rx.stats().dtls_dropped;
+        while handled(&rx) < 120 {
+            assert!(!rx.receive().unwrap());
+        }
+        let burst = seen.lock().unwrap().len();
+        assert!(
+            (1..=DTLS_FORWARD_BURST as usize + 1).contains(&burst),
+            "{burst} forwarded in one burst"
+        );
+
+        std::thread::sleep(Duration::from_millis(1000));
+        for _ in 0..50 {
+            peer.send_to(&DTLS_RECORD, dest).unwrap();
+        }
+        while handled(&rx) < 170 {
+            assert!(!rx.receive().unwrap());
+        }
+        let refilled = seen.lock().unwrap().len() - burst;
+        assert!(
+            (DTLS_FORWARD_PER_SECOND as usize..=DTLS_FORWARD_PER_SECOND as usize + 2)
+                .contains(&refilled),
+            "{refilled} forwarded after one second"
+        );
+    }
+
+    #[test]
+    fn dtls_forward_bucket_refills_and_saturates() {
+        let start = Instant::now();
+        let mut bucket = DtlsForwardBucket::new(start);
+        for _ in 0..DTLS_FORWARD_BURST {
+            assert!(bucket.try_take(start));
+        }
+        assert!(!bucket.try_take(start));
+        // 250 ms at 4 per second is one token.
+        assert!(!bucket.try_take(start + Duration::from_millis(200)));
+        assert!(bucket.try_take(start + Duration::from_millis(450)));
+        assert!(!bucket.try_take(start + Duration::from_millis(450)));
+        // A long idle time fills it to the capacity, not beyond.
+        let later = start + Duration::from_hours(1440);
+        for _ in 0..DTLS_FORWARD_BURST {
+            assert!(bucket.try_take(later));
+        }
+        assert!(!bucket.try_take(later));
+        // A clock that steps back takes nothing and adds nothing.
+        assert!(!bucket.try_take(start));
+    }
+
+    /// PERF-008: the part of a millisecond between two calls is not lost,
+    /// so a caller that asks more often than once per millisecond still
+    /// gets the full rate.
+    #[test]
+    fn dtls_forward_bucket_keeps_the_sub_millisecond_remainder() {
+        let start = Instant::now();
+        let mut bucket = DtlsForwardBucket::new(start);
+        for _ in 0..DTLS_FORWARD_BURST {
+            assert!(bucket.try_take(start));
+        }
+        // One call every 700 microseconds for two seconds.
+        let mut taken = 0u32;
+        for step in 1..=2858u64 {
+            if bucket.try_take(start + Duration::from_micros(step * 700)) {
+                taken += 1;
+            }
+        }
+        assert_eq!(taken, 2 * DTLS_FORWARD_PER_SECOND);
+    }
+
+    /// With a sink installed, RTP and muxed RTCP are handled exactly as
+    /// without one, and a DTLS flood from the peer does not hold
+    /// `receive()` beyond one read timeout.
+    #[test]
+    fn rtp_and_rtcp_unchanged_and_receive_bounded_with_a_sink() {
+        let (mut rx, rx_socket, peer, jb) = dtls_test_receiver();
+        let dest = rx_socket.local_addr().unwrap();
+        let (sink, seen) = recording_sink(true);
+        rx.set_dtls_sink(sink, peer.local_addr().unwrap());
+        rx.set_rtcp_mux(true);
+        rx.set_expected_remote(peer.local_addr().unwrap());
+
+        let mut rtp = vec![0x80, 0x00, 0, 1, 0, 0, 0, 160, 0, 0, 0, 7];
+        rtp.extend_from_slice(&[0xFF; 160]);
+        peer.send_to(&rtp, dest).unwrap();
+        assert!(rx.receive().unwrap());
+        assert!(!jb.is_empty());
+        let rr = [0x80, 201, 0, 1, 0, 0, 0, 1];
+        peer.send_to(&rr, dest).unwrap();
+        assert!(!rx.receive().unwrap());
+        assert_eq!(rx.take_muxed_rtcp().unwrap().0, rr);
+        assert_eq!(seen.lock().unwrap().len(), 0);
+        let stats = rx.stats();
+        assert_eq!(stats.packets_received, 1);
+        assert_eq!((stats.dtls_forwarded, stats.dtls_dropped), (0, 0));
+
+        for _ in 0..(MAX_DROPPED_PER_RECEIVE * 3) {
+            peer.send_to(&DTLS_RECORD, dest).unwrap();
+        }
+        let start = Instant::now();
+        assert!(!rx.receive().unwrap());
+        assert!(start.elapsed() < Duration::from_millis(300));
+        let stats = rx.stats();
+        assert_eq!(
+            stats.dtls_forwarded + stats.dtls_dropped,
+            MAX_DROPPED_PER_RECEIVE as u64
+        );
+        assert_eq!(
+            rx_socket.read_timeout().unwrap(),
+            Some(Duration::from_millis(100))
+        );
+    }
+
     /// PERF-003: a burst of dropped datagrams is consumed in one call and
     /// the RTP packet behind it is still delivered.
     #[test]
@@ -1710,6 +2152,366 @@ mod tests {
         assert_eq!(rx.stats().srtp_errors, 4);
         assert!(rx.seen_expected_source);
         assert_eq!(jb.len(), 1);
+    }
+
+    /// What the peer of the restart tests sends: SRTP packets of one
+    /// stream (SSRC 0x1111) with chosen sequence numbers, from one
+    /// outbound context that lives across our pipeline restarts, as the
+    /// peer's does.
+    struct RestartPeer {
+        socket: UdpSocket,
+        context: Arc<proto_srtp::SrtpContext>,
+        dest: SocketAddr,
+    }
+
+    impl RestartPeer {
+        fn protect(&self, seq: u16) -> Bytes {
+            let header = proto_rtp::RtpHeader::new(0, seq, u32::from(seq) * 160, 0x1111);
+            SrtpProtect::new(&self.context)
+                .protect_rtp_parts(&header, &[0x5A; 160])
+                .unwrap()
+        }
+
+        fn send(&self, packet: &[u8]) {
+            self.socket.send_to(packet, self.dest).unwrap();
+        }
+    }
+
+    /// One "pipeline" of the restart tests: a new receiver on the call's
+    /// socket with contexts built from `keys`, as `AudioPipeline::start`
+    /// builds them.
+    fn restart_receiver(
+        socket: &Arc<UdpSocket>,
+        peer: SocketAddr,
+        keys: &crate::media_security::SrtpSessionKeys,
+    ) -> (RtpReceiver, u32) {
+        let ssrc = keys.transmit_ssrc().unwrap();
+        let contexts = crate::media_security::build_srtp_contexts(keys, ssrc).unwrap();
+        let mut rx = RtpReceiver::new(Arc::clone(socket), SharedJitterBuffer::new(8000, 160, 60));
+        rx.set_srtp(contexts.rtp_rx);
+        rx.set_expected_remote(peer);
+        (rx, contexts.local_ssrc)
+    }
+
+    fn restart_fixture() -> (Arc<UdpSocket>, RestartPeer) {
+        use crate::media_security::{build_srtp_contexts, tests::keys};
+        let rx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        rx_socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let peer = RestartPeer {
+            socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
+            context: build_srtp_contexts(&keys(1, 2), 0x1111).unwrap().rtp_tx,
+            dest: rx_socket.local_addr().unwrap(),
+        };
+        (rx_socket, peer)
+    }
+
+    /// RFC-003 / SEC-002 (RFC 3711 §3.3.1): the peer's stream wraps its
+    /// sequence number, then our pipeline is restarted under the same
+    /// master keys. With the call's SRTP state the new receiver goes on
+    /// with rollover counter 1 and the stream still decrypts; and the
+    /// pipelines of the call keep one transmit SSRC (RFC 3711 §3.2.3).
+    #[test]
+    fn srtp_receive_survives_a_pipeline_restart_after_a_sequence_wrap() {
+        use crate::media_security::{SrtpCallState, tests::keys};
+
+        let (socket, peer) = restart_fixture();
+        let peer_addr = peer.socket.local_addr().unwrap();
+        let state = SrtpCallState::new().unwrap();
+        let call_keys = || keys(2, 1).with_call_state(state.clone());
+
+        let (mut first, first_ssrc) = restart_receiver(&socket, peer_addr, &call_keys());
+        for seq in [0xFFFD, 0xFFFE, 0xFFFF, 0, 1, 2] {
+            peer.send(&peer.protect(seq));
+            assert!(first.receive().unwrap(), "seq {seq:#06x}");
+        }
+        assert_eq!(first.stats().srtp_errors, 0);
+        drop(first);
+
+        // Restart: a new receiver, the call's contexts.
+        let (mut second, second_ssrc) = restart_receiver(&socket, peer_addr, &call_keys());
+        for seq in [3, 4] {
+            peer.send(&peer.protect(seq));
+            assert!(second.receive().unwrap(), "seq {seq} after the restart");
+        }
+        assert_eq!(second.stats().srtp_errors, 0);
+        assert_eq!(first_ssrc, second_ssrc, "transmit SSRC changed in one call");
+        drop(second);
+
+        // The same restart without the call's state is what used to
+        // happen: rollover counter 0 again, nothing authenticates.
+        let (mut stateless, _) = restart_receiver(&socket, peer_addr, &keys(2, 1));
+        peer.send(&peer.protect(5));
+        assert!(!stateless.receive().unwrap());
+        assert_eq!(stateless.stats().srtp_errors, 1);
+    }
+
+    /// RFC-003 / SEC-002 (RFC 3711 §3.3.2): a packet recorded before a
+    /// pipeline restart is refused after it, because the replay window
+    /// belongs to the call and not to the pipeline.
+    #[test]
+    fn srtp_replay_across_a_pipeline_restart_is_refused() {
+        use crate::media_security::{SrtpCallState, tests::keys};
+
+        let (socket, peer) = restart_fixture();
+        let peer_addr = peer.socket.local_addr().unwrap();
+        let state = SrtpCallState::new().unwrap();
+        let call_keys = || keys(2, 1).with_call_state(state.clone());
+
+        let (mut first, _) = restart_receiver(&socket, peer_addr, &call_keys());
+        let recorded: Vec<Bytes> = (100..104).map(|seq| peer.protect(seq)).collect();
+        for packet in &recorded {
+            peer.send(packet);
+            assert!(first.receive().unwrap());
+        }
+        drop(first);
+
+        let (mut second, _) = restart_receiver(&socket, peer_addr, &call_keys());
+        for packet in &recorded {
+            peer.send(packet);
+            assert!(!second.receive().unwrap(), "replayed packet accepted");
+        }
+        assert_eq!(second.stats().srtp_errors, 4);
+        // The stream itself goes on.
+        peer.send(&peer.protect(104));
+        assert!(second.receive().unwrap());
+    }
+
+    /// One "pipeline" of the transmit restart tests: a new transmitter on
+    /// `socket` installed the way `AudioPipeline::start` installs it.
+    fn restart_transmitter(
+        socket: &Arc<UdpSocket>,
+        dest: SocketAddr,
+        keys: &crate::media_security::SrtpSessionKeys,
+    ) -> RtpTransmitter {
+        let contexts =
+            crate::media_security::build_srtp_contexts(keys, keys.transmit_ssrc().unwrap())
+                .unwrap();
+        let mut tx = RtpTransmitter::new(Arc::clone(socket), dest, contexts.local_ssrc, 0, 160);
+        tx.start_srtp(
+            contexts.rtp_tx,
+            contexts.tx_resume,
+            contexts.tx_claim,
+            keys.call_state(),
+            8000,
+        );
+        tx
+    }
+
+    /// Sends `count` packets and authenticates each with `receiver`, the
+    /// one inbound context a single-context peer (the SBC's leg, this
+    /// client) keeps for the association. Returns the headers, or the
+    /// number of packets that authenticated before the first failure.
+    fn send_to_single_context(
+        tx: &mut RtpTransmitter,
+        wire: &UdpSocket,
+        receiver: &proto_srtp::SrtpContext,
+        count: usize,
+    ) -> Result<Vec<proto_rtp::RtpHeader>, usize> {
+        let mut headers = Vec::with_capacity(count);
+        let mut buf = [0u8; 1500];
+        for _ in 0..count {
+            tx.send(&[0x5A; 160]).unwrap();
+            let (len, _) = wire.recv_from(&mut buf).unwrap();
+            match proto_srtp::SrtpUnprotect::new(receiver).unprotect_rtp(&buf[..len]) {
+                Ok(packet) => {
+                    assert_eq!(packet.payload.as_ref(), [0x5A; 160]);
+                    headers.push(packet.header);
+                }
+                Err(_) => return Err(headers.len()),
+            }
+        }
+        Ok(headers)
+    }
+
+    /// RFC-011 (RFC 3711 §3.2.3, §3.3.1): our pipeline is restarted under
+    /// the same master keys, before and after our stream wraps its
+    /// sequence number. A receiver with ONE context for the association
+    /// (as the SBC's leg has) keeps authenticating every packet, because
+    /// the new transmitter goes on with the call's SSRC, outbound context
+    /// and next sequence number. The first packet after each restart
+    /// carries the marker bit and the timestamp does not go back.
+    #[test]
+    fn srtp_transmit_survives_pipeline_restarts_for_a_single_context_receiver() {
+        use crate::media_security::{SrtpCallState, build_srtp_contexts, tests::keys};
+
+        let wire = UdpSocket::bind("127.0.0.1:0").unwrap();
+        wire.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let dest = wire.local_addr().unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        // The peer: one inbound context for the whole call.
+        let peer = build_srtp_contexts(&keys(1, 2), 0x1111).unwrap().rtp_rx;
+        let state = SrtpCallState::new().unwrap();
+        let call_keys = || keys(2, 1).with_call_state(state.clone());
+
+        // First pipeline, placed shortly before the sequence wrap.
+        let mut first = restart_transmitter(&socket, dest, &call_keys());
+        first.continue_stream(0xFFF0, Some(1_000_000));
+        let before = send_to_single_context(&mut first, &wire, &peer, 8).unwrap();
+        let ssrc = before[0].ssrc;
+        assert_eq!(before.last().unwrap().sequence_number, 0xFFF7);
+        drop(first);
+
+        // Restart before the wrap: same SSRC, next sequence number.
+        let mut second = restart_transmitter(&socket, dest, &call_keys());
+        let across = send_to_single_context(&mut second, &wire, &peer, 40).unwrap();
+        assert_eq!(across[0].ssrc, ssrc, "SSRC changed across a restart");
+        assert_eq!(across[0].sequence_number, 0xFFF8);
+        assert!(across[0].marker, "no marker bit after the restart");
+        assert!(!across[1].marker);
+        assert!(
+            across[0]
+                .timestamp
+                .wrapping_sub(before.last().unwrap().timestamp)
+                < 8000,
+            "timestamp did not continue: {} after {}",
+            across[0].timestamp,
+            before.last().unwrap().timestamp
+        );
+        assert_eq!(across.last().unwrap().sequence_number, 0x001F);
+        assert_eq!(peer.highest_rtp_index(), 0x1_001F, "peer rollover counter");
+        drop(second);
+
+        // Restart after the wrap: the rollover counter is still the
+        // context's, so the peer's estimate stays right.
+        let mut third = restart_transmitter(&socket, dest, &call_keys());
+        let after = send_to_single_context(&mut third, &wire, &peer, 10).unwrap();
+        assert_eq!(after[0].ssrc, ssrc);
+        assert_eq!(after[0].sequence_number, 0x0020);
+        assert!(after[0].marker);
+        assert_eq!(peer.highest_rtp_index(), 0x1_0029);
+        drop(third);
+
+        // What a restart without the call's state does, and did before:
+        // a new context (rollover counter 0) under the same keys. After
+        // the wrap the single-context peer authenticates none of it.
+        let mut stateless = restart_transmitter(&socket, dest, &keys(2, 1));
+        stateless.continue_stream(0x0100, None);
+        assert_eq!(
+            send_to_single_context(&mut stateless, &wire, &peer, 3).err(),
+            Some(0),
+            "a restart without call state was expected to lose the peer"
+        );
+    }
+
+    /// SEC-017 / NIST-019 (RFC 7714 §8.4): while a transmitter of the
+    /// call lives, contexts for a second one are refused (no audio
+    /// start), so no (SSRC, index) pair is sealed twice. Once it is
+    /// dropped the next transmitter goes on at the next sequence number.
+    #[test]
+    fn second_transmitter_is_refused_while_the_first_lives() {
+        use crate::media_security::{SrtpCallState, build_srtp_contexts, tests::keys};
+
+        let wire = UdpSocket::bind("127.0.0.1:0").unwrap();
+        wire.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let dest = wire.local_addr().unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let peer = build_srtp_contexts(&keys(1, 2), 0x1111).unwrap().rtp_rx;
+        let state = SrtpCallState::new().unwrap();
+        let call_keys = || keys(2, 1).with_call_state(state.clone());
+        let claim = || {
+            let keys = call_keys();
+            build_srtp_contexts(&keys, keys.transmit_ssrc().unwrap())
+        };
+
+        let mut first = restart_transmitter(&socket, dest, &call_keys());
+        first.continue_stream(0x0100, None);
+        let before = send_to_single_context(&mut first, &wire, &peer, 5).unwrap();
+        assert_eq!(before.last().unwrap().sequence_number, 0x0104);
+
+        // The first transmitter is alive: refused, before and after it
+        // sends more.
+        assert!(matches!(claim(), Err(crate::AudioError::SrtpError(_))));
+        let more = send_to_single_context(&mut first, &wire, &peer, 3).unwrap();
+        assert_eq!(more.last().unwrap().sequence_number, 0x0107);
+        assert!(matches!(claim(), Err(crate::AudioError::SrtpError(_))));
+
+        // After the drop the stream is free and continues at +1.
+        drop(first);
+        let mut second = restart_transmitter(&socket, dest, &call_keys());
+        let after = send_to_single_context(&mut second, &wire, &peer, 3).unwrap();
+        assert_eq!(after[0].ssrc, before[0].ssrc);
+        assert_eq!(after[0].sequence_number, 0x0108);
+        assert!(after[0].marker);
+    }
+
+    /// RFC-014, POA&M-338 (5): a restart that changes the RTP clock rate
+    /// (here PCMU at 8000 to Opus at 48000) keeps the call's SSRC, SRTP
+    /// context and sequence numbering. This is a deliberate deviation
+    /// from RFC 7160 §4.1 (a different SSRC per clock rate): a new SSRC
+    /// needs a new outbound context at rollover counter zero, which a
+    /// single-context receiver that has counted a rollover (the SBC's
+    /// leg) does not follow. This test pins the behaviour; change it
+    /// together with the POA&M item.
+    #[test]
+    fn clock_rate_change_keeps_the_ssrc() {
+        use crate::media_security::{SrtpCallState, build_srtp_contexts, tests::keys};
+
+        let wire = UdpSocket::bind("127.0.0.1:0").unwrap();
+        wire.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let dest = wire.local_addr().unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        // The peer: one inbound context for the whole call.
+        let peer = build_srtp_contexts(&keys(1, 2), 0x1111).unwrap().rtp_rx;
+        let state = SrtpCallState::new().unwrap();
+        let call_keys = || keys(2, 1).with_call_state(state.clone());
+
+        // PCMU: clock rate 8000, 160 ticks per packet; the stream wraps
+        // its sequence number before the codec changes.
+        let mut pcmu = restart_transmitter(&socket, dest, &call_keys());
+        pcmu.continue_stream(0xFFFC, Some(500_000));
+        let before = send_to_single_context(&mut pcmu, &wire, &peer, 8).unwrap();
+        let last = before.last().unwrap();
+        assert_eq!(last.sequence_number, 0x0003);
+        drop(pcmu);
+
+        // Opus: clock rate 48000, 960 ticks per packet.
+        let keys = call_keys();
+        let contexts = build_srtp_contexts(&keys, keys.transmit_ssrc().unwrap()).unwrap();
+        let mut opus =
+            RtpTransmitter::new(Arc::clone(&socket), dest, contexts.local_ssrc, 111, 960);
+        opus.start_srtp(
+            contexts.rtp_tx,
+            contexts.tx_resume,
+            contexts.tx_claim,
+            keys.call_state(),
+            48000,
+        );
+        // The single-context peer follows the stream across the change.
+        let after = send_to_single_context(&mut opus, &wire, &peer, 4).unwrap();
+        assert_eq!(after[0].ssrc, last.ssrc, "SSRC changed with the clock rate");
+        assert_eq!(after[0].sequence_number, 0x0004);
+        assert_eq!(after[0].payload_type, 111);
+        assert!(after[0].marker, "no marker bit after the restart");
+        // The timestamp goes on from the old stream's next value by the
+        // pause counted at the new rate (well under two seconds here).
+        let advanced = after[0]
+            .timestamp
+            .wrapping_sub(last.timestamp.wrapping_add(160));
+        assert!(advanced < 96_000, "timestamp advanced by {advanced}");
+        assert_eq!(
+            after[1].timestamp.wrapping_sub(after[0].timestamp),
+            960,
+            "new clock rate's increment"
+        );
+        assert_eq!(peer.highest_rtp_index(), 0x1_0007, "peer rollover counter");
+    }
+
+    /// RFC 3550 §5.1: the timestamp of a continued stream moves on by the
+    /// length of the pause at the new pipeline's clock rate.
+    #[test]
+    fn continued_stream_timestamp_advances_by_the_pause() {
+        use crate::media_security::SrtpCallState;
+
+        let state = SrtpCallState::new().unwrap();
+        assert_eq!(state.resume_timestamp(8000), None);
+        state.note_transmit_stopped(u32::MAX - 10);
+        std::thread::sleep(Duration::from_millis(50));
+        let resumed = state.resume_timestamp(8000).unwrap();
+        // 50 ms at 8 kHz is 400 ticks; allow a slow machine two seconds.
+        let advanced = resumed.wrapping_sub(u32::MAX - 10);
+        assert!((400..16_000).contains(&advanced), "advanced by {advanced}");
     }
 
     /// SEC-001: on a keyed session a forged same-IP packet does not move

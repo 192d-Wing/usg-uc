@@ -7,15 +7,35 @@ name: SRTP audio gate
 # This is the ONLY test that exercises proto-srtp against a standard SRTP
 # implementation (pion/srtp), so it catches wire-interop regressions that
 # self-contained unit tests cannot — e.g. a non-standard SRTP KDF.
+#
+# It also runs the soft client's media stack against the same pion peer
+# (client-core `dtls_interop_pion`): MediaSession + DTLS driver for the
+# handshake, then client-audio's RTP transmitter/receiver and RTCP session
+# with SRTP and SRTCP on the one media socket, in both DTLS roles. That is
+# the interop evidence for client DTLS-SRTP (POA&M-324), which is why the
+# client media crates are in the path filters below.
+#
+# Last, it runs two soft-client media stacks through the SBC relay and the
+# sidecar for one call (client-integration-tests `dtls_sbc_sidecar`): the call is held for
+# 2.5 s with SRTP and SRTCP crossing the SBC, no side may see the DTLS
+# association closed meanwhile, and both clients must get close_notify when
+# the SBC ends the call. This is the gate for the association lifetime: a
+# sidecar that closes the association after the handshake fails it.
 on:
   push:
     branches: [main]
     paths:
       - 'crates/proto/proto-dtls/**'
       - 'crates/proto/proto-srtp/**'
+      - 'crates/proto/proto-rtp/**'
       - 'crates/uc/uc-crypto/**'
       - 'crates/sbc/sbc-media-core/**'
       - 'crates/sbc/sbc-daemon/**'
+      - 'crates/client/client-sip-ua/**'
+      - 'crates/client/client-audio/**'
+      - 'crates/client/client-core/**'
+      - 'crates/client/client-types/**'
+      - 'crates/client/client-integration-tests/**'
       - 'sidecar/**'
       - '.github/workflows/srtp-audio.yml'
   pull_request:
@@ -23,9 +43,15 @@ on:
     paths:
       - 'crates/proto/proto-dtls/**'
       - 'crates/proto/proto-srtp/**'
+      - 'crates/proto/proto-rtp/**'
       - 'crates/uc/uc-crypto/**'
       - 'crates/sbc/sbc-media-core/**'
       - 'crates/sbc/sbc-daemon/**'
+      - 'crates/client/client-sip-ua/**'
+      - 'crates/client/client-audio/**'
+      - 'crates/client/client-core/**'
+      - 'crates/client/client-types/**'
+      - 'crates/client/client-integration-tests/**'
       - 'sidecar/**'
       - '.github/workflows/srtp-audio.yml'
   workflow_dispatch:
@@ -88,3 +114,25 @@ jobs:
         env:
           PEER_BIN: ${{ runner.temp }}/bin/peer
         run: cargo test -p proto-dtls --test interop_pion -- --ignored --nocapture
+
+      # The soft client's own media stack against the same peer, in both DTLS
+      # roles: MediaSession::begin_secure + the DTLS driver task, then
+      # client-audio's RtpTransmitter / RtpReceiver (rtcp-mux, DTLS forward
+      # sink) / RtcpSession on the same socket after the handoff. #[ignore]d
+      # (needs PEER_BIN). Default features on purpose: the shipped feature
+      # set (TLS-only, no plaintext RTP). libasound2-dev (installed above) is
+      # needed to build client-audio; no audio device is opened.
+      - name: Run the soft-client pion interop (client + server role)
+        env:
+          PEER_BIN: ${{ runner.temp }}/bin/peer
+        run: cargo test -p client-core --test dtls_interop_pion -- --ignored --nocapture
+
+      # Two soft-client media stacks (one per DTLS role) on one call through
+      # sbc-media-core's terminating relay and the real sidecar: handshakes,
+      # 2.5 s of SRTP/SRTCP across the SBC with the associations staying up,
+      # then close_notify to both clients when the SBC stops the relay.
+      # #[ignore]d (needs SIDECAR_BIN). Default features, as shipped.
+      - name: Run the soft-client call through the SBC relay + sidecar
+        env:
+          SIDECAR_BIN: ${{ runner.temp }}/bin/sidecar
+        run: cargo test -p client-integration-tests --test dtls_sbc_sidecar -- --ignored --nocapture

@@ -15,6 +15,7 @@ use crate::comfort_noise::encode_cn_payload;
 use crate::decode_thread::DecodeCommand;
 use crate::dtmf_sender::DtmfSender;
 use crate::file_source::FileAudioSource;
+use crate::media_security::SrtpCallState;
 use crate::noise_shaper::{CompandingLaw, NoiseShaper, NoiseShaperConfig};
 use crate::pipeline::{PipelineStats, resample_into};
 use crate::rtcp_session::RtcpSession;
@@ -84,7 +85,9 @@ impl IoThreadHandle {
         }
     }
 
-    /// Stops the I/O thread and waits for it to finish.
+    /// Stops the I/O thread and waits for it to finish. The transmitter
+    /// is gone when this returns (the thread owns it), and with it the
+    /// claim on the call's outbound SRTP stream.
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(handle) = self.thread.take()
@@ -114,7 +117,17 @@ pub struct IoThreadConfig {
     pub rtcp_remote_addr: Option<SocketAddr>,
     /// SRTCP (transmit, receive) contexts. `Some` on every secure stream;
     /// only `None` for plaintext (insecure-rtp) pipelines.
-    pub rtcp_srtp: Option<(SrtpContext, SrtpContext)>,
+    pub rtcp_srtp: Option<(Arc<SrtpContext>, Arc<SrtpContext>)>,
+    /// The call's SRTP state on a secure stream that has one: the source
+    /// of a new SSRC after a collision, so that it is not one an earlier
+    /// pipeline of the call used under the same keys (RFC 7714 §8.4).
+    pub srtp_call_state: Option<SrtpCallState>,
+    /// Set by the pipeline before it stops the thread for a restart
+    /// within the call (`AudioPipeline::stop_for_restart`); clear when
+    /// the stop ends the stream. Read once, after the loop: with it set
+    /// and a call SRTP state (which keeps the SSRC for the next pipeline)
+    /// no RTCP BYE is sent (RFC 3550 §6.3.7).
+    pub restart_pending: Arc<AtomicBool>,
     /// RTCP is multiplexed on the RTP socket (RFC 5761).
     pub rtcp_mux: bool,
     /// Local SSRC (for RTCP reports).
@@ -282,6 +295,8 @@ fn io_loop(
     // RTCP session (optional — created if RTCP socket is provided)
     let rtcp_mux = config.rtcp_mux;
     let rtcp_srtp = config.rtcp_srtp;
+    let srtp_call_state = config.srtp_call_state;
+    let restart_pending = config.restart_pending;
     let mut rtcp_session =
         config
             .rtcp_socket
@@ -380,15 +395,45 @@ fn io_loop(
             .as_ref()
             .is_some_and(RtcpSession::ssrc_collision_detected);
         if receiver.ssrc_collision_detected() || rtcp_collision {
-            let new_ssrc = crate::rtp_handler::generate_ssrc();
-            transmitter.change_ssrc(new_ssrc);
-            receiver.set_local_ssrc(new_ssrc);
+            // NIST 800-53 Rev5: SC-13 -- on a secure stream the new SSRC
+            // is one this call has not used under its keys. If none is
+            // left the SSRC stays as it is (a collision is the lesser
+            // evil; a repeated SSRC could repeat a nonce).
+            // RFC 3711 §3.2.3: the new SSRC is a new source, so it gets a
+            // new outbound SRTP context (rollover counter zero), which
+            // the call's state keeps for later pipelines. The SRTCP
+            // context goes on (its index is carried in the packet).
+            // POAM: POA&M-338 -- a peer with one receive context per
+            // association that has counted a rollover does not follow.
+            let (new_ssrc, new_rtp_tx) = srtp_call_state.as_ref().map_or_else(
+                || (Some(crate::rtp_handler::generate_ssrc()), None),
+                |call| {
+                    call.ssrc_after_collision()
+                        .map_or((None, None), |new| (Some(new.ssrc), new.rtp_tx))
+                },
+            );
             receiver.clear_ssrc_collision();
             if let Some(ref mut rtcp) = rtcp_session {
-                rtcp.set_local_ssrc(new_ssrc);
                 rtcp.clear_ssrc_collision();
             }
-            warn!("SSRC collision resolved: new local SSRC={:#010x}", new_ssrc);
+            if let Some(new_ssrc) = new_ssrc {
+                // RFC 3550 §8.2: an RTCP BYE for the SSRC that is given
+                // up, sent while the transmitter still has it. Once per
+                // collision.
+                if let Some(ref mut rtcp) = rtcp_session {
+                    let tx = transmitter.stats();
+                    let jb = receiver.jitter_buffer_stats();
+                    rtcp.abandon_local_ssrc(new_ssrc, &tx, &jb);
+                }
+                transmitter.change_ssrc(new_ssrc);
+                if let Some(context) = new_rtp_tx {
+                    transmitter.set_srtp(context);
+                }
+                receiver.set_local_ssrc(new_ssrc);
+                warn!("SSRC collision resolved: new local SSRC={:#010x}", new_ssrc);
+            } else {
+                warn!("SSRC collision not resolved: no unused SSRC left for this call");
+            }
         }
 
         // 1b. Auto-recover from capture device disappearance (USB/Bluetooth disconnect).
@@ -655,10 +700,17 @@ fn io_loop(
 
     // RFC 3550 §6.6: send an RTCP BYE (compound with SR/RR + SDES) so the
     // remote can distinguish a deliberate hangup from a crash.
+    // RFC 3550 §6.3.7: not when the pipeline stops for a restart within a
+    // call whose SRTP state keeps the SSRC: the next pipeline continues
+    // this source, and a BYE would tell the peer that it has left. The
+    // BYE is sent by the pipeline that stops when the call ends (and for
+    // an SSRC given up after a collision, above). Without a call state
+    // the next pipeline takes a new SSRC, so this one is said goodbye to.
     if let Some(ref mut rtcp) = rtcp_session {
         let tx = transmitter.stats();
         let jb = receiver.jitter_buffer_stats();
-        rtcp.send_bye(&tx, &jb);
+        let stream_continues = srtp_call_state.is_some() && restart_pending.load(Ordering::Relaxed);
+        rtcp.finish(&tx, &jb, stream_continues);
     }
 
     // Final stats update on exit

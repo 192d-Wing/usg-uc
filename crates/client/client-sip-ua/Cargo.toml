@@ -35,11 +35,21 @@ bytes.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 zeroize.workspace = true
+# Wait-free byte ring from the audio I/O thread to the DTLS driver.
+ringbuf.workspace = true
 # Ephemeral self-signed P-384 DTLS identity (same spec as sbc-media-core).
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 
+# `sendto(MSG_DONTWAIT)` for the DTLS driver's sends after the media socket
+# was handed to the audio thread (no blocking call on a runtime worker).
+# socket2 and libc (not nix: its `net` feature does not build for iOS).
+[target.'cfg(unix)'.dependencies]
+socket2.workspace = true
+libc = "0.2"
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

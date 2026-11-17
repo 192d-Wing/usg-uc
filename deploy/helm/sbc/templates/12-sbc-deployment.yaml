@@ -102,6 +102,15 @@ spec:
             - "/run/usg/dtls-terminator.sock"
             - "-fingerprint-file"
             - "/run/usg/dtls-terminator.fp"
+            # One session per terminated media leg: two per call (SC-5).
+            - "-max-sessions"
+            - {{ .Values.sbcDaemon.dtlsTerminate.maxSessions | int | default (mul 2 (.Values.sbcDaemon.config.max_calls | int)) | quote }}
+          {{- with .Values.sbcDaemon.dtlsTerminate.goMemLimit }}
+          env:
+            # Just under the memory limit; see values.yaml for the sizing.
+            - name: GOMEMLIMIT
+              value: {{ . | quote }}
+          {{- end }}
           # `-healthcheck` connects to the socket and reads the Hello frame the
           # sidecar sends on accept, proving the accept loop is live — stronger
           # than testing the socket file (which lingers after a crash).

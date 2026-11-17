@@ -529,8 +529,11 @@ mod incoming_call_tests {
             result.err()
         );
 
-        // Should emit a SendResponse event with 200 OK and CallStateChanged event
+        // A TLS call is answered with 200 OK and reported `Connecting`:
+        // `Connected` follows only after the ACK and a completed DTLS-SRTP
+        // handshake (POA&M-324), neither of which happens in this test.
         let mut saw_200_ok = false;
+        let mut saw_connecting_event = false;
         let mut saw_connected_event = false;
         while let Ok(event) = rx.try_recv() {
             match event {
@@ -539,6 +542,12 @@ mod incoming_call_tests {
                     if response_str.contains("200 OK") {
                         saw_200_ok = true;
                     }
+                }
+                CallManagerEvent::CallStateChanged {
+                    state: CallState::Connecting,
+                    ..
+                } => {
+                    saw_connecting_event = true;
                 }
                 CallManagerEvent::CallStateChanged {
                     state: CallState::Connected,
@@ -552,8 +561,12 @@ mod incoming_call_tests {
 
         assert!(saw_200_ok, "Should send 200 OK when accepting call");
         assert!(
-            saw_connected_event,
-            "Should emit Connected state change event"
+            saw_connecting_event,
+            "Should emit Connecting state change event"
+        );
+        assert!(
+            !saw_connected_event,
+            "Must not report Connected before the DTLS-SRTP handshake"
         );
 
         // Verify internal state tracking

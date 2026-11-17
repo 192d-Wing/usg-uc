@@ -23,7 +23,7 @@ use crate::jitter_buffer::{JitterBufferConfig, SharedJitterBuffer};
 use crate::media_security::{MediaSecurity, build_srtp_contexts};
 use crate::noise_shaper::NoiseShaperConfig;
 use crate::postfilter::PostfilterConfig;
-use crate::rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
+use crate::rtp_handler::{DtlsForward, RtpReceiver, RtpStats, RtpTransmitter};
 use crate::vad::VadConfig;
 use crate::{AudioError, AudioResult};
 use client_types::DtmfDigit;
@@ -219,6 +219,9 @@ pub struct PipelineConfig {
     pub socket: Option<UdpSocket>,
     /// RTCP is multiplexed on the RTP port (RFC 5761, `a=rtcp-mux` agreed).
     pub rtcp_mux: bool,
+    /// Sink for DTLS-class datagrams from the DTLS peer (post-handshake
+    /// servicing, RFC 5764 §5.1.2). `None`: they are counted and dropped.
+    pub dtls_sink: Option<DtlsForward>,
     /// Whether transmit is muted.
     pub muted: bool,
     /// Music on Hold file path (optional).
@@ -255,6 +258,7 @@ impl PipelineConfig {
             security,
             socket: None,
             rtcp_mux: false,
+            dtls_sink: None,
             muted: false,
             moh_file_path: None,
             dtmf_payload_type: None,
@@ -388,6 +392,10 @@ pub struct AudioPipeline {
     muted: Arc<AtomicBool>,
     /// Running flag for background threads.
     running: Arc<AtomicBool>,
+    /// Set by [`Self::stop_for_restart`] before the I/O thread is stopped:
+    /// the call's stream continues in the next pipeline, so the thread
+    /// sends no RTCP BYE if the SSRC is kept (RFC 3550 §6.3.7).
+    restart_pending: Arc<AtomicBool>,
     /// Shared statistics (written by I/O thread, read by UI).
     stats: Arc<Mutex<PipelineStats>>,
     /// Whether MOH is currently active.
@@ -417,6 +425,7 @@ impl AudioPipeline {
             io_thread: None,
             muted: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
+            restart_pending: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Mutex::new(PipelineStats::default())),
             moh_active: Arc::new(AtomicBool::new(false)),
             has_moh_audio: false,
@@ -456,16 +465,27 @@ impl AudioPipeline {
             ));
         }
 
-        // Generate the SSRC and build every SRTP/SRTCP context BEFORE any
+        // Choose the SSRC and build every SRTP/SRTCP context BEFORE any
         // socket or device is touched: invalid keys fail here with nothing
         // bound and nothing sent (RFC 5764 §4.1; NIST 800-53 Rev5: SC-8(1)).
-        let ssrc = generate_ssrc();
-        let srtp = match &config.security {
-            MediaSecurity::Srtp(keys) => Some(build_srtp_contexts(keys, ssrc)?),
+        //
+        // RFC 3711 §3.2.3 / §3.3.1 / §3.3.2, RFC 7714 §8.4; NIST 800-53
+        // Rev5: SC-13, SC-23 -- a call restarts its pipeline under
+        // unchanged master keys. With the call's SRTP state attached to
+        // the keys both directions go on with the call's contexts: the
+        // receive side with its rollover counter and replay windows, the
+        // transmit side with its SSRC, rollover counter and SRTCP index,
+        // at the sequence number after the last one sent (`tx_resume`).
+        // POAM: POA&M-338 -- see `SrtpCallState` for what is left.
+        let (ssrc, srtp, srtp_call_state) = match &config.security {
+            MediaSecurity::Srtp(keys) => {
+                let set = build_srtp_contexts(keys, keys.transmit_ssrc()?)?;
+                (set.local_ssrc, Some(set), keys.call_state().cloned())
+            }
             #[cfg(feature = "insecure-rtp")]
             MediaSecurity::Plaintext => {
                 warn!("Audio pipeline starting WITHOUT SRTP (insecure-rtp build)");
-                None
+                (crate::rtp_handler::generate_ssrc(), None, None)
             }
         };
 
@@ -570,9 +590,23 @@ impl AudioPipeline {
         // RFC 5761 §4: demultiplex RTCP on the RTP socket when agreed.
         receiver.set_rtcp_mux(config.rtcp_mux);
 
+        // RFC 7983 §7: DTLS records from the DTLS peer go to the driver.
+        if let Some(forward) = config.dtls_sink.take() {
+            receiver.set_dtls_sink(forward.sink, forward.remote);
+        }
+
         // Install the per-direction SRTP contexts built above.
         let rtcp_srtp = srtp.map(|set| {
-            transmitter.set_srtp(set.rtp_tx);
+            // RFC 3711 §3.3.1: if an earlier pipeline of the call sent
+            // with this context, go on after its last sequence number,
+            // with the timestamp moved on by the pause and the marker bit.
+            transmitter.start_srtp(
+                set.rtp_tx,
+                set.tx_resume,
+                set.tx_claim,
+                srtp_call_state.as_ref(),
+                clock_rate,
+            );
             receiver.set_srtp(set.rtp_rx);
             debug!("SRTP/SRTCP enabled for audio pipeline");
             (set.rtcp_tx, set.rtcp_rx)
@@ -629,6 +663,7 @@ impl AudioPipeline {
         // Set running flag
         self.muted.store(config.muted, Ordering::Relaxed);
         self.moh_active.store(false, Ordering::Relaxed);
+        self.restart_pending.store(false, Ordering::Relaxed);
         self.running.store(true, Ordering::Relaxed);
 
         // Create AEC reference buffer (shared between decode and I/O threads).
@@ -704,6 +739,8 @@ impl AudioPipeline {
             rtcp_socket,
             rtcp_remote_addr,
             rtcp_srtp,
+            srtp_call_state,
+            restart_pending: self.restart_pending.clone(),
             rtcp_mux: config.rtcp_mux,
             local_ssrc: ssrc,
             dtmf_volume: config.dtmf_volume,
@@ -750,7 +787,20 @@ impl AudioPipeline {
         Ok(local_port)
     }
 
-    /// Stops the audio pipeline.
+    /// Stops the audio pipeline for a restart within the same call: as
+    /// [`Self::stop`], but on a secure stream with a call SRTP state (the
+    /// next pipeline continues the same SSRC) no RTCP BYE is sent.
+    ///
+    /// RFC 3550 §6.3.7, §6.6: BYE means the source has left; here it has
+    /// not. Use [`Self::stop`] when the call ends.
+    pub fn stop_for_restart(&mut self) {
+        self.restart_pending.store(true, Ordering::Relaxed);
+        self.stop();
+    }
+
+    /// Stops the audio pipeline. The stream ends: an RTCP BYE is sent for
+    /// the local SSRC (RFC 3550 §6.6). Returns after the I/O thread, and
+    /// with it the transmitter, is gone.
     pub fn stop(&mut self) {
         if self.state == PipelineState::Stopped {
             return;

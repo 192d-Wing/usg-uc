@@ -60,11 +60,14 @@
 //!   input during the handshake" below for what a spoofed datagram can and
 //!   cannot do.
 //! - **SI-10**: all peer input goes through bounds-checked parsers.
-//! - **AU-2 / AU-3**: this library emits no audit records. The driver
-//!   (stage 2) MUST write one structured record through `uc-audit` for every
-//!   [`AssociationEvent::Connected`] and [`AssociationEvent::Failed`], with
-//!   the role, the [`FailureCause`], the presented fingerprint and whether
-//!   the handshake was mutually authenticated. A cause that arose during
+//! - **AU-2 / AU-3**: this library emits no audit records. Its driver MUST
+//!   write one structured record for every [`AssociationEvent::Connected`]
+//!   and [`AssociationEvent::Failed`], with the role, the [`FailureCause`],
+//!   the presented fingerprint and whether the handshake was mutually
+//!   authenticated. The soft client's driver
+//!   (`client-sip-ua/src/dtls_driver.rs`) writes them as structured
+//!   `tracing` records: the client has no audit sink, and `uc-audit` is the
+//!   SBC's event log. A cause that arose during
 //!   the handshake before the peer's `Finished` rests on unauthenticated
 //!   input (see below): record it as the reason the handshake failed, not
 //!   as proof of what the peer sent; the same holds for the presented
@@ -148,8 +151,8 @@
 //!   (no state is kept before the cookie returns); at the smallest accepted
 //!   MTU ([`crate::flight::MIN_MTU`]) our own `ClientHello` never fragments.
 //!
-//! POAM: POA&M-324 stays open until the soft client drives this association
-//! on the media socket (stage 2); nothing in the client uses it yet.
+//! The soft client drives this association on its media socket
+//! (`client-sip-ua/src/dtls_driver.rs`), one driver task per call.
 //!
 //! POAM: POA&M-333 (SC-23) -- RFC 8844 (`external_id_hash` unknown-key-share
 //! protection) is not implemented.
