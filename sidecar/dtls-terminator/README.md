@@ -40,7 +40,126 @@ The `service` package + `cmd/dtls-terminator` are the runnable sidecar: it
 listens on a Unix-domain socket and terminates one DTLS-SRTP leg per
 connection. Wire protocol (typed frames over the IPC): `Hello{fingerprint}` →
 `Start{role, peerFP}` → `Dtls{record}` … → `Ready{profile, srtpKeys}` (or
-`Error`). It refuses to start outside the FIPS module.
+`Error`) → `Dtls{record}` … for the rest of the call. It refuses to start
+outside the FIPS module.
+
+## Association lifetime
+
+`Ready` hands over the keys; it does not end the session. The DTLS
+association stays open in the sidecar for as long as the relay keeps the IPC
+connection open, which the relay does for the whole call, and `Dtls` frames
+keep flowing in both directions. Two reasons:
+
+- A peer that reads `close_notify` treats the association, and with it its
+  media, as over (the soft client stops its audio and fails the call unless a
+  BYE follows within a second). Closing the pion connection sends
+  `close_notify`, and the relay forwards every frame to the peer.
+- RFC 6347 §4.2.4: the side that sent the last flight must answer a
+  retransmission of the peer's last flight. As DTLS server that is the
+  sidecar, and it can only answer while the association exists.
+
+Until 2026-11-17 the session closed the association right after `Ready`, so
+neither held. What ends a session now:
+
+| Event | What the sidecar does |
+|---|---|
+| The relay closes the connection, or only its sending half (call over) | sends `close_notify` (it reaches the peer if the relay is still reading, which it is after a half-close), closes |
+| The peer sends `close_notify` | pion answers with its own `close_notify`; the sidecar sends `Error{"peer-close-notify: ..."}` to the relay, closes |
+| The peer sends a fatal alert | nothing goes back to the peer; the sidecar sends `Error{"peer-fatal-alert: ..."}` to the relay, closes |
+| The sidecar is stopping (SIGTERM/SIGINT) | sends `close_notify`, then `Error{"sidecar-shutdown: ..."}`, closes |
+| A frame other than `Dtls` after `Start` | sends `close_notify`, closes, logs a session error |
+
+An `Error` text after `Ready` starts with a fixed token, up to the colon. The
+relay maps it to the `reason` of its `dtls.association.closed` log record
+(`peer-close-notify`, `peer-fatal-alert`, `sidecar-shutdown`). pion reports a
+peer's `close_notify` and a fatal alert the same way (`io.EOF`); the sidecar
+tells them apart by whether pion answered with an alert of its own, which it
+does for `close_notify` only. The sidecar also logs one line per ended
+association (`session: association ended: <token>`); it does not know the
+call id, the relay's record has it. The `close_notify` / fatal-alert
+distinction is therefore an inference: it is wrong if pion earlier sent an
+alert of its own on that association, and the relay takes no action on either
+beyond its log record (NIST POA&M-340).
+
+The handshake timeout (30 s) covers the handshake only. After `Ready` there is
+no idle or lifetime limit in the sidecar: a session lasts as long as the relay
+holds the connection, and one session is one goroutine set (the session, the
+IPC reader, pion's loops).
+
+### Session limit and sizing (`-max-sessions`)
+
+A session lives for the whole call, so the number of sessions sizes the
+process: one per terminated media leg, two per call. Measured in the
+performance review of 2026-11-17 (macOS arm64, 100 established sessions after
+GC): 5 goroutines and about 70 KiB live per leg, so about **150 KiB per
+call**. Linux RSS has not been measured; it will differ somewhat, the order
+will not. The sizing below adds an allowance of 16 MiB for the process itself,
+which is an assumption, not a measurement.
+
+`-max-sessions N` (default 10000, or `$DTLS_TERMINATOR_MAX_SESSIONS`) caps
+concurrent sessions. Set it to **2 x the SBC's `max_calls`**; the Helm chart
+does. At the cap a new connection still gets `Hello` (the liveness probe reads
+only that and keeps passing), and its `Start` is answered with
+`Error{"session-limit: ..."}`: that leg's handshake fails and the call is
+refused, the calls in progress are not touched. Refusals are logged (the first
+and every 1000th), and once a minute the sidecar logs
+`sessions: active=N peak=N max=N refused=N` while it has sessions. That line
+is the only view of the count: there is no metric, the sizing below has not
+been measured on Linux, and the descriptor limit is not checked against the
+cap (NIST POA&M-342).
+
+Memory limit of the container: `16 MiB + max_calls x 150 KiB`, with headroom
+for the garbage collector, and `GOMEMLIMIT` set to about 90 % of the limit so
+that the collector works harder before the kernel kills the process (an OOM
+kill ends every association without `close_notify`). The chart's defaults
+(`max_calls: 5000`): 1 GiB limit, `GOMEMLIMIT=920MiB`.
+
+Consequences to know about:
+
+- **Stopping or restarting the sidecar ends the DTLS associations of every
+  call in progress**, with `close_notify` towards the peers. The relay keeps
+  its SRTP keys and keeps relaying, but a peer that honours `close_notify`
+  (the soft client does) ends its side. Before this change a restart only
+  affected handshakes in flight. The liveness probe restarts a wedged sidecar,
+  so this now reaches live calls (NIST POA&M-341). At shutdown the process
+  waits at most 5 s for the sessions to finish their teardown.
+- **Unprotected records after the handshake.** pion accepts epoch-0 (plaintext)
+  records for the life of a connection, so one forged plaintext `close_notify`
+  from the peer's address would end an established association and make pion
+  send a genuine `close_notify` to the real peer
+  (`TestPionHonoursUnprotectedCloseNotifyAfterHandshake` shows it). With
+  associations now living for the whole call, `plaintextgate.go` drops, after
+  the handshake, every datagram carrying an epoch-0 record that is not
+  handshake or a well-formed ChangeCipherSpec. A ChangeCipherSpec whose body is
+  not the single octet `0x01` is dropped too: pion would answer it with a
+  protected fatal alert to the real peer
+  (`TestMalformedChangeCipherSpecDoesNotAlertThePeer`).
+- **Unprotected handshake records after the handshake.** Epoch-0 handshake and
+  ChangeCipherSpec records are what a retransmitted final flight consists of,
+  so they must pass; but pion keeps every complete epoch-0 handshake message
+  for the life of the connection, so an unlimited stream of them from the
+  peer's address grew the process without bound. Each association therefore
+  accepts at most **32** such datagrams, and only in the first **60 s** after
+  its handshake; the rest are dropped and counted
+  (`TestHandshakeFloodAfterHandshakeIsBounded`,
+  `TestPlaintextGateHandshakeBudget`). The numbers: with a retransmission
+  timer that starts at 1 s and doubles, five retransmissions fall inside 60 s
+  (sent at about 1, 3, 7, 15 and 31 s), and a final flight is a handful of
+  datagrams. Once the budget is spent or the 60 s are over, a datagram that
+  carries the epoch-1 `Finished` together with epoch-0 records is dropped
+  whole. What is left (NIST POA&M-335): inside the
+  budget pion still acts on forged handshake records, and whoever can send
+  from the peer's address can use the budget up, after which a lost final
+  flight is not recovered and that call's handshake fails on the peer's side
+  (fail closed).
+- Dropped datagrams of both kinds are counted and logged once per session.
+- Key material after `Ready` (best effort): the exporter's output, the `Ready`
+  frame and the framing layer's copy of it are overwritten once the frame is
+  written. pion keeps the DTLS master secret for as long as the association
+  lives, and the same SRTP keys can be exported from it again, so a memory
+  image of the sidecar taken during a call still yields them (NIST POA&M-330).
+- On a failed handshake the `Error` frame now reaches the relay. Before, pion
+  had already closed the connection when the frame was written.
 
 ## Fingerprint provisioning (the signaling-time contract)
 
@@ -194,10 +313,33 @@ the alert), `TestRunRequiresADeadline`. Guard behaviour:
 `TestPionReassemblyAssumptions`. Acceptance:
 `TestDtlsInProfileRawPeerAccepted`, `TestDtlsSrtpMatchingKeys`.
 
+Association lifetime (added 2026-11-17). In this package (`lifetime_test.go`):
+`TestForgedUnprotectedAlertsDoNotEndAnEstablishedAssociation`,
+`TestPionHonoursUnprotectedCloseNotifyAfterHandshake`,
+`TestMalformedChangeCipherSpecDoesNotAlertThePeer`,
+`TestHandshakeFloodAfterHandshakeIsBounded`,
+`TestPlaintextGateHandshakeBudget`, `TestUnprotectedScanner`. In `service`
+(`lifetime_test.go`, `server_test.go`):
+`TestNoCloseNotifyAfterReadyWhileIPCOpen` (both roles, 2.5 s),
+`TestRetransmittedFinalClientFlightAnsweredAfterReady`,
+`TestRelayHalfCloseEndsSessionWithOneCloseNotify`,
+`TestRelayCloseEndsSession`, `TestPeerCloseNotifyIsReportedToRelay`,
+`TestPeerFatalAlertIsReportedToRelay` (a genuine protected fatal alert),
+`TestServerRefusesSessionsAtTheLimit`,
+`TestShutdownEndsEstablishedSession`, `TestShutdownEndsSessionBeforeReady`,
+`TestHandshakeTimeoutEndsSessionAndReportsError`,
+`TestNonDtlsFrameAfterReadyEndsSession`, `TestSessionsLeaveNoGoroutines`. In
+`ipc`: `TestReadDeadlineWakesRecv`. A soft-client call through the SBC relay
+and this sidecar, held for 2.5 s, with a restart of the clients' media
+objects after a sequence wrap, and ended by the SBC, is
+`crates/client/client-integration-tests/tests/dtls_sbc_sidecar.rs` (needs `SIDECAR_BIN`;
+run by `.github/workflows/srtp-audio.yml`).
+
 When this section was written (2026-11-16) these had passed in local runs
 only (go1.27.4, macOS arm64, `GOFIPS140=v1.26.0 GODEBUG=fips140=on go test
 -count=1 -race ./...`). `.github/workflows/sidecar-dtls.yml` runs
-`go test -v ./...` under `fips140=on` with Go 1.26 for changes under
-`sidecar/`, but had not yet run on this change. Not tested: any peer that is
-not pion (browsers, phones, other SBCs), Linux outside CI, and a soft-client
-call through the SBC.
+`go test -race -v ./...` under `fips140=on` with Go 1.26 for changes under
+`sidecar/`, but had not yet run on this change. The lifetime tests were run the
+same way on 2026-11-17, locally only. Not tested: any peer that is not pion
+or the soft client (browsers, phones, other SBCs), Linux outside CI, and a
+soft-client call through the SBC with SIP signalling.

@@ -22,7 +22,9 @@ use crate::recording_fork::{ForkStream, ForkTap, SessionFork, fork_changed};
 pub use crate::recording_fork::{
     RecordingForkPorts, recording_fork_dropped, recording_fork_packets,
 };
-use crate::srtp_relay::{TerminateRelayLeg, forward_dtls_to_sidecar, pump_sidecar_dtls_to_peer};
+use crate::srtp_relay::{
+    AssociationLabel, TerminateRelayLeg, forward_dtls_to_sidecar, pump_sidecar_dtls_to_peer,
+};
 use proto_srtp::{
     SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile, SrtpProtect, SrtpUnprotect,
 };
@@ -2505,7 +2507,8 @@ async fn terminate_supervisor(s: TerminateSetup) {
         return;
     };
 
-    // Peer→sidecar DTLS (post-handshake rekey) demuxed by each relay leg.
+    // Peer→sidecar DTLS (post-handshake: a retransmitted final flight, alerts)
+    // demuxed by each relay leg.
     let (a_dtls_tx, a_dtls_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     let (b_dtls_tx, b_dtls_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
 
@@ -2544,8 +2547,10 @@ async fn terminate_supervisor(s: TerminateSetup) {
         .run(s.shutdown.clone()),
     );
 
-    // Post-handshake DTLS pumps own the sidecar halves, keeping each association
-    // open for the whole call (finding #2).
+    // Post-handshake DTLS pumps own the sidecar halves. The sidecar keeps each
+    // association open for as long as its connection is open, so these tasks
+    // are what keeps it up for the whole call; on shutdown they close the
+    // connection and relay the sidecar's close_notify to the peer.
     tokio::spawn(forward_dtls_to_sidecar(
         a_dtls_rx,
         a_writer,
@@ -2556,17 +2561,27 @@ async fn terminate_supervisor(s: TerminateSetup) {
         b_writer,
         s.shutdown.clone(),
     ));
+    // NIST 800-53 Rev5: AU-3 -- each pump writes the association's
+    // `dtls.association.closed` record with the call id and the leg.
     tokio::spawn(pump_sidecar_dtls_to_peer(
         a_reader,
         Arc::clone(&s.a_socket),
         Arc::clone(&s.a_target),
         s.shutdown.clone(),
+        AssociationLabel {
+            call_id: s.call_id.clone(),
+            leg: "A",
+        },
     ));
     tokio::spawn(pump_sidecar_dtls_to_peer(
         b_reader,
         Arc::clone(&s.b_socket),
         Arc::clone(&s.b_target),
         s.shutdown.clone(),
+        AssociationLabel {
+            call_id: s.call_id.clone(),
+            leg: "B",
+        },
     ));
 
     // Separate-port SRTCP relay for non-muxed endpoints. Fresh SRTP contexts from

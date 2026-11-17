@@ -16,11 +16,12 @@
 //! ## Where the handshake lives
 //!
 //! [`association::DtlsAssociation`] is the DTLS 1.2 handshake: a sans-I/O
-//! state machine built on `uc-crypto`. [`DtlsSession`], [`DtlsConnection`]
-//! and [`Handshake`] are the older surface; they perform no handshake and
-//! fail closed (POA&M-324). `DtlsSession`, `Handshake` and the `verify`
-//! helpers are deprecated; `DtlsConnection` follows once its remaining
-//! callers have moved to the association (stage 2).
+//! state machine built on `uc-crypto`; the soft client uses it and nothing
+//! else from this crate's handshake surface. [`DtlsSession`],
+//! [`DtlsConnection`] and [`Handshake`] are the older surface; they perform
+//! no handshake and fail closed. `DtlsSession`, `Handshake` and the
+//! `verify` helpers are deprecated; `DtlsConnection` is still used by
+//! `sbc-media-core` only and follows once that has moved (stage 3).
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!

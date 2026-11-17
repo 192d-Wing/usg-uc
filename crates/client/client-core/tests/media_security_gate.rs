@@ -1,10 +1,12 @@
 //! B2: the media-security gate fails closed on TLS-account calls.
 //!
 //! Default (TLS-only) builds signal every stream as `UDP/TLS/RTP/SAVPF`, so
-//! audio must never start without DTLS-SRTP keys. Until POA&M-324 (a real
-//! DTLS handshake) every such call ends after connect with no audio. These
-//! tests drive the public `CallManager` API through the outbound connect,
-//! the inbound accept + ACK, and the re-INVITE paths.
+//! audio must never start without DTLS-SRTP keys. A call whose DTLS
+//! handshake does not complete ends with no audio and is never reported
+//! Connected (here: nothing answers DTLS at the peer's address, so the
+//! handshake times out). These tests drive the public `CallManager` API
+//! through the outbound connect, the inbound accept + ACK, and the
+//! re-INVITE paths. Successful handshakes are in `dtls_srtp_call.rs`.
 // NIST 800-53 Rev5: SC-8(1) (no plaintext media), SI-10 (SDP preflight).
 // RFC 5764 §4.1, RFC 5763 §5, RFC 8122 §5, RFC 3264 §6.
 #![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
@@ -92,6 +94,46 @@ fn reported_connected(events: &[CallManagerEvent]) -> bool {
     })
 }
 
+/// Runs the timer pass (which polls the DTLS handshake) and the call-agent
+/// event pump until the call has ended or `limit` is over. Returns the
+/// application events seen and the methods of the requests queued.
+async fn pump_until_ended(
+    manager: &mut CallManager,
+    rx: &mut mpsc::Receiver<CallManagerEvent>,
+    limit: std::time::Duration,
+) -> (Vec<CallManagerEvent>, Vec<String>) {
+    let deadline = std::time::Instant::now() + limit;
+    let mut events = Vec::new();
+    let mut methods = Vec::new();
+    loop {
+        manager.process_timers().await.unwrap();
+        for event in manager.poll_call_events() {
+            if let CallEvent::SendRequest { request, .. } = &event {
+                methods.push(request.method.as_str().to_string());
+            }
+            let _ = manager.handle_call_event(event).await;
+        }
+        events.extend(drain(rx));
+        let ended = events
+            .iter()
+            .any(|e| matches!(e, CallManagerEvent::CallEnded { .. }));
+        if ended || std::time::Instant::now() >= deadline {
+            return (events, methods);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+fn error_messages(events: &[CallManagerEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            CallManagerEvent::Error { message, .. } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Places a call and returns its ID and the INVITE the call agent queued.
 async fn place_call(manager: &mut CallManager) -> (String, SipRequest) {
     let call_id = manager
@@ -161,24 +203,50 @@ async fn offer_carries_one_full_sha384_fingerprint() {
     assert!(body.contains("a=setup:actpass\r\n"));
 }
 
-/// Establish error -> call ends: a valid SAVPF answer passes the preflight,
-/// DTLS establishment fails (POA&M-324), BYE is sent, no audio starts and
-/// the call is never reported Connected.
+/// Establish error -> call ends: a valid SAVPF answer passes the preflight
+/// and the DTLS handshake starts (the call is reported Connecting, not
+/// Connected); nothing answers at the peer's address, so the handshake
+/// times out, BYE is sent, no audio starts and the call is never reported
+/// Connected.
 #[tokio::test]
 async fn outbound_establish_error_ends_call_with_bye() {
     let (mut manager, mut rx) = manager();
+    manager.set_dtls_handshake_budget(std::time::Duration::from_secs(1));
     let (call_id, invite) = place_call(&mut manager).await;
     let _ = drain(&mut rx);
 
-    let sent = answer_call(
+    let mut sent = answer_call(
         &mut manager,
         &invite,
         &sdp("UDP/TLS/RTP/SAVPF", &good_attrs("active")),
     )
     .await;
 
-    let events = drain(&mut rx);
+    // The handshake runs; the call is not connected and not ended.
+    let mut events = drain(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            CallManagerEvent::CallStateChanged {
+                state: CallState::Connecting,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    assert!(!media_security_failed(&events, &call_id), "{events:?}");
+    assert!(manager.get_audio_session(&call_id).is_none());
+
+    let (later, methods) =
+        pump_until_ended(&mut manager, &mut rx, std::time::Duration::from_secs(8)).await;
+    events.extend(later);
+    sent.extend(methods);
     assert!(media_security_failed(&events, &call_id), "{events:?}");
+    assert_eq!(
+        error_messages(&events),
+        ["media-security: dtls-timeout"],
+        "{events:?}"
+    );
     assert!(!reported_connected(&events), "{events:?}");
     assert!(sent.iter().any(|m| m == "BYE"), "no BYE sent: {sent:?}");
     assert!(manager.get_audio_session(&call_id).is_none());
@@ -345,12 +413,14 @@ async fn inbound_insecure_offer_gets_488() {
 }
 
 /// Inbound accept path hits the gate: the 200 answers `a=setup:active`
-/// with our fingerprint, no audio starts before the ACK, and on ACK the
-/// failed DTLS establishment ends the call (BYE) without audio.
+/// with our fingerprint, no audio starts before the ACK, the call is
+/// reported Connecting (never Connected), and after the ACK the DTLS
+/// handshake that nobody answers ends the call (BYE) without audio.
 #[tokio::test]
 async fn inbound_accept_then_ack_fails_closed() {
     let source: SocketAddr = PEER.parse().unwrap();
     let (mut manager, mut rx) = manager();
+    manager.set_dtls_handshake_budget(std::time::Duration::from_secs(1));
     let request = invite(
         "secure-in",
         &sdp("UDP/TLS/RTP/SAVPF", &good_attrs("actpass")),
@@ -382,22 +452,44 @@ async fn inbound_accept_then_ack_fails_closed() {
     assert!(answer.contains("a=setup:active\r\n"), "{answer}");
     assert!(answer.contains("a=fingerprint:sha-384 "), "{answer}");
     assert!(manager.get_audio_session(&call_id).is_none());
+    // Answered, but not connected as far as the application is told.
+    assert!(!reported_connected(&events), "{events:?}");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            CallManagerEvent::CallStateChanged {
+                state: CallState::Connecting,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    let mut all_events = events;
 
     let ack = in_dialog("ACK", "secure-in", &local_tag, 1, "");
     manager
         .handle_sip_request_from(&ack, source, SipTransportKind::Tls)
         .await
         .unwrap();
-    let events = drain(&mut rx);
+    // The ACK starts the handshake; it does not wait for it.
+    let after_ack = drain(&mut rx);
+    assert!(
+        !media_security_failed(&after_ack, &call_id),
+        "{after_ack:?}"
+    );
+    all_events.extend(after_ack);
+
+    let (later, sent) =
+        pump_until_ended(&mut manager, &mut rx, std::time::Duration::from_secs(8)).await;
+    all_events.extend(later);
+    let events = all_events;
     assert!(media_security_failed(&events, &call_id), "{events:?}");
-    let sent: Vec<String> = manager
-        .poll_call_events()
-        .into_iter()
-        .filter_map(|e| match e {
-            CallEvent::SendRequest { request, .. } => Some(request.method.as_str().to_string()),
-            _ => None,
-        })
-        .collect();
+    assert_eq!(
+        error_messages(&events),
+        ["media-security: dtls-timeout"],
+        "{events:?}"
+    );
+    assert!(!reported_connected(&events), "{events:?}");
     assert!(sent.iter().any(|m| m == "BYE"), "{sent:?}");
     assert!(manager.get_audio_session(&call_id).is_none());
     assert_eq!(manager.all_call_ids(), &[] as &[String]);
@@ -528,7 +620,7 @@ mod udp_account {
     }
 
     fn udp_request(call_id: &str, to_tag: Option<&str>, cseq: u32, body: &str) -> SipRequest {
-        let to_tag = to_tag.map(|t| format!(";tag={t}")).unwrap_or_default();
+        let to_tag = to_tag.map_or_else(String::new, |t| format!(";tag={t}"));
         let text = format!(
             "INVITE sip:testuser@example.com SIP/2.0\r\n\
              Via: SIP/2.0/UDP {UDP_PEER};branch=z9hG4bK{call_id}{cseq}\r\n\

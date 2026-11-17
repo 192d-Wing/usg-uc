@@ -5,8 +5,9 @@
 //! [`DtlsConnection`] wraps the legacy [`crate::session::DtlsSession`],
 //! which performs no network handshake and fails closed (POA&M-324). The
 //! working DTLS 1.2 (RFC 6347) / DTLS-SRTP (RFC 5764) implementation is the
-//! sans-I/O [`crate::association::DtlsAssociation`]; this wrapper stays
-//! until the soft client is wired to it (stage 2 of POA&M-324).
+//! sans-I/O [`crate::association::DtlsAssociation`], which the soft client
+//! drives on its media socket. This wrapper stays while `sbc-media-core`
+//! still names it (stage 3).
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!

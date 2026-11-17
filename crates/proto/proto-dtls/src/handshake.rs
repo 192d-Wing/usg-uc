@@ -19,7 +19,8 @@
 //! disappear. The working implementation is
 //! [`crate::association::DtlsAssociation`]; new code must use that.
 //!
-//! POAM: POA&M-324 -- remove this module once nothing references it.
+//! POAM: POA&M-337 -- remove this module once nothing references it
+//! (legacy surface removal, stage 3).
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
@@ -191,7 +192,10 @@ impl HandshakeHeader {
 }
 
 /// DTLS handshake context.
-#[deprecated(note = "use association::DtlsAssociation (POA&M-324)")]
+#[deprecated(
+    since = "0.10.0",
+    note = "use association::DtlsAssociation; the legacy surface is removed under POA&M-337"
+)]
 pub struct Handshake {
     /// Whether we are the client.
     is_client: bool,

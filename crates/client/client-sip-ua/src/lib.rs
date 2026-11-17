@@ -20,7 +20,8 @@
 #![cfg_attr(test, allow(clippy::panic))]
 
 pub mod call_agent;
-pub mod dtls_handler;
+pub mod dtls_driver;
+pub mod dtls_forward;
 pub mod dtls_identity;
 pub mod ice_handler;
 pub mod media_session;
@@ -28,7 +29,8 @@ pub mod registration;
 pub mod sdp_dtls;
 
 pub use call_agent::{CallAgent, CallEvent};
-pub use dtls_handler::{DtlsEvent, DtlsHandler};
+pub use dtls_driver::{CauseBasis, DriverTimings, EarlyDtls, SecureProgress, SecurityCause};
+pub use dtls_forward::DtlsForwardTx;
 pub use dtls_identity::DtlsIdentity;
 pub use ice_handler::{IceEvent, IceHandler};
 pub use media_session::{MediaSession, MediaSessionEvent, MediaSessionState, NegotiatedSrtpKeys};

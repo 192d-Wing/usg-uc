@@ -245,6 +245,18 @@ impl SrtpContext {
         }
     }
 
+    /// Returns the highest 48-bit RTP packet index (`ROC << 16 | SEQ`,
+    /// RFC 3711 §3.3.1) this context has protected (outbound) or
+    /// authenticated (inbound); 0 before the first packet.
+    ///
+    /// A sender that hands its context to a new packetiser under the same
+    /// master key continues at the low 16 bits of this value plus one, so
+    /// that the rollover counter the receiver has estimated stays valid
+    /// (RFC 3711 §3.2.3, §3.3.1). Read-only; not for use per packet.
+    pub fn highest_rtp_index(&self) -> u64 {
+        (self.rtp_roc.load(Ordering::Acquire) << 16) | self.rtp_highest_seq.load(Ordering::Acquire)
+    }
+
     /// Gets the next RTCP index for outbound.
     ///
     /// ## Errors
@@ -464,6 +476,20 @@ mod tests {
         assert_eq!(ctx.next_rtp_index().unwrap(), 0);
         assert_eq!(ctx.next_rtp_index().unwrap(), 1);
         assert_eq!(ctx.next_rtp_index().unwrap(), 2);
+    }
+
+    #[test]
+    fn highest_rtp_index_follows_the_rollover_counter() {
+        let ctx = test_context();
+        assert_eq!(ctx.highest_rtp_index(), 0);
+        ctx.update_rtp_state(ctx.compute_rtp_index(0xFFFE));
+        assert_eq!(ctx.highest_rtp_index(), 0xFFFE);
+        // A late packet does not move it back.
+        ctx.update_rtp_state(ctx.compute_rtp_index(0xFFF0));
+        assert_eq!(ctx.highest_rtp_index(), 0xFFFE);
+        ctx.update_rtp_state(ctx.compute_rtp_index(0xFFFF));
+        ctx.update_rtp_state(ctx.compute_rtp_index(0x0000));
+        assert_eq!(ctx.highest_rtp_index(), 0x1_0000);
     }
 
     #[test]

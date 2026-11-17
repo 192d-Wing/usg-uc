@@ -10,9 +10,8 @@
 //! - **SC-5**: bounded parsing (count and length caps)
 //! - **SC-13**: sha-384 / sha-512 fingerprints only (CNSA 2.0)
 //! - **SC-23**: fingerprint binding of the DTLS session to signalling.
-//!   POAM: POA&M-324 -- the parsed fingerprints are verified against the
-//!   peer certificate only once the DTLS handshake lands; until then no
-//!   handshake completes and every TLS-account call fails closed.
+//!   The parsed fingerprints are what the call's DTLS association verifies
+//!   the peer certificate against (`MediaSession::begin_secure`).
 //!
 //! ## RFC Compliance
 //! - RFC 8122 §5: fingerprint grammar; media-level attributes override

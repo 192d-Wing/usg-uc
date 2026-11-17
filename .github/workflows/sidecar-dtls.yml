@@ -70,8 +70,10 @@ jobs:
       # FIPS by default) but pins the runtime posture explicitly. The
       # TestFIPSModeActive gate asserts fips140.Enabled() so a non-FIPS binary
       # fails the job rather than silently passing.
+      # -race: the session lifetime tests (goroutine-leak check, read-deadline
+      # wake-up, plaintext gate) are only meaningful under the race detector.
       - name: Test (FIPS 140-3, fips140=on)
-        run: go test -v ./...
+        run: go test -race -v ./...
         env:
           GODEBUG: fips140=on
 
@@ -112,4 +114,4 @@ jobs:
       # Loopback self-test: two peers handshake DTLS-SRTP and exchange real SRTP
       # media. Validates the peer before it's used against the SBC (F2d-2).
       - name: Test
-        run: go test -v ./...
+        run: go test -race -v ./...

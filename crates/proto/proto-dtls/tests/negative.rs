@@ -3269,7 +3269,9 @@ async fn legacy_dtls_session_still_fails_closed() {
             matches!(error, proto_dtls::DtlsError::HandshakeFailed { .. }),
             "{error}"
         );
-        assert!(error.to_string().contains("POA&M-324"), "{error}");
+        // The text says what to use instead and names no tracking item.
+        assert!(error.to_string().contains("legacy DtlsSession"), "{error}");
+        assert!(!error.to_string().contains("POA&M"), "{error}");
     }
 }
 

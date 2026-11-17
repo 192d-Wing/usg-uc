@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"errors"
 	dtlssession "github.com/192d-Wing/usg-uc/sidecar/dtls-terminator"
 	"github.com/192d-Wing/usg-uc/sidecar/dtls-terminator/ipc"
+	"os"
 )
 
 // A full DTLS-SRTP handshake driven over the framed-UDS IPC PacketConn instead
@@ -134,4 +136,56 @@ func unixPair(t *testing.T) (net.Conn, net.Conn) {
 		_ = a.c.Close()
 	})
 	return a.c, dialed
+}
+
+// A read deadline set while RecvFrame is already blocked applies to that
+// call, as on a net.Conn. pion cancels a blocked read this way; without it
+// a handshake with a silent peer could not be abandoned at its deadline.
+func TestReadDeadlineWakesRecv(t *testing.T) {
+	a, b := unixPair(t)
+	defer a.Close()
+	defer b.Close()
+	ft := ipc.NewFramedTransport(a)
+	defer ft.Close()
+
+	got := make(chan error, 1)
+	go func() {
+		_, err := ft.RecvFrame()
+		got <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-got:
+		t.Fatalf("RecvFrame returned early: %v", err)
+	default:
+	}
+	_ = ft.SetReadDeadline(time.Unix(1, 0))
+	select {
+	case err := <-got:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("RecvFrame returned %v, want a deadline error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RecvFrame still blocked after the deadline was set")
+	}
+
+	// Clearing the deadline while blocked keeps the read waiting, and the
+	// transport still delivers frames afterwards.
+	_ = ft.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	go func() {
+		f, err := ft.RecvFrame()
+		if err == nil && string(f) != "frame" {
+			err = errors.New("wrong frame")
+		}
+		got <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	_ = ft.SetReadDeadline(time.Time{})
+	time.Sleep(200 * time.Millisecond)
+	if err := ipc.NewFramedTransport(b).SendFrame([]byte("frame")); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-got; err != nil {
+		t.Fatalf("RecvFrame after the deadline was cleared: %v", err)
+	}
 }

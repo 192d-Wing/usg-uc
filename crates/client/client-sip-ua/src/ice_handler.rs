@@ -3,6 +3,7 @@
 //! Manages ICE candidate gathering, connectivity checks, and selected pair
 //! for establishing media connectivity through NATs and firewalls.
 
+use crate::dtls_driver::EarlyDtls;
 use crate::{SipUaError, SipUaResult};
 use proto_ice::agent::{GatheringState, IceState};
 use proto_ice::{
@@ -272,7 +273,16 @@ impl IceHandler {
     /// success); the controlled agent selects the pair the peer nominated.
     /// Returns `Ok(None)` when every pair failed or the check phase timed out
     /// — the caller then falls back to the SDP default destination.
-    pub async fn start_checks(&mut self) -> SipUaResult<Option<(SocketAddr, SocketAddr)>> {
+    ///
+    /// The check loop is the only reader of the media socket while it runs.
+    /// A DTLS datagram (RFC 7983 §7: first byte 20..=63) that arrives in
+    /// that time is put into `early` instead of being thrown away, so a
+    /// `ClientHello` sent before our checks finished is not lost
+    /// (RFC 5763 §5). The stash is bounded; see [`EarlyDtls`].
+    pub async fn start_checks(
+        &mut self,
+        early: &mut EarlyDtls,
+    ) -> SipUaResult<Option<(SocketAddr, SocketAddr)>> {
         let socket = self
             .socket
             .clone()
@@ -359,29 +369,51 @@ impl IceHandler {
             // match responses to our outstanding checks.
             match tokio::time::timeout(ta, socket.recv_from(&mut buf)).await {
                 Ok(Ok((n, from))) => {
-                    let Ok(msg) = StunMessage::parse(&buf[..n]) else {
-                        trace!(from = %from, "Non-STUN packet during ICE checks, ignored");
+                    let Some(datagram) = buf.get(..n) else {
                         continue;
                     };
-                    match msg.msg_type.class {
-                        StunClass::Request => {
-                            self.answer_peer_check(&socket, &msg, from).await;
-                        }
-                        StunClass::SuccessResponse | StunClass::ErrorResponse => {
-                            let Some(oc) = outstanding.remove(&msg.transaction_id) else {
-                                trace!("STUN response for unknown transaction, ignored");
-                                continue;
-                            };
-                            self.handle_check_response(&oc, &msg);
-                        }
-                        StunClass::Indication => {}
-                    }
+                    self.on_check_datagram(&socket, datagram, from, &mut outstanding, early)
+                        .await;
                 }
                 Ok(Err(e)) => {
                     return Err(SipUaError::TransportError(e.to_string()));
                 }
                 Err(_) => {} // Ta elapsed with nothing to read
             }
+        }
+    }
+
+    /// Handles one datagram read during the check phase: answers the
+    /// peer's checks, matches responses to ours, and keeps DTLS datagrams
+    /// for the association.
+    async fn on_check_datagram(
+        &mut self,
+        socket: &UdpSocket,
+        datagram: &[u8],
+        from: SocketAddr,
+        outstanding: &mut HashMap<[u8; 12], OutstandingCheck>,
+        early: &mut EarlyDtls,
+    ) {
+        let Ok(msg) = StunMessage::parse(datagram) else {
+            // NIST 800-53 Rev5: SC-5 -- bounded stash; anything that is
+            // not DTLS is dropped as before.
+            if !early.offer(datagram, from) {
+                trace!(from = %from, "Non-STUN packet during ICE checks, ignored");
+            }
+            return;
+        };
+        match msg.msg_type.class {
+            StunClass::Request => {
+                self.answer_peer_check(socket, &msg, from).await;
+            }
+            StunClass::SuccessResponse | StunClass::ErrorResponse => {
+                let Some(oc) = outstanding.remove(&msg.transaction_id) else {
+                    trace!("STUN response for unknown transaction, ignored");
+                    return;
+                };
+                self.handle_check_response(&oc, &msg);
+            }
+            StunClass::Indication => {}
         }
     }
 
@@ -751,6 +783,7 @@ mod tests {
         let mut b = IceHandler::for_inbound(b_addr, config, b_tx);
         a.set_socket(a_sock);
         b.set_socket(b_sock);
+        let (mut a_early, mut b_early) = (EarlyDtls::new(), EarlyDtls::new());
 
         // Exchange what SDP would carry: credentials and host candidates.
         a.gather_candidates().await.unwrap();
@@ -764,7 +797,7 @@ mod tests {
             b.add_remote_candidate(&c);
         }
 
-        let (ra, rb) = tokio::join!(a.start_checks(), b.start_checks());
+        let (ra, rb) = tokio::join!(a.start_checks(&mut a_early), b.start_checks(&mut b_early));
         // Both sides must have selected a pair.
         let (a_local, a_remote) = ra.unwrap().unwrap();
         let (b_local, b_remote) = rb.unwrap().unwrap();
@@ -814,8 +847,29 @@ mod tests {
         ));
 
         let started = Instant::now();
-        let result = h.start_checks().await.unwrap();
+        // While the checks run, the "peer" sends what an early DTLS client
+        // would, mixed with junk (RFC 5763 §5).
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        for i in 0..5u8 {
+            peer.send_to(&[22, 0xFE, 0xFD, i], local).unwrap();
+        }
+        peer.send_to(&[0x80, 0, 0, 1], local).unwrap();
+        peer.send_to(&[0xFF; 8], local).unwrap();
+        let mut early = EarlyDtls::new();
+        let result = h.start_checks(&mut early).await.unwrap();
         assert!(result.is_none());
+        // Five DTLS datagrams: the stash holds four, the oldest was
+        // dropped; the RTP-class and unknown datagrams were not kept.
+        assert_eq!(early.len(), EarlyDtls::MAX_DATAGRAMS);
+        assert_eq!(early.evicted(), 1);
+        let kept = early.take_from(peer_addr);
+        assert_eq!(
+            kept,
+            (1..5u8)
+                .map(|i| vec![22, 0xFE, 0xFD, i])
+                .collect::<Vec<_>>()
+        );
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "bounded by the phase timeout"

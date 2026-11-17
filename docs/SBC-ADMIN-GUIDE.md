@@ -757,6 +757,141 @@ another ECDHE group, the handshake fails when its deadline expires and the
 far end receives no alert. Only pion-based peers were tested. Details:
 `sidecar/dtls-terminator/README.md`, `docs/CNSA-2-COMPLIANCE.md` (DTLS-SRTP).
 
+### DTLS sidecar operation (`Terminate` mode; changed 2026-11-17)
+
+Applies only with `media.srtp.mode = "Terminate"`. Everything in this section
+was tested in local runs on macOS only; nothing here has been measured or run
+on Linux yet (NIST POA&M-339, POA&M-342).
+
+**The sidecar now holds each DTLS association for the whole call.** Before
+this change it closed the association, with `close_notify`, as soon as it had
+handed the SRTP keys to the SBC. It now keeps it open until the SBC ends the
+call, at which point it sends one `close_notify` to the peer. It also answers
+a peer that retransmits its last handshake flight. There is no idle or
+lifetime timer in the sidecar: a session lasts as long as the call.
+
+**Upgrade the sidecar before any soft client that performs DTLS-SRTP.** A
+soft client built from the client DTLS-SRTP change (feat/client-dtls-wiring)
+stops its audio when it receives `close_notify` and ends the call about one
+second later (`media-security: dtls-closed-by-peer`) unless a BYE arrives.
+Against an older sidecar that is every call. The sidecar and the SBC are
+upgraded together by the Helm chart; outside Helm, replace the sidecar
+binary first.
+
+**Stopping or restarting the sidecar ends the DTLS association of every
+call in progress** (NIST POA&M-341):
+
+- A graceful stop (SIGTERM or SIGINT, including a liveness-probe restart:
+  three failed probes 20 s apart in the Helm chart) sends `close_notify` on
+  every leg and waits at most 5 s for the sessions to finish. A peer that
+  honours `close_notify` ends its call; the soft client does, within about
+  one second.
+- A crash or an out-of-memory kill sends nothing. Peers are not told.
+- In both cases the SBC keeps the SRTP keys and **keeps relaying media on
+  those calls until signalling ends them**; it does not end the calls itself
+  (NIST POA&M-340). Nothing is sent in plaintext and no key changes.
+- A restarted sidecar has a new identity and fingerprint. The SBC reads the
+  fingerprint file again for each new call.
+- The SBC logs one warning per leg, so a sidecar restart with N terminated
+  calls up writes 2N warnings (see the reason table below).
+
+Drain first: restart the sidecar on purpose only when no terminated call is
+up on that node. Stop offering new calls to the node and wait for the active
+calls to end. There is no command that drains the sidecar by itself.
+
+**Session limit.** The sidecar runs one session per terminated media leg, two
+per call. `-max-sessions N` (default 10000, or the environment variable
+`DTLS_TERMINATOR_MAX_SESSIONS`) caps them; set it to 2 x `max_calls`. A value
+below 1, or an environment value that is not an integer, stops the sidecar at
+startup. At the limit a new leg is refused and that call fails to set up;
+calls in progress are not affected and the liveness probe keeps passing.
+
+**Memory.** Because sessions live for the whole call, the number of calls
+sizes the sidecar:
+
+```text
+memory limit  >=  16 MiB + max_calls x 150 KiB, plus headroom for the Go collector
+GOMEMLIMIT    ~=  90 % of the memory limit
+```
+
+For `max_calls = 5000` that is 749 MiB, hence a 1Gi limit and
+`GOMEMLIMIT=920MiB` (the Helm defaults). For 10000 calls: about 1.5 GiB,
+limit 2Gi, `GOMEMLIMIT=1840MiB`. If the limit is reached the kernel kills the
+sidecar and every call loses its DTLS association at once, without
+`close_notify`. Caveats, all open under NIST POA&M-342:
+
+- The 150 KiB per call is one measurement on macOS arm64 (100 established
+  sessions). It was taken before the sidecar's per-session read buffer was
+  reduced and was not repeated. **Linux memory use has not been measured.**
+- The 16 MiB for the process itself is an assumption, not a measurement.
+- Not included: after its handshake each session accepts up to 32
+  unauthenticated handshake datagrams, which the session's own peer can send
+  and which stay in memory until the call ends, up to about 64 KiB per
+  session. When sizing for hostile peers use `16 MiB + max_calls x 278 KiB`.
+- The limit of 2 x `max_calls` has no slack: sessions that are still closing
+  count against it, so at full load a new leg can be refused.
+- The sidecar does not check its file-descriptor limit against
+  `-max-sessions`.
+
+Measure the sidecar's resident memory on Linux at your `max_calls` before
+enabling termination at scale.
+
+**Helm values** (`sbcDaemon.dtlsTerminate`):
+
+| Value | Default | Meaning |
+|-------|---------|---------|
+| `maxSessions` | `0` | The sidecar's `-max-sessions`. `0` renders 2 x `sbcDaemon.config.max_calls`. |
+| `goMemLimit` | `"920MiB"` | `GOMEMLIMIT` for the sidecar. Empty: the variable is not set. Raise it together with `resources.limits.memory`. |
+| `resources.limits.memory` | `1Gi` (was `256Mi`) | Sized for `max_calls: 5000` with the formula above. |
+| `resources.requests.memory` | `128Mi` (was `64Mi`) | |
+
+**SBC log record `dtls.association.closed`.** The SBC writes one record per
+terminated leg when its DTLS association ends, with the fields `event`,
+`call_id`, `leg` (`A` or `B`), `remote` (the peer's address) and `reason`.
+It is a log record, not an audit event or a CDR field.
+
+| `reason` | Level | Meaning |
+|----------|-------|---------|
+| `call-ended` | info | Normal: the call ended and the sidecar closed the association. |
+| `peer-close-notify` | warn | The peer ended the association during the call with `close_notify` (see the note below). |
+| `peer-fatal-alert` | warn | The peer ended the association during the call with a fatal alert (see the note below). |
+| `sidecar-shutdown` | warn | The sidecar was stopped while the call was up. |
+| `sidecar-connection-lost` | warn | The connection to the sidecar ended during the call: the sidecar crashed or was killed. |
+| `sidecar-close-timeout` | warn | The call ended and the sidecar did not close the association within 500 ms. |
+| `sidecar-error` | warn | The sidecar reported an end the SBC has no token for; its text is in the `detail` field. |
+
+For every reason except `call-ended` the message says that SRTP relaying on
+that leg continues until signalling ends the call.
+
+`peer-close-notify` and `peer-fatal-alert` are **inferred** by the sidecar.
+Its DTLS library reports both as the same event; the sidecar takes an alert
+it sent itself as the answer to a `close_notify`, and the absence of one as a
+fatal alert. The label can be wrong if the library earlier sent an alert of
+its own on that association. Either reason does show that the peer ended the
+association; treat the distinction as advisory.
+
+**Rate limit on DTLS after the handshake.** On a terminated leg the SBC
+forwards DTLS datagrams that arrive after the handshake (a retransmitted last
+flight, an alert) to the sidecar at no more than a burst of 8 and then 4 per
+second. The rest are dropped, counted, and logged with the call id on the
+first and every 1000th drop ("post-handshake DTLS from the peer dropped").
+Media is not affected. Someone sending from a peer's address at that rate can
+keep the peer's `close_notify` from reaching the sidecar; the call then ends
+by signalling only (NIST POA&M-335).
+
+**Sidecar log lines** (container log; the sidecar does not know call ids):
+
+- `sessions: active=N peak=N max=N refused=N`, once a minute while there
+  are sessions. This is the only view of the session count: there is no
+  metric (NIST POA&M-342). Collect the container log and alert on `refused`
+  rising or `active` approaching `max`.
+- `session limit reached (max-sessions=N): M connection(s) refused so far`,
+  on the first refusal and every 1000th.
+- `session: association ended: <reason>`, for a peer-initiated end or a
+  shutdown. Nothing is logged for a normal call end.
+- `session: N datagram(s) ... dropped after the handshake`, once per
+  session, when forged unprotected DTLS records were dropped.
+
 ### T.38 fax relay (`[media.t38]`)
 
 The SBC can carry T.38 fax (RFC 3362 `m=image ... udptl t38`) after an

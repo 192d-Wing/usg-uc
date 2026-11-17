@@ -9,8 +9,8 @@
 
 use crate::{AppError, AppResult};
 use client_audio::{
-    AudioPipeline, AudioProcessingConfig, MediaSecurity, PipelineConfig, PipelineState,
-    PipelineStats,
+    AudioPipeline, AudioProcessingConfig, DtlsForward, MediaSecurity, PipelineConfig,
+    PipelineState, PipelineStats,
 };
 use client_types::DtmfDigit;
 use client_types::audio::CodecPreference;
@@ -39,6 +39,9 @@ pub struct AudioSessionConfig {
     pub socket: Option<std::net::UdpSocket>,
     /// RTCP multiplexed on the RTP port (RFC 5761).
     pub rtcp_mux: bool,
+    /// Sink for post-handshake DTLS records from the DTLS peer
+    /// (RFC 5764 §5.1.2). `None` on plain RTP calls.
+    pub dtls_sink: Option<DtlsForward>,
     /// Music on Hold file path (optional).
     pub moh_file_path: Option<String>,
     /// DTMF telephone-event payload type from SDP (`None` = use default 101).
@@ -65,6 +68,7 @@ impl AudioSessionConfig {
             security,
             socket: None,
             rtcp_mux: false,
+            dtls_sink: None,
             moh_file_path: None,
             dtmf_payload_type: None,
             dtmf_volume: 10,
@@ -133,6 +137,7 @@ impl AudioSession {
             security: config.security,
             socket: config.socket,
             rtcp_mux: config.rtcp_mux,
+            dtls_sink: config.dtls_sink,
             muted: self.pipeline.is_muted(),
             moh_file_path: config.moh_file_path,
             dtmf_payload_type: config.dtmf_payload_type,
@@ -161,8 +166,20 @@ impl AudioSession {
         Ok(local_port)
     }
 
+    /// Stops the audio session for a restart within the same call (codec
+    /// or remote address change): as [`Self::stop`], but no RTCP BYE is
+    /// sent when the next session continues the call's SSRC (RFC 3550
+    /// §6.3.7). Use [`Self::stop`] when the call ends.
+    pub async fn stop_for_restart(&mut self) -> AppResult<()> {
+        self.stop_with(true).await
+    }
+
     /// Stops the audio session.
     pub async fn stop(&mut self) -> AppResult<()> {
+        self.stop_with(false).await
+    }
+
+    async fn stop_with(&mut self, restart: bool) -> AppResult<()> {
         if !self.pipeline.is_running() {
             return Ok(());
         }
@@ -170,7 +187,11 @@ impl AudioSession {
         info!("Stopping audio session");
 
         // Stop pipeline (sync — pipeline joins its threads)
-        self.pipeline.stop();
+        if restart {
+            self.pipeline.stop_for_restart();
+        } else {
+            self.pipeline.stop();
+        }
 
         // Notify stopped
         let _ = self.event_tx.send(AudioSessionEvent::Stopped).await;

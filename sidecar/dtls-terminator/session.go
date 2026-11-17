@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/elliptic"
@@ -46,22 +47,66 @@ type Params struct {
 	PeerFingerprint string
 }
 
-// Result is the outcome of a completed DTLS-SRTP handshake.
+// Result is a DTLS-SRTP association whose handshake has completed.
 type Result struct {
 	SRTPKeys []byte                     // exported keying material (srtpKeyLen)
 	Profile  dtls.SRTPProtectionProfile // negotiated SRTP profile
 
 	conn *dtls.Conn // owned by the caller; tear down via Close() at session end
+	gate *plaintextGate
 }
 
-// Close tears down the DTLS association. Call it when the media session ends —
-// NOT before, since (per pion) this also closes the underlying PacketConn.
+// DroppedUnprotected returns how many inbound datagrams were withheld from
+// the association after the handshake because they carried an unprotected
+// alert, application-data or malformed ChangeCipherSpec record (see
+// plaintextGate). A genuine peer sends none, so a count above zero means
+// someone forged traffic from its address.
+func (r *Result) DroppedUnprotected() uint64 {
+	if r == nil || r.gate == nil {
+		return 0
+	}
+	return r.gate.dropped.Load()
+}
+
+// DroppedHandshake returns how many inbound datagrams with unprotected
+// handshake or ChangeCipherSpec records were withheld from the association
+// because its budget for them was spent or its window over (see
+// plaintextGate). A genuine peer stays far below the budget.
+func (r *Result) DroppedHandshake() uint64 {
+	if r == nil || r.gate == nil {
+		return 0
+	}
+	return r.gate.droppedHandshake.Load()
+}
+
+// Close ends the DTLS association: a close_notify alert is sent to the peer
+// (unless the peer ended the association first) and, per pion, the
+// underlying PacketConn is closed. Call it when the media session ends, NOT
+// before: a peer that reads close_notify stops its media (RFC 5764 ties the
+// SRTP session to the association), and an association that is gone cannot
+// answer a retransmission of the peer's final flight (RFC 6347 §4.2.4).
 func (r *Result) Close() error {
 	if r == nil || r.conn == nil {
 		return nil
 	}
 	return r.conn.Close()
 }
+
+// Read returns the next application-data record of the association. A
+// DTLS-SRTP association carries none (media is SRTP, beside it), so the
+// point of calling Read is to learn when the association ends: io.EOF means
+// the peer ended it (close_notify or a fatal alert), the transport ended, or
+// Close was called. Any other error (a record that failed authentication, a
+// warning alert, a read deadline) leaves the association up.
+//
+// pion keeps answering the peer's handshake retransmissions and alerts on
+// its own goroutines for as long as the association is open, whether or not
+// Read is called.
+func (r *Result) Read(p []byte) (int, error) { return r.conn.Read(p) }
+
+// SetReadDeadline bounds a Read in progress and later ones; the zero time
+// removes the bound. A deadline in the past makes a blocked Read return.
+func (r *Result) SetReadDeadline(t time.Time) error { return r.conn.SetReadDeadline(t) }
 
 // Run drives the DTLS-SRTP handshake for one leg over conn (a UDP- or
 // IPC-backed PacketConn) toward the peer at rAddr, verifies the peer's SDP
@@ -91,9 +136,10 @@ func (r *Result) Close() error {
 //
 // ctx must therefore carry a deadline; Run returns an error if it has none.
 //
-// On success the caller owns teardown via Result.Close() (which closes conn);
-// Run does NOT close the caller-provided conn on the success path. On failure
-// Run closes the DTLS conn it created.
+// On success the caller owns the association and its teardown via
+// Result.Close() (which closes conn); Run does NOT close the caller-provided
+// conn on the success path, and the association outlives ctx: ctx bounds the
+// handshake only. On failure Run closes the DTLS conn it created.
 func Run(ctx context.Context, conn net.PacketConn, rAddr net.Addr, p Params) (*Result, error) {
 	if p.Identity == nil {
 		return nil, fmt.Errorf("nil identity")
@@ -175,7 +221,10 @@ func Run(ctx context.Context, conn net.PacketConn, rAddr net.Addr, p Params) (*R
 	// on the wire (see groupGuard).
 	hctx, abort := context.WithCancel(ctx)
 	defer abort()
-	guard := newGroupGuard(conn, p.Role == RoleClient, abort)
+	// Under the guard, for the life of the association: after the handshake
+	// unprotected alerts are no longer let through to pion.
+	gate := newPlaintextGate(conn)
+	guard := newGroupGuard(gate, p.Role == RoleClient, abort)
 
 	var conn2 *dtls.Conn
 	var err error
@@ -211,6 +260,8 @@ func Run(ctx context.Context, conn net.PacketConn, rAddr net.Addr, p Params) (*R
 		}
 		return nil, err
 	}
+	res.gate = gate
+	gate.arm()
 	return res, nil
 }
 

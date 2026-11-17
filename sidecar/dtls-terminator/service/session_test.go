@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ func TestSessionRoundTrip(t *testing.T) {
 
 	// The sidecar service handles svcConn as the DTLS SERVER.
 	svcErr := make(chan error, 1)
-	go func() { svcErr <- HandleSession(svcConn, sidecarID) }()
+	go func() { svcErr <- HandleSession(context.Background(), svcConn, sidecarID) }()
 
 	ft := ipc.NewFramedTransport(relayConn)
 
@@ -98,8 +99,15 @@ func TestSessionRoundTrip(t *testing.T) {
 	if len(readyKeys) == 0 || string(readyKeys) != string(cres.SRTPKeys) {
 		t.Fatal("service Ready SRTP keys differ from the relay-side keys")
 	}
-	if err := <-svcErr; err != nil {
-		t.Fatalf("service session: %v", err)
+	// Ready does not end the session; the relay closing the connection does.
+	_ = relayConn.Close()
+	select {
+	case err := <-svcErr:
+		if err != nil {
+			t.Fatalf("service session: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("session did not end after the relay closed the connection")
 	}
 	t.Logf("PASS: service round-trip — %d-byte matching SRTP keys", len(readyKeys))
 }
@@ -147,7 +155,14 @@ func recvWithin(t *testing.T, ft ipc.FrameTransport, d time.Duration) ([]byte, e
 
 func unixPair(t *testing.T) (net.Conn, net.Conn) {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "svc.sock")
+	// Not t.TempDir(): it embeds the test name, and a long name pushes the
+	// path over the sun_path limit (104 bytes on macOS).
+	dir, err := os.MkdirTemp("", "dtls")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "svc.sock")
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatalf("listen unix: %v", err)

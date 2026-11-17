@@ -9,6 +9,315 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, DTLS-SRTP sidecar keeps the association for the whole call, POA&M-335, 340, 341, 342)
+
+Affects only SBCs that terminate DTLS-SRTP (`sbcDaemon.dtlsTerminate.enabled`,
+off by default). Relay mode is not affected. Tested on macOS only, against
+the in-tree soft-client stack and pion/dtls v3.1.5; the first Linux run is
+the PR's `Sidecar DTLS` and `SRTP audio gate` workflows.
+
+- **SBC: the `dtls-terminator` sidecar no longer closes the DTLS
+  association after the handshake.** (RFC 5764, RFC 6347 §4.2.4; SC-8,
+  SC-23) Before, the sidecar sent `close_notify` to the peer right after it
+  exported the SRTP keys, and did not answer a retransmitted final flight.
+  A peer that honours `close_notify` (the Stage 2 soft client does) saw its
+  call end about 20 ms after it connected. Now a session holds the
+  association until the media relay closes its IPC connection (call end),
+  the peer ends it, or the sidecar stops. There is no idle or lifetime
+  limit after the handshake. A retransmitted final flight is answered.
+- **Stopping the sidecar ends the DTLS association of every call in
+  progress.** (POA&M-341, open; SC-10) On SIGTERM or SIGINT the sidecar
+  closes its listener and sends `close_notify` to the peer of every live
+  leg, then waits at most 5 s for sessions to finish. Before, it drained
+  sessions, which were short. An image upgrade, a liveness-probe restart
+  or a pod eviction therefore ends terminated calls on peers that honour
+  `close_notify`: a soft client stops audio at once and ends its call
+  within about 1 s. The SBC relay keeps its SRTP keys and keeps relaying
+  until signalling ends the call. A crash sends nothing. Drain calls
+  before restarting the sidecar.
+- **Session limit: new flag `-max-sessions`.** (POA&M-342, open; SC-5,
+  SC-6) One session per terminated media leg, two per call. Default 10000,
+  or `$DTLS_TERMINATOR_MAX_SESSIONS`. A value below 1, or an environment
+  value that is not an integer, stops the sidecar at start. At the limit a
+  new leg is refused with `Error{"session-limit: ..."}`, so that call
+  fails to set up; calls in progress are not touched and the health probe
+  still passes. The count is a log line once a minute
+  (`sessions: active=N peak=N max=N refused=N`), not a metric.
+- **Plaintext gate after the handshake.** (POA&M-335, open; SC-5, SC-23)
+  pion/dtls v3.1.5 accepts unauthenticated epoch-0 records for the life of
+  a connection, so one forged plaintext `close_notify` from the peer's
+  address would end an established association. New `plaintextgate.go`
+  drops, once the handshake is over, every datagram that carries an
+  epoch-0 record other than handshake or a well-formed ChangeCipherSpec.
+  Epoch-0 handshake and ChangeCipherSpec datagrams (a retransmitted final
+  flight) pass up to a budget of 32 per association and only within 60 s
+  of the handshake's end. Drops are counted and logged once per session.
+  Nothing is dropped during the handshake. Inside the budget pion still
+  acts on forged handshake records, and a sender at the peer's address can
+  spend the budget; both fail closed.
+- **`Error` frame texts changed.** After `Ready` the sidecar now reports
+  `peer-close-notify: ...`, `peer-fatal-alert: ...` or
+  `sidecar-shutdown: ...`; a refused session gets `session-limit: ...`.
+  The text up to the colon is a fixed token. Anything that matched the
+  former free text must be changed. `peer-close-notify` versus
+  `peer-fatal-alert` is inferred by the sidecar from pion's behaviour, not
+  reported by pion (POA&M-340). The `Error` frame of a failed handshake
+  now reaches the relay; before, it was written after the connection was
+  closed. A handshake that hits its 30 s deadline with a silent peer now
+  returns at the deadline.
+- **Go API.** `service.HandleSession(ctx, conn, identity)` takes a context
+  (was `HandleSession(conn, identity)`); cancelling it ends the session
+  with `close_notify`. New `service.Server{Identity, MaxSessions}` with
+  `Serve(ctx, listener)` and `Stats()` owns the accept loop that was in
+  `main.go`; new `service.RefuseSession`, `service.DefaultMaxSessions` and
+  the exported `service.Err*` texts. `dtlssession.Result` gains `Read`,
+  `SetReadDeadline`, `DroppedUnprotected` and `DroppedHandshake`.
+  `ipc.FrameTransport.SetReadDeadline` now wakes a blocked `RecvFrame`.
+  The IPC framing is unchanged. `go.mod` and `go.sum` are unchanged.
+- **Helm: sidecar memory limit 256Mi -> 1Gi, request 64Mi -> 128Mi.** The
+  sidecar now holds about 150 KiB per terminated call for the whole call
+  (measured on macOS arm64, not yet on Linux; POA&M-342). The shipped
+  limit is sized for `max_calls: 5000`: 16 MiB + 5000 x 150 KiB = 749 MiB.
+  New values under `sbcDaemon.dtlsTerminate`:
+  - `maxSessions` (default `0`): rendered as `-max-sessions`; `0` means
+    2 x `sbcDaemon.config.max_calls`. A value that is not a number is read
+    as `0`.
+  - `goMemLimit` (default `"920MiB"`): sets `GOMEMLIMIT` on the sidecar,
+    about 90% of the memory limit. An empty value omits the variable.
+  If you raise `max_calls`, raise `resources.limits.memory` and
+  `goMemLimit` with it (10000 calls: limit 2Gi, `goMemLimit` 1840MiB). If
+  the limit is hit the kernel kills the sidecar and every terminated call
+  loses its DTLS association at once. Check node capacity and namespace
+  quotas for the larger request and limit before upgrading. Overrides of
+  `sbcDaemon.dtlsTerminate.resources` in your own values files keep their
+  old numbers; review them.
+- **Upgrade the chart and the sidecar image together.** The new chart
+  passes `-max-sessions`; a sidecar image built before this change does
+  not know the flag and exits at start, so the SBC pod does not start. A
+  new image under the old chart runs with the 256Mi limit, which holds
+  only about 1,600 calls now that sessions last for the call.
+  `release-sbc.yml` still does not build `usg-dtls-terminator`; build it
+  from `sidecar/dtls-terminator/Dockerfile` as for the entry below.
+- **Order of upgrade.** The media relay (`sbc-daemon` image) and the
+  sidecar of this change work with the other one from before this change,
+  in either order: a new relay with an old sidecar logs
+  `reason="sidecar-error"` or `sidecar-connection-lost` for each leg, and
+  an old relay with a new sidecar logs the new text and may cut off the
+  `close_notify` at call end. Both must be upgraded before any Stage 2
+  soft client places calls through a terminating SBC: with an old sidecar
+  such a call ends about 1 s after it connects (`dtls-closed-by-peer`).
+
+No SBC config key, CDR field, audit event type, metric or gRPC/REST API is
+changed. The log records below are new.
+
+### Added (SBC, DTLS association close record and post-handshake rate limit, POA&M-335, 340)
+
+- **SBC log: one `dtls.association.closed` record per terminated leg.**
+  (AU-2, AU-3) Fields: `event`, `call_id`, `leg` (`A` or `B`), `remote`
+  (bare `address:port`), `reason`, and `detail` for an unknown sidecar
+  text. `reason` is one of seven fixed tokens: `call-ended` (info, the
+  normal end), and at warn `peer-close-notify`, `peer-fatal-alert`,
+  `sidecar-shutdown`, `sidecar-connection-lost`, `sidecar-close-timeout`
+  and `sidecar-error`. The two `peer-*` tokens are as inferred by the
+  sidecar. A sidecar restart with N terminated calls writes 2N warn
+  records. SIEM rules that count SBC warnings should expect this. This is
+  a log record, not an audit event type; the audit schema is unchanged.
+- **The SBC takes no action on a mid-call close.** (POA&M-340, open;
+  SC-10, AC-12) When a peer or the sidecar ends an association the relay
+  writes the record and keeps relaying SRTP with the same keys until
+  signalling ends the call.
+- **SBC relay: post-handshake DTLS from a peer is rate limited.** (SC-5)
+  In terminate mode each leg forwards DTLS-class datagrams to the sidecar
+  at a burst of 8, then 4 per second. Refusals are counted in
+  `dropped_dtls` and `dtls_rate_limited` on the leg's log line. The
+  handshake does not pass through this limit. RTP and RTCP are not
+  affected. The limit is charged before authentication, so a sender at the
+  peer's address can keep the peer's own `close_notify` or retransmitted
+  final flight from the sidecar (POA&M-335); the call then ends by
+  signalling only.
+- **At call end the relay waits up to 500 ms** for the sidecar's
+  `close_notify` to reach the peer before it closes the leg's socket
+  (normally under a millisecond; the full wait only with a sidecar that
+  does not answer).
+- **Rust API (sbc-media-core).** `srtp_relay::pump_sidecar_dtls_to_peer`
+  takes a fifth argument, the new `srtp_relay::AssociationLabel` (call id
+  and leg). Breaking for out-of-tree callers; both in-tree callers are
+  updated.
+- **proto-srtp: `SrtpContext::highest_rtp_index()`**, a read-only getter
+  (`ROC << 16 | SEQ`). Protect and unprotect are unchanged.
+
+### BREAKING (client, DTLS-SRTP on TLS accounts, POA&M-324, 326, 337..339)
+
+**The soft client now performs DTLS-SRTP.** A call on a TLS account runs a
+DTLS 1.2 handshake on the media socket, checks the peer certificate against
+the fingerprint in this dialog's SDP, and carries SRTP and SRTCP audio under
+the exported keys. This replaces the state since #206, in which every call
+on a TLS account was ended right after it connected. POA&M-324 and 326
+close when this change merges, on one condition: a green run of the `SRTP
+audio gate` and `Sidecar DTLS` workflows on the PR head, recorded with URL
+and commit. Every test result so far is from macOS; nothing has run on
+Linux. Do not cut a `client-v*` tag before that run is recorded.
+
+Requires the SBC side of this change (sections above) wherever the SBC
+terminates DTLS-SRTP. The profile is the one of the entry below and has no
+fallback: ECDHE secp384r1, ECDSA P-384/SHA-384, AES-256-GCM, extended
+master secret, SRTP `AEAD_AES_256_GCM`. There is still no plaintext RTP on
+a TLS account.
+
+- **Client: `Connected` is reported only after the handshake.** (SC-8,
+  SC-23, IA-3) On a TLS account `CallStateChanged{Connecting}` is now
+  reported at the 200 OK (outbound) and when the call is accepted
+  (inbound; the handshake starts at the ACK). `CallStateChanged{Connected}`
+  follows only when the DTLS handshake has completed and audio has started
+  with the exported keys. Before, `Connected` followed the 200 OK at once.
+  Applications that start timers, ring-back handling or UI on `Connected`
+  see it later: a few milliseconds on a LAN, up to the 10 s handshake
+  budget (`CallManager::set_dtls_handshake_budget`, 1 to 15 s) on a lossy
+  path. A call that fails the handshake never reports `Connected`.
+- **Client: new fixed media-security causes.** `CallManagerEvent::Error`
+  keeps the form `media-security: <cause>`. New causes: `dtls-timeout`,
+  `dtls-fingerprint-mismatch`, `dtls-peer-authentication`,
+  `dtls-unsupported-parameters`, `dtls-no-srtp-profile`, `dtls-alert`,
+  `dtls-protocol-violation`, `dtls-closed-by-peer`, `dtls-internal`, and
+  for a handshake that could not be started `DTLS-SRTP could not be
+  started` and `too many DTLS-SRTP handshakes in progress`. The cause
+  `DTLS-SRTP handshake failed` is no longer sent. The alert number is
+  never in the event. Each failure ends the call (fail closed).
+- **Client: a mid-call `close_notify` stops audio at once.** (SC-10,
+  SC-23) The client then waits up to 1 s for the BYE. A BYE inside that
+  time is a normal remote hang-up; without one the call ends with
+  `media-security: dtls-closed-by-peer`. During that second the
+  application still shows the call as connected, with no audio. An
+  authenticated fatal alert mid-call stops audio and ends the call at once
+  (`dtls-alert`). A local hang-up sends one `close_notify`.
+- **Client: one outbound SRTP stream per call.** (RFC 3711 §3.2.3,
+  RFC 7714 §8.4; SC-13; POA&M-338, open) SSRC, sequence numbers, rollover
+  counter and SRTCP index now continue across hold/resume and re-INVITE
+  audio restarts, and the receive side keeps its rollover counter and
+  replay windows. No RTCP BYE is sent on a restart whose stream
+  continues. The SSRC is also kept across a codec change with another
+  clock rate, a deliberate deviation from RFC 7160 §4.1. After an SSRC
+  collision the old SSRC now gets an RTCP BYE. SRTP transmit SSRCs come
+  from the FIPS DRBG.
+- **Client: `DtlsIdentity::from_der` is stricter and `key_der()` is
+  removed.** (SC-12, IA-5) `from_der` fails unless the key is PKCS#8 P-384
+  and matches the leaf certificate; before, any non-empty key was
+  accepted. The PKCS#8 bytes are wiped once the key pair is loaded, and
+  the public accessor `DtlsIdentity::key_der()` is gone. New
+  `DtlsIdentity::credentials()`.
+- **Rust API, client-sip-ua.** Removed: `MediaSession::establish`, the
+  module `dtls_handler` with `DtlsHandler`, `DtlsEvent` and
+  `load_dtls_config_from_pem`. Added: `MediaSession::{begin_secure,
+  poll_secure, poll_security_closed, abandon_secure, dtls_forward_tx,
+  dtls_remote}`, modules `dtls_driver` and `dtls_forward`, and the
+  re-exports `DriverTimings`, `EarlyDtls`, `SecureProgress`,
+  `SecurityCause`, `CauseBasis` and `DtlsForwardTx`. Changed:
+  `IceHandler::start_checks` takes `&mut EarlyDtls`;
+  `MediaSession::set_dtls_role` fails once `begin_secure` ran;
+  `MediaSession::close` no longer returns a DTLS error. No client crate
+  uses `DtlsConnection` any more.
+- **Rust API, client-audio.** Changed: `SrtpContextSet` (`rtp_rx`,
+  `rtcp_rx`, `rtp_tx`, `rtcp_tx` are `Arc<SrtpContext>`; new fields
+  `local_ssrc`, `tx_resume`, `tx_claim`); `RtpReceiver::set_srtp`,
+  `RtpTransmitter::set_srtp` and both arguments of `RtcpSession::set_srtcp`
+  take `Arc<SrtpContext>`; `RtcpSession::finish` takes a third argument
+  `stream_continues`; new fields `PipelineConfig.dtls_sink`,
+  `IoThreadConfig.srtp_call_state` and `IoThreadConfig.restart_pending`
+  (struct literals must set them). `RtpStats.dtls_dropped` now means
+  "DTLS-class, not forwarded". Added: `SrtpCallState`, `TransmitClaim`,
+  `SrtpSessionKeys::{with_call_state, call_state, next_local_ssrc}`,
+  `RtpTransmitter::start_srtp`, `RtcpSession::{send_report,
+  abandon_local_ssrc}`, `AudioPipeline::stop_for_restart`, `DtlsSink`,
+  `DtlsForward`, `RtpReceiver::set_dtls_sink`, `RtpStats.dtls_forwarded`,
+  `DTLS_FORWARD_BURST` (8) and `DTLS_FORWARD_PER_SECOND` (4). A second
+  live transmitter for one call is refused with `AudioError::SrtpError`.
+- **Rust API, client-core.** Added: `CallManager::{poll_media_security,
+  set_dtls_handshake_budget}`, `AudioSession::stop_for_restart`, the field
+  `AudioSessionConfig.dtls_sink`. `App::poll_events` now handles media
+  security first. `client-ffi` and `client-gui-tauri` have no API change;
+  they see the later `Connected` and the new causes.
+- **client-core: feature `test-util`; do not build releases with
+  `--all-features`.** (CM-7) The feature compiles a test seam
+  (`CallManager::set_audio_devices_enabled`) that skips opening audio
+  devices. It cannot select plaintext. Only client-core's own tests
+  enable it, through a dev-dependency of the crate on itself. Default and
+  `--release` builds do not contain it (checked with `nm` on both rlibs);
+  any `--all-features` build does. `release-client.yml` builds
+  `-p client-gui-tauri` and `-p client-ffi` with default features and is
+  not affected. Keep it that way.
+
+### Added (client, DTLS log records, POA&M-324)
+
+Target `client_sip_ua::dtls_driver`, field `event`. Exactly one outcome
+record per handshake. (AU-2, AU-3) No key, salt or hello random is logged.
+New records for any collector that parses client logs:
+
+- **`dtls.handshake.connected`** (info): `call_id`, `role`, `remote`,
+  `duration_ms`, `srtp_profile`, `peer_fingerprint`,
+  `peer_authenticated=true`, `mutual_authentication`, `retransmits`,
+  `records_discarded`, `replays`, `fragments_rejected`, `early_datagrams`.
+- **`dtls.handshake.failed`** (warn): `call_id`, `role`, `remote`,
+  `duration_ms`, `cause` (the `dtls-*` token), `failure`, `alert`,
+  `cause_basis`, `presented_fingerprint_unauthenticated`, `watchdog`, the
+  counters above and `dropped_stun`, `dropped_media_early`,
+  `dropped_wrong_source`, `dropped_other`. Records written by the call
+  manager's deadline or for a driver task that died carry `origin`
+  (`call-manager-deadline`, `driver-gone`) and no counters.
+- **`dtls.handshake.cancelled`** (info, hang-up during the handshake):
+  `call_id`, `role`, `remote`, `duration_ms`.
+- **`dtls.association.closed`** (info for `reason="local-close"`, warn
+  otherwise): `call_id`, `role`, `remote`, `reason` (`local-close`,
+  `peer-close-notify`, `peer-alert`, `local-error`), `alert`,
+  `duration_ms`, `transmit_dropped`, `transmit_would_block`; the warn form
+  also `cause`, `cause_basis`, `failure` and optionally `origin`.
+- **`cause_basis`** says how far a failure cause can be trusted: `local`,
+  `peer-authenticated`, `unauthenticated-input` (every failure during the
+  handshake except a Finished mismatch, including every alert; do not read
+  these as peer misbehaviour), and `signalling` for causes decided from
+  the remote SDP. The call-level line "Media security negotiation failed;
+  ending call (fail closed)" gains the field `cause_basis`.
+  `mutual_authentication` is true only when the server asked for the
+  client certificate.
+
+### Changed (client and proto-dtls, dependencies and deprecations)
+
+- **proto-dtls: the five deprecations of the entry below now carry
+  `since = "0.10.0"`** and their notes name POA&M-337 instead of 324.
+  `DtlsConnection` and `DtlsConnectionManager` are still not deprecated:
+  the SBC crates use them (POA&M-337).
+- **Dependencies.** (SR-3) No new package or version in `Cargo.lock`; 13
+  new dependency edges, all to crates already in the workspace. Normal
+  dependencies: client-sip-ua gains `ringbuf` and, on unix, `nix`
+  (`sendto` with `MSG_DONTWAIT`); client-audio gains `uc-crypto` (DRBG,
+  constant-time compare). Dev-dependencies: client-sip-ua
+  `tracing-subscriber` and tokio `test-util`; client-core itself (feature
+  `test-util`), `tracing-subscriber`, `proto-dtls`, `proto-srtp`,
+  `proto-rtp`, `uc-crypto`, `rcgen`; client-integration-tests
+  `sbc-media-core`, `proto-dtls`, tokio `process`; proto-dtls `criterion`.
+  No new cryptographic dependency.
+- **CI.** The `SRTP audio gate` workflow now also runs the soft client's
+  media stack against pion in both DTLS roles and one call of two soft
+  clients through the SBC relay and the real sidecar. The `Sidecar DTLS`
+  workflow runs the Go tests with the race detector.
+
+Not tested by this change: any non-pion third-party peer, a call through
+the `AudioPipeline` with real audio devices, Windows (the non-blocking send
+after the handoff is unix only), Linux before the PR run.
+
+Compliance items of this change. Closed at merge, conditional on the CI
+run named above: POA&M-324 (client DTLS-SRTP) and 326. Narrowed: 325 (the
+STUN consent part stays open), 330 (the sidecar's `Ready` frame is now
+wiped, best effort), 335 (the gate and rate limit above; residuals stay).
+Opened: POA&M-337 (retire the legacy proto-dtls surface and
+`DtlsConnection`), 338 (SC-13/SC-23: SRTP stream continuity residuals on
+the client), 339 (SA-11: no test yet of a soft-client call set up by SIP
+through sbc-daemon, nor through the audio pipeline with devices), 340
+(SC-10/AC-12/AU-3: the SBC takes no action on a
+mid-call DTLS close; close reason inferred), 341 (SC-10: a sidecar restart
+ends live associations) and 342 (SC-5/SC-6/SI-4: sidecar session count is
+a log line, memory sizing not measured on Linux). The row texts are in
+`docs/NIST-800-53-CONTROLS.md`.
+
 ### BREAKING (SBC, DTLS-SRTP termination pinned to the CNSA profile, POA&M-335, 336)
 
 Affects only SBCs that terminate DTLS-SRTP (`sbcDaemon.dtlsTerminate.enabled`,
