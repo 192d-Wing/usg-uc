@@ -98,11 +98,12 @@ release") and `deploy/keycloak/central-config-clients.md`.
 
 **Environment changes.**
 
-- **sbc-media:** `SBC_MEDIA_GRPC_LISTEN` defaults to `127.0.0.1:9096`; a
-  non-loopback value exits with code 2. `MediaControllerService` has no
-  client authentication, so a media pool on separate addresses is not
-  supported in this release (`deploy/test/docker-compose.pool.yml` is
-  marked unsupported).
+- **sbc-media:** `SBC_MEDIA_GRPC_LISTEN` defaults to `127.0.0.1:9096`. A
+  non-loopback value exits with code 2 unless the controller runs with mTLS
+  (`SBC_MEDIA_GRPC_TLS_*`) and a non-empty
+  `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES`; there is no plaintext option off
+  loopback. An allow-list without TLS also exits with code 2. See "Added"
+  below. (SC-7, CM-7, IA-3)
 - **sbc-api, sbc-provision-server (`SBC_TRUSTED_PROXIES`):** an empty list
   now trusts no proxy and `X-Real-IP` is ignored (before, it was honoured
   from any peer). The provisioning source-network check and the sbc-api
@@ -151,6 +152,34 @@ release") and `deploy/keycloak/central-config-clients.md`.
   issues or mounts a trunk-agent client certificate (CN
   `<fullname>-sbc-trunk-agent`, added to the default allow-list), so the
   trunk agent can now be enabled together with `grpcMtls`. (IA-3, SC-8)
+- **sbc-media: mTLS for the MediaController gRPC listener.** New
+  `SBC_MEDIA_GRPC_TLS_{CERT,KEY,CLIENT_CA}_FILE` (all three or none; empty
+  counts as unset; a partial set exits with code 2): the listener requires
+  a client certificate chaining to the client CA.
+  `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES` (comma-separated, at most 64
+  entries) is checked against the client certificate's SAN DNS / SAN URI
+  (DNS case-insensitive, URI exact; not subject CN) on every `MediaControllerService` RPC; other names get
+  `PERMISSION_DENIED` and a `warn!` log line (not an audit record). The
+  gRPC health service on that listener needs a CA-issued client certificate
+  but is not name-checked. Certificate files are read at startup. The Helm
+  chart is unchanged: the co-located pod keeps the loopback listener.
+  (AC-3, IA-3, SC-8)
+- **sbc-daemon: TLS client for remote media nodes.** New
+  `SBC_MEDIA_CONTROLLER_TLS_{CA,CERT,KEY}_FILE` (all three or none) and the
+  optional `SBC_MEDIA_CONTROLLER_TLS_DOMAIN` (server name override; by
+  default the URL host, IP SANs included, is verified). With TLS every
+  `SBC_MEDIA_CONTROLLER_URL[S]` entry must be `https://`; without TLS every
+  entry must be a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`); a partial or
+  inconsistent setting stops startup with a configuration error. The PEM
+  files are re-read on each connect. TLS suites are tonic's rustls defaults,
+  not the CNSA 2.0 profile (POA&M-16). (IA-3, SC-8)
+- **Test tooling:** `deploy/test/gen-media-mtls-certs.sh` generates a
+  7-day ECDSA P-384 / SHA-384 test CA, two media-node server certificates
+  (IP SANs) and a `sbc-daemon` client certificate into
+  `deploy/test/certs/media-mtls/` (git-ignored; test only, files 0644).
+  `deploy/test/docker-compose.pool.yml` is supported again and runs the
+  pool over mTLS; the `sipp-audio-pool` and `sipp-audio-pool-failover`
+  integration jobs run the script before `docker compose up`.
 - **Helm values (sbc):** `sbcDaemon.grpcMtls.trunkAgentClientSecretName`,
   `sbcFrontend.realIpFrom`, `sbcApi.trustedProxies`,
   `sbcProvision.trustedProxies`,

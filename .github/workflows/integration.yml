@@ -153,6 +153,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The pool's media control channel is mTLS; generate the throwaway
+      # P-384 test PKI (gitignored deploy/test/certs/media-mtls).
+      - name: Generate media mTLS test certificates
+        run: bash deploy/test/gen-media-mtls-certs.sh
+
       - name: Build image + start signaling, 2 media nodes, and SIPp UAS
         run: docker compose -f "$COMPOSE" up -d --build sbc-signaling sbc-media-1 sbc-media-2 sipp-uas
 
@@ -211,6 +216,11 @@ jobs:
       COMPOSE: deploy/test/docker-compose.pool.yml
     steps:
       - uses: actions/checkout@v7
+
+      # The pool's media control channel is mTLS; generate the throwaway
+      # P-384 test PKI (gitignored deploy/test/certs/media-mtls).
+      - name: Generate media mTLS test certificates
+        run: bash deploy/test/gen-media-mtls-certs.sh
 
       - name: Build image + start signaling, 2 media nodes, and SIPp UAS
         run: docker compose -f "$COMPOSE" up -d --build sbc-signaling sbc-media-1 sbc-media-2 sipp-uas

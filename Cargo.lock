@@ -6453,8 +6453,12 @@ dependencies = [
 name = "sbc-media"
 version = "0.10.0"
 dependencies = [
+ "rcgen",
+ "rustls-pki-types",
+ "rustls-webpki",
  "sbc-grpc-api",
  "sbc-media-core",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

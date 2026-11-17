@@ -12,9 +12,17 @@
 //! Configuration (env), mirroring the daemon's `[media]` section so the pod
 //! relays identically to the in-process path:
 //! - `SBC_MEDIA_GRPC_LISTEN` — gRPC listen address (default `127.0.0.1:9096`).
-//!   Must be a loopback address: `MediaControllerService` has no client
-//!   authentication, so only the co-located daemon (same pod) may reach it.
-//!   A non-loopback value is a startup error (exit 2).
+//!   Without mTLS it must be a loopback address (only the co-located daemon
+//!   in the same pod may reach it). Off loopback it requires mTLS and a client
+//!   allow-list (below); there is no plaintext option. A violation is a
+//!   startup error (exit 2).
+//! - `SBC_MEDIA_GRPC_TLS_CERT_FILE`, `SBC_MEDIA_GRPC_TLS_KEY_FILE`,
+//!   `SBC_MEDIA_GRPC_TLS_CLIENT_CA_FILE` — server certificate, key and the CA
+//!   that client certificates must chain to (all three or none). With them
+//!   the listener requires a client certificate.
+//! - `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES` — comma-separated SAN DNS names or
+//!   URIs a client certificate must carry on every RPC (mTLS only; required
+//!   off loopback).
 //! - `SBC_MEDIA_RTP_PORT_MIN` / `SBC_MEDIA_RTP_PORT_MAX` — inclusive RTP port
 //!   range (defaults 16384 / 32768, the pipeline defaults).
 //! - `SBC_MEDIA_DEFAULT_MODE` — only `relay` (the default) is accepted; any
@@ -36,6 +44,10 @@ use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+mod grpc_tls;
+#[cfg(test)]
+mod mtls_handshake_tests;
+
 use tokio_stream::Stream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -56,6 +68,10 @@ use uc_media_engine::MediaMode;
 #[derive(Debug, Clone)]
 struct Config {
     grpc_listen: SocketAddr,
+    /// mTLS for the controller listener (`SBC_MEDIA_GRPC_TLS_*`).
+    grpc_tls: Option<grpc_tls::ServerTls>,
+    /// `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES` (mTLS only).
+    allowed_client_names: Vec<String>,
     rtp_port_min: u16,
     rtp_port_max: u16,
     default_mode: MediaMode,
@@ -86,25 +102,28 @@ fn env_port(key: &str, default: u16) -> Result<u16, String> {
     })
 }
 
-/// Parses `SBC_MEDIA_GRPC_LISTEN` (default `127.0.0.1:9096`) and refuses a
-/// non-loopback address, including the unspecified `0.0.0.0` / `[::]`.
-///
-/// NIST 800-53 Rev5: SC-7, CM-7, AC-3 — the controller service has no client
-/// authentication, so it is reachable only from inside the pod.
-// POAM: POA&M-383 MediaControllerService has no gRPC client authentication
-// (mTLS), so a standalone (off-pod) media node pool cannot be deployed.
-fn parse_grpc_listen(raw: Option<&str>) -> Result<SocketAddr, String> {
-    let addr: SocketAddr = raw
-        .unwrap_or("127.0.0.1:9096")
+/// Parses `SBC_MEDIA_GRPC_LISTEN` (default `127.0.0.1:9096`) without the
+/// listener rule.
+fn parse_grpc_listen_addr(raw: Option<&str>) -> Result<SocketAddr, String> {
+    raw.unwrap_or("127.0.0.1:9096")
         .trim()
         .parse()
-        .map_err(|e| format!("SBC_MEDIA_GRPC_LISTEN invalid: {e}"))?;
-    if !addr.ip().is_loopback() {
-        return Err(format!(
-            "SBC_MEDIA_GRPC_LISTEN {addr} must be a loopback address: \
-             MediaControllerService has no client authentication"
-        ));
-    }
+        .map_err(|e| format!("SBC_MEDIA_GRPC_LISTEN invalid: {e}"))
+}
+
+/// Parses `SBC_MEDIA_GRPC_LISTEN` for a plaintext listener: a non-loopback
+/// address, including the unspecified `0.0.0.0` / `[::]`, is refused. With
+/// mTLS configured, `Config::from_env` applies [`grpc_tls::check_listener`]
+/// instead.
+///
+/// NIST 800-53 Rev5: SC-7, CM-7, AC-3 — without client authentication the
+/// controller service is reachable only from inside the pod.
+// POAM: POA&M-383 mTLS plus a client-name allow-list now gate an off-pod
+// listener; AllocatePorts ownership and duplicate CreateSession are open.
+#[cfg(test)]
+fn parse_grpc_listen(raw: Option<&str>) -> Result<SocketAddr, String> {
+    let addr = parse_grpc_listen_addr(raw)?;
+    grpc_tls::check_listener(addr, None, &[])?;
     Ok(addr)
 }
 
@@ -125,8 +144,21 @@ fn parse_default_mode(value: &str) -> Result<MediaMode, String> {
 
 impl Config {
     fn from_env() -> Result<Self, String> {
+        // NIST 800-53 Rev5: IA-3, SC-8, AC-3, SC-7 — off loopback only with
+        // mTLS and a client allow-list.
         let grpc_listen =
-            parse_grpc_listen(std::env::var("SBC_MEDIA_GRPC_LISTEN").ok().as_deref())?;
+            parse_grpc_listen_addr(std::env::var("SBC_MEDIA_GRPC_LISTEN").ok().as_deref())?;
+        let grpc_tls = grpc_tls::server_tls_from(
+            std::env::var("SBC_MEDIA_GRPC_TLS_CERT_FILE").ok(),
+            std::env::var("SBC_MEDIA_GRPC_TLS_KEY_FILE").ok(),
+            std::env::var("SBC_MEDIA_GRPC_TLS_CLIENT_CA_FILE").ok(),
+        )?;
+        let allowed_client_names = grpc_tls::parse_allowed_client_names(
+            std::env::var("SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES")
+                .ok()
+                .as_deref(),
+        )?;
+        grpc_tls::check_listener(grpc_listen, grpc_tls.as_ref(), &allowed_client_names)?;
 
         let default_mode = parse_default_mode(
             &std::env::var("SBC_MEDIA_DEFAULT_MODE").unwrap_or_else(|_| "relay".to_string()),
@@ -159,6 +191,8 @@ impl Config {
 
         Ok(Self {
             grpc_listen,
+            grpc_tls,
+            allowed_client_names,
             rtp_port_min: env_port("SBC_MEDIA_RTP_PORT_MIN", 16_384)?,
             rtp_port_max: env_port("SBC_MEDIA_RTP_PORT_MAX", 32_768)?,
             default_mode,
@@ -302,9 +336,34 @@ async fn main() -> ExitCode {
         info!("shutdown signal received");
     };
 
-    info!(listen = %config.grpc_listen, "MediaControllerService listening");
-    let result = Server::builder()
-        .add_service(MediaControllerServiceServer::new(service))
+    let mut builder = Server::builder();
+    if let Some(tls) = &config.grpc_tls {
+        let tls_config = match grpc_tls::load_server_tls(tls) {
+            Ok(c) => c,
+            Err(e) => {
+                error!(error = %e, "MediaController TLS configuration");
+                return ExitCode::from(2);
+            }
+        };
+        builder = match builder.tls_config(tls_config) {
+            Ok(b) => b,
+            Err(e) => {
+                error!(error = %e, "MediaController TLS configuration");
+                return ExitCode::from(2);
+            }
+        };
+    }
+    let gate =
+        grpc_tls::ClientNameGate::new(config.grpc_tls.is_some(), &config.allowed_client_names);
+    info!(
+        listen = %config.grpc_listen,
+        mtls = config.grpc_tls.is_some(),
+        "MediaControllerService listening"
+    );
+    let result = builder
+        .add_service(MediaControllerServiceServer::with_interceptor(
+            service, gate,
+        ))
         .add_service(HealthServer::new(AlwaysServing))
         .serve_with_shutdown(config.grpc_listen, shutdown)
         .await;

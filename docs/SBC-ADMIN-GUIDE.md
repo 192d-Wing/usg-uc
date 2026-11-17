@@ -947,6 +947,8 @@ Values for `profile`, `fingerprint_hash` and `codecs` are the Rust enum variant 
 The live relay always anchors media (`Relay`) and does not transcode. The `Transcoder` in `sbc-media-core` is not in the live relay path. Validation therefore rejects:
 
 - `media.default_mode` other than `"Relay"` (the `sbc-media` pod also refuses any `SBC_MEDIA_DEFAULT_MODE` other than `relay` at startup);
+
+  **sbc-media control listener.** `SBC_MEDIA_GRPC_LISTEN` (default `127.0.0.1:9096`) must be a loopback address unless mutual TLS is configured: `SBC_MEDIA_GRPC_TLS_CERT_FILE`, `SBC_MEDIA_GRPC_TLS_KEY_FILE` and `SBC_MEDIA_GRPC_TLS_CLIENT_CA_FILE` (all three or none), plus a non-empty `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES` (SAN DNS names or URIs of permitted clients, checked on every MediaController RPC). There is no plaintext listener off loopback; a violation exits with code 2. On the daemon, `SBC_MEDIA_CONTROLLER_TLS_CA_FILE`, `SBC_MEDIA_CONTROLLER_TLS_CERT_FILE` and `SBC_MEDIA_CONTROLLER_TLS_KEY_FILE` (all three or none) enable the matching client; every `SBC_MEDIA_CONTROLLER_URL[S]` entry must then be `https://` (without them, every entry must be a loopback host: `127.0.0.0/8`, `[::1]` or `localhost`), and the verified server name is the URL host (DNS name or IP SAN) unless `SBC_MEDIA_CONTROLLER_TLS_DOMAIN` overrides it. A partial or inconsistent setting stops the daemon at startup. `deploy/test/docker-compose.pool.yml` shows a two-node pool over mTLS. The gRPC health service on that listener is not name-checked but still needs a client certificate from the CA. Open: `AllocatePorts` ownership and duplicate `CreateSession` (POA&M-383).
 - any entry in `media.realm_modes`;
 - a `media.codecs` list that is not exactly the default set (order does not matter; subsets, single codecs and duplicates are rejected; an empty list is rejected by the "at least one codec" check).
 
@@ -1305,7 +1307,7 @@ The table rejects unknown keys. Field rules are checked even when `enabled = fal
 
 **Startup refusals.** With recording enabled the daemon refuses to start when:
 
-- a remote media plane is configured (`SBC_MEDIA_CONTROLLER_URL` or `SBC_MEDIA_CONTROLLER_URLS`). The media control channel is plaintext and cannot carry SRTP keys, so recording works only with the in-process media relay (POA&M-301);
+- a remote media plane is configured (`SBC_MEDIA_CONTROLLER_URL` or `SBC_MEDIA_CONTROLLER_URLS`). The media control channel does not carry SRTP keys, so recording works only with the in-process media relay (POA&M-301);
 - there is no SIP TLS listener with a certificate (`transport.tls_listen`, `security.tls_cert_path`, `security.tls_key_path`). The recording session advertises that listener;
 - the `srs_uri` host does not resolve within 5 seconds;
 - `srs_tls_ca_file`, or the SBC certificate or key, cannot be loaded;

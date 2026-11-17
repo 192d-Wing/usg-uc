@@ -1,12 +1,14 @@
 # USG SBC Stress Test Environment — media-node POOL (Phase 3)
 #
-# UNSUPPORTED (does not start): sbc-media now binds its MediaControllerService
-# to loopback only and exits with code 2 on a non-loopback
-# SBC_MEDIA_GRPC_LISTEN, because the service has no client authentication.
-# A pool of media nodes on distinct IPs needs authenticated gRPC between the
-# daemon and each node first (tracked as an open POA&M item). Do not loosen
-# the listener check to run this file; use docker-compose.split.yml for the
-# co-located split.
+# The media control channel is mutual TLS: sbc-media refuses a non-loopback
+# listener without mTLS and a client allow-list. Generate the throwaway test
+# PKI first (ECDSA P-384, gitignored output in deploy/test/certs/media-mtls):
+#
+#   bash deploy/test/gen-media-mtls-certs.sh
+#
+# Each node presents a server certificate for its IP (SAN IP 172.28.2.11 /
+# .12) and admits only the daemon's client certificate (SAN DNS sbc-daemon).
+# NIST 800-53 Rev5: IA-3, SC-8, AC-3.
 #
 # A standalone media-node POOL: sbc-daemon runs signaling-only and load-balances
 # calls across TWO sbc-media nodes over gRPC. Each node has a distinct IP and
@@ -20,6 +22,7 @@
 # The daemon connects to both (SBC_MEDIA_CONTROLLER_URLS) and retries at startup.
 #
 # Usage:
+#   bash deploy/test/gen-media-mtls-certs.sh
 #   docker compose -f deploy/test/docker-compose.pool.yml up --build
 #
 # Pool counterpart of docker-compose.split.yml (single remote node).
@@ -33,8 +36,11 @@ services:
     image: usg-sbc-split:test
     container_name: sbc-signaling
     environment:
-      # Two media nodes → the daemon builds a load-balanced pool.
-      SBC_MEDIA_CONTROLLER_URLS: "http://172.28.2.11:9096,http://172.28.2.12:9096"
+      # Two media nodes → the daemon builds a load-balanced pool, over mTLS.
+      SBC_MEDIA_CONTROLLER_URLS: "https://172.28.2.11:9096,https://172.28.2.12:9096"
+      SBC_MEDIA_CONTROLLER_TLS_CA_FILE: /etc/sbc/media-mtls/ca.crt
+      SBC_MEDIA_CONTROLLER_TLS_CERT_FILE: /etc/sbc/media-mtls/sbc-daemon.crt
+      SBC_MEDIA_CONTROLLER_TLS_KEY_FILE: /etc/sbc/media-mtls/sbc-daemon.key
     ports:
       - "5060:5060/udp"
       - "5060:5060/tcp"
@@ -43,6 +49,7 @@ services:
       # Plain monolith config; the daemon's own zone media IP is 172.28.2.10
       # (no relay there) — media reaches a node only via per-call SDP steering.
       - ./sbc-test.toml:/etc/sbc/config.toml:ro
+      - ./certs/media-mtls:/etc/sbc/media-mtls:ro
     networks:
       sbc-signaling:
         ipv4_address: 172.28.1.10
@@ -68,8 +75,15 @@ services:
     image: usg-sbc-split:test
     container_name: sbc-media-1
     entrypoint: ["/usr/local/bin/sbc-media"]
+    volumes:
+      - ./certs/media-mtls:/etc/sbc/media-mtls:ro
     environment:
+      # Off loopback only with mTLS and a client allow-list.
       SBC_MEDIA_GRPC_LISTEN: "0.0.0.0:9096"
+      SBC_MEDIA_GRPC_TLS_CERT_FILE: /etc/sbc/media-mtls/media-1.crt
+      SBC_MEDIA_GRPC_TLS_KEY_FILE: /etc/sbc/media-mtls/media-1.key
+      SBC_MEDIA_GRPC_TLS_CLIENT_CA_FILE: /etc/sbc/media-mtls/ca.crt
+      SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES: "sbc-daemon"
       SBC_MEDIA_RTP_PORT_MIN: "16384"
       SBC_MEDIA_RTP_PORT_MAX: "16484"
       SBC_MEDIA_DEFAULT_MODE: "relay"
@@ -87,8 +101,15 @@ services:
     image: usg-sbc-split:test
     container_name: sbc-media-2
     entrypoint: ["/usr/local/bin/sbc-media"]
+    volumes:
+      - ./certs/media-mtls:/etc/sbc/media-mtls:ro
     environment:
+      # Off loopback only with mTLS and a client allow-list.
       SBC_MEDIA_GRPC_LISTEN: "0.0.0.0:9096"
+      SBC_MEDIA_GRPC_TLS_CERT_FILE: /etc/sbc/media-mtls/media-2.crt
+      SBC_MEDIA_GRPC_TLS_KEY_FILE: /etc/sbc/media-mtls/media-2.key
+      SBC_MEDIA_GRPC_TLS_CLIENT_CA_FILE: /etc/sbc/media-mtls/ca.crt
+      SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES: "sbc-daemon"
       SBC_MEDIA_RTP_PORT_MIN: "16384"
       SBC_MEDIA_RTP_PORT_MAX: "16484"
       SBC_MEDIA_DEFAULT_MODE: "relay"

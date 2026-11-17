@@ -441,7 +441,9 @@ This upgrade has breaking changes. Check each point before you upgrade.
   policies off. On CNIs that enforce policy on host traffic, set
   `networkPolicy.probeFrom` to the node CIDR. Needs Kubernetes >= 1.25.
 - **sbc-media (mediaSplit) binds its controller to 127.0.0.1:9096**; a
-  non-loopback `SBC_MEDIA_GRPC_LISTEN` exits with code 2.
+  non-loopback `SBC_MEDIA_GRPC_LISTEN` exits with code 2 unless mTLS
+  (`SBC_MEDIA_GRPC_TLS_*` plus `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES`) is
+  configured. The chart's co-located pod keeps loopback.
 - **`X-Real-IP` is ignored unless `SBC_TRUSTED_PROXIES` is set.** Set
   `sbcProvision.trustedProxies` (required with `allowedSourceCidrs`; rendering
   fails otherwise) and `sbcApi.trustedProxies` to the frontend pod CIDR. A
