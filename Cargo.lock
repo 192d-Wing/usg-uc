@@ -6465,6 +6465,7 @@ version = "0.10.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "proptest",
  "proto-dtls",
  "proto-rtp",
  "proto-srtp",
@@ -6479,6 +6480,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uc-codecs",
+ "uc-crypto",
  "uc-media-engine",
  "uc-types",
 ]

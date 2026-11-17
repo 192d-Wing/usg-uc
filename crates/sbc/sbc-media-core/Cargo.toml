@@ -25,6 +25,8 @@ proto-srtp.workspace = true
 uc-codecs.workspace = true
 uc-media-engine.workspace = true
 uc-types.workspace = true
+# CSPRNG (aws-lc DRBG) for the RTP port-pair start index (SC-7).
+uc-crypto.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
@@ -46,3 +48,5 @@ tokio-stream = { version = "0.1", optional = true, features = ["net", "sync"] }
 [dev-dependencies]
 # Test-only: subscriber init in the media_pipeline interop tests.
 tracing-subscriber.workspace = true
+# Property tests for the DTLS record-header plausibility walk (SI-10).
+proptest.workspace = true
