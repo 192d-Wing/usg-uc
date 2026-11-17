@@ -360,9 +360,44 @@ pub const MAX_GRPC_CLIENT_NAME_LEN: usize = 253;
 /// `grpc.allowed_client_names` is only enforced under `require_mtls`, so a
 /// list without it is rejected rather than silently ignored.
 ///
-/// ## NIST 800-53 Rev5: CM-6, AC-3, IA-3
+/// An enabled listener that is not on loopback must require mTLS and name
+/// its clients in `allowed_client_names`, so every RPC on every service
+/// passes the client-certificate allow-list; `require_mtls` needs all three
+/// TLS paths, so a missing one is a startup error instead of a daemon
+/// running without its listener.
+///
+/// ## NIST 800-53 Rev5: CM-6, CM-7, AC-3, IA-3, SC-7, SC-8
 fn validate_grpc(config: &crate::schema::GrpcConfig) -> ConfigResult<()> {
     let err = |message: String| Err(ConfigError::Validation { message });
+    if config.enabled {
+        if !config.require_mtls && !config.listen_addr.ip().is_loopback() {
+            return err(format!(
+                "grpc.listen_addr {} is not a loopback address; a non-loopback gRPC \
+                 listener requires grpc.require_mtls = true",
+                config.listen_addr
+            ));
+        }
+        if config.require_mtls
+            && (config.tls_cert_path.is_none()
+                || config.tls_key_path.is_none()
+                || config.tls_ca_path.is_none())
+        {
+            return err(
+                "grpc.require_mtls = true requires grpc.tls_cert_path, grpc.tls_key_path \
+                 and grpc.tls_ca_path"
+                    .to_string(),
+            );
+        }
+        // Off loopback, chaining to the CA alone would admit any workload
+        // the issuer signs for; name the permitted clients.
+        if !config.listen_addr.ip().is_loopback() && config.allowed_client_names.is_empty() {
+            return err(format!(
+                "grpc.listen_addr {} is not a loopback address; grpc.allowed_client_names \
+                 must list the permitted client certificate names",
+                config.listen_addr
+            ));
+        }
+    }
     if config.allowed_client_names.is_empty() {
         return Ok(());
     }

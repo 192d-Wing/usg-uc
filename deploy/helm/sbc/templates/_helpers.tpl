@@ -18,13 +18,79 @@
 {{- .Values.sbcDaemon.grpcMtls.clientSecretName | default (printf "%s-grpc-client-tls" (include "sbc.fullname" .)) -}}
 {{- end }}
 
-{{/* TOML array for grpc.allowed_client_names (sbcDaemon.grpcMtls). */}}
+{{/* Secret with the sbc-trunk-agent gRPC client certificate (sbcDaemon.grpcMtls). */}}
+{{- define "sbc.grpcTrunkAgentClientTlsSecret" -}}
+{{- .Values.sbcDaemon.grpcMtls.trunkAgentClientSecretName | default (printf "%s-grpc-trunk-agent-tls" (include "sbc.fullname" .)) -}}
+{{- end }}
+
+{{/* TOML array for grpc.allowed_client_names (sbcDaemon.grpcMtls). Default:
+     the sbc-api client CN, plus the trunk-agent client CN when the agent is
+     enabled. */}}
 {{- define "sbc.grpcAllowedClientNames" -}}
-{{- $names := .Values.sbcDaemon.grpcMtls.allowedClientNames | default (list (printf "%s-sbc-api" (include "sbc.fullname" .))) -}}
+{{- $default := list (printf "%s-sbc-api" (include "sbc.fullname" .)) -}}
+{{- if .Values.sbcTrunkAgent.enabled -}}
+{{- $default = append $default (printf "%s-sbc-trunk-agent" (include "sbc.fullname" .)) -}}
+{{- end -}}
+{{- $names := .Values.sbcDaemon.grpcMtls.allowedClientNames | default $default -}}
 [{{- range $i, $n := $names }}{{ if $i }}, {{ end }}{{ $n | quote }}{{ end -}}]
 {{- end -}}
 
-{{/* Daemon gRPC URL for in-cluster clients (https when grpcMtls is on). */}}
+{{/* Daemon gRPC listen address. With sbcDaemon.grpcMtls the configured
+     sbcDaemon.config.grpc_listen (default 0.0.0.0:9091); without it the
+     listener is loopback only, because the daemon refuses a plaintext
+     listener off loopback (NIST 800-53 Rev5: AC-3, SC-7, SC-8). */}}
+{{- define "sbc.grpcListen" -}}
+{{- $listen := .Values.sbcDaemon.config.grpc_listen | default "" -}}
+{{- if .Values.sbcDaemon.grpcMtls.enabled -}}
+{{- $listen | default "0.0.0.0:9091" -}}
+{{- else if $listen -}}
+{{- $listen -}}
+{{- else -}}
+127.0.0.1:9091
+{{- end -}}
+{{- end }}
+
+{{/* Render-time checks for the daemon gRPC settings (included from
+     13-sbc-services.yaml and 26-sbc-grpc-mtls.yaml). */}}
+{{- define "sbc.grpcMtlsPreflight" -}}
+{{- $m := .Values.sbcDaemon.grpcMtls -}}
+{{- if $m.enabled -}}
+{{- $secrets := and $m.serverSecretName $m.clientSecretName (or (not .Values.sbcTrunkAgent.enabled) $m.trunkAgentClientSecretName) -}}
+{{- if not (or $m.clusterIssuer $secrets) -}}
+{{- fail "sbcDaemon.grpcMtls.enabled requires sbcDaemon.grpcMtls.clusterIssuer (cert-manager) or explicit serverSecretName/clientSecretName (plus trunkAgentClientSecretName when sbcTrunkAgent.enabled); see DEPLOYING.md \"Daemon gRPC mTLS\"" -}}
+{{- end -}}
+{{- else -}}
+{{- if .Values.sbcApi.enabled -}}
+{{- fail "sbcDaemon.grpcMtls.enabled=false requires sbcApi.enabled=false: sbc-api reaches the daemon gRPC over the pod network, and without mTLS the daemon serves gRPC on loopback only" -}}
+{{- end -}}
+{{- if .Values.sbcTrunkAgent.enabled -}}
+{{- fail "sbcDaemon.grpcMtls.enabled=false requires sbcTrunkAgent.enabled=false: the trunk agent reaches the daemon gRPC over the pod network, and without mTLS the daemon serves gRPC on loopback only" -}}
+{{- end -}}
+{{- $listen := .Values.sbcDaemon.config.grpc_listen | default "" -}}
+{{- if and $listen (not (regexMatch "^(127\\.[0-9.]+|\\[::1\\]):[0-9]+$" $listen)) -}}
+{{- fail (printf "sbcDaemon.config.grpc_listen %q is not a loopback address; without sbcDaemon.grpcMtls the daemon gRPC listener must be loopback (leave grpc_listen empty or set 127.0.0.1:<port>)" $listen) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/* Render-time checks for client-address trust (included from
+     13-sbc-services.yaml). A trusted-proxy range is sound only while the
+     NetworkPolicy limits who can reach sbc-api and provisioning, and nginx
+     real_ip is sound only while the frontend is reachable from the edge
+     proxies alone (NIST 800-53 Rev5: SC-7, SI-10). */}}
+{{- define "sbc.clientAddressPreflight" -}}
+{{- $np := .Values.networkPolicy -}}
+{{- $proxies := or .Values.sbcProvision.trustedProxies .Values.sbcApi.trustedProxies -}}
+{{- if and $proxies (not $np.enabled) (not $np.trustedProxiesWithoutPolicy) -}}
+{{- fail "sbcProvision.trustedProxies / sbcApi.trustedProxies require networkPolicy.enabled=true: without it any pod in those ranges can set X-Real-IP. Set networkPolicy.trustedProxiesWithoutPolicy=true only if another control limits access to these pods to the frontend" -}}
+{{- end -}}
+{{- if and .Values.sbcFrontend.realIpFrom $np.enabled (not $np.edgeFrom) -}}
+{{- fail "sbcFrontend.realIpFrom requires networkPolicy.edgeFrom: list the edge proxy (ingress controller / Gateway) peers so only they can reach the frontend and set X-Forwarded-For" -}}
+{{- end -}}
+{{- end }}
+
+{{/* Daemon gRPC URL for in-cluster clients (https when grpcMtls is on; the
+     -grpc Service exists only then). */}}
 {{- define "sbc.daemonGrpcUrl" -}}
 {{- printf "%s://%s-grpc.%s.svc.cluster.local:9091" (ternary "https" "http" .Values.sbcDaemon.grpcMtls.enabled) (include "sbc.fullname" .) .Release.Namespace -}}
 {{- end }}
@@ -243,19 +309,20 @@ certificate_url = {{ .Values.sbcDaemon.stirShaken.certificateUrl | quote }}
 
 [grpc]
 # gRPC admin API. Used by sbc-api-server (when sbcApi.enabled) to call
-# TrunkSync / DialPlanSync / DidMappingSync after operator writes, so
-# the SIP router stays in sync without sbc-api going through the
-# daemon's REST endpoint. Kept off 9090 (sbcDaemon.config.metrics_listen,
-# reserved for a future metrics exporter).
+# TrunkSync / DialPlanSync / DidMappingSync after operator writes, and by
+# sbc-trunk-agent to publish trunk status. Kept off 9090
+# (sbcDaemon.config.metrics_listen, reserved for a future metrics exporter).
 # `enabled` defaults to false in the schema, so it MUST be set true
 # here or the gRPC server never starts and sbc-api's writes silently
 # skip the SIP-router refresh step.
 #
-# CdrService (CDRs = PII) is mounted only when this listener requires mTLS
-# or is loopback-bound; with sbcDaemon.grpcMtls.enabled=false the CDR API
-# answers 503 (NIST 800-53 Rev5: AC-3, SC-8, SI-12).
+# With sbcDaemon.grpcMtls (the default) the listener is on the pod network
+# and every RPC on every service needs an allow-listed client certificate.
+# Without it the listener is loopback only (sbc.grpcListen): the daemon
+# refuses a plaintext listener off loopback (NIST 800-53 Rev5: AC-3, IA-3,
+# SC-7, SC-8).
 enabled = true
-listen_addr = {{ .Values.sbcDaemon.config.grpc_listen | quote }}
+listen_addr = {{ include "sbc.grpcListen" . | quote }}
 enable_reflection = false
 require_mtls = {{ .Values.sbcDaemon.grpcMtls.enabled }}
 {{- if .Values.sbcDaemon.grpcMtls.enabled }}
@@ -263,8 +330,8 @@ tls_cert_path = "/etc/sbc/grpc-tls/tls.crt"
 tls_key_path = "/etc/sbc/grpc-tls/tls.key"
 tls_ca_path = "/etc/sbc/grpc-tls/ca.crt"
 # Only these client certificate names (SAN DNS/URI or subject CN) may call
-# the gRPC API; default is the chart's sbc-api client certificate CN
-# (NIST 800-53 Rev5: AC-3, IA-3).
+# the gRPC API; default is the chart's sbc-api client certificate CN, plus
+# the trunk-agent CN when sbcTrunkAgent is enabled (NIST 800-53 Rev5: AC-3, IA-3).
 allowed_client_names = {{ include "sbc.grpcAllowedClientNames" . }}
 {{- end }}
 
@@ -302,6 +369,11 @@ internal_domains = {{ .Values.sbcDaemon.topologyHiding.internalDomains | toJson 
 {{- end }}
 {{- end }}
 
+# Audit records (uc-audit) go to stdout with tracing target `audit`, which the
+# daemon log filter always admits, for collection by the cluster log
+# pipeline. On this path they are tamper-evident only through the hash chain
+# carried in each record; no chart-managed audit file is written
+# (NIST 800-53 Rev5: AU-2, AU-9, AU-12).
 [logging]
 level = "info"
 format = "json"

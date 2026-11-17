@@ -1,5 +1,13 @@
 # USG SBC Stress Test Environment — media-node POOL (Phase 3)
 #
+# UNSUPPORTED (does not start): sbc-media now binds its MediaControllerService
+# to loopback only and exits with code 2 on a non-loopback
+# SBC_MEDIA_GRPC_LISTEN, because the service has no client authentication.
+# A pool of media nodes on distinct IPs needs authenticated gRPC between the
+# daemon and each node first (tracked as an open POA&M item). Do not loosen
+# the listener check to run this file; use docker-compose.split.yml for the
+# co-located split.
+#
 # A standalone media-node POOL: sbc-daemon runs signaling-only and load-balances
 # calls across TWO sbc-media nodes over gRPC. Each node has a distinct IP and
 # reports it (SBC_MEDIA_ADVERTISED_IP); the daemon steers each call's SDP to the

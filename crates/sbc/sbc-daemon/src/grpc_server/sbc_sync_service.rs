@@ -84,11 +84,21 @@ impl SbcSyncService for SbcSyncServiceImpl {
         &self,
         request: Request<RemovePartitionRequest>,
     ) -> Result<Response<SyncSbcResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         let id = request.into_inner().partition_id;
         info!(partition_id = %id, "gRPC RemovePartition");
-        if let Some(ref router) = self.state.sbc_router {
+        let applied = if let Some(ref router) = self.state.sbc_router {
             router.write().await.remove_partition(&id);
-        }
+            true
+        } else {
+            false
+        };
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "SbcSyncService/RemovePartition",
+            &id,
+            super::admin_audit::AdminOutcome::applied(applied),
+        );
         Ok(Response::new(SyncSbcResponse {
             synced: true,
             message: "partition removed from SbcRouter".to_string(),
@@ -131,11 +141,21 @@ impl SbcSyncService for SbcSyncServiceImpl {
         &self,
         request: Request<RemoveCallingSearchSpaceRequest>,
     ) -> Result<Response<SyncSbcResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         let id = request.into_inner().css_id;
         info!(css_id = %id, "gRPC RemoveCallingSearchSpace");
-        if let Some(ref router) = self.state.sbc_router {
+        let applied = if let Some(ref router) = self.state.sbc_router {
             router.write().await.remove_css(&id);
-        }
+            true
+        } else {
+            false
+        };
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "SbcSyncService/RemoveCallingSearchSpace",
+            &id,
+            super::admin_audit::AdminOutcome::applied(applied),
+        );
         Ok(Response::new(SyncSbcResponse {
             synced: true,
             message: "CSS removed from SbcRouter".to_string(),
@@ -178,11 +198,21 @@ impl SbcSyncService for SbcSyncServiceImpl {
         &self,
         request: Request<RemoveRoutePatternRequest>,
     ) -> Result<Response<SyncSbcResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         let id = request.into_inner().pattern_id;
         info!(pattern_id = %id, "gRPC RemoveRoutePattern");
-        if let Some(ref router) = self.state.sbc_router {
+        let applied = if let Some(ref router) = self.state.sbc_router {
             router.write().await.remove_route_pattern(&id);
-        }
+            true
+        } else {
+            false
+        };
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "SbcSyncService/RemoveRoutePattern",
+            &id,
+            super::admin_audit::AdminOutcome::applied(applied),
+        );
         Ok(Response::new(SyncSbcResponse {
             synced: true,
             message: "route pattern removed from SbcRouter".to_string(),
@@ -225,11 +255,21 @@ impl SbcSyncService for SbcSyncServiceImpl {
         &self,
         request: Request<RemoveRouteListRequest>,
     ) -> Result<Response<SyncSbcResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         let id = request.into_inner().list_id;
         info!(list_id = %id, "gRPC RemoveRouteList");
-        if let Some(ref router) = self.state.sbc_router {
+        let applied = if let Some(ref router) = self.state.sbc_router {
             router.write().await.remove_route_list(&id);
-        }
+            true
+        } else {
+            false
+        };
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "SbcSyncService/RemoveRouteList",
+            &id,
+            super::admin_audit::AdminOutcome::applied(applied),
+        );
         Ok(Response::new(SyncSbcResponse {
             synced: true,
             message: "route list removed from SbcRouter".to_string(),

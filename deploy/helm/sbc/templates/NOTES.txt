@@ -33,7 +33,7 @@ OPERATOR DASHBOARD:
   /api/* → sbc-api-server pod
             ├ phones / DIDs / trunk groups / dial plans: read+write Postgres
             │   (then daemon TrunkSync / DialPlanSync / DidMappingSync
-            │    gRPC at {{ include "sbc.fullname" . }}-grpc:9091)
+            │    gRPC over mTLS at {{ include "sbc.fullname" . }}-grpc:9091)
             └ everything else (calls, registrations, users, partitions,
               CSS, route patterns, /system/stats, trunk-health,
               trunk-registration): reverse-proxied to the daemon.
@@ -96,3 +96,28 @@ Management-plane login (sbc-api / sbc-provision are now authenticated):
              -H 'content-type: application/json' \
              -d '{"username":"admin","password":"<password>"}'
   Then send the returned token as:  Authorization: Bearer <token>
+
+Daemon gRPC (9091):
+{{- if .Values.sbcDaemon.grpcMtls.enabled }}
+  mTLS on; allowed client names: {{ include "sbc.grpcAllowedClientNames" . }}
+{{- if eq (.Values.sbcDaemon.grpcMtls.issuerKind | default "ClusterIssuer") "ClusterIssuer" }}
+{{- if .Values.sbcDaemon.grpcMtls.clusterIssuer }}
+  NOTE: certificates come from ClusterIssuer {{ .Values.sbcDaemon.grpcMtls.clusterIssuer }}. Any workload that can
+  request a certificate from it can obtain an allow-listed name; prefer a
+  dedicated namespaced Issuer (sbcDaemon.grpcMtls.issuerKind: Issuer).
+{{- end }}
+{{- end }}
+{{- else }}
+  plaintext, loopback only (127.0.0.1); no -grpc Service.
+{{- end }}
+{{- if not .Values.sbcApi.trustedProxies }}
+{{- if .Values.sbcApi.enabled }}
+RECOMMENDED: set sbcApi.trustedProxies to the frontend pod CIDR. Without it
+  the admin login rate limiter sees only the nginx address, so failed logins
+  from any client share one bucket.
+{{- end }}
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+NetworkPolicies: default-deny ingress plus explicit allows
+  (templates/28-sbc-networkpolicy.yaml). Callers not listed there are blocked.
+{{- end }}

@@ -20,7 +20,12 @@
 //! Configuration (env):
 //! - `SBC_POSTGRES_URL` — trunk-group configuration source (required)
 //! - `SBC_DAEMON_GRPC_URL` — daemon gRPC endpoint to publish status to,
-//!   e.g. `http://sbc-daemon:9091` (required)
+//!   e.g. `https://sbc-daemon-grpc:9091` (required). Must be `https://`
+//!   when the TLS files below are set; a plaintext URL only reaches a
+//!   daemon whose gRPC listener is on loopback.
+//! - `SBC_DAEMON_GRPC_TLS_CA_FILE`, `SBC_DAEMON_GRPC_TLS_CERT_FILE`,
+//!   `SBC_DAEMON_GRPC_TLS_KEY_FILE` — PEM CA, client certificate and key
+//!   for mTLS to the daemon (all three or none; empty counts as unset)
 //! - `SBC_AGENT_GRPC_LISTEN` — health-probe gRPC listen address
 //!   (default `0.0.0.0:9096`)
 //! - `SBC_INSTANCE_NAME` — local SIP domain for From/Call-ID in OPTIONS
@@ -38,13 +43,14 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_stream::Stream;
-use tonic::transport::Server;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -58,11 +64,92 @@ use sbc_grpc_api::sbc::{PublishTrunkStatusRequest, TrunkHealthInfo, TrunkRegistr
 use sbc_trunk_services::monitor::{MonitoredTrunk, TrunkMonitor};
 use sbc_trunk_services::registrar::{TrunkRegConfig, TrunkRegistrar};
 
+/// Client mTLS material for the daemon gRPC channel (PEM file paths).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrpcClientTls {
+    ca: PathBuf,
+    cert: PathBuf,
+    key: PathBuf,
+}
+
+/// Daemon gRPC client TLS from `SBC_DAEMON_GRPC_TLS_{CA,CERT,KEY}_FILE`:
+/// all three or none, and an empty value counts as unset (same contract as
+/// sbc-api).
+///
+/// ## NIST 800-53 Rev5: IA-3, SC-8, CM-6
+fn daemon_tls_from(
+    ca: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+) -> Result<Option<GrpcClientTls>, String> {
+    let set = |v: Option<String>| v.filter(|s| !s.is_empty());
+    match (set(ca), set(cert), set(key)) {
+        (None, None, None) => Ok(None),
+        (Some(ca), Some(cert), Some(key)) => Ok(Some(GrpcClientTls {
+            ca: ca.into(),
+            cert: cert.into(),
+            key: key.into(),
+        })),
+        _ => Err("SBC_DAEMON_GRPC_TLS_{CA,CERT,KEY}_FILE: set all three or none".to_string()),
+    }
+}
+
+/// With client TLS configured the daemon URL must be `https://`, so the
+/// channel cannot fall back to plaintext.
+///
+/// ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality and Integrity)
+fn check_daemon_url(url: &str, tls: Option<&GrpcClientTls>) -> Result<(), String> {
+    let https = url
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
+    if tls.is_some() && !https {
+        return Err(format!(
+            "SBC_DAEMON_GRPC_URL {url:?} must use https:// when \
+             SBC_DAEMON_GRPC_TLS_{{CA,CERT,KEY}}_FILE are set"
+        ));
+    }
+    Ok(())
+}
+
+/// Builds the daemon gRPC endpoint (5 s connect, 10 s request timeout, as
+/// sbc-api), with mTLS when configured.
+///
+/// ## NIST 800-53 Rev5: IA-3, SC-8
+// POAM: SEC-9 (SC-13) tonic's default rustls provider and suites are used
+// on this channel, not the uc-transport CNSA 2.0 profile; the chart's
+// certificates are ECDSA P-384.
+// POAM: POA&M-387 (SC-12) the client certificate is read once; a rotated
+// certificate is picked up only after a restart.
+async fn daemon_endpoint(url: &str, tls: Option<&GrpcClientTls>) -> Result<Endpoint, String> {
+    async fn read(p: &std::path::Path) -> Result<String, String> {
+        tokio::fs::read_to_string(p)
+            .await
+            .map_err(|e| format!("{}: {e}", p.display()))
+    }
+    let endpoint = Endpoint::from_shared(url.to_string())
+        .map_err(|e| format!("SBC_DAEMON_GRPC_URL invalid: {e}"))?
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5));
+    let Some(tls) = tls else {
+        return Ok(endpoint);
+    };
+    let tls_cfg = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(read(&tls.ca).await?))
+        .identity(Identity::from_pem(
+            read(&tls.cert).await?,
+            read(&tls.key).await?,
+        ));
+    endpoint
+        .tls_config(tls_cfg)
+        .map_err(|e| format!("daemon gRPC TLS: {e}"))
+}
+
 /// Agent configuration, parsed from env at startup.
 #[derive(Debug, Clone)]
 struct Config {
     postgres_url: String,
     daemon_grpc_url: String,
+    daemon_grpc_tls: Option<GrpcClientTls>,
     grpc_listen: std::net::SocketAddr,
     instance_name: String,
     poll_interval: Duration,
@@ -78,6 +165,12 @@ impl Config {
             std::env::var("SBC_POSTGRES_URL").map_err(|_| "SBC_POSTGRES_URL is required")?;
         let daemon_grpc_url =
             std::env::var("SBC_DAEMON_GRPC_URL").map_err(|_| "SBC_DAEMON_GRPC_URL is required")?;
+        let daemon_grpc_tls = daemon_tls_from(
+            std::env::var("SBC_DAEMON_GRPC_TLS_CA_FILE").ok(),
+            std::env::var("SBC_DAEMON_GRPC_TLS_CERT_FILE").ok(),
+            std::env::var("SBC_DAEMON_GRPC_TLS_KEY_FILE").ok(),
+        )?;
+        check_daemon_url(&daemon_grpc_url, daemon_grpc_tls.as_ref())?;
         let grpc_listen = std::env::var("SBC_AGENT_GRPC_LISTEN")
             .unwrap_or_else(|_| "0.0.0.0:9096".to_string())
             .parse()
@@ -117,6 +210,7 @@ impl Config {
         Ok(Self {
             postgres_url,
             daemon_grpc_url,
+            daemon_grpc_tls,
             grpc_listen,
             instance_name,
             poll_interval,
@@ -372,8 +466,17 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let endpoint =
+        match daemon_endpoint(&config.daemon_grpc_url, config.daemon_grpc_tls.as_ref()).await {
+            Ok(e) => e,
+            Err(e) => {
+                error!(error = %e, "config error");
+                return ExitCode::from(2);
+            }
+        };
     info!(
         daemon = %config.daemon_grpc_url,
+        mtls = config.daemon_grpc_tls.is_some(),
         poll_secs = config.poll_interval.as_secs(),
         publish_secs = config.publish_interval.as_secs(),
         bind_ip = ?config.bind_ip,
@@ -465,10 +568,10 @@ async fn main() -> ExitCode {
         }
 
         if client.is_none() {
-            match TrunkStatusPublishServiceClient::connect(config.daemon_grpc_url.clone()).await {
-                Ok(c) => {
+            match endpoint.connect().await {
+                Ok(channel) => {
                     info!(daemon = %config.daemon_grpc_url, "Connected to daemon gRPC");
-                    client = Some(c);
+                    client = Some(TrunkStatusPublishServiceClient::new(channel));
                 }
                 Err(e) => {
                     warn!(error = %e, "Cannot reach daemon gRPC; will retry");
@@ -501,4 +604,63 @@ async fn main() -> ExitCode {
     monitor.stop_all();
     registrar.stop_all();
     ExitCode::SUCCESS
+}
+
+/// QA: the agent's daemon-gRPC client TLS settings are all-or-none,
+/// and a TLS client refuses a plaintext daemon URL (no downgrade).
+///
+/// ## NIST 800-53 Rev5: IA-3, SC-8
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod daemon_tls_tests {
+    use super::{check_daemon_url, daemon_tls_from};
+
+    fn s(v: &str) -> Option<String> {
+        v.to_string().into()
+    }
+
+    #[test]
+    fn qa_daemon_tls_all_or_none() {
+        assert!(daemon_tls_from(None, None, None).unwrap().is_none());
+        assert!(
+            daemon_tls_from(s("/tls/ca.crt"), s("/tls/tls.crt"), s("/tls/tls.key"))
+                .unwrap()
+                .is_some()
+        );
+        let partial = [
+            (s("/tls/ca.crt"), None, None),
+            (None, s("/tls/tls.crt"), None),
+            (None, None, s("/tls/tls.key")),
+            (s("/tls/ca.crt"), s("/tls/tls.crt"), None),
+            (s("/tls/ca.crt"), None, s("/tls/tls.key")),
+            (None, s("/tls/tls.crt"), s("/tls/tls.key")),
+        ];
+        for (ca, cert, key) in partial {
+            let e = daemon_tls_from(ca.clone(), cert.clone(), key.clone()).expect_err(&format!(
+                "partial TLS settings must be rejected: {ca:?} {cert:?} {key:?}"
+            ));
+            assert!(e.contains("SBC_DAEMON_GRPC_TLS"), "{e}");
+        }
+        // Empty values count as unset (same contract as sbc-api).
+        assert!(daemon_tls_from(s(""), s(""), s("")).unwrap().is_none());
+    }
+
+    #[test]
+    fn qa_daemon_tls_requires_https_url() {
+        let tls = daemon_tls_from(s("/tls/ca.crt"), s("/tls/tls.crt"), s("/tls/tls.key"))
+            .unwrap()
+            .unwrap();
+        assert!(check_daemon_url("https://rel-sbc-daemon-grpc:9091", Some(&tls)).is_ok());
+        for bad in [
+            "http://rel-sbc-daemon-grpc:9091",
+            "rel-sbc-daemon-grpc:9091",
+        ] {
+            assert!(
+                check_daemon_url(bad, Some(&tls)).is_err(),
+                "{bad} must be refused when TLS is configured"
+            );
+        }
+        // Without TLS settings the plaintext URL keeps working (loopback daemon).
+        assert!(check_daemon_url("http://127.0.0.1:9091", None).is_ok());
+    }
 }

@@ -9,6 +9,179 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, management-plane containment: daemon gRPC mTLS, NetworkPolicies, OIDC roles, central Postgres credentials)
+
+SBC only; the soft client is not affected. No CDR field and no audit event
+type changes. Several Helm defaults change and some installs that rendered
+before now fail to render until a value is supplied. The full upgrade text is
+in `deploy/helm/sbc/DEPLOYING.md` ("Upgrading to the containment hardening
+release") and `deploy/keycloak/central-config-clients.md`.
+
+**Upgrade checklist for operators** (do these before `helm upgrade`):
+
+1. **sbc chart: supply a daemon gRPC issuer or Secrets.**
+   `sbcDaemon.grpcMtls.enabled` is now `true` by default and rendering fails
+   unless one of these is set: `sbcDaemon.grpcMtls.clusterIssuer` (with
+   `issuerKind: Issuer` for a dedicated namespaced CA, recommended), or
+   `serverSecretName` + `clientSecretName` (+ `trunkAgentClientSecretName`
+   when `sbcTrunkAgent.enabled`), each holding `tls.crt`, `tls.key` and
+   `ca.crt`. **Site values files must add this, including
+   `deploy/helm/sites/sbc/oopl-001/values.yaml`**, which does not set it in
+   this change (the issuer on that cluster is site-specific). Certificates
+   the chart issues are ECDSA P-384.
+2. **sbc chart: `grpcMtls.enabled: false` is accepted only with
+   `sbcApi.enabled: false` and `sbcTrunkAgent.enabled: false`.** The daemon
+   gRPC then listens on `127.0.0.1:9091` only and no `-grpc` Service is
+   created.
+3. **sbc chart: `sbcDaemon.config.grpc_listen` defaults to `""`.** Empty
+   renders `0.0.0.0:9091` with mTLS and `127.0.0.1:9091` without. A
+   non-loopback value without mTLS fails rendering.
+4. **sbc chart: NetworkPolicies are on by default**
+   (`networkPolicy.enabled: true`, new `templates/28-sbc-networkpolicy.yaml`,
+   ingress only). Every pod of the release gets a default-deny ingress
+   baseline plus explicit allows: SIP and RTP to the daemon from any source;
+   daemon REST from the frontend and sbc-api; daemon gRPC 9091 (with mTLS)
+   from sbc-api, the trunk agent and `networkPolicy.daemonGrpcFrom`; sbc-api
+   and provisioning from the frontend; the frontend and client-config from
+   `networkPolicy.edgeFrom` (any source when empty); Postgres from the release
+   pods that use it. Any other in-cluster caller is blocked. Needs a CNI that
+   enforces NetworkPolicy and Kubernetes >= 1.25; on a CNI that applies
+   policy to host traffic set `networkPolicy.probeFrom` to the node CIDR.
+   Set `networkPolicy.enabled: false` to keep the previous behaviour.
+5. **sbc chart: client-address trust is explicit.**
+   - `sbcProvision.allowedSourceCidrs` now requires
+     `sbcProvision.trustedProxies` (the frontend pod CIDR); rendering fails
+     otherwise.
+   - `sbcProvision.trustedProxies` or `sbcApi.trustedProxies` with
+     `networkPolicy.enabled: false` fails rendering unless
+     `networkPolicy.trustedProxiesWithoutPolicy: true`.
+   - `sbcFrontend.realIpFrom` (new, default `[]`) lists the edge proxies'
+     own addresses for nginx `set_real_ip_from`; with NetworkPolicies on it
+     requires `networkPolicy.edgeFrom`. Do not list the whole pod CIDR.
+6. **sbc chart (`mediaSplit`): sbc-media binds its controller to
+   `127.0.0.1:9096`** and the `media-grpc` container port is removed.
+7. **central-config chart: no default database password.**
+   `postgres.password` (bundled) and `postgres.cnpg.password` (cnpg) default
+   to `""`; rendering fails when the value is empty or `change-me`. In cnpg
+   mode `postgres.cnpg.existingSecret` (new; keys `username`, `password`,
+   `dsn`, `dsnRo`) replaces the password value. **Existing installs:** set
+   the value to the password the database already uses, or rotate the role
+   password in the database in the same change; changing the Secret alone
+   does not change the password of an initialised bundled Postgres.
+8. **central-config chart (cnpg): DSNs use `sslmode=verify-full`.** The
+   chart-owned DSNs point at `<cluster>-rw|ro.<namespace>.svc` with
+   `sslrootcert=/etc/central-config/pg-ca/ca.crt`, mounted from
+   `postgres.cnpg.caSecret` (new; default `<cluster>-ca`, key `ca.crt`).
+   DSNs in an `existingSecret` or in `external` mode are yours to set. The
+   bundled (lab) DSN is now explicitly `sslmode=disable`. Passwords are
+   percent-encoded in the DSN.
+9. **Keycloak: bind the `config-admin` client scope to realm role
+   `fleet-admin`** after every realm import. The partial-import file now
+   carries the `scopeMappings` entry, but a partial import may not apply it;
+   `deploy/keycloak/central-config-clients.md` gives the console steps, the
+   `kcadm.sh` commands and a check that must print `fleet-admin`. The same
+   document adds two required user-profile settings (`sites` editable by
+   admins only; unmanaged attributes not `ENABLED`).
+10. **Daemon config files (non-Helm installs): check `[grpc]`.** See the
+    config changes below.
+
+**Config schema (sbc.toml) changes.** These apply at startup and on reload
+(a rejected reload keeps the running config).
+
+- `[grpc] listen_addr` default `0.0.0.0:9090` -> `127.0.0.1:9091`.
+- With `[grpc] enabled = true`, a non-loopback `listen_addr` (`0.0.0.0`
+  and `[::]` included) requires `require_mtls = true`, all three TLS paths
+  and a non-empty `allowed_client_names`; otherwise the config is rejected.
+  `require_mtls = true` without all three TLS paths is rejected on any
+  address. `GrpcServer::run` also refuses a plaintext non-loopback listener.
+  (AC-3, IA-3, SC-8, CM-7)
+
+**Environment changes.**
+
+- **sbc-media:** `SBC_MEDIA_GRPC_LISTEN` defaults to `127.0.0.1:9096`; a
+  non-loopback value exits with code 2. `MediaControllerService` has no
+  client authentication, so a media pool on separate addresses is not
+  supported in this release (`deploy/test/docker-compose.pool.yml` is
+  marked unsupported).
+- **sbc-api, sbc-provision-server (`SBC_TRUSTED_PROXIES`):** an empty list
+  now trusts no proxy and `X-Real-IP` is ignored (before, it was honoured
+  from any peer). The provisioning source-network check and the sbc-api
+  login rate limiter then key on the TCP peer. Set the variable (chart:
+  `sbcProvision.trustedProxies`, `sbcApi.trustedProxies`) to the frontend
+  pod CIDR. (SC-7, SI-10)
+
+**Authorization changes (REST API).**
+
+- **sbc-api:** an OIDC bearer token is accepted only with realm role
+  `fleet-admin` **and** a `sites` claim containing `*`. Any other valid
+  token gets `403 {"error":"insufficient role"}` and an
+  `AuthorizationDecision` deny record (policy `sbc-api-oidc`). OIDC users
+  that held only auditor or CDR-reader roles lose sbc-api access.
+  Permissions now come from roles only; requested `cdr:*` / `users:*` OAuth
+  scopes grant nothing. Local (password) logins are unchanged. (AC-3, AC-6)
+- **central-config-api:** the `config-admin` scope no longer grants fleet
+  access by itself. Fleet access needs a fleet role (`fleet-admin`, or
+  `config-admin` / `site-admin` as role names) and `sites` ∋ `*`.
+
+**SIEM and log parsers.**
+
+- Thirteen daemon gRPC admin RPCs now write a `ConfigurationChange` audit
+  record (existing event type, action `Modified`) with the caller
+  (`cert:<name>@<peer>` or `unauthenticated@<peer>`) and the description
+  `grpc <Service>/<Rpc> target=<id> outcome=<ok|noop|<gRPC code>>`:
+  `SbcSyncService/Remove{RoutePattern,RouteList,Partition,CallingSearchSpace}`,
+  `TrunkSyncService/RemoveTrunkGroup`, `DialPlanSyncService/RemoveDialPlan`,
+  `DidMappingSyncService/RemoveDirectoryNumber`,
+  `RegistrationService/DeleteRegistration`, `CallService/TerminateCall`,
+  `SystemService/{Shutdown,ReloadTls}`, `TrunkHealthService/RegisterTrunk`
+  and `ClusterService/DrainNode`. `ReloadTls` keeps its existing
+  `CryptoKeyOperation` record and adds this one. (AU-2, AU-3, AU-12)
+- The daemon log filter always admits target `audit` at info, so
+  `RUST_LOG` can no longer drop audit records. An invalid `RUST_LOG` prints
+  one line on stderr and falls back to `sbc=<level>,warn` (before: silent).
+- The CDR gRPC caller string uses the same `cert:` / `unauthenticated@`
+  form (moved, not changed).
+
+### Added (SBC, management-plane containment)
+
+- **sbc-trunk-agent: mTLS client for the daemon gRPC.** New
+  `SBC_DAEMON_GRPC_TLS_{CA,CERT,KEY}_FILE` (all three or none; empty counts
+  as unset). With TLS the daemon URL must be `https://`; a bad combination
+  exits with code 2. Connect timeout 5 s, request timeout 10 s. The chart
+  issues or mounts a trunk-agent client certificate (CN
+  `<fullname>-sbc-trunk-agent`, added to the default allow-list), so the
+  trunk agent can now be enabled together with `grpcMtls`. (IA-3, SC-8)
+- **Helm values (sbc):** `sbcDaemon.grpcMtls.trunkAgentClientSecretName`,
+  `sbcFrontend.realIpFrom`, `sbcApi.trustedProxies`,
+  `sbcProvision.trustedProxies`,
+  `sbcProvision.provisionSecret.{existingSecret,key}` (renders
+  `SBC_PROVISION_SECRET` from a Secret you manage), and
+  `networkPolicy.{enabled,edgeFrom,trustedProxiesWithoutPolicy,daemonGrpcFrom,probeFrom}`.
+- **Helm values (central-config):** `postgres.cnpg.existingSecret`,
+  `postgres.cnpg.caSecret`.
+- **NOTES.txt** (both charts) reports the gRPC mTLS mode and allow-list,
+  warns on a shared `ClusterIssuer`, recommends `sbcApi.trustedProxies`
+  when unset, and shows the central Postgres credential and TLS source.
+
+### Changed (SBC, dependencies and CI)
+
+- `central-config-store`: sqlx gains feature `tls-rustls-aws-lc-rs` (the
+  feature `uc-storage` already enables), so a `verify-full` DSN can
+  connect. No new crate enters `Cargo.lock`. sqlx builds its own rustls
+  client config with the aws-lc-rs default provider; the suites are not
+  pinned to CNSA 2.0, and CNPG issues P-256 server certificates by default
+  (POA&M-16 and POA&M-240 scope).
+- `sbc-api-server` dev-dependencies: `jsonwebtoken`, `aws-lc-rs`, `base64`
+  (router-level OIDC tests mint ES384 tokens); `sbc-integration-tests`
+  dev-dependency `serde_json`. All were already in the workspace lockfile.
+- CI: new step `cargo nextest run -p sbc-daemon --features grpc` in the
+  Test job (the `--all-features` run enables `cluster`, which compiles out
+  the non-cluster gRPC server and admin-audit tests). The `sbc` path filter
+  now also covers `deploy/helm/**`, `deploy/keycloak/**`, `deploy/config/**`,
+  `deploy/test/**` and `deploy/central-db/**`, which sbc tests read or embed.
+- `deploy/test/docker-compose.split.yml`: sbc-media shares the daemon
+  container's network namespace and serves gRPC on `127.0.0.1:9096`.
+
 ### BREAKING (SBC, DTLS-SRTP sidecar keeps the association for the whole call, POA&M-335, 340, 341, 342)
 
 Affects only SBCs that terminate DTLS-SRTP (`sbcDaemon.dtlsTerminate.enabled`,

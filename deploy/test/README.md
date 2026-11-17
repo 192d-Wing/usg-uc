@@ -109,3 +109,14 @@ Key metrics to watch:
 **High retransmissions**: Increase rate limiter thresholds in `sbc-test.toml`
 
 **SIPp "No 200 received"**: SBC may be overloaded — reduce `--rate` or `--concurrent`
+
+## Split signaling/media topologies
+
+- `docker-compose.split.yml`: the daemon runs signaling-only and drives a
+  co-located `sbc-media` over gRPC. `sbc-media` shares the daemon
+  container's network namespace (`network_mode: service:sbc-signaling`) and
+  listens on `127.0.0.1:9096`, as in the Helm `mediaSplit` pod.
+- `docker-compose.pool.yml`: **unsupported, does not start.** `sbc-media`
+  refuses a non-loopback `SBC_MEDIA_GRPC_LISTEN` (exit 2) because
+  `MediaControllerService` has no client authentication, so media nodes on
+  separate IPs cannot be driven until that exists.

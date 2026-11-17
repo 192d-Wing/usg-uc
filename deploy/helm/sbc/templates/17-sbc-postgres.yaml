@@ -19,6 +19,9 @@ Either way, the daemon reads SBC_POSTGRES_URL — single contract.
 This is intentionally a tiny StatefulSet rather than a bitnami subchart:
 keeps the chart self-contained and dependency-free, which matters for
 the 184-site air-gapped deploy pattern (see BOOTSTRAP.md).
+
+POAM: POA&M-384 (SC-8) the bundled instance has no TLS (sslmode defaults to
+disable); the sslmode of an existingSecret DSN is not checked.
 */}}
 {{- if .Values.sbcPostgres.enabled }}
 {{- $_ := required "sbcPostgres.password must be set to a non-empty value when sbcPostgres.enabled is true" .Values.sbcPostgres.password }}

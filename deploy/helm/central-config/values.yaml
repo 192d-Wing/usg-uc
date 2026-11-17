@@ -53,8 +53,11 @@ postgres:
   storage: 5Gi
   database: usg_config
   user: central
-  # Set a strong password for the bundled instance (lab only).
-  password: "change-me"
+  # REQUIRED in bundled mode: a strong password for the bundled instance
+  # (lab only). Rendering fails when it is empty or the change-me
+  # placeholder. The bundled Postgres has no server certificate, so its DSN
+  # is plaintext (sslmode=disable); use cnpg or external for production.
+  password: ""
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
     limits:   { cpu: "1",    memory: "1Gi" }
@@ -78,10 +81,21 @@ postgres:
     # Optional explicit operand image (else the operator's default).
     imageName: ""
     # App-user credential CNPG provisions (we own it so we can build both
-    # the -rw and -ro DSNs). Use a real secret manager in production.
+    # the -rw and -ro DSNs). REQUIRED unless existingSecret is set; rendering
+    # fails when it is empty or the change-me placeholder. Prefer
+    # existingSecret (a real secret manager) in production.
     database: usg_config
     user: central
-    password: "change-me"
+    password: ""
+    # Operator-owned kubernetes.io/basic-auth Secret with keys username,
+    # password, dsn and dsnRo. When set the chart renders no credential
+    # Secret and the API and CNPG bootstrap use this one. Its DSNs should
+    # carry sslmode=verify-full&sslrootcert=/etc/central-config/pg-ca/ca.crt.
+    existingSecret: ""
+    # Secret holding the CA (key ca.crt) that signs the CNPG server
+    # certificate; mounted at /etc/central-config/pg-ca for sslmode=verify-full.
+    # Default <cluster>-ca, the CA Secret CNPG generates.
+    caSecret: ""
     resources:
       requests: { cpu: "250m", memory: "512Mi" }
       limits:   { cpu: "2",    memory: "2Gi" }

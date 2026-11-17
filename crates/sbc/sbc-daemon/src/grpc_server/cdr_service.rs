@@ -98,15 +98,8 @@ fn caller_identity<T>(req: &Request<T>) -> Caller {
                 .collect()
         })
         .unwrap_or_default();
-    let who = req
-        .extensions()
-        .get::<super::PeerPrincipal>()
-        .map_or("unauthenticated", |p| p.0.as_str());
-    let peer = req
-        .remote_addr()
-        .map_or_else(|| "local".to_string(), |a| a.to_string());
     Caller {
-        principal: format!("{who}@{peer}"),
+        principal: super::peer_identity::caller_principal(req),
         on_behalf_of,
     }
 }
