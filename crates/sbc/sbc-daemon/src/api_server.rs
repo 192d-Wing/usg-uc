@@ -1862,8 +1862,6 @@ pub async fn sync_trunk_group_to_router(
         );
     }
 
-    sip_stack.add_trunk_group_to_router(group).await;
-
     // Register inbound trunk mapping (source IP → trunk group + CSS)
     let css_id = group_json.get("css_id").and_then(|v| v.as_str());
     let hosts: Vec<(String, u16)> = group_json
@@ -1880,11 +1878,24 @@ pub async fn sync_trunk_group_to_router(
                 .collect()
         })
         .unwrap_or_default();
-    if !hosts.is_empty() {
-        sip_stack.register_inbound_trunk(id, css_id, &hosts).await;
-    }
+    // Names are resolved before the trunk-sync guard is taken.
+    let ips = crate::sip_stack::SipStack::resolve_trunk_hosts(&hosts).await;
+
+    // NIST 800-53 Rev5: AC-3, AC-4, CM-3 - router add, source map and peer
+    // set change under the trunk-sync guard, so a concurrent removal runs
+    // wholly before or after them. The source map is replaced (no hosts
+    // clears the group's entries).
+    // POAM: POA&M-386 the gRPC sync path reads the group from the store
+    // before calling this; a delete that commits and runs its removal
+    // between that read and this guard is undone here (the deleted group
+    // is re-applied until the next sync or restart). Fix: re-read the
+    // store under the guard in grpc_server.
+    let sync = sip_stack.trunk_sync_guard().await;
+    sip_stack.add_trunk_group_to_router(group).await;
+    sip_stack.register_inbound_trunk_ips(id, css_id, &ips).await;
     // In-dialog peer set of the group's calls (NIST 800-53 Rev5: SC-23).
-    sip_stack.index_trunk_group_hosts(id, &hosts).await;
+    sip_stack.index_trunk_group_ips(id, ips).await;
+    drop(sync);
 
     tracing::info!(trunk_group = id, css = ?css_id, "Synced trunk group to SIP stack router");
     Ok(())
@@ -2351,6 +2362,113 @@ mod tests {
             {"id": "z", "host": "127.0.0.9", "max_calls": 0}
         ]});
         assert!(sync_trunk_group_to_router(&state, &g).await.is_err());
+    }
+
+    async fn inbound(state: &Arc<AppState>, ip: [u8; 4]) -> Option<(String, Option<String>)> {
+        let stack = state.sip_stack.as_ref().expect("stack");
+        stack
+            .lookup_inbound_trunk(std::net::Ipv4Addr::from(ip).into())
+            .await
+    }
+
+    // NIST 800-53 Rev5: AC-3, AC-4, CM-3
+    /// A re-sync (sbc-api update_group / add_trunk / update_trunk /
+    /// delete_trunk → gRPC SyncTrunkGroup) with changed hosts and CSS
+    /// replaces the group's inbound mapping.
+    #[tokio::test]
+    async fn resync_replaces_inbound_trunk_hosts_and_css() {
+        let state = divided_state(1).await;
+        let g = serde_json::json!({"id": "g", "css_id": "css-1", "trunks": [
+            {"id": "a", "host": "127.0.0.9"},
+            {"id": "b", "host": "127.0.0.10"}
+        ]});
+        sync_trunk_group_to_router(&state, &g)
+            .await
+            .expect("accepted");
+        assert_eq!(
+            inbound(&state, [127, 0, 0, 9]).await,
+            Some(("g".to_string(), Some("css-1".to_string())))
+        );
+
+        let g = serde_json::json!({"id": "g", "css_id": "css-2", "trunks": [
+            {"id": "b", "host": "127.0.0.10"},
+            {"id": "c", "host": "127.0.0.11"}
+        ]});
+        sync_trunk_group_to_router(&state, &g)
+            .await
+            .expect("accepted");
+        assert_eq!(
+            inbound(&state, [127, 0, 0, 9]).await,
+            None,
+            "old host dropped"
+        );
+        let new = Some(("g".to_string(), Some("css-2".to_string())));
+        assert_eq!(inbound(&state, [127, 0, 0, 10]).await, new);
+        assert_eq!(inbound(&state, [127, 0, 0, 11]).await, new);
+    }
+
+    // NIST 800-53 Rev5: AC-3, AC-4, CM-3
+    /// A re-sync after the group's last trunk is deleted (no hosts)
+    /// clears the group's inbound mapping; other groups are untouched.
+    #[tokio::test]
+    async fn resync_with_no_trunks_clears_inbound_trunk_hosts() {
+        let state = divided_state(1).await;
+        let g = serde_json::json!({"id": "g", "trunks": [{"id": "a", "host": "127.0.0.9"}]});
+        sync_trunk_group_to_router(&state, &g)
+            .await
+            .expect("accepted");
+        let o = serde_json::json!({"id": "o", "trunks": [{"id": "x", "host": "127.0.0.20"}]});
+        sync_trunk_group_to_router(&state, &o)
+            .await
+            .expect("accepted");
+        assert!(inbound(&state, [127, 0, 0, 9]).await.is_some());
+
+        let g = serde_json::json!({"id": "g", "trunks": []});
+        sync_trunk_group_to_router(&state, &g)
+            .await
+            .expect("accepted");
+        assert_eq!(inbound(&state, [127, 0, 0, 9]).await, None);
+        assert_eq!(
+            inbound(&state, [127, 0, 0, 20]).await,
+            Some(("o".to_string(), None))
+        );
+    }
+
+    // NIST 800-53 Rev5: AC-4, CM-3
+    /// An IP moved from group A to group B through two syncs maps
+    /// only to B, whichever group is synced first.
+    #[tokio::test]
+    async fn resync_moves_ip_between_groups() {
+        let state = divided_state(1).await;
+        let a = serde_json::json!({"id": "a", "trunks": [{"id": "t", "host": "127.0.0.9"}]});
+        sync_trunk_group_to_router(&state, &a)
+            .await
+            .expect("accepted");
+        // A first (drops the IP), then B (takes it).
+        let a2 = serde_json::json!({"id": "a", "trunks": [{"id": "t", "host": "127.0.0.12"}]});
+        let b = serde_json::json!({"id": "b", "trunks": [{"id": "t", "host": "127.0.0.9"}]});
+        sync_trunk_group_to_router(&state, &a2)
+            .await
+            .expect("accepted");
+        sync_trunk_group_to_router(&state, &b)
+            .await
+            .expect("accepted");
+        assert_eq!(
+            inbound(&state, [127, 0, 0, 9]).await,
+            Some(("b".to_string(), None))
+        );
+        // Removing A afterwards leaves the IP with B.
+        state
+            .sip_stack
+            .as_ref()
+            .expect("stack")
+            .remove_trunk_group_from_router("a")
+            .await;
+        assert_eq!(
+            inbound(&state, [127, 0, 0, 9]).await,
+            Some(("b".to_string(), None))
+        );
+        assert_eq!(inbound(&state, [127, 0, 0, 12]).await, None);
     }
 
     #[test]
