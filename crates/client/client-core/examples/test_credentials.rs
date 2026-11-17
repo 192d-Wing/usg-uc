@@ -23,9 +23,9 @@ fn main() {
     std::fs::create_dir_all(&temp_dir).unwrap();
     let settings_path = temp_dir.join("test-settings.toml");
 
-    // Clean up any previous test data
+    // Clean up any previous test data. Secrets are only ever persisted in
+    // the platform keyring; there is no credentials file to remove.
     let _ = std::fs::remove_file(&settings_path);
-    let _ = std::fs::remove_file(temp_dir.join("credentials.enc"));
 
     println!("Test directory: {}", temp_dir.display());
     println!("Settings path: {}\n", settings_path.display());
@@ -39,7 +39,9 @@ fn main() {
         if let Some(backend) = manager.credential_storage_backend() {
             println!("Credential storage backend: {}", backend);
         } else {
-            println!("WARNING: No credential storage available!");
+            println!(
+                "WARNING: No platform keyring; passwords stay in memory only and are not persisted."
+            );
         }
 
         // Create account with digest credentials
@@ -68,7 +70,8 @@ fn main() {
 
         // Persist passwords to secure storage
         match manager.persist_account_passwords() {
-            Ok(()) => println!("Passwords persisted successfully!"),
+            Ok(0) => println!("No password persisted (no platform keyring)."),
+            Ok(n) => println!("{n} password(s) persisted to the platform keyring."),
             Err(e) => println!("Failed to persist passwords: {}", e),
         }
 
@@ -125,15 +128,18 @@ fn main() {
         if has_password {
             println!("ERROR: Password found in settings file!");
         } else {
-            println!("PASS: Password is securely stored, not in settings file.");
+            println!("PASS: Password is not in the settings file.");
         }
     }
 
     // Cleanup
     println!("\n--- Cleanup ---");
+    {
+        let mut manager = SettingsManager::with_path(settings_path.clone()).unwrap();
+        let _ = manager.delete_digest_password("bulkvs-test");
+    }
     let _ = std::fs::remove_file(&settings_path);
-    let _ = std::fs::remove_file(temp_dir.join("credentials.enc"));
-    println!("Test files cleaned up.");
+    println!("Test files and keyring entry cleaned up.");
 
     println!("\n=== Test Complete ===");
 }

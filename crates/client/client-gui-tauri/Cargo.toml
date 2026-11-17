@@ -21,7 +21,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Client core and types. OIDC sign-in (discovery + browser PKCE +
-# keychain-persisted refresh token) ships on by default.
+# in-memory refresh token) ships on by default.
 client-types = { path = "../client-types" }
 client-core = { path = "../client-core", features = ["oidc"] }
 client-audio = { path = "../client-audio" }

@@ -22,6 +22,42 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   sidecars and the dashboard's npm tree.** GitHub Actions updates are
   grouped into one weekly PR.
 
+### Security (soft client, credential storage, POA&M-372, 373)
+
+Tested locally on macOS arm64 only. Android and iOS were not built for
+this change; no CI run yet.
+
+- **Soft client: secrets are stored only in the platform keyring.**
+  (IA-5(1), IA-5(6), SC-28) Digest passwords go to macOS Keychain, Windows
+  Credential Manager or the Linux Secret Service; the OIDC refresh-token API
+  is keystore-only too, but the desktop client does not persist refresh
+  tokens at all.
+  The `credentials.enc` fallback is removed: its AES-256-GCM key was
+  derived from the hostname, user name and config path, so anyone who
+  could read the file could decrypt it. Every Android and iOS build, and
+  any desktop without a usable keyring, used it. Those builds now persist
+  nothing: the secret stays in memory and the user signs in again after a
+  restart (POA&M-372). A leftover `credentials.enc` or
+  `credentials.enc.tmp` is deleted when the credential store starts and is
+  never read. The desktop client no longer logs that digest credentials
+  were persisted when they were not, and a stale "persisted" flag from an
+  older build is cleared on load. If the keyring check failed at start,
+  signing out still deletes the refresh-token keyring entry directly on
+  desktop (as does the `delete_digest_password` API), and an error is
+  logged if that fails.
+- **Action required: rotate exposed secrets.** Deleting the file does not
+  remove copies in backups or freed storage, and those copies remain
+  decryptable. Treat every digest password and OIDC refresh token stored
+  by a mobile or keyring-less desktop build before this change as exposed:
+  change those SIP passwords and revoke those refresh tokens at the IdP.
+- **Correction:** the statements that `uc-crypto::hkdf::hkdf_sha384` is
+  library-only with no shipped caller (`docs/CNSA-2-COMPLIANCE.md`, NIST
+  SC-12) were wrong for `oidc` and `digest-auth` client builds before this
+  change, which used it for the fallback key. They are correct now.
+- **Linux keyring transport is not CNSA** (POA&M-373): the Secret Service
+  D-Bus transfer uses DH-1024 and AES-128-CBC. It is local IPC; at-rest
+  protection is the keyring daemon's.
+
 ### BREAKING (SBC, DTLS-SRTP sidecar keeps the association for the whole call, POA&M-335, 340, 341, 342)
 
 Affects only SBCs that terminate DTLS-SRTP (`sbcDaemon.dtlsTerminate.enabled`,

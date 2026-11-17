@@ -44,13 +44,12 @@ fn update_account(username: &str, password: &str) -> Result<(), Box<dyn std::err
         account.caller_id = Some(caller_id);
     }
 
-    let mut creds = client_types::DigestAuthCredentials::new(username, password);
-    creds.password_persisted = true;
-    account.digest_credentials = Some(creds);
-
     let account_id = account.id.clone();
-    settings.set_account(account);
     let stored = settings.store_digest_password(&account_id, password)?;
+    let mut creds = client_types::DigestAuthCredentials::new(username, password);
+    creds.password_persisted = stored;
+    account.digest_credentials = Some(creds);
+    settings.set_account(account);
     println!("credentials updated for '{account_id}' (secure storage: {stored})");
     settings.save_if_dirty()?;
     Ok(())
