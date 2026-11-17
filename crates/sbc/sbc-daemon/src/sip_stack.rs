@@ -73,6 +73,8 @@ use uc_types::address::TransportType as AddrTransport;
 // SIPREC recording session glue (RFC 7866 SRC): the stack-side half of
 // `crate::recording`, kept out of this file.
 mod recording_session;
+// Call-leg SDP media security (RFC 4568 §8; SDES keys, CNSA suites).
+mod media_security;
 
 /// SIP stack for processing SIP messages.
 pub struct SipStack {
@@ -4861,7 +4863,14 @@ impl SipStack {
         // 4. The originator's new offer: follow its media address (a hold
         //    with c=0.0.0.0 is not an address and leaves the relay as is),
         //    then re-anchor the offer at the SBC's address facing the far leg.
-        let sdp_str = String::from_utf8_lossy(body);
+        // RFC 4568 §8: the new offer's keying (`media_security`); a refused
+        // offer leaves the session as it was (RFC 3261 §14.2).
+        let sdp_str = match self.secure_in_dialog_offer(body, &addrs, from_a_leg) {
+            Ok(s) => s,
+            Err(v) => {
+                return self.refuse_insecure_in_dialog_offer(req, source, &addrs, from_a_leg, v);
+            }
+        };
         let session_key = internal_id.to_string();
         // T.38 (RFC 3362 / T.38 Annex D): classify the offer. `None` keeps
         // the legacy audio handling; an image stream the relay cannot carry
@@ -5179,7 +5188,17 @@ impl SipStack {
         let content_type = req.headers.get_value(&HeaderName::ContentType);
         let body: Option<Bytes> = match (body, content_type) {
             (Some(b), Some(ct)) if is_sdp_content_type(ct) => {
-                let sdp_str = String::from_utf8_lossy(b);
+                // RFC 4568 §8 (`media_security`): offer rules, or answer
+                // rules for a PRACK answering a reliable 1xx offer (RFC 3262
+                // §5); 488 on refusal.
+                let role = media_security::relayed_request_role(&method, &addrs);
+                let sdp_str = match self.secure_in_dialog_body(b, &addrs, from_a_leg, role) {
+                    Ok(s) => s,
+                    Err(v) => {
+                        return self
+                            .refuse_insecure_in_dialog_offer(req, source, &addrs, from_a_leg, v);
+                    }
+                };
                 if let Some(ref pipeline) = self.media_pipeline
                     && let Some(media) = extract_media_address(&sdp_str)
                     && let Some(addr) = admitted_media_addr(&media)
@@ -5194,6 +5213,16 @@ impl SipStack {
                         .rewrite_reinvite(&sdp_str, &local_media)
                         .rewritten,
                 ))
+            }
+            // SI-10: parts are not walked, so SDP inside multipart is refused.
+            (Some(b), Some(ct)) if media_security::multipart_carries_sdp(ct, b) => {
+                return self.refuse_insecure_in_dialog_offer(
+                    req,
+                    source,
+                    &addrs,
+                    from_a_leg,
+                    proto_b2bua::MediaPolicyViolation::SdpInMultipart,
+                );
             }
             (Some(b), Some(_)) => Some(b.clone()),
             // RFC 3261 §7.4.1: a body without Content-Type is not relayable.
@@ -5379,13 +5408,31 @@ impl SipStack {
                 resp.headers.get_value(&HeaderName::ContentType),
             ) {
                 let b = if is_sdp_content_type(ct) {
-                    let sdp_str = String::from_utf8_lossy(b);
+                    // RFC 4568 §8 / §7.1.2 (`media_security`).
+                    let sdp_str = match self.secure_relayed_answer(b, addrs, pending.from_a_leg) {
+                        Ok(s) => s,
+                        Err(v) => {
+                            return self
+                                .refuse_insecure_relayed_answer(internal_id, addrs, pending, v)
+                                .await;
+                        }
+                    };
                     let local_media = leg_local_media(addrs, !pending.from_a_leg);
                     Bytes::from(
                         self.sdp_rewriter
                             .rewrite_reinvite(&sdp_str, &local_media)
                             .rewritten,
                     )
+                } else if media_security::multipart_carries_sdp(ct, b) {
+                    // SI-10: parts are not walked; SDP in multipart is refused.
+                    return self
+                        .refuse_insecure_relayed_answer(
+                            internal_id,
+                            addrs,
+                            pending,
+                            proto_b2bua::MediaPolicyViolation::SdpInMultipart,
+                        )
+                        .await;
                 } else {
                     b.clone()
                 };
@@ -5496,6 +5543,20 @@ impl SipStack {
             };
         }
 
+        // RFC 4568 §8 / §7.1.2: the answer's keying (`media_security`); the
+        // policy's output is what crosses.
+        let secured = match resp.body.as_deref().filter(|b| !b.is_empty()) {
+            Some(body) => match self.secure_relayed_answer(body, addrs, pending.from_a_leg) {
+                Ok(s) => Some(s),
+                Err(v) => {
+                    return self
+                        .refuse_insecure_in_dialog_answer(internal_id, addrs, pending, v)
+                        .await;
+                }
+            },
+            None => None,
+        };
+
         // 2xx: re-anchor the answer toward the originator.
         relay_session_timer_response_headers(&resp.headers, &mut ok.headers);
         ok.headers.set(
@@ -5505,7 +5566,14 @@ impl SipStack {
         let session_key = internal_id.to_string();
         let mut t38 = T38AnswerOutcome::default();
         let answer_sdp = self
-            .reanchor_reinvite_answer(resp, pending, addrs, &session_key, &mut ok, &mut t38)
+            .reanchor_reinvite_answer(
+                secured.as_deref(),
+                pending,
+                addrs,
+                &session_key,
+                &mut ok,
+                &mut t38,
+            )
             .await;
         let relayed = SipMessage::Response(ok);
 
@@ -5606,18 +5674,18 @@ impl SipStack {
     /// relay learns the answerer's media address (or, when T.38 is involved,
     /// `apply_t38_answer` moves it), the SDP is rewritten to the SBC's
     /// address and DTLS identity, and set as `ok`'s body. Returns the
-    /// rewritten answer, or `None` for a body-less 2xx.
+    /// rewritten answer, or `None` for a body-less 2xx. `secured` is the
+    /// answer as the media security policy let it cross.
     async fn reanchor_reinvite_answer(
         &self,
-        resp: &SipResponse,
+        secured: Option<&str>,
         pending: &PendingReinvite,
         addrs: &CallAddresses,
         session_key: &str,
         ok: &mut SipResponse,
         t38: &mut T38AnswerOutcome,
     ) -> Option<Bytes> {
-        let body = resp.body.as_ref().filter(|b| !b.is_empty())?;
-        let sdp_str = String::from_utf8_lossy(body);
+        let sdp_str = secured?;
         let local_media = if pending.from_a_leg {
             MediaAddress::new(&addrs.media_a_leg_ip, a_leg_media_port(addrs))
         } else {
@@ -5625,7 +5693,7 @@ impl SipStack {
         };
         let mut answer = if let Some(sw) = &pending.switch {
             self.apply_t38_answer(
-                &sdp_str,
+                sdp_str,
                 sw,
                 pending.from_a_leg,
                 session_key,
@@ -5635,7 +5703,7 @@ impl SipStack {
             .await
         } else {
             if let Some(ref pipeline) = self.media_pipeline
-                && let Some(media) = extract_media_address(&sdp_str)
+                && let Some(media) = extract_media_address(sdp_str)
                 && let Some(addr) = admitted_media_addr(&media)
             {
                 let _ = pipeline
@@ -5643,7 +5711,7 @@ impl SipStack {
                     .await;
             }
             self.sdp_rewriter
-                .rewrite_answer_for_a_leg(&sdp_str, &local_media)
+                .rewrite_answer_for_a_leg(sdp_str, &local_media)
                 .rewritten
         };
         if let Some(fp) = &self.dtls_fingerprint_source {
@@ -8731,7 +8799,19 @@ impl SipStack {
         if status_code == 183
             && let Some(ref body) = resp.body
         {
-            let sdp_str = String::from_utf8_lossy(body);
+            // RFC 4568 §8 / §7.1.2: the early answer's keying may not cross
+            // (`media_security`); the call is refused, not relayed.
+            let secured = match self.secure_initial_response(body, addrs) {
+                Ok(s) => s,
+                Err(v) => {
+                    return self
+                        .refuse_insecure_early_answer(internal_id, addrs, v)
+                        .await;
+                }
+            };
+            let sdp_str = secured
+                .as_deref()
+                .map_or_else(|| String::from_utf8_lossy(body), std::borrow::Cow::Borrowed);
             // Advertise the relay's caller-facing port (allocated at INVITE) when
             // anchored, so the early-media answer matches the eventual 200. The
             // relay itself starts on the 200 OK. Bare-port fallback otherwise.
@@ -8935,6 +9015,20 @@ impl SipStack {
             };
         }
 
+        // RFC 4568 §8 / §7.1.2: the answer's keying is checked before it is
+        // relayed and before any relay starts (`media_security`).
+        let secured_answer = match resp.body.as_deref().filter(|b| !b.is_empty()) {
+            Some(body) => match self.secure_initial_response(body, addrs) {
+                Ok(s) => s,
+                Err(v) => {
+                    return self
+                        .refuse_insecure_answer(resp, internal_id, addrs, v)
+                        .await;
+                }
+            },
+            None => None,
+        };
+
         // Build 200 OK for A-leg with rewritten SDP, carrying the A-leg
         // dialog's own Via/From/To/CSeq.
         let mut a_response = build_a_leg_response(StatusCode::OK, addrs);
@@ -8947,15 +9041,22 @@ impl SipStack {
         // both directions. The advertised A-leg port is the relay's
         // caller-facing port allocated at INVITE time.
         let mut terminated = false;
+        // The answer as the media security policy let it cross: the T.38
+        // check and every rewrite below start from it, never from the raw
+        // body (a stripped `a=crypto` must not come back).
+        let answer_sdp = resp.body.as_ref().map(|body| {
+            secured_answer
+                .as_deref()
+                .map_or_else(|| String::from_utf8_lossy(body), std::borrow::Cow::Borrowed)
+        });
         // Direct T.38 call (image-only initial offer): the callee's answer is
         // validated and clamped like a re-INVITE answer.
-        let initial_t38 = resp
-            .body
-            .as_ref()
+        let initial_t38 = answer_sdp
+            .as_deref()
             .filter(|_| addrs.initial_offer_kind == crate::t38::CallMediaKind::Image)
-            .map(|body| {
+            .map(|sdp| {
                 crate::t38::check_answer(
-                    &String::from_utf8_lossy(body),
+                    sdp,
                     addrs.anchored_index,
                     crate::t38::CallMediaKind::Image,
                     &self.t38,
@@ -8966,14 +9067,13 @@ impl SipStack {
             _ => None,
         };
         let mut kind_failed = None;
-        if let Some(ref body) = resp.body {
-            let sdp_str = String::from_utf8_lossy(body);
+        if let Some(sdp_str) = answer_sdp.as_deref() {
             let rtp_port = if let (Some(pipeline), Some(a_port)) =
                 (&self.media_pipeline, addrs.media_a_leg_port)
             {
                 let session_key = internal_id.to_string();
                 (terminated, kind_failed) = self
-                    .anchor_answer_relay(&**pipeline, &session_key, addrs, &sdp_str, t38_answer)
+                    .anchor_answer_relay(&**pipeline, &session_key, addrs, sdp_str, t38_answer)
                     .await;
                 a_port
             } else {
@@ -8989,7 +9089,7 @@ impl SipStack {
             let rewritten = t38_answer.map_or_else(
                 || {
                     self.sdp_rewriter
-                        .rewrite_answer_for_a_leg(&sdp_str, &local_media)
+                        .rewrite_answer_for_a_leg(sdp_str, &local_media)
                         .rewritten
                 },
                 |c| SdpRewriter::rewrite_with_selection(&c.sdp, &local_media, &c.stream),
@@ -9074,6 +9174,9 @@ impl SipStack {
             },
         ));
 
+        // POAM: POA&M-349 - a 2xx that carries an offer (the caller sent no
+        // SDP) is ACKed without the answer RFC 3264 §5 / RFC 3261 §13.2.2.4
+        // require; the caller's answer in its ACK is not relayed.
         let ack_request = Self::initial_invite_ack(resp, addrs);
 
         info!(
@@ -9952,7 +10055,7 @@ impl SipStack {
         // place (RFC 3264 §8) by the B-leg rewrite.
         //
         // ## NIST 800-53 Rev5: CM-7, SI-10, AU-2
-        let t38_offer = match req.body.as_ref().filter(|b| !b.is_empty()) {
+        let mut t38_offer = match req.body.as_ref().filter(|b| !b.is_empty()) {
             Some(body) => match crate::t38::classify_offer(
                 &String::from_utf8_lossy(body),
                 crate::t38::CallMediaKind::Audio,
@@ -10507,6 +10610,40 @@ impl SipStack {
             None => (None, Vec::new(), dest_user.clone(), None),
         };
 
+        // RFC 4568 §8 / §8.3, CNSA 2.0: SDES keying in the offer crosses
+        // only when both signalling hops are TLS, and only as
+        // AEAD_AES_256_GCM. Checked once the B-leg transport is known and
+        // before any media or recording state exists; a key that crosses
+        // keeps failover on TLS trunks (lease `tls_only`, as for `sips:`).
+        //
+        // ## NIST 800-53 Rev5: SC-8, SC-12, SC-13, CM-6, AU-2
+        let mut trunk_lease = trunk_lease;
+        let secured_offer = match self.secure_initial_offer(
+            req.body.as_deref(),
+            &media_security::legs(transport, b_leg_flow.transport),
+            t38_offer.as_mut(),
+        ) {
+            Ok((secured, sdes_crossed)) => {
+                if sdes_crossed && let Some(lease) = trunk_lease.as_mut() {
+                    lease.tls_only = true;
+                }
+                secured
+            }
+            Err(violation) => {
+                warn!(call_id = %a_leg_call_id, reason = violation.as_str(), "INVITE offer refused by media security policy, 488");
+                audit_invite_denied(req, source, &media_security::policy_label(violation));
+                self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                reject_cdr(488, uc_cdr::ReleaseCause::PolicyDenied);
+                self.release_slots(
+                    trunk_lease.as_ref(),
+                    vps_callee.as_deref(),
+                    TrunkOutcome::Abandoned,
+                )
+                .await;
+                return media_security::offer_refusal(req, source, violation, &self.config.domain);
+            }
+        };
+
         // 4. Create B2BUA call
         let internal_call_id = CallId::generate();
 
@@ -10680,7 +10817,9 @@ impl SipStack {
         let dtls_caller_fingerprint = caller_dtls.map(|d| d.fingerprint);
 
         let b_leg_sdp = req.body.as_ref().map(|body| {
-            let sdp_str = String::from_utf8_lossy(body);
+            let sdp_str = secured_offer
+                .as_deref()
+                .map_or_else(|| String::from_utf8_lossy(body), std::borrow::Cow::Borrowed);
             let local_media = MediaAddress::new(&b_media_ip_str, b_leg_rtp_port);
             let mut rewritten = t38_offer.as_ref().map_or_else(
                 || {
@@ -13514,6 +13653,8 @@ pub mod tests {
 
     // SIPREC recording session tests (sans-IO, with a mock media controller).
     mod recording;
+    // Call-leg SDP media security (SDES key and suite relay; RFC 4568 §8).
+    mod media_security;
     pub use recording::{rs_byes_queued_at_shutdown, rs_invite_for_server};
 
     /// For server tests: a stack with trunks t1 (127.0.0.2:5061) and t2

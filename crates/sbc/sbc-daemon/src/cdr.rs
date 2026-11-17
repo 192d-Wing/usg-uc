@@ -526,6 +526,20 @@ impl CdrEnd {
         )
     }
 
+    /// The SBC refused a call whose SDP keying breaks the media security
+    /// policy (SDES over an insecure hop, a non-CNSA suite). The caller
+    /// gets 488 (RFC 3261 §21.4.26).
+    ///
+    /// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records)
+    pub const fn media_security() -> Self {
+        Self::new(
+            Disposition::Failed,
+            ReleaseCause::PolicyDenied,
+            ReleaseSide::Sbc,
+            488,
+        )
+    }
+
     /// The SBC released the dialog because a leg went away (2xx never ACKed,
     /// relayed re-INVITE timed out or got 481).
     pub const fn dialog_lost(answered: bool, status: u16) -> Self {

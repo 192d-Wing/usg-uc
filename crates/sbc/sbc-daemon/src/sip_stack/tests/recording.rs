@@ -1298,10 +1298,77 @@ async fn fork_errors_apply_the_policy() {
     }
 }
 
-const SAVP_OFFER: &str = "v=0\r\no=- 1 1 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\n\
-    m=audio 4000 RTP/SAVP 0\r\na=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n";
-const SAVP_ANSWER: &str = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
-    m=audio 5000 RTP/SAVP 0\r\na=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n";
+/// A call leg's SDES line (key: 44 octets, bytes 0..44; not a secret and
+/// not [`SRS_KEY`]). SDES keying only crosses as AEAD_AES_256_GCM between
+/// TLS legs (RFC 4568 §8.3, CNSA 2.0; see [`tls_fixture`], [`tls_legs`]).
+const LEG_CRYPTO: &str = concat!(
+    "a=crypto:1 AEAD_AES_256_GCM inline:",
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKis=",
+    "\r\n"
+);
+const SAVP_OFFER: &str = concat!(
+    "v=0\r\no=- 1 1 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\n",
+    "m=audio 4000 RTP/SAVP 0\r\n",
+    "a=crypto:1 AEAD_AES_256_GCM inline:",
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKis=",
+    "\r\n"
+);
+const SAVP_ANSWER: &str = concat!(
+    "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n",
+    "m=audio 5000 RTP/SAVP 0\r\n",
+    "a=crypto:1 AEAD_AES_256_GCM inline:",
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKis=",
+    "\r\n"
+);
+
+/// A [`fixture`] whose trunks are TLS (at the [`t1`] / [`t2`] addresses),
+/// for calls placed with [`place_tls`]: SDES keying only crosses when both
+/// signalling hops are TLS (RFC 4568 §8.3).
+async fn tls_fixture(on_failure: RecordingFailureAction) -> Fixture {
+    let mut stack = SipStack::new(SipStackConfig::default());
+    let (routing, dial_plans, mut groups) = carrier_routing(10, ("none", ""), ["tls", "tls"]);
+    for trunk in groups.iter_mut().flat_map(|g| g.trunks.iter_mut()) {
+        trunk.port = 5060;
+    }
+    stack.init_router_from_config(&routing, &dial_plans, &groups);
+    stack
+        .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+        .await;
+    let cdr = cdr_emitter();
+    stack.set_cdr(Arc::new(crate::cdr::CdrContext::new(
+        Arc::clone(&cdr),
+        &sbc_config::schema::CdrConfig::default(),
+    )));
+    let media = Arc::new(ForkMedia::default());
+    stack.set_media_pipeline(Arc::clone(&media) as _);
+    stack.set_recording(settings(on_failure));
+    Fixture { stack, media, cdr }
+}
+
+/// Alice's INVITE for `call_id` to `user` with `offer`, received over TLS.
+async fn place_tls(stack: &SipStack, user: &str, call_id: &str, offer: &str) -> Vec<ProcessResult> {
+    flatten(
+        stack
+            .process_message_on(
+                &caller_request("INVITE", user, call_id, 1, None, Some(offer)),
+                alice(),
+                None,
+                AddrTransport::Tls,
+            )
+            .await,
+    )
+}
+
+/// Marks both signalling legs of the established `call_id` as TLS, as if it
+/// had been placed and routed over TLS, so an in-dialog SDES offer may
+/// cross (RFC 4568 §8.3). For tests about the recording, not the transport.
+async fn tls_legs(stack: &SipStack, call_id: &str) {
+    let mut corr = stack.call_correlation.write().await;
+    let id = corr.a_leg.get(call_id).cloned().expect("call is up");
+    let addrs = corr.addresses.get_mut(&id).expect("call record");
+    addrs.a_leg_flow.transport = AddrTransport::Tls;
+    addrs.b_leg_flow.transport = AddrTransport::Tls;
+}
 
 /// Places a call with `offer` that the INVITE alone shows to be
 /// unrecordable. Under `reject` it must be refused there (RFC-001 a);
@@ -1314,12 +1381,14 @@ async fn assert_refused_at_invite(
     answer: &str,
 ) {
     let capture = uc_audit::capture::start();
+    // Over TLS, so an SDES offer may cross to a TLS trunk (RFC 4568 §8.3).
     let placed = flatten(
         f.stack
-            .process_message(
+            .process_message_on(
                 &caller_request("INVITE", DIALED, call_id, 1, None, offer),
                 alice(),
                 None,
+                AddrTransport::Tls,
             )
             .await,
     );
@@ -1356,7 +1425,7 @@ async fn assert_refused_at_invite(
 #[tokio::test]
 async fn srtp_passthrough_call_is_not_recordable() {
     for policy in [REJECT, CONTINUE] {
-        let f = fixture(policy).await;
+        let f = tls_fixture(policy).await;
         assert_refused_at_invite(&f, "savp@test", policy, Some(SAVP_OFFER), SAVP_ANSWER).await;
     }
 }
@@ -1416,22 +1485,12 @@ async fn zrtp_call_is_not_recordable() {
 // the callee is still ACKed.
 #[tokio::test]
 async fn answer_dependent_unrecordable_call_is_refused_before_the_200_is_relayed() {
-    const CRYPTO: &str =
-        "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n";
-    let offer = format!("{ALICE_SDP}{CRYPTO}");
-    let answer = format!("{BOB_SDP}{CRYPTO}");
+    let offer = format!("{ALICE_SDP}{LEG_CRYPTO}");
+    let answer = format!("{BOB_SDP}{LEG_CRYPTO}");
     for policy in [REJECT, CONTINUE] {
-        let f = fixture(policy).await;
+        let f = tls_fixture(policy).await;
         let capture = uc_audit::capture::start();
-        let placed = flatten(
-            f.stack
-                .process_message(
-                    &caller_request("INVITE", DIALED, "osrtp@test", 1, None, Some(&offer)),
-                    alice(),
-                    None,
-                )
-                .await,
-        );
+        let placed = place_tls(&f.stack, DIALED, "osrtp@test", &offer).await;
         let b_invite = forwarded(&placed, &Method::Invite)
             .expect("the offer alone does not rule the call out")
             .0
@@ -2266,6 +2325,7 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
     for policy in [REJECT, CONTINUE] {
         let f = fixture(policy).await;
         let inv = rs_invite(&answered(&f.stack, "up@test").await);
+        tls_legs(&f.stack, "up@test").await;
         srs_ok(&f.stack, &inv).await;
         f.stack
             .process_message(

@@ -377,10 +377,6 @@ async fn qa_real_pipeline_forks_decryptable_media_to_the_fake_srs() {
     assert_eq!(call.stack.recording_counters().slots_held(), 0);
 }
 
-/// An SDES key line of a call leg (passthrough SRTP the SBC cannot read).
-const LEG_CRYPTO: &str =
-    "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n";
-
 // Fail secure with the real pipeline: a recorded cleartext call that is
 // re-negotiated to SDES SRTP (passed through unread) must stop reaching the
 // recorder. Under `continue` the call stays up and its media is still
@@ -396,6 +392,7 @@ async fn qa_real_pipeline_stops_forking_when_the_call_becomes_srtp_passthrough()
     };
     for (policy, port_min) in [(CONTINUE, 44_200), (REJECT, 44_400)] {
         let call = Box::pin(LiveCall::start(ip, policy, "live-up@test", port_min)).await;
+        tls_legs(&call.stack, call.call_id).await;
         let fork_ports = audio_ports(call.rs_invite.body.as_ref().unwrap());
         call.srs_answers().await;
         call.alice_sends(1, &[0x11; 160]).await;
@@ -939,17 +936,9 @@ async fn qa_emergency_call_survives_every_recording_failure_under_reject() {
 
     // Media the SBC cannot read (SDES passthrough).
     {
-        let f = fixture(REJECT).await;
+        let f = tls_fixture(REJECT).await;
         let capture = uc_audit::capture::start();
-        let placed = flatten(
-            f.stack
-                .process_message(
-                    &caller_request("INVITE", "911", ID, 1, None, Some(SAVP_OFFER)),
-                    alice(),
-                    None,
-                )
-                .await,
-        );
+        let placed = place_tls(&f.stack, "911", ID, SAVP_OFFER).await;
         let results = answer_with(&f.stack, &placed, SAVP_ANSWER).await;
         assert!(to_srs(&results, &Method::Invite).is_none());
         assert_emergency_kept(
@@ -1157,6 +1146,7 @@ async fn qa_callee_initiated_switch_to_srtp_passthrough_ends_the_recording() {
         let inv = rs_invite(&answer_with(&f.stack, &placed, BOB_SDP).await);
         srs_ok(&f.stack, &inv).await;
         caller_ack(&f.stack, "bup@test").await;
+        tls_legs(&f.stack, "bup@test").await;
 
         let capture = uc_audit::capture::start();
         let from = format!(
@@ -1656,6 +1646,7 @@ async fn qa_update_to_srtp_passthrough_ends_the_recording() {
     for policy in [REJECT, CONTINUE] {
         let f = fixture(policy).await;
         let inv = rs_invite(&answered(&f.stack, "upd@test").await);
+        tls_legs(&f.stack, "upd@test").await;
         srs_ok(&f.stack, &inv).await;
         f.stack
             .process_message(

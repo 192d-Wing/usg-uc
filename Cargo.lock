@@ -5353,6 +5353,7 @@ dependencies = [
 name = "proto-b2bua"
 version = "0.10.0"
 dependencies = [
+ "proptest",
  "proto-sdp",
  "thiserror 2.0.21",
 ]
