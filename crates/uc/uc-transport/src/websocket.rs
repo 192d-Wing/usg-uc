@@ -547,7 +547,11 @@ impl WebSocketListener {
                 .map_err(|e| TransportError::Io {
                     reason: format!("Accept failed: {e}"),
                 })?;
-        Ok((tcp_stream, SbcSocketAddr::from(peer_addr)))
+        // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 - IPv4-mapped peers reported as plain IPv4.
+        Ok((
+            tcp_stream,
+            SbcSocketAddr::from(crate::canonical_peer(peer_addr)),
+        ))
     }
 
     /// Completes the WebSocket upgrade on a stream from [`Self::accept_tcp`].
@@ -839,5 +843,53 @@ mod tests {
         };
         assert_eq!(status, Some(StatusCode::BAD_REQUEST));
         assert!(server.await.unwrap().is_err());
+    }
+
+    // NIST 800-53 Rev5: SC-7, SI-10
+    // An IPv4 client on a dual-stack `[::]` listener is reported with its
+    // plain IPv4 address (not `::ffff:a.b.c.d`), both from `accept_tcp` and
+    // on the upgraded transport.
+    #[tokio::test]
+    async fn ws_dual_stack_accept_tcp_reports_plain_ipv4_peer() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let bind = SbcSocketAddr::new_v6(Ipv6Addr::UNSPECIFIED, 0);
+        let Ok(l) = WebSocketListener::bind(&bind, false).await else {
+            crate::skip_dual_stack("cannot bind [::]:0 (no IPv6)");
+            return;
+        };
+        let l = Arc::new(l.with_options(WebSocketListenerOptions {
+            require_sip_subprotocol: false,
+        }));
+        let port = local(&l).port();
+        let accept = {
+            let l = Arc::clone(&l);
+            tokio::spawn(async move {
+                let (tcp, peer) = l.accept_tcp().await?;
+                let ws = l.complete_handshake(tcp, peer).await?;
+                Ok::<_, TransportError>((peer, ws))
+            })
+        };
+        let v4 = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let probe =
+            tokio::time::timeout(std::time::Duration::from_secs(2), TcpStream::connect(v4)).await;
+        let Ok(Ok(tcp)) = probe else {
+            crate::skip_dual_stack("127.0.0.1 cannot reach a [::] listener (no dual-stack)");
+            accept.abort();
+            return;
+        };
+        let (_ws, _resp) = tokio_tungstenite::client_async(request(v4, Some("sip")), tcp)
+            .await
+            .unwrap();
+        let (peer, server) = accept.await.unwrap().unwrap();
+        assert!(
+            peer.is_ipv4(),
+            "accept_tcp peer must be plain IPv4, got {peer}"
+        );
+        assert_eq!(peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let transport_peer = *server.peer_addr();
+        assert!(
+            transport_peer.is_ipv4(),
+            "transport peer_addr must be plain IPv4, got {transport_peer}"
+        );
     }
 }
