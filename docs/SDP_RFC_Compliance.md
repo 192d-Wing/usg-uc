@@ -9,7 +9,7 @@ This document tracks RFC compliance for the Session Description Protocol (SDP) i
 
 The client implements SDP for audio-only calls in two modes: plain RTP (`RTP/AVP`, only in `insecure-transports` builds on UDP/TCP accounts) and DTLS-SRTP with ICE (`UDP/TLS/RTP/SAVPF`, TLS accounts). By-design exclusions are SDES and TCP candidates.
 
-**Status (2026-11-17, feat/client-dtls-wiring; corrects the 2026-11-15 note that the DTLS-SRTP mode was signalling only).** The client offers and checks `a=fingerprint`, `a=setup` and `a=rtcp-mux`, and since 2026-11-17 acts on them: a call on a TLS account runs a DTLS 1.2 handshake on its media socket in the role `a=setup` gives it, the peer's certificate must match an `a=fingerprint` of this dialog's SDP, and audio starts as SRTP under the exported keys. A call whose handshake does not complete is ended with no audio; plaintext RTP is never sent on a stream signalled as SAVPF. Evidence is local test runs only (see `docs/NIST-800-53-CONTROLS.md`, "Soft client media security"). Open items: no new handshake when a re-INVITE changes fingerprint, setup or the remote transport address (POA&M-327), delayed-offer INVITEs rejected (POA&M-329), no RFC 8844 binding of the fingerprint (POA&M-333), and the answer still built from a template (RFC 3264 §6, baseline finding RFC-006). See "RFC 8122" and "RFC 5763 / RFC 4145 / RFC 5761" below.
+**Status (2026-11-17, feat/client-dtls-wiring; corrects the 2026-11-15 note that the DTLS-SRTP mode was signalling only).** The client offers and checks `a=fingerprint`, `a=setup` and `a=rtcp-mux`, and since 2026-11-17 acts on them: a call on a TLS account runs a DTLS 1.2 handshake on its media socket in the role `a=setup` gives it, the peer's certificate must match an `a=fingerprint` of this dialog's SDP, and audio starts as SRTP under the exported keys. A call whose handshake does not complete is ended with no audio; plaintext RTP is never sent on a stream signalled as SAVPF. Evidence is local test runs and the CI runs on PR #208's merged head, on Ubuntu x86_64 (see `docs/NIST-800-53-CONTROLS.md`, "Soft client media security"). Open items: no new handshake when a re-INVITE changes fingerprint, setup or the remote transport address (POA&M-327), delayed-offer INVITEs rejected (POA&M-329), no RFC 8844 binding of the fingerprint (POA&M-333), and the answer still built from a template (RFC 3264 §6, baseline finding RFC-006). See "RFC 8122" and "RFC 5763 / RFC 4145 / RFC 5761" below.
 
 ---
 
@@ -179,7 +179,7 @@ The client implements SDP for audio-only calls in two modes: plain RTP (`RTP/AVP
 
 ### RFC 8122 - Connection-Oriented Media over TLS in SDP ⚠️ PARTIAL
 
-**Status**: Partial. Fingerprints are generated and parsed, and since 2026-11-17 the peer's certificate is verified against them in the DTLS handshake (local test runs only). Partial because only `sha-384` / `sha-512` are accepted (deviation), a changed fingerprint in a re-INVITE starts no new association (NIST POA&M-327), and RFC 8844 is not implemented (NIST POA&M-333). Corrected 2026-11-15: this section previously said "fully compliant" and showed a `sha-256` fingerprint, which the client neither sends nor accepts.
+**Status**: Partial. Fingerprints are generated and parsed, and since 2026-11-17 the peer's certificate is verified against them in the DTLS handshake (local test runs and CI on Ubuntu x86_64). Partial because only `sha-384` / `sha-512` are accepted (deviation), a changed fingerprint in a re-INVITE starts no new association (NIST POA&M-327), and RFC 8844 is not implemented (NIST POA&M-333). Corrected 2026-11-15: this section previously said "fully compliant" and showed a `sha-256` fingerprint, which the client neither sends nor accepts.
 **Priority**: MEDIUM
 **Link**: <https://datatracker.ietf.org/doc/html/rfc8122>
 
@@ -486,13 +486,13 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 | RFC 4733 | RTP Payload for DTMF | ⚠️ Partial (SBC negotiation not wired, POA&M-142) | n/a |
 | RFC 3550 | RTP Transport Protocol | ✅ Compliant | 98% |
 | RFC 5245 | ICE | ⚠️ Partial (external lib) | 70% |
-| RFC 8122 | DTLS in SDP | ⚠️ Partial (sha-384/512 only; peer certificate verified against the fingerprint since 2026-11-17, local test runs only; no new association on a changed fingerprint, POA&M-327; no RFC 8844, POA&M-333) | n/a |
+| RFC 8122 | DTLS in SDP | ⚠️ Partial (sha-384/512 only; peer certificate verified against the fingerprint since 2026-11-17, local test runs and CI; no new association on a changed fingerprint, POA&M-327; no RFC 8844, POA&M-333) | n/a |
 | RFC 5763 / 4145 / 5761 | DTLS-SRTP setup role, rtcp-mux | ⚠️ Partial (role drives the handshake since 2026-11-17; handshake starts at 200 / ACK, POA&M-331; no new association on re-INVITE, POA&M-327; delayed offer rejected, POA&M-329) | n/a |
 | RFC 7587 | RTP Payload for Opus | ⚠️ Partial (POA&M-141, POA&M-142) | n/a |
 | RFC 4568 | SDP Security Descriptions | ❌ Not implemented for call legs (by design); used on the SIPREC recording session only | n/a |
 | RFC 7866 | SIPREC SDP (`a=label`, `a=recordpref`, `a=record`) | ⚠️ Partial (no `a=record`, POA&M-303) | n/a |
 
-**Overall Compliance**: no single figure is given since 2026-11-15. The earlier "~98%" predates the fix/client-srtp-b2 review, which found that the DTLS-SRTP path carried no secured media; see the status correction at the top. Since 2026-11-17 the DTLS-SRTP path carries secured media (local test runs only).
+**Overall Compliance**: no single figure is given since 2026-11-15. The earlier "~98%" predates the fix/client-srtp-b2 review, which found that the DTLS-SRTP path carried no secured media; see the status correction at the top. Since 2026-11-17 the DTLS-SRTP path carries secured media (local test runs and CI).
 
 ---
 
@@ -542,6 +542,7 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 | 2026-11-15 | fix/client-srtp-b2: status correction (DTLS-SRTP is signalling only, POA&M-324); RFC 8122 lowered to Partial (sha-384/512 only, no verification); RFC 3264 lowered to Partial (RFC-006, POA&M-329); added RFC 5763 / 4145 / 5761 section; m-line examples corrected | compliance-scribe |
 | 2026-11-16 | feat/client-dtls-handshake Stage 1: no SDP behaviour change and no status change; RFC 8122 verification note updated (library `DtlsAssociation` exists, client not wired, POA&M-324) | compliance-scribe |
 | 2026-11-17 | feat/client-dtls-wiring Stage 2: no change to the SDP the client sends or accepts; the DTLS-SRTP attributes now drive a handshake on the media socket and the peer certificate is verified against `a=fingerprint`; status notes for RFC 8122 and RFC 5763 / 4145 / 5761 updated; open items POA&M-327, -329, -331, -333 | compliance-scribe |
+| 2026-11-17 | docs/poam-324-326-ci-evidence: evidence notes updated for the green CI runs on PR #208's head (`4dfea0d`, Ubuntu x86_64); no status change | Claude Opus 5.5 |
 | 2026-02-07 | **FIXED**: proto-sdp: Updated RFC 4566 references to RFC 8866 | Claude Sonnet 4.5 |
 | 2026-02-07 | **FIXED**: proto-sdp: Removed duplicate doc comments, exported BandwidthInfo | Claude Sonnet 4.5 |
 

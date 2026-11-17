@@ -409,7 +409,7 @@ Stage 2 requirements recorded by the security review (13, summarised; they are o
 
 ### Soft client DTLS-SRTP signalling and media gate (RFC 5763, 5764, 8122, 4145, 5761, 7983, 3711; fix/client-srtp-b2)
 
-Added 2026-11-15, rewritten 2026-11-17 for feat/client-dtls-wiring (Stage 2). The soft client has no plaintext RTP path in default-feature (TLS) builds, and since Stage 2 a call on a TLS account runs a DTLS 1.2 handshake on its media socket (`client-sip-ua/src/dtls_driver.rs` driving `proto_dtls::DtlsAssociation`) and carries SRTP / SRTCP under the exported keys. A call whose handshake does not complete ends with no audio and is never reported Connected. The rows below say what the code does today. Statuses are from local runs on macOS arm64 only (nothing on Linux or in CI yet): unit and gate tests (`client-core/tests/media_security_gate.rs` unless another file is named), the driver and call tests (`client-sip-ua/tests/dtls_*.rs`, `client-core/tests/dtls_*.rs`), and two `#[ignore]` interoperability tests run by hand: pion/dtls v3.1.5 in both roles (`client-core/tests/dtls_interop_pion.rs`) and two client media stacks through the SBC relay and Go sidecar (`client-integration-tests/tests/dtls_sbc_sidecar.rs`). Not shown: a call set up by SIP through `sbc-daemon`, the audio pipeline with devices, any other peer (NIST POA&M-339). The RFC reviewer cited RFC 7160 §4.1 from memory; that section number was not re-checked against the RFC text.
+Added 2026-11-15, rewritten 2026-11-17 for feat/client-dtls-wiring (Stage 2). The soft client has no plaintext RTP path in default-feature (TLS) builds, and since Stage 2 a call on a TLS account runs a DTLS 1.2 handshake on its media socket (`client-sip-ua/src/dtls_driver.rs` driving `proto_dtls::DtlsAssociation`) and carries SRTP / SRTCP under the exported keys. A call whose handshake does not complete ends with no audio and is never reported Connected. The rows below say what the code does today. Statuses are from local runs on macOS arm64 and, on the merged PR head (`4dfea0d`, 2026-11-17), from CI on Ubuntu x86_64 (`CI` and `SRTP audio gate` workflows): unit and gate tests (`client-core/tests/media_security_gate.rs` unless another file is named), the driver and call tests (`client-sip-ua/tests/dtls_*.rs`, `client-core/tests/dtls_*.rs`), and two `#[ignore]` interoperability tests, run by hand and by the `SRTP audio gate` workflow: pion/dtls v3.1.5 in both roles (`client-core/tests/dtls_interop_pion.rs`) and two client media stacks through the SBC relay and Go sidecar (`client-integration-tests/tests/dtls_sbc_sidecar.rs`). Not shown: a call set up by SIP through `sbc-daemon`, the audio pipeline with devices, any other peer (NIST POA&M-339). The RFC reviewer cited RFC 7160 §4.1 from memory; that section number was not re-checked against the RFC text.
 
 | Behaviour | Status | Wiring | Notes |
 |-----------|--------|--------|-------|
@@ -473,7 +473,7 @@ Added 2026-11-15, rewritten 2026-11-17 for feat/client-dtls-wiring (Stage 2). Th
 
 ### RFC 3711 Section Mapping
 
-Soft-client wiring note (fix/client-srtp-b2; updated 2026-11-17): where a row says "soft client", the call site is in `client-audio`. A default-feature (TLS) build reaches it only with DTLS-SRTP keys, which since feat/client-dtls-wiring come from the handshake the client runs on the media socket (local test runs only so far; see "Soft client DTLS-SRTP signalling and media gate"). Before fix/client-srtp-b2 the soft client sent plaintext RTP on streams signalled as SAVPF (review BLOCKER B2).
+Soft-client wiring note (fix/client-srtp-b2; updated 2026-11-17): where a row says "soft client", the call site is in `client-audio`. A default-feature (TLS) build reaches it only with DTLS-SRTP keys, which since feat/client-dtls-wiring come from the handshake the client runs on the media socket (local test runs, and CI on Ubuntu x86_64 on PR #208's merged head; see "Soft client DTLS-SRTP signalling and media gate"). Before fix/client-srtp-b2 the soft client sent plaintext RTP on streams signalled as SAVPF (review BLOCKER B2).
 
 | Section | Title | Status | Wiring | Notes |
 |---------|-------|--------|--------|-------|
@@ -673,6 +673,8 @@ Neither feature (`uc-transport` `sctp`, `uc-aaa` `radius`) is enabled by any shi
 | RFC 6614 RadSec | Gap | Library-only | Not implemented; RADIUS/UDP MD5 is not CNSA (POA&M-280). |
 
 Last Updated: 2026-11-17
+
+2026-11-17: docs/poam-324-326-ci-evidence: soft-client section evidence note updated for the green CI runs on PR #208's head (`4dfea0d`, Ubuntu x86_64); no status change.
 
 2026-11-17: feat/client-dtls-wiring Stage 2: the soft client runs the `proto-dtls` association (proto-dtls section relabelled from Library-only to Wired (soft client); soft-client section rewritten: handshake, demultiplexing with DTLS servicing, fingerprint check, `close_notify` policy, SRTP continuity across pipeline restarts, RFC 7160 §4.1 deviation); RFC-006 and RFC-007 closed; SBC Go sidecar rows for the association lifetime, the plaintext gate, RFC 6347 §4.2.8 and the keep-relaying deviation (NIST POA&M-335, -340, -341). All evidence is local runs.
 

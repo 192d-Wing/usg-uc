@@ -146,12 +146,13 @@ account is reported Connected, and audio starts, only after the handshake has
 verified the peer against the SDP fingerprint and exported SRTP keys. Every
 other outcome ends the call with no audio. Evidence: the client test suites
 and two `#[ignore]` interoperability tests (pion/dtls v3.1.5 in both roles;
-two client media stacks through the SBC relay and its Go DTLS sidecar), **in
-local runs on macOS arm64 only**. Nothing has run on Linux or in CI on this
-change. Not shown: a call set up by SIP through `sbc-daemon`, the audio
-pipeline with devices, any other peer, Windows (NIST POA&M-339). The RFC
-reviewer cited RFC 7160 §4.1 from memory; the section number was not
-re-checked against the RFC text.
+two client media stacks through the SBC relay and its Go DTLS sidecar), in
+local runs on macOS arm64 and in CI on Ubuntu x86_64 on the merged PR head
+(`4dfea0d`, `SRTP audio gate` run 44066084371, 2026-11-17). Not shown: a
+call set up by SIP through `sbc-daemon`, the audio pipeline with devices,
+any other peer, Windows (NIST POA&M-339). The RFC reviewer cited RFC 7160
+§4.1 from memory; the section number was not re-checked against the RFC
+text.
 
 | Change, deviation or gap | RFC § | Where | Tests / tracking |
 |---|---|---|---|
