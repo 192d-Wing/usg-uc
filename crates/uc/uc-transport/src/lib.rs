@@ -87,6 +87,31 @@ use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
 
+/// Returns `addr` with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`)
+/// rewritten to plain IPv4; any other address is returned unchanged.
+///
+/// Dual-stack (`[::]`) sockets report IPv4 peers in mapped form. Applying
+/// this once at ingress lets consumers (source blocklists, trunk-peer
+/// matching, Via `received=`) compare against plain-IPv4 configuration.
+///
+/// NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 (one canonical form for peer addresses)
+#[must_use]
+pub(crate) const fn canonical_peer(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+/// Reports that a dual-stack test cannot run on this host. Skips (returns)
+/// normally; panics instead when `UC_REQUIRE_DUAL_STACK=1`, so a CI job
+/// that sets it cannot pass the canonical-peer tests by skipping them.
+#[cfg(test)]
+pub(crate) fn skip_dual_stack(reason: &str) {
+    assert!(
+        std::env::var("UC_REQUIRE_DUAL_STACK").as_deref() != Ok("1"),
+        "UC_REQUIRE_DUAL_STACK=1 but dual-stack test cannot run: {reason}"
+    );
+    eprintln!("skipping: {reason}");
+}
+
 /// Maximum SIP message size per RFC 3261.
 ///
 /// UDP messages are limited to 1300 bytes for MTU safety,

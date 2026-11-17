@@ -3952,7 +3952,7 @@ impl SipStack {
         let Some(ref hider) = self.topology_hider else {
             return false;
         };
-        if self.inbound_trunk_map.read().await.contains_key(&dest.ip()) {
+        if self.is_trunk_ip(dest.ip()).await {
             return true;
         }
         !hider.read().await.config().is_internal_ip(dest.ip())
@@ -4210,7 +4210,7 @@ impl SipStack {
                     && let Some((_, dest)) = wire_parts(el)
                     && let Some(slot) = trunk_dest.get_mut(i)
                 {
-                    *slot = map.contains_key(&dest.ip());
+                    *slot = trunk_map_contains(&map, dest.ip());
                 }
                 i += 1;
             });
@@ -7453,12 +7453,7 @@ impl SipStack {
         // Trunk sources are exempt from the per-user limiter: they carry
         // many users on one peering, and are bounded instead by the trunk
         // `max_calls` admission cap and VPS call limits (SC-5).
-        if self
-            .inbound_trunk_map
-            .read()
-            .await
-            .contains_key(&source.ip().to_canonical())
-        {
+        if self.is_trunk_ip(source.ip()).await {
             return None;
         }
         let user = req.headers.from_parsed().and_then(|f| f.uri.user)?;
@@ -10131,17 +10126,13 @@ impl SipStack {
         // the call record and is released with it.
         let mut vps_callee: Option<String> = None;
         if let Some(ref vps) = self.vps {
-            let direction = if self
-                .inbound_trunk_map
-                .read()
-                .await
-                .contains_key(&source.ip())
-            {
+            let source_ip = source.ip().to_canonical();
+            let direction = if self.is_trunk_ip(source_ip).await {
                 uc_vps::CallDirection::Inbound
             } else {
                 uc_vps::CallDirection::Unknown
             };
-            let mut attempt = uc_vps::CallAttempt::new(source.ip())
+            let mut attempt = uc_vps::CallAttempt::new(source_ip)
                 .with_callee(dialed.screening_key())
                 .with_request_uri(req.uri.to_string())
                 .with_direction(direction)
@@ -11030,11 +11021,7 @@ impl SipStack {
                 .map(extract_uri_from_header)
                 .map(|u| crate::cdr::uri_user(&u).to_string())
                 .filter(|u| !u.is_empty() && *u != caller && *u != self.config.instance_name);
-            let from_trunk = self
-                .inbound_trunk_map
-                .read()
-                .await
-                .contains_key(&source.ip());
+            let from_trunk = self.is_trunk_ip(source.ip()).await;
             crate::cdr::CdrDraft {
                 setup_ms: invite_received_ms,
                 a_call_id: a_leg_call_id.clone(),
@@ -12045,14 +12032,24 @@ impl SipStack {
         &self,
         source_ip: std::net::IpAddr,
     ) -> Option<(String, Option<String>)> {
-        self.inbound_trunk_map.read().await.get(&source_ip).cloned()
+        // NIST 800-53 Rev5: AC-4, SI-10 - an IPv4-mapped source matches its IPv4 trunk.
+        let ip = source_ip.to_canonical();
+        self.inbound_trunk_map.read().await.get(&ip).cloned()
+    }
+
+    /// Whether `ip` (either IPv4 or IPv4-mapped form) is a configured trunk
+    /// peer. Takes and releases the `inbound_trunk_map` read lock.
+    ///
+    /// NIST 800-53 Rev5: AC-4, SI-10
+    async fn is_trunk_ip(&self, ip: std::net::IpAddr) -> bool {
+        trunk_map_contains(&*self.inbound_trunk_map.read().await, ip)
     }
 
     /// Whether an INVITE from `source_ip` may be admitted: the address must
     /// belong to a configured trunk or to a current (unexpired) registration.
     async fn is_admitted_source(&self, source_ip: std::net::IpAddr) -> bool {
         let ip = source_ip.to_canonical();
-        if self.inbound_trunk_map.read().await.contains_key(&ip) {
+        if self.is_trunk_ip(ip).await {
             return true;
         }
         let loc = self.location_service.read().await;
@@ -13121,6 +13118,17 @@ fn admitted_media_addr(media: &MediaAddress) -> Option<SbcSocketAddr> {
     )))
 }
 
+/// Whether `ip` is a key of an already-locked `inbound_trunk_map`, after
+/// folding an IPv4-mapped address (`::ffff:a.b.c.d`) to plain IPv4.
+///
+/// NIST 800-53 Rev5: AC-4, SI-10
+fn trunk_map_contains<V>(
+    map: &std::collections::HashMap<std::net::IpAddr, V>,
+    ip: std::net::IpAddr,
+) -> bool {
+    map.contains_key(&ip.to_canonical())
+}
+
 /// Resolves a trunk host (IP literal or hostname) to every address it names.
 /// A hostname is resolved synchronously; failures yield an empty list.
 pub fn resolve_trunk_host_ips(host: &str) -> Vec<std::net::IpAddr> {
@@ -13876,6 +13884,35 @@ pub mod tests {
             other => panic!("Expected a single 403 response, got {other:?}"),
         }
         assert!(stack.in_flight_invites.read().await.is_empty());
+    }
+
+    // NIST 800-53 Rev5: AC-4, SI-10
+    /// A trunk configured by IPv4 address is found when the source arrives in
+    /// IPv4-mapped IPv6 form (`::ffff:a.b.c.d`, as on a dual-stack listener).
+    #[tokio::test]
+    async fn test_lookup_inbound_trunk_matches_ipv4_mapped_source() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk(
+                "carrier",
+                Some("css-1"),
+                &[("203.0.113.9".to_string(), 5060)],
+            )
+            .await;
+        let v4 = std::net::Ipv4Addr::new(203, 0, 113, 9);
+        let expected = Some(("carrier".to_string(), Some("css-1".to_string())));
+        assert_eq!(
+            stack.lookup_inbound_trunk(std::net::IpAddr::V4(v4)).await,
+            expected
+        );
+        let mapped: std::net::IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+        assert_eq!(
+            stack.lookup_inbound_trunk(mapped).await,
+            expected,
+            "IPv4-mapped source must resolve to the IPv4 trunk"
+        );
+        assert!(stack.is_trunk_ip(mapped).await);
+        assert!(stack.is_trunk_ip(std::net::IpAddr::V4(v4)).await);
     }
 
     /// The same INVITE is admitted once its source is a configured trunk.

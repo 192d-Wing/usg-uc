@@ -577,8 +577,11 @@ impl SctpListener {
         // approach is stateless. Pending associations are only tracked for
         // monitoring and cleanup purposes.
 
-        // Send to accept channel
-        let sbc_peer_addr = SbcSocketAddr::from(peer_addr);
+        // Send to accept channel. Only the address handed to consumers is
+        // canonical; the raw form above stays in use for cookie validation
+        // and send_to on the (possibly dual-stack) socket.
+        // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4
+        let sbc_peer_addr = SbcSocketAddr::from(crate::canonical_peer(peer_addr));
         if accept_tx.send((handle, sbc_peer_addr)).await.is_err() {
             warn!("Accept channel closed, dropping association");
         } else {
