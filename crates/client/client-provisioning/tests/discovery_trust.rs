@@ -22,7 +22,7 @@ type MetaSetter = fn(&mut OidcMetadata, &str);
 const ICAM_ISSUER: &str = "https://icam.oopl.dev.mil/realms/dcim";
 
 fn svc(input: &str) -> ServiceDomain {
-    parse_service_domain(input).unwrap_or_else(|e| panic!("`{input}` should parse: {e}"))
+    parse_service_domain(input).unwrap_or_else(|_| panic!("`{input}` should parse"))
 }
 
 fn discovery_doc(issuer: &str, config_endpoint: &str) -> DiscoveryDoc {
@@ -173,7 +173,7 @@ fn parse_rejects_fragment_query_path_userinfo() {
         let err = parse_service_domain(input).expect_err(input);
         assert!(
             matches!(err, ProvisioningError::InvalidServiceDomain(_)),
-            "`{input}` -> {err:?}"
+            "`{input}`"
         );
     }
 }
@@ -269,7 +269,7 @@ fn issuer_pin_does_not_apply_to_unrelated_service_domain() {
     let err = verify_issuer_pinned("voice-oopl.example.com", ICAM_ISSUER).unwrap_err();
     assert!(
         matches!(err, ProvisioningError::IssuerNotTrusted(_)),
-        "{err:?}"
+        "unexpected error variant"
     );
 }
 
@@ -285,7 +285,7 @@ fn issuer_sibling_under_shared_suffix_rejected() {
         let err = verify_issuer_pinned("a.dev.mil", issuer).unwrap_err();
         assert!(
             matches!(err, ProvisioningError::IssuerNotTrusted(_)),
-            "{issuer}: {err:?}"
+            "{issuer}"
         );
     }
 }
@@ -319,7 +319,7 @@ fn pinned_issuers_apply_only_to_their_service_scope() {
     for (scope, issuer_host) in PINNED_ISSUERS {
         let issuer = format!("https://{issuer_host}/realms/x");
         verify_issuer_pinned(&format!("sbc.{scope}"), &issuer)
-            .unwrap_or_else(|e| panic!("pin {scope} -> {issuer_host} must hold: {e}"));
+            .unwrap_or_else(|_| panic!("pin {scope} -> {issuer_host} must hold"));
         for other in ["voice.example.com", "sbc.example.mil", "x.dev.mil"] {
             assert!(
                 verify_issuer_pinned(other, &issuer).is_err(),
@@ -365,7 +365,7 @@ fn discovery_with_real_issuer_on_unrelated_domain_rejected() {
     .unwrap_err();
     assert!(
         matches!(err, ProvisioningError::IssuerNotTrusted(_)),
-        "{err:?}"
+        "unexpected error variant"
     );
 }
 
@@ -383,7 +383,7 @@ fn discovery_config_endpoint_off_domain_rejected() {
         let err = verify_discovery(&s, &discovery_doc(ICAM_ISSUER, endpoint)).unwrap_err();
         assert!(
             matches!(err, ProvisioningError::UntrustedEndpoint(_)),
-            "{endpoint}: {err:?}"
+            "{endpoint}"
         );
     }
 }
@@ -401,7 +401,7 @@ fn discovery_config_endpoint_sibling_under_shared_suffix_rejected() {
     .unwrap_err();
     assert!(
         matches!(err, ProvisioningError::UntrustedEndpoint(_)),
-        "{err:?}"
+        "unexpected error variant"
     );
 }
 
@@ -419,7 +419,7 @@ fn discovery_config_endpoint_non_https_or_userinfo_rejected() {
         let err = verify_discovery(&s, &discovery_doc(ICAM_ISSUER, endpoint)).unwrap_err();
         assert!(
             matches!(err, ProvisioningError::UntrustedEndpoint(_)),
-            "{endpoint:?}: {err:?}"
+            "{endpoint:?}"
         );
     }
 }
@@ -438,7 +438,7 @@ fn discovery_untrusted_issuer_rejected() {
         .unwrap_err();
         assert!(
             matches!(err, ProvisioningError::IssuerNotTrusted(_)),
-            "{issuer}: {err:?}"
+            "{issuer}"
         );
     }
 }
@@ -480,7 +480,7 @@ fn oidc_each_endpoint_off_issuer_domain_rejected() {
         let err = verify_oidc_endpoints(&m).unwrap_err();
         assert!(
             matches!(err, ProvisioningError::UntrustedEndpoint(_)),
-            "{name}: {err:?}"
+            "{name}"
         );
     }
 }
@@ -530,7 +530,7 @@ fn registrar_in_service_domain_accepted() {
         "oopl.dev.mil",
     ] {
         verify_client_config(&s, &client_config(reg))
-            .unwrap_or_else(|e| panic!("`{reg}` should be accepted: {e}"));
+            .unwrap_or_else(|_| panic!("`{reg}` should be accepted"));
     }
 }
 
@@ -549,7 +549,7 @@ fn registrar_off_domain_rejected() {
         let err = verify_client_config(&s, &client_config(reg)).unwrap_err();
         assert!(
             matches!(err, ProvisioningError::UntrustedEndpoint(_)),
-            "`{reg}`: {err:?}"
+            "`{reg}`"
         );
     }
 }
@@ -586,7 +586,7 @@ fn registrar_not_bare_host_rejected() {
         let err = verify_client_config(&s, &client_config(reg)).unwrap_err();
         assert!(
             matches!(err, ProvisioningError::UntrustedEndpoint(_)),
-            "{reg:?}: {err:?}"
+            "{reg:?}"
         );
     }
 }
@@ -654,7 +654,7 @@ fn sip_identity_in_service_domain_accepted() {
         ("sip:jane.doe%2Bx@oopl.dev.mil", "oopl.dev.mil"),
     ] {
         verify_client_config(&s, &client_config_sip("reg.oopl.dev.mil", uri, domain))
-            .unwrap_or_else(|e| panic!("`{uri}` / `{domain}` should be accepted: {e}"));
+            .unwrap_or_else(|_| panic!("`{uri}` / `{domain}` should be accepted"));
     }
 }
 
@@ -695,7 +695,7 @@ fn sip_uri_off_domain_or_malformed_rejected() {
         .unwrap_err();
         assert!(
             matches!(err, ProvisioningError::UntrustedEndpoint(_)),
-            "{uri:?}: {err:?}"
+            "{uri:?}"
         );
     }
 }
@@ -721,7 +721,7 @@ fn sip_domain_off_domain_or_not_bare_host_rejected() {
         .unwrap_err();
         assert!(
             matches!(err, ProvisioningError::UntrustedEndpoint(_)),
-            "{domain:?}: {err:?}"
+            "{domain:?}"
         );
     }
 }
@@ -736,7 +736,7 @@ fn sip_dn_and_display_name_accepted() {
         ("1455550100", "Zoë Müller"),
     ] {
         verify_client_config(&s, &client_config_identity(dn, name))
-            .unwrap_or_else(|e| panic!("{dn:?} / {name:?} should be accepted: {e}"));
+            .unwrap_or_else(|_| panic!("{dn:?} / {name:?} should be accepted"));
     }
     // No `user` block at all is fine; the GUI falls back to `sip.dn`.
     let mut cfg = client_config("reg.oopl.dev.mil");
@@ -765,7 +765,7 @@ fn sip_dn_empty_or_not_user_part_rejected() {
         let err = verify_client_config(&s, &client_config_identity(dn, "Jane Doe")).unwrap_err();
         assert!(
             matches!(err, ProvisioningError::UntrustedEndpoint(_)),
-            "{dn:?}: {err:?}"
+            "{dn:?}"
         );
     }
 }
@@ -790,7 +790,7 @@ fn display_name_control_chars_or_angle_brackets_rejected() {
             verify_client_config(&s, &client_config_identity("1455550100", name)).unwrap_err();
         assert!(
             matches!(err, ProvisioningError::UntrustedEndpoint(_)),
-            "{name:?}: {err:?}"
+            "{name:?}"
         );
     }
 }
@@ -829,7 +829,7 @@ fn device_verification_uris_off_issuer_domain_rejected() {
             let err = verify_device_authorization(&meta, &device).unwrap_err();
             assert!(
                 matches!(err, ProvisioningError::UntrustedEndpoint(_)),
-                "{bad:?}: {err:?}"
+                "{bad:?}"
             );
         }
     }
