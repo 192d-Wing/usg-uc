@@ -759,9 +759,11 @@ far end receives no alert. Only pion-based peers were tested. Details:
 
 ### DTLS sidecar operation (`Terminate` mode; changed 2026-11-17)
 
-Applies only with `media.srtp.mode = "Terminate"`. Everything in this section
-was tested in local runs on macOS only; nothing here has been measured or run
-on Linux yet (NIST POA&M-339, POA&M-342).
+Applies only with `media.srtp.mode = "Terminate"`. The behaviour in this
+section was tested in local runs on macOS. The sidecar's Go tests and one
+soft-client call through the relay and the sidecar also passed in CI on
+Linux (x86_64) on 2026-11-17. Memory use has not been measured on Linux
+(NIST POA&M-339, POA&M-342).
 
 **The sidecar now holds each DTLS association for the whole call.** Before
 this change it closed the association, with `close_notify`, as soon as it had

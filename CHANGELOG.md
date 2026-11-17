@@ -12,9 +12,10 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 ### BREAKING (SBC, DTLS-SRTP sidecar keeps the association for the whole call, POA&M-335, 340, 341, 342)
 
 Affects only SBCs that terminate DTLS-SRTP (`sbcDaemon.dtlsTerminate.enabled`,
-off by default). Relay mode is not affected. Tested on macOS only, against
-the in-tree soft-client stack and pion/dtls v3.1.5; the first Linux run is
-the PR's `Sidecar DTLS` and `SRTP audio gate` workflows.
+off by default). Relay mode is not affected. Tested on macOS against the
+in-tree soft-client stack and pion/dtls v3.1.5, and on Linux (x86_64) by
+the PR's `Sidecar DTLS` and `SRTP audio gate` workflows, both green on the
+merged head.
 
 - **SBC: the `dtls-terminator` sidecar no longer closes the DTLS
   association after the handshake.** (RFC 5764, RFC 6347 §4.2.4; SC-8,
@@ -153,10 +154,9 @@ DTLS 1.2 handshake on the media socket, checks the peer certificate against
 the fingerprint in this dialog's SDP, and carries SRTP and SRTCP audio under
 the exported keys. This replaces the state since #206, in which every call
 on a TLS account was ended right after it connected. POA&M-324 and 326
-close when this change merges, on one condition: a green run of the `SRTP
-audio gate` and `Sidecar DTLS` workflows on the PR head, recorded with URL
-and commit. Every test result so far is from macOS; nothing has run on
-Linux. Do not cut a `client-v*` tag before that run is recorded.
+are closed. Their condition, a green run of the `SRTP audio gate` and
+`Sidecar DTLS` workflows on the PR head, was met on Linux (x86_64) on
+commit `4dfea0d`; the runs are recorded in `docs/NIST-800-53-CONTROLS.md`.
 
 Requires the SBC side of this change (sections above) wherever the SBC
 terminates DTLS-SRTP. The profile is the one of the entry below and has no
@@ -302,10 +302,10 @@ New records for any collector that parses client logs:
 
 Not tested by this change: any non-pion third-party peer, a call through
 the `AudioPipeline` with real audio devices, Windows (the non-blocking send
-after the handoff is unix only), Linux before the PR run.
+after the handoff is unix only).
 
-Compliance items of this change. Closed at merge, conditional on the CI
-run named above: POA&M-324 (client DTLS-SRTP) and 326. Narrowed: 325 (the
+Compliance items of this change. Closed at merge, the CI run named above
+having passed: POA&M-324 (client DTLS-SRTP) and 326. Narrowed: 325 (the
 STUN consent part stays open), 330 (the sidecar's `Ready` frame is now
 wiped, best effort), 335 (the gate and rate limit above; residuals stay).
 Opened: POA&M-337 (retire the legacy proto-dtls surface and
