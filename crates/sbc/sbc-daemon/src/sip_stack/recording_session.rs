@@ -700,6 +700,7 @@ impl SipStack {
                         to: leg.to.clone(),
                         request_uri: s.srs_uri.clone(),
                         invite_cseq: 1,
+                        bye_cseq: 2,
                         released_at: now,
                         answered_tags: Vec::new(),
                     },

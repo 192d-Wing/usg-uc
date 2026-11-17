@@ -783,6 +783,10 @@ struct ReleasedInvite {
     /// The INVITE's Request-URI (fallback remote target).
     request_uri: SipUri,
     invite_cseq: u32,
+    /// CSeq of a late BYE: above the INVITE's and every number the call
+    /// reserved toward the callee (a PRACK, say) before release
+    /// (RFC 3261 §12.2.1.1).
+    bye_cseq: u32,
     released_at: Instant,
     /// To-tags already sent a BYE (bounded by [`RELEASED_CALL_MAX_TAGS`]).
     answered_tags: Vec<String>,
@@ -814,6 +818,7 @@ impl ReleasedInvite {
             to: addrs.b_leg_to.clone(),
             request_uri,
             invite_cseq,
+            bye_cseq: invite_cseq.saturating_add(1).max(addrs.b_leg_local_cseq),
             released_at: now,
             answered_tags: Vec::new(),
         }
@@ -4135,7 +4140,7 @@ impl SipStack {
         let bye = send(build_late_2xx_request(
             &entry,
             Method::Bye,
-            entry.invite_cseq.saturating_add(1),
+            entry.bye_cseq,
             &to_tag,
             uri,
             &routes,
@@ -10155,7 +10160,7 @@ impl SipStack {
         // or port (RFC 3261 §14.2, §20.43). The SDES rules follow routing.
         //
         // ## NIST 800-53 Rev5: SC-8, SC-13, CM-6, AU-2
-        if let Err(violation) = self.precheck_initial_offer(req, source, emergency) {
+        if let Err(violation) = self.precheck_initial_offer(req, emergency) {
             warn!(call_id = %a_leg_call_id, reason = violation.as_str(), "INVITE offer refused by media security policy, 488");
             audit_invite_denied(req, source, &media_security::policy_label(violation));
             self.in_flight_invites.write().await.remove(&a_leg_call_id);
@@ -10695,8 +10700,12 @@ impl SipStack {
         //
         // ## NIST 800-53 Rev5: SC-8, SC-12, SC-13, CM-6, AU-2
         let mut trunk_lease = trunk_lease;
+        // Only an SDP offer crosses as `application/sdp`; any other body is
+        // not relayed (RFC 3261 §13.2.1).
+        let offer_body = media_security::initial_offer_body(req);
         let secured_offer = match self.secure_initial_offer(
-            req.body.as_deref(),
+            req,
+            source,
             &media_security::legs(transport, b_leg_flow.transport),
             t38_offer.as_mut(),
             emergency,
@@ -10740,7 +10749,7 @@ impl SipStack {
             let ingress_group = self.lookup_inbound_trunk(source.ip()).await.map(|(g, _)| g);
             let egress_zone = self.egress_media_zone(receiving_zone, b_leg_external);
             let may_terminate = self.dtls_fingerprint_source.is_some()
-                && req.body.as_ref().is_some_and(|body| {
+                && offer_body.is_some_and(|body| {
                     crate::sdp_dtls::parse_peer_dtls(&String::from_utf8_lossy(body)).is_some()
                 });
             let admitted = self.recording_admit(
@@ -10753,7 +10762,7 @@ impl SipStack {
                     failover_targets: &failover_targets,
                 },
                 emergency,
-                req.body.as_deref(),
+                offer_body,
                 t38_offer
                     .as_ref()
                     .is_some_and(|c| c.kind == crate::t38::CallMediaKind::Image),
@@ -10843,7 +10852,7 @@ impl SipStack {
                     }
                     let caller_media = t38_offer.as_ref().map_or_else(
                         || {
-                            req.body.as_ref().and_then(|body| {
+                            offer_body.and_then(|body| {
                                 extract_media_address(&String::from_utf8_lossy(body))
                             })
                         },
@@ -10889,7 +10898,7 @@ impl SipStack {
         // (the SBC is the offerer toward the callee). Otherwise SDP is untouched.
         // Read from the offer as the policy let it cross, so a stripped
         // non-sha-384 fingerprint is never the one terminated.
-        let caller_dtls = req.body.as_ref().and_then(|body| {
+        let caller_dtls = offer_body.and_then(|body| {
             crate::sdp_dtls::parse_peer_dtls(
                 &secured_offer
                     .as_deref()
@@ -10899,7 +10908,7 @@ impl SipStack {
         let dtls_caller_setup = caller_dtls.as_ref().and_then(|d| d.setup);
         let dtls_caller_fingerprint = caller_dtls.map(|d| d.fingerprint);
 
-        let b_leg_sdp = req.body.as_ref().map(|body| {
+        let b_leg_sdp = offer_body.map(|body| {
             let sdp_str = secured_offer
                 .as_deref()
                 .map_or_else(|| String::from_utf8_lossy(body), std::borrow::Cow::Borrowed);

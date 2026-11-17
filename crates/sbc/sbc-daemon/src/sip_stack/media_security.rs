@@ -36,10 +36,12 @@
 //! policed whole, whatever their `Content-Type`.
 //!
 //! Emergency calls (47 CFR 9.16) are exempt from `media.srtp.required`
-//! only: a cleartext or delayed offer is admitted and audited as a granted
-//! `media_security:emergency_cleartext` decision; the fingerprint and SDES
-//! rules still apply. Under `media.srtp.required` the no-route
-//! announcement (cleartext RTP) is replaced by a 480.
+//! and, under `media.srtp.mode = Terminate` without a DTLS identity, are
+//! relayed opaquely instead of refused. Either bypass is audited once the
+//! call is routed, as a granted `media_security:emergency_cleartext`
+//! decision; the fingerprint and SDES rules still apply. Under
+//! `media.srtp.required` the no-route announcement (cleartext RTP) is
+//! replaced by a 480.
 //!
 //! Each refusal is audited as a denied `AuthorizationDecision` with policy
 //! `media_security:<label>`. No log line, audit record or `Warning` carries
@@ -106,14 +108,15 @@ impl SrtpPolicy {
     }
 }
 
-/// What the initial INVITE carries as an offer, for the pre-routing check.
+/// What the initial INVITE carries as an offer.
 enum InitialOffer<'a> {
     /// An `application/sdp` body (or a body without `Content-Type`).
     Sdp(&'a [u8]),
-    /// A `multipart/*` body: policed whole once routed
-    /// ([`SipStack::secure_initial_offer`]).
-    Multipart,
-    /// No body, or a body of another type: no offer (RFC 3261 §13.2.1).
+    /// A `multipart/*` body with an SDP part ([`multipart_carries_sdp`]):
+    /// policed whole once routed ([`SipStack::secure_initial_offer`]).
+    Multipart(&'a [u8]),
+    /// No body, or a body of another type, `multipart/*` without an SDP
+    /// part included: no offer (RFC 3261 §13.2.1, RFC 5621 §3).
     None,
 }
 
@@ -125,17 +128,28 @@ impl<'a> InitialOffer<'a> {
         match req.headers.get_value(&HeaderName::ContentType) {
             None => Self::Sdp(body),
             Some(ct) if super::is_sdp_content_type(ct) => Self::Sdp(body),
-            Some(ct)
-                if ct
-                    .trim_start()
-                    .get(..10)
-                    .is_some_and(|t| t.eq_ignore_ascii_case("multipart/")) =>
-            {
-                Self::Multipart
-            }
+            Some(ct) if multipart_carries_sdp(ct, body) => Self::Multipart(body),
             Some(_) => Self::None,
         }
     }
+
+    const fn body(&self) -> Option<&'a [u8]> {
+        match *self {
+            Self::Sdp(b) | Self::Multipart(b) => Some(b),
+            Self::None => None,
+        }
+    }
+}
+
+/// The initial INVITE's body when it is an offer ([`InitialOffer`]), the
+/// only body the B-leg INVITE may carry as `application/sdp`. Any other
+/// body is not relayed, so it is never relabelled as SDP.
+///
+/// ## NIST 800-53 Rev5: SI-10
+///
+/// ## RFC 3261 §13.2.1; RFC 3264 §5
+pub(super) fn initial_offer_body(req: &SipRequest) -> Option<&[u8]> {
+    InitialOffer::of(req).body()
 }
 
 /// How the media relay of a call starts at 200-OK time
@@ -383,13 +397,16 @@ impl SipStack {
     }
 
     /// The policy for one call. An emergency call (47 CFR 9.16) is exempt
-    /// from `media.srtp.required` only; the DTLS fingerprint and SDES rules
-    /// still apply to it.
+    /// from `media.srtp.required`, and is relayed opaquely when
+    /// `media.srtp.mode = Terminate` has no DTLS identity to terminate with;
+    /// the DTLS fingerprint and SDES rules still apply to it.
     ///
     /// ## NIST 800-53 Rev5: SC-8, CM-6
     pub(super) fn policy_for(&self, emergency: bool) -> MediaSecurityPolicy {
         MediaSecurityPolicy {
-            mode: if self.media_srtp.terminate || self.dtls_fingerprint_source.is_some() {
+            mode: if (self.media_srtp.terminate && !emergency)
+                || self.dtls_fingerprint_source.is_some()
+            {
                 KeyingMode::Terminate
             } else {
                 KeyingMode::Passthrough
@@ -410,7 +427,7 @@ impl SipStack {
     ///
     /// ## NIST 800-53 Rev5: SC-8, SC-24, CM-6
     fn termination_unavailable(&self) -> bool {
-        let unavailable = self.media_srtp.terminate && self.dtls_fingerprint_source.is_none();
+        let unavailable = self.terminate_without_identity();
         if unavailable
             && !self
                 .media_srtp
@@ -424,6 +441,33 @@ impl SipStack {
         unavailable
     }
 
+    /// `media.srtp.mode = Terminate` and no DTLS identity attached.
+    fn terminate_without_identity(&self) -> bool {
+        self.media_srtp.terminate && self.dtls_fingerprint_source.is_none()
+    }
+
+    /// Why the configured policy would have refused an emergency call that
+    /// its exemption admitted, or `None`: Terminate without a DTLS identity
+    /// (the call is relayed opaquely), a delayed offer under
+    /// `media.srtp.required`, or an offer that is not keyed as
+    /// `media.srtp.required` needs toward the routed B-leg (`legs`).
+    fn emergency_bypass(
+        &self,
+        req: &SipRequest,
+        legs: &LegContext,
+    ) -> Option<MediaPolicyViolation> {
+        if self.terminate_without_identity() {
+            return Some(MediaPolicyViolation::TerminationUnavailable);
+        }
+        if !self.media_srtp.required {
+            return None;
+        }
+        let Some(body) = InitialOffer::of(req).body() else {
+            return Some(MediaPolicyViolation::DelayedOffer);
+        };
+        check(body, SdpRole::Offer, &self.policy_for(false), legs).err()
+    }
+
     /// Checks the initial INVITE's offer before routing for the rules that
     /// do not depend on the B-leg, so no slot or port is taken for a call
     /// they refuse:
@@ -432,11 +476,11 @@ impl SipStack {
     ///   (`dtls_termination_unavailable`);
     /// - under `media.srtp.required`, an INVITE without an SDP offer
     ///   (`delayed_offer`): a body that is neither `application/sdp` nor
-    ///   `multipart/*` is no offer either;
+    ///   `multipart/*` with an SDP part is no offer either;
     /// - cleartext media under `media.srtp.required` and the DTLS
     ///   fingerprint rule, on an `application/sdp` body (or one without
     ///   `Content-Type`); a body that is not UTF-8 is malformed. A
-    ///   `multipart/*` body is policed whole by
+    ///   `multipart/*` body with an SDP part is policed whole by
     ///   [`Self::secure_initial_offer`] once routed.
     ///
     /// Both hops are taken as confidential, so a refusal here holds
@@ -444,32 +488,28 @@ impl SipStack {
     /// [`Self::secure_initial_offer`] once the B-leg is known (their
     /// `Warning` depends on its transport).
     ///
-    /// An emergency call is exempt from `media.srtp.required` (a cleartext
-    /// or delayed offer is admitted, audited as a granted
-    /// `media_security:emergency_cleartext` decision); the fingerprint
-    /// rule still applies.
+    /// An emergency call is exempt from `media.srtp.required` and from the
+    /// Terminate-without-identity refusal (it is relayed opaquely); the
+    /// fingerprint rule still applies. The exemption is audited by
+    /// [`Self::secure_initial_offer`] once the call is routed.
     ///
-    /// ## NIST 800-53 Rev5: SC-8, SC-13, CM-6, AU-2; 47 CFR 9.16
+    /// ## NIST 800-53 Rev5: SC-8, SC-13, CM-6; 47 CFR 9.16
     // POAM: POA&M-351 - a delayed offer is not supported under
     // media.srtp.required (the answer in the caller's ACK is not policed);
     // with required = false the ACK answer still crosses unchecked.
     pub(super) fn precheck_initial_offer(
         &self,
         req: &SipRequest,
-        source: SbcSocketAddr,
         emergency: bool,
     ) -> Result<(), MediaPolicyViolation> {
-        if self.termination_unavailable() {
+        // Evaluated (and logged once) for emergency calls too.
+        if self.termination_unavailable() && !emergency {
             return Err(MediaPolicyViolation::TerminationUnavailable);
         }
-        let required = self.media_srtp.required;
+        let required = self.media_srtp.required && !emergency;
         let body = match InitialOffer::of(req) {
             InitialOffer::Sdp(body) => body,
-            InitialOffer::Multipart => return Ok(()),
-            InitialOffer::None if required && emergency => {
-                audit_emergency_cleartext(req, source, MediaPolicyViolation::DelayedOffer);
-                return Ok(());
-            }
+            InitialOffer::Multipart(_) => return Ok(()),
             InitialOffer::None if required => return Err(MediaPolicyViolation::DelayedOffer),
             InitialOffer::None => return Ok(()),
         };
@@ -478,30 +518,18 @@ impl SipStack {
             from_confidential: true,
             to_confidential: true,
         };
-        let refusal = |require_srtp: bool| {
-            let policy = MediaSecurityPolicy {
-                require_srtp,
-                ..self.policy_for(false)
-            };
-            match apply_media_security(sdp, SdpRole::Offer, &policy, &any_tls) {
-                Err(
-                    v @ (MediaPolicyViolation::CleartextMedia { .. }
-                    | MediaPolicyViolation::UnsupportedProtocol { .. }
-                    | MediaPolicyViolation::FingerprintMissing { .. }
-                    | MediaPolicyViolation::FingerprintHashNotAllowed { .. }),
-                ) => Err(v),
-                _ => Ok(()),
-            }
+        let policy = MediaSecurityPolicy {
+            require_srtp: required,
+            ..self.policy_for(emergency)
         };
-        match refusal(required) {
+        match apply_media_security(sdp, SdpRole::Offer, &policy, &any_tls) {
             Err(
                 v @ (MediaPolicyViolation::CleartextMedia { .. }
-                | MediaPolicyViolation::UnsupportedProtocol { .. }),
-            ) if emergency => {
-                audit_emergency_cleartext(req, source, v);
-                refusal(false)
-            }
-            other => other,
+                | MediaPolicyViolation::UnsupportedProtocol { .. }
+                | MediaPolicyViolation::FingerprintMissing { .. }
+                | MediaPolicyViolation::FingerprintHashNotAllowed { .. }),
+            ) => Err(v),
+            _ => Ok(()),
         }
     }
 
@@ -698,22 +726,28 @@ impl SipStack {
         .map(|s| s.sdp)
     }
 
-    /// Checks the initial INVITE's offer toward the routed B-leg (`legs`)
-    /// under the call's policy ([`Self::policy_for`]). The body is policed
-    /// whole, whatever its `Content-Type`. Returns the body to forward when
-    /// the policy rewrote it (`None`: forward as received) and whether an
-    /// SDES key crosses. The T.38 classification's copy of the offer gets
-    /// the same rewrite.
+    /// Checks the initial INVITE's offer ([`initial_offer_body`]) toward
+    /// the routed B-leg (`legs`) under the call's policy
+    /// ([`Self::policy_for`]). A `multipart/*` offer is policed whole.
+    /// Returns the body to forward when the policy rewrote it (`None`:
+    /// forward as received) and whether an SDES key crosses. The T.38
+    /// classification's copy of the offer gets the same rewrite.
     ///
-    /// ## NIST 800-53 Rev5: SC-8, SC-12, SC-13, CM-6
+    /// An emergency call admitted only by its exemption is audited here,
+    /// once the SDES and fingerprint rules have passed
+    /// ([`Self::audit_emergency_exemption`]).
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-12, SC-13, CM-6, AU-2; 47 CFR 9.16
     pub(super) fn secure_initial_offer(
         &self,
-        body: Option<&[u8]>,
+        req: &SipRequest,
+        source: SbcSocketAddr,
         legs: &LegContext,
         t38: Option<&mut crate::t38::Classified>,
         emergency: bool,
     ) -> Result<(Option<String>, bool), MediaPolicyViolation> {
-        let Some(body) = body.filter(|b| !b.is_empty()) else {
+        let Some(body) = initial_offer_body(req) else {
+            self.audit_emergency_exemption(req, source, legs, emergency);
             return Ok((None, false));
         };
         let policy = self.policy_for(emergency);
@@ -732,7 +766,26 @@ impl SipStack {
             Cow::Owned(s) => Some(s),
             Cow::Borrowed(_) => None,
         };
+        self.audit_emergency_exemption(req, source, legs, emergency);
         Ok((rewritten, sdes_crossed))
+    }
+
+    /// For an emergency call the configured policy would have refused
+    /// ([`Self::emergency_bypass`]): a warning log and a granted
+    /// `media_security:emergency_cleartext` decision. Called once per call,
+    /// after the call is routed and its offer passed the remaining rules.
+    ///
+    /// ## NIST 800-53 Rev5: AU-2, AU-3, SC-8; 47 CFR 9.16
+    fn audit_emergency_exemption(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+        legs: &LegContext,
+        emergency: bool,
+    ) {
+        if emergency && let Some(why) = self.emergency_bypass(req, legs) {
+            audit_emergency_cleartext(req, source, why);
+        }
     }
 
     /// Refuses an in-dialog offer (re-INVITE, UPDATE, PRACK or another
@@ -845,7 +898,9 @@ impl SipStack {
     /// A 2xx that crosses the CANCEL is ACKed and BYEd by the released-call
     /// path. A reliable 18x carrying the offer of a call whose INVITE had
     /// none is first PRACKed with an answer declining every stream
-    /// (RFC 3262 §5, RFC 3264 §6).
+    /// (RFC 3262 §5, RFC 3264 §6). The PRACK's CSeq is reserved on the
+    /// live record before the call is released, so the BYE for a 2xx that
+    /// crosses the CANCEL takes a higher one (RFC 3261 §12.2.1.1).
     ///
     /// ## NIST 800-53 Rev5: SC-8, SC-12, SC-24, AU-2
     pub(super) async fn refuse_insecure_early_answer(
@@ -855,9 +910,20 @@ impl SipStack {
         addrs: &CallAddresses,
         violation: MediaPolicyViolation,
     ) -> ProcessResult {
-        let prack = (initial_response_role(addrs) == SdpRole::Offer)
+        let mut prack = (initial_response_role(addrs) == SdpRole::Offer)
             .then(|| declined_offer_prack(resp, addrs))
             .flatten();
+        if prack.is_some() {
+            // A call already gone has no early dialog left to PRACK.
+            match self.reserve_leg_cseq(internal_id, true).await {
+                Some(n) => {
+                    if let Some(p) = prack.as_mut() {
+                        p.headers.set(HeaderName::CSeq, format!("{n} PRACK"));
+                    }
+                }
+                None => prack = None,
+            }
+        }
         let ended = self
             .end_early_dialog(internal_id, addrs, violation, true)
             .await;
@@ -1067,15 +1133,16 @@ impl SipStack {
 }
 
 /// `AuthorizationDecision` (granted) for an emergency call admitted past
-/// `media.srtp.required` (a cleartext or delayed offer), with a warning
-/// log, so every bypass is on the audit trail with its source.
+/// `media.srtp.required` (a cleartext or delayed offer) or relayed opaquely
+/// for want of a DTLS identity under `media.srtp.mode = Terminate`, with a
+/// warning log, so every bypass is on the audit trail with its source.
 ///
 /// ## NIST 800-53 Rev5: AU-2, AU-3, SC-8; 47 CFR 9.16
 fn audit_emergency_cleartext(req: &SipRequest, source: SbcSocketAddr, why: MediaPolicyViolation) {
     warn!(
         call_id = req.headers.call_id().unwrap_or(""),
         reason = why.as_str(),
-        "Emergency call admitted without SRTP (media.srtp.required bypassed)"
+        "Emergency call admitted past the media security policy (SRTP not enforced)"
     );
     audit(uc_audit::AuditEvent::AuthorizationDecision(
         uc_audit::event::AuthorizationDecision {
@@ -1116,7 +1183,13 @@ fn mlines(sdp: &str) -> impl Iterator<Item = (&str, bool, &str)> {
 /// declines every offered stream with the SBC's B-leg media address
 /// (RFC 3262 §5, §7.2; RFC 3264 §6). `None` when the 18x is not reliable,
 /// its To-tag is not relayable, or the offer cannot be read; the CANCEL
-/// still ends the early dialog.
+/// still ends the early dialog. The caller sets the CSeq it reserved.
+///
+/// Addressed like a relayed PRACK: Request-URI and destination are the
+/// B-leg's stored next hop, without the fork's Contact or Record-Route,
+/// which the SBC does not keep per early dialog.
+// POAM: POA&M-54 - PRACKs (relayed or SBC-built) do not use the early
+// dialog's remote target and route set (RFC 3261 §12.1.2, RFC-007).
 fn declined_offer_prack(resp: &SipResponse, addrs: &CallAddresses) -> Option<SipRequest> {
     if !lists_option(&resp.headers, &HeaderName::Require, "100rel") {
         return None;

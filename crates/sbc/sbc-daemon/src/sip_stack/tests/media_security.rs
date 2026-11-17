@@ -2905,17 +2905,21 @@ async fn required_true_t38_image_offer_still_routes() {
 // RFC 3362; 47 CFR 9.16. NIST 800-53 Rev5: SC-8, SC-24, CM-6, AU-2.
 // ----------------------------------------------------------------------
 
-/// A granted `media_security:<label>` decision for `action` was audited.
-fn assert_granted(events: &[uc_audit::AuditEvent], label: &str, action: &str) {
+/// Exactly one granted `media_security:<label>` decision for `action` was
+/// audited.
+fn assert_granted_once(events: &[uc_audit::AuditEvent], label: &str, action: &str) {
     let policy = format!("media_security:{label}");
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            uc_audit::AuditEvent::AuthorizationDecision(d)
-                if d.policy == policy && d.granted && d.action == action
-        )),
-        "no granted {policy} for {action}: {events:?}"
-    );
+    let n = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                uc_audit::AuditEvent::AuthorizationDecision(d)
+                    if d.policy == policy && d.granted && d.action == action
+            )
+        })
+        .count();
+    assert_eq!(n, 1, "granted {policy} for {action}: {events:?}");
 }
 
 /// Under `media.srtp.required` an INVITE without SDP is refused before
@@ -2972,7 +2976,7 @@ async fn delayed_offer_is_refused_488_before_routing_when_required() {
 }
 
 /// An emergency call (911) is exempt from `media.srtp.required` only: a
-/// cleartext offer and a delayed offer are routed, each audited as a
+/// cleartext offer and a delayed offer are routed, each audited once as a
 /// granted `media_security:emergency_cleartext` decision, and the cleartext
 /// answer is relayed.
 #[tokio::test]
@@ -2995,7 +2999,7 @@ async fn emergency_cleartext_invite_is_routed_and_audited() {
     .await;
     let (inv, dest) = forwarded(&placed, &Method::Invite).expect("emergency INVITE routed");
     assert!(body_of(inv).contains("RTP/AVP"), "{}", body_of(inv));
-    assert_granted(&capture.events(), "emergency_cleartext", "INVITE");
+    assert_granted_once(&capture.events(), "emergency_cleartext", "INVITE");
     let inv = inv.clone();
     let results = send(
         &stack,
@@ -3025,7 +3029,7 @@ async fn emergency_cleartext_invite_is_routed_and_audited() {
         forwarded(&placed, &Method::Invite).is_some(),
         "emergency delayed offer refused: {placed:?}"
     );
-    assert_granted(&capture.events(), "emergency_cleartext", "INVITE");
+    assert_granted_once(&capture.events(), "emergency_cleartext", "INVITE");
 }
 
 /// The emergency exemption covers `media.srtp.required` only: SDES over a
@@ -3300,11 +3304,28 @@ async fn refused_reliable_183_offer_is_pracked_with_declined_answer() {
     let (r, _) = responded(&results, 488).expect("488 to the caller");
     assert_warning_is_fixed(r);
     assert_all_released(&stack).await;
+
+    // RFC 3261 §12.2.1.1: the PRACK's CSeq was reserved, so the BYE for a
+    // 2xx that crosses the CANCEL in the same dialog takes a higher one.
+    let prack_cseq = prack.headers.cseq_parsed().expect("PRACK CSeq").sequence;
+    let crossed = send(
+        &stack,
+        &response_to(&inv, 200, Some("bobtag"), None),
+        dest,
+        AddrTransport::Tls,
+    )
+    .await;
+    let (bye, _) = forwarded(&crossed, &Method::Bye).expect("BYE for the crossing 2xx");
+    let bye_cseq = bye.headers.cseq_parsed().expect("BYE CSeq").sequence;
+    assert!(
+        bye_cseq > prack_cseq,
+        "BYE {bye_cseq} <= PRACK {prack_cseq}"
+    );
 }
 
 /// The relay plan is decided before the A-leg 2xx exists: terminate mode,
-/// an INVITE whose multipart body carries no SDP (so no caller
-/// fingerprint), and a DTLS answer. The plan would start no relay, so the
+/// an INVITE whose multipart body has an SDP part without media (so no
+/// caller fingerprint), and a DTLS answer. The plan would start no relay, so the
 /// 2xx is refused like any insecure answer: ACK + BYE to the callee, 488 to
 /// the caller, `PolicyTerminated`, and the caller never sees a 2xx.
 #[tokio::test]
@@ -3318,7 +3339,10 @@ async fn relay_plan_refusal_is_decided_before_the_2xx() {
         "",
         Some((
             "multipart/mixed;boundary=b1",
-            "--b1\r\nContent-Type: text/plain\r\n\r\nhello\r\n--b1--\r\n",
+            &format!(
+                "--b1\r\nContent-Type: application/sdp\r\n\r\n{}--b1--\r\n",
+                offer("")
+            ),
         )),
     );
     let placed = send(&stack, &invite, alice(), AddrTransport::Tls).await;
@@ -3371,4 +3395,174 @@ async fn multipart_cleartext_offer_is_refused_after_routing() {
     );
     assert_refused_302(&results);
     assert_all_released(&stack).await;
+}
+
+/// `media.srtp.mode = Terminate` with no DTLS identity: an emergency call
+/// is not refused but relayed opaquely (the caller's fingerprint reaches
+/// the callee, the relay starts opaque), audited once as a granted
+/// `media_security:emergency_cleartext` decision. Other calls on the same
+/// stack are still refused (`dtls_termination_unavailable`).
+#[tokio::test]
+async fn emergency_call_is_relayed_opaquely_when_termination_unavailable() {
+    let (mut stack, media) = media_trunk_stack(["tls", "tls"]).await;
+    stack.set_media_security_policy(&srtp_config(true, sbc_config::schema::SrtpMode::Terminate));
+    let capture = uc_audit::capture::start();
+    let placed = send(
+        &stack,
+        &caller_request(
+            "INVITE",
+            "911",
+            "e911-noid@test",
+            1,
+            None,
+            Some(&dtls_offer()),
+        ),
+        alice(),
+        AddrTransport::Tls,
+    )
+    .await;
+    let (inv, dest) = forwarded(&placed, &Method::Invite).expect("emergency INVITE routed");
+    assert!(body_of(inv).contains(FP_A), "{}", body_of(inv));
+    assert!(!body_of(inv).contains(FP_SBC), "{}", body_of(inv));
+    let events = capture.events();
+    assert_granted_once(&events, "emergency_cleartext", "INVITE");
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            uc_audit::AuditEvent::AuthorizationDecision(d)
+                if d.policy == "media_security:dtls_termination_unavailable"
+        )),
+        "{events:?}"
+    );
+    let inv = inv.clone();
+    let results = send(
+        &stack,
+        &response_to(&inv, 200, Some("bobtag"), Some(&dtls_answer())),
+        dest,
+        AddrTransport::Tls,
+    )
+    .await;
+    assert!(responded(&results, 200).is_some(), "{results:?}");
+    assert_eq!(media.starts(), 1);
+    assert!(
+        media
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l == "start opaque"),
+        "relay not opaque"
+    );
+
+    let results = place_on(
+        &stack,
+        "noid-normal@test",
+        AddrTransport::Tls,
+        &dtls_offer(),
+    )
+    .await;
+    assert!(
+        forwarded_all(&results, &Method::Invite).is_empty(),
+        "{results:?}"
+    );
+    assert_refused_399(&results);
+}
+
+/// Under `media.srtp.required` a multipart INVITE body without an SDP part
+/// is no offer: refused before routing like an INVITE without a body
+/// (`delayed_offer`). An emergency call with the same body is routed and
+/// audited once; with `required = false` the call routes too. Either way
+/// the body is not relayed, so it never reaches the callee labelled
+/// `application/sdp`.
+#[tokio::test]
+async fn multipart_without_sdp_part_is_a_delayed_offer() {
+    let text_only = |call_id: &str, dialed: &str| {
+        with_extra(
+            &caller_request("INVITE", dialed, call_id, 1, None, None),
+            "",
+            Some((
+                "multipart/mixed;boundary=b1",
+                "--b1\r\nContent-Type: text/plain\r\n\r\nm=audio 4000 RTP/AVP 0\r\n--b1--\r\n",
+            )),
+        )
+    };
+    let assert_bodyless = |inv: &proto_sip::message::SipRequest| {
+        assert!(
+            inv.body.as_deref().unwrap_or_default().is_empty(),
+            "{inv:?}"
+        );
+        assert!(
+            inv.headers.get_value(&HeaderName::ContentType).is_none(),
+            "{inv:?}"
+        );
+    };
+
+    let stack = trunk_stack_protos(["tls", "tls"]).await;
+    let capture = uc_audit::capture::start();
+    let results = send(
+        &stack,
+        &text_only("mp-nosdp@test", DIALED),
+        alice(),
+        AddrTransport::Tls,
+    )
+    .await;
+    assert!(
+        forwarded_all(&results, &Method::Invite).is_empty(),
+        "{results:?}"
+    );
+    assert_refused_399(&results);
+    assert_denied(&capture.events(), "delayed_offer", "INVITE");
+    assert_all_released(&stack).await;
+
+    let capture = uc_audit::capture::start();
+    let results = send(
+        &stack,
+        &text_only("mp-nosdp-e911@test", "911"),
+        alice(),
+        AddrTransport::Tls,
+    )
+    .await;
+    let (inv, _) = forwarded(&results, &Method::Invite).expect("emergency INVITE routed");
+    assert_bodyless(inv);
+    assert_granted_once(&capture.events(), "emergency_cleartext", "INVITE");
+
+    let mut stack = trunk_stack_protos(["tls", "tls"]).await;
+    stack.set_media_security_policy(&srtp_config(
+        false,
+        sbc_config::schema::SrtpMode::Passthrough,
+    ));
+    let results = send(
+        &stack,
+        &text_only("mp-nosdp-opt@test", DIALED),
+        alice(),
+        AddrTransport::Tls,
+    )
+    .await;
+    let (inv, _) = forwarded(&results, &Method::Invite).expect("B-leg INVITE");
+    assert_bodyless(inv);
+}
+
+/// The emergency exemption is audited once the call is routed: a
+/// multipart offer whose SDP part is cleartext is policed after routing,
+/// and the emergency call gets exactly one granted record.
+#[tokio::test]
+async fn emergency_multipart_cleartext_offer_is_audited_once() {
+    let stack = trunk_stack_protos(["tls", "tls"]).await;
+    let sdp = offer(&clear_audio(4000, "RTP/AVP"));
+    let multipart = format!(
+        "--b1\r\nContent-Type: application/sdp\r\n\r\n{sdp}\r\n--b1\r\n\
+         Content-Type: text/plain\r\n\r\nhello\r\n--b1--\r\n"
+    );
+    let invite = with_extra(
+        &caller_request("INVITE", "911", "e911-mp@test", 1, None, None),
+        "",
+        Some(("multipart/mixed;boundary=b1", &multipart)),
+    );
+    let capture = uc_audit::capture::start();
+    let results = send(&stack, &invite, alice(), AddrTransport::Tls).await;
+    assert!(
+        forwarded(&results, &Method::Invite).is_some(),
+        "{results:?}"
+    );
+    assert_granted_once(&capture.events(), "emergency_cleartext", "INVITE");
 }
