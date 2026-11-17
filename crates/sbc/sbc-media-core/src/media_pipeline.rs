@@ -1944,41 +1944,15 @@ impl MediaPipeline {
                 .map_err(|e| MediaPipelineError::BindFailed(format!("{b_bind}: {e}")))?,
         );
 
-        // Best-effort separate-port SRTCP relay (RTP port + 1) for endpoints that
-        // did not negotiate rtcp-mux. Muxed SRTCP already rides the media relay; a
-        // bind failure here disables only non-muxed RTCP, never audio. RTCP remotes
-        // default to the RTP remote's port + 1 and latch symmetrically.
-        let rtcp = match (
-            a_remote.port().checked_add(1),
-            b_remote.port().checked_add(1),
-        ) {
-            (Some(a_rtcp_rport), Some(b_rtcp_rport)) => {
-                let a_rtcp_bind = format!("{}:{}", ctx.a_leg_bind_ip, ctx.a_leg_rtcp_port);
-                let b_rtcp_bind = format!("{}:{}", ctx.b_leg_bind_ip, ctx.b_leg_rtcp_port);
-                match (
-                    UdpSocket::bind(&a_rtcp_bind).await,
-                    UdpSocket::bind(&b_rtcp_bind).await,
-                ) {
-                    (Ok(a_rtcp_sock), Ok(b_rtcp_sock)) => {
-                        let a_rtcp_remote = std::net::SocketAddr::new(a_remote.ip(), a_rtcp_rport);
-                        let b_rtcp_remote = std::net::SocketAddr::new(b_remote.ip(), b_rtcp_rport);
-                        Some(TerminateRtcp {
-                            a_socket: Arc::new(a_rtcp_sock),
-                            b_socket: Arc::new(b_rtcp_sock),
-                            a_remote: a_rtcp_remote,
-                            b_remote: b_rtcp_remote,
-                            a_target: Arc::new(std::sync::RwLock::new(a_rtcp_remote)),
-                            b_target: Arc::new(std::sync::RwLock::new(b_rtcp_remote)),
-                        })
-                    }
-                    (a_res, b_res) => {
-                        warn!(call_id = %call_id, a_err = ?a_res.err(), b_err = ?b_res.err(), "terminate RTCP sockets failed to bind (audio unaffected)");
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
+        // RFC 5761; RFC 5764 §4.1: terminate mode relays RTCP only when it is
+        // multiplexed on the media port, where the leg's DTLS association
+        // keys it. No RTP + 1 socket is bound: RTCP on a separate port would
+        // need its own DTLS handshake on that transport, which the SBC does
+        // not run, so non-muxed RTCP is not relayed in terminate mode.
+        // NIST 800-53 Rev5: CM-7 (Least Functionality), SC-13 -- one SRTP
+        // context per key and direction, each owned by a single relay task.
+        // POAM: POA&M-343 - non-muxed (separate-port) RTCP is not relayed in
+        // terminate mode.
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let a_target = Arc::new(std::sync::RwLock::new(a_remote));
@@ -2000,7 +1974,6 @@ impl MediaPipeline {
             b_target: Arc::clone(&b_target),
             shutdown: shutdown_rx,
             media_failure_tx: self.config.media_failure_tx.clone(),
-            rtcp,
             a_fork: ctx
                 .recording
                 .as_ref()
@@ -2394,18 +2367,6 @@ pub struct LegDtlsParams {
     pub role: Role,
 }
 
-/// Sockets + addresses for the separate RTCP (RTP-port + 1) relay, used only by
-/// endpoints that did NOT negotiate rtcp-mux. Muxed SRTCP rides the media relay
-/// (see [`TerminateRelayLeg`]); this bundle services the non-muxed case.
-struct TerminateRtcp {
-    a_socket: Arc<UdpSocket>,
-    b_socket: Arc<UdpSocket>,
-    a_remote: std::net::SocketAddr,
-    b_remote: std::net::SocketAddr,
-    a_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
-    b_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
-}
-
 /// Everything the terminate supervisor owns for one call (bundled so the spawn
 /// and the supervisor signature stay manageable).
 struct TerminateSetup {
@@ -2426,9 +2387,6 @@ struct TerminateSetup {
     /// Signalled with `call_id` if a leg's handshake fails, so the call is torn
     /// down rather than left up with dead media.
     media_failure_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    /// Separate-port SRTCP relay for non-muxed endpoints. `None` when the RTCP
-    /// sockets could not be bound (audio is unaffected; only non-muxed RTCP is).
-    rtcp: Option<TerminateRtcp>,
     /// SIPREC fork tap for media received from the A-leg (`None` when
     /// recording is disabled on the pipeline).
     a_fork: Option<ForkTap>,
@@ -2493,6 +2451,11 @@ async fn terminate_supervisor(s: TerminateSetup) {
 
     // Four SRTP contexts. The ssrc only seeds per-stream replay state — the AEAD
     // nonce uses the packet's SSRC (see proto-srtp) — so the leg ssrc is fine.
+    // NIST 800-53 Rev5: SC-13, SC-8 -- these are the only contexts built from
+    // the keys, and each is moved into exactly one relay task, so every key
+    // and direction has one replay window (RFC 3711 §3.3.2) and one
+    // SRTP/SRTCP index sequence (RFC 7714 §8.1, §9.1). Muxed SRTCP rides the
+    // media-port tasks; there is no RTP + 1 relay in terminate mode.
     let ctxs = (
         SrtpContext::new(&a_in, SrtpDirection::Inbound, s.a_ssrc),
         SrtpContext::new(&a_out, SrtpDirection::Outbound, s.a_ssrc),
@@ -2583,55 +2546,6 @@ async fn terminate_supervisor(s: TerminateSetup) {
             leg: "B",
         },
     ));
-
-    // Separate-port SRTCP relay for non-muxed endpoints. Fresh SRTP contexts from
-    // the SAME keying material (independent replay windows); on the RTCP port
-    // every packet is SRTCP, so TerminateRelayLeg re-protects it via the RTCP
-    // path. Muxed RTCP already rides the media relay above.
-    if let Some(rtcp) = s.rtcp {
-        let rtcp_ctxs = (
-            SrtpContext::new(&a_in, SrtpDirection::Inbound, s.a_ssrc),
-            SrtpContext::new(&a_out, SrtpDirection::Outbound, s.a_ssrc),
-            SrtpContext::new(&b_in, SrtpDirection::Inbound, s.b_ssrc),
-            SrtpContext::new(&b_out, SrtpDirection::Outbound, s.b_ssrc),
-        );
-        if let (Ok(a_rin), Ok(a_reg), Ok(b_rin), Ok(b_reg)) = rtcp_ctxs {
-            tokio::spawn(
-                TerminateRelayLeg {
-                    recv_sock: Arc::clone(&rtcp.a_socket),
-                    send_sock: Arc::clone(&rtcp.b_socket),
-                    ingress: a_rin,
-                    egress: b_reg,
-                    expected_remote: rtcp.a_remote,
-                    recv_target: Arc::clone(&rtcp.a_target),
-                    forward_target: Arc::clone(&rtcp.b_target),
-                    dtls_out: None,
-                    call_id: s.call_id.clone(),
-                    direction: "A→B RTCP",
-                    fork: None,
-                }
-                .run(s.shutdown.clone()),
-            );
-            tokio::spawn(
-                TerminateRelayLeg {
-                    recv_sock: rtcp.b_socket,
-                    send_sock: rtcp.a_socket,
-                    ingress: b_rin,
-                    egress: a_reg,
-                    expected_remote: rtcp.b_remote,
-                    recv_target: rtcp.b_target,
-                    forward_target: rtcp.a_target,
-                    dtls_out: None,
-                    call_id: s.call_id.clone(),
-                    direction: "B→A RTCP",
-                    fork: None,
-                }
-                .run(s.shutdown.clone()),
-            );
-        } else {
-            warn!(call_id = %s.call_id, "RTCP SRTP context creation failed; non-muxed RTCP not relayed");
-        }
-    }
 
     info!(call_id = %s.call_id, "DTLS-SRTP termination established; relaying media");
 }
@@ -4793,5 +4707,371 @@ mod recording_fork_tests {
         c.a.send_to(&rtp(1, 1, &[1; 40]), c.sbc_a).await.unwrap();
         assert!(recv(&c.b, Duration::from_secs(2)).await.is_some());
         assert!(recv(&srs, Duration::from_millis(200)).await.is_none());
+    }
+}
+
+/// Terminate mode: one SRTP context per key and direction, RTCP only on the
+/// media port (RFC 5761; RFC 5764 §4.1), and no RTP + 1 relay socket.
+///
+/// Drives `start_relay_terminate` over a mock sidecar (same framing as
+/// `terminate_relay_end_to_end`) with real UDP peers on 127.0.0.1.
+///
+/// NIST 800-53 Rev5: SC-8, SC-13, SC-23
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod terminate_srtp_context_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+
+    const FP: &str = "sha-384 SIDECAR";
+    /// SSRC used by peer A for both RTP and RTCP (RTCP sender SSRC).
+    const A_SSRC: u32 = 0x0001_2345;
+    /// SSRC used by peer B for both RTP and RTCP (RTCP sender SSRC).
+    const B_SSRC: u32 = 0x0006_7890;
+
+    async fn wr<W: AsyncWriteExt + Unpin>(w: &mut W, t: u8, body: &[u8]) {
+        let n = 1 + body.len();
+        let mut f = Vec::with_capacity(2 + n);
+        f.extend_from_slice(&u16::try_from(n).unwrap().to_be_bytes());
+        f.push(t);
+        f.extend_from_slice(body);
+        w.write_all(&f).await.unwrap();
+    }
+
+    async fn rd<R: AsyncReadExt + Unpin>(r: &mut R) {
+        let mut h = [0u8; 2];
+        r.read_exact(&mut h).await.unwrap();
+        let mut b = vec![0u8; usize::from(u16::from_be_bytes(h))];
+        r.read_exact(&mut b).await.unwrap();
+    }
+
+    fn srtp_ctx(key: &[u8], salt: &[u8], dir: SrtpDirection, ssrc: u32) -> SrtpContext {
+        let m =
+            SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, key.to_vec(), salt.to_vec()).unwrap();
+        SrtpContext::new(&m, dir, ssrc).unwrap()
+    }
+
+    fn leg_params(peer_fingerprint: &str) -> LegDtlsParams {
+        LegDtlsParams {
+            peer_fingerprint: peer_fingerprint.into(),
+            role: Role::Server,
+        }
+    }
+
+    /// Binds a UDP socket on an even/odd port pair `(p, p + 1)` on loopback, so
+    /// anything the relay emitted towards a peer's RTP + 1 port is observed.
+    async fn bind_pair() -> (UdpSocket, UdpSocket) {
+        for _ in 0..200 {
+            let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = rtp.local_addr().unwrap().port();
+            let Some(next) = port.checked_add(1) else {
+                continue;
+            };
+            if let Ok(rtcp) = UdpSocket::bind(("127.0.0.1", next)).await {
+                return (rtp, rtcp);
+            }
+        }
+        unreachable!("no free loopback port pair");
+    }
+
+    async fn recv(s: &UdpSocket, wait: Duration) -> Option<Vec<u8>> {
+        let mut b = [0u8; 2048];
+        match tokio::time::timeout(wait, s.recv_from(&mut b)).await {
+            Ok(Ok((n, _))) => Some(b[..n].to_vec()),
+            _ => None,
+        }
+    }
+
+    /// RTCP RR (PT 201) from `A_SSRC` with a distinguishable 4-byte body.
+    fn rtcp_rr(fill: u8) -> Vec<u8> {
+        rtcp_rr_from(A_SSRC, fill)
+    }
+
+    /// RTCP RR (PT 201) from `ssrc` with a distinguishable 4-byte body.
+    fn rtcp_rr_from(ssrc: u32, fill: u8) -> Vec<u8> {
+        let s = ssrc.to_be_bytes();
+        vec![
+            0x80, 201, 0, 2, s[0], s[1], s[2], s[3], fill, fill, fill, fill,
+        ]
+    }
+
+    /// SRTCP index from the trailing `E || index` word (RFC 3711 §3.4; no MKI).
+    fn srtcp_index(pkt: &[u8]) -> u32 {
+        let t = &pkt[pkt.len() - 4..];
+        u32::from_be_bytes([t[0], t[1], t[2], t[3]]) & 0x7fff_ffff
+    }
+
+    struct Call {
+        pipeline: MediaPipeline,
+        sock_path: std::path::PathBuf,
+        /// SBC A-leg media port and its RTP + 1 port.
+        a_relay: SocketAddr,
+        a_relay_rtcp: SocketAddr,
+        /// SBC B-leg media port and its RTP + 1 port.
+        b_relay: SocketAddr,
+        b_relay_rtcp: SocketAddr,
+        /// Peer A sends from here (media port remote).
+        peer_a: UdpSocket,
+        /// Peer A's RTP + 1 port (observed: must receive nothing).
+        peer_a_rtcp: UdpSocket,
+        /// Peer B media port and its RTP + 1 port.
+        peer_b: UdpSocket,
+        peer_b_rtcp: UdpSocket,
+        /// Peer A's sending context (client_write key).
+        a_send: SrtpContext,
+        /// Peer B's receiving context (server_write key).
+        b_recv: SrtpContext,
+        /// One SRTP packet peer A sent on the media port that the SBC accepted
+        /// and relayed to peer B.
+        accepted_rtp: Vec<u8>,
+        /// Mock sidecar keying material: (client key, client salt, server
+        /// key, server salt). The SBC is DTLS server on both legs, so each
+        /// peer sends under the client_write key.
+        keys: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
+    }
+
+    impl Call {
+        async fn stop(self) {
+            let _ = self.pipeline.stop_relay("call").await;
+            let _ = std::fs::remove_file(&self.sock_path);
+        }
+    }
+
+    /// Sets up a terminated call (SBC is DTLS server on both legs), completes
+    /// both mock handshakes and waits until A->B media crosses the media port.
+    async fn terminated_call(tag: &str) -> Call {
+        let blob: Vec<u8> = (0..88).map(|_| rand::random::<u8>()).collect();
+        let client_key = blob[0..32].to_vec();
+        let server_key = blob[32..64].to_vec();
+        let client_salt = blob[64..76].to_vec();
+        let server_salt = blob[76..88].to_vec();
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "usg-srtpctx-{tag}-{}-{}.sock",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let blob2 = blob.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let blob = blob2.clone();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = stream.into_split();
+                    wr(&mut w, 1, FP.as_bytes()).await; // Hello
+                    rd(&mut r).await; // Start
+                    rd(&mut r).await; // forwarded DTLS trigger
+                    let mut ready = vec![0u8, 8];
+                    ready.extend_from_slice(&blob);
+                    wr(&mut w, 4, &ready).await; // Ready(profile=8, keys)
+                    let mut sink = [0u8; 64];
+                    let _ = r.read(&mut sink).await;
+                });
+            }
+        });
+
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let port_base = 32_000_u16.wrapping_add((rand::random::<u16>() % 8_000) & !1);
+        let pipeline = MediaPipeline::new(MediaPipelineConfig {
+            srtp_required: false,
+            terminate_dtls: true,
+            dtls_sidecar_socket: Some(sock_path.clone()),
+            dtls_fingerprint: Some(Arc::new(
+                crate::dtls_identity::DtlsFingerprintSource::from_static(FP.to_string()),
+            )),
+            rtp_port_min: port_base,
+            rtp_port_max: port_base + 200,
+            ..Default::default()
+        });
+        let ports = pipeline
+            .create_session_with_zones(
+                "call",
+                Some(MediaMode::Relay),
+                Some(loopback),
+                Some(loopback),
+            )
+            .await
+            .unwrap();
+
+        let (peer_a, peer_a_rtcp) = bind_pair().await;
+        let (peer_b, peer_b_rtcp) = bind_pair().await;
+        let a_relay: SocketAddr = ([127, 0, 0, 1], ports.a_leg_rtp_port).into();
+        let b_relay: SocketAddr = ([127, 0, 0, 1], ports.b_leg_rtp_port).into();
+        let a_relay_rtcp: SocketAddr = ([127, 0, 0, 1], ports.a_leg_rtp_port + 1).into();
+        let b_relay_rtcp: SocketAddr = ([127, 0, 0, 1], ports.b_leg_rtp_port + 1).into();
+        pipeline
+            .set_remote_address("call", true, peer_a.local_addr().unwrap().into())
+            .await
+            .unwrap();
+        pipeline
+            .set_remote_address("call", false, peer_b.local_addr().unwrap().into())
+            .await
+            .unwrap();
+
+        pipeline
+            .start_relay_terminate("call", leg_params("sha-384 A"), leg_params("sha-384 B"))
+            .await
+            .unwrap();
+
+        peer_a.send_to(&[22u8, 1, 2], a_relay).await.unwrap();
+        peer_b.send_to(&[22u8, 1, 2], b_relay).await.unwrap();
+
+        let a_send = srtp_ctx(&client_key, &client_salt, SrtpDirection::Outbound, A_SSRC);
+        let b_recv = srtp_ctx(&server_key, &server_salt, SrtpDirection::Inbound, A_SSRC);
+
+        let mut accepted_rtp = None;
+        for i in 0..40u16 {
+            let pkt = RtpPacket::new(RtpHeader::new(0, 100 + i, 900, A_SSRC), vec![0x5A; 160]);
+            let srtp = SrtpProtect::new(&a_send).protect_rtp(&pkt).unwrap();
+            peer_a.send_to(&srtp, a_relay).await.unwrap();
+            if recv(&peer_b, Duration::from_millis(150)).await.is_some() {
+                accepted_rtp = Some(srtp.to_vec());
+                break;
+            }
+        }
+        let accepted_rtp = accepted_rtp.expect("terminated media never crossed A->B");
+        // Let the supervisor finish spawning the remaining relay tasks.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        Call {
+            pipeline,
+            sock_path,
+            a_relay,
+            a_relay_rtcp,
+            b_relay,
+            b_relay_rtcp,
+            peer_a,
+            peer_a_rtcp,
+            peer_b,
+            peer_b_rtcp,
+            a_send,
+            b_recv,
+            accepted_rtp,
+            keys: (client_key, client_salt, server_key, server_salt),
+        }
+    }
+
+    /// Asserts nothing reaches either of a peer's ports within the wait.
+    async fn assert_silent(what: &str, media: &UdpSocket, rtcp_port: &UdpSocket) {
+        let on_rtcp = recv(rtcp_port, Duration::from_millis(300)).await;
+        let on_media = recv(media, Duration::from_millis(100)).await;
+        assert!(
+            on_rtcp.is_none() && on_media.is_none(),
+            "{what} re-emitted (RTP + 1: {}, media: {})",
+            on_rtcp.is_some(),
+            on_media.is_some()
+        );
+    }
+
+    // Muxed SRTCP towards B is protected by the single A->B task under B's
+    // egress key, so its SRTCP index (part of the AEAD nonce with the SSRC,
+    // RFC 7714 §9.1) never repeats.
+    #[tokio::test]
+    async fn terminate_egress_srtcp_indices_unique_on_media_port() {
+        let c = terminated_call("idx").await;
+
+        let mut indices = Vec::new();
+        for round in 0..8u8 {
+            let p = SrtpProtect::new(&c.a_send)
+                .protect_rtcp(&rtcp_rr(0x10 + round))
+                .unwrap();
+            c.peer_a.send_to(&p, c.a_relay).await.unwrap();
+            let out = recv(&c.peer_b, Duration::from_millis(500))
+                .await
+                .expect("muxed SRTCP relayed to B");
+            assert!(
+                SrtpUnprotect::new(&c.b_recv)
+                    .unprotect_rtcp_sync(&out)
+                    .is_ok(),
+                "B must authenticate media-port SRTCP"
+            );
+            indices.push(srtcp_index(&out));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for idx in &indices {
+            assert!(
+                seen.insert(*idx),
+                "egress SRTCP index {idx} repeated; all: {indices:?}"
+            );
+        }
+        c.stop().await;
+    }
+
+    // Terminate mode relays nothing that arrives on a leg's RTP + 1 port:
+    // neither SRTP nor SRTCP, fresh or already accepted on the media port.
+    #[tokio::test]
+    async fn terminate_rtp_plus_one_traffic_not_reemitted() {
+        let c = terminated_call("rtp1").await;
+        let (ck, cs, _, _) = &c.keys;
+        let b_send = srtp_ctx(ck, cs, SrtpDirection::Outbound, B_SSRC);
+
+        // A-leg RTP + 1: replayed SRTP, fresh SRTP, fresh and replayed SRTCP.
+        c.peer_a
+            .send_to(&c.accepted_rtp, c.a_relay_rtcp)
+            .await
+            .unwrap();
+        assert_silent("SRTP replayed to A RTP + 1", &c.peer_b, &c.peer_b_rtcp).await;
+
+        let fresh = SrtpProtect::new(&c.a_send)
+            .protect_rtp(&RtpPacket::new(
+                RtpHeader::new(0, 400, 900, A_SSRC),
+                vec![0x5A; 160],
+            ))
+            .unwrap();
+        c.peer_a.send_to(&fresh, c.a_relay_rtcp).await.unwrap();
+        assert_silent("fresh SRTP to A RTP + 1", &c.peer_b, &c.peer_b_rtcp).await;
+
+        let p = SrtpProtect::new(&c.a_send)
+            .protect_rtcp(&rtcp_rr(0x33))
+            .unwrap();
+        c.peer_a.send_to(&p, c.a_relay_rtcp).await.unwrap();
+        assert_silent("fresh SRTCP to A RTP + 1", &c.peer_b, &c.peer_b_rtcp).await;
+        c.peer_a.send_to(&p, c.a_relay).await.unwrap();
+        assert!(
+            recv(&c.peer_b, Duration::from_millis(500)).await.is_some(),
+            "muxed SRTCP relayed to B"
+        );
+        c.peer_a.send_to(&p, c.a_relay_rtcp).await.unwrap();
+        assert_silent("SRTCP replayed to A RTP + 1", &c.peer_b, &c.peer_b_rtcp).await;
+
+        // B-leg RTP + 1: fresh SRTP and SRTCP from B.
+        let srtp = SrtpProtect::new(&b_send)
+            .protect_rtp(&RtpPacket::new(
+                RtpHeader::new(0, 500, 900, B_SSRC),
+                vec![0xA5; 160],
+            ))
+            .unwrap();
+        c.peer_b.send_to(&srtp, c.b_relay_rtcp).await.unwrap();
+        assert_silent("SRTP to B RTP + 1", &c.peer_a, &c.peer_a_rtcp).await;
+        let p = SrtpProtect::new(&b_send)
+            .protect_rtcp(&rtcp_rr_from(B_SSRC, 0x44))
+            .unwrap();
+        c.peer_b.send_to(&p, c.b_relay_rtcp).await.unwrap();
+        assert_silent("SRTCP to B RTP + 1", &c.peer_a, &c.peer_a_rtcp).await;
+
+        c.stop().await;
+    }
+
+    // NIST 800-53 Rev5: CM-7 -- once the terminated call is relaying, the
+    // relay holds no A-leg or B-leg RTP + 1 socket (both stay bindable).
+    #[tokio::test]
+    async fn terminate_binds_no_rtp_plus_one_port() {
+        let c = terminated_call("nobind").await;
+
+        for (leg, addr) in [("A", c.a_relay_rtcp), ("B", c.b_relay_rtcp)] {
+            let r = UdpSocket::bind(addr).await;
+            assert!(
+                r.is_ok(),
+                "{leg}-leg RTP + 1 port {addr} is bound by the relay: {:?}",
+                r.err()
+            );
+        }
+        c.stop().await;
     }
 }
