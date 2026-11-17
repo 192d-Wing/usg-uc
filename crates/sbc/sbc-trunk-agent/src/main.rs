@@ -444,19 +444,23 @@ impl Health for AlwaysServing {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)]
-async fn main() -> ExitCode {
-    // Install the process-level rustls CryptoProvider (aws-lc, FIPS) before
-    // any TLS config is built: with more than one provider feature compiled
-    // into the workspace, rustls cannot choose one and panics at first use.
-    // NIST 800-53 Rev5: SC-13
+/// Installs the process-level rustls CryptoProvider (aws-lc, FIPS) before
+/// any TLS config is built: with more than one provider feature compiled
+/// into the workspace, rustls cannot choose one and panics at first use.
+// NIST 800-53 Rev5: SC-13
+fn install_crypto_provider() {
     if rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .is_err()
     {
         eprintln!("rustls CryptoProvider was already installed");
     }
+}
+
+#[tokio::main(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn main() -> ExitCode {
+    install_crypto_provider();
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sbc_trunk_agent=debug"));
     tracing_subscriber::fmt()
