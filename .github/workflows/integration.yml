@@ -39,7 +39,9 @@ jobs:
     env:
       COMPOSE: deploy/test/docker-compose.yml
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Build image + start SBC and SIPp UAS
         run: docker compose -f "$COMPOSE" up -d --build sbc sipp-uas
@@ -94,7 +96,9 @@ jobs:
     env:
       COMPOSE: deploy/test/docker-compose.split.yml
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Build image + start signaling, media, and SIPp UAS
         run: docker compose -f "$COMPOSE" up -d --build sbc-signaling sbc-media sipp-uas
@@ -151,7 +155,9 @@ jobs:
     env:
       COMPOSE: deploy/test/docker-compose.pool.yml
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Build image + start signaling, 2 media nodes, and SIPp UAS
         run: docker compose -f "$COMPOSE" up -d --build sbc-signaling sbc-media-1 sbc-media-2 sipp-uas
@@ -210,7 +216,9 @@ jobs:
     env:
       COMPOSE: deploy/test/docker-compose.pool.yml
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Build image + start signaling, 2 media nodes, and SIPp UAS
         run: docker compose -f "$COMPOSE" up -d --build sbc-signaling sbc-media-1 sbc-media-2 sipp-uas
