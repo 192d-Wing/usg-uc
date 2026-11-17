@@ -32,14 +32,19 @@ impl Blocklist {
     }
 
     /// Blocks a source IP. `duration` of `None` blocks permanently.
+    ///
+    /// The address is stored canonical (`IpAddr::to_canonical`), so
+    /// `::ffff:a.b.c.d` and `a.b.c.d` are the same block.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7, AC-4, SI-10
     pub fn block_source(&mut self, source: IpAddr, duration: Option<Duration>) {
         self.sources
-            .insert(source, duration.map(|d| Instant::now() + d));
+            .insert(source.to_canonical(), duration.map(|d| Instant::now() + d));
     }
 
-    /// Unblocks a source IP.
+    /// Unblocks a source IP (either IPv4 or IPv4-mapped form).
     pub fn unblock_source(&mut self, source: IpAddr) {
-        self.sources.remove(&source);
+        self.sources.remove(&source.to_canonical());
     }
 
     /// Blocks a caller-number prefix. `duration` of `None` blocks
@@ -65,9 +70,14 @@ impl Blocklist {
         self.caller_prefixes.retain(|(p, _)| *p != prefix);
     }
 
-    /// Whether a source IP is currently blocked.
+    /// Whether a source IP is currently blocked. An IPv4-mapped source
+    /// matches its plain-IPv4 entry.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7, AC-4, SI-10
     pub fn is_source_blocked(&self, source: IpAddr) -> bool {
-        self.sources.get(&source).is_some_and(is_active)
+        self.sources
+            .get(&source.to_canonical())
+            .is_some_and(is_active)
     }
 
     /// Returns the blocking prefix (canonical form) if the caller number
@@ -163,5 +173,69 @@ mod tests {
         bl.block_caller_prefix("+1-900", None);
         assert_eq!(bl.blocked_prefix_count(), 2);
         assert_eq!(bl.caller_block_match("1 (900) 555 1212"), Some("1900"));
+    }
+
+    // NIST 800-53 Rev5: SC-7, AC-4, SI-10
+    // An IPv4 address and its IPv4-mapped IPv6 form (`::ffff:a.b.c.d`) are
+    // the same source; a block on either form applies to both.
+    fn doc_v4() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))
+    }
+
+    fn doc_mapped() -> IpAddr {
+        IpAddr::V6(Ipv4Addr::new(198, 51, 100, 7).to_ipv6_mapped())
+    }
+
+    #[test]
+    fn configured_v4_blocks_mapped_source() {
+        let mut bl = Blocklist::new();
+        bl.block_source(doc_v4(), None);
+        assert!(bl.is_source_blocked(doc_mapped()));
+        assert!(bl.is_source_blocked(doc_v4()));
+    }
+
+    #[test]
+    fn configured_mapped_blocks_v4_source() {
+        let mut bl = Blocklist::new();
+        bl.block_source(doc_mapped(), None);
+        assert!(bl.is_source_blocked(doc_v4()));
+        assert!(bl.is_source_blocked(doc_mapped()));
+    }
+
+    #[test]
+    fn unblock_via_mapped_form_clears_v4_block() {
+        let mut bl = Blocklist::new();
+        bl.block_source(doc_v4(), None);
+        bl.unblock_source(doc_mapped());
+        assert!(!bl.is_source_blocked(doc_v4()));
+        assert!(!bl.is_source_blocked(doc_mapped()));
+        assert_eq!(bl.blocked_source_count(), 0);
+    }
+
+    #[test]
+    fn unblock_via_v4_form_clears_mapped_block() {
+        let mut bl = Blocklist::new();
+        bl.block_source(doc_mapped(), None);
+        bl.unblock_source(doc_v4());
+        assert!(!bl.is_source_blocked(doc_v4()));
+        assert!(!bl.is_source_blocked(doc_mapped()));
+        assert_eq!(bl.blocked_source_count(), 0);
+    }
+
+    #[test]
+    fn mapped_and_v4_block_count_once() {
+        let mut bl = Blocklist::new();
+        bl.block_source(doc_v4(), None);
+        bl.block_source(doc_mapped(), None);
+        assert_eq!(bl.blocked_source_count(), 1);
+    }
+
+    #[test]
+    fn native_ipv6_source_is_not_aliased_to_v4() {
+        let mut bl = Blocklist::new();
+        bl.block_source(doc_v4(), None);
+        // ::c633:6407 (IPv4-compatible, deprecated) is not the mapped form.
+        let compat = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 7).to_ipv6_compatible());
+        assert!(!bl.is_source_blocked(compat));
     }
 }
