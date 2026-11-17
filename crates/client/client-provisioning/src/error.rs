@@ -14,6 +14,14 @@ pub enum ProvisioningError {
     /// The discovery document's issuer is not trusted for the entered domain.
     #[error("issuer not trusted: {0}")]
     IssuerNotTrusted(String),
+    /// The entered service domain is not a bare DNS host (`host`,
+    /// `host:port`, optional `https://` and trailing `/`).
+    #[error("invalid service domain: {0}")]
+    InvalidServiceDomain(String),
+    /// A discovery/OIDC/config endpoint or registrar is not https, carries
+    /// userinfo, or lies outside the trusted registrable domain.
+    #[error("endpoint not trusted: {0}")]
+    UntrustedEndpoint(String),
     /// Sign-in was not completed in time (the device code expired).
     #[error("timed out: {0}")]
     Timeout(String),

@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, call-leg SDES keys only over TLS and only AEAD_AES_256_GCM, POA&M-347, 348, 349, 350)
+
+Affects every SBC. There is no setting to turn it off. Tested in local runs
+on macOS (2026-11-17). Operator details: `docs/SBC-ADMIN-GUIDE.md`
+"Call-leg SRTP keying (SDES)".
+
+- **SDES keys cross only between two TLS hops.** (RFC 4568 §8.3; SC-8,
+  SC-12) Before, `a=crypto` lines were relayed unread on any transport. Now
+  an SDP body whose SDES key would arrive or leave on UDP, TCP or WS is
+  refused with 488 `Warning: 399 <host> "SDES keying requires TLS on every
+  hop"`. A key that crosses on an initial INVITE keeps failover on TLS
+  trunks. The check covers the two hops the SBC terminates (POA&M-348).
+- **Only `AEAD_AES_256_GCM` SDES is relayed.** (RFC 7714 §14.1; SC-13)
+  `AES_CM_128_HMAC_SHA1_*` and other suites, lines with more than one
+  `inline:` key, a wrong key length, or `FEC_KEY`, `UNENCRYPTED_*`,
+  `UNAUTHENTICATED_SRTP` or unknown session parameters are stripped from
+  offers and refused in answers (488 `Warning: 306`).
+- **Refused answers end the call.** A refused 183 gets the callee a CANCEL
+  and the caller a 488; a refused 2xx gets the callee an ACK and BYE and the
+  caller a 488; a refused in-dialog 2xx ends the call with BYE on both legs.
+  The CDR ends `Failed` / `PolicyDenied` / 488. A retransmitted 2xx of a
+  refused re-INVITE is not re-ACKed (POA&M-350).
+- **MIKEY (`a=key-mgmt`) is no longer relayed**: stripped from offers,
+  refused in answers.
+- **Relayed in-dialog bodies the SBC cannot read are refused**: a
+  non-identity `Content-Encoding`, `multipart/*` containing SDP, or a
+  non-SDP body containing `a=crypto` / `a=key-mgmt` gets 488
+  `Warning: 399`.
+- **Terminate mode** strips every `a=crypto` and refuses a section with no
+  DTLS keying.
+- **Audit**: each refusal is a denied `AuthorizationDecision` with policy
+  `media_security:<label>`; not aggregated and no metrics (POA&M-347).
+- Not changed: cleartext `RTP/AVP` is still relayed; `media.srtp.required`
+  is not enforced on call-leg SDP. Pre-existing, now recorded: a 2xx that
+  carries an offer is ACKed without an answer on the normal path
+  (POA&M-349).
+- Docs: `docs/SBC-ADMIN-GUIDE.md` example used `media.srtp.mode = "Relay"`,
+  which does not load; valid values are `"Passthrough"` and `"Terminate"`.
+
+### Security (SBC, supported base images)
+
+- **SBC images: runtime bases moved off end-of-life releases and pinned
+  by digest.** (SI-2, CM-8, SR-3) The eight Rust service images and the
+  `dtls-terminator` sidecar move from Alpine 3.21 and 3.20 to Alpine
+  3.24.4. The dashboard moves from nginx-unprivileged 1.27 to 1.30.6
+  (Alpine 3.24). The `sbc-daemon` image stays on Debian trixie-slim, now
+  pinned by digest. Ports, users and nginx paths are unchanged. Builder
+  stages still use tags.
+- **Dependabot now watches every Dockerfile, the Go modules of both
+  sidecars and the dashboard's npm tree.** GitHub Actions updates are
+  grouped into one weekly PR.
+
 ### BREAKING (SBC, DTLS-SRTP sidecar keeps the association for the whole call, POA&M-335, 340, 341, 342)
 
 Affects only SBCs that terminate DTLS-SRTP (`sbcDaemon.dtlsTerminate.enabled`,

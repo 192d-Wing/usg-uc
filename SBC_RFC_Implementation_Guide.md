@@ -491,6 +491,16 @@ Open: RFC 3966 `;phone-context` is dropped (POA&M-100) and `urn:service:sos` is 
 - Crypto suite must be AEAD_AES_256_GCM
 - **Recommendation:** Prefer DTLS-SRTP over SDES for CNSA 2.0 compliance
 
+**Implementation status (sbc-daemon, fix/sdes-key-policy; local macOS run, 2026-11-17):**
+
+- The SBC relays SDES; it does not generate or consume call-leg SDES keys. `proto-b2bua/src/media_policy.rs` `apply_media_security` checks every SDP body that crosses it.
+- **Deviation (CNSA 2.0):** only `AEAD_AES_256_GCM` with one 44-octet inline key is relayed. `AES_CM_128_HMAC_SHA1_80` and every other suite are stripped from offers and refused in answers, so the "standard crypto suites" requirement above is not met by design.
+- Signalling: the key crosses only when both hops the SBC terminates are SIP over TLS (hop by hop, NIST POA&M-348).
+- Multiple crypto lines: an offer keeps every acceptable line; an answer must carry exactly one acceptable line per active SDES section.
+- Tag matching: answer tags are **not** cross-checked against the offer.
+- Session parameters: allow-list (`KDR`, `WSH`, `FEC_ORDER`); lifetime at most 2^48; MKI length 1-128.
+- Details: `docs/RFC_COMPLIANCE_GAPS.md` "sbc-daemon call-leg media security", `docs/SBC-ADMIN-GUIDE.md` "Call-leg SRTP keying (SDES)".
+
 ---
 
 ### RFC 5763/5764 - DTLS-SRTP
