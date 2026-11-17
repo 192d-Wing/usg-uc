@@ -298,7 +298,7 @@
 
 ### Gaps
 - No `TODO`/`FIXME` found
-- The SBC does not run ICE (by design: media anchoring with symmetric latching); ICE is a soft-client feature
+- The SBC does not run ICE (by design: media anchoring with symmetric latching); ICE is a soft-client feature. The SBC latch is exact-first with a 500 ms grace for NAT, and on DTLS-SRTP-terminated legs moves only on authenticated SRTP/SRTCP (`docs/RFC_COMPLIANCE_GAPS.md`, "sbc-media-core media source latching")
 
 ---
 
