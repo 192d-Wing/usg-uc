@@ -28,7 +28,7 @@ COPY . ./
 ENV GOFIPS140=v1.26.0 CGO_ENABLED=0 GOOS=linux
 RUN go build -trimpath -ldflags="-s -w" -o /dtls-terminator ./cmd/dtls-terminator
 
-FROM alpine:3.20
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 RUN adduser -D -u 65532 sidecar
 COPY --from=build /dtls-terminator /usr/local/bin/dtls-terminator
 
