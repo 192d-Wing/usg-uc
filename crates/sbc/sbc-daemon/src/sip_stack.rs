@@ -220,6 +220,12 @@ pub struct SipStack {
     ///
     /// ## NIST 800-53 Rev5: AC-21, SC-4, CM-6 (secure default)
     trusted_trunk_groups: RwLock<HashSet<String>>,
+    /// Serialises trunk-group sync and removal so a removal cannot land
+    /// between a sync's router add and its source-map update (see
+    /// [`Self::trunk_sync_guard`]).
+    ///
+    /// ## NIST 800-53 Rev5: AC-4, CM-3
+    trunk_sync: tokio::sync::Mutex<()>,
     /// `[media.t38]` fax relay policy. Default: disabled (fail-closed).
     /// Applied at startup; a reload reports it as restart-required.
     ///
@@ -3090,6 +3096,7 @@ impl SipStack {
             digest,
             signaling_audit,
             trusted_trunk_groups: RwLock::new(HashSet::new()),
+            trunk_sync: tokio::sync::Mutex::new(()),
             t38: sbc_config::T38Config::default(),
             t38_counters: crate::t38::T38Counters::default(),
             recording: None,
@@ -3176,6 +3183,7 @@ impl SipStack {
             digest,
             signaling_audit,
             trusted_trunk_groups: RwLock::new(HashSet::new()),
+            trunk_sync: tokio::sync::Mutex::new(()),
             t38: sbc_config::T38Config::default(),
             t38_counters: crate::t38::T38Counters::default(),
             recording: None,
@@ -8428,14 +8436,17 @@ impl SipStack {
 
             // Config-file trunks are admitted INVITE sources too (the API
             // path does this in register_inbound_trunk). No CSS for these.
-            let map = self.inbound_trunk_map.get_mut();
-            let mut hosts = HashSet::new();
-            for t_config in &tg_config.trunks {
-                for ip in resolve_trunk_host_ips(&t_config.host) {
-                    map.insert(ip, (tg_config.id.clone(), None));
-                    hosts.insert(ip);
-                }
-            }
+            let hosts: HashSet<std::net::IpAddr> = tg_config
+                .trunks
+                .iter()
+                .flat_map(|t| resolve_trunk_host_ips(&t.host))
+                .collect();
+            replace_inbound_trunk(
+                self.inbound_trunk_map.get_mut(),
+                &tg_config.id,
+                None,
+                &hosts,
+            );
             index_trunk_hosts(self.trunk_group_hosts.get_mut(), &tg_config.id, hosts);
         }
 
@@ -10732,7 +10743,11 @@ impl SipStack {
         //
         // ## NIST 800-53 Rev5: IA-9, SI-10, SC-5
         let stir_in = match self.stir.as_ref() {
-            Some(stir) => stir.inbound(req, source.ip(), &a_leg_call_id).await,
+            Some(stir) => {
+                let group = self.lookup_inbound_trunk(source.ip()).await.map(|(g, _)| g);
+                stir.inbound(req, source.ip(), group.as_deref(), &a_leg_call_id)
+                    .await
+            }
             None => crate::stir::InboundStir::default(),
         };
         if let Some(reason) = stir_in.reject {
@@ -13093,13 +13108,47 @@ impl SipStack {
         }
     }
 
-    /// Removes a trunk group from the router.
+    /// Guard that serialises trunk-group changes: a sync holds it across
+    /// its router add, source-map update and peer-set update, and
+    /// [`Self::remove_trunk_group_from_router`] holds it for the whole
+    /// removal. Not reentrant: the methods called under it do not take it.
+    ///
+    /// ## NIST 800-53 Rev5: AC-4, CM-3
+    pub async fn trunk_sync_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.trunk_sync.lock().await
+    }
+
+    /// Removes a trunk group from the router, together with its inbound
+    /// source addresses, dialog peer set and trust-domain membership.
+    /// Takes the trunk-sync guard; each map lock is taken on its own.
     pub async fn remove_trunk_group_from_router(&self, id: &str) {
+        let _sync = self.trunk_sync_guard().await;
         if let Some(ref router_lock) = self.router {
             let mut router = router_lock.write().await;
             router.remove_trunk_group(id);
         }
+        // NIST 800-53 Rev5: AC-3, AC-4, CM-3 - a removed group's addresses
+        // are no longer admitted as trunk sources.
+        self.inbound_trunk_map
+            .write()
+            .await
+            .retain(|_, (group, _)| group != id);
         self.trunk_group_hosts.write().await.remove(id);
+        // NIST 800-53 Rev5: AC-21, CM-3 - a re-created group starts untrusted.
+        self.trusted_trunk_groups.write().await.remove(id);
+    }
+
+    /// Resolves trunk host names to canonical IPs off the async workers.
+    pub async fn resolve_trunk_hosts(hosts: &[(String, u16)]) -> HashSet<std::net::IpAddr> {
+        let names: Vec<String> = hosts.iter().map(|(h, _)| h.clone()).collect();
+        tokio::task::spawn_blocking(move || {
+            names
+                .iter()
+                .flat_map(|h| resolve_trunk_host_ips(h))
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Records the configured hosts of trunk group `group_id` (all their
@@ -13108,33 +13157,48 @@ impl SipStack {
     ///
     /// ## NIST 800-53 Rev5: SC-23, AC-3
     pub async fn index_trunk_group_hosts(&self, group_id: &str, hosts: &[(String, u16)]) {
-        let names: Vec<String> = hosts.iter().map(|(h, _)| h.clone()).collect();
-        let ips: HashSet<std::net::IpAddr> = tokio::task::spawn_blocking(move || {
-            names
-                .iter()
-                .flat_map(|h| resolve_trunk_host_ips(h))
-                .collect()
-        })
-        .await
-        .unwrap_or_default();
+        let ips = Self::resolve_trunk_hosts(hosts).await;
+        self.index_trunk_group_ips(group_id, ips).await;
+    }
+
+    /// [`Self::index_trunk_group_hosts`] with the addresses already resolved.
+    pub async fn index_trunk_group_ips(&self, group_id: &str, ips: HashSet<std::net::IpAddr>) {
         index_trunk_hosts(&mut *self.trunk_group_hosts.write().await, group_id, ips);
     }
 
     /// Registers a trunk group for inbound call identification.
-    /// Maps each trunk's host IP to the trunk group ID and CSS.
+    /// Maps each trunk's host IP to the trunk group ID and CSS, replacing
+    /// the group's earlier entries; empty `hosts` clears the group.
+    ///
+    /// NIST 800-53 Rev5: AC-3, AC-4, CM-3
     pub async fn register_inbound_trunk(
         &self,
         trunk_group_id: &str,
         css_id: Option<&str>,
         hosts: &[(String, u16)],
     ) {
-        let mut map = self.inbound_trunk_map.write().await;
-        for (host, _port) in hosts {
-            for ip in resolve_trunk_host_ips(host) {
-                map.insert(ip, (trunk_group_id.to_string(), css_id.map(String::from)));
-            }
-        }
-        info!(trunk_group = trunk_group_id, css = ?css_id, hosts = hosts.len(), "Registered inbound trunk for CSS routing");
+        let ips = Self::resolve_trunk_hosts(hosts).await;
+        self.register_inbound_trunk_ips(trunk_group_id, css_id, &ips)
+            .await;
+    }
+
+    /// [`Self::register_inbound_trunk`] with the addresses already resolved
+    /// (canonical form).
+    ///
+    /// NIST 800-53 Rev5: AC-3, AC-4, CM-3
+    pub async fn register_inbound_trunk_ips(
+        &self,
+        trunk_group_id: &str,
+        css_id: Option<&str>,
+        ips: &HashSet<std::net::IpAddr>,
+    ) {
+        replace_inbound_trunk(
+            &mut *self.inbound_trunk_map.write().await,
+            trunk_group_id,
+            css_id,
+            ips,
+        );
+        info!(trunk_group = trunk_group_id, css = ?css_id, addresses = ips.len(), "Registered inbound trunk for CSS routing");
     }
 
     /// Looks up which trunk group and CSS an inbound call belongs to by source IP.
@@ -14281,6 +14345,30 @@ fn same_socket(a: SbcSocketAddr, b: SbcSocketAddr) -> bool {
     a.ip().to_canonical() == b.ip().to_canonical() && a.port() == b.port()
 }
 
+/// Replaces the `inbound_trunk_map` entries of trunk group `group` with
+/// `ips` (canonical) and `css`. An address already mapped to another group
+/// moves to `group`.
+///
+/// NIST 800-53 Rev5: AC-3, AC-4, CM-3
+fn replace_inbound_trunk(
+    map: &mut std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>,
+    group: &str,
+    css: Option<&str>,
+    ips: &HashSet<std::net::IpAddr>,
+) {
+    map.retain(|_, (g, _)| g != group);
+    for ip in ips {
+        if let Some((previous, _)) = map.insert(*ip, (group.to_string(), css.map(String::from))) {
+            // Only another group's entry can remain after the retain.
+            warn!(
+                trunk_group = group,
+                previous_trunk_group = %previous,
+                "Trunk host address moved from another trunk group"
+            );
+        }
+    }
+}
+
 /// Stores `ips` as the host set of trunk group `group`, warning when an
 /// address is also a host of another group: a dialog on either group then
 /// admits requests from it (SC-23).
@@ -15114,6 +15202,268 @@ pub mod tests {
         );
         assert!(stack.is_trunk_ip(mapped).await);
         assert!(stack.is_trunk_ip(std::net::IpAddr::V4(v4)).await);
+    }
+
+    /// Sends a minimal out-of-dialog INVITE from `ip:5060` and returns the
+    /// result (trunk-map pruning tests).
+    async fn invite_from(stack: &SipStack, ip: [u8; 4], tag: &str) -> ProcessResult {
+        let [a, b, c, d] = ip;
+        let invite = format!(
+            "INVITE sip:9999@sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {a}.{b}.{c}.{d}:5060;branch=z9hG4bK{tag}\r\n\
+             From: <sip:carrier@example.com>;tag={tag}\r\n\
+             To: <sip:9999@sbc.local>\r\n\
+             Call-ID: {tag}@example.com\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: <sip:carrier@{a}.{b}.{c}.{d}:5060>\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        );
+        let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(a, b, c, d), 5060);
+        stack
+            .process_message(&Bytes::from(invite), source, None)
+            .await
+    }
+
+    /// Whether `result` is the single 403 of source admission.
+    fn is_forbidden(result: &ProcessResult) -> bool {
+        matches!(
+            result,
+            ProcessResult::Response { message: SipMessage::Response(resp), .. }
+                if resp.status.code() == 403
+        )
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> std::net::IpAddr {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d))
+    }
+
+    // NIST 800-53 Rev5: AC-3, AC-4, CM-3
+    /// Once a trunk group is removed (gRPC `RemoveTrunkGroup`, which
+    /// sbc-api's REST delete calls), its former source IP is no longer a
+    /// trunk: the lookup is None and an INVITE from it gets the
+    /// source-admission 403.
+    #[tokio::test]
+    async fn test_removed_trunk_group_source_no_longer_admitted() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.ensure_router().await;
+        stack
+            .register_inbound_trunk(
+                "carrier",
+                Some("css-1"),
+                &[("203.0.113.9".to_string(), 5060)],
+            )
+            .await;
+        assert!(!is_forbidden(
+            &invite_from(&stack, [203, 0, 113, 9], "rm1").await
+        ));
+
+        stack.remove_trunk_group_from_router("carrier").await;
+
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
+        let mapped: std::net::IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+        assert_eq!(stack.lookup_inbound_trunk(mapped).await, None);
+        assert!(!stack.is_trunk_ip(v4(203, 0, 113, 9)).await);
+        let result = invite_from(&stack, [203, 0, 113, 9], "rm2").await;
+        assert!(
+            is_forbidden(&result),
+            "INVITE from a removed trunk group's IP must get 403, got {result:?}"
+        );
+    }
+
+    // NIST 800-53 Rev5: AC-3, AC-4, CM-3
+    /// Re-registering a group with different hosts replaces the
+    /// group's addresses: the old IP is no longer admitted, the new one is.
+    #[tokio::test]
+    async fn test_resync_with_changed_hosts_drops_old_ip() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk(
+                "carrier",
+                Some("css-1"),
+                &[("203.0.113.9".to_string(), 5060)],
+            )
+            .await;
+        stack
+            .register_inbound_trunk(
+                "carrier",
+                Some("css-1"),
+                &[("203.0.113.10".to_string(), 5060)],
+            )
+            .await;
+
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 10)).await,
+            Some(("carrier".to_string(), Some("css-1".to_string())))
+        );
+        assert!(!is_forbidden(
+            &invite_from(&stack, [203, 0, 113, 10], "ch1").await
+        ));
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await,
+            None,
+            "the group's old host must be dropped on re-sync"
+        );
+        let result = invite_from(&stack, [203, 0, 113, 9], "ch2").await;
+        assert!(
+            is_forbidden(&result),
+            "INVITE from a group's former host must get 403, got {result:?}"
+        );
+    }
+
+    // NIST 800-53 Rev5: AC-4, CM-3
+    /// Re-registering a group with a new CSS changes the CSS every
+    /// address of the group maps to, including after a host is dropped.
+    #[tokio::test]
+    async fn test_resync_with_new_css_replaces_css() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk(
+                "carrier",
+                Some("css-1"),
+                &[
+                    ("203.0.113.9".to_string(), 5060),
+                    ("203.0.113.10".to_string(), 5060),
+                ],
+            )
+            .await;
+        stack
+            .register_inbound_trunk(
+                "carrier",
+                Some("css-2"),
+                &[("203.0.113.9".to_string(), 5060)],
+            )
+            .await;
+
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await,
+            Some(("carrier".to_string(), Some("css-2".to_string())))
+        );
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 10)).await,
+            None,
+            "a dropped host must not keep the old CSS"
+        );
+
+        // CSS removed altogether: the group maps to no CSS.
+        stack
+            .register_inbound_trunk("carrier", None, &[("203.0.113.9".to_string(), 5060)])
+            .await;
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await,
+            Some(("carrier".to_string(), None))
+        );
+    }
+
+    // NIST 800-53 Rev5: AC-4, CM-3
+    /// An IP moved from group A to group B belongs only to B: a later
+    /// re-sync or removal of A leaves it with B, and removing B drops it.
+    #[tokio::test]
+    async fn test_ip_moved_between_groups_belongs_only_to_new_group() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk(
+                "a",
+                Some("css-a"),
+                &[
+                    ("203.0.113.9".to_string(), 5060),
+                    ("203.0.113.10".to_string(), 5060),
+                ],
+            )
+            .await;
+        // B synced first with the moved IP, then A re-synced without it.
+        stack
+            .register_inbound_trunk("b", Some("css-b"), &[("203.0.113.9".to_string(), 5060)])
+            .await;
+        stack
+            .register_inbound_trunk("a", Some("css-a"), &[("203.0.113.10".to_string(), 5060)])
+            .await;
+        let in_b = Some(("b".to_string(), Some("css-b".to_string())));
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, in_b);
+
+        // Removing A must not take B's address with it.
+        stack.remove_trunk_group_from_router("a").await;
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, in_b);
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 10)).await, None);
+
+        // Removing B drops it: nothing still maps it to A either.
+        stack.remove_trunk_group_from_router("b").await;
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
+    }
+
+    // NIST 800-53 Rev5: AC-3, AC-4, CM-3
+    /// Re-registering a group with no hosts clears its addresses.
+    #[tokio::test]
+    async fn test_resync_with_empty_hosts_clears_group() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk("carrier", None, &[("203.0.113.9".to_string(), 5060)])
+            .await;
+        stack
+            .register_inbound_trunk("other", None, &[("203.0.113.20".to_string(), 5060)])
+            .await;
+        stack.register_inbound_trunk("carrier", None, &[]).await;
+
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
+        assert!(is_forbidden(
+            &invite_from(&stack, [203, 0, 113, 9], "em1").await
+        ));
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 20)).await,
+            Some(("other".to_string(), None)),
+            "other groups are untouched"
+        );
+    }
+
+    // NIST 800-53 Rev5: AC-4, CM-3
+    /// A removal that arrives while a sync holds the trunk-sync guard
+    /// (between its router add and its source-map update) runs after the
+    /// sync: the group ends with no source entries and no peer set.
+    #[tokio::test]
+    async fn test_remove_during_sync_waits_for_guard() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.ensure_router().await;
+        let stack = Arc::new(stack);
+        let body = serde_json::json!({"id": "carrier", "trunks": [
+            {"id": "t1", "host": "203.0.113.9", "port": 5060}
+        ]});
+        let group = crate::api_server::trunk_group_from_json(&body).unwrap();
+
+        let sync = stack.trunk_sync_guard().await;
+        stack.add_trunk_group_to_router(group).await;
+        let remover = {
+            let stack = Arc::clone(&stack);
+            tokio::spawn(async move { stack.remove_trunk_group_from_router("carrier").await })
+        };
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!remover.is_finished(), "removal waits for the sync");
+        stack
+            .register_inbound_trunk("carrier", None, &[("203.0.113.9".to_string(), 5060)])
+            .await;
+        stack
+            .index_trunk_group_hosts("carrier", &[("203.0.113.9".to_string(), 5060)])
+            .await;
+        drop(sync);
+        remover.await.unwrap();
+
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
+        assert!(!stack.is_trunk_ip(v4(203, 0, 113, 9)).await);
+        assert!(!stack.trunk_group_hosts.read().await.contains_key("carrier"));
+    }
+
+    // NIST 800-53 Rev5: AC-21, CM-3
+    /// Removing a trunk group drops its trust-domain membership, so a group
+    /// later re-created with the same id starts untrusted.
+    #[tokio::test]
+    async fn test_removed_trunk_group_leaves_trust_domain() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack.set_trunk_group_trust_domain("carrier", true).await;
+        stack.set_trunk_group_trust_domain("other", true).await;
+        stack.remove_trunk_group_from_router("carrier").await;
+        assert!(!stack.trunk_group_trusted("carrier").await);
+        assert!(stack.trunk_group_trusted("other").await);
     }
 
     /// The same INVITE is admitted once its source is a configured trunk.
@@ -21003,24 +21353,31 @@ pub mod tests {
             id: "carriers".into(),
             name: String::new(),
             strategy: "priority".into(),
-            trunks: vec![
-                trunk(
-                    "t1",
-                    "127.0.0.2",
-                    sbc_config::TrunkStirConfig {
-                        sign: true,
-                        ..Default::default()
-                    },
-                ),
-                trunk(
-                    "alice-trunk",
-                    "192.168.1.1",
-                    sbc_config::TrunkStirConfig {
-                        verify: true,
-                        ..Default::default()
-                    },
-                ),
-            ],
+            trunks: vec![trunk(
+                "t1",
+                "127.0.0.2",
+                sbc_config::TrunkStirConfig {
+                    sign: true,
+                    ..Default::default()
+                },
+            )],
+            zone: None,
+            require_tls: false,
+            trust_domain: true,
+        });
+        // alice's ingress trunk, in the group the SIP stack maps her to.
+        c.trunk_groups.push(sbc_config::TrunkGroupConfig {
+            id: "pbx".into(),
+            name: String::new(),
+            strategy: "priority".into(),
+            trunks: vec![trunk(
+                "alice-trunk",
+                "192.168.1.1",
+                sbc_config::TrunkStirConfig {
+                    verify: true,
+                    ..Default::default()
+                },
+            )],
             zone: None,
             require_tls: false,
             trust_domain: true,
@@ -21224,16 +21581,25 @@ pub mod tests {
                         ..Default::default()
                     },
                 ),
-                trunk(
-                    "alice-trunk",
-                    "192.168.1.1",
-                    sbc_config::TrunkStirConfig {
-                        verify: true,
-                        strip_inbound_identity: true,
-                        ..Default::default()
-                    },
-                ),
             ],
+            zone: None,
+            require_tls: false,
+            trust_domain: true,
+        });
+        // alice's ingress trunk, in the group the SIP stack maps her to.
+        c.trunk_groups.push(sbc_config::TrunkGroupConfig {
+            id: "pbx".into(),
+            name: String::new(),
+            strategy: "priority".into(),
+            trunks: vec![trunk(
+                "alice-trunk",
+                "192.168.1.1",
+                sbc_config::TrunkStirConfig {
+                    verify: true,
+                    strip_inbound_identity: true,
+                    ..Default::default()
+                },
+            )],
             zone: None,
             require_tls: false,
             trust_domain: true,
