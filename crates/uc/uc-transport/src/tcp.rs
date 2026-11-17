@@ -11,7 +11,7 @@
 
 use crate::error::{TransportError, TransportResult};
 use crate::listener::ListenerConfig;
-use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
+use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport, canonical_peer};
 use bytes::BytesMut;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
@@ -67,12 +67,11 @@ impl TcpTransport {
             })?
             .into();
 
-        let peer_addr = stream
-            .peer_addr()
-            .map_err(|e| TransportError::Io {
-                reason: format!("failed to get peer address: {e}"),
-            })?
-            .into();
+        // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 - IPv4-mapped peers reported as plain IPv4.
+        let peer_addr = canonical_peer(stream.peer_addr().map_err(|e| TransportError::Io {
+            reason: format!("failed to get peer address: {e}"),
+        })?)
+        .into();
 
         debug!(local = %local_addr, peer = %peer_addr, "TCP transport created");
 
@@ -418,6 +417,8 @@ impl TcpListener {
                     reason: format!("accept failed: {e}"),
                 })?;
 
+        // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 - IPv4-mapped peers reported as plain IPv4.
+        let peer_addr = canonical_peer(peer_addr);
         debug!(peer = %peer_addr, "accepted TCP connection");
 
         let transport = TcpTransport::from_stream(stream)?;
@@ -609,5 +610,45 @@ mod tests {
             .expect("reader must end on peer close")
             .unwrap();
         assert!(r.is_err());
+    }
+
+    // NIST 800-53 Rev5: SC-7, SI-10
+    // An IPv4 client on a dual-stack `[::]` listener is reported with its
+    // plain IPv4 address, so consumers comparing against IPv4 configuration
+    // (blocklists, trunk maps) see the canonical form.
+    #[tokio::test]
+    async fn test_tcp_dual_stack_accept_reports_plain_ipv4_peer() {
+        use std::net::Ipv4Addr;
+        let Ok(listener) = TcpListener::bind(SbcSocketAddr::new_v6(Ipv6Addr::UNSPECIFIED, 0)).await
+        else {
+            crate::skip_dual_stack("cannot bind [::]:0 (no IPv6)");
+            return;
+        };
+        let port = listener.local_addr().port();
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let v4 = SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, port);
+        let connect =
+            tokio::time::timeout(std::time::Duration::from_secs(2), TcpTransport::connect(v4))
+                .await;
+        let Ok(Ok(client)) = connect else {
+            crate::skip_dual_stack("127.0.0.1 cannot reach a [::] listener (no dual-stack)");
+            accept.abort();
+            return;
+        };
+        let (server, peer) = accept.await.unwrap().unwrap();
+        assert!(peer.is_ipv4(), "accept peer must be plain IPv4, got {peer}");
+        assert_eq!(peer.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let transport_peer = *server.peer_addr();
+        assert!(
+            transport_peer.is_ipv4(),
+            "transport peer_addr must be plain IPv4, got {transport_peer}"
+        );
+        client.send(b"x", &v4).await.unwrap();
+        let msg = server.recv().await.unwrap();
+        assert!(
+            msg.source.is_ipv4(),
+            "received message source must be plain IPv4, got {}",
+            msg.source
+        );
     }
 }
