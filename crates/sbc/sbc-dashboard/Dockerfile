@@ -24,7 +24,7 @@ RUN npm run build
 # =============================================================================
 # Stage 2: Runtime — nginx serving the static bundle and proxying API paths.
 # =============================================================================
-FROM docker.io/nginxinc/nginx-unprivileged:1.30.6-alpine3.24@sha256:f5116ed4606f3eb015dd4a8e28cb9b351476dc0ad4bc6e9f93b19cec130cdf03 AS runtime
+FROM docker.io/nginxinc/nginx-unprivileged:1.31.7-alpine3.24@sha256:b5047b9b76845eac124358373c6852377c52e4b05834a47647e955dd91cb8f1e AS runtime
 
 # Template, not final config — entrypoint envsubst's $SBC_API_UPSTREAM in
 # at container start so the upstream Service name can be set per-deploy
