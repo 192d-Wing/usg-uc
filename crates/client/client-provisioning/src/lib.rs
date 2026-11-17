@@ -31,7 +31,10 @@ pub mod pkce;
 pub mod session;
 pub mod wire;
 
-pub use discovery::verify_issuer_pinned;
+pub use discovery::{
+    ServiceDomain, parse_service_domain, verify_client_config, verify_device_authorization,
+    verify_discovery, verify_issuer_pinned, verify_oidc_endpoints,
+};
 pub use error::ProvisioningError;
 pub use http::{CaTrust, build_http_client};
 pub use pkce::{PkcePair, generate_pkce, random_token};
@@ -39,6 +42,15 @@ pub use session::{PersistedProvisioning, ProvisionedSession, SessionState};
 pub use wire::{ClientConfig, DeviceAuthorization, DiscoveryDoc, OidcMetadata, TokenResponse};
 
 use wire::DiscoveryOidc;
+
+/// Response-body cap for discovery, OIDC metadata, device and token
+/// responses (and error bodies).
+///
+/// NIST 800-53 Rev5: SC-5 (bounded resource use).
+const MAX_SMALL_BODY: usize = 64 * 1024;
+
+/// Response-body cap for the per-user client config.
+const MAX_CONFIG_BODY: usize = 256 * 1024;
 
 /// Extracts the `nonce` claim from an ID token's payload WITHOUT verifying
 /// the signature.
@@ -73,35 +85,45 @@ impl ProvisioningClient {
         })
     }
 
-    /// Fetches `https://{service_domain}/.well-known/sip-client-config`.
+    /// Fetches `https://{service}/.well-known/sip-client-config` and
+    /// validates it with [`discovery::verify_discovery`] before returning.
+    ///
+    /// NIST 800-53 Rev5: IA-5, SC-23, SI-10.
     ///
     /// # Errors
-    /// [`ProvisioningError::Discovery`] on a transport or non-2xx error, or
-    /// [`ProvisioningError::Json`] if the body doesn't match the schema.
+    /// [`ProvisioningError::Discovery`] on a transport or non-2xx error,
+    /// [`ProvisioningError::Json`] if the body doesn't match the schema, or
+    /// [`ProvisioningError::IssuerNotTrusted`] /
+    /// [`ProvisioningError::UntrustedEndpoint`] if the document names an
+    /// issuer or config endpoint outside the service's trust scope.
     pub async fn fetch_discovery(
         &self,
-        service_domain: &str,
+        service: &ServiceDomain,
     ) -> Result<DiscoveryDoc, ProvisioningError> {
-        let host = service_domain
-            .trim()
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_end_matches('/');
-        let url = format!("https://{host}/.well-known/sip-client-config");
-        self.get_json(&url, None)
+        let doc: DiscoveryDoc = self
+            .get_json(&service.discovery_url(), None)
             .await
-            .map_err(ProvisioningError::into_discovery)
+            .map_err(ProvisioningError::into_discovery)?;
+        discovery::verify_discovery(service, &doc)?;
+        Ok(doc)
     }
 
     /// Fetches `{issuer}/.well-known/openid-configuration`.
     ///
     /// # Errors
-    /// [`ProvisioningError::Discovery`]/[`ProvisioningError::Json`] as above;
-    /// also errors when the metadata's `issuer` doesn't round-trip.
+    /// [`ProvisioningError::IssuerNotTrusted`] before any I/O when `issuer`
+    /// is not https or carries userinfo, a query or a fragment;
+    /// [`ProvisioningError::Discovery`] on a transport, non-2xx or body error;
+    /// also errors when the metadata's `issuer` doesn't round-trip, and
+    /// [`ProvisioningError::UntrustedEndpoint`] when an endpoint is outside
+    /// the issuer's registrable domain ([`discovery::verify_oidc_endpoints`]).
+    ///
+    /// NIST 800-53 Rev5: IA-5, SC-23, SI-10.
     pub async fn fetch_oidc_metadata(
         &self,
         issuer: &str,
     ) -> Result<OidcMetadata, ProvisioningError> {
+        discovery::verify_issuer_url(issuer)?;
         let url = format!(
             "{}/.well-known/openid-configuration",
             issuer.trim_end_matches('/')
@@ -116,6 +138,7 @@ impl ProvisioningClient {
                 meta.issuer
             )));
         }
+        discovery::verify_oidc_endpoints(&meta)?;
         Ok(meta)
     }
 
@@ -173,12 +196,18 @@ impl ProvisioningClient {
     /// Starts a Device Authorization Grant (RFC 8628 §3.1) — the desktop
     /// sign-in flow. The caller opens `verification_uri_complete` (falling
     /// back to `verification_uri`) in the system browser, shows `user_code`
-    /// to the user, and then [`Self::poll_device_token`]s.
+    /// to the user, and then [`Self::poll_device_token`]s. Both verification
+    /// URLs are checked with [`discovery::verify_device_authorization`]
+    /// before this returns.
+    ///
+    /// NIST 800-53 Rev5: IA-5, SC-23, SI-10.
     ///
     /// # Errors
     /// [`ProvisioningError::Authorization`] when the IdP advertises no
     /// device authorization endpoint, [`ProvisioningError::TokenExchange`]
-    /// on a transport/HTTP error, [`ProvisioningError::Json`] on a bad body.
+    /// on a transport/HTTP error, [`ProvisioningError::Json`] on a bad or
+    /// oversized body, [`ProvisioningError::UntrustedEndpoint`] when a
+    /// verification URL is outside the issuer's registrable domain.
     pub async fn start_device_authorization(
         &self,
         meta: &OidcMetadata,
@@ -214,14 +243,14 @@ impl ProvisioningClient {
             .map_err(|e| ProvisioningError::TokenExchange(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = error_body(resp).await;
             return Err(ProvisioningError::TokenExchange(format!(
                 "device authorization endpoint returned {status}: {body}"
             )));
         }
-        resp.json()
-            .await
-            .map_err(|e| ProvisioningError::Json(e.to_string()))
+        let device: DeviceAuthorization = read_json(resp, MAX_SMALL_BODY).await?;
+        discovery::verify_device_authorization(meta, &device)?;
+        Ok(device)
     }
 
     /// Polls the token endpoint until the user approves the device grant
@@ -266,13 +295,10 @@ impl ProvisioningClient {
                 .await
                 .map_err(|e| ProvisioningError::TokenExchange(e.to_string()))?;
             if resp.status().is_success() {
-                return resp
-                    .json()
-                    .await
-                    .map_err(|e| ProvisioningError::Json(e.to_string()));
+                return read_json(resp, MAX_SMALL_BODY).await;
             }
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = error_body(resp).await;
             match classify_device_poll(&body) {
                 DevicePoll::Pending => {}
                 DevicePoll::SlowDown => interval += Duration::from_secs(5),
@@ -346,14 +372,32 @@ impl ProvisioningClient {
 
     /// Fetches the per-user config with `Authorization: Bearer`.
     ///
+    /// `config_endpoint` is checked against `service` before any I/O (https,
+    /// no userinfo, inside the service's registrable domain), and the
+    /// returned config is checked with [`discovery::verify_client_config`]
+    /// before it is returned.
+    ///
+    /// NIST 800-53 Rev5: IA-5, SC-23, SI-10, AC-4.
+    ///
     /// # Errors
+    /// [`ProvisioningError::UntrustedEndpoint`] when the endpoint or the
+    /// provisioned registrar/SIP identity is out of scope;
     /// [`ProvisioningError::Unauthorized`] on a 401 (token expired/invalid →
-    /// refresh and retry once); [`ProvisioningError::Config`] otherwise.
+    /// refresh and retry once); [`ProvisioningError::Json`] on a bad or
+    /// oversized body; [`ProvisioningError::Config`] otherwise, including a
+    /// 3xx (redirects are not followed).
     pub async fn fetch_client_config(
         &self,
+        service: &ServiceDomain,
         config_endpoint: &str,
         access_token: &str,
     ) -> Result<ClientConfig, ProvisioningError> {
+        // The bearer token is only sent to an endpoint in the service scope.
+        discovery::verify_endpoint_in_scope(
+            "config_endpoint",
+            config_endpoint,
+            service.registrable(),
+        )?;
         let resp = self
             .http
             .get(config_endpoint)
@@ -364,12 +408,10 @@ impl ProvisioningClient {
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(ProvisioningError::Unauthorized);
         }
-        let resp = resp
-            .error_for_status()
-            .map_err(|e| ProvisioningError::Config(e.to_string()))?;
-        resp.json()
-            .await
-            .map_err(|e| ProvisioningError::Json(e.to_string()))
+        check_success(resp.status()).map_err(ProvisioningError::Config)?;
+        let cfg: ClientConfig = read_json(resp, MAX_CONFIG_BODY).await?;
+        discovery::verify_client_config(service, &cfg)?;
+        Ok(cfg)
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(
@@ -384,12 +426,9 @@ impl ProvisioningClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| ProvisioningError::Http(e.to_string()))?
-            .error_for_status()
             .map_err(|e| ProvisioningError::Http(e.to_string()))?;
-        resp.json()
-            .await
-            .map_err(|e| ProvisioningError::Json(e.to_string()))
+        check_success(resp.status()).map_err(ProvisioningError::Http)?;
+        read_json(resp, MAX_SMALL_BODY).await
     }
 
     async fn post_token(
@@ -406,15 +445,67 @@ impl ProvisioningClient {
             .map_err(|e| ProvisioningError::TokenExchange(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = error_body(resp).await;
             return Err(ProvisioningError::TokenExchange(format!(
                 "token endpoint returned {status}: {body}"
             )));
         }
-        resp.json()
-            .await
-            .map_err(|e| ProvisioningError::Json(e.to_string()))
+        read_json(resp, MAX_SMALL_BODY).await
     }
+}
+
+/// Requires a 2xx status. A 3xx is reported as not followed (the HTTP
+/// client has redirects disabled).
+///
+/// NIST 800-53 Rev5: AC-4.
+fn check_success(status: reqwest::StatusCode) -> Result<(), String> {
+    if status.is_success() {
+        Ok(())
+    } else if status.is_redirection() {
+        Err(format!("server returned {status}; redirect not followed"))
+    } else {
+        Err(format!("server returned {status}"))
+    }
+}
+
+/// Reads at most `limit` body bytes; a longer body is an error.
+///
+/// NIST 800-53 Rev5: SC-5, SI-10.
+async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+    let too_large = || format!("response body exceeds {limit} bytes");
+    if resp
+        .content_length()
+        .is_some_and(|len| usize::try_from(len).map_or(true, |len| len > limit))
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Capped read + JSON decode.
+async fn read_json<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    limit: usize,
+) -> Result<T, ProvisioningError> {
+    let body = read_capped(resp, limit)
+        .await
+        .map_err(ProvisioningError::Json)?;
+    serde_json::from_slice(&body).map_err(|e| ProvisioningError::Json(e.to_string()))
+}
+
+/// Capped error body for diagnostics; empty when unreadable or oversized.
+async fn error_body(resp: reqwest::Response) -> String {
+    read_capped(resp, MAX_SMALL_BODY).await.map_or_else(
+        |_| String::new(),
+        |b| String::from_utf8_lossy(&b).into_owned(),
+    )
 }
 
 /// How a non-2xx token-endpoint response should steer the device-grant
@@ -520,5 +611,127 @@ mod tests {
         let token = format!("eyJhbGciOiJFUzI1NiJ9.{payload}.sig");
         assert_eq!(id_token_nonce(&token).as_deref(), Some("NONCE-42"));
         assert!(id_token_nonce("not-a-jwt").is_none());
+    }
+
+    #[test]
+    fn check_success_reports_redirect_not_followed() {
+        use reqwest::StatusCode;
+        assert!(check_success(StatusCode::OK).is_ok());
+        assert!(check_success(StatusCode::NO_CONTENT).is_ok());
+        for s in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::FOUND,
+            StatusCode::TEMPORARY_REDIRECT,
+        ] {
+            let err = check_success(s).unwrap_err();
+            assert!(err.contains("redirect not followed"), "{s}: {err}");
+        }
+        for s in [
+            StatusCode::NOT_MODIFIED,
+            StatusCode::NOT_FOUND,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(check_success(s).is_err(), "{s}");
+        }
+    }
+
+    /// Answers one request with `response` on a fresh listener; returns the URL.
+    async fn serve_once(response: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = sock.write_all(&response).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://127.0.0.1:{port}/.well-known/openid-configuration")
+    }
+
+    /// Plaintext client so status/body handling can be exercised without a
+    /// TLS fixture; production clients are https-only.
+    fn plaintext_client() -> ProvisioningClient {
+        ProvisioningClient {
+            http: http::build_http_client_with(&CaTrust::System, false).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_json_redirect_is_discovery_error_not_followed() {
+        let url = serve_once(
+            b"HTTP/1.1 302 Found\r\nLocation: https://example.com/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        let err = plaintext_client()
+            .get_json::<serde_json::Value>(&url, None)
+            .await
+            .map_err(ProvisioningError::into_discovery)
+            .unwrap_err();
+        assert!(
+            matches!(&err, ProvisioningError::Discovery(m) if m.contains("redirect not followed")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_json_accepts_small_body() {
+        let body = br#"{"ok":true}"#;
+        let mut resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(body);
+        let url = serve_once(resp).await;
+        let v: serde_json::Value = plaintext_client().get_json(&url, None).await.unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn get_json_rejects_oversized_body_by_length() {
+        let body = vec![b' '; MAX_SMALL_BODY + 1];
+        let mut resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(&body);
+        let url = serve_once(resp).await;
+        let err = plaintext_client()
+            .get_json::<serde_json::Value>(&url, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ProvisioningError::Json(m) if m.contains("exceeds")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_json_rejects_oversized_body_without_length() {
+        // No Content-Length: body is delimited by connection close, so the
+        // cap must be enforced while streaming.
+        let mut resp = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        resp.extend(std::iter::repeat_n(b' ', MAX_SMALL_BODY + 1));
+        let url = serve_once(resp).await;
+        let err = plaintext_client()
+            .get_json::<serde_json::Value>(&url, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ProvisioningError::Json(m) if m.contains("exceeds")),
+            "{err:?}"
+        );
     }
 }

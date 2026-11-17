@@ -17,8 +17,8 @@ use std::time::Duration;
 use chrono::Utc;
 use client_core::{ClientApp, ProvisioningSettings, SettingsManager};
 use client_provisioning::{
-    verify_issuer_pinned, CaTrust, ClientConfig, DiscoveryDoc, OidcMetadata, ProvisionedSession,
-    ProvisioningClient, SessionState, TokenResponse,
+    parse_service_domain, CaTrust, ClientConfig, DiscoveryDoc, OidcMetadata, ProvisionedSession,
+    ProvisioningClient, ServiceDomain, SessionState, TokenResponse,
 };
 use client_types::TransportPreference;
 use serde::Serialize;
@@ -251,10 +251,13 @@ pub async fn start_signin(
     app: AppHandle,
     state: State<'_, TauriAppState>,
 ) -> Result<(), String> {
-    let domain = domain.trim().to_string();
-    if domain.is_empty() {
+    if domain.trim().is_empty() {
         return Err("Enter the service domain (e.g. sbc.oopl.dev.mil)".to_string());
     }
+    // Parsed once; the normalized form is what is fetched, persisted and
+    // compared. NIST 800-53 Rev5: SI-10.
+    let service = parse_service_domain(&domain).map_err(|e| e.to_string())?;
+    let domain = service.to_string();
 
     // The user clicked Continue on the untrusted-CA warning: provisioning
     // HTTP for this app run skips server-cert verification. Only honored
@@ -307,7 +310,7 @@ pub async fn start_signin(
 
     let ctx = SigninCtx::from_state(&state);
     tauri::async_runtime::spawn(async move {
-        if let Err(message) = run_signin_flow(&app, &ctx, &domain, cancel_rx).await {
+        if let Err(message) = run_signin_flow(&app, &ctx, &service, cancel_rx).await {
             if message == "cancelled" {
                 {
                     let mut s = ctx.session.write().await;
@@ -449,23 +452,25 @@ pub async fn try_silent_resume(
 async fn run_signin_flow(
     app: &AppHandle,
     ctx: &SigninCtx,
-    domain: &str,
+    service: &ServiceDomain,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
     // 1. Discovery + issuer pinning (the trust bootstrap — before any browser).
+    //    `fetch_discovery` / `fetch_oidc_metadata` validate the issuer, the
+    //    config endpoint and every OIDC endpoint before returning.
+    //    NIST 800-53 Rev5: IA-5, SC-23.
     set_session_state(app, ctx, SessionState::Discovering).await;
     {
         let mut s = ctx.session.write().await;
-        s.service_domain = domain.to_string();
+        s.service_domain = service.to_string();
     }
     emit_progress(app, "discovering", "Contacting service…");
     let trust = ca_trust(ctx).await;
     let pc = ProvisioningClient::new(&trust).map_err(|e| e.to_string())?;
     let discovery = pc
-        .fetch_discovery(domain)
+        .fetch_discovery(service)
         .await
         .map_err(|e| e.to_string())?;
-    verify_issuer_pinned(domain, &discovery.oidc.issuer).map_err(|e| e.to_string())?;
     let meta = pc
         .fetch_oidc_metadata(&discovery.oidc.issuer)
         .await
@@ -481,6 +486,8 @@ async fn run_signin_flow(
         .start_device_authorization(&meta, &discovery.oidc, &pkce.challenge)
         .await
         .map_err(|e| e.to_string())?;
+    // Both verification URLs were scope-checked against the issuer by
+    // `start_device_authorization`.
     let verify_url = device
         .verification_uri_complete
         .clone()
@@ -524,13 +531,14 @@ async fn run_signin_flow(
     emit_progress(app, "provisioning", "Fetching your phone configuration…");
     let cfg = pc
         .fetch_client_config(
+            service,
             &discovery.provisioning.config_endpoint,
             &tokens.access_token,
         )
         .await
         .map_err(|e| e.to_string())?;
 
-    finish_provisioning(app, ctx, domain, discovery, meta, tokens, cfg).await
+    finish_provisioning(app, ctx, service, discovery, meta, tokens, cfg).await
 }
 
 /// Silent token refresh + config re-fetch (no browser). Used by silent
@@ -541,13 +549,15 @@ async fn silent_refresh(
     domain: &str,
     refresh_token: &str,
 ) -> Result<(), String> {
+    // Stored domains are re-parsed (an earlier build may have stored the
+    // raw input). NIST 800-53 Rev5: SI-10.
+    let service = &parse_service_domain(domain).map_err(|e| e.to_string())?;
     let trust = ca_trust(ctx).await;
     let pc = ProvisioningClient::new(&trust).map_err(|e| e.to_string())?;
     let discovery = pc
-        .fetch_discovery(domain)
+        .fetch_discovery(service)
         .await
         .map_err(|e| e.to_string())?;
-    verify_issuer_pinned(domain, &discovery.oidc.issuer).map_err(|e| e.to_string())?;
     let meta = pc
         .fetch_oidc_metadata(&discovery.oidc.issuer)
         .await
@@ -558,12 +568,13 @@ async fn silent_refresh(
         .map_err(|e| e.to_string())?;
     let cfg = pc
         .fetch_client_config(
+            service,
             &discovery.provisioning.config_endpoint,
             &tokens.access_token,
         )
         .await
         .map_err(|e| e.to_string())?;
-    finish_provisioning(app, ctx, domain, discovery, meta, tokens, cfg).await
+    finish_provisioning(app, ctx, service, discovery, meta, tokens, cfg).await
 }
 
 /// Maps the provisioned config onto the default account, persists everything
@@ -571,12 +582,13 @@ async fn silent_refresh(
 async fn finish_provisioning(
     app: &AppHandle,
     ctx: &SigninCtx,
-    domain: &str,
+    service: &ServiceDomain,
     discovery: DiscoveryDoc,
     meta: OidcMetadata,
     tokens: TokenResponse,
     cfg: ClientConfig,
 ) -> Result<(), String> {
+    let domain = service.to_string();
     let account = client_provisioning::mapping::to_sip_account(
         &cfg,
         &tokens.access_token,
@@ -592,7 +604,7 @@ async fn finish_provisioning(
         let mut sm = ctx.settings_manager.write().await;
         sm.set_account(account.clone());
         sm.set_default_account(Some(account.id.clone()));
-        if let Err(e) = sm.delete_refresh_token(domain) {
+        if let Err(e) = sm.delete_refresh_token(&domain) {
             debug!(error = %e, "no legacy keychain refresh token to scrub");
         }
         let extra_ca = sm
@@ -601,7 +613,7 @@ async fn finish_provisioning(
             .as_ref()
             .and_then(|p| p.extra_ca_cert_file.clone());
         sm.settings_mut().provisioning = Some(ProvisioningSettings {
-            service_domain: domain.to_string(),
+            service_domain: domain.clone(),
             refresh_token_persisted: false,
             extra_ca_cert_file: extra_ca,
         });
@@ -613,7 +625,7 @@ async fn finish_provisioning(
     {
         let mut s = ctx.session.write().await;
         s.state = SessionState::Registered;
-        s.service_domain = domain.to_string();
+        s.service_domain.clone_from(&domain);
         s.discovery = Some(discovery);
         s.oidc_meta = Some(meta);
         s.access_token = Some(Zeroizing::new(tokens.access_token.clone()));

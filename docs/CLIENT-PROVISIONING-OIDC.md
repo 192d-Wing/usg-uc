@@ -97,6 +97,14 @@ browser flow. Active calls are not torn down — only re-REGISTER fails.
 - Served on the anycast VIP, TLS required, no auth.
 - Cacheable (`Cache-Control: max-age=300`) — contents are per-POP but stable.
 - This is the only URL the client ever constructs from user input.
+- The entered service domain must be `host`, `host:port` or
+  `https://host[:port]`, with an optional trailing `/`. Any other scheme,
+  userinfo, path, query, fragment, IP literal, non-LDH label, or a host that
+  is itself a public suffix is refused before any request
+  (`client-provisioning/src/discovery.rs` `parse_service_domain`).
+- All provisioning and OIDC HTTP requests are https-only and do not follow
+  redirects; a 3xx response is an error (`client-provisioning/src/http.rs`
+  `build_http_client`, `src/lib.rs` `check_success`).
 
 ### Discovery example
 
@@ -162,10 +170,27 @@ Notes:
 - `issuer` is the OIDC issuer; the client fetches
   `{issuer}/.well-known/openid-configuration` from there — we never hardcode
   Keycloak paths in the client.
-- The client MUST verify that the discovery document's `issuer` host is under
-  the same registrable domain as the entered service domain, or matches an
-  allowlist pinned at build time. This prevents a compromised POP from
-  redirecting auth to an attacker IdP.
+- The client MUST verify that the discovery document's `issuer` is https,
+  has no userinfo, query or fragment, and its host is under the same
+  registrable domain as the entered service domain, or matches a build-time
+  pin scoped to that registrable domain (`PINNED_ISSUERS`). A pin applies
+  only to service domains under its own registrable domain. The only pin,
+  `icam.oopl.dev.mil` for `oopl.dev.mil`, is already covered by the
+  same-domain rule and grants no further trust. This limits which IdP a
+  POP can send the client to.
+- "Registrable domain" is one label plus the longest matching entry of a
+  built-in suffix list (`dev.mil`; otherwise the TLD), not the full Public
+  Suffix List (POA&M-370). So `sbc.oopl.dev.mil` is scoped to
+  `oopl.dev.mil`, and `a.dev.mil` and `b.dev.mil` are different scopes.
+- `provisioning.config_endpoint` MUST be https, without userinfo, with a
+  DNS host inside the entered service domain's registrable domain (any
+  port). The client checks this before sending the bearer token
+  (`fetch_client_config`).
+- The OIDC metadata `issuer` and its authorization, token,
+  device_authorization, end_session and revocation endpoints, and the
+  device grant's `verification_uri` / `verification_uri_complete`, MUST be
+  https, without userinfo, inside the issuer's registrable domain
+  (`verify_oidc_endpoints`, `verify_device_authorization`).
 
 ## Endpoint 2: Client Config (provisioning)
 
@@ -316,6 +341,15 @@ Notes:
   yet — it does an A/AAAA lookup of the registrar domain (IPv6 preferred)
   with the default port derived from the URI scheme (`sips:` → 5061,
   `sip:` → 5060). See Implementation Phases below.
+
+- The client refuses a config whose `registration.registrar_domain` is not
+  a bare `host` or `host:port` (LDH DNS name, port 1-65535) inside the
+  entered service domain's registrable domain. `sip.uri` must be
+  `sip:`/`sips:` `[user@]host[:port]` with no parameters or headers, and
+  `sip.domain` a bare DNS host, both in the same scope
+  (`client-provisioning/src/discovery.rs` `verify_client_config`).
+  `features` is not checked. This is a client-side check only; a matching
+  check where the POP builds the config is an SBC-side follow-up.
 
 - Registration robustness uses SIP Outbound (RFC 5626): the Contact carries
   `reg-id` and `+sip.instance`, flows are kept alive per RFC 5626 keepalives,
@@ -483,8 +517,12 @@ round trip — no browser unless the refresh token is dead.
   the `user_code` so the user can match it against the browser page
   (RFC 8628 §5.4 remote-phishing mitigation); the token binding is
   possession of the `device_code` on the client's TLS polling channel.
-- **Issuer pinning.** Discovery is the trust bootstrap; constrain the issuer
-  to the entered domain's registrable domain or a built-in allowlist.
+- **Issuer pinning.** Discovery is the trust bootstrap. The issuer must be
+  in the entered domain's registrable domain or match a built-in pin scoped
+  to that registrable domain; the config endpoint, registrar and SIP
+  identity must be in the entered domain's registrable domain, and the OIDC
+  endpoints in the issuer's. Requests are https-only and redirects are not
+  followed. See Endpoint 1 notes.
 - **No `password` grant.** Direct access grants stay disabled even though
   they would be "easier" — they bypass MFA and train users to type IdP
   passwords into native apps.
