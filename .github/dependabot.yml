@@ -1,23 +1,52 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+# Dependabot version updates (SI-2, SR-3).
+# Options: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Base images are pinned as `tag@sha256:digest`; the docker entries bump both.
+# Keep the docker `directories` list in step with the Dockerfiles in the tree.
 
 version: 2
 updates:
-  - package-ecosystem: "cargo" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  - package-ecosystem: "cargo"
+    directory: "/"
     schedule:
       interval: "weekly"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    # Optional: Raise PRs with a specific label
     labels:
       - "actions updates"
-  # .github/dependabot.yml
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
   - package-ecosystem: "docker"
-    directory: "/"
+    directories:
+      - "/"
+      - "/ci/image"
+      - "/crates/sbc/central-config-api"
+      - "/crates/sbc/central-config-import"
+      - "/crates/sbc/sbc-announcement-server"
+      - "/crates/sbc/sbc-api-server"
+      - "/crates/sbc/sbc-client-config-server"
+      - "/crates/sbc/sbc-config-sync"
+      - "/crates/sbc/sbc-dashboard"
+      - "/crates/sbc/sbc-provision-server"
+      - "/crates/sbc/sbc-trunk-agent"
+      - "/sidecar/dtls-terminator"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "gomod"
+    directories:
+      - "/sidecar/dtls-terminator"
+      - "/sidecar/srtp-test-peer"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "npm"
+    directory: "/crates/sbc/sbc-dashboard"
     schedule:
       interval: "weekly"
