@@ -68,6 +68,7 @@ fn free_port() -> std::io::Result<u16> {
 
 #[tokio::test]
 async fn mtls_listener_admits_only_allow_listed_client() -> TestResult {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let ca = Pki::new()?;
     let other_ca = Pki::new()?;
     let server = ca.leaf(&["127.0.0.1"], ExtendedKeyUsagePurpose::ServerAuth)?;

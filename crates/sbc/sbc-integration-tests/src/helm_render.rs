@@ -304,9 +304,18 @@ fn qa_helm_render_trunk_agent_with_mtls() {
     );
     let fname = fullname(&out);
     let cert = get(&out, "Certificate", &format!("{fname}-grpc-trunk-agent"));
-    assert!(cert.contains(&format!("{fname}-sbc-trunk-agent")), "{cert}");
-    assert!(cert.contains("client auth"), "{cert}");
-    assert!(cert.contains("384"), "P-384 key: {cert}");
+    assert!(
+        cert.contains(&format!("{fname}-sbc-trunk-agent")),
+        "trunk-agent Certificate names the agent CN"
+    );
+    assert!(
+        cert.contains("client auth"),
+        "trunk-agent Certificate has client auth"
+    );
+    assert!(
+        cert.contains("384"),
+        "trunk-agent Certificate uses a P-384 key"
+    );
 
     let cfg = sbc_config::load_from_str(&daemon_config(&out)).expect("rendered config loads");
     let names = cfg.grpc.expect("[grpc]").allowed_client_names;
@@ -476,8 +485,14 @@ fn qa_helm_render_provision_trusted_proxies() {
     let tp = env_entry(prov, "SBC_TRUSTED_PROXIES").expect("SBC_TRUSTED_PROXIES");
     assert!(tp.contains("10.42.0.0/16"), "{tp}");
     let secret = env_entry(prov, "SBC_PROVISION_SECRET").expect("SBC_PROVISION_SECRET");
-    assert!(secret.contains("secretKeyRef"), "{secret}");
-    assert!(secret.contains("name: s\n"), "{secret}");
+    assert!(
+        secret.contains("secretKeyRef"),
+        "SBC_PROVISION_SECRET comes from a secretKeyRef"
+    );
+    assert!(
+        secret.contains("name: s\n"),
+        "SBC_PROVISION_SECRET references the existing Secret"
+    );
 }
 
 #[test]
@@ -555,8 +570,11 @@ fn qa_helm_render_central_cnpg_password_and_tls() {
         let line = secret
             .lines()
             .find(|l| l.trim_start().starts_with(key))
-            .unwrap_or_else(|| panic!("{key} in {secret}"));
-        assert!(line.contains(tls), "{line}");
+            .unwrap_or_else(|| panic!("{key} present in the CNPG Secret"));
+        assert!(
+            line.contains(tls),
+            "{key} uses sslmode=verify-full with the CNPG CA"
+        );
     }
     let api = get(&out, "Deployment", &format!("{fname}-api"));
     assert!(

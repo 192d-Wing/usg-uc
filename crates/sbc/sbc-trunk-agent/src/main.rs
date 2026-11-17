@@ -447,6 +447,16 @@ impl Health for AlwaysServing {
 #[tokio::main(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn main() -> ExitCode {
+    // Install the process-level rustls CryptoProvider (aws-lc, FIPS) before
+    // any TLS config is built: with more than one provider feature compiled
+    // into the workspace, rustls cannot choose one and panics at first use.
+    // NIST 800-53 Rev5: SC-13
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        eprintln!("rustls CryptoProvider was already installed");
+    }
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sbc_trunk_agent=debug"));
     tracing_subscriber::fmt()
@@ -622,11 +632,10 @@ mod daemon_tls_tests {
     #[test]
     fn qa_daemon_tls_all_or_none() {
         assert!(daemon_tls_from(None, None, None).unwrap().is_none());
-        assert!(
-            daemon_tls_from(s("/tls/ca.crt"), s("/tls/tls.crt"), s("/tls/tls.key"))
-                .unwrap()
-                .is_some()
-        );
+        assert!(matches!(
+            daemon_tls_from(s("/tls/ca.crt"), s("/tls/tls.crt"), s("/tls/tls.key")),
+            Ok(Some(_))
+        ));
         let partial = [
             (s("/tls/ca.crt"), None, None),
             (None, s("/tls/tls.crt"), None),

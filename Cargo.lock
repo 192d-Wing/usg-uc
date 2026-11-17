@@ -6454,6 +6454,7 @@ name = "sbc-media"
 version = "0.10.0"
 dependencies = [
  "rcgen",
+ "rustls",
  "rustls-pki-types",
  "rustls-webpki",
  "sbc-grpc-api",
@@ -6518,6 +6519,7 @@ dependencies = [
 name = "sbc-trunk-agent"
 version = "0.10.0"
 dependencies = [
+ "rustls",
  "sbc-config-store",
  "sbc-grpc-api",
  "sbc-trunk-services",
