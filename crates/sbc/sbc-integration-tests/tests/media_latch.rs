@@ -1,4 +1,4 @@
-//! Opaque media relay source latching under a same-IP sprayer (SR-12).
+//! Opaque media relay source latching under a same-IP sprayer.
 //!
 //! Drives the real `sbc-media-core` opaque relay through `start_relay`. An
 //! attacker socket on the callee's IP sprays the SBC's B-leg port from the

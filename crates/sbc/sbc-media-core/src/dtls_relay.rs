@@ -788,7 +788,7 @@ mod tests {
         sidecar.await.unwrap();
     }
 
-    // ---- SR-12: handshake pump source handling ------------------------------
+    // ---- Handshake pump source handling --------------------------------------
     //
     // No single datagram may redirect the pump. Inbound DTLS must pass a
     // record-header plausibility walk; up to MAX_HANDSHAKE_SOURCES other
@@ -834,7 +834,7 @@ mod tests {
         tokio::task::JoinHandle<Vec<Vec<u8>>>,
     ) {
         let path =
-            std::env::temp_dir().join(format!("usg-sr12-{name}-{}.sock", std::process::id()));
+            std::env::temp_dir().join(format!("usg-hs-src-{name}-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let fp = "sha-384 SIDECAR";

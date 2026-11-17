@@ -165,11 +165,12 @@ impl DtlsForwardBucket {
 /// SRTP/SRTCP under the leg's profile, its SSRC is one this leg has already
 /// authenticated (any SSRC before the first authenticated packet, so that a
 /// wrong seed can be corrected) and, for SRTP, its index is above the
-/// highest authenticated one; the latch moves to that port (and
-/// `recv_target` with it) only when the unprotect succeeds. Otherwise it is
-/// dropped and counted: `dropped_stale_relatch` for an SRTP index that does
-/// not advance (dropped before unprotect, so the context is not touched),
-/// `dropped_unauth_source` for everything else. The latch is never moved by
+/// highest authenticated one (for SRTCP, an index the RTCP replay window
+/// accepts); the latch moves to that port (and `recv_target` with it) only
+/// when the unprotect succeeds. Otherwise it is dropped and counted:
+/// `dropped_stale_relatch` for an SRTP index that does not advance or an
+/// SRTCP index the replay window rejects (dropped before unprotect, so the
+/// context is not touched), `dropped_unauth_source` for everything else. The latch is never moved by
 /// an unauthenticated datagram.
 ///
 /// DTLS-class datagrams reach the sidecar from the latched source and, until
@@ -403,13 +404,15 @@ impl TerminateRelayLeg {
                         self.media_authenticated.store(true, Ordering::Release);
                     }
                     if !from_latched {
-                        // A stale SRTP index was refused before unprotect
-                        // (`trial_gate`).
-                        // POAM: POA&M-346 -- SRTCP has no such freshness
-                        // rule: an observer of a genuine SRTCP packet that the
-                        // relay never received can replay it from another
-                        // port on the peer's IP and move the latch until the
-                        // peer's next packet moves it back.
+                        // A stale SRTP index, and an SRTCP index the RTCP
+                        // replay window rejects, were refused before
+                        // unprotect (`trial_gate`).
+                        // POAM: POA&M-346 -- SRTCP needs only an index the
+                        // replay window accepts, not a new highest one: an
+                        // observer of a genuine SRTCP packet that the relay
+                        // never received can replay it from another port on
+                        // the peer's IP and move the latch until the peer's
+                        // next packet moves it back.
                         latch_moves += 1;
                         if latch_moves == 1 || latch_moves.is_multiple_of(100) {
                             info!(
@@ -489,7 +492,28 @@ impl TerminateRelayLeg {
         if !ssrc.is_some_and(|s| auth_ssrcs.contains(s)) {
             return TrialGate::Refuse;
         }
-        if !is_rtcp {
+        if is_rtcp {
+            // RFC 3711 §3.4 / RFC 7714 §17: the SRTCP index is the low 31
+            // bits of the trailing word (E || index; no MKI on these legs).
+            // An index the RTCP replay window would reject is dropped before
+            // the AEAD open; the check is read-only, as in unprotect.
+            let Some(index_word) = pkt
+                .len()
+                .checked_sub(4)
+                .and_then(|at| pkt.get(at..))
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_be_bytes)
+            else {
+                return TrialGate::Refuse;
+            };
+            if self
+                .ingress
+                .check_rtcp_replay(u64::from(index_word & 0x7FFF_FFFF))
+                .is_err()
+            {
+                return TrialGate::Stale;
+            }
+        } else {
             // RFC 3711 §3.3.1: the index this packet would have. A relatch
             // needs a new highest index; anything else is a replay or a
             // packet the latched source already moved past.
@@ -535,7 +559,8 @@ impl TerminateRelayLeg {
 enum TrialGate {
     /// Unprotect it.
     Try,
-    /// An SRTP index that does not advance: dropped before unprotect.
+    /// An SRTP index that does not advance, or an SRTCP index the replay
+    /// window rejects: dropped before unprotect.
     Stale,
     /// Wrong shape or an SSRC not authenticated on the leg.
     Refuse,
@@ -1605,7 +1630,7 @@ mod tests {
         let _ = handle.await;
     }
 
-    // ---- SR-12: source latching on the terminated leg -----------------------
+    // ---- Source latching on the terminated leg ------------------------------
     //
     // The leg's initial latch is the value in `recv_target` when it starts
     // (the handshake's source). Another port on the expected IP moves the
@@ -1982,6 +2007,46 @@ mod tests {
         }
     }
 
+    // An SRTCP packet already accepted from the seed, replayed from another
+    // port, is refused before unprotect by the RTCP replay window: not
+    // relayed, no latch move, counted as dropped_stale_relatch. On the media
+    // port (rtcp-mux) and on a separate RTCP-port leg.
+    // NIST 800-53 Rev5: SC-7, SC-23
+    #[tokio::test]
+    async fn terminate_leg_refuses_replayed_srtcp_before_unprotect() {
+        for direction in ["A→B", "A→B RTCP"] {
+            let (logs, _guard) = capture_logs();
+            let leg = latch_leg(direction).await;
+            let p1 = leg.p1.local_addr().unwrap();
+
+            let first = leg.srtcp(1);
+            leg.p1.send_to(&first, leg.relay_addr).await.unwrap();
+            assert!(
+                leg.far_next(1000).await.is_some(),
+                "{direction}: SRTCP from the seed"
+            );
+            leg.p2.send_to(&first, leg.relay_addr).await.unwrap();
+            assert_eq!(
+                leg.far_next(150).await,
+                None,
+                "{direction}: replayed SRTCP relayed"
+            );
+            assert_eq!(
+                leg.target(),
+                p1,
+                "{direction}: replayed SRTCP moved the latch"
+            );
+
+            let text = logs.text();
+            assert!(
+                text.contains("dropped_stale_relatch=1"),
+                "{direction}: the replay is counted as dropped_stale_relatch:\n{text}"
+            );
+            assert!(!text.contains("media.latch.moved"), "{direction}: {text}");
+            leg.stop().await;
+        }
+    }
+
     // A DTLS-class datagram from a port that is not latched never reaches the
     // sidecar channel; the latched (seed) source's does.
     #[tokio::test]
@@ -2094,7 +2159,7 @@ mod tests {
         leg.stop().await;
     }
 
-    // PERF-1: once an SSRC has authenticated on the leg, a packet from
+    // Once an SSRC has authenticated on the leg, a packet from
     // another port is only tried under one of the leg's SSRCs. A packet
     // under a new SSRC (even one that would authenticate) neither moves the
     // latch nor is relayed; the known SSRC from the same port does move it.

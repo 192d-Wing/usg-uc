@@ -236,17 +236,21 @@ impl RtpPortAllocator {
             return Err(MediaPipelineError::PortExhausted);
         }
         let pick = usize::try_from(draw % len).unwrap_or(0);
-        let index = pool.free.swap_remove(pick);
+        let Some(&index) = pool.free.get(pick) else {
+            return Err(MediaPipelineError::PortExhausted);
+        };
+        // index < pairs guarantees rtp <= max_port - 1, so rtcp fits; checked
+        // all the same, before the pair leaves the free list.
+        let pair = index
+            .checked_mul(2)
+            .and_then(|offset| self.min_port.checked_add(offset))
+            .and_then(|rtp| Some((rtp, rtp.checked_add(1)?)))
+            .ok_or(MediaPipelineError::PortExhausted)?;
+        pool.free.swap_remove(pick);
         if let Some(used) = pool.in_use.get_mut(usize::from(index)) {
             *used = true;
         }
-        // index < pairs guarantees rtp <= max_port - 1, so rtcp fits; checked
-        // all the same.
-        let rtp = index
-            .checked_mul(2)
-            .and_then(|offset| self.min_port.checked_add(offset));
-        rtp.and_then(|rtp| Some((rtp, rtp.checked_add(1)?)))
-            .ok_or(MediaPipelineError::PortExhausted)
+        Ok(pair)
     }
 
     /// Releases a port pair back to the pool. A port that is not the RTP
@@ -405,6 +409,14 @@ struct LegRemote {
 
 /// Default re-latch grace window (see [`LegRemote`]).
 const RELATCH_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Packets an exact SDP source must send after taking an opaque RTP leg's
+/// latch before the latch is established: from then on silence from the
+/// exact source no longer lets another port on its IP take the latch.
+/// Eight packets is 160 ms of 20 ms audio; one spoofed datagram stays well
+/// below it.
+// NIST 800-53 Rev5: SC-7 (Boundary Protection)
+const EXACT_ESTABLISHED_PACKETS: u32 = 8;
 
 impl LegRemote {
     fn new(addr: std::net::SocketAddr) -> Self {
@@ -2788,16 +2800,24 @@ fn log_handshake_sources(
 /// and the opposite direction's send target follows the latch (RFC 4961
 /// symmetric RTP); packets from any other source are dropped and counted.
 ///
-/// The latch is not sticky either way:
-/// - On an RTP leg, a leg latched to a non-exact source moves to the exact
-///   SDP source as soon as it sends. Not on an RTCP leg: its SDP address is
-///   only a guess (RTP port + 1; `a=rtcp`, RFC 3605, is not honoured), so a
-///   sender on that guessed port must not take the latch from the peer's
-///   real RTCP source.
-/// - On either kind, a leg latched to the exact SDP source moves to another
-///   port on its IP that keeps sending once the exact source has been silent
-///   for the grace window, so one datagram spoofed from the SDP address
-///   does not cut a NAT'd peer off for the rest of the call.
+/// Once latched, only an RTP leg moves without a signalled re-latch:
+/// - A leg latched to a non-exact source moves to the exact SDP source as
+///   soon as it sends.
+/// - A leg latched to the exact SDP source moves to another port on its IP
+///   that keeps sending once the exact source has been silent for the grace
+///   window, but only while the exact latch is weak: the exact source has
+///   sent fewer than [`EXACT_ESTABLISHED_PACKETS`] packets since it took
+///   the latch. One datagram spoofed from the SDP address therefore does
+///   not cut a NAT'd peer off for the rest of the call, while a peer that
+///   has been streaming from its SDP port keeps its latch through silence
+///   (hold, VAD).
+///
+/// An RTCP leg's SDP address is only a guess (RTP port + 1; `a=rtcp`,
+/// RFC 3605, is not honoured), so neither move applies to it: a sender on
+/// the guessed port does not take the latch from the peer's real RTCP
+/// source, and an RTCP leg latched to the exact address stays there until a
+/// signalled re-latch. A non-exact RTCP latch comes only from the initial
+/// (or re-latch) grace fallback.
 ///
 /// This relay holds no keys, so it cannot tell a peer behind NAT that sends
 /// from an unsignalled port from another sender on the same IP once the
@@ -2811,8 +2831,10 @@ fn log_handshake_sources(
 // same-IP sender on an unsignalled port can take the latch of a leg whose
 // peer does not send from its SDP port, and a sender spoofing the SDP
 // address at least once per grace window holds an RTP leg's latch there,
-// away from a NAT'd peer, for as long as it sends (authenticated media,
-// SR-08, is the fix).
+// away from a NAT'd peer, for as long as it sends, and a same-IP sender
+// can take a weak exact RTP latch (fewer than EXACT_ESTABLISHED_PACKETS
+// from the exact source) once the exact source has been silent for the
+// grace window. Authenticated (SRTP) media is the fix.
 #[allow(clippy::too_many_arguments)]
 async fn relay_leg(
     recv_sock: Arc<UdpSocket>,
@@ -2850,6 +2872,9 @@ async fn relay_leg(
     // are not the latched source's.
     let mut other_heard_at: Option<tokio::time::Instant> = None;
     let mut exact_heard = false;
+    // Packets from the exact SDP source since it last took the latch,
+    // saturating at EXACT_ESTABLISHED_PACKETS.
+    let mut exact_packets: u32 = 0;
     let mut latch_moves: u64 = 0;
     let mut dropped: u64 = 0;
     let mut forwarded: u64 = 0;
@@ -2874,6 +2899,7 @@ async fn relay_leg(
                                     Some(tokio::time::Instant::now() + ctl.grace);
                                 other_heard_at = None;
                                 exact_heard = false;
+                                exact_packets = 0;
                             }
                         }
                         if src == expected_remote {
@@ -2884,16 +2910,18 @@ async fn relay_leg(
                         // grace window passes; then a same-IP source may
                         // (symmetric NAT). A stale packet from the old port is
                         // dropped and never touches the reverse send target.
-                        // On RTP legs the exact SDP address takes the latch back
-                        // from a non-exact source; on any leg a same-IP port
-                        // takes it from an exact source that has been silent
-                        // for the grace (see the function docs).
+                        // On RTP legs only, the exact SDP address takes the latch
+                        // back from a non-exact source, and a same-IP port takes
+                        // it from a weak exact latch whose source has been
+                        // silent for the grace (see the function docs).
                         // NIST 800-53 Rev5: SC-7
                         let acceptable = match latched {
                             Some(latched_src) if src == latched_src => true,
                             Some(_) if src == expected_remote => matches!(kind, RelayKind::Rtp),
                             Some(latched_src)
-                                if latched_src == expected_remote
+                                if matches!(kind, RelayKind::Rtp)
+                                    && latched_src == expected_remote
+                                    && exact_packets < EXACT_ESTABLISHED_PACKETS
                                     && src.ip() == expected_remote.ip() =>
                             {
                                 let now = tokio::time::Instant::now();
@@ -2941,6 +2969,7 @@ async fn relay_leg(
                             relatch_fallback_at = None;
                             other_heard_at = None;
                             exact_heard = false;
+                            exact_packets = 0;
                             if src != expected_remote {
                                 debug!(
                                     call_id = %call_id,
@@ -2970,6 +2999,10 @@ async fn relay_leg(
                                     }
                                 }
                             }
+                        }
+
+                        if src == expected_remote && exact_packets < EXACT_ESTABLISHED_PACKETS {
+                            exact_packets += 1;
                         }
 
                         let dest = match forward_target.read() {
@@ -4520,7 +4553,7 @@ mod tests {
         assert!(rtcp_a > 0, "peer A recovered no relayed SRTCP (split)");
         assert!(rtcp_b > 0, "peer B recovered no relayed SRTCP (split)");
     }
-    // ---- SR-12: opaque initial latch, random port pairs, terminate seed ----
+    // ---- Opaque initial latch, random port pairs, terminate seed ----------
 
     /// Spawns an opaque RTP relay leg for `expected` with re-latch control
     /// `grace`; returns the relay's receive address, the shared reverse
@@ -4546,7 +4579,7 @@ mod tests {
             expected,
             Arc::clone(&recv_target),
             Arc::new(std::sync::RwLock::new(receiver)),
-            "sr12-opaque".to_string(),
+            "opaque-latch".to_string(),
             "A→B",
             kind,
             LegRelayControl {
@@ -4707,10 +4740,10 @@ mod tests {
         false
     }
 
-    /// SEC-01 / NIST-001: the exact-source override is not sticky. A leg
-    /// latched to a NAT'd peer's port receives one datagram spoofed from the
-    /// SDP `ip:port` and moves there; the NAT'd peer keeps sending and takes
-    /// the latch back once the SDP source has been silent for the grace.
+    /// The exact-source override is not sticky while weak. A leg latched to a
+    /// NAT'd peer's port receives one datagram spoofed from the SDP `ip:port`
+    /// and moves there; the NAT'd peer keeps sending and takes the latch back
+    /// once the SDP source has been silent for the grace.
     // NIST 800-53 Rev5: SC-7
     #[tokio::test]
     async fn relay_leg_nat_source_recovers_from_one_spoofed_exact_datagram() {
@@ -4779,8 +4812,8 @@ mod tests {
         stop_exact.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// RFC-2: on an RTCP leg the SDP address is only RTP port + 1 (a=rtcp is
-    /// not honoured), so it does not take the latch from the source the leg
+    /// On an RTCP leg the SDP address is only RTP port + 1 (a=rtcp is not
+    /// honoured), so it does not take the latch from the source the leg
     /// latched to.
     #[tokio::test]
     async fn relay_leg_rtcp_exact_source_does_not_override() {
@@ -4812,6 +4845,107 @@ mod tests {
             "the RTP+1 address took an RTCP latch"
         );
         assert_eq!(*recv_target.read().unwrap(), actual.local_addr().unwrap());
+    }
+
+    /// An RTCP leg latched to its exact SDP address stays there: a same-IP
+    /// port that sends two packets more than the grace apart, then keeps
+    /// sending for 2 s while the exact source is silent, never takes the
+    /// latch, and the exact source's RTCP is still relayed afterwards.
+    // NIST 800-53 Rev5: SC-7
+    #[tokio::test]
+    async fn relay_leg_rtcp_exact_latch_has_no_silence_takeover() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let exact = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let neighbour = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let exact_addr = exact.local_addr().unwrap();
+        let (relay_addr, recv_target, _sd) = spawn_opaque_leg(
+            exact_addr,
+            receiver.local_addr().unwrap(),
+            None,
+            RelayKind::Rtcp,
+        )
+        .await;
+
+        exact.send_to(b"rtcp-1", relay_addr).await.unwrap();
+        assert_eq!(
+            recv_payload(&receiver).await.as_deref(),
+            Some(&b"rtcp-1"[..])
+        );
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+
+        // Two packets more than the grace apart (the first arms a silence
+        // window on an RTP leg, the second would complete it).
+        neighbour.send_to(b"spray-1", relay_addr).await.unwrap();
+        tokio::time::sleep(RELATCH_GRACE + std::time::Duration::from_millis(100)).await;
+        neighbour.send_to(b"spray-2", relay_addr).await.unwrap();
+        assert_eq!(
+            recv_payload(&receiver).await,
+            None,
+            "a same-IP port took an exact RTCP latch after the grace"
+        );
+
+        // Then a packet every 100 ms for 2 s.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let sprayer = Arc::clone(&neighbour);
+        tokio::spawn(async move {
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = sprayer.send_to(b"spray", relay_addr).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+        assert!(
+            !recv_until(&receiver, b"spray", 2000).await,
+            "a same-IP port took an exact RTCP latch during the exact source's silence"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+
+        exact.send_to(b"rtcp-2", relay_addr).await.unwrap();
+        assert!(
+            recv_until(&receiver, b"rtcp-2", 2000).await,
+            "the exact source's RTCP was not relayed"
+        );
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+    }
+
+    /// Once the exact SDP source has sent EXACT_ESTABLISHED_PACKETS since it
+    /// took an RTP leg's latch, the latch is established: the source going
+    /// silent for well over the grace does not let a same-IP port take it.
+    // NIST 800-53 Rev5: SC-7
+    #[tokio::test]
+    async fn relay_leg_established_exact_latch_survives_silence() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let exact = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let neighbour = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let exact_addr = exact.local_addr().unwrap();
+        let (relay_addr, recv_target, _sd) = spawn_opaque_leg(
+            exact_addr,
+            receiver.local_addr().unwrap(),
+            Some(std::time::Duration::from_millis(100)),
+            RelayKind::Rtp,
+        )
+        .await;
+
+        // The exact source sends past the threshold, then goes silent.
+        let established = usize::try_from(EXACT_ESTABLISHED_PACKETS).unwrap() + 2;
+        for _ in 0..established {
+            exact.send_to(b"exact", relay_addr).await.unwrap();
+            assert_eq!(
+                recv_payload(&receiver).await.as_deref(),
+                Some(&b"exact"[..])
+            );
+        }
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+
+        let stop_spray = stream_from(Arc::clone(&neighbour), relay_addr, b"spray");
+        // Eight grace windows of spraying against a silent exact source.
+        assert!(
+            !recv_until(&receiver, b"spray", 800).await,
+            "a same-IP port took an established exact latch"
+        );
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+        stop_spray.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The free list hands out each pair once, takes a released pair back
@@ -4911,7 +5045,7 @@ mod tests {
         };
 
         let fp = "sha-384 SIDECAR";
-        let sock = std::env::temp_dir().join(format!("usg-sr12-seed-{}.sock", std::process::id()));
+        let sock = std::env::temp_dir().join(format!("usg-term-seed-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
         // One message per session once its Ready is written.
