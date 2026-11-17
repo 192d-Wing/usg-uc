@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### Security (SBC, supported base images)
+
+- **SBC images: runtime bases moved off end-of-life releases and pinned
+  by digest.** (SI-2, CM-8, SR-3) The eight Rust service images and the
+  `dtls-terminator` sidecar move from Alpine 3.21 and 3.20 to Alpine
+  3.24.4. The dashboard moves from nginx-unprivileged 1.27 to 1.30.6
+  (Alpine 3.24). The `sbc-daemon` image stays on Debian trixie-slim, now
+  pinned by digest. Ports, users and nginx paths are unchanged. Builder
+  stages still use tags.
+- **Dependabot now watches every Dockerfile, the Go modules of both
+  sidecars and the dashboard's npm tree.** GitHub Actions updates are
+  grouped into one weekly PR.
+
 ### BREAKING (SBC, DTLS-SRTP sidecar keeps the association for the whole call, POA&M-335, 340, 341, 342)
 
 Affects only SBCs that terminate DTLS-SRTP (`sbcDaemon.dtlsTerminate.enabled`,
