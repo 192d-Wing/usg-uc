@@ -48,8 +48,9 @@ pub struct MediaPipelineConfig {
     /// `media.srtp.required`, copied onto each media session and reported
     /// in stats. The relay does not refuse packets on it: enforcement is in
     /// signalling (the SIP stack's SDP media security policy).
-    // POAM: no media-plane backstop refuses cleartext RTP on a session
-    // when SRTP is required; signalling is the only enforcement point.
+    // POAM: POA&M-352 - no media-plane backstop refuses cleartext RTP on a
+    // session when SRTP is required; signalling is the only enforcement
+    // point, and a remote media node only reports the flag.
     pub srtp_required: bool,
     /// Whether RTCP multiplexing is enabled.
     pub rtcp_mux: bool,

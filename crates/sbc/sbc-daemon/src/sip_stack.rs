@@ -215,11 +215,11 @@ pub struct SipStack {
     ///
     /// ## NIST 800-53 Rev5: CM-6, CM-7, SC-5, SC-8
     t38: sbc_config::T38Config,
-    /// `media.srtp.required`: no cleartext or unkeyed active stream crosses
-    /// a call leg. Default `true` (fail closed), as in `SrtpConfig`.
+    /// `[media.srtp]` call-leg policy: `required` (default `true`, fail
+    /// closed, as in `SrtpConfig`) and the configured `mode`.
     ///
     /// ## NIST 800-53 Rev5: SC-8, CM-6
-    media_srtp_required: bool,
+    media_srtp: media_security::SrtpPolicy,
     /// T.38 switchover counters and active-call gauge (SI-4).
     t38_counters: crate::t38::T38Counters,
     /// `[recording]` SIPREC SRC settings; `None` when recording is off (the
@@ -1135,6 +1135,9 @@ struct CallAddresses {
     ///
     /// ## NIST 800-53 Rev5: AU-14, SC-5, SC-12
     recording: crate::recording::CallRecording,
+    /// Emergency-classified call (47 CFR 9.16): exempt from
+    /// `media.srtp.required` (`media_security`).
+    emergency: bool,
 }
 
 /// Which legs of a call get topology-hidden egress.
@@ -2995,7 +2998,7 @@ impl SipStack {
             signaling_audit,
             trusted_trunk_groups: RwLock::new(HashSet::new()),
             t38: sbc_config::T38Config::default(),
-            media_srtp_required: true,
+            media_srtp: media_security::SrtpPolicy::default(),
             t38_counters: crate::t38::T38Counters::default(),
             recording: None,
             recording_counters: crate::recording::RecordingCounters::default(),
@@ -3081,7 +3084,7 @@ impl SipStack {
             signaling_audit,
             trusted_trunk_groups: RwLock::new(HashSet::new()),
             t38: sbc_config::T38Config::default(),
-            media_srtp_required: true,
+            media_srtp: media_security::SrtpPolicy::default(),
             t38_counters: crate::t38::T38Counters::default(),
             recording: None,
             recording_counters: crate::recording::RecordingCounters::default(),
@@ -3140,14 +3143,14 @@ impl SipStack {
     }
 
     /// Sets the `[media.srtp]` call-leg policy: `required` is enforced on
-    /// every SDP that crosses (`media_security`). `mode` takes effect
-    /// through the DTLS identity ([`Self::set_dtls_fingerprint_source`],
-    /// set only for `Terminate`); `profile` has one value, the only suite
-    /// the policy lets cross.
+    /// every SDP that crosses (`media_security`). `mode = Terminate` needs
+    /// the DTLS identity ([`Self::set_dtls_fingerprint_source`]); without
+    /// one, new calls are refused. `profile` has one value and constrains
+    /// SDES lines only.
     ///
     /// ## NIST 800-53 Rev5: SC-8, CM-6
     pub fn set_media_security_policy(&mut self, srtp: &sbc_config::schema::SrtpConfig) {
-        self.media_srtp_required = srtp.required;
+        self.media_srtp.configure(srtp);
     }
 
     /// T.38 switchover counters (metrics endpoint).
@@ -3288,7 +3291,7 @@ impl SipStack {
         answer_sdp: &str,
     ) -> bool {
         let plan = Self::relay_plan(
-            &self.media_security_policy(),
+            &self.call_policy(addrs),
             self.dtls_fingerprint_source.is_some(),
             addrs.dtls_caller_fingerprint.as_ref(),
             addrs.dtls_caller_setup,
@@ -3305,10 +3308,8 @@ impl SipStack {
                 true
             }
             RelayPlan::Refuse(violation) => {
-                // POAM: a late-offer call in terminate mode (INVITE without
-                // SDP) has no caller fingerprint at 200-OK time and reaches
-                // this refusal with no relay started; the answer gate does
-                // not catch it.
+                // Backstop: `secure_initial_answer` refuses the 2xx on this
+                // plan before the A-leg 2xx is built.
                 error!(
                     call_id = %addrs.a_leg_sip_call_id,
                     reason = violation.as_str(),
@@ -8869,7 +8870,7 @@ impl SipStack {
                 Ok(s) => s,
                 Err(v) => {
                     return self
-                        .refuse_insecure_early_answer(internal_id, addrs, v)
+                        .refuse_insecure_early_answer(resp, internal_id, addrs, v)
                         .await;
                 }
             };
@@ -9081,16 +9082,13 @@ impl SipStack {
 
         // RFC 4568 §8 / §7.1.2: the answer's keying is checked before it is
         // relayed and before any relay starts (`media_security`).
-        let secured_answer = match resp.body.as_deref().filter(|b| !b.is_empty()) {
-            Some(body) => match self.secure_initial_response(body, addrs) {
-                Ok(s) => s,
-                Err(v) => {
-                    return self
-                        .refuse_insecure_answer(resp, internal_id, addrs, v)
-                        .await;
-                }
-            },
-            None => None,
+        let secured_answer = match self.secure_initial_answer(resp.body.as_deref(), addrs) {
+            Ok(s) => s,
+            Err(v) => {
+                return self
+                    .refuse_insecure_answer(resp, internal_id, addrs, v)
+                    .await;
+            }
         };
 
         // Build 200 OK for A-leg with rewritten SDP, carrying the A-leg
@@ -10157,7 +10155,7 @@ impl SipStack {
         // or port (RFC 3261 §14.2, §20.43). The SDES rules follow routing.
         //
         // ## NIST 800-53 Rev5: SC-8, SC-13, CM-6, AU-2
-        if let Err(violation) = self.precheck_initial_offer(req.body.as_deref()) {
+        if let Err(violation) = self.precheck_initial_offer(req, source, emergency) {
             warn!(call_id = %a_leg_call_id, reason = violation.as_str(), "INVITE offer refused by media security policy, 488");
             audit_invite_denied(req, source, &media_security::policy_label(violation));
             self.in_flight_invites.write().await.remove(&a_leg_call_id);
@@ -10552,10 +10550,11 @@ impl SipStack {
                         self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
                             .await;
                         let result = self
-                            .play_announcement_to_caller(
+                            .no_route_response(
                                 req,
                                 source,
                                 transport,
+                                emergency,
                                 crate::announcement::AnnouncementType::NumberNotInService,
                             )
                             .await;
@@ -10662,10 +10661,11 @@ impl SipStack {
             self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
                 .await;
             let result = self
-                .play_announcement_to_caller(
+                .no_route_response(
                     req,
                     source,
                     transport,
+                    emergency,
                     crate::announcement::AnnouncementType::NumberNotInService,
                 )
                 .await;
@@ -10699,6 +10699,7 @@ impl SipStack {
             req.body.as_deref(),
             &media_security::legs(transport, b_leg_flow.transport),
             t38_offer.as_mut(),
+            emergency,
         ) {
             Ok((secured, sdes_crossed)) => {
                 if sdes_crossed && let Some(lease) = trunk_lease.as_mut() {
@@ -11400,6 +11401,7 @@ impl SipStack {
                         .as_ref()
                         .map_or(crate::t38::CallMediaKind::Audio, |c| c.kind),
                     recording,
+                    emergency,
                 },
             );
         }
@@ -14199,8 +14201,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_invite_unresolvable_destination() {
-        let config = SipStackConfig::default();
-        let stack = SipStack::new(config);
+        let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
             .register_inbound_trunk("test-trunk", None, &[("127.0.0.1".to_string(), 5060)])
@@ -14240,8 +14241,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_invite_to_registered_user() {
-        let config = SipStackConfig::default();
-        let stack = SipStack::new(config);
+        let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
             .register_inbound_trunk("test-trunk", None, &[("192.168.1.100".to_string(), 5060)])
@@ -14356,8 +14356,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_bye_from_a_leg() {
-        let config = SipStackConfig::default();
-        let stack = SipStack::new(config);
+        let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
             .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
@@ -14430,6 +14429,15 @@ pub mod tests {
         assert_eq!(stack.call_count().await, 0);
     }
 
+    /// A default stack with `media.srtp.required = false`: the dialog cases
+    /// below send INVITEs without SDP (a delayed offer), which the required
+    /// policy refuses with 488 before routing.
+    fn delayed_offer_stack() -> SipStack {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.set_media_security_policy(&srtp_not_required());
+        stack
+    }
+
     /// Sets up a registered bob and an INVITE from alice (A-leg Call-ID
     /// `call-bye-guard@test`, From tag `g1`), returning alice's address.
     async fn call_from_alice(stack: &SipStack) -> SbcSocketAddr {
@@ -14495,7 +14503,7 @@ pub mod tests {
     /// call up (RFC 3261 §12.2.2).
     #[tokio::test]
     async fn test_bye_with_wrong_tag_is_rejected() {
-        let stack = SipStack::new(SipStackConfig::default());
+        let stack = delayed_offer_stack();
         let alice = call_from_alice(&stack).await;
         let result = stack
             .process_message(&Bytes::from(guard_bye("forged")), alice, None)
@@ -14512,7 +14520,7 @@ pub mod tests {
     /// peer's is refused and leaves the call up.
     #[tokio::test]
     async fn test_bye_from_wrong_source_is_rejected() {
-        let stack = SipStack::new(SipStackConfig::default());
+        let stack = delayed_offer_stack();
         let _alice = call_from_alice(&stack).await;
         let elsewhere = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(10, 9, 9, 9), 5060);
         let result = stack
@@ -14528,8 +14536,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_cancel_pending_invite() {
-        let config = SipStackConfig::default();
-        let stack = SipStack::new(config);
+        let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
             .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
@@ -15158,6 +15165,7 @@ pub mod tests {
             media_terminated: crate::t38::RelaySecurity::Opaque,
             initial_offer_kind: crate::t38::CallMediaKind::Audio,
             recording: crate::recording::CallRecording::default(),
+            emergency: false,
         }
     }
 

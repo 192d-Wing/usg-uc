@@ -1131,6 +1131,13 @@ impl Server {
                 info!(fingerprint = %fp, "Remote media plane DTLS-SRTP termination enabled");
                 Some(Arc::new(DtlsFingerprintSource::from_static(fp)))
             }
+            // NIST 800-53 Rev5: SC-8, SC-24 - with media.srtp.mode =
+            // Terminate the SIP stack refuses new calls without an identity
+            // (fail closed); the operator must see why.
+            Err(e) if self.config.media.srtp.mode == sbc_config::SrtpMode::Terminate => {
+                error!(reason = %e, "Remote media plane has no DTLS fingerprint but media.srtp.mode = Terminate; new calls will be refused");
+                None
+            }
             Err(e) => {
                 info!(reason = %e, "Remote media plane has no DTLS fingerprint (non-terminate mode)");
                 None

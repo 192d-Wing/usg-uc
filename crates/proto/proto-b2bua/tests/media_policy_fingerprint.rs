@@ -3,20 +3,17 @@
 //!
 //! Each active DTLS m-line (`UDP/TLS/RTP/SAVP(F)`, RFC 5764 §8) needs at
 //! least one applicable `a=fingerprint` (RFC 8122 §5) whose hash is
-//! `sha-384` (CNSA 2.0; matched case-insensitively) and whose value is 48
-//! colon-separated hex octets. Media-level lines apply first, else the
-//! session-level ones (RFC 8122 §5). An offer strips every other line and
-//! is refused (Warning 306) when none is left; an answer is refused on any
-//! non-sha-384 line and never rewritten. Declined (port 0) sections are not
-//! checked (RFC 3264 §8).
+//! `sha-384` or `sha-512` (CNSA 2.0; matched case-insensitively) and whose
+//! value is 48 or 64 colon-separated hex octets to match. Media-level lines
+//! apply first, else the session-level ones (RFC 8122 §5). Offers and
+//! answers alike lose every other line; the body is refused when an active
+//! DTLS m-line has none left: Warning 306 when only unaccepted lines
+//! applied, 399 when none did. Declined (port 0) sections are not checked
+//! (RFC 3264 §8).
 //!
-//! These cases use only today's API. They assert the warn-code (306) and
-//! the m-line index, not variant names, so they compile before and after
-//! the variants are added; only `policy()` changes when the policy struct
-//! gains `require_srtp` (set it to `false` there: the rule is independent
-//! of it).
+//! The cases assert the warn-code and the m-line index, not variant names.
 //!
-//! NIST 800-53 Rev5: SC-8, SC-13, SI-10. RFC 8122 §5; RFC 5763 §5;
+//! NIST 800-53 Rev5: SC-8, SC-13, SC-23, SI-10. RFC 8122 §5; RFC 5763 §5;
 //! RFC 5764 §8; RFC 3264 §8.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -64,6 +61,10 @@ fn sha256() -> String {
     fp("sha-256", 32, 0x80)
 }
 
+fn sha512() -> String {
+    fp("sha-512", 64, 0x40)
+}
+
 fn sdp(session_attrs: &str, media: &str) -> String {
     format!(
         "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n\
@@ -100,23 +101,61 @@ fn assert_306(e: MediaPolicyViolation, index: usize) {
     assert_eq!(e.index(), Some(index), "{}", e.as_str());
 }
 
+/// No applicable fingerprint at all: `fingerprint_missing`, Warning 399.
+fn assert_missing(e: MediaPolicyViolation, index: usize) {
+    assert_eq!(e.as_str(), "fingerprint_missing");
+    assert_eq!(e.warning_code(), 399, "{}", e.as_str());
+    assert_eq!(e.index(), Some(index), "{}", e.as_str());
+}
+
 // --- Offers -----------------------------------------------------------
 
+/// sha-256, sha-1 and md5 are refused although RFC 8122 allows them (a
+/// CNSA 2.0 deviation), in either role.
 #[test]
-fn offer_with_only_non_sha384_fingerprint_is_refused() {
-    for hash in [("sha-1", 20), ("sha-256", 32), ("sha-512", 64), ("md5", 16)] {
+fn only_unaccepted_hash_is_refused() {
+    for hash in [("sha-1", 20), ("sha-256", 32), ("md5", 16)] {
         let f = fp(hash.0, hash.1, 0x22);
         for mode in MODES {
-            let e = refused(&sdp("", &dtls(4000, &[&f])), SdpRole::Offer, mode);
-            assert_306(e, 0);
+            for role in [SdpRole::Offer, SdpRole::Answer] {
+                let e = refused(&sdp("", &dtls(4000, &[&f])), role, mode);
+                assert_306(e, 0);
+            }
         }
     }
+}
+
+/// CNSA 2.0 allows SHA-512 as well as SHA-384.
+#[test]
+fn sha512_fingerprint_is_accepted() {
+    let good = sha512();
+    let upper = good.replacen("sha-512", "SHA-512", 1);
+    for f in [&good, &upper] {
+        let body = sdp("", &dtls(4000, &[f]));
+        for role in [SdpRole::Offer, SdpRole::Answer] {
+            for mode in MODES {
+                let s = apply_media_security(&body, role, &policy(mode), &TLS_TLS)
+                    .unwrap_or_else(|e| panic!("{role:?} {mode:?}: {}", e.as_str()));
+                assert!(matches!(s.sdp, Cow::Borrowed(_)), "{role:?} {mode:?}");
+            }
+        }
+    }
+    // The digest length must match the hash.
+    let short = fp("sha-512", 48, 0x40);
+    assert_306(
+        refused(
+            &sdp("", &dtls(4000, &[&short])),
+            SdpRole::Offer,
+            KeyingMode::Passthrough,
+        ),
+        0,
+    );
 }
 
 #[test]
 fn offer_dtls_mline_without_any_fingerprint_is_refused() {
     for mode in MODES {
-        assert_306(refused(&sdp("", &dtls(4000, &[])), SdpRole::Offer, mode), 0);
+        assert_missing(refused(&sdp("", &dtls(4000, &[])), SdpRole::Offer, mode), 0);
     }
 }
 
@@ -273,20 +312,38 @@ fn declined_dtls_mline_is_not_checked() {
 
 // --- Answers ----------------------------------------------------------
 
+/// RFC 8122 §5 allows several fingerprints: an answer keeps the accepted
+/// ones and loses the rest (removing a line cannot weaken the binding), and
+/// is refused only when an active DTLS m-line keeps none.
 #[test]
-fn answer_with_any_non_sha384_line_is_refused_not_stripped() {
+fn answer_strips_unaccepted_lines_and_keeps_accepted() {
     let good = sha384();
+    let good512 = sha512();
     let bad = sha256();
     for mode in MODES {
-        for fps in [vec![good.as_str(), bad.as_str()], vec![bad.as_str()]] {
-            let body = sdp("", &dtls(5000, &fps));
-            assert_306(refused(&body, SdpRole::Answer, mode), 0);
+        for keep in [&good, &good512] {
+            let body = sdp("", &dtls(5000, &[&bad, keep]));
+            let s = apply_media_security(&body, SdpRole::Answer, &policy(mode), &TLS_TLS)
+                .unwrap_or_else(|e| panic!("{mode:?}: {}", e.as_str()));
+            assert_eq!(
+                fingerprint_lines(&s.sdp),
+                vec![format!("a=fingerprint:{keep}")],
+                "{mode:?}"
+            );
+            assert_eq!(s.stripped_fingerprints, 1);
         }
+        assert_306(
+            refused(&sdp("", &dtls(5000, &[&bad])), SdpRole::Answer, mode),
+            0,
+        );
+        // A session-level line that does not apply (the m-line has its own)
+        // is stripped, not a refusal.
         let session = sdp(&format!("a=fingerprint:{bad}\r\n"), &dtls(5000, &[&good]));
+        let s = apply_media_security(&session, SdpRole::Answer, &policy(mode), &TLS_TLS)
+            .unwrap_or_else(|e| panic!("session-level sha-256 in an answer: {}", e.as_str()));
         assert_eq!(
-            refused(&session, SdpRole::Answer, mode).warning_code(),
-            306,
-            "session-level sha-256 in an answer"
+            fingerprint_lines(&s.sdp),
+            vec![format!("a=fingerprint:{good}")]
         );
     }
 }
@@ -294,7 +351,7 @@ fn answer_with_any_non_sha384_line_is_refused_not_stripped() {
 #[test]
 fn answer_dtls_without_fingerprint_is_refused() {
     for mode in MODES {
-        assert_306(
+        assert_missing(
             refused(&sdp("", &dtls(5000, &[])), SdpRole::Answer, mode),
             0,
         );
@@ -397,32 +454,50 @@ fn applicable(body: &str) -> Vec<(bool, Vec<String>)> {
         .collect()
 }
 
-fn is_sha384(line: &str) -> bool {
+/// sha-384 with 48 octets or sha-512 with 64 (CNSA 2.0).
+fn is_accepted(line: &str) -> bool {
     let v = line.split_once(':').map_or("", |(_, v)| v);
     let Some((hash, value)) = v.split_once(' ') else {
         return false;
     };
     let octets: Vec<&str> = value.split(':').collect();
-    hash.eq_ignore_ascii_case("sha-384")
-        && octets.len() == 48
+    let want = if hash.eq_ignore_ascii_case("sha-384") {
+        48
+    } else if hash.eq_ignore_ascii_case("sha-512") {
+        64
+    } else {
+        return false;
+    };
+    octets.len() == want
         && octets
             .iter()
             .all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 proptest! {
-    /// An accepted offer keeps at least one sha-384 line for every active
-    /// DTLS m-line, and every line that applies to an active m-line is
-    /// sha-384 (declined sections are not checked).
+    /// An accepted offer or answer keeps at least one accepted line for
+    /// every active DTLS m-line, and every line that applies to an active
+    /// m-line is accepted (declined sections are not checked). Lines are
+    /// only removed, never added.
     #[test]
-    fn accepted_offer_has_only_sha384_fingerprints(body in dtls_body()) {
-        for mode in MODES {
-            if let Ok(s) = apply_media_security(&body, SdpRole::Offer, &policy(mode), &TLS_TLS) {
-                for (active, lines) in applicable(&s.sdp) {
-                    if active {
-                        prop_assert!(!lines.is_empty(), "{}", s.sdp);
-                        for l in &lines {
-                            prop_assert!(is_sha384(l), "{mode:?}: {l} crossed in\n{}", s.sdp);
+    fn accepted_body_has_only_accepted_fingerprints(body in dtls_body()) {
+        for role in [SdpRole::Offer, SdpRole::Answer] {
+            for mode in MODES {
+                if let Ok(s) = apply_media_security(&body, role, &policy(mode), &TLS_TLS) {
+                    let before = fingerprint_lines(&body);
+                    for l in fingerprint_lines(&s.sdp) {
+                        prop_assert!(before.contains(&l), "{l} added");
+                    }
+                    for (active, lines) in applicable(&s.sdp) {
+                        if active {
+                            prop_assert!(!lines.is_empty(), "{}", s.sdp);
+                            for l in &lines {
+                                prop_assert!(
+                                    is_accepted(l),
+                                    "{role:?} {mode:?}: {l} crossed in\n{}",
+                                    s.sdp
+                                );
+                            }
                         }
                     }
                 }
@@ -430,26 +505,15 @@ proptest! {
         }
     }
 
-    /// An accepted answer is unchanged in its fingerprints, and every line
-    /// that applies to an active m-line is sha-384.
+    /// Offers and answers get the same fingerprint verdict and rewrite.
     #[test]
-    fn accepted_answer_has_only_sha384_fingerprints(body in dtls_body()) {
-        if let Ok(s) = apply_media_security(
-            &body,
-            SdpRole::Answer,
-            &policy(KeyingMode::Passthrough),
-            &TLS_TLS,
-        ) {
-            prop_assert_eq!(fingerprint_lines(&s.sdp), fingerprint_lines(&body));
-            for (active, lines) in applicable(&s.sdp) {
-                if active {
-                    prop_assert!(!lines.is_empty(), "{}", s.sdp);
-                    for l in &lines {
-                        prop_assert!(is_sha384(l), "{l}");
-                    }
-                }
-            }
-        }
+    fn answer_and_offer_agree_on_fingerprints(body in dtls_body()) {
+        let p = policy(KeyingMode::Passthrough);
+        let offer = apply_media_security(&body, SdpRole::Offer, &p, &TLS_TLS)
+            .map(|s| s.sdp.into_owned());
+        let answer = apply_media_security(&body, SdpRole::Answer, &p, &TLS_TLS)
+            .map(|s| s.sdp.into_owned());
+        prop_assert_eq!(offer, answer);
     }
 
     /// Idempotent, and m-lines (count, ports, protocols) are kept.

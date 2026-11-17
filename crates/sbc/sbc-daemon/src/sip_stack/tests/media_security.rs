@@ -1296,7 +1296,12 @@ async fn relayed_prack_response_with_unpoliced_body_is_refused() {
 /// stream (RFC 3264 §6), then the callee is BYEd and the caller gets 488.
 #[tokio::test]
 async fn refused_late_offer_2xx_is_acked_with_declined_answer() {
-    let stack = trunk_stack_protos(["tls", "tls"]).await;
+    // A delayed offer needs `media.srtp.required = false`.
+    let mut stack = trunk_stack_protos(["tls", "tls"]).await;
+    stack.set_media_security_policy(&srtp_config(
+        false,
+        sbc_config::schema::SrtpMode::Passthrough,
+    ));
     let placed = flatten(
         stack
             .process_message_on(
@@ -1344,7 +1349,12 @@ async fn refused_late_offer_2xx_is_acked_with_declined_answer() {
 /// answer rules (exactly one crypto line), not stripped as an offer.
 #[tokio::test]
 async fn prack_answer_to_reliable_offer_uses_answer_rules() {
-    let stack = trunk_stack_protos(["tls", "tls"]).await;
+    // A delayed offer needs `media.srtp.required = false`.
+    let mut stack = trunk_stack_protos(["tls", "tls"]).await;
+    stack.set_media_security_policy(&srtp_config(
+        false,
+        sbc_config::schema::SrtpMode::Passthrough,
+    ));
     let invite = with_extra(
         &caller_request("INVITE", DIALED, "prack-ans@test", 1, None, None),
         "Supported: 100rel\r\n",
@@ -1783,6 +1793,13 @@ fn assert_refused_306(results: &[ProcessResult]) {
     assert_warning_is_fixed(r);
 }
 
+/// A refusal with Warning 399 (missing fingerprint, delayed offer, ...).
+fn assert_refused_399(results: &[ProcessResult]) {
+    let (r, _) = responded(results, 488).expect("488");
+    assert!(warning_of(r).starts_with("399 "), "{}", warning_of(r));
+    assert_warning_is_fixed(r);
+}
+
 /// A denied `media_security:<label>` decision for `action` was audited.
 fn assert_denied(events: &[uc_audit::AuditEvent], label: &str, action: &str) {
     let policy = format!("media_security:{label}");
@@ -1950,7 +1967,7 @@ async fn terminate_mode_callee_without_fingerprint_refuses_not_opaque() {
         (
             "dtls-no-fingerprint",
             "m=audio 5000 UDP/TLS/RTP/SAVP 0\r\na=setup:active\r\na=sendrecv\r\n".to_string(),
-            "306 ",
+            "399 ",
         ),
         ("rtp-avp", clear_audio(5000, "RTP/AVP"), "302 "),
     ]
@@ -1992,10 +2009,38 @@ async fn sha256_only_fingerprint_offer_is_refused() {
     Box::pin(assert_fingerprint_only_offer_refused("sha-256", 32)).await;
 }
 
-/// Item 14. The same for sha-512.
+/// CNSA 2.0 allows SHA-512 as well as SHA-384: a sha-512-only DTLS offer
+/// is relayed with its fingerprint, and a sha-512 callee answer completes
+/// the call. sha-1 is refused like sha-256.
 #[tokio::test]
-async fn sha512_only_fingerprint_offer_is_refused() {
-    Box::pin(assert_fingerprint_only_offer_refused("sha-512", 64)).await;
+async fn sha512_only_fingerprint_offer_is_accepted() {
+    let fp = fingerprint("sha-512", 64, 0x10);
+    let stack = trunk_stack_protos(["tls", "tls"]).await;
+    let results = place_on(
+        &stack,
+        "sha-512-only@test",
+        AddrTransport::Tls,
+        &offer(&dtls_audio_fps(4000, "actpass", &[&fp])),
+    )
+    .await;
+    let (req, _) = forwarded(&results, &Method::Invite).expect("B-leg INVITE");
+    assert!(
+        body_of(req).contains(&format!("a=fingerprint:{fp}")),
+        "{}",
+        body_of(req)
+    );
+
+    let answer = answer_body(&dtls_audio_fps(
+        5000,
+        "active",
+        &[&fingerprint("sha-512", 64, 0x60)],
+    ));
+    let (_stack, media, _inv, _dest, results) =
+        Box::pin(dtls_call_answered("sha-512-ans@test", false, 200, &answer)).await;
+    assert!(responded(&results, 200).is_some(), "{results:?}");
+    assert_eq!(media.starts(), 1);
+
+    Box::pin(assert_fingerprint_only_offer_refused("sha-1", 20)).await;
 }
 
 async fn assert_fingerprint_only_offer_refused(hash: &str, octets: usize) {
@@ -2044,7 +2089,8 @@ async fn sha384_fingerprint_with_malformed_value_is_refused() {
 }
 
 /// A DTLS m-line with no fingerprint at all (none at session level either)
-/// is refused in an offer (Warning 306).
+/// is refused in an offer. A missing attribute is Warning 399 (306 is for
+/// an attribute the SBC does not accept).
 #[tokio::test]
 async fn dtls_offer_without_fingerprint_is_refused() {
     let stack = trunk_stack_protos(["tls", "tls"]).await;
@@ -2059,7 +2105,7 @@ async fn dtls_offer_without_fingerprint_is_refused() {
         forwarded_all(&results, &Method::Invite).is_empty(),
         "{results:?}"
     );
-    assert_refused_306(&results);
+    assert_refused_399(&results);
     assert_all_released(&stack).await;
 }
 
@@ -2378,12 +2424,12 @@ async fn cleartext_prack_offer_is_refused_488() {
     assert_refused_302(&results);
 }
 
-/// Item 23. sha-384 plus an extra sha-256 line: in an offer the sha-256
-/// line is stripped and the sha-384 line crosses; in an answer any
-/// non-sha-384 line refuses (never stripped), as does a sha-256-only
-/// answer.
+/// Item 23. sha-384 plus an extra sha-256 line: in an offer and in an
+/// answer the sha-256 line is stripped and the sha-384 line crosses
+/// (RFC 8122 §5 allows several; removing one cannot weaken the binding). A
+/// sha-256-only answer is refused.
 #[tokio::test]
-async fn sha384_fingerprint_with_extra_sha256_line_is_stripped_in_offer_refused_in_answer() {
+async fn sha384_fingerprint_with_extra_sha256_line_is_stripped_in_offer_and_answer() {
     let sha256 = fingerprint("sha-256", 32, 0x80);
     let sha256_hex = sha256.split_once(' ').map_or("", |(_, h)| h).to_string();
 
@@ -2428,31 +2474,34 @@ async fn sha384_fingerprint_with_extra_sha256_line_is_stripped_in_offer_refused_
     );
     assert!(body.contains(&format!("a=fingerprint:{FP_A}")), "{body}");
 
-    // Answers: refused, not stripped.
+    // Answer: the extra line is stripped from the 2xx the caller gets.
     let b = fp_b();
-    for (i, (label, fps)) in [
-        ("sha-384 + sha-256", vec![b.as_str(), sha256.as_str()]),
-        ("sha-256 only", vec![sha256.as_str()]),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (stack, media, _inv, _dest, results) = Box::pin(dtls_call_answered(
-            &format!("fp-mixed-ans-{i}@test"),
-            false,
-            200,
-            &answer_body(&dtls_audio_fps(5000, "active", &fps)),
-        ))
-        .await;
-        assert_initial_answer_torn_down(&results, &media);
-        let (r, _) = responded(&results, 488).unwrap_or_else(|| panic!("{label}: 488"));
-        assert!(
-            warning_of(r).starts_with("306 "),
-            "{label}: {}",
-            warning_of(r)
-        );
-        assert_all_released(&stack).await;
-    }
+    let (_stack, media, _inv, _dest, results) = Box::pin(dtls_call_answered(
+        "fp-mixed-ans-0@test",
+        false,
+        200,
+        &answer_body(&dtls_audio_fps(5000, "active", &[&b, &sha256])),
+    ))
+    .await;
+    let (ok, _) = responded(&results, 200).expect("2xx to the caller");
+    let body = resp_body(ok);
+    assert!(!body.contains(&sha256_hex), "sha-256 crossed: {body}");
+    assert_eq!(body.matches("a=fingerprint:").count(), 1, "{body}");
+    assert!(body.contains(&format!("a=fingerprint:{b}")), "{body}");
+    assert_eq!(media.starts(), 1);
+
+    // Answer: only sha-256 is refused.
+    let (stack, media, _inv, _dest, results) = Box::pin(dtls_call_answered(
+        "fp-mixed-ans-1@test",
+        false,
+        200,
+        &answer_body(&dtls_audio_fps(5000, "active", &[&sha256])),
+    ))
+    .await;
+    assert_initial_answer_torn_down(&results, &media);
+    let (r, _) = responded(&results, 488).expect("sha-256 only: 488");
+    assert!(warning_of(r).starts_with("306 "), "{}", warning_of(r));
+    assert_all_released(&stack).await;
 }
 
 // Guards: these pass before and after the change.
@@ -2847,4 +2896,479 @@ async fn required_true_t38_image_offer_still_routes() {
     );
     let placed = place_on(&stack, "req-t38@test", AddrTransport::Tls, &t38_offer).await;
     assert!(forwarded(&placed, &Method::Invite).is_some(), "{placed:?}");
+}
+
+// ----------------------------------------------------------------------
+// Delayed offer, emergency calls, m=image, no-route, terminate identity
+//
+// RFC 3261 §13.2.1, §14.2, §20.43; RFC 3262 §5, §7.2; RFC 3264 §6;
+// RFC 3362; 47 CFR 9.16. NIST 800-53 Rev5: SC-8, SC-24, CM-6, AU-2.
+// ----------------------------------------------------------------------
+
+/// A granted `media_security:<label>` decision for `action` was audited.
+fn assert_granted(events: &[uc_audit::AuditEvent], label: &str, action: &str) {
+    let policy = format!("media_security:{label}");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            uc_audit::AuditEvent::AuthorizationDecision(d)
+                if d.policy == policy && d.granted && d.action == action
+        )),
+        "no granted {policy} for {action}: {events:?}"
+    );
+}
+
+/// Under `media.srtp.required` an INVITE without SDP is refused before
+/// routing: 488 with Warning 399 "Delayed offer not supported when SRTP is
+/// required", no B-leg INVITE, a denied `media_security:delayed_offer`
+/// decision, a `PolicyDenied`/488 CDR and every slot released. A body that
+/// is neither `application/sdp` nor multipart is no offer either.
+#[tokio::test]
+async fn delayed_offer_is_refused_488_before_routing_when_required() {
+    let mut stack = trunk_stack_protos(["tls", "tls"]).await;
+    let emitter = cdr_emitter();
+    stack.set_cdr(Arc::new(crate::cdr::CdrContext::new(
+        Arc::clone(&emitter),
+        &sbc_config::schema::CdrConfig::default(),
+    )));
+    let capture = uc_audit::capture::start();
+    let results = send(
+        &stack,
+        &caller_request("INVITE", DIALED, "delayed@test", 1, None, None),
+        alice(),
+        AddrTransport::Tls,
+    )
+    .await;
+    assert!(
+        forwarded_all(&results, &Method::Invite).is_empty(),
+        "delayed offer routed: {results:?}"
+    );
+    assert_refused_399(&results);
+    let (r, _) = responded(&results, 488).expect("488");
+    assert!(
+        warning_of(r).ends_with("\"Delayed offer not supported when SRTP is required\""),
+        "{}",
+        warning_of(r)
+    );
+    assert_denied(&capture.events(), "delayed_offer", "INVITE");
+    let c = one_cdr(&emitter);
+    assert_eq!(c.release_cause, uc_cdr::ReleaseCause::PolicyDenied);
+    assert_eq!(c.final_sip_status, 488);
+    assert_all_released(&stack).await;
+
+    let stack = trunk_stack_protos(["tls", "tls"]).await;
+    let text = with_extra(
+        &caller_request("INVITE", DIALED, "delayed-text@test", 1, None, None),
+        "",
+        Some(("text/plain", "m=audio 4000 RTP/AVP 0\r\n")),
+    );
+    let results = send(&stack, &text, alice(), AddrTransport::Tls).await;
+    assert!(
+        forwarded_all(&results, &Method::Invite).is_empty(),
+        "{results:?}"
+    );
+    assert_refused_399(&results);
+    assert_all_released(&stack).await;
+}
+
+/// An emergency call (911) is exempt from `media.srtp.required` only: a
+/// cleartext offer and a delayed offer are routed, each audited as a
+/// granted `media_security:emergency_cleartext` decision, and the cleartext
+/// answer is relayed.
+#[tokio::test]
+async fn emergency_cleartext_invite_is_routed_and_audited() {
+    let (stack, media) = media_trunk_stack(["udp", "udp"]).await;
+    let capture = uc_audit::capture::start();
+    let placed = send(
+        &stack,
+        &caller_request(
+            "INVITE",
+            "911",
+            "e911-clear@test",
+            1,
+            None,
+            Some(&offer(&clear_audio(4000, "RTP/AVP"))),
+        ),
+        alice(),
+        AddrTransport::Udp,
+    )
+    .await;
+    let (inv, dest) = forwarded(&placed, &Method::Invite).expect("emergency INVITE routed");
+    assert!(body_of(inv).contains("RTP/AVP"), "{}", body_of(inv));
+    assert_granted(&capture.events(), "emergency_cleartext", "INVITE");
+    let inv = inv.clone();
+    let results = send(
+        &stack,
+        &response_to(
+            &inv,
+            200,
+            Some("bobtag"),
+            Some(&answer_body(&clear_audio(5000, "RTP/AVP"))),
+        ),
+        dest,
+        AddrTransport::Udp,
+    )
+    .await;
+    assert!(responded(&results, 200).is_some(), "{results:?}");
+    assert_eq!(media.starts(), 1);
+
+    let stack = trunk_stack_protos(["udp", "udp"]).await;
+    let capture = uc_audit::capture::start();
+    let placed = send(
+        &stack,
+        &caller_request("INVITE", "911", "e911-delayed@test", 1, None, None),
+        alice(),
+        AddrTransport::Udp,
+    )
+    .await;
+    assert!(
+        forwarded(&placed, &Method::Invite).is_some(),
+        "emergency delayed offer refused: {placed:?}"
+    );
+    assert_granted(&capture.events(), "emergency_cleartext", "INVITE");
+}
+
+/// The emergency exemption covers `media.srtp.required` only: SDES over a
+/// UDP hop is still refused (Warning 399), and so is a sha-256-only DTLS
+/// fingerprint (Warning 306). Neither is audited as an exemption.
+#[tokio::test]
+async fn emergency_sdes_over_udp_and_bad_fingerprint_still_refused() {
+    for (i, (body, code)) in [
+        (offer(&savp_audio(4000, &gcm(1, KEY_256))), "399 "),
+        (
+            offer(&dtls_audio_fps(
+                4000,
+                "actpass",
+                &[&fingerprint("sha-256", 32, 0x80)],
+            )),
+            "306 ",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let stack = trunk_stack_protos(["udp", "udp"]).await;
+        let capture = uc_audit::capture::start();
+        let results = send(
+            &stack,
+            &caller_request(
+                "INVITE",
+                "911",
+                &format!("e911-refused-{i}@test"),
+                1,
+                None,
+                Some(&body),
+            ),
+            alice(),
+            AddrTransport::Udp,
+        )
+        .await;
+        assert!(
+            forwarded_all(&results, &Method::Invite).is_empty(),
+            "case {i} relayed: {results:?}"
+        );
+        let (r, _) = responded(&results, 488).expect("488");
+        assert!(
+            warning_of(r).starts_with(code),
+            "case {i}: {}",
+            warning_of(r)
+        );
+        assert_no_inline_key(&results);
+        assert!(
+            !capture.events().iter().any(|e| matches!(
+                e,
+                uc_audit::AuditEvent::AuthorizationDecision(d)
+                    if d.policy == "media_security:emergency_cleartext"
+            )),
+            "case {i}: exemption audited for a refused call"
+        );
+        assert_all_released(&stack).await;
+    }
+}
+
+/// Only `m=image ... udptl` is exempt from `media.srtp.required`: an
+/// `m=image` line with an RTP profile is checked like any m-line, with
+/// T.38 disabled (the default) too.
+#[tokio::test]
+async fn image_offer_with_rtp_profile_is_checked_as_cleartext() {
+    let stack = trunk_stack_protos(["tls", "tls"]).await;
+    let capture = uc_audit::capture::start();
+    let results = place_on(
+        &stack,
+        "image-rtp-offer@test",
+        AddrTransport::Tls,
+        &offer(&format!(
+            "{}m=image 4100 RTP/AVP 0\r\n",
+            dtls_audio_fps(4000, "actpass", &[FP_A])
+        )),
+    )
+    .await;
+    assert!(
+        forwarded_all(&results, &Method::Invite).is_empty(),
+        "{results:?}"
+    );
+    assert_refused_302(&results);
+    assert_denied(&capture.events(), "cleartext_media", "INVITE");
+    assert_all_released(&stack).await;
+}
+
+/// The callee's 2xx to an audio offer puts an active `m=image` where the
+/// offer had audio: `udptl` the T.38 rules do not accept (T.38 disabled)
+/// and an RTP profile are both refused before the relay starts.
+#[tokio::test]
+async fn image_answer_to_audio_offer_is_refused() {
+    for (i, (answer, code)) in [
+        (
+            "m=image 5000 udptl t38\r\na=T38FaxVersion:0\r\na=T38FaxUdpEC:t38UDPRedundancy\r\n",
+            "302 ",
+        ),
+        ("m=image 5000 RTP/AVP 0\r\n", "302 "),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (stack, media, _inv, _dest, results) = Box::pin(dtls_call_answered(
+            &format!("image-ans-{i}@test"),
+            false,
+            200,
+            &answer_body(answer),
+        ))
+        .await;
+        assert_initial_answer_torn_down(&results, &media);
+        let (r, _) = responded(&results, 488).expect("488 to the caller");
+        assert!(
+            warning_of(r).starts_with(code),
+            "case {i}: {}",
+            warning_of(r)
+        );
+        assert_all_released(&stack).await;
+    }
+
+    // `media.srtp.required = false` does not let it through either.
+    let (mut stack, media) = media_trunk_stack(["tls", "tls"]).await;
+    stack.set_media_security_policy(&srtp_config(
+        false,
+        sbc_config::schema::SrtpMode::Passthrough,
+    ));
+    let placed = place_on(
+        &stack,
+        "image-ans-opt@test",
+        AddrTransport::Tls,
+        &dtls_offer(),
+    )
+    .await;
+    let (inv, dest) = forwarded(&placed, &Method::Invite).expect("B-leg INVITE");
+    let inv = inv.clone();
+    let results = send(
+        &stack,
+        &response_to(
+            &inv,
+            200,
+            Some("bobtag"),
+            Some(&answer_body("m=image 5000 RTP/AVP 0\r\n")),
+        ),
+        dest,
+        AddrTransport::Tls,
+    )
+    .await;
+    assert_initial_answer_torn_down(&results, &media);
+    let (r, _) = responded(&results, 488).expect("488 to the caller");
+    assert!(warning_of(r).starts_with("302 "), "{}", warning_of(r));
+}
+
+/// Under `media.srtp.required` a call nothing routes is answered 480, not
+/// with the announcement (which answers in cleartext RTP/AVP).
+#[tokio::test]
+async fn no_route_with_required_srtp_is_480_not_announcement() {
+    let stack = SipStack::new(SipStackConfig::default());
+    stack
+        .register_inbound_trunk("test-trunk", None, &[("127.0.0.1".to_string(), 5060)])
+        .await;
+    let invite = format!(
+        "INVITE sip:bob@nonexistent.invalid SIP/2.0\r\n\
+         Via: SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-noroute\r\n\
+         From: <sip:alice@example.com>;tag=nr1\r\n\
+         To: <sip:bob@nonexistent.invalid>\r\n\
+         Call-ID: noroute-srtp@test\r\n\
+         CSeq: 1 INVITE\r\n\
+         Contact: <sip:alice@client.example.com:5060>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{}",
+        dtls_offer().len(),
+        dtls_offer()
+    );
+    let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+    let results = send(&stack, &Bytes::from(invite), source, AddrTransport::Udp).await;
+    assert!(
+        responded(&results, 200).is_none(),
+        "announcement played: {results:?}"
+    );
+    let (r, _) = responded(&results, 480).expect("480");
+    assert_eq!(r.body.as_deref().unwrap_or_default(), b"", "no SDP answer");
+}
+
+/// `media.srtp.mode = Terminate` with no DTLS identity attached (the
+/// remote media plane reported none): new calls are refused before routing
+/// (488, Warning 399, `dtls_termination_unavailable`), not relayed
+/// opaquely. Once the identity is attached the same offer routes.
+#[tokio::test]
+async fn terminate_mode_without_identity_refuses_new_calls() {
+    let mut stack = trunk_stack_protos(["tls", "tls"]).await;
+    stack.set_media_security_policy(&srtp_config(true, sbc_config::schema::SrtpMode::Terminate));
+    let capture = uc_audit::capture::start();
+    for i in 0..2 {
+        let results = place_on(
+            &stack,
+            &format!("term-noid-{i}@test"),
+            AddrTransport::Tls,
+            &dtls_offer(),
+        )
+        .await;
+        assert!(
+            forwarded_all(&results, &Method::Invite).is_empty(),
+            "{results:?}"
+        );
+        assert_refused_399(&results);
+    }
+    assert_denied(&capture.events(), "dtls_termination_unavailable", "INVITE");
+    assert_all_released(&stack).await;
+
+    stack.set_dtls_fingerprint_source(Arc::new(
+        sbc_media_core::dtls_identity::DtlsFingerprintSource::from_static(FP_SBC.to_string()),
+    ));
+    let results = place_on(&stack, "term-id@test", AddrTransport::Tls, &dtls_offer()).await;
+    assert!(
+        forwarded(&results, &Method::Invite).is_some(),
+        "{results:?}"
+    );
+}
+
+/// `media.srtp.required = false`, delayed offer: the callee's reliable 183
+/// carries an offer the policy refuses. It is PRACKed with an answer
+/// declining every stream before the CANCEL (RFC 3262 §5), and the caller
+/// gets 488.
+#[tokio::test]
+async fn refused_reliable_183_offer_is_pracked_with_declined_answer() {
+    let mut stack = trunk_stack_protos(["tls", "tls"]).await;
+    stack.set_media_security_policy(&srtp_config(
+        false,
+        sbc_config::schema::SrtpMode::Passthrough,
+    ));
+    let invite = with_extra(
+        &caller_request("INVITE", DIALED, "prack-decline@test", 1, None, None),
+        "Supported: 100rel\r\n",
+        None,
+    );
+    let placed = send(&stack, &invite, alice(), AddrTransport::Tls).await;
+    let (inv, dest) = forwarded(&placed, &Method::Invite).expect("B-leg INVITE");
+    let inv = inv.clone();
+    let reliable = with_extra(
+        &response_to(&inv, 183, Some("bobtag"), None),
+        "Require: 100rel\r\nRSeq: 4\r\n",
+        Some((
+            "application/sdp",
+            &answer_body(&savp_audio(5000, &aes128(1))),
+        )),
+    );
+    let results = send(&stack, &reliable, dest, AddrTransport::Tls).await;
+    assert!(responded(&results, 183).is_none(), "{results:?}");
+    let order: Vec<&Method> = results
+        .iter()
+        .filter_map(|r| match r {
+            ProcessResult::Forward {
+                message: SipMessage::Request(req),
+                ..
+            } => Some(&req.method),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, vec![&Method::Prack, &Method::Cancel], "{results:?}");
+    let (prack, _) = forwarded(&results, &Method::Prack).expect("PRACK");
+    assert_eq!(ext_header_value(&prack.headers, "RAck"), Some("4 1 INVITE"));
+    assert!(
+        prack
+            .headers
+            .get_value(&HeaderName::To)
+            .is_some_and(|t| t.contains("tag=bobtag")),
+        "{prack:?}"
+    );
+    assert!(prack.headers.get_value(&HeaderName::Contact).is_none());
+    let answer = body_of(prack);
+    assert!(answer.contains("m=audio 0 RTP/SAVP 0\r\n"), "{answer}");
+    assert!(!answer.contains("crypto"), "{answer}");
+    assert_no_inline_key(&results);
+    let (r, _) = responded(&results, 488).expect("488 to the caller");
+    assert_warning_is_fixed(r);
+    assert_all_released(&stack).await;
+}
+
+/// The relay plan is decided before the A-leg 2xx exists: terminate mode,
+/// an INVITE whose multipart body carries no SDP (so no caller
+/// fingerprint), and a DTLS answer. The plan would start no relay, so the
+/// 2xx is refused like any insecure answer: ACK + BYE to the callee, 488 to
+/// the caller, `PolicyTerminated`, and the caller never sees a 2xx.
+#[tokio::test]
+async fn relay_plan_refusal_is_decided_before_the_2xx() {
+    let (mut stack, media) = media_trunk_stack(["tls", "tls"]).await;
+    stack.set_dtls_fingerprint_source(Arc::new(
+        sbc_media_core::dtls_identity::DtlsFingerprintSource::from_static(FP_SBC.to_string()),
+    ));
+    let invite = with_extra(
+        &caller_request("INVITE", DIALED, "plan-refuse@test", 1, None, None),
+        "",
+        Some((
+            "multipart/mixed;boundary=b1",
+            "--b1\r\nContent-Type: text/plain\r\n\r\nhello\r\n--b1--\r\n",
+        )),
+    );
+    let placed = send(&stack, &invite, alice(), AddrTransport::Tls).await;
+    let (inv, dest) = forwarded(&placed, &Method::Invite).expect("B-leg INVITE");
+    let inv = inv.clone();
+    let capture = uc_audit::capture::start();
+    let results = send(
+        &stack,
+        &response_to(&inv, 200, Some("bobtag"), Some(&dtls_answer())),
+        dest,
+        AddrTransport::Tls,
+    )
+    .await;
+    assert_initial_answer_torn_down(&results, &media);
+    let (r, _) = responded(&results, 488).expect("488 to the caller");
+    assert!(warning_of(r).starts_with("399 "), "{}", warning_of(r));
+    let events = capture.events();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            uc_audit::AuditEvent::CallTerminated(t)
+                if matches!(t.reason, uc_audit::event::TerminationReason::PolicyTerminated)
+        )),
+        "{events:?}"
+    );
+    assert_denied(&events, "fingerprint_missing", "answer");
+    assert_all_released(&stack).await;
+}
+
+/// The pre-routing check polices `application/sdp` bodies only; a
+/// multipart INVITE body is policed whole once routed, so a cleartext SDP
+/// part is still refused (488, Warning 302) with every slot released.
+#[tokio::test]
+async fn multipart_cleartext_offer_is_refused_after_routing() {
+    let stack = trunk_stack_protos(["tls", "tls"]).await;
+    let sdp = offer(&clear_audio(4000, "RTP/AVP"));
+    let multipart = format!(
+        "--b1\r\nContent-Type: application/sdp\r\n\r\n{sdp}\r\n--b1\r\n\
+         Content-Type: text/plain\r\n\r\nhello\r\n--b1--\r\n"
+    );
+    let invite = with_extra(
+        &caller_request("INVITE", DIALED, "multipart-clear@test", 1, None, None),
+        "",
+        Some(("multipart/mixed;boundary=b1", &multipart)),
+    );
+    let results = send(&stack, &invite, alice(), AddrTransport::Tls).await;
+    assert!(
+        forwarded_all(&results, &Method::Invite).is_empty(),
+        "{results:?}"
+    );
+    assert_refused_302(&results);
+    assert_all_released(&stack).await;
 }

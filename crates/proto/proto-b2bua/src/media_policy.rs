@@ -43,20 +43,27 @@
 //!
 //! - **DTLS fingerprints** (RFC 8122 §5, RFC 5763 §5; whatever
 //!   `require_srtp` says): an active DTLS m-line needs at least one
-//!   applicable `a=fingerprint` whose hash is `sha-384` (CNSA 2.0, matched
-//!   case-insensitively) and whose value is 48 colon-separated hex octets.
-//!   Media-level lines apply, else the session-level ones. An offer strips
-//!   every other `a=fingerprint` line (session level and active sections)
-//!   and is refused when an active DTLS m-line has none left; an answer is
-//!   refused on any other line and is never rewritten for it.
+//!   applicable `a=fingerprint` whose hash is `sha-384` or `sha-512` (the
+//!   hashes CNSA 2.0 allows, matched case-insensitively) and whose value is
+//!   48 or 64 colon-separated hex octets to match. Media-level lines apply,
+//!   else the session-level ones. Offers and answers alike lose every other
+//!   `a=fingerprint` line (session level and active sections): removing a
+//!   line cannot weaken the binding the remaining ones give. The body is
+//!   refused only when an active DTLS m-line has no accepted line left.
+//!   `sha-256`, `sha-1` and `md5` are refused even though RFC 8122 allows
+//!   them (a deliberate CNSA 2.0 deviation).
 //! - **`require_srtp`** (`media.srtp.required`): every active m-line other
-//!   than `m=image` must be a DTLS profile keyed by a passing fingerprint, or
-//!   `RTP/SAVP(F)` keeping an SDES line that passes the SDES rules.
-//!   `RTP/AVP(F)` and an unkeyed `RTP/SAVP(F)` are cleartext media; `UDP`,
-//!   `TCP`, `udptl` and unknown protocols are an unsupported protocol. In
-//!   terminate mode only DTLS passes (SDES is not terminated). One failing
-//!   m-line refuses the whole body. `m=image` follows the T.38 rules of the
-//!   SIP stack, not this one.
+//!   than `m=image <port> udptl` must be a DTLS profile keyed by a passing
+//!   fingerprint (`UDP/TLS/RTP/SAVP(F)`, `TCP/DTLS/RTP/SAVP(F)`,
+//!   `TCP/TLS/RTP/SAVP(F)`, and the data-channel profiles
+//!   `UDP/DTLS/SCTP` and `TCP/DTLS/SCTP`, RFC 8841), or `RTP/SAVP(F)`
+//!   keeping an SDES line that passes the SDES rules. `RTP/AVP(F)` and an
+//!   unkeyed `RTP/SAVP(F)` are cleartext media; `UDP`, `TCP`, `udptl`
+//!   outside `m=image`, `TCP/TLS/RTP/AVP(F)` and unknown protocols are an
+//!   unsupported protocol. In terminate mode only DTLS passes (SDES is not
+//!   terminated). One failing m-line refuses the whole body. Only
+//!   `m=image ... udptl` follows the T.38 rules of the SIP stack instead; an
+//!   `m=image` line with any other protocol is checked like any m-line.
 //!
 //! Without `require_srtp`, cleartext profiles are not refused here.
 //!
@@ -67,10 +74,10 @@
 //! whitespace trim `proto-sdp` applies. When `proto-sdp` parses the body,
 //! its m-line count and ports must agree with the tokenizer's.
 //!
-//! ## NIST 800-53 Rev5: SC-8, SC-8(1), SC-12, SC-13, CM-6, SI-10
+//! ## NIST 800-53 Rev5: SC-8, SC-8(1), SC-12, SC-13, SC-23, CM-6, SI-10
 //!
 //! ## RFC 4568 §6.3, §7.1.2, §8, §9.1, §9.2; RFC 4567; RFC 7714 §14.1;
-//! RFC 5764 §8; RFC 5763 §5; RFC 8122 §5; RFC 3264 §6, §8
+//! RFC 5764 §8; RFC 5763 §5; RFC 8122 §5; RFC 8841 §4; RFC 3264 §6, §8
 // POAM: POA&M-348 - the SDES confidentiality check is hop by hop (RFC 4568
 // §8.3): it covers the two signalling hops the SBC terminates, not hops
 // beyond them.
@@ -93,11 +100,9 @@ const MAX_KEY_LIFETIME: u64 = 1 << 48;
 /// Largest MKI length in octets (RFC 4568 §9.2: `mki-length` 1..=128).
 const MAX_MKI_LENGTH: u16 = 128;
 
-/// The only DTLS fingerprint hash that may cross (CNSA 2.0).
-const FINGERPRINT_HASH: &str = "sha-384";
-
-/// SHA-384 digest length in octets.
-const FINGERPRINT_OCTETS: usize = 48;
+/// The DTLS fingerprint hashes that may cross and their digest lengths in
+/// octets: CNSA 2.0 allows SHA-384 and SHA-512 (RFC 8122 §5 hash names).
+const FINGERPRINT_HASHES: [(&str, usize); 2] = [("sha-384", 48), ("sha-512", 64)];
 
 /// Who keys SRTP on the SBC's media relay (`media.srtp.mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,8 +119,9 @@ pub enum KeyingMode {
 pub struct MediaSecurityPolicy {
     /// Who keys SRTP.
     pub mode: KeyingMode,
-    /// `media.srtp.required`: no active stream other than `m=image` crosses
-    /// without SRTP keying (DTLS-SRTP, or SDES in passthrough mode).
+    /// `media.srtp.required`: no active stream other than
+    /// `m=image ... udptl` crosses without SRTP keying (DTLS-SRTP, or SDES
+    /// in passthrough mode). The SIP stack clears it for emergency calls.
     ///
     /// ## NIST 800-53 Rev5: SC-8, SC-8(1), CM-6
     pub require_srtp: bool,
@@ -126,9 +132,10 @@ pub struct MediaSecurityPolicy {
 pub enum SdpRole {
     /// An offer: unacceptable keying lines are stripped.
     Offer,
-    /// An answer: unacceptable keying is refused, not stripped. Only
-    /// lines that never cross in any case are removed: `a=crypto` on a
-    /// declined section, on a DTLS m-line, or in terminate mode.
+    /// An answer: unacceptable SDES and MIKEY keying is refused, not
+    /// stripped. Only lines that never cross in any case are removed:
+    /// `a=crypto` on a declined section, on a DTLS m-line, or in terminate
+    /// mode, and `a=fingerprint` lines with a hash that is not accepted.
     Answer,
 }
 
@@ -166,8 +173,23 @@ pub struct Secured<'a> {
     pub stripped_crypto: u16,
     /// `a=key-mgmt` lines removed.
     pub stripped_key_mgmt: u16,
-    /// `a=fingerprint` lines removed (not sha-384, or malformed).
+    /// `a=fingerprint` lines removed (not sha-384 or sha-512, or malformed).
     pub stripped_fingerprints: u16,
+}
+
+/// The peer's DTLS attributes for the stream the relay anchors: the first
+/// active m-line other than `m=image ... udptl`, when it is a DTLS profile.
+/// See [`anchored_dtls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchoredDtls<'a> {
+    /// Zero-based index of the m-line.
+    pub index: usize,
+    /// `<hash> <value>` of the first accepted `a=fingerprint` applying to
+    /// it (media level, else session level), trimmed.
+    pub fingerprint: &'a str,
+    /// The `a=setup` value applying to it (media level, else session
+    /// level), trimmed.
+    pub setup: Option<&'a str>,
 }
 
 /// Why a body may not cross. `index` is the zero-based m-line; a
@@ -214,8 +236,10 @@ pub enum MediaPolicyViolation {
         /// The m-line.
         index: usize,
     },
-    /// `require_srtp`: an active stream's transport protocol is not an RTP
-    /// profile (`UDP`, `TCP`, `udptl` outside `m=image`, unknown).
+    /// `require_srtp`: an active stream's transport protocol is not one the
+    /// policy accepts (`UDP`, `TCP`, `udptl` outside `m=image`,
+    /// `TCP/TLS/RTP/AVP(F)`, unknown), or an answer puts a stream of
+    /// another media type where the offer had audio.
     UnsupportedProtocol {
         /// The m-line.
         index: usize,
@@ -225,12 +249,19 @@ pub enum MediaPolicyViolation {
         /// The m-line.
         index: usize,
     },
-    /// An `a=fingerprint` line is not sha-384 with 48 hex octets: in an
-    /// answer, or in an offer that keeps none for a DTLS m-line.
+    /// An active DTLS m-line keeps no accepted `a=fingerprint` line (every
+    /// applicable one has another hash, or a malformed value).
     FingerprintHashNotAllowed {
         /// The m-line.
         index: usize,
     },
+    /// `require_srtp`: an initial INVITE without an SDP offer. The offer
+    /// would arrive in the callee's 2xx and its answer in the ACK, after the
+    /// call is answered, so it is refused up front.
+    DelayedOffer,
+    /// `media.srtp.mode = Terminate` but the SBC has no DTLS identity to
+    /// terminate with (for example, the remote media plane reported none).
+    TerminationUnavailable,
 }
 
 impl MediaPolicyViolation {
@@ -248,24 +279,28 @@ impl MediaPolicyViolation {
             Self::UnsupportedProtocol { .. } => "unsupported_protocol",
             Self::FingerprintMissing { .. } => "fingerprint_missing",
             Self::FingerprintHashNotAllowed { .. } => "fingerprint_hash_not_allowed",
+            Self::DelayedOffer => "delayed_offer",
+            Self::TerminationUnavailable => "dtls_termination_unavailable",
         }
     }
 
     /// RFC 3261 §20.43 warn-code: 302 for a media transport protocol the
     /// SBC does not accept, 306 for an attribute it does not accept, 399 for
-    /// the signalling transport and termination rules.
+    /// a missing attribute, the signalling transport and termination rules.
     pub const fn warning_code(&self) -> u16 {
         match self {
             Self::CleartextMedia { .. } | Self::UnsupportedProtocol { .. } => 302,
             Self::NoAcceptableCryptoSuite { .. }
             | Self::UnsupportedKeyManagement { .. }
-            | Self::FingerprintMissing { .. }
             | Self::FingerprintHashNotAllowed { .. } => 306,
             Self::MalformedSdp
             | Self::SdesOverInsecureSignalling { .. }
             | Self::SdesNotTerminable { .. }
             | Self::SdpInMultipart
-            | Self::UnpolicedBody => 399,
+            | Self::UnpolicedBody
+            | Self::FingerprintMissing { .. }
+            | Self::DelayedOffer
+            | Self::TerminationUnavailable => 399,
         }
     }
 
@@ -282,14 +317,22 @@ impl MediaPolicyViolation {
             Self::CleartextMedia { .. } => "SRTP is required",
             Self::UnsupportedProtocol { .. } => "Media transport protocol not supported",
             Self::FingerprintMissing { .. } => "DTLS fingerprint required",
-            Self::FingerprintHashNotAllowed { .. } => "Only sha-384 DTLS fingerprints are accepted",
+            Self::FingerprintHashNotAllowed { .. } => {
+                "Only sha-384 and sha-512 DTLS fingerprints are accepted"
+            }
+            Self::DelayedOffer => "Delayed offer not supported when SRTP is required",
+            Self::TerminationUnavailable => "DTLS-SRTP termination unavailable",
         }
     }
 
     /// The m-line the violation is reported against, if any.
     pub const fn index(&self) -> Option<usize> {
         match self {
-            Self::MalformedSdp | Self::SdpInMultipart | Self::UnpolicedBody => None,
+            Self::MalformedSdp
+            | Self::SdpInMultipart
+            | Self::UnpolicedBody
+            | Self::DelayedOffer
+            | Self::TerminationUnavailable => None,
             Self::NoAcceptableCryptoSuite { index }
             | Self::SdesOverInsecureSignalling { index }
             | Self::SdesNotTerminable { index }
@@ -319,6 +362,8 @@ enum LineKind {
     KeyMgmt,
     /// `a=fingerprint` (RFC 8122).
     Fingerprint,
+    /// `a=setup` (RFC 4145); crosses unchanged.
+    Setup,
     /// Anything else; crosses unchanged.
     Other,
 }
@@ -326,8 +371,8 @@ enum LineKind {
 /// The m-line transport protocol, as far as keying goes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Profile {
-    /// Not an RTP profile (`UDP`, `TCP`, `udptl`, unknown), or session
-    /// level.
+    /// Not an accepted profile (`UDP`, `TCP`, `udptl`,
+    /// `TCP/TLS/RTP/AVP(F)`, unknown), or session level.
     #[default]
     Other,
     /// Cleartext RTP: `RTP/AVP`, `RTP/AVPF` (and `TCP/RTP/AVP(F)`).
@@ -335,8 +380,9 @@ enum Profile {
     /// `RTP/SAVP(F)`: keyed by SDES or another key management method.
     Savp,
     /// `UDP/TLS/RTP/SAVP(F)` (RFC 5764 §8), `TCP/DTLS/RTP/SAVP(F)`
-    /// (RFC 7850 §3) or `TCP/TLS/RTP/SAVP(F)`: keyed by DTLS, so SDES on
-    /// them never crosses.
+    /// (RFC 7850 §3), `TCP/TLS/RTP/SAVP(F)`, or the data-channel profiles
+    /// `UDP/DTLS/SCTP` and `TCP/DTLS/SCTP` (RFC 8841 §4): keyed by DTLS, so
+    /// the fingerprint rule applies and SDES on them never crosses.
     Dtls,
 }
 
@@ -345,12 +391,12 @@ enum Profile {
 #[derive(Debug, Default, Clone, Copy)]
 struct Section {
     port_zero: bool,
-    /// `m=image` (T.38): left to the SIP stack's T.38 rules.
-    image: bool,
+    /// `m=image <port> udptl` (T.38): left to the SIP stack's T.38 rules.
+    t38: bool,
     profile: Profile,
     /// `a=fingerprint` lines.
     fingerprints: u16,
-    /// `a=fingerprint` lines that are sha-384 with a well-formed value.
+    /// `a=fingerprint` lines with an accepted hash and a well-formed value.
     fingerprints_ok: u16,
     crypto: u16,
     crypto_ok: u16,
@@ -374,7 +420,7 @@ enum CryptoStrip {
 struct Plan {
     crypto: CryptoStrip,
     strip_key_mgmt: bool,
-    /// Strip the `a=fingerprint` lines that are not sha-384 (offers).
+    /// Strip the `a=fingerprint` lines that are not accepted.
     strip_bad_fingerprint: bool,
 }
 
@@ -433,7 +479,7 @@ fn scan(sdp: &str) -> Result<Scan, MediaPolicyViolation> {
                 }
                 out.fingerprint_ok.push(ok);
             }
-            LineKind::Media | LineKind::Other => {}
+            LineKind::Media | LineKind::Setup | LineKind::Other => {}
         }
     }
     Ok(out)
@@ -514,7 +560,7 @@ fn rewrite<'a>(sdp: &str, session_plan: Plan, plans: &[Plan], scanned: &Scan) ->
                     Some(&mut stripped_fingerprints),
                 )
             }
-            LineKind::Other => (false, None),
+            LineKind::Setup | LineKind::Other => (false, None),
         };
         if strip {
             if let Some(n) = counter {
@@ -536,10 +582,10 @@ fn rewrite<'a>(sdp: &str, session_plan: Plan, plans: &[Plan], scanned: &Scan) ->
 /// How the active streams of `sdp` are keyed, read without applying the
 /// policy.
 ///
-/// A DTLS m-line with a sha-384 fingerprint (media or session level) is
+/// A DTLS m-line with an accepted fingerprint (media or session level) is
 /// DTLS-SRTP, an `RTP/SAVP(F)` m-line with an `a=crypto` line is SDES, any
-/// other active stream is cleartext. `m=image` and declined m-lines do not
-/// count. One cleartext active stream makes the body
+/// other active stream is cleartext. `m=image ... udptl` and declined
+/// m-lines do not count. One cleartext active stream makes the body
 /// cleartext; then SDES wins over DTLS-SRTP. A body that cannot be
 /// tokenized is cleartext (fail closed).
 ///
@@ -550,7 +596,7 @@ pub fn classify_keying(sdp: &str) -> LegKeying {
     };
     let session_fp = scanned.session.fingerprints_ok > 0;
     let mut keying = LegKeying::NoActiveStream;
-    for s in scanned.sections.iter().filter(|s| !s.port_zero && !s.image) {
+    for s in scanned.sections.iter().filter(|s| !s.port_zero && !s.t38) {
         let section = match s.profile {
             Profile::Dtls if s.fingerprints_ok > 0 || session_fp => LegKeying::DtlsSrtp,
             Profile::Savp if s.crypto > 0 => LegKeying::Sdes,
@@ -559,6 +605,60 @@ pub fn classify_keying(sdp: &str) -> LegKeying {
         keying = merge_keying(keying, section);
     }
     keying
+}
+
+/// The peer's DTLS attributes for the stream the relay anchors.
+///
+/// Read with the policy's own tokenizer (case-insensitive names,
+/// `proto-sdp` trim) from the first active m-line other than
+/// `m=image ... udptl`. `None` when the body cannot be tokenized, that
+/// m-line is not a DTLS profile, or no accepted fingerprint applies to it.
+/// Declined sections are never read.
+///
+/// ## NIST 800-53 Rev5: SC-8, SC-23, SI-10; RFC 8122 §5; RFC 4145 §4
+#[must_use]
+pub fn anchored_dtls(sdp: &str) -> Option<AnchoredDtls<'_>> {
+    #[derive(Default)]
+    struct Found<'a> {
+        fingerprint: Option<&'a str>,
+        setup: Option<&'a str>,
+    }
+    let scanned = scan(sdp).ok()?;
+    let index = scanned
+        .sections
+        .iter()
+        .position(|s| !s.port_zero && !s.t38)?;
+    if scanned.sections.get(index)?.profile != Profile::Dtls {
+        return None;
+    }
+    let (mut session, mut media) = (Found::default(), Found::default());
+    let mut section: Option<usize> = None;
+    for raw in sdp.split_inclusive('\n') {
+        let (kind, value) = classify(raw);
+        let found = match (kind, section) {
+            (LineKind::Media, _) => {
+                section = Some(section.map_or(0, |i| i + 1));
+                continue;
+            }
+            (_, None) => &mut session,
+            (_, Some(i)) if i == index => &mut media,
+            _ => continue,
+        };
+        match kind {
+            LineKind::Fingerprint
+                if found.fingerprint.is_none() && fingerprint_acceptable(value) =>
+            {
+                found.fingerprint = Some(value.trim());
+            }
+            LineKind::Setup if found.setup.is_none() => found.setup = Some(value.trim()),
+            _ => {}
+        }
+    }
+    Some(AnchoredDtls {
+        index,
+        fingerprint: media.fingerprint.or(session.fingerprint)?,
+        setup: media.setup.or(session.setup),
+    })
 }
 
 /// An answer that declines every stream of `offer`.
@@ -646,6 +746,8 @@ fn classify(raw: &str) -> (LineKind, &str) {
         LineKind::KeyMgmt
     } else if name.eq_ignore_ascii_case("fingerprint") {
         LineKind::Fingerprint
+    } else if name.eq_ignore_ascii_case("setup") {
+        LineKind::Setup
     } else {
         LineKind::Other
     };
@@ -666,8 +768,9 @@ fn parse_mline(value: &str) -> Result<Section, MediaPolicyViolation> {
     let port: u16 = port
         .parse()
         .map_err(|_| MediaPolicyViolation::MalformedSdp)?;
-    // RFC 5764 §8 (UDP/TLS), RFC 7850 §3 (TCP/DTLS). TCP/TLS/RTP/SAVP(F)
-    // stays on the list so SDES never crosses on it either.
+    // RFC 5764 §8 (UDP/TLS), RFC 7850 §3 (TCP/DTLS), RFC 8841 §4 (DTLS/SCTP
+    // data channels). TCP/TLS/RTP/SAVP(F) stays on the list so SDES never
+    // crosses on it either.
     let dtls = [
         "UDP/TLS/RTP/SAVP",
         "UDP/TLS/RTP/SAVPF",
@@ -675,12 +778,21 @@ fn parse_mline(value: &str) -> Result<Section, MediaPolicyViolation> {
         "TCP/DTLS/RTP/SAVPF",
         "TCP/TLS/RTP/SAVP",
         "TCP/TLS/RTP/SAVPF",
+        "UDP/DTLS/SCTP",
+        "TCP/DTLS/SCTP",
     ]
     .iter()
     .any(|p| proto.eq_ignore_ascii_case(p));
+    // TLS around cleartext RTP (`TCP/TLS/RTP/AVP(F)`) is neither SRTP nor
+    // plain RTP to the relay: an unsupported protocol.
+    let tls_avp = proto
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("TCP/TLS/"));
     let tail = proto.rsplit('/').next().unwrap_or("");
     let profile = if dtls {
         Profile::Dtls
+    } else if tls_avp {
+        Profile::Other
     } else if tail.eq_ignore_ascii_case("SAVP") || tail.eq_ignore_ascii_case("SAVPF") {
         Profile::Savp
     } else if tail.eq_ignore_ascii_case("AVP") || tail.eq_ignore_ascii_case("AVPF") {
@@ -690,7 +802,9 @@ fn parse_mline(value: &str) -> Result<Section, MediaPolicyViolation> {
     };
     Ok(Section {
         port_zero: port == 0,
-        image: media.eq_ignore_ascii_case("image"),
+        // Only UDPTL is T.38 (RFC 3362); any other `m=image` protocol is
+        // policed like any m-line.
+        t38: media.eq_ignore_ascii_case("image") && proto.eq_ignore_ascii_case("udptl"),
         profile,
         ..Section::default()
     })
@@ -717,8 +831,10 @@ fn cross_check(sdp: &str, sections: &[Section]) -> Result<(), MediaPolicyViolati
 
 /// RFC 4568 §9.1 (`a=crypto` is media-level only) and RFC 4567 at session
 /// level: stripped from offers, refused in answers. A session-level
-/// `a=fingerprint` that is not sha-384 is stripped from an offer and
-/// refuses an answer (RFC 8122 §5; CNSA 2.0).
+/// `a=fingerprint` that is not accepted is stripped from offers and answers
+/// alike (RFC 8122 §5; CNSA 2.0): it either does not apply (every DTLS
+/// m-line has media-level lines) or would bind to a hash CNSA 2.0 does not
+/// allow.
 fn plan_session(session: &Section, role: SdpRole) -> Result<Plan, MediaPolicyViolation> {
     if role == SdpRole::Answer {
         if session.crypto > 0 {
@@ -727,14 +843,11 @@ fn plan_session(session: &Section, role: SdpRole) -> Result<Plan, MediaPolicyVio
         if session.key_mgmt > 0 {
             return Err(MediaPolicyViolation::UnsupportedKeyManagement { index: 0 });
         }
-        if session.fingerprints_ok < session.fingerprints {
-            return Err(MediaPolicyViolation::FingerprintHashNotAllowed { index: 0 });
-        }
     }
     Ok(Plan {
         crypto: CryptoStrip::All,
         strip_key_mgmt: true,
-        strip_bad_fingerprint: role == SdpRole::Offer,
+        strip_bad_fingerprint: true,
     })
 }
 
@@ -758,7 +871,7 @@ fn plan_section(
             LegKeying::NoActiveStream,
         ));
     }
-    let dtls_keyed = check_fingerprints(index, s, session, role)?;
+    let dtls_keyed = check_fingerprints(index, s, session)?;
 
     // RFC 4567: MIKEY is not supported; an answer cannot be rewritten.
     if s.key_mgmt > 0 && role == SdpRole::Answer {
@@ -787,22 +900,20 @@ fn plan_section(
 
 /// The DTLS fingerprint rule for one active section (RFC 8122 §5, RFC 5763
 /// §5; CNSA 2.0), whatever `require_srtp` says. Returns whether a DTLS
-/// m-line is keyed by a sha-384 fingerprint that crosses.
+/// m-line is keyed by an accepted fingerprint that crosses.
 ///
-/// An answer is refused on any line that is not sha-384 (it is never
-/// rewritten). An offer loses those lines in the rewrite; media-level lines
-/// apply, and when none is left the session-level ones do.
+/// Offers and answers lose the lines that are not accepted in the rewrite
+/// (on any active m-line); media-level lines apply, and when none is left
+/// the session-level ones do. No applicable line at all is
+/// `FingerprintMissing` (399); only unaccepted ones is
+/// `FingerprintHashNotAllowed` (306).
 ///
-/// ## NIST 800-53 Rev5: SC-8, SC-13, SI-10
+/// ## NIST 800-53 Rev5: SC-8, SC-13, SC-23, SI-10
 fn check_fingerprints(
     index: usize,
     s: &Section,
     session: &Section,
-    role: SdpRole,
 ) -> Result<bool, MediaPolicyViolation> {
-    if role == SdpRole::Answer && s.fingerprints_ok < s.fingerprints {
-        return Err(MediaPolicyViolation::FingerprintHashNotAllowed { index });
-    }
     if s.profile != Profile::Dtls {
         return Ok(false);
     }
@@ -831,7 +942,7 @@ fn plan_sdes(
     let mut plan = Plan {
         crypto: CryptoStrip::Keep,
         strip_key_mgmt: true,
-        strip_bad_fingerprint: role == SdpRole::Offer,
+        strip_bad_fingerprint: true,
     };
     if s.crypto == 0 {
         return Ok((plan, 0));
@@ -868,11 +979,14 @@ fn plan_sdes(
 }
 
 /// `require_srtp` (`media.srtp.required`) for one active section: it must
-/// be SRTP-keyed once the other rules have run. `m=image` is left to the
-/// SIP stack's T.38 rules. In terminate mode SDES never survives
+/// be SRTP-keyed once the other rules have run. `m=image ... udptl` is left
+/// to the SIP stack's T.38 rules. In terminate mode SDES never survives
 /// ([`plan_sdes`]), so only DTLS passes there.
 ///
 /// ## NIST 800-53 Rev5: SC-8, SC-8(1), CM-6
+// POAM: POA&M-353 - one failing active m-line refuses the whole SDP; the
+// stream is not declined in place, so an offer mixing secured audio with a
+// non-RTP stream over TLS (BFCP, MSRP) is refused as a whole.
 fn check_required(
     index: usize,
     s: &Section,
@@ -885,7 +999,7 @@ fn check_required(
         (s.profile, keying),
         (Profile::Savp, LegKeying::Sdes) | (Profile::Dtls, LegKeying::DtlsSrtp)
     );
-    if !policy.require_srtp || s.image || keyed {
+    if !policy.require_srtp || s.t38 || keyed {
         return Ok(());
     }
     match s.profile {
@@ -908,31 +1022,34 @@ fn merge_keying(acc: LegKeying, section: LegKeying) -> LegKeying {
     }
 }
 
-/// Whether `<hash> <value>` of one `a=fingerprint` (after `fingerprint:`)
-/// may cross: hash `sha-384` (ASCII case-insensitive) and 48
-/// colon-separated two-digit hex octets (RFC 8122 §5; CNSA 2.0).
+/// Whether `<hash> <value>` of one `a=fingerprint` may cross.
 ///
-/// ## NIST 800-53 Rev5: SC-13, SI-10
+/// The value is what follows `fingerprint:`. The hash must be `sha-384` or
+/// `sha-512` (CNSA 2.0 allows SHA-384 and SHA-512; ASCII
+/// case-insensitive), with 48 or 64 colon-separated two-digit hex octets
+/// to match (RFC 8122 §5).
+///
+/// ## NIST 800-53 Rev5: SC-13, SC-23, SI-10
 #[must_use]
 pub fn fingerprint_acceptable(value: &str) -> bool {
     let mut fields = value.split_ascii_whitespace();
     let (Some(hash), Some(digest), None) = (fields.next(), fields.next(), fields.next()) else {
         return false;
     };
-    if !hash.eq_ignore_ascii_case(FINGERPRINT_HASH) {
+    let Some(&(_, want)) = FINGERPRINT_HASHES
+        .iter()
+        .find(|(name, _)| hash.eq_ignore_ascii_case(name))
+    else {
         return false;
-    }
+    };
     let mut octets = 0usize;
     for octet in digest.split(':') {
         octets += 1;
-        if octets > FINGERPRINT_OCTETS
-            || octet.len() != 2
-            || !octet.bytes().all(|b| b.is_ascii_hexdigit())
-        {
+        if octets > want || octet.len() != 2 || !octet.bytes().all(|b| b.is_ascii_hexdigit()) {
             return false;
         }
     }
-    octets == FINGERPRINT_OCTETS
+    octets == want
 }
 
 /// Whether one `a=crypto` value (after `crypto:`) may cross: tag, the CNSA
@@ -1083,6 +1200,51 @@ mod tests {
         assert!(!fingerprint_acceptable(&format!("{FP} extra")));
         assert!(!fingerprint_acceptable("sha-384"));
         assert!(!fingerprint_acceptable(""));
+        // CNSA 2.0 also allows SHA-512: 64 octets, not 48.
+        let sha512 = format!("SHA-512 {}", ["AB"; 64].join(":"));
+        assert!(fingerprint_acceptable(&sha512));
+        assert!(!fingerprint_acceptable(
+            &FP.replacen("sha-384", "sha-512", 1)
+        ));
+        assert!(!fingerprint_acceptable(
+            &sha512.replacen("SHA-512", "sha-384", 1)
+        ));
+        assert!(!fingerprint_acceptable(&format!(
+            "md5 {}",
+            ["AB"; 16].join(":")
+        )));
+    }
+
+    /// The anchored stream's accepted fingerprint and setup: media level
+    /// first, else session level; names matched case-insensitively and
+    /// trimmed; declined sections and unaccepted hashes never read.
+    #[test]
+    fn anchored_dtls_reads_the_anchored_stream() {
+        let sha256 = format!("sha-256 {}", ["CD"; 32].join(":"));
+        let body = format!(
+            "v=0\r\na=Fingerprint: {FP}\r\na=SETUP:actpass\r\n\
+             m=audio 0 UDP/TLS/RTP/SAVP 0\r\na=fingerprint:{sha256}\r\na=setup:active\r\n\
+             m=audio 4000 UDP/TLS/RTP/SAVP 0\r\n A=fingerprint:{sha256}\r\n"
+        );
+        let a = anchored_dtls(&body).unwrap();
+        assert_eq!(a.index, 1);
+        assert_eq!(a.fingerprint, FP);
+        assert_eq!(a.setup, Some("actpass"));
+        let media = format!(
+            "v=0\r\nm=image 4100 udptl t38\r\nm=audio 4000 UDP/TLS/RTP/SAVP 0\r\n\
+             a=fingerprint:{sha256}\r\na=fingerprint:{FP}\r\na=setup:passive\r\n"
+        );
+        let a = anchored_dtls(&media).unwrap();
+        assert_eq!((a.index, a.fingerprint, a.setup), (1, FP, Some("passive")));
+        // Not DTLS, only an unaccepted hash, or nothing active.
+        assert!(anchored_dtls("v=0\r\nm=audio 4000 RTP/AVP 0\r\n").is_none());
+        assert!(
+            anchored_dtls(&format!(
+                "v=0\r\nm=audio 4000 UDP/TLS/RTP/SAVP 0\r\na=fingerprint:{sha256}\r\n"
+            ))
+            .is_none()
+        );
+        assert!(anchored_dtls("v=0\r\nm=audio 0 UDP/TLS/RTP/SAVP 0\r\n").is_none());
     }
 
     #[test]

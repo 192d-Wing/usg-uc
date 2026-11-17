@@ -1,30 +1,22 @@
 //! `require_srtp` rules of `proto_b2bua::media_policy::apply_media_security`
 //! and `classify_keying`.
 //!
-//! PENDING: not built (Cargo only discovers `tests/*.rs`). Written against
-//! the planned interface:
+//! Interface: `MediaSecurityPolicy { mode, require_srtp }`;
+//! `CleartextMedia { index }` and `UnsupportedProtocol { index }` (Warning
+//! 302), `FingerprintHashNotAllowed { index }` (306), `FingerprintMissing
+//! { index }`, `DelayedOffer` and `TerminationUnavailable` (399);
+//! `classify_keying`, re-exported at the crate root.
 //!
-//! - `MediaSecurityPolicy { mode: KeyingMode, require_srtp: bool }`;
-//! - `MediaPolicyViolation::CleartextMedia { index }` and
-//!   `UnsupportedProtocol { index }` (Warning 302, labels `cleartext_media`
-//!   and `unsupported_protocol`), `FingerprintMissing { index }` and
-//!   `FingerprintHashNotAllowed { index }` (Warning 306, labels
-//!   `fingerprint_missing` and `fingerprint_hash_not_allowed`);
-//! - `pub fn classify_keying(sdp: &str) -> LegKeying`, re-exported at the
-//!   crate root.
-//!
-//! Enable: `git mv tests/media_policy_required.rs.pending
-//! tests/media_policy_required.rs`; adjust names here if the change chose
-//! different ones.
-//!
-//! Rules: with `require_srtp`, every active non-image m-line must be a
-//! DTLS profile with a passing sha-384 fingerprint, or `RTP/SAVP(F)` with
-//! SDES that passes the SDES rules. `RTP/AVP(F)` is `CleartextMedia`; UDP,
-//! TCP and unknown protocols are `UnsupportedProtocol`. One failing m-line
-//! refuses the whole body. Terminate mode with `require_srtp` needs DTLS on
-//! every active non-image m-line. Declined (port 0) m-lines and
-//! `m=image udptl` are not checked here; an SDP with no active stream is
-//! allowed (`NoActiveStream`).
+//! Rules: with `require_srtp`, every active m-line other than
+//! `m=image ... udptl` must be a DTLS profile (including the RFC 8841
+//! DTLS/SCTP data-channel profiles) with a passing sha-384 or sha-512
+//! fingerprint, or `RTP/SAVP(F)` with SDES that passes the SDES rules.
+//! `RTP/AVP(F)` is `CleartextMedia`; UDP, TCP, `TCP/TLS/RTP/AVP(F)` and
+//! unknown protocols are `UnsupportedProtocol`. One failing m-line refuses
+//! the whole body. Terminate mode with `require_srtp` needs DTLS on every
+//! such m-line. Declined (port 0) m-lines and `m=image udptl` are not
+//! checked here; an `m=image` line with another protocol is. An SDP with no
+//! active stream is allowed (`NoActiveStream`).
 //!
 //! NIST 800-53 Rev5: SC-8, SC-8(1), SC-13, CM-6, SI-10. RFC 3264 §6, §8;
 //! RFC 5764 §8; RFC 8122 §5; RFC 4568 §8.
@@ -241,6 +233,66 @@ fn matrix() -> Vec<Row> {
             term_required: None,
             term_optional: None,
         },
+        // Only `m=image ... udptl` is exempt: an image line with an RTP
+        // profile is cleartext media like any other.
+        Row {
+            name: "dtls audio + rtp/avp image",
+            body: sdp(&format!(
+                "{}{}",
+                dtls("audio", 4000, "UDP/TLS/RTP/SAVP"),
+                clear("image", 4100, "RTP/AVP")
+            )),
+            pass_required: Some("cleartext_media"),
+            pass_optional: None,
+            term_required: Some("cleartext_media"),
+            term_optional: None,
+        },
+        Row {
+            name: "tcp image",
+            body: sdp(&clear("image", 4100, "TCP")),
+            pass_required: Some("unsupported_protocol"),
+            pass_optional: None,
+            term_required: Some("unsupported_protocol"),
+            term_optional: None,
+        },
+        // RFC 8841: DTLS/SCTP data channels are keyed by DTLS.
+        Row {
+            name: "dtls audio + udp/dtls/sctp application",
+            body: sdp(&format!(
+                "{}{}",
+                dtls("audio", 4000, "UDP/TLS/RTP/SAVP"),
+                dtls("application", 4004, "UDP/DTLS/SCTP")
+            )),
+            pass_required: None,
+            pass_optional: None,
+            term_required: None,
+            term_optional: None,
+        },
+        Row {
+            name: "tcp/dtls/sctp application",
+            body: sdp(&dtls("application", 4004, "TCP/DTLS/SCTP")),
+            pass_required: None,
+            pass_optional: None,
+            term_required: None,
+            term_optional: None,
+        },
+        Row {
+            name: "udp/dtls/sctp without fingerprint",
+            body: sdp(&clear("application", 4004, "UDP/DTLS/SCTP")),
+            pass_required: Some("fingerprint_missing"),
+            pass_optional: Some("fingerprint_missing"),
+            term_required: Some("fingerprint_missing"),
+            term_optional: Some("fingerprint_missing"),
+        },
+        // TLS around cleartext RTP is not SRTP: unsupported, not cleartext.
+        Row {
+            name: "tcp/tls/rtp/avp audio",
+            body: sdp(&clear("audio", 4000, "TCP/TLS/RTP/AVP")),
+            pass_required: Some("unsupported_protocol"),
+            pass_optional: None,
+            term_required: Some("unsupported_protocol"),
+            term_optional: None,
+        },
     ]
 }
 
@@ -310,7 +362,8 @@ fn fingerprint_variants_and_codes() {
         matches!(e, MediaPolicyViolation::FingerprintMissing { index: 0 }),
         "{e:?}"
     );
-    assert_eq!(e.warning_code(), 306);
+    // A missing attribute is not an attribute the SBC refuses: 399.
+    assert_eq!(e.warning_code(), 399);
     assert_eq!(e.as_str(), "fingerprint_missing");
 
     let sha256 = sdp(&format!(
@@ -329,12 +382,7 @@ fn fingerprint_variants_and_codes() {
             "{role:?}: {e:?}"
         );
     }
-    let answer_mixed = sdp(&format!(
-        "m=audio 5000 UDP/TLS/RTP/SAVP 0\r\na=fingerprint:{}\r\na=fingerprint:{}\r\n",
-        sha384(),
-        fp("sha-256", 32, 0x80)
-    ));
-    let e = apply(&answer_mixed, SdpRole::Answer, PASS, true, &TLS_TLS).unwrap_err();
+    let e = apply(&sha256, SdpRole::Answer, PASS, true, &TLS_TLS).unwrap_err();
     assert!(
         matches!(
             e,
@@ -343,6 +391,15 @@ fn fingerprint_variants_and_codes() {
         "{e:?}"
     );
     assert_eq!(e.as_str(), "fingerprint_hash_not_allowed");
+    // An answer with an accepted line next to a sha-256 one keeps the
+    // accepted line (RFC 8122 §5 allows several).
+    let answer_mixed = sdp(&format!(
+        "m=audio 5000 UDP/TLS/RTP/SAVP 0\r\na=fingerprint:{}\r\na=fingerprint:{}\r\n",
+        sha384(),
+        fp("sha-256", 32, 0x80)
+    ));
+    let s = apply(&answer_mixed, SdpRole::Answer, PASS, true, &TLS_TLS).unwrap();
+    assert!(s.contains(&sha384()) && !s.contains("sha-256"), "{s}");
 }
 
 #[test]
@@ -361,12 +418,18 @@ fn labels_and_warning_texts_are_fixed() {
         (
             MediaPolicyViolation::FingerprintMissing { index: 0 },
             "fingerprint_missing",
-            306,
+            399,
         ),
         (
             MediaPolicyViolation::FingerprintHashNotAllowed { index: 0 },
             "fingerprint_hash_not_allowed",
             306,
+        ),
+        (MediaPolicyViolation::DelayedOffer, "delayed_offer", 399),
+        (
+            MediaPolicyViolation::TerminationUnavailable,
+            "dtls_termination_unavailable",
+            399,
         ),
     ] {
         assert_eq!(v.as_str(), label);
@@ -484,6 +547,8 @@ fn any_section() -> impl Strategy<Value = String> {
             Just("UDP"),
             Just("TCP"),
             Just("udptl"),
+            Just("UDP/DTLS/SCTP"),
+            Just("TCP/TLS/RTP/AVP"),
         ],
         prop::bool::ANY,
         prop::bool::ANY,
@@ -515,14 +580,16 @@ fn secure_proto(proto: &str) -> bool {
         "UDP/TLS/RTP/SAVPF",
         "TCP/DTLS/RTP/SAVP",
         "TCP/DTLS/RTP/SAVPF",
+        "UDP/DTLS/SCTP",
+        "TCP/DTLS/SCTP",
     ]
     .iter()
     .any(|p| p.eq_ignore_ascii_case(proto))
 }
 
 proptest! {
-    /// With `require_srtp`, every active non-image m-line of an accepted
-    /// body has a secure profile.
+    /// With `require_srtp`, every active m-line of an accepted body other
+    /// than `m=image ... udptl` has a secure profile.
     #[test]
     fn required_accepts_only_secure_active_streams(body in any_body()) {
         for role in ROLES {
@@ -530,14 +597,16 @@ proptest! {
                 if let Ok(s) = apply_media_security(&body, role, &policy(mode, true), &TLS_TLS) {
                     for l in s.sdp.lines().filter(|l| l.starts_with("m=")) {
                         let f: Vec<&str> = l[2..].split_ascii_whitespace().collect();
-                        if f[0] == "image" || f[1] == "0" {
+                        if (f[0] == "image" && f[2] == "udptl") || f[1] == "0" {
                             continue;
                         }
                         prop_assert!(secure_proto(f[2]), "{role:?} {mode:?}: {l}");
                         if mode == TERM {
+                            let upper = f[2].to_ascii_uppercase();
                             prop_assert!(
-                                f[2].to_ascii_uppercase().contains("TLS/RTP/SAVP")
-                                    || f[2].to_ascii_uppercase().contains("DTLS/RTP/SAVP"),
+                                upper.contains("TLS/RTP/SAVP")
+                                    || upper.contains("DTLS/RTP/SAVP")
+                                    || upper.contains("DTLS/SCTP"),
                                 "terminate needs DTLS: {l}"
                             );
                         }
