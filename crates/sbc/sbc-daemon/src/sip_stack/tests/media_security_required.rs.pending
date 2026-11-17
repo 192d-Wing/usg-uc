@@ -1,0 +1,306 @@
+// PENDING: not built. These cases need APIs that do not exist yet:
+//
+// - `SipStack::set_media_security_policy(&sbc_config::schema::SrtpConfig)`
+//   (next to `set_t38_config`);
+// - `SipStack::relay_plan(&MediaSecurityPolicy, has_dtls_identity,
+//   caller_fingerprint: Option<&String>, caller_setup, answer_sdp: &str)
+//   -> RelayPlan`, replacing `terminate_params`;
+// - `enum RelayPlan { Terminate(LegDtlsParams, LegDtlsParams), Opaque,
+//   Refuse(MediaPolicyViolation) }` in `sip_stack.rs`;
+// - `MediaSecurityPolicy { mode, require_srtp }` and the
+//   `CleartextMedia` / `FingerprintMissing` / `FingerprintHashNotAllowed`
+//   variants in `proto_b2bua::media_policy`.
+//
+// Enable: append this file to `tests/media_security.rs` (it uses that
+// file's helpers: `place_on`, `send`, `media_trunk_stack`, `dtls_offer`,
+// `dtls_answer`, `dtls_audio_fps`, `clear_audio`, `fingerprint`, `fp_b`,
+// `FP_A`, `FP_SBC`, ...) and delete it:
+//
+//   cat media_security_required.rs.pending >> media_security.rs
+//   git rm media_security_required.rs.pending
+//
+// Adjust names here if the change chose different ones.
+//
+// NIST 800-53 Rev5: SC-8, SC-24, CM-6. RFC 5763 §5; RFC 5764 §8.
+
+// ----------------------------------------------------------------------
+// media.srtp.required = false, and the relay plan
+// ----------------------------------------------------------------------
+
+fn srtp_config(
+    required: bool,
+    mode: sbc_config::schema::SrtpMode,
+) -> sbc_config::schema::SrtpConfig {
+    sbc_config::schema::SrtpConfig {
+        required,
+        mode,
+        ..sbc_config::schema::SrtpConfig::default()
+    }
+}
+
+/// Item 17. The relay plan at 200-OK time, pure.
+///
+/// - Terminate with sha-384 fingerprints on both legs: `Terminate`, with
+///   each leg's peer fingerprint and the SBC's DTLS role.
+/// - Terminate, a leg without a (sha-384) fingerprint: `Refuse` when
+///   required, else `Opaque` (logged).
+/// - Passthrough, required, cleartext answer: `Refuse(CleartextMedia)`;
+///   a keyed or all-declined answer: `Opaque`.
+#[test]
+fn relay_plan_refuses_unkeyed_leg_when_required() {
+    use crate::sdp_dtls::SetupRole;
+    use proto_b2bua::media_policy::{KeyingMode, MediaPolicyViolation, MediaSecurityPolicy};
+    use sbc_media_core::dtls_sidecar::Role;
+
+    let p = |mode, require_srtp| MediaSecurityPolicy { mode, require_srtp };
+    let caller_fp = FP_A.to_string();
+    let dtls = dtls_answer();
+    let no_fp = answer_body("m=audio 5000 UDP/TLS/RTP/SAVP 0\r\na=setup:active\r\n");
+    let sha256 = answer_body(&dtls_audio_fps(
+        5000,
+        "active",
+        &[&fingerprint("sha-256", 32, 0x80)],
+    ));
+    let plain = answer_body(&clear_audio(5000, "RTP/AVP"));
+    let sdes = answer_body(&savp_audio(5000, &gcm(1, KEY_256_B)));
+    let declined = answer_body(&clear_audio(0, "RTP/AVP"));
+
+    // Terminate, both sha-384.
+    for required in [true, false] {
+        match SipStack::relay_plan(
+            &p(KeyingMode::Terminate, required),
+            true,
+            Some(&caller_fp),
+            Some(SetupRole::ActPass),
+            &dtls,
+        ) {
+            RelayPlan::Terminate(a, b) => {
+                assert_eq!(a.peer_fingerprint, FP_A);
+                assert!(matches!(a.role, Role::Server));
+                assert_eq!(b.peer_fingerprint, fp_b());
+                assert!(matches!(b.role, Role::Server));
+            }
+            other => panic!("required={required}: {other:?}"),
+        }
+    }
+
+    // Terminate, a leg without a usable fingerprint.
+    for (label, caller, answer) in [
+        ("callee none", Some(&caller_fp), no_fp.as_str()),
+        ("callee cleartext", Some(&caller_fp), plain.as_str()),
+        ("caller none", None, dtls.as_str()),
+    ] {
+        let plan = SipStack::relay_plan(
+            &p(KeyingMode::Terminate, true),
+            true,
+            caller,
+            Some(SetupRole::ActPass),
+            answer,
+        );
+        assert!(matches!(plan, RelayPlan::Refuse(_)), "{label}: {plan:?}");
+        let plan = SipStack::relay_plan(
+            &p(KeyingMode::Terminate, false),
+            true,
+            caller,
+            Some(SetupRole::ActPass),
+            answer,
+        );
+        assert!(matches!(plan, RelayPlan::Opaque), "{label} optional: {plan:?}");
+    }
+    assert!(matches!(
+        SipStack::relay_plan(
+            &p(KeyingMode::Terminate, true),
+            true,
+            Some(&caller_fp),
+            None,
+            &no_fp,
+        ),
+        RelayPlan::Refuse(MediaPolicyViolation::FingerprintMissing { .. })
+    ));
+    // A sha-256 callee fingerprint is never terminated.
+    for required in [true, false] {
+        let plan = SipStack::relay_plan(
+            &p(KeyingMode::Terminate, required),
+            true,
+            Some(&caller_fp),
+            None,
+            &sha256,
+        );
+        assert!(!matches!(plan, RelayPlan::Terminate(..)), "{plan:?}");
+    }
+    // A sha-256 caller fingerprint is never terminated either.
+    let caller_sha256 = fingerprint("sha-256", 32, 0x80);
+    let plan = SipStack::relay_plan(
+        &p(KeyingMode::Terminate, true),
+        true,
+        Some(&caller_sha256),
+        None,
+        &dtls,
+    );
+    assert!(matches!(plan, RelayPlan::Refuse(_)), "{plan:?}");
+
+    // Passthrough.
+    assert!(matches!(
+        SipStack::relay_plan(&p(KeyingMode::Passthrough, true), false, None, None, &plain),
+        RelayPlan::Refuse(MediaPolicyViolation::CleartextMedia { .. })
+    ));
+    for (label, answer) in [("dtls", &dtls), ("sdes", &sdes), ("declined", &declined)] {
+        let plan =
+            SipStack::relay_plan(&p(KeyingMode::Passthrough, true), false, None, None, answer);
+        assert!(matches!(plan, RelayPlan::Opaque), "{label}: {plan:?}");
+    }
+    assert!(matches!(
+        SipStack::relay_plan(&p(KeyingMode::Passthrough, false), false, None, None, &plain),
+        RelayPlan::Opaque
+    ));
+}
+
+/// Item 18. Guard: with `media.srtp.required = false` a cleartext call
+/// works as before: the RTP/AVP offer routes (to a UDP trunk too), the
+/// RTP/AVP answer is relayed and the opaque relay starts.
+#[tokio::test]
+async fn required_false_keeps_rtp_avp_working() {
+    let (mut stack, media) = media_trunk_stack(["udp", "udp"]).await;
+    stack.set_media_security_policy(&srtp_config(
+        false,
+        sbc_config::schema::SrtpMode::Passthrough,
+    ));
+    let placed = place_on(
+        &stack,
+        "opt-avp@test",
+        AddrTransport::Tls,
+        &offer(&clear_audio(4000, "RTP/AVP")),
+    )
+    .await;
+    let (inv, dest) = forwarded(&placed, &Method::Invite).expect("B-leg INVITE");
+    let inv = inv.clone();
+    let results = send(
+        &stack,
+        &response_to(
+            &inv,
+            200,
+            Some("bobtag"),
+            Some(&answer_body(&clear_audio(5000, "RTP/AVP"))),
+        ),
+        dest,
+        AddrTransport::Udp,
+    )
+    .await;
+    assert!(responded(&results, 200).is_some(), "{results:?}");
+    assert_eq!(media.starts(), 1);
+    assert!(
+        media.log.lock().unwrap().iter().any(|l| l == "start opaque"),
+        "{:?}",
+        media.log
+    );
+}
+
+/// With `required = false` the fingerprint rule still applies: a
+/// sha-256-only DTLS offer is refused (Warning 306).
+#[tokio::test]
+async fn required_false_still_enforces_sha384_fingerprints() {
+    let mut stack = trunk_stack_protos(["tls", "tls"]).await;
+    stack.set_media_security_policy(&srtp_config(
+        false,
+        sbc_config::schema::SrtpMode::Passthrough,
+    ));
+    let results = place_on(
+        &stack,
+        "opt-sha256@test",
+        AddrTransport::Tls,
+        &offer(&dtls_audio_fps(
+            4000,
+            "actpass",
+            &[&fingerprint("sha-256", 32, 0x80)],
+        )),
+    )
+    .await;
+    assert!(
+        forwarded_all(&results, &Method::Invite).is_empty(),
+        "{results:?}"
+    );
+    assert_refused_306(&results);
+    assert_all_released(&stack).await;
+}
+
+/// With `required = false` in terminate mode, a cleartext callee answer
+/// falls back to the opaque relay (logged), as before.
+#[tokio::test]
+async fn required_false_terminate_cleartext_callee_relays_opaquely() {
+    let (mut stack, media) = media_trunk_stack(["tls", "tls"]).await;
+    stack.set_dtls_fingerprint_source(Arc::new(
+        sbc_media_core::dtls_identity::DtlsFingerprintSource::from_static(FP_SBC.to_string()),
+    ));
+    stack.set_media_security_policy(&srtp_config(false, sbc_config::schema::SrtpMode::Terminate));
+    let placed = place_on(&stack, "opt-term@test", AddrTransport::Tls, &dtls_offer()).await;
+    let (inv, dest) = forwarded(&placed, &Method::Invite).expect("B-leg INVITE");
+    let inv = inv.clone();
+    let results = send(
+        &stack,
+        &response_to(
+            &inv,
+            200,
+            Some("bobtag"),
+            Some(&answer_body(&clear_audio(5000, "RTP/AVP"))),
+        ),
+        dest,
+        AddrTransport::Tls,
+    )
+    .await;
+    assert!(responded(&results, 200).is_some(), "{results:?}");
+    assert!(
+        media.log.lock().unwrap().iter().any(|l| l == "start opaque"),
+        "{:?}",
+        media.log
+    );
+}
+
+/// The setter can switch enforcement back on: `required = true` refuses
+/// RTP/AVP again (the same stack as the default).
+#[tokio::test]
+async fn set_media_security_policy_required_true_refuses_rtp_avp() {
+    let mut stack = trunk_stack_protos(["tls", "tls"]).await;
+    stack.set_media_security_policy(&srtp_config(
+        false,
+        sbc_config::schema::SrtpMode::Passthrough,
+    ));
+    stack.set_media_security_policy(&srtp_config(
+        true,
+        sbc_config::schema::SrtpMode::Passthrough,
+    ));
+    let results = place_on(
+        &stack,
+        "set-req@test",
+        AddrTransport::Tls,
+        &offer(&clear_audio(4000, "RTP/AVP")),
+    )
+    .await;
+    assert!(
+        forwarded_all(&results, &Method::Invite).is_empty(),
+        "{results:?}"
+    );
+    assert_refused_302(&results);
+}
+
+/// T.38 with `required = true` and `allow_cleartext`: an image-only offer
+/// (audio declined) still routes; the T.38 rules, not the SRTP rule,
+/// govern `m=image`.
+#[tokio::test]
+async fn required_true_t38_image_offer_still_routes() {
+    let (mut stack, _media) = media_trunk_stack(["tls", "tls"]).await;
+    stack.set_t38_config(sbc_config::T38Config {
+        enabled: true,
+        allow_cleartext: true,
+        ..sbc_config::T38Config::default()
+    });
+    stack.set_media_security_policy(&srtp_config(
+        true,
+        sbc_config::schema::SrtpMode::Passthrough,
+    ));
+    let t38_offer = offer(
+        "m=audio 0 RTP/AVP 0\r\nm=image 4100 udptl t38\r\na=T38FaxVersion:0\r\n\
+         a=T38MaxBitRate:14400\r\na=T38FaxUdpEC:t38UDPRedundancy\r\n",
+    );
+    let placed = place_on(&stack, "req-t38@test", AddrTransport::Tls, &t38_offer).await;
+    assert!(forwarded(&placed, &Method::Invite).is_some(), "{placed:?}");
+}

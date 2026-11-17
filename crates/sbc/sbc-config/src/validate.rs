@@ -2764,6 +2764,30 @@ mod tests {
         assert!(validate_config(&config).is_ok());
     }
 
+    // CM-6: with media.srtp.required, a passthrough relay cannot fork
+    // cleartext for recording (every call is SRTP keyed end to end), so
+    // recording.enabled needs mode = Terminate or required = false.
+    #[test]
+    fn validate_rejects_recording_with_passthrough_and_required() {
+        let ca = env!("CARGO_MANIFEST_PATH");
+        let mut c = recording_enabled_config(ca);
+        c.media.srtp.required = true;
+        c.media.srtp.mode = crate::schema::SrtpMode::Passthrough;
+        let e = recording_err(&c);
+        assert!(e.contains("recording.enabled"), "{e}");
+        assert!(e.contains("media.srtp.required"), "{e}");
+        assert!(e.to_ascii_lowercase().contains("passthrough"), "{e}");
+        c.media.srtp.mode = crate::schema::SrtpMode::Terminate;
+        assert!(validate_config(&c).is_ok(), "{:?}", validate_config(&c));
+        c.media.srtp.mode = crate::schema::SrtpMode::Passthrough;
+        c.media.srtp.required = false;
+        assert!(validate_config(&c).is_ok(), "{:?}", validate_config(&c));
+        // Recording off: the combination is not checked.
+        c.media.srtp.required = true;
+        c.recording.enabled = false;
+        assert!(validate_config(&c).is_ok(), "{:?}", validate_config(&c));
+    }
+
     #[test]
     fn t38_terminate_mode_is_not_an_error() {
         let mut config = SbcConfig::default();
