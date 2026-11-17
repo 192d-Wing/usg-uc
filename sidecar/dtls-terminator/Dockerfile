@@ -14,7 +14,7 @@
 # - SC-13 Cryptographic Protection: FIPS 140-3 module (GOFIPS140=v1.26.0)
 # - CM-7 Least Functionality: single static binary, nonroot, no shell in PID 1
 
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27-bookworm AS build
 WORKDIR /src
 
 # Cache module downloads separately from the source build.
