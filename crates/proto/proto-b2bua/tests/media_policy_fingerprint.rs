@@ -27,9 +27,12 @@ use proto_b2bua::media_policy::{
 };
 use std::borrow::Cow;
 
-// Gains `require_srtp: false` when the field lands.
+// The fingerprint rule is independent of `require_srtp`.
 const fn policy(mode: KeyingMode) -> MediaSecurityPolicy {
-    MediaSecurityPolicy { mode }
+    MediaSecurityPolicy {
+        mode,
+        require_srtp: false,
+    }
 }
 
 const TLS_TLS: LegContext = LegContext {

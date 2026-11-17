@@ -149,6 +149,7 @@ impl LiveCall {
         // shares this host's address but not these ports.
         s.media_ports = rtp_port_min..=rtp_port_min + 98;
         stack.set_recording(s);
+        stack.set_media_security_policy(&srtp_not_required());
 
         let alice = UdpSocket::bind((ip, 0)).await.unwrap();
         let bob = UdpSocket::bind((ip, 0)).await.unwrap();
@@ -498,6 +499,7 @@ async fn qa_real_pipeline_activation_error_fails_closed() {
         let mut s = settings(policy);
         s.local_media_ip = Some(lo);
         stack.set_recording(s);
+        stack.set_media_security_policy(&srtp_not_required());
         let f = Fixture {
             stack,
             media: Arc::new(ForkMedia::default()),
@@ -1755,6 +1757,7 @@ async fn qa_mass_teardown_paces_rs_byes_to_the_recorder_lane() {
     let mut s = settings(REJECT);
     s.max_sessions = CALLS;
     stack.set_recording(s);
+    stack.set_media_security_policy(&srtp_not_required());
     let f = Fixture { stack, media, cdr };
     let mut ids = Vec::new();
     for i in 0..CALLS {
@@ -1981,6 +1984,7 @@ async fn qa_duplicated_callee_200_does_not_tear_down_a_recorded_call() {
     let media = Arc::new(RacyMedia::default());
     stack.set_media_pipeline(Arc::clone(&media) as _);
     stack.set_recording(settings(REJECT));
+    stack.set_media_security_policy(&srtp_not_required());
     let capture = uc_audit::capture::start();
     let placed = place_call(&stack, "dup@test").await;
     let b_invite = forwarded(&placed, &Method::Invite).unwrap().0.clone();

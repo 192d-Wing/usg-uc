@@ -59,7 +59,12 @@ fn policy(mode: KeyingMode, require_srtp: bool) -> MediaSecurityPolicy {
 
 fn fp(hash: &str, octets: usize, seed: u8) -> String {
     let hex: Vec<String> = (0..octets)
-        .map(|i| format!("{:02X}", seed.wrapping_add(u8::try_from(i % 256).unwrap_or(0))))
+        .map(|i| {
+            format!(
+                "{:02X}",
+                seed.wrapping_add(u8::try_from(i % 256).unwrap_or(0))
+            )
+        })
         .collect();
     format!("{hash} {}", hex.join(":"))
 }
@@ -277,7 +282,10 @@ fn cleartext_and_unsupported_report_index_and_302() {
         clear("video", 4002, "RTP/AVP")
     ));
     let e = apply(&body, SdpRole::Offer, PASS, true, &TLS_TLS).unwrap_err();
-    assert!(matches!(e, MediaPolicyViolation::CleartextMedia { index: 1 }), "{e:?}");
+    assert!(
+        matches!(e, MediaPolicyViolation::CleartextMedia { index: 1 }),
+        "{e:?}"
+    );
     assert_eq!(e.warning_code(), 302);
     assert_eq!(e.index(), Some(1));
 
@@ -287,7 +295,10 @@ fn cleartext_and_unsupported_report_index_and_302() {
         dtls("audio", 4000, "UDP/TLS/RTP/SAVP")
     ));
     let e = apply(&body, SdpRole::Offer, PASS, true, &TLS_TLS).unwrap_err();
-    assert!(matches!(e, MediaPolicyViolation::UnsupportedProtocol { index: 0 }), "{e:?}");
+    assert!(
+        matches!(e, MediaPolicyViolation::UnsupportedProtocol { index: 0 }),
+        "{e:?}"
+    );
     assert_eq!(e.warning_code(), 302);
 }
 
@@ -295,7 +306,10 @@ fn cleartext_and_unsupported_report_index_and_302() {
 fn fingerprint_variants_and_codes() {
     let missing = sdp("m=audio 4000 UDP/TLS/RTP/SAVP 0\r\na=setup:actpass\r\n");
     let e = apply(&missing, SdpRole::Offer, PASS, false, &TLS_TLS).unwrap_err();
-    assert!(matches!(e, MediaPolicyViolation::FingerprintMissing { index: 0 }), "{e:?}");
+    assert!(
+        matches!(e, MediaPolicyViolation::FingerprintMissing { index: 0 }),
+        "{e:?}"
+    );
     assert_eq!(e.warning_code(), 306);
     assert_eq!(e.as_str(), "fingerprint_missing");
 
@@ -322,7 +336,10 @@ fn fingerprint_variants_and_codes() {
     ));
     let e = apply(&answer_mixed, SdpRole::Answer, PASS, true, &TLS_TLS).unwrap_err();
     assert!(
-        matches!(e, MediaPolicyViolation::FingerprintHashNotAllowed { index: 0 }),
+        matches!(
+            e,
+            MediaPolicyViolation::FingerprintHashNotAllowed { index: 0 }
+        ),
         "{e:?}"
     );
     assert_eq!(e.as_str(), "fingerprint_hash_not_allowed");
@@ -331,7 +348,11 @@ fn fingerprint_variants_and_codes() {
 #[test]
 fn labels_and_warning_texts_are_fixed() {
     for (v, label, code) in [
-        (MediaPolicyViolation::CleartextMedia { index: 0 }, "cleartext_media", 302),
+        (
+            MediaPolicyViolation::CleartextMedia { index: 0 },
+            "cleartext_media",
+            302,
+        ),
         (
             MediaPolicyViolation::UnsupportedProtocol { index: 0 },
             "unsupported_protocol",
@@ -351,7 +372,10 @@ fn labels_and_warning_texts_are_fixed() {
         assert_eq!(v.as_str(), label);
         assert_eq!(v.warning_code(), code);
         let text = v.warning_text();
-        assert!(!text.is_empty() && text.is_ascii() && !text.contains('"'), "{text}");
+        assert!(
+            !text.is_empty() && text.is_ascii() && !text.contains('"'),
+            "{text}"
+        );
     }
 }
 
@@ -443,7 +467,12 @@ fn classify_keying_is_reexported() {
 
 fn any_section() -> impl Strategy<Value = String> {
     (
-        prop_oneof![Just("audio"), Just("video"), Just("application"), Just("image")],
+        prop_oneof![
+            Just("audio"),
+            Just("video"),
+            Just("application"),
+            Just("image")
+        ],
         prop_oneof![Just(0u16), Just(4000u16)],
         prop_oneof![
             Just("RTP/AVP"),
@@ -462,7 +491,10 @@ fn any_section() -> impl Strategy<Value = String> {
         .prop_map(|(kind, port, proto, with_fp, with_crypto)| {
             let mut s = format!("m={kind} {port} {proto} 0\r\n");
             if with_fp {
-                s.push_str(&format!("a=setup:actpass\r\na=fingerprint:{}\r\n", sha384()));
+                s.push_str(&format!(
+                    "a=setup:actpass\r\na=fingerprint:{}\r\n",
+                    sha384()
+                ));
             }
             if with_crypto {
                 s.push_str(&format!("a=crypto:1 AEAD_AES_256_GCM inline:{KEY_256}\r\n"));

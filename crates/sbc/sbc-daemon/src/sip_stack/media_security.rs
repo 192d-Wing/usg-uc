@@ -57,6 +57,32 @@ use std::borrow::Cow;
 use tracing::{debug, warn};
 use uc_types::address::{SbcSocketAddr, TransportType as AddrTransport};
 
+/// How the media relay of a call starts at 200-OK time
+/// ([`SipStack::relay_plan`]).
+pub(super) enum RelayPlan {
+    /// Terminate DTLS-SRTP on both legs: the A-leg's, then the B-leg's
+    /// peer fingerprint and the SBC's DTLS role.
+    Terminate(
+        sbc_media_core::media_pipeline::LegDtlsParams,
+        sbc_media_core::media_pipeline::LegDtlsParams,
+    ),
+    /// Forward RTP/SRTP opaquely.
+    Opaque,
+    /// Start no relay: a leg is not keyed as the policy requires.
+    Refuse(MediaPolicyViolation),
+}
+
+/// Names the plan only: no fingerprint reaches a log line (SI-11).
+impl std::fmt::Debug for RelayPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Terminate(..) => f.write_str("Terminate(..)"),
+            Self::Opaque => f.write_str("Opaque"),
+            Self::Refuse(v) => write!(f, "Refuse({v:?})"),
+        }
+    }
+}
+
 /// Signalling confidentiality of the hop an SDP arrives on (`from`) and
 /// the hop it is sent on (`to`). Only TLS counts (RFC 4568 §8.3).
 // WSS is not offered (`wss_listen` is rejected at config load), so WS/WSS
@@ -107,6 +133,7 @@ pub(super) fn check<'b>(
             ?role,
             stripped_crypto = secured.stripped_crypto,
             stripped_key_mgmt = secured.stripped_key_mgmt,
+            stripped_fingerprints = secured.stripped_fingerprints,
             "SDP keying lines stripped by media security policy"
         );
     }
@@ -265,8 +292,11 @@ impl ReleasedCalls {
 }
 
 impl SipStack {
-    /// The configured keying mode: terminate when the SBC holds a DTLS
-    /// identity (`media.srtp.mode = terminate`), else passthrough.
+    /// The configured policy: terminate when the SBC holds a DTLS identity
+    /// (`media.srtp.mode = terminate`), else passthrough; SRTP required per
+    /// `media.srtp.required`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, CM-6
     pub(super) fn media_security_policy(&self) -> MediaSecurityPolicy {
         MediaSecurityPolicy {
             mode: if self.dtls_fingerprint_source.is_some() {
@@ -274,6 +304,39 @@ impl SipStack {
             } else {
                 KeyingMode::Passthrough
             },
+            require_srtp: self.media_srtp_required,
+        }
+    }
+
+    /// Checks the initial INVITE's offer before routing for the rules that
+    /// do not depend on the B-leg: cleartext media under
+    /// `media.srtp.required` and the DTLS fingerprint rule. Both hops are
+    /// taken as confidential, so a refusal here holds whatever B-leg the
+    /// call would take, and no slot or port is taken for it. The SDES rules
+    /// are reported by [`Self::secure_initial_offer`] once the B-leg is
+    /// known (their `Warning` depends on its transport).
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-13, CM-6
+    pub(super) fn precheck_initial_offer(
+        &self,
+        body: Option<&[u8]>,
+    ) -> Result<(), MediaPolicyViolation> {
+        let Some(body) = body.filter(|b| !b.is_empty()) else {
+            return Ok(());
+        };
+        let any_tls = LegContext {
+            from_confidential: true,
+            to_confidential: true,
+        };
+        let sdp = std::str::from_utf8(body).map_err(|_| MediaPolicyViolation::MalformedSdp)?;
+        match apply_media_security(sdp, SdpRole::Offer, &self.media_security_policy(), &any_tls) {
+            Err(
+                v @ (MediaPolicyViolation::CleartextMedia { .. }
+                | MediaPolicyViolation::UnsupportedProtocol { .. }
+                | MediaPolicyViolation::FingerprintMissing { .. }
+                | MediaPolicyViolation::FingerprintHashNotAllowed { .. }),
+            ) => Err(v),
+            _ => Ok(()),
         }
     }
 

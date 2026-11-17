@@ -858,6 +858,8 @@ impl Server {
         // NIST 800-53 Rev5: CM-6, CM-7 - `[media.t38]` fax relay policy
         // (fail-closed default; enforced per offer in the SIP stack).
         sip_stack.set_t38_config(config.media.t38.clone());
+        // NIST 800-53 Rev5: SC-8, CM-6 - media.srtp.required on call legs.
+        sip_stack.set_media_security_policy(&config.media.srtp);
         for w in sbc_config::validate::t38_warnings(config) {
             warn!(event = "config.t38_warning", "{w}");
         }

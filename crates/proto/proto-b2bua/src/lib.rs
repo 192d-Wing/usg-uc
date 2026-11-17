@@ -66,7 +66,7 @@ pub use error::{B2buaError, B2buaResult};
 pub use leg::{CallLeg, LegConfig, LegRole, LegState};
 pub use media_policy::{
     KeyingMode, LegContext, LegKeying, MediaPolicyViolation, MediaSecurityPolicy, SdpRole, Secured,
-    apply_media_security, declined_answer,
+    apply_media_security, classify_keying, declined_answer,
 };
 pub use mode::{
     CodecNegotiationMode, MediaAddress, MediaHandling, MediaRelayConfig, MediaTerminationConfig,
