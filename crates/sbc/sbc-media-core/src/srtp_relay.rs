@@ -12,6 +12,7 @@
 //! transform; the relay task that pumps sockets is layered on top.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::dtls_relay::is_dtls_record;
+use crate::dtls_relay::{HandshakePeers, is_dtls_record};
 use crate::dtls_sidecar::{SidecarError, SidecarEvent, SidecarReader, SidecarWriter};
 use crate::recording_fork::{ForkTap, fork_changed};
 
@@ -90,10 +91,11 @@ pub const DTLS_FORWARD_PER_SECOND: u32 = 4;
 /// (a handful of datagrams per retransmission, at intervals of a second or
 /// more: RFC 6347 §4.2.4.1) and one alert; both fit the burst.
 ///
-/// The handshake itself does not pass through here: a [`TerminateRelayLeg`]
-/// is only started once both legs' handshakes have completed and their keys
-/// are exported ([`crate::dtls_relay::establish_srtp_leg`] reads the socket
-/// until then).
+/// The handshake does not pass through a leg's bucket: a
+/// [`TerminateRelayLeg`] is only started once both legs' handshakes have
+/// completed and their keys are exported
+/// ([`crate::dtls_relay::run_handshake_pump`] reads the socket until then,
+/// behind a bucket of its own with the same numbers).
 // POAM: POA&M-335 -- residual: the bucket is charged before authentication
 // (the relay cannot tell a forged DTLS-class datagram from a genuine one),
 // and forged and genuine datagrams share it. A sender spoofing the leg's
@@ -105,7 +107,7 @@ pub const DTLS_FORWARD_PER_SECOND: u32 = 4;
 // only (or that peer's handshake fails at its own timeout); the drops are
 // counted and logged with the call id.
 #[derive(Debug, Clone, Copy)]
-struct DtlsForwardBucket {
+pub(crate) struct DtlsForwardBucket {
     /// Thousandths of a token available.
     millitokens: u32,
     /// When the bucket was last refilled.
@@ -115,7 +117,7 @@ struct DtlsForwardBucket {
 impl DtlsForwardBucket {
     const CAPACITY: u32 = DTLS_FORWARD_BURST * 1000;
 
-    const fn new(now: Instant) -> Self {
+    pub(crate) const fn new(now: Instant) -> Self {
         Self {
             millitokens: Self::CAPACITY,
             refilled: now,
@@ -123,7 +125,7 @@ impl DtlsForwardBucket {
     }
 
     /// Takes one token if there is one.
-    fn try_take(&mut self, now: Instant) -> bool {
+    pub(crate) fn try_take(&mut self, now: Instant) -> bool {
         let elapsed_ms = u64::try_from(now.saturating_duration_since(self.refilled).as_millis())
             .unwrap_or(u64::MAX);
         if elapsed_ms > 0 {
@@ -152,8 +154,29 @@ impl DtlsForwardBucket {
 ///
 /// Reads SRTP from `recv_sock`, re-protects it for the far leg, and sends it
 /// on `send_sock`. Post-handshake DTLS records (a retransmitted final flight,
-/// alerts; first byte 20..=63) are forwarded to the sidecar via `dtls_out`,
-/// rate-limited, rather than treated as media.
+/// alerts; first byte 20..=63) from the latched source are forwarded to the
+/// sidecar via `dtls_out`, rate-limited, rather than treated as media.
+///
+/// Source latching: the leg starts latched to the value in `recv_target`
+/// (the supervisor writes the handshake's source there). Only datagrams from
+/// `expected_remote`'s IP are considered. A datagram from the latched source
+/// is processed as usual. A media datagram from another port on that IP is
+/// tried (unprotected like any other) only when it has the shape of
+/// SRTP/SRTCP under the leg's profile, its SSRC is one this leg has already
+/// authenticated (any SSRC before the first authenticated packet, so that a
+/// wrong seed can be corrected) and, for SRTP, its index is above the
+/// highest authenticated one (for SRTCP, an index the RTCP replay window
+/// accepts); the latch moves to that port (and `recv_target` with it) only
+/// when the unprotect succeeds. Otherwise it is dropped and counted:
+/// `dropped_stale_relatch` for an SRTP index that does not advance or an
+/// SRTCP index the replay window rejects (dropped before unprotect, so the
+/// context is not touched), `dropped_unauth_source` for everything else. The latch is never moved by
+/// an unauthenticated datagram.
+///
+/// DTLS-class datagrams reach the sidecar from the latched source and, until
+/// the first packet on this side of the call authenticates
+/// (`media_authenticated`), also from any of `handshake_peers`: a peer whose
+/// final flight was lost retransmits it from wherever it ran the handshake.
 pub struct TerminateRelayLeg {
     /// Socket this leg receives the near peer's SRTP/DTLS on.
     pub recv_sock: Arc<UdpSocket>,
@@ -170,16 +193,27 @@ pub struct TerminateRelayLeg {
     /// SRTCP indices (and AEAD nonces) under the key are used once
     /// (RFC 7714 §8.1, §9.1).
     pub egress: SrtpContext,
-    /// The near peer's SDP media address (until the source is latched).
+    /// The near peer's SDP media address. Only its IP is used: datagrams
+    /// from any other IP are dropped.
     pub expected_remote: SocketAddr,
     /// Shared latch for this leg's near-peer address (the opposite direction
-    /// sends here); updated on the first accepted packet.
+    /// and the sidecar's post-handshake DTLS send here). Its value when the
+    /// leg starts is the initial latch; the leg writes it when an
+    /// authenticated packet moves the latch.
     pub recv_target: Arc<RwLock<SocketAddr>>,
     /// Where to send re-protected media — the far leg's latched address.
     pub forward_target: Arc<RwLock<SocketAddr>>,
     /// Post-handshake DTLS records demuxed off `recv_sock` go here (to the
     /// sidecar). `None` drops them (tests).
     pub dtls_out: Option<mpsc::Sender<Vec<u8>>>,
+    /// The sources the handshake pump forwarded DTLS from (empty on the
+    /// separate-port RTCP legs).
+    pub handshake_peers: HandshakePeers,
+    /// Set by the first packet that authenticates on this side of the call
+    /// (shared with the side's RTCP leg and its [`pump_sidecar_dtls_to_peer`]);
+    /// from then on DTLS is accepted from, and sent to, the latched source
+    /// only.
+    pub media_authenticated: Arc<AtomicBool>,
     /// Call id for logging.
     pub call_id: String,
     /// Direction label for logging ("A→B" / "B→A").
@@ -195,12 +229,29 @@ impl TerminateRelayLeg {
         let mut buf = [0u8; 2048];
         let mut fork = self.fork.take();
         let has_fork = fork.is_some();
-        let mut latched: Option<SocketAddr> = None;
+        // NIST 800-53 Rev5: SC-7 -- the initial latch is the seed the
+        // supervisor wrote (the handshake's source, a hint); a poisoned lock
+        // still holds a whole address.
+        let mut latched: SocketAddr = *self
+            .recv_target
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut latch_moves: u64 = 0;
         let mut forwarded: u64 = 0;
         // Kept separate so an off-path spoofing attempt (SC-7 boundary event) is
-        // distinguishable from crypto/keying breakage or sidecar backpressure.
+        // distinguishable from crypto/keying breakage or sidecar backpressure:
+        // wrong IP, same IP but not latched and not authenticated, same IP
+        // but not latched with a stale SRTP index, and the latched source
+        // failing auth.
         let mut dropped_source: u64 = 0;
+        let mut dropped_unauth_source: u64 = 0;
+        let mut dropped_stale_relatch: u64 = 0;
         let mut dropped_auth: u64 = 0;
+        // SSRCs that have authenticated on this leg (bounded, no allocation):
+        // a packet from another port is only tried under one of them.
+        let mut auth_ssrcs = AuthenticatedSsrcs::default();
+        // Local copy of `media_authenticated` for this leg's own packets.
+        let mut authenticated = false;
         let mut dropped_dtls: u64 = 0;
         let mut dtls_rate_limited: u64 = 0;
         let mut dtls_bucket = DtlsForwardBucket::new(Instant::now());
@@ -219,13 +270,9 @@ impl TerminateRelayLeg {
                         continue;
                     }
 
-                    // Source filter: before latching accept only the SDP peer's
-                    // IP; after, only the exact latched source (symmetric RTP).
-                    let acceptable = latched.map_or_else(
-                        || src.ip() == self.expected_remote.ip(),
-                        |latched_src| src == latched_src,
-                    );
-                    if !acceptable {
+                    // Source filter: only the SDP peer's IP. The exact latched
+                    // source is checked below.
+                    if src.ip() != self.expected_remote.ip() {
                         dropped_source += 1;
                         if dropped_source == 1 || dropped_source.is_multiple_of(1000) {
                             warn!(
@@ -236,18 +283,33 @@ impl TerminateRelayLeg {
                         }
                         continue;
                     }
-                    if latched.is_none() {
-                        latched = Some(src);
-                        if let Ok(mut t) = self.recv_target.write() {
-                            *t = src;
-                        }
-                    }
+                    // NIST 800-53 Rev5: SC-7, SC-23, SI-10 -- another port on
+                    // the peer's IP is not trusted until a packet from it
+                    // authenticates under this leg's SRTP key (RFC 3711 §3.3,
+                    // RFC 7362 §7).
+                    let from_latched = src == latched;
 
                     // Demux (RFC 7983 + RFC 5761): post-handshake DTLS (a
                     // retransmitted final flight, an alert) → sidecar;
                     // otherwise SRTP media or muxed SRTCP → reprotect for the
                     // far leg and forward.
                     if is_dtls_record(buf[0]) {
+                        // RFC 6347 §4.2.4: until media authenticates, a
+                        // retransmitted final flight may come from any source
+                        // the handshake ran with (the seed is only a hint).
+                        // One atomic load, DTLS-class datagrams only.
+                        let admissible = from_latched
+                            || (!self.media_authenticated.load(Ordering::Acquire)
+                                && self.handshake_peers.contains(src));
+                        if !admissible {
+                            // DTLS cannot be authenticated here: only the
+                            // latched source's (and, before media
+                            // authenticates, the handshake sources') reaches
+                            // the sidecar.
+                            dropped_unauth_source += 1;
+                            self.warn_unauth_source(src, latched, dropped_unauth_source);
+                            continue;
+                        }
                         if let Some(tx) = &self.dtls_out {
                             // NIST 800-53 Rev5: SC-5 -- the bucket comes before
                             // the copy, so a flood allocates nothing and the
@@ -282,6 +344,29 @@ impl TerminateRelayLeg {
                     }
 
                     let is_rtcp = is_rtcp_packet(&buf[..n]);
+                    let pkt_ssrc = packet_ssrc(&buf[..n], is_rtcp);
+                    // Trial path for a non-latched source: cheap checks first
+                    // (shape, so junk does not reach proto-srtp's allocating
+                    // error paths; a known SSRC, so junk does not cost an AEAD
+                    // open; a fresh SRTP index, so a replay does not touch the
+                    // context), then the same unprotect the latched source's
+                    // packets get.
+                    // NIST 800-53 Rev5: SC-5, SC-7
+                    if !from_latched {
+                        match self.trial_gate(&buf[..n], is_rtcp, pkt_ssrc, &auth_ssrcs) {
+                            TrialGate::Try => {}
+                            TrialGate::Stale => {
+                                dropped_stale_relatch += 1;
+                                self.warn_stale_relatch(src, latched, dropped_stale_relatch);
+                                continue;
+                            }
+                            TrialGate::Refuse => {
+                                dropped_unauth_source += 1;
+                                self.warn_unauth_source(src, latched, dropped_unauth_source);
+                                continue;
+                            }
+                        }
+                    }
                     // Decrypted media kept for the recording fork (the same
                     // steps as `reprotect_rtp`, with the plaintext retained).
                     let mut decrypted = None;
@@ -303,6 +388,11 @@ impl TerminateRelayLeg {
                         Err(e) => {
                             // Auth/replay/short-packet failures are dropped, never
                             // forwarded — the SBC must not emit unauthenticated media.
+                            if !from_latched {
+                                dropped_unauth_source += 1;
+                                self.warn_unauth_source(src, latched, dropped_unauth_source);
+                                continue;
+                            }
                             dropped_auth += 1;
                             if dropped_auth == 1 || dropped_auth.is_multiple_of(1000) {
                                 warn!(error = %e, call_id = %self.call_id, direction = self.direction, is_rtcp, dropped_auth, "SRTP/SRTCP unprotect failed; dropping");
@@ -310,6 +400,39 @@ impl TerminateRelayLeg {
                             continue;
                         }
                     };
+                    // Authenticated: record the SSRC (the first authenticated
+                    // packet seeds the set) and, once, tell the DTLS paths.
+                    if let Some(ssrc) = pkt_ssrc {
+                        auth_ssrcs.insert(ssrc);
+                    }
+                    if !authenticated {
+                        authenticated = true;
+                        self.media_authenticated.store(true, Ordering::Release);
+                    }
+                    if !from_latched {
+                        // A stale SRTP index, and an SRTCP index the RTCP
+                        // replay window rejects, were refused before
+                        // unprotect (`trial_gate`).
+                        // POAM: POA&M-346 -- SRTCP needs only an index the
+                        // replay window accepts, not a new highest one: an
+                        // observer of a genuine SRTCP packet that the relay
+                        // never received can replay it from another port on
+                        // the peer's IP and move the latch until the peer's
+                        // next packet moves it back.
+                        latch_moves += 1;
+                        if latch_moves == 1 || latch_moves.is_multiple_of(100) {
+                            info!(
+                                event = "media.latch.moved",
+                                call_id = %self.call_id, direction = self.direction,
+                                from = %latched, to = %src, basis = "srtp-auth", latch_moves,
+                                "relay leg latch moved to an authenticated source"
+                            );
+                        }
+                        latched = src;
+                        if let Ok(mut t) = self.recv_target.write() {
+                            *t = src;
+                        }
+                    }
 
                     let dest = match self.forward_target.read() {
                         Ok(g) => *g,
@@ -354,6 +477,178 @@ impl TerminateRelayLeg {
             }
         }
     }
+
+    /// Whether a packet from a port that is not latched may be tried (see
+    /// the type docs). No allocation, no crypto.
+    fn trial_gate(
+        &self,
+        pkt: &[u8],
+        is_rtcp: bool,
+        ssrc: Option<u32>,
+        auth_ssrcs: &AuthenticatedSsrcs,
+    ) -> TrialGate {
+        if !could_be_srtp(pkt, is_rtcp, self.ingress.profile().auth_tag_len()) {
+            return TrialGate::Refuse;
+        }
+        if auth_ssrcs.is_empty() {
+            // Nothing has authenticated yet (the seed may be wrong): any
+            // well-formed packet may be tried.
+            return TrialGate::Try;
+        }
+        if !ssrc.is_some_and(|s| auth_ssrcs.contains(s)) {
+            return TrialGate::Refuse;
+        }
+        if is_rtcp {
+            // RFC 3711 §3.4 / RFC 7714 §17: the SRTCP index is the low 31
+            // bits of the trailing word (E || index; no MKI on these legs).
+            // An index the RTCP replay window would reject is dropped before
+            // the AEAD open; the check is read-only, as in unprotect.
+            let Some(index_word) = pkt
+                .len()
+                .checked_sub(4)
+                .and_then(|at| pkt.get(at..))
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_be_bytes)
+            else {
+                return TrialGate::Refuse;
+            };
+            if self
+                .ingress
+                .check_rtcp_replay(u64::from(index_word & 0x7FFF_FFFF))
+                .is_err()
+            {
+                return TrialGate::Stale;
+            }
+        } else {
+            // RFC 3711 §3.3.1: the index this packet would have. A relatch
+            // needs a new highest index; anything else is a replay or a
+            // packet the latched source already moved past.
+            let Some(&[hi, lo]) = pkt.get(2..4) else {
+                return TrialGate::Refuse;
+            };
+            let index = self.ingress.compute_rtp_index(u16::from_be_bytes([hi, lo]));
+            if index <= self.ingress.highest_rtp_index() {
+                return TrialGate::Stale;
+            }
+        }
+        TrialGate::Try
+    }
+
+    /// Logs a packet from the peer's IP that was dropped because its port
+    /// is not latched and its SRTP index does not advance the highest
+    /// authenticated one (first, then every 1000th).
+    fn warn_stale_relatch(&self, src: SocketAddr, latched: SocketAddr, dropped_stale_relatch: u64) {
+        if dropped_stale_relatch == 1 || dropped_stale_relatch.is_multiple_of(1000) {
+            warn!(
+                call_id = %self.call_id, direction = self.direction,
+                source = %src, latched = %latched, dropped_stale_relatch,
+                "SRTP relay dropping a stale-index packet from a port that is not latched"
+            );
+        }
+    }
+
+    /// Logs a datagram from the peer's IP that was dropped because its port
+    /// is not latched and it did not authenticate (first, then every 1000th).
+    fn warn_unauth_source(&self, src: SocketAddr, latched: SocketAddr, dropped_unauth_source: u64) {
+        if dropped_unauth_source == 1 || dropped_unauth_source.is_multiple_of(1000) {
+            warn!(
+                call_id = %self.call_id, direction = self.direction,
+                source = %src, latched = %latched, dropped_unauth_source,
+                "SRTP relay dropping unauthenticated packet from a port that is not latched"
+            );
+        }
+    }
+}
+
+/// What [`TerminateRelayLeg::trial_gate`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrialGate {
+    /// Unprotect it.
+    Try,
+    /// An SRTP index that does not advance, or an SRTCP index the replay
+    /// window rejects: dropped before unprotect.
+    Stale,
+    /// Wrong shape or an SSRC not authenticated on the leg.
+    Refuse,
+}
+
+/// Most SSRCs one leg remembers as authenticated. A peer sends one media
+/// SSRC per leg (and RTCP under the same one); the rest is headroom.
+const MAX_AUTH_SSRCS: usize = 4;
+
+/// SSRCs that have authenticated on one leg. Fixed size; once full, further
+/// SSRCs are not remembered (packets under them are still relayed from the
+/// latched source, but cannot move the latch).
+// NIST 800-53 Rev5: SC-5
+#[derive(Debug, Default)]
+struct AuthenticatedSsrcs {
+    ssrcs: [Option<u32>; MAX_AUTH_SSRCS],
+}
+
+impl AuthenticatedSsrcs {
+    fn is_empty(&self) -> bool {
+        self.ssrcs.iter().all(Option::is_none)
+    }
+
+    fn contains(&self, ssrc: u32) -> bool {
+        self.ssrcs.contains(&Some(ssrc))
+    }
+
+    /// Adds `ssrc` if it is new and there is room. A compare per slot.
+    fn insert(&mut self, ssrc: u32) {
+        for slot in &mut self.ssrcs {
+            match slot {
+                Some(s) if *s == ssrc => return,
+                Some(_) => {}
+                None => {
+                    *slot = Some(ssrc);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Whether `pkt` has the shape of SRTP (or SRTCP when `is_rtcp`) under a
+/// profile with `tag`-byte authentication tags. SRTP: version 2 and long
+/// enough for the fixed header, the CSRC list, any header extension
+/// (RFC 3550 §5.1, §5.3.1) and the tag. SRTCP: version 2, long enough for
+/// the header, the tag and the index word, and the E flag set (RFC 3711
+/// §3.4; the AEAD profile always encrypts). Checked before a trial
+/// unprotect. No allocation.
+fn could_be_srtp(pkt: &[u8], is_rtcp: bool, tag: usize) -> bool {
+    let Some(&b0) = pkt.first() else {
+        return false;
+    };
+    if b0 & 0xC0 != 0x80 {
+        return false;
+    }
+    if is_rtcp {
+        let e_flag = pkt
+            .len()
+            .checked_sub(4)
+            .and_then(|i| pkt.get(i))
+            .is_some_and(|b| b & 0x80 != 0);
+        return pkt.len() >= 8 + tag + 4 && e_flag;
+    }
+    let mut header = proto_rtp::RTP_HEADER_MIN_SIZE + 4 * usize::from(b0 & 0x0F);
+    if b0 & 0x10 != 0 {
+        // Extension: profile(2) length-in-words(2), then the words.
+        let Some(&[hi, lo]) = pkt.get(header + 2..header + 4) else {
+            return false;
+        };
+        header += 4 + 4 * usize::from(u16::from_be_bytes([hi, lo]));
+    }
+    pkt.len() >= header + tag
+}
+
+/// The cleartext SSRC of an SRTP packet (bytes 8..12) or the sender SSRC of
+/// an SRTCP packet (bytes 4..8, RFC 3550 §6.4).
+fn packet_ssrc(pkt: &[u8], is_rtcp: bool) -> Option<u32> {
+    let at = if is_rtcp { 4 } else { 8 };
+    pkt.get(at..at + 4)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(u32::from_be_bytes)
 }
 
 /// How long [`pump_sidecar_dtls_to_peer`] keeps relaying after the call has
@@ -413,6 +708,14 @@ pub async fn forward_dtls_to_sidecar(
 /// moment, the sidecar answers with `close_notify` and closes, and the pump
 /// relays that record first, for at most [`SIDECAR_CLOSE_GRACE`].
 ///
+/// Each record goes to the leg's latched address (`peer`) and, until the
+/// first packet on this side of the call authenticates, to every source the
+/// handshake ran with as well (`fanout`; at most
+/// [`crate::dtls_relay::MAX_HANDSHAKE_SOURCES`] + 1 sends, all to the peer's
+/// IP): the latch seed is a hint, and a peer whose final flight was lost has
+/// to receive the retransmission where it ran the handshake (RFC 6347
+/// §4.2.4).
+///
 /// However the association ends, one `dtls.association.closed` record is
 /// written with the call id, the leg and the peer's address (`assoc`): at
 /// info when the call ended, at warn for everything else.
@@ -424,13 +727,14 @@ pub async fn pump_sidecar_dtls_to_peer(
     mut reader: SidecarReader,
     sock: Arc<UdpSocket>,
     peer: Arc<RwLock<SocketAddr>>,
+    fanout: HandshakeFanout,
     mut shutdown: watch::Receiver<bool>,
     assoc: AssociationLabel,
 ) {
     loop {
         tokio::select! {
             event = reader.read() => {
-                if let Some(end) = relay_sidecar_event(event, &sock, &peer).await {
+                if let Some(end) = relay_sidecar_event(event, &sock, &peer, &fanout).await {
                     // POAM: POA&M-340 -- the association is gone but the call
                     // is not ended here: the relay legs keep this leg's SRTP
                     // keys and keep relaying until signalling ends the call.
@@ -444,7 +748,8 @@ pub async fn pump_sidecar_dtls_to_peer(
     // The call is over. The sidecar closing its end is the expected answer.
     let drain = async {
         loop {
-            if let Some(end) = relay_sidecar_event(reader.read().await, &sock, &peer).await {
+            if let Some(end) = relay_sidecar_event(reader.read().await, &sock, &peer, &fanout).await
+            {
                 return end;
             }
         }
@@ -453,6 +758,17 @@ pub async fn pump_sidecar_dtls_to_peer(
         Ok(end) => assoc.record_closed(&peer, end.reason_at_call_end(), end.detail()),
         Err(_) => assoc.record_closed(&peer, CLOSED_SIDECAR_TIMEOUT, ""),
     }
+}
+
+/// Where [`pump_sidecar_dtls_to_peer`] also sends the sidecar's records until
+/// media authenticates.
+#[derive(Debug, Clone, Default)]
+pub struct HandshakeFanout {
+    /// The sources the handshake pump forwarded DTLS from.
+    pub peers: HandshakePeers,
+    /// Shared with the side's relay legs (see
+    /// [`TerminateRelayLeg::media_authenticated`]).
+    pub media_authenticated: Arc<AtomicBool>,
 }
 
 /// Which association a [`pump_sidecar_dtls_to_peer`] task serves, for its
@@ -567,6 +883,7 @@ async fn relay_sidecar_event(
     event: Result<SidecarEvent, SidecarError>,
     sock: &UdpSocket,
     peer: &RwLock<SocketAddr>,
+    fanout: &HandshakeFanout,
 ) -> Option<SidecarEnd> {
     match event {
         Ok(SidecarEvent::Dtls(record)) => {
@@ -574,6 +891,12 @@ async fn relay_sidecar_event(
                 return Some(SidecarEnd::Fault("peer address unavailable"));
             };
             let _ = sock.send_to(&record, dest).await;
+            // NIST 800-53 Rev5: SC-5 -- bounded by the fixed-size set.
+            if !fanout.media_authenticated.load(Ordering::Acquire) {
+                for other in fanout.peers.iter().filter(|a| *a != dest) {
+                    let _ = sock.send_to(&record, other).await;
+                }
+            }
             None
         }
         // After the handshake an `Error` is the sidecar's report that the
@@ -691,6 +1014,8 @@ mod tests {
             recv_target: Arc::new(RwLock::new(peer_addr)),
             forward_target: Arc::new(RwLock::new(far_addr)),
             dtls_out: None,
+            handshake_peers: HandshakePeers::default(),
+            media_authenticated: Arc::default(),
             call_id: "call".into(),
             direction: "A→B",
             fork: None,
@@ -760,6 +1085,8 @@ mod tests {
             recv_target: Arc::new(RwLock::new(peer_addr)),
             forward_target: Arc::new(RwLock::new(far_addr)),
             dtls_out: None,
+            handshake_peers: HandshakePeers::default(),
+            media_authenticated: Arc::default(),
             call_id: "call".into(),
             direction: "A→B",
             fork: Some(tap),
@@ -892,6 +1219,8 @@ mod tests {
             recv_target: Arc::new(RwLock::new(peer_addr)),
             forward_target: Arc::new(RwLock::new(far_addr)),
             dtls_out: Some(dtls_tx),
+            handshake_peers: HandshakePeers::default(),
+            media_authenticated: Arc::default(),
             call_id: "call".into(),
             direction: "A→B",
             fork: None,
@@ -949,6 +1278,8 @@ mod tests {
             recv_target: Arc::new(RwLock::new(peer_addr)),
             forward_target: Arc::new(RwLock::new(far.local_addr().unwrap())),
             dtls_out: Some(dtls_tx),
+            handshake_peers: HandshakePeers::default(),
+            media_authenticated: Arc::default(),
             call_id: "call".into(),
             direction: "A→B",
             fork: None,
@@ -1087,6 +1418,10 @@ mod tests {
     }
 
     async fn pumps(name: &str) -> Pumps {
+        pumps_with(name, HandshakeFanout::default()).await
+    }
+
+    async fn pumps_with(name: &str, fanout: HandshakeFanout) -> Pumps {
         let path =
             std::env::temp_dir().join(format!("usg-pump-{name}-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -1115,6 +1450,7 @@ mod tests {
             reader,
             relay,
             target,
+            fanout,
             sd_rx,
             AssociationLabel {
                 call_id: format!("call-{name}"),
@@ -1269,6 +1605,8 @@ mod tests {
             recv_target: Arc::new(RwLock::new(peer_addr)),
             forward_target: Arc::new(RwLock::new(far_addr)),
             dtls_out: None,
+            handshake_peers: HandshakePeers::default(),
+            media_authenticated: Arc::default(),
             call_id: "call".into(),
             direction: "A→B",
             fork: None,
@@ -1296,5 +1634,631 @@ mod tests {
 
         let _ = sd_tx.send(true);
         let _ = handle.await;
+    }
+
+    // ---- Source latching on the terminated leg ------------------------------
+    //
+    // The leg's initial latch is the value in `recv_target` when it starts
+    // (the handshake's source). Another port on the expected IP moves the
+    // latch only with a packet that passes unprotect (and, for RTP, advances
+    // the highest authenticated index). DTLS-class datagrams are forwarded to
+    // the sidecar from the latched source only.
+
+    /// Captures `tracing` output for the current thread (the tests run on
+    /// tokio's current-thread runtime, so the leg's events land here).
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        // tracing-core caches a callsite's interest when it is first hit.
+        // With a single registered dispatcher it asks only the hitting
+        // thread's default, so a concurrent test thread with no subscriber
+        // would cache "never" for this thread's capture as well. A second,
+        // process-wide dispatcher that is never dropped keeps every capture
+        // in the interest computation.
+        static KEEP: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        KEEP.get_or_init(|| {
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::sink)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            )
+        });
+        let cap = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (cap, guard)
+    }
+
+    /// One running leg with its peer-side sockets: `p1` is the seed (the
+    /// handshake source), `p2` another port on the same IP.
+    struct LatchLeg {
+        relay_addr: SocketAddr,
+        p1: UdpSocket,
+        p2: UdpSocket,
+        far: UdpSocket,
+        recv_target: Arc<RwLock<SocketAddr>>,
+        dtls_rx: mpsc::Receiver<Vec<u8>>,
+        media_authenticated: Arc<AtomicBool>,
+        peer_send: SrtpContext,
+        far_recv: SrtpContext,
+        shutdown: watch::Sender<bool>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    const LATCH_SSRC: u32 = 0x5151_0001;
+
+    async fn latch_leg(direction: &'static str) -> LatchLeg {
+        latch_leg_with(direction, false).await
+    }
+
+    /// As [`latch_leg`]; with `handshake_peers`, P1 and P2 are both
+    /// handshake sources.
+    async fn latch_leg_with(direction: &'static str, handshake_peers: bool) -> LatchLeg {
+        let relay_recv = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_send = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let p1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let p2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let far = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_recv.local_addr().unwrap();
+        let p1_addr = p1.local_addr().unwrap();
+        let peers = if handshake_peers {
+            HandshakePeers::from_addrs(&[p1_addr, p2.local_addr().unwrap()])
+        } else {
+            HandshakePeers::default()
+        };
+        let media_authenticated = Arc::new(AtomicBool::new(false));
+
+        let (key_a, salt_a) = random_material();
+        let (key_b, salt_b) = random_material();
+        let recv_target = Arc::new(RwLock::new(p1_addr));
+        let (dtls_tx, dtls_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (shutdown, sd_rx) = watch::channel(false);
+        let leg = TerminateRelayLeg {
+            recv_sock: relay_recv,
+            send_sock: relay_send,
+            ingress: ctx(&key_a, &salt_a, SrtpDirection::Inbound, LATCH_SSRC),
+            egress: ctx(&key_b, &salt_b, SrtpDirection::Outbound, LATCH_SSRC),
+            expected_remote: p1_addr,
+            recv_target: Arc::clone(&recv_target),
+            forward_target: Arc::new(RwLock::new(far.local_addr().unwrap())),
+            dtls_out: Some(dtls_tx),
+            handshake_peers: peers,
+            media_authenticated: Arc::clone(&media_authenticated),
+            call_id: "latch-call".into(),
+            direction,
+            fork: None,
+        };
+        let handle = tokio::spawn(leg.run(sd_rx));
+        LatchLeg {
+            relay_addr,
+            p1,
+            p2,
+            far,
+            recv_target,
+            dtls_rx,
+            media_authenticated,
+            peer_send: ctx(&key_a, &salt_a, SrtpDirection::Outbound, LATCH_SSRC),
+            far_recv: ctx(&key_b, &salt_b, SrtpDirection::Inbound, LATCH_SSRC),
+            shutdown,
+            handle,
+        }
+    }
+
+    impl LatchLeg {
+        fn srtp(&self, seq: u16) -> Vec<u8> {
+            self.srtp_ssrc(seq, LATCH_SSRC)
+        }
+
+        /// SRTP under the leg's key with another SSRC in the header.
+        fn srtp_ssrc(&self, seq: u16, ssrc: u32) -> Vec<u8> {
+            let pkt = RtpPacket::new(
+                RtpHeader::new(0, seq, u32::from(seq) * 160, ssrc),
+                vec![0x5A; 160],
+            );
+            SrtpProtect::new(&self.peer_send)
+                .protect_rtp(&pkt)
+                .unwrap()
+                .to_vec()
+        }
+
+        fn srtcp(&self, marker: u8) -> Vec<u8> {
+            let rr = [
+                0x80, 201, 0, 2, 0x51, 0x51, 0, 1, marker, marker, marker, marker,
+            ];
+            SrtpProtect::new(&self.peer_send)
+                .protect_rtcp(&rr)
+                .unwrap()
+                .to_vec()
+        }
+
+        fn target(&self) -> SocketAddr {
+            *self.recv_target.read().unwrap()
+        }
+
+        /// The next datagram at the far peer within `ms`, if any.
+        async fn far_next(&self, ms: u64) -> Option<Vec<u8>> {
+            let mut buf = [0u8; 2048];
+            match tokio::time::timeout(Duration::from_millis(ms), self.far.recv_from(&mut buf))
+                .await
+            {
+                Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
+                _ => None,
+            }
+        }
+
+        async fn stop(self) {
+            let _ = self.shutdown.send(true);
+            let _ = self.handle.await;
+        }
+    }
+
+    // Port of the review probe `terminate_leg_latches_before_auth`, with the
+    // assertions inverted: one unauthenticated datagram from another port on
+    // the peer's IP neither captures the latch nor blocks genuine SRTP from
+    // the seed.
+    // NIST 800-53 Rev5: SC-7, SC-23, SI-10
+    #[tokio::test]
+    async fn terminate_leg_ignores_unauthenticated_first_datagram() {
+        let (logs, _guard) = capture_logs();
+        let leg = latch_leg("A→B").await;
+        let seed = leg.p1.local_addr().unwrap();
+
+        leg.p2.send_to(&[0x80u8; 40], leg.relay_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for seq in 1..=20u16 {
+            leg.p1
+                .send_to(&leg.srtp(seq), leg.relay_addr)
+                .await
+                .unwrap();
+        }
+        // Counted by sequence number once everything is sent, so the result
+        // does not depend on per-packet scheduling.
+        let mut relayed = std::collections::BTreeSet::new();
+        while relayed.len() < 20 {
+            let Some(out) = leg.far_next(2000).await else {
+                break;
+            };
+            let rtp = SrtpUnprotect::new(&leg.far_recv)
+                .unprotect_rtp(&out)
+                .expect("relayed packet must open under the far leg's key");
+            relayed.insert(rtp.header.sequence_number);
+        }
+        assert_eq!(
+            relayed,
+            (1..=20u16).collect(),
+            "genuine SRTP from the seed relayed {}/20",
+            relayed.len()
+        );
+        assert_eq!(leg.target(), seed);
+
+        let text = logs.text();
+        assert!(
+            !text.contains("media.latch.moved"),
+            "no latch move expected:\n{text}"
+        );
+        assert!(
+            text.contains("dropped_unauth_source=1"),
+            "the junk datagram is counted as dropped_unauth_source:\n{text}"
+        );
+        leg.stop().await;
+    }
+
+    // NAT rebinding: junk from P2 does not move the latch; genuine SRTP from
+    // P2 is relayed and moves it; junk from the old port does not move it
+    // back; genuine SRTP from the old port (authenticated, fresh index) does.
+    #[tokio::test]
+    async fn terminate_leg_relatches_only_on_authenticated_packet() {
+        let (logs, _guard) = capture_logs();
+        let leg = latch_leg("A→B").await;
+        let p1 = leg.p1.local_addr().unwrap();
+        let p2 = leg.p2.local_addr().unwrap();
+
+        leg.p2.send_to(&[0x80u8; 40], leg.relay_addr).await.unwrap();
+        assert_eq!(leg.far_next(150).await, None, "junk must not be relayed");
+        assert_eq!(leg.target(), p1, "junk from P2 moved the latch");
+
+        leg.p2.send_to(&leg.srtp(1), leg.relay_addr).await.unwrap();
+        let out = leg
+            .far_next(1000)
+            .await
+            .expect("authenticated SRTP from P2 must be relayed");
+        let rtp = SrtpUnprotect::new(&leg.far_recv)
+            .unprotect_rtp(&out)
+            .unwrap();
+        assert_eq!(rtp.header.sequence_number, 1);
+        assert_eq!(
+            leg.target(),
+            p2,
+            "authenticated SRTP from P2 moves the latch"
+        );
+
+        leg.p1.send_to(&[0x80u8; 40], leg.relay_addr).await.unwrap();
+        assert_eq!(leg.far_next(150).await, None);
+        assert_eq!(
+            leg.target(),
+            p2,
+            "junk from the old port moved the latch back"
+        );
+
+        leg.p1.send_to(&leg.srtp(2), leg.relay_addr).await.unwrap();
+        let out = leg
+            .far_next(1000)
+            .await
+            .expect("authenticated SRTP from P1 must be relayed");
+        let rtp = SrtpUnprotect::new(&leg.far_recv)
+            .unprotect_rtp(&out)
+            .unwrap();
+        assert_eq!(rtp.header.sequence_number, 2);
+        assert_eq!(leg.target(), p1);
+
+        let text = logs.text();
+        assert!(
+            text.contains("media.latch.moved") && text.contains("srtp-auth"),
+            "expected a media.latch.moved event with basis srtp-auth:\n{text}"
+        );
+        assert!(text.contains("dropped_unauth_source"), "{text}");
+        leg.stop().await;
+    }
+
+    // A genuine packet already accepted from the seed, replayed from another
+    // port, fails the replay check: not relayed, no latch move. A genuine
+    // packet that never arrived (lost), replayed from another port after a
+    // later one was accepted, authenticates but does not advance the highest
+    // index: no latch move.
+    #[tokio::test]
+    async fn terminate_leg_refuses_replayed_packet_as_relatch() {
+        let (logs, _guard) = capture_logs();
+        let leg = latch_leg("A→B").await;
+        let p1 = leg.p1.local_addr().unwrap();
+
+        let first = leg.srtp(10);
+        leg.p1.send_to(&first, leg.relay_addr).await.unwrap();
+        assert!(leg.far_next(1000).await.is_some());
+        leg.p2.send_to(&first, leg.relay_addr).await.unwrap();
+        assert_eq!(leg.far_next(150).await, None, "replay must not be relayed");
+        assert_eq!(leg.target(), p1, "replayed packet moved the latch");
+
+        // Captured on the path but lost before the relay.
+        let lost = leg.srtp(11);
+        leg.p1.send_to(&leg.srtp(12), leg.relay_addr).await.unwrap();
+        assert!(leg.far_next(1000).await.is_some());
+        leg.p2.send_to(&lost, leg.relay_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            leg.target(),
+            p1,
+            "a stale (non-advancing) authenticated packet moved the latch"
+        );
+        // Both are refused before unprotect, on their own counter.
+        let text = logs.text();
+        assert!(
+            text.contains("dropped_stale_relatch=1"),
+            "the replays are counted as dropped_stale_relatch:\n{text}"
+        );
+        assert!(!text.contains("media.latch.moved"), "{text}");
+        leg.stop().await;
+    }
+
+    // SRTCP authenticates a relatch too: on the media port (rtcp-mux) and on a
+    // separate RTCP-port leg seeded with the SDP RTCP address.
+    #[tokio::test]
+    async fn terminate_leg_relatches_on_authenticated_srtcp() {
+        for direction in ["A→B", "A→B RTCP"] {
+            let leg = latch_leg(direction).await;
+            let p1 = leg.p1.local_addr().unwrap();
+            let p2 = leg.p2.local_addr().unwrap();
+
+            // The seed's first SRTCP is relayed (latched source).
+            leg.p1.send_to(&leg.srtcp(1), leg.relay_addr).await.unwrap();
+            assert!(
+                leg.far_next(1000).await.is_some(),
+                "{direction}: SRTCP from the seed"
+            );
+            // Junk RTCP-looking datagram from P2: dropped, no move.
+            let mut junk = vec![0x80u8, 201, 0, 2];
+            junk.extend_from_slice(&[0u8; 36]);
+            leg.p2.send_to(&junk, leg.relay_addr).await.unwrap();
+            assert_eq!(leg.far_next(150).await, None, "{direction}: junk relayed");
+            assert_eq!(leg.target(), p1, "{direction}: junk SRTCP moved the latch");
+
+            // Authenticated SRTCP from P2 (rebinding): relayed, latch moves.
+            leg.p2.send_to(&leg.srtcp(2), leg.relay_addr).await.unwrap();
+            let out = leg.far_next(1000).await;
+            assert!(
+                out.is_some(),
+                "{direction}: authenticated SRTCP from P2 not relayed"
+            );
+            let out = out.unwrap();
+            let rtcp = SrtpUnprotect::new(&leg.far_recv)
+                .unprotect_rtcp(&out)
+                .await
+                .unwrap();
+            assert_eq!(rtcp[8], 2);
+            assert_eq!(
+                leg.target(),
+                p2,
+                "{direction}: latch did not follow SRTCP auth"
+            );
+            leg.stop().await;
+        }
+    }
+
+    // An SRTCP packet already accepted from the seed, replayed from another
+    // port, is refused before unprotect by the RTCP replay window: not
+    // relayed, no latch move, counted as dropped_stale_relatch. On the media
+    // port (rtcp-mux) and on a separate RTCP-port leg.
+    // NIST 800-53 Rev5: SC-7, SC-23
+    #[tokio::test]
+    async fn terminate_leg_refuses_replayed_srtcp_before_unprotect() {
+        for direction in ["A→B", "A→B RTCP"] {
+            let (logs, _guard) = capture_logs();
+            let leg = latch_leg(direction).await;
+            let p1 = leg.p1.local_addr().unwrap();
+
+            let first = leg.srtcp(1);
+            leg.p1.send_to(&first, leg.relay_addr).await.unwrap();
+            assert!(
+                leg.far_next(1000).await.is_some(),
+                "{direction}: SRTCP from the seed"
+            );
+            leg.p2.send_to(&first, leg.relay_addr).await.unwrap();
+            assert_eq!(
+                leg.far_next(150).await,
+                None,
+                "{direction}: replayed SRTCP relayed"
+            );
+            assert_eq!(
+                leg.target(),
+                p1,
+                "{direction}: replayed SRTCP moved the latch"
+            );
+
+            let text = logs.text();
+            assert!(
+                text.contains("dropped_stale_relatch=1"),
+                "{direction}: the replay is counted as dropped_stale_relatch:\n{text}"
+            );
+            assert!(!text.contains("media.latch.moved"), "{direction}: {text}");
+            leg.stop().await;
+        }
+    }
+
+    // A DTLS-class datagram from a port that is not latched never reaches the
+    // sidecar channel; the latched (seed) source's does.
+    #[tokio::test]
+    async fn terminate_leg_drops_dtls_from_unlatched_source() {
+        let mut leg = latch_leg("A→B").await;
+        let p1 = leg.p1.local_addr().unwrap();
+
+        let forged = [22u8, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0xEE];
+        let genuine = [22u8, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0x11];
+        leg.p2.send_to(&forged, leg.relay_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(leg.target(), p1, "DTLS from P2 moved the latch");
+        leg.p1.send_to(&genuine, leg.relay_addr).await.unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(2), leg.dtls_rx.recv())
+            .await
+            .expect("the seed's DTLS record was not forwarded")
+            .unwrap();
+        assert_eq!(
+            got, genuine,
+            "first record at the sidecar must be the seed's"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), leg.dtls_rx.recv())
+                .await
+                .is_err(),
+            "nothing else may reach the sidecar"
+        );
+        leg.stop().await;
+    }
+
+    // Until media authenticates on this side, the sidecar's records also go
+    // to every handshake source (a peer whose final flight was lost, on a
+    // port the seed did not pick); afterwards to the latched address only.
+    // NIST 800-53 Rev5: SC-5 (bounded fan-out), SC-7
+    #[tokio::test]
+    async fn sidecar_records_fan_out_to_handshake_sources_until_media_authenticates() {
+        let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let authenticated = Arc::new(AtomicBool::new(false));
+        let mut p = pumps_with(
+            "fanout",
+            HandshakeFanout {
+                peers: HandshakePeers::from_addrs(&[other.local_addr().unwrap()]),
+                media_authenticated: Arc::clone(&authenticated),
+            },
+        )
+        .await;
+
+        write_typed(&mut p.sidecar_w, MSG_DTLS, b"final-flight").await;
+        assert_eq!(peer_recv(&p.peer).await, b"final-flight");
+        assert_eq!(
+            peer_recv(&other).await,
+            b"final-flight",
+            "handshake source did not get the record before media authenticated"
+        );
+
+        authenticated.store(true, Ordering::Release);
+        write_typed(&mut p.sidecar_w, MSG_DTLS, b"after-auth").await;
+        assert_eq!(peer_recv(&p.peer).await, b"after-auth");
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), other.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "record fanned out after media authenticated"
+        );
+        let _ = p.shutdown.send(true);
+        drop(p.sidecar_w);
+        let _ = tokio::time::timeout(Duration::from_secs(2), p.pump).await;
+    }
+
+    // Until the first packet authenticates, post-handshake DTLS from any
+    // handshake source reaches the sidecar (a retransmitted final flight
+    // from the port the seed did not pick); a port that was not a handshake
+    // source never does; after the first authenticated packet only the
+    // latched source's does.
+    // NIST 800-53 Rev5: SC-7, SC-5
+    #[tokio::test]
+    async fn terminate_leg_accepts_handshake_source_dtls_until_media_authenticates() {
+        let mut leg = latch_leg_with("A→B", true).await;
+        let p3 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let p1 = leg.p1.local_addr().unwrap();
+        let retransmit = [22u8, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 3, 0, 1, 0x33];
+        let stranger = [22u8, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 4, 0, 1, 0x44];
+        let late = [22u8, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 5, 0, 1, 0x55];
+
+        p3.send_to(&stranger, leg.relay_addr).await.unwrap();
+        leg.p2.send_to(&retransmit, leg.relay_addr).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), leg.dtls_rx.recv())
+            .await
+            .expect("the handshake source's DTLS was not forwarded")
+            .unwrap();
+        assert_eq!(
+            got, retransmit,
+            "a non-handshake port's DTLS reached the sidecar"
+        );
+        assert_eq!(leg.target(), p1, "DTLS moved the latch");
+
+        // The peer's first SRTP from the seed authenticates: the window closes.
+        leg.p1.send_to(&leg.srtp(1), leg.relay_addr).await.unwrap();
+        assert!(leg.far_next(2000).await.is_some());
+        assert!(leg.media_authenticated.load(Ordering::Acquire));
+        leg.p2.send_to(&late, leg.relay_addr).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), leg.dtls_rx.recv())
+                .await
+                .is_err(),
+            "handshake-source DTLS forwarded after media authenticated"
+        );
+        leg.stop().await;
+    }
+
+    // Once an SSRC has authenticated on the leg, a packet from
+    // another port is only tried under one of the leg's SSRCs. A packet
+    // under a new SSRC (even one that would authenticate) neither moves the
+    // latch nor is relayed; the known SSRC from the same port does move it.
+    #[tokio::test]
+    async fn terminate_leg_tries_other_ports_only_under_authenticated_ssrcs() {
+        let (logs, _guard) = capture_logs();
+        let leg = latch_leg("A→B").await;
+        let p2 = leg.p2.local_addr().unwrap();
+
+        leg.p1.send_to(&leg.srtp(1), leg.relay_addr).await.unwrap();
+        assert!(leg.far_next(2000).await.is_some());
+        leg.p2
+            .send_to(&leg.srtp_ssrc(2, 0x0BAD_5555), leg.relay_addr)
+            .await
+            .unwrap();
+        assert_eq!(leg.far_next(200).await, None, "unknown SSRC relayed");
+        assert_eq!(leg.target(), leg.p1.local_addr().unwrap());
+
+        leg.p2.send_to(&leg.srtp(3), leg.relay_addr).await.unwrap();
+        assert!(leg.far_next(2000).await.is_some());
+        assert_eq!(
+            leg.target(),
+            p2,
+            "known SSRC from P2 did not move the latch"
+        );
+        let text = logs.text();
+        assert!(text.contains("dropped_unauth_source=1"), "{text}");
+        leg.stop().await;
+    }
+
+    // The shape check before a trial unprotect: version, CSRC list, header
+    // extension length and tag for SRTP; length and E flag for SRTCP.
+    #[test]
+    fn could_be_srtp_checks_header_fit() {
+        const TAG: usize = 16;
+        let mut media = vec![0x80u8, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1];
+        media.extend_from_slice(&[0u8; TAG]);
+        assert!(could_be_srtp(&media, false, TAG));
+        // Version 1.
+        let mut v1 = media.clone();
+        v1[0] = 0x40;
+        assert!(!could_be_srtp(&v1, false, TAG));
+        // CC = 15 claims 60 bytes of CSRCs that are not there.
+        let mut csrc = media.clone();
+        csrc[0] = 0x8F;
+        assert!(!could_be_srtp(&csrc, false, TAG));
+        // X set: an extension of 0xFFFF words does not fit.
+        let mut ext = vec![
+            0x90u8, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0xBE, 0xDE, 0xFF, 0xFF,
+        ];
+        ext.extend_from_slice(&[0u8; TAG]);
+        assert!(!could_be_srtp(&ext, false, TAG));
+        // X set with a one-word extension that fits.
+        let mut ext_ok = vec![
+            0x90u8, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0xBE, 0xDE, 0, 1, 0, 0, 0, 0,
+        ];
+        ext_ok.extend_from_slice(&[0u8; TAG]);
+        assert!(could_be_srtp(&ext_ok, false, TAG));
+        // X set but too short for the extension header.
+        assert!(!could_be_srtp(&ext[..13], false, TAG));
+
+        let mut control = vec![0x80u8, 201, 0, 1, 0, 0, 0, 1];
+        control.extend_from_slice(&[0u8; TAG]);
+        control.extend_from_slice(&[0x80, 0, 0, 1]);
+        assert!(could_be_srtp(&control, true, TAG));
+        let mut no_e = control.clone();
+        let e = no_e.len() - 4;
+        no_e[e] = 0;
+        assert!(!could_be_srtp(&no_e, true, TAG), "SRTCP without the E flag");
+        assert!(!could_be_srtp(&control[..control.len() - 1], true, TAG + 1));
+        assert!(!could_be_srtp(&[], false, TAG));
+    }
+
+    #[test]
+    fn authenticated_ssrcs_are_bounded() {
+        let mut set = AuthenticatedSsrcs::default();
+        assert!(set.is_empty());
+        for ssrc in 1..=u32::try_from(MAX_AUTH_SSRCS).unwrap() + 2 {
+            set.insert(ssrc);
+            set.insert(ssrc);
+        }
+        assert!(!set.is_empty());
+        assert!(set.contains(1));
+        assert!(set.contains(u32::try_from(MAX_AUTH_SSRCS).unwrap()));
+        assert!(!set.contains(u32::try_from(MAX_AUTH_SSRCS).unwrap() + 1));
+        assert_eq!(
+            packet_ssrc(&[0x80, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4], false),
+            Some(0x0102_0304)
+        );
+        assert_eq!(
+            packet_ssrc(&[0x80, 201, 0, 0, 9, 8, 7, 6], true),
+            Some(0x0908_0706)
+        );
+        assert_eq!(packet_ssrc(&[0x80, 0, 0], false), None);
     }
 }
