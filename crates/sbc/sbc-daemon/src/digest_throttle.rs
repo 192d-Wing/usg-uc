@@ -65,10 +65,12 @@
 //!   and by spending that budget can keep a registered phone from
 //!   refreshing until its binding expires. A phone whose NAT mapping
 //!   changes port is not exempt until it re-registers outside a window;
-//! - reset on success: a correct response outside a window forgets the
-//!   username's failures, so a guesser that stays under [`FREE_FAILURES`]
-//!   wrong responses between two successful registrations of the victim
-//!   (e.g. 4 guesses per refresh interval) never opens a window;
+//! - reset on success: a correct response on a fresh nonce outside a
+//!   window forgets the username's failures, so a guesser that stays
+//!   under [`FREE_FAILURES`] wrong responses between two successful
+//!   registrations of the victim (e.g. 4 guesses per refresh interval)
+//!   never opens a window. A correct response on a stale nonce (which a
+//!   copy of an earlier request can be) does not reset the count;
 //! - the thresholds ([`FREE_FAILURES`], [`BASE_BACKOFF`], [`MAX_BACKOFF`],
 //!   [`FAILURE_MEMORY`], [`EXEMPT_FAILURES`]) are constants, not
 //!   organization-defined configuration.
@@ -320,7 +322,7 @@ impl DigestThrottle {
     }
 
     /// Forgets the failures of `username` after a successful
-    /// authentication.
+    /// authentication (a correct response on a fresh nonce).
     ///
     /// POAM: POA&M-316 - reset on success: a guesser that stays under
     /// [`FREE_FAILURES`] wrong responses between two successful
