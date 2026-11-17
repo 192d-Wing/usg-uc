@@ -24,7 +24,9 @@
 //!
 //! The SIP stack does not walk MIME parts on in-dialog bodies it relays
 //! opaquely: a `multipart/*` body with an SDP part is refused
-//! (`sdp_in_multipart`). INVITE, re-INVITE, UPDATE, 18x and 2xx bodies are
+//! (`sdp_in_multipart`), and so is a body with a non-identity
+//! `Content-Encoding` or a non-SDP body that mentions `a=crypto` or
+//! `a=key-mgmt` (`unpoliced_body`). INVITE, re-INVITE, UPDATE, 18x and 2xx bodies are
 //! policed whole, whatever their `Content-Type`.
 //!
 //! Each refusal is audited as a denied `AuthorizationDecision` with policy
@@ -50,7 +52,7 @@ use proto_b2bua::media_policy::{
     apply_media_security,
 };
 use proto_sip::message::{SipRequest, SipResponse};
-use proto_sip::{HeaderName, Method, SipMessage, StatusCode};
+use proto_sip::{HeaderName, Headers, Method, SipMessage, StatusCode};
 use std::borrow::Cow;
 use tracing::{debug, warn};
 use uc_types::address::{SbcSocketAddr, TransportType as AddrTransport};
@@ -124,6 +126,52 @@ pub(super) fn multipart_carries_sdp(content_type: &str, body: &[u8]) -> bool {
             .any(|w| w.eq_ignore_ascii_case(needle))
     };
     is_multipart && (mentions(b"application/sdp") || mentions(b"multipart/"))
+}
+
+/// Whether every `Content-Encoding` coding on the message is `identity`
+/// (RFC 3261 §20.12; case-insensitive). No header is identity.
+fn content_encoding_is_identity(headers: &Headers) -> bool {
+    headers.get_all(&HeaderName::ContentEncoding).all(|h| {
+        h.value
+            .split(',')
+            .map(str::trim)
+            .all(|c| c.is_empty() || c.eq_ignore_ascii_case("identity"))
+    })
+}
+
+/// Why a relayed in-dialog body (PRACK, INFO, MESSAGE, NOTIFY and their
+/// responses) may not cross unwalked, or `None`. An `application/sdp` body
+/// is policed by the caller; this only covers what that check cannot see:
+///
+/// - a non-identity `Content-Encoding` (gzip and the like) hides the
+///   content, whatever its type;
+/// - a `multipart/*` body with an SDP part ([`multipart_carries_sdp`]);
+/// - any other body that mentions `a=crypto` or `a=key-mgmt` (ASCII
+///   case-insensitive), whatever its `Content-Type`.
+///
+/// ## NIST 800-53 Rev5: SC-8, SC-12, SI-10
+///
+/// ## RFC 4568 §8; RFC 4567 §3; RFC 3261 §20.12
+pub(super) fn unpoliced_body_violation(
+    headers: &Headers,
+    content_type: &str,
+    body: &[u8],
+) -> Option<MediaPolicyViolation> {
+    if !content_encoding_is_identity(headers) {
+        return Some(MediaPolicyViolation::UnpolicedBody);
+    }
+    if super::is_sdp_content_type(content_type) {
+        return None;
+    }
+    if multipart_carries_sdp(content_type, body) {
+        return Some(MediaPolicyViolation::SdpInMultipart);
+    }
+    let mentions = |needle: &[u8]| {
+        body.windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+    };
+    (mentions(b"a=crypto") || mentions(b"a=key-mgmt"))
+        .then_some(MediaPolicyViolation::UnpolicedBody)
 }
 
 /// The role of a callee's SDP in a 18x/2xx to the initial INVITE: an

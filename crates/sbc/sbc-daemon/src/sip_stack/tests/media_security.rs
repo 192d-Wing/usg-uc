@@ -1059,7 +1059,7 @@ async fn established_on(
     (stack, inv)
 }
 
-/// SEC-01: on a direct T.38 call (image-only offer) the callee's answer
+/// On a direct T.38 call (image-only offer) the callee's answer
 /// has `a=crypto` on its declined audio section. The policy strips it, and
 /// the T.38 answer check and rewrite start from the policy's output, so the
 /// key never reaches a caller on UDP.
@@ -1100,7 +1100,7 @@ async fn direct_t38_answer_declined_crypto_never_reaches_udp_caller() {
     assert!(!body.contains("a=crypto"), "{body}");
 }
 
-/// SEC-02: a PRACK whose body is multipart with an SDP part is refused
+/// A PRACK whose body is multipart with an SDP part is refused
 /// with 488 + Warning 399 (parts are not walked) and not forwarded.
 #[tokio::test]
 async fn prack_with_multipart_sdp_is_refused_488() {
@@ -1146,7 +1146,136 @@ async fn prack_with_multipart_sdp_is_refused_488() {
     assert!(forwarded(&results, &Method::Prack).is_some(), "{results:?}");
 }
 
-/// RFC-01: the callee's 2xx carries the offer (the INVITE had none) and
+/// A reliable 183 on a ringing 100rel call, PRACKed by nothing yet.
+async fn ringing_reliable_183() -> SipStack {
+    let (stack, b_invite) = Box::pin(ringing_call_100rel()).await;
+    let reliable = with_extra(
+        &response_to(&b_invite, 183, Some("bobtag"), None),
+        "Require: 100rel\r\nRSeq: 7\r\n",
+        None,
+    );
+    let results = flatten(stack.process_message(&reliable, bob(), None).await);
+    assert!(responded(&results, 183).is_some(), "{results:?}");
+    stack
+}
+
+/// The PRACK is refused with 488 + Warning 399 (`unpoliced_body`), not
+/// forwarded.
+fn assert_prack_refused(results: &[ProcessResult], cseq: &str) {
+    assert!(
+        forwarded(results, &Method::Prack).is_none(),
+        "unpoliced body relayed: {results:?}"
+    );
+    assert_no_inline_key(results);
+    let (r, d) = responded(results, 488).expect("488 to the PRACK");
+    assert_eq!(d, alice());
+    assert_eq!(r.headers.cseq(), Some(cseq));
+    assert!(warning_of(r).starts_with("399 "), "{}", warning_of(r));
+    assert_warning_is_fixed(r);
+}
+
+/// A gzip-encoded body is not walked, so it could hide an SDP part: a
+/// PRACK with a gzip multipart body is refused, even with no SDP visible;
+/// the same multipart with an identity encoding crosses.
+#[tokio::test]
+async fn prack_with_gzip_multipart_body_is_refused_488() {
+    let stack = Box::pin(ringing_reliable_183()).await;
+    let multipart = "--b1\r\nContent-Type: text/plain\r\n\r\nhi\r\n--b1--\r\n";
+    let prack = with_extra(
+        &alice_request("PRACK", 315, Some("bobtag"), None),
+        "RAck: 7 314 INVITE\r\nContent-Encoding: GZIP\r\n",
+        Some(("multipart/mixed;boundary=b1", multipart)),
+    );
+    let results = flatten(stack.process_message(&prack, alice(), None).await);
+    assert_prack_refused(&results, "315 PRACK");
+    // A gzip coding after identity still counts.
+    let prack = with_extra(
+        &alice_request("PRACK", 316, Some("bobtag"), None),
+        "RAck: 7 314 INVITE\r\nContent-Encoding: identity, gzip\r\n",
+        Some(("multipart/mixed;boundary=b1", multipart)),
+    );
+    let results = flatten(stack.process_message(&prack, alice(), None).await);
+    assert_prack_refused(&results, "316 PRACK");
+    let plain = with_extra(
+        &alice_request("PRACK", 317, Some("bobtag"), None),
+        "RAck: 7 314 INVITE\r\nContent-Encoding: identity\r\n",
+        Some(("multipart/mixed;boundary=b1", multipart)),
+    );
+    let results = flatten(stack.process_message(&plain, alice(), None).await);
+    let (fwd, _) = forwarded(&results, &Method::Prack).expect("multipart PRACK relayed");
+    assert!(body_of(fwd).contains("hi"), "{}", body_of(fwd));
+}
+
+/// SDES keying outside an `application/sdp` body is refused whatever the
+/// `Content-Type` (a `message/sipfrag` here; attribute names are matched
+/// case-insensitively).
+#[tokio::test]
+async fn sipfrag_body_with_crypto_is_refused_488() {
+    let stack = Box::pin(ringing_reliable_183()).await;
+    let frag = format!(
+        "SIP/2.0 200 OK\r\n\r\nm=audio 4000 RTP/SAVP 0\r\n{}",
+        gcm(1, KEY_256).replace("a=crypto", "A=Crypto")
+    );
+    let prack = with_extra(
+        &alice_request("PRACK", 315, Some("bobtag"), None),
+        "RAck: 7 314 INVITE\r\n",
+        Some(("message/sipfrag", &frag)),
+    );
+    let results = flatten(stack.process_message(&prack, alice(), None).await);
+    assert_prack_refused(&results, "315 PRACK");
+    let mikey = with_extra(
+        &alice_request("PRACK", 316, Some("bobtag"), None),
+        "RAck: 7 314 INVITE\r\n",
+        Some(("text/plain", MIKEY)),
+    );
+    let results = flatten(stack.process_message(&mikey, alice(), None).await);
+    assert_prack_refused(&results, "316 PRACK");
+}
+
+/// The callee's 2xx to a relayed PRACK with a gzip or a keyed non-SDP body
+/// is refused like an SDP answer that may not cross: 488 to the PRACK, and
+/// the early call ends (CANCEL callee, 488 on the caller's INVITE).
+#[tokio::test]
+async fn relayed_prack_response_with_unpoliced_body_is_refused() {
+    for (extra, ct, body) in [
+        (
+            "Content-Encoding: gzip\r\n",
+            "text/plain",
+            "compressed".to_string(),
+        ),
+        ("", "message/sipfrag", gcm(1, KEY_256_B)),
+    ] {
+        let stack = Box::pin(ringing_reliable_183()).await;
+        let prack = with_extra(
+            &alice_request("PRACK", 315, Some("bobtag"), None),
+            "RAck: 7 314 INVITE\r\n",
+            None,
+        );
+        let results = flatten(stack.process_message(&prack, alice(), None).await);
+        let (fwd, _) = forwarded(&results, &Method::Prack).expect("PRACK to the callee");
+        let fwd = fwd.clone();
+        let ok = with_extra(
+            &response_to(&fwd, 200, None, None),
+            extra,
+            Some((ct, &body)),
+        );
+        let results = flatten(stack.process_message(&ok, bob(), None).await);
+        assert!(responded(&results, 200).is_none(), "{ct}: {results:?}");
+        assert!(
+            forwarded(&results, &Method::Cancel).is_some(),
+            "{ct}: {results:?}"
+        );
+        assert_no_inline_key(&results);
+        let cseqs: Vec<_> = responses(&results, 488)
+            .iter()
+            .filter_map(|r| r.headers.cseq())
+            .collect();
+        assert!(cseqs.contains(&"315 PRACK"), "{ct}: {cseqs:?}");
+        assert!(cseqs.contains(&"314 INVITE"), "{ct}: {cseqs:?}");
+    }
+}
+
+/// The callee's 2xx carries the offer (the INVITE had none) and
 /// the offer is refused. The ACK still carries an answer, declining every
 /// stream (RFC 3264 §6), then the callee is BYEd and the caller gets 488.
 #[tokio::test]
@@ -1194,7 +1323,7 @@ async fn refused_late_offer_2xx_is_acked_with_declined_answer() {
     assert_all_released(&stack).await;
 }
 
-/// RFC-03 / SEC-05: on a late-offer call the callee's reliable 183 carries
+/// On a late-offer call the callee's reliable 183 carries
 /// the offer; the caller's PRACK carries the answer and is checked with
 /// answer rules (exactly one crypto line), not stripped as an offer.
 #[tokio::test]
@@ -1428,9 +1557,11 @@ async fn in_dialog_2xx_refusal_byes_both_legs() {
     assert_eq!(stack.call_count().await, 0);
 }
 
-/// RFC-02: an UPDATE in the early dialog whose 2xx answer may not cross.
-/// No BYE (the dialog is not confirmed): 488 to the UPDATE, CANCEL to the
-/// callee and 488 on the caller's INVITE.
+/// The caller's UPDATE in the early dialog (after the callee's 180,
+/// RFC 3311 §5.1) gets a 2xx whose SDP answer has no acceptable suite.
+/// The INVITE is unanswered, so there is no confirmed dialog to BYE
+/// (RFC 3261 §15): the UPDATE gets 488, the callee a CANCEL (RFC 3261 §9)
+/// and the caller's INVITE 488.
 #[tokio::test]
 async fn early_dialog_update_answer_refusal_cancels_without_bye() {
     let stack = trunk_stack_protos(["tls", "tls"]).await;

@@ -174,6 +174,10 @@ pub enum MediaPolicyViolation {
     /// An SDP part inside a `multipart/*` body. The SIP stack does not walk
     /// MIME parts on relayed bodies, so it refuses them (fail closed).
     SdpInMultipart,
+    /// A relayed body the SIP stack cannot police: it has a non-identity
+    /// `Content-Encoding`, or it is not `application/sdp` and carries SDES
+    /// or MIKEY keying attributes (fail closed).
+    UnpolicedBody,
 }
 
 impl MediaPolicyViolation {
@@ -186,6 +190,7 @@ impl MediaPolicyViolation {
             Self::SdesNotTerminable { .. } => "sdes_not_terminable",
             Self::UnsupportedKeyManagement { .. } => "unsupported_key_management",
             Self::SdpInMultipart => "sdp_in_multipart",
+            Self::UnpolicedBody => "unpoliced_body",
         }
     }
 
@@ -197,7 +202,8 @@ impl MediaPolicyViolation {
             Self::MalformedSdp
             | Self::SdesOverInsecureSignalling { .. }
             | Self::SdesNotTerminable { .. }
-            | Self::SdpInMultipart => 399,
+            | Self::SdpInMultipart
+            | Self::UnpolicedBody => 399,
         }
     }
 
@@ -210,13 +216,14 @@ impl MediaPolicyViolation {
             Self::SdesNotTerminable { .. } => "SDES keying cannot be terminated",
             Self::UnsupportedKeyManagement { .. } => "Key management method not supported",
             Self::SdpInMultipart => "SDP in a multipart body is not relayed",
+            Self::UnpolicedBody => "Encoded or non-SDP keying body is not relayed",
         }
     }
 
     /// The m-line the violation is reported against, if any.
     pub const fn index(&self) -> Option<usize> {
         match self {
-            Self::MalformedSdp | Self::SdpInMultipart => None,
+            Self::MalformedSdp | Self::SdpInMultipart | Self::UnpolicedBody => None,
             Self::NoAcceptableCryptoSuite { index }
             | Self::SdesOverInsecureSignalling { index }
             | Self::SdesNotTerminable { index }

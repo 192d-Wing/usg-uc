@@ -5186,6 +5186,13 @@ impl SipStack {
         // far leg, as for re-INVITE; other bodies are opaque.
         let body = req.body.as_ref().filter(|b| !b.is_empty());
         let content_type = req.headers.get_value(&HeaderName::ContentType);
+        // SI-10: parts and encodings are not walked; a body that could hide
+        // SDP keying is refused (`media_security`).
+        if let (Some(b), Some(ct)) = (body, content_type)
+            && let Some(v) = media_security::unpoliced_body_violation(&req.headers, ct, b)
+        {
+            return self.refuse_insecure_in_dialog_offer(req, source, &addrs, from_a_leg, v);
+        }
         let body: Option<Bytes> = match (body, content_type) {
             (Some(b), Some(ct)) if is_sdp_content_type(ct) => {
                 // RFC 4568 §8 (`media_security`): offer rules, or answer
@@ -5213,16 +5220,6 @@ impl SipStack {
                         .rewrite_reinvite(&sdp_str, &local_media)
                         .rewritten,
                 ))
-            }
-            // SI-10: parts are not walked, so SDP inside multipart is refused.
-            (Some(b), Some(ct)) if media_security::multipart_carries_sdp(ct, b) => {
-                return self.refuse_insecure_in_dialog_offer(
-                    req,
-                    source,
-                    &addrs,
-                    from_a_leg,
-                    proto_b2bua::MediaPolicyViolation::SdpInMultipart,
-                );
             }
             (Some(b), Some(_)) => Some(b.clone()),
             // RFC 3261 §7.4.1: a body without Content-Type is not relayable.
@@ -5407,6 +5404,12 @@ impl SipStack {
                 resp.body.as_ref().filter(|b| !b.is_empty()),
                 resp.headers.get_value(&HeaderName::ContentType),
             ) {
+                // SI-10: parts and encodings are not walked (`media_security`).
+                if let Some(v) = media_security::unpoliced_body_violation(&resp.headers, ct, b) {
+                    return self
+                        .refuse_insecure_relayed_answer(internal_id, addrs, pending, v)
+                        .await;
+                }
                 let b = if is_sdp_content_type(ct) {
                     // RFC 4568 §8 / §7.1.2 (`media_security`).
                     let sdp_str = match self.secure_relayed_answer(b, addrs, pending.from_a_leg) {
@@ -5423,16 +5426,6 @@ impl SipStack {
                             .rewrite_reinvite(&sdp_str, &local_media)
                             .rewritten,
                     )
-                } else if media_security::multipart_carries_sdp(ct, b) {
-                    // SI-10: parts are not walked; SDP in multipart is refused.
-                    return self
-                        .refuse_insecure_relayed_answer(
-                            internal_id,
-                            addrs,
-                            pending,
-                            proto_b2bua::MediaPolicyViolation::SdpInMultipart,
-                        )
-                        .await;
                 } else {
                     b.clone()
                 };

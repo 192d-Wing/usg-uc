@@ -170,7 +170,7 @@ fn mki_and_lifetime_accepted_multiple_inline_keys_refused() {
     let line = format!("a=crypto:1 AEAD_AES_256_GCM inline:{KEY_256}|2^20|1:4\r\n");
     let out = ok(&savp(&line), SdpRole::Offer, PASS, &TLS_TLS);
     assert_eq!(crypto_lines(&out).len(), 1, "{out}");
-    // RFC-04: one inline key-param per line; a multi-key line is stripped
+    // One inline key-param per line; a multi-key line is stripped
     // from an offer and refused when it is the only one.
     let multi = format!(
         "a=crypto:1 AEAD_AES_256_GCM inline:{KEY_256}|2^20|1:4;inline:{KEY_256_B}|2^20|2:4\r\n"
@@ -193,7 +193,7 @@ fn mki_and_lifetime_accepted_multiple_inline_keys_refused() {
     ));
 }
 
-/// RFC-05: `FEC_KEY` and unknown session parameters are not acceptable.
+/// `FEC_KEY` and unknown session parameters are not acceptable.
 #[test]
 fn fec_key_and_unknown_session_params_are_stripped() {
     for p in [format!("FEC_KEY=inline:{KEY_256_B}"), "-EXT".to_string()] {
