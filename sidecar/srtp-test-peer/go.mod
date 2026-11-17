@@ -9,7 +9,7 @@ go 1.26.0
 require (
 	github.com/192d-Wing/usg-uc/sidecar/dtls-terminator v0.0.0
 	github.com/pion/dtls/v3 v3.1.5 // indirect
-	github.com/pion/rtp v1.10.2
+	github.com/pion/rtp v1.10.6
 	github.com/pion/srtp/v3 v3.0.12
 )
 
