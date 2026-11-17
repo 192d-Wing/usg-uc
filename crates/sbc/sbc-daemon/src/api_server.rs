@@ -1883,6 +1883,8 @@ pub async fn sync_trunk_group_to_router(
     if !hosts.is_empty() {
         sip_stack.register_inbound_trunk(id, css_id, &hosts).await;
     }
+    // In-dialog peer set of the group's calls (NIST 800-53 Rev5: SC-23).
+    sip_stack.index_trunk_group_hosts(id, &hosts).await;
 
     tracing::info!(trunk_group = id, css = ?css_id, "Synced trunk group to SIP stack router");
     Ok(())
@@ -2447,6 +2449,10 @@ mod tests {
             ("sbc_deferred_send_dropped_total", 11),
             ("sbc_signaling_audit_dropped_total", 0),
             ("sbc_in_dialog_rejects_unknown_dialog_total", 0),
+            ("sbc_in_dialog_rejects_to_tag_mismatch_total", 0),
+            ("sbc_in_dialog_rejects_foreign_source_total", 0),
+            ("sbc_in_dialog_rejects_ack_mismatch_total", 0),
+            ("sbc_in_dialog_rejects_cancel_no_match_total", 0),
             ("sbc_digest_verify_ok_total", 0),
             ("sbc_digest_credentials_users", 0),
             ("sbc_digest_credentials_reload_failures_total", 0),
