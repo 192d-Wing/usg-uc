@@ -51,7 +51,8 @@ pub fn test_account_with_registrar(registrar_addr: SocketAddr) -> SipAccount {
     )
 }
 
-/// Creates a test certificate info matching the stub data.
+/// Fabricated certificate info (development data). A normal build must
+/// never list, select or sign with it.
 pub fn test_certificate_info() -> CertificateInfo {
     CertificateInfo {
         thumbprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2".to_string(),

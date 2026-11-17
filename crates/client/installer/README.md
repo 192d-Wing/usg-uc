@@ -132,5 +132,5 @@ cargo build --release -p client-gui-windows
 
 - The installer does NOT require administrative privileges for per-user installation
 - System-wide installation (Program Files) requires elevation
-- Smart card authentication is required - no passwords are stored
+- No passwords are stored in default builds; accounts authenticate by OIDC Bearer token. Smart-card login is not yet available (NIST POA&M-371): a CAC/PIV certificate cannot authenticate the client
 - All sensitive data is zeroized on application exit

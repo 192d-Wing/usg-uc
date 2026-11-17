@@ -248,12 +248,11 @@ async fn test_audio_stats_no_call() {
     assert!(stats.is_none());
 }
 
-/// Integration test: Full call manager setup with certificate.
+/// Integration test: Full call manager setup.
 #[tokio::test]
 async fn test_call_manager_full_setup() {
     init_test_tracing();
 
-    use client_core::CertificateStore;
     use client_types::audio::CodecPreference;
 
     let (tx, _rx) = mpsc::channel::<CallManagerEvent>(32);
@@ -270,18 +269,8 @@ async fn test_call_manager_full_setup() {
     let ice_config = IceConfig::default();
     manager.set_ice_config(ice_config);
 
-    // 3. Configure DTLS credentials from certificate store
-    #[cfg(not(windows))]
-    {
-        let store = CertificateStore::open_personal();
-        let certs = store.list_certificates().unwrap();
-
-        if let Some(cert) = certs.iter().find(|c| c.is_valid) {
-            if let Ok(chain) = store.get_certificate_chain(&cert.thumbprint) {
-                manager.set_dtls_credentials(chain, Vec::new());
-            }
-        }
-    }
+    // 3. DTLS credentials need a usable key; a key-less card certificate
+    //    is not configured (no card-backed signer).
 
     // 4. Set preferred codec
     manager.set_preferred_codec(CodecPreference::Opus);
@@ -341,7 +330,7 @@ mod sdp_tests {
 
         // These would be verified against actual SDP output in full integration
         for element in &expected_elements {
-            assert!(!element.is_empty());
+            assert_ne!(*element, "");
         }
     }
 }
@@ -724,7 +713,7 @@ mod incoming_call_tests {
 
         // Verify call info
         let info = &incoming[0];
-        assert!(!info.call_id.is_empty());
+        assert_ne!(info.call_id, "");
         assert_eq!(info.remote_uri, "sips:charlie@example.com");
     }
 }

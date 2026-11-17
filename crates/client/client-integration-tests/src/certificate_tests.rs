@@ -1,65 +1,63 @@
 //! Certificate integration tests.
 //!
-//! Tests the complete certificate flow from store access through
-//! ClientApp configuration to CallManager DTLS setup.
+//! Tests the certificate flow from store access through `ClientApp`
+//! configuration. The store lists only real certificates (none are
+//! fabricated outside client-core unit tests), and smart-card signing has
+//! no card-backed implementation yet, so card-only paths fail closed.
+// NIST 800-53 Rev5: IA-2(2), IA-2(12) (not met: fails closed), IA-5(2)
+// POAM: POA&M-371
 
 use crate::test_utils::{allocate_test_addr, init_test_tracing, test_certificate_info};
-use client_core::{AppEvent, CertificateStore, ClientApp};
+use client_core::{AppEvent, CertStoreError, CertificateStore, ClientApp};
 use client_types::{CertificateConfig, CertificateSelectionMode};
 use tokio::sync::mpsc;
 
-/// Tests that the certificate store can list certificates.
+/// Tests that the certificate store lists certificates and never returns
+/// the fabricated development certificate.
 #[tokio::test]
 async fn test_certificate_store_list() {
     init_test_tracing();
 
     let store = CertificateStore::open_personal();
     let certs = store.list_certificates();
-
-    // On non-Windows, we get stub data
-    // On Windows, we get real certificates (may be empty)
     assert!(certs.is_ok());
 
-    #[cfg(not(windows))]
-    {
-        let certs = certs.unwrap();
-        assert!(!certs.is_empty(), "Should have stub certificates");
-
-        // Verify stub certificate properties
-        let valid_certs: Vec<_> = certs.iter().filter(|c| c.is_valid).collect();
-        assert!(!valid_certs.is_empty(), "Should have valid certificates");
-
-        // Check CNSA 2.0 compliant certificates exist
-        let p384_certs: Vec<_> = valid_certs
-            .iter()
-            .filter(|c| c.key_algorithm.contains("P-384"))
-            .collect();
-        assert!(
-            !p384_certs.is_empty(),
-            "Should have P-384 certificates for CNSA 2.0"
-        );
-    }
+    let fabricated = test_certificate_info();
+    let certs = certs.unwrap();
+    assert!(
+        !certs.iter().any(|c| c.thumbprint == fabricated.thumbprint),
+        "fabricated certificate listed"
+    );
 }
 
-/// Tests certificate selection with auto-select mode prefers P-384.
+/// Tests that auto-select prefers a valid P-384 certificate when one is
+/// listed.
 #[tokio::test]
 async fn test_certificate_auto_select_prefers_cnsa() {
     init_test_tracing();
 
     let config = CertificateConfig::new();
     let store = CertificateStore::open_personal();
+    let certs = store.list_certificates().unwrap();
+    let has_p384 = certs
+        .iter()
+        .any(|c| c.is_valid && c.key_algorithm.contains("P-384"));
 
-    #[cfg(not(windows))]
-    {
-        let cert = store.select_certificate(&config).unwrap();
-
-        // Auto-select should prefer ECDSA P-384 (CNSA 2.0)
-        assert!(
-            cert.key_algorithm.contains("P-384"),
-            "Should select P-384 certificate, got: {}",
-            cert.key_algorithm
-        );
-        assert!(cert.is_valid, "Selected certificate should be valid");
+    match store.select_certificate(&config) {
+        Ok(cert) => {
+            assert!(cert.is_valid, "Selected certificate should be valid");
+            if has_p384 {
+                assert!(
+                    cert.key_algorithm.contains("P-384"),
+                    "Should select P-384 certificate, got: {}",
+                    cert.key_algorithm
+                );
+            }
+        }
+        Err(e) => assert!(
+            !certs.iter().any(|c| c.is_valid),
+            "valid certificate listed but selection failed: {e}"
+        ),
     }
 }
 
@@ -69,35 +67,36 @@ async fn test_certificate_find_by_thumbprint() {
     init_test_tracing();
 
     let store = CertificateStore::open_personal();
-    let expected = test_certificate_info();
 
-    #[cfg(not(windows))]
-    {
-        let cert = store.find_by_thumbprint(&expected.thumbprint).unwrap();
-
-        assert_eq!(cert.thumbprint, expected.thumbprint);
-        assert_eq!(cert.subject_cn, expected.subject_cn);
-        assert_eq!(cert.key_algorithm, expected.key_algorithm);
+    for cert in store.list_certificates().unwrap() {
+        let found = store.find_by_thumbprint(&cert.thumbprint).unwrap();
+        assert_eq!(found.thumbprint, cert.thumbprint);
     }
+
+    let fabricated = test_certificate_info();
+    assert!(matches!(
+        store.find_by_thumbprint(&fabricated.thumbprint),
+        Err(CertStoreError::CertificateNotFound(_))
+    ));
 }
 
-/// Tests that selecting a specific certificate works.
+/// Tests that selecting a specific certificate works for listed
+/// certificates and fails for an unknown one.
 #[tokio::test]
 async fn test_certificate_specific_selection() {
     init_test_tracing();
 
-    #[cfg(not(windows))]
-    {
-        // Select the second stub certificate specifically
-        let thumbprint = "B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3";
-        let config = CertificateConfig::new().with_thumbprint(thumbprint);
+    let store = CertificateStore::open_personal();
 
-        let store = CertificateStore::open_personal();
-        let cert = store.select_certificate(&config).unwrap();
-
-        assert_eq!(cert.thumbprint, thumbprint);
-        assert_eq!(cert.subject_cn, "Jane Smith (PIV)");
+    for cert in store.list_certificates().unwrap() {
+        let config = CertificateConfig::new().with_thumbprint(&cert.thumbprint);
+        let selected = store.select_certificate(&config).unwrap();
+        assert_eq!(selected.thumbprint, cert.thumbprint);
     }
+
+    let fabricated = test_certificate_info();
+    let config = CertificateConfig::new().with_thumbprint(&fabricated.thumbprint);
+    assert!(store.select_certificate(&config).is_err());
 }
 
 /// Tests that expired certificates are filtered in auto-select.
@@ -110,55 +109,68 @@ async fn test_certificate_filters_expired() {
 
     let store = CertificateStore::open_personal();
 
-    #[cfg(not(windows))]
-    {
-        let cert = store.select_certificate(&config).unwrap();
-
-        // Should not select the expired "Test User (Expired)" certificate
+    if let Ok(cert) = store.select_certificate(&config) {
         assert!(cert.is_valid);
-        assert_ne!(cert.subject_cn, "Test User (Expired)");
     }
 }
 
-/// Tests getting the certificate chain (DER-encoded).
+/// Tests getting the certificate chain (DER-encoded): a returned chain is
+/// the certificate itself; an unknown thumbprint has none.
 #[tokio::test]
 async fn test_certificate_get_chain() {
     init_test_tracing();
 
     let store = CertificateStore::open_personal();
-    let cert_info = test_certificate_info();
 
-    #[cfg(not(windows))]
-    {
-        let chain = store.get_certificate_chain(&cert_info.thumbprint).unwrap();
-
-        assert!(!chain.is_empty(), "Should return at least one certificate");
-        assert!(!chain[0].is_empty(), "Certificate should not be empty");
-
-        // Verify it looks like a DER-encoded certificate (starts with SEQUENCE tag)
-        assert_eq!(chain[0][0], 0x30, "Should start with ASN.1 SEQUENCE tag");
+    for cert in store.list_certificates().unwrap() {
+        if let Ok(chain) = store.get_certificate_chain(&cert.thumbprint) {
+            assert!(!chain.is_empty(), "Should return at least one certificate");
+            assert!(!chain[0].is_empty(), "Certificate should not be empty");
+            // DER-encoded certificate starts with a SEQUENCE tag
+            assert_eq!(chain[0][0], 0x30, "Should start with ASN.1 SEQUENCE tag");
+        }
     }
+
+    let fabricated = test_certificate_info();
+    assert!(store.get_certificate_chain(&fabricated.thumbprint).is_err());
 }
 
-/// Tests that has_private_key returns true for stub certificates.
+/// Off Windows no card-backed signer exists: no listed certificate claims a
+/// usable private key, signing and PIN checks report `NotSupported`.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_certificate_has_private_key() {
+    use client_core::SignatureAlgorithm;
+    use client_types::SmartCardPin;
+
     init_test_tracing();
 
     let store = CertificateStore::open_personal();
-    let cert_info = test_certificate_info();
+    let pin = SmartCardPin::new("123456");
 
-    #[cfg(not(windows))]
-    {
-        let has_key = store.has_private_key(&cert_info.thumbprint).unwrap();
-        assert!(
-            has_key,
-            "Stub certificates should report having a private key"
-        );
+    for cert in store.list_certificates().unwrap() {
+        assert!(!matches!(store.has_private_key(&cert.thumbprint), Ok(true)));
+        assert!(matches!(
+            store.sign_data(
+                &cert.thumbprint,
+                b"data",
+                SignatureAlgorithm::EcdsaSha384,
+                Some(&pin)
+            ),
+            Err(CertStoreError::NotSupported)
+        ));
+        assert!(matches!(
+            store.verify_pin(&cert.thumbprint, &pin),
+            Err(CertStoreError::NotSupported)
+        ));
     }
+
+    let fabricated = test_certificate_info();
+    assert!(store.has_private_key(&fabricated.thumbprint).is_err());
 }
 
-/// Tests the complete certificate configuration flow in ClientApp.
+/// A smart-card certificate (no key) is refused by `ClientApp` and leaves
+/// no certificate configured.
 #[tokio::test]
 async fn test_client_app_certificate_configuration() {
     init_test_tracing();
@@ -176,32 +188,39 @@ async fn test_client_app_certificate_configuration() {
         return;
     };
 
-    // Verify no certificate initially
     assert!(!app.has_client_certificate());
     assert!(app.client_certificate_thumbprint().is_none());
 
-    // Configure certificate
-    let cert_info = test_certificate_info();
     let store = CertificateStore::open_personal();
+    let chains: Vec<(String, Vec<Vec<u8>>)> = store
+        .list_certificates()
+        .unwrap()
+        .into_iter()
+        .filter_map(|c| {
+            store
+                .get_certificate_chain(&c.thumbprint)
+                .ok()
+                .map(|chain| (c.thumbprint, chain))
+        })
+        .collect();
 
-    #[cfg(not(windows))]
-    {
-        let chain = store.get_certificate_chain(&cert_info.thumbprint).unwrap();
+    // A placeholder chain stands in when the host lists none.
+    let candidates = if chains.is_empty() {
+        vec![(test_certificate_info().thumbprint, vec![vec![0x30, 0x00]])]
+    } else {
+        chains
+    };
 
-        app.set_client_certificate(chain, &cert_info.thumbprint);
-
-        // Verify certificate is configured
-        assert!(app.has_client_certificate());
-        assert_eq!(
-            app.client_certificate_thumbprint(),
-            Some(cert_info.thumbprint.as_str())
-        );
+    for (thumbprint, chain) in candidates {
+        assert!(app.set_client_certificate(chain, &thumbprint).is_err());
+        assert!(!app.has_client_certificate());
+        assert!(app.client_certificate_thumbprint().is_none());
     }
 }
 
-/// Tests that certificate change is reflected in the app.
+/// A refused card certificate does not register an mTLS account.
 #[tokio::test]
-async fn test_client_app_certificate_change() {
+async fn test_client_app_mtls_refused_without_key() {
     init_test_tracing();
 
     let (tx, _rx) = mpsc::channel::<AppEvent>(32);
@@ -214,42 +233,31 @@ async fn test_client_app_certificate_change() {
         return;
     };
 
-    let store = CertificateStore::open_personal();
+    let fabricated = test_certificate_info();
+    assert!(
+        app.set_client_certificate(vec![vec![0x30, 0x00]], &fabricated.thumbprint)
+            .is_err()
+    );
 
-    #[cfg(not(windows))]
-    {
-        // Configure first certificate
-        let cert1_thumbprint = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
-        let chain1 = store.get_certificate_chain(cert1_thumbprint).unwrap();
-
-        app.set_client_certificate(chain1, cert1_thumbprint);
-        assert_eq!(app.client_certificate_thumbprint(), Some(cert1_thumbprint));
-
-        // Change to second certificate
-        let cert2_thumbprint = "B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3";
-        let chain2 = store.get_certificate_chain(cert2_thumbprint).unwrap();
-
-        app.set_client_certificate(chain2, cert2_thumbprint);
-        assert_eq!(app.client_certificate_thumbprint(), Some(cert2_thumbprint));
-    }
+    let account = crate::test_utils::test_account();
+    assert_eq!(account.auth_mode, client_types::SipAuthMode::Mtls);
+    let state_before = app.state();
+    let error = app.register_account(&account).await.unwrap_err();
+    assert!(error.to_string().contains("certificate"), "{error}");
+    assert_eq!(app.state(), state_before);
 }
 
-/// Tests listing smart card readers.
+/// Tests listing smart card readers: no fabricated reader names.
 #[tokio::test]
 async fn test_certificate_list_smart_card_readers() {
     init_test_tracing();
 
     let store = CertificateStore::open_personal();
     let readers = store.list_smart_card_readers();
-
     assert!(readers.is_ok());
 
-    #[cfg(not(windows))]
-    {
-        let readers = readers.unwrap();
-        // Stub data includes reader names
-        assert!(!readers.is_empty(), "Should have stub reader names");
-    }
+    let fabricated = test_certificate_info().reader_name.unwrap();
+    assert!(!readers.unwrap().contains(&fabricated));
 }
 
 /// Tests certificate store refresh.
@@ -259,70 +267,32 @@ async fn test_certificate_store_refresh() {
 
     let mut store = CertificateStore::open_personal();
 
-    // Get initial list
     let certs_before = store.list_certificates().unwrap();
-
-    // Refresh
     store.refresh().unwrap();
-
-    // Get list again
     let certs_after = store.list_certificates().unwrap();
 
-    // Should have same certificates (stub data is static)
-    #[cfg(not(windows))]
-    {
-        assert_eq!(certs_before.len(), certs_after.len());
-    }
+    assert_eq!(certs_before.len(), certs_after.len());
 }
 
-/// Integration test: Full certificate selection to app configuration flow.
+/// Certificate-store flow with a real card: needs a card with a CNSA
+/// certificate (Windows CNG). Covers the store only; SIP TLS still refuses
+/// a card certificate (POA&M-371).
+#[cfg(windows)]
 #[tokio::test]
-async fn test_full_certificate_selection_flow() {
+#[ignore = "requires a smart card"]
+async fn test_card_certificate_store_flow() {
     init_test_tracing();
 
-    // 1. Open certificate store
     let store = CertificateStore::open_personal();
+    let config = CertificateConfig::new();
+    let selected = store.select_certificate(&config).unwrap();
 
-    // 2. List available certificates
-    let certs = store.list_certificates().unwrap();
-
-    #[cfg(not(windows))]
-    {
-        assert!(!certs.is_empty());
-
-        // 3. Auto-select best certificate (CNSA 2.0 compliant)
-        let config = CertificateConfig::new();
-        let selected = store.select_certificate(&config).unwrap();
-
-        assert!(selected.is_valid);
-        assert!(
-            selected.key_algorithm.contains("P-384"),
-            "Should select CNSA 2.0 compliant certificate"
-        );
-
-        // 4. Verify private key exists (for smart card)
-        let has_key = store.has_private_key(&selected.thumbprint).unwrap();
-        assert!(has_key, "Certificate should have associated private key");
-
-        // 5. Get certificate chain
-        let chain = store.get_certificate_chain(&selected.thumbprint).unwrap();
-        assert!(!chain.is_empty());
-
-        // 6. Create ClientApp and configure certificate
-        let (tx, _rx) = mpsc::channel::<AppEvent>(32);
-        let sip_addr = allocate_test_addr().await;
-        let media_addr = allocate_test_addr().await;
-
-        if let Ok(mut app) = ClientApp::new(sip_addr, media_addr, tx) {
-            app.set_client_certificate(chain, &selected.thumbprint);
-
-            assert!(app.has_client_certificate());
-            assert_eq!(
-                app.client_certificate_thumbprint(),
-                Some(selected.thumbprint.as_str())
-            );
-
-            println!("Full certificate flow completed: {}", selected.subject_cn);
-        }
-    }
+    assert!(selected.is_valid);
+    assert!(
+        selected.key_algorithm.contains("P-384"),
+        "Should select CNSA 2.0 compliant certificate"
+    );
+    assert!(store.has_private_key(&selected.thumbprint).unwrap());
+    let chain = store.get_certificate_chain(&selected.thumbprint).unwrap();
+    assert!(!chain.is_empty());
 }
