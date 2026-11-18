@@ -464,16 +464,15 @@ GET /api/v1/cdrs/stats
 
 ### Authorization for CDR endpoints
 
+An OIDC token reaches sbc-api only when it carries the `config-admin` scope **and** realm role `fleet-admin` with `sites` containing `*`. Any other valid token gets `403 {"error": "insufficient role"}`, audited as an `AuthorizationDecision` deny with policy `sbc-api-oidc`, before the per-route checks below run.
+
 | Credential | `cdr:read` | `cdr:export` |
 | --- | --- | --- |
 | Legacy admin credential | yes | yes |
-| OIDC role `cdr-reader` or `auditor` | yes | no |
-| OIDC role `cdr-exporter` or `fleet-admin` | yes | yes |
-| OIDC scope `cdr:read` | yes | no |
-| OIDC scope `cdr:export` | yes | yes |
-| `config-admin` only | no | no |
+| OIDC fleet admin (`fleet-admin`, `sites` ∋ `*`) | yes | yes |
+| OIDC `config-admin` scope without `fleet-admin` on `*` | no (403 at the gate) | no (403 at the gate) |
 
-A refused request gets `403 {"error": "permission cdr:read required"}` (or `cdr:export`). It is audited as an `AuthorizationDecision` deny with policy `cdr-rbac` and the user, or `anonymous`.
+The per-route check grants from roles only (`cdr-reader` / `auditor` read, `cdr-exporter` / `fleet-admin` export); requested scopes such as `cdr:read` / `cdr:export` grant nothing. On sbc-api only a fleet admin passes the gate. A refused request gets `403 {"error": "permission cdr:read required"}` (or `cdr:export`). It is audited as an `AuthorizationDecision` deny with policy `cdr-rbac` and the user, or `anonymous`.
 
 ### gRPC CdrService (daemon)
 

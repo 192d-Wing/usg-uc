@@ -1881,7 +1881,8 @@ pub struct GrpcConfig {
     /// Enable the gRPC API server.
     pub enabled: bool,
 
-    /// Listen address for the gRPC server.
+    /// Listen address for the gRPC server (default `127.0.0.1:9091`). A
+    /// non-loopback address requires `require_mtls = true`.
     pub listen_addr: SocketAddr,
 
     /// Path to TLS certificate (PEM format, P-384 ECDSA).
@@ -1919,7 +1920,8 @@ impl Default for GrpcConfig {
     fn default() -> Self {
         // Use unwrap for hardcoded valid address in Default impl
         #[allow(clippy::unwrap_used)]
-        let listen_addr = "0.0.0.0:9090".parse().unwrap();
+        // NIST 800-53 Rev5: CM-7, SC-7 (loopback unless mTLS is configured)
+        let listen_addr = "127.0.0.1:9091".parse().unwrap();
 
         Self {
             enabled: false,

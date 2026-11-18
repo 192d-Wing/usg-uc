@@ -109,3 +109,26 @@ Key metrics to watch:
 **High retransmissions**: Increase rate limiter thresholds in `sbc-test.toml`
 
 **SIPp "No 200 received"**: SBC may be overloaded — reduce `--rate` or `--concurrent`
+
+## Split signaling/media topologies
+
+- `docker-compose.split.yml`: the daemon runs signaling-only and drives a
+  co-located `sbc-media` over gRPC. `sbc-media` shares the daemon
+  container's network namespace (`network_mode: service:sbc-signaling`) and
+  listens on `127.0.0.1:9096`, as in the Helm `mediaSplit` pod.
+- `docker-compose.pool.yml`: a two-node media pool on separate IPs. The
+  control channel is mutual TLS, because `sbc-media` refuses a non-loopback
+  `SBC_MEDIA_GRPC_LISTEN` without `SBC_MEDIA_GRPC_TLS_{CERT,KEY,CLIENT_CA}_FILE`
+  and a non-empty `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES` (exit 2). Generate the
+  throwaway P-384 test PKI before `docker compose up`:
+
+  ```bash
+  bash deploy/test/gen-media-mtls-certs.sh # -> deploy/test/certs/media-mtls/ (gitignored)
+  docker compose -f deploy/test/docker-compose.pool.yml up --build
+  ```
+
+  The daemon uses `SBC_MEDIA_CONTROLLER_TLS_{CA,CERT,KEY}_FILE` (all three or
+  none) with `https://` node URLs; the server name verified is the URL host
+  (the IP SAN here) unless `SBC_MEDIA_CONTROLLER_TLS_DOMAIN` overrides it. The
+  certificates are valid for 7 days and the keys are world-readable so the
+  containers' non-root user can read the bind mount: test use only.

@@ -499,7 +499,7 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 | RFC 3550 | RTP Transport Protocol | ✅ Compliant | 98% |
 | RFC 5245 | ICE | ⚠️ Partial (external lib) | 70% |
 | RFC 8122 | DTLS in SDP | ⚠️ Partial (sha-384/512 only, client and SBC call legs; peer certificate verified against the fingerprint since 2026-11-17, local test runs and CI; no new association on a changed fingerprint, POA&M-327; no RFC 8844, POA&M-333) | n/a |
-| RFC 5763 / 4145 / 5761 | DTLS-SRTP setup role, rtcp-mux | ⚠️ Partial (role drives the handshake since 2026-11-17; handshake starts at 200 / ACK, POA&M-331; no new association on re-INVITE, POA&M-327; delayed offer rejected, POA&M-329) | n/a |
+| RFC 5763 / 4145 / 5761 | DTLS-SRTP setup role, rtcp-mux | ⚠️ Partial (SBC terminate mode relays RTCP only when muxed and does not require `a=rtcp-mux`, POA&M-343; role drives the handshake since 2026-11-17; handshake starts at 200 / ACK, POA&M-331; no new association on re-INVITE, POA&M-327; delayed offer rejected, POA&M-329) | n/a |
 | RFC 7587 | RTP Payload for Opus | ⚠️ Partial (POA&M-141, POA&M-142) | n/a |
 | RFC 4568 | SDP Security Descriptions | ⚠️ Call legs: policed by the SBC (TLS hops only, `AEAD_AES_256_GCM` only; hop by hop, POA&M-348), not generated or consumed; SIPREC recording session: generated | n/a |
 | RFC 4567 | Key Management Extensions for SDP (`a=key-mgmt`) | ❌ Not supported; stripped from offers, refused in answers (SBC) | n/a |

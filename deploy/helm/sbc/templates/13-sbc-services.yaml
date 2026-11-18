@@ -76,11 +76,15 @@ spec:
   ports:
     - { name: api, port: 80, targetPort: 80, protocol: TCP }
 {{- end }}
+{{- include "sbc.grpcMtlsPreflight" . }}
+{{- include "sbc.clientAddressPreflight" . }}
+{{- if .Values.sbcDaemon.grpcMtls.enabled }}
 ---
-# Daemon gRPC admin endpoint. ClusterIP only — never externally exposed.
-# sbc-api-server reaches the daemon's TrunkSync / DialPlanSync /
-# DidMappingSync services here. Always created (no feature gate) since
-# the gRPC server is enabled in the daemon image.
+# Daemon gRPC admin endpoint. ClusterIP only, never externally exposed, and
+# created only with sbcDaemon.grpcMtls: the listener then requires an
+# allow-listed client certificate on every RPC, and the NetworkPolicy
+# (28-sbc-networkpolicy.yaml) admits 9091 only from sbc-api and the trunk
+# agent. Without mTLS the listener is loopback only and has no Service.
 apiVersion: v1
 kind: Service
 metadata:
@@ -94,6 +98,7 @@ spec:
     {{- include "sbc.selectorLabels" . | nindent 4 }}
   ports:
     - { name: grpc, port: 9091, targetPort: 9091, protocol: TCP }
+{{- end }}
 {{- if .Values.services.metrics.enabled }}
 ---
 apiVersion: v1

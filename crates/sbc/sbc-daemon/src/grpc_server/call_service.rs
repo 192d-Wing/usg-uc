@@ -106,6 +106,7 @@ impl CallService for CallServiceImpl {
         &self,
         request: Request<TerminateCallRequest>,
     ) -> Result<Response<TerminateCallResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         let req = request.into_inner();
         info!(
             call_id = %req.call_id,
@@ -116,7 +117,14 @@ impl CallService for CallServiceImpl {
 
         // TODO: Implement actual call termination via B2BUA
         // This would send BYE to both legs
-        Err(Status::unimplemented("TerminateCall not yet implemented"))
+        let status = Status::unimplemented("TerminateCall not yet implemented");
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "CallService/TerminateCall",
+            &req.call_id,
+            super::admin_audit::AdminOutcome::Failed(&status),
+        );
+        Err(status)
     }
 
     async fn get_call_stats(

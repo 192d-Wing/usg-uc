@@ -1150,7 +1150,7 @@ mod tests {
     use central_config_store::CentralConfigStore;
 
     use super::*;
-    use crate::state::{ADMIN_SCOPE, AppState, OPERATOR_SCOPE, SYNC_SCOPE};
+    use crate::state::{AppState, OPERATOR_SCOPE, SYNC_SCOPE};
 
     const TEST_KID: &str = "test-key-1";
     const TEST_ISSUER: &str = "https://idp.example.mil/realms/config";
@@ -1368,12 +1368,50 @@ mod tests {
         (status, body)
     }
 
-    /// A legacy full-fleet operator token: the base operator scope plus the
-    /// `config-admin` scope, no `roles`/`sites`. ABAC treats it as a fleet
-    /// admin, so it still has full access (back-compat path).
+    /// The `config-admin` OAuth scope (requested by the dashboard). It
+    /// authorizes nothing by itself.
+    const CONFIG_ADMIN_SCOPE: &str = "config-admin";
+
+    /// A full-fleet operator token: role `fleet-admin` on sites `["*"]`,
+    /// with the scopes the dashboard requests.
     fn admin_token() -> String {
-        let scope = format!("{OPERATOR_SCOPE} {ADMIN_SCOPE}");
-        mint(None, &scope, TEST_AUDIENCE, now() + 3600)
+        let scope = format!("{OPERATOR_SCOPE} {CONFIG_ADMIN_SCOPE}");
+        mint_full(
+            None,
+            &scope,
+            TEST_AUDIENCE,
+            now() + 3600,
+            &["fleet-admin"],
+            &["*"],
+        )
+    }
+
+    /// QA: a token whose only privilege is the `config-admin`
+    /// scope (no roles, no sites) is denied on site and fleet resources.
+    #[tokio::test]
+    async fn scope_only_token_forbidden() {
+        let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+            return;
+        };
+        let app = app(&admin, "cca_scope_only").await; // seeds MUHJ + phone p1
+        let scope = format!("{OPERATOR_SCOPE} {CONFIG_ADMIN_SCOPE}");
+        let tok = mint(None, &scope, TEST_AUDIENCE, now() + 3600);
+        for (method, uri, body) in [
+            ("GET", "/v1/sites/MUHJ/phones", None),
+            (
+                "POST",
+                "/v1/sites/MUHJ/phones",
+                Some(json!({"id": "p7", "mac_address": "77:77:77:77:77:77"})),
+            ),
+            (
+                "POST",
+                "/v1/sites",
+                Some(json!({"site_code": "MSCO", "fqdn_base": "msco.x"})),
+            ),
+        ] {
+            let (s, _) = send_req(&app, method, uri, Some(&tok), body).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{method} {uri} with scope only");
+        }
     }
 
     #[tokio::test]

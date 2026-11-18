@@ -183,8 +183,15 @@ pub struct TerminateRelayLeg {
     /// Socket to send re-protected media to the far peer on.
     pub send_sock: Arc<UdpSocket>,
     /// Unprotects packets arriving on `recv_sock` (this leg's ingress key).
+    ///
+    /// NIST 800-53 Rev5: SC-13, SC-8 -- owned by this task alone, so the key
+    /// and direction have one replay window (RFC 3711 §3.3.2).
     pub ingress: SrtpContext,
     /// Protects packets sent on `send_sock` (the far leg's egress key).
+    ///
+    /// NIST 800-53 Rev5: SC-13 -- owned by this task alone, so the SRTP and
+    /// SRTCP indices (and AEAD nonces) under the key are used once
+    /// (RFC 7714 §8.1, §9.1).
     pub egress: SrtpContext,
     /// The near peer's SDP media address. Only its IP is used: datagrams
     /// from any other IP are dropped.
@@ -197,7 +204,7 @@ pub struct TerminateRelayLeg {
     /// Where to send re-protected media — the far leg's latched address.
     pub forward_target: Arc<RwLock<SocketAddr>>,
     /// Post-handshake DTLS records demuxed off `recv_sock` go here (to the
-    /// sidecar). `None` drops them (the separate-port RTCP legs, tests).
+    /// sidecar). `None` drops them (tests).
     pub dtls_out: Option<mpsc::Sender<Vec<u8>>>,
     /// The sources the handshake pump forwarded DTLS from (empty on the
     /// separate-port RTCP legs).
@@ -212,8 +219,7 @@ pub struct TerminateRelayLeg {
     /// Direction label for logging ("A→B" / "B→A").
     pub direction: &'static str,
     /// SIPREC fork tap for the media this leg decrypts (RFC 7866 §8). `None`
-    /// when recording is disabled on the pipeline, and on the separate-port
-    /// RTCP legs.
+    /// when recording is disabled on the pipeline.
     pub fork: Option<ForkTap>,
 }
 
