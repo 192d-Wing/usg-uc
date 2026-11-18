@@ -13,5 +13,8 @@ categories.workspace = true
 thiserror = "2.0"
 proto-sdp.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true
