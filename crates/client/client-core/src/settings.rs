@@ -1053,7 +1053,10 @@ mod tests {
             let mut manager = manager_in(dir.path());
 
             let stored = manager
-                .store_digest_password("test", "secret-password")
+                .store_digest_password(
+                    "test",
+                    &crate::credential_store::legacy_fixture::test_secret(),
+                )
                 .unwrap();
 
             assert!(
@@ -1084,7 +1087,9 @@ mod tests {
             let mut account = test_account();
             account.digest_credentials = Some(client_types::DigestAuthCredentials {
                 username: "alice".to_string(),
-                password: zeroize::Zeroizing::new("secret-password".to_string()),
+                password: zeroize::Zeroizing::new(
+                    crate::credential_store::legacy_fixture::test_secret(),
+                ),
                 password_persisted: false,
                 allow_md5_digest: None,
                 md5_policy_version: client_types::account::DIGEST_MD5_POLICY_VERSION,
@@ -1150,7 +1155,10 @@ mod tests {
             let mut manager = manager_in(dir.path());
 
             let stored = manager
-                .store_refresh_token("example.com", "refresh-token")
+                .store_refresh_token(
+                    "example.com",
+                    &crate::credential_store::legacy_fixture::test_secret(),
+                )
                 .unwrap();
 
             assert!(!stored, "no keyring: store_refresh_token must be Ok(false)");

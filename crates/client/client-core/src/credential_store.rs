@@ -344,6 +344,19 @@ impl std::fmt::Debug for CredentialStore {
 #[cfg(any(feature = "digest-auth", feature = "oidc"))]
 pub(crate) mod legacy_fixture {
     use std::collections::HashMap;
+
+    /// A random per-run test secret, so no credential literal is compiled
+    /// into the tests.
+    pub fn test_secret() -> String {
+        use std::fmt::Write as _;
+        uc_crypto::random::generate_random::<16>()
+            .unwrap()
+            .iter()
+            .fold(String::with_capacity(32), |mut out, b| {
+                let _ = write!(out, "{b:02x}");
+                out
+            })
+    }
     use std::path::{Path, PathBuf};
 
     /// Legacy encrypted credentials file name.
@@ -382,7 +395,7 @@ pub(crate) mod legacy_fixture {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         let json = serde_json::to_string(&map).unwrap();
-        let nonce = [0x5a_u8; 12];
+        let nonce = uc_crypto::random::generate_nonce().unwrap();
         let ciphertext = legacy_key(config_dir)
             .seal(&nonce, AAD, json.as_bytes())
             .unwrap();
@@ -454,7 +467,7 @@ mod tests {
 #[cfg(any(feature = "digest-auth", feature = "oidc"))]
 mod no_keyring_tests {
     use super::legacy_fixture::{
-        LEGACY_FILE, LEGACY_TMP_FILE, dir_entries, read_legacy_credentials,
+        LEGACY_FILE, LEGACY_TMP_FILE, dir_entries, read_legacy_credentials, test_secret,
         write_legacy_credentials,
     };
     use super::*;
@@ -465,7 +478,7 @@ mod no_keyring_tests {
         let dir = tempdir().unwrap();
         let mut store = CredentialStore::without_keyring(dir.path().to_path_buf());
 
-        store.store_password("acct", "secret-password").unwrap();
+        store.store_password("acct", &test_secret()).unwrap();
 
         assert!(
             dir_entries(dir.path()).is_empty(),
@@ -479,7 +492,7 @@ mod no_keyring_tests {
         let dir = tempdir().unwrap();
         let mut store = CredentialStore::without_keyring(dir.path().to_path_buf());
 
-        store.store_password("acct", "secret-password").unwrap();
+        store.store_password("acct", &test_secret()).unwrap();
         let got = store.get_password("acct").unwrap();
 
         assert!(got.is_none(), "no keyring: secret must not be persisted");
@@ -590,7 +603,7 @@ mod no_keyring_tests {
         let mut store = CredentialStore::without_keyring(dir.path().to_path_buf());
         let got = store.get_password("acct").unwrap();
         assert!(got.is_none());
-        store.store_password("acct", "secret").unwrap();
+        store.store_password("acct", &test_secret()).unwrap();
     }
 
     /// Deleting a legacy symlink unlinks the link only; the target outside

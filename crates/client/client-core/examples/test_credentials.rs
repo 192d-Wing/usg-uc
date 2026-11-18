@@ -71,8 +71,8 @@ fn main() {
         // Persist passwords to secure storage
         match manager.persist_account_passwords() {
             Ok(0) => println!("No password persisted (no platform keyring)."),
-            Ok(n) => println!("{n} password(s) persisted to the platform keyring."),
-            Err(e) => println!("Failed to persist passwords: {}", e),
+            Ok(_) => println!("Password persisted to the platform keyring."),
+            Err(_) => println!("Failed to persist passwords."),
         }
 
         // Save settings (without password in file)
