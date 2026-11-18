@@ -368,11 +368,29 @@ release") and `deploy/keycloak/central-config-clients.md`.
 - **CI.** Every third-party action in `.github/workflows/` is pinned to a
   full commit SHA, with the version in a comment. Workflow tokens are
   read-only by default. Writes are granted per job: `packages: write` on the
-  SBC image build and merge jobs, `contents: write` on the client release
+  SBC image publish and merge jobs, `contents: write` on the client release
   job, and `pages`/`id-token` on the docs deploy job. The Iron Bank user is
-  exposed only to the SBC build job. `actions/checkout` no longer keeps the
+  exposed only to the SBC publish build job. `actions/checkout` no longer keeps the
   token in the git config (`persist-credentials: false`). Not a change for
   operators or for image and release contents.
+- **SBC: release images are signed and attested.** (SR-4, SI-7, SA-10)
+  Every image has BuildKit provenance (`mode=max`) and an SBOM per platform,
+  a cosign keyless signature on the index digest, and a GitHub
+  build-provenance attestation in GHCR. New image:
+  `ghcr.io/192d-wing/dtls-terminator`. Only an `sbc-v<semver>` tag
+  publishes, and release images are built cold from the tagged source (no
+  registry build cache). A published version is never overwritten. A
+  dispatch on a branch builds the images with a read-only token and pushes
+  nothing. Publishing jobs run in the `release` environment. The `push`
+  dispatch input is removed. The `latest` tag is no longer updated. Deploy
+  by digest and verify as described in CONTRIBUTING.md ("Verifying
+  releases").
+- **Client: release assets are signed and attested.** (SR-4, SI-7) Releases
+  attach an SPDX SBOM of the source tree and a `<file>.sigstore.json` cosign
+  bundle for every asset, including `SHA256SUMS`. They also carry GitHub
+  build-provenance and SBOM attestations. Tag builds are cold (no Rust
+  build cache). A release is created only from a `client-v<semver>` tag, in
+  the `release` environment.
 
 ### Security (SBC, supported base images)
 
