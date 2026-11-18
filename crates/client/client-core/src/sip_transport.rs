@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 #[cfg(feature = "insecure-transports")]
@@ -470,43 +471,149 @@ pub enum TransportEvent {
     },
 }
 
-/// Active TLS connection to a SIP peer (write half only).
+/// Write half of a TLS stream to a SIP peer.
+type TlsWriteHalf = tokio::io::WriteHalf<TlsStream<TcpStream>>;
+
+/// Deadline for writing one SIP message (write + flush) on an established
+/// stream connection (SR-45 / SEC-1). A peer that stops reading (zero
+/// window, black-holed ACKs) fills the send buffer; without a deadline the
+/// sender, and the event pump it runs on, would wait forever.
+pub(crate) const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Active TLS connection to a SIP peer (write half only), as stored in the
+/// connections map.
 ///
 /// The read half lives in the per-connection receive task: a read must
 /// never execute under the shared connections lock, or every sender
 /// deadlocks behind a receive that is itself waiting for the response to
-/// the message the sender is trying to write.
-struct TlsConnection {
-    /// TLS stream write half.
-    write_half: tokio::io::WriteHalf<TlsStream<TcpStream>>,
-    /// Peer address.
-    peer_addr: SocketAddr,
+/// the message the sender is trying to write. Writes do not run under the
+/// map lock either: senders clone the [`TlsWriter`] handle, release the map
+/// and then write, so one stalled peer cannot block traffic to any other
+/// peer or the receive tasks.
+///
+/// Dropping the entry (remove, replace, `clear`) drops `_close_tx`, which
+/// tells the receive task to stop and release its read half, so an evicted
+/// connection's socket is actually closed.
+///
+/// Generic over the byte sink only so eviction can be exercised without a
+/// TLS peer; production code uses the default.
+struct TlsConnection<W = TlsWriteHalf> {
+    /// Shareable write handle.
+    writer: TlsWriter<W>,
+    /// Close signal for this connection's receive task (never sent; the
+    /// drop is the signal).
+    _close_tx: tokio::sync::oneshot::Sender<()>,
 }
 
-impl TlsConnection {
-    /// Creates a new TLS connection from the write half of a split stream.
-    const fn new(
-        write_half: tokio::io::WriteHalf<TlsStream<TcpStream>>,
-        peer_addr: SocketAddr,
-    ) -> Self {
+/// Cloneable write handle to one TLS connection.
+struct TlsWriter<W = TlsWriteHalf> {
+    /// TLS stream write half; the mutex serialises whole messages so two
+    /// senders never interleave bytes on the stream.
+    write_half: Arc<Mutex<W>>,
+    /// Peer address.
+    peer_addr: SocketAddr,
+    /// Per-connection id, unique within one [`SipTransport`]. Eviction
+    /// removes a map entry only when its generation still matches, so a
+    /// stale sender or an orphaned reader cannot evict a newer connection
+    /// to the same peer.
+    generation: u64,
+    /// Set while a message is being written and cleared only when its
+    /// write and flush complete. Left set when a send times out or fails,
+    /// since part of a TLS record (or SIP message) may then be on the
+    /// stream; every later send on this connection, including from a clone
+    /// taken before eviction, is refused. Only read or written while
+    /// `write_half` is locked, so the mutex orders it (`Relaxed` suffices).
+    poisoned: Arc<AtomicBool>,
+}
+
+impl<W> Clone for TlsWriter<W> {
+    fn clone(&self) -> Self {
         Self {
-            write_half,
-            peer_addr,
+            write_half: Arc::clone(&self.write_half),
+            peer_addr: self.peer_addr,
+            generation: self.generation,
+            poisoned: Arc::clone(&self.poisoned),
         }
     }
+}
 
-    /// Sends a SIP message.
-    async fn send(&mut self, message: &[u8]) -> AppResult<()> {
+impl<W: tokio::io::AsyncWrite + Unpin> TlsConnection<W> {
+    /// Creates a map entry from the write half of a split stream; returns
+    /// it with the receiver the receive task waits on for closure.
+    fn new(
+        write_half: W,
+        peer_addr: SocketAddr,
+        generation: u64,
+    ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+        let conn = Self {
+            writer: TlsWriter {
+                write_half: Arc::new(Mutex::new(write_half)),
+                peer_addr,
+                generation,
+                poisoned: Arc::new(AtomicBool::new(false)),
+            },
+            _close_tx: close_tx,
+        };
+        (conn, close_rx)
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> TlsWriter<W> {
+    /// Sends one SIP message; write and flush together are bounded by
+    /// `deadline`. Refused without writing once an earlier send on this
+    /// connection timed out or failed part-way (see `poisoned`).
+    // NIST 800-53 Rev5: SC-5, SI-17 (a peer that stops reading cannot hold
+    // the sender past `deadline`); SC-8 (integrity of the SIP message
+    // stream: nothing is appended after a partially written message).
+    async fn send(&self, message: &[u8], deadline: std::time::Duration) -> AppResult<()> {
         let peer = self.peer_addr;
-        self.write_half
-            .write_all(message)
+        let write = async {
+            let mut write_half = self.write_half.lock().await;
+            if self.poisoned.load(Ordering::Relaxed) {
+                return Err(AppError::Sip(format!(
+                    "connection to {peer} unusable after an earlier failed send"
+                )));
+            }
+            // Stays set if this future is dropped (deadline) or errors
+            // part-way through the write.
+            self.poisoned.store(true, Ordering::Relaxed);
+            write_half
+                .write_all(message)
+                .await
+                .map_err(|e| AppError::Sip(format!("Failed to send to {peer}: {e}")))?;
+            write_half
+                .flush()
+                .await
+                .map_err(|e| AppError::Sip(format!("Failed to flush to {peer}: {e}")))?;
+            // Cleared before the lock is released, so no waiting sender can
+            // observe the in-progress value.
+            self.poisoned.store(false, Ordering::Relaxed);
+            drop(write_half);
+            Ok(())
+        };
+        tokio::time::timeout(deadline, write)
             .await
-            .map_err(|e| AppError::Sip(format!("Failed to send to {peer}: {e}")))?;
-        self.write_half
-            .flush()
-            .await
-            .map_err(|e| AppError::Sip(format!("Failed to flush to {peer}: {e}")))?;
-        Ok(())
+            .map_err(|_| AppError::Sip(format!("send to {peer} timed out after {deadline:?}")))?
+    }
+}
+
+/// Removes `peer`'s entry only if it is still the connection with
+/// `generation`. Returns whether an entry was removed.
+async fn remove_connection_if_current<W>(
+    connections: &Mutex<HashMap<SocketAddr, TlsConnection<W>>>,
+    peer: SocketAddr,
+    generation: u64,
+) -> bool {
+    let mut connections = connections.lock().await;
+    if connections
+        .get(&peer)
+        .is_some_and(|conn| conn.writer.generation == generation)
+    {
+        connections.remove(&peer);
+        true
+    } else {
+        false
     }
 }
 
@@ -660,6 +767,34 @@ impl TransportConfig {
     }
 }
 
+/// Deadline for the TCP connect to a SIP peer (SR-45).
+pub(crate) const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Deadline for the TLS handshake with a SIP peer once TCP is up (SR-45).
+pub(crate) const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-phase deadlines for establishing a stream connection to a SIP peer.
+///
+/// Always [`ConnectTimeouts::default`] (the named consts) outside this
+/// crate's unit tests; only `#[cfg(test)]` code can shorten them
+/// (NIST 800-53 Rev5: CM-7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectTimeouts {
+    /// TCP connect deadline.
+    pub(crate) tcp_connect: std::time::Duration,
+    /// TLS handshake deadline.
+    pub(crate) tls_handshake: std::time::Duration,
+}
+
+impl Default for ConnectTimeouts {
+    fn default() -> Self {
+        Self {
+            tcp_connect: TCP_CONNECT_TIMEOUT,
+            tls_handshake: TLS_HANDSHAKE_TIMEOUT,
+        }
+    }
+}
+
 /// SIP Transport manager.
 ///
 /// Manages TLS connections to SIP peers and handles message routing.
@@ -679,6 +814,13 @@ pub struct SipTransport {
     event_tx: mpsc::Sender<TransportEvent>,
     /// Transport configuration.
     config: Arc<RwLock<TransportConfig>>,
+    /// Connect/handshake deadlines (SR-45).
+    connect_timeouts: ConnectTimeouts,
+    /// Per-message write deadline on established connections (SR-45).
+    /// Always [`SEND_TIMEOUT`] outside this crate's unit tests.
+    send_timeout: std::time::Duration,
+    /// Source of [`TlsWriter::generation`] ids.
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
 impl SipTransport {
@@ -704,7 +846,25 @@ impl SipTransport {
             udp_socket: Arc::new(RwLock::new(None)),
             event_tx,
             config: Arc::new(RwLock::new(config)),
+            connect_timeouts: ConnectTimeouts::default(),
+            send_timeout: SEND_TIMEOUT,
+            next_generation: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Test seam: overrides the connect/handshake deadlines. Unit tests only;
+    /// no build outside `cfg(test)` can change them.
+    #[cfg(test)]
+    pub(crate) const fn with_connect_timeouts(mut self, timeouts: ConnectTimeouts) -> Self {
+        self.connect_timeouts = timeouts;
+        self
+    }
+
+    /// Test seam: overrides the per-message send deadline. Unit tests only.
+    #[cfg(test)]
+    pub(crate) const fn with_send_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.send_timeout = timeout;
+        self
     }
 
     /// Sets the certificate verification mode.
@@ -883,19 +1043,38 @@ impl SipTransport {
             "Sending SIP request"
         );
 
-        // Get or create connection
-        let mut connections = self.connections.lock().await;
+        // Get or create connection. The map lock is held only to clone the
+        // write handle, never across connect or socket I/O.
+        let mut writer = self.writer_for(destination).await;
 
-        if !connections.contains_key(&destination) {
+        if writer.is_none() {
             // Need to establish connection
-            drop(connections); // Release lock during connect
+            // NIST 800-53 Rev5: SC-5, SI-17 — bounded by `connect_timeouts`
+            // (TCP 5 s, then TLS 10 s); SC-10 — a TCP connection whose TLS
+            // handshake does not complete in 10 s is dropped.
+            // POAM: POA&M-374 -- resolve and connect still run inline on
+            // the client event pump, which the GUI drives under the client
+            // mutex. One outbound request can stall the pump (inbound
+            // calls, registration refresh, hang-up) for up to 28 s: RFC 3263
+            // chain 8 s (2 s per query, no re-send) + A/AAAA fallback 5 s
+            // (make_call) + TCP connect 5 s + TLS handshake 10 s, then up to
+            // 5 s per send. Requests sent in one pump pass add, with no
+            // negative cache per destination, and the target host may be
+            // peer-chosen via Contact / Record-Route. Concurrent connects to
+            // one peer are not de-duplicated (the later insert replaces the
+            // earlier entry; generation ids keep eviction correct). An ACK
+            // for a 2xx to an unresolved, black-holed next hop can take
+            // longer than the UAS waits for it (64*T1, RFC 3261 §13.3.1.4),
+            // so the UAS may give up on the dialog. A system lookup that hit
+            // its deadline keeps its blocking-pool thread (getaddrinfo) until
+            // the OS resolver gives up. Moving connect/resolve off the pump
+            // is not done here.
             self.connect(destination).await?;
-            connections = self.connections.lock().await;
+            writer = self.writer_for(destination).await;
         }
 
-        let conn = connections
-            .get_mut(&destination)
-            .ok_or_else(|| AppError::Sip(format!("No connection to {destination}")))?;
+        let writer =
+            writer.ok_or_else(|| AppError::Sip(format!("No connection to {destination}")))?;
 
         // Serialize and send
         let message_bytes = request.to_string();
@@ -906,10 +1085,7 @@ impl SipTransport {
         );
         trace!(destination = %destination, "\n{message_bytes}");
 
-        conn.send(message_bytes.as_bytes()).await?;
-        drop(connections);
-
-        Ok(())
+        self.send_on(&writer, message_bytes.as_bytes()).await
     }
 
     /// Sends a SIP response to the specified destination.
@@ -929,9 +1105,7 @@ impl SipTransport {
 
         // Get existing connection - responses are sent on the same connection
         // that received the request
-        let mut connections = self.connections.lock().await;
-
-        let conn = connections.get_mut(&destination).ok_or_else(|| {
+        let writer = self.writer_for(destination).await.ok_or_else(|| {
             AppError::Sip(format!(
                 "No connection to {destination} - cannot send response without established connection"
             ))
@@ -947,10 +1121,34 @@ impl SipTransport {
         );
         trace!(destination = %destination, "\n{message_bytes}");
 
-        conn.send(message_bytes.as_bytes()).await?;
-        drop(connections);
+        self.send_on(&writer, message_bytes.as_bytes()).await
+    }
 
-        Ok(())
+    /// Clones the write handle for `destination` under the map lock and
+    /// releases the lock before returning.
+    async fn writer_for(&self, destination: SocketAddr) -> Option<TlsWriter> {
+        self.connections
+            .lock()
+            .await
+            .get(&destination)
+            .map(|conn| conn.writer.clone())
+    }
+
+    /// Writes one message on `writer` under the send deadline. On timeout
+    /// or error the connection is evicted (only if the map still holds this
+    /// same connection), which also stops its receive task; the next send
+    /// reconnects.
+    // NIST 800-53 Rev5: SC-5, SI-17 (bounded write on an established
+    // connection; no map lock held across socket I/O).
+    async fn send_on(&self, writer: &TlsWriter, message: &[u8]) -> AppResult<()> {
+        let result = writer.send(message, self.send_timeout).await;
+        if let Err(e) = &result {
+            let peer = writer.peer_addr;
+            let removed =
+                remove_connection_if_current(&self.connections, peer, writer.generation).await;
+            warn!(peer = %peer, error = %e, evicted = removed, "SIP send failed; connection dropped");
+        }
+        result
     }
 
     /// Gets or creates the UDP socket, returning it along with a flag indicating if it's new.
@@ -1120,12 +1318,39 @@ impl SipTransport {
     }
 
     /// Establishes a TLS connection to a peer.
+    ///
+    /// The TCP connect and the TLS handshake each run under their own
+    /// deadline (`connect_timeouts`); on expiry the partial stream is
+    /// dropped and nothing is inserted into `connections`.
+    // NIST 800-53 Rev5: SC-5, SI-17 (bounded TCP connect / handshake; a
+    // silent peer cannot stall the event pump indefinitely); SC-10 (a TCP
+    // connection whose TLS handshake does not complete in 10 s is dropped).
+    // RFC 3261 §18: the failure is returned to the caller as an error, which
+    // only logs it; it is not reported to the TU as a 503 (§8.1.3.1,
+    // §17.1.1.2) and no next RFC 3263 target is tried.
+    // POAM: POA&M-377 -- transport error -> TU 503 and RFC 3263 §4.3
+    // next-target failover not implemented.
     async fn connect(&self, peer: SocketAddr) -> AppResult<()> {
         info!(peer = %peer, "Connecting to SIP peer");
+        let ConnectTimeouts {
+            tcp_connect,
+            tls_handshake,
+        } = self.connect_timeouts;
+        debug!(
+            peer = %peer,
+            tcp_connect = ?tcp_connect,
+            tls_handshake = ?tls_handshake,
+            "SIP peer connect deadlines"
+        );
 
         // Connect TCP
-        let tcp_stream = TcpStream::connect(peer)
+        let tcp_stream = tokio::time::timeout(tcp_connect, TcpStream::connect(peer))
             .await
+            .map_err(|_| {
+                AppError::Sip(format!(
+                    "TCP connect to {peer} timed out after {tcp_connect:?}"
+                ))
+            })?
             .map_err(|e| AppError::Sip(format!("Failed to connect to {peer}: {e}")))?;
 
         // Verify against the configured registrar DNS name when set;
@@ -1147,10 +1372,15 @@ impl SipTransport {
 
         // TLS handshake
         let connector = TlsConnector::from(tls_config);
-        let tls_stream = connector
-            .connect(server_name, tcp_stream)
-            .await
-            .map_err(|e| AppError::Sip(format!("TLS handshake failed with {peer}: {e}")))?;
+        let tls_stream =
+            tokio::time::timeout(tls_handshake, connector.connect(server_name, tcp_stream))
+                .await
+                .map_err(|_| {
+                    AppError::Sip(format!(
+                        "TLS handshake with {peer} timed out after {tls_handshake:?}"
+                    ))
+                })?
+                .map_err(|e| AppError::Sip(format!("TLS handshake failed with {peer}: {e}")))?;
 
         info!(peer = %peer, "TLS connection established");
 
@@ -1158,10 +1388,13 @@ impl SipTransport {
         // connections map; the receive task owns the read half outright so
         // a pending read can never hold the connections lock.
         let (read_half, write_half) = tokio::io::split(tls_stream);
-        {
-            let mut connections = self.connections.lock().await;
-            connections.insert(peer, TlsConnection::new(write_half, peer));
-        }
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (conn, close_rx) = TlsConnection::new(write_half, peer, generation);
+        // Replacing an existing entry (two concurrent connects to one peer)
+        // drops the old entry's close signal, so its reader exits.
+        self.connections.lock().await.insert(peer, conn);
 
         // Notify connected. `connect()` runs inside the event pump, which
         // is the only reader of this channel: an awaited send on a full
@@ -1176,26 +1409,35 @@ impl SipTransport {
         }
 
         // Spawn receive task for this connection
-        self.spawn_receive_task(TlsReader::new(read_half, peer));
+        self.spawn_receive_task(TlsReader::new(read_half, peer), generation, close_rx);
 
         Ok(())
     }
 
     /// Spawns a task to receive messages from a connection.
-    fn spawn_receive_task(&self, mut reader: TlsReader) {
+    ///
+    /// The task stops when its map entry is dropped (shutdown, replace,
+    /// send-failure eviction) via `close_rx`; it never takes the map lock
+    /// while reading and never waits on a writer.
+    fn spawn_receive_task(
+        &self,
+        mut reader: TlsReader,
+        generation: u64,
+        mut close_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
         let connections = self.connections.clone();
         let event_tx = self.event_tx.clone();
         let peer = reader.peer_addr;
 
         tokio::spawn(async move {
             loop {
-                // Stop when the connection was removed (shutdown/replace);
-                // the lock is taken briefly and never held across the read.
-                if !connections.lock().await.contains_key(&peer) {
-                    break;
-                }
+                let received = tokio::select! {
+                    // Entry dropped: release the read half so the socket closes.
+                    _ = &mut close_rx => break,
+                    received = reader.recv() => received,
+                };
 
-                match reader.recv().await {
+                match received {
                     Ok(Some(message)) => {
                         debug!(peer = %peer, "Received SIP message");
                         match message {
@@ -1231,8 +1473,9 @@ impl SipTransport {
                             })
                             .await;
 
-                        // Remove connection
-                        connections.lock().await.remove(&peer);
+                        // Remove this connection only; a newer connection
+                        // to the same peer keeps its entry.
+                        remove_connection_if_current(&connections, peer, generation).await;
                         break;
                     }
                 }
@@ -2336,5 +2579,429 @@ mod tests {
         // Verify order preserved (proxy first, then client)
         assert!(via_headers[0].value.contains("proxy.example.com"));
         assert!(via_headers[1].value.contains("client.example.com"));
+    }
+
+    // ---- SR-45: bounded connect / TLS handshake (QA, written before the fix) ----
+
+    /// Short deadlines so the tests finish quickly; the test-side guard
+    /// (`SR45_GUARD`) is well above them.
+    const SR45_TIMEOUTS: ConnectTimeouts = ConnectTimeouts {
+        tcp_connect: std::time::Duration::from_millis(500),
+        tls_handshake: std::time::Duration::from_millis(300),
+    };
+
+    /// Test-side bound on every await that could hang. A failure is a clean
+    /// assertion, never a stuck test.
+    const SR45_GUARD: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// A TCP listener that accepts every connection and never sends a byte
+    /// (a middlebox or attacker that stalls the `ClientHello`). The accepted
+    /// sockets are held open until the returned task is aborted.
+    async fn sr45_silent_listener() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            // Held only to keep the accepted sockets open.
+            #[allow(clippy::collection_is_never_read)]
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        (addr, task)
+    }
+
+    fn sr45_transport() -> SipTransport {
+        let (tx, _rx) = mpsc::channel(16);
+        SipTransport::new(tx)
+            .unwrap()
+            .with_connect_timeouts(SR45_TIMEOUTS)
+    }
+
+    fn sr45_options_request() -> SipRequest {
+        use proto_sip::header::{Header, HeaderName};
+        use proto_sip::method::Method;
+        use proto_sip::uri::SipUri;
+        let mut request = SipRequest::new(Method::Options, SipUri::new("example.com"));
+        request.add_header(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/TLS client.example.com:5061;branch=z9hG4bKsr45",
+        ));
+        request.add_header(Header::new(HeaderName::From, "<sip:qa@example.com>;tag=1"));
+        request.add_header(Header::new(HeaderName::To, "<sip:example.com>"));
+        request.add_header(Header::new(HeaderName::CallId, "sr45@client.example.com"));
+        request.add_header(Header::new(HeaderName::CSeq, "1 OPTIONS"));
+        request.add_header(Header::new(HeaderName::ContentLength, "0"));
+        request
+    }
+
+    fn sr45_assert_timeout_error(err: &AppError, peer: SocketAddr, phase: &str) {
+        let text = err.to_string().to_ascii_lowercase();
+        assert!(
+            text.contains(&peer.to_string()),
+            "error must name the peer {peer}: {err}"
+        );
+        assert!(
+            text.contains(phase),
+            "error must name the phase {phase:?}: {err}"
+        );
+        assert!(
+            text.contains("timed out"),
+            "error must say it timed out: {err}"
+        );
+    }
+
+    /// The named defaults are the deadlines every non-test transport uses.
+    #[test]
+    fn test_sr45_default_connect_timeouts() {
+        assert_eq!(TCP_CONNECT_TIMEOUT, std::time::Duration::from_secs(5));
+        assert_eq!(TLS_HANDSHAKE_TIMEOUT, std::time::Duration::from_secs(10));
+        let (tx, _rx) = mpsc::channel(1);
+        let transport = SipTransport::new(tx).unwrap();
+        assert_eq!(transport.connect_timeouts, ConnectTimeouts::default());
+        assert_eq!(transport.connect_timeouts.tcp_connect, TCP_CONNECT_TIMEOUT);
+        assert_eq!(
+            transport.connect_timeouts.tls_handshake,
+            TLS_HANDSHAKE_TIMEOUT
+        );
+    }
+
+    /// SR-45: a peer that accepts TCP and never answers the `ClientHello`
+    /// makes `connect` fail at the handshake deadline, leaving no entry in
+    /// the connections map.
+    #[tokio::test]
+    async fn test_sr45_connect_silent_tls_peer_times_out() {
+        let (peer, listener) = sr45_silent_listener().await;
+        let transport = sr45_transport();
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(SR45_GUARD, transport.connect(peer)).await;
+        listener.abort();
+        let Ok(result) = outcome else {
+            panic!(
+                "SR-45: connect() to a silent TLS peer did not return within {SR45_GUARD:?} \
+                 (handshake deadline {:?})",
+                SR45_TIMEOUTS.tls_handshake
+            );
+        };
+        let elapsed = started.elapsed();
+        let err = result.unwrap_err();
+        sr45_assert_timeout_error(&err, peer, "handshake");
+        assert!(
+            elapsed >= SR45_TIMEOUTS.tls_handshake,
+            "returned before the handshake deadline: {elapsed:?}"
+        );
+        assert!(
+            transport.connections.lock().await.is_empty(),
+            "SR-45: a timed-out connect left a connection in the map"
+        );
+    }
+
+    /// SR-45 at the caller: `send_request` over a silent peer returns an
+    /// error within the deadline (the event pump is not held), the map stays
+    /// empty, and a retry is bounded the same way.
+    #[tokio::test]
+    async fn test_sr45_send_request_silent_tls_peer_times_out() {
+        let (peer, listener) = sr45_silent_listener().await;
+        let transport = sr45_transport();
+        let request = sr45_options_request();
+
+        for attempt in 1..=2 {
+            let outcome =
+                tokio::time::timeout(SR45_GUARD, transport.send_request(&request, peer)).await;
+            let Ok(result) = outcome else {
+                listener.abort();
+                panic!(
+                    "SR-45: send_request attempt {attempt} to a silent TLS peer did not return \
+                     within {SR45_GUARD:?}"
+                );
+            };
+            let err = result.unwrap_err();
+            sr45_assert_timeout_error(&err, peer, "handshake");
+            assert!(
+                transport.connections.lock().await.is_empty(),
+                "SR-45: attempt {attempt} left a connection in the map"
+            );
+        }
+        listener.abort();
+    }
+
+    /// SR-45: a TCP connect that never completes (SYN to a black-holed
+    /// TEST-NET-1 address, RFC 5737) fails at the connect deadline. On hosts
+    /// with no route the connect fails immediately instead; the error and the
+    /// empty map are checked either way, the "timed out" wording only when
+    /// the deadline was what ended it.
+    #[tokio::test]
+    async fn test_sr45_connect_blackholed_peer_times_out() {
+        let peer: SocketAddr = "192.0.2.1:5061".parse().unwrap();
+        let transport = sr45_transport();
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(SR45_GUARD, transport.connect(peer)).await;
+        let Ok(result) = outcome else {
+            panic!(
+                "SR-45: TCP connect to a black-holed peer did not return within {SR45_GUARD:?} \
+                 (connect deadline {:?})",
+                SR45_TIMEOUTS.tcp_connect
+            );
+        };
+        let elapsed = started.elapsed();
+        let err = result.unwrap_err();
+        let text = err.to_string().to_ascii_lowercase();
+        assert!(
+            text.contains(&peer.to_string()),
+            "error must name the peer: {err}"
+        );
+        assert!(text.contains("connect"), "error must name the phase: {err}");
+        if elapsed >= SR45_TIMEOUTS.tcp_connect {
+            sr45_assert_timeout_error(&err, peer, "connect");
+        }
+        assert!(transport.connections.lock().await.is_empty());
+    }
+
+    // ---- SR-45 / SEC-1: bounded writes on established connections ----
+
+    /// Test-shortened send deadline.
+    const SEC1_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+
+    /// A TLS 1.3 (CNSA provider) server on loopback that completes the
+    /// handshake and then never reads. Returns its address, the DER of its
+    /// self-signed P-384 certificate (IP SAN 127.0.0.1) and the server task.
+    fn sec1_tls_server_never_reads() -> (SocketAddr, Vec<u8>, tokio::task::JoinHandle<()>) {
+        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P384_SHA384};
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap();
+        let cert = CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_der = cert.der().to_vec();
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            uc_transport::tls::cnsa_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(cert_der.clone())],
+            PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        // Small receive buffer so the client's writes back up quickly.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(8).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            // Held only to keep the accepted streams open, unread.
+            #[allow(clippy::collection_is_never_read)]
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                if let Ok(stream) = acceptor.accept(sock).await {
+                    held.push(stream);
+                }
+            }
+        });
+        (addr, cert_der, task)
+    }
+
+    /// The named default is the deadline every non-test transport uses.
+    #[test]
+    fn test_sec1_default_send_timeout() {
+        assert_eq!(SEND_TIMEOUT, std::time::Duration::from_secs(5));
+        let (tx, _rx) = mpsc::channel(1);
+        let transport = SipTransport::new(tx).unwrap();
+        assert_eq!(transport.send_timeout, SEND_TIMEOUT);
+    }
+
+    /// SEC-1: a TLS peer that completes the handshake and then stops reading
+    /// makes a large write fail at the send deadline; the entry is evicted
+    /// and the map lock is free while the write is pending.
+    #[tokio::test]
+    async fn test_sec1_send_to_peer_that_never_reads_times_out() {
+        let (peer, cert_der, server) = sec1_tls_server_never_reads();
+        let (tx, _rx) = mpsc::channel(16);
+        let config = TransportConfig::new().with_verification_mode(CertVerificationMode::Custom {
+            trusted_certs: vec![cert_der],
+        });
+        let transport = SipTransport::with_config(tx, config)
+            .unwrap()
+            .with_connect_timeouts(SR45_TIMEOUTS)
+            .with_send_timeout(SEC1_SEND_TIMEOUT);
+
+        let Ok(connected) = tokio::time::timeout(SR45_GUARD, transport.connect(peer)).await else {
+            panic!("connect to the test server did not return within {SR45_GUARD:?}");
+        };
+        connected.unwrap();
+        let Some(writer) = transport.writer_for(peer).await else {
+            panic!("connect did not insert an entry");
+        };
+
+        // Far more than loopback send + receive buffers can absorb.
+        let payload = vec![b'x'; 64 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let send = transport.send_on(&writer, &payload);
+        tokio::pin!(send);
+
+        // While the write is stuck, the map lock is not held by the sender.
+        let probe = async {
+            tokio::time::sleep(SEC1_SEND_TIMEOUT / 4).await;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                transport.connections.lock(),
+            )
+            .await
+            .is_ok()
+        };
+        let (result, lock_free) = tokio::join!(tokio::time::timeout(SR45_GUARD, &mut send), probe);
+        server.abort();
+        let Ok(result) = result else {
+            panic!("SEC-1: send to a non-reading peer did not return within {SR45_GUARD:?}");
+        };
+        let elapsed = started.elapsed();
+        assert!(lock_free, "SEC-1: connections lock held across socket I/O");
+        let err = result.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("send to {peer} timed out after")),
+            "unexpected error: {text}"
+        );
+        assert!(elapsed >= SEC1_SEND_TIMEOUT, "returned early: {elapsed:?}");
+        assert!(
+            transport.connections.lock().await.is_empty(),
+            "SEC-1: timed-out connection left in the map"
+        );
+    }
+
+    /// SEC-1 / SEC-6: eviction by a stale generation (a sender or orphaned
+    /// reader of an older connection) leaves a newer connection in place;
+    /// the matching generation removes it and signals its reader.
+    #[tokio::test]
+    async fn test_sec1_stale_generation_cannot_evict_newer_connection() {
+        let peer: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+        let connections: Mutex<HashMap<SocketAddr, TlsConnection<tokio::io::Sink>>> =
+            Mutex::new(HashMap::new());
+
+        let (old, mut old_close) = TlsConnection::new(tokio::io::sink(), peer, 1);
+        connections.lock().await.insert(peer, old);
+        let (new, mut new_close) = TlsConnection::new(tokio::io::sink(), peer, 2);
+        // Replacing the entry closes the old connection's reader.
+        connections.lock().await.insert(peer, new);
+        assert!(
+            old_close
+                .try_recv()
+                .is_err_and(|e| e == tokio::sync::oneshot::error::TryRecvError::Closed)
+        );
+
+        assert!(!remove_connection_if_current(&connections, peer, 1).await);
+        assert_eq!(
+            connections
+                .lock()
+                .await
+                .get(&peer)
+                .map(|c| c.writer.generation),
+            Some(2)
+        );
+        assert_eq!(
+            new_close.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+            "newer connection's reader must keep running"
+        );
+
+        assert!(remove_connection_if_current(&connections, peer, 2).await);
+        assert!(connections.lock().await.is_empty());
+        assert_eq!(
+            new_close.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        );
+        assert!(!remove_connection_if_current(&connections, peer, 2).await);
+    }
+
+    /// SEC-1: the write deadline applies on any sink; a sink with no reader
+    /// (full duplex buffer) times out and the error names the peer.
+    #[tokio::test]
+    async fn test_sec1_writer_send_times_out_on_full_sink() {
+        let peer: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+        let (client, _server) = tokio::io::duplex(64);
+        let (conn, _close) = TlsConnection::new(client, peer, 0);
+        let deadline = std::time::Duration::from_millis(100);
+        let Ok(result) =
+            tokio::time::timeout(SR45_GUARD, conn.writer.send(&[0u8; 1024], deadline)).await
+        else {
+            panic!("send did not return within {SR45_GUARD:?}");
+        };
+        let text = result.unwrap_err().to_string();
+        assert!(
+            text.contains(&format!("send to {peer} timed out after {deadline:?}")),
+            "unexpected error: {text}"
+        );
+
+        // A message that fits is written and flushed within the deadline.
+        let (client, mut server) = tokio::io::duplex(64);
+        let (conn, _close) = TlsConnection::new(client, peer, 1);
+        conn.writer.send(b"ok", deadline).await.unwrap();
+        let mut got = [0u8; 2];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ok");
+    }
+
+    /// SEC-9 / RFC-10: after a send times out part-way, a second sender
+    /// holding a clone taken before the failure is refused and writes
+    /// nothing, so no bytes are appended after a truncated record.
+    #[tokio::test]
+    async fn test_sec9_send_after_timed_out_send_is_refused() {
+        let peer: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+        let (client, mut server) = tokio::io::duplex(64);
+        let (conn, _close) = TlsConnection::new(client, peer, 0);
+        let first = conn.writer.clone();
+        let second = conn.writer.clone();
+        let deadline = std::time::Duration::from_millis(100);
+
+        let Ok(result) =
+            tokio::time::timeout(SR45_GUARD, first.send(&[b'x'; 1024], deadline)).await
+        else {
+            panic!("send did not return within {SR45_GUARD:?}");
+        };
+        assert!(
+            result.is_err(),
+            "1024 bytes into a 64-byte pipe must time out"
+        );
+
+        // Drain the partial write so the pipe has room again.
+        let mut partial = [0u8; 64];
+        server.read_exact(&mut partial).await.unwrap();
+        assert!(partial.iter().all(|&b| b == b'x'));
+
+        let text = second.send(b"ok", deadline).await.unwrap_err().to_string();
+        assert!(
+            text.contains(&format!("connection to {peer} unusable")),
+            "unexpected error: {text}"
+        );
+        let mut extra = [0u8; 1];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            server.read(&mut extra),
+        )
+        .await;
+        assert!(
+            read.is_err(),
+            "refused sender wrote to the stream: {read:?}"
+        );
+    }
+
+    /// A completed send leaves the connection usable for the next one.
+    #[tokio::test]
+    async fn test_sec9_successful_send_does_not_poison() {
+        let peer: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+        let (client, mut server) = tokio::io::duplex(64);
+        let (conn, _close) = TlsConnection::new(client, peer, 0);
+        let deadline = std::time::Duration::from_millis(100);
+        conn.writer.send(b"one", deadline).await.unwrap();
+        conn.writer.clone().send(b"two", deadline).await.unwrap();
+        let mut got = [0u8; 6];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"onetwo");
     }
 }

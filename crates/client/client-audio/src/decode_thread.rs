@@ -154,6 +154,38 @@ struct ScheduledDtmf {
     ended: bool,
 }
 
+/// Maximum number of telephone-events queued for playout per call (SR-48).
+/// The schedule is pre-sized to this so the decode thread does not allocate
+/// for it in steady state.
+///
+/// On overflow the OLDEST queued event is dropped: events whose END never
+/// arrives are never expired by [`advance_dtmf_schedule`], so dropping the
+/// newest would let a flood of never-ended events lock out every later
+/// real digit.
+// NIST 800-53 Rev5: SC-5, SI-10 (bounded per-call state on wire input).
+const DTMF_SCHEDULE_CAP: usize = 8;
+
+/// Maximum distance, in RTP timestamp units, between a NEW telephone-event's
+/// start and the current playout position. Starts further ahead or behind
+/// are rejected.
+///
+/// The playout position is measured on the AUDIO codec's RTP clock
+/// ([`rtp_ts_units_per_ms`]): 4 s for PCMU/PCMA/G.722 (8000 Hz), 0.67 s for
+/// Opus (48000 Hz), still above any jitter-buffer lead.
+// NIST 800-53 Rev5: SC-5, SI-10. RFC 4733 §2.3/§2.5: the event timestamp is
+// the event start on the media clock, so it tracks the audio timeline.
+// POAM: POA&M-378 -- with Opus the offer carries only telephone-event/8000
+// while the audio clock is 48000; RFC 4733 §2.1 / RFC 7160 let a sender use
+// a different clock (and timestamp base) for events, so event timestamps
+// and durations are then compared on the wrong clock (digits rejected,
+// durations 6x off). Not offering telephone-event/48000 with Opus, and not
+// scaling, is a recorded deviation.
+const DTMF_MAX_START_DISTANCE: u32 = 32_000;
+
+/// Bound of the received-DTMF notification channel (SR-48). Notifications
+/// beyond it are dropped rather than blocking the decode thread.
+const DTMF_RX_CHANNEL_CAP: usize = 16;
+
 /// Mutable DTMF playout state threaded through [`advance_dtmf_schedule`].
 struct DtmfPlayout {
     schedule: std::collections::VecDeque<ScheduledDtmf>,
@@ -168,9 +200,9 @@ struct DtmfPlayout {
 }
 
 impl DtmfPlayout {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            schedule: std::collections::VecDeque::new(),
+            schedule: std::collections::VecDeque::with_capacity(DTMF_SCHEDULE_CAP),
             active_gen: None,
             fade_in: false,
             active_start: None,
@@ -240,7 +272,155 @@ fn advance_dtmf_schedule(now_ts: u32, dtmf: &mut DtmfPlayout, device_rate: u32) 
 }
 
 /// Maximum valid DTMF duration in timestamp units (5000ms at 8kHz = 40000).
+// POAM: POA&M-378 -- RFC 4733 §2.5.1.3 lets one segment's duration run to
+// 65535 units (then the sender starts a new segment); events over 40000
+// (5 s at 8 kHz, 0.83 s at 48 kHz) are discarded as malformed here, so a
+// long press is cut short or heard twice. Recorded deviation.
 const DTMF_MAX_DURATION: u16 = 40000;
+
+/// Receive-side state of the RFC 4733 event in progress.
+///
+/// RFC 4733 sends several packets per event (NEW, continuations, 3x END),
+/// all carrying the event's start timestamp. `current_ts` stays set after
+/// the END so retransmitted END packets are not taken as a new event.
+struct DtmfRx {
+    /// Start timestamp of the current event.
+    current_ts: Option<u32>,
+    /// Duration of the current event (monotonic within an event).
+    current_duration: u16,
+}
+
+impl DtmfRx {
+    const fn new() -> Self {
+        Self {
+            current_ts: None,
+            current_duration: 0,
+        }
+    }
+}
+
+/// What [`ingest_dtmf_event`] did with one telephone-event packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DtmfIngest {
+    /// Dropped before touching the receive state: a non-monotonic duration
+    /// within the event, or a duration over [`DTMF_MAX_DURATION`] (counted
+    /// as malformed).
+    Discarded,
+    /// A NEW event that is already an END shorter than
+    /// [`DTMF_MIN_DURATION`] (counted as malformed).
+    ShortEnd,
+    /// A NEW event whose start is more than [`DTMF_MAX_START_DISTANCE`]
+    /// from the playout position (counted in `dtmf_rejected`; not queued,
+    /// not counted as received, receive state untouched).
+    Rejected,
+    /// A NEW event was queued for playout.
+    Scheduled,
+    /// A continuation/END was applied to the playing or a queued tone (or
+    /// matched neither).
+    Updated,
+}
+
+/// Applies one decoded telephone-event packet (start timestamp `packet_ts`)
+/// to the receive state and the playout schedule.
+///
+/// `playout_ts` is the current playout position in RTP timestamp units
+/// (`None` before the first decoded frame, in which case the start-distance
+/// check is skipped and only [`DTMF_SCHEDULE_CAP`] bounds the schedule).
+///
+/// Allocation-free: the schedule never grows past its pre-sized capacity.
+// NIST 800-53 Rev5: SC-5, SI-10 (bounded, validated wire input).
+fn ingest_dtmf_event(
+    rx: &mut DtmfRx,
+    dtmf: &mut DtmfPlayout,
+    packet_ts: u32,
+    event: DtmfEvent,
+    playout_ts: Option<u32>,
+    metrics: &DecodeMetrics,
+) -> DtmfIngest {
+    let is_new = rx.current_ts != Some(packet_ts);
+    if !is_new && event.duration < rx.current_duration {
+        return DtmfIngest::Discarded; // Non-monotonic duration within event
+    }
+    if event.duration > DTMF_MAX_DURATION {
+        metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
+        return DtmfIngest::Discarded; // Duration exceeds RFC sanity bound (5s)
+    }
+    // A NEW start far from the playout clock (wrapping signed distance) is
+    // a hostile or broken sender, not a digit to play.
+    // `min(d, -d)` on the wrapped difference is |signed distance| mod 2^32.
+    if is_new
+        && playout_ts.is_some_and(|p| {
+            let d = packet_ts.wrapping_sub(p);
+            d.min(d.wrapping_neg()) > DTMF_MAX_START_DISTANCE
+        })
+    {
+        metrics.dtmf_rejected.fetch_add(1, Ordering::Relaxed);
+        return DtmfIngest::Rejected;
+    }
+    if is_new && event.end && event.duration < DTMF_MIN_DURATION {
+        // Refused before touching the receive state (SEC-5): the event in
+        // progress keeps its duration.
+        metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
+        return DtmfIngest::ShortEnd;
+    }
+    rx.current_duration = event.duration;
+    // Every packet refines the playout end: ts is the event start, duration
+    // grows monotonically and the END packet carries the final value.
+    let event_end_ts = packet_ts.wrapping_add(u32::from(event.duration));
+
+    if is_new {
+        rx.current_ts = Some(packet_ts);
+        metrics.dtmf_received.fetch_add(1, Ordering::Relaxed);
+        // Schedule for playout-timeline activation rather than activating
+        // now: with rapid digit sequences this packet arrives while the
+        // previous tone is still playing out, and switching the generator
+        // here blurred/stuttered digits.
+        if dtmf.schedule.len() >= DTMF_SCHEDULE_CAP {
+            // Drop-oldest keeps the push within the pre-sized capacity.
+            dtmf.schedule.pop_front();
+            metrics.dtmf_rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        dtmf.schedule.push_back(ScheduledDtmf {
+            digit: event.digit,
+            start_ts: packet_ts,
+            end_ts: event_end_ts,
+            ended: event.end,
+        });
+        return DtmfIngest::Scheduled;
+    }
+    if dtmf.active_start == Some(packet_ts) {
+        // Continuation/END for the currently playing tone.
+        dtmf.end_ts = Some(event_end_ts);
+        dtmf.active_ended |= event.end;
+    } else if let Some(entry) = dtmf.schedule.iter_mut().find(|e| e.start_ts == packet_ts) {
+        // Continuation/END for a not-yet-started tone.
+        entry.end_ts = event_end_ts;
+        entry.ended |= event.end;
+    }
+    DtmfIngest::Updated
+}
+
+/// Sender half of the received-DTMF notification channel (decode thread to
+/// the pipeline owner, drained by `AudioPipeline::drain_received_dtmf`).
+pub type DtmfRxSender = mpsc::SyncSender<DtmfDigit>;
+
+/// Creates the received-DTMF notification channel, bounded to
+/// [`DTMF_RX_CHANNEL_CAP`] (the buffer is allocated once, here).
+///
+/// No production code drains the receiver yet
+/// (`AudioPipeline::drain_received_dtmf` has no caller); once it is full,
+/// further notifications are dropped (newest lost), which is intended: the
+/// decode thread must never block on it.
+// NIST 800-53 Rev5: SC-5 (bounded queue fed by wire input).
+pub(crate) fn dtmf_rx_channel() -> (DtmfRxSender, mpsc::Receiver<DtmfDigit>) {
+    mpsc::sync_channel(DTMF_RX_CHANNEL_CAP)
+}
+
+/// Notifies the pipeline owner of a newly received digit. Never blocks the
+/// decode thread: a full or disconnected channel drops the notification.
+fn notify_dtmf_rx(tx: &DtmfRxSender, digit: DtmfDigit) {
+    let _ = tx.try_send(digit);
+}
 
 /// Command sent from the main thread to the decode thread.
 pub enum DecodeCommand {
@@ -296,6 +476,60 @@ impl Drop for DecodeThreadHandle {
     }
 }
 
+/// RTP timestamp units per millisecond on the audio codec's RTP clock
+/// (8 for PCMU/PCMA and G.722, 48 for Opus).
+///
+/// RFC 3551 §4.5.2: G.722 samples at 16 kHz but its RTP clock is 8000 Hz,
+/// so the per-frame sample count must not be used for this.
+const fn rtp_ts_units_per_ms(rtp_clock_rate: u32) -> u32 {
+    let units = rtp_clock_rate / 1000;
+    if units == 0 { 1 } else { units }
+}
+
+/// Playout position extrapolated from the last anchor (RTP ts of the last
+/// decoded or CN frame) by the wall time elapsed since it.
+#[allow(clippy::cast_possible_truncation)]
+const fn extrapolate_playout_ts(anchor_ts: u32, elapsed: Duration, units_per_ms: u32) -> u32 {
+    anchor_ts.wrapping_add((elapsed.as_millis() as u32).saturating_mul(units_per_ms))
+}
+
+/// Interval between two rate-limited warnings.
+const WARN_RATE_LIMIT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Allocation-free limiter for a warning driven by wire input: the first
+/// occurrence is logged, then at most one per [`WARN_RATE_LIMIT_INTERVAL`],
+/// carrying how many were suppressed since the last one.
+// NIST 800-53 Rev5: AU-4, SC-5 (wire input must not drive warn-level log
+// volume).
+struct WarnRateLimit {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl WarnRateLimit {
+    const fn new() -> Self {
+        Self {
+            last: None,
+            suppressed: 0,
+        }
+    }
+
+    /// Records one occurrence at `now`. Returns `Some(suppressed)` when it
+    /// should be logged (the count of occurrences dropped since the last
+    /// logged one), `None` when it is suppressed.
+    fn check(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < WARN_RATE_LIMIT_INTERVAL)
+        {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
 /// Shared atomic counters for decode-thread metrics.
 ///
 /// Created by the pipeline and passed to `spawn()`. The decode thread
@@ -312,6 +546,15 @@ pub struct DecodeMetrics {
     pub dtmf_received: AtomicU64,
     /// Malformed DTMF packets (invalid duration, impossible jumps).
     pub dtmf_malformed: AtomicU64,
+    /// Telephone-event PACKETS refused by the per-call bounds (SR-48), not
+    /// events: each packet of an event whose NEW start was too far from the
+    /// playout clock counts (its continuations and ENDs look new again and
+    /// are refused too), plus one per queued event evicted when the schedule
+    /// was full.
+    pub dtmf_rejected: AtomicU64,
+    /// Audio packets the codec failed to decode (wire-driven; the matching
+    /// `warn!` is rate-limited, see [`WarnRateLimit`]).
+    pub decode_errors: AtomicU64,
     /// Decoded frames dropped because they were longer than one ptime
     /// (RTP payload larger than the negotiated frame).
     pub oversized_frames_dropped: AtomicU64,
@@ -325,6 +568,8 @@ impl DecodeMetrics {
             plc_generated: AtomicU64::new(0),
             dtmf_received: AtomicU64::new(0),
             dtmf_malformed: AtomicU64::new(0),
+            dtmf_rejected: AtomicU64::new(0),
+            decode_errors: AtomicU64::new(0),
             oversized_frames_dropped: AtomicU64::new(0),
         })
     }
@@ -349,7 +594,7 @@ pub struct DecodeThreadConfig {
     pub comfort_noise: ComfortNoiseConfig,
     /// Channel for received DTMF digit notifications.
     /// When present, the decode thread sends each new DTMF digit here.
-    pub dtmf_rx_tx: Option<mpsc::Sender<DtmfDigit>>,
+    pub dtmf_rx_tx: Option<DtmfRxSender>,
     /// Shared DTMF packet queue (JB bypass).
     /// When present, DTMF packets arrive here instead of the jitter buffer.
     pub dtmf_queue: Option<SharedDtmfQueue>,
@@ -515,10 +760,11 @@ fn decode_loop(
 
     let codec_clock_rate = codec.clock_rate();
     let codec_samples = codec.samples_per_frame();
-    // RTP timestamp units per millisecond (e.g. 8 at 8kHz G.711) — used to
-    // extrapolate the playout clock by wall time when the JB is empty.
-    #[allow(clippy::cast_possible_truncation)]
-    let ts_units_per_ms = (codec_samples / 20).max(1) as u32;
+    // RTP timestamp units per millisecond on the codec's RTP clock (8 for
+    // G.711 and G.722, 48 for Opus) — used to extrapolate the playout clock
+    // by wall time when the JB is empty or DTMF arrives between frames.
+    // RFC 3551 §4.5.2: G.722's RTP clock is 8000 Hz, not its 16 kHz rate.
+    let ts_units_per_ms = rtp_ts_units_per_ms(codec_clock_rate);
     let mut device_rate = config.device_rate;
     #[allow(clippy::cast_possible_truncation)]
     let mut device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
@@ -557,11 +803,9 @@ fn decode_loop(
     // multiple packets per event (start + continuations + 3× end), all sharing
     // the same RTP timestamp. We keep this set even after end so retransmitted
     // end packets are still filtered by the is_new check.
-    let mut current_dtmf_ts: Option<u32> = None;
-    // Track duration of the current DTMF event for validation.
     // RFC 4733 duration increases monotonically across continuation packets;
-    // a decrease indicates a malformed packet.
-    let mut current_dtmf_duration: u16 = 0;
+    // a decrease indicates a malformed packet (see DtmfRx / ingest_dtmf_event).
+    let mut dtmf_rx = DtmfRx::new();
     // DTMF playout state: scheduled events, the active tone generator, and
     // its fade/boundary bookkeeping (see DtmfPlayout / advance_dtmf_schedule).
     let mut dtmf = DtmfPlayout::new();
@@ -574,6 +818,8 @@ fn decode_loop(
     // scheduled tones must still start/stop on time with no frames arriving.
     let mut last_decoded_ts: Option<u32> = None;
     let mut last_decoded_at = Instant::now();
+    // Rate limit for the per-packet "Decode error" warning (SEC-4).
+    let mut decode_error_warn = WarnRateLimit::new();
 
     // Gain gate state: holds the gate open during speech to prevent
     // gain fluctuation at speech boundaries that amplifies quantization noise.
@@ -715,63 +961,53 @@ fn decode_loop(
                         packet.payload[2],
                         packet.payload[3],
                     ];
-                    let is_new = current_dtmf_ts != Some(packet.timestamp);
+                    let is_new = dtmf_rx.current_ts != Some(packet.timestamp);
                     if let Some(event) = DtmfEvent::decode(&bytes) {
-                        if !is_new && event.duration < current_dtmf_duration {
-                            continue; // Non-monotonic duration within event
-                        }
-                        if event.duration > DTMF_MAX_DURATION {
-                            metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
-                            continue; // Duration exceeds RFC sanity bound (5s)
-                        }
-                        current_dtmf_duration = event.duration;
-                        dtmf_last_packet = Instant::now();
-                        // Every packet refines the playout end: ts is the
-                        // event start, duration grows monotonically and the
-                        // END packet carries the final value.
-                        let event_end_ts = packet.timestamp.wrapping_add(u32::from(event.duration));
-
-                        if is_new {
-                            if event.end && event.duration < DTMF_MIN_DURATION {
-                                metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
+                        // Playout position now: the last decoded frame's
+                        // timestamp extrapolated by wall time. Only a NEW
+                        // event uses it (start-distance check).
+                        let playout_ts = if is_new {
+                            last_decoded_ts.map(|anchor| {
+                                extrapolate_playout_ts(
+                                    anchor,
+                                    last_decoded_at.elapsed(),
+                                    ts_units_per_ms,
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        match ingest_dtmf_event(
+                            &mut dtmf_rx,
+                            &mut dtmf,
+                            packet.timestamp,
+                            event,
+                            playout_ts,
+                            metrics,
+                        ) {
+                            DtmfIngest::Discarded | DtmfIngest::Rejected => continue,
+                            DtmfIngest::ShortEnd => {
+                                dtmf_last_packet = Instant::now();
                                 continue;
                             }
-                            current_dtmf_ts = Some(packet.timestamp);
-                            metrics.dtmf_received.fetch_add(1, Ordering::Relaxed);
-                            info!(
-                                "DTMF bypass: NEW event digit={:?} ts={} seq={} end={} dur={}",
-                                event.digit,
-                                packet.timestamp,
-                                packet.sequence,
-                                event.end,
-                                event.duration
-                            );
-                            // Schedule for playout-timeline activation rather
-                            // than activating now: with rapid digit sequences
-                            // this packet arrives while the previous tone is
-                            // still playing out, and switching the generator
-                            // here blurred/stuttered digits.
-                            dtmf.schedule.push_back(ScheduledDtmf {
-                                digit: event.digit,
-                                start_ts: packet.timestamp,
-                                end_ts: event_end_ts,
-                                ended: event.end,
-                            });
-                            if let Some(ref tx) = config.dtmf_rx_tx {
-                                let _ = tx.send(event.digit);
+                            DtmfIngest::Scheduled => {
+                                dtmf_last_packet = Instant::now();
+                                // NIST 800-53 Rev5: AU-4, SC-5 -- per-event
+                                // logs are debug: wire input must not drive
+                                // info-level log volume.
+                                debug!(
+                                    "DTMF bypass: NEW event digit={:?} ts={} seq={} end={} dur={}",
+                                    event.digit,
+                                    packet.timestamp,
+                                    packet.sequence,
+                                    event.end,
+                                    event.duration
+                                );
+                                if let Some(ref tx) = config.dtmf_rx_tx {
+                                    notify_dtmf_rx(tx, event.digit);
+                                }
                             }
-                        } else if dtmf.active_start == Some(packet.timestamp) {
-                            // Continuation/END for the currently playing tone.
-                            dtmf.end_ts = Some(event_end_ts);
-                            dtmf.active_ended |= event.end;
-                        } else if let Some(entry) = dtmf
-                            .schedule
-                            .iter_mut()
-                            .find(|e| e.start_ts == packet.timestamp)
-                        {
-                            // Continuation/END for a not-yet-started tone.
-                            entry.end_ts = event_end_ts;
-                            entry.ended |= event.end;
+                            DtmfIngest::Updated => dtmf_last_packet = Instant::now(),
                         }
                         // Write DTMF trace entry
                         if let Some(ref mut trace) = dtmf_trace {
@@ -790,7 +1026,7 @@ fn decode_loop(
                             );
                         }
                         if event.end {
-                            info!(
+                            debug!(
                                 "DTMF bypass: END digit={:?} ts={} dur={}ms",
                                 event.digit,
                                 packet.timestamp,
@@ -837,6 +1073,12 @@ fn decode_loop(
 
                         // Handle RFC 3389 Comfort Noise packets (PT=13)
                         if packet.payload_type == proto_rtp::payload_types::CN {
+                            // CN carries a valid RTP timestamp on the audio
+                            // clock (RFC 3389 §4): re-anchor the playout
+                            // clock so DTMF during VAD silence is measured
+                            // from here, not from the last speech frame.
+                            last_decoded_ts = Some(packet.timestamp);
+                            last_decoded_at = Instant::now();
                             let noise_level = decode_cn_payload(&packet.payload);
                             cng.update_level(noise_level);
                             let cn_buf = &mut scratch[..adjusted_device_samples];
@@ -865,7 +1107,10 @@ fn decode_loop(
                         let codec_pcm = match codec.decode(&packet.payload) {
                             Ok(pcm) => pcm,
                             Err(e) => {
-                                warn!("Decode error: {e}");
+                                metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                                if let Some(suppressed) = decode_error_warn.check(Instant::now()) {
+                                    warn!("Decode error: {e} ({suppressed} suppressed)");
+                                }
                                 break;
                             }
                         };
@@ -1080,10 +1325,11 @@ fn decode_loop(
                         // by wall time so scheduled tones still start and stop
                         // on time (carriers suppress audio during rapid DTMF).
                         if let Some(anchor_ts) = last_decoded_ts {
-                            #[allow(clippy::cast_possible_truncation)]
-                            let elapsed_units = (last_decoded_at.elapsed().as_millis() as u32)
-                                .saturating_mul(ts_units_per_ms);
-                            let now_ts = anchor_ts.wrapping_add(elapsed_units);
+                            let now_ts = extrapolate_playout_ts(
+                                anchor_ts,
+                                last_decoded_at.elapsed(),
+                                ts_units_per_ms,
+                            );
                             let end_reached = advance_dtmf_schedule(now_ts, &mut dtmf, device_rate);
                             if end_reached && let Some(mut tone_gen) = dtmf.active_gen.take() {
                                 // Boundary frame with no decoded audio to
@@ -2057,5 +2303,441 @@ mod tests {
         assert_eq!(metrics.dtmf_malformed.load(Ordering::Relaxed), 0);
         metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
         assert_eq!(metrics.dtmf_malformed.load(Ordering::Relaxed), 1);
+    }
+
+    // ---- SR-48: RFC 4733 per-call bounds (QA, written before the fix) ----
+
+    /// One telephone-event packet payload as the bypass queue decodes it.
+    fn sr48_event(digit: DtmfDigit, end: bool, duration: u16) -> DtmfEvent {
+        DtmfEvent {
+            digit,
+            end,
+            volume: DtmfEvent::DEFAULT_VOLUME,
+            duration,
+        }
+    }
+
+    /// 200 ms ahead of the playout point at 8 kHz: an ordinary jitter-buffer
+    /// lead for a NEW event packet.
+    const SR48_NEAR_LEAD: u32 = 1600;
+
+    /// 60 s at 8 kHz: far outside any sane playout window. Any start-distance
+    /// bound of "a few seconds" must reject it.
+    const SR48_FAR: u32 = 8000 * 60;
+
+    /// Hostile far end: thousands of NEW events, each with a distinct start
+    /// timestamp and no END, each close to the playout point. The schedule
+    /// must stay within `DTMF_SCHEDULE_CAP` and must not reallocate.
+    #[test]
+    fn test_sr48_schedule_bounded_under_distinct_start_flood() {
+        let metrics = DecodeMetrics::new();
+        let mut rx = DtmfRx::new();
+        let mut dtmf = DtmfPlayout::new();
+        let capacity_before = dtmf.schedule.capacity();
+        assert!(
+            capacity_before >= DTMF_SCHEDULE_CAP,
+            "schedule must be pre-sized to the cap"
+        );
+
+        let base: u32 = 1_000_000;
+        for i in 0..5_000_u32 {
+            let start = base.wrapping_add(i * 160);
+            // Playout runs just behind each event, as on a live call, so
+            // the start-distance check is not what bounds the schedule.
+            let playout = Some(start.wrapping_sub(SR48_NEAR_LEAD));
+            let _ = ingest_dtmf_event(
+                &mut rx,
+                &mut dtmf,
+                start,
+                sr48_event(DtmfDigit::Five, false, 160),
+                playout,
+                &metrics,
+            );
+            assert!(
+                dtmf.schedule.len() <= DTMF_SCHEDULE_CAP,
+                "SR-48: schedule grew to {} entries after {} NEW events (cap {DTMF_SCHEDULE_CAP})",
+                dtmf.schedule.len(),
+                i + 1
+            );
+        }
+        assert_eq!(
+            dtmf.schedule.capacity(),
+            capacity_before,
+            "SR-48: schedule reallocated on the real-time decode thread"
+        );
+    }
+
+    /// Same flood before the first decoded frame (no playout anchor yet):
+    /// the cap holds on its own.
+    #[test]
+    fn test_sr48_schedule_bounded_without_playout_anchor() {
+        let metrics = DecodeMetrics::new();
+        let mut rx = DtmfRx::new();
+        let mut dtmf = DtmfPlayout::new();
+        for i in 0..1_000_u32 {
+            let _ = ingest_dtmf_event(
+                &mut rx,
+                &mut dtmf,
+                i.wrapping_mul(160),
+                sr48_event(DtmfDigit::One, false, 160),
+                None,
+                &metrics,
+            );
+        }
+        assert!(
+            dtmf.schedule.len() <= DTMF_SCHEDULE_CAP,
+            "SR-48: schedule has {} entries with no playout anchor (cap {DTMF_SCHEDULE_CAP})",
+            dtmf.schedule.len()
+        );
+    }
+
+    /// A NEW event whose start is far ahead of the playout point (RTP
+    /// timestamp distance, wrapping) is rejected: not queued, not counted
+    /// as received.
+    #[test]
+    fn test_sr48_far_future_start_rejected() {
+        for anchor in [1_000_000_u32, u32::MAX - 100] {
+            let metrics = DecodeMetrics::new();
+            let mut rx = DtmfRx::new();
+            let mut dtmf = DtmfPlayout::new();
+            let start = anchor.wrapping_add(SR48_FAR);
+            let outcome = ingest_dtmf_event(
+                &mut rx,
+                &mut dtmf,
+                start,
+                sr48_event(DtmfDigit::Nine, false, 160),
+                Some(anchor),
+                &metrics,
+            );
+            assert_ne!(
+                outcome,
+                DtmfIngest::Scheduled,
+                "SR-48: start {start} is 60 s ahead of playout {anchor} and must be rejected"
+            );
+            assert!(
+                dtmf.schedule.is_empty(),
+                "SR-48: far-future event was queued (anchor {anchor})"
+            );
+            assert_eq!(metrics.dtmf_received.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// A NEW event whose start is far behind the playout point is rejected.
+    #[test]
+    fn test_sr48_far_past_start_rejected() {
+        for anchor in [10_000_000_u32, 50] {
+            let metrics = DecodeMetrics::new();
+            let mut rx = DtmfRx::new();
+            let mut dtmf = DtmfPlayout::new();
+            let start = anchor.wrapping_sub(SR48_FAR);
+            let outcome = ingest_dtmf_event(
+                &mut rx,
+                &mut dtmf,
+                start,
+                sr48_event(DtmfDigit::Two, false, 160),
+                Some(anchor),
+                &metrics,
+            );
+            assert_ne!(
+                outcome,
+                DtmfIngest::Scheduled,
+                "SR-48: start {start} is 60 s behind playout {anchor} and must be rejected"
+            );
+            assert!(dtmf.schedule.is_empty());
+            assert_eq!(metrics.dtmf_received.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// Regression: an ordinary event a jitter-buffer depth ahead of the
+    /// playout point is accepted, including across the 32-bit wrap.
+    #[test]
+    fn test_sr48_near_start_accepted_across_wrap() {
+        for anchor in [1_000_000_u32, u32::MAX - 100, u32::MAX] {
+            let metrics = DecodeMetrics::new();
+            let mut rx = DtmfRx::new();
+            let mut dtmf = DtmfPlayout::new();
+            let start = anchor.wrapping_add(SR48_NEAR_LEAD);
+            let outcome = ingest_dtmf_event(
+                &mut rx,
+                &mut dtmf,
+                start,
+                sr48_event(DtmfDigit::Star, false, 160),
+                Some(anchor),
+                &metrics,
+            );
+            assert_eq!(outcome, DtmfIngest::Scheduled, "anchor {anchor}");
+            assert_eq!(dtmf.schedule.len(), 1);
+            assert_eq!(metrics.dtmf_received.load(Ordering::Relaxed), 1);
+            // A packet slightly behind playout (late NEW) is accepted too.
+            let late = anchor.wrapping_sub(SR48_NEAR_LEAD);
+            let outcome = ingest_dtmf_event(
+                &mut rx,
+                &mut dtmf,
+                late,
+                sr48_event(DtmfDigit::Pound, false, 160),
+                Some(anchor),
+                &metrics,
+            );
+            assert_eq!(
+                outcome,
+                DtmfIngest::Scheduled,
+                "late start, anchor {anchor}"
+            );
+        }
+    }
+
+    /// Regression: a normal digit (NEW, continuations, 3x END) activates on
+    /// the playout timeline and the END stops it at start + duration.
+    #[test]
+    fn test_sr48_real_end_still_stops_tone() {
+        let metrics = DecodeMetrics::new();
+        let mut rx = DtmfRx::new();
+        let mut dtmf = DtmfPlayout::new();
+        let start: u32 = 80_000;
+        let playout = Some(start - SR48_NEAR_LEAD);
+        let feed = |rx: &mut DtmfRx, dtmf: &mut DtmfPlayout, end: bool, dur: u16| {
+            ingest_dtmf_event(
+                rx,
+                dtmf,
+                start,
+                sr48_event(DtmfDigit::Seven, end, dur),
+                playout,
+                &metrics,
+            )
+        };
+
+        assert_eq!(feed(&mut rx, &mut dtmf, false, 160), DtmfIngest::Scheduled);
+        // Continuation while still queued updates the queued entry.
+        assert_eq!(feed(&mut rx, &mut dtmf, false, 480), DtmfIngest::Updated);
+        assert!(!advance_dtmf_schedule(
+            start - SR48_NEAR_LEAD,
+            &mut dtmf,
+            48000
+        ));
+        assert!(dtmf.active_gen.is_none(), "activated before its window");
+        // Playout reaches the start: the tone activates.
+        assert!(!advance_dtmf_schedule(start, &mut dtmf, 48000));
+        assert!(dtmf.active_gen.is_some(), "tone did not activate");
+        // Continuation and END for the playing tone; END retransmitted.
+        assert_eq!(feed(&mut rx, &mut dtmf, false, 640), DtmfIngest::Updated);
+        for _ in 0..3 {
+            assert_eq!(feed(&mut rx, &mut dtmf, true, 800), DtmfIngest::Updated);
+        }
+        assert_eq!(metrics.dtmf_received.load(Ordering::Relaxed), 1);
+        assert!(
+            !advance_dtmf_schedule(start + 799, &mut dtmf, 48000),
+            "tone stopped before its END duration"
+        );
+        assert!(
+            advance_dtmf_schedule(start + 800, &mut dtmf, 48000),
+            "SR-48 regression: END no longer stops the tone"
+        );
+    }
+
+    /// Regression: an END that arrives while the event is still queued is
+    /// recorded on the queued entry and stops the tone once played.
+    #[test]
+    fn test_sr48_end_before_activation_stops_tone() {
+        let metrics = DecodeMetrics::new();
+        let mut rx = DtmfRx::new();
+        let mut dtmf = DtmfPlayout::new();
+        let start: u32 = 4_000;
+        let playout = Some(start - SR48_NEAR_LEAD);
+        for (end, dur) in [(false, 160), (false, 400), (true, 800), (true, 800)] {
+            let _ = ingest_dtmf_event(
+                &mut rx,
+                &mut dtmf,
+                start,
+                sr48_event(DtmfDigit::Zero, end, dur),
+                playout,
+                &metrics,
+            );
+        }
+        assert_eq!(dtmf.schedule.len(), 1);
+        assert!(dtmf.schedule[0].ended);
+        assert!(!advance_dtmf_schedule(start, &mut dtmf, 48000));
+        assert!(dtmf.active_gen.is_some());
+        assert!(advance_dtmf_schedule(start + 800, &mut dtmf, 48000));
+    }
+
+    /// The received-DTMF notification channel is bounded: a far end that
+    /// floods NEW events while nothing drains the receiver (production has
+    /// no drain caller) cannot grow it, and the decode thread never blocks
+    /// on it.
+    #[test]
+    fn test_sr48_received_dtmf_channel_bounded_and_non_blocking() {
+        const SENT: usize = 10_000;
+        /// Generous ceiling for any sane bounded capacity.
+        const MAX_QUEUED: usize = 64;
+        let (tx, rx) = dtmf_rx_channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let sender = thread::spawn(move || {
+            for _ in 0..SENT {
+                notify_dtmf_rx(&tx, DtmfDigit::Three);
+            }
+            let _ = done_tx.send(());
+            tx
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "SR-48: notify_dtmf_rx blocked the decode thread on a full channel"
+        );
+        let _tx = sender.join().unwrap();
+        let queued = rx.try_iter().count();
+        assert!(
+            queued <= MAX_QUEUED,
+            "SR-48: {queued} digits queued after {SENT} notifications with no reader \
+             (expected a bounded channel, <= {MAX_QUEUED})"
+        );
+    }
+
+    // ---- SR-48 fix round 1 ----
+
+    /// RFC-1: the playout clock runs at the codec's RTP clock rate, which for
+    /// G.722 is 8000 Hz (RFC 3551 §4.5.2), not its 16 kHz sample rate.
+    #[test]
+    fn test_rfc1_ts_units_per_ms_follow_rtp_clock() {
+        for (pref, want) in [
+            (CodecPreference::G711Ulaw, 8),
+            (CodecPreference::G711Alaw, 8),
+            (CodecPreference::G722, 8),
+            (CodecPreference::Opus, 48),
+        ] {
+            let codec = CodecPipeline::new(pref).unwrap();
+            assert_eq!(
+                super::rtp_ts_units_per_ms(codec.clock_rate()),
+                want,
+                "{pref:?}"
+            );
+        }
+        // Opus: unchanged from the old samples-per-20ms derivation.
+        let opus = CodecPipeline::new(CodecPreference::Opus).unwrap();
+        assert_eq!(
+            super::rtp_ts_units_per_ms(opus.clock_rate()),
+            u32::try_from(opus.samples_per_frame() / 20).unwrap()
+        );
+        assert_eq!(super::rtp_ts_units_per_ms(0), 1);
+    }
+
+    /// RFC-1: on a G.722 call, a digit whose event start is 5 s after the
+    /// last decoded frame (VAD silence, carrier suppressing audio) is
+    /// accepted. With the old 16 units/ms the extrapolated playout ran 2x
+    /// and the start looked 5 s behind, so it was rejected.
+    #[test]
+    fn test_rfc1_g722_event_five_seconds_after_last_frame_accepted() {
+        let codec = CodecPipeline::new(CodecPreference::G722).unwrap();
+        let units = super::rtp_ts_units_per_ms(codec.clock_rate());
+        let anchor: u32 = 1_000_000;
+        let elapsed = Duration::from_secs(5);
+        // Sender's event start on its 8000 Hz RTP clock, 5 s later.
+        let packet_ts = anchor.wrapping_add(5 * 8000);
+        let playout = super::extrapolate_playout_ts(anchor, elapsed, units);
+
+        let metrics = DecodeMetrics::new();
+        let mut rx = DtmfRx::new();
+        let mut dtmf = DtmfPlayout::new();
+        let outcome = ingest_dtmf_event(
+            &mut rx,
+            &mut dtmf,
+            packet_ts,
+            sr48_event(DtmfDigit::Three, false, 160),
+            Some(playout),
+            &metrics,
+        );
+        assert_eq!(outcome, DtmfIngest::Scheduled);
+        assert_eq!(metrics.dtmf_rejected.load(Ordering::Relaxed), 0);
+
+        // The old derivation (samples_per_frame / 20 = 16) rejects it.
+        let old_units = u32::try_from(codec.samples_per_frame() / 20).unwrap();
+        assert_eq!(old_units, 16);
+        let mut rx = DtmfRx::new();
+        let mut dtmf = DtmfPlayout::new();
+        let old = ingest_dtmf_event(
+            &mut rx,
+            &mut dtmf,
+            packet_ts,
+            sr48_event(DtmfDigit::Three, false, 160),
+            Some(super::extrapolate_playout_ts(anchor, elapsed, old_units)),
+            &metrics,
+        );
+        assert_eq!(old, DtmfIngest::Rejected);
+    }
+
+    /// The extrapolation wraps on the 32-bit RTP timestamp.
+    #[test]
+    fn test_rfc1_extrapolate_playout_wraps() {
+        let got = super::extrapolate_playout_ts(u32::MAX - 7, Duration::from_millis(2), 8);
+        assert_eq!(got, 8);
+    }
+
+    /// SEC-5: a NEW event that is already a too-short END is refused
+    /// without overwriting the duration of the event in progress, so the
+    /// next continuation of that event is not taken as non-monotonic.
+    #[test]
+    fn test_sec5_short_end_leaves_current_duration() {
+        let metrics = DecodeMetrics::new();
+        let mut rx = DtmfRx::new();
+        let mut dtmf = DtmfPlayout::new();
+        let start: u32 = 50_000;
+        assert_eq!(
+            ingest_dtmf_event(
+                &mut rx,
+                &mut dtmf,
+                start,
+                sr48_event(DtmfDigit::One, false, 800),
+                Some(start),
+                &metrics,
+            ),
+            DtmfIngest::Scheduled
+        );
+        assert_eq!(rx.current_duration, 800);
+
+        // Different start ts, END with duration below DTMF_MIN_DURATION.
+        assert_eq!(
+            ingest_dtmf_event(
+                &mut rx,
+                &mut dtmf,
+                start + 160,
+                sr48_event(DtmfDigit::Two, true, DTMF_MIN_DURATION - 1),
+                Some(start),
+                &metrics,
+            ),
+            DtmfIngest::ShortEnd
+        );
+        assert_eq!(rx.current_duration, 800, "ShortEnd overwrote the duration");
+        assert_eq!(rx.current_ts, Some(start));
+
+        // The original event continues at 960: a monotonic update.
+        assert_eq!(
+            ingest_dtmf_event(
+                &mut rx,
+                &mut dtmf,
+                start,
+                sr48_event(DtmfDigit::One, false, 960),
+                None,
+                &metrics,
+            ),
+            DtmfIngest::Updated
+        );
+        assert_eq!(rx.current_duration, 960);
+    }
+
+    /// SEC-4: the first decode error is logged, the rest within the interval
+    /// are suppressed and counted, and the next logged one reports them.
+    #[test]
+    fn test_sec4_warn_rate_limit() {
+        let mut limit = super::WarnRateLimit::new();
+        let t0 = Instant::now();
+        assert_eq!(limit.check(t0), Some(0));
+        for i in 1..=50_u64 {
+            assert_eq!(limit.check(t0 + Duration::from_millis(i * 10)), None);
+        }
+        let t1 = t0 + super::WARN_RATE_LIMIT_INTERVAL;
+        assert_eq!(limit.check(t1), Some(50));
+        assert_eq!(limit.check(t1 + Duration::from_millis(1)), None);
+        assert_eq!(
+            limit.check(t1 + super::WARN_RATE_LIMIT_INTERVAL * 3),
+            Some(1)
+        );
     }
 }

@@ -669,6 +669,7 @@ impl CallManager {
     /// NIST 800-53 Rev5: SC-8(1), SC-23 -- fingerprints come only from the
     /// preflight of this dialog's SDP (strict parser), the role from its
     /// `a=setup`; one handshake per call.
+    // POAM: POA&M-374 (ICE checks inline on the pump)
     async fn begin_secure_media(
         &mut self,
         call_id: &str,

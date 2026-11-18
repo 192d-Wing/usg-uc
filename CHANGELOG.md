@@ -22,6 +22,60 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   sidecars and the dashboard's npm tree.** GitHub Actions updates are
   grouped into one weekly PR.
 
+### Security (client, SIP connect, DNS and send deadlines; RFC 4733 receive bounds; POA&M-374, 375, 377, 378)
+
+Tested locally on macOS arm64 only; no CI run yet.
+
+- **Client: SIP connect, DNS and send steps have deadlines.** (SC-5,
+  SI-17; SC-10 only for the dropped TLS handshake) TCP connect 5 s, TLS
+  handshake 10 s, each NAPTR, SRV or
+  A/AAAA query 2 s with no re-send (hickory defaults were 5 s with 2
+  re-sends, 15 s per unanswered query; names are sent fully qualified, so
+  the system search list adds no queries), RFC 3263 resolution chain 8 s,
+  single A/AAAA fallback lookup 5 s, write of one message on an
+  established SIP-TLS connection 5 s. DNS completes before the client
+  transaction starts, so Timer B is unaffected. Before, a peer that accepted TCP and
+  never answered the `ClientHello`, a resolver that never answered, or a
+  peer that stopped reading could freeze the client (no inbound calls, no
+  registration refresh, hang-up blocked). On expiry the request fails with
+  an error naming the peer or host and the phase, and a partial or
+  stalled connection is dropped. The connection map lock is no longer held across socket I/O.
+  A send that times out or fails part-way through a write marks the
+  connection unusable: later sends on it are refused with
+  `connection to {peer} unusable after an earlier failed send` and write
+  nothing, so a message is never appended to a partial one.
+- **uc-dns: query-limited constructors (additive).**
+  `HickoryDnsResolver::from_system_conf_with_query_limits(cache,
+  query_timeout, retries)` and `SipResolver::with_system_dns_query_limits(
+  query_timeout, retries)` build from the system DNS configuration and set
+  the per-query timeout and re-send count; like `from_system_conf` they
+  fail closed (no system configuration means no DNS backend, never public
+  resolvers). Existing constructors and their callers are unchanged.
+- **Client: received RFC 4733 telephone-events are bounded per call.**
+  (SC-5, SI-10) At most 8 scheduled events (oldest dropped); a new event
+  more than 32,000 timestamp units from the playout position is rejected;
+  received-digit notifications use a bounded channel and are dropped when
+  full. New counters `PipelineStats::dtmf_rejected` and
+  `PipelineStats::decode_errors`. The DTMF playout position now follows the
+  codec's RTP clock (G.722 counts 8 units/ms, not 16), and a comfort-noise
+  packet re-anchors it.
+- **Client: log changes for log collectors.** (AU-4) The per-event lines
+  `DTMF bypass: NEW event ...` and `DTMF bypass: END ...` are now logged at
+  `debug`, not `info`, so they are absent at the default level. The
+  `Decode error: ...` warning is rate-limited (first one, then at most one
+  per second) and now ends with `(N suppressed)`.
+- **Open items.** The waits still run inline on the client event pump
+  under the GUI client mutex: up to 28 s per outbound request on the
+  connect path (DNS 8 s + 5 s, TCP 5 s, TLS 10 s), then up to 5 s per
+  send, plus up to 3 s of ICE checks. An ACK for a 2xx to an unresolved,
+  unreachable next hop can outlast the UAS's 64*T1 wait, and a system
+  lookup that hit its deadline keeps a blocking thread until the OS
+  resolver gives up (POA&M-374). The STUN server lookup at start-up has no deadline
+  (POA&M-375). A transport failure is logged, not reported to the
+  transaction user as a 503, and no next DNS target is tried (POA&M-377).
+  RFC 4733 receive deviations: Opus calls offer only `telephone-event/8000`,
+  and events over 40,000 units are discarded (POA&M-378).
+
 ### BREAKING (SBC, DTLS-SRTP sidecar keeps the association for the whole call, POA&M-335, 340, 341, 342)
 
 Affects only SBCs that terminate DTLS-SRTP (`sbcDaemon.dtlsTerminate.enabled`,

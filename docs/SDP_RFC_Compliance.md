@@ -119,6 +119,7 @@ The client implements SDP for audio-only calls in two modes: plain RTP (`RTP/AVP
 - **Section 2.3.3 (Payload Format)**: 4-byte format correctly encoded/decoded
 - **Section 2.5 (Procedures - Multiple Packets)**: Same timestamp for all packets in event
 - **Section 2.5.1.1 (Duration)**: Duration increments correctly, end bit set on final packets
+- **Section 2.5 (receive, soft client)**: received events are bounded per call in `client-audio/src/decode_thread.rs`: at most 8 scheduled events (oldest dropped), a new event more than 32,000 timestamp units from the playout position is rejected (4 s at 8 kHz, 0.67 s with Opus; the playout position follows the audio codec's RTP clock, G.722 at 8000 Hz per RFC 3551 §4.5.2), digit notifications go through a bounded channel. Tests `test_sr48_*`, `test_rfc1_*`. Deviations (NIST POA&M-378): with Opus only `telephone-event/8000` is offered and event timestamps are compared on the 48 kHz audio clock (§2.1, RFC 7160); events longer than 40,000 units are discarded, below the 65,535 a segment may reach (§2.5.1.3). Local runs on macOS arm64 only
 - **Section 3 (SDP)**: `a=rtpmap:101 telephone-event/8000` and `a=fmtp:101 0-15`
 - **Conditional Sending**: Only sends RFC 4733 if negotiated in SDP
 

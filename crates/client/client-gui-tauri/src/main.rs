@@ -179,6 +179,65 @@ async fn trust_extra_ca_for_sip(
     }
 }
 
+/// Deadline for the registrar pre-resolve (same 5 s as the SIP UA's DNS
+/// lookups).
+#[cfg(feature = "insecure-transports")]
+const REGISTRAR_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the configured registrar resolves to an IPv6 address, which
+/// selects the UDP SIP socket family. Unresolvable or unset: IPv4.
+#[cfg(feature = "insecure-transports")]
+async fn registrar_prefers_ipv6(settings_manager: &Arc<RwLock<SettingsManager>>) -> bool {
+    let settings = settings_manager.read().await;
+    let registrar_uri = settings
+        .default_account()
+        .map_or_else(String::new, |a| a.registrar_uri.clone());
+    drop(settings);
+
+    if registrar_uri.is_empty() {
+        false
+    } else {
+        // Strip sip:/sips: prefix for DNS lookup
+        let host = registrar_uri
+            .strip_prefix("sips:")
+            .or_else(|| registrar_uri.strip_prefix("sip:"))
+            .unwrap_or(&registrar_uri);
+        // NIST 800-53 Rev5: SC-5, SI-17 — bound the pre-resolve
+        // (same 5 s deadline as the SIP UA's DNS lookups); a stalled
+        // resolver defaults to IPv4 like any other lookup failure.
+        let lookup = tokio::time::timeout(
+            REGISTRAR_DNS_TIMEOUT,
+            tokio::net::lookup_host(format!("{host}:5060")),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("DNS lookup for {host} timed out after {REGISTRAR_DNS_TIMEOUT:?}"),
+            ))
+        });
+        match lookup {
+            Ok(addrs) => {
+                let all_addrs: Vec<_> = addrs.collect();
+                let has_ipv4 = all_addrs.iter().any(std::net::SocketAddr::is_ipv4);
+                let has_ipv6 = all_addrs.iter().any(std::net::SocketAddr::is_ipv6);
+                info!(
+                    registrar = host,
+                    ipv4 = has_ipv4,
+                    ipv6 = has_ipv6,
+                    "Registrar DNS resolved"
+                );
+                // Prefer IPv6 when available
+                has_ipv6
+            }
+            Err(e) => {
+                info!(error = %e, "Registrar DNS pre-resolve failed, defaulting to IPv4");
+                false
+            }
+        }
+    }
+}
+
 /// Initialize the SIP client core.
 #[tauri::command]
 async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String> {
@@ -213,43 +272,7 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
     // Resolve registrar DNS to determine if we need IPv4 or IPv6 socket.
     // If the registrar only has AAAA records (no A records), use IPv6.
     #[cfg(feature = "insecure-transports")]
-    let use_ipv6 = {
-        let settings = state.settings_manager.read().await;
-        let registrar_uri = settings
-            .default_account()
-            .map(|a| a.registrar_uri.clone())
-            .unwrap_or_default();
-        drop(settings);
-
-        if registrar_uri.is_empty() {
-            false
-        } else {
-            // Strip sip:/sips: prefix for DNS lookup
-            let host = registrar_uri
-                .strip_prefix("sips:")
-                .or_else(|| registrar_uri.strip_prefix("sip:"))
-                .unwrap_or(&registrar_uri);
-            match tokio::net::lookup_host(format!("{host}:5060")).await {
-                Ok(addrs) => {
-                    let all_addrs: Vec<_> = addrs.collect();
-                    let has_ipv4 = all_addrs.iter().any(std::net::SocketAddr::is_ipv4);
-                    let has_ipv6 = all_addrs.iter().any(std::net::SocketAddr::is_ipv6);
-                    info!(
-                        registrar = host,
-                        ipv4 = has_ipv4,
-                        ipv6 = has_ipv6,
-                        "Registrar DNS resolved"
-                    );
-                    // Prefer IPv6 when available
-                    has_ipv6
-                }
-                Err(e) => {
-                    info!(error = %e, "Registrar DNS pre-resolve failed, defaulting to IPv4");
-                    false
-                }
-            }
-        }
-    };
+    let use_ipv6 = registrar_prefers_ipv6(&state.settings_manager).await;
 
     // Get UDP socket and event sender for the receive loop BEFORE initialize
     // This ensures the receive loop is running before any registration sends
