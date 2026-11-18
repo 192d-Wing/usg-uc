@@ -2331,8 +2331,8 @@ mod tests {
         let config = TransportConfig::new()
             .with_client_certificate(vec![vec![1]], Some(Zeroizing::new(vec![0xAB; 4])));
         let text = format!("{config:?}");
-        assert!(text.contains("<redacted>"), "{text}");
-        assert!(!text.contains("171"), "{text}");
+        assert!(text.contains("<redacted>"), "Debug output is not redacted");
+        assert!(!text.contains("171"), "Debug output contains key bytes");
     }
 
     #[tokio::test]

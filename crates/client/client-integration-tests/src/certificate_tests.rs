@@ -49,8 +49,7 @@ async fn test_certificate_auto_select_prefers_cnsa() {
             if has_p384 {
                 assert!(
                     cert.key_algorithm.contains("P-384"),
-                    "Should select P-384 certificate, got: {}",
-                    cert.key_algorithm
+                    "Should select a P-384 certificate"
                 );
             }
         }

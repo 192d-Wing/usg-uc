@@ -91,8 +91,7 @@ fn selection_never_picks_a_fabricated_certificate() {
         if let Ok(cert) = store.select_certificate(&config) {
             assert!(
                 !is_fabricated(&cert),
-                "{mode:?} selected fabricated certificate {}",
-                cert.subject_cn
+                "{mode:?} selected a fabricated certificate"
             );
         }
     }
@@ -102,7 +101,7 @@ fn selection_never_picks_a_fabricated_certificate() {
         let result = store.select_certificate(&config);
         assert!(
             result.is_err(),
-            "specific selection of a fabricated thumbprint succeeded: {result:?}"
+            "specific selection of a fabricated thumbprint succeeded"
         );
     }
 }
@@ -112,7 +111,10 @@ fn fabricated_thumbprints_are_not_found() {
     let store = CertificateStore::open_personal();
     for thumbprint in STUB_THUMBPRINTS {
         let result = store.find_by_thumbprint(thumbprint);
-        assert!(result.is_err(), "{thumbprint}: {result:?}");
+        assert!(
+            result.is_err(),
+            "selection of a fabricated thumbprint succeeded"
+        );
     }
 }
 
@@ -184,8 +186,7 @@ fn verify_pin_is_not_supported_off_windows() {
             let result = store.verify_pin(thumbprint, &SmartCardPin::new(pin));
             assert!(
                 matches!(result, Err(CertStoreError::NotSupported)),
-                "thumbprint {thumbprint:?}, PIN of length {}: {result:?}",
-                pin.len()
+                "verify_pin did not return NotSupported"
             );
         }
     }
@@ -233,8 +234,7 @@ fn certificate_chain_is_never_the_fabricated_der() {
             for der in &chain {
                 assert!(
                     !der.windows(STUB_DER_CN.len()).any(|w| w == STUB_DER_CN),
-                    "{}: chain contains the fabricated certificate",
-                    cert.thumbprint
+                    "chain contains the fabricated certificate"
                 );
             }
         }
@@ -253,8 +253,7 @@ fn has_private_key_is_not_claimed_off_windows() {
         let result = store.has_private_key(&cert.thumbprint);
         assert!(
             !matches!(result, Ok(true)),
-            "{}: private key claimed without a card-backed signer",
-            cert.thumbprint
+            "private key claimed without a card-backed signer"
         );
     }
 }

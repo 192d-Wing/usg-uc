@@ -15,7 +15,7 @@
 use crate::settings::CertificateFilterSettings;
 use client_types::{CertificateConfig, CertificateInfo, CertificateSelectionMode, SmartCardPin};
 use thiserror::Error;
-#[cfg(not(windows))]
+#[cfg(all(not(windows), any(target_os = "macos", not(test))))]
 use tracing::warn;
 use tracing::{debug, info};
 
