@@ -938,3 +938,14 @@ From the compliance audit; revisit if a deployment requires them.
 
 - [ ] v0.2.0 workspace version bumps are parked in a `git stash` (release work);
   land them on the release branch when cutting v0.2.0.
+- [ ] **CodeQL flags test fixtures as hard-coded crypto values.** Rule
+  `rust/hard-coded-cryptographic-value` reports literal test passwords and
+  keys (111 open on `main` as of 2026-11-18, 107 already dismissed as
+  "used in tests"); every PR that adds a digest or key test turns the
+  CodeQL check red. Default setup cannot exclude test code, and path
+  filters cannot reach inline `#[cfg(test)] mod tests` blocks. Fix: switch
+  CodeQL to advanced setup with a config that excludes test paths (or
+  filters this rule there), move the large inline test modules
+  (`sbc-daemon` `sip_stack.rs`, `digest_credentials.rs`, `runtime.rs`;
+  `proto-sip` `digest_verifier.rs`) into `tests/` files, then close the
+  dismissed and open fixture alerts. Touches CI workflows.
