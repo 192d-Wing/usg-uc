@@ -259,6 +259,61 @@ If the IdP uses a private CA, set `sbcClientConfig.extraCaCert` to the PEM block
 so the pods trust its OIDC metadata/JWKS. Alternatively, enable `gateway` to let
 cert-manager issue and terminate the edge certificate automatically.
 
+### Daemon gRPC mTLS
+
+`sbcDaemon.grpcMtls.enabled` is `true` by default: sbc-api and the trunk agent
+reach the daemon gRPC (port 9091) over the pod network, and the daemon refuses
+a plaintext gRPC listener that is not on loopback. Rendering fails until you
+supply one of:
+
+- **cert-manager:** `sbcDaemon.grpcMtls.clusterIssuer: <issuer>` (and
+  `issuerKind: Issuer` for a namespaced issuer). The chart issues ECDSA P-384
+  certificates: the server certificate for `<fullname>-grpc`, the sbc-api
+  client certificate (CN `<fullname>-sbc-api`) and, with
+  `sbcTrunkAgent.enabled`, the trunk-agent client certificate (CN
+  `<fullname>-sbc-trunk-agent`). Use a dedicated CA issuer for this, for
+  example a namespaced CA `Issuer`:
+
+  ```yaml
+  apiVersion: cert-manager.io/v1
+  kind: Issuer
+  metadata: { name: sbc-grpc-ca, namespace: sbc-system }
+  spec:
+    ca: { secretName: sbc-grpc-ca }   # tls.crt/tls.key of a P-384 CA
+  ```
+
+  A shared `ClusterIssuer` also works, but then any workload that can request
+  a certificate from it can obtain an allow-listed name.
+- **Your own Secrets:** `serverSecretName` and `clientSecretName` (plus
+  `trunkAgentClientSecretName` with the trunk agent), each holding `tls.crt`,
+  `tls.key` and `ca.crt`. P-384 example with `openssl`:
+
+  ```sh
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-384 -nodes -days 365 \
+    -subj "/CN=sbc-grpc-ca" -keyout ca.key -out ca.crt
+  F=sbc-<site>   # the chart fullname
+  issue() { # $1 name, $2 extension
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-384 -nodes \
+      -subj "/CN=$1" -keyout "$1.key" -out "$1.csr"
+    openssl x509 -req -in "$1.csr" -CA ca.crt -CAkey ca.key -days 90 \
+      -extfile <(printf '%s' "$2") -out "$1.crt"
+    kubectl -n sbc-system create secret generic "$1-tls" \
+      --from-file=tls.crt="$1.crt" --from-file=tls.key="$1.key" --from-file=ca.crt
+  }
+  issue "$F-grpc" "subjectAltName=DNS:$F-grpc,DNS:$F-grpc.sbc-system.svc,DNS:$F-grpc.sbc-system.svc.cluster.local
+  extendedKeyUsage=serverAuth"
+  issue "$F-sbc-api" "extendedKeyUsage=clientAuth"
+  issue "$F-sbc-trunk-agent" "extendedKeyUsage=clientAuth"   # with the trunk agent
+  ```
+
+  then set `serverSecretName: $F-grpc-tls`, `clientSecretName: $F-sbc-api-tls`
+  and `trunkAgentClientSecretName: $F-sbc-trunk-agent-tls`.
+
+`grpcMtls.enabled: false` renders only with `sbcApi.enabled: false` and
+`sbcTrunkAgent.enabled: false`: the daemon gRPC then listens on 127.0.0.1 only
+(no `-grpc` Service), reachable from inside the pod, e.g. `kubectl exec ...
+sbc-cli`.
+
 ---
 
 ## 7. Verify
@@ -359,6 +414,63 @@ This upgrade has breaking changes. Check each point before you upgrade.
   files every 30 s and reloads them when they change, so cert-manager renewals
   apply without a restart. A failed reload keeps the old certificate in use;
   watch `sbc_api_tls_cert_reload_failures_total`.
+
+### Upgrading to the containment hardening release (pr/sec-containment)
+
+This upgrade has breaking changes. Check each point before you upgrade.
+
+- **Daemon gRPC mTLS is on by default** (`sbcDaemon.grpcMtls.enabled: true`)
+  and needs `grpcMtls.clusterIssuer` or explicit Secret names; rendering
+  fails otherwise (see "Daemon gRPC mTLS" above). Site values files,
+  including `deploy/helm/sites/sbc/oopl-001/values.yaml`, must add one.
+  `grpcMtls.enabled: false` now fails rendering while `sbcApi` or
+  `sbcTrunkAgent` is enabled. The trunk agent can now run with mTLS (its own
+  client certificate, `grpcMtls.trunkAgentClientSecretName`).
+- **`sbcDaemon.config.grpc_listen` defaults to empty**: `0.0.0.0:9091` with
+  mTLS, `127.0.0.1:9091` without. A non-loopback value without mTLS fails
+  rendering, and the daemon refuses such a `[grpc]` section at startup. The
+  `-grpc` Service exists only with mTLS.
+- **NetworkPolicies are on by default** (`networkPolicy.enabled: true`,
+  `templates/28-sbc-networkpolicy.yaml`): default-deny ingress for every pod
+  of the release, with allows for SIP/RTP to the daemon, daemon REST from the
+  frontend and sbc-api, daemon gRPC from sbc-api and the trunk agent, sbc-api
+  and provisioning from the frontend, the frontend and client-config from
+  `networkPolicy.edgeFrom` (any source when empty) and Postgres from the
+  release pods. Any other caller (Prometheus scrapes, ad-hoc tools) is
+  blocked: add it with `networkPolicy.daemonGrpcFrom` (gRPC) or turn the
+  policies off. On CNIs that enforce policy on host traffic, set
+  `networkPolicy.probeFrom` to the node CIDR. Needs Kubernetes >= 1.25.
+- **sbc-media (mediaSplit) binds its controller to 127.0.0.1:9096**; a
+  non-loopback `SBC_MEDIA_GRPC_LISTEN` exits with code 2 unless mTLS
+  (`SBC_MEDIA_GRPC_TLS_*` plus `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES`) is
+  configured. The chart's co-located pod keeps loopback.
+- **`X-Real-IP` is ignored unless `SBC_TRUSTED_PROXIES` is set.** Set
+  `sbcProvision.trustedProxies` (required with `allowedSourceCidrs`; rendering
+  fails otherwise) and `sbcApi.trustedProxies` to the frontend pod CIDR. A
+  pod-CIDR value is sound only while `networkPolicy.enabled` (on a CNI that
+  enforces it): with policies off, rendering fails unless you set
+  `networkPolicy.trustedProxiesWithoutPolicy: true` and restrict access to
+  sbc-api and provisioning some other way. For phone addresses to reach nginx
+  through an ingress controller, also set `sbcFrontend.realIpFrom` to the
+  edge proxies' **own** addresses only (never the whole pod CIDR: every listed
+  address may assert any client address), together with
+  `networkPolicy.edgeFrom` naming those proxies (rendering fails without it
+  while policies are on), so nothing else can reach the frontend.
+- **`SBC_PROVISION_SECRET`** can now come from a Secret:
+  `sbcProvision.provisionSecret.existingSecret` (key
+  `sbcProvision.provisionSecret.key`, default `provision-secret`).
+- **OIDC access to sbc-api needs realm role `fleet-admin` and `sites` ∋ `*`**;
+  other valid tokens get 403. The `config-admin` scope no longer grants
+  anything on its own (central-config-api as well). See
+  `deploy/keycloak/central-config-clients.md`.
+- **central-config chart: no default database password.** `postgres.password`
+  (bundled) and `postgres.cnpg.password` (cnpg, or
+  `postgres.cnpg.existingSecret`) are required, and `change-me` is refused.
+  On an existing install set the password the database already uses, or
+  rotate the role password in the database in the same change: a new Secret
+  value alone does not change the password of an initialised bundled
+  Postgres. In cnpg mode the chart-owned DSNs now use `sslmode=verify-full`
+  against `postgres.cnpg.caSecret` (default `<cluster>-ca`, key `ca.crt`).
 
 ### Upgrading to the client DTLS-SRTP release (feat/client-dtls-wiring)
 

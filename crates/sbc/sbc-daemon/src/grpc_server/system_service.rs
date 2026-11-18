@@ -156,8 +156,9 @@ impl SystemService for SystemServiceImpl {
 
     async fn reload_tls(
         &self,
-        _request: Request<ReloadTlsRequest>,
+        request: Request<ReloadTlsRequest>,
     ) -> Result<Response<ReloadTlsResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         info!("gRPC ReloadTls");
 
         let result = self.state.reload_tls_certificates();
@@ -167,6 +168,19 @@ impl SystemService for SystemServiceImpl {
             .as_ref()
             .map(|a| a.key_path().clone());
         audit_tls_reload(&result, key_path.as_deref());
+        // The key operation record above has no caller field; this record
+        // names the certificate principal that asked for the reload.
+        // NIST 800-53 Rev5: AU-3, AU-12
+        let failed = result
+            .as_ref()
+            .err()
+            .map(|_| Status::internal("TLS reload failed"));
+        let outcome = match (&result, &failed) {
+            (Ok(true), _) => super::admin_audit::AdminOutcome::Applied,
+            (_, Some(status)) => super::admin_audit::AdminOutcome::Failed(status),
+            _ => super::admin_audit::AdminOutcome::NoOp,
+        };
+        super::admin_audit::audit_admin_rpc(admin, "SystemService/ReloadTls", "api-tls", outcome);
         match result {
             Ok(true) => {
                 let tls_stats = self.state.tls_stats();
@@ -236,6 +250,7 @@ impl SystemService for SystemServiceImpl {
         &self,
         request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         let req = request.into_inner();
         info!(
             timeout_secs = req.timeout_secs,
@@ -246,7 +261,14 @@ impl SystemService for SystemServiceImpl {
 
         // TODO: Implement actual shutdown initiation
         // This would need access to the ShutdownCoordinator
-        Err(Status::unimplemented("Shutdown not yet implemented"))
+        let status = Status::unimplemented("Shutdown not yet implemented");
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "SystemService/Shutdown",
+            &format!("drain_only={}", req.drain_only),
+            super::admin_audit::AdminOutcome::Failed(&status),
+        );
+        Err(status)
     }
 }
 

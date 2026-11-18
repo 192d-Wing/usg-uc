@@ -43,12 +43,23 @@ app.kubernetes.io/component: postgres
 {{- printf "%s-pg" (include "central-config.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
+{{/* Credential Secret for cnpg mode: postgres.cnpg.existingSecret or ours. */}}
+{{- define "central-config.cnpgSecret" -}}
+{{- .Values.postgres.cnpg.existingSecret | default (printf "%s-cnpg" (include "central-config.fullname" .)) -}}
+{{- end }}
+
+{{/* CA Secret (key ca.crt) for verify-full to the CNPG Cluster. */}}
+{{- define "central-config.cnpgCaSecret" -}}
+{{- .Values.postgres.cnpg.caSecret | default (printf "%s-ca" (include "central-config.cnpgName" .)) -}}
+{{- end }}
+
 {{/*
   Database env for the API: the read-write CENTRAL_POSTGRES_URL, an optional
   read-only CENTRAL_POSTGRES_RO_URL (which enables the read/write split), and
   the per-pool connection cap. Sourced per `postgres.mode`:
     bundled  — one Secret, dsn only (no replica; reads use the primary).
-    cnpg     — our owned Secret with dsn (-rw) and dsnRo (-ro).
+    cnpg     — our owned Secret (or postgres.cnpg.existingSecret) with dsn
+               (-rw) and dsnRo (-ro).
     external — existingSecret.key for RW, optional existingSecret.roKey for RO.
 */}}
 {{- define "central-config.dsnEnv" -}}
@@ -60,12 +71,12 @@ app.kubernetes.io/component: postgres
       name: {{ include "central-config.fullname" . }}-postgres
       key: dsn
 {{- else if eq $mode "cnpg" }}
-      name: {{ include "central-config.fullname" . }}-cnpg
+      name: {{ include "central-config.cnpgSecret" . }}
       key: dsn
 - name: CENTRAL_POSTGRES_RO_URL
   valueFrom:
     secretKeyRef:
-      name: {{ include "central-config.fullname" . }}-cnpg
+      name: {{ include "central-config.cnpgSecret" . }}
       key: dsnRo
 {{- else if eq $mode "external" }}
       name: {{ required "postgres.existingSecret.name required when postgres.mode=external" .Values.postgres.existingSecret.name }}

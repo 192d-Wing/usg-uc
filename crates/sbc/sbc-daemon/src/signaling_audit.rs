@@ -40,7 +40,7 @@ pub const MAX_AUDIT_FIELD_BYTES: usize = 256;
 /// characters and truncates to [`MAX_AUDIT_FIELD_BYTES`] on a char boundary.
 ///
 /// ## NIST 800-53 Rev5: AU-3, AU-9, SC-5
-fn audit_field(s: &str) -> String {
+pub fn audit_field(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(MAX_AUDIT_FIELD_BYTES));
     for c in s.chars().filter(|c| !c.is_control()) {
         if out.len() + c.len_utf8() > MAX_AUDIT_FIELD_BYTES {

@@ -17,7 +17,11 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate", "chrono"] }
+# `tls-rustls-aws-lc-rs`: so a DSN with `sslmode=verify-full` and
+# `sslrootcert` (the chart's CNPG mode) can connect. sqlx builds its own
+# rustls ClientConfig with the aws-lc-rs default provider (suites not
+# CNSA-pinned; POA&M-240).
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate", "chrono", "tls-rustls-aws-lc-rs"] }
 chrono = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 
