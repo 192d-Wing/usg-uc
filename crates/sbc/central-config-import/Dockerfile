@@ -66,7 +66,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # =============================================================================
 # Stage 4: Runtime — alpine with the bare libs the binary needs.
 # =============================================================================
-FROM alpine:3.21 AS runtime
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -g 1000 importer \

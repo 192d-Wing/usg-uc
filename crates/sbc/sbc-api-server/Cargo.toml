@@ -78,3 +78,7 @@ nix = { workspace = true, features = ["fs", "user"] }
 tempfile.workspace = true
 uc-user-mgmt = { path = "../../uc/uc-user-mgmt", default-features = false, features = ["postgres", "encryption", "sqlite"] }
 uc-audit = { workspace = true, features = ["test-capture"] }
+# Router-level OIDC tests: mint ES384 tokens against a static JWKS.
+jsonwebtoken.workspace = true
+aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
+base64 = "0.22"

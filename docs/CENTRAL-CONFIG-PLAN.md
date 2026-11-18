@@ -86,7 +86,8 @@ Key properties:
 - **Site code is the security boundary.** One OIDC `config-sync` credential
   per site, its `site_code` claim pinned to one shard; a site can read and
   upload only its own rows, never another's, and never fleet templates.
-  Operators use a separate `config-admin` scope for fleet-wide writes.
+  Operators use a separate `config-admin` scope as the token audience;
+  fleet-wide writes also require role `fleet-admin` with `sites` containing `*`.
 
 ---
 
@@ -333,7 +334,9 @@ epoch), which the journal handles naturally and lets you do staged rollout
 - Operator authz is a second OIDC scope, `config-admin`, validated by a
   separate validator sharing the same issuer/JWKS as the sync validator —
   so a site's `config-sync` pull token can never write and an operator
-  token can never masquerade as a site agent. (Per-site operator scoping
+  token can never masquerade as a site agent. The scope alone grants
+  nothing: writes are authorized on the token's roles and `sites` claim
+  (`policy.rs` `Subject::permits`). (Per-site operator scoping
   like `config-admin:MUHJ` and the dashboard site-selector/fleet views
   remain to wire up.)
 - Validation moved central: trunk-group and dial-plan payloads are parsed

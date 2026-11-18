@@ -50,17 +50,18 @@ pub fn parse_cidr_list(raw: &str) -> Result<Vec<IpNet>, String> {
 ///   if the direct peer (`peer`) is within one of those networks;
 ///   otherwise the header is ignored and `peer` is returned, so a direct
 ///   caller cannot spoof its address.
-/// - When `trusted_proxies` is empty, proxy verification is disabled and
-///   `X-Real-IP` is honored unconditionally (preserving the historical
-///   behavior). Front-facing pods should log a startup warning in this
-///   case and operators should set the trusted-proxy list to the nginx
-///   pod network.
+/// - When `trusted_proxies` is empty, no proxy is trusted: the header is
+///   ignored and `peer` is returned. Behind nginx that is the proxy's
+///   address, so operators set the trusted-proxy list to the nginx pod
+///   network to key decisions on the real client.
 ///
 /// Falls back to `peer` whenever the header is absent or unparseable.
+///
+/// ## NIST 800-53 Rev5: SC-7, SI-10 (client-supplied header trusted only
+/// from configured proxies)
 #[must_use]
 pub fn resolve_client_ip(headers: &HeaderMap, peer: IpAddr, trusted_proxies: &[IpNet]) -> IpAddr {
-    let trust_header =
-        trusted_proxies.is_empty() || trusted_proxies.iter().any(|net| net.contains(&peer));
+    let trust_header = trusted_proxies.iter().any(|net| net.contains(&peer));
     if trust_header
         && let Some(ip) = headers
             .get("x-real-ip")
@@ -103,11 +104,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_trusted_list_honors_header_unconditionally() {
-        // Verification disabled: header is trusted even from an
-        // arbitrary peer (historical behavior).
+    fn empty_trusted_list_ignores_header() {
+        // No proxy is trusted: the client IP is the TCP peer.
         let got = resolve_client_ip(&hdrs(Some("203.0.113.7")), ip("10.9.9.9"), &[]);
-        assert_eq!(got, ip("203.0.113.7"));
+        assert_eq!(got, ip("10.9.9.9"));
     }
 
     #[test]

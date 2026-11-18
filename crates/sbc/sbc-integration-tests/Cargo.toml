@@ -57,6 +57,8 @@ tokio-stream = { version = "0.1", features = ["net"], optional = true }
 [dev-dependencies]
 # SIPREC fork test: the fake recorder's SRTP contexts (siprec_fork).
 proto-srtp.workspace = true
+# Realm-import checks (config_tests) and the helm render tests (helm_render).
+serde_json.workspace = true
 
 [lib]
 name = "sbc_integration_tests"

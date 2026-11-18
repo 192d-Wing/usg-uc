@@ -51,8 +51,8 @@ pub struct Config {
     /// (comma-separated). The login rate limiter keys on the real
     /// client IP only when the request's TCP peer is one of these; a
     /// caller connecting directly to this pod (bypassing nginx) can't
-    /// forge its address. Empty = trust `X-Real-IP` unconditionally
-    /// (a startup warning is logged).
+    /// forge its address. Empty = trust no proxy: `X-Real-IP` is ignored
+    /// and the limiter keys on the TCP peer.
     pub trusted_proxies: Vec<ipnet::IpNet>,
 
     /// Client certificate for mTLS to the daemon's gRPC listener

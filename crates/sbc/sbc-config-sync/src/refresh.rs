@@ -80,6 +80,8 @@ impl GrpcRefresher {
     /// # Errors
     /// Returns the URI parse error string if `daemon_grpc_url` is malformed.
     /// The connection itself is lazy and never fails here.
+    // POAM: POA&M-382 (IA-3, SC-8) plaintext channel; no gRPC TLS client, so
+    // an mTLS-only daemon listener cannot be reached.
     pub fn connect(daemon_grpc_url: &str) -> Result<Self, String> {
         let channel = Channel::from_shared(daemon_grpc_url.to_string())
             .map_err(|e| e.to_string())?

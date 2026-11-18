@@ -2,6 +2,10 @@ server {
     listen 8080;
     server_name _;
 
+    # Trusted edge proxies for the client address (sbcFrontend.realIpFrom,
+    # rendered by the chart; empty when unset).
+    ${SBC_REAL_IP_CONF}
+
     # --- Security headers (C10) ---
     add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ${SBC_OIDC_ISSUER}; frame-ancestors 'none'" always;
     add_header X-Frame-Options "DENY" always;

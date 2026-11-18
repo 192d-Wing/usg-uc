@@ -24,10 +24,11 @@ use crate::media_pipeline::{
 use sbc_grpc_api::sbc as pb;
 use sbc_grpc_api::sbc::media_controller_service_client::MediaControllerServiceClient;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use uc_media_engine::MediaMode;
 use uc_types::address::SbcSocketAddr;
 
@@ -37,6 +38,156 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Deadline for one media-control RPC. Well under the INVITE's Timer B, so a
 /// dead node is marked down and the call placed on another node in time.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Client mTLS material for the media control channel (PEM file paths), from
+/// `SBC_MEDIA_CONTROLLER_TLS_{CA,CERT,KEY}_FILE` plus the optional
+/// `SBC_MEDIA_CONTROLLER_TLS_DOMAIN` server-name override.
+///
+/// ## NIST 800-53 Rev5: IA-3, SC-8
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaControllerTls {
+    /// CA that signs the media nodes' server certificates.
+    pub ca: PathBuf,
+    /// This daemon's client certificate.
+    pub cert: PathBuf,
+    /// This daemon's client private key.
+    pub key: PathBuf,
+    /// Server name to verify instead of the URL host (DNS name or IP).
+    pub domain: Option<String>,
+}
+
+impl MediaControllerTls {
+    /// All three files or none; an empty value counts as unset. `domain`
+    /// is only meaningful with the files.
+    ///
+    /// # Errors
+    /// A message naming the variables when only some files are set, or a
+    /// domain override without them.
+    pub fn from_parts(
+        ca: Option<String>,
+        cert: Option<String>,
+        key: Option<String>,
+        domain: Option<String>,
+    ) -> Result<Option<Self>, String> {
+        let set = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+        let domain = set(domain);
+        match (set(ca), set(cert), set(key)) {
+            (None, None, None) if domain.is_none() => Ok(None),
+            (Some(ca), Some(cert), Some(key)) => Ok(Some(Self {
+                ca: ca.into(),
+                cert: cert.into(),
+                key: key.into(),
+                domain,
+            })),
+            _ => Err(
+                "SBC_MEDIA_CONTROLLER_TLS_{CA,CERT,KEY}_FILE: set all three or none \
+                      (SBC_MEDIA_CONTROLLER_TLS_DOMAIN needs them)"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// From the process environment.
+    ///
+    /// # Errors
+    /// As [`Self::from_parts`].
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let var = |k: &str| std::env::var(k).ok();
+        Self::from_parts(
+            var("SBC_MEDIA_CONTROLLER_TLS_CA_FILE"),
+            var("SBC_MEDIA_CONTROLLER_TLS_CERT_FILE"),
+            var("SBC_MEDIA_CONTROLLER_TLS_KEY_FILE"),
+            var("SBC_MEDIA_CONTROLLER_TLS_DOMAIN"),
+        )
+    }
+}
+
+/// Checks a media node URL against the client TLS setting.
+///
+/// With client TLS configured the URL must be `https://`, so the control
+/// channel cannot fall back to plaintext. Without TLS the node must be on
+/// loopback (`127.0.0.0/8`, `[::1]` or `localhost`): a media node off
+/// loopback accepts only an mTLS client.
+///
+/// # Errors
+/// A message naming the URL and `SBC_MEDIA_CONTROLLER_TLS_*`.
+///
+/// ## NIST 800-53 Rev5: SC-8, SC-7
+pub fn check_media_url(url: &str, tls: Option<&MediaControllerTls>) -> Result<(), String> {
+    let https = url
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
+    if tls.is_some() {
+        if !https {
+            return Err(format!(
+                "media node URL {url:?} must use https:// when \
+                 SBC_MEDIA_CONTROLLER_TLS_{{CA,CERT,KEY}}_FILE are set"
+            ));
+        }
+        return Ok(());
+    }
+    let loopback = url
+        .parse::<tonic::codegen::http::Uri>()
+        .ok()
+        .and_then(|u| u.host().map(str::to_ascii_lowercase))
+        .is_some_and(|h| {
+            let h = h.trim_start_matches('[').trim_end_matches(']');
+            h == "localhost" || h.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        });
+    if !loopback {
+        return Err(format!(
+            "media node URL {url:?} is not a loopback address: set \
+             SBC_MEDIA_CONTROLLER_TLS_{{CA,CERT,KEY}}_FILE (mTLS) for a remote media node"
+        ));
+    }
+    Ok(())
+}
+
+/// Opens the control channel to `url`, with mTLS when `tls` is set. The PEM
+/// files are read on every call, so a reconnect picks up rotated files.
+///
+/// # Errors
+/// [`MediaPipelineError::Rpc`] for an invalid URL, unreadable files, a
+/// plaintext URL under TLS, or a failed connect / handshake.
+///
+/// ## NIST 800-53 Rev5: IA-3, SC-8
+// POAM: SEC-9 (SC-13) tonic's default rustls provider and suites are used on
+// this channel, not the uc-transport CNSA 2.0 profile.
+pub async fn connect_channel(
+    url: &str,
+    tls: Option<&MediaControllerTls>,
+) -> Result<Channel, MediaPipelineError> {
+    let rpc_err =
+        |e: tonic::transport::Error| MediaPipelineError::Rpc(format!("connect {url} failed: {e}"));
+    check_media_url(url, tls).map_err(MediaPipelineError::Rpc)?;
+    // Without deadlines an RPC to a node that died without closing its
+    // socket hangs instead of failing, so the pool never routes away from
+    // it (NIST 800-53 Rev5: SC-5, CP-10). The request timeout covers a
+    // streaming RPC only until its response headers arrive, so the
+    // long-lived event stream is unaffected.
+    let mut endpoint = Endpoint::from_shared(url.to_string())
+        .map_err(rpc_err)?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT);
+    if let Some(tls) = tls {
+        async fn read(p: &std::path::Path) -> Result<String, MediaPipelineError> {
+            tokio::fs::read_to_string(p)
+                .await
+                .map_err(|e| MediaPipelineError::Rpc(format!("{}: {e}", p.display())))
+        }
+        let mut cfg = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(read(&tls.ca).await?))
+            .identity(Identity::from_pem(
+                read(&tls.cert).await?,
+                read(&tls.key).await?,
+            ));
+        if let Some(domain) = &tls.domain {
+            cfg = cfg.domain_name(domain.clone());
+        }
+        endpoint = endpoint.tls_config(cfg).map_err(rpc_err)?;
+    }
+    endpoint.connect().await.map_err(rpc_err)
+}
 
 /// A [`MediaController`] backed by a gRPC connection to an out-of-process media
 /// plane. Cheap to clone-per-call: the inner tonic client shares one HTTP/2
@@ -62,21 +213,19 @@ impl GrpcMediaController {
     /// Returns [`MediaPipelineError::Rpc`] if the connection cannot be
     /// established.
     pub async fn connect(url: String) -> Result<Self, MediaPipelineError> {
-        let rpc_err = |e: tonic::transport::Error| {
-            MediaPipelineError::Rpc(format!("connect {url} failed: {e}"))
-        };
-        // Without deadlines an RPC to a node that died without closing its
-        // socket hangs instead of failing, so the pool never routes away from
-        // it (NIST 800-53 Rev5: SC-5, CP-10). The request timeout covers a
-        // streaming RPC only until its response headers arrive, so the
-        // long-lived event stream is unaffected.
-        let channel = Endpoint::from_shared(url.clone())
-            .map_err(rpc_err)?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .connect()
-            .await
-            .map_err(rpc_err)?;
+        Self::connect_with_tls(url, None).await
+    }
+
+    /// Connects to the media process at `url`, with client mTLS when `tls`
+    /// is set (`https://` required). See [`connect_channel`].
+    ///
+    /// # Errors
+    /// As [`connect_channel`].
+    pub async fn connect_with_tls(
+        url: String,
+        tls: Option<&MediaControllerTls>,
+    ) -> Result<Self, MediaPipelineError> {
+        let channel = connect_channel(&url, tls).await?;
         Ok(Self::new(MediaControllerServiceClient::new(channel)))
     }
 
@@ -874,5 +1023,104 @@ mod tests {
             map_status(Status::invalid_argument("x")),
             MediaPipelineError::CodecNegotiationFailed
         ));
+    }
+
+    fn s(v: &str) -> Option<String> {
+        v.to_string().into()
+    }
+
+    #[test]
+    fn controller_tls_all_or_none() {
+        assert_eq!(
+            MediaControllerTls::from_parts(None, None, None, None),
+            Ok(None)
+        );
+        assert_eq!(
+            MediaControllerTls::from_parts(s(""), s(" "), s(""), None),
+            Ok(None),
+            "empty counts as unset"
+        );
+        let full = MediaControllerTls::from_parts(s("/t/ca"), s("/t/c"), s("/t/k"), s("node-1"));
+        assert!(full.as_ref().is_ok_and(|t| {
+            t.as_ref()
+                .is_some_and(|t| t.domain.as_deref() == Some("node-1"))
+        }));
+        for (ca, cert, key, dom) in [
+            (s("/t/ca"), None, None, None),
+            (None, s("/t/c"), s("/t/k"), None),
+            (s("/t/ca"), s("/t/c"), None, None),
+            (None, None, None, s("node-1")),
+        ] {
+            let r = MediaControllerTls::from_parts(ca, cert, key, dom);
+            assert!(
+                r.as_ref()
+                    .is_err_and(|e| e.contains("SBC_MEDIA_CONTROLLER_TLS")),
+                "{r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_tls_requires_https() {
+        let tls = MediaControllerTls {
+            ca: "/t/ca".into(),
+            cert: "/t/c".into(),
+            key: "/t/k".into(),
+            domain: None,
+        };
+        assert!(check_media_url("https://172.28.2.11:9096", Some(&tls)).is_ok());
+        assert!(check_media_url("HTTPS://node:9096", Some(&tls)).is_ok());
+        for bad in ["http://172.28.2.11:9096", "172.28.2.11:9096", ""] {
+            assert!(check_media_url(bad, Some(&tls)).is_err(), "{bad}");
+        }
+        assert!(check_media_url("http://127.0.0.1:9096", None).is_ok());
+    }
+
+    #[test]
+    fn plaintext_media_url_only_on_loopback() {
+        for ok in [
+            "http://127.0.0.1:9096",
+            "http://127.9.8.7:9096",
+            "http://[::1]:9096",
+            "http://localhost:9096",
+            "http://LOCALHOST:9096",
+        ] {
+            assert!(check_media_url(ok, None).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://172.28.2.11:9096",
+            "http://0.0.0.0:9096",
+            "http://[::]:9096",
+            "http://sbc-media:9096",
+            "http://localhost.example:9096",
+            "http://127.0.0.1.example:9096",
+            "https://172.28.2.11:9096",
+            "not a url",
+            "",
+        ] {
+            let r = check_media_url(bad, None);
+            assert!(
+                r.as_ref()
+                    .is_err_and(|e| e.contains("SBC_MEDIA_CONTROLLER_TLS")),
+                "{bad}: {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_url_refused_under_tls_before_connecting() {
+        let tls = MediaControllerTls {
+            ca: "/nonexistent/ca".into(),
+            cert: "/nonexistent/c".into(),
+            key: "/nonexistent/k".into(),
+            domain: None,
+        };
+        let r =
+            GrpcMediaController::connect_with_tls("http://127.0.0.1:1".into(), Some(&tls)).await;
+        assert!(
+            matches!(&r, Err(MediaPipelineError::Rpc(m)) if m.contains("https://")),
+            "{:?}",
+            r.err()
+        );
     }
 }
