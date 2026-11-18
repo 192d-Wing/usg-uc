@@ -16,21 +16,21 @@
 use proto_dtls::{DtlsConfig, DtlsConnection, DtlsRole, DtlsState, SrtpKeyingMaterial};
 use proto_rtp::{RtpHeader, RtpPacket, SequenceTracker};
 
-use crate::dtls_relay::{EstablishedLeg, establish_srtp_leg};
+use crate::dtls_relay::{EstablishedLeg, HandshakePeers, HandshakeSourceStats, establish_srtp_leg};
 use crate::dtls_sidecar::{Role, SidecarReader, SidecarWriter};
 use crate::recording_fork::{ForkStream, ForkTap, SessionFork, fork_changed};
 pub use crate::recording_fork::{
     RecordingForkPorts, recording_fork_dropped, recording_fork_packets,
 };
 use crate::srtp_relay::{
-    AssociationLabel, TerminateRelayLeg, forward_dtls_to_sidecar, pump_sidecar_dtls_to_peer,
+    AssociationLabel, HandshakeFanout, TerminateRelayLeg, forward_dtls_to_sidecar,
+    pump_sidecar_dtls_to_peer,
 };
 use proto_srtp::{
     SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile, SrtpProtect, SrtpUnprotect,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -139,17 +139,32 @@ impl Default for MediaPipelineConfig {
 }
 
 /// Allocates RTP port pairs (even=RTP, odd=RTCP) from a configured range.
+///
+/// Pairs are handed out in random order: each allocation takes a free pair
+/// chosen uniformly by the CSPRNG from a free list, so the ports of the next
+/// call cannot be predicted from those of an earlier one (RFC 6056 port
+/// randomisation, applied to media ports). Allocation and release are O(1)
+/// under the lock; the random draw happens before the lock is taken.
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection), SC-5 (fixed-size pool)
 pub struct RtpPortAllocator {
-    /// Monotonically increasing pair index (modulo the usable pair count).
-    /// u32 so the u16 wraparound of long-running allocation cannot
-    /// underflow/overflow the port arithmetic.
-    next_index: AtomicU32,
     /// Minimum port in range.
     min_port: u16,
     /// Maximum port in range.
     max_port: u16,
-    /// Currently allocated ports.
-    allocated: RwLock<std::collections::HashSet<u16>>,
+    /// Free and in-use pair indices.
+    pool: RwLock<PairPool>,
+}
+
+/// The pair indices of an [`RtpPortAllocator`] (pair `i` is
+/// `min_port + 2i`, `min_port + 2i + 1`). Sized once from the range (at most
+/// 32768 pairs).
+struct PairPool {
+    /// Indices of the free pairs, in no particular order.
+    free: Vec<u16>,
+    /// Whether each pair is allocated (so a stray or repeated release cannot
+    /// put a pair on the free list twice).
+    in_use: Vec<bool>,
 }
 
 impl RtpPortAllocator {
@@ -170,56 +185,98 @@ impl RtpPortAllocator {
         } else {
             min_port.saturating_add(1)
         };
+        let pairs = Self::pairs_in(min_port, max_port);
         Self {
-            next_index: AtomicU32::new(0),
             min_port,
             max_port,
-            allocated: RwLock::new(std::collections::HashSet::new()),
+            pool: RwLock::new(PairPool {
+                free: (0..pairs).collect(),
+                in_use: vec![false; usize::from(pairs)],
+            }),
         }
+    }
+
+    /// Number of usable pairs in `min_port..=max_port` (`min_port` even).
+    /// At most 32768, so every pair index fits a `u16`.
+    fn pairs_in(min_port: u16, max_port: u16) -> u16 {
+        if max_port <= min_port {
+            return 0;
+        }
+        // Each pair occupies (even, even+1); both ends inclusive.
+        (max_port - min_port).div_ceil(2)
     }
 
     /// Number of usable (RTP, RTCP) port pairs in the range.
     fn pair_count(&self) -> u32 {
-        if self.max_port <= self.min_port {
-            return 0;
-        }
-        // Each pair occupies (even, even+1); both ends inclusive.
-        (u32::from(self.max_port) - u32::from(self.min_port)).div_ceil(2)
+        u32::from(Self::pairs_in(self.min_port, self.max_port))
     }
 
     /// Allocates an even-numbered RTP port. Returns (rtp_port, rtcp_port).
+    ///
+    /// # Errors
+    /// [`MediaPipelineError::PortExhausted`] when every pair is in use, and
+    /// also when the CSPRNG fails (fail closed: no predictable fallback).
     // rtp/rtcp are the standard protocol names for the port pair.
     #[allow(clippy::similar_names)]
     pub async fn allocate_pair(&self) -> Result<(u16, u16), MediaPipelineError> {
-        let mut allocated = self.allocated.write().await;
-        let pairs = self.pair_count();
-        if pairs == 0 {
+        // NIST 800-53 Rev5: SC-7 -- the choice comes from the aws-lc DRBG
+        // (uc-crypto), drawn before the lock. The modulo bias is below 2^-48
+        // for any free-list length.
+        let draw = match uc_crypto::random::generate_random::<8>() {
+            Ok(bytes) => u64::from_le_bytes(bytes),
+            Err(e) => {
+                warn!(error = %e, "CSPRNG failure; not allocating an RTP port pair");
+                return Err(MediaPipelineError::PortExhausted);
+            }
+        };
+
+        let mut pool = self.pool.write().await;
+        let len = u64::try_from(pool.free.len()).unwrap_or(u64::MAX);
+        if len == 0 {
             return Err(MediaPipelineError::PortExhausted);
         }
-
-        for _ in 0..pairs {
-            let index = self.next_index.fetch_add(1, Ordering::Relaxed) % pairs;
-            // index < pairs guarantees rtp <= max_port - 1, so rtcp fits
-            // without overflow.
-            #[allow(clippy::cast_possible_truncation)]
-            let rtp = self.min_port + (index as u16) * 2;
-            let rtcp = rtp + 1;
-
-            if !allocated.contains(&rtp) {
-                allocated.insert(rtp);
-                allocated.insert(rtcp);
-                return Ok((rtp, rtcp));
-            }
+        let pick = usize::try_from(draw % len).unwrap_or(0);
+        let Some(&index) = pool.free.get(pick) else {
+            return Err(MediaPipelineError::PortExhausted);
+        };
+        // index < pairs guarantees rtp <= max_port - 1, so rtcp fits; checked
+        // all the same, before the pair leaves the free list.
+        let pair = index
+            .checked_mul(2)
+            .and_then(|offset| self.min_port.checked_add(offset))
+            .and_then(|rtp| Some((rtp, rtp.checked_add(1)?)))
+            .ok_or(MediaPipelineError::PortExhausted)?;
+        pool.free.swap_remove(pick);
+        if let Some(used) = pool.in_use.get_mut(usize::from(index)) {
+            *used = true;
         }
-
-        Err(MediaPipelineError::PortExhausted)
+        Ok(pair)
     }
 
-    /// Releases a port pair back to the pool.
+    /// Releases a port pair back to the pool. A port that is not the RTP
+    /// port of an allocated pair is ignored.
     pub async fn release_pair(&self, rtp_port: u16) {
-        let mut allocated = self.allocated.write().await;
-        allocated.remove(&rtp_port);
-        allocated.remove(&(rtp_port + 1));
+        let Some(offset) = rtp_port.checked_sub(self.min_port) else {
+            return;
+        };
+        if offset % 2 != 0 {
+            return;
+        }
+        let index = offset / 2;
+        let mut pool = self.pool.write().await;
+        if let Some(used) = pool.in_use.get_mut(usize::from(index))
+            && *used
+        {
+            *used = false;
+            pool.free.push(index);
+        }
+    }
+
+    /// Number of ports (two per pair) currently allocated.
+    #[cfg(test)]
+    async fn allocated_port_count(&self) -> usize {
+        let pool = self.pool.read().await;
+        2 * pool.in_use.iter().filter(|used| **used).count()
     }
 }
 
@@ -352,6 +409,14 @@ struct LegRemote {
 
 /// Default re-latch grace window (see [`LegRemote`]).
 const RELATCH_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Packets an exact SDP source must send after taking an opaque RTP leg's
+/// latch before the latch is established: from then on silence from the
+/// exact source no longer lets another port on its IP take the latch.
+/// Eight packets is 160 ms of 20 ms audio; one spoofed datagram stays well
+/// below it.
+// NIST 800-53 Rev5: SC-7 (Boundary Protection)
+const EXACT_ESTABLISHED_PACKETS: u32 = 8;
 
 impl LegRemote {
     fn new(addr: std::net::SocketAddr) -> Self {
@@ -1228,16 +1293,24 @@ impl MediaPipeline {
             })?
             .current();
 
-        let leg = establish_srtp_leg(
+        let mut stats = HandshakeSourceStats::default();
+        let result = establish_srtp_leg(
             media_socket,
             signaling_peer,
             sidecar_socket,
             &own_fingerprint,
             peer_fingerprint,
             role,
+            &mut stats,
         )
-        .await
-        .map_err(|e| MediaPipelineError::DtlsHandshakeFailed(e.to_string()))?;
+        .await;
+        log_handshake_sources(
+            call_id,
+            if is_a_leg { "A" } else { "B" },
+            &stats,
+            result.as_ref().ok().map(|leg| leg.peer_addr),
+        );
+        let leg = result.map_err(|e| MediaPipelineError::DtlsHandshakeFailed(e.to_string()))?;
 
         // SSRC for this leg (falls back if the session vanished mid-handshake;
         // the store below then fails cleanly with DtlsConnectionNotFound).
@@ -1944,41 +2017,15 @@ impl MediaPipeline {
                 .map_err(|e| MediaPipelineError::BindFailed(format!("{b_bind}: {e}")))?,
         );
 
-        // Best-effort separate-port SRTCP relay (RTP port + 1) for endpoints that
-        // did not negotiate rtcp-mux. Muxed SRTCP already rides the media relay; a
-        // bind failure here disables only non-muxed RTCP, never audio. RTCP remotes
-        // default to the RTP remote's port + 1 and latch symmetrically.
-        let rtcp = match (
-            a_remote.port().checked_add(1),
-            b_remote.port().checked_add(1),
-        ) {
-            (Some(a_rtcp_rport), Some(b_rtcp_rport)) => {
-                let a_rtcp_bind = format!("{}:{}", ctx.a_leg_bind_ip, ctx.a_leg_rtcp_port);
-                let b_rtcp_bind = format!("{}:{}", ctx.b_leg_bind_ip, ctx.b_leg_rtcp_port);
-                match (
-                    UdpSocket::bind(&a_rtcp_bind).await,
-                    UdpSocket::bind(&b_rtcp_bind).await,
-                ) {
-                    (Ok(a_rtcp_sock), Ok(b_rtcp_sock)) => {
-                        let a_rtcp_remote = std::net::SocketAddr::new(a_remote.ip(), a_rtcp_rport);
-                        let b_rtcp_remote = std::net::SocketAddr::new(b_remote.ip(), b_rtcp_rport);
-                        Some(TerminateRtcp {
-                            a_socket: Arc::new(a_rtcp_sock),
-                            b_socket: Arc::new(b_rtcp_sock),
-                            a_remote: a_rtcp_remote,
-                            b_remote: b_rtcp_remote,
-                            a_target: Arc::new(std::sync::RwLock::new(a_rtcp_remote)),
-                            b_target: Arc::new(std::sync::RwLock::new(b_rtcp_remote)),
-                        })
-                    }
-                    (a_res, b_res) => {
-                        warn!(call_id = %call_id, a_err = ?a_res.err(), b_err = ?b_res.err(), "terminate RTCP sockets failed to bind (audio unaffected)");
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
+        // RFC 5761; RFC 5764 §4.1: terminate mode relays RTCP only when it is
+        // multiplexed on the media port, where the leg's DTLS association
+        // keys it. No RTP + 1 socket is bound: RTCP on a separate port would
+        // need its own DTLS handshake on that transport, which the SBC does
+        // not run, so non-muxed RTCP is not relayed in terminate mode.
+        // NIST 800-53 Rev5: CM-7 (Least Functionality), SC-13 -- one SRTP
+        // context per key and direction, each owned by a single relay task.
+        // POAM: POA&M-343 - non-muxed (separate-port) RTCP is not relayed in
+        // terminate mode.
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let a_target = Arc::new(std::sync::RwLock::new(a_remote));
@@ -2000,7 +2047,6 @@ impl MediaPipeline {
             b_target: Arc::clone(&b_target),
             shutdown: shutdown_rx,
             media_failure_tx: self.config.media_failure_tx.clone(),
-            rtcp,
             a_fork: ctx
                 .recording
                 .as_ref()
@@ -2394,18 +2440,6 @@ pub struct LegDtlsParams {
     pub role: Role,
 }
 
-/// Sockets + addresses for the separate RTCP (RTP-port + 1) relay, used only by
-/// endpoints that did NOT negotiate rtcp-mux. Muxed SRTCP rides the media relay
-/// (see [`TerminateRelayLeg`]); this bundle services the non-muxed case.
-struct TerminateRtcp {
-    a_socket: Arc<UdpSocket>,
-    b_socket: Arc<UdpSocket>,
-    a_remote: std::net::SocketAddr,
-    b_remote: std::net::SocketAddr,
-    a_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
-    b_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
-}
-
 /// Everything the terminate supervisor owns for one call (bundled so the spawn
 /// and the supervisor signature stay manageable).
 struct TerminateSetup {
@@ -2426,9 +2460,6 @@ struct TerminateSetup {
     /// Signalled with `call_id` if a leg's handshake fails, so the call is torn
     /// down rather than left up with dead media.
     media_failure_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    /// Separate-port SRTCP relay for non-muxed endpoints. `None` when the RTCP
-    /// sockets could not be bound (audio is unaffected; only non-muxed RTCP is).
-    rtcp: Option<TerminateRtcp>,
     /// SIPREC fork tap for media received from the A-leg (`None` when
     /// recording is disabled on the pipeline).
     a_fork: Option<ForkTap>,
@@ -2441,6 +2472,9 @@ struct TerminateSetup {
 /// no media is relayed (fail-closed). All spawned tasks stop on the shutdown
 /// watch (task abort does not cascade to children, so teardown signals it).
 async fn terminate_supervisor(s: TerminateSetup) {
+    // Owned here so that a failed or timed-out handshake still reports them.
+    let mut a_stats = HandshakeSourceStats::default();
+    let mut b_stats = HandshakeSourceStats::default();
     let (a_res, b_res) = tokio::join!(
         establish_srtp_leg(
             &s.a_socket,
@@ -2449,6 +2483,7 @@ async fn terminate_supervisor(s: TerminateSetup) {
             &s.own_fingerprint,
             &s.a_leg.peer_fingerprint,
             s.a_leg.role,
+            &mut a_stats,
         ),
         establish_srtp_leg(
             &s.b_socket,
@@ -2457,7 +2492,21 @@ async fn terminate_supervisor(s: TerminateSetup) {
             &s.own_fingerprint,
             &s.b_leg.peer_fingerprint,
             s.b_leg.role,
+            &mut b_stats,
         ),
+    );
+    // NIST 800-53 Rev5: AU-2, AU-3 -- on success and on failure.
+    log_handshake_sources(
+        &s.call_id,
+        "A",
+        &a_stats,
+        a_res.as_ref().ok().map(|leg| leg.peer_addr),
+    );
+    log_handshake_sources(
+        &s.call_id,
+        "B",
+        &b_stats,
+        b_res.as_ref().ok().map(|leg| leg.peer_addr),
     );
     let (a_est, b_est) = match (a_res, b_res) {
         (Ok(a), Ok(b)) => (a, b),
@@ -2483,16 +2532,30 @@ async fn terminate_supervisor(s: TerminateSetup) {
         outbound: a_out,
         reader: a_reader,
         writer: a_writer,
+        peer_addr: a_peer,
+        handshake_peers: a_peers,
     } = a_est;
     let EstablishedLeg {
         inbound: b_in,
         outbound: b_out,
         reader: b_reader,
         writer: b_writer,
+        peer_addr: b_peer,
+        handshake_peers: b_peers,
     } = b_est;
+    // Set by the first authenticated packet from each side (its media leg;
+    // RTCP is muxed); until then post-handshake DTLS is accepted from, and
+    // sent to, every handshake source of that side.
+    let a_authenticated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let b_authenticated = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Four SRTP contexts. The ssrc only seeds per-stream replay state — the AEAD
     // nonce uses the packet's SSRC (see proto-srtp) — so the leg ssrc is fine.
+    // NIST 800-53 Rev5: SC-13, SC-8 -- these are the only contexts built from
+    // the keys, and each is moved into exactly one relay task, so every key
+    // and direction has one replay window (RFC 3711 §3.3.2) and one
+    // SRTP/SRTCP index sequence (RFC 7714 §8.1, §9.1). Muxed SRTCP rides the
+    // media-port tasks; there is no RTP + 1 relay in terminate mode.
     let ctxs = (
         SrtpContext::new(&a_in, SrtpDirection::Inbound, s.a_ssrc),
         SrtpContext::new(&a_out, SrtpDirection::Outbound, s.a_ssrc),
@@ -2512,6 +2575,17 @@ async fn terminate_supervisor(s: TerminateSetup) {
     let (a_dtls_tx, a_dtls_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     let (b_dtls_tx, b_dtls_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
 
+    // NIST 800-53 Rev5: SC-7 -- seed each leg's latch (and the send target
+    // of the opposite direction and of the sidecar's post-handshake DTLS)
+    // with the source the handshake completed with, before any task that
+    // reads it is spawned. The seed is a hint: a wrong one is corrected by
+    // the leg on the peer's first authenticated SRTP packet.
+    for (target, peer) in [(&s.a_target, a_peer), (&s.b_target, b_peer)] {
+        if let Ok(mut t) = target.write() {
+            *t = peer;
+        }
+    }
+
     // A→B: unprotect A's media, re-protect for B.
     tokio::spawn(
         TerminateRelayLeg {
@@ -2523,6 +2597,8 @@ async fn terminate_supervisor(s: TerminateSetup) {
             recv_target: Arc::clone(&s.a_target),
             forward_target: Arc::clone(&s.b_target),
             dtls_out: Some(a_dtls_tx),
+            handshake_peers: a_peers,
+            media_authenticated: Arc::clone(&a_authenticated),
             call_id: s.call_id.clone(),
             direction: "A→B",
             fork: s.a_fork,
@@ -2540,6 +2616,8 @@ async fn terminate_supervisor(s: TerminateSetup) {
             recv_target: Arc::clone(&s.b_target),
             forward_target: Arc::clone(&s.a_target),
             dtls_out: Some(b_dtls_tx),
+            handshake_peers: b_peers,
+            media_authenticated: Arc::clone(&b_authenticated),
             call_id: s.call_id.clone(),
             direction: "B→A",
             fork: s.b_fork,
@@ -2567,6 +2645,10 @@ async fn terminate_supervisor(s: TerminateSetup) {
         a_reader,
         Arc::clone(&s.a_socket),
         Arc::clone(&s.a_target),
+        HandshakeFanout {
+            peers: a_peers,
+            media_authenticated: Arc::clone(&a_authenticated),
+        },
         s.shutdown.clone(),
         AssociationLabel {
             call_id: s.call_id.clone(),
@@ -2577,6 +2659,10 @@ async fn terminate_supervisor(s: TerminateSetup) {
         b_reader,
         Arc::clone(&s.b_socket),
         Arc::clone(&s.b_target),
+        HandshakeFanout {
+            peers: b_peers,
+            media_authenticated: Arc::clone(&b_authenticated),
+        },
         s.shutdown.clone(),
         AssociationLabel {
             call_id: s.call_id.clone(),
@@ -2584,73 +2670,81 @@ async fn terminate_supervisor(s: TerminateSetup) {
         },
     ));
 
-    // Separate-port SRTCP relay for non-muxed endpoints. Fresh SRTP contexts from
-    // the SAME keying material (independent replay windows); on the RTCP port
-    // every packet is SRTCP, so TerminateRelayLeg re-protects it via the RTCP
-    // path. Muxed RTCP already rides the media relay above.
-    if let Some(rtcp) = s.rtcp {
-        let rtcp_ctxs = (
-            SrtpContext::new(&a_in, SrtpDirection::Inbound, s.a_ssrc),
-            SrtpContext::new(&a_out, SrtpDirection::Outbound, s.a_ssrc),
-            SrtpContext::new(&b_in, SrtpDirection::Inbound, s.b_ssrc),
-            SrtpContext::new(&b_out, SrtpDirection::Outbound, s.b_ssrc),
-        );
-        if let (Ok(a_rin), Ok(a_reg), Ok(b_rin), Ok(b_reg)) = rtcp_ctxs {
-            tokio::spawn(
-                TerminateRelayLeg {
-                    recv_sock: Arc::clone(&rtcp.a_socket),
-                    send_sock: Arc::clone(&rtcp.b_socket),
-                    ingress: a_rin,
-                    egress: b_reg,
-                    expected_remote: rtcp.a_remote,
-                    recv_target: Arc::clone(&rtcp.a_target),
-                    forward_target: Arc::clone(&rtcp.b_target),
-                    dtls_out: None,
-                    call_id: s.call_id.clone(),
-                    direction: "A→B RTCP",
-                    fork: None,
-                }
-                .run(s.shutdown.clone()),
-            );
-            tokio::spawn(
-                TerminateRelayLeg {
-                    recv_sock: rtcp.b_socket,
-                    send_sock: rtcp.a_socket,
-                    ingress: b_rin,
-                    egress: a_reg,
-                    expected_remote: rtcp.b_remote,
-                    recv_target: rtcp.b_target,
-                    forward_target: rtcp.a_target,
-                    dtls_out: None,
-                    call_id: s.call_id.clone(),
-                    direction: "B→A RTCP",
-                    fork: None,
-                }
-                .run(s.shutdown.clone()),
-            );
-        } else {
-            warn!(call_id = %s.call_id, "RTCP SRTP context creation failed; non-muxed RTCP not relayed");
-        }
-    }
-
     info!(call_id = %s.call_id, "DTLS-SRTP termination established; relaying media");
+}
+
+/// Logs one warn line per handshake that dropped datagrams while choosing
+/// sources, whether it completed (`peer` is then the latch seed) or not (the
+/// pump has no call id; see [`crate::dtls_relay::HandshakeSourceStats`]).
+fn log_handshake_sources(
+    call_id: &str,
+    leg: &'static str,
+    stats: &HandshakeSourceStats,
+    peer: Option<std::net::SocketAddr>,
+) {
+    if stats.any_dropped() {
+        warn!(
+            call_id = %call_id, leg,
+            completed = peer.is_some(),
+            dropped_implausible = stats.dropped_implausible,
+            dropped_overflow = stats.dropped_overflow,
+            dropped_after_exact = stats.dropped_after_exact,
+            dropped_rate_limited = stats.dropped_rate_limited,
+            send_failures = stats.send_failures,
+            sources = stats.sources,
+            peer = ?peer,
+            "DTLS handshake pump dropped datagrams from the peer's IP"
+        );
+    }
 }
 
 /// One direction of the media relay (RTP or RTCP, per `kind`) with source
 /// validation and symmetric latching.
 ///
-/// Before latching, only packets whose source IP matches the SDP-negotiated
-/// remote are forwarded (the port may differ behind NAT). The first accepted
-/// packet latches the exact source: subsequent packets must match it, and the
-/// opposite direction's send target is updated so replies go to where media
-/// actually arrives from (RFC 4961 symmetric RTP). Packets from any other
-/// source are dropped and counted — an off-path attacker who learns the media
-/// port can no longer inject into or overwrite the stream.
+/// Only packets whose source IP matches the SDP-negotiated remote are
+/// considered. The latch is exact-first, both at the start of the leg and
+/// after a signalled remote change: a packet from the exact SDP `ip:port`
+/// latches at once; another port on that IP (NAT) latches only after the
+/// grace window (the leg's [`LegRemote`] grace, or [`RELATCH_GRACE`]) has
+/// passed with no exact match. The latched source's packets are forwarded
+/// and the opposite direction's send target follows the latch (RFC 4961
+/// symmetric RTP); packets from any other source are dropped and counted.
+///
+/// Once latched, only an RTP leg moves without a signalled re-latch:
+/// - A leg latched to a non-exact source moves to the exact SDP source as
+///   soon as it sends.
+/// - A leg latched to the exact SDP source moves to another port on its IP
+///   that keeps sending once the exact source has been silent for the grace
+///   window, but only while the exact latch is weak: the exact source has
+///   sent fewer than [`EXACT_ESTABLISHED_PACKETS`] packets since it took
+///   the latch. One datagram spoofed from the SDP address therefore does
+///   not cut a NAT'd peer off for the rest of the call, while a peer that
+///   has been streaming from its SDP port keeps its latch through silence
+///   (hold, VAD).
+///
+/// An RTCP leg's SDP address is only a guess (RTP port + 1; `a=rtcp`,
+/// RFC 3605, is not honoured), so neither move applies to it: a sender on
+/// the guessed port does not take the latch from the peer's real RTCP
+/// source, and an RTCP leg latched to the exact address stays there until a
+/// signalled re-latch. A non-exact RTCP latch comes only from the initial
+/// (or re-latch) grace fallback.
+///
+/// This relay holds no keys, so it cannot tell a peer behind NAT that sends
+/// from an unsignalled port from another sender on the same IP once the
+/// grace has passed.
 ///
 /// `call_id` + `direction` are carried for structured logging/metrics; the
 /// socket/target set is inherent to a bidirectional forwarder.
 ///
 /// ## NIST 800-53 Rev5: SC-7 (Boundary Protection), SC-8
+// POAM: POA&M-345 -- opaque relay residual: after the grace window a
+// same-IP sender on an unsignalled port can take the latch of a leg whose
+// peer does not send from its SDP port, and a sender spoofing the SDP
+// address at least once per grace window holds an RTP leg's latch there,
+// away from a NAT'd peer, for as long as it sends, and a same-IP sender
+// can take a weak exact RTP latch (fewer than EXACT_ESTABLISHED_PACKETS
+// from the exact source) once the exact source has been silent for the
+// grace window. Authenticated (SRTP) media is the fix.
 #[allow(clippy::too_many_arguments)]
 async fn relay_leg(
     recv_sock: Arc<UdpSocket>,
@@ -2672,9 +2766,26 @@ async fn relay_leg(
     let mut expected_remote = expected_remote;
     let mut seen_epoch: u64 = 0;
     let mut latched: Option<std::net::SocketAddr> = None;
-    // Set while a signalled re-latch waits for the exact SDP `ip:port`:
-    // the earliest instant a same-IP, different-port source may latch.
-    let mut relatch_fallback_at: Option<tokio::time::Instant> = None;
+    // Set while the leg (at its start, or after a signalled re-latch) waits
+    // for the exact SDP `ip:port`: the earliest instant a same-IP,
+    // different-port source may latch.
+    // NIST 800-53 Rev5: SC-7 -- the initial latch is exact-first too.
+    let grace = control
+        .remote
+        .as_ref()
+        .map_or(RELATCH_GRACE, |ctl| ctl.grace);
+    let mut relatch_fallback_at: Option<tokio::time::Instant> =
+        Some(tokio::time::Instant::now() + grace);
+    // While latched to the exact SDP source: when another same-IP port was
+    // first heard since the exact source last sent, and whether the exact
+    // source has sent since then. The clock is read only for packets that
+    // are not the latched source's.
+    let mut other_heard_at: Option<tokio::time::Instant> = None;
+    let mut exact_heard = false;
+    // Packets from the exact SDP source since it last took the latch,
+    // saturating at EXACT_ESTABLISHED_PACKETS.
+    let mut exact_packets: u32 = 0;
+    let mut latch_moves: u64 = 0;
     let mut dropped: u64 = 0;
     let mut forwarded: u64 = 0;
     let has_fork = fork.is_some();
@@ -2696,15 +2807,45 @@ async fn relay_leg(
                                 }
                                 relatch_fallback_at =
                                     Some(tokio::time::Instant::now() + ctl.grace);
+                                other_heard_at = None;
+                                exact_heard = false;
+                                exact_packets = 0;
                             }
                         }
-                        // RFC 3264 §8.3.1 / RFC 4961: after a re-latch only the
-                        // exact SDP address latches until the grace window
-                        // passes; then a same-IP source may (symmetric NAT).
-                        // A stale packet from the old port is dropped and never
-                        // touches the reverse send target.
+                        if src == expected_remote {
+                            exact_heard = true;
+                        }
+                        // RFC 3264 §8.3.1 / RFC 4961: at the start and after a
+                        // re-latch only the exact SDP address latches until the
+                        // grace window passes; then a same-IP source may
+                        // (symmetric NAT). A stale packet from the old port is
+                        // dropped and never touches the reverse send target.
+                        // On RTP legs only, the exact SDP address takes the latch
+                        // back from a non-exact source, and a same-IP port takes
+                        // it from a weak exact latch whose source has been
+                        // silent for the grace (see the function docs).
+                        // NIST 800-53 Rev5: SC-7
                         let acceptable = match latched {
-                            Some(latched_src) => src == latched_src,
+                            Some(latched_src) if src == latched_src => true,
+                            Some(_) if src == expected_remote => matches!(kind, RelayKind::Rtp),
+                            Some(latched_src)
+                                if matches!(kind, RelayKind::Rtp)
+                                    && latched_src == expected_remote
+                                    && exact_packets < EXACT_ESTABLISHED_PACKETS
+                                    && src.ip() == expected_remote.ip() =>
+                            {
+                                let now = tokio::time::Instant::now();
+                                match other_heard_at {
+                                    Some(at) if !exact_heard => now.saturating_duration_since(at) >= grace,
+                                    _ => {
+                                        // Start (or restart) the silence window.
+                                        other_heard_at = Some(now);
+                                        exact_heard = false;
+                                        false
+                                    }
+                                }
+                            }
+                            Some(_) => false,
                             None if src == expected_remote => true,
                             None if src.ip() != expected_remote.ip() => false,
                             None => relatch_fallback_at
@@ -2726,9 +2867,19 @@ async fn relay_leg(
                             continue;
                         }
 
-                        if latched.is_none() {
+                        if latched != Some(src) {
+                            let basis = if src == expected_remote {
+                                "sdp-exact"
+                            } else if latched == Some(expected_remote) {
+                                "exact-silent"
+                            } else {
+                                "grace-elapsed"
+                            };
                             latched = Some(src);
                             relatch_fallback_at = None;
+                            other_heard_at = None;
+                            exact_heard = false;
+                            exact_packets = 0;
                             if src != expected_remote {
                                 debug!(
                                     call_id = %call_id,
@@ -2739,8 +2890,29 @@ async fn relay_leg(
                                 );
                             }
                             if let Ok(mut target) = recv_target.write() {
-                                *target = src;
+                                let from = *target;
+                                if from != src {
+                                    *target = src;
+                                    latch_moves += 1;
+                                    if latch_moves == 1 || latch_moves.is_multiple_of(100) {
+                                        info!(
+                                            event = "media.latch.moved",
+                                            call_id = %call_id,
+                                            direction,
+                                            kind = kind.label(),
+                                            from = %from,
+                                            to = %src,
+                                            basis,
+                                            latch_moves,
+                                            "relay leg latch moved"
+                                        );
+                                    }
+                                }
                             }
+                        }
+
+                        if src == expected_remote && exact_packets < EXACT_ESTABLISHED_PACKETS {
+                            exact_packets += 1;
                         }
 
                         let dest = match forward_target.read() {
@@ -3282,8 +3454,9 @@ mod tests {
         use tokio::time::timeout;
 
         // Stand-ins for the caller (A leg) and callee (B leg) endpoints. Their
-        // RTCP is modeled on the same sockets; the relay accepts the first RTCP
-        // packet by source IP, then latches the exact source (symmetric RTCP).
+        // RTCP is modeled on the same sockets; the relay accepts an RTCP packet
+        // from another port on the SDP IP once the grace window has passed,
+        // then latches the exact source (symmetric RTCP).
         let caller = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let caller_addr = caller.local_addr().unwrap();
@@ -3324,6 +3497,11 @@ mod tests {
         let a_rtcp = format!("127.0.0.1:{}", ports.a_leg_rtp_port + 1);
         let b_rtcp = format!("127.0.0.1:{}", ports.b_leg_rtp_port + 1);
         let mut buf = [0u8; 64];
+
+        // The modeled RTCP sources are not the SDP RTCP ports (RTP port + 1),
+        // so they latch only after the initial grace window (exact-first,
+        // NAT fallback).
+        tokio::time::sleep(RELATCH_GRACE + Duration::from_millis(100)).await;
 
         // The B→A RTCP send target defaults to callee_rtp_port+1; latch it to the
         // callee's real socket first by sending a report from the callee side.
@@ -3367,12 +3545,14 @@ mod tests {
         allocator.release_pair(p1).await;
         assert_eq!(allocator.allocate_pair().await.unwrap().0, p1);
 
-        // Top-of-range allocation never overflows u16.
+        // Top-of-range allocation never overflows u16. The order is random;
+        // the two pairs handed out are exactly the two in the range.
         let allocator = RtpPortAllocator::new(65532, 65535);
-        let (rtp, rtcp) = allocator.allocate_pair().await.unwrap();
-        assert_eq!((rtp, rtcp), (65532, 65533));
-        let (rtp, rtcp) = allocator.allocate_pair().await.unwrap();
-        assert_eq!((rtp, rtcp), (65534, 65535));
+        let first = allocator.allocate_pair().await.unwrap();
+        let second = allocator.allocate_pair().await.unwrap();
+        let mut got = [first, second];
+        got.sort_unstable();
+        assert_eq!(got, [(65532, 65533), (65534, 65535)]);
         assert!(allocator.allocate_pair().await.is_err());
     }
 
@@ -3702,8 +3882,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Peer's first DTLS record (first byte 22 = handshake).
-        peer.send_to(&[22u8, 1, 2], relay_addr).await.unwrap();
+        // Peer's first DTLS record (type 22 = handshake, DTLS 1.2, empty
+        // body): it has to pass the pump's record-header plausibility walk.
+        peer.send_to(
+            &[22u8, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
+            relay_addr,
+        )
+        .await
+        .unwrap();
 
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -3864,9 +4050,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Trigger both handshakes (a DTLS-classified record on each media port).
-        peer_a.send_to(&[22u8, 1, 2], &a_relay).await.unwrap();
-        peer_b.send_to(&[22u8, 1, 2], &b_relay).await.unwrap();
+        // Trigger both handshakes (a plausible DTLS 1.2 handshake record on
+        // each media port, from the SDP address).
+        let hello = [22u8, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+        peer_a.send_to(&hello, &a_relay).await.unwrap();
+        peer_b.send_to(&hello, &b_relay).await.unwrap();
 
         let media_ssrc = 0x0001_2345;
         let peer_a_send = srtp_ctx(
@@ -4275,6 +4463,608 @@ mod tests {
         assert!(rtcp_a > 0, "peer A recovered no relayed SRTCP (split)");
         assert!(rtcp_b > 0, "peer B recovered no relayed SRTCP (split)");
     }
+    // ---- Opaque initial latch, random port pairs, terminate seed ----------
+
+    /// Spawns an opaque RTP relay leg for `expected` with re-latch control
+    /// `grace`; returns the relay's receive address, the shared reverse
+    /// target and the shutdown sender (kept alive by the caller).
+    async fn spawn_opaque_leg(
+        expected: std::net::SocketAddr,
+        receiver: std::net::SocketAddr,
+        grace: Option<std::time::Duration>,
+        kind: RelayKind,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::RwLock<std::net::SocketAddr>>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let relay_in = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_out = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_addr = relay_in.local_addr().unwrap();
+        let recv_target = Arc::new(std::sync::RwLock::new(expected));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(relay_leg(
+            relay_in,
+            relay_out,
+            expected,
+            Arc::clone(&recv_target),
+            Arc::new(std::sync::RwLock::new(receiver)),
+            "opaque-latch".to_string(),
+            "A→B",
+            kind,
+            LegRelayControl {
+                remote: grace.map(|g| Arc::new(LegRemote::with_grace(expected, g))),
+                media_kind: Arc::new(std::sync::atomic::AtomicU8::new(MediaKind::Audio.as_u8())),
+            },
+            shutdown_rx,
+            None,
+        ));
+        (relay_addr, recv_target, shutdown_tx)
+    }
+
+    /// The initial latch is exact-first, like a re-latch: inside the grace
+    /// window a same-IP, other-port source is dropped and does not touch the
+    /// reverse target; the exact SDP source latches at once. Checked on an
+    /// RTP leg (grace from its `LegRemote`) and an RTCP leg (no control,
+    /// `RELATCH_GRACE`).
+    // NIST 800-53 Rev5: SC-7
+    #[tokio::test]
+    async fn relay_leg_initial_latch_is_exact_first() {
+        for (kind, grace) in [
+            (RelayKind::Rtp, Some(std::time::Duration::from_millis(400))),
+            (RelayKind::Rtcp, None),
+        ] {
+            let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let exact = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let neighbour = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let exact_addr = exact.local_addr().unwrap();
+            let (relay_addr, recv_target, _sd) =
+                spawn_opaque_leg(exact_addr, receiver.local_addr().unwrap(), grace, kind).await;
+
+            neighbour.send_to(b"spray", relay_addr).await.unwrap();
+            let mut buf = [0u8; 64];
+            let early = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                receiver.recv_from(&mut buf),
+            )
+            .await;
+            assert!(
+                early.is_err(),
+                "{}: other-port packet inside the initial grace was forwarded",
+                kind.label()
+            );
+            assert_eq!(*recv_target.read().unwrap(), exact_addr, "{}", kind.label());
+
+            exact.send_to(b"media", relay_addr).await.unwrap();
+            assert_eq!(
+                recv_payload(&receiver).await.as_deref(),
+                Some(&b"media"[..]),
+                "{}: exact SDP source must latch at once",
+                kind.label()
+            );
+            assert_eq!(*recv_target.read().unwrap(), exact_addr);
+        }
+    }
+
+    /// With no packet from the exact SDP source, a same-IP, other-port source
+    /// (NAT) latches only after the initial grace window.
+    #[tokio::test]
+    async fn relay_leg_initial_nat_fallback_after_grace() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let natted = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sdp = silent.local_addr().unwrap();
+        let (relay_addr, recv_target, _sd) = spawn_opaque_leg(
+            sdp,
+            receiver.local_addr().unwrap(),
+            Some(std::time::Duration::from_millis(200)),
+            RelayKind::Rtp,
+        )
+        .await;
+
+        natted.send_to(b"early", relay_addr).await.unwrap();
+        assert_eq!(
+            recv_payload(&receiver).await,
+            None,
+            "other-port packet inside the initial grace was forwarded"
+        );
+        assert_eq!(*recv_target.read().unwrap(), sdp);
+
+        // The 500 ms receive timeout above exceeds the 200 ms grace.
+        natted.send_to(b"nat", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await.as_deref(), Some(&b"nat"[..]));
+        assert_eq!(*recv_target.read().unwrap(), natted.local_addr().unwrap());
+    }
+
+    /// A leg latched to a non-exact source (after the grace) moves to the
+    /// exact SDP source as soon as it sends; the neighbour is then dropped.
+    #[tokio::test]
+    async fn relay_leg_exact_source_overrides_non_exact_latch() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let exact = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let neighbour = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let exact_addr = exact.local_addr().unwrap();
+        let (relay_addr, recv_target, _sd) = spawn_opaque_leg(
+            exact_addr,
+            receiver.local_addr().unwrap(),
+            Some(std::time::Duration::from_millis(50)),
+            RelayKind::Rtp,
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        neighbour.send_to(b"n1", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await.as_deref(), Some(&b"n1"[..]));
+        assert_eq!(
+            *recv_target.read().unwrap(),
+            neighbour.local_addr().unwrap()
+        );
+
+        exact.send_to(b"e1", relay_addr).await.unwrap();
+        assert_eq!(
+            recv_payload(&receiver).await.as_deref(),
+            Some(&b"e1"[..]),
+            "exact SDP source must override a non-exact latch"
+        );
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+
+        neighbour.send_to(b"n2", relay_addr).await.unwrap();
+        exact.send_to(b"e2", relay_addr).await.unwrap();
+        assert_eq!(recv_payload(&receiver).await.as_deref(), Some(&b"e2"[..]));
+        assert_eq!(
+            recv_payload(&receiver).await,
+            None,
+            "neighbour still forwarded"
+        );
+    }
+
+    /// Sends `payload` from `sock` to `to` every 20 ms (an RTP-like stream)
+    /// until the returned flag is set.
+    fn stream_from(
+        sock: Arc<UdpSocket>,
+        to: std::net::SocketAddr,
+        payload: &'static [u8],
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        tokio::spawn(async move {
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = sock.send_to(payload, to).await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        stop
+    }
+
+    /// Reads from `receiver` until `want` arrives (true) or `ms` pass.
+    async fn recv_until(receiver: &UdpSocket, want: &[u8], ms: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
+        let mut buf = [0u8; 64];
+        while let Ok(Ok((n, _))) =
+            tokio::time::timeout_at(deadline, receiver.recv_from(&mut buf)).await
+        {
+            if &buf[..n] == want {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The exact-source override is not sticky while weak. A leg latched to a
+    /// NAT'd peer's port receives one datagram spoofed from the SDP `ip:port`
+    /// and moves there; the NAT'd peer keeps sending and takes the latch back
+    /// once the SDP source has been silent for the grace.
+    // NIST 800-53 Rev5: SC-7
+    #[tokio::test]
+    async fn relay_leg_nat_source_recovers_from_one_spoofed_exact_datagram() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let exact = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let natted = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let exact_addr = exact.local_addr().unwrap();
+        let nat_addr = natted.local_addr().unwrap();
+        let (relay_addr, recv_target, _sd) = spawn_opaque_leg(
+            exact_addr,
+            receiver.local_addr().unwrap(),
+            Some(std::time::Duration::from_millis(200)),
+            RelayKind::Rtp,
+        )
+        .await;
+
+        // The NAT'd peer streams; it latches once the initial grace passes.
+        let stop = stream_from(Arc::clone(&natted), relay_addr, b"nat");
+        assert!(
+            recv_until(&receiver, b"nat", 2000).await,
+            "NAT source never latched"
+        );
+        assert_eq!(*recv_target.read().unwrap(), nat_addr);
+
+        // One spoofed datagram from the SDP address takes the latch...
+        exact.send_to(b"spoof", relay_addr).await.unwrap();
+        assert!(
+            recv_until(&receiver, b"spoof", 2000).await,
+            "exact override"
+        );
+        // ...and the NAT'd peer takes it back after the grace of silence.
+        assert!(
+            recv_until(&receiver, b"nat", 3000).await,
+            "NAT source did not recover the latch"
+        );
+        assert_eq!(*recv_target.read().unwrap(), nat_addr);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// An exact SDP source that keeps sending holds the latch against a
+    /// same-IP neighbour that sprays well past the grace window.
+    #[tokio::test]
+    async fn relay_leg_exact_source_that_keeps_sending_holds_the_latch() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let exact = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let neighbour = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let exact_addr = exact.local_addr().unwrap();
+        let (relay_addr, recv_target, _sd) = spawn_opaque_leg(
+            exact_addr,
+            receiver.local_addr().unwrap(),
+            Some(std::time::Duration::from_millis(100)),
+            RelayKind::Rtp,
+        )
+        .await;
+
+        let stop_exact = stream_from(Arc::clone(&exact), relay_addr, b"exact");
+        assert!(recv_until(&receiver, b"exact", 2000).await);
+        let stop_spray = stream_from(Arc::clone(&neighbour), relay_addr, b"spray");
+        // Six grace windows of spraying.
+        assert!(
+            !recv_until(&receiver, b"spray", 600).await,
+            "the neighbour took the latch from a sending exact source"
+        );
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+        stop_spray.store(true, std::sync::atomic::Ordering::Relaxed);
+        stop_exact.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// On an RTCP leg the SDP address is only RTP port + 1 (a=rtcp is not
+    /// honoured), so it does not take the latch from the source the leg
+    /// latched to.
+    #[tokio::test]
+    async fn relay_leg_rtcp_exact_source_does_not_override() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let guessed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let actual = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let guessed_addr = guessed.local_addr().unwrap();
+        let (relay_addr, recv_target, _sd) = spawn_opaque_leg(
+            guessed_addr,
+            receiver.local_addr().unwrap(),
+            None,
+            RelayKind::Rtcp,
+        )
+        .await;
+
+        tokio::time::sleep(RELATCH_GRACE + std::time::Duration::from_millis(100)).await;
+        actual.send_to(b"rtcp-1", relay_addr).await.unwrap();
+        assert_eq!(
+            recv_payload(&receiver).await.as_deref(),
+            Some(&b"rtcp-1"[..])
+        );
+        assert_eq!(*recv_target.read().unwrap(), actual.local_addr().unwrap());
+
+        guessed.send_to(b"guessed", relay_addr).await.unwrap();
+        actual.send_to(b"rtcp-2", relay_addr).await.unwrap();
+        assert_eq!(
+            recv_payload(&receiver).await.as_deref(),
+            Some(&b"rtcp-2"[..]),
+            "the RTP+1 address took an RTCP latch"
+        );
+        assert_eq!(*recv_target.read().unwrap(), actual.local_addr().unwrap());
+    }
+
+    /// An RTCP leg latched to its exact SDP address stays there: a same-IP
+    /// port that sends two packets more than the grace apart, then keeps
+    /// sending for 2 s while the exact source is silent, never takes the
+    /// latch, and the exact source's RTCP is still relayed afterwards.
+    // NIST 800-53 Rev5: SC-7
+    #[tokio::test]
+    async fn relay_leg_rtcp_exact_latch_has_no_silence_takeover() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let exact = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let neighbour = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let exact_addr = exact.local_addr().unwrap();
+        let (relay_addr, recv_target, _sd) = spawn_opaque_leg(
+            exact_addr,
+            receiver.local_addr().unwrap(),
+            None,
+            RelayKind::Rtcp,
+        )
+        .await;
+
+        exact.send_to(b"rtcp-1", relay_addr).await.unwrap();
+        assert_eq!(
+            recv_payload(&receiver).await.as_deref(),
+            Some(&b"rtcp-1"[..])
+        );
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+
+        // Two packets more than the grace apart (the first arms a silence
+        // window on an RTP leg, the second would complete it).
+        neighbour.send_to(b"spray-1", relay_addr).await.unwrap();
+        tokio::time::sleep(RELATCH_GRACE + std::time::Duration::from_millis(100)).await;
+        neighbour.send_to(b"spray-2", relay_addr).await.unwrap();
+        assert_eq!(
+            recv_payload(&receiver).await,
+            None,
+            "a same-IP port took an exact RTCP latch after the grace"
+        );
+
+        // Then a packet every 100 ms for 2 s.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let sprayer = Arc::clone(&neighbour);
+        tokio::spawn(async move {
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = sprayer.send_to(b"spray", relay_addr).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+        assert!(
+            !recv_until(&receiver, b"spray", 2000).await,
+            "a same-IP port took an exact RTCP latch during the exact source's silence"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+
+        exact.send_to(b"rtcp-2", relay_addr).await.unwrap();
+        assert!(
+            recv_until(&receiver, b"rtcp-2", 2000).await,
+            "the exact source's RTCP was not relayed"
+        );
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+    }
+
+    /// Once the exact SDP source has sent EXACT_ESTABLISHED_PACKETS since it
+    /// took an RTP leg's latch, the latch is established: the source going
+    /// silent for well over the grace does not let a same-IP port take it.
+    // NIST 800-53 Rev5: SC-7
+    #[tokio::test]
+    async fn relay_leg_established_exact_latch_survives_silence() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let exact = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let neighbour = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let exact_addr = exact.local_addr().unwrap();
+        let (relay_addr, recv_target, _sd) = spawn_opaque_leg(
+            exact_addr,
+            receiver.local_addr().unwrap(),
+            Some(std::time::Duration::from_millis(100)),
+            RelayKind::Rtp,
+        )
+        .await;
+
+        // The exact source sends past the threshold, then goes silent.
+        let established = usize::try_from(EXACT_ESTABLISHED_PACKETS).unwrap() + 2;
+        for _ in 0..established {
+            exact.send_to(b"exact", relay_addr).await.unwrap();
+            assert_eq!(
+                recv_payload(&receiver).await.as_deref(),
+                Some(&b"exact"[..])
+            );
+        }
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+
+        let stop_spray = stream_from(Arc::clone(&neighbour), relay_addr, b"spray");
+        // Eight grace windows of spraying against a silent exact source.
+        assert!(
+            !recv_until(&receiver, b"spray", 800).await,
+            "a same-IP port took an established exact latch"
+        );
+        assert_eq!(*recv_target.read().unwrap(), exact_addr);
+        stop_spray.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The free list hands out each pair once, takes a released pair back
+    /// once (a repeated or stray release does not duplicate it), and ignores
+    /// ports that are not the RTP port of a pair in range.
+    #[tokio::test]
+    async fn port_allocator_free_list_release_is_idempotent() {
+        let allocator = RtpPortAllocator::new(40_000, 40_007);
+        assert_eq!(allocator.pair_count(), 4);
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            got.push(allocator.allocate_pair().await.unwrap().0);
+        }
+        assert!(allocator.allocate_pair().await.is_err());
+        assert_eq!(allocator.allocated_port_count().await, 8);
+
+        let freed = got[1];
+        allocator.release_pair(freed).await;
+        allocator.release_pair(freed).await;
+        allocator.release_pair(freed + 1).await; // the RTCP port
+        allocator.release_pair(39_998).await; // below the range
+        allocator.release_pair(40_100).await; // above the range
+        assert_eq!(allocator.allocated_port_count().await, 6);
+        assert_eq!(allocator.allocate_pair().await.unwrap(), (freed, freed + 1));
+        assert!(
+            allocator.allocate_pair().await.is_err(),
+            "a double release put the pair on the free list twice"
+        );
+
+        // A full u16 range has 32768 pairs and every index fits.
+        let full = RtpPortAllocator::new(0, 65535);
+        assert_eq!(full.pair_count(), 32_768);
+        let (even, odd) = full.allocate_pair().await.unwrap();
+        assert!(even % 2 == 0 && odd == even + 1);
+    }
+
+    /// Port pairs are drawn at random from the free list, not handed out in
+    /// sequence. Over 64 allocations from 1000 pairs, a sequential allocator
+    /// gives 63 steps of +2; a random one gives (almost always) none, and the
+    /// sequence is not increasing (probability of either under a uniform
+    /// draw is far below 2^-60).
+    // NIST 800-53 Rev5: SC-7
+    #[tokio::test]
+    async fn port_allocation_is_not_sequential() {
+        let allocator = RtpPortAllocator::new(20_000, 21_999);
+        assert_eq!(allocator.pair_count(), 1000);
+        let mut rtp = Vec::new();
+        for _ in 0..64 {
+            let (p, c) = allocator.allocate_pair().await.unwrap();
+            assert!(p % 2 == 0 && c == p + 1 && (20_000..=21_998).contains(&p));
+            rtp.push(p);
+        }
+        let mut uniq = rtp.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 64, "a pair was handed out twice");
+
+        let steps_of_two = rtp.windows(2).filter(|w| w[1] == w[0] + 2).count();
+        let increasing = rtp.windows(2).all(|w| w[1] > w[0]);
+        assert!(
+            steps_of_two < 32,
+            "{steps_of_two} of 63 allocations were the previous pair + 2: {rtp:?}"
+        );
+        assert!(
+            !increasing,
+            "allocations were monotonically increasing: {rtp:?}"
+        );
+    }
+
+    /// The supervisor seeds the leg's send target with the source the
+    /// handshake completed with, before any SRTP: a peer that handshakes from
+    /// a port other than its SDP port gets the SBC's media there.
+    #[tokio::test]
+    async fn terminate_supervisor_seeds_target_with_handshake_source() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        async fn wr<W: AsyncWriteExt + Unpin>(w: &mut W, t: u8, body: &[u8]) {
+            let n = 1 + body.len();
+            let mut f = Vec::with_capacity(2 + n);
+            f.extend_from_slice(&u16::try_from(n).unwrap().to_be_bytes());
+            f.push(t);
+            f.extend_from_slice(body);
+            w.write_all(&f).await.unwrap();
+        }
+        async fn rd<R: AsyncReadExt + Unpin>(r: &mut R) {
+            let mut h = [0u8; 2];
+            r.read_exact(&mut h).await.unwrap();
+            let mut b = vec![0u8; usize::from(u16::from_be_bytes(h))];
+            r.read_exact(&mut b).await.unwrap();
+        }
+        // A plausible DTLS 1.2 handshake record (13-byte header + body).
+        let hello: Vec<u8> = {
+            let mut r = vec![22u8, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 1, 0, 4];
+            r.extend_from_slice(b"helo");
+            r
+        };
+
+        let fp = "sha-384 SIDECAR";
+        let sock = std::env::temp_dir().join(format!("usg-term-seed-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        // One message per session once its Ready is written.
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let ready_tx = ready_tx.clone();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = stream.into_split();
+                    wr(&mut w, 1, fp.as_bytes()).await; // Hello
+                    rd(&mut r).await; // Start
+                    rd(&mut r).await; // the peer's first record
+                    let mut ready = vec![0u8, 8];
+                    ready.extend_from_slice(&[7u8; 88]);
+                    wr(&mut w, 4, &ready).await; // Ready
+                    let _ = ready_tx.send(());
+                    let mut sink = [0u8; 64];
+                    let _ = r.read(&mut sink).await;
+                });
+            }
+        });
+
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let port_base = 24_000_u16.wrapping_add((rand::random::<u16>() % 8_000) & !1);
+        let pipeline = MediaPipeline::new(MediaPipelineConfig {
+            srtp_required: false,
+            terminate_dtls: true,
+            dtls_sidecar_socket: Some(sock.clone()),
+            dtls_fingerprint: Some(Arc::new(
+                crate::dtls_identity::DtlsFingerprintSource::from_static(fp.to_string()),
+            )),
+            rtp_port_min: port_base,
+            rtp_port_max: port_base + 200,
+            ..Default::default()
+        });
+        let ports = pipeline
+            .create_session_with_zones(
+                "seed",
+                Some(MediaMode::Relay),
+                Some(loopback),
+                Some(loopback),
+            )
+            .await
+            .unwrap();
+
+        // A's SDP port never sends; A handshakes from another port.
+        let a_sdp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_actual = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        pipeline
+            .set_remote_address("seed", true, a_sdp.local_addr().unwrap().into())
+            .await
+            .unwrap();
+        pipeline
+            .set_remote_address("seed", false, peer_b.local_addr().unwrap().into())
+            .await
+            .unwrap();
+        pipeline
+            .start_relay_terminate(
+                "seed",
+                LegDtlsParams {
+                    peer_fingerprint: "sha-384 A".into(),
+                    role: Role::Server,
+                },
+                LegDtlsParams {
+                    peer_fingerprint: "sha-384 B".into(),
+                    role: Role::Server,
+                },
+            )
+            .await
+            .unwrap();
+        let a_target = {
+            let sessions = pipeline.sessions.read().await;
+            Arc::clone(sessions.get("seed").unwrap().a_leg_target.as_ref().unwrap())
+        };
+
+        a_actual
+            .send_to(&hello, format!("127.0.0.1:{}", ports.a_leg_rtp_port))
+            .await
+            .unwrap();
+        peer_b
+            .send_to(&hello, format!("127.0.0.1:{}", ports.b_leg_rtp_port))
+            .await
+            .unwrap();
+
+        // Precondition: both handshakes completed (the sidecar sent Ready).
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx.recv())
+                .await
+                .expect("a leg's handshake did not reach Ready")
+                .unwrap();
+        }
+        // No SRTP is sent: only the handshake can have moved the target.
+        let want = a_actual.local_addr().unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while *a_target.read().unwrap() != want && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            *a_target.read().unwrap(),
+            want,
+            "A-leg target is not the handshake source (SDP address {})",
+            a_sdp.local_addr().unwrap()
+        );
+
+        let _ = pipeline.stop_relay("seed").await;
+        let _ = std::fs::remove_file(&sock);
+    }
 }
 
 /// SIPREC recording fork through the pipeline (RFC 7866 §8).
@@ -4364,7 +5154,7 @@ mod recording_fork_tests {
     }
 
     async fn allocated_ports(pipeline: &MediaPipeline) -> usize {
-        pipeline.port_allocator.allocated.read().await.len()
+        pipeline.port_allocator.allocated_port_count().await
     }
 
     /// Polls until `port` can be bound again (the relay task drops a stopped
@@ -4793,5 +5583,377 @@ mod recording_fork_tests {
         c.a.send_to(&rtp(1, 1, &[1; 40]), c.sbc_a).await.unwrap();
         assert!(recv(&c.b, Duration::from_secs(2)).await.is_some());
         assert!(recv(&srs, Duration::from_millis(200)).await.is_none());
+    }
+}
+
+/// Terminate mode: one SRTP context per key and direction, RTCP only on the
+/// media port (RFC 5761; RFC 5764 §4.1), and no RTP + 1 relay socket.
+///
+/// Drives `start_relay_terminate` over a mock sidecar (same framing as
+/// `terminate_relay_end_to_end`) with real UDP peers on 127.0.0.1.
+///
+/// NIST 800-53 Rev5: SC-8, SC-13, SC-23
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod terminate_srtp_context_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+
+    const FP: &str = "sha-384 SIDECAR";
+    /// SSRC used by peer A for both RTP and RTCP (RTCP sender SSRC).
+    const A_SSRC: u32 = 0x0001_2345;
+    /// SSRC used by peer B for both RTP and RTCP (RTCP sender SSRC).
+    const B_SSRC: u32 = 0x0006_7890;
+
+    async fn wr<W: AsyncWriteExt + Unpin>(w: &mut W, t: u8, body: &[u8]) {
+        let n = 1 + body.len();
+        let mut f = Vec::with_capacity(2 + n);
+        f.extend_from_slice(&u16::try_from(n).unwrap().to_be_bytes());
+        f.push(t);
+        f.extend_from_slice(body);
+        w.write_all(&f).await.unwrap();
+    }
+
+    async fn rd<R: AsyncReadExt + Unpin>(r: &mut R) {
+        let mut h = [0u8; 2];
+        r.read_exact(&mut h).await.unwrap();
+        let mut b = vec![0u8; usize::from(u16::from_be_bytes(h))];
+        r.read_exact(&mut b).await.unwrap();
+    }
+
+    fn srtp_ctx(key: &[u8], salt: &[u8], dir: SrtpDirection, ssrc: u32) -> SrtpContext {
+        let m =
+            SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, key.to_vec(), salt.to_vec()).unwrap();
+        SrtpContext::new(&m, dir, ssrc).unwrap()
+    }
+
+    fn leg_params(peer_fingerprint: &str) -> LegDtlsParams {
+        LegDtlsParams {
+            peer_fingerprint: peer_fingerprint.into(),
+            role: Role::Server,
+        }
+    }
+
+    /// Binds a UDP socket on an even/odd port pair `(p, p + 1)` on loopback, so
+    /// anything the relay emitted towards a peer's RTP + 1 port is observed.
+    async fn bind_pair() -> (UdpSocket, UdpSocket) {
+        for _ in 0..200 {
+            let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = rtp.local_addr().unwrap().port();
+            let Some(next) = port.checked_add(1) else {
+                continue;
+            };
+            if let Ok(rtcp) = UdpSocket::bind(("127.0.0.1", next)).await {
+                return (rtp, rtcp);
+            }
+        }
+        unreachable!("no free loopback port pair");
+    }
+
+    async fn recv(s: &UdpSocket, wait: Duration) -> Option<Vec<u8>> {
+        let mut b = [0u8; 2048];
+        match tokio::time::timeout(wait, s.recv_from(&mut b)).await {
+            Ok(Ok((n, _))) => Some(b[..n].to_vec()),
+            _ => None,
+        }
+    }
+
+    /// RTCP RR (PT 201) from `A_SSRC` with a distinguishable 4-byte body.
+    fn rtcp_rr(fill: u8) -> Vec<u8> {
+        rtcp_rr_from(A_SSRC, fill)
+    }
+
+    /// RTCP RR (PT 201) from `ssrc` with a distinguishable 4-byte body.
+    fn rtcp_rr_from(ssrc: u32, fill: u8) -> Vec<u8> {
+        let s = ssrc.to_be_bytes();
+        vec![
+            0x80, 201, 0, 2, s[0], s[1], s[2], s[3], fill, fill, fill, fill,
+        ]
+    }
+
+    /// SRTCP index from the trailing `E || index` word (RFC 3711 §3.4; no MKI).
+    fn srtcp_index(pkt: &[u8]) -> u32 {
+        let t = &pkt[pkt.len() - 4..];
+        u32::from_be_bytes([t[0], t[1], t[2], t[3]]) & 0x7fff_ffff
+    }
+
+    struct Call {
+        pipeline: MediaPipeline,
+        sock_path: std::path::PathBuf,
+        /// SBC A-leg media port and its RTP + 1 port.
+        a_relay: SocketAddr,
+        a_relay_rtcp: SocketAddr,
+        /// SBC B-leg media port and its RTP + 1 port.
+        b_relay: SocketAddr,
+        b_relay_rtcp: SocketAddr,
+        /// Peer A sends from here (media port remote).
+        peer_a: UdpSocket,
+        /// Peer A's RTP + 1 port (observed: must receive nothing).
+        peer_a_rtcp: UdpSocket,
+        /// Peer B media port and its RTP + 1 port.
+        peer_b: UdpSocket,
+        peer_b_rtcp: UdpSocket,
+        /// Peer A's sending context (client_write key).
+        a_send: SrtpContext,
+        /// Peer B's receiving context (server_write key).
+        b_recv: SrtpContext,
+        /// One SRTP packet peer A sent on the media port that the SBC accepted
+        /// and relayed to peer B.
+        accepted_rtp: Vec<u8>,
+        /// Mock sidecar keying material: (client key, client salt, server
+        /// key, server salt). The SBC is DTLS server on both legs, so each
+        /// peer sends under the client_write key.
+        keys: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
+    }
+
+    impl Call {
+        async fn stop(self) {
+            let _ = self.pipeline.stop_relay("call").await;
+            let _ = std::fs::remove_file(&self.sock_path);
+        }
+    }
+
+    /// Sets up a terminated call (SBC is DTLS server on both legs), completes
+    /// both mock handshakes and waits until A->B media crosses the media port.
+    async fn terminated_call(tag: &str) -> Call {
+        let blob: Vec<u8> = (0..88).map(|_| rand::random::<u8>()).collect();
+        let client_key = blob[0..32].to_vec();
+        let server_key = blob[32..64].to_vec();
+        let client_salt = blob[64..76].to_vec();
+        let server_salt = blob[76..88].to_vec();
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "usg-srtpctx-{tag}-{}-{}.sock",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let blob2 = blob.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let blob = blob2.clone();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = stream.into_split();
+                    wr(&mut w, 1, FP.as_bytes()).await; // Hello
+                    rd(&mut r).await; // Start
+                    rd(&mut r).await; // forwarded DTLS trigger
+                    let mut ready = vec![0u8, 8];
+                    ready.extend_from_slice(&blob);
+                    wr(&mut w, 4, &ready).await; // Ready(profile=8, keys)
+                    let mut sink = [0u8; 64];
+                    let _ = r.read(&mut sink).await;
+                });
+            }
+        });
+
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let port_base = 32_000_u16.wrapping_add((rand::random::<u16>() % 8_000) & !1);
+        let pipeline = MediaPipeline::new(MediaPipelineConfig {
+            srtp_required: false,
+            terminate_dtls: true,
+            dtls_sidecar_socket: Some(sock_path.clone()),
+            dtls_fingerprint: Some(Arc::new(
+                crate::dtls_identity::DtlsFingerprintSource::from_static(FP.to_string()),
+            )),
+            rtp_port_min: port_base,
+            rtp_port_max: port_base + 200,
+            ..Default::default()
+        });
+        let ports = pipeline
+            .create_session_with_zones(
+                "call",
+                Some(MediaMode::Relay),
+                Some(loopback),
+                Some(loopback),
+            )
+            .await
+            .unwrap();
+
+        let (peer_a, peer_a_rtcp) = bind_pair().await;
+        let (peer_b, peer_b_rtcp) = bind_pair().await;
+        let a_relay: SocketAddr = ([127, 0, 0, 1], ports.a_leg_rtp_port).into();
+        let b_relay: SocketAddr = ([127, 0, 0, 1], ports.b_leg_rtp_port).into();
+        let a_relay_rtcp: SocketAddr = ([127, 0, 0, 1], ports.a_leg_rtp_port + 1).into();
+        let b_relay_rtcp: SocketAddr = ([127, 0, 0, 1], ports.b_leg_rtp_port + 1).into();
+        pipeline
+            .set_remote_address("call", true, peer_a.local_addr().unwrap().into())
+            .await
+            .unwrap();
+        pipeline
+            .set_remote_address("call", false, peer_b.local_addr().unwrap().into())
+            .await
+            .unwrap();
+
+        pipeline
+            .start_relay_terminate("call", leg_params("sha-384 A"), leg_params("sha-384 B"))
+            .await
+            .unwrap();
+
+        peer_a
+            .send_to(&[22u8, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0], a_relay)
+            .await
+            .unwrap();
+        peer_b
+            .send_to(&[22u8, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0], b_relay)
+            .await
+            .unwrap();
+
+        let a_send = srtp_ctx(&client_key, &client_salt, SrtpDirection::Outbound, A_SSRC);
+        let b_recv = srtp_ctx(&server_key, &server_salt, SrtpDirection::Inbound, A_SSRC);
+
+        let mut accepted_rtp = None;
+        for i in 0..40u16 {
+            let pkt = RtpPacket::new(RtpHeader::new(0, 100 + i, 900, A_SSRC), vec![0x5A; 160]);
+            let srtp = SrtpProtect::new(&a_send).protect_rtp(&pkt).unwrap();
+            peer_a.send_to(&srtp, a_relay).await.unwrap();
+            if recv(&peer_b, Duration::from_millis(150)).await.is_some() {
+                accepted_rtp = Some(srtp.to_vec());
+                break;
+            }
+        }
+        let accepted_rtp = accepted_rtp.expect("terminated media never crossed A->B");
+        // Let the supervisor finish spawning the remaining relay tasks.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        Call {
+            pipeline,
+            sock_path,
+            a_relay,
+            a_relay_rtcp,
+            b_relay,
+            b_relay_rtcp,
+            peer_a,
+            peer_a_rtcp,
+            peer_b,
+            peer_b_rtcp,
+            a_send,
+            b_recv,
+            accepted_rtp,
+            keys: (client_key, client_salt, server_key, server_salt),
+        }
+    }
+
+    /// Asserts nothing reaches either of a peer's ports within the wait.
+    async fn assert_silent(what: &str, media: &UdpSocket, rtcp_port: &UdpSocket) {
+        let on_rtcp = recv(rtcp_port, Duration::from_millis(300)).await;
+        let on_media = recv(media, Duration::from_millis(100)).await;
+        assert!(
+            on_rtcp.is_none() && on_media.is_none(),
+            "{what} re-emitted (RTP + 1: {}, media: {})",
+            on_rtcp.is_some(),
+            on_media.is_some()
+        );
+    }
+
+    // Muxed SRTCP towards B is protected by the single A->B task under B's
+    // egress key, so its SRTCP index (part of the AEAD nonce with the SSRC,
+    // RFC 7714 §9.1) never repeats.
+    #[tokio::test]
+    async fn terminate_egress_srtcp_indices_unique_on_media_port() {
+        let c = terminated_call("idx").await;
+
+        let mut indices = Vec::new();
+        for round in 0..8u8 {
+            let p = SrtpProtect::new(&c.a_send)
+                .protect_rtcp(&rtcp_rr(0x10 + round))
+                .unwrap();
+            c.peer_a.send_to(&p, c.a_relay).await.unwrap();
+            let out = recv(&c.peer_b, Duration::from_millis(500))
+                .await
+                .expect("muxed SRTCP relayed to B");
+            assert!(
+                SrtpUnprotect::new(&c.b_recv)
+                    .unprotect_rtcp_sync(&out)
+                    .is_ok(),
+                "B must authenticate media-port SRTCP"
+            );
+            indices.push(srtcp_index(&out));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for idx in &indices {
+            assert!(
+                seen.insert(*idx),
+                "egress SRTCP index {idx} repeated; all: {indices:?}"
+            );
+        }
+        c.stop().await;
+    }
+
+    // Terminate mode relays nothing that arrives on a leg's RTP + 1 port:
+    // neither SRTP nor SRTCP, fresh or already accepted on the media port.
+    #[tokio::test]
+    async fn terminate_rtp_plus_one_traffic_not_reemitted() {
+        let c = terminated_call("rtp1").await;
+        let (ck, cs, _, _) = &c.keys;
+        let b_send = srtp_ctx(ck, cs, SrtpDirection::Outbound, B_SSRC);
+
+        // A-leg RTP + 1: replayed SRTP, fresh SRTP, fresh and replayed SRTCP.
+        c.peer_a
+            .send_to(&c.accepted_rtp, c.a_relay_rtcp)
+            .await
+            .unwrap();
+        assert_silent("SRTP replayed to A RTP + 1", &c.peer_b, &c.peer_b_rtcp).await;
+
+        let fresh = SrtpProtect::new(&c.a_send)
+            .protect_rtp(&RtpPacket::new(
+                RtpHeader::new(0, 400, 900, A_SSRC),
+                vec![0x5A; 160],
+            ))
+            .unwrap();
+        c.peer_a.send_to(&fresh, c.a_relay_rtcp).await.unwrap();
+        assert_silent("fresh SRTP to A RTP + 1", &c.peer_b, &c.peer_b_rtcp).await;
+
+        let p = SrtpProtect::new(&c.a_send)
+            .protect_rtcp(&rtcp_rr(0x33))
+            .unwrap();
+        c.peer_a.send_to(&p, c.a_relay_rtcp).await.unwrap();
+        assert_silent("fresh SRTCP to A RTP + 1", &c.peer_b, &c.peer_b_rtcp).await;
+        c.peer_a.send_to(&p, c.a_relay).await.unwrap();
+        assert!(
+            recv(&c.peer_b, Duration::from_millis(500)).await.is_some(),
+            "muxed SRTCP relayed to B"
+        );
+        c.peer_a.send_to(&p, c.a_relay_rtcp).await.unwrap();
+        assert_silent("SRTCP replayed to A RTP + 1", &c.peer_b, &c.peer_b_rtcp).await;
+
+        // B-leg RTP + 1: fresh SRTP and SRTCP from B.
+        let srtp = SrtpProtect::new(&b_send)
+            .protect_rtp(&RtpPacket::new(
+                RtpHeader::new(0, 500, 900, B_SSRC),
+                vec![0xA5; 160],
+            ))
+            .unwrap();
+        c.peer_b.send_to(&srtp, c.b_relay_rtcp).await.unwrap();
+        assert_silent("SRTP to B RTP + 1", &c.peer_a, &c.peer_a_rtcp).await;
+        let p = SrtpProtect::new(&b_send)
+            .protect_rtcp(&rtcp_rr_from(B_SSRC, 0x44))
+            .unwrap();
+        c.peer_b.send_to(&p, c.b_relay_rtcp).await.unwrap();
+        assert_silent("SRTCP to B RTP + 1", &c.peer_a, &c.peer_a_rtcp).await;
+
+        c.stop().await;
+    }
+
+    // NIST 800-53 Rev5: CM-7 -- once the terminated call is relaying, the
+    // relay holds no A-leg or B-leg RTP + 1 socket (both stay bindable).
+    #[tokio::test]
+    async fn terminate_binds_no_rtp_plus_one_port() {
+        let c = terminated_call("nobind").await;
+
+        for (leg, addr) in [("A", c.a_relay_rtcp), ("B", c.b_relay_rtcp)] {
+            let r = UdpSocket::bind(addr).await;
+            assert!(
+                r.is_ok(),
+                "{leg}-leg RTP + 1 port {addr} is bound by the relay: {:?}",
+                r.err()
+            );
+        }
+        c.stop().await;
     }
 }

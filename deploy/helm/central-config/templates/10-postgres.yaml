@@ -1,9 +1,21 @@
 {{- if eq (.Values.postgres.mode | default "bundled") "bundled" }}
+{{- $pass := required "postgres.password is required in postgres.mode=bundled (no default credential)" .Values.postgres.password }}
+{{- if eq $pass "change-me" }}
+{{- fail "postgres.password must not be the change-me placeholder" }}
+{{- end }}
+{{- /* Percent-encoded for the DSN userinfo (QueryEscape, then space as %20). */}}
+{{- $passUrl := $pass | urlquery | replace "+" "%20" }}
 # Bundled single-instance central Postgres — LAB/DEV ONLY.
 #
 # Production must use an HA, PITR-backed Postgres: set postgres.mode=cnpg
 # (CloudNativePG Cluster, see 11-postgres-cnpg.yaml) or postgres.mode=external.
 # This is the one datastore in the system that must not lose writes.
+#
+# The bundled image has no server certificate, so the DSN below is explicitly
+# plaintext (sslmode=disable): lab only. NIST 800-53 Rev5: IA-5 (no default
+# authenticator). SC-8 is not met in this mode; in cnpg mode the chart-owned
+# DSNs use verify-full, and external DSNs are operator-defined.
+# POAM: POA&M-384 (SC-8) bundled mode is plaintext; operator DSN sslmode is not checked.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -14,8 +26,8 @@ metadata:
 type: Opaque
 stringData:
   username: {{ .Values.postgres.user | quote }}
-  password: {{ .Values.postgres.password | quote }}
-  dsn: "postgres://{{ .Values.postgres.user }}:{{ .Values.postgres.password }}@{{ include "central-config.fullname" . }}-postgres.{{ .Release.Namespace }}.svc.cluster.local:5432/{{ .Values.postgres.database }}"
+  password: {{ $pass | quote }}
+  dsn: "postgres://{{ .Values.postgres.user }}:{{ $passUrl }}@{{ include "central-config.fullname" . }}-postgres.{{ .Release.Namespace }}.svc.cluster.local:5432/{{ .Values.postgres.database }}?sslmode=disable"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

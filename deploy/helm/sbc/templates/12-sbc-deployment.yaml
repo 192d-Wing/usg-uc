@@ -226,8 +226,9 @@ spec:
             - { name: sip-tls,  containerPort: 5061, protocol: TCP }
             - { name: api,      containerPort: 80,   protocol: TCP }
             - { name: metrics,  containerPort: 9090, protocol: TCP }
-            # gRPC admin API; consumed by sbc-api-server (when enabled)
-            # for TrunkSync / DialPlanSync / DidMappingSync RPCs.
+            # gRPC admin API; consumed by sbc-api-server and sbc-trunk-agent
+            # over mTLS (sbcDaemon.grpcMtls). Without mTLS the listener is
+            # bound to loopback and this port is not reachable off the pod.
             - { name: grpc,     containerPort: 9091, protocol: TCP }
           livenessProbe:
             httpGet: { path: /healthz, port: api }
@@ -292,8 +293,12 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/sbc-media"]
           env:
+            # Loopback only: MediaControllerService has no client
+            # authentication, and sbc-media refuses a non-loopback address.
+            # The daemon in this pod dials it at 127.0.0.1:9096.
+            # NIST 800-53 Rev5: SC-7, CM-7
             - name: SBC_MEDIA_GRPC_LISTEN
-              value: "0.0.0.0:9096"
+              value: "127.0.0.1:9096"
             # Match the daemon's [media] rtp_port_min/max (config helper literals).
             - name: SBC_MEDIA_RTP_PORT_MIN
               value: "16384"
@@ -312,8 +317,6 @@ spec:
             - name: SBC_MEDIA_DTLS_FINGERPRINT_FILE
               value: "/run/usg/dtls-terminator.fp"
             {{- end }}
-          ports:
-            - { name: media-grpc, containerPort: 9096, protocol: TCP }
           resources:
             {{- toYaml .Values.mediaSplit.resources | nindent 12 }}
           securityContext:
