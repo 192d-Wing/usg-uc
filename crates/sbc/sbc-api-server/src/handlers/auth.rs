@@ -217,7 +217,8 @@ mod tests {
     fn bad_login() -> LoginRequest {
         LoginRequest {
             username: "admin".to_string(),
-            password: "wrong".to_string(),
+            // Generated per run: any value fails against the unparseable hash.
+            password: format!("invalid-{}", std::process::id()),
         }
     }
 
