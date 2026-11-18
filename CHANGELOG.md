@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
-### BREAKING (SBC, in-dialog request and CANCEL matching, POA&M-380..385)
+### BREAKING (SBC, in-dialog request and CANCEL matching, POA&M-390..395)
 
 Affects every SBC call. Peers that follow RFC 3261 see no change on
 correct traffic; requests that only matched loosely before are now
@@ -26,7 +26,7 @@ refused. Tested by `sip_stack/tests/dialog_binding.rs` and unit tests in
   registered callee, its binding. The transport must be the leg's or a
   stronger one. A UA registered over UDP that sends a large request over
   TCP from another port gets 403; register such UAs over TCP or TLS
-  (POA&M-384).
+  (POA&M-394).
 - **Endpoints that re-register on a new flow are followed.** (RFC 5626
   §4.4, §5.3) Only with REGISTER authentication on: an endpoint caller or
   registered callee whose in-dialog request arrives on a new flow holding
@@ -48,7 +48,7 @@ refused. Tested by `sip_stack/tests/dialog_binding.rs` and unit tests in
   up to 2 s and then tear the call down). After the final response: 200
   only, the call is unchanged. A matched pending INVITE: 200, and 487 on
   the INVITE's own transaction, sent to the INVITE's source. A CANCEL of a
-  pending re-INVITE gets 200 and the re-INVITE completes (POA&M-385).
+  pending re-INVITE gets 200 and the re-INVITE completes (POA&M-395).
 - **The B-leg CANCEL waits for a provisional.** (RFC 3261 §9.1) The SBC
   sends the CANCEL toward the callee only after the B-leg INVITE drew a
   1xx, and drops it if a final response arrives first.
@@ -73,10 +73,10 @@ refused. Tested by `sip_stack/tests/dialog_binding.rs` and unit tests in
   SIEM parsers of that field must be updated. The audit schema is
   unchanged.
 - **Known limits** (open): a 2xx from a later fork is not adopted as the
-  callee dialog (POA&M-380); an INVITE copy from another source is answered
-  from the stored transaction (POA&M-381); trunk-group membership is read
-  from the live configuration (POA&M-382, accepted risk); UDP source
-  spoofing by a party that has seen the dialog (POA&M-383, accepted risk,
+  callee dialog (POA&M-390); an INVITE copy from another source is answered
+  from the stored transaction (POA&M-391); trunk-group membership is read
+  from the live configuration (POA&M-392, accepted risk); UDP source
+  spoofing by a party that has seen the dialog (POA&M-393, accepted risk,
   use TLS).
 
 No SBC config key, CDR field, audit event type or REST/gRPC API is

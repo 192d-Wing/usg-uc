@@ -3518,7 +3518,7 @@ impl SipStack {
     /// other copy is processed statelessly (not recorded on the stored
     /// transaction). NIST 800-53 Rev5: SC-23.
     ///
-    /// POAM: POA&M-381 an INVITE copy (same branch and Call-ID) from another
+    /// POAM: POA&M-391 an INVITE copy (same branch and Call-ID) from another
     /// source is still answered from the stored transaction, to that
     /// source.
     async fn answer_request_retransmit(&self, req: &SipRequest, ingress: &Ingress) -> TxnCheck {
@@ -4966,7 +4966,7 @@ impl SipStack {
     /// of its hosts, RFC 3263 §4.3 / RFC 3261 §12.2.1.1); an endpoint peer
     /// admits a new flow that holds its registration.
     ///
-    /// POAM: POA&M-382 trunk-group membership is read from the live
+    /// POAM: POA&M-392 trunk-group membership is read from the live
     /// configuration: a reload changes it for calls in progress, and an
     /// address configured in two groups is admitted for calls of both (a
     /// load-time warning names it). The leg's own IP is always admitted.
@@ -9177,7 +9177,7 @@ impl SipStack {
 
         // Learn the remote (callee) tag from the first tagged response —
         // it completes the dialog identity used by in-dialog BYE/ACK.
-        // POAM: POA&M-380 a 2xx from another fork (another To tag) does not
+        // POAM: POA&M-390 a 2xx from another fork (another To tag) does not
         // replace it, so that fork's in-dialog requests get 481.
         if addrs.dialog_to_tag.is_none()
             && let Some(tag) = resp
@@ -12445,7 +12445,7 @@ impl SipStack {
         // A pending re-INVITE matches only its own transaction (its CSeq is
         // not the initial INVITE's), so the claim below refuses and the
         // CANCEL gets 200 with no effect.
-        // POAM: POA&M-385 RFC 3261 §9.2: a UAS SHOULD answer a cancelled
+        // POAM: POA&M-395 RFC 3261 §9.2: a UAS SHOULD answer a cancelled
         // re-INVITE 487; the SBC lets the re-INVITE complete instead.
         self.cancel_initial_invite(req, &ingress, ident.as_ref(), &sip_call_id, &matches_call)
             .await

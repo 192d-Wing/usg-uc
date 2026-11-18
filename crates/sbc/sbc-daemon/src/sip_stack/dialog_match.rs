@@ -37,14 +37,14 @@
 //!
 //! Every IP is compared in canonical form (`to_canonical()`).
 //!
-//! POAM: POA&M-384 an endpoint is pinned to its flow's port even across a
+//! POAM: POA&M-394 an endpoint is pinned to its flow's port even across a
 //! transport change: a UA registered over UDP that switches to TCP for a
 //! large request (RFC 3261 §18.1.1) sends it from another port and gets
 //! 403. Such UAs must register over TCP/TLS (local SC-23 policy: admitting
 //! another port of the same IP would admit every device behind a shared
 //! NAT address).
 //!
-//! POAM: POA&M-383 UDP source addresses can be spoofed: an on-path party that
+//! POAM: POA&M-393 UDP source addresses can be spoofed: an on-path party that
 //! has seen a dialog's tags and sends from the leg's exact IP:port is
 //! admitted (accepted risk; TLS is the mitigation).
 //!

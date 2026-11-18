@@ -1885,7 +1885,7 @@ pub async fn sync_trunk_group_to_router(
     // set change under the trunk-sync guard, so a concurrent removal runs
     // wholly before or after them. The source map is replaced (no hosts
     // clears the group's entries).
-    // POAM: POA&M-386 the gRPC sync path reads the group from the store
+    // POAM: POA&M-396 the gRPC sync path reads the group from the store
     // before calling this; a delete that commits and runs its removal
     // between that read and this guard is undone here (the deleted group
     // is re-applied until the next sync or restart). Fix: re-read the
