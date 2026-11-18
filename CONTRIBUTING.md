@@ -40,6 +40,64 @@ A bare `v*` tag triggers nothing. The workspace `version` in `Cargo.toml` is
 still shared; bump it when the SBC ships, and bump the `client-gui-tauri` /
 `tauri.conf.json` version when the client ships.
 
+Only an `sbc-v<semver>` or `client-v<semver>` tag publishes (`sbc-v1.2.3`,
+`client-v1.2.3-rc.1`). A `workflow_dispatch` of `release-sbc.yml` on a branch
+builds the images with a read-only token and pushes nothing. Release builds
+use no build cache. A published image version is never overwritten: cut a
+new version instead. Publishing jobs run in the `release` GitHub environment. Its
+deployment refs must be limited to tags `sbc-v*` and `client-v*`, and it must
+have required reviewers. The Iron Bank secrets (`REPO1_USER`, `REPO1`) belong
+in that environment. Release tags should be protected by a tag ruleset,
+because whoever can push a release tag controls the workflow that signs it.
+The GHCR packages still grant this repository's workflows write access
+("Manage Actions access"). Narrowing that to publishing through an
+environment-only credential is future work, which is why the checks below
+matter.
+
+### Verifying releases
+
+Images and client assets are signed with cosign keyless (GitHub OIDC) and
+carry GitHub build-provenance attestations. Images also carry BuildKit
+provenance and an SBOM. Client releases attach an SPDX SBOM, `SHA256SUMS`,
+and a `<file>.sigstore.json` bundle for every asset. Check each artifact
+against the identity of its own release workflow at a release tag.
+
+Requires cosign v3.0 or later. cosign v2.4 and later need
+`--new-bundle-format`. Older versions cannot read these signatures.
+
+```bash
+ISSUER=https://token.actions.githubusercontent.com
+SBC_ID='^https://github\.com/192d-Wing/usg-uc/\.github/workflows/release-sbc\.yml@refs/tags/sbc-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+CLIENT_ID='^https://github\.com/192d-Wing/usg-uc/\.github/workflows/release-client\.yml@refs/tags/client-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
+# SBC image: resolve the tag to a digest, verify, then deploy by digest.
+IMG=ghcr.io/192d-wing/sbc-daemon
+DIGEST=$(docker buildx imagetools inspect "$IMG:0.11.0" --format '{{json .Manifest}}' | jq -r .digest)
+cosign verify --certificate-identity-regexp "$SBC_ID" \
+  --certificate-oidc-issuer "$ISSUER" "$IMG@$DIGEST"
+gh attestation verify "oci://$IMG@$DIGEST" --repo 192d-Wing/usg-uc \
+  --cert-identity-regex "$SBC_ID" --cert-oidc-issuer "$ISSUER" \
+  --source-ref refs/tags/sbc-v0.11.0
+
+# Client release assets (bash, in the download directory; any subset of
+# the assets may be present).
+shopt -s nullglob
+for f in SHA256SUMS sip-softclient-* client-ffi-* usg-uc-*.spdx.json; do
+  case "$f" in *.sigstore.json) continue ;; esac
+  cosign verify-blob --bundle "$f.sigstore.json" \
+    --certificate-identity-regexp "$CLIENT_ID" \
+    --certificate-oidc-issuer "$ISSUER" "$f"
+done
+sha256sum -c --ignore-missing SHA256SUMS   # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+A=sip-softclient-0.2.0-x86_64-unknown-linux-gnu.tar.gz
+gh attestation verify "$A" --repo 192d-Wing/usg-uc \
+  --cert-identity-regex "$CLIENT_ID" --cert-oidc-issuer "$ISSUER" \
+  --source-ref refs/tags/client-v0.2.0
+gh attestation verify "$A" --repo 192d-Wing/usg-uc \
+  --cert-identity-regex "$CLIENT_ID" --cert-oidc-issuer "$ISSUER" \
+  --predicate-type https://spdx.dev/Document/v2.3
+```
+
 ---
 
 ## 3. Commit Messages
