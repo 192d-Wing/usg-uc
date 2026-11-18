@@ -25763,12 +25763,7 @@ pub mod tests {
         let cap = uc_audit::capture::start();
         let www = digest_challenge(&stack, "alice", 1).await;
         let nonce = www_param(&www, "nonce").unwrap();
-        stack
-            .digest
-            .as_ref()
-            .unwrap()
-            .clock_skew_secs
-            .store(301, Ordering::Relaxed);
+        age_digest_nonces(&stack);
         let r = register_with(
             &stack,
             "alice",
@@ -26232,14 +26227,16 @@ pub mod tests {
         );
     }
 
-    /// Ages every nonce issued so far past the nonce lifetime.
+    /// Ages every nonce issued so far past the configured nonce lifetime
+    /// (`digest_nonce_ttl_secs`, at least 1 s as in `SipStack::new`).
     fn age_digest_nonces(stack: &SipStack) {
+        let past_ttl = stack.config.digest_nonce_ttl_secs.max(1) + 1;
         stack
             .digest
             .as_ref()
             .unwrap()
             .clock_skew_secs
-            .store(301, Ordering::Relaxed);
+            .store(past_ttl, Ordering::Relaxed);
     }
 
     /// AC-7 (POA&M-316): a correct response on a stale nonce (for example
@@ -26304,7 +26301,8 @@ pub mod tests {
         let www = digest_challenge(&stack, "alice", 1).await;
         let early = www_param(&www, "nonce").unwrap();
         for i in 0..FREE_FAILURES {
-            digest_attempt(&stack, src, "alice", "nope", 10 + i * 2).await;
+            let r = digest_attempt(&stack, src, "alice", "nope", 10 + i * 2).await;
+            assert!(responded(&r, 401).is_some(), "{r:?}");
         }
         let digest = stack.digest.as_ref().unwrap();
         assert_eq!(lock_leaf(&digest.throttle).tracked(), 1);
@@ -26338,7 +26336,8 @@ pub mod tests {
         assert_eq!(lock_leaf(&digest.throttle).tracked(), 0, "count cleared");
 
         // Counted from zero again: one wrong response opens no window.
-        digest_attempt(&stack, src, "alice", "nope", 40).await;
+        let r = digest_attempt(&stack, src, "alice", "nope", 40).await;
+        assert!(responded(&r, 401).is_some(), "{r:?}");
         assert!(!lock_leaf(&digest.throttle).is_blocked("alice", true, Instant::now()));
         assert_eq!(digest_count(&stack, "throttled"), 0);
     }
