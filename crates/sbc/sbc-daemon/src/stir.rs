@@ -86,8 +86,8 @@ struct VerifySide {
 pub struct StirService {
     signing: Option<SigningSide>,
     verifying: Option<VerifySide>,
-    /// Ingress trunk by source IP: (trunk id, settings).
-    trunk_by_ip: HashMap<IpAddr, (String, TrunkStirConfig)>,
+    /// Ingress trunk by source IP: (trunk group id, trunk id, settings).
+    trunk_by_ip: HashMap<IpAddr, (String, String, TrunkStirConfig)>,
     /// Egress trunk settings by trunk id.
     trunk_by_id: HashMap<String, TrunkStirConfig>,
     /// Verification-failure audit limiter (ingress trunk, reason).
@@ -430,7 +430,7 @@ impl StirService {
             for t in &g.trunks {
                 egress.insert(t.id.clone(), t.stir_shaken);
                 for ip in crate::sip_stack::resolve_trunk_host_ips(&t.host) {
-                    ingress.insert(ip, (t.id.clone(), t.stir_shaken));
+                    ingress.insert(ip, (g.id.clone(), t.id.clone(), t.stir_shaken));
                 }
             }
         }
@@ -593,10 +593,25 @@ impl StirService {
         });
     }
 
-    /// Verifies the inbound INVITE (RFC 8224 §6.2).
-    pub async fn inbound(&self, req: &SipRequest, source: IpAddr, call_id: &str) -> InboundStir {
+    /// Verifies the inbound INVITE (RFC 8224 §6.2). `trunk_group` is the
+    /// source's current trunk group (`SipStack::lookup_inbound_trunk`): the
+    /// configured trunk settings apply only while the source is still a
+    /// trunk of the group they were loaded for.
+    ///
+    /// NIST 800-53 Rev5: AC-4, CM-3
+    pub async fn inbound(
+        &self,
+        req: &SipRequest,
+        source: IpAddr,
+        trunk_group: Option<&str>,
+        call_id: &str,
+    ) -> InboundStir {
         let mut out = InboundStir::default();
-        let Some((trunk_id, trunk)) = self.trunk_by_ip.get(&source.to_canonical()) else {
+        let Some((_, trunk_id, trunk)) = self
+            .trunk_by_ip
+            .get(&source.to_canonical())
+            .filter(|(group, _, _)| trunk_group == Some(group.as_str()))
+        else {
             return out;
         };
         let identities: Vec<&str> = req
@@ -1285,6 +1300,36 @@ mod tests {
             trust_domain: true,
         });
         c
+    }
+
+    // NIST 800-53 Rev5: AC-4, CM-3
+    /// An ingress trunk's STIR settings apply only while its source address
+    /// is still a trunk of the group they were configured for.
+    #[tokio::test]
+    async fn inbound_settings_follow_current_trunk_group() {
+        let f = test_support::sti_files();
+        let mut c = signing_config(&f);
+        c.trunk_groups[0].trunks[0]
+            .stir_shaken
+            .strip_inbound_identity = false;
+        let svc = test_support::service(&c);
+        let uri: proto_sip::uri::SipUri = "sip:+12025550100@sbc.test".parse().unwrap();
+        let mut req = SipRequest::new(proto_sip::Method::Invite, uri);
+        req.headers.add(Header::new(
+            HeaderName::Identity,
+            "e30.e30.sig;info=<https://x/a.pem>",
+        ));
+        let ip: IpAddr = "192.0.2.10".parse().unwrap();
+
+        let same = svc.inbound(&req, ip, Some("g"), "c1").await;
+        assert_eq!(same.passthrough_identity.len(), 1, "configured group");
+        let moved = svc.inbound(&req, ip, Some("other"), "c2").await;
+        assert!(
+            moved.passthrough_identity.is_empty(),
+            "moved to another group"
+        );
+        let removed = svc.inbound(&req, ip, None, "c3").await;
+        assert!(removed.passthrough_identity.is_empty(), "no longer a trunk");
     }
 
     fn sign_failures(events: &[uc_audit::AuditEvent]) -> Vec<(String, String, u64)> {

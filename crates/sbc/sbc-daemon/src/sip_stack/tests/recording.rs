@@ -299,19 +299,58 @@ async fn caller_ack(stack: &SipStack, call_id: &str) -> Vec<ProcessResult> {
     caller_ack_for(stack, DIALED, call_id, 1).await
 }
 
-/// The caller's ACK for the 2xx to its INVITE number `cseq` toward `user`.
+/// The caller's ACK for the 2xx to its INVITE number `cseq` toward `user`,
+/// on the transport the caller's leg is bound to.
 async fn caller_ack_for(
     stack: &SipStack,
     user: &str,
     call_id: &str,
     cseq: u32,
 ) -> Vec<ProcessResult> {
+    let transport = a_leg_transport(stack, call_id).await;
+    caller_ack_on(stack, user, call_id, cseq, transport).await
+}
+
+/// [`caller_ack_for`] on `transport`, for an ACK that arrives after the
+/// call record is gone.
+async fn caller_ack_on(
+    stack: &SipStack,
+    user: &str,
+    call_id: &str,
+    cseq: u32,
+    transport: AddrTransport,
+) -> Vec<ProcessResult> {
     let ack = caller_request("ACK", user, call_id, cseq, Some("bobtag"), None);
     let ack = Bytes::from(String::from_utf8(ack.to_vec()).unwrap().replace(
         &format!("z9hG4bK-{call_id}-{cseq}"),
         &format!("z9hG4bK-{call_id}-ack{cseq}"),
     ));
-    flatten(stack.process_message(&ack, alice(), None).await)
+    flatten(
+        stack
+            .process_message_on(&ack, alice(), None, transport)
+            .await,
+    )
+}
+
+/// The transport the caller's leg of `call_id` is bound to (UDP when there
+/// is no such call): in-dialog requests from the caller must arrive on it
+/// (RFC 3261 §12.2.2 peer binding, transport floor).
+async fn a_leg_transport(stack: &SipStack, call_id: &str) -> AddrTransport {
+    let corr = stack.call_correlation.read().await;
+    corr.a_leg
+        .get(call_id)
+        .and_then(|id| corr.addresses.get(id))
+        .map_or(AddrTransport::Udp, |a| a.a_leg_flow.transport)
+}
+
+/// `request` from the caller of `call_id`, on the transport its leg is bound to.
+async fn from_alice(stack: &SipStack, call_id: &str, request: &Bytes) -> Vec<ProcessResult> {
+    let transport = a_leg_transport(stack, call_id).await;
+    flatten(
+        stack
+            .process_message_on(request, alice(), None, transport)
+            .await,
+    )
 }
 
 /// The SBC's BYEs toward the call legs (not the SRS), by destination.
@@ -400,7 +439,7 @@ fn srs_request(invite: &SipRequest, method: &str, from_tag: &str) -> Bytes {
 
 async fn caller_bye(stack: &SipStack, call_id: &str) -> Vec<ProcessResult> {
     let bye = caller_request("BYE", DIALED, call_id, 2, Some("bobtag"), None);
-    flatten(stack.process_message(&bye, alice(), None).await)
+    from_alice(stack, call_id, &bye).await
 }
 
 async fn poll(stack: &SipStack) -> Vec<ProcessResult> {
@@ -2364,10 +2403,11 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
         tls_legs(&f.stack, "up@test").await;
         srs_ok(&f.stack, &inv).await;
         f.stack
-            .process_message(
+            .process_message_on(
                 &caller_request("ACK", DIALED, "up@test", 1, Some("bobtag"), None),
                 alice(),
                 None,
+                AddrTransport::Tls,
             )
             .await;
         // Hold (still RTP/AVP): the recording goes on.
@@ -2375,7 +2415,7 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
         let hold_answer = BOB_SDP.replace("a=sendrecv", "a=recvonly");
         let results = flatten(
             f.stack
-                .process_message(
+                .process_message_on(
                     &caller_request(
                         "INVITE",
                         DIALED,
@@ -2386,6 +2426,7 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
                     ),
                     alice(),
                     None,
+                    AddrTransport::Tls,
                 )
                 .await,
         );
@@ -2405,10 +2446,11 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
             "hold keeps recording"
         );
         f.stack
-            .process_message(
+            .process_message_on(
                 &caller_request("ACK", DIALED, "up@test", 2, Some("bobtag"), None),
                 alice(),
                 None,
+                AddrTransport::Tls,
             )
             .await;
 
@@ -2416,7 +2458,7 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
         let capture = uc_audit::capture::start();
         let results = flatten(
             f.stack
-                .process_message(
+                .process_message_on(
                     &caller_request(
                         "INVITE",
                         DIALED,
@@ -2427,6 +2469,7 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
                     ),
                     alice(),
                     None,
+                    AddrTransport::Tls,
                 )
                 .await,
         );
@@ -2451,7 +2494,7 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
             // RFC 3261 §15: the caller's BYE waits for its ACK of the
             // re-INVITE's 2xx.
             assert_eq!(leg_byes(&results), vec![t1()], "{results:?}");
-            results.extend(caller_ack_for(&f.stack, DIALED, "up@test", 3).await);
+            results.extend(caller_ack_on(&f.stack, DIALED, "up@test", 3, AddrTransport::Tls).await);
         }
         assert_eq!(f.media.count("fork-stop"), 1);
         let events = capture.events();
