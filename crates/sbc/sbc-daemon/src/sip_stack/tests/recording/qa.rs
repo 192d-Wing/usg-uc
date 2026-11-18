@@ -415,7 +415,7 @@ async fn qa_real_pipeline_stops_forking_when_the_call_becomes_srtp_passthrough()
         );
         let results = flatten(
             call.stack
-                .process_message(
+                .process_message_on(
                     &caller_request(
                         "INVITE",
                         DIALED,
@@ -426,6 +426,7 @@ async fn qa_real_pipeline_stops_forking_when_the_call_becomes_srtp_passthrough()
                     ),
                     super::alice(),
                     None,
+                    AddrTransport::Tls,
                 )
                 .await,
         );
@@ -447,7 +448,8 @@ async fn qa_real_pipeline_stops_forking_when_the_call_becomes_srtp_passthrough()
         results.extend(queued);
         // RFC 3261 §15: the caller's BYE (under `reject`) waits for its ACK
         // of the re-INVITE's 2xx.
-        results.extend(caller_ack_for(&call.stack, DIALED, call.call_id, 2).await);
+        results
+            .extend(caller_ack_on(&call.stack, DIALED, call.call_id, 2, AddrTransport::Tls).await);
         for port in &fork_ports {
             assert!(
                 port_is_released(ip, *port).await,
@@ -814,7 +816,7 @@ async fn assert_emergency_kept(
         "{reason:?}: no teardown audited"
     );
     let bye = caller_request("BYE", "911", call_id, 2, Some("bobtag"), None);
-    f.stack.process_message(&bye, alice(), None).await;
+    from_alice(&f.stack, call_id, &bye).await;
     let c = one_cdr(&f.cdr);
     assert!(c.emergency);
     assert_eq!(c.disposition, uc_cdr::Disposition::Answered, "{reason:?}");
@@ -1163,7 +1165,11 @@ async fn qa_callee_initiated_switch_to_srtp_passthrough_ends_the_recording() {
             b_invite.headers.call_id().unwrap(),
             SAVP_ANSWER.len(),
         ));
-        let results = flatten(f.stack.process_message(&reinvite, t1(), None).await);
+        let results = flatten(
+            f.stack
+                .process_message_on(&reinvite, t1(), None, AddrTransport::Tls)
+                .await,
+        );
         let (to_caller, dest) = forwarded(&results, &Method::Invite)
             .unwrap_or_else(|| panic!("callee re-INVITE relayed to the caller: {results:?}"));
         assert_eq!(dest, alice());
@@ -1194,7 +1200,9 @@ async fn qa_callee_initiated_switch_to_srtp_passthrough_ends_the_recording() {
             let ack = ack.split("Content-Type:").next().unwrap().to_string()
                 + "Content-Length: 0\r\n\r\n";
             results.extend(flatten(
-                f.stack.process_message(&Bytes::from(ack), t1(), None).await,
+                f.stack
+                    .process_message_on(&Bytes::from(ack), t1(), None, AddrTransport::Tls)
+                    .await,
             ));
         }
         assert_eq!(f.media.count("fork-stop"), 1, "{policy:?}");
@@ -1649,16 +1657,17 @@ async fn qa_update_to_srtp_passthrough_ends_the_recording() {
         tls_legs(&f.stack, "upd@test").await;
         srs_ok(&f.stack, &inv).await;
         f.stack
-            .process_message(
+            .process_message_on(
                 &caller_request("ACK", DIALED, "upd@test", 1, Some("bobtag"), None),
                 alice(),
                 None,
+                AddrTransport::Tls,
             )
             .await;
         let capture = uc_audit::capture::start();
         let results = flatten(
             f.stack
-                .process_message(
+                .process_message_on(
                     &caller_request(
                         "UPDATE",
                         DIALED,
@@ -1669,6 +1678,7 @@ async fn qa_update_to_srtp_passthrough_ends_the_recording() {
                     ),
                     alice(),
                     None,
+                    AddrTransport::Tls,
                 )
                 .await,
         );
