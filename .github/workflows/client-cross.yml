@@ -59,18 +59,21 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       # Target caching matters most here: these jobs' bottleneck is the
       # C/C++ deps (aws-lc-fips, oboe) that Swatinem caches in target/.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: cross-${{ matrix.target }}
       # aws-lc-fips-sys builds the FIPS module with Go; macOS runners do not
       # ship it on PATH (ubuntu/windows do).
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         if: runner.os == 'macOS'
         with:
           go-version: stable

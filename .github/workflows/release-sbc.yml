@@ -36,19 +36,23 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   REGISTRY: ghcr.io/192d-wing
   IRONBANK_REGISTRY: registry1.dso.mil
-  # Mirror the Iron Bank robot user into env so steps can gate on its
-  # presence (the `secrets` context isn't allowed in `if:` conditions).
-  IRONBANK_USER: ${{ secrets.REPO1_USER }}
 
 jobs:
   build:
     name: ${{ matrix.image.name }} (${{ matrix.platform.arch }})
     runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Mirror the Iron Bank robot user into env so steps can gate on its
+      # presence (the `secrets` context isn't allowed in `if:` conditions).
+      # Job-scoped: only this job logs in to Iron Bank.
+      IRONBANK_USER: ${{ secrets.REPO1_USER }}
     strategy:
       fail-fast: false
       matrix:
@@ -70,20 +74,22 @@ jobs:
           - { arch: linux/amd64, runner: ubuntu-24.04 }
           - { arch: linux/arm64, runner: ubuntu-24.04-arm }
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Normalize platform name
         run: echo "PLATFORM_PAIR=${arch//\//-}" >> "$GITHUB_ENV"
         env:
           arch: ${{ matrix.platform.arch }}
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Iron Bank base-image source (when the Dockerfile base ARGs point there).
       # Skipped silently if the org secrets aren't configured.
       - name: Log in to Iron Bank
         if: ${{ env.IRONBANK_USER != '' }}
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.IRONBANK_REGISTRY }}
           username: ${{ secrets.REPO1_USER }}
@@ -91,7 +97,7 @@ jobs:
 
       - name: Log in to GHCR
         if: ${{ github.event_name == 'push' || inputs.push }}
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -99,13 +105,13 @@ jobs:
 
       - name: Image metadata (labels)
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ matrix.image.name }}
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.dockerfile }}
@@ -131,7 +137,7 @@ jobs:
 
       - name: Upload digest
         if: ${{ github.event_name == 'push' || inputs.push }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-${{ matrix.image.name }}-${{ env.PLATFORM_PAIR }}
           path: /tmp/digests/*
@@ -143,22 +149,25 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build
     if: ${{ github.event_name == 'push' || inputs.push }}
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
         image: [sbc-daemon, sbc-api-server, sbc-provision-server, sbc-client-config-server, sbc-announcement-server, sbc-trunk-agent, central-config-api, central-config-import, sbc-config-sync, sbc-dashboard]
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp/digests
           pattern: digests-${{ matrix.image }}-*
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -166,7 +175,7 @@ jobs:
 
       - name: Image metadata (tags)
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ matrix.image }}
           # `type=match` instead of `type=semver` because the tag carries the
@@ -181,6 +190,7 @@ jobs:
       - name: Create multi-arch manifest
         working-directory: /tmp/digests
         run: |
+          # shellcheck disable=SC2046 # word splitting into -t args / refs is intended
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ matrix.image }}@sha256:%s ' *)

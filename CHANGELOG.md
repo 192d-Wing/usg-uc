@@ -82,6 +82,17 @@ refused. Tested by `sip_stack/tests/dialog_binding.rs` and unit tests in
 No SBC config key, CDR field, audit event type or REST/gRPC API is
 changed.
 
+### Security (CI, workflow supply chain)
+
+- **CI.** Every third-party action in `.github/workflows/` is pinned to a
+  full commit SHA, with the version in a comment. Workflow tokens are
+  read-only by default. Writes are granted per job: `packages: write` on the
+  SBC image build and merge jobs, `contents: write` on the client release
+  job, and `pages`/`id-token` on the docs deploy job. The Iron Bank user is
+  exposed only to the SBC build job. `actions/checkout` no longer keeps the
+  token in the git config (`persist-credentials: false`). Not a change for
+  operators or for image and release contents.
+
 ### Security (SBC, supported base images)
 
 - **SBC images: runtime bases moved off end-of-life releases and pinned

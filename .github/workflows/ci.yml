@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -63,8 +62,10 @@ jobs:
       # `--exclude a --exclude b ...` for the out-of-scope crates ('' = all)
       exclude: ${{ steps.scope.outputs.exclude }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         if: github.event_name == 'pull_request'
         with:
@@ -94,16 +95,20 @@ jobs:
           set -euo pipefail
           # Full workspace on push-to-main or when the shared core changed.
           if [[ "$EVENT" != "pull_request" || "$SHARED" == "true" ]]; then
-            echo "rust=true"   >> "$GITHUB_OUTPUT"
-            echo "client=true" >> "$GITHUB_OUTPUT"
-            echo "exclude="    >> "$GITHUB_OUTPUT"
+            {
+              echo "rust=true"
+              echo "client=true"
+              echo "exclude="
+            } >> "$GITHUB_OUTPUT"
             echo "scope: full workspace"
             exit 0
           fi
           if [[ "$SBC" != "true" && "$CLIENT" != "true" ]]; then
-            echo "rust=false"  >> "$GITHUB_OUTPUT"
-            echo "client=false" >> "$GITHUB_OUTPUT"
-            echo "exclude="    >> "$GITHUB_OUTPUT"
+            {
+              echo "rust=false"
+              echo "client=false"
+              echo "exclude="
+            } >> "$GITHUB_OUTPUT"
             echo "scope: no Rust changes"
             exit 0
           fi
@@ -121,9 +126,11 @@ jobs:
               exclude+=" --exclude $pkg"
             done
           done
-          echo "rust=true"        >> "$GITHUB_OUTPUT"
-          echo "client=$CLIENT"   >> "$GITHUB_OUTPUT"
-          echo "exclude=$exclude" >> "$GITHUB_OUTPUT"
+          {
+            echo "rust=true"
+            echo "client=$CLIENT"
+            echo "exclude=$exclude"
+          } >> "$GITHUB_OUTPUT"
           echo "scope: skipping groups: ${skip[*]}"
           echo "exclude:$exclude"
 
@@ -131,9 +138,12 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -143,9 +153,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
           components: clippy
       - name: Install system dependencies
         run: |
@@ -158,7 +171,7 @@ jobs:
       # when the GitHub cache backend is unavailable). Clippy is the canonical
       # "does the whole workspace type-check" job — no separate build job
       # needed, since `cargo test` below compiles every target too.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ci
       - run: cargo clippy --workspace --all-targets --all-features ${{ needs.changes.outputs.exclude }}
@@ -174,8 +187,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -183,10 +200,10 @@ jobs:
       - name: Install client system dependencies (GTK/WebKit/ALSA)
         if: needs.changes.outputs.client == 'true'
         run: sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ci
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: nextest
       # nextest runs the test suite faster than `cargo test` (better
@@ -217,9 +234,13 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-audit
       - run: cargo audit
@@ -230,8 +251,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -239,7 +264,7 @@ jobs:
       - name: Install client system dependencies (GTK/WebKit/ALSA)
         if: needs.changes.outputs.client == 'true'
         run: sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ci
       - run: cargo doc --workspace --no-deps --all-features ${{ needs.changes.outputs.exclude }}
@@ -253,22 +278,25 @@ jobs:
     # coverage on every merge.
     if: github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
           components: llvm-tools-preview
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: coverage
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-llvm-cov
       - run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v7
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
           flags: unit
@@ -283,9 +311,7 @@ jobs:
   ci-ok:
     name: CI OK
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
+    permissions: {}
     if: always()
     needs: [changes, fmt, clippy, test, docs, audit]
     steps:
