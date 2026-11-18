@@ -9,6 +9,8 @@
 //! - **RFC 7092**: B2BUA Taxonomy
 //! - **RFC 5853**: SBC Requirements
 //! - **RFC 3960**: Early Media (183 Session Progress)
+//! - **RFC 4568 §8**: SDES keys cross only confidential signalling hops
+//!   ([`media_policy`])
 //!
 //! ## B2BUA Types (RFC 7092)
 //!
@@ -51,6 +53,7 @@ pub mod call;
 pub mod early_media;
 pub mod error;
 pub mod leg;
+pub mod media_policy;
 pub mod mode;
 pub mod sdp_rewrite;
 
@@ -61,6 +64,10 @@ pub use early_media::{
 };
 pub use error::{B2buaError, B2buaResult};
 pub use leg::{CallLeg, LegConfig, LegRole, LegState};
+pub use media_policy::{
+    AnchoredDtls, KeyingMode, LegContext, LegKeying, MediaPolicyViolation, MediaSecurityPolicy,
+    SdpRole, Secured, anchored_dtls, apply_media_security, classify_keying, declined_answer,
+};
 pub use mode::{
     CodecNegotiationMode, MediaAddress, MediaHandling, MediaRelayConfig, MediaTerminationConfig,
     ModeCharacteristics, ModeConfig, SdpModification, SdpRewriteContext, TopologyHiding,

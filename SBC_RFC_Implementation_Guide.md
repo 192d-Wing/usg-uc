@@ -114,6 +114,14 @@ Open: RFC 3966 `;phone-context` is dropped (POA&M-100) and `urn:service:sos` is 
 - Every switchover outcome is audited as `media_switchover`.
 - Gaps: POA&M-290 (no UDPTL inspection, truncation over 2048 bytes), -291 (no TCPTL/DTLS), -293 (one anchored stream), -294 (answer not checked against the offer, no live reload). SDP-less re-INVITE and 183 early-media answers are not T.38-classified.
 
+**Implementation status: required SRTP on call legs (sbc-daemon; local macOS run, 2026-11-17):**
+
+- **Deviation (delayed offer, RFC 3261 §13.3.1 / RFC 3264 §5):** with `media.srtp.required = true` (the default) an initial INVITE without an SDP offer gets 488 `Warning: 399` before routing, because the answer would arrive in the caller's ACK, after the call is answered (NIST POA&M-351; test `delayed_offer_is_refused_488_before_routing_when_required`). Emergency calls are exempt. With `required = false` the ACK answer is relayed unchecked.
+- **Deviation (whole-body refusal, §6 / §8):** one non-compliant active m-line refuses the whole offer or answer; the stream is not declined with port 0 (NIST POA&M-353; test `cleartext_video_with_srtp_audio_refuses_whole_offer`). Declined m-lines are not checked.
+- A refused late offer is still answered: the ACK to a refused 2xx and the PRACK to a refused reliable 183 carry an answer that declines every stream (`proto-b2bua` `declined_answer`; tests `refused_late_offer_2xx_is_acked_with_declined_answer`, `refused_reliable_183_offer_is_pracked_with_declined_answer`). The PRACK goes to the stored B-leg target, not the early dialog's remote target (NIST POA&M-54).
+- An answer on an audio call may not put an active `m=image` where the offer had another stream unless T.38 accepts it (test `image_answer_to_audio_offer_is_refused`).
+- Details: `docs/RFC_COMPLIANCE_GAPS.md` "sbc-daemon call-leg media security", `docs/SBC-ADMIN-GUIDE.md` "Required SRTP on call legs".
+
 ---
 
 ### RFC 4566 - SDP: Session Description Protocol
@@ -441,6 +449,12 @@ Open: RFC 3966 `;phone-context` is dropped (POA&M-100) and `urn:service:sos` is 
 - **CRITICAL:** Fingerprint hash must be SHA-384 or SHA-512, NOT SHA-256
 - DTLS certificates must use P-384 minimum (transitioning to ML-KEM/ML-DSA)
 
+**Implementation status: call-leg fingerprints (sbc-daemon; local macOS run, 2026-11-17):**
+
+- **Deviation (RFC 8122 §5, RFC 8827):** only `sha-384` and `sha-512` fingerprints with a value of the matching length cross the SBC. Other `a=fingerprint` lines are stripped from offers and answers; a body whose active DTLS m-line keeps none is refused (488, `Warning: 399` when none was present, `306` when all were stripped), whatever `media.srtp.required` says. `sha-256`-only peers, which RFC 8122 and RFC 8827 allow, are refused (`proto-b2bua/src/media_policy.rs` `fingerprint_acceptable`; tests `sha256_only_fingerprint_offer_is_refused`, `sha512_fingerprint_is_accepted`, `required_false_still_enforces_sha384_fingerprints`).
+- In `media.srtp.mode = "Terminate"` the SBC terminates DTLS on each leg with its own fingerprint and needs an accepted fingerprint from both peers; `Terminate` without a DTLS identity refuses new calls (tests `relay_plan_requires_identity_and_both_fingerprints`, `terminate_mode_without_identity_refuses_new_calls`).
+- In `Passthrough` the SBC does not take part in the handshake and does not check the `use_srtp` profile the endpoints negotiate.
+
 ---
 
 ### RFC 5764 - DTLS Extension for SRTP Keys
@@ -490,6 +504,17 @@ Open: RFC 3966 `;phone-context` is dropped (POA&M-100) and `urn:service:sos` is 
 - If using SDES, MUST use SIPS (TLS) for signaling
 - Crypto suite must be AEAD_AES_256_GCM
 - **Recommendation:** Prefer DTLS-SRTP over SDES for CNSA 2.0 compliance
+
+**Implementation status (sbc-daemon, fix/sdes-key-policy; local macOS run, 2026-11-17):**
+
+- The SBC relays SDES; it does not generate or consume call-leg SDES keys. `proto-b2bua/src/media_policy.rs` `apply_media_security` checks every SDP body that crosses it.
+- **Deviation (CNSA 2.0):** only `AEAD_AES_256_GCM` with one 44-octet inline key is relayed. `AES_CM_128_HMAC_SHA1_80` and every other suite are stripped from offers and refused in answers, so the "standard crypto suites" requirement above is not met by design.
+- Signalling: the key crosses only when both hops the SBC terminates are SIP over TLS (hop by hop, NIST POA&M-348).
+- Multiple crypto lines: an offer keeps every acceptable line; an answer must carry exactly one acceptable line per active SDES section.
+- Tag matching: answer tags are **not** cross-checked against the offer.
+- Session parameters: allow-list (`KDR`, `WSH`, `FEC_ORDER`); lifetime at most 2^48; MKI length 1-128.
+- With `media.srtp.required = true` an active `RTP/SAVP(F)` stream needs an acceptable SDES line to cross; one with no keying at all is cleartext media (488 `Warning: 302`). In Terminate SDES never passes.
+- Details: `docs/RFC_COMPLIANCE_GAPS.md` "sbc-daemon call-leg media security", `docs/SBC-ADMIN-GUIDE.md` "Call-leg SRTP keying (SDES)".
 
 ---
 

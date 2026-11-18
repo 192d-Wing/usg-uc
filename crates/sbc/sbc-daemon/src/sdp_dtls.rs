@@ -72,48 +72,73 @@ pub struct PeerDtls {
     pub setup: Option<SetupRole>,
 }
 
-/// Extracts the peer's DTLS parameters from an SDP body, if it offers
-/// DTLS-SRTP (i.e. carries an `a=fingerprint`). Returns `None` for plain SDP.
+/// Extracts the peer's DTLS parameters from an SDP body, if the stream the
+/// relay anchors is DTLS-SRTP with an accepted fingerprint. Read with the
+/// media security policy's tokenizer ([`proto_b2bua::anchored_dtls`]):
+/// names case-insensitive and trimmed, media-level lines before
+/// session-level ones, declined sections and fingerprints with a hash
+/// CNSA 2.0 does not allow ignored. Returns `None` otherwise.
+///
+/// ## NIST 800-53 Rev5: SC-8, SC-23; RFC 8122 §5; RFC 4145 §4
 #[must_use]
 pub fn parse_peer_dtls(sdp: &str) -> Option<PeerDtls> {
-    let mut fingerprint = None;
-    let mut setup = None;
-    for line in sdp.lines() {
-        let line = line.trim();
-        // First fingerprint / first setup wins (session- or first media-level).
-        if let Some(v) = line.strip_prefix("a=fingerprint:")
-            && fingerprint.is_none()
-        {
-            fingerprint = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("a=setup:")
-            && setup.is_none()
-        {
-            setup = SetupRole::parse(v);
-        }
-    }
-    fingerprint.map(|fingerprint| PeerDtls { fingerprint, setup })
+    proto_b2bua::anchored_dtls(sdp).map(|d| PeerDtls {
+        fingerprint: d.fingerprint.to_string(),
+        setup: d.setup.and_then(SetupRole::parse),
+    })
 }
 
-/// Rewrites every `a=fingerprint`/`a=setup` line in `sdp` to advertise the
-/// SBC's own `fingerprint` and the given `setup` role. Only touches SDP that
-/// already carries `a=fingerprint` (DTLS-SRTP); plain SDP is returned as-is so
-/// this is safe to call unconditionally on terminated calls.
+/// `a=<name>:` at the start of a line, after the trim `proto-sdp` applies
+/// and ASCII case-insensitively, as the media security policy reads it.
+fn is_attribute(line: &str, name: &str) -> bool {
+    let line = line.trim();
+    let Some(rest) = line
+        .get(..2)
+        .filter(|p| p.eq_ignore_ascii_case("a="))
+        .and_then(|_| line.get(2..))
+    else {
+        return false;
+    };
+    rest.split_once(':')
+        .is_some_and(|(n, _)| n.trim().eq_ignore_ascii_case(name))
+}
+
+/// Rewrites the `a=fingerprint`/`a=setup` lines in `sdp` to advertise the
+/// SBC's own `fingerprint` and the given `setup` role: in each section (and
+/// at session level) the first `a=fingerprint` line becomes the SBC's and
+/// any further one is dropped, so no peer fingerprint crosses. Names are
+/// matched as [`parse_peer_dtls`] reads them. Only touches SDP that carries
+/// `a=fingerprint` (DTLS-SRTP); plain SDP is returned as-is so this is safe
+/// to call unconditionally on terminated calls.
 ///
 /// Preserves the original line endings (SDP uses CRLF on the wire).
+///
+/// ## NIST 800-53 Rev5: SC-8, SC-23
 #[must_use]
 pub fn rewrite_local_dtls(sdp: &str, fingerprint: &str, setup: SetupRole) -> String {
-    if !sdp.contains("a=fingerprint:") {
+    if !sdp.lines().any(|l| is_attribute(l, "fingerprint")) {
         return sdp.to_string();
     }
     // Rebuild line by line, preserving the trailing CR of CRLF endings.
     let mut out = String::with_capacity(sdp.len());
+    let mut section_has_fingerprint = false;
     for line in sdp.split_inclusive('\n') {
         // Split the line body from its ("\r\n" / "\n" / "") terminator.
         let (body, term) = split_line_terminator(line);
-        if body.starts_with("a=fingerprint:") {
+        let trimmed = body.trim();
+        if trimmed
+            .get(..2)
+            .is_some_and(|p| p.eq_ignore_ascii_case("m="))
+        {
+            section_has_fingerprint = false;
+            out.push_str(body);
+        } else if is_attribute(body, "fingerprint") {
+            if std::mem::replace(&mut section_has_fingerprint, true) {
+                continue;
+            }
             out.push_str("a=fingerprint:");
             out.push_str(fingerprint);
-        } else if body.starts_with("a=setup:") {
+        } else if is_attribute(body, "setup") {
             out.push_str("a=setup:");
             out.push_str(setup.as_str());
         } else {
@@ -140,22 +165,78 @@ fn split_line_terminator(line: &str) -> (&str, &str) {
 mod tests {
     use super::*;
 
-    const DTLS_SDP: &str = "v=0\r\n\
-        o=- 1 1 IN IP4 10.0.0.1\r\n\
-        s=-\r\n\
-        c=IN IP4 10.0.0.1\r\n\
-        t=0 0\r\n\
-        m=audio 5004 UDP/TLS/RTP/SAVP 8\r\n\
-        a=rtpmap:8 PCMA/8000\r\n\
-        a=setup:actpass\r\n\
-        a=fingerprint:sha-384 AA:BB:CC\r\n\
-        a=sendrecv\r\n";
+    /// A sha-384 fingerprint: 48 octets of a fixed pattern, not a digest.
+    const FP: &str = "sha-384 AA:BB:CC:00:01:02:03:04:05:06:07:08:09:0A:0B:0C:\
+                      0D:0E:0F:10:11:12:13:14:15:16:17:18:19:1A:1B:1C:1D:1E:1F:\
+                      20:21:22:23:24:25:26:27:28:29:2A:2B:2C";
+
+    fn dtls_sdp() -> String {
+        format!(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 10.0.0.1\r\n\
+             s=-\r\n\
+             c=IN IP4 10.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 5004 UDP/TLS/RTP/SAVP 8\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
+             a=setup:actpass\r\n\
+             a=fingerprint:{FP}\r\n\
+             a=sendrecv\r\n"
+        )
+    }
 
     #[test]
     fn parses_peer_fingerprint_and_setup() {
-        let peer = parse_peer_dtls(DTLS_SDP).unwrap();
-        assert_eq!(peer.fingerprint, "sha-384 AA:BB:CC");
+        let peer = parse_peer_dtls(&dtls_sdp()).unwrap();
+        assert_eq!(peer.fingerprint, FP);
         assert_eq!(peer.setup, Some(SetupRole::ActPass));
+    }
+
+    /// The anchored (first active) stream's fingerprint, matched as the
+    /// policy matches it: a declined section's line and an unaccepted hash
+    /// are never taken, upper-case names and spaces are read.
+    #[test]
+    fn parses_the_anchored_streams_accepted_fingerprint() {
+        let sha256 = format!("sha-256 {}", ["AB"; 32].join(":"));
+        let sdp = format!(
+            "v=0\r\nm=audio 0 UDP/TLS/RTP/SAVP 8\r\na=fingerprint:{sha256}\r\n\
+             m=audio 5004 UDP/TLS/RTP/SAVP 8\r\nA=Fingerprint: {sha256}\r\n\
+             a=FINGERPRINT : {FP}\r\na=Setup:active\r\n"
+        );
+        let peer = parse_peer_dtls(&sdp).unwrap();
+        assert_eq!(peer.fingerprint, FP);
+        assert_eq!(peer.setup, Some(SetupRole::Active));
+        // Only an unaccepted hash, or a short value: no peer DTLS.
+        let only_256 =
+            format!("v=0\r\nm=audio 5004 UDP/TLS/RTP/SAVP 8\r\na=fingerprint:{sha256}\r\n");
+        assert!(parse_peer_dtls(&only_256).is_none());
+        assert!(
+            parse_peer_dtls(
+                "v=0\r\nm=audio 5004 UDP/TLS/RTP/SAVP 8\r\na=fingerprint:sha-384 AA:BB\r\n"
+            )
+            .is_none()
+        );
+    }
+
+    /// Every peer fingerprint line is replaced or dropped, whatever its
+    /// case, so only the SBC's crosses.
+    #[test]
+    fn rewrite_replaces_mixed_case_lines_and_drops_extras() {
+        let sdp = format!(
+            "v=0\r\na=FINGERPRINT:{FP}\r\nm=audio 5004 UDP/TLS/RTP/SAVP 8\r\n\
+             a=Fingerprint:{FP}\r\n a=fingerprint:sha-512 {}\r\nA=SETUP:actpass\r\n",
+            ["01"; 64].join(":")
+        );
+        let out = rewrite_local_dtls(&sdp, "sha-384 DD:EE:FF", SetupRole::Passive);
+        assert_eq!(
+            out.matches("a=fingerprint:sha-384 DD:EE:FF\r\n").count(),
+            2,
+            "{out}"
+        );
+        assert!(!out.contains("AA:BB:CC"), "{out}");
+        assert!(!out.to_ascii_lowercase().contains("sha-512"), "{out}");
+        assert!(out.contains("a=setup:passive\r\n"), "{out}");
+        assert!(!out.contains("actpass"), "{out}");
     }
 
     #[test]
@@ -171,7 +252,7 @@ mod tests {
 
     #[test]
     fn rewrites_to_local_fingerprint_and_role() {
-        let out = rewrite_local_dtls(DTLS_SDP, "sha-384 DD:EE:FF", SetupRole::Passive);
+        let out = rewrite_local_dtls(&dtls_sdp(), "sha-384 DD:EE:FF", SetupRole::Passive);
         assert!(out.contains("a=fingerprint:sha-384 DD:EE:FF\r\n"));
         assert!(out.contains("a=setup:passive\r\n"));
         // The peer's values are gone; other lines untouched; CRLF preserved.

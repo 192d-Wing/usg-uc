@@ -9,6 +9,158 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, `media.srtp.required` enforced on call legs; sha-384/512 DTLS fingerprints only, POA&M-351, 352, 353)
+
+Affects every SBC: `media.srtp.required` defaults to `true`. Tested in local
+runs on macOS (2026-11-17). Operator details: `docs/SBC-ADMIN-GUIDE.md`
+"Required SRTP on call legs".
+
+- **Cleartext media is refused on call legs.** (SC-8, SC-8(1), CM-6)
+  Before, `media.srtp.required` was not read for call-leg SDP. Now every
+  active m-line other than `m=image ... udptl` must be DTLS-SRTP or, in
+  `Passthrough`, SDES `AEAD_AES_256_GCM`. `RTP/AVP(F)` gets 488
+  `Warning: 302 <host> "SRTP is required"`; `UDP`, `TCP`,
+  `TCP/TLS/RTP/AVP(F)`, BFCP, MSRP and unknown protocols get 488
+  `Warning: 302 <host> "Media transport protocol not supported"`. A
+  cleartext answer ends the call. One failing m-line refuses the whole body
+  (POA&M-353). Set `required = false` to keep cleartext RTP.
+- **Delayed offer is refused under `required`.** An INVITE without an SDP
+  offer gets 488 `Warning: 399 <host> "Delayed offer not supported when SRTP
+  is required"` before routing (POA&M-351). With `required = false` the
+  answer in the caller's ACK is not checked.
+- **Only `sha-384` and `sha-512` DTLS fingerprints cross, also with
+  `required = false`.** (SC-13, SC-23; deviation from RFC 8122 §5) Other
+  `a=fingerprint` lines are stripped; an active DTLS m-line left with none
+  gets 488 `Warning: 306` (or `399` when it had none). `sha-256`-only peers
+  are refused.
+- **No route: 480 instead of the announcement** under `required`, since the
+  announcement answers with cleartext RTP.
+- **`Terminate` without a DTLS identity refuses new calls** with 488
+  `Warning: 399 <host> "DTLS-SRTP termination unavailable"` (SC-24), logged
+  at `error` once. Before, such calls were relayed opaquely.
+- **Emergency calls** (dialled number in `vps.emergency_numbers`) are
+  exempt from `required` and relayed opaquely under `Terminate` without an
+  identity; the fingerprint and SDES rules still apply. Each exemption that
+  changed the outcome is audited once per call as a granted
+  `media_security:emergency_cleartext` decision.
+- **Recording**: `recording.enabled = true` with `required = true` and
+  `mode = "Passthrough"` no longer loads; use `mode = "Terminate"` or
+  `required = false`.
+- **`[media.srtp]` is restart-required** on reload.
+- Signalling only: the media relay and `sbc-media` (`SBC_MEDIA_SRTP_REQUIRED`)
+  do not refuse cleartext packets (POA&M-352).
+
+### BREAKING (SBC, call-leg SDES keys only over TLS and only AEAD_AES_256_GCM, POA&M-347, 348, 349, 350)
+
+Affects every SBC. There is no setting to turn it off. Tested in local runs
+on macOS (2026-11-17). Operator details: `docs/SBC-ADMIN-GUIDE.md`
+"Call-leg SRTP keying (SDES)".
+
+- **SDES keys cross only between two TLS hops.** (RFC 4568 §8.3; SC-8,
+  SC-12) Before, `a=crypto` lines were relayed unread on any transport. Now
+  an SDP body whose SDES key would arrive or leave on UDP, TCP or WS is
+  refused with 488 `Warning: 399 <host> "SDES keying requires TLS on every
+  hop"`. A key that crosses on an initial INVITE keeps failover on TLS
+  trunks. The check covers the two hops the SBC terminates (POA&M-348).
+- **Only `AEAD_AES_256_GCM` SDES is relayed.** (RFC 7714 §14.1; SC-13)
+  `AES_CM_128_HMAC_SHA1_*` and other suites, lines with more than one
+  `inline:` key, a wrong key length, or `FEC_KEY`, `UNENCRYPTED_*`,
+  `UNAUTHENTICATED_SRTP` or unknown session parameters are stripped from
+  offers and refused in answers (488 `Warning: 306`).
+- **Refused answers end the call.** A refused 183 gets the callee a CANCEL
+  and the caller a 488; a refused 2xx gets the callee an ACK and BYE and the
+  caller a 488; a refused in-dialog 2xx ends the call with BYE on both legs.
+  The CDR ends `Failed` / `PolicyDenied` / 488. A retransmitted 2xx of a
+  refused re-INVITE is not re-ACKed (POA&M-350).
+- **MIKEY (`a=key-mgmt`) is no longer relayed**: stripped from offers,
+  refused in answers.
+- **Relayed in-dialog bodies the SBC cannot read are refused**: a
+  non-identity `Content-Encoding`, `multipart/*` containing SDP, or a
+  non-SDP body containing `a=crypto` / `a=key-mgmt` gets 488
+  `Warning: 399`.
+- **Terminate mode** strips every `a=crypto` and refuses a section with no
+  DTLS keying.
+- **Audit**: each refusal is a denied `AuthorizationDecision` with policy
+  `media_security:<label>`; not aggregated and no metrics (POA&M-347).
+- Pre-existing, now recorded: a 2xx that carries an offer is ACKed without
+  an answer on the normal path (POA&M-349). `media.srtp.required` is now
+  enforced; see the entry above.
+- Docs: `docs/SBC-ADMIN-GUIDE.md` example used `media.srtp.mode = "Relay"`,
+  which does not load; valid values are `"Passthrough"` and `"Terminate"`.
+
+### BREAKING (SBC, in-dialog request and CANCEL matching, POA&M-390..395)
+
+Affects every SBC call. Peers that follow RFC 3261 see no change on
+correct traffic; requests that only matched loosely before are now
+refused. Tested by `sip_stack/tests/dialog_binding.rs` and unit tests in
+`sip_stack/dialog_match.rs` (local runs). CI evidence: PR TBD.
+
+- **In-dialog requests are bound to the dialog's peer.** (RFC 3261
+  §12.2.2; SC-23, AC-3) A re-INVITE, UPDATE, PRACK, INFO, MESSAGE,
+  NOTIFY, BYE or 2xx ACK must match the call leg's Call-ID, remote tag and
+  local tag (481 otherwise, also for a wrong or empty To tag), and must
+  come from that leg's peer (403 otherwise). The peer of a trunk leg is
+  any configured host of its trunk group, on any port; of a UDP endpoint,
+  its IP and port; of a TCP/TLS/WS endpoint, its connection; of a
+  registered callee, its binding. The transport must be the leg's or a
+  stronger one. A UA registered over UDP that sends a large request over
+  TCP from another port gets 403; register such UAs over TCP or TLS
+  (POA&M-394).
+- **Endpoints that re-register on a new flow are followed.** (RFC 5626
+  §4.4, §5.3) Only with REGISTER authentication on: an endpoint caller or
+  registered callee whose in-dialog request arrives on a new flow holding
+  the live registration of the leg's AOR is admitted, and the call leg
+  moves to that flow once the request is accepted. Without REGISTER
+  authentication such a request gets 403.
+- **A BYE after the answer must carry the To tag** (481 otherwise). A
+  caller's BYE before the answer still ends the call: the SBC sends a
+  CANCEL to the callee, a 487 to the caller's INVITE and a 200 to the BYE,
+  with one To tag.
+- **An ACK for a 2xx must carry the INVITE's CSeq number and method ACK**,
+  plus the 2xx's From and To tags, from the peer. Any other ACK is
+  ignored, and the 2xx keeps retransmitting until the right ACK arrives
+  or the retransmission times out.
+- **CANCEL is matched to its INVITE.** (RFC 3261 §9.2) A CANCEL must match
+  the pending INVITE's top-Via branch and sent-by, Call-ID, From tag, CSeq
+  number and source (RFC 2543 matching for a branch without the magic
+  cookie). No match: 481, no effect, no wait (before, the SBC could wait
+  up to 2 s and then tear the call down). After the final response: 200
+  only, the call is unchanged. A matched pending INVITE: 200, and 487 on
+  the INVITE's own transaction, sent to the INVITE's source. A CANCEL of a
+  pending re-INVITE gets 200 and the re-INVITE completes (POA&M-395).
+- **The B-leg CANCEL waits for a provisional.** (RFC 3261 §9.1) The SBC
+  sends the CANCEL toward the callee only after the B-leg INVITE drew a
+  1xx, and drops it if a final response arrives first.
+- **INVITE reusing a Call-ID being routed.** An INVITE with the Call-ID of
+  an INVITE the SBC is still routing gets 482 when it is the same request
+  on another path (same From tag and CSeq, another branch or sent-by,
+  RFC 3261 §8.2.2.2) and 403 otherwise.
+- **Responses without a To tag** (RFC 2543 peers) still make a dialog: an
+  absent tag matches only an absent tag.
+- **Audit and metrics.** (AU-2, AU-3, SI-4) Four new in-dialog audit
+  policies, `in-dialog:to-tag-mismatch`, `in-dialog:foreign-source`,
+  `in-dialog:ack-mismatch` and `in-dialog:cancel-no-match`, with gauges
+  `sbc_in_dialog_rejects_to_tag_mismatch_total`,
+  `sbc_in_dialog_rejects_foreign_source_total`,
+  `sbc_in_dialog_rejects_ack_mismatch_total` and
+  `sbc_in_dialog_rejects_cancel_no_match_total`. A BYE from a source that
+  is not the leg's peer is now audited as `in-dialog:foreign-source`
+  (before: `in-dialog:from-tag-mismatch`). The INVITE refusal above is
+  audited as `invite:merged-request`. The `resource` of in-dialog
+  rejection records is now `<Request-URI> call-id=<Call-ID>
+  src-port=<port>`, the Call-ID percent-encoded and capped at 64 bytes;
+  SIEM parsers of that field must be updated. The audit schema is
+  unchanged.
+- **Known limits** (open): a 2xx from a later fork is not adopted as the
+  callee dialog (POA&M-390); an INVITE copy from another source is answered
+  from the stored transaction (POA&M-391); trunk-group membership is read
+  from the live configuration (POA&M-392, accepted risk); UDP source
+  spoofing by a party that has seen the dialog (POA&M-393, accepted risk,
+  use TLS).
+
+No SBC config key, CDR field, audit event type or REST/gRPC API is
+changed.
+
 ### BREAKING (SBC, management-plane containment: daemon gRPC mTLS, NetworkPolicies, OIDC roles, central Postgres credentials)
 
 SBC only; the soft client is not affected. No CDR field and no audit event
@@ -216,11 +368,29 @@ release") and `deploy/keycloak/central-config-clients.md`.
 - **CI.** Every third-party action in `.github/workflows/` is pinned to a
   full commit SHA, with the version in a comment. Workflow tokens are
   read-only by default. Writes are granted per job: `packages: write` on the
-  SBC image build and merge jobs, `contents: write` on the client release
+  SBC image publish and merge jobs, `contents: write` on the client release
   job, and `pages`/`id-token` on the docs deploy job. The Iron Bank user is
-  exposed only to the SBC build job. `actions/checkout` no longer keeps the
+  exposed only to the SBC publish build job. `actions/checkout` no longer keeps the
   token in the git config (`persist-credentials: false`). Not a change for
   operators or for image and release contents.
+- **SBC: release images are signed and attested.** (SR-4, SI-7, SA-10)
+  Every image has BuildKit provenance (`mode=max`) and an SBOM per platform,
+  a cosign keyless signature on the index digest, and a GitHub
+  build-provenance attestation in GHCR. New image:
+  `ghcr.io/192d-wing/dtls-terminator`. Only an `sbc-v<semver>` tag
+  publishes, and release images are built cold from the tagged source (no
+  registry build cache). A published version is never overwritten. A
+  dispatch on a branch builds the images with a read-only token and pushes
+  nothing. Publishing jobs run in the `release` environment. The `push`
+  dispatch input is removed. The `latest` tag is no longer updated. Deploy
+  by digest and verify as described in CONTRIBUTING.md ("Verifying
+  releases").
+- **Client: release assets are signed and attested.** (SR-4, SI-7) Releases
+  attach an SPDX SBOM of the source tree and a `<file>.sigstore.json` cosign
+  bundle for every asset, including `SHA256SUMS`. They also carry GitHub
+  build-provenance and SBOM attestations. Tag builds are cold (no Rust
+  build cache). A release is created only from a `client-v<semver>` tag, in
+  the `release` environment.
 
 ### Security (SBC, supported base images)
 
@@ -288,6 +458,42 @@ Tested locally on macOS arm64 only; no CI run yet.
   transaction user as a 503, and no next DNS target is tried (POA&M-377).
   RFC 4733 receive deviations: Opus calls offer only `telephone-event/8000`,
   and events over 40,000 units are discarded (POA&M-378).
+
+### Security (soft client, credential storage, POA&M-372, 373)
+
+Tested locally on macOS arm64 only. Android and iOS were not built for
+this change; no CI run yet.
+
+- **Soft client: secrets are stored only in the platform keyring.**
+  (IA-5(1), IA-5(6), SC-28) Digest passwords go to macOS Keychain, Windows
+  Credential Manager or the Linux Secret Service; the OIDC refresh-token API
+  is keystore-only too, but the desktop client does not persist refresh
+  tokens at all.
+  The `credentials.enc` fallback is removed: its AES-256-GCM key was
+  derived from the hostname, user name and config path, so anyone who
+  could read the file could decrypt it. Every Android and iOS build, and
+  any desktop without a usable keyring, used it. Those builds now persist
+  nothing: the secret stays in memory and the user signs in again after a
+  restart (POA&M-372). A leftover `credentials.enc` or
+  `credentials.enc.tmp` is deleted when the credential store starts and is
+  never read. The desktop client no longer logs that digest credentials
+  were persisted when they were not, and a stale "persisted" flag from an
+  older build is cleared on load. If the keyring check failed at start,
+  signing out still deletes the refresh-token keyring entry directly on
+  desktop (as does the `delete_digest_password` API), and an error is
+  logged if that fails.
+- **Action required: rotate exposed secrets.** Deleting the file does not
+  remove copies in backups or freed storage, and those copies remain
+  decryptable. Treat every digest password and OIDC refresh token stored
+  by a mobile or keyring-less desktop build before this change as exposed:
+  change those SIP passwords and revoke those refresh tokens at the IdP.
+- **Correction:** the statements that `uc-crypto::hkdf::hkdf_sha384` is
+  library-only with no shipped caller (`docs/CNSA-2-COMPLIANCE.md`, NIST
+  SC-12) were wrong for `oidc` and `digest-auth` client builds before this
+  change, which used it for the fallback key. They are correct now.
+- **Linux keyring transport is not CNSA** (POA&M-373): the Secret Service
+  D-Bus transfer uses DH-1024 and AES-128-CBC. It is local IPC; at-rest
+  protection is the keyring daemon's.
 
 ### BREAKING (SBC, DTLS-SRTP sidecar keeps the association for the whole call, POA&M-335, 340, 341, 342)
 

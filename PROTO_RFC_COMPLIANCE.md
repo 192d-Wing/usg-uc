@@ -7,7 +7,7 @@
 
 > **Status legend.** *Wired (sbc-daemon | sbc-media-core | soft client)* — a shipped binary has a call site for this (the binary is named). *Library-only* — implemented and tested in a `proto-*`/`uc-*` crate, but no shipped binary calls it. *Planned* — not implemented. A row that says only "Full"/"Complete" describes crate-level capability; the wiring column/annotation says what the running SBC actually does.
 
-**Dependency facts behind the wiring labels** (from `Cargo.toml`): `sbc-daemon` depends on proto-sip, proto-transaction, proto-dialog, proto-b2bua, proto-registrar, proto-jwt, proto-rtp, proto-srtp, proto-dtls, proto-stun, proto-stir-shaken, `uc-sti` and `sbc-media-core` — but **not** proto-sdp. `sbc-media-core` (linked into `sbc-daemon` and `sbc-media`) depends on proto-dtls, proto-rtp, proto-srtp. `client-sip-ua` lists proto-sdp, proto-registrar, proto-stun and proto-turn but has no source references to them. proto-stir-shaken is used by `sbc-daemon` and `uc-sti`. The SBC does not run ICE (it anchors media and latches symmetrically). SBC DTLS-SRTP termination is a Go sidecar (`sbc-media-core/src/dtls_sidecar.rs`), not proto-dtls.
+**Dependency facts behind the wiring labels** (from `Cargo.toml`): `sbc-daemon` depends on proto-sip, proto-transaction, proto-dialog, proto-b2bua, proto-registrar, proto-jwt, proto-rtp, proto-srtp, proto-dtls, proto-stun, proto-stir-shaken, `uc-sti`, `sbc-media-core` and proto-sdp (used for T.38 and, through proto-b2bua `media_policy`, for the SDES policy; see §2). `sbc-media-core` (linked into `sbc-daemon` and `sbc-media`) depends on proto-dtls, proto-rtp, proto-srtp. `client-sip-ua` lists proto-sdp, proto-registrar, proto-stun and proto-turn but has no source references to them. proto-stir-shaken is used by `sbc-daemon` and `uc-sti`. The SBC does not run ICE (it anchors media and latches symmetrically). SBC DTLS-SRTP termination is a Go sidecar (`sbc-media-core/src/dtls_sidecar.rs`), not proto-dtls.
 
 ---
 
@@ -31,7 +31,7 @@
 | **RFC 3325** | P-Asserted-Identity | Header support, topology hiding. **Wired (sbc-daemon)**: topology hider, and `sanitize_inbound_identity` (POA&M-232/236) strips PAI/PPI at ingress unless the source is a trunk in a `trust_domain = true` group (default `false`, so trust must be granted explicitly; API-registered groups always untrusted; §5; tests `sanitize_inbound_identity_untrusted_only`, `inbound_identity_sanitized_by_trust_domain`). Library-only: `rpid_to_pai` / `ManipulationAction::RpidToPai` convert only RPID elements with `screen=yes` into a re-serialized name-addr (one sip, one tel; `privacy=uri` → `Privacy: id`, `name`/`full` → `id;user`); tests `unscreened_rpid_not_asserted`, `rpid_params_stripped_from_pai`, `rpid_encoded_crlf_cannot_inject`, `rpid_to_pai_preset_on_parsed_message`. `strip_pai_outbound` preset acts on parsed `HeaderName::PAssertedIdentity` (test `trunk_interop_strips_pai_from_parsed_message`) |
 | **RFC 3326** | Reason Header | Header name defined in proto-sip. **Wired (sbc-daemon, CDR only)**: `sbc-daemon/src/cdr.rs` reads every `Reason` header field (`sip_stack.rs` `reason_headers()`, `CdrEnd::with_reasons`). Splitting on `,` and `;` respects quoted strings and quoted-pairs (RFC 3261 §25.1, `split_unquoted`). The first `protocol=Q.850` cause in 1..=127 is recorded as `q850_cause`. The daemon does not add or rewrite Reason. Tests `q850_parses_rfc3326_reason`, `q850_from_separate_reason_headers`, `cdr_answered_then_callee_bye_with_q850` |
 | **RFC 3327** | Path Header | **Partial** — `path_values()` (splits combined values), `prepend_path()`; only list handling was reviewed. **Library-only** — daemon REGISTER handling never reads or inserts Path |
-| **RFC 3428** | MESSAGE Method | Method enum entry. Library-only — daemon returns 405 |
+| **RFC 3428** | MESSAGE Method | Method enum entry. Daemon relays in-dialog MESSAGE (POA&M-182); out of dialog it returns 405 |
 | **RFC 3455** | P-Headers | Header names defined. Library-only |
 | **RFC 3515** | REFER Method | Method enum entry, header support. **Wired (soft client only)** — `call_agent.rs` sends REFER; daemon returns 405 (not relayed) |
 | **RFC 3891** | Replaces Header | Header name defined. Library-only |
@@ -39,8 +39,8 @@
 | **RFC 4028** | Session Timers | Header names (Session-Expires, Min-SE). **Wired (sbc-daemon, relay only)** — `relay_session_timer_request_headers` / `relay_session_timer_response_headers` on INVITE/re-INVITE/UPDATE and their responses (`sip_stack.rs`); no local refresher |
 | **RFC 4168** | SCTP Transport for SIP | Transport enum entry. Library-only — `uc-transport` `sctp` feature not enabled by any binary |
 | **RFC 4566** | SDP | Referenced |
-| **RFC 6086** | INFO Method | Method enum entry. Library-only — daemon returns 405 |
-| **RFC 6665** | SIP Events (SUBSCRIBE/NOTIFY) | Method enum entries, header support. Library-only — daemon returns 405; client only reads Subscription-State on REFER NOTIFY |
+| **RFC 6086** | INFO Method | Method enum entry. Daemon relays in-dialog INFO (POA&M-182); out of dialog it returns 405 |
+| **RFC 6665** | SIP Events (SUBSCRIBE/NOTIFY) | Method enum entries, header support. Library-only — daemon relays in-dialog NOTIFY (POA&M-182) and returns 405 for SUBSCRIBE and out-of-dialog NOTIFY; client only reads Subscription-State on REFER NOTIFY |
 | **RFC 7118** | WebSocket Transport for SIP | Transport: WS/WSS. Wired (sbc-daemon `transport.ws_listen`, plain WS); WSS planned — the transport does not terminate TLS. §4: `sip` subprotocol required (HTTP 400 otherwise; `ws_require_sip_subprotocol = false` is a non-conformant opt-out). §5: one SIP message per WS message; incomplete messages discarded. RFC 6455 message/frame caps 65,535 bytes. See `docs/RFC_COMPLIANCE_GAPS.md` |
 | **RFC 8224** | STIR Identity | Header name defined; reason phrases 428/436/437/438 in `response.rs` (test `stir_reason_phrases`). Wired (sbc-daemon STIR path, off by default) |
 
@@ -67,7 +67,7 @@
 - RFC 3261 §16.4 `maddr`: daemon passes the configured listener port as the received port, not the actual local socket port (`// POAM:` in sbc-daemon `sip_stack.rs`, NIST POA&M-286)
 - sbc-daemon calls `DigestVerifier` (REGISTER only, enabled by `[digest_auth]`, off by default; POA&M-270 closed; no INVITE challenge, POA&M-271), `preprocess_route_information`, `compute_loop_hash` (own semantics, not `detect_loop`), `apply_privacy` and `sanitize_inbound_identity` (POA&M-236 partial); `DigestVerifier` nc state is node-local (`// POAM:` in `digest_verifier.rs`, POA&M-272)
 - Compact header forms (§7.3.3) supported for core headers (parse-only; the daemon/client framers special-case only `l:`)
-- sbc-daemon relays only REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE; all other methods receive 405
+- sbc-daemon handles REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE, and relays PRACK/INFO/MESSAGE/NOTIFY in dialog only (tagged To, NIST POA&M-182); out of dialog those four and all other methods receive 405, and a tagged-To request of another method for an unknown dialog receives 481. In-dialog requests are matched on Call-ID, both tags and the leg's peer (481 / 403; see `docs/RFC_COMPLIANCE_GAPS.md` §12.2.2)
 - sbc-daemon trunk failover (RFC 3263 §4.3): 408/Timer B/503 plus local-policy 500/502/504; a transport error on the first send of a B-leg INVITE also fails over immediately; a trunk's 503 `Retry-After` (§21.5.4, §20.33) sets the trunk cooldown, clamped to `general.trunk_retry_after_max_secs` (RFC-001 resolved). See `docs/RFC_COMPLIANCE_GAPS.md`
 - sbc-daemon transaction timers follow the receive transport (reliable on TCP/TLS/WS/WSS/SCTP, so no Timer A/E/G there; RFC 3261 §17.1.1.2/§17.1.2.2/§17.2.1/§17.2.2). Timer-loop sends (failover INVITEs, BYEs) still go out on UDP (POA&M-5); the stream-loop wiring has no end-to-end test. See `docs/RFC_COMPLIANCE_GAPS.md`
 - sbc-daemon stream framing (RFC 3261 §18.3/§20.14): on TCP/TLS a missing, duplicate, conflicting or malformed Content-Length gets a 400 and the connection closes; the framer shares `SipMessage::stream_message_len` with the parser. Post-framing parse still uses datagram rules (POA&M-64)
@@ -84,24 +84,26 @@
 
 **Primary Standard:** RFC 8866 (SDP, supersedes RFC 4566)
 
-**Wiring note:** `sbc-daemon` uses proto-sdp only for T.38 (since 2026-11-08): `proto-b2bua::sdp_rewrite` stream selection and `sbc-daemon/src/t38.rs` parse SDP with proto-sdp to classify `image` m-lines and read T.38 Annex D attributes. Otherwise `sbc-daemon` does string-based SDP handling via `proto_b2bua::SdpRewriter` / `extract_media_address` and `sdp_dtls.rs`; `client-sip-ua` lists the dependency but has no call sites. All rows below are **Library-only** except RFC 3362 / T.38 Annex D.
+**Wiring note:** `sbc-daemon` uses proto-sdp for T.38 (since 2026-11-08): `proto-b2bua::sdp_rewrite` stream selection and `sbc-daemon/src/t38.rs` parse SDP with proto-sdp to classify `image` m-lines and read T.38 Annex D attributes. Since fix/sdes-key-policy, `proto-b2bua::media_policy` also parses each crossing SDP body with proto-sdp (`SessionDescription`) to cross-check its m-lines, and validates the inline key of an `a=crypto` line with `CryptoAttribute::parse`. Otherwise `sbc-daemon` does string-based SDP handling via `proto_b2bua::SdpRewriter` / `extract_media_address` and `sdp_dtls.rs`; `client-sip-ua` lists the dependency but has no call sites. All rows below are **Library-only** except RFC 3362 / T.38 Annex D and the `a=crypto` key parse used by the SBC's SDES policy (RFC 4568 row).
 
 ### RFCs Referenced
 
 | RFC | Title | Status |
 |-----|-------|--------|
 | **RFC 8866** | SDP | **Full** — session, media, attributes, connection, bandwidth (§5.8), repeat times (§5.11), multicast (§5.7). **Library-only** |
-| **RFC 3264** | Offer/Answer Model | **Full** — answer generation (§6), direction negotiation (§6.1), hold/resume (§8.4.3), stream disable (§8.4), media modification validation (§8.4), multicast (§6.2). **Library-only** — daemon relays re-INVITE SDP (hold/resume) opaquely |
+| **RFC 3264** | Offer/Answer Model | **Full** — answer generation (§6), direction negotiation (§6.1), hold/resume (§8.4.3), stream disable (§8.4), media modification validation (§8.4), multicast (§6.2). **Library-only** — daemon relays re-INVITE SDP (hold/resume) opaquely. SBC call legs (local macOS run, 2026-11-17): with `media.srtp.required` (default) a delayed offer (§5, INVITE without SDP) is refused with 488 (NIST POA&M-351); a body with one non-compliant active m-line is refused whole rather than declining that stream (§6, §8; POA&M-353); `proto-b2bua` `declined_answer` answers a refused late offer (2xx ACK, reliable 183 PRACK) with every stream declined |
 | **RFC 2365** | Administratively Scoped Multicast | Multicast scope detection. Library-only |
 | **RFC 3551** | RTP/AVP Profile | Transport protocol enum. Library-only |
 | **RFC 3711** | SRTP | Transport protocol: RTP/SAVP. Library-only |
 | **RFC 3890** | TIAS Bandwidth | Bandwidth modifier. Library-only |
-| **RFC 4568** | SDP Security Descriptions (SDES) | **Full** — crypto attribute parsing, cipher suites, key params. **Library-only** for call legs — the shipped call media path is DTLS-SRTP only and passes `a=crypto` through unread. **Wired (sbc-daemon)** for the SIPREC recording session only: `uc-siprec` `build_rs_offer` generates one `a=crypto:1 AEAD_AES_256_GCM` line per RS stream, sent over the recorder TLS connection (RFC 4568 §8.3), and `rs_answer.rs` `parse_rs_answer` requires the answer to echo tag 1 and the suite (§5.1.2, §6.3). The SRS's key is not used (the SBC only sends) |
+| **RFC 4568** | SDP Security Descriptions (SDES) | **Full** — crypto attribute parsing, cipher suites, key params. Call legs: the SBC generates and consumes no SDES keys, and since fix/sdes-key-policy (local macOS run, 2026-11-17) it **polices** every `a=crypto` line that crosses it (`proto-b2bua/src/media_policy.rs`, see §11): the key crosses only between two SIP-over-TLS hops (§8.3, hop by hop, NIST POA&M-348), only `AEAD_AES_256_GCM` with one 44-octet inline key, session parameters allow-listed (§6.3), session-level lines stripped or refused (§9.1). proto-sdp `CryptoAttribute::parse` checks the inline key. SDES generation is **Wired (sbc-daemon)** for the SIPREC recording session only: `uc-siprec` `build_rs_offer` generates one `a=crypto:1 AEAD_AES_256_GCM` line per RS stream, sent over the recorder TLS connection (RFC 4568 §8.3), and `rs_answer.rs` `parse_rs_answer` requires the answer to echo tag 1 and the suite (§5.1.2, §6.3). The SRS's key is not used (the SBC only sends) |
 | **RFC 4572** | Fingerprint Attribute for DTLS | Referenced |
 | **RFC 4585** | RTP/AVPF | Transport protocol enum. Library-only |
 | **RFC 5245** | ICE Candidates in SDP | Referenced |
 | **RFC 6188** | AES-256-CM | Cipher suite enum. Library-only |
-| **RFC 7714** | AES-GCM for SRTP | Cipher suite: AEAD_AES_256_GCM. The SIPREC recording fork is wired (`sbc-media-core/src/recording_fork.rs`, `proto-srtp` `protect_rtp_in_place`): SBC-owned SSRC and packet counter per stream so the nonce (§8.1) cannot repeat (§8.4). The RS offer uses only `AEAD_AES_256_GCM` (§14.1); an AES_CM_128-only SRS answers 488. No packet-level RFC 7714 known-answer test; no SRTCP is sent on the RS |
+| **RFC 7714** | AES-GCM for SRTP | Cipher suite: AEAD_AES_256_GCM. The SIPREC recording fork is wired (`sbc-media-core/src/recording_fork.rs`, `proto-srtp` `protect_rtp_in_place`): SBC-owned SSRC and packet counter per stream so the nonce (§8.1) cannot repeat (§8.4). The RS offer uses only `AEAD_AES_256_GCM` (§14.1); an AES_CM_128-only SRS answers 488. On call legs the SBC relays SDES only for `AEAD_AES_256_GCM` (§14.1; `proto-b2bua/src/media_policy.rs`, local macOS run, 2026-11-17). No packet-level RFC 7714 known-answer test; no SRTCP is sent on the RS |
+| **RFC 4567** | Key Management Extensions for SDP (`a=key-mgmt`) | **Not supported.** proto-sdp has no `a=key-mgmt` type. The SBC strips `a=key-mgmt` from offers and refuses it in answers and as the only keying of a section (`proto-b2bua/src/media_policy.rs`, local macOS run, 2026-11-17) |
+| **RFC 3830** | MIKEY | **Not implemented.** No MIKEY parser or key exchange; MIKEY offered through RFC 4567 is not relayed (above) |
 | **RFC 3362** | image/t38 MIME type | **Partial** — `MediaType::Image`, `TransportProtocol::Udptl` (`media.rs`, test `test_image_udptl`). `TCPTL` rejected (POA&M-291). **Wired (sbc-daemon T.38 switchover)** |
 | **ITU-T T.38 Annex D** | T.38 SDP attributes | **Partial** — `t38.rs` `T38Params`: total parsing (duplicates, overflow, non-ASCII rejected), absent `T38FaxUdpEC` = no EC, `clamp` only lowers. Tests `parse_full_annex_d`, `round_trip`, `rejects_bad_values`, `clamp_only_lowers`, `table_round_trip`. Answer is not checked against the offer (version downgrade, EC fallback; POA&M-294). **Wired (sbc-daemon)** |
 
@@ -321,7 +323,7 @@
 | **RFC 5746** | Renegotiation Indication | Extension / SCSV exchanged; renegotiation itself is not supported. Library-only |
 | **RFC 8844** | Unknown Key-Share Attacks on DTLS-SRTP | **Not implemented** (NIST POA&M-333) |
 | **RFC 5288** | AES-GCM for TLS | Nonce construction for record encryption; sealing through `uc_crypto::tls12::Tls12GcmSealer` (the module's TLS 1.2 GCM construction, which refuses a non-increasing explicit nonce). Wired (soft client) since 2026-11-17 (local test runs only) |
-| **RFC 4572** / **RFC 8122** | Fingerprint Attribute | Certificate fingerprint module, SHA-384 / SHA-512 only. **Wired (sbc-media-core `dtls_identity.rs`, sbc-daemon `sdp_dtls.rs`; soft client)**. Soft client (fix/client-srtp-b2): generates its `sha-384` fingerprint (`client-sip-ua/src/dtls_identity.rs`) and parses remote ones with `from_sdp_strict` (strict `XX:XX` grammar, exact digest length, at most 256 bytes; tests `strict_parse_round_trip_and_case`, `strict_parse_rejects_bad_input`). `sha-256` is refused, a deliberate CNSA 2.0 deviation from RFC 8122 §5 interoperability. `verify_any` (RFC 8122 §5: match any one of the signalled fingerprints; an empty set never matches; test `verify_any_matches_one_of_set`) is called only by the legacy surface; `DtlsAssociation` verifies the peer's leaf certificate against the fingerprint set itself, and since 2026-11-17 the soft client runs it with the fingerprints of the dialog's SDP (tests `fingerprint_mismatch_fails_closed_in_both_roles`, `fingerprint_mismatch_ends_the_call_and_is_never_connected`) |
+| **RFC 4572** / **RFC 8122** | Fingerprint Attribute | Certificate fingerprint module, SHA-384 / SHA-512 only. **Wired (sbc-media-core `dtls_identity.rs`, sbc-daemon `sdp_dtls.rs`; soft client)**. Soft client (fix/client-srtp-b2): generates its `sha-384` fingerprint (`client-sip-ua/src/dtls_identity.rs`) and parses remote ones with `from_sdp_strict` (strict `XX:XX` grammar, exact digest length, at most 256 bytes; tests `strict_parse_round_trip_and_case`, `strict_parse_rejects_bad_input`). `sha-256` is refused, a deliberate CNSA 2.0 deviation from RFC 8122 §5 interoperability. SBC call legs (local macOS run, 2026-11-17): `proto-b2bua/src/media_policy.rs` keeps only `sha-384` / `sha-512` `a=fingerprint` lines of the matching length on every crossing offer and answer and refuses a body whose active DTLS m-line keeps none, whatever `media.srtp.required` says (same deviation; tests `only_unaccepted_hash_is_refused`, `sha512_fingerprint_is_accepted`, `sha256_only_fingerprint_offer_is_refused`). `verify_any` (RFC 8122 §5: match any one of the signalled fingerprints; an empty set never matches; test `verify_any_matches_one_of_set`) is called only by the legacy surface; `DtlsAssociation` verifies the peer's leaf certificate against the fingerprint set itself, and since 2026-11-17 the soft client runs it with the fingerprints of the dialog's SDP (tests `fingerprint_mismatch_fails_closed_in_both_roles`, `fingerprint_mismatch_ends_the_call_and_is_never_connected`) |
 | **RFC 7627** | Extended Master Secret | Mandatory in `DtlsAssociation`, both roles; a peer without it fails the handshake (stricter than the RFC, which lets it be negotiated). The `config.rs` option belongs to the legacy surface. Wired (soft client) since 2026-11-17 (local test runs only). The SBC Go sidecar requires it as well since 2026-11-16 |
 | **RFC 7714** | AES-GCM Cipher Suite | `SRTP_AEAD_AES_256_GCM` is the only `use_srtp` profile offered or accepted. Wired (soft client) since 2026-11-17 (local test runs only) |
 
@@ -353,7 +355,7 @@
 | RFC | Title | Status |
 |-----|-------|--------|
 | **RFC 3261** | SIP Transactions | **Full** — client INVITE (§17.1.1), client non-INVITE (§17.1.2), server INVITE (§17.2.1), server non-INVITE (§17.2.2), transaction matching (§17.1.3), branch magic cookie, Timer T1/T2/T4, 2xx bypass for server INVITE. **Wired (sbc-daemon `sip_stack.rs`: `ServerInviteTransaction`/`ServerNonInviteTransaction`/`ClientInviteTransaction`/`ClientNonInviteTransaction`, `TransactionKey`, timers driven by `poll_timers`; soft client `registration.rs`/`call_agent.rs`)** |
-| **RFC 3262** | 100rel / PRACK | **Full** — RSeq/RAck headers, reliable provisional tracking, random initial RSeq (1 to 2^31). **Library-only** — no binary sends or handles PRACK; sbc-daemon returns 405 |
+| **RFC 3262** | 100rel / PRACK | **Full** — RSeq/RAck headers, reliable provisional tracking, random initial RSeq (1 to 2^31). **Library-only** — no binary uses the library's PRACK support; sbc-daemon relays in-dialog PRACK with its own RAck mapping (POA&M-182) and returns 405 out of dialog |
 | **RFC 3311** | UPDATE | Non-INVITE transaction machine reuse. **Wired (sbc-daemon)** — `handle_update` opens server/client non-INVITE transactions and relays |
 | **RFC 4028** | Session Timers | UPDATE for session timer refresh. **Wired (sbc-daemon, header relay only)** — see §1/§10 |
 
@@ -394,7 +396,7 @@
 | **RFC 5875** | XCAP Diff Event | Event package entry. Library-only |
 | **RFC 6035** | VoIP Metrics (vq-rtcpxr) | Event package entry. Library-only |
 | **RFC 6446** | Session Recording | Event package entry. Library-only |
-| **RFC 6665** | SIP Events | **Full** — subscription states, termination reasons, IANA event package validation (§7.2). **Library-only** — `subscription.rs` unused; daemon 405s SUBSCRIBE/NOTIFY; client reads Subscription-State header as a string on REFER NOTIFY |
+| **RFC 6665** | SIP Events | **Full** — subscription states, termination reasons, IANA event package validation (§7.2). **Library-only** — `subscription.rs` unused; daemon 405s SUBSCRIBE and out-of-dialog NOTIFY (in-dialog NOTIFY is relayed); client reads Subscription-State header as a string on REFER NOTIFY |
 | **RFC 6910** | Auto-Configuration | Event package entry. Library-only |
 | **RFC 7614** | Location Conveyance | Event package entry. Library-only |
 | **RFC 7840** | Multiple Phone Numbers | Event package entry. Library-only |
@@ -425,12 +427,14 @@
 | **RFC 3264** | Offer/Answer | Hold signaling via direction — daemon relays re-INVITE SDP opaquely. §8: `rewrite_connection_and_port` now preserves port 0 on declined m-lines (previously re-enabled them; test `test_port_zero_preserved`). Single anchored stream selection `select_anchored_stream` / `SdpRewriter::rewrite_with_selection` declines extra active streams in place when an image m-line is involved (tests `test_selection`, `test_selection_two_images_and_hostile`); general multi-stream anchoring is POA&M-293. **Wired (sbc-daemon)** |
 | **RFC 3362 / T.38 Annex D** | T.38 SDP | `rewrite_t38_attributes` clamps Annex D attributes, other lines byte-for-byte (test `test_rewrite_t38_attributes`). **Wired (sbc-daemon)** |
 | **RFC 4566** | SDP Format | Referenced for SDP rewrite |
+| **RFC 4568 §6.3, §7.1.2, §8, §9.1; RFC 4567; RFC 7714 §14.1; RFC 8122 §5; RFC 5764 §8; RFC 8841 §4** | Call-leg media security policy | `media_policy.rs` `apply_media_security` (pure; no I/O, no cryptography): SDES keys cross only between two confidential (TLS) hops; only `AEAD_AES_256_GCM` with one 44-octet inline key; offers stripped, answers checked for exactly one acceptable line; `a=key-mgmt` not supported; terminate mode strips every `a=crypto`. DTLS m-lines keep only `sha-384` / `sha-512` fingerprints and are refused with none left (deviation from RFC 8122 §5, which allows `sha-256`). `require_srtp` (`media.srtp.required`): every active m-line other than `m=image ... udptl` must be DTLS-keyed (`UDP/TLS/RTP/SAVP(F)`, `TCP/DTLS/RTP/SAVP(F)`, `TCP/TLS/RTP/SAVP(F)`, `UDP/DTLS/SCTP`, `TCP/DTLS/SCTP`) or SDES-keyed `RTP/SAVP(F)`; one failing m-line refuses the body (NIST POA&M-353). The DTLS-SRTP `use_srtp` profile is negotiated by the endpoints in passthrough and not checked here. `declined_answer` builds an answer that declines every stream (RFC 3264 §6). Hop by hop only (NIST POA&M-348). Tests `tests/media_policy_tests.rs`, `tests/media_policy_props.rs`, `tests/media_policy_fingerprint.rs`, `tests/media_policy_required.rs`, unit tests in `media_policy.rs`. **Wired (sbc-daemon `sip_stack/media_security.rs`)**, local macOS run, 2026-11-17 |
 
 ### Key Files
 - `src/lib.rs` — B2BUA types per RFC 7092 §3
 - `src/mode.rs` — mode-specific behavior per RFC 7092
 - `src/sdp_rewrite.rs` — SDP rewriting for media anchoring per RFC 7092 (wired: sbc-daemon)
 - `src/early_media.rs` — RFC 3960 early media handling (library-only)
+- `src/media_policy.rs` — call-leg media security policy: SDES keying (RFC 4568 §8), DTLS fingerprint hash (RFC 8122 §5), required SRTP (wired: sbc-daemon)
 
 ---
 
@@ -504,7 +508,7 @@
 - **proto-ice** — soft client only (checks, nomination; STUN via settings); the SBC does not run ICE; RFC 7675 consent and §10 keepalives unused
 - **proto-dtls** — `DtlsAssociation` (the handshake added 2026-11-16) is run by the soft client since 2026-11-17 (`client-sip-ua/src/dtls_driver.rs`; local test runs only); no SBC binary uses it: SBC DTLS termination is the Go sidecar. The legacy `DtlsConnection` / `DtlsSession` surface performs no handshake and is used by no client crate (NIST POA&M-337). `fingerprint.rs` and PEM loading are also on shipped paths
 - **proto-sip** proxy/routing/redirect/options modules, Path header; **proto-transaction** PRACK; **proto-registrar** GRUU/Path/Service-Route/flow manager; **proto-b2bua** early-media module; **proto-rtp** translator/mixer/scheduler/collision detector
-- **sbc-daemon** relays only REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE; REFER, SUBSCRIBE/NOTIFY, PRACK, MESSAGE, INFO, PUBLISH receive 405
+- **sbc-daemon** handles REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE and relays PRACK, INFO, MESSAGE and NOTIFY in dialog only (with its own code, not the proto-dialog/proto-transaction modules); REFER, SUBSCRIBE and PUBLISH, and out-of-dialog PRACK/INFO/MESSAGE/NOTIFY, receive 405
 
 ### Intentional Deviations (All Documented)
 
@@ -515,6 +519,7 @@
 | proto-stun | RFC 5389 (MD5 key derivation) | SHA-384 | CNSA 2.0 |
 | proto-stun | RFC 5389 (HMAC-SHA1) | HMAC-SHA256 | RFC 8445 requirement |
 | proto-stun | RFC 4013 SASLprep | Simplified | Noted in comments |
+| proto-b2bua | RFC 4568 crypto suites (any registered suite) | Only `AEAD_AES_256_GCM` SDES is relayed; other suites are stripped from offers and refused in answers; answer tags are not cross-checked against the offer | CNSA 2.0 |
 
 ### Potential Improvements
 1. **proto-rtp**: Mixer/translator reception reports have `jitter`, `last_sr`, `delay_since_last_sr` hardcoded to 0 — would need per-source JitterCalculator and SR timestamp tracking
@@ -577,7 +582,8 @@ Since SIPREC phase 3 (2026-11-09) `sbc-daemon` calls `uc-siprec` to record calls
 | RFC 4347 | DTLS over UDP | proto-sip | library (transport enum only) |
 | RFC 4538 | Media Authorization | proto-dialog | library |
 | RFC 4566 | SDP | proto-sip, proto-b2bua | sbc-daemon (string-based rewrite) |
-| RFC 4568 | SDP Security Descriptions | proto-sdp | library |
+| RFC 4568 | SDP Security Descriptions | proto-sdp, proto-b2bua (`media_policy.rs`) | sbc-daemon (call-leg SDES policy: TLS hops only, `AEAD_AES_256_GCM` only; local macOS run, 2026-11-17); SIPREC RS offer |
+| RFC 4567 / RFC 3830 | SDP Key Management / MIKEY | proto-b2bua (`media_policy.rs`, refusal only) | sbc-daemon (not supported: stripped from offers, refused in answers) |
 | RFC 4145 | TCP-Based Media Transport in SDP (`a=setup`) | client-sip-ua `sdp_dtls.rs`; sbc-daemon `sdp_dtls.rs` | soft client (role signalling; drives the DTLS role since 2026-11-17); sbc-daemon |
 | RFC 4572 | Fingerprint Attribute | proto-sdp, proto-dtls | sbc-media-core, sbc-daemon, soft client |
 | RFC 4575 | Conference Event Package | proto-dialog | library |
@@ -617,9 +623,9 @@ Since SIPREC phase 3 (2026-11-09) `sbc-daemon` calls `uc-siprec` to record calls
 | RFC 7616 | HTTP Digest (SHA-256, SHA-512-256) | proto-sip, proto-registrar | sbc-daemon REGISTER via proto-sip `DigestVerifier`, enabled by `[digest_auth]` (off by default); one challenge for the configured algorithm, SHA-256 or SHA-512-256; HA1 file credentials; no INVITE challenge (POA&M-271) |
 | RFC 7627 | Extended Master Secret | proto-dtls (mandatory in `DtlsAssociation`) | soft client (since 2026-11-17); required by the SBC Go sidecar |
 | RFC 7675 | Consent Freshness | proto-ice | library |
-| RFC 7714 | AES-GCM for SRTP | proto-srtp, proto-sdp, proto-dtls | sbc-media-core; soft client (keys from DTLS-SRTP since 2026-11-17) |
+| RFC 7714 | AES-GCM for SRTP | proto-srtp, proto-sdp, proto-dtls, proto-b2bua (`media_policy.rs`, suite check) | sbc-media-core; sbc-daemon (only `AEAD_AES_256_GCM` SDES crosses, local macOS run, 2026-11-17); soft client (keys from DTLS-SRTP since 2026-11-17) |
 | RFC 7983 | Multiplexing Scheme Updates for DTLS-SRTP | client-sip-ua (`dtls_driver.rs`, handshake phase); client-audio (`rtp_handler.rs` `classify`) | soft client (classification; DTLS routed to the association in both phases since 2026-11-17, from the negotiated address only; STUN dropped, NIST POA&M-325) |
-| RFC 8122 | Connection-Oriented Media over TLS in SDP (fingerprint) | proto-dtls `fingerprint.rs`, `association.rs` (verification); client-sip-ua `sdp_dtls.rs` | soft client (generate and strict parse, sha-384/512 only; peer certificate verified against the SDP fingerprint in the DTLS handshake since 2026-11-17); sbc-daemon, sbc-media-core |
+| RFC 8122 | Connection-Oriented Media over TLS in SDP (fingerprint) | proto-dtls `fingerprint.rs`, `association.rs` (verification); client-sip-ua `sdp_dtls.rs` | soft client (generate and strict parse, sha-384/512 only; peer certificate verified against the SDP fingerprint in the DTLS handshake since 2026-11-17); sbc-daemon (call-leg SDP: only sha-384/512 cross, local macOS run, 2026-11-17), sbc-media-core |
 | RFC 8844 | Unknown Key-Share Attacks on DTLS-SRTP | none | not implemented (NIST POA&M-333) |
 | RFC 7865 | SIPREC Metadata Model | uc-siprec | sbc-daemon (Partial; complete snapshot in the RS INVITE only; off by default) |
 | RFC 7866 | SIPREC Protocol | uc-siprec | sbc-daemon, sbc-media-core (Partial; SRC for two-party audio calls; off by default; no RTCP, no `a=record`, no SRS-initiated requests) |

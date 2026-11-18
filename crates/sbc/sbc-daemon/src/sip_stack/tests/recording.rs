@@ -18,6 +18,38 @@ use uc_audit::event::{
 };
 use uc_cdr::RecordingTag;
 
+// Recording in passthrough mode needs `media.srtp.required = false`
+// (sbc-config rejects it otherwise): these calls are cleartext RTP/AVP, so
+// the shared DTLS-SRTP fixtures are shadowed here.
+const ALICE_SDP: &str = "v=0\r\no=- 1 1 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\na=sendrecv\r\n";
+const BOB_SDP: &str = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\na=sendrecv\r\n";
+
+/// The parent module's `place_call`, with this module's cleartext offer.
+async fn place_call(stack: &SipStack, call_id: &str) -> Vec<ProcessResult> {
+    place_call_to(stack, DIALED, call_id).await
+}
+
+/// The parent module's `place_call_to`, with this module's cleartext offer.
+async fn place_call_to(stack: &SipStack, user: &str, call_id: &str) -> Vec<ProcessResult> {
+    flatten(
+        stack
+            .process_message(
+                &caller_request("INVITE", user, call_id, 1, None, Some(ALICE_SDP)),
+                alice(),
+                None,
+            )
+            .await,
+    )
+}
+
+/// `[media.srtp]` with `required = false`, passthrough.
+fn srtp_not_required() -> sbc_config::schema::SrtpConfig {
+    sbc_config::schema::SrtpConfig {
+        required: false,
+        ..sbc_config::schema::SrtpConfig::default()
+    }
+}
+
 const REJECT: RecordingFailureAction = RecordingFailureAction::Reject;
 const CONTINUE: RecordingFailureAction = RecordingFailureAction::Continue;
 
@@ -222,6 +254,7 @@ async fn fixture_with(
     let mut s = settings(on_failure);
     tweak(&mut s);
     stack.set_recording(s);
+    stack.set_media_security_policy(&srtp_not_required());
     Fixture { stack, media, cdr }
 }
 
@@ -266,19 +299,58 @@ async fn caller_ack(stack: &SipStack, call_id: &str) -> Vec<ProcessResult> {
     caller_ack_for(stack, DIALED, call_id, 1).await
 }
 
-/// The caller's ACK for the 2xx to its INVITE number `cseq` toward `user`.
+/// The caller's ACK for the 2xx to its INVITE number `cseq` toward `user`,
+/// on the transport the caller's leg is bound to.
 async fn caller_ack_for(
     stack: &SipStack,
     user: &str,
     call_id: &str,
     cseq: u32,
 ) -> Vec<ProcessResult> {
+    let transport = a_leg_transport(stack, call_id).await;
+    caller_ack_on(stack, user, call_id, cseq, transport).await
+}
+
+/// [`caller_ack_for`] on `transport`, for an ACK that arrives after the
+/// call record is gone.
+async fn caller_ack_on(
+    stack: &SipStack,
+    user: &str,
+    call_id: &str,
+    cseq: u32,
+    transport: AddrTransport,
+) -> Vec<ProcessResult> {
     let ack = caller_request("ACK", user, call_id, cseq, Some("bobtag"), None);
     let ack = Bytes::from(String::from_utf8(ack.to_vec()).unwrap().replace(
         &format!("z9hG4bK-{call_id}-{cseq}"),
         &format!("z9hG4bK-{call_id}-ack{cseq}"),
     ));
-    flatten(stack.process_message(&ack, alice(), None).await)
+    flatten(
+        stack
+            .process_message_on(&ack, alice(), None, transport)
+            .await,
+    )
+}
+
+/// The transport the caller's leg of `call_id` is bound to (UDP when there
+/// is no such call): in-dialog requests from the caller must arrive on it
+/// (RFC 3261 §12.2.2 peer binding, transport floor).
+async fn a_leg_transport(stack: &SipStack, call_id: &str) -> AddrTransport {
+    let corr = stack.call_correlation.read().await;
+    corr.a_leg
+        .get(call_id)
+        .and_then(|id| corr.addresses.get(id))
+        .map_or(AddrTransport::Udp, |a| a.a_leg_flow.transport)
+}
+
+/// `request` from the caller of `call_id`, on the transport its leg is bound to.
+async fn from_alice(stack: &SipStack, call_id: &str, request: &Bytes) -> Vec<ProcessResult> {
+    let transport = a_leg_transport(stack, call_id).await;
+    flatten(
+        stack
+            .process_message_on(request, alice(), None, transport)
+            .await,
+    )
 }
 
 /// The SBC's BYEs toward the call legs (not the SRS), by destination.
@@ -367,7 +439,7 @@ fn srs_request(invite: &SipRequest, method: &str, from_tag: &str) -> Bytes {
 
 async fn caller_bye(stack: &SipStack, call_id: &str) -> Vec<ProcessResult> {
     let bye = caller_request("BYE", DIALED, call_id, 2, Some("bobtag"), None);
-    flatten(stack.process_message(&bye, alice(), None).await)
+    from_alice(stack, call_id, &bye).await
 }
 
 async fn poll(stack: &SipStack) -> Vec<ProcessResult> {
@@ -1298,10 +1370,78 @@ async fn fork_errors_apply_the_policy() {
     }
 }
 
-const SAVP_OFFER: &str = "v=0\r\no=- 1 1 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\n\
-    m=audio 4000 RTP/SAVP 0\r\na=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n";
-const SAVP_ANSWER: &str = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
-    m=audio 5000 RTP/SAVP 0\r\na=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n";
+/// A call leg's SDES line (key: 44 octets, bytes 0..44; not a secret and
+/// not [`SRS_KEY`]). SDES keying only crosses as AEAD_AES_256_GCM between
+/// TLS legs (RFC 4568 §8.3, CNSA 2.0; see [`tls_fixture`], [`tls_legs`]).
+const LEG_CRYPTO: &str = concat!(
+    "a=crypto:1 AEAD_AES_256_GCM inline:",
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKis=",
+    "\r\n"
+);
+const SAVP_OFFER: &str = concat!(
+    "v=0\r\no=- 1 1 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\n",
+    "m=audio 4000 RTP/SAVP 0\r\n",
+    "a=crypto:1 AEAD_AES_256_GCM inline:",
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKis=",
+    "\r\n"
+);
+const SAVP_ANSWER: &str = concat!(
+    "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n",
+    "m=audio 5000 RTP/SAVP 0\r\n",
+    "a=crypto:1 AEAD_AES_256_GCM inline:",
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKis=",
+    "\r\n"
+);
+
+/// A [`fixture`] whose trunks are TLS (at the [`t1`] / [`t2`] addresses),
+/// for calls placed with [`place_tls`]: SDES keying only crosses when both
+/// signalling hops are TLS (RFC 4568 §8.3).
+async fn tls_fixture(on_failure: RecordingFailureAction) -> Fixture {
+    let mut stack = SipStack::new(SipStackConfig::default());
+    let (routing, dial_plans, mut groups) = carrier_routing(10, ("none", ""), ["tls", "tls"]);
+    for trunk in groups.iter_mut().flat_map(|g| g.trunks.iter_mut()) {
+        trunk.port = 5060;
+    }
+    stack.init_router_from_config(&routing, &dial_plans, &groups);
+    stack
+        .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+        .await;
+    let cdr = cdr_emitter();
+    stack.set_cdr(Arc::new(crate::cdr::CdrContext::new(
+        Arc::clone(&cdr),
+        &sbc_config::schema::CdrConfig::default(),
+    )));
+    let media = Arc::new(ForkMedia::default());
+    stack.set_media_pipeline(Arc::clone(&media) as _);
+    stack.set_recording(settings(on_failure));
+    stack.set_media_security_policy(&srtp_not_required());
+    Fixture { stack, media, cdr }
+}
+
+/// Alice's INVITE for `call_id` to `user` with `offer`, received over TLS.
+async fn place_tls(stack: &SipStack, user: &str, call_id: &str, offer: &str) -> Vec<ProcessResult> {
+    flatten(
+        stack
+            .process_message_on(
+                &caller_request("INVITE", user, call_id, 1, None, Some(offer)),
+                alice(),
+                None,
+                AddrTransport::Tls,
+            )
+            .await,
+    )
+}
+
+/// Marks both signalling legs of the established `call_id` as TLS, as if it
+/// had been placed and routed over TLS, so an in-dialog SDES offer may
+/// cross (RFC 4568 §8.3). For tests about the recording, not the transport.
+async fn tls_legs(stack: &SipStack, call_id: &str) {
+    let mut corr = stack.call_correlation.write().await;
+    let id = corr.a_leg.get(call_id).cloned().expect("call is up");
+    let addrs = corr.addresses.get_mut(&id).expect("call record");
+    addrs.a_leg_flow.transport = AddrTransport::Tls;
+    addrs.b_leg_flow.transport = AddrTransport::Tls;
+}
 
 /// Places a call with `offer` that the INVITE alone shows to be
 /// unrecordable. Under `reject` it must be refused there (RFC-001 a);
@@ -1314,12 +1454,14 @@ async fn assert_refused_at_invite(
     answer: &str,
 ) {
     let capture = uc_audit::capture::start();
+    // Over TLS, so an SDES offer may cross to a TLS trunk (RFC 4568 §8.3).
     let placed = flatten(
         f.stack
-            .process_message(
+            .process_message_on(
                 &caller_request("INVITE", DIALED, call_id, 1, None, offer),
                 alice(),
                 None,
+                AddrTransport::Tls,
             )
             .await,
     );
@@ -1356,7 +1498,7 @@ async fn assert_refused_at_invite(
 #[tokio::test]
 async fn srtp_passthrough_call_is_not_recordable() {
     for policy in [REJECT, CONTINUE] {
-        let f = fixture(policy).await;
+        let f = tls_fixture(policy).await;
         assert_refused_at_invite(&f, "savp@test", policy, Some(SAVP_OFFER), SAVP_ANSWER).await;
     }
 }
@@ -1366,6 +1508,7 @@ async fn srtp_passthrough_call_is_not_recordable() {
 async fn call_without_a_media_relay_is_not_recordable() {
     let (mut stack, cdr) = cdr_stack().await;
     stack.set_recording(settings(REJECT));
+    stack.set_media_security_policy(&srtp_not_required());
     let f = Fixture {
         stack,
         media: Arc::new(ForkMedia::default()),
@@ -1416,22 +1559,12 @@ async fn zrtp_call_is_not_recordable() {
 // the callee is still ACKed.
 #[tokio::test]
 async fn answer_dependent_unrecordable_call_is_refused_before_the_200_is_relayed() {
-    const CRYPTO: &str =
-        "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n";
-    let offer = format!("{ALICE_SDP}{CRYPTO}");
-    let answer = format!("{BOB_SDP}{CRYPTO}");
+    let offer = format!("{ALICE_SDP}{LEG_CRYPTO}");
+    let answer = format!("{BOB_SDP}{LEG_CRYPTO}");
     for policy in [REJECT, CONTINUE] {
-        let f = fixture(policy).await;
+        let f = tls_fixture(policy).await;
         let capture = uc_audit::capture::start();
-        let placed = flatten(
-            f.stack
-                .process_message(
-                    &caller_request("INVITE", DIALED, "osrtp@test", 1, None, Some(&offer)),
-                    alice(),
-                    None,
-                )
-                .await,
-        );
+        let placed = place_tls(&f.stack, DIALED, "osrtp@test", &offer).await;
         let b_invite = forwarded(&placed, &Method::Invite)
             .expect("the offer alone does not rule the call out")
             .0
@@ -1592,6 +1725,7 @@ async fn cross_group_fixture(tweak: impl FnOnce(&mut RecordingSettings)) -> Fixt
     let mut s = settings(REJECT);
     tweak(&mut s);
     stack.set_recording(s);
+    stack.set_media_security_policy(&srtp_not_required());
     Fixture { stack, media, cdr }
 }
 
@@ -2266,12 +2400,14 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
     for policy in [REJECT, CONTINUE] {
         let f = fixture(policy).await;
         let inv = rs_invite(&answered(&f.stack, "up@test").await);
+        tls_legs(&f.stack, "up@test").await;
         srs_ok(&f.stack, &inv).await;
         f.stack
-            .process_message(
+            .process_message_on(
                 &caller_request("ACK", DIALED, "up@test", 1, Some("bobtag"), None),
                 alice(),
                 None,
+                AddrTransport::Tls,
             )
             .await;
         // Hold (still RTP/AVP): the recording goes on.
@@ -2279,7 +2415,7 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
         let hold_answer = BOB_SDP.replace("a=sendrecv", "a=recvonly");
         let results = flatten(
             f.stack
-                .process_message(
+                .process_message_on(
                     &caller_request(
                         "INVITE",
                         DIALED,
@@ -2290,6 +2426,7 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
                     ),
                     alice(),
                     None,
+                    AddrTransport::Tls,
                 )
                 .await,
         );
@@ -2309,10 +2446,11 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
             "hold keeps recording"
         );
         f.stack
-            .process_message(
+            .process_message_on(
                 &caller_request("ACK", DIALED, "up@test", 2, Some("bobtag"), None),
                 alice(),
                 None,
+                AddrTransport::Tls,
             )
             .await;
 
@@ -2320,7 +2458,7 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
         let capture = uc_audit::capture::start();
         let results = flatten(
             f.stack
-                .process_message(
+                .process_message_on(
                     &caller_request(
                         "INVITE",
                         DIALED,
@@ -2331,6 +2469,7 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
                     ),
                     alice(),
                     None,
+                    AddrTransport::Tls,
                 )
                 .await,
         );
@@ -2355,7 +2494,7 @@ async fn mid_call_switch_to_srtp_passthrough_ends_the_recording() {
             // RFC 3261 §15: the caller's BYE waits for its ACK of the
             // re-INVITE's 2xx.
             assert_eq!(leg_byes(&results), vec![t1()], "{results:?}");
-            results.extend(caller_ack_for(&f.stack, DIALED, "up@test", 3).await);
+            results.extend(caller_ack_on(&f.stack, DIALED, "up@test", 3, AddrTransport::Tls).await);
         }
         assert_eq!(f.media.count("fork-stop"), 1);
         let events = capture.events();
@@ -2398,6 +2537,7 @@ async fn rs_messages_bypass_topology_hiding() {
     let media = Arc::new(ForkMedia::default());
     stack.set_media_pipeline(Arc::clone(&media) as _);
     stack.set_recording(settings(REJECT));
+    stack.set_media_security_policy(&srtp_not_required());
     let f = Fixture { stack, media, cdr };
     let results = answered(&f.stack, "th@test").await;
     let inv = rs_invite(&results);
@@ -2449,6 +2589,7 @@ async fn held_bye_is_hidden_the_same_on_ack_and_on_timeout() {
         let media = Arc::new(ForkMedia::default());
         stack.set_media_pipeline(Arc::clone(&media) as _);
         stack.set_recording(settings(REJECT));
+        stack.set_media_security_policy(&srtp_not_required());
         let f = Fixture { stack, media, cdr };
         let placed = place_call(&f.stack, "th-hold@test").await;
         let answered = answer_with(&f.stack, &placed, BOB_SDP).await;

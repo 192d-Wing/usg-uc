@@ -2,64 +2,106 @@ name: Release SBC
 
 # Builds the SBC pod images (sbc-daemon, sbc-api-server, sbc-provision-server,
 # sbc-client-config-server, sbc-announcement-server, sbc-trunk-agent,
-# sbc-dashboard) for linux/amd64 + linux/arm64 and publishes a multi-arch
+# central-config-api, central-config-import, sbc-config-sync, sbc-dashboard,
+# dtls-terminator) for linux/amd64 + linux/arm64 and publishes a multi-arch
 # manifest per image.
 #
 # Each architecture builds on a NATIVE runner (no QEMU) — important for the
 # heavy Rust + aws-lc-fips compile — pushing by digest; a per-image merge job
 # then assembles the manifest list.
 #
-# Base images are pulled with Iron Bank (registry1.dso.mil) credentials when
-# present (org secrets REPO1_USER / REPO1) so a Platform One environment can
-# point the Dockerfiles' base ARGs at hardened images without a workflow
-# change. Output goes to GHCR by default — override env.REGISTRY for a Harbor
-# / Platform One project registry.
+# Published images carry BuildKit provenance (mode=max) and an SBOM per
+# platform, a keyless cosign signature on the index digest, and a GitHub
+# build-provenance attestation pushed to the registry. Verification commands
+# are in CONTRIBUTING.md ("Verifying releases").
+#
+# The Iron Bank (registry1.dso.mil) login runs on publish builds when
+# REPO1_USER / REPO1 are set, for pulling hardened base images if a
+# Dockerfile's FROM is pointed there (none are today). Branch builds never
+# log in to Iron Bank. Output goes to GHCR by default — override
+# env.REGISTRY for a Harbor / Platform One project registry.
 #
 # Triggers:
-#   - an `sbc-v<semver>` tag (sbc-v1.2.3) cuts released images tagged with
-#     the version (and `latest` on the default branch). The prefix keeps the
-#     SBC release cadence independent of the soft client
+#   - an `sbc-v<semver>` tag (sbc-v1.2.3, sbc-v1.2.3-rc.1) cuts released
+#     images tagged with the version. The prefix keeps the SBC release
+#     cadence independent of the soft client
 #     (.github/workflows/release-client.yml, `client-v*`) and the docs site
-#     (`docs-v*`); a bare `v*` tag no longer triggers anything.
-#   - workflow_dispatch builds on-demand images tagged with the short SHA.
+#     (`docs-v*`); a bare `v*` tag no longer triggers anything. An `sbc-v*`
+#     tag that isn't semver builds but does not publish.
+#   - workflow_dispatch on a branch builds every image as a check only
+#     (`build` job): read-only token, no registry login, no push, no merge or
+#     signing. Dispatch on an `sbc-v<semver>` tag finishes a release whose
+#     run failed before merge; it never overwrites a published version.
+#
+# Publishing is decided once, in the `gate` job; `build` and `build-publish`
+# are mutually exclusive on needs.gate.outputs.publish. Publishing jobs
+# (build-publish, merge) run in the `release` environment, which must be
+# configured in the repo settings: deployment refs limited to tags `sbc-v*`
+# and `client-v*`, required reviewers, and the Iron Bank secrets
+# (REPO1_USER, REPO1) stored there rather than at org/repo level.
 
 on:
   push:
     tags:
       - 'sbc-v*'
   workflow_dispatch:
-    inputs:
-      push:
-        description: 'Push images to the registry (false = build only)'
-        type: boolean
-        default: true
 
 permissions:
   contents: read
+
+# One run per ref at a time; never cancel a run that may be mid-publish.
+concurrency:
+  group: release-sbc-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io/192d-wing
   IRONBANK_REGISTRY: registry1.dso.mil
 
 jobs:
+  gate:
+    name: Publish gate
+    runs-on: ubuntu-24.04
+    permissions: {}
+    outputs:
+      publish: ${{ steps.gate.outputs.publish }}
+    steps:
+      - name: Publish only from an sbc-v<semver> tag
+        id: gate
+        run: |
+          re='^sbc-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if [[ "$REF_TYPE" == "tag" && "$REF_NAME" =~ $re ]]; then
+            publish=true
+          else
+            publish=false
+            if [[ "$REF_TYPE" == "tag" ]]; then
+              echo "::warning::tag $REF_NAME is not sbc-v<semver>; building without publishing"
+            fi
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+
+  # Build-only check (branch dispatch, or a non-semver tag). Read-only token,
+  # no registry credentials, nothing pushed.
   build:
     name: ${{ matrix.image.name }} (${{ matrix.platform.arch }})
     runs-on: ${{ matrix.platform.runner }}
+    needs: gate
+    if: ${{ needs.gate.outputs.publish != 'true' }}
     permissions:
       contents: read
-      packages: write
     env:
-      # Mirror the Iron Bank robot user into env so steps can gate on its
-      # presence (the `secrets` context isn't allowed in `if:` conditions).
-      # Job-scoped: only this job logs in to Iron Bank.
-      IRONBANK_USER: ${{ secrets.REPO1_USER }}
-    strategy:
+      PUBLISH: 'false'
+    strategy: &build-strategy
       fail-fast: false
       matrix:
         image:
           # The Rust images use cargo-chef and copy the whole workspace, so
-          # their context is the repo root. The dashboard image copies only
-          # its own package.json / src, so its context is its crate dir.
+          # their context is the repo root. The dashboard and DTLS sidecar
+          # images copy only their own sources, so their context is their
+          # own directory.
           - { name: sbc-daemon, dockerfile: Dockerfile, context: . }
           - { name: sbc-api-server, dockerfile: crates/sbc/sbc-api-server/Dockerfile, context: . }
           - { name: sbc-provision-server, dockerfile: crates/sbc/sbc-provision-server/Dockerfile, context: . }
@@ -70,23 +112,76 @@ jobs:
           - { name: central-config-import, dockerfile: crates/sbc/central-config-import/Dockerfile, context: . }
           - { name: sbc-config-sync, dockerfile: crates/sbc/sbc-config-sync/Dockerfile, context: . }
           - { name: sbc-dashboard, dockerfile: crates/sbc/sbc-dashboard/Dockerfile, context: crates/sbc/sbc-dashboard }
+          - { name: dtls-terminator, dockerfile: sidecar/dtls-terminator/Dockerfile, context: sidecar/dtls-terminator }
         platform:
           - { arch: linux/amd64, runner: ubuntu-24.04 }
           - { arch: linux/arm64, runner: ubuntu-24.04-arm }
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Normalize platform name
+      - &normalize-platform
+        name: Normalize platform name
         run: echo "PLATFORM_PAIR=${arch//\//-}" >> "$GITHUB_ENV"
         env:
           arch: ${{ matrix.platform.arch }}
 
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - &setup-buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # Iron Bank base-image source (when the Dockerfile base ARGs point there).
-      # Skipped silently if the org secrets aren't configured.
+      - &meta-labels
+        name: Image metadata (labels)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image.name }}
+
+      - &build-image
+        name: Build (and push by digest when publishing)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.platform.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # No registry cache: release images are built cold from the tagged
+          # source, so nothing a branch run (or anyone with packages: write)
+          # wrote to the registry can end up in a signed image. Branch checks
+          # build cold too.
+          no-cache: true
+          provenance: mode=max
+          # Pinned SBOM generator (docker/buildkit-syft-scanner stable-1).
+          sbom: generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=${{ env.PUBLISH }}
+
+  # Release build on an sbc-v<semver> tag. Same matrix and build steps as
+  # `build` (YAML anchors), plus registry logins and the digest hand-off.
+  build-publish:
+    name: ${{ matrix.image.name }} (${{ matrix.platform.arch }}, publish)
+    runs-on: ${{ matrix.platform.runner }}
+    needs: gate
+    if: ${{ needs.gate.outputs.publish == 'true' }}
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUBLISH: 'true'
+      # Mirror the Iron Bank robot user into env so steps can gate on its
+      # presence (the `secrets` context isn't allowed in `if:` conditions).
+      # Job-scoped: only this job logs in to Iron Bank.
+      IRONBANK_USER: ${{ secrets.REPO1_USER }}
+    strategy: *build-strategy
+    steps:
+      - *checkout
+      - *normalize-platform
+      - *setup-buildx
+
+      # For Iron Bank base pulls, if a Dockerfile's FROM is pointed there.
+      # Skipped silently if the secrets aren't available to this job.
       - name: Log in to Iron Bank
         if: ${{ env.IRONBANK_USER != '' }}
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -96,47 +191,23 @@ jobs:
           password: ${{ secrets.REPO1 }}
 
       - name: Log in to GHCR
-        if: ${{ github.event_name == 'push' || inputs.push }}
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata (labels)
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ${{ env.REGISTRY }}/${{ matrix.image.name }}
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: ${{ matrix.image.context }}
-          file: ${{ matrix.image.dockerfile }}
-          platforms: ${{ matrix.platform.arch }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Registry cache instead of type=gha: the GHA cache backend can't fit
-          # 7 images x 2 arches of mode=max Rust layers under the 10 GB repo
-          # limit (constant eviction), and its API throttles the 14 concurrent
-          # exporters. GHCR dedupes blobs already pushed, so steady-state
-          # exports are cheap. cache-to is empty on build-only dispatch runs
-          # (no GHCR login, so no way to write cache); empty is ignored.
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ matrix.image.name }}:buildcache-${{ env.PLATFORM_PAIR }}
-          cache-to: ${{ (github.event_name == 'push' || inputs.push) && format('type=registry,ref={0}/{1}:buildcache-{2},mode=max,image-manifest=true,oci-mediatypes=true', env.REGISTRY, matrix.image.name, env.PLATFORM_PAIR) || '' }}
-          provenance: false
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=${{ github.event_name == 'push' || inputs.push }}
+      - *meta-labels
+      - *build-image
 
       - name: Export digest
-        if: ${{ github.event_name == 'push' || inputs.push }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
 
       - name: Upload digest
-        if: ${{ github.event_name == 'push' || inputs.push }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-${{ matrix.image.name }}-${{ env.PLATFORM_PAIR }}
@@ -147,15 +218,18 @@ jobs:
   merge:
     name: Merge ${{ matrix.image }}
     runs-on: ubuntu-24.04
-    needs: build
-    if: ${{ github.event_name == 'push' || inputs.push }}
+    needs: [gate, build-publish]
+    if: ${{ needs.gate.outputs.publish == 'true' }}
+    environment: release
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
-        image: [sbc-daemon, sbc-api-server, sbc-provision-server, sbc-client-config-server, sbc-announcement-server, sbc-trunk-agent, central-config-api, central-config-import, sbc-config-sync, sbc-dashboard]
+        image: [sbc-daemon, sbc-api-server, sbc-provision-server, sbc-client-config-server, sbc-announcement-server, sbc-trunk-agent, central-config-api, central-config-import, sbc-config-sync, sbc-dashboard, dtls-terminator]
     steps:
       - name: Download digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -165,6 +239,8 @@ jobs:
           merge-multiple: true
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Log in to GHCR
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -181,19 +257,63 @@ jobs:
           # `type=match` instead of `type=semver` because the tag carries the
           # `sbc-` prefix. Group 1 strips it: sbc-v1.2.3 -> 1.2.3 and 1.2;
           # pre-releases (sbc-v1.2.3-rc.1) get only the full version tag.
+          # A dispatch run on an sbc-v* tag also gets the short-SHA tag.
           tags: |
             type=match,pattern=sbc-v(\d+\.\d+\.\d+.*),group=1
             type=match,pattern=sbc-v(\d+\.\d+)\.\d+$,group=1
-            type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=,enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - name: Create multi-arch manifest
-        working-directory: /tmp/digests
+      - name: Refuse to overwrite a published version
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          # shellcheck disable=SC2046 # word splitting into -t args / refs is intended
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ matrix.image }}@sha256:%s ' *)
+          set -euo pipefail
+          if out="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" 2>&1)"; then
+            echo "::error::${IMAGE}:${VERSION} is already published; cut a new version instead"
+            exit 1
+          elif ! grep -qi 'not found' <<< "$out"; then
+            echo "$out" >&2
+            echo "::error::could not check whether ${IMAGE}:${VERSION} exists"
+            exit 1
+          fi
+
+      - name: Create multi-arch manifest
+        id: manifest
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t tag_args < <(jq -r '.tags[] | ("-t", .)' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          refs=()
+          for d in *; do refs+=("${IMAGE}@sha256:${d}"); done
+          docker buildx imagetools create "${tag_args[@]}" "${refs[@]}"
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$digest" == sha256:* ]] || { echo "could not resolve index digest: $digest" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Inspect
-        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "${IMAGE}@${DIGEST}"
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+
+      # Keyless: the certificate binds the signature to this workflow file at
+      # the sbc-v* tag ref (GitHub OIDC). Signed by digest, never by tag.
+      - name: Sign image (cosign keyless)
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+
+      # No storage record: that API needs an artifact-metadata permission this
+      # job doesn't hold; the attestation itself is still pushed to GHCR.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ matrix.image }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
