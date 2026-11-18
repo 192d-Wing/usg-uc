@@ -116,27 +116,28 @@ async fn test_two_clients_call_flow_structure() {
         return;
     };
 
-    // 3. Configure certificates for both clients
-    #[cfg(not(windows))]
+    // 3. A smart-card certificate (no key) is refused for both clients
     {
         let store = CertificateStore::open_personal();
         let certs = store.list_certificates().unwrap();
 
         if let Some(cert) = certs.iter().find(|c| c.is_valid) {
             if let Ok(chain) = store.get_certificate_chain(&cert.thumbprint) {
-                client1.set_client_certificate(chain.clone(), &cert.thumbprint);
-                client2.set_client_certificate(chain, &cert.thumbprint);
+                assert!(
+                    client1
+                        .set_client_certificate(chain.clone(), &cert.thumbprint)
+                        .is_err()
+                );
+                assert!(
+                    client2
+                        .set_client_certificate(chain, &cert.thumbprint)
+                        .is_err()
+                );
             }
         }
 
-        assert!(
-            client1.has_client_certificate(),
-            "Client 1 should have certificate"
-        );
-        assert!(
-            client2.has_client_certificate(),
-            "Client 2 should have certificate"
-        );
+        assert!(!client1.has_client_certificate());
+        assert!(!client2.has_client_certificate());
     }
 
     // 4. Verify both clients are in correct initial state
@@ -208,41 +209,40 @@ async fn test_two_clients_concurrent_operations() {
         return;
     };
 
-    // Perform operations concurrently
+    // Perform operations concurrently: each refuses a key-less certificate
     let (result1, result2) = tokio::join!(
         async {
-            #[cfg(not(windows))]
-            {
-                let store = CertificateStore::open_personal();
-                let certs = store.list_certificates().unwrap();
-                if let Some(cert) = certs.iter().find(|c| c.is_valid) {
-                    if let Ok(chain) = store.get_certificate_chain(&cert.thumbprint) {
-                        client1.set_client_certificate(chain, &cert.thumbprint);
-                    }
+            let store = CertificateStore::open_personal();
+            let certs = store.list_certificates().unwrap();
+            if let Some(cert) = certs.iter().find(|c| c.is_valid) {
+                if let Ok(chain) = store.get_certificate_chain(&cert.thumbprint) {
+                    assert!(
+                        client1
+                            .set_client_certificate(chain, &cert.thumbprint)
+                            .is_err()
+                    );
                 }
             }
             client1.has_client_certificate()
         },
         async {
-            #[cfg(not(windows))]
-            {
-                let store = CertificateStore::open_personal();
-                let certs = store.list_certificates().unwrap();
-                if let Some(cert) = certs.iter().find(|c| c.is_valid) {
-                    if let Ok(chain) = store.get_certificate_chain(&cert.thumbprint) {
-                        client2.set_client_certificate(chain, &cert.thumbprint);
-                    }
+            let store = CertificateStore::open_personal();
+            let certs = store.list_certificates().unwrap();
+            if let Some(cert) = certs.iter().find(|c| c.is_valid) {
+                if let Ok(chain) = store.get_certificate_chain(&cert.thumbprint) {
+                    assert!(
+                        client2
+                            .set_client_certificate(chain, &cert.thumbprint)
+                            .is_err()
+                    );
                 }
             }
             client2.has_client_certificate()
         }
     );
 
-    #[cfg(not(windows))]
-    {
-        assert!(result1, "Client 1 should have certificate configured");
-        assert!(result2, "Client 2 should have certificate configured");
-    }
+    assert!(!result1, "Client 1 must not hold a key-less certificate");
+    assert!(!result2, "Client 2 must not hold a key-less certificate");
 
     println!("Concurrent operations completed successfully");
 }

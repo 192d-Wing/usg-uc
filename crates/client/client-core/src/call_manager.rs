@@ -412,9 +412,8 @@ impl CallManager {
     /// Sets the DTLS credentials.
     ///
     /// The user's certificate becomes the DTLS-SRTP identity only when its
-    /// private key is exportable and P-384 (CNSA 2.0). On the smart-card path
-    /// the key is empty (it never leaves the card), so the per-process
-    /// ephemeral identity is kept: DTLS-SRTP binds the peer by the signalled
+    /// private key is exportable and P-384 (CNSA 2.0). An empty key keeps
+    /// the ephemeral identity: DTLS-SRTP binds the peer by the signalled
     /// fingerprint (RFC 5763 §5, RFC 8122), not by PKI.
     pub fn set_dtls_credentials(&mut self, cert_chain: Vec<Vec<u8>>, private_key: Vec<u8>) {
         if private_key.is_empty() {

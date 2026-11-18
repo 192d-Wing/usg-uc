@@ -821,6 +821,21 @@ impl RegistrationAgent {
         self.registrations.get(account_id).map(|r| r.state)
     }
 
+    /// Returns the account configuration this agent registers for
+    /// `account_id` (the one its REGISTERs and refreshes are built from).
+    pub fn account(&self, account_id: &str) -> Option<&SipAccount> {
+        self.registrations.get(account_id).map(|r| &r.account)
+    }
+
+    /// Returns the account whose registration uses `call_id` (every REGISTER
+    /// of one registration reuses its Call-ID, RFC 3261 §10.2).
+    pub fn account_for_call_id(&self, call_id: &str) -> Option<&SipAccount> {
+        self.registrations
+            .values()
+            .find(|r| r.call_id == call_id)
+            .map(|r| &r.account)
+    }
+
     /// Builds a REGISTER request for an account.
     fn build_register_request(
         registration: &mut AccountRegistration,
@@ -1330,6 +1345,26 @@ mod tests {
             agent.get_state("test"),
             Some(RegistrationState::Registering)
         );
+    }
+
+    /// The held account is found by id and by the REGISTER's Call-ID (the
+    /// client app gates every REGISTER on it, SR-46).
+    #[tokio::test]
+    async fn test_account_lookup_by_id_and_call_id() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut agent = RegistrationAgent::new("192.168.1.100:5060".parse().unwrap(), tx);
+        agent.register(&test_account()).await.unwrap();
+        let _ = rx.recv().await.unwrap();
+        let request = sent_request(rx.recv().await.unwrap());
+        let call_id = request.headers.get_value(&HeaderName::CallId).unwrap();
+
+        assert_eq!(agent.account("test").map(|a| a.id.as_str()), Some("test"));
+        assert_eq!(
+            agent.account_for_call_id(call_id).map(|a| a.id.as_str()),
+            Some("test")
+        );
+        assert!(agent.account("unknown").is_none());
+        assert!(agent.account_for_call_id("other@example.com").is_none());
     }
 
     /// Extracts the request from a `SendRequest` event, panicking otherwise.

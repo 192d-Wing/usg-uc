@@ -144,31 +144,7 @@ impl DtlsIdentity {
         cert_chain_der: Vec<Vec<u8>>,
         key_der: Zeroizing<Vec<u8>>,
     ) -> SipUaResult<Self> {
-        let key_pair = rcgen::KeyPair::try_from(key_der.as_slice())
-            .map_err(|_| SipUaError::CertificateError("DTLS key is not PKCS#8".into()))?;
-        if key_pair.algorithm() != &rcgen::PKCS_ECDSA_P384_SHA384 {
-            return Err(SipUaError::CertificateError(
-                "DTLS key must be ECDSA P-384 (CNSA 2.0)".into(),
-            ));
-        }
-        let leaf = cert_chain_der
-            .first()
-            .ok_or_else(|| SipUaError::CertificateError("empty DTLS certificate chain".into()))?;
-        let (spki, sig_alg_oid) = leaf_spki_and_sig_alg(leaf).ok_or_else(|| {
-            SipUaError::CertificateError("DTLS certificate is not valid DER".into())
-        })?;
-        // NIST 800-53 Rev5: SI-10 -- the fingerprint we advertise must be of
-        // a certificate that our key can actually prove possession of.
-        if spki != key_pair.public_key_der().as_slice() {
-            return Err(SipUaError::CertificateError(
-                "DTLS certificate does not match the private key".into(),
-            ));
-        }
-        if sig_alg_oid != OID_ECDSA_WITH_SHA384 {
-            return Err(SipUaError::CertificateError(
-                "DTLS certificate must be signed with ecdsa-with-SHA384 (CNSA 2.0)".into(),
-            ));
-        }
+        check_user_identity(&cert_chain_der, &key_der)?;
         Self::from_der(cert_chain_der, key_der)
     }
 
@@ -198,6 +174,45 @@ impl DtlsIdentity {
     pub fn cert_chain_der(&self) -> &[Vec<u8>] {
         &self.cert_chain_der
     }
+}
+
+/// Checks a user-supplied certificate chain and PKCS#8 key (CNSA 2.0).
+///
+/// The key must be ECDSA P-384, the leaf certificate must carry that key's
+/// public key, and the leaf must be signed with ecdsa-with-SHA384. Shared
+/// by the DTLS identity and the SIP-TLS client certificate.
+///
+/// # Errors
+/// Returns [`SipUaError::CertificateError`] if the key is not PKCS#8 or not
+/// P-384, the chain is empty or not DER, the leaf does not match the key,
+/// or the leaf is not signed with ecdsa-with-SHA384.
+// NIST 800-53 Rev5: SC-13, SI-10 (CNSA 2.0 identity; key proves the leaf).
+pub fn check_user_identity(cert_chain_der: &[Vec<u8>], key_der: &[u8]) -> SipUaResult<()> {
+    let key_pair = rcgen::KeyPair::try_from(key_der)
+        .map_err(|_| SipUaError::CertificateError("key is not PKCS#8".into()))?;
+    if key_pair.algorithm() != &rcgen::PKCS_ECDSA_P384_SHA384 {
+        return Err(SipUaError::CertificateError(
+            "key must be ECDSA P-384 (CNSA 2.0)".into(),
+        ));
+    }
+    let leaf = cert_chain_der
+        .first()
+        .ok_or_else(|| SipUaError::CertificateError("empty certificate chain".into()))?;
+    let (spki, sig_alg_oid) = leaf_spki_and_sig_alg(leaf)
+        .ok_or_else(|| SipUaError::CertificateError("certificate is not valid DER".into()))?;
+    // NIST 800-53 Rev5: SI-10 -- the certificate we present (or whose
+    // fingerprint we advertise) must be one our key can prove possession of.
+    if spki != key_pair.public_key_der().as_slice() {
+        return Err(SipUaError::CertificateError(
+            "certificate does not match the private key".into(),
+        ));
+    }
+    if sig_alg_oid != OID_ECDSA_WITH_SHA384 {
+        return Err(SipUaError::CertificateError(
+            "certificate must be signed with ecdsa-with-SHA384 (CNSA 2.0)".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// DER content of OID 1.2.840.10045.4.3.3 (ecdsa-with-SHA384, RFC 5758 §3.2).

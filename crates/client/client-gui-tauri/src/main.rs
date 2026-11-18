@@ -1355,10 +1355,14 @@ async fn verify_pin(
     pin: String,
     state: State<'_, TauriAppState>,
 ) -> Result<bool, String> {
+    // NIST 800-53 Rev5: IA-5(1), SC-28 (the PIN buffer is wiped on drop;
+    // moved, not copied, into the zeroizing `SmartCardPin`)
+    let mut pin = zeroize::Zeroizing::new(pin);
+    let smart_card_pin = SmartCardPin::new(std::mem::take(&mut *pin));
+    drop(pin);
     info!("Verifying PIN for certificate: {thumbprint}");
 
     let store = state.cert_store.read().await;
-    let smart_card_pin = SmartCardPin::new(&pin);
 
     store
         .verify_pin(&thumbprint, &smart_card_pin)
@@ -1367,6 +1371,8 @@ async fn verify_pin(
             client_core::CertStoreError::SmartCardNotPresent => {
                 "Smart card not present - please insert your CAC/PIV card".to_string()
             }
+            // NIST 800-53 Rev5: IA-6, SI-11 (fixed text, no card detail)
+            client_core::CertStoreError::NotSupported => e.to_string(),
             _ => format!("PIN verification failed: {e}"),
         })
 }

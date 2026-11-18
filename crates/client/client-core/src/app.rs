@@ -16,13 +16,13 @@ use client_types::audio::CodecPreference;
 use client_types::{
     CallInfo, CallQualityMetrics, CallState, DtmfDigit, RegistrationState, SipAccount,
 };
-#[cfg(feature = "insecure-transports")]
 use proto_sip::header::HeaderName;
 use proto_sip::message::SipRequest;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
+use zeroize::Zeroizing;
 
 /// Most transport events handled in one [`ClientApp::poll_events`] pass.
 ///
@@ -352,49 +352,77 @@ impl ClientApp {
         {
             info!(account_id = %account.id, "Auto-registering default account");
             let account = account.clone();
-            self.register_account(&account).await?;
-            info!(account_id = %account.id, "Auto-registration started successfully");
+            // A refused default account (e.g. mTLS without a client key) is
+            // logged and the app stays up, Ready and unregistered.
+            match self.register_account(&account).await {
+                Ok(()) => {
+                    info!(account_id = %account.id, "Auto-registration started successfully");
+                }
+                Err(e) => {
+                    // NIST 800-53 Rev5: SI-11 (the user is told, the app
+                    // stays up)
+                    error!(account_id = %account.id, error = %e, "Auto-registration refused");
+                    let _ = self
+                        .app_event_tx
+                        .send(AppEvent::RegistrationStateChanged {
+                            account_id: account.id.clone(),
+                            state: RegistrationState::Failed,
+                        })
+                        .await;
+                    let _ = self
+                        .app_event_tx
+                        .send(AppEvent::Error {
+                            message: format!("Auto-registration refused: {e}"),
+                        })
+                        .await;
+                }
+            }
         }
 
         info!("Application initialization complete");
         Ok(())
     }
 
-    /// Sets the client certificate for mTLS authentication.
+    /// Sets a smart-card client certificate (chain only; the key stays on
+    /// the card).
     ///
-    /// The certificate chain should be DER-encoded, with the end-entity
-    /// certificate first, followed by any intermediate certificates.
+    /// No card-backed signer exists for the SIP TLS handshake or DTLS, so
+    /// this always fails and changes nothing. Use
+    /// `set_client_certificate_with_key()` for a software identity.
     ///
-    /// This configures:
-    /// - SIP transport for mTLS with the registrar
-    /// - Call manager for DTLS-SRTP with media endpoints
-    #[allow(clippy::needless_pass_by_value)] // cert_chain is consumed by set_dtls_credentials
-    pub fn set_client_certificate(&mut self, cert_chain: Vec<Vec<u8>>, thumbprint: &str) {
-        info!(
+    /// # Errors
+    /// Always returns `AppError::Sip`: smart card signing is unavailable.
+    // NIST 800-53 Rev5: IA-2(2), IA-2(12) (not met: fails closed)
+    // POAM: POA&M-371 card-backed TLS signer (PKCS#11 / CNG `ResolvesClientCert`).
+    #[allow(clippy::needless_pass_by_value)] // public API shape: callers hand over the chain
+    pub fn set_client_certificate(
+        &mut self,
+        cert_chain: Vec<Vec<u8>>,
+        thumbprint: &str,
+    ) -> AppResult<()> {
+        error!(
             thumbprint = %thumbprint,
             chain_length = cert_chain.len(),
-            "Setting client certificate for authentication"
+            kept = ?self.client_cert_thumbprint,
+            "Smart card client certificate refused: card signing unavailable"
         );
-
-        self.client_cert_chain = Some(cert_chain.clone());
-        self.client_cert_thumbprint = Some(thumbprint.to_string());
-
-        // Configure the call manager with the DTLS credentials
-        // For smart card certificates, the private key stays on the card
-        // and signing operations are performed by the Windows CryptoAPI
-        self.call_manager
-            .set_dtls_credentials(cert_chain, Vec::new());
-
-        // Note: For smart card mTLS, we pass the cert chain without private key.
-        // The Windows TLS stack handles smart card signing natively.
-        // For software keys, pass the private key via set_client_certificate_with_key().
-        info!("Client certificate configured for DTLS");
+        Err(AppError::Sip(
+            "Smart card client certificate not usable: card-backed signing is not supported"
+                .to_string(),
+        ))
     }
 
     /// Sets the client certificate with private key for mTLS authentication.
     ///
     /// Use this for software-based certificates where the private key is available.
-    /// For smart card certificates, use `set_client_certificate()` instead.
+    /// The key must be PKCS#8 ECDSA P-384 matching the leaf, which must be
+    /// signed with ecdsa-with-SHA384. The pair is validated by the SIP
+    /// transport first; on error nothing is changed. The key buffer is
+    /// wiped when no longer needed.
+    ///
+    /// # Errors
+    /// Returns an error if the pair is refused or no SIP transport exists.
+    // NIST 800-53 Rev5: IA-2, IA-3, IA-5(2), SC-12
     pub async fn set_client_certificate_with_key(
         &mut self,
         cert_chain: Vec<Vec<u8>>,
@@ -407,20 +435,26 @@ impl ClientApp {
             "Setting client certificate with private key for mTLS"
         );
 
+        let mut private_key = Zeroizing::new(private_key);
+
+        // Configure the SIP transport for mTLS (validates the key)
+        let transport = self
+            .sip_transport
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No SIP transport for client certificate".to_string()))?;
+        transport
+            .set_client_certificate(cert_chain.clone(), Some(private_key.clone()))
+            .await?;
+        info!("SIP transport configured for mTLS");
+
         self.client_cert_chain = Some(cert_chain.clone());
         self.client_cert_thumbprint = Some(thumbprint.to_string());
 
-        // Configure the SIP transport for mTLS
-        if let Some(ref transport) = self.sip_transport {
-            transport
-                .set_client_certificate(cert_chain.clone(), Some(private_key.clone()))
-                .await?;
-            info!("SIP transport configured for mTLS");
-        }
-
         // Configure the call manager with the DTLS credentials
+        // Moves the key buffer out (no copy); the call manager wraps it in
+        // `Zeroizing` and the emptied local wrapper wipes nothing more.
         self.call_manager
-            .set_dtls_credentials(cert_chain, private_key);
+            .set_dtls_credentials(cert_chain, std::mem::take(&mut *private_key));
 
         info!("Client certificate configured for mTLS and DTLS");
         Ok(())
@@ -536,10 +570,17 @@ impl ClientApp {
         }
     }
 
-    /// Registers a SIP account.
-    pub async fn register_account(&mut self, account: &SipAccount) -> AppResult<()> {
-        info!(account_id = %account.id, "Registering account");
-
+    /// Checks that `account` may be registered (and refreshed) by this
+    /// build and with the installed credentials: TLS only unless
+    /// `insecure-transports` is built in, and an mTLS account only with a
+    /// client certificate whose key the TLS handshake can sign with.
+    ///
+    /// Used by `register_account`, the refresh on `RegistrationEvent::Expiring`
+    /// and, as a last check, before any REGISTER is put on the wire.
+    ///
+    /// # Errors
+    /// `AppError::Settings` naming the reason; the refusal is `error!`-logged.
+    pub async fn ensure_registrable(&self, account: &SipAccount) -> AppResult<()> {
         // Default builds are TLS-only (CNSA 2.0). UDP/TCP exist for lab
         // and commercial-provider testing and require an explicit
         // `insecure-transports` build feature.
@@ -556,6 +597,35 @@ impl ClientApp {
                 account.transport
             )));
         }
+
+        // NIST 800-53 Rev5: IA-2, IA-3, IA-5(2) (an mTLS account needs a
+        // client certificate with a usable software key; never REGISTER
+        // without one)
+        if account.auth_mode == client_types::SipAuthMode::Mtls {
+            let has_client_auth = match self.sip_transport {
+                Some(ref transport) => transport.has_client_auth().await,
+                None => false,
+            };
+            if !has_client_auth {
+                error!(
+                    account_id = %account.id,
+                    "mTLS account refused: no client certificate with a usable private key"
+                );
+                return Err(AppError::Settings(
+                    "mTLS account requires a client certificate with a usable private key; \
+                     smart card signing is not supported"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Registers a SIP account.
+    pub async fn register_account(&mut self, account: &SipAccount) -> AppResult<()> {
+        info!(account_id = %account.id, "Registering account");
+
+        self.ensure_registrable(account).await?;
 
         self.state = AppState::Registering;
         self.current_account_id = Some(account.id.clone());
@@ -843,12 +913,22 @@ impl ClientApp {
                     "Registration expiring"
                 );
 
-                // Auto-refresh registration
-                if let Some(account) = self.settings_manager.get_account(&account_id) {
-                    let account = account.clone();
-                    if let Err(e) = self.registration_agent.register(&account).await {
-                        warn!(error = %e, "Failed to refresh registration");
-                    }
+                // Auto-refresh the account the registration agent holds
+                // (the one that was registered), not the settings copy,
+                // which may have been edited since. It is re-checked
+                // against the same gate as `register_account`.
+                // NIST 800-53 Rev5: IA-2, IA-3, IA-5(2)
+                let Some(account) = self.registration_agent.account(&account_id).cloned() else {
+                    warn!(account_id = %account_id, "Expiring registration not held by the agent");
+                    return Ok(());
+                };
+                if let Err(e) = self.ensure_registrable(&account).await {
+                    error!(account_id = %account_id, error = %e, "Registration refresh refused");
+                    self.refuse_registration(account_id, &e).await;
+                    return Ok(());
+                }
+                if let Err(e) = self.registration_agent.register(&account).await {
+                    warn!(error = %e, "Failed to refresh registration");
                 }
             }
             RegistrationEvent::SendRequest {
@@ -860,6 +940,10 @@ impl ClientApp {
                     destination = %destination,
                     "Processing SendRequest event"
                 );
+
+                if !self.register_send_allowed(&request).await {
+                    return Ok(());
+                }
 
                 // Send via SIP transport
                 if let Some(ref transport) = self.sip_transport {
@@ -891,6 +975,58 @@ impl ClientApp {
         }
 
         Ok(())
+    }
+
+    /// Last check before the wire: every REGISTER (initial, refresh, auth
+    /// retry, 503 retry, un-REGISTER) belongs to an account the agent
+    /// holds, matched by its Call-ID, and that account must pass
+    /// `ensure_registrable`. An unknown Call-ID is refused. A refusal is
+    /// logged and reported to the GUI.
+    // NIST 800-53 Rev5: IA-2, IA-3, IA-5(2)
+    async fn register_send_allowed(&mut self, request: &SipRequest) -> bool {
+        let account = request
+            .headers
+            .get_value(&HeaderName::CallId)
+            .and_then(|call_id| self.registration_agent.account_for_call_id(call_id))
+            .cloned();
+        let Some(account) = account else {
+            error!(method = %request.method, "REGISTER for no held registration refused");
+            let _ = self
+                .app_event_tx
+                .send(AppEvent::Error {
+                    message: "Registration request refused: unknown registration".to_string(),
+                })
+                .await;
+            return false;
+        };
+        if let Err(e) = self.ensure_registrable(&account).await {
+            error!(account_id = %account.id, error = %e, "REGISTER refused before send");
+            self.refuse_registration(account.id, &e).await;
+            return false;
+        }
+        true
+    }
+
+    /// Reports a registration the gate refused: the app leaves the
+    /// registering state and the GUI gets `Failed` plus the reason.
+    // NIST 800-53 Rev5: SI-11
+    async fn refuse_registration(&mut self, account_id: String, reason: &AppError) {
+        if matches!(self.state, AppState::Registering | AppState::Registered) {
+            self.state = AppState::Ready;
+        }
+        let _ = self
+            .app_event_tx
+            .send(AppEvent::RegistrationStateChanged {
+                account_id,
+                state: RegistrationState::Failed,
+            })
+            .await;
+        let _ = self
+            .app_event_tx
+            .send(AppEvent::Error {
+                message: format!("Registration refused: {reason}"),
+            })
+            .await;
     }
 
     /// Handles a call manager event.
@@ -1562,6 +1698,25 @@ mod tests {
         "192.0.2.50:5061".parse().unwrap()
     }
 
+    /// A P-384 self-signed client identity: (DER chain, PKCS#8 key).
+    fn software_identity() -> (Vec<Vec<u8>>, Vec<u8>) {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["client.invalid".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        (vec![cert.der().to_vec()], key.serialize_der())
+    }
+
+    /// Installs a software client certificate and key, which is what makes
+    /// an mTLS account registrable (SR-46).
+    async fn install_software_identity(app: &mut ClientApp) {
+        let (chain, key) = software_identity();
+        app.set_client_certificate_with_key(chain, key, "software-test-identity")
+            .await
+            .unwrap();
+    }
+
     fn parse_request(text: &str) -> SipRequest {
         match SipMessage::parse(text.as_bytes()).unwrap() {
             SipMessage::Request(request) => request,
@@ -1732,6 +1887,8 @@ mod tests {
         let unspecified: SocketAddr = "0.0.0.0:0".parse().unwrap();
         let mut app =
             ClientApp::from_parts(unspecified, unspecified, app_tx, settings, contacts).unwrap();
+        // SR-46: an mTLS account registers only with a client key.
+        install_software_identity(&mut app).await;
 
         let account = SipAccount::new(
             "test-account",
@@ -1998,6 +2155,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (app_tx, mut app_rx) = mpsc::channel(64);
         let mut app = hermetic_app(dir.path(), app_tx);
+        // SR-46: with a client key installed, only the transport check
+        // can refuse these accounts.
+        install_software_identity(&mut app).await;
         let state_before = app.state;
 
         // Where a cleartext REGISTER would land.
@@ -2070,6 +2230,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (app_tx, _app_rx) = mpsc::channel(64);
         let mut app = hermetic_app(dir.path(), app_tx);
+        // SR-46: an mTLS account registers only with a client key.
+        install_software_identity(&mut app).await;
 
         // A "registrar" listening on the same port for TCP and UDP.
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2525,6 +2687,415 @@ mod tests {
         assert!(
             per_pass.iter().all(|n| *n <= MAX_TRANSPORT_EVENTS_PER_POLL),
             "{per_pass:?}"
+        );
+    }
+
+    // SR-46: an mTLS account registers only when the SIP transport holds a
+    // client certificate and a usable private key. Without one the
+    // REGISTER would go out with no client certificate at all.
+    // NIST 800-53 Rev5: IA-2, IA-3, IA-5(2).
+
+    /// A TCP "registrar" for an account: anything sent for a REGISTER
+    /// would start with a connection here.
+    async fn sr46_registrar() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("sips:{}", listener.local_addr().unwrap());
+        (listener, uri)
+    }
+
+    fn sr46_account(id: &str, registrar_uri: &str) -> SipAccount {
+        SipAccount::new(id, "Test User", "sips:testuser@example.com", registrar_uri)
+    }
+
+    fn sr46_queued_register(app: &mut ClientApp) -> Option<SipRequest> {
+        std::iter::from_fn(|| app.reg_event_rx.try_recv().ok()).find_map(|event| match event {
+            RegistrationEvent::SendRequest { request, .. } => Some(request),
+            _ => None,
+        })
+    }
+
+    /// The refused account left no trace: no REGISTER queued, nothing
+    /// reached the registrar after a pump pass, state and current account
+    /// unchanged.
+    async fn sr46_assert_nothing_sent(
+        app: &mut ClientApp,
+        registrar: &tokio::net::TcpListener,
+        state_before: AppState,
+        what: &str,
+    ) {
+        assert!(
+            sr46_queued_register(app).is_none(),
+            "{what}: a REGISTER was queued"
+        );
+        assert_eq!(app.state, state_before, "{what}: application state moved");
+        assert!(
+            app.current_account_id.is_none(),
+            "{what}: account recorded as current"
+        );
+        qa_poll(app, what).await;
+        let connected = tokio::time::timeout(Duration::from_millis(300), registrar.accept()).await;
+        assert!(connected.is_err(), "{what}: the registrar was contacted");
+    }
+
+    fn sr46_assert_certificate_error(error: &AppError, what: &str) {
+        let text = error.to_string().to_lowercase();
+        assert!(text.contains("certificate"), "{what}: {error}");
+    }
+
+    #[tokio::test]
+    async fn test_sr46_mtls_account_without_client_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let state_before = app.state;
+        let (registrar, uri) = sr46_registrar().await;
+
+        let account = sr46_account("mtls-account", &uri);
+        assert_eq!(account.auth_mode, client_types::SipAuthMode::Mtls);
+
+        let error = app.register_account(&account).await.unwrap_err();
+        sr46_assert_certificate_error(&error, "no client certificate");
+        sr46_assert_nothing_sent(&mut app, &registrar, state_before, "no client certificate").await;
+    }
+
+    /// A smart-card certificate (chain only, key on the card) does not
+    /// make an mTLS account registrable: there is no card-backed signer
+    /// for the TLS handshake. The call reports that and changes nothing.
+    #[tokio::test]
+    async fn test_sr46_smart_card_certificate_does_not_enable_mtls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let state_before = app.state;
+        let (registrar, uri) = sr46_registrar().await;
+        let (chain, _key) = software_identity();
+
+        let result = app.set_client_certificate(chain, "card-thumbprint");
+        assert!(
+            result.is_err(),
+            "a key-less card certificate was accepted for SIP mTLS"
+        );
+        assert!(!app.has_client_certificate());
+        assert!(app.client_certificate_thumbprint().is_none());
+
+        let error = app
+            .register_account(&sr46_account("mtls-account", &uri))
+            .await
+            .unwrap_err();
+        sr46_assert_certificate_error(&error, "card certificate only");
+        sr46_assert_nothing_sent(&mut app, &registrar, state_before, "card certificate only").await;
+    }
+
+    /// A key the transport cannot sign with is refused when installed and
+    /// leaves the mTLS account unregistrable.
+    #[tokio::test]
+    async fn test_sr46_unusable_client_key_does_not_enable_mtls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let state_before = app.state;
+        let (registrar, uri) = sr46_registrar().await;
+        let (chain, _key) = software_identity();
+        // SEQUENCE { INTEGER 0, SEQUENCE {} }: sniffs as PKCS#8, signs nothing.
+        let unusable = vec![0x30, 0x05, 0x02, 0x01, 0x00, 0x30, 0x00];
+
+        let result = app
+            .set_client_certificate_with_key(chain, unusable, "bad-key")
+            .await;
+        assert!(result.is_err(), "an unusable client key was accepted");
+
+        let error = app
+            .register_account(&sr46_account("mtls-account", &uri))
+            .await
+            .unwrap_err();
+        sr46_assert_certificate_error(&error, "unusable key");
+        sr46_assert_nothing_sent(&mut app, &registrar, state_before, "unusable key").await;
+    }
+
+    /// Positive control: with a software certificate and key the same
+    /// mTLS account registers and its REGISTER is queued.
+    #[tokio::test]
+    async fn test_sr46_mtls_account_with_software_key_registers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        install_software_identity(&mut app).await;
+
+        app.register_account(&sr46_account("mtls-account", "sips:192.0.2.1:5061"))
+            .await
+            .unwrap();
+        assert!(sr46_queued_register(&mut app).is_some());
+        assert_eq!(app.state, AppState::Registering);
+    }
+
+    /// The refusal is not sticky: once a key is installed, an account
+    /// refused before registers.
+    #[tokio::test]
+    async fn test_sr46_refusal_clears_after_key_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let account = sr46_account("mtls-account", "sips:192.0.2.1:5061");
+
+        assert!(app.register_account(&account).await.is_err());
+        install_software_identity(&mut app).await;
+        app.register_account(&account).await.unwrap();
+        assert!(sr46_queued_register(&mut app).is_some());
+    }
+
+    /// Bearer accounts authenticate with the access token, not a client
+    /// certificate: the mTLS check does not apply to them.
+    #[tokio::test]
+    async fn test_sr46_bearer_account_registers_without_client_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        assert!(!app.has_client_certificate());
+
+        let mut account = sr46_account("bearer-account", "sips:192.0.2.1:5061");
+        account.auth_mode = client_types::SipAuthMode::Bearer;
+        account.bearer_token = Some(zeroize::Zeroizing::new("header.payload.sig".to_string()));
+
+        app.register_account(&account).await.unwrap();
+        let register = sr46_queued_register(&mut app).unwrap();
+        let authorization = register
+            .headers
+            .get_value(&proto_sip::header::HeaderName::Authorization)
+            .unwrap();
+        assert!(authorization.starts_with("Bearer "), "{authorization}");
+    }
+
+    /// Digest accounts (test builds) are not affected by the mTLS check.
+    #[cfg(feature = "digest-auth")]
+    #[tokio::test]
+    async fn test_sr46_digest_account_registers_without_client_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+
+        let mut account = sr46_account("digest-account", "sips:192.0.2.1:5061");
+        account.auth_mode = client_types::SipAuthMode::Digest;
+
+        app.register_account(&account).await.unwrap();
+        assert!(sr46_queued_register(&mut app).is_some());
+    }
+
+    /// Start-up auto-registration of a stored mTLS default account goes
+    /// through the same check: no REGISTER without a client key. (Whether
+    /// `initialize` itself reports the refusal is left to the
+    /// implementation; nothing may be sent either way.)
+    #[tokio::test]
+    async fn test_sr46_initialize_does_not_register_mtls_default_without_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let (registrar, uri) = sr46_registrar().await;
+
+        let account = sr46_account("default-account", &uri);
+        app.settings_mut().set_account(account);
+        app.settings_mut()
+            .set_default_account(Some("default-account".to_string()));
+
+        let _ = app.initialize().await;
+        assert!(
+            sr46_queued_register(&mut app).is_none(),
+            "auto-registration queued a REGISTER without a client key"
+        );
+        qa_poll(&mut app, "after initialize").await;
+        let connected = tokio::time::timeout(Duration::from_millis(300), registrar.accept()).await;
+        assert!(connected.is_err(), "the registrar was contacted");
+    }
+
+    /// Collects the app events queued so far.
+    fn sr46_app_events(rx: &mut mpsc::Receiver<AppEvent>) -> Vec<AppEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn sr46_reports_failure(events: &[AppEvent], account_id: &str) -> bool {
+        let failed = events.iter().any(|event| {
+            matches!(
+                event,
+                AppEvent::RegistrationStateChanged { account_id: id, state: RegistrationState::Failed }
+                    if id == account_id
+            )
+        });
+        let error = events
+            .iter()
+            .any(|event| matches!(event, AppEvent::Error { .. }));
+        failed && error
+    }
+
+    /// SEC-003: a refused default account at start-up is reported to the
+    /// GUI (Failed + Error) and the app stays Ready.
+    #[tokio::test]
+    async fn test_sr46_initialize_reports_refused_default_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, mut app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let account = sr46_account("default-account", "sips:192.0.2.1:5061");
+        app.settings_mut().set_account(account);
+        app.settings_mut()
+            .set_default_account(Some("default-account".to_string()));
+
+        app.initialize().await.unwrap();
+        assert_eq!(app.state, AppState::Ready);
+        let events = sr46_app_events(&mut app_rx);
+        assert!(
+            sr46_reports_failure(&events, "default-account"),
+            "refusal not reported: {events:?}"
+        );
+    }
+
+    /// SEC-001 / NIST-009: the refresh uses the account the agent
+    /// registered, not the settings copy. A Bearer registration whose
+    /// settings copy was edited to mTLS (no client key) refreshes as
+    /// Bearer; nothing goes out as mTLS.
+    #[tokio::test]
+    async fn test_sr46_refresh_ignores_settings_copy_edited_to_mtls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, _app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let mut account = sr46_account("refresh-account", "sips:192.0.2.1:5061");
+        account.auth_mode = client_types::SipAuthMode::Bearer;
+        account.bearer_token = Some(zeroize::Zeroizing::new("header.payload.sig".to_string()));
+        app.register_account(&account).await.unwrap();
+        assert!(sr46_queued_register(&mut app).is_some());
+
+        let mut edited = account.clone();
+        edited.auth_mode = client_types::SipAuthMode::Mtls;
+        edited.bearer_token = None;
+        app.settings_mut().set_account(edited);
+
+        app.handle_registration_event(RegistrationEvent::Expiring {
+            account_id: "refresh-account".to_string(),
+            expires_in_secs: 10,
+        })
+        .await
+        .unwrap();
+
+        let held = app.registration_agent.account("refresh-account").unwrap();
+        assert_eq!(held.auth_mode, client_types::SipAuthMode::Bearer);
+        let refresh = sr46_queued_register(&mut app).unwrap();
+        let authorization = refresh
+            .headers
+            .get_value(&HeaderName::Authorization)
+            .unwrap();
+        assert!(authorization.starts_with("Bearer "), "{authorization}");
+    }
+
+    /// Puts an mTLS registration into the agent without the app gate (a
+    /// state the gate must still catch later) and returns its REGISTER.
+    async fn sr46_ungated_mtls_registration(app: &mut ClientApp, uri: &str) -> SipRequest {
+        app.registration_agent
+            .register(&sr46_account("held-mtls", uri))
+            .await
+            .unwrap();
+        sr46_queued_register(app).unwrap()
+    }
+
+    /// SEC-001: an Expiring event for an mTLS registration with no client
+    /// key queues no REGISTER and is reported (Failed + Error).
+    #[tokio::test]
+    async fn test_sr46_refresh_of_mtls_without_key_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, mut app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let (registrar, uri) = sr46_registrar().await;
+        let _ = sr46_ungated_mtls_registration(&mut app, &uri).await;
+        // The settings copy names the same mTLS account (the old refresh
+        // path registered from it without any check).
+        app.settings_mut()
+            .set_account(sr46_account("held-mtls", &uri));
+        let _ = sr46_app_events(&mut app_rx);
+
+        app.handle_registration_event(RegistrationEvent::Expiring {
+            account_id: "held-mtls".to_string(),
+            expires_in_secs: 10,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            sr46_queued_register(&mut app).is_none(),
+            "refresh queued a REGISTER without a client key"
+        );
+        let events = sr46_app_events(&mut app_rx);
+        assert!(
+            sr46_reports_failure(&events, "held-mtls"),
+            "refusal not reported: {events:?}"
+        );
+        qa_poll(&mut app, "after refused refresh").await;
+        let connected = tokio::time::timeout(Duration::from_millis(300), registrar.accept()).await;
+        assert!(connected.is_err(), "the registrar was contacted");
+    }
+
+    /// SEC-001 defence in depth: a REGISTER for an mTLS account is not put
+    /// on the wire while the transport has no client certificate, however
+    /// it was queued.
+    #[tokio::test]
+    async fn test_sr46_mtls_register_not_sent_without_client_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, mut app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let (registrar, uri) = sr46_registrar().await;
+        let request = sr46_ungated_mtls_registration(&mut app, &uri).await;
+        let destination = registrar.local_addr().unwrap();
+        let _ = sr46_app_events(&mut app_rx);
+
+        // Bounded: a REGISTER that did go out would stall in the TLS
+        // handshake with this plain TCP listener.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.handle_registration_event(RegistrationEvent::SendRequest {
+                request,
+                destination,
+            }),
+        )
+        .await;
+
+        let connected = tokio::time::timeout(Duration::from_millis(300), registrar.accept()).await;
+        assert!(connected.is_err(), "REGISTER reached the registrar");
+        let events = sr46_app_events(&mut app_rx);
+        assert!(
+            sr46_reports_failure(&events, "held-mtls"),
+            "refusal not reported: {events:?}"
+        );
+    }
+
+    /// A REGISTER whose Call-ID matches no held registration is refused.
+    #[tokio::test]
+    async fn test_sr46_register_for_unknown_registration_not_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_tx, mut app_rx) = mpsc::channel(64);
+        let mut app = hermetic_app(dir.path(), app_tx);
+        let (registrar, _uri) = sr46_registrar().await;
+        let request = parse_request(
+            "REGISTER sips:example.com SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKunknown\r\n\
+             Max-Forwards: 70\r\n\
+             From: <sips:testuser@example.com>;tag=a\r\n\
+             To: <sips:testuser@example.com>\r\n\
+             Call-ID: not-held@example.com\r\n\
+             CSeq: 1 REGISTER\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+        );
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.handle_registration_event(RegistrationEvent::SendRequest {
+                request,
+                destination: registrar.local_addr().unwrap(),
+            }),
+        )
+        .await;
+
+        let connected = tokio::time::timeout(Duration::from_millis(300), registrar.accept()).await;
+        assert!(connected.is_err(), "REGISTER reached the registrar");
+        let events = sr46_app_events(&mut app_rx);
+        assert!(
+            events.iter().any(|e| matches!(e, AppEvent::Error { .. })),
+            "{events:?}"
         );
     }
 }

@@ -2,16 +2,22 @@
 //!
 //! Provides access to certificates from various sources:
 //! - Windows: Windows Certificate Store (`CryptoAPI`)
-//! - macOS: Keychain + PKCS#11 (for `YubiKey`, etc.)
-//! - Linux: PKCS#11 (for `YubiKey`, etc.)
+//! - macOS: Keychain identities, `YubiKey` (`yubico-piv-tool`), PKCS#11 (opt-in)
+//! - Linux: none (empty list; POA&M-371)
 //!
-//! CAC/PIV smart cards are supported on all platforms through
-//! platform-native APIs or PKCS#11.
+//! Only Windows has a card-backed signer and PIN check (CNG), and neither
+//! has a SIP-TLS or DTLS caller. Elsewhere certificates can be listed, but
+//! PIN verification and signing return `CertStoreError::NotSupported`;
+//! nothing is simulated in a normal build.
+// NIST 800-53 Rev5: IA-2(2), IA-2(12) (not met: fails closed), IA-5(2)
+// POAM: POA&M-371 no card-backed signer for SIP-TLS or DTLS on any platform.
 
 use crate::settings::CertificateFilterSettings;
 use client_types::{CertificateConfig, CertificateInfo, CertificateSelectionMode, SmartCardPin};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+#[cfg(all(not(windows), any(target_os = "macos", not(test))))]
+use tracing::warn;
+use tracing::{debug, info};
 
 /// Signature algorithm for signing operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +68,7 @@ pub enum CertStoreError {
     WindowsError(String),
 
     /// Not supported on this platform.
-    #[error("Certificate store access not supported on this platform")]
+    #[error("Smart card operation not supported on this platform")]
     NotSupported,
 }
 
@@ -71,30 +77,19 @@ pub type CertStoreResult<T> = Result<T, CertStoreError>;
 
 /// Certificate store manager for accessing smart card certificates.
 ///
-/// On Windows, this uses the Windows Certificate Store APIs.
-/// On other platforms, it provides stub data for development.
+/// On Windows, this uses the Windows Certificate Store APIs. On macOS it
+/// lists the Keychain, a `YubiKey` and (opt-in) PKCS#11 tokens. Listing
+/// returns only real certificates; it never fabricates any.
 pub struct CertificateStore {
     /// Store name (e.g., "MY" for personal certificates).
     store_name: String,
-    /// Cached certificates (for stub mode or caching).
-    #[allow(dead_code)]
-    cached_certs: Vec<CertificateInfo>,
 }
 
 impl CertificateStore {
     /// Creates a new certificate store accessor.
     pub fn new(store_name: &str) -> Self {
-        let cached_certs = if cfg!(windows) {
-            // On Windows, start with empty cache - will be populated on first list
-            Vec::new()
-        } else {
-            // On non-Windows, use stub data
-            Self::create_stub_certificates()
-        };
-
         Self {
             store_name: store_name.to_string(),
-            cached_certs,
         }
     }
 
@@ -114,7 +109,7 @@ impl CertificateStore {
 
         #[cfg(not(windows))]
         {
-            self.list_certificates_stub()
+            self.list_certificates_host()
         }
     }
 
@@ -288,7 +283,9 @@ impl CertificateStore {
             .ok_or(CertStoreError::NoCertificatesFound)
     }
 
-    /// Creates stub certificates for development and testing.
+    /// Creates fabricated certificates for unit tests only.
+    // NIST 800-53 Rev5: CM-7 (never compiled into a normal build)
+    #[cfg(all(test, not(windows)))]
     fn create_stub_certificates() -> Vec<CertificateInfo> {
         vec![
             CertificateInfo {
@@ -351,7 +348,7 @@ impl CertificateStore {
     /// Lists certificates on macOS from Keychain and PKCS#11.
     #[cfg(target_os = "macos")]
     #[allow(clippy::unnecessary_wraps)]
-    fn list_certificates_stub(&self) -> CertStoreResult<Vec<CertificateInfo>> {
+    fn list_certificates_host(&self) -> CertStoreResult<Vec<CertificateInfo>> {
         use std::collections::HashSet;
 
         let mut certificates = Vec::new();
@@ -423,20 +420,28 @@ impl CertificateStore {
             }
         }
 
+        #[cfg(test)]
         if certificates.is_empty() {
-            info!("No certificates found - returning stub data for testing");
             return Ok(Self::create_stub_certificates());
         }
 
         Ok(certificates)
     }
 
-    /// Lists certificates on Linux from PKCS#11 only.
+    /// No certificate source is implemented on this platform: the list is
+    /// empty (fabricated certificates exist only in unit tests).
     #[cfg(all(not(windows), not(target_os = "macos")))]
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
-    fn list_certificates_stub(&self) -> CertStoreResult<Vec<CertificateInfo>> {
-        warn!("Certificate store using stub data - not on Windows or macOS");
-        Ok(Self::create_stub_certificates())
+    fn list_certificates_host(&self) -> CertStoreResult<Vec<CertificateInfo>> {
+        #[cfg(test)]
+        {
+            Ok(Self::create_stub_certificates())
+        }
+        #[cfg(not(test))]
+        {
+            warn!("No certificate store available on this platform");
+            Ok(Vec::new())
+        }
     }
 
     /// Lists certificates from `YubiKey` using yubico-piv-tool (subprocess).
@@ -652,13 +657,30 @@ impl CertificateStore {
     #[cfg(target_os = "macos")]
     #[allow(clippy::unnecessary_wraps)]
     fn list_certificates_macos_keychain(&self) -> CertStoreResult<Vec<CertificateInfo>> {
-        use security_framework::item::{ItemClass, ItemSearchOptions, Reference, SearchResult};
-
         info!("Listing certificates from macOS Keychain");
 
-        let mut certificates = Vec::new();
+        let certificates: Vec<CertificateInfo> = Self::keychain_identity_certificates()
+            .into_iter()
+            .map(|(der_data, summary)| {
+                // Update the subject_cn with the actual value from Security Framework
+                let mut cert_info =
+                    self.parse_der_certificate(&der_data, Some("macOS Keychain".to_string()), None);
+                cert_info.subject_cn.clone_from(&summary);
+                cert_info.subject_dn = summary;
+                cert_info
+            })
+            .collect();
+        info!("Found {} identities in Keychain", certificates.len());
 
-        // Search for identities (certificates with private keys)
+        Ok(certificates)
+    }
+
+    /// Returns `(DER, subject summary)` for each Keychain identity
+    /// (certificate with a private key), at most 100.
+    #[cfg(target_os = "macos")]
+    fn keychain_identity_certificates() -> Vec<(Vec<u8>, String)> {
+        use security_framework::item::{ItemClass, ItemSearchOptions, Reference, SearchResult};
+
         let search_results = ItemSearchOptions::new()
             .class(ItemClass::identity())
             .load_refs(true)
@@ -666,31 +688,23 @@ impl CertificateStore {
             .search();
 
         match search_results {
-            Ok(results) => {
-                for result in results {
+            Ok(results) => results
+                .into_iter()
+                .filter_map(|result| {
                     if let SearchResult::Ref(Reference::Identity(identity)) = result
                         && let Ok(cert) = identity.certificate()
                     {
-                        let der_data = cert.to_der();
-                        // Update the subject_cn with the actual value from Security Framework
-                        let mut cert_info = self.parse_der_certificate(
-                            &der_data,
-                            Some("macOS Keychain".to_string()),
-                            None,
-                        );
-                        cert_info.subject_cn = cert.subject_summary();
-                        cert_info.subject_dn = cert.subject_summary();
-                        certificates.push(cert_info);
+                        Some((cert.to_der(), cert.subject_summary()))
+                    } else {
+                        None
                     }
-                }
-                info!("Found {} identities in Keychain", certificates.len());
-            }
+                })
+                .collect(),
             Err(e) => {
                 debug!("Failed to search Keychain for identities: {}", e);
+                Vec::new()
             }
         }
-
-        Ok(certificates)
     }
 
     /// Lists certificates from PKCS#11 tokens (`YubiKey`, smart cards, etc.).
@@ -1378,10 +1392,17 @@ impl CertificateStore {
             self.get_certificate_chain_windows(thumbprint)
         }
 
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         {
-            // Return stub certificate for non-Windows
-            self.get_certificate_chain_stub(thumbprint)
+            self.get_certificate_chain_macos(thumbprint)
+        }
+
+        // NIST 800-53 Rev5: IA-2(2), IA-2(12) (not met: fails closed)
+        // POAM: POA&M-371 no card certificate source off Windows/macOS.
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        {
+            let _ = self.find_by_thumbprint(thumbprint)?;
+            Err(CertStoreError::NotSupported)
         }
     }
 
@@ -1453,33 +1474,42 @@ impl CertificateStore {
         }
     }
 
-    /// Gets a stub certificate chain for non-Windows platforms.
-    #[cfg(not(windows))]
-    fn get_certificate_chain_stub(&self, thumbprint: &str) -> CertStoreResult<Vec<Vec<u8>>> {
-        // Verify the certificate exists in our stub data
+    /// Gets the end-entity certificate DER on macOS.
+    ///
+    /// Only Keychain identities carry their DER; any other listed
+    /// certificate (e.g. read from `yubico-piv-tool` status) returns
+    /// `NotSupported`.
+    #[cfg(target_os = "macos")]
+    fn get_certificate_chain_macos(&self, thumbprint: &str) -> CertStoreResult<Vec<Vec<u8>>> {
+        for (der, _) in Self::keychain_identity_certificates() {
+            let info = self.parse_der_certificate(&der, None, None);
+            if info.thumbprint.eq_ignore_ascii_case(thumbprint) {
+                return Ok(vec![der]);
+            }
+        }
         let _ = self.find_by_thumbprint(thumbprint)?;
-
-        // Return a self-signed test certificate (DER-encoded)
-        // This is a minimal X.509 v3 certificate for testing
-        // In production, this would come from the actual certificate store
-        let stub_cert = create_stub_der_certificate();
-        Ok(vec![stub_cert])
+        Err(CertStoreError::NotSupported)
     }
 
-    /// Checks if a certificate has an associated private key.
+    /// Checks if a certificate has an associated private key that this
+    /// store can use for signing.
     ///
     /// For smart card certificates, this verifies the card is present.
+    /// Off Windows no card-backed signer exists, so a listed certificate
+    /// reports `false`.
     pub fn has_private_key(&self, thumbprint: &str) -> CertStoreResult<bool> {
         #[cfg(windows)]
         {
             self.has_private_key_windows(thumbprint)
         }
 
+        // NIST 800-53 Rev5: IA-2(2), IA-2(12) (not met: fails closed; no
+        // usable key without a signer)
+        // POAM: POA&M-371 card-backed signer (PKCS#11) off Windows.
         #[cfg(not(windows))]
         {
-            // Stub always has a "private key"
             let _ = self.find_by_thumbprint(thumbprint)?;
-            Ok(true)
+            Ok(false)
         }
     }
 
@@ -1567,9 +1597,12 @@ impl CertificateStore {
             self.sign_data_windows(thumbprint, data, algorithm, pin)
         }
 
+        // NIST 800-53 Rev5: IA-2(2), IA-2(12) (not met: fails closed)
+        // POAM: POA&M-371 card-backed signer (PKCS#11) off Windows.
         #[cfg(not(windows))]
         {
-            self.sign_data_stub(thumbprint, data, algorithm, pin)
+            let _ = (data, pin);
+            Err(CertStoreError::NotSupported)
         }
     }
 
@@ -1705,11 +1738,13 @@ impl CertificateStore {
             // If PIN was provided, set it on the key (for NCrypt keys)
             if let Some(pin_value) = pin {
                 // Convert PIN to wide string
-                let pin_wide: Vec<u16> = pin_value
-                    .as_str()
-                    .encode_utf16()
-                    .chain(std::iter::once(0))
-                    .collect();
+                // NIST 800-53 Rev5: SC-28 (wide PIN copy wiped on drop; the
+                // capacity is reserved up front so no unwiped buffer is
+                // left behind by a reallocation)
+                let mut pin_wide =
+                    zeroize::Zeroizing::new(Vec::<u16>::with_capacity(pin_value.len() + 1));
+                pin_wide.extend(pin_value.as_str().encode_utf16());
+                pin_wide.push(0);
 
                 // NCryptSetProperty for PIN
                 use windows::Win32::Security::Cryptography::NCryptSetProperty;
@@ -1803,37 +1838,6 @@ impl CertificateStore {
         }
     }
 
-    /// Stub signing implementation for non-Windows platforms.
-    #[cfg(not(windows))]
-    fn sign_data_stub(
-        &self,
-        thumbprint: &str,
-        data: &[u8],
-        algorithm: SignatureAlgorithm,
-        _pin: Option<&SmartCardPin>,
-    ) -> CertStoreResult<Vec<u8>> {
-        // Verify certificate exists
-        let _ = self.find_by_thumbprint(thumbprint)?;
-
-        warn!("Using stub signing - not for production use");
-
-        // Return a fake signature based on algorithm
-        let sig_size = match algorithm {
-            SignatureAlgorithm::EcdsaSha384 => 96, // P-384 signature
-            SignatureAlgorithm::EcdsaSha256 => 64, // P-256 signature
-            SignatureAlgorithm::RsaSha384 | SignatureAlgorithm::RsaSha256 => 256, // RSA 2048
-        };
-
-        // Create deterministic fake signature from data hash
-        let mut signature = vec![0u8; sig_size];
-        #[allow(clippy::cast_possible_truncation)]
-        for (i, byte) in data.iter().cycle().take(sig_size).enumerate() {
-            signature[i] = byte.wrapping_add(i as u8);
-        }
-
-        Ok(signature)
-    }
-
     /// Verifies that a certificate's private key is accessible with the given PIN.
     ///
     /// This attempts to acquire the private key without actually signing anything,
@@ -1846,7 +1850,8 @@ impl CertificateStore {
     /// # Returns
     /// Ok(true) if the PIN is correct and key is accessible,
     /// Err(PinIncorrect) if the PIN is wrong,
-    /// Err(SmartCardNotPresent) if the card is not inserted.
+    /// Err(SmartCardNotPresent) if the card is not inserted,
+    /// Err(NotSupported) on every platform other than Windows.
     pub fn verify_pin(&self, thumbprint: &str, pin: &SmartCardPin) -> CertStoreResult<bool> {
         info!(thumbprint = %thumbprint, "Verifying smart card PIN");
 
@@ -1855,9 +1860,13 @@ impl CertificateStore {
             self.verify_pin_windows(thumbprint, pin)
         }
 
+        // NIST 800-53 Rev5: IA-2(2), IA-2(12) (not met: fails closed), IA-5(2)
+        // (no card-backed PIN check; refuse)
+        // POAM: POA&M-371 card PIN entry and signer off Windows.
         #[cfg(not(windows))]
         {
-            self.verify_pin_stub(thumbprint, pin)
+            let _ = (thumbprint, pin);
+            Err(CertStoreError::NotSupported)
         }
     }
 
@@ -1960,11 +1969,12 @@ impl CertificateStore {
             let key_handle = NCRYPT_KEY_HANDLE(acquired.0);
 
             // Set PIN
-            let pin_wide: Vec<u16> = pin
-                .as_str()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
+            // NIST 800-53 Rev5: SC-28 (wide PIN copy wiped on drop; the
+            // capacity is reserved up front so no unwiped buffer is left
+            // behind by a reallocation)
+            let mut pin_wide = zeroize::Zeroizing::new(Vec::<u16>::with_capacity(pin.len() + 1));
+            pin_wide.extend(pin.as_str().encode_utf16());
+            pin_wide.push(0);
 
             let ncrypt_pin_property: Vec<u16> = "SmartCardPin"
                 .encode_utf16()
@@ -1991,78 +2001,6 @@ impl CertificateStore {
             }
         }
     }
-
-    /// Stub PIN verification for non-Windows platforms.
-    #[cfg(not(windows))]
-    fn verify_pin_stub(&self, thumbprint: &str, pin: &SmartCardPin) -> CertStoreResult<bool> {
-        // Verify certificate exists
-        let _ = self.find_by_thumbprint(thumbprint)?;
-
-        // Accept any PIN that's at least 4 digits for testing
-        if pin.len() >= 4 {
-            info!("Stub PIN verified (test mode)");
-            Ok(true)
-        } else {
-            Err(CertStoreError::PinIncorrect)
-        }
-    }
-}
-
-/// Creates a stub DER-encoded certificate for testing on non-Windows platforms.
-#[cfg(not(windows))]
-fn create_stub_der_certificate() -> Vec<u8> {
-    // This is a minimal self-signed test certificate
-    // Generated for testing purposes only - not for production use
-    // Subject: CN=Test User, O=Test Org
-    // Key: ECDSA P-384
-    // Validity: 2024-01-01 to 2027-01-01
-    //
-    // In a real implementation, you would load a test certificate from a file
-    // or generate one using a crypto library
-    vec![
-        0x30, 0x82, 0x01, 0x5a, // SEQUENCE, length
-        0x30, 0x82, 0x01, 0x00, // tbsCertificate SEQUENCE
-        0xa0, 0x03, 0x02, 0x01, 0x02, // version [0] INTEGER 2 (v3)
-        0x02, 0x01, 0x01, // serialNumber INTEGER 1
-        0x30, 0x0a, // signature AlgorithmIdentifier
-        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03, // ecdsa-with-SHA384
-        0x30, 0x1f, // issuer Name
-        0x31, 0x1d, 0x30, 0x1b, 0x06, 0x03, 0x55, 0x04, 0x03, // CN=
-        0x0c, 0x14, 0x54, 0x65, 0x73, 0x74, 0x20, 0x55, 0x73, 0x65, 0x72, 0x20, 0x28, 0x53, 0x74,
-        0x75, 0x62, 0x20, 0x43, 0x41, 0x43, 0x29, // "Test User (Stub CAC)"
-        0x30, 0x1e, // validity
-        0x17, 0x0d, 0x32, 0x34, 0x30, 0x31, 0x30, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
-        0x5a, // notBefore: 240101000000Z
-        0x17, 0x0d, 0x32, 0x37, 0x30, 0x31, 0x30, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
-        0x5a, // notAfter: 270101000000Z
-        0x30, 0x1f, // subject Name (same as issuer for self-signed)
-        0x31, 0x1d, 0x30, 0x1b, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x14, 0x54, 0x65, 0x73, 0x74,
-        0x20, 0x55, 0x73, 0x65, 0x72, 0x20, 0x28, 0x53, 0x74, 0x75, 0x62, 0x20, 0x43, 0x41, 0x43,
-        0x29, 0x30, 0x76, // subjectPublicKeyInfo
-        0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // ecPublicKey
-        0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22, // secp384r1
-        0x03, 0x62, 0x00, // BIT STRING, 97 bytes (P-384 public key placeholder)
-        0x04, // Uncompressed point
-        // X coordinate (48 bytes) - placeholder
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x01, // Y coordinate (48 bytes) - placeholder
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x02, 0x30, 0x0a, // signatureAlgorithm
-        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03, // ecdsa-with-SHA384
-        0x03, 0x48, 0x00, // signature BIT STRING (placeholder)
-        0x30, 0x45, // ECDSA-Sig-Value SEQUENCE
-        0x02, 0x21, 0x00, // r INTEGER
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x01, 0x02, 0x20, // s INTEGER
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x02,
-    ]
 }
 
 /// Parses basic X.509 certificate information from DER-encoded data.
@@ -2482,61 +2420,45 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// SR-46: off Windows no card-backed signer exists, so signing fails
+    /// closed for every algorithm, with or without a PIN, including the
+    /// fabricated unit-test certificates.
+    // NIST 800-53 Rev5: IA-2(2), IA-2(12) (not met: fails closed)
+    #[cfg(not(windows))]
     #[test]
-    fn test_sign_data_stub() {
-        // This test is only valid with stub data (Linux without real cert store)
-        #[cfg(all(not(windows), not(target_os = "macos")))]
-        {
-            let store = CertificateStore::open_personal();
-            let thumbprint = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
-            let data = b"test data to sign";
-            let pin = SmartCardPin::new("1234");
+    fn test_sign_data_not_supported_off_windows() {
+        let store = CertificateStore::open_personal();
+        let pin = SmartCardPin::new("1234");
+        let thumbprint = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
 
-            // Sign with ECDSA P-384
-            let signature = store
-                .sign_data(
-                    thumbprint,
-                    data,
-                    SignatureAlgorithm::EcdsaSha384,
-                    Some(&pin),
-                )
-                .unwrap();
-            assert_eq!(signature.len(), 96); // P-384 signature size
-
-            // Sign with ECDSA P-256
-            let signature = store
-                .sign_data(
-                    thumbprint,
-                    data,
-                    SignatureAlgorithm::EcdsaSha256,
-                    Some(&pin),
-                )
-                .unwrap();
-            assert_eq!(signature.len(), 64); // P-256 signature size
-
-            // Sign with RSA
-            let signature = store
-                .sign_data(thumbprint, data, SignatureAlgorithm::RsaSha384, Some(&pin))
-                .unwrap();
-            assert_eq!(signature.len(), 256); // RSA 2048 signature size
+        for algorithm in [
+            SignatureAlgorithm::EcdsaSha384,
+            SignatureAlgorithm::EcdsaSha256,
+            SignatureAlgorithm::RsaSha384,
+            SignatureAlgorithm::RsaSha256,
+        ] {
+            for pin in [None, Some(&pin)] {
+                let result = store.sign_data(thumbprint, b"test data", algorithm, pin);
+                assert!(
+                    matches!(result, Err(CertStoreError::NotSupported)),
+                    "{algorithm:?}: {result:?}"
+                );
+            }
         }
     }
 
+    /// SR-46: the fabricated unit-test certificates report no usable key
+    /// and no chain off Windows.
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     #[test]
-    fn test_sign_data_without_pin() {
-        // This test is only valid with stub data
-        #[cfg(all(not(windows), not(target_os = "macos")))]
-        {
-            let store = CertificateStore::open_personal();
-            let thumbprint = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
-            let data = b"test data to sign";
-
-            // Sign without PIN (should still work in stub mode)
-            let signature = store
-                .sign_data(thumbprint, data, SignatureAlgorithm::EcdsaSha384, None)
-                .unwrap();
-            assert_eq!(signature.len(), 96);
-        }
+    fn test_stub_certificate_has_no_key_or_chain() {
+        let store = CertificateStore::open_personal();
+        let thumbprint = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
+        assert!(matches!(store.has_private_key(thumbprint), Ok(false)));
+        assert!(matches!(
+            store.get_certificate_chain(thumbprint),
+            Err(CertStoreError::NotSupported)
+        ));
     }
 
     #[test]
@@ -2546,31 +2468,55 @@ mod tests {
         let pin = SmartCardPin::new("1234");
 
         let result = store.sign_data("INVALID", data, SignatureAlgorithm::EcdsaSha384, Some(&pin));
+        #[cfg(windows)]
         assert!(matches!(
             result,
             Err(CertStoreError::CertificateNotFound(_))
         ));
+        #[cfg(not(windows))]
+        assert!(
+            matches!(result, Err(CertStoreError::NotSupported)),
+            "{result:?}"
+        );
     }
 
+    /// SR-46: there is no card-backed PIN check off Windows, so
+    /// `verify_pin` fails closed for every PIN and every thumbprint,
+    /// including the fabricated test certificates. It must never return
+    /// `Ok(true)`, and it reports `NotSupported` (not `PinIncorrect` or
+    /// `CertificateNotFound`) so the GUI can say why.
+    // NIST 800-53 Rev5: IA-2(2), IA-2(12) (not met: fails closed), IA-5(2).
+    #[cfg(not(windows))]
     #[test]
-    fn test_verify_pin_stub() {
-        // This test is only valid with stub data
-        #[cfg(all(not(windows), not(target_os = "macos")))]
-        {
-            let store = CertificateStore::open_personal();
-            let thumbprint = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
+    fn test_verify_pin_not_supported_off_windows() {
+        let store = CertificateStore::open_personal();
+        let thumbprints = [
+            "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2",
+            "B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3",
+            "C3D4E5F6G7H8C3D4E5F6G7H8C3D4E5F6G7H8C3D4E5F6G7H8C3D4E5F6G7H8C3D4",
+            "INVALID",
+            "",
+        ];
+        let pins = ["0000", "1234", "123456", "12345678", "123", ""];
 
-            // Valid PIN (4+ digits)
-            let valid_pin = SmartCardPin::new("1234");
-            let result = store.verify_pin(thumbprint, &valid_pin);
-            assert!(result.is_ok());
-            assert!(result.unwrap());
-
-            // Invalid PIN (too short)
-            let short_pin = SmartCardPin::new("123");
-            let result = store.verify_pin(thumbprint, &short_pin);
-            assert!(matches!(result, Err(CertStoreError::PinIncorrect)));
+        for thumbprint in thumbprints {
+            for pin in pins {
+                let result = store.verify_pin(thumbprint, &SmartCardPin::new(pin));
+                assert!(
+                    matches!(result, Err(CertStoreError::NotSupported)),
+                    "thumbprint {thumbprint:?}, PIN of length {}: {result:?}",
+                    pin.len()
+                );
+            }
         }
+    }
+
+    /// SR-46: the `NotSupported` text is what the GUI shows for a PIN
+    /// attempt off Windows.
+    #[test]
+    fn test_not_supported_error_text() {
+        let text = CertStoreError::NotSupported.to_string().to_lowercase();
+        assert!(text.contains("not supported"), "{text}");
     }
 
     #[test]
@@ -2579,10 +2525,17 @@ mod tests {
         let pin = SmartCardPin::new("1234");
 
         let result = store.verify_pin("INVALID", &pin);
+        #[cfg(windows)]
         assert!(matches!(
             result,
             Err(CertStoreError::CertificateNotFound(_))
         ));
+        // SR-46: off Windows the PIN check is refused before any lookup.
+        #[cfg(not(windows))]
+        assert!(
+            matches!(result, Err(CertStoreError::NotSupported)),
+            "{result:?}"
+        );
     }
 
     #[test]

@@ -132,8 +132,10 @@ cargo build --release -p client-gui-windows
 
 - The installer does NOT require administrative privileges for per-user installation
 - System-wide installation (Program Files) requires elevation
-- Smart card authentication is the production mode. `digest-auth` builds
-  (interop testing) store the SIP digest password in Windows Credential
-  Manager; no password is written to the settings file. OIDC tokens are
-  kept in memory only.
+- No passwords are stored in default builds; accounts authenticate by
+  OIDC Bearer token. Smart-card login is not yet available (NIST
+  POA&M-371): a CAC/PIV certificate cannot authenticate the client.
+  `digest-auth` builds (interop testing) store the SIP digest password
+  in Windows Credential Manager; no password is written to the settings
+  file. OIDC tokens are kept in memory only.
 - All sensitive data is zeroized on application exit

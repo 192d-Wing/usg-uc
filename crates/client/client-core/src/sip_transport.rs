@@ -48,6 +48,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::{debug, error, info, trace, warn};
+use zeroize::Zeroizing;
 
 /// Certificate verification mode for TLS connections.
 #[derive(Debug, Clone, Default)]
@@ -134,27 +135,53 @@ struct ClientCertResolver {
 }
 
 impl ClientCertResolver {
-    /// Creates a new resolver without a certificate.
-    const fn new() -> Self {
-        Self {
-            certified_key: None,
-        }
-    }
+    /// Creates a resolver with the given certificate chain and PKCS#8 key.
+    ///
+    /// The key must be ECDSA P-384, the leaf certificate must carry its
+    /// public key and be signed with ecdsa-with-SHA384 (CNSA 2.0). Anything
+    /// else is an error; there is no fallback to a handshake without a
+    /// client certificate (rustls would send an empty `Certificate` if the
+    /// key could not sign `ecdsa_secp384r1_sha384`).
+    // NIST 800-53 Rev5: IA-2, IA-3, IA-5(2), SC-13
+    fn with_cert(cert_chain_der: &[Vec<u8>], key_der: &[u8]) -> AppResult<Self> {
+        client_sip_ua::dtls_identity::check_user_identity(cert_chain_der, key_der).map_err(
+            |e| {
+                error!(error = %e, "Client certificate refused for mTLS");
+                AppError::Sip(format!("Unusable client certificate or private key: {e}"))
+            },
+        )?;
 
-    /// Creates a resolver with the given certificate chain and private key.
-    fn with_cert(cert_chain: Vec<CertificateDer<'static>>, key: &PrivateKeyDer<'static>) -> Self {
-        let signing_key = match rustls::crypto::aws_lc_rs::sign::any_supported_type(key) {
-            Ok(key) => key,
-            Err(e) => {
+        let key = PrivateKeyDer::try_from(key_der)
+            .map_err(|e| AppError::Sip(format!("Invalid private key format: {e}")))?;
+        let signing_key =
+            rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).map_err(|e| {
                 error!(error = %e, "Failed to parse private key for client auth");
-                return Self::new();
-            }
-        };
-
-        let certified_key = CertifiedKey::new(cert_chain, signing_key);
-        Self {
-            certified_key: Some(Arc::new(certified_key)),
+                AppError::Sip(format!("Unusable client certificate private key: {e}"))
+            })?;
+        if signing_key
+            .choose_scheme(&[SignatureScheme::ECDSA_NISTP384_SHA384])
+            .is_none()
+        {
+            error!("Client private key cannot sign ecdsa_secp384r1_sha384");
+            return Err(AppError::Sip(
+                "Client private key must be ECDSA P-384 (CNSA 2.0)".to_string(),
+            ));
         }
+
+        let certs: Vec<CertificateDer<'static>> = cert_chain_der
+            .iter()
+            .map(|c| CertificateDer::from(c.clone()))
+            .collect();
+        let certified_key = CertifiedKey::new(certs, signing_key);
+        certified_key.keys_match().map_err(|e| {
+            error!(error = %e, "Client certificate does not match the private key");
+            AppError::Sip(format!(
+                "Client certificate does not match the private key: {e}"
+            ))
+        })?;
+        Ok(Self {
+            certified_key: Some(Arc::new(certified_key)),
+        })
     }
 }
 
@@ -618,20 +645,39 @@ impl<R: AsyncRead + Unpin> TlsReader<R> {
 }
 
 /// Configuration for the SIP transport layer.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct TransportConfig {
     /// Certificate verification mode.
     pub verification_mode: CertVerificationMode,
     /// Client certificate chain for mTLS (DER-encoded).
     pub client_cert_chain: Option<Vec<Vec<u8>>>,
-    /// Client private key for mTLS (DER-encoded).
-    /// If `None` and `client_cert_chain` is `Some`, smart card signing is assumed.
-    pub client_private_key: Option<Vec<u8>>,
+    /// Client private key for mTLS (PKCS#8 DER), wiped on drop and never
+    /// printed. A chain without a key is refused when the TLS configuration
+    /// is built (no card-backed signer).
+    // NIST 800-53 Rev5: SC-12, SC-28 (key material zeroized, redacted Debug)
+    pub client_private_key: Option<Zeroizing<Vec<u8>>>,
     /// DNS name presented as SNI and verified against the server certificate
     /// when connecting over TLS. Connections are made to resolved socket
     /// addresses, so without this the peer IP is used — which fails
     /// verification for certificates that only carry DNS SANs.
     pub tls_server_name: Option<String>,
+}
+
+impl std::fmt::Debug for TransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportConfig")
+            .field("verification_mode", &self.verification_mode)
+            .field(
+                "client_cert_chain",
+                &self.client_cert_chain.as_ref().map(Vec::len),
+            )
+            .field(
+                "client_private_key",
+                &self.client_private_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("tls_server_name", &self.tls_server_name)
+            .finish()
+    }
 }
 
 impl TransportConfig {
@@ -652,7 +698,7 @@ impl TransportConfig {
     pub fn with_client_certificate(
         mut self,
         cert_chain: Vec<Vec<u8>>,
-        private_key: Option<Vec<u8>>,
+        private_key: Option<Zeroizing<Vec<u8>>>,
     ) -> Self {
         self.client_cert_chain = Some(cert_chain);
         self.client_private_key = private_key;
@@ -744,13 +790,16 @@ impl SipTransport {
     ///
     /// # Arguments
     /// * `cert_chain` - DER-encoded certificate chain (end-entity first)
-    /// * `private_key` - Optional DER-encoded private key. If `None`, smart card signing is assumed.
+    /// * `private_key` - DER-encoded private key. `None` is refused: no
+    ///   card-backed TLS signer exists, so a key-less certificate cannot
+    ///   authenticate.
     ///
-    /// This will close all existing connections and rebuild the TLS config.
+    /// On success this closes all existing connections and rebuilds the TLS
+    /// config. On error the previous configuration is kept unchanged.
     pub async fn set_client_certificate(
         &self,
         cert_chain: Vec<Vec<u8>>,
-        private_key: Option<Vec<u8>>,
+        private_key: Option<Zeroizing<Vec<u8>>>,
     ) -> AppResult<()> {
         info!(
             cert_count = cert_chain.len(),
@@ -759,11 +808,13 @@ impl SipTransport {
         );
 
         let mut config = self.config.write().await;
-        config.client_cert_chain = Some(cert_chain);
-        config.client_private_key = private_key;
+        let mut candidate = config.clone();
+        candidate.client_cert_chain = Some(cert_chain);
+        candidate.client_private_key = private_key;
 
-        // Rebuild TLS config
-        let new_tls_config = Self::create_tls_config(&config)?;
+        // Rebuild TLS config; only commit the candidate if it is usable.
+        let new_tls_config = Self::create_tls_config(&candidate)?;
+        *config = candidate;
         drop(config);
 
         // Update the TLS config
@@ -773,6 +824,21 @@ impl SipTransport {
         self.connections.lock().await.clear();
 
         Ok(())
+    }
+
+    /// Returns true when the active TLS configuration presents a client
+    /// certificate: its resolver was built from a chain and a key that
+    /// passed the P-384 / key-match checks in `ClientCertResolver::with_cert`.
+    /// A configuration that failed to build is never installed, so a
+    /// refused pair never makes this true.
+    // NIST 800-53 Rev5: IA-2, IA-3 (derived from the live TLS config, not
+    // from the stored settings)
+    pub async fn has_client_auth(&self) -> bool {
+        self.tls_config
+            .read()
+            .await
+            .client_auth_cert_resolver
+            .has_certs()
     }
 
     /// Creates CNSA 2.0 compliant TLS configuration.
@@ -832,36 +898,30 @@ impl SipTransport {
     ) -> AppResult<ClientConfig> {
         match (&config.client_cert_chain, &config.client_private_key) {
             (Some(cert_chain), Some(private_key)) => {
-                // Full mTLS with certificate and private key
-                let certs: Vec<CertificateDer<'static>> = cert_chain
-                    .iter()
-                    .map(|c| CertificateDer::from(c.clone()))
-                    .collect();
-
-                let key = PrivateKeyDer::try_from(private_key.clone())
-                    .map_err(|e| AppError::Sip(format!("Invalid private key format: {e}")))?;
-
+                // Full mTLS with certificate and software private key.
+                // The key is borrowed, not copied (SC-12).
                 info!(
-                    cert_count = certs.len(),
+                    cert_count = cert_chain.len(),
                     "Configuring mTLS with private key"
                 );
 
                 // Use custom resolver for client certificates
-                let resolver = ClientCertResolver::with_cert(certs, &key);
+                let resolver = ClientCertResolver::with_cert(cert_chain, private_key)?;
                 Ok(builder.with_client_cert_resolver(Arc::new(resolver)))
             }
             (Some(cert_chain), None) => {
-                // Certificate without private key - smart card signing
-                // For smart cards, the Windows TLS stack handles signing
-                // We configure the certs but can't provide the resolver without
-                // the private key. The OS will prompt for PIN when needed.
-                info!(
+                // NIST 800-53 Rev5: IA-2(2), IA-2(12) (not met: fails closed;
+                // refuse rather than connect without client authentication)
+                // POAM: POA&M-371 card-backed TLS signer (PKCS#11 / CNG
+                // `ResolvesClientCert`) for smart-card client certificates.
+                error!(
                     cert_count = cert_chain.len(),
-                    "Client certificate configured (smart card signing)"
+                    "Client certificate without a private key refused: card signing unavailable"
                 );
-                warn!("Smart card mTLS requires Windows native TLS stack");
-                // For now, proceed without client auth - platform handles it
-                Ok(builder.with_no_client_auth())
+                Err(AppError::Sip(
+                    "Client certificate has no private key; smart card TLS signing is not supported"
+                        .to_string(),
+                ))
             }
             (None, _) => {
                 // No client authentication
@@ -2094,7 +2154,7 @@ mod tests {
     fn test_transport_config_builder() {
         let config = TransportConfig::new()
             .with_verification_mode(CertVerificationMode::Insecure)
-            .with_client_certificate(vec![vec![1, 2, 3]], Some(vec![4, 5, 6]));
+            .with_client_certificate(vec![vec![1, 2, 3]], Some(Zeroizing::new(vec![4, 5, 6])));
 
         assert!(matches!(
             config.verification_mode,
@@ -2114,6 +2174,165 @@ mod tests {
             transport.is_ok(),
             "Transport with insecure mode should be created"
         );
+    }
+
+    /// A P-384 self-signed client identity: (DER chain, PKCS#8 key).
+    fn sr46_software_identity() -> (Vec<Vec<u8>>, Vec<u8>) {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["client.invalid".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        (vec![cert.der().to_vec()], key.serialize_der())
+    }
+
+    /// Bytes that sniff as PKCS#8 (SEQUENCE, version 0, SEQUENCE) but are
+    /// not a key any signer accepts.
+    const SR46_UNUSABLE_PKCS8: [u8; 7] = [0x30, 0x05, 0x02, 0x01, 0x00, 0x30, 0x00];
+
+    /// SR-46: a client certificate without a private key cannot sign the
+    /// TLS `CertificateVerify`. The transport refuses it instead of
+    /// connecting without client authentication.
+    // NIST 800-53 Rev5: IA-2, IA-3, IA-5(2).
+    #[tokio::test]
+    async fn test_sr46_set_client_certificate_without_key_is_refused() {
+        let (tx, _rx) = mpsc::channel(32);
+        let transport = SipTransport::new(tx).unwrap();
+        let (chain, _key) = sr46_software_identity();
+
+        let result = transport.set_client_certificate(chain, None).await;
+        assert!(result.is_err(), "certificate without a key was accepted");
+    }
+
+    /// SR-46: same refusal when the key-less certificate comes in through
+    /// the constructor.
+    #[test]
+    fn test_sr46_with_config_certificate_without_key_is_refused() {
+        let (tx, _rx) = mpsc::channel(32);
+        let (chain, _key) = sr46_software_identity();
+        let config = TransportConfig::new().with_client_certificate(chain, None);
+
+        assert!(
+            SipTransport::with_config(tx, config).is_err(),
+            "transport built with a certificate and no key"
+        );
+    }
+
+    /// SR-46: a key that parses as PKCS#8 but yields no signer must not
+    /// fall back to a handshake without a client certificate either.
+    #[tokio::test]
+    async fn test_sr46_set_client_certificate_with_unusable_key_is_refused() {
+        let (tx, _rx) = mpsc::channel(32);
+        let transport = SipTransport::new(tx).unwrap();
+        let (chain, _key) = sr46_software_identity();
+
+        let result = transport
+            .set_client_certificate(chain, Some(Zeroizing::new(SR46_UNUSABLE_PKCS8.to_vec())))
+            .await;
+        assert!(
+            result.is_err(),
+            "certificate with an unusable key was accepted"
+        );
+    }
+
+    /// SR-46 positive control: certificate plus a usable P-384 key is
+    /// accepted.
+    #[tokio::test]
+    async fn test_sr46_set_client_certificate_with_key_is_accepted() {
+        let (tx, _rx) = mpsc::channel(32);
+        let transport = SipTransport::new(tx).unwrap();
+        let (chain, key) = sr46_software_identity();
+
+        transport
+            .set_client_certificate(chain, Some(Zeroizing::new(key)))
+            .await
+            .unwrap();
+        assert!(transport.has_client_auth().await);
+    }
+
+    /// Installs `chain` + `key` on a fresh transport and returns whether
+    /// it was accepted and whether client auth is then active.
+    async fn sr46_install(chain: Vec<Vec<u8>>, key: Vec<u8>) -> (bool, bool) {
+        let (tx, _rx) = mpsc::channel(32);
+        let transport = SipTransport::new(tx).unwrap();
+        let accepted = transport
+            .set_client_certificate(chain, Some(Zeroizing::new(key)))
+            .await
+            .is_ok();
+        (accepted, transport.has_client_auth().await)
+    }
+
+    /// SEC-002 / NIST-007: a P-256 key (with its own matching P-256
+    /// certificate) is not CNSA 2.0 and is refused.
+    // NIST 800-53 Rev5: IA-5(2), SC-13.
+    #[tokio::test]
+    async fn test_sr46_p256_client_key_is_refused() {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["client.invalid".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let (accepted, active) = sr46_install(vec![cert.der().to_vec()], key.serialize_der()).await;
+        assert!(!accepted, "P-256 client key accepted");
+        assert!(!active, "client auth active after a refused key");
+    }
+
+    /// SEC-002 / NIST-007: a P-384 key that does not belong to the leaf
+    /// certificate is refused (rustls would otherwise present a
+    /// certificate the key cannot prove).
+    #[tokio::test]
+    async fn test_sr46_mismatched_client_key_is_refused() {
+        let (chain, _key) = sr46_software_identity();
+        let (_other_chain, other_key) = sr46_software_identity();
+        let (accepted, active) = sr46_install(chain, other_key).await;
+        assert!(!accepted, "mismatched client key accepted");
+        assert!(!active, "client auth active after a refused key");
+    }
+
+    /// SEC-002 / NIST-007: a P-384 leaf signed with ecdsa-with-SHA256 is
+    /// refused.
+    #[tokio::test]
+    async fn test_sr46_sha256_signed_client_leaf_is_refused() {
+        let issuer = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let issuer_cert = rcgen::CertificateParams::new(vec!["ca.invalid".to_string()])
+            .unwrap()
+            .self_signed(&issuer)
+            .unwrap();
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["client.invalid".to_string()])
+            .unwrap()
+            .signed_by(&key, &issuer_cert, &issuer)
+            .unwrap();
+        let (accepted, active) = sr46_install(vec![leaf.der().to_vec()], key.serialize_der()).await;
+        assert!(!accepted, "ecdsa-with-SHA256 leaf accepted");
+        assert!(!active, "client auth active after a refused leaf");
+    }
+
+    /// SEC-006: a refused pair leaves a previously installed valid pair
+    /// active; `has_client_auth` follows the live TLS configuration.
+    #[tokio::test]
+    async fn test_sr46_refused_pair_keeps_previous_client_auth() {
+        let (tx, _rx) = mpsc::channel(32);
+        let transport = SipTransport::new(tx).unwrap();
+        assert!(!transport.has_client_auth().await);
+        let (chain, key) = sr46_software_identity();
+        transport
+            .set_client_certificate(chain.clone(), Some(Zeroizing::new(key)))
+            .await
+            .unwrap();
+        assert!(transport.has_client_auth().await);
+        assert!(transport.set_client_certificate(chain, None).await.is_err());
+        assert!(transport.has_client_auth().await);
+    }
+
+    /// NIST-008: the private key never appears in `Debug` output.
+    #[test]
+    fn test_transport_config_debug_redacts_private_key() {
+        let config = TransportConfig::new()
+            .with_client_certificate(vec![vec![1]], Some(Zeroizing::new(vec![0xAB; 4])));
+        let text = format!("{config:?}");
+        assert!(text.contains("<redacted>"), "Debug output is not redacted");
+        assert!(!text.contains("171"), "Debug output contains key bytes");
     }
 
     #[tokio::test]

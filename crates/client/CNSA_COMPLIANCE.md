@@ -11,7 +11,7 @@ This document describes the CNSA 2.0 compliance status for the USG SIP Soft Clie
 | AES-256-GCM | Implemented; tested in local runs on macOS arm64 and in CI on Ubuntu x86_64 (merged PR head `4dfea0d`, 2026-11-17). Since feat/client-dtls-wiring (2026-11-17) a call on a TLS account runs a DTLS 1.2 handshake on its media socket and carries SRTP and SRTCP (`AEAD_AES_256_GCM` only, via `proto-srtp`) under the exported keys; the DTLS records themselves use AES-256-GCM. Default-feature (TLS) builds have no plaintext RTP path: a call whose handshake does not complete is ended with no audio. `SrtpSessionKeys::validate` (`client-audio/src/media_security.rs`) rejects any other profile or key/salt length (tests `wrong_lengths_rejected`, `srtp_loopback_no_plaintext_on_wire`, `srtcp_round_trip_and_no_plaintext_on_wire`; with handshake keys: `client-core/tests/dtls_interop_pion.rs`, `client-integration-tests/tests/dtls_sbc_sidecar.rs`) |
 | P-384/P-521 curves | ✅ Certificate store prefers P-384. The DTLS identity is an ephemeral self-signed ECDSA P-384 / SHA-384 certificate, or a user P-384 certificate whose public key matches its key and which is signed with ecdsa-with-SHA384 (`client-sip-ua/src/dtls_identity.rs`; tests `generate_p384_identity_with_single_prefix_fingerprint`, `from_user_der_requires_matching_key_and_sha384_signature`). Since 2026-11-17 it is the client's certificate in the DTLS-SRTP handshake, which uses ECDHE on secp384r1 and `ecdsa_secp384r1_sha384` only (P-521 is not offered for DTLS) |
 | SHA-384+ hashing | Partial. Certificate thumbprints use SHA-256+. The DTLS `a=fingerprint` we advertise is SHA-384, and only sha-384 / sha-512 remote fingerprints are accepted (sha-256 and weaker are refused, a deliberate deviation from RFC 8122 interoperability; `proto-dtls/src/fingerprint.rs` `from_sdp_strict`, tests `strict_parse_rejects_bad_input`, `sha256_only_rejected_mixed_keeps_cnsa`). Since 2026-11-17 the certificate the peer presents in the DTLS handshake must match an accepted fingerprint before any key is exported (tests `fingerprint_mismatch_fails_closed_in_both_roles`, `fingerprint_mismatch_ends_the_call_and_is_never_connected`). The handshake hash and PRF are SHA-384 |
-| No password auth | Partial. Smart card (CAC/PIV) and OIDC bearer sign-in are the default; `digest-auth` builds add SIP digest passwords. Stored digest passwords are kept only in the platform keyring (OIDC tokens are not persisted); with no usable keyring they are not persisted (NIST POA&M-372) |
+| No password auth | Partial. Default builds have no password authentication: accounts authenticate by OIDC Bearer token or by mTLS with a software P-384 key. Smart-card (CAC/PIV) authentication is not available (NIST POA&M-371). `digest-auth` builds add SIP digest passwords for interop testing. Stored digest passwords are kept only in the platform keyring (OIDC tokens are not persisted); with no usable keyring they are not persisted (NIST POA&M-372) |
 
 ## Crate-by-Crate Compliance
 
@@ -20,8 +20,8 @@ This document describes the CNSA 2.0 compliance status for the USG SIP Soft Clie
 **Status: ✅ Compliant**
 
 - `TransportPreference` defaults to `TlsOnly` but also has `Udp` and `Tcp` variants (marked not CNSA compliant) in all builds; UDP SIP code exists only with the `insecure-transports` feature
-- `SipAccount` has no password fields - only certificate-based auth
-- `CertificateConfig` supports smart card certificate selection
+- In default builds `SipAccount` has no password fields; it authenticates by mTLS client certificate with a usable key or by OIDC Bearer token (`digest-auth` adds digest credentials)
+- `CertificateConfig` supports smart card certificate selection; a selected card certificate cannot authenticate SIP (NIST POA&M-371)
 - `SrtpKeyMaterial` in sensitive.rs requires 32-byte keys (AES-256)
 - Memory zeroization for all sensitive data via `zeroize` crate
 
@@ -54,17 +54,18 @@ This document describes the CNSA 2.0 compliance status for the USG SIP Soft Clie
 **Status: media secured by DTLS-SRTP since 2026-11-17 (local runs on macOS arm64; CI on Ubuntu x86_64 on the merged PR head `4dfea0d`); fails closed otherwise**
 
 - Certificate store prefers ECDSA P-384 certificates
+- mTLS gate (2026-11-17): an mTLS account is registered, refreshed or sent a REGISTER only while the SIP-TLS config holds a client certificate with a usable key (`ClientApp::ensure_registrable`, `SipTransport::has_client_auth`); otherwise nothing is sent. The key must be PKCS#8 ECDSA P-384 matching a leaf signed with ecdsa-with-SHA384; a chain without a key is refused (`ClientCertResolver::with_cert`, `configure_client_auth`). Only a software key is accepted, and no GUI or FFI path installs one. Smart-card certificates are refused (NIST POA&M-371). Tests: `test_sr46_*` in `src/app.rs` and `src/sip_transport.rs`, `tests/smartcard_fail_closed.rs`
 - The settings file holds no passwords or shared secrets. With `digest-auth` / `oidc`, secrets are stored only in the platform keyring (`src/credential_store.rs`); there is no file fallback, and a legacy `credentials.enc` is deleted when the credential store initialises and is never read (NIST POA&M-372)
 - Media gate: `CallManager::media_security_for` (`src/call_manager.rs`) is the one place a call obtains its media security. A TLS account, or a remote that signals `SAVP`/`SAVPF`, requires DTLS-SRTP keys; without them the call is ended (488 to an inbound offer, BYE after an answer). Since 2026-11-17 the call manager starts the DTLS handshake when the remote SDP has passed its checks and reports the call `Connected`, and starts audio, only when the handshake has produced keys; a peer's `close_notify` or fatal alert mid-call stops the audio and ends the call. Tests: `client-core/tests/media_security_gate.rs`, `client-core/tests/dtls_srtp_call.rs`, `test_media_security_for_by_account_and_build`
 - SRTP session keys are copied from the DTLS keying material into `Zeroizing` buffers when audio starts and then moved into the audio pipeline (`src/media_security.rs` `srtp_session_keys`). Key copies that are not wiped are listed under NIST POA&M-330
 
-### client-gui-windows
+### client-gui-tauri
 
-**Status: ✅ Compliant**
+**Status: smart-card login not available (NIST POA&M-371)**
 
 - No cryptographic operations performed directly
 - Certificate selection UI shows CNSA 2.0 compliance info
-- No password entry fields - smart card PIN entry via secure card reader
+- No password entry fields. The PIN dialog is checked by CNG on Windows only; elsewhere it returns "not supported". A verified PIN does not enable SIP mTLS
 
 ## Cryptographic Algorithm Restrictions
 
@@ -74,7 +75,7 @@ This document describes the CNSA 2.0 compliance status for the USG SIP Soft Clie
 - ❌ P-256 curves (use P-384 or P-521)
 - ❌ RSA < 3072 bits (use ECDSA or RSA-3072+)
 - ❌ MD5 (not CNSA; answered for legacy SIP digest only on explicit opt-in or on TLS accounts with the policy unset, see POA&M-276)
-- ❌ Password-based authentication in production builds (PKI or OIDC only; `digest-auth` is for interop testing)
+- ❌ Password-based authentication in production builds (absent from default builds; `digest-auth` is for interop testing only)
 
 ### Required Algorithms
 - ✅ AES-256-GCM for symmetric encryption
@@ -85,30 +86,21 @@ This document describes the CNSA 2.0 compliance status for the USG SIP Soft Clie
 
 ## Smart Card Authentication
 
-The soft client ONLY supports smart card-based authentication:
+Planned, not implemented (NIST POA&M-371). CAC, PIV and SIPR token certificates can be listed (Windows certificate store; macOS Keychain identities, `YubiKey`, opt-in PKCS#11; none on Linux), but no card-backed signer exists for SIP-TLS or DTLS on any platform, so a card certificate cannot authenticate the client. The client fails closed: `ClientApp::set_client_certificate` (chain only) always returns an error, and an mTLS account without a usable software key is not registered. Off Windows PIN verification and signing return `NotSupported`.
 
-1. **CAC (Common Access Card)** - DoD ID certificates
-2. **PIV (Personal Identity Verification)** - Federal civilian certificates
-3. **SIPR Token** - Classified network tokens
-
-Password-based SIP digest authentication is also supported (`DigestAuthCredentials` in `client-types/src/account.rs`); see the client-sip-ua section above for the algorithm rules and exceptions.
+Password-based SIP digest authentication exists only in `digest-auth` builds (`DigestAuthCredentials` in `client-types/src/account.rs`); see the client-sip-ua section above for the algorithm rules and exceptions.
 
 ## Key Management
 
 - SRTP master keys are derived via DTLS-SRTP (RFC 5764 §4.2 exporter over the TLS 1.2 PRF with SHA-384) since 2026-11-17, one association per call. No key, salt or random value is logged (tests `successful_call_writes_one_outcome_record_and_no_secret_as_client`, `..._as_server`)
 - SRTP key types accept only 32-byte keys (AES-256) with 12-byte salts
 - SRTP key buffers held by the client are `Zeroizing` (wiped on drop), and the per-call SRTP state wipes its transmit key material on drop. Not wiped: the rcgen `KeyPair` copy of the DTLS identity key and the identity key pair itself for the life of the process (NIST POA&M-330), and copies inside `proto-srtp` contexts and aws-lc. Wiping is asserted by type, not observed in memory
-- Private keys never leave the smart card
+- Smart-card private keys are never read by the client. A software mTLS key is held in memory in a `Zeroizing` buffer with a redacted `Debug` (`TransportConfig.client_private_key`; test `test_transport_config_debug_redacts_private_key`); copies inside rustls / aws-lc and rcgen are not wiped (NIST POA&M-330)
 - The client does no cryptography of its own on stored credentials: at-rest protection is the OS keystore's, outside the CNSA boundary. The Linux Secret Service D-Bus transfer uses DH-1024 and AES-128-CBC (not CNSA, NIST POA&M-373). The removed `credentials.enc` fallback used CNSA algorithms under a derivable key, which gave no protection
 
 ## Audit Trail
 
-All security-relevant events are logged:
-- Certificate selection
-- Registration attempts
-- Call establishment/termination
-- Authentication failures
-- Configuration changes
+The client has no audit sink; AU-9 is not claimed. Security events are structured `tracing` records only, including registration refusals (mTLS account without a usable key, non-TLS transport, unknown registration), refused client certificates, and DTLS handshake outcomes. See the NIST soft-client AU-2 / AU-3 / AU-12 row and POA&M-371.
 
 ## Testing
 
@@ -116,4 +108,5 @@ CNSA 2.0 compliance can be verified by:
 1. Checking that only TLS 1.3 connections are established with CNSA suites and groups (`test_tls_config_uses_cnsa_provider`, `tls_config_uses_cnsa_provider`; config-level assertion, no handshake test)
 2. Verifying SRTP uses AEAD_AES_256_GCM (`wrong_lengths_rejected`, `srtp_loopback_no_plaintext_on_wire`, `srtcp_round_trip_and_no_plaintext_on_wire`), that the DTLS-SRTP handshake negotiates it with a peer (`client-core/tests/dtls_interop_pion.rs` and `client-integration-tests/tests/dtls_sbc_sidecar.rs`; both `#[ignore]`, need locally built Go binaries, run locally only so far), and that a TLS call without keys ends with no audio (`client-core/tests/media_security_gate.rs`)
 3. Confirming certificate algorithms are P-384/P-521 ECDSA
-4. Confirming that default builds (no `digest-auth` feature) do not enable the client's SIP digest paths (feature gating, by code reading; no test asserts this)
+4. Testing that a smart-card certificate and an mTLS account without a usable key are refused (`client-core/tests/smartcard_fail_closed.rs`; `test_sr46_*` in `client-core/src/app.rs` and `client-core/src/sip_transport.rs`)
+5. Confirming that default builds (no `digest-auth` feature) do not enable the client's SIP digest paths (feature gating, by code reading; no test asserts this)

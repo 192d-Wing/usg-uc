@@ -141,7 +141,9 @@ impl DigestAuthCredentials {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SipAuthMode {
-    /// Mutual-TLS smart-card client certificate (CNSA 2.0 default).
+    /// Mutual-TLS client certificate (default). Needs a usable private key;
+    /// smart-card signing is not implemented (POA&M-371), so a card
+    /// certificate alone is refused.
     #[default]
     Mtls,
     /// Username/password digest (testing only; NOT CNSA 2.0 compliant).
@@ -153,8 +155,9 @@ pub enum SipAuthMode {
 
 /// SIP account configuration.
 ///
-/// Note: Authentication uses smart card client certificates via mutual TLS.
-/// No password-based authentication is supported.
+/// Authentication uses an mTLS client certificate with a usable key, or an
+/// OIDC Bearer token. Password digest exists only with the `digest-auth`
+/// feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SipAccount {
     /// Unique account identifier.
