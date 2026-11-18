@@ -25,7 +25,10 @@ const FP_384: &str = "sha-384 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11
 
 // PR-B adds `require_srtp`; only this helper changes then.
 fn policy(mode: KeyingMode) -> MediaSecurityPolicy {
-    MediaSecurityPolicy { mode }
+    MediaSecurityPolicy {
+        mode,
+        require_srtp: false,
+    }
 }
 
 const PASS: KeyingMode = KeyingMode::Passthrough;

@@ -27,11 +27,14 @@ fn outsider() -> SbcSocketAddr {
 /// The test call's INVITE branch (`alice_request("INVITE", 1, ..)`).
 const A_INVITE_BRANCH: &str = "z9hG4bK-alice-1-INVITE";
 
-/// SDP whose connection address is the outsider's.
-const OUTSIDER_SDP: &str = "v=0\r\no=- 9 9 IN IP4 203.0.113.66\r\ns=-\r\nc=IN IP4 203.0.113.66\r\nt=0 0\r\nm=audio 6666 RTP/AVP 0\r\na=sendrecv\r\n";
+/// SDP whose connection address is the outsider's. DTLS-SRTP with a
+/// `sha-384` fingerprint, like the shared fixtures, so `media.srtp.required`
+/// admits it and only the dialog match decides.
+const OUTSIDER_SDP: &str = "v=0\r\no=- 9 9 IN IP4 203.0.113.66\r\ns=-\r\nc=IN IP4 203.0.113.66\r\nt=0 0\r\nm=audio 6666 UDP/TLS/RTP/SAVP 0\r\na=setup:actpass\r\na=fingerprint:sha-384 71:72:73:74:75:76:77:78:79:7A:7B:7C:7D:7E:7F:80:81:82:83:84:85:86:87:88:89:8A:8B:8C:8D:8E:8F:90:91:92:93:94:95:96:97:98:99:9A:9B:9C:9D:9E:9F:A0\r\na=sendrecv\r\n";
 
-/// Alice's own new media address (a legitimate re-offer).
-const ALICE_MOVED_SDP: &str = "v=0\r\no=- 1 3 IN IP4 192.168.1.50\r\ns=-\r\nc=IN IP4 192.168.1.50\r\nt=0 0\r\nm=audio 4400 RTP/AVP 0\r\na=sendrecv\r\n";
+/// Alice's own new media address (a legitimate re-offer; DTLS-SRTP as
+/// [`OUTSIDER_SDP`]).
+const ALICE_MOVED_SDP: &str = "v=0\r\no=- 1 3 IN IP4 192.168.1.50\r\ns=-\r\nc=IN IP4 192.168.1.50\r\nt=0 0\r\nm=audio 4400 UDP/TLS/RTP/SAVP 0\r\na=setup:actpass\r\na=fingerprint:sha-384 11:12:13:14:15:16:17:18:19:1A:1B:1C:1D:1E:1F:20:21:22:23:24:25:26:27:28:29:2A:2B:2C:2D:2E:2F:30:31:32:33:34:35:36:37:38:39:3A:3B:3C:3D:3E:3F:40\r\na=sendrecv\r\n";
 
 /// A CANCEL on the test call (`call-relay@test`) with the given top-Via
 /// branch, From tag and CSeq number.

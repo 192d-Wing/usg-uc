@@ -46,10 +46,12 @@ device and Apple code-signing.
   hold the INVITE per RFC 3261 timers until the device re-registers. Its own
   scope/design doc; the migration plan flags this as Phase 3. Android FCM
   shares this component.
-- [ ] **iOS Keychain `CertProvider`** — replace the DEBUG dev-seed +
-  encrypted-file credential store with Secure Enclave / Keychain and
-  CAC/PIV-derived credentials (Purebred-style) for production mTLS. The
-  dev-seed (`DevSeed.swift`, DEBUG-only) is a test stopgap.
+- [ ] **iOS Keychain `CertProvider`** — replace the DEBUG dev-seed with
+  Secure Enclave / Keychain and CAC/PIV-derived credentials (Purebred-style)
+  for production mTLS, and add a Keychain-backed credential store. Today
+  nothing is persisted on iOS: the digest password stays in memory only
+  (NIST POA&M-372). The dev-seed (`DevSeed.swift`, DEBUG-only)
+  is a test stopgap.
 - [ ] **App distribution** — TestFlight / MDM; NIAP/STIG evaluation tracked
   under `stigs/`.
 
@@ -69,7 +71,8 @@ behavior.
 - [ ] **FCM high-priority push** — wake the app for incoming INVITEs in the
   background. Shares the server-side push gateway with iOS PushKit (see above).
 - [ ] **Android KeyStore `CertProvider`** — hardware-backed keys / derived
-  credentials, replacing the DEBUG dev-seed + encrypted-file store.
+  credentials, replacing the DEBUG dev-seed, plus a KeyStore-backed
+  credential store. Today nothing is persisted on Android (NIST POA&M-372).
 
 ## Other native clients
 

@@ -11,12 +11,18 @@
 //!
 //! - an offer (initial or in-dialog): 488 + `Warning` to the offerer, not
 //!   forwarded; an in-dialog refusal keeps the session as it was (RFC 3261
-//!   §14.2);
-//! - a 183 answer: CANCEL to the callee, 488 to the caller (RFC 3261 §9);
-//! - an initial 2xx answer: ACK + BYE to the callee, 488 to the caller, who
-//!   never sees the 2xx, and no relay is started (RFC 3261 §13.2.2.4, §15).
-//!   When that 2xx carried an offer (the INVITE had none), the ACK carries
-//!   an answer that declines every stream (RFC 3264 §6);
+//!   §14.2). Under `media.srtp.required` an initial INVITE without an SDP
+//!   offer is refused the same way (`delayed_offer`), and with
+//!   `media.srtp.mode = Terminate` but no DTLS identity every new call is
+//!   (`dtls_termination_unavailable`);
+//! - a 183 answer: CANCEL to the callee, 488 to the caller (RFC 3261 §9).
+//!   A reliable 183 carrying the offer is first PRACKed with an answer that
+//!   declines every stream (RFC 3262 §5);
+//! - an initial 2xx answer, or one on which the relay would start no relay
+//!   ([`SipStack::secure_initial_answer`]): ACK + BYE to the callee, 488 to
+//!   the caller, who never sees the 2xx, and no relay is started (RFC 3261
+//!   §13.2.2.4, §15). When that 2xx carried an offer (the INVITE had none),
+//!   the ACK carries an answer that declines every stream (RFC 3264 §6);
 //! - an in-dialog 2xx answer: the dialog is committed, so the answerer is
 //!   ACKed, the originator gets 488 and both legs get a BYE. In an early
 //!   dialog (UPDATE before the 2xx, RFC 3311) there is nothing to BYE: the
@@ -28,6 +34,14 @@
 //! `Content-Encoding` or a non-SDP body that mentions `a=crypto` or
 //! `a=key-mgmt` (`unpoliced_body`). INVITE, re-INVITE, UPDATE, 18x and 2xx bodies are
 //! policed whole, whatever their `Content-Type`.
+//!
+//! Emergency calls (47 CFR 9.16) are exempt from `media.srtp.required`
+//! and, under `media.srtp.mode = Terminate` without a DTLS identity, are
+//! relayed opaquely instead of refused. Either bypass is audited once the
+//! call is routed, as a granted `media_security:emergency_cleartext`
+//! decision; the fingerprint and SDES rules still apply. Under
+//! `media.srtp.required` the no-route announcement (cleartext RTP) is
+//! replaced by a 480.
 //!
 //! Each refusal is audited as a denied `AuthorizationDecision` with policy
 //! `media_security:<label>`. No log line, audit record or `Warning` carries
@@ -41,9 +55,10 @@
 // an offer the policy rewrote is visible only in a debug log line.
 
 use super::{
-    CallAddresses, PendingReinvite, PendingRelay, ProcessResult, ReleasedCalls, SipStack, audit,
-    audit_call_terminated, build_a_leg_response, build_b_leg_cancel, create_response_from_request,
-    extract_param, lock_leaf,
+    B_LEG_INVITE_CSEQ, CallAddresses, PendingReinvite, PendingRelay, ProcessResult, ReleasedCalls,
+    SipStack, audit, audit_call_terminated, build_a_leg_response, build_b_leg_cancel,
+    create_response_from_request, ext_header_value, extract_param, is_sip_token, lists_option,
+    lock_leaf, parse_rseq, relayable_header_value, with_tag,
 };
 use crate::flow::Flow;
 use proto_b2bua::CallId;
@@ -54,8 +69,114 @@ use proto_b2bua::media_policy::{
 use proto_sip::message::{SipRequest, SipResponse};
 use proto_sip::{HeaderName, Headers, Method, SipMessage, StatusCode};
 use std::borrow::Cow;
-use tracing::{debug, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{debug, error, info, warn};
 use uc_types::address::{SbcSocketAddr, TransportType as AddrTransport};
+
+/// `[media.srtp]` as the SIP stack enforces it.
+///
+/// ## NIST 800-53 Rev5: SC-8, CM-6
+#[derive(Debug)]
+pub(super) struct SrtpPolicy {
+    /// `media.srtp.required`. Default `true` (fail closed), as in
+    /// `SrtpConfig`.
+    required: bool,
+    /// `media.srtp.mode = Terminate` was configured. Terminate also applies
+    /// whenever a DTLS identity is attached (only done for Terminate).
+    terminate: bool,
+    /// The "Terminate without a DTLS identity" error was logged.
+    unavailable_logged: AtomicBool,
+}
+
+impl Default for SrtpPolicy {
+    fn default() -> Self {
+        Self {
+            required: true,
+            terminate: false,
+            unavailable_logged: AtomicBool::new(false),
+        }
+    }
+}
+
+impl SrtpPolicy {
+    /// Takes `required` and `mode` from the configuration. `profile` has a
+    /// single value (`AEAD_AES_256_GCM`); it constrains SDES lines only, as
+    /// DTLS-SRTP endpoints negotiate `use_srtp` between themselves.
+    pub(super) fn configure(&mut self, srtp: &sbc_config::schema::SrtpConfig) {
+        self.required = srtp.required;
+        self.terminate = srtp.mode == sbc_config::schema::SrtpMode::Terminate;
+    }
+}
+
+/// What the initial INVITE carries as an offer.
+enum InitialOffer<'a> {
+    /// An `application/sdp` body (or a body without `Content-Type`).
+    Sdp(&'a [u8]),
+    /// A `multipart/*` body with an SDP part ([`multipart_carries_sdp`]):
+    /// policed whole once routed ([`SipStack::secure_initial_offer`]).
+    Multipart(&'a [u8]),
+    /// No body, or a body of another type, `multipart/*` without an SDP
+    /// part included: no offer (RFC 3261 §13.2.1, RFC 5621 §3).
+    None,
+}
+
+impl<'a> InitialOffer<'a> {
+    fn of(req: &'a SipRequest) -> Self {
+        let Some(body) = req.body.as_deref().filter(|b| !b.is_empty()) else {
+            return Self::None;
+        };
+        match req.headers.get_value(&HeaderName::ContentType) {
+            None => Self::Sdp(body),
+            Some(ct) if super::is_sdp_content_type(ct) => Self::Sdp(body),
+            Some(ct) if multipart_carries_sdp(ct, body) => Self::Multipart(body),
+            Some(_) => Self::None,
+        }
+    }
+
+    const fn body(&self) -> Option<&'a [u8]> {
+        match *self {
+            Self::Sdp(b) | Self::Multipart(b) => Some(b),
+            Self::None => None,
+        }
+    }
+}
+
+/// The initial INVITE's body when it is an offer ([`InitialOffer`]), the
+/// only body the B-leg INVITE may carry as `application/sdp`. Any other
+/// body is not relayed, so it is never relabelled as SDP.
+///
+/// ## NIST 800-53 Rev5: SI-10
+///
+/// ## RFC 3261 §13.2.1; RFC 3264 §5
+pub(super) fn initial_offer_body(req: &SipRequest) -> Option<&[u8]> {
+    InitialOffer::of(req).body()
+}
+
+/// How the media relay of a call starts at 200-OK time
+/// ([`SipStack::relay_plan`]).
+pub(super) enum RelayPlan {
+    /// Terminate DTLS-SRTP on both legs: the A-leg's, then the B-leg's
+    /// peer fingerprint and the SBC's DTLS role.
+    Terminate(
+        sbc_media_core::media_pipeline::LegDtlsParams,
+        sbc_media_core::media_pipeline::LegDtlsParams,
+    ),
+    /// Forward RTP/SRTP opaquely.
+    Opaque,
+    /// Start no relay: a leg is not keyed as the policy requires.
+    Refuse(MediaPolicyViolation),
+}
+
+/// Names the plan only: no fingerprint reaches a log line (SI-11).
+impl std::fmt::Debug for RelayPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Terminate(..) => f.write_str("Terminate(..)"),
+            Self::Opaque => f.write_str("Opaque"),
+            Self::Refuse(v) => write!(f, "Refuse({v:?})"),
+        }
+    }
+}
 
 /// Signalling confidentiality of the hop an SDP arrives on (`from`) and
 /// the hop it is sent on (`to`). Only TLS counts (RFC 4568 §8.3).
@@ -107,6 +228,7 @@ pub(super) fn check<'b>(
             ?role,
             stripped_crypto = secured.stripped_crypto,
             stripped_key_mgmt = secured.stripped_key_mgmt,
+            stripped_fingerprints = secured.stripped_fingerprints,
             "SDP keying lines stripped by media security policy"
         );
     }
@@ -265,36 +387,295 @@ impl ReleasedCalls {
 }
 
 impl SipStack {
-    /// The configured keying mode: terminate when the SBC holds a DTLS
-    /// identity (`media.srtp.mode = terminate`), else passthrough.
+    /// The configured policy: terminate when `media.srtp.mode = Terminate`
+    /// or the SBC holds a DTLS identity, else passthrough; SRTP required per
+    /// `media.srtp.required`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, CM-6
     pub(super) fn media_security_policy(&self) -> MediaSecurityPolicy {
+        self.policy_for(false)
+    }
+
+    /// The policy for one call. An emergency call (47 CFR 9.16) is exempt
+    /// from `media.srtp.required`, and is relayed opaquely when
+    /// `media.srtp.mode = Terminate` has no DTLS identity to terminate with;
+    /// the DTLS fingerprint and SDES rules still apply to it.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, CM-6
+    pub(super) fn policy_for(&self, emergency: bool) -> MediaSecurityPolicy {
         MediaSecurityPolicy {
-            mode: if self.dtls_fingerprint_source.is_some() {
+            mode: if (self.media_srtp.terminate && !emergency)
+                || self.dtls_fingerprint_source.is_some()
+            {
                 KeyingMode::Terminate
             } else {
                 KeyingMode::Passthrough
             },
+            require_srtp: self.media_srtp.required && !emergency,
         }
+    }
+
+    /// The policy for an established or ringing call.
+    pub(super) fn call_policy(&self, addrs: &CallAddresses) -> MediaSecurityPolicy {
+        self.policy_for(addrs.emergency)
+    }
+
+    /// `media.srtp.mode = Terminate` with no DTLS identity to terminate with
+    /// (the remote media plane reported no fingerprint): no call could be
+    /// keyed as configured, so new calls are refused (fail closed). Logged
+    /// at error level once.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-24, CM-6
+    fn termination_unavailable(&self) -> bool {
+        let unavailable = self.terminate_without_identity();
+        if unavailable
+            && !self
+                .media_srtp
+                .unavailable_logged
+                .swap(true, Ordering::Relaxed)
+        {
+            error!(
+                "media.srtp.mode = Terminate but no DTLS-SRTP identity is attached; refusing new calls"
+            );
+        }
+        unavailable
+    }
+
+    /// `media.srtp.mode = Terminate` and no DTLS identity attached.
+    fn terminate_without_identity(&self) -> bool {
+        self.media_srtp.terminate && self.dtls_fingerprint_source.is_none()
+    }
+
+    /// Why the configured policy would have refused an emergency call that
+    /// its exemption admitted, or `None`: Terminate without a DTLS identity
+    /// (the call is relayed opaquely), a delayed offer under
+    /// `media.srtp.required`, or an offer that is not keyed as
+    /// `media.srtp.required` needs toward the routed B-leg (`legs`).
+    fn emergency_bypass(
+        &self,
+        req: &SipRequest,
+        legs: &LegContext,
+    ) -> Option<MediaPolicyViolation> {
+        if self.terminate_without_identity() {
+            return Some(MediaPolicyViolation::TerminationUnavailable);
+        }
+        if !self.media_srtp.required {
+            return None;
+        }
+        let Some(body) = InitialOffer::of(req).body() else {
+            return Some(MediaPolicyViolation::DelayedOffer);
+        };
+        check(body, SdpRole::Offer, &self.policy_for(false), legs).err()
+    }
+
+    /// Checks the initial INVITE's offer before routing for the rules that
+    /// do not depend on the B-leg, so no slot or port is taken for a call
+    /// they refuse:
+    ///
+    /// - `media.srtp.mode = Terminate` without a DTLS identity
+    ///   (`dtls_termination_unavailable`);
+    /// - under `media.srtp.required`, an INVITE without an SDP offer
+    ///   (`delayed_offer`): a body that is neither `application/sdp` nor
+    ///   `multipart/*` with an SDP part is no offer either;
+    /// - cleartext media under `media.srtp.required` and the DTLS
+    ///   fingerprint rule, on an `application/sdp` body (or one without
+    ///   `Content-Type`); a body that is not UTF-8 is malformed. A
+    ///   `multipart/*` body with an SDP part is policed whole by
+    ///   [`Self::secure_initial_offer`] once routed.
+    ///
+    /// Both hops are taken as confidential, so a refusal here holds
+    /// whatever B-leg the call would take. The SDES rules are reported by
+    /// [`Self::secure_initial_offer`] once the B-leg is known (their
+    /// `Warning` depends on its transport).
+    ///
+    /// An emergency call is exempt from `media.srtp.required` and from the
+    /// Terminate-without-identity refusal (it is relayed opaquely); the
+    /// fingerprint rule still applies. The exemption is audited by
+    /// [`Self::secure_initial_offer`] once the call is routed.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-13, CM-6; 47 CFR 9.16
+    // POAM: POA&M-351 - a delayed offer is not supported under
+    // media.srtp.required (the answer in the caller's ACK is not policed);
+    // with required = false the ACK answer still crosses unchecked.
+    pub(super) fn precheck_initial_offer(
+        &self,
+        req: &SipRequest,
+        emergency: bool,
+    ) -> Result<(), MediaPolicyViolation> {
+        // Evaluated (and logged once) for emergency calls too.
+        if self.termination_unavailable() && !emergency {
+            return Err(MediaPolicyViolation::TerminationUnavailable);
+        }
+        let required = self.media_srtp.required && !emergency;
+        let body = match InitialOffer::of(req) {
+            InitialOffer::Sdp(body) => body,
+            InitialOffer::Multipart(_) => return Ok(()),
+            InitialOffer::None if required => return Err(MediaPolicyViolation::DelayedOffer),
+            InitialOffer::None => return Ok(()),
+        };
+        let sdp = std::str::from_utf8(body).map_err(|_| MediaPolicyViolation::MalformedSdp)?;
+        let any_tls = LegContext {
+            from_confidential: true,
+            to_confidential: true,
+        };
+        let policy = MediaSecurityPolicy {
+            require_srtp: required,
+            ..self.policy_for(emergency)
+        };
+        match apply_media_security(sdp, SdpRole::Offer, &policy, &any_tls) {
+            Err(
+                v @ (MediaPolicyViolation::CleartextMedia { .. }
+                | MediaPolicyViolation::UnsupportedProtocol { .. }
+                | MediaPolicyViolation::FingerprintMissing { .. }
+                | MediaPolicyViolation::FingerprintHashNotAllowed { .. }),
+            ) => Err(v),
+            _ => Ok(()),
+        }
+    }
+
+    /// A call nothing routes would get the no-route announcement, which
+    /// answers with cleartext `RTP/AVP` whatever the offer was. Under
+    /// `media.srtp.required` (emergency calls excepted) the caller gets 480
+    /// instead, the final response the announcement path falls back to.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, CM-6
+    pub(super) async fn no_route_response(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+        transport: AddrTransport,
+        emergency: bool,
+        announcement: crate::announcement::AnnouncementType,
+    ) -> ProcessResult {
+        if self.policy_for(emergency).require_srtp {
+            info!(
+                call_id = req.headers.call_id().unwrap_or(""),
+                "No route; announcement skipped (cleartext media, SRTP required), 480"
+            );
+            let unavailable =
+                create_response_from_request(req, StatusCode::TEMPORARILY_UNAVAILABLE);
+            return ProcessResult::Response {
+                message: SipMessage::Response(unavailable),
+                destination: source,
+                flow: Flow::Reply,
+            };
+        }
+        self.play_announcement_to_caller(req, source, transport, announcement)
+            .await
     }
 
     /// Checks the callee's SDP in a 18x/2xx to the initial INVITE, from the
     /// B-leg to the A-leg. Returns the body to relay when the policy
-    /// rewrote it (`None`: relay as received).
+    /// rewrote it (`None`: relay as received). An answer of an audio call
+    /// may not put an active `m=image` where the offer had another stream
+    /// ([`Self::check_answer_media_types`]).
     pub(super) fn secure_initial_response(
         &self,
         body: &[u8],
         addrs: &CallAddresses,
     ) -> Result<Option<String>, MediaPolicyViolation> {
+        let role = initial_response_role(addrs);
         let secured = check(
             body,
-            initial_response_role(addrs),
-            &self.media_security_policy(),
+            role,
+            &self.call_policy(addrs),
             &legs_for(addrs, false),
         )?;
+        if role == SdpRole::Answer {
+            self.check_answer_media_types(&secured.sdp, addrs)?;
+        }
         Ok(match secured.sdp {
             Cow::Owned(s) => Some(s),
             Cow::Borrowed(_) => None,
         })
+    }
+
+    /// Checks the callee's 2xx to the initial INVITE before the A-leg 2xx
+    /// is built: the policy ([`Self::secure_initial_response`]), then the
+    /// relay plan the 2xx would start ([`SipStack::relay_plan`]). A plan
+    /// that starts no relay refuses the answer here, so a call is never
+    /// answered without media. Returns the body to relay when rewritten.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-24 (fail closed)
+    pub(super) fn secure_initial_answer(
+        &self,
+        body: Option<&[u8]>,
+        addrs: &CallAddresses,
+    ) -> Result<Option<String>, MediaPolicyViolation> {
+        let Some(body) = body.filter(|b| !b.is_empty()) else {
+            return Ok(None);
+        };
+        let secured = self.secure_initial_response(body, addrs)?;
+        // The same condition under which `anchor_answer_relay` calls
+        // `start_media_relay`.
+        if self.media_pipeline.is_some()
+            && addrs.media_a_leg_port.is_some()
+            && addrs.initial_offer_kind == crate::t38::CallMediaKind::Audio
+        {
+            let sdp = secured
+                .as_deref()
+                .map_or_else(|| String::from_utf8_lossy(body), Cow::Borrowed);
+            if let RelayPlan::Refuse(v) = Self::relay_plan(
+                &self.call_policy(addrs),
+                self.dtls_fingerprint_source.is_some(),
+                addrs.dtls_caller_fingerprint.as_ref(),
+                addrs.dtls_caller_setup,
+                &sdp,
+            ) {
+                return Err(v);
+            }
+        }
+        Ok(secured)
+    }
+
+    /// RFC 3264 §6: an answer's m-line `i` has the offer's media type. On an
+    /// audio call, an active `m=image` where the offer (as sent to the
+    /// callee) had another stream is refused unless it is `udptl` and the
+    /// T.38 rules accept it (`media.t38.enabled`, not a DTLS-terminated
+    /// call, `check_answer`). Anything else would let an image stream cross
+    /// where the policy checked audio.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SI-10
+    fn check_answer_media_types(
+        &self,
+        answer: &str,
+        addrs: &CallAddresses,
+    ) -> Result<(), MediaPolicyViolation> {
+        if addrs.initial_offer_kind != crate::t38::CallMediaKind::Audio {
+            return Ok(());
+        }
+        let offer = addrs
+            .b_leg_last_sdp
+            .as_deref()
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("");
+        let offered_image: Vec<bool> = mlines(offer)
+            .map(|(media, _, _)| media.eq_ignore_ascii_case("image"))
+            .collect();
+        for (index, (media, active, proto)) in mlines(answer).enumerate() {
+            if !active
+                || !media.eq_ignore_ascii_case("image")
+                || offered_image.get(index).copied().unwrap_or(false)
+            {
+                continue;
+            }
+            let t38_accepted = proto.eq_ignore_ascii_case("udptl")
+                && self.t38.enabled
+                && self.call_policy(addrs).mode != KeyingMode::Terminate
+                && matches!(
+                    crate::t38::check_answer(
+                        answer,
+                        index,
+                        crate::t38::CallMediaKind::Image,
+                        &self.t38
+                    ),
+                    crate::t38::AnswerCheck::Accepted(_)
+                );
+            if !t38_accepted {
+                return Err(MediaPolicyViolation::UnsupportedProtocol { index });
+            }
+        }
+        Ok(())
     }
 
     /// Checks an in-dialog offer (re-INVITE, UPDATE) from one leg to the
@@ -321,7 +702,7 @@ impl SipStack {
         check(
             body,
             role,
-            &self.media_security_policy(),
+            &self.call_policy(addrs),
             &legs_for(addrs, from_a_leg),
         )
         .map(|s| s.sdp)
@@ -339,28 +720,37 @@ impl SipStack {
         check(
             body,
             SdpRole::Answer,
-            &self.media_security_policy(),
+            &self.call_policy(addrs),
             &legs_for(addrs, !originator_from_a_leg),
         )
         .map(|s| s.sdp)
     }
 
-    /// Checks the initial INVITE's offer toward the routed B-leg (`legs`).
+    /// Checks the initial INVITE's offer ([`initial_offer_body`]) toward
+    /// the routed B-leg (`legs`) under the call's policy
+    /// ([`Self::policy_for`]). A `multipart/*` offer is policed whole.
     /// Returns the body to forward when the policy rewrote it (`None`:
     /// forward as received) and whether an SDES key crosses. The T.38
     /// classification's copy of the offer gets the same rewrite.
     ///
-    /// ## NIST 800-53 Rev5: SC-8, SC-12, SC-13, CM-6
+    /// An emergency call admitted only by its exemption is audited here,
+    /// once the SDES and fingerprint rules have passed
+    /// ([`Self::audit_emergency_exemption`]).
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-12, SC-13, CM-6, AU-2; 47 CFR 9.16
     pub(super) fn secure_initial_offer(
         &self,
-        body: Option<&[u8]>,
+        req: &SipRequest,
+        source: SbcSocketAddr,
         legs: &LegContext,
         t38: Option<&mut crate::t38::Classified>,
+        emergency: bool,
     ) -> Result<(Option<String>, bool), MediaPolicyViolation> {
-        let Some(body) = body.filter(|b| !b.is_empty()) else {
+        let Some(body) = initial_offer_body(req) else {
+            self.audit_emergency_exemption(req, source, legs, emergency);
             return Ok((None, false));
         };
-        let policy = self.media_security_policy();
+        let policy = self.policy_for(emergency);
         let secured = check(body, SdpRole::Offer, &policy, legs)?;
         let sdes_crossed = secured.keying == LegKeying::Sdes;
         if let Some(c) = t38 {
@@ -376,7 +766,26 @@ impl SipStack {
             Cow::Owned(s) => Some(s),
             Cow::Borrowed(_) => None,
         };
+        self.audit_emergency_exemption(req, source, legs, emergency);
         Ok((rewritten, sdes_crossed))
+    }
+
+    /// For an emergency call the configured policy would have refused
+    /// ([`Self::emergency_bypass`]): a warning log and a granted
+    /// `media_security:emergency_cleartext` decision. Called once per call,
+    /// after the call is routed and its offer passed the remaining rules.
+    ///
+    /// ## NIST 800-53 Rev5: AU-2, AU-3, SC-8; 47 CFR 9.16
+    fn audit_emergency_exemption(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+        legs: &LegContext,
+        emergency: bool,
+    ) {
+        if emergency && let Some(why) = self.emergency_bypass(req, legs) {
+            audit_emergency_cleartext(req, source, why);
+        }
     }
 
     /// Refuses an in-dialog offer (re-INVITE, UPDATE, PRACK or another
@@ -487,17 +896,48 @@ impl SipStack {
     /// response: CANCEL toward the callee (RFC 3261 §9) and 488 with a
     /// `Warning` on the caller's INVITE. The early answer is not relayed.
     /// A 2xx that crosses the CANCEL is ACKed and BYEd by the released-call
-    /// path.
+    /// path. A reliable 18x carrying the offer of a call whose INVITE had
+    /// none is first PRACKed with an answer declining every stream
+    /// (RFC 3262 §5, RFC 3264 §6). The PRACK's CSeq is reserved on the
+    /// live record before the call is released, so the BYE for a 2xx that
+    /// crosses the CANCEL takes a higher one (RFC 3261 §12.2.1.1).
     ///
     /// ## NIST 800-53 Rev5: SC-8, SC-12, SC-24, AU-2
     pub(super) async fn refuse_insecure_early_answer(
         &self,
+        resp: &SipResponse,
         internal_id: &CallId,
         addrs: &CallAddresses,
         violation: MediaPolicyViolation,
     ) -> ProcessResult {
-        self.end_early_dialog(internal_id, addrs, violation, true)
-            .await
+        let mut prack = (initial_response_role(addrs) == SdpRole::Offer)
+            .then(|| declined_offer_prack(resp, addrs))
+            .flatten();
+        if prack.is_some() {
+            // A call already gone has no early dialog left to PRACK.
+            match self.reserve_leg_cseq(internal_id, true).await {
+                Some(n) => {
+                    if let Some(p) = prack.as_mut() {
+                        p.headers.set(HeaderName::CSeq, format!("{n} PRACK"));
+                    }
+                }
+                None => prack = None,
+            }
+        }
+        let ended = self
+            .end_early_dialog(internal_id, addrs, violation, true)
+            .await;
+        match prack {
+            Some(prack) => ProcessResult::Multiple(vec![
+                ProcessResult::Forward {
+                    message: SipMessage::Request(prack),
+                    destination: addrs.b_leg_destination,
+                    flow: addrs.b_leg_flow.clone().into(),
+                },
+                ended,
+            ]),
+            None => ended,
+        }
     }
 
     /// CANCEL toward the callee and 488 on the caller's INVITE for an
@@ -690,6 +1130,99 @@ impl SipStack {
             call.fail(status.code(), status.reason_phrase());
         }
     }
+}
+
+/// `AuthorizationDecision` (granted) for an emergency call admitted past
+/// `media.srtp.required` (a cleartext or delayed offer) or relayed opaquely
+/// for want of a DTLS identity under `media.srtp.mode = Terminate`, with a
+/// warning log, so every bypass is on the audit trail with its source.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-3, SC-8; 47 CFR 9.16
+fn audit_emergency_cleartext(req: &SipRequest, source: SbcSocketAddr, why: MediaPolicyViolation) {
+    warn!(
+        call_id = req.headers.call_id().unwrap_or(""),
+        reason = why.as_str(),
+        "Emergency call admitted past the media security policy (SRTP not enforced)"
+    );
+    audit(uc_audit::AuditEvent::AuthorizationDecision(
+        uc_audit::event::AuthorizationDecision {
+            identity: req
+                .headers
+                .get_value(&HeaderName::From)
+                .map_or_else(|| source.to_string(), super::extract_uri_from_header),
+            resource: req.uri.to_string(),
+            action: "INVITE".to_string(),
+            granted: true,
+            policy: "media_security:emergency_cleartext".to_string(),
+            source_ip: Some(source.ip()),
+        },
+    ));
+}
+
+/// The m-lines of `sdp` as `(media, active, proto)`, tokenized as the
+/// policy does (trimmed, `m=` case-insensitive). A line that does not
+/// parse is reported inactive with an empty protocol.
+fn mlines(sdp: &str) -> impl Iterator<Item = (&str, bool, &str)> {
+    sdp.lines().filter_map(|line| {
+        let line = line.trim();
+        let rest = line
+            .get(..2)
+            .filter(|p| p.eq_ignore_ascii_case("m="))
+            .and_then(|_| line.get(2..))?;
+        let mut fields = rest.split_ascii_whitespace();
+        let media = fields.next().unwrap_or("");
+        let port = fields.next().unwrap_or("0");
+        let port = port.split_once('/').map_or(port, |(p, _)| p);
+        let active = port.parse::<u16>().is_ok_and(|p| p != 0);
+        Some((media, active, fields.next().unwrap_or("")))
+    })
+}
+
+/// The PRACK for a refused reliable 18x that carried an offer: in that
+/// fork's early dialog, acknowledging its `RSeq`, carrying an answer that
+/// declines every offered stream with the SBC's B-leg media address
+/// (RFC 3262 §5, §7.2; RFC 3264 §6). `None` when the 18x is not reliable,
+/// its To-tag is not relayable, or the offer cannot be read; the CANCEL
+/// still ends the early dialog. The caller sets the CSeq it reserved.
+///
+/// Addressed like a relayed PRACK: Request-URI and destination are the
+/// B-leg's stored next hop, without the fork's Contact or Record-Route,
+/// which the SBC does not keep per early dialog.
+// POAM: POA&M-54 - PRACKs (relayed or SBC-built) do not use the early
+// dialog's remote target and route set (RFC 3261 §12.1.2, RFC-007).
+fn declined_offer_prack(resp: &SipResponse, addrs: &CallAddresses) -> Option<SipRequest> {
+    if !lists_option(&resp.headers, &HeaderName::Require, "100rel") {
+        return None;
+    }
+    let rseq = ext_header_value(&resp.headers, "RSeq").and_then(parse_rseq)?;
+    let tag = resp
+        .headers
+        .to_tag()
+        .filter(|t| is_sip_token(t) && relayable_header_value("tag", t))?;
+    let offer = resp
+        .body
+        .as_deref()
+        .and_then(|b| std::str::from_utf8(b).ok())?;
+    let ip = addrs.media_b_leg_ip.parse::<std::net::IpAddr>().ok()?;
+    let answer = proto_b2bua::media_policy::declined_answer(offer, ip)?;
+    let mut prack = SipStack::build_leg_in_dialog_request(
+        addrs,
+        true,
+        &Method::Prack,
+        addrs.b_leg_local_cseq,
+        Some(answer.as_bytes()),
+    );
+    // RFC 3262 §7.2: no Contact; the RAck names the B-leg INVITE.
+    prack.headers.remove(&HeaderName::Contact);
+    prack.headers.set(
+        HeaderName::Custom("RAck".to_string()),
+        format!("{rseq} {B_LEG_INVITE_CSEQ} INVITE"),
+    );
+    prack.headers.set(
+        HeaderName::To,
+        with_tag(&addrs.b_leg_to, Some(tag.as_str())),
+    );
+    Some(prack)
 }
 
 /// Puts on `ack` an answer that declines every stream of the offer in the

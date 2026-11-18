@@ -865,16 +865,26 @@ async fn update_sip_settings(
         }
     }
 
+    #[cfg(feature = "digest-auth")]
+    let has_digest_password = account
+        .digest_credentials
+        .as_ref()
+        .is_some_and(|c| !c.password.is_empty());
+
     manager.set_account(account);
     manager.set_default_account(Some("default".to_string()));
 
     // Persist digest credentials to secure storage (keychain)
     #[cfg(feature = "digest-auth")]
     {
-        if let Err(e) = manager.persist_account_passwords() {
-            warn!("Failed to persist passwords to secure storage: {e}");
-        } else {
-            info!("Digest credentials persisted to secure storage");
+        match manager.persist_account_passwords() {
+            Err(e) => warn!("Failed to persist passwords to secure storage: {e}"),
+            Ok(n) if n > 0 => info!("Digest credentials persisted to secure storage"),
+            // POAM: POA&M-372 -- no platform keyring: password kept in memory only.
+            Ok(_) if has_digest_password => {
+                warn!("Digest password not persisted: no platform keyring (POA&M-372)");
+            }
+            Ok(_) => {}
         }
     }
 

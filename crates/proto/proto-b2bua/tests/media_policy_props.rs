@@ -113,6 +113,7 @@ fn context() -> impl Strategy<Value = (SdpRole, MediaSecurityPolicy, LegContext)
                     } else {
                         KeyingMode::Passthrough
                     },
+                    require_srtp: false,
                 },
                 LegContext {
                     from_confidential: from,

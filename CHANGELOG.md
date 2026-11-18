@@ -31,6 +31,47 @@ Tested locally on macOS arm64; Windows covered by the CI cross-target build only
   The trust scope uses a built-in suffix list, not the full Public Suffix
   List (POA&M-370).
 
+### BREAKING (SBC, `media.srtp.required` enforced on call legs; sha-384/512 DTLS fingerprints only, POA&M-351, 352, 353)
+
+Affects every SBC: `media.srtp.required` defaults to `true`. Tested in local
+runs on macOS (2026-11-17). Operator details: `docs/SBC-ADMIN-GUIDE.md`
+"Required SRTP on call legs".
+
+- **Cleartext media is refused on call legs.** (SC-8, SC-8(1), CM-6)
+  Before, `media.srtp.required` was not read for call-leg SDP. Now every
+  active m-line other than `m=image ... udptl` must be DTLS-SRTP or, in
+  `Passthrough`, SDES `AEAD_AES_256_GCM`. `RTP/AVP(F)` gets 488
+  `Warning: 302 <host> "SRTP is required"`; `UDP`, `TCP`,
+  `TCP/TLS/RTP/AVP(F)`, BFCP, MSRP and unknown protocols get 488
+  `Warning: 302 <host> "Media transport protocol not supported"`. A
+  cleartext answer ends the call. One failing m-line refuses the whole body
+  (POA&M-353). Set `required = false` to keep cleartext RTP.
+- **Delayed offer is refused under `required`.** An INVITE without an SDP
+  offer gets 488 `Warning: 399 <host> "Delayed offer not supported when SRTP
+  is required"` before routing (POA&M-351). With `required = false` the
+  answer in the caller's ACK is not checked.
+- **Only `sha-384` and `sha-512` DTLS fingerprints cross, also with
+  `required = false`.** (SC-13, SC-23; deviation from RFC 8122 §5) Other
+  `a=fingerprint` lines are stripped; an active DTLS m-line left with none
+  gets 488 `Warning: 306` (or `399` when it had none). `sha-256`-only peers
+  are refused.
+- **No route: 480 instead of the announcement** under `required`, since the
+  announcement answers with cleartext RTP.
+- **`Terminate` without a DTLS identity refuses new calls** with 488
+  `Warning: 399 <host> "DTLS-SRTP termination unavailable"` (SC-24), logged
+  at `error` once. Before, such calls were relayed opaquely.
+- **Emergency calls** (dialled number in `vps.emergency_numbers`) are
+  exempt from `required` and relayed opaquely under `Terminate` without an
+  identity; the fingerprint and SDES rules still apply. Each exemption that
+  changed the outcome is audited once per call as a granted
+  `media_security:emergency_cleartext` decision.
+- **Recording**: `recording.enabled = true` with `required = true` and
+  `mode = "Passthrough"` no longer loads; use `mode = "Terminate"` or
+  `required = false`.
+- **`[media.srtp]` is restart-required** on reload.
+- Signalling only: the media relay and `sbc-media` (`SBC_MEDIA_SRTP_REQUIRED`)
+  do not refuse cleartext packets (POA&M-352).
+
 ### BREAKING (SBC, call-leg SDES keys only over TLS and only AEAD_AES_256_GCM, POA&M-347, 348, 349, 350)
 
 Affects every SBC. There is no setting to turn it off. Tested in local runs
@@ -63,10 +104,9 @@ on macOS (2026-11-17). Operator details: `docs/SBC-ADMIN-GUIDE.md`
   DTLS keying.
 - **Audit**: each refusal is a denied `AuthorizationDecision` with policy
   `media_security:<label>`; not aggregated and no metrics (POA&M-347).
-- Not changed: cleartext `RTP/AVP` is still relayed; `media.srtp.required`
-  is not enforced on call-leg SDP. Pre-existing, now recorded: a 2xx that
-  carries an offer is ACKed without an answer on the normal path
-  (POA&M-349).
+- Pre-existing, now recorded: a 2xx that carries an offer is ACKed without
+  an answer on the normal path (POA&M-349). `media.srtp.required` is now
+  enforced; see the entry above.
 - Docs: `docs/SBC-ADMIN-GUIDE.md` example used `media.srtp.mode = "Relay"`,
   which does not load; valid values are `"Passthrough"` and `"Terminate"`.
 
@@ -386,6 +426,42 @@ release") and `deploy/keycloak/central-config-clients.md`.
 - **Dependabot now watches every Dockerfile, the Go modules of both
   sidecars and the dashboard's npm tree.** GitHub Actions updates are
   grouped into one weekly PR.
+
+### Security (soft client, credential storage, POA&M-372, 373)
+
+Tested locally on macOS arm64 only. Android and iOS were not built for
+this change; no CI run yet.
+
+- **Soft client: secrets are stored only in the platform keyring.**
+  (IA-5(1), IA-5(6), SC-28) Digest passwords go to macOS Keychain, Windows
+  Credential Manager or the Linux Secret Service; the OIDC refresh-token API
+  is keystore-only too, but the desktop client does not persist refresh
+  tokens at all.
+  The `credentials.enc` fallback is removed: its AES-256-GCM key was
+  derived from the hostname, user name and config path, so anyone who
+  could read the file could decrypt it. Every Android and iOS build, and
+  any desktop without a usable keyring, used it. Those builds now persist
+  nothing: the secret stays in memory and the user signs in again after a
+  restart (POA&M-372). A leftover `credentials.enc` or
+  `credentials.enc.tmp` is deleted when the credential store starts and is
+  never read. The desktop client no longer logs that digest credentials
+  were persisted when they were not, and a stale "persisted" flag from an
+  older build is cleared on load. If the keyring check failed at start,
+  signing out still deletes the refresh-token keyring entry directly on
+  desktop (as does the `delete_digest_password` API), and an error is
+  logged if that fails.
+- **Action required: rotate exposed secrets.** Deleting the file does not
+  remove copies in backups or freed storage, and those copies remain
+  decryptable. Treat every digest password and OIDC refresh token stored
+  by a mobile or keyring-less desktop build before this change as exposed:
+  change those SIP passwords and revoke those refresh tokens at the IdP.
+- **Correction:** the statements that `uc-crypto::hkdf::hkdf_sha384` is
+  library-only with no shipped caller (`docs/CNSA-2-COMPLIANCE.md`, NIST
+  SC-12) were wrong for `oidc` and `digest-auth` client builds before this
+  change, which used it for the fallback key. They are correct now.
+- **Linux keyring transport is not CNSA** (POA&M-373): the Secret Service
+  D-Bus transfer uses DH-1024 and AES-128-CBC. It is local IPC; at-rest
+  protection is the keyring daemon's.
 
 ### BREAKING (SBC, DTLS-SRTP sidecar keeps the association for the whole call, POA&M-335, 340, 341, 342)
 

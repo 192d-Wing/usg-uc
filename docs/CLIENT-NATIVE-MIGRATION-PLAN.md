@@ -107,7 +107,7 @@ The existing I/O-thread/decode-thread model is kept everywhere; on iOS/Android t
 - **macOS:** existing Keychain + PKCS#11/YubiKey (unchanged).
 - **iOS:** Keychain / Secure Enclave via Security.framework, surfaced through `PlatformServices`. For CAC/PIV, mobile has no reader — plan for **derived credentials** (DoD Purebred-style: cert + key provisioned into the Keychain/KeyStore) as the mTLS identity source.
 - **Android:** Android KeyStore via `KeyChain.choosePrivateKeyAlias` / hardware-backed keys, same derived-credential model.
-- `keyring` (digest-auth credential storage) has no mobile backends → on mobile, route credential storage through `PlatformServices` (iOS Keychain / Android EncryptedSharedPreferences-or-KeyStore).
+- `keyring` (digest-auth credential storage) has no mobile backends → on mobile, route credential storage through `PlatformServices` (iOS Keychain / Android EncryptedSharedPreferences-or-KeyStore). Until then mobile builds persist no digest password or refresh token (SR-47 removed the file fallback, whose key was derivable; NIST POA&M-372).
 
 ### 2.4 Mobile call lifecycle (net-new functionality, biggest non-port work)
 

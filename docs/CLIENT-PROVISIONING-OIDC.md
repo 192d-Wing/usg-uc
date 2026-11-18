@@ -501,10 +501,18 @@ stateDiagram-v2
     Failover --> Discovering: all SRV targets failed
 ```
 
-Persisted across restarts (OS keystore — Keychain on macOS, Android
-Keystore): the service domain, refresh token, and last-known config. On
-launch the client goes straight to `Refreshing` and is registered in one
-round trip — no browser unless the refresh token is dead.
+Persisted across restarts: the service domain and the non-secret session
+slice, in the settings file. Tokens are not persisted: the desktop client
+keeps the access and refresh tokens only in the in-memory session
+(`client-gui-tauri/src/signin.rs`; `refresh_token_persisted` is always
+written `false`), so every launch starts with a browser sign-in, and each
+sign-in deletes any refresh token an earlier build left in the OS keystore.
+`SettingsManager::store_refresh_token` (OS keystore only: macOS Keychain,
+Windows Credential Manager, Linux Secret Service; with no usable keyring it
+returns `Ok(false)` and stores nothing, NIST POA&M-372) has no caller
+today. The last-known config is not persisted. The mobile clients do not
+run OIDC sign-in yet (`client-ffi` has no `oidc` feature). Silent resume
+straight to `Refreshing` on launch is therefore not active.
 
 ## Security Considerations
 
@@ -526,7 +534,9 @@ round trip — no browser unless the refresh token is dead.
 - **No `password` grant.** Direct access grants stay disabled even though
   they would be "easier" — they bypass MFA and train users to type IdP
   passwords into native apps.
-- **Refresh token storage** in the OS keystore, never plaintext config files.
+- **Refresh token storage**: not persisted today (in-memory session only).
+  The keystore-only API (`store_refresh_token`) never writes a config file
+  and, with no keystore, stores nothing (NIST POA&M-372).
 - **Ephemeral digest credentials** are one-time-fetch, short-lived (≤ token
   lifetime), and `no-store`; the SBC's credential table is fed by the
   provisioning service, not a static subscriber database. Digest exchanges
@@ -554,8 +564,8 @@ round trip — no browser unless the refresh token is dead.
 2. **Client sign-in flow** — implemented: Device Authorization Grant
    (RFC 8628) browser sign-in in the Tauri backend
    (`client-gui-tauri/src/signin.rs` — no loopback listener; the app shows
-   the `user_code` and polls the token endpoint), keychain-persisted
-   refresh token, and auto-provisioning via `client-provisioning`
+   the `user_code` and polls the token endpoint), in-memory refresh
+   token (not persisted), and auto-provisioning via `client-provisioning`
    (config → `SipAccount`, `auth_mode = Bearer`). The Authorization Code +
    PKCE helpers remain in `client-provisioning` for the Android
    claimed-App-Link flow.

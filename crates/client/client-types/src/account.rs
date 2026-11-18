@@ -26,8 +26,12 @@ pub struct DigestAuthCredentials {
     #[serde(skip)]
     pub password: zeroize::Zeroizing<String>,
     /// Indicates whether the password is stored in secure credential storage.
-    /// When true, the password can be retrieved from platform keyring or
-    /// encrypted file on application startup.
+    /// Set only after a successful keyring store; when true, the password is
+    /// retrieved from the platform keyring on application startup. It stays
+    /// false where no keyring is available (mobile, or a desktop without a
+    /// usable keyring): the password is then never written to disk. A value
+    /// carried over from an older build is cleared on load when there is no
+    /// keyring or the keyring has no entry for the account.
     #[serde(default)]
     pub password_persisted: bool,
     /// Whether an MD5/MD5-sess digest challenge may be answered when the

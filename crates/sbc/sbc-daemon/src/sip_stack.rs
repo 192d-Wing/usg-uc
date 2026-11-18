@@ -75,6 +75,7 @@ use uc_types::address::TransportType as AddrTransport;
 mod recording_session;
 // Call-leg SDP media security (RFC 4568 §8; SDES keys, CNSA suites).
 mod media_security;
+use media_security::RelayPlan;
 
 // In-dialog and CANCEL matching (RFC 3261 §9.2, §12.2.2): pure helpers.
 mod dialog_match;
@@ -233,6 +234,11 @@ pub struct SipStack {
     ///
     /// ## NIST 800-53 Rev5: CM-6, CM-7, SC-5, SC-8
     t38: sbc_config::T38Config,
+    /// `[media.srtp]` call-leg policy: `required` (default `true`, fail
+    /// closed, as in `SrtpConfig`) and the configured `mode`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, CM-6
+    media_srtp: media_security::SrtpPolicy,
     /// T.38 switchover counters and active-call gauge (SI-4).
     t38_counters: crate::t38::T38Counters,
     /// `[recording]` SIPREC SRC settings; `None` when recording is off (the
@@ -844,6 +850,10 @@ struct ReleasedInvite {
     /// The INVITE's Request-URI (fallback remote target).
     request_uri: SipUri,
     invite_cseq: u32,
+    /// CSeq of a late BYE: above the INVITE's and every number the call
+    /// reserved toward the callee (a PRACK, say) before release
+    /// (RFC 3261 §12.2.1.1).
+    bye_cseq: u32,
     released_at: Instant,
     /// To-tags already sent a BYE (bounded by [`RELEASED_CALL_MAX_TAGS`]).
     answered_tags: Vec<String>,
@@ -875,6 +885,7 @@ impl ReleasedInvite {
             to: addrs.b_leg_to.clone(),
             request_uri,
             invite_cseq,
+            bye_cseq: invite_cseq.saturating_add(1).max(addrs.b_leg_local_cseq),
             released_at: now,
             answered_tags: Vec::new(),
         }
@@ -1232,6 +1243,9 @@ struct CallAddresses {
     ///
     /// ## NIST 800-53 Rev5: AU-14, SC-5, SC-12
     recording: crate::recording::CallRecording,
+    /// Emergency-classified call (47 CFR 9.16): exempt from
+    /// `media.srtp.required` (`media_security`).
+    emergency: bool,
 }
 
 /// Which legs of a call get topology-hidden egress.
@@ -3100,6 +3114,7 @@ impl SipStack {
             trusted_trunk_groups: RwLock::new(HashSet::new()),
             trunk_sync: tokio::sync::Mutex::new(()),
             t38: sbc_config::T38Config::default(),
+            media_srtp: media_security::SrtpPolicy::default(),
             t38_counters: crate::t38::T38Counters::default(),
             recording: None,
             recording_counters: crate::recording::RecordingCounters::default(),
@@ -3187,6 +3202,7 @@ impl SipStack {
             trusted_trunk_groups: RwLock::new(HashSet::new()),
             trunk_sync: tokio::sync::Mutex::new(()),
             t38: sbc_config::T38Config::default(),
+            media_srtp: media_security::SrtpPolicy::default(),
             t38_counters: crate::t38::T38Counters::default(),
             recording: None,
             recording_counters: crate::recording::RecordingCounters::default(),
@@ -3242,6 +3258,17 @@ impl SipStack {
     /// ## NIST 800-53 Rev5: CM-6
     pub fn set_t38_config(&mut self, t38: sbc_config::T38Config) {
         self.t38 = t38;
+    }
+
+    /// Sets the `[media.srtp]` call-leg policy: `required` is enforced on
+    /// every SDP that crosses (`media_security`). `mode = Terminate` needs
+    /// the DTLS identity ([`Self::set_dtls_fingerprint_source`]); without
+    /// one, new calls are refused. `profile` has one value and constrains
+    /// SDES lines only.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, CM-6
+    pub fn set_media_security_policy(&mut self, srtp: &sbc_config::schema::SrtpConfig) {
+        self.media_srtp.configure(srtp);
     }
 
     /// T.38 switchover counters (metrics endpoint).
@@ -3304,42 +3331,76 @@ impl SipStack {
         }
     }
 
-    /// Derives the per-leg DTLS-SRTP terminate params for a call, or `None` to
-    /// relay opaquely. Termination requires the SBC to terminate
-    /// (`has_dtls_identity`) **and both legs to offer DTLS**: the caller's
-    /// fingerprint captured at INVITE, the callee's parsed from its answer.
-    /// Pure so the terminate/opaque decision is unit-testable.
-    fn terminate_params(
+    /// How the media relay for a call starts at 200-OK time. Pure so the
+    /// decision is unit-testable.
+    ///
+    /// - Terminate mode (`policy.mode` with `has_dtls_identity`): both legs
+    ///   need a sha-384 fingerprint, the caller's captured at INVITE and the
+    ///   callee's parsed from its answer. A fingerprint with another hash
+    ///   (or a malformed one) is refused whatever `require_srtp` says. A
+    ///   missing one is refused under `require_srtp`, else the call relays
+    ///   opaquely (SRTP to RTP interworking is not supported).
+    /// - Passthrough: under `require_srtp` a cleartext answer is refused;
+    ///   anything else relays opaquely.
+    ///
+    /// The answer gate refuses these answers before the relay starts, so a
+    /// `Refuse` here is a backstop.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-13, SC-24 (fail closed)
+    fn relay_plan(
+        policy: &proto_b2bua::media_policy::MediaSecurityPolicy,
         has_dtls_identity: bool,
         caller_fingerprint: Option<&String>,
         caller_setup: Option<crate::sdp_dtls::SetupRole>,
         answer_sdp: &str,
-    ) -> Option<(
-        sbc_media_core::media_pipeline::LegDtlsParams,
-        sbc_media_core::media_pipeline::LegDtlsParams,
-    )> {
-        if !has_dtls_identity {
-            return None;
+    ) -> RelayPlan {
+        use proto_b2bua::media_policy::{
+            KeyingMode, LegKeying, MediaPolicyViolation, classify_keying, fingerprint_acceptable,
+        };
+        if policy.mode != KeyingMode::Terminate || !has_dtls_identity {
+            if policy.require_srtp && classify_keying(answer_sdp) == LegKeying::Cleartext {
+                return RelayPlan::Refuse(MediaPolicyViolation::CleartextMedia { index: 0 });
+            }
+            return RelayPlan::Opaque;
         }
-        let caller_fp = caller_fingerprint?;
-        let callee = crate::sdp_dtls::parse_peer_dtls(answer_sdp)?;
-        Some((
-            sbc_media_core::media_pipeline::LegDtlsParams {
-                peer_fingerprint: caller_fp.clone(),
-                role: Self::sbc_dtls_role(caller_setup),
-            },
-            sbc_media_core::media_pipeline::LegDtlsParams {
-                peer_fingerprint: callee.fingerprint,
-                role: Self::sbc_dtls_role(callee.setup),
-            },
-        ))
+        let callee = crate::sdp_dtls::parse_peer_dtls(answer_sdp);
+        // RFC 8122 §5; CNSA 2.0: only sha-384 is terminated.
+        if [
+            caller_fingerprint.map(String::as_str),
+            callee.as_ref().map(|c| c.fingerprint.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|fp| !fingerprint_acceptable(fp))
+        {
+            return RelayPlan::Refuse(MediaPolicyViolation::FingerprintHashNotAllowed { index: 0 });
+        }
+        match (caller_fingerprint, callee) {
+            (Some(a_leg_fp), Some(b_leg)) => RelayPlan::Terminate(
+                sbc_media_core::media_pipeline::LegDtlsParams {
+                    peer_fingerprint: a_leg_fp.clone(),
+                    role: Self::sbc_dtls_role(caller_setup),
+                },
+                sbc_media_core::media_pipeline::LegDtlsParams {
+                    peer_fingerprint: b_leg.fingerprint,
+                    role: Self::sbc_dtls_role(b_leg.setup),
+                },
+            ),
+            _ if policy.require_srtp => {
+                RelayPlan::Refuse(MediaPolicyViolation::FingerprintMissing { index: 0 })
+            }
+            _ => RelayPlan::Opaque,
+        }
     }
 
-    /// Starts the media relay for a call at 200-OK time: DTLS-SRTP termination
-    /// when [`Self::terminate_params`] applies, else the opaque forwarding relay
-    /// (plain RTP or SRTP pass-through). Errors are logged, not propagated —
-    /// media failure must not fail call setup. Returns true when the relay
+    /// Starts the media relay for a call at 200-OK time per
+    /// [`Self::relay_plan`]: DTLS-SRTP termination, the opaque forwarding
+    /// relay (plain RTP or SRTP pass-through), or no relay at all for a leg
+    /// the policy refuses. Relay errors are logged, not propagated — media
+    /// failure must not fail call setup. Returns true when the relay
     /// terminates DTLS-SRTP (UDPTL is then refused on this call).
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-24
     async fn start_media_relay(
         &self,
         pipeline: &dyn sbc_media_core::media_pipeline::MediaController,
@@ -3347,33 +3408,49 @@ impl SipStack {
         addrs: &CallAddresses,
         answer_sdp: &str,
     ) -> bool {
-        let params = Self::terminate_params(
+        let plan = Self::relay_plan(
+            &self.call_policy(addrs),
             self.dtls_fingerprint_source.is_some(),
             addrs.dtls_caller_fingerprint.as_ref(),
             addrs.dtls_caller_setup,
             answer_sdp,
         );
-        if let Some((a_leg, b_leg)) = params {
-            if let Err(e) = pipeline
-                .start_relay_terminate(session_key, a_leg, b_leg)
-                .await
-            {
-                warn!(error = %e, call_id = %addrs.a_leg_sip_call_id, "start_relay_terminate failed");
+        match plan {
+            RelayPlan::Terminate(a_leg, b_leg) => {
+                if let Err(e) = pipeline
+                    .start_relay_terminate(session_key, a_leg, b_leg)
+                    .await
+                {
+                    warn!(error = %e, call_id = %addrs.a_leg_sip_call_id, "start_relay_terminate failed");
+                }
+                true
             }
-            return true;
+            RelayPlan::Refuse(violation) => {
+                // Backstop: `secure_initial_answer` refuses the 2xx on this
+                // plan before the A-leg 2xx is built.
+                error!(
+                    call_id = %addrs.a_leg_sip_call_id,
+                    reason = violation.as_str(),
+                    "Media relay refused by media security policy; no relay started"
+                );
+                false
+            }
+            RelayPlan::Opaque => {
+                if self.dtls_fingerprint_source.is_some() {
+                    // Terminate configured but a leg offered no fingerprint
+                    // (`media.srtp.required = false`); SRTP to RTP
+                    // interworking is not supported, so relay opaquely.
+                    warn!(
+                        call_id = %addrs.a_leg_sip_call_id,
+                        "DTLS termination configured but a leg offered no fingerprint; relaying opaquely"
+                    );
+                }
+                if let Err(e) = pipeline.start_relay(session_key).await {
+                    warn!(error = %e, call_id = %addrs.a_leg_sip_call_id, "start_relay failed");
+                }
+                false
+            }
         }
-        if self.dtls_fingerprint_source.is_some() {
-            // Terminate configured but a leg offered no fingerprint; SRTP↔RTP
-            // interworking is not yet supported, so relay opaquely.
-            warn!(
-                call_id = %addrs.a_leg_sip_call_id,
-                "DTLS termination configured but a leg offered no fingerprint; relaying opaquely"
-            );
-        }
-        if let Err(e) = pipeline.start_relay(session_key).await {
-            warn!(error = %e, call_id = %addrs.a_leg_sip_call_id, "start_relay failed");
-        }
-        false
     }
 
     /// Builds a BYE for one leg of a confirmed dialog from stored dialog state.
@@ -4288,7 +4365,7 @@ impl SipStack {
         let bye = send(build_late_2xx_request(
             &entry,
             Method::Bye,
-            entry.invite_cseq.saturating_add(1),
+            entry.bye_cseq,
             &to_tag,
             uri,
             &routes,
@@ -9325,7 +9402,7 @@ impl SipStack {
                 Ok(s) => s,
                 Err(v) => {
                     return self
-                        .refuse_insecure_early_answer(internal_id, addrs, v)
+                        .refuse_insecure_early_answer(resp, internal_id, addrs, v)
                         .await;
                 }
             };
@@ -9583,16 +9660,13 @@ impl SipStack {
 
         // RFC 4568 §8 / §7.1.2: the answer's keying is checked before it is
         // relayed and before any relay starts (`media_security`).
-        let secured_answer = match resp.body.as_deref().filter(|b| !b.is_empty()) {
-            Some(body) => match self.secure_initial_response(body, addrs) {
-                Ok(s) => s,
-                Err(v) => {
-                    return self
-                        .refuse_insecure_answer(resp, internal_id, addrs, v)
-                        .await;
-                }
-            },
-            None => None,
+        let secured_answer = match self.secure_initial_answer(resp.body.as_deref(), addrs) {
+            Ok(s) => s,
+            Err(v) => {
+                return self
+                    .refuse_insecure_answer(resp, internal_id, addrs, v)
+                    .await;
+            }
         };
 
         // Build 200 OK for A-leg with rewritten SDP, carrying the A-leg
@@ -10749,6 +10823,19 @@ impl SipStack {
             None => None,
         };
 
+        // `media.srtp.required` and the sha-384 DTLS fingerprint rule do not
+        // depend on the B-leg: refused here, before routing takes any slot
+        // or port (RFC 3261 §14.2, §20.43). The SDES rules follow routing.
+        //
+        // ## NIST 800-53 Rev5: SC-8, SC-13, CM-6, AU-2
+        if let Err(violation) = self.precheck_initial_offer(req, emergency) {
+            warn!(call_id = %a_leg_call_id, reason = violation.as_str(), "INVITE offer refused by media security policy, 488");
+            audit_invite_denied(req, source, &media_security::policy_label(violation));
+            self.in_flight_invites.write().await.remove(&a_leg_call_id);
+            reject_cdr(488, uc_cdr::ReleaseCause::PolicyDenied);
+            return media_security::offer_refusal(req, source, violation, &self.config.domain);
+        }
+
         // `cdr.on_failure = "reject_new_calls"`: while the CDR pipeline is
         // unhealthy, new calls that could not be accounted for are refused.
         // Emergency calls are never refused for an accounting failure.
@@ -11144,10 +11231,11 @@ impl SipStack {
                         self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
                             .await;
                         let result = self
-                            .play_announcement_to_caller(
+                            .no_route_response(
                                 req,
                                 source,
                                 transport,
+                                emergency,
                                 crate::announcement::AnnouncementType::NumberNotInService,
                             )
                             .await;
@@ -11254,10 +11342,11 @@ impl SipStack {
             self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
                 .await;
             let result = self
-                .play_announcement_to_caller(
+                .no_route_response(
                     req,
                     source,
                     transport,
+                    emergency,
                     crate::announcement::AnnouncementType::NumberNotInService,
                 )
                 .await;
@@ -11287,10 +11376,15 @@ impl SipStack {
         //
         // ## NIST 800-53 Rev5: SC-8, SC-12, SC-13, CM-6, AU-2
         let mut trunk_lease = trunk_lease;
+        // Only an SDP offer crosses as `application/sdp`; any other body is
+        // not relayed (RFC 3261 §13.2.1).
+        let offer_body = media_security::initial_offer_body(req);
         let secured_offer = match self.secure_initial_offer(
-            req.body.as_deref(),
+            req,
+            source,
             &media_security::legs(transport, b_leg_flow.transport),
             t38_offer.as_mut(),
+            emergency,
         ) {
             Ok((secured, sdes_crossed)) => {
                 if sdes_crossed && let Some(lease) = trunk_lease.as_mut() {
@@ -11331,7 +11425,7 @@ impl SipStack {
             let ingress_group = self.lookup_inbound_trunk(source.ip()).await.map(|(g, _)| g);
             let egress_zone = self.egress_media_zone(receiving_zone, b_leg_external);
             let may_terminate = self.dtls_fingerprint_source.is_some()
-                && req.body.as_ref().is_some_and(|body| {
+                && offer_body.is_some_and(|body| {
                     crate::sdp_dtls::parse_peer_dtls(&String::from_utf8_lossy(body)).is_some()
                 });
             let admitted = self.recording_admit(
@@ -11344,7 +11438,7 @@ impl SipStack {
                     failover_targets: &failover_targets,
                 },
                 emergency,
-                req.body.as_deref(),
+                offer_body,
                 t38_offer
                     .as_ref()
                     .is_some_and(|c| c.kind == crate::t38::CallMediaKind::Image),
@@ -11434,7 +11528,7 @@ impl SipStack {
                     }
                     let caller_media = t38_offer.as_ref().map_or_else(
                         || {
-                            req.body.as_ref().and_then(|body| {
+                            offer_body.and_then(|body| {
                                 extract_media_address(&String::from_utf8_lossy(body))
                             })
                         },
@@ -11478,14 +11572,19 @@ impl SipStack {
         // `a=setup` picks the SBC's answering role for the A-leg 183/200), and
         // on the B-leg offer advertise the SBC's own fingerprint with actpass
         // (the SBC is the offerer toward the callee). Otherwise SDP is untouched.
-        let caller_dtls = req
-            .body
-            .as_ref()
-            .and_then(|body| crate::sdp_dtls::parse_peer_dtls(&String::from_utf8_lossy(body)));
+        // Read from the offer as the policy let it cross, so a stripped
+        // non-sha-384 fingerprint is never the one terminated.
+        let caller_dtls = offer_body.and_then(|body| {
+            crate::sdp_dtls::parse_peer_dtls(
+                &secured_offer
+                    .as_deref()
+                    .map_or_else(|| String::from_utf8_lossy(body), std::borrow::Cow::Borrowed),
+            )
+        });
         let dtls_caller_setup = caller_dtls.as_ref().and_then(|d| d.setup);
         let dtls_caller_fingerprint = caller_dtls.map(|d| d.fingerprint);
 
-        let b_leg_sdp = req.body.as_ref().map(|body| {
+        let b_leg_sdp = offer_body.map(|body| {
             let sdp_str = secured_offer
                 .as_deref()
                 .map_or_else(|| String::from_utf8_lossy(body), std::borrow::Cow::Borrowed);
@@ -12010,6 +12109,7 @@ impl SipStack {
                         .as_ref()
                         .map_or(crate::t38::CallMediaKind::Audio, |c| c.kind),
                     recording,
+                    emergency,
                 },
             );
         }
@@ -15661,8 +15761,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_invite_unresolvable_destination() {
-        let config = SipStackConfig::default();
-        let stack = SipStack::new(config);
+        let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
             .register_inbound_trunk("test-trunk", None, &[("127.0.0.1".to_string(), 5060)])
@@ -15702,8 +15801,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_invite_to_registered_user() {
-        let config = SipStackConfig::default();
-        let stack = SipStack::new(config);
+        let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
             .register_inbound_trunk("test-trunk", None, &[("192.168.1.100".to_string(), 5060)])
@@ -15818,8 +15916,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_bye_from_a_leg() {
-        let config = SipStackConfig::default();
-        let stack = SipStack::new(config);
+        let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
             .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
@@ -15892,6 +15989,15 @@ pub mod tests {
         assert_eq!(stack.call_count().await, 0);
     }
 
+    /// A default stack with `media.srtp.required = false`: the dialog cases
+    /// below send INVITEs without SDP (a delayed offer), which the required
+    /// policy refuses with 488 before routing.
+    fn delayed_offer_stack() -> SipStack {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.set_media_security_policy(&srtp_not_required());
+        stack
+    }
+
     /// Sets up a registered bob and an INVITE from alice (A-leg Call-ID
     /// `call-bye-guard@test`, From tag `g1`), returning alice's address.
     async fn call_from_alice(stack: &SipStack) -> SbcSocketAddr {
@@ -15957,7 +16063,7 @@ pub mod tests {
     /// call up (RFC 3261 §12.2.2).
     #[tokio::test]
     async fn test_bye_with_wrong_tag_is_rejected() {
-        let stack = SipStack::new(SipStackConfig::default());
+        let stack = delayed_offer_stack();
         let alice = call_from_alice(&stack).await;
         let result = stack
             .process_message(&Bytes::from(guard_bye("forged")), alice, None)
@@ -15974,7 +16080,7 @@ pub mod tests {
     /// peer's is refused and leaves the call up.
     #[tokio::test]
     async fn test_bye_from_wrong_source_is_rejected() {
-        let stack = SipStack::new(SipStackConfig::default());
+        let stack = delayed_offer_stack();
         let _alice = call_from_alice(&stack).await;
         let elsewhere = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(10, 9, 9, 9), 5060);
         let result = stack
@@ -15990,8 +16096,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_cancel_pending_invite() {
-        let config = SipStackConfig::default();
-        let stack = SipStack::new(config);
+        let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
             .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
@@ -16501,34 +16606,72 @@ pub mod tests {
     }
 
     #[test]
-    fn terminate_params_requires_identity_and_both_fingerprints() {
+    fn relay_plan_requires_identity_and_both_fingerprints() {
         use crate::sdp_dtls::SetupRole;
+        use proto_b2bua::media_policy::{KeyingMode, MediaSecurityPolicy};
         use sbc_media_core::dtls_sidecar::Role;
-        let answer_dtls = "v=0\r\nm=audio 5004 UDP/TLS/RTP/SAVP 8\r\n\
-            a=setup:active\r\na=fingerprint:sha-384 BB:CC\r\n";
+        // Fixed 48-octet patterns, not certificate digests.
+        let octets = |seed: u8| {
+            (0..48u8)
+                .map(|i| format!("{:02X}", seed.wrapping_add(i)))
+                .collect::<Vec<_>>()
+                .join(":")
+        };
+        let b_leg_fp = format!("sha-384 {}", octets(0xB0));
+        let answer_dtls = format!(
+            "v=0\r\nm=audio 5004 UDP/TLS/RTP/SAVP 8\r\n\
+             a=setup:active\r\na=fingerprint:{b_leg_fp}\r\n"
+        );
         let answer_plain = "v=0\r\nm=audio 5004 RTP/AVP 8\r\n";
-        let caller_fp = "sha-384 AA".to_string();
+        let a_leg_fp = format!("sha-384 {}", octets(0xA0));
+        let terminate = |require_srtp| MediaSecurityPolicy {
+            mode: KeyingMode::Terminate,
+            require_srtp,
+        };
 
-        // Terminate + both legs offered DTLS → Some, with roles derived from each
-        // peer's setup (caller actpass → SBC server; callee active → SBC server).
-        let (a, b) = SipStack::terminate_params(
+        // Terminate + both legs offered DTLS → terminate, with roles derived
+        // from each peer's setup (caller actpass → SBC server; callee active
+        // → SBC server).
+        let RelayPlan::Terminate(a, b) = SipStack::relay_plan(
+            &terminate(true),
             true,
-            Some(&caller_fp),
+            Some(&a_leg_fp),
             Some(SetupRole::ActPass),
-            answer_dtls,
-        )
-        .expect("both legs DTLS → terminate");
-        assert_eq!(a.peer_fingerprint, "sha-384 AA");
+            &answer_dtls,
+        ) else {
+            panic!("both legs DTLS → terminate");
+        };
+        assert_eq!(a.peer_fingerprint, a_leg_fp);
         assert!(matches!(a.role, Role::Server));
-        assert_eq!(b.peer_fingerprint, "sha-384 BB:CC");
+        assert_eq!(b.peer_fingerprint, b_leg_fp);
         assert!(matches!(b.role, Role::Server));
 
         // Not terminating (no SBC identity) → opaque.
-        assert!(SipStack::terminate_params(false, Some(&caller_fp), None, answer_dtls).is_none());
-        // Caller never offered DTLS → opaque.
-        assert!(SipStack::terminate_params(true, None, None, answer_dtls).is_none());
-        // Callee's answer carries no fingerprint → opaque (interworking unsupported).
-        assert!(SipStack::terminate_params(true, Some(&caller_fp), None, answer_plain).is_none());
+        assert!(matches!(
+            SipStack::relay_plan(
+                &terminate(false),
+                false,
+                Some(&a_leg_fp),
+                None,
+                &answer_dtls
+            ),
+            RelayPlan::Opaque
+        ));
+        // Caller never offered DTLS → opaque only without required SRTP.
+        assert!(matches!(
+            SipStack::relay_plan(&terminate(false), true, None, None, &answer_dtls),
+            RelayPlan::Opaque
+        ));
+        // Callee's answer carries no fingerprint → opaque only without
+        // required SRTP (interworking unsupported).
+        assert!(matches!(
+            SipStack::relay_plan(&terminate(false), true, Some(&a_leg_fp), None, answer_plain),
+            RelayPlan::Opaque
+        ));
+        assert!(matches!(
+            SipStack::relay_plan(&terminate(true), true, Some(&a_leg_fp), None, answer_plain),
+            RelayPlan::Refuse(_)
+        ));
     }
 
     // A confirmed B2BUA dialog (remote tag learned), for the media-failure
@@ -16594,6 +16737,7 @@ pub mod tests {
             media_terminated: crate::t38::RelaySecurity::Opaque,
             initial_offer_kind: crate::t38::CallMediaKind::Audio,
             recording: crate::recording::CallRecording::default(),
+            emergency: false,
         }
     }
 
@@ -16688,8 +16832,11 @@ pub mod tests {
 
     use std::fmt::Write as _;
 
-    const ALICE_SDP: &str = "v=0\r\no=- 1 1 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\na=sendrecv\r\n";
-    const BOB_SDP: &str = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\na=sendrecv\r\n";
+    // DTLS-SRTP (UDP/TLS/RTP/SAVP, sha-384 fingerprint): the stack enforces
+    // `media.srtp.required` by default. The fingerprints are fixed 48-octet
+    // patterns, not certificate digests.
+    const ALICE_SDP: &str = "v=0\r\no=- 1 1 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\nm=audio 4000 UDP/TLS/RTP/SAVP 0\r\na=setup:actpass\r\na=fingerprint:sha-384 11:12:13:14:15:16:17:18:19:1A:1B:1C:1D:1E:1F:20:21:22:23:24:25:26:27:28:29:2A:2B:2C:2D:2E:2F:30:31:32:33:34:35:36:37:38:39:3A:3B:3C:3D:3E:3F:40\r\na=sendrecv\r\n";
+    const BOB_SDP: &str = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5000 UDP/TLS/RTP/SAVP 0\r\na=setup:active\r\na=fingerprint:sha-384 41:42:43:44:45:46:47:48:49:4A:4B:4C:4D:4E:4F:50:51:52:53:54:55:56:57:58:59:5A:5B:5C:5D:5E:5F:60:61:62:63:64:65:66:67:68:69:6A:6B:6C:6D:6E:6F:70\r\na=sendrecv\r\n";
 
     fn alice() -> SbcSocketAddr {
         SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060)
@@ -25432,7 +25579,7 @@ pub mod tests {
         }
     }
 
-    const INTERNAL_SDP: &str = "v=0\r\no=pbxuser 4711 9 IN IP4 10.0.0.7\r\ns=-\r\nc=IN IP4 198.51.100.20\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\n";
+    const INTERNAL_SDP: &str = "v=0\r\no=pbxuser 4711 9 IN IP4 10.0.0.7\r\ns=-\r\nc=IN IP4 198.51.100.20\r\nt=0 0\r\nm=audio 4000 UDP/TLS/RTP/SAVP 0\r\na=setup:actpass\r\na=fingerprint:sha-384 71:72:73:74:75:76:77:78:79:7A:7B:7C:7D:7E:7F:80:81:82:83:84:85:86:87:88:89:8A:8B:8C:8D:8E:8F:90:91:92:93:94:95:96:97:98:99:9A:9B:9C:9D:9E:9F:A0\r\n";
 
     #[tokio::test]
     async fn th_residual_headers_scrubbed() {
@@ -25846,7 +25993,12 @@ pub mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn announcement_bye_uses_caller_flow_tls() {
-        let stack = SipStack::new(SipStackConfig::default());
+        let mut stack = SipStack::new(SipStackConfig::default());
+        // The announcement call is cleartext RTP/AVP.
+        stack.set_media_security_policy(&sbc_config::schema::SrtpConfig {
+            required: false,
+            ..sbc_config::schema::SrtpConfig::default()
+        });
         stack
             .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
             .await;
@@ -29178,6 +29330,17 @@ pub mod tests {
         a=T38MaxBitRate:14400\r\na=T38FaxUdpEC:t38UDPRedundancy\r\n";
     const BOB_AUDIO: &str = "v=0\r\no=- 2 4 IN IP4 10.20.30.40\r\ns=-\r\nc=IN IP4 10.20.30.40\r\nt=0 0\r\n\
         m=audio 5000 RTP/AVP 0\r\na=sendrecv\r\n";
+    // The T.38 cases run on cleartext audio calls (`media.srtp.required =
+    // false`; T.38 needs `allow_cleartext` either way).
+    const ALICE_AUDIO: &str = "v=0\r\no=- 1 1 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\n\
+        m=audio 4000 RTP/AVP 0\r\na=sendrecv\r\n";
+
+    fn srtp_not_required() -> sbc_config::schema::SrtpConfig {
+        sbc_config::schema::SrtpConfig {
+            required: false,
+            ..sbc_config::schema::SrtpConfig::default()
+        }
+    }
 
     fn t38_enabled() -> sbc_config::T38Config {
         sbc_config::T38Config {
@@ -29200,6 +29363,7 @@ pub mod tests {
         let mut stack = SipStack::new(SipStackConfig::default());
         stack.set_media_pipeline(Arc::clone(&media) as _);
         stack.set_t38_config(t38);
+        stack.set_media_security_policy(&srtp_not_required());
         stack
             .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
             .await;
@@ -29219,7 +29383,7 @@ pub mod tests {
         let results = flatten(
             stack
                 .process_message(
-                    &alice_request("INVITE", 1, None, Some(ALICE_SDP)),
+                    &alice_request("INVITE", 1, None, Some(ALICE_AUDIO)),
                     alice(),
                     None,
                 )

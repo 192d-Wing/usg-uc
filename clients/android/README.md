@@ -89,6 +89,9 @@ single `override val \`message\``.
   before touching `StateFlow` — a direct port of `AppModel.swift`'s contract.
 - **digest-auth**: both build scripts pass `--features digest-auth` (BulkVS-style
   password auth for commercial interop). Production mTLS-only builds drop it.
+  The digest password is not persisted on Android (no KeyStore provider yet,
+  NIST POA&M-372): it stays in memory only, so after a restart the account
+  has no password until it is entered again.
 - **DevSeed** (optional, DEBUG only): drop a gitignored
   `app/src/main/assets/DevSeed.json` (same schema as the Apple app's) and the
   ViewModel seeds + registers a dev account on a fresh install. Absent → skipped.
