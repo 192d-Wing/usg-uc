@@ -766,11 +766,11 @@ field, audit event type or gRPC/REST API is changed or removed.
   minutes without one, or on a correct response on a fresh nonce. A
   correct response on a stale nonce (answered `stale=true`), such as a
   copy of an earlier REGISTER, neither resets nor adds to the count. A
-  source that already holds a
-  binding for the AOR may still refresh during a window (3 failures per
-  window allowed). The values are fixed, and the state is per node
-  (POA&M-316). A sustained attack on one username can keep that user's
-  unregistered devices from registering while it lasts; alert on
+  source that already holds a binding for the AOR may still refresh
+  during a window (3 failures per window allowed). The values are fixed,
+  and the state is per node (POA&M-316). A sustained attack on one
+  username can keep that user's unregistered devices from registering
+  while it lasts; alert on
   `sbc_digest_verify_throttled_total`.
 - **Metrics:** `sbc_digest_credentials_users` (users in the loaded table),
   `sbc_digest_credentials_reload_failures_total` (reloads that kept the
