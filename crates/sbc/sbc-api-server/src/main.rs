@@ -25,6 +25,8 @@ mod state;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     // Tracing first so init failures get logged.
+    // POAM: POA&M-385 (AU-2, AU-12) RUST_LOG can drop the `audit` target here;
+    // sbc-daemon always admits it (`env_filter`).
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sbc_api_server=debug"));
     tracing_subscriber::fmt()

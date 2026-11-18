@@ -3,7 +3,6 @@
 {{- $name := include "central-config.cnpgName" . }}
 {{- $ns := .Release.Namespace }}
 {{- $user := $cnpg.user | default "central" }}
-{{- $pass := $cnpg.password | default "change-me" }}
 {{- $db := $cnpg.database | default "usg_config" }}
 # Production central Postgres via the CloudNativePG operator.
 #
@@ -20,6 +19,20 @@
 #
 # We own the app-user credential (below) so we can publish both the -rw and
 # -ro DSNs the API consumes; CNPG uses it to create the app user/database.
+# With postgres.cnpg.existingSecret the operator owns that Secret instead.
+#
+# NIST 800-53 Rev5: IA-5 (no default credential: a password or an existing
+# Secret is required and "change-me" is refused), SC-8 (the chart-owned DSNs
+# verify the CNPG server certificate against its CA, sslmode=verify-full;
+# DSNs in an operator-owned existingSecret are not checked). The `.svc` host
+# matches the server certificate names CNPG issues.
+{{- if not $cnpg.existingSecret }}
+{{- $pass := required "postgres.cnpg.password (or postgres.cnpg.existingSecret) is required in postgres.mode=cnpg" $cnpg.password }}
+{{- if eq $pass "change-me" }}
+{{- fail "postgres.cnpg.password must not be the change-me placeholder" }}
+{{- end }}
+{{- /* Percent-encoded for the DSN userinfo (QueryEscape, then space as %20). */}}
+{{- $passUrl := $pass | urlquery | replace "+" "%20" }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -32,9 +45,10 @@ type: kubernetes.io/basic-auth
 stringData:
   username: {{ $user | quote }}
   password: {{ $pass | quote }}
-  dsn: "postgres://{{ $user }}:{{ $pass }}@{{ $name }}-rw.{{ $ns }}.svc.cluster.local:5432/{{ $db }}"
-  dsnRo: "postgres://{{ $user }}:{{ $pass }}@{{ $name }}-ro.{{ $ns }}.svc.cluster.local:5432/{{ $db }}"
+  dsn: "postgres://{{ $user }}:{{ $passUrl }}@{{ $name }}-rw.{{ $ns }}.svc:5432/{{ $db }}?sslmode=verify-full&sslrootcert=/etc/central-config/pg-ca/ca.crt"
+  dsnRo: "postgres://{{ $user }}:{{ $passUrl }}@{{ $name }}-ro.{{ $ns }}.svc:5432/{{ $db }}?sslmode=verify-full&sslrootcert=/etc/central-config/pg-ca/ca.crt"
 ---
+{{- end }}
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -55,7 +69,7 @@ spec:
       database: {{ $db | quote }}
       owner: {{ $user | quote }}
       secret:
-        name: {{ include "central-config.fullname" . }}-cnpg
+        name: {{ include "central-config.cnpgSecret" . }}
   storage:
     size: {{ $cnpg.storage | default "20Gi" | quote }}
   {{- with $cnpg.resources }}

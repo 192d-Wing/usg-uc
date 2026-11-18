@@ -1080,13 +1080,16 @@ impl Server {
     /// reached, so signaling does not start pointing at a dead media plane.
     #[cfg(feature = "grpc")]
     pub async fn wire_remote_media(&mut self) -> Result<(), ServerError> {
+        use sbc_media_core::dtls_identity::DtlsFingerprintSource;
+        use sbc_media_core::grpc_media_controller::{
+            GrpcMediaController, MediaControllerTls, check_media_url,
+        };
+        use sbc_media_core::grpc_media_pool::MediaPool;
+
         let urls = Self::remote_media_urls();
         if urls.is_empty() {
             return Ok(());
         }
-        use sbc_media_core::dtls_identity::DtlsFingerprintSource;
-        use sbc_media_core::grpc_media_controller::GrpcMediaController;
-        use sbc_media_core::grpc_media_pool::MediaPool;
 
         // Connect every configured node, retrying each: media and signaling are
         // commonly brought up together, so a node may not be listening yet.
@@ -1094,12 +1097,24 @@ impl Server {
         // must stop signaling rather than run with a hole in the pool.
         const CONNECT_ATTEMPTS: u32 = 30;
         const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+        // NIST 800-53 Rev5: IA-3, SC-8 — client mTLS to the media nodes
+        // (SBC_MEDIA_CONTROLLER_TLS_*); with it every URL must be https://.
+        // A media node off loopback accepts only an mTLS client.
+        let tls = MediaControllerTls::from_env()
+            .map_err(|message| ServerError::ConfigError { message })?;
+        for url in &urls {
+            check_media_url(url, tls.as_ref())
+                .map_err(|message| ServerError::ConfigError { message })?;
+        }
+        if tls.is_some() {
+            info!("remote media control channel uses mTLS");
+        }
         info!(nodes = urls.len(), "Connecting to remote media plane");
         let mut clients: Vec<GrpcMediaController> = Vec::with_capacity(urls.len());
         for url in &urls {
             let mut attempt = 1;
             let client = loop {
-                match GrpcMediaController::connect(url.clone()).await {
+                match GrpcMediaController::connect_with_tls(url.clone(), tls.as_ref()).await {
                     Ok(client) => break client,
                     Err(e) if attempt < CONNECT_ATTEMPTS => {
                         warn!(url, attempt, error = %e, "media node not ready; retrying");
@@ -1356,7 +1371,8 @@ impl Server {
     /// configured remote media node list (`SBC_MEDIA_CONTROLLER_URL[S]`).
     ///
     /// - Remote media nodes cannot fork to a recorder: the media control
-    ///   channel is plaintext and would carry SRTP master keys (POA&M-301).
+    ///   channel would have to carry SRTP master keys, which it does not
+    ///   (POA&M-301; the channel can be mTLS, `SBC_MEDIA_CONTROLLER_TLS_*`).
     ///   A recorder that can never record is a misconfiguration, so the
     ///   daemon refuses to start rather than fail every matched call.
     /// - The RS Via / Contact advertise the TLS listener, and the daemon

@@ -55,9 +55,20 @@ spec:
                   name: {{ .Values.sbcPostgres.existingSecret.name }}
                   key: {{ .Values.sbcPostgres.existingSecret.key | default "dsn" }}
             {{- end }}
-            # gRPC endpoint of the daemon's TrunkStatusPublishService.
+            # gRPC endpoint of the daemon's TrunkStatusPublishService
+            # (https: the daemon listener off loopback requires mTLS).
             - name: SBC_DAEMON_GRPC_URL
-              value: "http://{{ include "sbc.fullname" . }}-grpc.{{ .Release.Namespace }}.svc.cluster.local:9091"
+              value: {{ include "sbc.daemonGrpcUrl" . | quote }}
+            {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+            # mTLS client identity (CN <fullname>-sbc-trunk-agent, on the
+            # daemon's allow-list). NIST 800-53 Rev5: IA-3, SC-8
+            - name: SBC_DAEMON_GRPC_TLS_CA_FILE
+              value: /etc/sbc/grpc-tls/ca.crt
+            - name: SBC_DAEMON_GRPC_TLS_CERT_FILE
+              value: /etc/sbc/grpc-tls/tls.crt
+            - name: SBC_DAEMON_GRPC_TLS_KEY_FILE
+              value: /etc/sbc/grpc-tls/tls.key
+            {{- end }}
             - name: SBC_AGENT_GRPC_LISTEN
               value: "0.0.0.0:9096"
             - name: SBC_INSTANCE_NAME
@@ -101,6 +112,17 @@ spec:
               drop: [ALL]
               # Required to bind local UDP :5060 when SBC_TRUNK_BIND_IP is set.
               add: [NET_BIND_SERVICE]
+          {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+          volumeMounts:
+            - { name: grpc-tls, mountPath: /etc/sbc/grpc-tls, readOnly: true }
+          {{- end }}
+      {{- if .Values.sbcDaemon.grpcMtls.enabled }}
+      volumes:
+        - name: grpc-tls
+          secret:
+            secretName: {{ include "sbc.grpcTrunkAgentClientTlsSecret" . }}
+            defaultMode: 0440
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service

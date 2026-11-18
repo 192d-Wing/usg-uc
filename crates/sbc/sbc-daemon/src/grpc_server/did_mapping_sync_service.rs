@@ -94,13 +94,23 @@ impl DidMappingSyncService for DidMappingSyncServiceImpl {
         &self,
         request: Request<RemoveDirectoryNumberRequest>,
     ) -> Result<Response<RemoveDirectoryNumberResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         let req = request.into_inner();
         let did = req.did;
         info!(did, "gRPC RemoveDirectoryNumber");
 
-        if let Some(ref sip_stack) = self.state.sip_stack {
+        let applied = if let Some(ref sip_stack) = self.state.sip_stack {
             sip_stack.remove_did_mapping(&did).await;
-        }
+            true
+        } else {
+            false
+        };
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "DidMappingSyncService/RemoveDirectoryNumber",
+            &did,
+            super::admin_audit::AdminOutcome::applied(applied),
+        );
         Ok(Response::new(RemoveDirectoryNumberResponse {
             success: true,
             message: "removed from SIP routing map".to_string(),

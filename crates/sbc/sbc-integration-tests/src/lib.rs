@@ -35,6 +35,9 @@ mod config_tests;
 mod health_tests;
 
 #[cfg(test)]
+mod helm_render;
+
+#[cfg(test)]
 mod metrics_tests;
 
 #[cfg(test)]

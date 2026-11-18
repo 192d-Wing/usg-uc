@@ -27,3 +27,14 @@ sbc-grpc-api.workspace = true
 # The media plane itself (pipeline, relay, DTLS identity, MediaControllerServer).
 sbc-media-core = { workspace = true, features = ["grpc"] }
 uc-media-engine.workspace = true
+# Client-certificate name check on the mTLS MediaController listener
+# (parsing only; the TLS stack already verified the chain).
+rustls-pki-types.workspace = true
+# Process-level CryptoProvider selection (aws-lc, as the daemon).
+rustls.workspace = true
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# P-384 test PKI for the in-process mTLS handshake test.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+tempfile.workspace = true

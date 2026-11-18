@@ -48,8 +48,8 @@ pub struct Config {
     /// (comma-separated). The source allowlist keys on the header only
     /// when the request's TCP peer is one of these, so a caller
     /// connecting directly to this pod (bypassing nginx) can't forge an
-    /// allowed source IP. Empty = trust `X-Real-IP` unconditionally (a
-    /// startup warning is logged when `allowed_cidrs` is also set).
+    /// allowed source IP. Empty = trust no proxy: `X-Real-IP` is ignored
+    /// (a startup warning is logged when `allowed_cidrs` is also set).
     pub trusted_proxies: Vec<ipnet::IpNet>,
 
     /// Shared secret for HMAC-based device authentication. When set,

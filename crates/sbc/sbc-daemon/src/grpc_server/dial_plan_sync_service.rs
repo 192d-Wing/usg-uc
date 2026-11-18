@@ -81,16 +81,26 @@ impl DialPlanSyncService for DialPlanSyncServiceImpl {
         &self,
         request: Request<RemoveDialPlanRequest>,
     ) -> Result<Response<RemoveDialPlanResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         let req = request.into_inner();
         let plan_id = req.plan_id;
         info!(plan_id, "gRPC RemoveDialPlan");
 
-        if let Some(ref sip_stack) = self.state.sip_stack
+        let applied = if let Some(ref sip_stack) = self.state.sip_stack
             && let Some(router_lock) = sip_stack.router()
         {
             let mut router = router_lock.write().await;
             router.remove_dial_plan(&plan_id);
-        }
+            true
+        } else {
+            false
+        };
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "DialPlanSyncService/RemoveDialPlan",
+            &plan_id,
+            super::admin_audit::AdminOutcome::applied(applied),
+        );
         Ok(Response::new(RemoveDialPlanResponse {
             success: true,
             message: "removed from SIP router".to_string(),
