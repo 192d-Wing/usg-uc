@@ -175,9 +175,9 @@ struct SourceRestriction {
 /// The client IP comes from nginx's `X-Real-IP` header, but only when
 /// the request's TCP peer is a configured trusted proxy — otherwise a
 /// caller reaching this pod directly could forge an allowed source IP.
-/// When no trusted proxies are configured the header is trusted
-/// unconditionally (a startup warning is logged) and the check falls
-/// back to the direct peer only when the header is absent.
+/// When no trusted proxies are configured the header is ignored and the
+/// check uses the direct peer (behind nginx that is the proxy address, so
+/// a startup warning asks for `SBC_TRUSTED_PROXIES`).
 ///
 /// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
 async fn restrict_source(
@@ -383,9 +383,9 @@ fn source_restriction(cfg: &Config) -> SourceRestriction {
         info!(cidrs = ?restriction.allowed, "provisioning restricted to source networks");
         if restriction.trusted_proxies.is_empty() {
             warn!(
-                "SBC_TRUSTED_PROXIES unset — X-Real-IP is trusted unconditionally; a caller \
-                 reaching this pod directly (bypassing nginx) can forge an allowed source IP and \
-                 defeat the source-network check. Set it to the frontend nginx pod network."
+                "SBC_TRUSTED_PROXIES unset: X-Real-IP is ignored and the source-network check \
+                 sees the TCP peer, which behind nginx is the proxy address. Set it to the \
+                 frontend nginx pod network."
             );
         } else {
             info!(trusted_proxies = ?restriction.trusted_proxies, "X-Real-IP trusted only from these networks");
@@ -469,5 +469,57 @@ mod span_tests {
         assert!(!err.contains("hunter2"));
         let err = mint_token_output(Some("5a".repeat(20)), Some("aabbccddeeff")).unwrap_err();
         assert!(!err.contains("5a5a"));
+    }
+}
+
+/// QA: with no trusted proxies configured, the source-network
+/// check uses the TCP peer, not a client-supplied `X-Real-IP`.
+///
+/// ## NIST 800-53 Rev5: SC-7, SI-10
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod source_restriction_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    fn nets(v: &[&str]) -> Arc<Vec<ipnet::IpNet>> {
+        Arc::new(v.iter().map(|s| s.parse().unwrap()).collect())
+    }
+
+    async fn status(trusted: &[&str], peer: &str, x_real_ip: Option<&str>) -> StatusCode {
+        let restriction = SourceRestriction {
+            allowed: nets(&["10.0.100.0/24"]),
+            trusted_proxies: nets(trusted),
+        };
+        let app: Router = Router::new()
+            .route("/provision/{*path}", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                restriction,
+                restrict_source,
+            ));
+        let mut req = axum::http::Request::get("/provision/aabbccddeeff.cfg");
+        if let Some(h) = x_real_ip {
+            req = req.header("x-real-ip", h);
+        }
+        let mut req = req.body(axum::body::Body::empty()).unwrap();
+        let peer: std::net::SocketAddr = format!("{peer}:40000").parse().unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn qa_forged_header_without_trusted_proxies_is_forbidden() {
+        assert_eq!(
+            status(&[], "10.42.0.9", Some("10.0.100.5")).await,
+            StatusCode::FORBIDDEN
+        );
+        // Controls: a peer inside the allowed range passes; a trusted proxy
+        // still relays the phone's address.
+        assert_eq!(status(&[], "10.0.100.7", None).await, StatusCode::OK);
+        assert_eq!(
+            status(&["10.42.0.0/16"], "10.42.0.9", Some("10.0.100.5")).await,
+            StatusCode::OK
+        );
     }
 }

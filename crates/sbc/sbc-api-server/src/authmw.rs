@@ -10,7 +10,10 @@
 //!    token or API key, from the `Authorization: Bearer` header or the
 //!    `sbc_session` cookie), or
 //! 2. the OIDC path — a bearer token that validates against the configured
-//!    issuer/audience with the `config-admin` scope.
+//!    issuer/audience with the `config-admin` scope **and** whose claims make
+//!    the caller a fleet admin: role `fleet-admin` and `sites` containing
+//!    `"*"`. A client may request a scope, so the scope is only a coarse
+//!    gate; a valid token without the role and site grant gets 403.
 //!
 //! The legacy check runs first (cheap, sync); OIDC is only tried when it
 //! fails, and only when an OIDC validator is configured.
@@ -24,9 +27,14 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use proto_jwt::Validator;
 
-/// The OIDC scope an operator token must carry to use the management API —
-/// the same scope the central config API requires for writes.
+/// The OIDC scope an operator token must carry to reach the management API.
+/// It is a coarse gate only and authorizes nothing by itself: the caller
+/// also needs role `fleet-admin` on sites `"*"` (see [`Principal::is_config_admin`]).
 pub const ADMIN_SCOPE: &str = "config-admin";
+
+/// OIDC role that makes a caller a config admin on sbc-api (together with
+/// the `"*"` site grant).
+const CONFIG_ADMIN_ROLE: &str = "fleet-admin";
 
 /// Shared state for [`require_auth`].
 #[derive(Clone)]
@@ -94,6 +102,7 @@ const GRANT_CDR_READ: u8 = 1 << 0;
 const GRANT_CDR_EXPORT: u8 = 1 << 1;
 const GRANT_USERS_READ: u8 = 1 << 2;
 const GRANT_USERS_ADMIN: u8 = 1 << 3;
+const GRANT_CONFIG_ADMIN: u8 = 1 << 4;
 
 impl Principal {
     /// The legacy admin credential (single administrator / API key): all
@@ -103,18 +112,27 @@ impl Principal {
         Self {
             user: "admin".to_string(),
             issuer: None,
-            grants: GRANT_CDR_READ | GRANT_CDR_EXPORT | GRANT_USERS_READ | GRANT_USERS_ADMIN,
+            grants: GRANT_CDR_READ
+                | GRANT_CDR_EXPORT
+                | GRANT_USERS_READ
+                | GRANT_USERS_ADMIN
+                | GRANT_CONFIG_ADMIN,
         }
     }
 
-    /// An OIDC operator: CDR permissions from roles or explicit scopes.
+    /// An OIDC operator: permissions from roles only (scopes grant nothing).
     #[must_use]
     pub fn from_claims(c: &proto_jwt::Claims) -> Self {
         let role = |set: &[&str]| c.roles.iter().any(|r| set.contains(&r.as_str()));
-        let cdr_export = role(CDR_EXPORT_ROLES) || c.has_scope(PERM_CDR_EXPORT);
-        let cdr_read = cdr_export || role(CDR_READ_ROLES) || c.has_scope(PERM_CDR_READ);
-        let users_admin = role(USERS_ADMIN_ROLES) || c.has_scope(PERM_USERS_ADMIN);
-        let users_read = users_admin || role(USERS_READ_ROLES) || c.has_scope(PERM_USERS_READ);
+        // NIST 800-53 Rev5: AC-3, AC-6 — every grant comes from roles (and
+        // sites), never from requested scopes: a client chooses its scopes.
+        let cdr_export = role(CDR_EXPORT_ROLES);
+        let cdr_read = cdr_export || role(CDR_READ_ROLES);
+        let users_admin = role(USERS_ADMIN_ROLES);
+        let users_read = users_admin || role(USERS_READ_ROLES);
+        // NIST 800-53 Rev5: AC-3, AC-6 — config admin from claims only (role
+        // and fleet site grant), never from the requested scope.
+        let config_admin = role(&[CONFIG_ADMIN_ROLE]) && c.sites.iter().any(|s| s == "*");
         let bit = |b: u8, on: bool| if on { b } else { 0 };
         Self {
             user: c
@@ -125,8 +143,19 @@ impl Principal {
             grants: bit(GRANT_CDR_READ, cdr_read)
                 | bit(GRANT_CDR_EXPORT, cdr_export)
                 | bit(GRANT_USERS_READ, users_read)
-                | bit(GRANT_USERS_ADMIN, users_admin),
+                | bit(GRANT_USERS_ADMIN, users_admin)
+                | bit(GRANT_CONFIG_ADMIN, config_admin),
         }
+    }
+
+    /// Whether this principal may use the management API: the legacy admin
+    /// credential, or an OIDC operator with role `fleet-admin` on sites
+    /// `"*"`.
+    ///
+    /// ## NIST 800-53 Rev5: AC-3, AC-6
+    #[must_use]
+    pub const fn is_config_admin(&self) -> bool {
+        self.grants & GRANT_CONFIG_ADMIN != 0
     }
 
     /// Record the (validated) issuer that vouched for this principal.
@@ -177,11 +206,17 @@ fn audit_denied(user: &str, path: &str, perm: &str) {
     } else {
         "cdr-rbac"
     };
+    audit_deny(user, path, perm, policy);
+}
+
+/// One `AuthorizationDecision` deny record.
+// POAM: POA&M-386 (AU-3) `source_ip` is not recorded on these denials.
+fn audit_deny(user: &str, path: &str, action: &str, policy: &str) {
     uc_audit::log_event(uc_audit::AuditEvent::AuthorizationDecision(
         uc_audit::event::AuthorizationDecision {
             identity: user.to_string(),
             resource: path.to_string(),
-            action: perm.to_string(),
+            action: action.to_string(),
             granted: false,
             policy: policy.to_string(),
             source_ip: None,
@@ -269,13 +304,29 @@ pub async fn require_auth(State(auth): State<AuthState>, mut req: Request, next:
         return next.run(req).await;
     }
 
-    // 2. OIDC operator token (config-admin), if configured.
+    // 2. OIDC operator token (config-admin scope), if configured. A valid
+    // token is authenticated, but only a fleet admin is authorized.
+    // NIST 800-53 Rev5: AC-3, AC-6, AU-2
     if let Some(validator) = &auth.oidc
         && let Some(token) = bearer(req.headers())
         && let Ok(claims) = validator.validate(&token).await
     {
-        req.extensions_mut()
-            .insert(Principal::from_claims(&claims).with_issuer(validator.issuer()));
+        let principal = Principal::from_claims(&claims).with_issuer(validator.issuer());
+        if !principal.is_config_admin() {
+            tracing::warn!(path = %req.uri().path(), user = %principal.user, "OIDC principal lacks fleet-admin on all sites");
+            audit_deny(
+                &principal.user,
+                req.uri().path(),
+                CONFIG_ADMIN_ROLE,
+                "sbc-api-oidc",
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({ "error": "insufficient role" })),
+            )
+                .into_response();
+        }
+        req.extensions_mut().insert(principal);
         return next.run(req).await;
     }
 
@@ -313,8 +364,9 @@ mod tests {
         assert_eq!(p.user, "op1");
         let p = Principal::from_claims(&claims(&["auditor"], "config-admin"));
         assert!(p.has(PERM_CDR_READ) && !p.has(PERM_CDR_EXPORT));
-        let p = Principal::from_claims(&claims(&[], "config-admin cdr:export"));
-        assert!(p.has(PERM_CDR_READ) && p.has(PERM_CDR_EXPORT));
+        // A requested permission scope grants nothing; only roles do.
+        let p = Principal::from_claims(&claims(&[], "config-admin cdr:read cdr:export"));
+        assert!(!p.has(PERM_CDR_READ) && !p.has(PERM_CDR_EXPORT));
         assert!(Principal::admin().has(PERM_CDR_EXPORT));
         assert!(!Principal::admin().has("cdr:admin"));
     }
@@ -396,8 +448,9 @@ mod tests {
             let p = Principal::from_claims(&claims(&[r], "config-admin"));
             assert!(p.has(PERM_USERS_READ) && p.has(PERM_USERS_ADMIN), "{r}");
         }
-        let p = Principal::from_claims(&claims(&[], "config-admin users:admin"));
-        assert!(p.has(PERM_USERS_READ) && p.has(PERM_USERS_ADMIN));
+        // A requested permission scope grants nothing; only roles do.
+        let p = Principal::from_claims(&claims(&[], "config-admin users:read users:admin"));
+        assert!(!p.has(PERM_USERS_READ) && !p.has(PERM_USERS_ADMIN));
         assert!(Principal::admin().has(PERM_USERS_ADMIN));
     }
 
@@ -414,5 +467,142 @@ mod tests {
 
         h.insert(header::AUTHORIZATION, "Basic dXNlcjpwYXNz".parse().unwrap());
         assert_eq!(bearer(&h), None, "non-Bearer scheme ignored");
+    }
+    // --- QA: OIDC access to sbc-api needs a fleet admin ---------
+
+    fn claims_sites(roles: &[&str], sites: &[&str], scope: &str) -> proto_jwt::Claims {
+        serde_json::from_value(serde_json::json!({
+            "sub": "s-1",
+            "preferred_username": "op1",
+            "roles": roles,
+            "sites": sites,
+            "scope": scope,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn qa_scope_only_oidc_principal_is_not_config_admin() {
+        let p = Principal::from_claims(&claims_sites(&[], &[], "config config-admin"));
+        assert!(!p.is_config_admin());
+        let p = Principal::from_claims(&claims_sites(&["auditor"], &["*"], "config-admin"));
+        assert!(!p.is_config_admin(), "a read role is not config admin");
+        let p = Principal::from_claims(&claims_sites(&["fleet-admin"], &["*"], "config-admin"));
+        assert!(p.is_config_admin());
+        assert!(Principal::admin().is_config_admin(), "legacy credential");
+    }
+
+    #[test]
+    fn qa_fleet_admin_without_star_site_is_not_config_admin() {
+        for sites in [&[][..], &["MUHJ"][..], &["MUHJ", "MPLS"][..]] {
+            let p = Principal::from_claims(&claims_sites(&["fleet-admin"], sites, "config-admin"));
+            assert!(!p.is_config_admin(), "sites={sites:?}");
+        }
+    }
+
+    const QA_KID: &str = "qa-es384";
+    const QA_ISSUER: &str = "https://idp.example/realms/qa";
+    const QA_AUD: &str = "sbc-api";
+
+    /// A fresh P-384 key: (JWT signing key, static JWKS).
+    fn qa_key() -> (jsonwebtoken::EncodingKey, jsonwebtoken::jwk::JwkSet) {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &SystemRandom::new())
+                .unwrap();
+        let pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, pkcs8.as_ref()).unwrap();
+        let point = pair.public_key().as_ref();
+        let jwks = serde_json::from_value(serde_json::json!({
+            "keys": [{
+                "kty": "EC", "crv": "P-384", "kid": QA_KID, "alg": "ES384", "use": "sig",
+                "x": URL_SAFE_NO_PAD.encode(&point[1..49]),
+                "y": URL_SAFE_NO_PAD.encode(&point[49..97]),
+            }]
+        }))
+        .unwrap();
+        (jsonwebtoken::EncodingKey::from_ec_der(pkcs8.as_ref()), jwks)
+    }
+
+    fn qa_token(key: &jsonwebtoken::EncodingKey, roles: &[&str], sites: &[&str]) -> String {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES384);
+        header.kid = Some(QA_KID.to_string());
+        let claims = serde_json::json!({
+            "sub": "s-qa", "preferred_username": "qa-op", "iss": QA_ISSUER, "aud": QA_AUD,
+            "exp": exp, "scope": "openid config-admin", "roles": roles, "sites": sites,
+        });
+        jsonwebtoken::encode(&header, &claims, key).unwrap()
+    }
+
+    fn qa_app(jwks: jsonwebtoken::jwk::JwkSet) -> Router {
+        let validator = Arc::new(Validator::new(
+            Arc::new(proto_jwt::JwksCache::with_static(jwks)),
+            proto_jwt::ValidatorConfig {
+                issuer: QA_ISSUER.to_string(),
+                audiences: vec![QA_AUD.to_string()],
+                required_scope: ADMIN_SCOPE,
+                leeway_secs: 30,
+            },
+        ));
+        let authenticator = Arc::new(
+            uc_auth::Authenticator::new("admin", "not-a-phc-hash", vec![7u8; 48]).unwrap(),
+        );
+        let auth = AuthState::new(authenticator, Some(validator), &["/healthz"]);
+        Router::new()
+            .route("/api/v1/trunkgroups", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(auth, require_auth))
+    }
+
+    async fn qa_get(app: &Router, token: &str) -> StatusCode {
+        let req = axum::http::Request::get("/api/v1/trunkgroups")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn qa_require_auth_forbids_non_admin_oidc_principal() {
+        let (key, jwks) = qa_key();
+        let app = qa_app(jwks);
+
+        // Control: a fleet admin on every site gets through.
+        assert_eq!(
+            qa_get(&app, &qa_token(&key, &["fleet-admin"], &["*"])).await,
+            StatusCode::OK
+        );
+
+        let capture = uc_audit::capture::start();
+        // A validly signed token carrying the scope but no admin role.
+        assert_eq!(
+            qa_get(&app, &qa_token(&key, &[], &[])).await,
+            StatusCode::FORBIDDEN
+        );
+        let denials: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::AuthorizationDecision(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(denials.len(), 1, "{denials:?}");
+        assert!(!denials[0].granted);
+        assert_eq!(denials[0].policy, "sbc-api-oidc");
+        assert_eq!(denials[0].resource, "/api/v1/trunkgroups");
+
+        // A fleet admin restricted to one site is not a fleet admin here.
+        assert_eq!(
+            qa_get(&app, &qa_token(&key, &["fleet-admin"], &["MUHJ"])).await,
+            StatusCode::FORBIDDEN
+        );
     }
 }

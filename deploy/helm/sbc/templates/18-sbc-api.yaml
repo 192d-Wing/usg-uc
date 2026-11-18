@@ -75,6 +75,13 @@ spec:
               value: "http://{{ include "sbc.fullname" . }}-api.{{ .Release.Namespace }}.svc.cluster.local:80"
             - name: SBC_DAEMON_GRPC_URL
               value: {{ include "sbc.daemonGrpcUrl" . | quote }}
+            {{- with .Values.sbcApi.trustedProxies }}
+            # X-Real-IP is trusted only from these networks (the frontend
+            # nginx pods), so the login limiter keys on the real client;
+            # unset = trust no proxy. NIST 800-53 Rev5: AC-7, SC-7
+            - name: SBC_TRUSTED_PROXIES
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- if .Values.sbcDaemon.grpcMtls.enabled }}
             # mTLS client identity for the daemon gRPC listener; needed for
             # the CDR API (CdrService is mTLS/loopback only). NIST: IA-3, SC-8

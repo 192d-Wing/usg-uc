@@ -14,8 +14,12 @@
 //! - `sites` — the site codes the roles apply to, or `["*"]` for the whole
 //!   fleet.
 //!
-//! Back-compat: a token carrying the legacy `config-admin` OAuth scope is
-//! treated as a full fleet admin (`*:*` on `*`).
+//! The `config-admin` OAuth scope grants nothing by itself: a client may
+//! request a scope, so authorization is decided on the `roles` and `sites`
+//! claims only (RFC 6749 §3.3). Fleet access needs a fleet role (e.g.
+//! `fleet-admin`) **and** `sites` containing `"*"`.
+//!
+//! NIST 800-53 Rev5: AC-3, AC-6 (authorization on role and site claims)
 
 use proto_jwt::Claims;
 
@@ -123,8 +127,6 @@ fn role_grants(role: &str, action: Action) -> bool {
 pub struct Subject {
     roles: Vec<String>,
     sites: Vec<String>,
-    /// Legacy `config-admin` OAuth scope → full fleet admin.
-    fleet_via_scope: bool,
 }
 
 impl Subject {
@@ -134,7 +136,6 @@ impl Subject {
         Self {
             roles: claims.roles.clone(),
             sites: claims.sites.clone(),
-            fleet_via_scope: claims.has_scope(crate::state::ADMIN_SCOPE),
         }
     }
 
@@ -151,9 +152,6 @@ impl Subject {
     /// (`site` is `None` for fleet-level entities).
     #[must_use]
     pub fn permits(&self, action: Action, site: Option<&str>) -> bool {
-        if self.fleet_via_scope {
-            return true;
-        }
         let action_ok = self.roles.iter().any(|r| role_grants(r, action));
         if !action_ok {
             return false;
@@ -169,15 +167,24 @@ impl Subject {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
+    /// Builds the subject the way the request path does: from claims.
+    fn subject_from(roles: &[&str], sites: &[&str], scope: Option<&str>) -> Subject {
+        let claims: Claims = serde_json::from_value(serde_json::json!({
+            "sub": "qa-operator",
+            "roles": roles,
+            "sites": sites,
+            "scope": scope,
+        }))
+        .expect("claims");
+        Subject::from_claims(&claims)
+    }
+
     fn subject(roles: &[&str], sites: &[&str]) -> Subject {
-        Subject {
-            roles: roles.iter().map(|s| (*s).to_string()).collect(),
-            sites: sites.iter().map(|s| (*s).to_string()).collect(),
-            fleet_via_scope: false,
-        }
+        subject_from(roles, sites, Some("openid config"))
     }
 
     const PHONES_W: Action = Action::new(Entity::Phones, Verb::Write);
@@ -223,15 +230,32 @@ mod tests {
         assert!(!raw.permits(PHONES_W, Some("MUHJ")));
     }
 
+    /// QA: the `config-admin` OAuth scope authorizes nothing by
+    /// itself; authorization comes from roles and the site allowlist.
     #[test]
-    fn legacy_config_admin_scope_is_full_fleet() {
-        let s = Subject {
-            roles: vec![],
-            sites: vec![],
-            fleet_via_scope: true,
-        };
-        assert!(s.permits(PHONES_W, Some("ANY")));
-        assert!(s.permits(Action::new(Entity::Templates, Verb::Write), None));
+    fn qa_config_admin_scope_alone_grants_nothing() {
+        let s = subject_from(&[], &[], Some("config config-admin"));
+        assert!(!s.permits(PHONES_R, Some("MUHJ")));
+        assert!(!s.permits(PHONES_W, Some("MUHJ")));
+        assert!(!s.permits(Action::new(Entity::Templates, Verb::Write), None));
+        assert!(!s.permits(Action::new(Entity::Sites, Verb::Write), None));
+        // The scope does not widen a narrower role either.
+        let auditor = subject_from(&["auditor"], &["MUHJ"], Some("config config-admin"));
+        assert!(!auditor.permits(PHONES_W, Some("MUHJ")));
+        assert!(!auditor.permits(PHONES_R, Some("MPLS")));
+    }
+
+    /// QA: fleet-level entities need a fleet role and `sites ∋ "*"`.
+    #[test]
+    fn qa_fleet_admin_role_needs_star_site_for_fleet_entities() {
+        let fleet = subject_from(&["fleet-admin"], &["*"], Some("config config-admin"));
+        assert!(fleet.permits(Action::new(Entity::Templates, Verb::Write), None));
+        assert!(fleet.permits(Action::new(Entity::Sites, Verb::Write), None));
+        let one_site = subject_from(&["fleet-admin"], &["MUHJ"], Some("config config-admin"));
+        assert!(!one_site.permits(Action::new(Entity::Templates, Verb::Write), None));
+        assert!(!one_site.permits(Action::new(Entity::Sites, Verb::Read), None));
+        assert!(one_site.permits(PHONES_W, Some("MUHJ")));
+        assert!(!one_site.permits(PHONES_W, Some("MPLS")));
     }
 
     #[test]

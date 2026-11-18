@@ -1,17 +1,16 @@
+{{- include "sbc.grpcMtlsPreflight" . }}
 {{- if .Values.sbcDaemon.grpcMtls.enabled }}
 {{- /*
-mTLS for the daemon gRPC listener (sbcDaemon.grpcMtls). The daemon mounts
-CdrService (CDRs = PII) only on an mTLS or loopback listener, so this is
-what lets sbc-api serve the CDR API. With clusterIssuer set, cert-manager
-issues an ECDSA P-384 (CNSA 2.0) server certificate for the -grpc Service and
-a client certificate for sbc-api; otherwise both Secrets must already exist
+mTLS for the daemon gRPC listener (sbcDaemon.grpcMtls, on by default). A
+gRPC listener off loopback always requires an allow-listed client
+certificate, on every service. With clusterIssuer set, cert-manager issues
+ECDSA P-384 (CNSA 2.0) certificates: a server certificate for the -grpc
+Service, a client certificate for sbc-api and, when sbcTrunkAgent is
+enabled, one for the trunk agent. Otherwise the Secrets must already exist
 (tls.crt, tls.key, ca.crt).
 
 NIST 800-53 Rev5: IA-3, SC-8, SC-13, AC-3
 */ -}}
-{{- if .Values.sbcTrunkAgent.enabled }}
-{{- fail "sbcDaemon.grpcMtls.enabled cannot be combined with sbcTrunkAgent.enabled: the trunk agent has no gRPC TLS client yet" }}
-{{- end }}
 {{- if .Values.sbcDaemon.grpcMtls.clusterIssuer }}
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -53,5 +52,26 @@ spec:
   issuerRef:
     name: {{ .Values.sbcDaemon.grpcMtls.clusterIssuer | quote }}
     kind: {{ .Values.sbcDaemon.grpcMtls.issuerKind | default "ClusterIssuer" }}
+{{- if .Values.sbcTrunkAgent.enabled }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "sbc.fullname" . }}-grpc-trunk-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "sbc.grpcTrunkAgentClientTlsSecret" . }}
+  commonName: {{ printf "%s-sbc-trunk-agent" (include "sbc.fullname" .) }}
+  usages: [client auth]
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+    rotationPolicy: Always
+  issuerRef:
+    name: {{ .Values.sbcDaemon.grpcMtls.clusterIssuer | quote }}
+    kind: {{ .Values.sbcDaemon.grpcMtls.issuerKind | default "ClusterIssuer" }}
+{{- end }}
 {{- end }}
 {{- end }}

@@ -253,39 +253,18 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         request: Request<DrainNodeRequest>,
     ) -> Result<Response<DrainNodeResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         let req = request.into_inner();
-        info!(
-            node_id = %req.node_id,
-            timeout_secs = req.timeout_secs,
-            reason = %req.reason,
-            "gRPC DrainNode"
+        let node = req.node_id.clone();
+        let result = self.drain_node_inner(req).await;
+        // NIST 800-53 Rev5: AU-2, AU-3, AU-12 — marks a cluster node failed.
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "ClusterService/DrainNode",
+            &node,
+            super::admin_audit::AdminOutcome::from_result(result.as_ref().map(|_| ())),
         );
-
-        let node_id = uc_cluster::NodeId::new(&req.node_id);
-
-        // Check if node exists
-        let node = self.cluster.membership().get_node(&node_id).await;
-        if node.is_none() {
-            return Err(Status::not_found(format!(
-                "Node not found: {}",
-                req.node_id
-            )));
-        }
-
-        // Mark node as draining
-        // Note: This would normally trigger call migration
-        match self.cluster.membership().mark_failed(&node_id).await {
-            Ok(()) => {
-                let response = DrainNodeResponse {
-                    success: true,
-                    message: format!("Node {} marked for draining", req.node_id),
-                    calls_draining: 0,          // TODO: Track actual calls
-                    registrations_migrating: 0, // TODO: Track registrations
-                };
-                Ok(Response::new(response))
-            }
-            Err(e) => Err(Status::internal(format!("Failed to drain node: {e}"))),
-        }
+        result
     }
 
     async fn undo_failover(
@@ -324,6 +303,46 @@ impl ClusterService for ClusterServiceImpl {
         // For now, return empty stream
         let stream = tokio_stream::empty();
         Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+impl ClusterServiceImpl {
+    async fn drain_node_inner(
+        &self,
+        req: DrainNodeRequest,
+    ) -> Result<Response<DrainNodeResponse>, Status> {
+        info!(
+            node_id = %req.node_id,
+            timeout_secs = req.timeout_secs,
+            reason = %req.reason,
+            "gRPC DrainNode"
+        );
+
+        let node_id = uc_cluster::NodeId::new(&req.node_id);
+
+        // Check if node exists
+        let node = self.cluster.membership().get_node(&node_id).await;
+        if node.is_none() {
+            return Err(Status::not_found(format!(
+                "Node not found: {}",
+                req.node_id
+            )));
+        }
+
+        // Mark node as draining
+        // Note: This would normally trigger call migration
+        match self.cluster.membership().mark_failed(&node_id).await {
+            Ok(()) => {
+                let response = DrainNodeResponse {
+                    success: true,
+                    message: format!("Node {} marked for draining", req.node_id),
+                    calls_draining: 0,          // TODO: Track actual calls
+                    registrations_migrating: 0, // TODO: Track registrations
+                };
+                Ok(Response::new(response))
+            }
+            Err(e) => Err(Status::internal(format!("Failed to drain node: {e}"))),
+        }
     }
 }
 
