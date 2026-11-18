@@ -30,6 +30,80 @@ Tested locally on macOS arm64; Windows covered by the CI cross-target build only
   HTTPS only, redirects are not followed, and response bodies are capped.
   The trust scope uses a built-in suffix list, not the full Public Suffix
   List (POA&M-370).
+
+### BREAKING (SBC, in-dialog request and CANCEL matching, POA&M-390..395)
+
+Affects every SBC call. Peers that follow RFC 3261 see no change on
+correct traffic; requests that only matched loosely before are now
+refused. Tested by `sip_stack/tests/dialog_binding.rs` and unit tests in
+`sip_stack/dialog_match.rs` (local runs). CI evidence: PR TBD.
+
+- **In-dialog requests are bound to the dialog's peer.** (RFC 3261
+  §12.2.2; SC-23, AC-3) A re-INVITE, UPDATE, PRACK, INFO, MESSAGE,
+  NOTIFY, BYE or 2xx ACK must match the call leg's Call-ID, remote tag and
+  local tag (481 otherwise, also for a wrong or empty To tag), and must
+  come from that leg's peer (403 otherwise). The peer of a trunk leg is
+  any configured host of its trunk group, on any port; of a UDP endpoint,
+  its IP and port; of a TCP/TLS/WS endpoint, its connection; of a
+  registered callee, its binding. The transport must be the leg's or a
+  stronger one. A UA registered over UDP that sends a large request over
+  TCP from another port gets 403; register such UAs over TCP or TLS
+  (POA&M-394).
+- **Endpoints that re-register on a new flow are followed.** (RFC 5626
+  §4.4, §5.3) Only with REGISTER authentication on: an endpoint caller or
+  registered callee whose in-dialog request arrives on a new flow holding
+  the live registration of the leg's AOR is admitted, and the call leg
+  moves to that flow once the request is accepted. Without REGISTER
+  authentication such a request gets 403.
+- **A BYE after the answer must carry the To tag** (481 otherwise). A
+  caller's BYE before the answer still ends the call: the SBC sends a
+  CANCEL to the callee, a 487 to the caller's INVITE and a 200 to the BYE,
+  with one To tag.
+- **An ACK for a 2xx must carry the INVITE's CSeq number and method ACK**,
+  plus the 2xx's From and To tags, from the peer. Any other ACK is
+  ignored, and the 2xx keeps retransmitting until the right ACK arrives
+  or the retransmission times out.
+- **CANCEL is matched to its INVITE.** (RFC 3261 §9.2) A CANCEL must match
+  the pending INVITE's top-Via branch and sent-by, Call-ID, From tag, CSeq
+  number and source (RFC 2543 matching for a branch without the magic
+  cookie). No match: 481, no effect, no wait (before, the SBC could wait
+  up to 2 s and then tear the call down). After the final response: 200
+  only, the call is unchanged. A matched pending INVITE: 200, and 487 on
+  the INVITE's own transaction, sent to the INVITE's source. A CANCEL of a
+  pending re-INVITE gets 200 and the re-INVITE completes (POA&M-395).
+- **The B-leg CANCEL waits for a provisional.** (RFC 3261 §9.1) The SBC
+  sends the CANCEL toward the callee only after the B-leg INVITE drew a
+  1xx, and drops it if a final response arrives first.
+- **INVITE reusing a Call-ID being routed.** An INVITE with the Call-ID of
+  an INVITE the SBC is still routing gets 482 when it is the same request
+  on another path (same From tag and CSeq, another branch or sent-by,
+  RFC 3261 §8.2.2.2) and 403 otherwise.
+- **Responses without a To tag** (RFC 2543 peers) still make a dialog: an
+  absent tag matches only an absent tag.
+- **Audit and metrics.** (AU-2, AU-3, SI-4) Four new in-dialog audit
+  policies, `in-dialog:to-tag-mismatch`, `in-dialog:foreign-source`,
+  `in-dialog:ack-mismatch` and `in-dialog:cancel-no-match`, with gauges
+  `sbc_in_dialog_rejects_to_tag_mismatch_total`,
+  `sbc_in_dialog_rejects_foreign_source_total`,
+  `sbc_in_dialog_rejects_ack_mismatch_total` and
+  `sbc_in_dialog_rejects_cancel_no_match_total`. A BYE from a source that
+  is not the leg's peer is now audited as `in-dialog:foreign-source`
+  (before: `in-dialog:from-tag-mismatch`). The INVITE refusal above is
+  audited as `invite:merged-request`. The `resource` of in-dialog
+  rejection records is now `<Request-URI> call-id=<Call-ID>
+  src-port=<port>`, the Call-ID percent-encoded and capped at 64 bytes;
+  SIEM parsers of that field must be updated. The audit schema is
+  unchanged.
+- **Known limits** (open): a 2xx from a later fork is not adopted as the
+  callee dialog (POA&M-390); an INVITE copy from another source is answered
+  from the stored transaction (POA&M-391); trunk-group membership is read
+  from the live configuration (POA&M-392, accepted risk); UDP source
+  spoofing by a party that has seen the dialog (POA&M-393, accepted risk,
+  use TLS).
+
+No SBC config key, CDR field, audit event type or REST/gRPC API is
+changed.
+
 ### BREAKING (SBC, management-plane containment: daemon gRPC mTLS, NetworkPolicies, OIDC roles, central Postgres credentials)
 
 SBC only; the soft client is not affected. No CDR field and no audit event

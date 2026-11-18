@@ -31,7 +31,7 @@
 | **RFC 3325** | P-Asserted-Identity | Header support, topology hiding. **Wired (sbc-daemon)**: topology hider, and `sanitize_inbound_identity` (POA&M-232/236) strips PAI/PPI at ingress unless the source is a trunk in a `trust_domain = true` group (default `false`, so trust must be granted explicitly; API-registered groups always untrusted; §5; tests `sanitize_inbound_identity_untrusted_only`, `inbound_identity_sanitized_by_trust_domain`). Library-only: `rpid_to_pai` / `ManipulationAction::RpidToPai` convert only RPID elements with `screen=yes` into a re-serialized name-addr (one sip, one tel; `privacy=uri` → `Privacy: id`, `name`/`full` → `id;user`); tests `unscreened_rpid_not_asserted`, `rpid_params_stripped_from_pai`, `rpid_encoded_crlf_cannot_inject`, `rpid_to_pai_preset_on_parsed_message`. `strip_pai_outbound` preset acts on parsed `HeaderName::PAssertedIdentity` (test `trunk_interop_strips_pai_from_parsed_message`) |
 | **RFC 3326** | Reason Header | Header name defined in proto-sip. **Wired (sbc-daemon, CDR only)**: `sbc-daemon/src/cdr.rs` reads every `Reason` header field (`sip_stack.rs` `reason_headers()`, `CdrEnd::with_reasons`). Splitting on `,` and `;` respects quoted strings and quoted-pairs (RFC 3261 §25.1, `split_unquoted`). The first `protocol=Q.850` cause in 1..=127 is recorded as `q850_cause`. The daemon does not add or rewrite Reason. Tests `q850_parses_rfc3326_reason`, `q850_from_separate_reason_headers`, `cdr_answered_then_callee_bye_with_q850` |
 | **RFC 3327** | Path Header | **Partial** — `path_values()` (splits combined values), `prepend_path()`; only list handling was reviewed. **Library-only** — daemon REGISTER handling never reads or inserts Path |
-| **RFC 3428** | MESSAGE Method | Method enum entry. Library-only — daemon returns 405 |
+| **RFC 3428** | MESSAGE Method | Method enum entry. Daemon relays in-dialog MESSAGE (POA&M-182); out of dialog it returns 405 |
 | **RFC 3455** | P-Headers | Header names defined. Library-only |
 | **RFC 3515** | REFER Method | Method enum entry, header support. **Wired (soft client only)** — `call_agent.rs` sends REFER; daemon returns 405 (not relayed) |
 | **RFC 3891** | Replaces Header | Header name defined. Library-only |
@@ -39,8 +39,8 @@
 | **RFC 4028** | Session Timers | Header names (Session-Expires, Min-SE). **Wired (sbc-daemon, relay only)** — `relay_session_timer_request_headers` / `relay_session_timer_response_headers` on INVITE/re-INVITE/UPDATE and their responses (`sip_stack.rs`); no local refresher |
 | **RFC 4168** | SCTP Transport for SIP | Transport enum entry. Library-only — `uc-transport` `sctp` feature not enabled by any binary |
 | **RFC 4566** | SDP | Referenced |
-| **RFC 6086** | INFO Method | Method enum entry. Library-only — daemon returns 405 |
-| **RFC 6665** | SIP Events (SUBSCRIBE/NOTIFY) | Method enum entries, header support. Library-only — daemon returns 405; client only reads Subscription-State on REFER NOTIFY |
+| **RFC 6086** | INFO Method | Method enum entry. Daemon relays in-dialog INFO (POA&M-182); out of dialog it returns 405 |
+| **RFC 6665** | SIP Events (SUBSCRIBE/NOTIFY) | Method enum entries, header support. Library-only — daemon relays in-dialog NOTIFY (POA&M-182) and returns 405 for SUBSCRIBE and out-of-dialog NOTIFY; client only reads Subscription-State on REFER NOTIFY |
 | **RFC 7118** | WebSocket Transport for SIP | Transport: WS/WSS. Wired (sbc-daemon `transport.ws_listen`, plain WS); WSS planned — the transport does not terminate TLS. §4: `sip` subprotocol required (HTTP 400 otherwise; `ws_require_sip_subprotocol = false` is a non-conformant opt-out). §5: one SIP message per WS message; incomplete messages discarded. RFC 6455 message/frame caps 65,535 bytes. See `docs/RFC_COMPLIANCE_GAPS.md` |
 | **RFC 8224** | STIR Identity | Header name defined; reason phrases 428/436/437/438 in `response.rs` (test `stir_reason_phrases`). Wired (sbc-daemon STIR path, off by default) |
 
@@ -67,7 +67,7 @@
 - RFC 3261 §16.4 `maddr`: daemon passes the configured listener port as the received port, not the actual local socket port (`// POAM:` in sbc-daemon `sip_stack.rs`, NIST POA&M-286)
 - sbc-daemon calls `DigestVerifier` (REGISTER only, enabled by `[digest_auth]`, off by default; POA&M-270 closed; no INVITE challenge, POA&M-271), `preprocess_route_information`, `compute_loop_hash` (own semantics, not `detect_loop`), `apply_privacy` and `sanitize_inbound_identity` (POA&M-236 partial); `DigestVerifier` nc state is node-local (`// POAM:` in `digest_verifier.rs`, POA&M-272)
 - Compact header forms (§7.3.3) supported for core headers (parse-only; the daemon/client framers special-case only `l:`)
-- sbc-daemon relays only REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE; all other methods receive 405
+- sbc-daemon handles REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE, and relays PRACK/INFO/MESSAGE/NOTIFY in dialog only (tagged To, NIST POA&M-182); out of dialog those four and all other methods receive 405, and a tagged-To request of another method for an unknown dialog receives 481. In-dialog requests are matched on Call-ID, both tags and the leg's peer (481 / 403; see `docs/RFC_COMPLIANCE_GAPS.md` §12.2.2)
 - sbc-daemon trunk failover (RFC 3263 §4.3): 408/Timer B/503 plus local-policy 500/502/504; a transport error on the first send of a B-leg INVITE also fails over immediately; a trunk's 503 `Retry-After` (§21.5.4, §20.33) sets the trunk cooldown, clamped to `general.trunk_retry_after_max_secs` (RFC-001 resolved). See `docs/RFC_COMPLIANCE_GAPS.md`
 - sbc-daemon transaction timers follow the receive transport (reliable on TCP/TLS/WS/WSS/SCTP, so no Timer A/E/G there; RFC 3261 §17.1.1.2/§17.1.2.2/§17.2.1/§17.2.2). Timer-loop sends (failover INVITEs, BYEs) still go out on UDP (POA&M-5); the stream-loop wiring has no end-to-end test. See `docs/RFC_COMPLIANCE_GAPS.md`
 - sbc-daemon stream framing (RFC 3261 §18.3/§20.14): on TCP/TLS a missing, duplicate, conflicting or malformed Content-Length gets a 400 and the connection closes; the framer shares `SipMessage::stream_message_len` with the parser. Post-framing parse still uses datagram rules (POA&M-64)
@@ -353,7 +353,7 @@
 | RFC | Title | Status |
 |-----|-------|--------|
 | **RFC 3261** | SIP Transactions | **Full** — client INVITE (§17.1.1), client non-INVITE (§17.1.2), server INVITE (§17.2.1), server non-INVITE (§17.2.2), transaction matching (§17.1.3), branch magic cookie, Timer T1/T2/T4, 2xx bypass for server INVITE. **Wired (sbc-daemon `sip_stack.rs`: `ServerInviteTransaction`/`ServerNonInviteTransaction`/`ClientInviteTransaction`/`ClientNonInviteTransaction`, `TransactionKey`, timers driven by `poll_timers`; soft client `registration.rs`/`call_agent.rs`)** |
-| **RFC 3262** | 100rel / PRACK | **Full** — RSeq/RAck headers, reliable provisional tracking, random initial RSeq (1 to 2^31). **Library-only** — no binary sends or handles PRACK; sbc-daemon returns 405 |
+| **RFC 3262** | 100rel / PRACK | **Full** — RSeq/RAck headers, reliable provisional tracking, random initial RSeq (1 to 2^31). **Library-only** — no binary uses the library's PRACK support; sbc-daemon relays in-dialog PRACK with its own RAck mapping (POA&M-182) and returns 405 out of dialog |
 | **RFC 3311** | UPDATE | Non-INVITE transaction machine reuse. **Wired (sbc-daemon)** — `handle_update` opens server/client non-INVITE transactions and relays |
 | **RFC 4028** | Session Timers | UPDATE for session timer refresh. **Wired (sbc-daemon, header relay only)** — see §1/§10 |
 
@@ -394,7 +394,7 @@
 | **RFC 5875** | XCAP Diff Event | Event package entry. Library-only |
 | **RFC 6035** | VoIP Metrics (vq-rtcpxr) | Event package entry. Library-only |
 | **RFC 6446** | Session Recording | Event package entry. Library-only |
-| **RFC 6665** | SIP Events | **Full** — subscription states, termination reasons, IANA event package validation (§7.2). **Library-only** — `subscription.rs` unused; daemon 405s SUBSCRIBE/NOTIFY; client reads Subscription-State header as a string on REFER NOTIFY |
+| **RFC 6665** | SIP Events | **Full** — subscription states, termination reasons, IANA event package validation (§7.2). **Library-only** — `subscription.rs` unused; daemon 405s SUBSCRIBE and out-of-dialog NOTIFY (in-dialog NOTIFY is relayed); client reads Subscription-State header as a string on REFER NOTIFY |
 | **RFC 6910** | Auto-Configuration | Event package entry. Library-only |
 | **RFC 7614** | Location Conveyance | Event package entry. Library-only |
 | **RFC 7840** | Multiple Phone Numbers | Event package entry. Library-only |
@@ -504,7 +504,7 @@
 - **proto-ice** — soft client only (checks, nomination; STUN via settings); the SBC does not run ICE; RFC 7675 consent and §10 keepalives unused
 - **proto-dtls** — `DtlsAssociation` (the handshake added 2026-11-16) is run by the soft client since 2026-11-17 (`client-sip-ua/src/dtls_driver.rs`; local test runs only); no SBC binary uses it: SBC DTLS termination is the Go sidecar. The legacy `DtlsConnection` / `DtlsSession` surface performs no handshake and is used by no client crate (NIST POA&M-337). `fingerprint.rs` and PEM loading are also on shipped paths
 - **proto-sip** proxy/routing/redirect/options modules, Path header; **proto-transaction** PRACK; **proto-registrar** GRUU/Path/Service-Route/flow manager; **proto-b2bua** early-media module; **proto-rtp** translator/mixer/scheduler/collision detector
-- **sbc-daemon** relays only REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE; REFER, SUBSCRIBE/NOTIFY, PRACK, MESSAGE, INFO, PUBLISH receive 405
+- **sbc-daemon** handles REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE and relays PRACK, INFO, MESSAGE and NOTIFY in dialog only (with its own code, not the proto-dialog/proto-transaction modules); REFER, SUBSCRIBE and PUBLISH, and out-of-dialog PRACK/INFO/MESSAGE/NOTIFY, receive 405
 
 ### Intentional Deviations (All Documented)
 
