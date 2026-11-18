@@ -715,14 +715,17 @@ rtp_port_min = 16384
 rtp_port_max = 32768
 
 [media.srtp]
-# Require SRTP encryption (CNSA 2.0: AEAD_AES_256_GCM is the only profile).
-# Not enforced on call-leg SDP: cleartext RTP/AVP offers are still relayed.
+# Require SRTP on every call leg (default true). Enforced on call-leg SDP:
+# cleartext RTP and INVITEs without an SDP offer get 488. Emergency calls are
+# exempt. See "Required SRTP on call legs". Restart required.
 required = true
-profile = "AeadAes256Gcm"        # only value; the relay rejects any other profile
+profile = "AeadAes256Gcm"        # only value; constrains SDES a=crypto lines only
 # "Passthrough" (default) relays SRTP/DTLS opaquely, end to end; "Terminate"
 # has the SBC terminate DTLS-SRTP on each leg (requires [media.dtls]
 # sidecar_socket and fingerprint_file — the daemon aborts at startup
-# otherwise). Any other value fails to load. See "Call-leg SRTP keying (SDES)".
+# otherwise). With a remote media plane that reports no DTLS fingerprint,
+# "Terminate" refuses new calls with 488. Any other value fails to load.
+# See "Call-leg SRTP keying (SDES)". Restart required.
 mode = "Passthrough"
 
 [media.dtls]
@@ -730,7 +733,9 @@ mode = "Passthrough"
 # self-signed P-384 certificate at startup.
 cert_path = "/etc/sbc/dtls-cert.pem"
 key_path = "/etc/sbc/dtls-key.pem"
-fingerprint_hash = "Sha384"      # Sha384 (default) or Sha512
+fingerprint_hash = "Sha384"      # Sha384 (default) or Sha512; validated, not read
+                                 # by the daemon. Peers' fingerprints must be
+                                 # sha-384 or sha-512 whatever it says.
 # Required when srtp.mode = "Terminate": the Go DTLS-SRTP terminator
 # sidecar's Unix socket and the file it publishes its fingerprint to.
 sidecar_socket = "/run/sbc/dtls-sidecar.sock"
@@ -901,8 +906,10 @@ by signalling only (NIST POA&M-335).
 The SBC checks the SRTP keying in every SDP body that crosses it: the
 initial INVITE offer, the callee's 18x/2xx answer (or offer, when the INVITE
 had no SDP), re-INVITE and UPDATE offers and answers, and PRACK and other
-in-dialog bodies it relays. There is no setting for this policy; it follows
-`media.srtp.mode`. Tested in local runs on macOS (2026-11-17).
+in-dialog bodies it relays. The SDES and fingerprint rules have no setting;
+they follow `media.srtp.mode`. `media.srtp.required` adds the rules in
+"Required SRTP on call legs" below. Tested in local runs on macOS
+(2026-11-17).
 
 **Rules in `Passthrough` mode (the default).**
 
@@ -931,14 +938,30 @@ in-dialog bodies it relays. There is no setting for this policy; it follows
   offers and refused in answers.
 - MIKEY (`a=key-mgmt`, RFC 4567) is not supported: removed from offers,
   refused in answers and refused when it is the only keying of a section.
-- Cleartext `RTP/AVP` is not refused by this policy, and
-  `media.srtp.required` is not enforced on call-leg SDP.
+- Cleartext `RTP/AVP` is refused only under `media.srtp.required` (see
+  below).
 - In passthrough the endpoints negotiate DTLS-SRTP end to end; the SBC does
-  not check the profile they agree on.
+  not check the profile they agree on. It checks only the fingerprint hash
+  (next rule).
+
+**DTLS fingerprints (both modes, whatever `media.srtp.required` says).** An
+active DTLS m-line (`UDP/TLS/RTP/SAVP(F)`, `TCP/DTLS/RTP/SAVP(F)`,
+`TCP/TLS/RTP/SAVP(F)`, `UDP/DTLS/SCTP`, `TCP/DTLS/SCTP`) needs an
+`a=fingerprint` with hash `sha-384` or `sha-512` (CNSA 2.0) and a value of
+48 or 64 hex octets. Media-level lines apply, else session-level ones. Other
+`a=fingerprint` lines are removed from offers and answers. The body is
+refused only when an active DTLS m-line keeps none: `fingerprint_missing`
+(399) when it had none, `fingerprint_hash_not_allowed` (306) when all it had
+were `sha-256`, `sha-1`, `md5` or malformed.
 
 **Rules in `Terminate` mode.** The SBC keys each leg with DTLS-SRTP, so
 every `a=crypto` line is removed, from answers too. A section left with no
-DTLS keying is refused.
+DTLS keying is refused. Both legs need an accepted fingerprint; with
+`media.srtp.required = false` a leg without one is relayed opaquely (SRTP to
+RTP interworking is not supported). `Terminate` without a DTLS identity (a
+remote media plane that reports no fingerprint) refuses every new call with
+488 `dtls_termination_unavailable`, logged at `error` once; emergency calls
+are relayed opaquely instead.
 
 **Bodies the SBC does not parse.** In-dialog bodies relayed opaquely
 (PRACK, INFO, MESSAGE, NOTIFY and their responses) are refused when they
@@ -953,9 +976,9 @@ that does not parse is refused as malformed.
 
 | Refused body | Result |
 | ------------ | ------ |
-| Initial INVITE offer | 488 to the caller; nothing is sent to a trunk; CDR `PolicyDenied`, 488 |
-| 183 answer | CANCEL to the callee, 488 to the caller |
-| 2xx to the initial INVITE | ACK and BYE to the callee, 488 to the caller (who never sees the 2xx); no media relay is started. A retransmitted 2xx is re-ACKed only. When the 2xx carried an offer, the ACK carries an answer that declines every stream |
+| Initial INVITE offer | 488 to the caller; nothing is sent to a trunk; CDR `PolicyDenied`, 488. Cleartext media, an unsupported protocol, the fingerprint rule, a delayed offer and Terminate without identity are refused before routing, so no slot or port is taken (a `multipart/*` offer is checked after routing) |
+| 183 answer | CANCEL to the callee, 488 to the caller. A reliable 183 that carried the offer (INVITE without SDP) is first PRACKed with an answer that declines every stream |
+| 2xx to the initial INVITE | ACK and BYE to the callee, 488 to the caller (who never sees the 2xx); no media relay is started. Also when the answer passes the SDP rules but the relay it would start does not (for example a Terminate leg without an accepted fingerprint under `media.srtp.required`). A retransmitted 2xx is re-ACKed only. When the 2xx carried an offer, the ACK carries an answer that declines every stream |
 | re-INVITE, UPDATE or relayed in-dialog request | 488 to the sender; the request is not forwarded and the session stays as it was |
 | 2xx to a re-INVITE or UPDATE on an answered call | ACK (re-INVITE), 488 to the offerer, BYE on both legs |
 | 2xx to an UPDATE before the call is answered | 488 to the UPDATE, CANCEL to the callee, 488 on the caller's INVITE |
@@ -981,6 +1004,12 @@ Hiding"), so the peer sees a 488 without it.
 | `unsupported_key_management` | 306 | `Key management method not supported` |
 | `sdp_in_multipart` | 399 | `SDP in a multipart body is not relayed` |
 | `unpoliced_body` | 399 | `Encoded or non-SDP keying body is not relayed` |
+| `cleartext_media` | 302 | `SRTP is required` |
+| `unsupported_protocol` | 302 | `Media transport protocol not supported` |
+| `fingerprint_missing` | 399 | `DTLS fingerprint required` |
+| `fingerprint_hash_not_allowed` | 306 | `Only sha-384 and sha-512 DTLS fingerprints are accepted` |
+| `delayed_offer` | 399 | `Delayed offer not supported when SRTP is required` |
+| `dtls_termination_unavailable` | 399 | `DTLS-SRTP termination unavailable` |
 
 **Audit and logs.** With `logging.audit_enabled`, each refusal is an
 `AuthorizationDecision` with `granted = false` and policy
@@ -995,7 +1024,10 @@ and refusals are not aggregated per source (POA&M-347).
 **Limits.** The TLS check covers the two hops the SBC terminates, not hops
 beyond its peers (POA&M-348). When the callee's 2xx to an INVITE without SDP
 carries an offer and is accepted, the SBC ACKs it without an answer
-(POA&M-349, pre-existing).
+(POA&M-349, pre-existing); with `media.srtp.required = true` such INVITEs
+are refused up front (POA&M-351). One failing active m-line refuses the
+whole body (POA&M-353). A PRACK the SBC builds goes to the stored B-leg
+target, not the early dialog's remote target and route set (POA&M-54).
 
 **Upgrading (behaviour change).** Calls that worked before may now be
 refused or changed:
@@ -1013,6 +1045,79 @@ refused or changed:
   `multipart/*` with SDP, or non-SDP bodies with `a=crypto` / `a=key-mgmt`:
   refused with 488 `Warning: 399`; a refused response ends the call.
 - `a=key-mgmt` (MIKEY) is no longer relayed.
+- `a=fingerprint` with `sha-256`, `sha-1` or `md5`: removed; a DTLS m-line
+  left with no `sha-384` / `sha-512` fingerprint is refused, also with
+  `media.srtp.required = false`.
+
+### Required SRTP on call legs (`media.srtp.required`)
+
+`media.srtp.required` (default `true`) is enforced on every SDP offer and
+answer that crosses the SBC, on top of the rules above. It is enforced in
+signalling only: the media relay, and a remote media node
+(`SBC_MEDIA_SRTP_REQUIRED`), do not refuse cleartext packets themselves
+(POA&M-352). Tested in local runs on macOS (2026-11-17).
+
+**What `required = true` accepts.** Every active m-line other than
+`m=image <port> udptl` (T.38, see `[media.t38]`) must be:
+
+- a DTLS profile (`UDP/TLS/RTP/SAVP(F)`, `TCP/DTLS/RTP/SAVP(F)`,
+  `TCP/TLS/RTP/SAVP(F)`, `UDP/DTLS/SCTP`, `TCP/DTLS/SCTP`) with an accepted
+  fingerprint, or
+- in `Passthrough` only, `RTP/SAVP(F)` keeping an acceptable SDES line
+  (which needs TLS on both hops).
+
+In `Terminate` mode only DTLS passes.
+
+| SDP content | Label | Code |
+| ----------- | ----- | ---- |
+| `RTP/AVP(F)`, or `RTP/SAVP(F)` with no keying left | `cleartext_media` | 302 |
+| `UDP`, `TCP`, `udptl` outside `m=image`, `TCP/TLS/RTP/AVP(F)`, BFCP, MSRP, unknown protocols | `unsupported_protocol` | 302 |
+| An answer on an audio call that puts an active `m=image` where the offer had another stream (unless `udptl` accepted by the T.38 rules) | `unsupported_protocol` | 302 |
+| Initial INVITE with no body, a non-SDP body, or `multipart/*` without an SDP part (delayed offer) | `delayed_offer` | 399 |
+| `media.srtp.mode = "Terminate"` with no DTLS identity (any new call, whatever `required` says) | `dtls_termination_unavailable` | 399 |
+
+One failing active m-line refuses the whole body; the stream is not
+declined in place (POA&M-353). Declined (port 0) m-lines are not checked.
+Refusals follow "What a refusal does" above.
+
+**No route.** Under `required` a call that nothing routes gets **480**
+instead of the "number not in service" announcement, which answers with
+cleartext RTP. Emergency calls still get the announcement.
+
+**Emergency calls.** A call whose dialled number (the Request-URI user
+before any translation) is in `vps.emergency_numbers` is exempt from
+`required`, and with `Terminate` without a DTLS identity it is relayed
+opaquely. The fingerprint and SDES rules still apply. When the exemption
+admits a call the configured policy would have refused, the SBC logs a
+warning and, with `logging.audit_enabled`, records one `AuthorizationDecision`
+per call with `granted = true` and policy `media_security:emergency_cleartext`.
+
+**Recording.** `recording.enabled = true` with `required = true` and
+`mode = "Passthrough"` fails validation: a passthrough relay cannot record
+SRTP calls. Use `mode = "Terminate"`, or `required = false` to record
+cleartext calls only.
+
+**`required = false`.** Cleartext RTP crosses. The DTLS fingerprint and SDES
+rules still apply. A delayed offer is relayed, and the answer in the
+caller's ACK is not checked (POA&M-351).
+
+**Reload.** `[media.srtp]` is read at startup. A configuration reload reports
+a change as restart-required and does not apply it.
+
+**Upgrading (behaviour change).** With the default `required = true`, calls
+that worked before may now be refused:
+
+- cleartext `RTP/AVP` calls, re-INVITEs and UPDATEs: 488 `Warning: 302`, or
+  the call is ended when the answer is cleartext. Set `required = false` to
+  keep cleartext RTP;
+- delayed-offer INVITEs (no SDP): 488 `Warning: 399` before routing;
+- unrouted calls: 480 instead of the announcement;
+- peers that sign only `sha-256` fingerprints: refused **even with
+  `required = false`** (`Warning: 306`);
+- offers with a cleartext or non-RTP stream next to secured audio (video,
+  BFCP, MSRP): the whole offer is refused;
+- `recording.enabled` with `mode = "Passthrough"` no longer loads unless
+  `required = false`.
 
 ### T.38 fax relay (`[media.t38]`)
 
@@ -1419,7 +1524,7 @@ The table rejects unknown keys. Field rules are checked even when `enabled = fal
 
 **Startup warnings.** With recording enabled the daemon logs a warning at load for each of these:
 
-1. `media.srtp.mode = passthrough`: only cleartext-RTP calls can be recorded; SRTP calls that match the trigger are refused or torn down (`reject`) or left unrecorded (`continue`).
+1. `media.srtp.mode = passthrough` (loads only with `media.srtp.required = false`): only cleartext-RTP calls can be recorded; SRTP calls that match the trigger are refused or torn down (`reject`) or left unrecorded (`continue`).
 2. `on_failure = reject` with `recordpref_never = honour`: any call party can keep its call unrecorded by sending `a=recordpref:off`.
 3. `record_all = true` with `max_sessions` below this node's `general.max_calls`: calls beyond `max_sessions` are refused with 503 (`reject`) or left unrecorded (`continue`). The defaults (`max_sessions = 256`, `max_calls = 10000`) raise this warning as soon as `record_all = true`.
 
@@ -1431,7 +1536,7 @@ The table rejects unknown keys. Field rules are checked even when `enabled = fal
 - `srs_tls_ca_file`, or the SBC certificate or key, cannot be loaded;
 - the SBC has no local media address toward the recorder (no route, and `srs_zone` has no media address).
 
-Configuration validation separately rejects `enabled = true` without `notice_acknowledged = true`, `srs_uri`, `srs_tls_ca_file`, a trigger, or `transport.tls_listen`.
+Configuration validation separately rejects `enabled = true` without `notice_acknowledged = true`, `srs_uri`, `srs_tls_ca_file`, a trigger, or `transport.tls_listen`, and `enabled = true` with `media.srtp.required = true` and `media.srtp.mode = "Passthrough"` (set `mode = "Terminate"`, or `required = false` to record cleartext calls only).
 
 ### Which calls can be recorded
 
@@ -1903,6 +2008,7 @@ The SBC is designed for CNSA 2.0 compliance:
 - SIP-over-TLS is TLS 1.3 only (cipher suites are not further restricted; P-384 certificate type is recommended but not enforced)
 - SRTP with AEAD_AES_256_GCM (256-bit) — the only profile the media plane accepts
 - DTLS-SRTP (DTLS 1.2, Go terminator sidecar) with SHA-384 fingerprint and a self-signed P-384 SBC identity
+- Call-leg SDP: only `sha-384` / `sha-512` DTLS fingerprints and `AEAD_AES_256_GCM` SDES keys cross the SBC
 
 See [CNSA-2-COMPLIANCE.md](CNSA-2-COMPLIANCE.md) for details.
 
@@ -1918,7 +2024,7 @@ The SBC implements controls from NIST 800-53 Rev5 (wiring state in parentheses):
 - **IA-2**: REGISTER authentication (wired, off by default: OIDC Bearer via `SBC_AUTH_MODE=bearer`, or RFC 7616 digest via `[digest_auth]` with an HA1 credentials file; no per-INVITE challenge; SIP mTLS planned)
 - **SC-5**: DoS protection (rate limiting, `max_calls` admission, per-trunk `max_calls`, `per_callee_max_concurrent`, `max_registrations` — wired, per node; bounded emergency reserve)
 - **SC-7**: Boundary protection (topology hiding — wired)
-- **SC-8**: Transmission confidentiality (TLS 1.3 SIP listeners, AEAD SRTP — wired)
+- **SC-8**: Transmission confidentiality (TLS 1.3 SIP listeners, AEAD SRTP, `media.srtp.required` on call-leg SDP — wired; signalling only, no media-plane backstop)
 - **SC-13**: Cryptographic protection (FIPS aws-lc-rs provider — wired)
 - **SC-24**: Fail in known state (single-node graceful shutdown wired; cluster failover planned)
 
