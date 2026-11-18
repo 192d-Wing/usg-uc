@@ -301,6 +301,13 @@ pub struct PipelineStats {
     pub dtmf_events_sent: u64,
     /// Malformed DTMF packets (invalid event code, duration, or impossible jumps).
     pub dtmf_malformed: u64,
+    /// Telephone-event PACKETS (not events) refused by the per-call bounds:
+    /// every packet of an event whose start was too far from the playout
+    /// clock (continuations and ENDs included), plus one per queued event
+    /// evicted from a full schedule.
+    pub dtmf_rejected: u64,
+    /// Audio packets the codec failed to decode.
+    pub decode_errors: u64,
     /// Decoded frames dropped because the RTP payload was longer than one ptime.
     pub oversized_frames_dropped: u64,
     /// Current AGC gain (linear, 1.0 = unity).
@@ -681,7 +688,7 @@ impl AudioPipeline {
         };
 
         // Create DTMF receive notification channel
-        let (dtmf_rx_tx, dtmf_rx_rx) = std::sync::mpsc::channel();
+        let (dtmf_rx_tx, dtmf_rx_rx) = decode_thread::dtmf_rx_channel();
 
         // Spawn decode thread
         let decode_config = DecodeThreadConfig {
@@ -923,6 +930,8 @@ impl AudioPipeline {
             stats.plc_generated_frames = m.plc_generated.load(Ordering::Relaxed);
             stats.dtmf_events_received = m.dtmf_received.load(Ordering::Relaxed);
             stats.dtmf_malformed = m.dtmf_malformed.load(Ordering::Relaxed);
+            stats.dtmf_rejected = m.dtmf_rejected.load(Ordering::Relaxed);
+            stats.decode_errors = m.decode_errors.load(Ordering::Relaxed);
             stats.oversized_frames_dropped = m.oversized_frames_dropped.load(Ordering::Relaxed);
         }
         stats

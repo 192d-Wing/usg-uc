@@ -153,16 +153,8 @@ impl SipResolver {
     #[must_use]
     pub fn new(config: SipResolverConfig, cache: Arc<DnsCache>) -> Self {
         #[cfg(feature = "resolver")]
-        let dns_resolver = match HickoryDnsResolver::from_system_conf(Arc::clone(&cache)) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "system DNS configuration unavailable; SIP resolver running without DNS backend"
-                );
-                None
-            }
-        };
+        let dns_resolver =
+            Self::system_backend_or_none(HickoryDnsResolver::from_system_conf(Arc::clone(&cache)));
 
         Self {
             config,
@@ -178,6 +170,56 @@ impl SipResolver {
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(SipResolverConfig::default(), Arc::new(DnsCache::default()))
+    }
+
+    /// Creates a SIP resolver with default configuration whose system DNS
+    /// backend bounds every query (see
+    /// [`HickoryDnsResolver::from_system_conf_with_query_limits`]): an
+    /// unanswered query costs `query_timeout * (retries + 1)`. Query names are
+    /// sent fully qualified, so each RFC 3263 §4 step is one query with no
+    /// resolv.conf search-domain expansion.
+    ///
+    /// Otherwise identical to [`Self::with_defaults`]: if the system DNS
+    /// configuration cannot be read the resolver runs with no DNS backend and
+    /// never falls back to hickory's public default resolvers.
+    ///
+    /// NIST 800-53 Rev5: CM-7 (enterprise resolver, fail-safe), SC-5, SI-17
+    /// (bounded per-query time).
+    #[cfg(feature = "resolver")]
+    #[must_use]
+    pub fn with_system_dns_query_limits(query_timeout: Duration, retries: usize) -> Self {
+        let cache = Arc::new(DnsCache::default());
+        let dns_resolver =
+            Self::system_backend_or_none(HickoryDnsResolver::from_system_conf_with_query_limits(
+                Arc::clone(&cache),
+                query_timeout,
+                retries,
+            ));
+        Self {
+            config: SipResolverConfig::default(),
+            cache,
+            naptr_resolver: NaptrResolver::new(),
+            srv_resolver: SrvResolver::new(),
+            dns_resolver,
+        }
+    }
+
+    /// Keeps a system-configured backend, or logs and runs without one (never
+    /// hickory's public defaults).
+    #[cfg(feature = "resolver")]
+    fn system_backend_or_none(
+        backend: DnsResult<HickoryDnsResolver>,
+    ) -> Option<HickoryDnsResolver> {
+        match backend {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "system DNS configuration unavailable; SIP resolver running without DNS backend"
+                );
+                None
+            }
+        }
     }
 
     /// Creates a SIP resolver with actual DNS resolution enabled.
@@ -705,6 +747,24 @@ mod tests {
         let resolver = SipResolver::with_defaults();
         let system_ok = HickoryDnsResolver::from_system_conf(Arc::new(DnsCache::default())).is_ok();
         assert_eq!(resolver.has_dns_resolver(), system_ok);
+    }
+
+    /// SR-45 / RFC-2: the query-limited constructor keeps `with_defaults`
+    /// semantics (system backend or none, default config) and applies the
+    /// limits to the backend.
+    #[cfg(feature = "resolver")]
+    #[test]
+    fn test_with_system_dns_query_limits_mirrors_with_defaults() {
+        let limited = SipResolver::with_system_dns_query_limits(Duration::from_secs(2), 0);
+        let defaults = SipResolver::with_defaults();
+        assert_eq!(limited.has_dns_resolver(), defaults.has_dns_resolver());
+        assert_eq!(limited.config().use_naptr, defaults.config().use_naptr);
+        assert_eq!(limited.config().use_srv, defaults.config().use_srv);
+        if let Some(backend) = limited.dns_resolver.as_ref() {
+            let opts = backend.resolver().options();
+            assert_eq!(opts.timeout, Duration::from_secs(2));
+            assert_eq!(opts.attempts, 0);
+        }
     }
 
     #[allow(clippy::unwrap_used)]

@@ -3168,9 +3168,23 @@ impl CallAgent {
                 }
             })
             .await;
-        match resolver
-            .resolve(&sip_uri.host, sip_uri.port, preference)
-            .await
+        // NIST 800-53 Rev5: SC-5, SI-17 — each NAPTR/SRV/A query is bounded
+        // at the resolver (2 s, no re-send; `build_resolver`), and the whole
+        // chain has its own 8 s budget, so SRV is still asked after an
+        // unanswered NAPTR (RFC 3263 §4.1, §4.2). A timeout takes the same
+        // fallback path as any other RFC 3263 failure, so the worst case is
+        // 8 s + 5 s (A/AAAA fallback).
+        match crate::net_timeout::bounded_dns(
+            &sip_uri.host,
+            crate::net_timeout::DNS_RESOLVE_CHAIN_TIMEOUT,
+            async {
+                resolver
+                    .resolve(&sip_uri.host, sip_uri.port, preference)
+                    .await
+                    .map_err(|e| SipUaError::ConfigError(e.to_string()))
+            },
+        )
+        .await
         {
             Ok(targets) => {
                 // Targets arrive sorted by SRV priority/weight; among the
@@ -3210,8 +3224,16 @@ impl CallAgent {
     /// configuration is used; if it is unavailable the resolver runs with no
     /// DNS backend (numeric/cached only, then the system A/AAAA fallback) and
     /// never queries hickory's public default resolvers.
+    ///
+    /// NIST 800-53 Rev5: SC-5, SI-17 — each query is limited to
+    /// `DNS_QUERY_TIMEOUT` with `DNS_QUERY_RETRIES` re-sends instead of the
+    /// system's 5 s x 3 sends, so one unanswered query cannot use up the
+    /// chain budget.
     fn build_resolver() -> SipResolver {
-        let resolver = SipResolver::with_defaults();
+        let resolver = SipResolver::with_system_dns_query_limits(
+            crate::net_timeout::DNS_QUERY_TIMEOUT,
+            crate::net_timeout::DNS_QUERY_RETRIES,
+        );
         if resolver.has_dns_resolver() {
             debug!("RFC 3263 resolver using system DNS configuration");
         } else {
@@ -3226,13 +3248,20 @@ impl CallAgent {
         let default_port = if transport == "TLS" { 5061 } else { 5060 };
         let port = sip_uri.port.unwrap_or(default_port);
 
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&format!("{host}:{port}"))
-            .await
-            .map_err(|e| {
-                error!(host = %host, error = %e, "parse_destination: DNS resolution failed");
-                SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}"))
-            })?
-            .collect();
+        let addrs: Vec<SocketAddr> = crate::net_timeout::bounded_dns(
+            host,
+            crate::net_timeout::DNS_LOOKUP_TIMEOUT,
+            async {
+                tokio::net::lookup_host(&format!("{host}:{port}"))
+                    .await
+                    .map(Iterator::collect)
+                    .map_err(|e| {
+                        error!(host = %host, error = %e, "parse_destination: DNS resolution failed");
+                        SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}"))
+                    })
+            },
+        )
+        .await?;
 
         // Prefer IPv6 (AAAA) over IPv4 (A) to match socket address family
         addrs

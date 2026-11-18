@@ -1168,10 +1168,16 @@ impl RegistrationAgent {
         // DNS resolution for hostnames — prefer IPv6 (AAAA) over IPv4 (A).
         // The UDP socket address family is chosen at startup to match.
         let lookup_host = format!("{host}:{port}");
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&lookup_host)
-            .await
-            .map_err(|e| SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}")))?
-            .collect();
+        let addrs: Vec<SocketAddr> =
+            crate::net_timeout::bounded_dns(host, crate::net_timeout::DNS_LOOKUP_TIMEOUT, async {
+                tokio::net::lookup_host(&lookup_host)
+                    .await
+                    .map(Iterator::collect)
+                    .map_err(|e| {
+                        SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}"))
+                    })
+            })
+            .await?;
         addrs
             .iter()
             .find(|a| a.is_ipv6())

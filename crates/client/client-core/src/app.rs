@@ -1618,6 +1618,9 @@ fn ice_config_from_settings(network: &crate::settings::NetworkSettings) -> proto
         } else {
             format!("{host_port}:3478")
         };
+        // POAM: POA&M-375 -- blocking std getaddrinfo with no deadline on a
+        // tokio worker, reached from ClientApp::new under the GUI client
+        // mutex; a stalled resolver stalls client initialisation.
         match target.to_socket_addrs() {
             Ok(mut addrs) => {
                 if let Some(addr) = addrs.next() {
