@@ -18,6 +18,38 @@ use uc_audit::event::{
 };
 use uc_cdr::RecordingTag;
 
+// Recording in passthrough mode needs `media.srtp.required = false`
+// (sbc-config rejects it otherwise): these calls are cleartext RTP/AVP, so
+// the shared DTLS-SRTP fixtures are shadowed here.
+const ALICE_SDP: &str = "v=0\r\no=- 1 1 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\na=sendrecv\r\n";
+const BOB_SDP: &str = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\na=sendrecv\r\n";
+
+/// The parent module's `place_call`, with this module's cleartext offer.
+async fn place_call(stack: &SipStack, call_id: &str) -> Vec<ProcessResult> {
+    place_call_to(stack, DIALED, call_id).await
+}
+
+/// The parent module's `place_call_to`, with this module's cleartext offer.
+async fn place_call_to(stack: &SipStack, user: &str, call_id: &str) -> Vec<ProcessResult> {
+    flatten(
+        stack
+            .process_message(
+                &caller_request("INVITE", user, call_id, 1, None, Some(ALICE_SDP)),
+                alice(),
+                None,
+            )
+            .await,
+    )
+}
+
+/// `[media.srtp]` with `required = false`, passthrough.
+fn srtp_not_required() -> sbc_config::schema::SrtpConfig {
+    sbc_config::schema::SrtpConfig {
+        required: false,
+        ..sbc_config::schema::SrtpConfig::default()
+    }
+}
+
 const REJECT: RecordingFailureAction = RecordingFailureAction::Reject;
 const CONTINUE: RecordingFailureAction = RecordingFailureAction::Continue;
 
@@ -222,6 +254,7 @@ async fn fixture_with(
     let mut s = settings(on_failure);
     tweak(&mut s);
     stack.set_recording(s);
+    stack.set_media_security_policy(&srtp_not_required());
     Fixture { stack, media, cdr }
 }
 
@@ -1381,6 +1414,7 @@ async fn tls_fixture(on_failure: RecordingFailureAction) -> Fixture {
     let media = Arc::new(ForkMedia::default());
     stack.set_media_pipeline(Arc::clone(&media) as _);
     stack.set_recording(settings(on_failure));
+    stack.set_media_security_policy(&srtp_not_required());
     Fixture { stack, media, cdr }
 }
 
@@ -1474,6 +1508,7 @@ async fn srtp_passthrough_call_is_not_recordable() {
 async fn call_without_a_media_relay_is_not_recordable() {
     let (mut stack, cdr) = cdr_stack().await;
     stack.set_recording(settings(REJECT));
+    stack.set_media_security_policy(&srtp_not_required());
     let f = Fixture {
         stack,
         media: Arc::new(ForkMedia::default()),
@@ -1690,6 +1725,7 @@ async fn cross_group_fixture(tweak: impl FnOnce(&mut RecordingSettings)) -> Fixt
     let mut s = settings(REJECT);
     tweak(&mut s);
     stack.set_recording(s);
+    stack.set_media_security_policy(&srtp_not_required());
     Fixture { stack, media, cdr }
 }
 
@@ -2501,6 +2537,7 @@ async fn rs_messages_bypass_topology_hiding() {
     let media = Arc::new(ForkMedia::default());
     stack.set_media_pipeline(Arc::clone(&media) as _);
     stack.set_recording(settings(REJECT));
+    stack.set_media_security_policy(&srtp_not_required());
     let f = Fixture { stack, media, cdr };
     let results = answered(&f.stack, "th@test").await;
     let inv = rs_invite(&results);
@@ -2552,6 +2589,7 @@ async fn held_bye_is_hidden_the_same_on_ack_and_on_timeout() {
         let media = Arc::new(ForkMedia::default());
         stack.set_media_pipeline(Arc::clone(&media) as _);
         stack.set_recording(settings(REJECT));
+        stack.set_media_security_policy(&srtp_not_required());
         let f = Fixture { stack, media, cdr };
         let placed = place_call(&f.stack, "th-hold@test").await;
         let answered = answer_with(&f.stack, &placed, BOB_SDP).await;

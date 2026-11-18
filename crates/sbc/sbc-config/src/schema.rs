@@ -1196,13 +1196,34 @@ pub enum SrtpMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SrtpConfig {
-    /// Require SRTP for all calls.
+    /// Require SRTP on every call leg (default `true`), enforced in
+    /// signalling on each SDP offer and answer that crosses the SBC: every
+    /// active m-line other than `m=image ... udptl` must be DTLS-keyed
+    /// (`UDP/TLS/RTP/SAVP(F)`, `TCP/DTLS/RTP/SAVP(F)`,
+    /// `TCP/TLS/RTP/SAVP(F)`, `UDP/DTLS/SCTP` or `TCP/DTLS/SCTP` with a
+    /// sha-384 or sha-512 `a=fingerprint`) or, in `Passthrough` mode over
+    /// TLS signalling, `RTP/SAVP(F)` with an `AEAD_AES_256_GCM` `a=crypto`
+    /// line. A cleartext offer gets 488 (Warning 302); a cleartext answer
+    /// ends the call. An INVITE without an SDP offer (delayed offer) gets
+    /// 488 (Warning 399). In `Terminate` mode both legs must be DTLS-SRTP.
+    /// Emergency calls are exempt from this setting only. `false` lets
+    /// cleartext RTP cross (the DTLS fingerprint and SDES rules still
+    /// apply). With `recording.enabled` it needs `mode = Terminate`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, SC-8(1), CM-6
     pub required: bool,
 
-    /// SRTP profile (CNSA 2.0: only AES-256-GCM).
+    /// SRTP profile (CNSA 2.0: only AES-256-GCM). The only accepted value.
+    /// It constrains SDES only: `a=crypto` lines with another suite never
+    /// cross. DTLS-SRTP endpoints negotiate the `use_srtp` profile between
+    /// themselves; in `Passthrough` the SBC does not see or enforce it.
+    ///
+    /// ## NIST 800-53 Rev5: SC-13
     pub profile: CnsaSrtpProfile,
 
     /// Whether the SBC terminates DTLS-SRTP or relays it opaquely.
+    /// `Terminate` needs a DTLS identity (the sidecar's, or the remote
+    /// media plane's); without one the daemon refuses new calls.
     pub mode: SrtpMode,
 }
 

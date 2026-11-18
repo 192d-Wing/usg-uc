@@ -653,7 +653,7 @@ fn validate_media_enforced(config: &crate::schema::MediaConfig) -> ConfigResult<
 /// Validates `[recording]` (SIPREC SRC, RFC 7866).
 ///
 /// Field rules apply whether or not recording is enabled; the enable-only
-/// rules (notice, SRS, CA, trigger, TLS listener) apply when
+/// rules (notice, SRS, CA, trigger, TLS listener, SRTP mode) apply when
 /// `enabled = true`. Rules that depend on the environment (remote media
 /// controller URLs, SRS host resolution, SRS CA parsing) are daemon startup
 /// errors, not checked here.
@@ -745,6 +745,18 @@ fn validate_recording(config: &SbcConfig) -> ConfigResult<()> {
         return err(
             "recording.enabled = true needs a transport.tls_listen address (the recording \
              session is signalled over TLS only)"
+                .to_string(),
+        );
+    }
+    // CM-6: with media.srtp.required every call is SRTP keyed end to end,
+    // so a passthrough relay never has cleartext to fork to the SRS and
+    // every matched call would fail recording. Refused at load instead.
+    if config.media.srtp.required && config.media.srtp.mode == crate::schema::SrtpMode::Passthrough
+    {
+        return err(
+            "recording.enabled = true with media.srtp.required = true needs \
+             media.srtp.mode = Terminate (a Passthrough relay cannot record SRTP calls); \
+             set media.srtp.required = false to record cleartext calls only"
                 .to_string(),
         );
     }
@@ -2142,6 +2154,9 @@ mod tests {
 
     fn recording_enabled_config(ca: &str) -> SbcConfig {
         let mut c = SbcConfig::default();
+        // Passthrough recording needs required SRTP off (see
+        // validate_rejects_recording_with_passthrough_and_required).
+        c.media.srtp.required = false;
         c.recording.enabled = true;
         c.recording.notice_acknowledged = true;
         c.recording.srs_uri = Some("sips:srs.example.net:5061".to_string());
@@ -2797,6 +2812,30 @@ mod tests {
         config.media.t38.allow_cleartext = false;
         config.media.srtp.required = false;
         assert!(validate_config(&config).is_ok());
+    }
+
+    // CM-6: with media.srtp.required, a passthrough relay cannot fork
+    // cleartext for recording (every call is SRTP keyed end to end), so
+    // recording.enabled needs mode = Terminate or required = false.
+    #[test]
+    fn validate_rejects_recording_with_passthrough_and_required() {
+        let ca = env!("CARGO_MANIFEST_PATH");
+        let mut c = recording_enabled_config(ca);
+        c.media.srtp.required = true;
+        c.media.srtp.mode = crate::schema::SrtpMode::Passthrough;
+        let e = recording_err(&c);
+        assert!(e.contains("recording.enabled"), "{e}");
+        assert!(e.contains("media.srtp.required"), "{e}");
+        assert!(e.to_ascii_lowercase().contains("passthrough"), "{e}");
+        c.media.srtp.mode = crate::schema::SrtpMode::Terminate;
+        assert!(validate_config(&c).is_ok(), "{:?}", validate_config(&c));
+        c.media.srtp.mode = crate::schema::SrtpMode::Passthrough;
+        c.media.srtp.required = false;
+        assert!(validate_config(&c).is_ok(), "{:?}", validate_config(&c));
+        // Recording off: the combination is not checked.
+        c.media.srtp.required = true;
+        c.recording.enabled = false;
+        assert!(validate_config(&c).is_ok(), "{:?}", validate_config(&c));
     }
 
     #[test]

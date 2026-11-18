@@ -192,6 +192,7 @@ The client implements SDP for audio-only calls in two modes: plain RTP (`RTP/AVP
 #### Deviation (CNSA 2.0)
 
 - Only `sha-384` and `sha-512` fingerprints are accepted. `sha-256` (the RFC 8122 §5 interoperable default), `sha-1`, `sha-224` and `md5` values are ignored; an SDP with no accepted fingerprint is refused (488 for an offer, BYE for an answer). This is deliberate and costs interoperability with peers that offer only `sha-256`. Tests `sha256_only_rejected_mixed_keeps_cnsa`, `qa_inbound_mixed_hash_list_with_cnsa_entry_rings`
+- **SBC call legs (sbc-daemon; local macOS run, 2026-11-17)**: the same rule applies to every SDP body that crosses the SBC, in both `media.srtp.mode` values and whatever `media.srtp.required` says (`proto-b2bua/src/media_policy.rs` `fingerprint_acceptable`, `check_fingerprints`). On active DTLS m-lines (`UDP/TLS/RTP/SAVP(F)`, `TCP/DTLS/RTP/SAVP(F)`, `TCP/TLS/RTP/SAVP(F)`, `UDP/DTLS/SCTP`, `TCP/DTLS/SCTP`) media-level fingerprints apply, else session-level ones; `a=fingerprint` lines other than `sha-384` / `sha-512` with a value of 48 / 64 hex octets are stripped from offers and answers, and a body whose active DTLS m-line keeps none is refused: 488 `Warning: 399 "DTLS fingerprint required"` when it had none, `306 "Only sha-384 and sha-512 DTLS fingerprints are accepted"` when every line was stripped (an answer ends the call). Hash names and hex are case-insensitive. Tests `only_unaccepted_hash_is_refused`, `offer_strips_extra_hash_lines_and_keeps_sha384`, `answer_strips_unaccepted_lines_and_keeps_accepted`, `offer_hash_name_and_hex_are_case_insensitive`, `sha256_only_fingerprint_offer_is_refused`, `sha512_only_fingerprint_offer_is_accepted`, `required_false_still_enforces_sha384_fingerprints`. In passthrough the SBC does not verify the certificate against the fingerprint; the endpoints do. In Terminate the SBC's DTLS sidecar does, with the fingerprint the SBC passes for each leg
 
 #### Not Implemented
 
@@ -240,6 +241,7 @@ The client implements SDP for audio-only calls in two modes: plain RTP (`RTP/AVP
 - §6.3: session parameters are an allow-list (`KDR` 0-24, `WSH` at least 64, `FEC_ORDER`); `FEC_KEY`, `UNENCRYPTED_SRTP`, `UNENCRYPTED_SRTCP`, `UNAUTHENTICATED_SRTP`, extensions and unknown parameters make a line unacceptable. Lifetime at most 2^48; MKI length 1-128 (§9.2).
 - §9.1: session-level `a=crypto` is stripped from offers and refused in answers. `a=crypto` on declined (port 0) sections and on DTLS m-lines is stripped.
 - A section with no acceptable line refuses the whole offer (488 `Warning: 306`); streams are not declined one by one.
+- With `media.srtp.required = true` (default) an active `RTP/SAVP(F)` section crosses only with an acceptable `a=crypto` line, and only in passthrough; one with no keying, and `RTP/AVP(F)`, is cleartext media (488 `Warning: 302`). Emergency calls are exempt (NIST call-leg media security row).
 - RFC 4567 (`a=key-mgmt`, MIKEY): not supported; stripped from offers, refused in answers and when it is the only keying.
 - Tests: `crates/proto/proto-b2bua/tests/media_policy_tests.rs`, `crates/sbc/sbc-daemon/src/sip_stack/tests/media_security.rs`. Operator behaviour: `docs/SBC-ADMIN-GUIDE.md` "Call-leg SRTP keying (SDES)".
 
@@ -492,11 +494,11 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 | RFC | Title | Status | Compliance % |
 |-----|-------|--------|--------------|
 | RFC 8866 | SDP: Session Description Protocol | ✅ Compliant | 100% |
-| RFC 3264 | Offer/Answer Model with SDP | ⚠️ Partial (answer from template, RFC-006; delayed offer rejected, POA&M-329; SBC ACKs a 2xx that carries an offer without an answer, POA&M-349) | n/a |
+| RFC 3264 | Offer/Answer Model with SDP | ⚠️ Partial (answer from template, RFC-006; delayed offer rejected, POA&M-329; SBC refuses delayed offer under `media.srtp.required`, POA&M-351, and otherwise ACKs a 2xx that carries an offer without an answer, POA&M-349; SBC refuses a whole body for one non-compliant m-line, POA&M-353) | n/a |
 | RFC 4733 | RTP Payload for DTMF | ⚠️ Partial (SBC negotiation not wired, POA&M-142) | n/a |
 | RFC 3550 | RTP Transport Protocol | ✅ Compliant | 98% |
 | RFC 5245 | ICE | ⚠️ Partial (external lib) | 70% |
-| RFC 8122 | DTLS in SDP | ⚠️ Partial (sha-384/512 only; peer certificate verified against the fingerprint since 2026-11-17, local test runs and CI; no new association on a changed fingerprint, POA&M-327; no RFC 8844, POA&M-333) | n/a |
+| RFC 8122 | DTLS in SDP | ⚠️ Partial (sha-384/512 only, client and SBC call legs; peer certificate verified against the fingerprint since 2026-11-17, local test runs and CI; no new association on a changed fingerprint, POA&M-327; no RFC 8844, POA&M-333) | n/a |
 | RFC 5763 / 4145 / 5761 | DTLS-SRTP setup role, rtcp-mux | ⚠️ Partial (SBC terminate mode relays RTCP only when muxed and does not require `a=rtcp-mux`, POA&M-343; role drives the handshake since 2026-11-17; handshake starts at 200 / ACK, POA&M-331; no new association on re-INVITE, POA&M-327; delayed offer rejected, POA&M-329) | n/a |
 | RFC 7587 | RTP Payload for Opus | ⚠️ Partial (POA&M-141, POA&M-142) | n/a |
 | RFC 4568 | SDP Security Descriptions | ⚠️ Call legs: policed by the SBC (TLS hops only, `AEAD_AES_256_GCM` only; hop by hop, POA&M-348), not generated or consumed; SIPREC recording session: generated | n/a |
@@ -554,6 +556,7 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 | 2026-11-16 | feat/client-dtls-handshake Stage 1: no SDP behaviour change and no status change; RFC 8122 verification note updated (library `DtlsAssociation` exists, client not wired, POA&M-324) | compliance-scribe |
 | 2026-11-17 | feat/client-dtls-wiring Stage 2: no change to the SDP the client sends or accepts; the DTLS-SRTP attributes now drive a handshake on the media socket and the peer certificate is verified against `a=fingerprint`; status notes for RFC 8122 and RFC 5763 / 4145 / 5761 updated; open items POA&M-327, -329, -331, -333 | compliance-scribe |
 | 2026-11-17 | docs/poam-324-326-ci-evidence: evidence notes updated for the green CI runs on PR #208's head (`4dfea0d`, Ubuntu x86_64); no status change | Claude Opus 5.5 |
+| 2026-11-17 | sbc-daemon: `media.srtp.required` enforced on call-leg SDP; call-leg fingerprints limited to sha-384/512 (RFC 8122 section); RFC 3264 row notes POA&M-351 and POA&M-353; no status change | compliance-scribe |
 | 2026-02-07 | **FIXED**: proto-sdp: Updated RFC 4566 references to RFC 8866 | Claude Sonnet 4.5 |
 | 2026-02-07 | **FIXED**: proto-sdp: Removed duplicate doc comments, exported BandwidthInfo | Claude Sonnet 4.5 |
 

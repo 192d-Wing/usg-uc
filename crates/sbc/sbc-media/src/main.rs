@@ -75,6 +75,9 @@ struct Config {
     rtp_port_min: u16,
     rtp_port_max: u16,
     default_mode: MediaMode,
+    /// `SBC_MEDIA_SRTP_REQUIRED`: reported in stats; enforcement is in
+    /// signalling (the SBC daemon's SDP media security policy).
+    // POAM: POA&M-352 - the media node does not refuse cleartext RTP on it.
     srtp_required: bool,
     terminate_dtls: bool,
     dtls_sidecar_socket: Option<PathBuf>,

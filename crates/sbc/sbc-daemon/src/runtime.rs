@@ -479,6 +479,11 @@ impl Runtime {
         if old.media.t38 != new.media.t38 {
             keys.push("media.t38".to_string());
         }
+        // NIST 800-53 Rev5: CM-6 - `[media.srtp]` (required, mode) is read
+        // at startup by the SIP stack and the DTLS identity loader.
+        if old.media.srtp != new.media.srtp {
+            keys.push("media.srtp".to_string());
+        }
         // NIST 800-53 Rev5: CM-6 - `[recording]` is read at startup only
         // (POA&M-302).
         if old.recording != new.recording {

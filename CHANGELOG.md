@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, `media.srtp.required` enforced on call legs; sha-384/512 DTLS fingerprints only, POA&M-351, 352, 353)
+
+Affects every SBC: `media.srtp.required` defaults to `true`. Tested in local
+runs on macOS (2026-11-17). Operator details: `docs/SBC-ADMIN-GUIDE.md`
+"Required SRTP on call legs".
+
+- **Cleartext media is refused on call legs.** (SC-8, SC-8(1), CM-6)
+  Before, `media.srtp.required` was not read for call-leg SDP. Now every
+  active m-line other than `m=image ... udptl` must be DTLS-SRTP or, in
+  `Passthrough`, SDES `AEAD_AES_256_GCM`. `RTP/AVP(F)` gets 488
+  `Warning: 302 <host> "SRTP is required"`; `UDP`, `TCP`,
+  `TCP/TLS/RTP/AVP(F)`, BFCP, MSRP and unknown protocols get 488
+  `Warning: 302 <host> "Media transport protocol not supported"`. A
+  cleartext answer ends the call. One failing m-line refuses the whole body
+  (POA&M-353). Set `required = false` to keep cleartext RTP.
+- **Delayed offer is refused under `required`.** An INVITE without an SDP
+  offer gets 488 `Warning: 399 <host> "Delayed offer not supported when SRTP
+  is required"` before routing (POA&M-351). With `required = false` the
+  answer in the caller's ACK is not checked.
+- **Only `sha-384` and `sha-512` DTLS fingerprints cross, also with
+  `required = false`.** (SC-13, SC-23; deviation from RFC 8122 §5) Other
+  `a=fingerprint` lines are stripped; an active DTLS m-line left with none
+  gets 488 `Warning: 306` (or `399` when it had none). `sha-256`-only peers
+  are refused.
+- **No route: 480 instead of the announcement** under `required`, since the
+  announcement answers with cleartext RTP.
+- **`Terminate` without a DTLS identity refuses new calls** with 488
+  `Warning: 399 <host> "DTLS-SRTP termination unavailable"` (SC-24), logged
+  at `error` once. Before, such calls were relayed opaquely.
+- **Emergency calls** (dialled number in `vps.emergency_numbers`) are
+  exempt from `required` and relayed opaquely under `Terminate` without an
+  identity; the fingerprint and SDES rules still apply. Each exemption that
+  changed the outcome is audited once per call as a granted
+  `media_security:emergency_cleartext` decision.
+- **Recording**: `recording.enabled = true` with `required = true` and
+  `mode = "Passthrough"` no longer loads; use `mode = "Terminate"` or
+  `required = false`.
+- **`[media.srtp]` is restart-required** on reload.
+- Signalling only: the media relay and `sbc-media` (`SBC_MEDIA_SRTP_REQUIRED`)
+  do not refuse cleartext packets (POA&M-352).
+
 ### BREAKING (SBC, call-leg SDES keys only over TLS and only AEAD_AES_256_GCM, POA&M-347, 348, 349, 350)
 
 Affects every SBC. There is no setting to turn it off. Tested in local runs
@@ -41,10 +82,9 @@ on macOS (2026-11-17). Operator details: `docs/SBC-ADMIN-GUIDE.md`
   DTLS keying.
 - **Audit**: each refusal is a denied `AuthorizationDecision` with policy
   `media_security:<label>`; not aggregated and no metrics (POA&M-347).
-- Not changed: cleartext `RTP/AVP` is still relayed; `media.srtp.required`
-  is not enforced on call-leg SDP. Pre-existing, now recorded: a 2xx that
-  carries an offer is ACKed without an answer on the normal path
-  (POA&M-349).
+- Pre-existing, now recorded: a 2xx that carries an offer is ACKed without
+  an answer on the normal path (POA&M-349). `media.srtp.required` is now
+  enforced; see the entry above.
 - Docs: `docs/SBC-ADMIN-GUIDE.md` example used `media.srtp.mode = "Relay"`,
   which does not load; valid values are `"Passthrough"` and `"Terminate"`.
 
