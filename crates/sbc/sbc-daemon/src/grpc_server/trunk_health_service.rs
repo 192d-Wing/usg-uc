@@ -119,10 +119,26 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
         &self,
         request: Request<RegisterTrunkRequest>,
     ) -> Result<Response<RegisterTrunkResponse>, Status> {
-        let req = request.into_inner();
-        let trunk_id = req.trunk_id;
+        let admin = super::peer_identity::caller_principal(&request);
+        let trunk_id = request.into_inner().trunk_id;
         info!(trunk_id, "gRPC RegisterTrunk");
+        let response = self.register_trunk_by_id(trunk_id.clone()).await;
+        // NIST 800-53 Rev5: AU-2, AU-3, AU-12 — starts an outbound
+        // registration with stored credentials; record the caller.
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "TrunkHealthService/RegisterTrunk",
+            &trunk_id,
+            super::admin_audit::AdminOutcome::applied(response.success),
+        );
+        Ok(Response::new(response))
+    }
+}
 
+impl TrunkHealthServiceImpl {
+    /// Looks up the trunk and starts its registration; `success: false`
+    /// when nothing was started.
+    async fn register_trunk_by_id(&self, trunk_id: String) -> RegisterTrunkResponse {
         // Look up the trunk's credentials. Same fall-through logic the
         // REST handler used: Postgres first, MemStore fallback.
         let groups: Vec<serde_json::Value> = if let Some(ref store) = self.state.trunk_group_store {
@@ -146,10 +162,10 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             }
         }
         let Some(trunk) = found_trunk else {
-            return Ok(Response::new(RegisterTrunkResponse {
+            return RegisterTrunkResponse {
                 success: false,
                 message: format!("Trunk not found: {trunk_id}"),
-            }));
+            };
         };
 
         let username = trunk
@@ -173,21 +189,21 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             .unwrap_or(5060) as u16;
 
         if username.is_empty() || host.is_empty() {
-            return Ok(Response::new(RegisterTrunkResponse {
+            return RegisterTrunkResponse {
                 success: false,
                 message: "Trunk missing SIP credentials or host".to_string(),
-            }));
+            };
         }
 
         let Some(ref registrar) = self.state.trunk_registrar else {
             warn!(trunk_id, "Trunk registrar not configured");
-            return Ok(Response::new(RegisterTrunkResponse {
+            return RegisterTrunkResponse {
                 success: false,
                 message: "trunk registration runs in the sbc-trunk-agent pod \
                           (SBC_TRUNK_SERVICES=external); it re-registers \
                           automatically on its next config poll"
                     .to_string(),
-            }));
+            };
         };
 
         // NIST 800-53 Rev5: CM-6, SI-10 — POA&M-255 MD5 policy; a non-bool
@@ -209,9 +225,9 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             external_ip: None,
             allow_md5_digest,
         });
-        Ok(Response::new(RegisterTrunkResponse {
+        RegisterTrunkResponse {
             success: true,
             message: format!("Registration started for {trunk_id}"),
-        }))
+        }
     }
 }

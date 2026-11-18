@@ -1,4 +1,7 @@
 {{- if .Values.sbcProvision.enabled }}
+{{- if and .Values.sbcProvision.allowedSourceCidrs (not .Values.sbcProvision.trustedProxies) }}
+{{- fail "sbcProvision.allowedSourceCidrs requires sbcProvision.trustedProxies: set it to the pod CIDR the frontend nginx pods run in, so the source check sees the phone address (X-Real-IP) instead of the proxy" }}
+{{- end }}
 # sbc-provision-server — phone provisioning HTTP pod.
 #
 # Owns `/provision/<MAC>.{cfg,xml}`. Reads the phone record from
@@ -54,11 +57,26 @@ spec:
             - name: SBC_PROVISION_PORT
               value: "80"
             # Source-network restriction (defense in depth): only these
-            # CIDRs (the phone VLANs, as seen via nginx X-Forwarded-For)
+            # CIDRs (the phone VLANs, as relayed by nginx in X-Real-IP)
             # may fetch provisioning configs. Empty = app-layer check off.
             {{- with .Values.sbcProvision.allowedSourceCidrs }}
             - name: SBC_PROVISION_ALLOWED_CIDRS
               value: {{ join "," . | quote }}
+            {{- end }}
+            # X-Real-IP is trusted only from these networks (the frontend
+            # nginx pods); unset = trust no proxy. The NetworkPolicy admits
+            # this pod only from the frontend. NIST 800-53 Rev5: SC-7, SI-10
+            {{- with .Values.sbcProvision.trustedProxies }}
+            - name: SBC_TRUSTED_PROXIES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.sbcProvision.provisionSecret.existingSecret }}
+            # Provisioning URL token secret (hex, >= 32 bytes decoded).
+            - name: SBC_PROVISION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.sbcProvision.provisionSecret.key | default "provision-secret" }}
             {{- end }}
             {{- if .Values.sbcProvision.allowUnauthenticated }}
             - name: SBC_PROVISION_ALLOW_UNAUTHENTICATED

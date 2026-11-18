@@ -130,7 +130,7 @@ pub struct AppState {
     /// Networks from which the `X-Real-IP` header is trusted (the nginx
     /// pod range). Used to resolve the real client IP for the login rate
     /// limiter without letting a direct caller spoof it. Empty = trust
-    /// the header unconditionally.
+    /// no proxy (the TCP peer is the client).
     pub trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
 
@@ -229,6 +229,8 @@ impl AppState {
             // POAM: tonic's rustls defaults are used (TLS 1.2+1.3, default
             // suites) on both ends of this channel, not the uc-transport CNSA
             // 2.0 config; the chart's certificates are ECDSA P-384.
+            // POAM: POA&M-387 (SC-12) read once at startup; a rotated client
+            // certificate is picked up only after a restart.
             async fn read(p: &std::path::Path) -> Result<String, StateError> {
                 tokio::fs::read_to_string(p)
                     .await
@@ -272,10 +274,10 @@ impl AppState {
         info!("management-plane authentication enabled");
 
         if cfg.trusted_proxies.is_empty() {
-            tracing::warn!(
-                "SBC_TRUSTED_PROXIES unset — X-Real-IP is trusted unconditionally; a caller \
-                 reaching this pod directly (bypassing nginx) can forge its source IP and evade \
-                 the login rate limiter. Set it to the frontend nginx pod network."
+            info!(
+                "SBC_TRUSTED_PROXIES unset: X-Real-IP is ignored; the client IP is the TCP \
+                 peer (the login rate limiter keys on the proxy address behind nginx). Set it \
+                 to the frontend nginx pod network."
             );
         } else {
             info!(trusted_proxies = ?cfg.trusted_proxies, "X-Real-IP trusted only from these networks");

@@ -299,7 +299,7 @@ Wired via gRPC only (`--features cluster,grpc`): `ClusterService.DrainNode` mark
 
 ### Cluster Status (gRPC)
 
-Wired (`--features cluster,grpc`) on the daemon's gRPC management port (`[grpc] listen_addr`, default `0.0.0.0:9090`):
+Wired (`--features cluster,grpc`) on the daemon's gRPC management port (`[grpc] listen_addr`, default `127.0.0.1:9091`, loopback only). To reach it from other nodes, bind a non-loopback address; the daemon then requires `[grpc] require_mtls = true` with all three TLS paths and a non-empty `allowed_client_names`, so each peer or operator tool needs an allow-listed client certificate. `DrainNode` is audited with the caller (`ConfigurationChange`, `grpc ClusterService/DrainNode`).
 
 | RPC | Status |
 |-----|--------|
@@ -382,7 +382,7 @@ Given the current wiring, the achievable HA posture is **shared registration sta
 | 5070 | TCP | Cluster control plane (Planned — nothing binds `control_bind` today) |
 | 8080 | HTTP | Daemon probes (`/healthz`, `/readyz`) and `sbc-api-server` REST |
 | 8443 | HTTPS | API (external) |
-| 9090 | gRPC | Daemon management API (`ClusterService`, default `[grpc] listen_addr`) |
+| 9091 | gRPC | Daemon management API (`ClusterService`; default `[grpc] listen_addr` is `127.0.0.1:9091`, off loopback only with mTLS) |
 | 16384-32767 | UDP | RTP media |
 
 ### Sizing Guidelines

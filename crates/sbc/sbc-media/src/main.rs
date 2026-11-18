@@ -11,7 +11,18 @@
 //!
 //! Configuration (env), mirroring the daemon's `[media]` section so the pod
 //! relays identically to the in-process path:
-//! - `SBC_MEDIA_GRPC_LISTEN` — gRPC listen address (default `0.0.0.0:9096`).
+//! - `SBC_MEDIA_GRPC_LISTEN` — gRPC listen address (default `127.0.0.1:9096`).
+//!   Without mTLS it must be a loopback address (only the co-located daemon
+//!   in the same pod may reach it). Off loopback it requires mTLS and a client
+//!   allow-list (below); there is no plaintext option. A violation is a
+//!   startup error (exit 2).
+//! - `SBC_MEDIA_GRPC_TLS_CERT_FILE`, `SBC_MEDIA_GRPC_TLS_KEY_FILE`,
+//!   `SBC_MEDIA_GRPC_TLS_CLIENT_CA_FILE` — server certificate, key and the CA
+//!   that client certificates must chain to (all three or none). With them
+//!   the listener requires a client certificate.
+//! - `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES` — comma-separated SAN DNS names or
+//!   URIs a client certificate must carry on every RPC (mTLS only; required
+//!   off loopback).
 //! - `SBC_MEDIA_RTP_PORT_MIN` / `SBC_MEDIA_RTP_PORT_MAX` — inclusive RTP port
 //!   range (defaults 16384 / 32768, the pipeline defaults).
 //! - `SBC_MEDIA_DEFAULT_MODE` — only `relay` (the default) is accepted; any
@@ -33,10 +44,14 @@ use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+mod grpc_tls;
+#[cfg(test)]
+mod mtls_handshake_tests;
+
 use tokio_stream::Stream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use sbc_grpc_api::health::health_check_response::ServingStatus;
@@ -53,6 +68,10 @@ use uc_media_engine::MediaMode;
 #[derive(Debug, Clone)]
 struct Config {
     grpc_listen: SocketAddr,
+    /// mTLS for the controller listener (`SBC_MEDIA_GRPC_TLS_*`).
+    grpc_tls: Option<grpc_tls::ServerTls>,
+    /// `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES` (mTLS only).
+    allowed_client_names: Vec<String>,
     rtp_port_min: u16,
     rtp_port_max: u16,
     default_mode: MediaMode,
@@ -83,6 +102,31 @@ fn env_port(key: &str, default: u16) -> Result<u16, String> {
     })
 }
 
+/// Parses `SBC_MEDIA_GRPC_LISTEN` (default `127.0.0.1:9096`) without the
+/// listener rule.
+fn parse_grpc_listen_addr(raw: Option<&str>) -> Result<SocketAddr, String> {
+    raw.unwrap_or("127.0.0.1:9096")
+        .trim()
+        .parse()
+        .map_err(|e| format!("SBC_MEDIA_GRPC_LISTEN invalid: {e}"))
+}
+
+/// Parses `SBC_MEDIA_GRPC_LISTEN` for a plaintext listener: a non-loopback
+/// address, including the unspecified `0.0.0.0` / `[::]`, is refused. With
+/// mTLS configured, `Config::from_env` applies [`grpc_tls::check_listener`]
+/// instead.
+///
+/// NIST 800-53 Rev5: SC-7, CM-7, AC-3 — without client authentication the
+/// controller service is reachable only from inside the pod.
+// POAM: POA&M-383 mTLS plus a client-name allow-list now gate an off-pod
+// listener; AllocatePorts ownership and duplicate CreateSession are open.
+#[cfg(test)]
+fn parse_grpc_listen(raw: Option<&str>) -> Result<SocketAddr, String> {
+    let addr = parse_grpc_listen_addr(raw)?;
+    grpc_tls::check_listener(addr, None, &[])?;
+    Ok(addr)
+}
+
 /// Parses `SBC_MEDIA_DEFAULT_MODE`. Only `relay` is accepted.
 ///
 /// NIST 800-53 Rev5: CM-6 (Configuration Settings) — the daemon rejects a
@@ -100,10 +144,21 @@ fn parse_default_mode(value: &str) -> Result<MediaMode, String> {
 
 impl Config {
     fn from_env() -> Result<Self, String> {
-        let grpc_listen: SocketAddr = std::env::var("SBC_MEDIA_GRPC_LISTEN")
-            .unwrap_or_else(|_| "0.0.0.0:9096".to_string())
-            .parse()
-            .map_err(|e| format!("SBC_MEDIA_GRPC_LISTEN invalid: {e}"))?;
+        // NIST 800-53 Rev5: IA-3, SC-8, AC-3, SC-7 — off loopback only with
+        // mTLS and a client allow-list.
+        let grpc_listen =
+            parse_grpc_listen_addr(std::env::var("SBC_MEDIA_GRPC_LISTEN").ok().as_deref())?;
+        let grpc_tls = grpc_tls::server_tls_from(
+            std::env::var("SBC_MEDIA_GRPC_TLS_CERT_FILE").ok(),
+            std::env::var("SBC_MEDIA_GRPC_TLS_KEY_FILE").ok(),
+            std::env::var("SBC_MEDIA_GRPC_TLS_CLIENT_CA_FILE").ok(),
+        )?;
+        let allowed_client_names = grpc_tls::parse_allowed_client_names(
+            std::env::var("SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES")
+                .ok()
+                .as_deref(),
+        )?;
+        grpc_tls::check_listener(grpc_listen, grpc_tls.as_ref(), &allowed_client_names)?;
 
         let default_mode = parse_default_mode(
             &std::env::var("SBC_MEDIA_DEFAULT_MODE").unwrap_or_else(|_| "relay".to_string()),
@@ -136,6 +191,8 @@ impl Config {
 
         Ok(Self {
             grpc_listen,
+            grpc_tls,
+            allowed_client_names,
             rtp_port_min: env_port("SBC_MEDIA_RTP_PORT_MIN", 16_384)?,
             rtp_port_max: env_port("SBC_MEDIA_RTP_PORT_MAX", 32_768)?,
             default_mode,
@@ -221,6 +278,16 @@ fn build_server(config: &Config) -> Result<MediaControllerServer, String> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
+    // Install the process-level rustls CryptoProvider (aws-lc, FIPS) before
+    // any TLS config is built: with more than one provider feature compiled
+    // into the workspace, rustls cannot choose one and panics at first use.
+    // NIST 800-53 Rev5: SC-13
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        eprintln!("rustls CryptoProvider was already installed");
+    }
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sbc_media=debug"));
     tracing_subscriber::fmt()
@@ -237,14 +304,6 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-
-    // TODO: gRPC authentication (mTLS or token) on MediaControllerService.
-    // Any peer that can reach this port can allocate ports / drive relays;
-    // restrict access via NetworkPolicy until gRPC auth is implemented.
-    warn!(
-        "MediaControllerService gRPC is unauthenticated — restrict access via \
-         NetworkPolicy until gRPC auth is implemented"
-    );
 
     info!(
         listen = %config.grpc_listen,
@@ -287,9 +346,34 @@ async fn main() -> ExitCode {
         info!("shutdown signal received");
     };
 
-    info!(listen = %config.grpc_listen, "MediaControllerService listening");
-    let result = Server::builder()
-        .add_service(MediaControllerServiceServer::new(service))
+    let mut builder = Server::builder();
+    if let Some(tls) = &config.grpc_tls {
+        let tls_config = match grpc_tls::load_server_tls(tls) {
+            Ok(c) => c,
+            Err(e) => {
+                error!(error = %e, "MediaController TLS configuration");
+                return ExitCode::from(2);
+            }
+        };
+        builder = match builder.tls_config(tls_config) {
+            Ok(b) => b,
+            Err(e) => {
+                error!(error = %e, "MediaController TLS configuration");
+                return ExitCode::from(2);
+            }
+        };
+    }
+    let gate =
+        grpc_tls::ClientNameGate::new(config.grpc_tls.is_some(), &config.allowed_client_names);
+    info!(
+        listen = %config.grpc_listen,
+        mtls = config.grpc_tls.is_some(),
+        "MediaControllerService listening"
+    );
+    let result = builder
+        .add_service(MediaControllerServiceServer::with_interceptor(
+            service, gate,
+        ))
         .add_service(HealthServer::new(AlwaysServing))
         .serve_with_shutdown(config.grpc_listen, shutdown)
         .await;
@@ -330,6 +414,38 @@ mod tests {
                     .as_ref()
                     .is_err_and(|e| e.contains("SBC_MEDIA_DEFAULT_MODE")),
                 "{bad:?}: {result:?}"
+            );
+        }
+    }
+    // QA: MediaControllerService has no client authentication, so
+    // its listener is loopback-only.
+    #[test]
+    fn qa_grpc_listen_defaults_to_loopback() {
+        let want = SocketAddr::from(([127, 0, 0, 1], 9096));
+        assert_eq!(parse_grpc_listen(None), Ok(want));
+    }
+
+    #[test]
+    fn qa_grpc_listen_rejects_wildcard_and_pod_ip() {
+        for bad in ["0.0.0.0:9096", "10.0.0.5:9096", "[::]:9096"] {
+            let result = parse_grpc_listen(Some(bad));
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.contains("SBC_MEDIA_GRPC_LISTEN") && e.contains("loopback")),
+                "{bad:?}: {result:?}"
+            );
+        }
+        assert!(parse_grpc_listen(Some("not-an-address")).is_err());
+    }
+
+    #[test]
+    fn qa_grpc_listen_accepts_ipv6_loopback() {
+        for ok in ["[::1]:9096", "127.0.0.1:19096"] {
+            let addr = parse_grpc_listen(Some(ok));
+            assert!(
+                addr.as_ref().is_ok_and(|a| a.ip().is_loopback()),
+                "{ok}: {addr:?}"
             );
         }
     }

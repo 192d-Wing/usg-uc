@@ -1,0 +1,284 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /*
+Ingress NetworkPolicies for this release (networkPolicy.enabled, on by
+default). A default-deny baseline selects every pod of the release; the
+policies below add explicit allows. Policies are additive, so a pod gets the
+union of the allows that select it. Every `from.podSelector` carries the
+release instance label, so two site releases in one namespace do not admit
+each other. Ingress only: egress (DNS, carriers, IdP, STUN, central config)
+is not restricted here.
+POAM: POA&M-381 (SC-7(5)) no egress policies.
+
+NIST 800-53 Rev5: SC-7, SC-7(5) (deny by default, allow by exception),
+CM-7, AC-3
+*/ -}}
+{{- $np := .Values.networkPolicy }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sbc.fullname" . }}-default-deny
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "sbc.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+---
+# Daemon: SIP and RTP from any source (the SIP LoadBalancer keeps client
+# addresses, externalTrafficPolicy: Local), REST from the frontend and
+# sbc-api, and the gRPC admin port only with mTLS. No rule for the metrics
+# port (no listener), 8443 (no Service) or the media controller (loopback
+# only).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sbc.fullname" . }}-daemon
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sbc.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: UDP
+          port: 5060
+        - protocol: TCP
+          port: 5060
+        - protocol: TCP
+          port: 5061
+    {{- /* RTP/SRTP relay range: the [media] rtp_port_min/max literals. */}}
+    - ports:
+        - protocol: UDP
+          port: 16384
+          endPort: 32768
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.frontendSelectorLabels" . | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.apiSelectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 80
+    {{- $grpcPeers := or .Values.sbcApi.enabled .Values.sbcTrunkAgent.enabled $np.daemonGrpcFrom }}
+    {{- if and .Values.sbcDaemon.grpcMtls.enabled $grpcPeers }}
+    {{- /* gRPC under mTLS (client certificate checked on every RPC). Only
+         with at least one peer: an empty `from` would admit all. */}}
+    - from:
+        {{- if .Values.sbcApi.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.apiSelectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if .Values.sbcTrunkAgent.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.trunkAgentSelectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- with $np.daemonGrpcFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 9091
+    {{- end }}
+{{- if .Values.sbcApi.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sbc.fullname" . }}-sbc-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sbc.apiSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.frontendSelectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 80
+{{- end }}
+{{- if .Values.sbcProvision.enabled }}
+---
+# Provisioning is reached only through the frontend nginx, which is what
+# makes sbcProvision.trustedProxies = the pod CIDR sound.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sbc.fullname" . }}-provision
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sbc.provisionSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.frontendSelectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 80
+{{- end }}
+{{- if .Values.sbcFrontend.enabled }}
+---
+# The HTTP edge: from networkPolicy.edgeFrom, or any source when empty.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sbc.fullname" . }}-frontend
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sbc.frontendSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8080
+      {{- with $np.edgeFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- if .Values.sbcClientConfig.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sbc.fullname" . }}-client-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sbc.clientConfigSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 80
+      {{- with $np.edgeFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- if .Values.sbcPostgres.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sbc.fullname" . }}-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sbc.postgresSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.selectorLabels" . | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.apiSelectorLabels" . | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.provisionSelectorLabels" . | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.trunkAgentSelectorLabels" . | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.configSyncSelectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+{{- end }}
+{{- if .Values.sbcAnnouncement.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sbc.fullname" . }}-announcement
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sbc.announcementSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "sbc.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9095
+    {{- /* Announcement RTP: the pinned range, or every UDP port when the
+         pod uses ephemeral ports. */}}
+    - ports:
+        {{- if and .Values.sbcAnnouncement.rtpPortMin .Values.sbcAnnouncement.rtpPortMax }}
+        - protocol: UDP
+          port: {{ .Values.sbcAnnouncement.rtpPortMin | int }}
+          endPort: {{ .Values.sbcAnnouncement.rtpPortMax | int }}
+        {{- else }}
+        - protocol: UDP
+        {{- end }}
+{{- end }}
+{{- with $np.probeFrom }}
+---
+# kubelet probes on CNIs that enforce policy on host-originated traffic.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sbc.fullname" $ }}-probes
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "sbc.name" $ }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+{{- end }}

@@ -23,11 +23,6 @@ pub const SYNC_SCOPE: &str = "config-sync";
 /// never masquerade as a site's sync agent.
 pub const OPERATOR_SCOPE: &str = "config";
 
-/// Legacy full-fleet operator scope. A token carrying this is treated by
-/// ABAC as a fleet admin (`*:*` on every site), so existing `config-admin`
-/// credentials keep working without `roles`/`sites` claims.
-pub const ADMIN_SCOPE: &str = "config-admin";
-
 /// State init errors.
 #[derive(Debug, Error)]
 pub enum StateError {
