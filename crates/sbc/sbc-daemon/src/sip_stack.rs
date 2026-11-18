@@ -74,6 +74,13 @@ use uc_types::address::TransportType as AddrTransport;
 // `crate::recording`, kept out of this file.
 mod recording_session;
 
+// In-dialog and CANCEL matching (RFC 3261 §9.2, §12.2.2): pure helpers.
+mod dialog_match;
+use dialog_match::{
+    BLegPeerKind, DialogPeer, DialogRule, Ingress, InviteIdentity, LegRegistration, PeerVerdict,
+    RequestIdentity,
+};
+
 /// SIP stack for processing SIP messages.
 pub struct SipStack {
     /// Transaction store.
@@ -129,6 +136,12 @@ pub struct SipStack {
     /// Used to resolve which CSS to use for routing inbound calls from trunks.
     inbound_trunk_map:
         RwLock<std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>>,
+    /// Trunk group → canonical IPs of its configured hosts, resolved when
+    /// the group is loaded. A trunk leg's dialog peer is any of them (see
+    /// `dialog_match`); unlike `inbound_trunk_map` an address may belong to
+    /// several groups. Keyed by configured group ids, bounded by the
+    /// configuration (SC-5).
+    trunk_group_hosts: RwLock<std::collections::HashMap<String, Arc<HashSet<std::net::IpAddr>>>>,
     /// Directory number mapping: DID → username for inbound call routing,
     /// with the reverse user → TN index the STIR binding uses.
     did_map: RwLock<crate::stir_binding::DidMap>,
@@ -171,7 +184,7 @@ pub struct SipStack {
     allocated_ports: Arc<std::sync::Mutex<HashSet<u16>>>,
     /// In-flight INVITE Call-IDs: prevents TOCTOU race between the
     /// retransmit check and the correlation insert.
-    in_flight_invites: RwLock<HashSet<String>>,
+    in_flight_invites: RwLock<HashMap<String, InFlightInvite>>,
     /// 2xx responses to INVITEs the SBC answered as UAS, retransmitted until
     /// ACKed (RFC 3261 §13.3.1.4). Keyed by the SIP Call-ID of that leg.
     pending_2xx: RwLock<HashMap<String, Pending2xx>>,
@@ -207,6 +220,12 @@ pub struct SipStack {
     ///
     /// ## NIST 800-53 Rev5: AC-21, SC-4, CM-6 (secure default)
     trusted_trunk_groups: RwLock<HashSet<String>>,
+    /// Serialises trunk-group sync and removal so a removal cannot land
+    /// between a sync's router add and its source-map update (see
+    /// [`Self::trunk_sync_guard`]).
+    ///
+    /// ## NIST 800-53 Rev5: AC-4, CM-3
+    trunk_sync: tokio::sync::Mutex<()>,
     /// `[media.t38]` fax relay policy. Default: disabled (fail-closed).
     /// Applied at startup; a reload reports it as restart-required.
     ///
@@ -448,7 +467,24 @@ struct TransactionStore {
     client_invite: HashMap<TransactionKey, ClientInviteState>,
     /// Client non-INVITE transactions.
     client_non_invite: HashMap<TransactionKey, ClientNonInviteState>,
+    /// CANCELs of B-leg INVITEs whose client transaction did not exist yet
+    /// (the INVITE was being handed to the transport), keyed by the
+    /// INVITE's branch: picked up when that transaction is opened (RFC 3261
+    /// §9.1). Capped at [`MAX_EARLY_CANCELS`], aged out after 64*T1 (SC-5).
+    early_cancels: HashMap<String, EarlyCancel>,
 }
+
+/// A CANCEL waiting for its INVITE's client transaction
+/// (`TransactionStore::early_cancels`).
+struct EarlyCancel {
+    queued_at: Instant,
+    /// The call the INVITE belonged to (its record may be gone by then).
+    call: CallId,
+    message: SipMessage,
+}
+
+/// Bound of `TransactionStore::early_cancels` (SC-5).
+const MAX_EARLY_CANCELS: usize = 1024;
 
 /// State for server INVITE transaction.
 struct ServerInviteState {
@@ -464,6 +500,15 @@ struct ServerInviteState {
     /// Call-ID of the request that opened the transaction; a later request
     /// with the same branch but another Call-ID is a new request.
     call_id: String,
+    /// Connection the INVITE arrived on (streams); a CANCEL or non-2xx ACK
+    /// must arrive on it.
+    conn: Option<crate::stir_binding::ConnId>,
+    /// Branch, sent-by, From tag and CSeq number a CANCEL must repeat
+    /// (RFC 3261 §9.2). `None` when the INVITE lacked one of them.
+    invite: Option<InviteIdentity>,
+    /// `false` for an INVITE refused as a merged request (482): no CANCEL
+    /// acts through its transaction (SC-23).
+    cancel_target: bool,
 }
 
 /// State for server non-INVITE transaction.
@@ -473,9 +518,23 @@ struct ServerNonInviteState {
     created_at: Instant,
     /// Last response sent; re-sent on a request retransmission (§17.2.2).
     last_response: Option<SipMessage>,
-    /// Call-ID of the request that opened the transaction (see
-    /// `ServerInviteState::call_id`).
-    call_id: String,
+    /// Where the request that opened the transaction came from (transport
+    /// and connection included). Its Call-ID, sent-by, From tag and CSeq
+    /// number are part of the key (`RequestIdentity::txn_branch`).
+    opened_by: Ingress,
+}
+
+/// What the transaction layer does with a received request
+/// (`SipStack::answer_request_retransmit`).
+enum TxnCheck {
+    /// A retransmission: this is the answer.
+    Answer(Box<ProcessResult>),
+    /// A new request: open its server transaction.
+    New,
+    /// A copy of a request in progress from outside the leg's peers:
+    /// processed on its own, without opening, replacing or recording onto
+    /// the stored transaction.
+    Stateless,
 }
 
 /// State for client INVITE transaction.
@@ -499,6 +558,10 @@ struct ClientInviteState {
     /// Timer A has re-sent the INVITE, so a send failure may be the
     /// retransmission's rather than the first send's.
     retransmitted: bool,
+    /// CANCEL of this INVITE waiting for its first provisional (RFC 3261
+    /// §9.1); sent with it, dropped on a final response, gone with the
+    /// transaction (Timer B bounds the wait).
+    pending_cancel: Option<SipMessage>,
 }
 
 /// Slots in [`FirstSendLedger`]; bounded (SC-5), independent of load.
@@ -600,8 +663,12 @@ impl TransactionStore {
         self.client_non_invite.retain(|_, s| young(s.created_at));
     }
 
-    /// Drops transactions whose state machine has reached Terminated.
+    /// Drops transactions whose state machine has reached Terminated, and
+    /// early CANCELs whose INVITE never opened a transaction within 64*T1.
     fn prune_terminated(&mut self) {
+        let max_wait = proto_transaction::DEFAULT_T1 * 64;
+        self.early_cancels
+            .retain(|_, e| e.queued_at.elapsed() < max_wait);
         self.server_invite
             .retain(|_, s| !s.transaction.is_terminated());
         self.server_non_invite
@@ -928,7 +995,10 @@ fn build_late_2xx_request(
     ));
     r.headers.set(HeaderName::MaxForwards, "70");
     r.headers.set(HeaderName::From, &e.from);
-    r.headers.set(HeaderName::To, with_tag(&e.to, Some(to_tag)));
+    r.headers.set(
+        HeaderName::To,
+        with_tag(&e.to, (!to_tag.is_empty()).then_some(to_tag)),
+    );
     r.headers.set(HeaderName::CallId, &e.call_id);
     r.headers.set(HeaderName::CSeq, format!("{cseq} {name}"));
     for route in routes {
@@ -982,6 +1052,21 @@ struct CallAddresses {
     ///
     /// ## NIST 800-53 Rev5: SC-8; RFC 3261 §18.1.1, §26.2
     b_leg_flow: LegFlow,
+    /// Connection the caller's INVITE arrived on (streams): an endpoint's
+    /// in-dialog requests must use it (local SC-23 policy, see
+    /// `dialog_match`), unless they come from a re-registered flow.
+    a_leg_conn: Option<crate::stir_binding::ConnId>,
+    /// Trunk group the caller's address belonged to at INVITE; `None` for
+    /// an endpoint. Selects the A-leg peer rule (see `dialog_match`).
+    a_leg_trunk_group: Option<String>,
+    /// Registration the endpoint caller's INVITE flow held, if any: a new
+    /// flow holding it is still the caller (RFC 5626 §4.4, §5.3).
+    a_leg_registration: Option<Arc<LegRegistration>>,
+    /// Whether the B-leg goes to a registered contact (peer pinned to the
+    /// contact's flow address) or a trunk.
+    b_leg_peer_kind: BLegPeerKind,
+    /// Registration of the callee's contact (registered B-leg only).
+    b_leg_registration: Option<Arc<LegRegistration>>,
     /// SBC sent-by (`host:port`) for A-leg Via/Contact, the listener of the
     /// A-leg transport (RFC 3261 §18.1.1).
     a_leg_local_addr: String,
@@ -1030,6 +1115,16 @@ struct CallAddresses {
     a_leg_from: String,
     /// To header of the original A-leg INVITE (no tag until answered).
     a_leg_to: String,
+    /// Request-URI of the original A-leg INVITE (RFC 2543 CANCEL matching,
+    /// RFC 3261 §17.2.3).
+    a_leg_ruri: String,
+    /// The SBC's own A-leg tag, used toward the caller when the callee sent
+    /// no tag (see `CallAddresses::a_leg_tag`).
+    a_leg_local_tag: String,
+    /// Tags of the 1xx relayed to the caller before the answer: each names
+    /// an early dialog the caller may use (RFC 3261 §12.1.1). Capped at
+    /// [`MAX_EARLY_DIALOGS`] (SC-5).
+    a_leg_early_tags: Vec<String>,
     /// CSeq value of the original A-leg INVITE (e.g. "314 INVITE").
     a_leg_cseq: String,
     /// From header sent on the B-leg INVITE (includes our from-tag).
@@ -1072,6 +1167,14 @@ struct CallAddresses {
     /// Set once the B-leg answered (first 2xx seen). A later 2xx is a
     /// retransmission: re-ACK only, do not restart media.
     b_leg_answered: bool,
+    /// A 2xx from the callee is being processed: set atomically when the
+    /// 2xx path takes the answer, before `b_leg_answered`, so a CANCEL or
+    /// the caller's early BYE cannot claim the call in between (SC-23).
+    b_leg_answer_claimed: bool,
+    /// The caller's BYE arrived while that 2xx was being processed: it got
+    /// its 200 (with this To tag), and the 2xx path ends the call when it
+    /// commits, answering the INVITE 487 with the same tag (SEC-9, RFC-21).
+    bye_pending: Option<String>,
     /// Next CSeq for SBC-originated requests toward each leg. The B-leg
     /// INVITE used 1; the SBC→caller direction has its own sequence space.
     a_leg_local_cseq: u32,
@@ -2762,6 +2865,12 @@ struct Pending2xx {
     flow: LegFlow,
     /// CSeq number of the INVITE answered (the ACK must carry it).
     cseq: u32,
+    /// The dialog's peer and the 2xx's From/To tags: only the ACK of that
+    /// dialog, from that peer, stops the retransmission (RFC 3261
+    /// §13.2.2.4; NIST 800-53 Rev5: SC-23).
+    peer: DialogPeer,
+    from_tag: Option<String>,
+    to_tag: Option<String>,
     call: CallId,
     interval: std::time::Duration,
     next_at: Instant,
@@ -2965,7 +3074,7 @@ impl SipStack {
             first_send_ok: FirstSendLedger::new(),
             next_rtp_port: std::sync::atomic::AtomicU16::new(32_770),
             allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            in_flight_invites: RwLock::new(HashSet::new()),
+            in_flight_invites: RwLock::new(HashMap::new()),
             pending_2xx: RwLock::new(HashMap::new()),
             user_limiter: None,
             emergency_trunk_group: None,
@@ -2974,6 +3083,7 @@ impl SipStack {
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
+            trunk_group_hosts: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(crate::stir_binding::DidMap::default()),
             stir_flows: RwLock::new(crate::stir_binding::StirFlows::default()),
             announcement_calls: Arc::new(
@@ -2986,6 +3096,7 @@ impl SipStack {
             digest,
             signaling_audit,
             trusted_trunk_groups: RwLock::new(HashSet::new()),
+            trunk_sync: tokio::sync::Mutex::new(()),
             t38: sbc_config::T38Config::default(),
             t38_counters: crate::t38::T38Counters::default(),
             recording: None,
@@ -3050,7 +3161,7 @@ impl SipStack {
             first_send_ok: FirstSendLedger::new(),
             next_rtp_port: std::sync::atomic::AtomicU16::new(32_770),
             allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            in_flight_invites: RwLock::new(HashSet::new()),
+            in_flight_invites: RwLock::new(HashMap::new()),
             pending_2xx: RwLock::new(HashMap::new()),
             user_limiter: None,
             emergency_trunk_group: None,
@@ -3059,6 +3170,7 @@ impl SipStack {
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
+            trunk_group_hosts: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(crate::stir_binding::DidMap::default()),
             stir_flows: RwLock::new(crate::stir_binding::StirFlows::default()),
             announcement_calls: Arc::new(
@@ -3071,6 +3183,7 @@ impl SipStack {
             digest,
             signaling_audit,
             trusted_trunk_groups: RwLock::new(HashSet::new()),
+            trunk_sync: tokio::sync::Mutex::new(()),
             t38: sbc_config::T38Config::default(),
             t38_counters: crate::t38::T38Counters::default(),
             recording: None,
@@ -3290,7 +3403,7 @@ impl SipStack {
             // To = the caller's From. The SBC→A direction has its own CSeq space.
             bye.headers.set(
                 HeaderName::From,
-                with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
+                with_tag(&addrs.a_leg_to, Some(addrs.a_leg_tag())),
             );
             bye.headers.set(HeaderName::To, &addrs.a_leg_from);
             bye.headers
@@ -3344,7 +3457,7 @@ impl SipStack {
             // To = the caller's From.
             inv.headers.set(
                 HeaderName::From,
-                with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
+                with_tag(&addrs.a_leg_to, Some(addrs.a_leg_tag())),
             );
             inv.headers.set(HeaderName::To, &addrs.a_leg_from);
         }
@@ -3387,50 +3500,100 @@ impl SipStack {
     /// If `req` retransmits a request already in the server transaction store
     /// (RFC 3261 §17.2.3: top Via branch + CSeq method), returns what to do
     /// about it — re-send the last response, or nothing while the first copy
-    /// is still being processed. `None` means the request is new.
+    /// is still being processed.
     ///
-    /// A retransmission is a copy of the same request, so a stored transaction
-    /// whose Call-ID differs is a branch collision (a client that reuses
-    /// branch values, or a forged one), not a retransmission: the request is
-    /// treated as new instead of being swallowed or answered with another
-    /// call's response.
-    async fn answer_request_retransmit(
-        &self,
-        req: &SipRequest,
-        source: SbcSocketAddr,
-    ) -> Option<ProcessResult> {
-        let branch = req.headers.via_branch()?;
-        let key = TransactionKey::server(&branch, req.method.to_string());
-        let call_id = req.headers.call_id().unwrap_or("");
-        let mut txns = self.transactions.write().await;
+    /// A retransmission is a copy of the same request, so a stored INVITE
+    /// transaction whose Call-ID differs is a branch collision (a client
+    /// that reuses branch values, or a forged one), not a retransmission:
+    /// the request is treated as new instead of being swallowed or answered
+    /// with another call's response.
+    ///
+    /// A non-INVITE transaction is keyed by branch, method, Call-ID,
+    /// sent-by, From tag and CSeq number (RFC 3261 §17.2.3 plus the fields
+    /// every copy repeats), so another request on the same branch is a
+    /// transaction of its own: it can neither pre-empt nor read the
+    /// original request's answer. A copy comes from the stored source, or
+    /// from another dialog peer of its leg when the stored one is a peer
+    /// too (another host of the same trunk, a re-registered flow); any
+    /// other copy is processed statelessly (not recorded on the stored
+    /// transaction). NIST 800-53 Rev5: SC-23.
+    ///
+    /// POAM: POA&M-391 an INVITE copy (same branch and Call-ID) from another
+    /// source is still answered from the stored transaction, to that
+    /// source.
+    async fn answer_request_retransmit(&self, req: &SipRequest, ingress: &Ingress) -> TxnCheck {
+        let Some(branch) = req.headers.via_branch() else {
+            return TxnCheck::New;
+        };
         let (resend, last) = if req.method == Method::Invite {
-            let st = txns
+            let key = TransactionKey::server(&branch, "INVITE");
+            let call_id = req.headers.call_id().unwrap_or("");
+            let mut txns = self.transactions.write().await;
+            let Some(st) = txns
                 .server_invite
                 .get_mut(&key)
-                .filter(|st| st.call_id == call_id)?;
+                .filter(|st| st.call_id == call_id)
+            else {
+                return TxnCheck::New;
+            };
             (
                 st.transaction.receive_request().unwrap_or(false),
                 st.last_response.clone(),
             )
         } else {
-            let st = txns
-                .server_non_invite
-                .get_mut(&key)
-                .filter(|st| st.call_id == call_id)?;
+            let identity = RequestIdentity::of(&req.headers);
+            let key = TransactionKey::server(identity.txn_branch(&branch), req.method.to_string());
+            let opened_by = {
+                let txns = self.transactions.read().await;
+                txns.server_non_invite.get(&key).map(|st| st.opened_by)
+            };
+            let Some(opened_by) = opened_by else {
+                return TxnCheck::New;
+            };
+            // Another source is the same sender only when both it and the
+            // opener are peers of the leg: a copy first sent by a foreign
+            // host never answers the peer's own request.
+            let same_sender = same_socket(opened_by.source, ingress.source)
+                || (self.in_leg_peer_set(identity.call_id(), ingress).await
+                    && self.in_leg_peer_set(identity.call_id(), &opened_by).await);
+            if !same_sender {
+                debug!(method = %req.method, branch = %branch, source = %ingress.source, "Copy of a request in progress from another sender; processed statelessly");
+                return TxnCheck::Stateless;
+            }
+            let mut txns = self.transactions.write().await;
+            let Some(st) = txns.server_non_invite.get_mut(&key) else {
+                return TxnCheck::New;
+            };
             (
                 st.transaction.receive_request().unwrap_or(false),
                 st.last_response.clone(),
             )
         };
-        drop(txns);
         debug!(method = %req.method, branch = %branch, resend, "Request retransmission");
-        match (resend, last) {
-            (true, Some(message)) => Some(ProcessResult::Response {
+        TxnCheck::Answer(Box::new(match (resend, last) {
+            (true, Some(message)) => ProcessResult::Response {
                 message,
-                destination: source,
+                destination: ingress.source,
                 flow: Flow::Reply,
-            }),
-            _ => Some(ProcessResult::NoAction),
+            },
+            _ => ProcessResult::NoAction,
+        }))
+    }
+
+    /// Whether `ingress` is a dialog peer of the call leg whose SIP Call-ID
+    /// is `sip_call_id` (see [`Self::peer_admits`]); `false` outside calls.
+    async fn in_leg_peer_set(&self, sip_call_id: &str, ingress: &Ingress) -> bool {
+        let peer = {
+            let corr = self.call_correlation.read().await;
+            corr.a_leg
+                .get(sip_call_id)
+                .map(|id| (id, false))
+                .or_else(|| corr.b_leg.get(sip_call_id).map(|id| (id, true)))
+                .and_then(|(id, b_leg)| corr.addresses.get(id).map(|a| a.leg_peer(b_leg)))
+        };
+        match peer {
+            Some(peer) => self.peer_admits(&peer, ingress).await != PeerMatch::No,
+            None => false,
         }
     }
 
@@ -3442,12 +3605,20 @@ impl SipStack {
         req: &SipRequest,
         source: SbcSocketAddr,
         transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
     ) {
         let txn_transport = txn_transport(transport);
         let Some(branch) = req.headers.via_branch() else {
             return;
         };
-        let key = TransactionKey::server(&branch, req.method.to_string());
+        let key = if req.method == Method::Invite {
+            TransactionKey::server(&branch, "INVITE")
+        } else {
+            TransactionKey::server(
+                RequestIdentity::of(&req.headers).txn_branch(&branch),
+                req.method.to_string(),
+            )
+        };
         let call_id = req.headers.call_id().unwrap_or("").to_string();
         let now = Instant::now();
         let mut txns = self.transactions.write().await;
@@ -3473,14 +3644,14 @@ impl SipStack {
                     created_at: now,
                     last_response: None,
                     call_id,
+                    conn,
+                    invite: InviteIdentity::of_request(req, &Method::Invite),
+                    cancel_target: true,
                 },
             );
         } else {
-            if txns
-                .server_non_invite
-                .get(&key)
-                .is_some_and(|st| st.call_id == call_id)
-            {
+            // Never replaced (see `answer_request_retransmit`).
+            if txns.server_non_invite.contains_key(&key) {
                 return;
             }
             txns.server_non_invite.insert(
@@ -3492,7 +3663,11 @@ impl SipStack {
                     source,
                     created_at: now,
                     last_response: None,
-                    call_id,
+                    opened_by: Ingress {
+                        source,
+                        transport,
+                        conn,
+                    },
                 },
             );
         }
@@ -3507,8 +3682,19 @@ impl SipStack {
     /// kept for retransmissions. `Flow::Reply` must already be resolved
     /// (see [`resolve_reply`]).
     async fn track_result(&self, result: &ProcessResult) {
+        self.track_result_with(result, true).await;
+    }
+
+    /// [`Self::track_result`]; responses to a non-INVITE request are
+    /// recorded on its server transaction only when `record_non_invite`
+    /// (false for a request processed statelessly, which must not write to
+    /// the transaction it collided with).
+    async fn track_result_with(&self, result: &ProcessResult, record_non_invite: bool) {
         match result {
-            ProcessResult::Response { message, .. } => self.record_server_response(message).await,
+            ProcessResult::Response { message, .. } => {
+                self.record_server_response(message, record_non_invite)
+                    .await;
+            }
             ProcessResult::Forward {
                 message,
                 destination,
@@ -3523,7 +3709,7 @@ impl SipStack {
             }
             ProcessResult::Multiple(results) => {
                 for r in results {
-                    Box::pin(self.track_result(r)).await;
+                    Box::pin(self.track_result_with(r, record_non_invite)).await;
                 }
             }
             ProcessResult::NoAction | ProcessResult::Error { .. } => {}
@@ -3533,7 +3719,7 @@ impl SipStack {
     /// Feeds a response the TU is sending to its server transaction (matched
     /// by the response's top Via branch + CSeq method, which mirror the
     /// request's) and keeps a copy for retransmission.
-    async fn record_server_response(&self, message: &SipMessage) {
+    async fn record_server_response(&self, message: &SipMessage, record_non_invite: bool) {
         let SipMessage::Response(resp) = message else {
             return;
         };
@@ -3544,16 +3730,24 @@ impl SipStack {
             return;
         };
         let code = resp.status.code();
-        let key = TransactionKey::server(&branch, cseq.method.to_string());
         let mut txns = self.transactions.write().await;
         if cseq.method == Method::Invite {
+            let key = TransactionKey::server(&branch, "INVITE");
             if let Some(st) = txns.server_invite.get_mut(&key) {
                 let _ = st.transaction.send_response(code);
                 st.last_response = Some(message.clone());
             }
-        } else if let Some(st) = txns.server_non_invite.get_mut(&key) {
-            let _ = st.transaction.send_response(code);
-            st.last_response = Some(message.clone());
+        } else if record_non_invite {
+            // The response copies the request's Via, Call-ID, From and CSeq,
+            // so it names its own request's transaction.
+            let key = TransactionKey::server(
+                RequestIdentity::of(&resp.headers).txn_branch(&branch),
+                cseq.method.to_string(),
+            );
+            if let Some(st) = txns.server_non_invite.get_mut(&key) {
+                let _ = st.transaction.send_response(code);
+                st.last_response = Some(message.clone());
+            }
         }
     }
 
@@ -3594,9 +3788,14 @@ impl SipStack {
         let mut txns = self.transactions.write().await;
         txns.sweep_if_needed();
         if req.method == Method::Invite {
-            let Some(call) = call else {
+            // A CANCEL that arrived before this transaction existed waits on
+            // it for the first provisional (RFC 3261 §9.1); its call may
+            // already be released.
+            let early = txns.early_cancels.remove(&branch);
+            let Some(call) = call.or_else(|| early.as_ref().map(|e| e.call.clone())) else {
                 return;
             };
+            let pending_cancel = early.map(|e| e.message);
             txns.client_invite
                 .entry(key.clone())
                 .or_insert_with(|| ClientInviteState {
@@ -3609,6 +3808,7 @@ impl SipStack {
                     call,
                     initial_send_pending: true,
                     retransmitted: false,
+                    pending_cancel,
                 });
         } else {
             txns.client_non_invite
@@ -3664,10 +3864,27 @@ impl SipStack {
         response: &SipMessage,
         destination: SbcSocketAddr,
         flow: LegFlow,
-        cseq: u32,
+        peer: DialogPeer,
     ) {
         let now = Instant::now();
         let t1 = proto_transaction::DEFAULT_T1;
+        // A missing tag is the null tag (RFC 3261 §12.1.1); the ACK then
+        // carries none either.
+        let tag = |name: HeaderName| match response {
+            SipMessage::Response(r) => r
+                .headers
+                .get_value(&name)
+                .and_then(|v| extract_param(v, "tag"))
+                .filter(|t| !t.is_empty())
+                .map(String::from),
+            SipMessage::Request(_) => None,
+        };
+        let (from_tag, to_tag) = (tag(HeaderName::From), tag(HeaderName::To));
+        // The 2xx repeats the INVITE's CSeq; the ACK must carry its number.
+        let cseq = match response {
+            SipMessage::Response(r) => r.headers.cseq_parsed().map_or(1, |c| c.sequence),
+            SipMessage::Request(_) => 1,
+        };
         self.pending_2xx.write().await.insert(
             leg_call_id.to_string(),
             Pending2xx {
@@ -3675,6 +3892,9 @@ impl SipStack {
                 destination,
                 flow,
                 cseq,
+                peer,
+                from_tag,
+                to_tag,
                 call: call.clone(),
                 interval: t1,
                 next_at: now + t1,
@@ -3973,13 +4193,18 @@ impl SipStack {
         branch: &str,
         cseq: u32,
     ) -> Option<ProcessResult> {
-        // A 2xx without a (valid) To tag is malformed; nothing to ACK.
-        let to_tag = resp
+        // A 2xx without a To tag (RFC 2543 UAS) has the null tag, stored as
+        // ""; a tag that is not a token is malformed: nothing to ACK.
+        let to_tag = match resp
             .headers
             .get_value(&HeaderName::To)
             .and_then(|t| extract_param(t, "tag"))
-            .filter(|t| is_sip_token(t))?
-            .to_string();
+            .filter(|t| !t.is_empty())
+        {
+            Some(t) if is_sip_token(t) => t.to_string(),
+            Some(_) => return None,
+            None => String::new(),
+        };
         let (entry, send_bye) = {
             let mut store = lock_leaf(&self.released_invites);
             // NIST 800-53 Rev5: SC-5, SI-10 - only the peer the INVITE went
@@ -4600,12 +4825,13 @@ impl SipStack {
 
     /// Handles UPDATE (RFC 3311). Only in-dialog UPDATEs are meaningful to a
     /// B2BUA; one without a To tag matches no dialog (481).
-    async fn handle_update(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
+    async fn handle_update(&self, message: SipMessage, ingress: Ingress) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
                 reason: "Expected request".to_string(),
             };
         };
+        let source = ingress.source;
         if req.headers.to_tag().is_none() {
             let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
             return ProcessResult::Response {
@@ -4614,7 +4840,7 @@ impl SipStack {
                 flow: Flow::Reply,
             };
         }
-        self.handle_in_dialog_request(req, source).await
+        self.handle_in_dialog_request(req, ingress).await
     }
 
     /// A held teardown BYE whose 2xx retransmission gave up (64*T1): hidden
@@ -4670,17 +4896,23 @@ impl SipStack {
         bye
     }
 
-    /// Matches an in-dialog request to its B2BUA call: the Call-ID names
-    /// either leg and the request's From tag is that leg's remote tag.
-    /// Returns the call, whether the caller (A-leg) sent it, and a snapshot
-    /// of its addressing; `Err(481)` when no dialog matches (RFC 3261
-    /// §12.2.2), so a forged request with a guessed Call-ID is never relayed.
+    /// Matches an in-dialog request to its B2BUA call (RFC 3261 §12.2.2):
+    /// the Call-ID names either leg, the From tag is that leg's remote tag,
+    /// the To tag is one of its local tags (`rule`), and the request came
+    /// from the leg's peer (see [`dialog_match`]). Returns the call, whether
+    /// the caller (A-leg) sent it, and a snapshot of its addressing. A
+    /// Call-ID or tag mismatch is `Err(481)`; the right dialog from another
+    /// sender is `Err(403)`. The last field says the request came on a new,
+    /// re-registered flow of the leg: the caller re-pins the leg
+    /// ([`Self::repin_leg`]) only once it accepted the request.
     ///
-    /// ## NIST 800-53 Rev5: SC-23, AC-4
+    /// ## NIST 800-53 Rev5: SC-23, AC-3, AC-4, SI-10
     async fn match_dialog(
         &self,
         req: &SipRequest,
-    ) -> Result<(CallId, bool, CallAddresses), (StatusCode, InDialogPolicy)> {
+        ingress: &Ingress,
+        rule: DialogRule,
+    ) -> Result<(CallId, bool, CallAddresses, bool), (StatusCode, InDialogPolicy)> {
         let method = &req.method;
         let sip_call_id = req.headers.call_id().unwrap_or("");
         let (internal_id, from_a_leg, addrs) = {
@@ -4701,22 +4933,171 @@ impl SipStack {
             };
             found
         };
-        let remote_tag = if from_a_leg {
-            extract_param(&addrs.a_leg_from, "tag").map(String::from)
-        } else {
-            addrs.dialog_to_tag.clone()
-        };
-        if addrs.dialog_to_tag.is_none()
-            || remote_tag.is_none()
-            || req.headers.from_tag() != remote_tag
-        {
-            warn!(method = %method, call_id = %sip_call_id, "In-dialog request does not match the dialog's tags, 481");
-            return Err((
-                StatusCode::CALL_DOES_NOT_EXIST,
-                InDialogPolicy::FromTagMismatch,
-            ));
+        if let Some(mismatch) = dialog_match::tag_mismatch(req, &addrs, from_a_leg, rule) {
+            debug!(method = %method, call_id = %sip_call_id, "In-dialog request does not match the dialog's tags, 481");
+            return Err(mismatch);
         }
-        Ok((internal_id, from_a_leg, addrs))
+        let new_flow = match self
+            .peer_admits(&addrs.leg_peer(!from_a_leg), ingress)
+            .await
+        {
+            PeerMatch::Same => false,
+            PeerMatch::NewFlow => true,
+            PeerMatch::No => {
+                debug!(method = %method, call_id = %sip_call_id, source = %ingress.source, "In-dialog request from outside the dialog's peer, 403");
+                return Err((StatusCode::FORBIDDEN, InDialogPolicy::ForeignSource));
+            }
+        };
+        Ok((internal_id, from_a_leg, addrs, new_flow))
+    }
+
+    /// Trunk group whose configured address is `ip` (canonical form).
+    async fn trunk_group_of(&self, ip: std::net::IpAddr) -> Option<String> {
+        self.inbound_trunk_map
+            .read()
+            .await
+            .get(&ip.to_canonical())
+            .map(|(group, _)| group.clone())
+    }
+
+    /// How `ingress` relates to the dialog peer `peer` (see
+    /// [`dialog_match`]). A trunk peer also admits any configured host of
+    /// its trunk group (a carrier may send in-dialog requests from another
+    /// of its hosts, RFC 3263 §4.3 / RFC 3261 §12.2.1.1); an endpoint peer
+    /// admits a new flow that holds its registration.
+    ///
+    /// POAM: POA&M-392 trunk-group membership is read from the live
+    /// configuration: a reload changes it for calls in progress, and an
+    /// address configured in two groups is admitted for calls of both (a
+    /// load-time warning names it). The leg's own IP is always admitted.
+    ///
+    /// ## NIST 800-53 Rev5: SC-23, AC-3
+    async fn peer_admits(&self, peer: &DialogPeer, ingress: &Ingress) -> PeerMatch {
+        match peer.admits(ingress) {
+            PeerVerdict::Admit => PeerMatch::Same,
+            PeerVerdict::Reject => PeerMatch::No,
+            PeerVerdict::Resolve => {
+                if let Some(group) = peer.trunk_group() {
+                    let ip = ingress.source.ip().to_canonical();
+                    let in_group = self
+                        .trunk_group_hosts
+                        .read()
+                        .await
+                        .get(group)
+                        .is_some_and(|hosts| hosts.contains(&ip))
+                        || self
+                            .inbound_trunk_map
+                            .read()
+                            .await
+                            .get(&ip)
+                            .is_some_and(|(g, _)| g == group);
+                    return if in_group {
+                        PeerMatch::Same
+                    } else {
+                        PeerMatch::No
+                    };
+                }
+                // Without an RFC 5626 instance-id the registration does not
+                // name a device: any device of the AOR could hold it, so a
+                // new flow is only accepted from the leg's own IP (a NAT
+                // port change). Another IP needs the same instance-id.
+                match peer.registration() {
+                    Some(reg)
+                        if (reg.instance_id.is_some() || peer.same_ip(ingress))
+                            && self.flow_holds_registration(reg, ingress).await =>
+                    {
+                        PeerMatch::NewFlow
+                    }
+                    _ => PeerMatch::No,
+                }
+            }
+        }
+    }
+
+    /// Moves a leg to the new flow `ingress` came from: requests toward the
+    /// peer follow its current registered flow (RFC 5626 §5.3). Returns the
+    /// updated record.
+    ///
+    /// ## NIST 800-53 Rev5: SC-23
+    async fn repin_leg(
+        &self,
+        internal_id: &CallId,
+        b_leg: bool,
+        ingress: &Ingress,
+    ) -> Option<CallAddresses> {
+        let mut corr = self.call_correlation.write().await;
+        let a = corr.addresses.get_mut(internal_id)?;
+        let flow = LegFlow::inbound(ingress.transport);
+        if b_leg {
+            a.b_leg_destination = ingress.source;
+            a.b_leg_flow = flow;
+        } else {
+            if a.a_leg_flow.transport != ingress.transport {
+                // The sent-by names the listener of the new transport.
+                let host = a
+                    .a_leg_local_addr
+                    .rsplit_once(':')
+                    .map_or(a.a_leg_local_addr.as_str(), |(h, _)| h)
+                    .to_string();
+                a.a_leg_local_addr = host_port(&host, self.signaling_port(ingress.transport));
+            }
+            a.a_leg_source = ingress.source;
+            a.a_leg_flow = flow;
+            a.a_leg_conn = ingress.conn;
+        }
+        debug!(call_id = %a.a_leg_sip_call_id, b_leg, source = %ingress.source, "Dialog leg follows the peer's re-registered flow");
+        Some(a.clone())
+    }
+
+    /// [`Self::repin_leg`] for the leg whose SIP Call-ID is `sip_call_id`.
+    async fn repin_by_call_id(&self, sip_call_id: &str, ingress: &Ingress) {
+        let leg = {
+            let corr = self.call_correlation.read().await;
+            corr.a_leg
+                .get(sip_call_id)
+                .map(|id| (id.clone(), false))
+                .or_else(|| corr.b_leg.get(sip_call_id).map(|id| (id.clone(), true)))
+        };
+        if let Some((id, b_leg)) = leg {
+            let _ = self.repin_leg(&id, b_leg, ingress).await;
+        }
+    }
+
+    /// Whether a CANCEL or non-2xx ACK on an INVITE server transaction
+    /// comes from the right sender: the dialog peer of the leg the INVITE
+    /// came on (the same rule as on the TU path), or, before the call record
+    /// exists, the INVITE's own flow `invite` (source, transport,
+    /// connection) and its trunk group. RFC 3261 §9.2 / §17.2.3 match the
+    /// request; this binds its sender.
+    ///
+    /// ## NIST 800-53 Rev5: SC-23, AC-3
+    async fn txn_peer_admits(
+        &self,
+        sip_call_id: &str,
+        invite: (
+            SbcSocketAddr,
+            AddrTransport,
+            Option<crate::stir_binding::ConnId>,
+        ),
+        ingress: &Ingress,
+    ) -> bool {
+        let leg = {
+            let corr = self.call_correlation.read().await;
+            corr.a_leg
+                .get(sip_call_id)
+                .map(|id| (id.clone(), false))
+                .or_else(|| corr.b_leg.get(sip_call_id).map(|id| (id.clone(), true)))
+                .and_then(|(id, b_leg)| corr.addresses.get(&id).map(|a| a.leg_peer(b_leg)))
+        };
+        let Some(peer) = leg else {
+            let (source, transport, conn) = invite;
+            let group = self.trunk_group_of(source.ip()).await;
+            let peer = DialogPeer::a_leg(source, transport, conn, group.as_deref(), None);
+            return self.peer_admits(&peer, ingress).await == PeerMatch::Same;
+        };
+        // A CANCEL or non-2xx ACK ends a transaction, not a dialog: the leg
+        // does not follow its flow.
+        self.peer_admits(&peer, ingress).await != PeerMatch::No
     }
 
     /// Builds the 2xx that answers a body-less session refresh locally
@@ -4801,30 +5182,54 @@ impl SipStack {
     /// hold/resume, codec changes and RFC 4028 refreshes work end to end. A
     /// body-less refresh is answered locally with the SDP last sent to that
     /// leg. One re-INVITE at a time crosses the B2BUA (491 otherwise, §14.2).
-    async fn handle_in_dialog_request(
-        &self,
-        req: &SipRequest,
-        source: SbcSocketAddr,
-    ) -> ProcessResult {
-        let method = req.method.clone();
-        let sip_call_id = req.headers.call_id().unwrap_or("").to_string();
+    async fn handle_in_dialog_request(&self, req: &SipRequest, ingress: Ingress) -> ProcessResult {
+        let source = ingress.source;
         let respond = |status: StatusCode| ProcessResult::Response {
             message: SipMessage::Response(create_response_from_request(req, status)),
             destination: source,
             flow: Flow::Reply,
         };
 
-        // 1. Match the dialog: Call-ID on either leg, and the request's From
-        //    tag must be that leg's remote tag (a forged request with a
-        //    guessed Call-ID gets 481, not a relayed session change).
-        //    RFC 3261 §12.2.2; audited, rate limited (POA&M-252, AU-2).
-        let (internal_id, from_a_leg, addrs) = match self.match_dialog(req).await {
-            Ok(found) => found,
-            Err((status, policy)) => {
-                self.signaling_audit
-                    .in_dialog_reject(req, source, policy, Instant::now());
-                return respond(status);
-            }
+        // 1. Match the dialog: Call-ID on either leg, From tag = the leg's
+        //    remote tag, To tag = its local tag (481 otherwise), sent by the
+        //    leg's peer (403 otherwise). RFC 3261 §12.2.2; audited, rate
+        //    limited (POA&M-252, AU-2). NIST 800-53 Rev5: SC-23, AC-3.
+        let (internal_id, from_a_leg, addrs, new_flow) =
+            match self.match_dialog(req, &ingress, DialogRule::InDialog).await {
+                Ok(found) => found,
+                Err((status, policy)) => {
+                    self.signaling_audit
+                        .in_dialog_reject(req, source, policy, Instant::now());
+                    return respond(status);
+                }
+            };
+        let result = self
+            .in_dialog_request_matched(req, &ingress, internal_id.clone(), from_a_leg, addrs)
+            .await;
+        // The leg follows a re-registered flow only once its request is
+        // accepted (NIST 800-53 Rev5: SC-23).
+        if new_flow && !is_rejection(&result) {
+            let _ = self.repin_leg(&internal_id, !from_a_leg, &ingress).await;
+        }
+        result
+    }
+
+    /// [`Self::handle_in_dialog_request`] once the dialog matched.
+    async fn in_dialog_request_matched(
+        &self,
+        req: &SipRequest,
+        ingress: &Ingress,
+        internal_id: CallId,
+        from_a_leg: bool,
+        addrs: CallAddresses,
+    ) -> ProcessResult {
+        let source = ingress.source;
+        let method = req.method.clone();
+        let sip_call_id = req.headers.call_id().unwrap_or("").to_string();
+        let respond = |status: StatusCode| ProcessResult::Response {
+            message: SipMessage::Response(create_response_from_request(req, status)),
+            destination: source,
+            flow: Flow::Reply,
         };
 
         // 2. Glare (§14.2): a second session change while one is in flight.
@@ -4846,7 +5251,7 @@ impl SipStack {
                     &ok,
                     source,
                     addrs.leg_flow(!from_a_leg),
-                    req.headers.cseq_parsed().map_or(1, |c| c.sequence),
+                    addrs.leg_peer(!from_a_leg),
                 )
                 .await;
             }
@@ -5058,8 +5463,51 @@ impl SipStack {
     async fn relay_in_dialog_non_session(
         &self,
         req: &SipRequest,
-        source: SbcSocketAddr,
+        ingress: Ingress,
     ) -> ProcessResult {
+        let source = ingress.source;
+        let respond = |status: StatusCode| ProcessResult::Response {
+            message: SipMessage::Response(create_response_from_request(req, status)),
+            destination: source,
+            flow: Flow::Reply,
+        };
+
+        // RFC 3261 §12.2.2: no matching dialog or tags → 481, the dialog
+        // from a sender that is not its peer → 403; audited and rate limited
+        // per source (POA&M-252; NIST 800-53 Rev5: AU-2, SI-4, SC-23).
+        let audit_reject = |policy: InDialogPolicy| {
+            self.signaling_audit
+                .in_dialog_reject(req, source, policy, Instant::now());
+        };
+        let (internal_id, from_a_leg, addrs, new_flow) =
+            match self.match_dialog(req, &ingress, DialogRule::InDialog).await {
+                Ok(found) => found,
+                Err((status, policy)) => {
+                    audit_reject(policy);
+                    return respond(status);
+                }
+            };
+        let result = self
+            .non_session_matched(req, &ingress, internal_id.clone(), from_a_leg, addrs)
+            .await;
+        // The leg follows a re-registered flow only once its request is
+        // accepted (NIST 800-53 Rev5: SC-23).
+        if new_flow && !is_rejection(&result) {
+            let _ = self.repin_leg(&internal_id, !from_a_leg, &ingress).await;
+        }
+        result
+    }
+
+    /// [`Self::relay_in_dialog_non_session`] once the dialog matched.
+    async fn non_session_matched(
+        &self,
+        req: &SipRequest,
+        ingress: &Ingress,
+        internal_id: CallId,
+        from_a_leg: bool,
+        addrs: CallAddresses,
+    ) -> ProcessResult {
+        let source = ingress.source;
         let method = req.method.clone();
         let sip_call_id = req.headers.call_id().unwrap_or("").to_string();
         let respond = |status: StatusCode| ProcessResult::Response {
@@ -5067,20 +5515,9 @@ impl SipStack {
             destination: source,
             flow: Flow::Reply,
         };
-
-        // RFC 3261 §12.2.2: no matching dialog (or a forged From tag) → 481,
-        // audited and rate limited per source (POA&M-252; NIST 800-53 Rev5:
-        // AU-2, SI-4).
         let audit_reject = |policy: InDialogPolicy| {
             self.signaling_audit
                 .in_dialog_reject(req, source, policy, Instant::now());
-        };
-        let (internal_id, from_a_leg, addrs) = match self.match_dialog(req).await {
-            Ok(found) => found,
-            Err((status, policy)) => {
-                audit_reject(policy);
-                return respond(status);
-            }
         };
 
         // Method-specific headers that cross the B2BUA, validated (SI-10).
@@ -5705,7 +6142,7 @@ impl SipStack {
             relayed,
             orig_dest,
             orig_flow,
-            cseq_number(&pending.orig_cseq),
+            addrs.leg_peer(!pending.from_a_leg),
         )
         .await;
         (forward, record)
@@ -5968,10 +6405,37 @@ impl SipStack {
         trunk_failed: bool,
         end: crate::cdr::CdrEnd,
     ) -> bool {
-        let mut removed = {
+        match self.claim_call_record(internal_id, |_| true).await {
+            Claim::Claimed(removed) => {
+                self.release_claimed(internal_id, removed, trunk_failed, &end)
+                    .await;
+                true
+            }
+            Claim::Refused | Claim::Gone => false,
+        }
+    }
+
+    /// Removes the call record if `still` holds for it, in the same
+    /// `call_correlation` critical section that checks it: a teardown that
+    /// depends on the call's state (a CANCEL needs it unanswered) cannot
+    /// race the change of that state. Only the claimer tears the call down;
+    /// it must then call [`Self::release_claimed`].
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-23
+    async fn claim_call_record(
+        &self,
+        internal_id: &CallId,
+        still: impl FnOnce(&CallAddresses) -> bool,
+    ) -> Claim {
+        let removed = {
             let mut corr = self.call_correlation.write().await;
+            match corr.addresses.get(internal_id) {
+                None => return Claim::Gone,
+                Some(a) if !still(a) => return Claim::Refused,
+                Some(_) => {}
+            }
             let Some(removed) = corr.addresses.remove(internal_id) else {
-                return false;
+                return Claim::Gone;
             };
             corr.a_leg.remove(&removed.a_leg_sip_call_id);
             corr.b_leg.remove(&removed.b_leg_sip_call_id);
@@ -5980,21 +6444,33 @@ impl SipStack {
             }
             removed
         };
-        // The single end-of-call hook for the recording session: BYE (or
-        // CANCEL) to the SRS, slot release, audit and the CDR fields, on
-        // every teardown path (AU-12, SC-5).
-        self.recording_call_ended(internal_id, &mut removed, &end);
         // RFC 3261 §13.2.2.4: a 2xx can still cross the release of an
         // unanswered call (CANCEL, Timer B, failover exhaustion, ...); keep
         // the attempt so it gets ACK+BYE. Answered calls tear down normally.
+        // Recorded at the claim, so no 2xx lands in between.
         if !removed.b_leg_answered && !removed.b_leg_branch.is_empty() {
             let now = Instant::now();
             lock_leaf(&self.released_invites).insert(ReleasedInvite::of(&removed, now), now);
         }
+        Claim::Claimed(Box::new(removed))
+    }
+
+    /// Releases what a claimed call record holds (exactly once: only the
+    /// claimer of the record gets here) and emits its CDR.
+    async fn release_claimed(
+        &self,
+        internal_id: &CallId,
+        mut removed: Box<CallAddresses>,
+        trunk_failed: bool,
+        end: &crate::cdr::CdrEnd,
+    ) {
+        // The single end-of-call hook for the recording session: BYE (or
+        // CANCEL) to the SRS, slot release, audit and the CDR fields, on
+        // every teardown path (AU-12, SC-5).
+        self.recording_call_ended(internal_id, &mut removed, end);
         for port in &removed.rtp_ports {
             self.release_rtp_port(*port);
         }
-        // Exactly once per call: only the remover of the record gets here.
         if removed.media_kind == crate::t38::CallMediaKind::Image {
             self.t38_counters.image_ended();
         }
@@ -6013,9 +6489,8 @@ impl SipStack {
         )
         .await;
         if let Some(cdr) = &self.cdr {
-            cdr.emit_call(std::mem::take(&mut removed.cdr), &end);
+            cdr.emit_call(std::mem::take(&mut removed.cdr), end);
         }
-        true
     }
 
     /// Releases a trunk slot and/or a VPS callee slot.
@@ -7961,12 +8436,18 @@ impl SipStack {
 
             // Config-file trunks are admitted INVITE sources too (the API
             // path does this in register_inbound_trunk). No CSS for these.
-            let map = self.inbound_trunk_map.get_mut();
-            for t_config in &tg_config.trunks {
-                for ip in resolve_trunk_host_ips(&t_config.host) {
-                    map.insert(ip, (tg_config.id.clone(), None));
-                }
-            }
+            let hosts: HashSet<std::net::IpAddr> = tg_config
+                .trunks
+                .iter()
+                .flat_map(|t| resolve_trunk_host_ips(&t.host))
+                .collect();
+            replace_inbound_trunk(
+                self.inbound_trunk_map.get_mut(),
+                &tg_config.id,
+                None,
+                &hosts,
+            );
+            index_trunk_hosts(self.trunk_group_hosts.get_mut(), &tg_config.id, hosts);
         }
 
         // Load dial plans
@@ -8337,10 +8818,18 @@ impl SipStack {
             };
         let hiding_snapshot = hiding.get(..hiding_len).unwrap_or_default();
         let is_request = message.is_request();
+        let mut stateless = false;
         let mut result = match message {
             SipMessage::Request(_) => {
-                self.process_request(message, source, receiving_zone, transport, conn)
-                    .await
+                self.process_request(
+                    message,
+                    source,
+                    receiving_zone,
+                    transport,
+                    conn,
+                    &mut stateless,
+                )
+                .await
             }
             SipMessage::Response(_) => self.process_response(message, source, transport).await,
         };
@@ -8358,12 +8847,14 @@ impl SipStack {
         // Replies are pinned to the receive transport first, so every
         // result leaves here with a concrete flow.
         resolve_reply(&mut result, transport);
-        self.track_result(&result).await;
+        self.track_result_with(&result, !stateless).await;
         result
     }
 
     /// Processes a SIP request. `receiving_zone` is the zone the request arrived
     /// on (used by INVITE to pick the caller-facing media interface).
+    /// `stateless` is set when the request rides no server transaction of
+    /// its own (see [`TxnCheck::Stateless`]).
     async fn process_request(
         &self,
         message: SipMessage,
@@ -8371,6 +8862,7 @@ impl SipStack {
         receiving_zone: Option<&str>,
         transport: AddrTransport,
         conn: Option<crate::stir_binding::ConnId>,
+        stateless: &mut bool,
     ) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -8391,14 +8883,25 @@ impl SipStack {
         // Transaction layer (RFC 3261 §17.2): a retransmitted request is
         // answered from its server transaction, never re-processed. ACK has
         // no server transaction of its own.
+        let ingress = Ingress {
+            source,
+            transport,
+            conn,
+        };
         if method != Method::Ack {
-            if let Some(answer) = self.answer_request_retransmit(req, source).await {
-                return answer;
+            let check = self.answer_request_retransmit(req, &ingress).await;
+            if let TxnCheck::Answer(answer) = check {
+                return *answer;
             }
             if let Some(rejected) = self.user_rate_limit(req, source, transport, conn).await {
                 return rejected;
             }
-            self.open_server_transaction(req, source, transport).await;
+            if matches!(check, TxnCheck::Stateless) {
+                *stateless = true;
+            } else {
+                self.open_server_transaction(req, source, transport, conn)
+                    .await;
+            }
         }
 
         // A request inside a recording session dialog (from the SRS) never
@@ -8413,12 +8916,12 @@ impl SipStack {
                 self.handle_invite(message, source, receiving_zone, transport, conn)
                     .await
             }
-            Method::Ack => self.handle_ack(message).await,
-            Method::Bye => self.handle_bye(message, source).await,
-            Method::Cancel => self.handle_cancel(message, source).await,
+            Method::Ack => self.handle_ack(message, ingress).await,
+            Method::Bye => self.handle_bye(message, ingress).await,
+            Method::Cancel => self.handle_cancel(message, ingress).await,
             Method::Options => self.handle_options(message, source).await,
-            Method::Update => self.handle_update(message, source).await,
-            _ => self.handle_other_request(message, source).await,
+            Method::Update => self.handle_update(message, ingress).await,
+            _ => self.handle_other_request(message, ingress).await,
         }
     }
 
@@ -8447,6 +8950,21 @@ impl SipStack {
                             .transaction
                             .receive_response(status_code)
                             .unwrap_or(false);
+                        // RFC 3261 §9.1: a queued CANCEL goes out with the
+                        // first provisional; a final makes it moot. Its call
+                        // is already torn down, so the 1xx goes no further.
+                        if status_code < 200
+                            && let Some(cancel) = st.pending_cancel.take()
+                        {
+                            return ControlFlow::Break(ProcessResult::Forward {
+                                message: cancel,
+                                destination: st.destination,
+                                flow: st.flow.clone().into(),
+                            });
+                        }
+                        if status_code >= 200 {
+                            st.pending_cancel = None;
+                        }
                         if status_code >= 300 {
                             // ACK every non-2xx final, and again for each
                             // retransmission of it (§17.1.1.3).
@@ -8604,12 +9122,19 @@ impl SipStack {
         let mut addrs = a.clone();
         drop(corr);
 
-        // 2a. Response to a relayed mid-dialog re-INVITE/UPDATE.
-        if let Some(pending) = addrs
-            .pending_reinvite
-            .clone()
-            .filter(|p| p.fwd_branch == branch)
-        {
+        // A response to a CANCEL the SBC sent completes that CANCEL's own
+        // client transaction (above) and is never a final response of the
+        // request it cancelled (RFC 3261 §9.1).
+        if cseq.method == Method::Cancel {
+            debug!(call_id = %sip_call_id, status = status_code, "Response to a CANCEL; absorbed");
+            return ack_action.unwrap_or(ProcessResult::NoAction);
+        }
+
+        // 2a. Response to a relayed mid-dialog re-INVITE/UPDATE: the
+        //     forwarded request's branch, CSeq method and number.
+        if let Some(pending) = addrs.pending_reinvite.clone().filter(|p| {
+            p.fwd_branch == branch && cseq.method == p.method && cseq.sequence == p.fwd_cseq
+        }) {
             let tu = self
                 .handle_reinvite_response(resp, &internal_id, &addrs, &pending)
                 .await;
@@ -8652,6 +9177,8 @@ impl SipStack {
 
         // Learn the remote (callee) tag from the first tagged response —
         // it completes the dialog identity used by in-dialog BYE/ACK.
+        // POAM: POA&M-390 a 2xx from another fork (another To tag) does not
+        // replace it, so that fork's in-dialog requests get 481.
         if addrs.dialog_to_tag.is_none()
             && let Some(tag) = resp
                 .headers
@@ -8683,7 +9210,7 @@ impl SipStack {
         if (200..300).contains(&status_code) {
             // 2xx success (200 OK)
             return self
-                .handle_success_response(resp, &internal_id, &addrs)
+                .handle_success_response(resp, source, &internal_id, &addrs)
                 .await;
         }
 
@@ -8840,6 +9367,25 @@ impl SipStack {
             }
         }
 
+        // RFC 3261 §12.1.1: each tagged 1xx gives the caller an early dialog
+        // whose To tag is this one; the caller's requests in it (PRACK,
+        // UPDATE, BYE) must match (bounded, SC-5).
+        if let Some(tag) = a_response
+            .headers
+            .get_value(&HeaderName::To)
+            .and_then(|v| extract_param(v, "tag"))
+            .filter(|t| !t.is_empty())
+            && !addrs.a_leg_early_tags.iter().any(|t| t == tag)
+        {
+            let mut corr = self.call_correlation.write().await;
+            if let Some(a) = corr.addresses.get_mut(internal_id)
+                && a.a_leg_early_tags.len() < MAX_EARLY_DIALOGS
+                && !a.a_leg_early_tags.iter().any(|t| t == tag)
+            {
+                a.a_leg_early_tags.push(tag.to_string());
+            }
+        }
+
         info!(
             status = status_code,
             call_id = %addrs.a_leg_sip_call_id,
@@ -8910,6 +9456,7 @@ impl SipStack {
     async fn handle_success_response(
         &self,
         resp: &proto_sip::message::SipResponse,
+        source: SbcSocketAddr,
         internal_id: &CallId,
         addrs: &CallAddresses,
     ) -> ProcessResult {
@@ -8923,16 +9470,42 @@ impl SipStack {
         // copy claims the answer under the write lock, so a duplicate can
         // neither start a second recording session nor fail the first
         // (NIST 800-53 Rev5: SC-24, SC-5).
-        if addrs.b_leg_answered
-            || (addrs.recording.matched && !self.recording_claim_answer(internal_id).await)
-        {
+        let re_ack = || {
             debug!(call_id = %addrs.a_leg_sip_call_id, "Retransmitted 200 OK from B-leg, re-sending ACK");
             let ack = Self::build_leg_in_dialog_request(addrs, true, &Method::Ack, 1, None);
-            return ProcessResult::Forward {
+            ProcessResult::Forward {
                 message: SipMessage::Request(ack),
                 destination: addrs.b_leg_destination,
                 flow: addrs.b_leg_flow.clone().into(),
-            };
+            }
+        };
+        if addrs.b_leg_answered
+            || (addrs.recording.matched && !self.recording_claim_answer(internal_id).await)
+        {
+            return re_ack();
+        }
+        // SEC-1: the answer races a CANCEL (or the caller's early BYE) for
+        // the unanswered call; whichever changes the record first wins,
+        // under the correlation write lock. A call the CANCEL already
+        // claimed gets the released-INVITE treatment (ACK and BYE toward
+        // the callee), never a 200 toward the caller after its 487
+        // (RFC 3261 §9.2, §13.2.2.4; NIST 800-53 Rev5: SC-23).
+        let taken = {
+            let mut corr = self.call_correlation.write().await;
+            corr.addresses
+                .get_mut(internal_id)
+                .map(|a| !std::mem::replace(&mut a.b_leg_answer_claimed, true))
+        };
+        match taken {
+            Some(true) => {}
+            Some(false) => return re_ack(),
+            None => {
+                let branch = resp.headers.via_branch().unwrap_or_default();
+                let cseq = resp.headers.cseq_parsed().map_or(1, |c| c.sequence);
+                return self
+                    .late_2xx_teardown(resp, source, &addrs.b_leg_sip_call_id, &branch, cseq)
+                    .unwrap_or(ProcessResult::NoAction);
+            }
         }
 
         // Build 200 OK for A-leg with rewritten SDP, carrying the A-leg
@@ -9043,9 +9616,13 @@ impl SipStack {
 
         // Remember the answer for body-less refreshes, and that the B-leg
         // has answered (later 2xx are retransmissions).
-        {
+        let mut bye_tag = None;
+        let committed = {
             let mut corr = self.call_correlation.write().await;
-            if let Some(a) = corr.addresses.get_mut(internal_id) {
+            if let Some(a) = corr.addresses.get_mut(internal_id).filter(|a| {
+                bye_tag.clone_from(&a.bye_pending);
+                a.bye_pending.is_none()
+            }) {
                 a.b_leg_answered = true;
                 a.a_leg_last_sdp.clone_from(&a_response.body);
                 a.established_at = Some(Instant::now());
@@ -9061,7 +9638,66 @@ impl SipStack {
                 }
                 // POA&M-294: CDR schema v3 records the answered media kind.
                 a.cdr.note_media_kind(a.media_kind.cdr());
+                true
+            } else {
+                false
             }
+        };
+        // The call ended while the answer was being set up (a CANCEL claimed
+        // it), or the caller's BYE arrived meanwhile (`bye_pending`): stop
+        // the relay started above and release the call. The caller gets a
+        // 487 on its INVITE only when its BYE ended the call (a CANCEL has
+        // already sent its own). The callee's dialog ends like a 2xx for a
+        // released INVITE (ACK and BYE, RFC 3261 §13.2.2.4).
+        // NIST 800-53 Rev5: SC-5, SC-23.
+        if !committed {
+            if let Some(ref pipeline) = self.media_pipeline {
+                let key = internal_id.to_string();
+                let _ = pipeline.stop_relay(&key).await;
+                let _ = pipeline.remove_session(&key).await;
+            }
+            drop(recording_results);
+            self.calls.write().await.remove(internal_id);
+            let mut out = Vec::new();
+            if self
+                .finish_call_record(internal_id, false, crate::cdr::CdrEnd::bye(true, false))
+                .await
+            {
+                // The caller's BYE ended the call (`bye_pending`): its
+                // INVITE still needs its final response. 487 on the INVITE
+                // transaction (Timer G, ACK absorption), with the tag of the
+                // BYE's 200 (RFC 3261 §15, §9.2). A CANCEL that claimed the
+                // call sent its own 487.
+                audit_call_terminated(addrs, uc_audit::event::TerminationReason::CallerHangup);
+                let mut terminated = build_a_leg_response(
+                    StatusCode::new(487).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
+                    addrs,
+                );
+                if let Some(tag) = bye_tag.as_deref() {
+                    terminated
+                        .headers
+                        .set(HeaderName::To, with_tag(&addrs.a_leg_to, Some(tag)));
+                }
+                out.push(ProcessResult::Response {
+                    message: SipMessage::Response(terminated),
+                    destination: addrs.a_leg_source,
+                    flow: addrs.a_leg_flow.clone().into(),
+                });
+            }
+            let branch = resp.headers.via_branch().unwrap_or_default();
+            let cseq = resp.headers.cseq_parsed().map_or(1, |c| c.sequence);
+            debug!(call_id = %addrs.a_leg_sip_call_id, "Call ended while its answer was set up; callee dialog torn down");
+            out.extend(self.late_2xx_teardown(
+                resp,
+                source,
+                &addrs.b_leg_sip_call_id,
+                &branch,
+                cseq,
+            ));
+            return match out.len() {
+                0 => ProcessResult::NoAction,
+                _ => ProcessResult::Multiple(out),
+            };
         }
         let t38_failed = match initial_t38 {
             Some(crate::t38::AnswerCheck::Failed(reason)) => Some(reason),
@@ -9089,7 +9725,7 @@ impl SipStack {
             &a_message,
             addrs.a_leg_source,
             addrs.a_leg_flow.clone(),
-            cseq_number(&addrs.a_leg_cseq),
+            addrs.leg_peer(false),
         )
         .await;
 
@@ -9770,7 +10406,12 @@ impl SipStack {
         // dialog (RFC 3261 §14), relayed to the other leg — or 481 when no
         // dialog matches (§12.2.2). Admission is the dialog match itself.
         if req.headers.to_tag().is_some() {
-            return self.handle_in_dialog_request(req, source).await;
+            let ingress = Ingress {
+                source,
+                transport,
+                conn,
+            };
+            return self.handle_in_dialog_request(req, ingress).await;
         }
 
         // Source admission: only configured trunks and currently registered
@@ -9923,13 +10564,40 @@ impl SipStack {
         }
         // Mark this Call-ID as in-flight under a write lock so a second
         // copy arriving before the correlation insert is also absorbed
-        // (TOCTOU fix — H4).
-        {
+        // (TOCTOU fix — H4). A CANCEL that repeats this INVITE marks it
+        // while it is routed (`SipStack::mark_in_flight_invite_cancelled`).
+        let identity = InviteIdentity::of_request(req, &Method::Invite);
+        let merged = {
             let mut in_flight = self.in_flight_invites.write().await;
-            if !in_flight.insert(a_leg_call_id.clone()) {
-                debug!(call_id = %a_leg_call_id, "INVITE retransmit (in-flight), absorbing");
-                return ProcessResult::NoAction;
+            match in_flight.get(&a_leg_call_id) {
+                Some(e) if e.identity == identity => {
+                    debug!(call_id = %a_leg_call_id, "INVITE retransmit (in-flight), absorbing");
+                    return ProcessResult::NoAction;
+                }
+                // RFC 3261 §8.2.2.2: same From tag, Call-ID and CSeq on
+                // another branch or sent-by is a merged request (482);
+                // anything else reusing the Call-ID is refused (403).
+                Some(e) => Some(match (e.identity.as_ref(), identity.as_ref()) {
+                    (Some(a), Some(b)) if a.same_request_as(b) => StatusCode::LOOP_DETECTED,
+                    _ => StatusCode::FORBIDDEN,
+                }),
+                None => {
+                    in_flight.insert(
+                        a_leg_call_id.clone(),
+                        InFlightInvite {
+                            identity,
+                            source,
+                            transport,
+                            conn,
+                            cancelled: false,
+                        },
+                    );
+                    None
+                }
             }
+        };
+        if let Some(status) = merged {
+            return self.refuse_merged_invite(req, source, status).await;
         }
 
         // Draining (graceful shutdown): refuse new calls, let existing ones
@@ -10075,7 +10743,11 @@ impl SipStack {
         //
         // ## NIST 800-53 Rev5: IA-9, SI-10, SC-5
         let stir_in = match self.stir.as_ref() {
-            Some(stir) => stir.inbound(req, source.ip(), &a_leg_call_id).await,
+            Some(stir) => {
+                let group = self.lookup_inbound_trunk(source.ip()).await.map(|(g, _)| g);
+                stir.inbound(req, source.ip(), group.as_deref(), &a_leg_call_id)
+                    .await
+            }
             None => crate::stir::InboundStir::default(),
         };
         if let Some(reason) = stir_in.reject {
@@ -10215,6 +10887,9 @@ impl SipStack {
         // Gates topology hiding so only outside-facing legs are anonymized
         // (rewriting an inside-facing leg's Via/Contact would misroute it).
         let mut b_leg_external = false;
+        // Registration of the callee's contact when routed to a registered
+        // user (binds the B-leg dialog peer, see `dialog_match`).
+        let mut b_leg_registration: Option<Arc<LegRegistration>> = None;
         // Trunk slot, failover targets and translated number when the call
         // is routed to a trunk.
         let mut trunk_route: Option<TrunkRoute> = None;
@@ -10277,6 +10952,7 @@ impl SipStack {
             if let Some(binding) = found_contact {
                 if let Some((flow, dest)) = binding_target(&binding) {
                     b_leg_flow = flow;
+                    b_leg_registration = Some(LegRegistration::of(&binding));
                     Some(dest)
                 } else {
                     b_leg_flow = LegFlow::UDP;
@@ -11076,6 +11752,15 @@ impl SipStack {
             let mut calls = self.calls.write().await;
             calls.insert(internal_call_id.clone(), call, call_slot);
         }
+        // The caller's trunk group binds the A-leg dialog peer (SC-23); an
+        // endpoint caller is also bound to the registration its flow holds.
+        let a_leg_trunk_group = self.trunk_group_of(source.ip()).await;
+        let a_leg_registration = if a_leg_trunk_group.is_none() {
+            self.flow_registration(source, transport, conn, &from_uri)
+                .await
+        } else {
+            None
+        };
         {
             let mut corr = self.call_correlation.write().await;
             corr.a_leg
@@ -11127,6 +11812,15 @@ impl SipStack {
                     b_leg_destination,
                     a_leg_flow: LegFlow::inbound(transport),
                     b_leg_flow: b_leg_flow.clone(),
+                    a_leg_conn: conn,
+                    a_leg_trunk_group,
+                    a_leg_registration,
+                    b_leg_peer_kind: if b_leg_external {
+                        BLegPeerKind::Trunk
+                    } else {
+                        BLegPeerKind::Registered
+                    },
+                    b_leg_registration,
                     a_leg_local_addr,
                     a_leg_sip_call_id: a_leg_call_id.clone(),
                     b_leg_sip_call_id: b_leg_sip_call_id.clone(),
@@ -11147,6 +11841,9 @@ impl SipStack {
                     a_leg_via,
                     a_leg_from,
                     a_leg_to,
+                    a_leg_ruri: req.uri.to_string(),
+                    a_leg_local_tag: generate_tag(),
+                    a_leg_early_tags: Vec::new(),
                     a_leg_cseq,
                     b_leg_from,
                     b_leg_to,
@@ -11160,6 +11857,8 @@ impl SipStack {
                     media_b_leg_ip: b_media_ip_str,
                     media_b_leg_port: b_leg_rtp_port,
                     b_leg_answered: false,
+                    b_leg_answer_claimed: false,
+                    bye_pending: None,
                     a_leg_local_cseq: 1,
                     b_leg_local_cseq: 2,
                     a_leg_last_sdp: None,
@@ -11182,10 +11881,17 @@ impl SipStack {
                 },
             );
         }
-        // INVITE correlation is stored — remove from in-flight set (H4).
-        {
-            let mut in_flight = self.in_flight_invites.write().await;
-            in_flight.remove(&a_leg_call_id);
+        // INVITE correlation is stored — remove from in-flight set (H4). A
+        // CANCEL that matched while the INVITE was routed marked it: answer
+        // 487 instead of forwarding it (RFC 3261 §9.2).
+        let cancelled = self
+            .in_flight_invites
+            .write()
+            .await
+            .remove(&a_leg_call_id)
+            .is_some_and(|e| e.cancelled);
+        if cancelled {
+            return self.invite_cancelled_while_routing(&internal_call_id).await;
         }
 
         // 9. Transactions: the server INVITE transaction was opened in
@@ -11219,7 +11925,7 @@ impl SipStack {
     /// An ACK for a non-2xx final shares the INVITE's branch and completes
     /// that server transaction (RFC 3261 §17.2.1). An ACK for a 2xx is its
     /// own transaction and stops the TU's 2xx retransmission (§13.3.1.4).
-    async fn handle_ack(&self, message: SipMessage) -> ProcessResult {
+    async fn handle_ack(&self, message: SipMessage, ingress: Ingress) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
                 reason: "Expected request".to_string(),
@@ -11228,14 +11934,51 @@ impl SipStack {
 
         let call_id = req.headers.call_id().unwrap_or("").to_string();
         debug!(uri = %req.uri, call_id = %call_id, "Processing ACK");
+        // A mismatched ACK gets no response (RFC 3261 §17.2.1: an ACK is
+        // never answered); it is audited, rate limited (AU-2, SI-4).
+        let reject = || {
+            debug!(call_id = %call_id, source = %ingress.source, "ACK does not match its dialog or peer; ignored");
+            self.signaling_audit.in_dialog_reject(
+                req,
+                ingress.source,
+                InDialogPolicy::AckMismatch,
+                Instant::now(),
+            );
+            ProcessResult::NoAction
+        };
 
+        // ACK of a non-2xx final: the INVITE's server transaction (RFC 3261
+        // §17.2.3), the INVITE's identity (branch, sent-by, From tag, CSeq
+        // number), from the leg's dialog peer (NIST 800-53 Rev5: SC-23).
         if let Some(branch) = req.headers.via_branch() {
-            let mut txns = self.transactions.write().await;
-            if let Some(st) = txns
-                .server_invite
-                .get_mut(&TransactionKey::server(&branch, "INVITE"))
-            {
-                let _ = st.transaction.receive_ack();
+            let key = TransactionKey::server(&branch, "INVITE");
+            let ident = InviteIdentity::of_request(req, &Method::Ack);
+            let found = {
+                let txns = self.transactions.read().await;
+                txns.server_invite
+                    .get(&key)
+                    .filter(|st| st.call_id == call_id)
+                    .map(|st| {
+                        let matches = ident.as_ref().map_or_else(
+                            // RFC 2543 client: the branch alone (no cookie on
+                            // either side).
+                            || st.invite.is_none(),
+                            |i| i.matches_txn(st, &call_id),
+                        );
+                        (matches, st.source, st.flow.transport, st.conn)
+                    })
+            };
+            if let Some((matches, src, transport, conn)) = found {
+                if !matches
+                    || !self
+                        .txn_peer_admits(&call_id, (src, transport, conn), &ingress)
+                        .await
+                {
+                    return reject();
+                }
+                if let Some(st) = self.transactions.write().await.server_invite.get_mut(&key) {
+                    let _ = st.transaction.receive_ack();
+                }
                 debug!(call_id = %call_id, "ACK completed non-2xx INVITE transaction");
                 return ProcessResult::NoAction;
             }
@@ -11246,19 +11989,64 @@ impl SipStack {
         // transaction is still in the table (until the next timer tick
         // prunes it); the 2xx retransmission then draws another ACK, which
         // lands here.
-        let cseq = req.headers.cseq_parsed().map(|c| c.sequence);
-        let held = {
-            let mut pending = self.pending_2xx.write().await;
-            if pending
-                .get(&call_id)
-                .is_some_and(|p| cseq.is_none_or(|n| n == p.cseq))
-            {
-                debug!(call_id = %call_id, "ACK received for 2xx; retransmission stopped");
-                pending.remove(&call_id).and_then(|p| p.held_bye)
+        //
+        // RFC 3261 §13.2.2.4: the ACK of a 2xx carries the INVITE's CSeq
+        // number and the 2xx's dialog tags, and it must come from the
+        // dialog's peer; anything else leaves the 2xx retransmitting
+        // (NIST 800-53 Rev5: SC-23, AC-3, SI-10).
+        let verdict = {
+            let pending = self.pending_2xx.read().await;
+            let Some(p) = pending.get(&call_id) else {
+                return ProcessResult::NoAction;
+            };
+            if dialog_match::ack_matches_2xx(
+                req,
+                p.cseq,
+                p.from_tag.as_deref(),
+                p.to_tag.as_deref(),
+            ) {
+                match p.peer.admits(&ingress) {
+                    PeerVerdict::Admit => Some(None),
+                    PeerVerdict::Reject => None,
+                    // A trunk-group host or a re-registered flow: resolved
+                    // below, off this lock.
+                    PeerVerdict::Resolve => Some(Some(p.peer.clone())),
+                }
             } else {
                 None
             }
         };
+        let Some(resolve) = verdict else {
+            return reject();
+        };
+        let mut new_flow = false;
+        if let Some(peer) = resolve {
+            match self.peer_admits(&peer, &ingress).await {
+                PeerMatch::Same => {}
+                PeerMatch::NewFlow => new_flow = true,
+                PeerMatch::No => return reject(),
+            }
+        }
+        let (accepted, held) = {
+            let mut pending = self.pending_2xx.write().await;
+            if pending.get(&call_id).is_some_and(|p| {
+                dialog_match::ack_matches_2xx(
+                    req,
+                    p.cseq,
+                    p.from_tag.as_deref(),
+                    p.to_tag.as_deref(),
+                ) && p.peer.admits(&ingress) != PeerVerdict::Reject
+            }) {
+                debug!(call_id = %call_id, "ACK received for 2xx; retransmission stopped");
+                (true, pending.remove(&call_id).and_then(|p| p.held_bye))
+            } else {
+                (false, None)
+            }
+        };
+        // The leg follows a re-registered flow once its ACK is accepted.
+        if new_flow && accepted {
+            self.repin_by_call_id(&call_id, &ingress).await;
+        }
         // RFC 3261 §15: the dialog is confirmed now, so a teardown BYE that
         // was waiting for this ACK may go out. Not hidden here: the egress
         // pass of this ACK's `process_message` hides it, once, with the
@@ -11276,80 +12064,115 @@ impl SipStack {
     /// 2. Send 200 OK to BYE sender
     /// 3. Build BYE for the other leg
     /// 4. Stop media relay and clean up call state
-    async fn handle_bye(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
+    async fn handle_bye(&self, message: SipMessage, ingress: Ingress) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
                 reason: "Expected request".to_string(),
             };
         };
+        let source = ingress.source;
 
         let sip_call_id = req.headers.call_id().unwrap_or("").to_string();
 
         debug!(call_id = %sip_call_id, "Processing BYE");
 
-        // Look up the call — could be from A-leg or B-leg
-        let corr = self.call_correlation.read().await;
-        let (internal_id, is_from_a_leg) = if let Some(id) = corr.a_leg.get(&sip_call_id) {
-            (id.clone(), true)
-        } else if let Some(id) = corr.b_leg.get(&sip_call_id) {
-            (id.clone(), false)
+        // The BYE must name the dialog (Call-ID, From tag, and the To tag once
+        // answered) and come from that leg's peer; a Call-ID alone is
+        // caller-chosen and visible on the wire. No dialog: 481 (RFC 3261
+        // §15.1.2), a 200 would let a forged BYE look successful. Audited,
+        // rate limited (POA&M-252; NIST 800-53 Rev5: AU-2, SI-4, SC-23, AC-3).
+        // A BYE ends the call: no leg follows its flow.
+        let (internal_id, is_from_a_leg, mut addrs, _new_flow) =
+            match self.match_dialog(req, &ingress, DialogRule::Bye).await {
+                Ok(found) => found,
+                Err((status, policy)) => {
+                    debug!(
+                        call_id = %sip_call_id,
+                        source = %source,
+                        status = status.code(),
+                        "Rejecting BYE that does not match the dialog"
+                    );
+                    self.signaling_audit
+                        .in_dialog_reject(req, source, policy, Instant::now());
+                    let response = create_response_from_request(req, status);
+                    return ProcessResult::Response {
+                        message: SipMessage::Response(response),
+                        destination: source,
+                        flow: Flow::Reply,
+                    };
+                }
+            };
+
+        // The caller's BYE before the answer (RFC 3261 §15 lets the caller
+        // end an early dialog) is carried out as a CANCEL of the B-leg INVITE
+        // (§9.1) and a 487 on the caller's INVITE (H6): the callee has no
+        // confirmed dialog to BYE, and the INVITE still needs its final
+        // response, also when a tagged 1xx made an early dialog. That holds
+        // only while the call is unanswered, so the call is claimed in the
+        // same critical section that checks it (a 2xx that got there first
+        // makes this a BYE). NIST 800-53 Rev5: SC-23.
+        if is_from_a_leg && !addrs.b_leg_answered {
+            match self
+                .claim_call_record(&internal_id, |a| {
+                    !a.b_leg_answered && !a.b_leg_answer_claimed
+                })
+                .await
+            {
+                Claim::Claimed(rec) => {
+                    let unsent = self.mark_claimed_invite_cancelled(&sip_call_id).await;
+                    let how = (
+                        crate::cdr::CdrEnd::bye(true, false),
+                        uc_audit::event::TerminationReason::CallerHangup,
+                    );
+                    return self
+                        .cancel_pending_invite(req, source, internal_id, rec, unsent, how)
+                        .await;
+                }
+                Claim::Refused => {
+                    // Answered meanwhile: end the confirmed dialog with BYE.
+                    let current = {
+                        let corr = self.call_correlation.read().await;
+                        corr.addresses.get(&internal_id).cloned()
+                    };
+                    match current {
+                        Some(a) => addrs = a,
+                        None => return Self::bye_gone(req, source),
+                    }
+                }
+                Claim::Gone => return Self::bye_gone(req, source),
+            }
+        }
+
+        // SEC-9: the callee's 2xx is being set up (relay, recording) but not
+        // committed yet: tearing the call down now would race it. The BYE is
+        // answered and left to the 2xx path, which ends the call when it
+        // commits (ACK and BYE toward the callee). Checked under the
+        // correlation lock the commit takes.
+        let deferred = if is_from_a_leg {
+            let mut corr = self.call_correlation.write().await;
+            corr.addresses.get_mut(&internal_id).and_then(|a| {
+                if !a.b_leg_answer_claimed || a.b_leg_answered {
+                    return None;
+                }
+                let tag = a
+                    .bye_pending
+                    .clone()
+                    .unwrap_or_else(|| a.a_leg_tag().to_string());
+                a.bye_pending = Some(tag.clone());
+                Some(tag)
+            })
         } else {
-            // No dialog matches: 481 Call/Transaction Does Not Exist
-            // (RFC 3261 §15.1.2). A 200 here would hide a stale dialog from
-            // the far end and let a forged BYE look successful.
-            debug!(call_id = %sip_call_id, "BYE for unknown dialog, 481");
-            // Audited, rate limited (POA&M-252; NIST 800-53 Rev5: AU-2, SI-4).
-            drop(corr);
-            self.signaling_audit.in_dialog_reject(
-                req,
-                source,
-                InDialogPolicy::UnknownDialog,
-                Instant::now(),
-            );
-            let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
-            return ProcessResult::Response {
-                message: SipMessage::Response(response),
-                destination: source,
-                flow: Flow::Reply,
-            };
+            None
         };
-
-        let Some(a) = corr.addresses.get(&internal_id) else {
-            drop(corr);
-            self.signaling_audit.in_dialog_reject(
-                req,
-                source,
-                InDialogPolicy::UnknownDialog,
-                Instant::now(),
-            );
-            let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
+        if let Some(tag) = deferred {
+            debug!(call_id = %sip_call_id, "BYE crossed the answer being set up; the 2xx path ends the call");
+            // The same To tag as the 487 the 2xx path sends the INVITE.
+            let mut ok = create_response_from_request(req, StatusCode::OK);
+            if let Some(to) = req.headers.get_value(&HeaderName::To) {
+                ok.headers.set(HeaderName::To, with_tag(to, Some(&tag)));
+            }
             return ProcessResult::Response {
-                message: SipMessage::Response(response),
-                destination: source,
-                flow: Flow::Reply,
-            };
-        };
-        let addrs = a.clone();
-        drop(corr);
-
-        // The BYE must come from the dialog peer on that leg and carry that
-        // leg's tags; a Call-ID alone is caller-chosen and visible on the wire.
-        if let Some(status) = bye_dialog_mismatch(req, &addrs, is_from_a_leg, source) {
-            warn!(
-                call_id = %sip_call_id,
-                source = %source,
-                status = status.code(),
-                "Rejecting BYE that does not match the dialog"
-            );
-            self.signaling_audit.in_dialog_reject(
-                req,
-                source,
-                InDialogPolicy::FromTagMismatch,
-                Instant::now(),
-            );
-            let response = create_response_from_request(req, status);
-            return ProcessResult::Response {
-                message: SipMessage::Response(response),
+                message: SipMessage::Response(ok),
                 destination: source,
                 flow: Flow::Reply,
             };
@@ -11373,11 +12196,7 @@ impl SipStack {
         // Build 200 OK for BYE sender
         let ok_response = create_response_from_request(req, StatusCode::OK);
 
-        // Build the forwarded request for the other leg. If the B-leg
-        // dialog has no To-tag yet (early dialog — no final response
-        // received), send CANCEL instead of BYE (H6). A BYE in an early
-        // dialog is invalid per RFC 3261 §15 and will be rejected by
-        // conformant UAs.
+        // Build the BYE for the other leg.
         let other_call_id = if is_from_a_leg {
             &addrs.b_leg_sip_call_id
         } else {
@@ -11389,8 +12208,6 @@ impl SipStack {
         let (other_dest, other_flow) = addrs.leg_target(is_from_a_leg);
         let other_sent_by = addrs.leg_sent_by(is_from_a_leg);
 
-        let use_cancel = is_from_a_leg && addrs.dialog_to_tag.is_none();
-
         let other_uri = leg_request_uri(
             None,
             &other_dest.ip().to_string(),
@@ -11400,29 +12217,8 @@ impl SipStack {
         // RFC 3261 §12.2.1.1: the BYE's CSeq is reserved on the live record,
         // not taken from the snapshot, so it cannot repeat the number of a
         // request relayed concurrently on this call.
-        let bye_cseq = if use_cancel {
-            None
-        } else {
-            self.reserve_leg_cseq(&internal_id, is_from_a_leg).await
-        };
-        let forward_request = if use_cancel {
-            // Early dialog: send CANCEL mirroring the original INVITE
-            // (same Via branch, From, To without tag).
-            let mut cancel_req = proto_sip::message::SipRequest::new(Method::Cancel, other_uri);
-            cancel_req.headers.set(HeaderName::CallId, other_call_id);
-            cancel_req.headers.set(HeaderName::CSeq, "1 CANCEL");
-            cancel_req.headers.set(HeaderName::From, &addrs.b_leg_from);
-            cancel_req.headers.set(HeaderName::To, &addrs.b_leg_to);
-            cancel_req.headers.set(HeaderName::MaxForwards, "70");
-            // RFC 3261 §9.1: same Via (transport, sent-by, branch) as the
-            // INVITE being cancelled.
-            cancel_req.headers.add(Header::new(
-                HeaderName::Via,
-                crate::flow::via_for(&other_flow, other_sent_by, &addrs.b_leg_branch),
-            ));
-            cancel_req.headers.set(HeaderName::ContentLength, "0");
-            cancel_req
-        } else {
+        let bye_cseq = self.reserve_leg_cseq(&internal_id, is_from_a_leg).await;
+        let forward_request = {
             // Confirmed dialog: send BYE with dialog identity.
             let mut bye_request = proto_sip::message::SipRequest::new(Method::Bye, other_uri);
             bye_request.headers.set(HeaderName::CallId, other_call_id);
@@ -11444,7 +12240,7 @@ impl SipStack {
                 // From). The SBC→A direction has its own CSeq space.
                 bye_request.headers.set(
                     HeaderName::From,
-                    with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
+                    with_tag(&addrs.a_leg_to, Some(addrs.a_leg_tag())),
                 );
                 bye_request.headers.set(HeaderName::To, &addrs.a_leg_from);
                 bye_request.headers.set(
@@ -11484,18 +12280,12 @@ impl SipStack {
             let mut calls = self.calls.write().await;
             calls.remove(&internal_id);
         }
-        self.finish_call_record(
-            &internal_id,
-            false,
-            crate::cdr::CdrEnd::bye(is_from_a_leg, addrs.b_leg_answered)
-                .with_reasons(reason_headers(&req.headers)),
-        )
-        .await;
+        let end = crate::cdr::CdrEnd::bye(is_from_a_leg, addrs.b_leg_answered)
+            .with_reasons(reason_headers(&req.headers));
 
         info!(
             call_id = %sip_call_id,
             from_a_leg = is_from_a_leg,
-            early_dialog = use_cancel,
             "Call terminated via BYE"
         );
         audit_call_terminated(
@@ -11506,6 +12296,7 @@ impl SipStack {
                 uc_audit::event::TerminationReason::CalleeHangup
             },
         );
+        self.finish_call_record(&internal_id, false, end).await;
 
         ProcessResult::Multiple(vec![
             ProcessResult::Response {
@@ -11521,126 +12312,406 @@ impl SipStack {
         ])
     }
 
-    /// Handles CANCEL request.
+    /// 481 for a BYE whose call ended while it was processed (RFC 3261
+    /// §15.1.2).
+    fn bye_gone(req: &SipRequest, source: SbcSocketAddr) -> ProcessResult {
+        debug!(
+            call_id = req.headers.call_id().unwrap_or(""),
+            "BYE crossed the end of its call, 481"
+        );
+        ProcessResult::Response {
+            message: SipMessage::Response(create_response_from_request(
+                req,
+                StatusCode::CALL_DOES_NOT_EXIST,
+            )),
+            destination: source,
+            flow: Flow::Reply,
+        }
+    }
+
+    /// Handles CANCEL request (RFC 3261 §9.2).
     ///
-    /// B2BUA CANCEL flow:
-    /// 1. Match CANCEL to pending A-leg INVITE
-    /// 2. Send 200 OK for CANCEL to sender
-    /// 3. Send 487 Request Terminated for the original INVITE
-    /// 4. Send CANCEL to B-leg (if pending)
-    /// 5. Clean up call state
-    async fn handle_cancel(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
+    /// A CANCEL acts on an INVITE only when it matches that INVITE and comes
+    /// from the leg's dialog peer (the rule of every in-dialog request, see
+    /// [`dialog_match`]):
+    /// - RFC 3261 client: the INVITE's server transaction (top-Via branch and
+    ///   sent-by, Call-ID, From tag, CSeq number), or, once that transaction
+    ///   is gone, the stored call record;
+    /// - RFC 2543 client (no magic cookie): the stored record (§17.2.3).
+    ///
+    /// Outcomes:
+    /// - no match: 481, nothing changes, never waits;
+    /// - matched after the final response: 200, nothing changes (RFC 3261
+    ///   §9.2);
+    /// - matched while the initial INVITE is pending: 200 to the CANCEL, 487
+    ///   on the INVITE transaction, CANCEL toward the callee. The call is
+    ///   claimed atomically, so a 2xx that wins the race leaves the CANCEL
+    ///   without effect; an INVITE still being routed is marked and answered
+    ///   487 instead of being forwarded;
+    /// - matched while a re-INVITE is pending: 200, no effect (the
+    ///   re-INVITE completes).
+    ///
+    /// ## NIST 800-53 Rev5: SC-23, AC-3, SI-10, SC-5, AU-12
+    async fn handle_cancel(&self, message: SipMessage, ingress: Ingress) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
                 reason: "Expected request".to_string(),
             };
         };
-
+        let source = ingress.source;
         let sip_call_id = req.headers.call_id().unwrap_or("").to_string();
-
         debug!(call_id = %sip_call_id, "Processing CANCEL");
+        let respond = |status: StatusCode| ProcessResult::Response {
+            message: SipMessage::Response(create_response_from_request(req, status)),
+            destination: source,
+            flow: Flow::Reply,
+        };
+        // RFC 3261 §9.2: a CANCEL matching no transaction SHOULD get 481.
+        // Audited, rate limited (POA&M-252; AU-2, SI-4).
+        let no_match = || {
+            debug!(call_id = %sip_call_id, source = %source, "CANCEL matches no pending INVITE, 481");
+            self.signaling_audit.in_dialog_reject(
+                req,
+                source,
+                InDialogPolicy::CancelNoMatch,
+                Instant::now(),
+            );
+            respond(StatusCode::CALL_DOES_NOT_EXIST)
+        };
 
-        // Look up the call via A-leg Call-ID.  When messages are spawned
-        // as independent tasks, a CANCEL can arrive before the INVITE's
-        // correlation entry is stored.  If the Call-ID is currently
-        // in-flight (INVITE processing), wait for it to finish before
-        // giving up.
-        let mut corr = self.call_correlation.read().await;
-        if !corr.a_leg.contains_key(&sip_call_id)
-            && self.in_flight_invites.read().await.contains(&sip_call_id)
-        {
-            drop(corr);
-            for _ in 0..20 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                if !self.in_flight_invites.read().await.contains(&sip_call_id) {
-                    break;
-                }
+        // SI-10: without an RFC 3261 branch (or a CANCEL CSeq) only the
+        // RFC 2543 rules can match.
+        let ident = InviteIdentity::of_request(req, &Method::Cancel);
+        let matches_call = |a: &CallAddresses| {
+            ident.as_ref().map_or_else(
+                || dialog_match::cancel_matches_rfc2543(req, a, &sip_call_id),
+                |i| i.matches_call(a, &sip_call_id),
+            )
+        };
+
+        // 1. Transaction match (RFC 3261 §9.2, §17.2.3).
+        let txn = match &ident {
+            Some(i) => {
+                let txns = self.transactions.read().await;
+                txns.server_invite
+                    .get(&TransactionKey::server(i.branch(), "INVITE"))
+                    .filter(|st| st.call_id == sip_call_id && st.cancel_target)
+                    .map(|st| {
+                        (
+                            i.matches_txn(st, &sip_call_id),
+                            st.transaction.state()
+                                == proto_transaction::server::ServerInviteState::Proceeding,
+                            (st.source, st.flow.transport, st.conn),
+                        )
+                    })
             }
-            corr = self.call_correlation.read().await;
+            None => None,
+        };
+        let pending = match txn {
+            // The INVITE's transaction exists but this CANCEL does not repeat
+            // it.
+            Some((false, _, _)) => return no_match(),
+            Some((true, pending, invite)) => {
+                if !self.txn_peer_admits(&sip_call_id, invite, &ingress).await {
+                    return no_match();
+                }
+                pending
+            }
+            // 2. TU match when there is no transaction (swept while the
+            //    call rang, or an RFC 2543 client): the stored INVITE and the
+            //    A-leg dialog peer. Whether the INVITE is still pending is
+            //    decided by the record, at the claim below.
+            None => {
+                let Some((_, addrs)) = self
+                    .cancel_target(&sip_call_id)
+                    .await
+                    .filter(|(_, a)| matches_call(a))
+                else {
+                    return no_match();
+                };
+                if self.peer_admits(&addrs.leg_peer(false), &ingress).await == PeerMatch::No {
+                    return no_match();
+                }
+                true
+            }
+        };
+
+        // 3. Matched. RFC 3261 §9.2: after a final response the CANCEL has
+        //    no effect.
+        if !pending {
+            debug!(call_id = %sip_call_id, "CANCEL after the final response; no effect");
+            return respond(StatusCode::OK);
         }
-        let Some(id) = corr.a_leg.get(&sip_call_id) else {
-            // No INVITE transaction to cancel: 481 (RFC 3261 §9.2).
-            debug!(call_id = %sip_call_id, "CANCEL matches no pending INVITE, 481");
-            let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
-            return ProcessResult::Response {
-                message: SipMessage::Response(response),
-                destination: source,
-                flow: Flow::Reply,
-            };
-        };
-        let internal_id = id.clone();
+        // A pending re-INVITE matches only its own transaction (its CSeq is
+        // not the initial INVITE's), so the claim below refuses and the
+        // CANCEL gets 200 with no effect.
+        // POAM: POA&M-395 RFC 3261 §9.2: a UAS SHOULD answer a cancelled
+        // re-INVITE 487; the SBC lets the re-INVITE complete instead.
+        self.cancel_initial_invite(req, &ingress, ident.as_ref(), &sip_call_id, &matches_call)
+            .await
+    }
 
-        let Some(a) = corr.addresses.get(&internal_id) else {
-            let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
-            return ProcessResult::Response {
-                message: SipMessage::Response(response),
-                destination: source,
-                flow: Flow::Reply,
-            };
-        };
-        let addrs = a.clone();
-        drop(corr);
+    /// Snapshot of the call an A-leg Call-ID names, for CANCEL matching.
+    async fn cancel_target(&self, sip_call_id: &str) -> Option<(CallId, CallAddresses)> {
+        let corr = self.call_correlation.read().await;
+        let id = corr.a_leg.get(sip_call_id)?;
+        corr.addresses.get(id).map(|a| (id.clone(), a.clone()))
+    }
 
-        // Fail the call
+    /// Marks the in-flight INVITE with this A-leg Call-ID cancelled after a
+    /// CANCEL or BYE claimed its call record (the claim matched the record).
+    /// Returns whether it was still in flight, i.e. never forwarded.
+    async fn mark_claimed_invite_cancelled(&self, sip_call_id: &str) -> bool {
+        self.in_flight_invites
+            .write()
+            .await
+            .get_mut(sip_call_id)
+            .map(|e| e.cancelled = true)
+            .is_some()
+    }
+
+    /// Marks the INVITE with this A-leg Call-ID, while it is routed and has
+    /// no call record yet, as cancelled: only when the CANCEL repeats that
+    /// INVITE's identity (`ident`) and comes from the INVITE's peer, so an
+    /// INVITE or CANCEL of another sender reusing the Call-ID cannot end it.
+    /// The INVITE path then answers 487 instead of forwarding it (RFC 3261
+    /// §9.2). An RFC 2543 CANCEL cannot be matched before the record
+    /// exists and marks nothing.
+    ///
+    /// ## NIST 800-53 Rev5: SC-23, AC-3
+    async fn mark_in_flight_invite_cancelled(
+        &self,
+        sip_call_id: &str,
+        ident: Option<&InviteIdentity>,
+        ingress: &Ingress,
+    ) -> bool {
+        let Some(ident) = ident else {
+            return false;
+        };
+        let flow = {
+            let in_flight = self.in_flight_invites.read().await;
+            in_flight
+                .get(sip_call_id)
+                .filter(|e| e.identity.as_ref() == Some(ident))
+                .map(|e| (e.source, e.transport, e.conn))
+        };
+        let Some((source, transport, conn)) = flow else {
+            return false;
+        };
+        let group = self.trunk_group_of(source.ip()).await;
+        let peer = DialogPeer::a_leg(source, transport, conn, group.as_deref(), None);
+        if self.peer_admits(&peer, ingress).await != PeerMatch::Same {
+            return false;
+        }
+        self.in_flight_invites
+            .write()
+            .await
+            .get_mut(sip_call_id)
+            .filter(|e| e.identity.as_ref() == Some(ident))
+            .map(|e| e.cancelled = true)
+            .is_some()
+    }
+
+    /// Refuses (`status`: 482 for a merged request, else 403) an INVITE
+    /// whose Call-ID belongs to another INVITE still being routed. Its
+    /// transaction is never a CANCEL target, so it cannot be used to cancel
+    /// the other INVITE. Audited, rate limited.
+    ///
+    /// ## NIST 800-53 Rev5: SC-23, SI-10, AU-2
+    async fn refuse_merged_invite(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+        status: StatusCode,
+    ) -> ProcessResult {
+        if let Some(branch) = req.headers.via_branch()
+            && let Some(st) = self
+                .transactions
+                .write()
+                .await
+                .server_invite
+                .get_mut(&TransactionKey::server(&branch, "INVITE"))
+        {
+            st.cancel_target = false;
+        }
+        debug!(call_id = req.headers.call_id().unwrap_or(""), source = %source, status = status.code(), "INVITE reuses the Call-ID of an INVITE being routed");
+        self.signaling_audit
+            .signaling_reject(req, source, "invite:merged-request", Instant::now());
+        ProcessResult::Response {
+            message: SipMessage::Response(create_response_from_request(req, status)),
+            destination: source,
+            flow: Flow::Reply,
+        }
+    }
+
+    /// Ends the pending initial INVITE a matched CANCEL names: claims the
+    /// call while it is unanswered and still this INVITE's (`matches`), in
+    /// one critical section with the check; else 200 only. An INVITE whose
+    /// record is not stored yet is marked cancelled (see
+    /// [`Self::mark_in_flight_invite_cancelled`]).
+    ///
+    /// ## NIST 800-53 Rev5: SC-23, SC-5
+    async fn cancel_initial_invite(
+        &self,
+        req: &SipRequest,
+        ingress: &Ingress,
+        ident: Option<&InviteIdentity>,
+        sip_call_id: &str,
+        matches: &(dyn Fn(&CallAddresses) -> bool + Sync),
+    ) -> ProcessResult {
+        let source = ingress.source;
+        let ok = || ProcessResult::Response {
+            message: SipMessage::Response(create_response_from_request(req, StatusCode::OK)),
+            destination: source,
+            flow: Flow::Reply,
+        };
+        let still = |a: &CallAddresses| !a.b_leg_answered && !a.b_leg_answer_claimed && matches(a);
+        // Two tries: the INVITE may store its record between the first try
+        // and the in-flight check (it stores the record, then leaves the
+        // in-flight set), so the second try sees it.
+        for _ in 0..2 {
+            let id = self
+                .call_correlation
+                .read()
+                .await
+                .a_leg
+                .get(sip_call_id)
+                .cloned();
+            let claim = match &id {
+                Some(id) => self.claim_call_record(id, still).await,
+                None => Claim::Gone,
+            };
+            match (claim, id) {
+                (Claim::Claimed(addrs), Some(id)) => {
+                    // Still in flight: the INVITE was never forwarded.
+                    let unsent = self.mark_claimed_invite_cancelled(sip_call_id).await;
+                    let how = (
+                        crate::cdr::CdrEnd::cancel(),
+                        uc_audit::event::TerminationReason::Canceled,
+                    );
+                    return self
+                        .cancel_pending_invite(req, source, id, addrs, unsent, how)
+                        .await;
+                }
+                (Claim::Gone, _) => {
+                    if self
+                        .mark_in_flight_invite_cancelled(sip_call_id, ident, ingress)
+                        .await
+                    {
+                        debug!(call_id = %sip_call_id, "CANCEL marks the INVITE being routed; it is answered 487");
+                        return ok();
+                    }
+                }
+                _ => break,
+            }
+        }
+        debug!(call_id = %sip_call_id, "CANCEL after the final response; no effect");
+        ok()
+    }
+
+    /// The CANCEL of the call's B-leg INVITE (RFC 3261 §9.1: same
+    /// Request-URI, Call-ID, From, To, CSeq number and top Via). It is sent
+    /// only once the INVITE drew a provisional; before that it waits on the
+    /// INVITE's client transaction, or, when that transaction is not open
+    /// yet (the INVITE is being handed to the transport), for it to open
+    /// (`TransactionStore::early_cancels`; sent as is if that store is
+    /// full). Returns the CANCEL to send now; `None` when it is queued or
+    /// there is nothing left to cancel (a final response arrived).
+    async fn b_leg_cancel(&self, call: &CallId, addrs: &CallAddresses) -> Option<ProcessResult> {
+        let cancel = SipMessage::Request(build_b_leg_cancel(addrs));
+        let key = TransactionKey::client(&addrs.b_leg_branch, "INVITE");
+        let mut txns = self.transactions.write().await;
+        if !txns.client_invite.contains_key(&key) && txns.early_cancels.len() < MAX_EARLY_CANCELS {
+            txns.early_cancels.insert(
+                addrs.b_leg_branch.clone(),
+                EarlyCancel {
+                    queued_at: Instant::now(),
+                    call: call.clone(),
+                    message: cancel,
+                },
+            );
+            return None;
+        }
+        if let Some(st) = txns.client_invite.get_mut(&key) {
+            match st.transaction.state() {
+                proto_transaction::client::ClientInviteState::Calling => {
+                    st.pending_cancel = Some(cancel);
+                    return None;
+                }
+                proto_transaction::client::ClientInviteState::Proceeding => {}
+                _ => return None,
+            }
+        }
+        Some(ProcessResult::Forward {
+            message: cancel,
+            destination: addrs.b_leg_destination,
+            flow: addrs.b_leg_flow.clone().into(),
+        })
+    }
+
+    /// Tears down a claimed pending INVITE for a matched CANCEL (or the
+    /// caller's BYE before the answer): 200 to `req`, 487 on the INVITE's
+    /// server transaction (its stored Via/From/To/CSeq, to its source and
+    /// flow, RFC 3261 §9.2), both with the same To tag, and a CANCEL toward
+    /// the callee unless the INVITE was never forwarded (`invite_unsent`);
+    /// see [`Self::b_leg_cancel`].
+    async fn cancel_pending_invite(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+        internal_id: CallId,
+        addrs: Box<CallAddresses>,
+        invite_unsent: bool,
+        how: (crate::cdr::CdrEnd, uc_audit::event::TerminationReason),
+    ) -> ProcessResult {
         {
             let mut calls = self.calls.write().await;
             if let Some(call) = calls.get_mut(&internal_id) {
                 call.fail(487, "Request Terminated");
             }
+            calls.remove(&internal_id);
         }
-
-        // Stop media if started
         if let Some(ref pipeline) = self.media_pipeline {
             let call_id_str = internal_id.to_string();
             let _ = pipeline.stop_relay(&call_id_str).await;
             let _ = pipeline.remove_session(&call_id_str).await;
         }
 
-        // 200 OK for CANCEL
-        let cancel_ok = create_response_from_request(req, StatusCode::OK);
-
-        // 487 Request Terminated for the original INVITE
-        let mut terminated = proto_sip::message::SipResponse::new(
-            StatusCode::new(487).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
-        );
-        // Copy headers from CANCEL (same Via/From/To/Call-ID as original INVITE)
-        if let Some(via) = req.headers.get_value(&HeaderName::Via) {
-            terminated.headers.add(Header::new(HeaderName::Via, via));
-        }
-        if let Some(from) = req.headers.get_value(&HeaderName::From) {
-            terminated.headers.set(HeaderName::From, from);
-        }
+        // 200 OK for the CANCEL and 487 on the INVITE transaction, built from
+        // the INVITE (never from the CANCEL), so `record_server_response`
+        // finds the transaction: Timer G, ACK absorption and retransmission
+        // replay. One To tag on both (the UAS's tag for this request).
+        let mut cancel_ok = create_response_from_request(req, StatusCode::OK);
         if let Some(to) = req.headers.get_value(&HeaderName::To) {
-            let to_with_tag = if to.contains("tag=") {
-                to.to_string()
-            } else {
-                format!("{};tag={}", to, generate_tag())
-            };
-            terminated.headers.set(HeaderName::To, to_with_tag);
+            cancel_ok
+                .headers
+                .set(HeaderName::To, with_tag(to, Some(addrs.a_leg_tag())));
         }
-        terminated.headers.set(HeaderName::CallId, &sip_call_id);
-        terminated.headers.set(HeaderName::CSeq, &addrs.a_leg_cseq);
-        terminated.headers.set(HeaderName::ContentLength, "0");
+        let terminated = build_a_leg_response(
+            StatusCode::new(487).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
+            &addrs,
+        );
+        let b_cancel = if invite_unsent {
+            None
+        } else {
+            self.b_leg_cancel(&internal_id, &addrs).await
+        };
+        let (a_dest, a_flow) = (addrs.a_leg_source, addrs.a_leg_flow.clone());
+        let (end, reason) = how;
 
-        let b_cancel = build_b_leg_cancel(&addrs);
-
-        // Clean up; RTP ports (C12) and the trunk / VPS slots are released
-        // with the correlation record, exactly once.
-        {
-            let mut calls = self.calls.write().await;
-            calls.remove(&internal_id);
-        }
-        self.finish_call_record(
+        info!(call_id = %addrs.a_leg_sip_call_id, method = %req.method, "Call cancelled");
+        audit_call_terminated(&addrs, reason);
+        // RTP ports (C12) and the trunk / VPS slots are released with the
+        // claimed record, exactly once.
+        self.release_claimed(
             &internal_id,
+            addrs,
             false,
-            crate::cdr::CdrEnd::cancel().with_reasons(reason_headers(&req.headers)),
+            &end.with_reasons(reason_headers(&req.headers)),
         )
         .await;
 
-        info!(call_id = %sip_call_id, "Call cancelled");
-        audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Canceled);
-
-        ProcessResult::Multiple(vec![
+        let mut out = vec![
             ProcessResult::Response {
                 message: SipMessage::Response(cancel_ok),
                 destination: source,
@@ -11648,15 +12719,53 @@ impl SipStack {
             },
             ProcessResult::Response {
                 message: SipMessage::Response(terminated),
-                destination: source,
-                flow: Flow::Reply,
+                destination: a_dest,
+                flow: a_flow.into(),
             },
-            ProcessResult::Forward {
-                message: SipMessage::Request(b_cancel),
-                destination: addrs.b_leg_destination,
-                flow: addrs.b_leg_flow.clone().into(),
-            },
-        ])
+        ];
+        out.extend(b_cancel);
+        ProcessResult::Multiple(out)
+    }
+
+    /// Answers 487 to an INVITE a CANCEL marked while it was routed (see
+    /// [`Self::mark_in_flight_invite_cancelled`]): the call is claimed and released
+    /// and the INVITE is not forwarded. `NoAction` when the CANCEL already
+    /// ended the call.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5; RFC 3261 §9.2
+    async fn invite_cancelled_while_routing(&self, internal_id: &CallId) -> ProcessResult {
+        let Claim::Claimed(addrs) = self
+            .claim_call_record(internal_id, |a| !a.b_leg_answered)
+            .await
+        else {
+            return ProcessResult::NoAction;
+        };
+        {
+            let mut calls = self.calls.write().await;
+            if let Some(call) = calls.get_mut(internal_id) {
+                call.fail(487, "Request Terminated");
+            }
+            calls.remove(internal_id);
+        }
+        if let Some(ref pipeline) = self.media_pipeline {
+            let call_id_str = internal_id.to_string();
+            let _ = pipeline.stop_relay(&call_id_str).await;
+            let _ = pipeline.remove_session(&call_id_str).await;
+        }
+        let terminated = build_a_leg_response(
+            StatusCode::new(487).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
+            &addrs,
+        );
+        let (dest, flow) = (addrs.a_leg_source, addrs.a_leg_flow.clone());
+        info!(call_id = %addrs.a_leg_sip_call_id, "Call cancelled while routing");
+        audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Canceled);
+        self.release_claimed(internal_id, addrs, false, &crate::cdr::CdrEnd::cancel())
+            .await;
+        ProcessResult::Response {
+            message: SipMessage::Response(terminated),
+            destination: dest,
+            flow: flow.into(),
+        }
     }
 
     /// Handles OPTIONS request (keepalive/capability query).
@@ -11693,16 +12802,13 @@ impl SipStack {
     }
 
     /// Handles other requests.
-    async fn handle_other_request(
-        &self,
-        message: SipMessage,
-        source: SbcSocketAddr,
-    ) -> ProcessResult {
+    async fn handle_other_request(&self, message: SipMessage, ingress: Ingress) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
                 reason: "Expected request".to_string(),
             };
         };
+        let source = ingress.source;
 
         // In-dialog PRACK/INFO/MESSAGE/NOTIFY cross the B2BUA (POA&M-182).
         // Out of dialog (untagged To) they stay 405 below: the SBC is not an
@@ -11713,7 +12819,7 @@ impl SipStack {
                 Method::Prack | Method::Info | Method::Message | Method::Notify
             )
         {
-            return self.relay_in_dialog_non_session(req, source).await;
+            return self.relay_in_dialog_non_session(req, ingress).await;
         }
 
         // An in-dialog request (tagged To) for a dialog this SBC does not
@@ -12002,29 +13108,97 @@ impl SipStack {
         }
     }
 
-    /// Removes a trunk group from the router.
+    /// Guard that serialises trunk-group changes: a sync holds it across
+    /// its router add, source-map update and peer-set update, and
+    /// [`Self::remove_trunk_group_from_router`] holds it for the whole
+    /// removal. Not reentrant: the methods called under it do not take it.
+    ///
+    /// ## NIST 800-53 Rev5: AC-4, CM-3
+    pub async fn trunk_sync_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.trunk_sync.lock().await
+    }
+
+    /// Removes a trunk group from the router, together with its inbound
+    /// source addresses, dialog peer set and trust-domain membership.
+    /// Takes the trunk-sync guard; each map lock is taken on its own.
     pub async fn remove_trunk_group_from_router(&self, id: &str) {
+        let _sync = self.trunk_sync_guard().await;
         if let Some(ref router_lock) = self.router {
             let mut router = router_lock.write().await;
             router.remove_trunk_group(id);
         }
+        // NIST 800-53 Rev5: AC-3, AC-4, CM-3 - a removed group's addresses
+        // are no longer admitted as trunk sources.
+        self.inbound_trunk_map
+            .write()
+            .await
+            .retain(|_, (group, _)| group != id);
+        self.trunk_group_hosts.write().await.remove(id);
+        // NIST 800-53 Rev5: AC-21, CM-3 - a re-created group starts untrusted.
+        self.trusted_trunk_groups.write().await.remove(id);
+    }
+
+    /// Resolves trunk host names to canonical IPs off the async workers.
+    pub async fn resolve_trunk_hosts(hosts: &[(String, u16)]) -> HashSet<std::net::IpAddr> {
+        let names: Vec<String> = hosts.iter().map(|(h, _)| h.clone()).collect();
+        tokio::task::spawn_blocking(move || {
+            names
+                .iter()
+                .flat_map(|h| resolve_trunk_host_ips(h))
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Records the configured hosts of trunk group `group_id` (all their
+    /// resolved addresses) as the group's dialog peers, replacing any
+    /// earlier set. Name resolution runs off the async workers.
+    ///
+    /// ## NIST 800-53 Rev5: SC-23, AC-3
+    pub async fn index_trunk_group_hosts(&self, group_id: &str, hosts: &[(String, u16)]) {
+        let ips = Self::resolve_trunk_hosts(hosts).await;
+        self.index_trunk_group_ips(group_id, ips).await;
+    }
+
+    /// [`Self::index_trunk_group_hosts`] with the addresses already resolved.
+    pub async fn index_trunk_group_ips(&self, group_id: &str, ips: HashSet<std::net::IpAddr>) {
+        index_trunk_hosts(&mut *self.trunk_group_hosts.write().await, group_id, ips);
     }
 
     /// Registers a trunk group for inbound call identification.
-    /// Maps each trunk's host IP to the trunk group ID and CSS.
+    /// Maps each trunk's host IP to the trunk group ID and CSS, replacing
+    /// the group's earlier entries; empty `hosts` clears the group.
+    ///
+    /// NIST 800-53 Rev5: AC-3, AC-4, CM-3
     pub async fn register_inbound_trunk(
         &self,
         trunk_group_id: &str,
         css_id: Option<&str>,
         hosts: &[(String, u16)],
     ) {
-        let mut map = self.inbound_trunk_map.write().await;
-        for (host, _port) in hosts {
-            for ip in resolve_trunk_host_ips(host) {
-                map.insert(ip, (trunk_group_id.to_string(), css_id.map(String::from)));
-            }
-        }
-        info!(trunk_group = trunk_group_id, css = ?css_id, hosts = hosts.len(), "Registered inbound trunk for CSS routing");
+        let ips = Self::resolve_trunk_hosts(hosts).await;
+        self.register_inbound_trunk_ips(trunk_group_id, css_id, &ips)
+            .await;
+    }
+
+    /// [`Self::register_inbound_trunk`] with the addresses already resolved
+    /// (canonical form).
+    ///
+    /// NIST 800-53 Rev5: AC-3, AC-4, CM-3
+    pub async fn register_inbound_trunk_ips(
+        &self,
+        trunk_group_id: &str,
+        css_id: Option<&str>,
+        ips: &HashSet<std::net::IpAddr>,
+    ) {
+        replace_inbound_trunk(
+            &mut *self.inbound_trunk_map.write().await,
+            trunk_group_id,
+            css_id,
+            ips,
+        );
+        info!(trunk_group = trunk_group_id, css = ?css_id, addresses = ips.len(), "Registered inbound trunk for CSS routing");
     }
 
     /// Looks up which trunk group and CSS an inbound call belongs to by source IP.
@@ -12073,9 +13247,19 @@ impl SipStack {
         aor: &str,
         key: &crate::stir_binding::FlowKey,
     ) -> bool {
+        Self::flow_binding(loc, aor, key).is_some()
+    }
+
+    /// The live binding of `aor` whose contact is the flow `key` (see
+    /// [`Self::flow_has_binding`]).
+    fn flow_binding<'a>(
+        loc: &'a LocationService,
+        aor: &str,
+        key: &crate::stir_binding::FlowKey,
+    ) -> Option<&'a proto_registrar::Binding> {
         let (ip, port, transport) = *key;
         let transport_name = transport.to_string();
-        loc.lookup(aor).iter().any(|b| {
+        loc.lookup(aor).into_iter().find(|b| {
             b.contact_uri().parse::<SipUri>().is_ok_and(|c| {
                 c.host
                     .trim_start_matches('[')
@@ -12090,6 +13274,59 @@ impl SipStack {
                     })
             })
         })
+    }
+
+    /// Registration held by the flow an endpoint request arrived on: the
+    /// From user's AOR, when the flow index binds it to that flow and its
+    /// live binding is the flow. `None` otherwise.
+    /// Lock order matches REGISTER (location, then flows).
+    ///
+    /// ## NIST 800-53 Rev5: SC-23, IA-3
+    async fn flow_registration(
+        &self,
+        source: SbcSocketAddr,
+        transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
+        from_uri: &str,
+    ) -> Option<Arc<LegRegistration>> {
+        let key = crate::stir_binding::flow_key(source.ip(), source.port(), transport);
+        let from_user = from_uri.parse::<SipUri>().ok().and_then(|u| u.user);
+        let loc = self.location_service.read().await;
+        let flows = self.stir_flows.read().await;
+        let candidates = flows.get(&key, conn)?;
+        let user_of = |aor: &str| aor.parse::<SipUri>().ok().and_then(|u| u.user);
+        // Only the From user's own AOR: another AOR sharing the flow (a
+        // shared NAT address, an IP PBX) is not this caller (SEC-10).
+        candidates
+            .iter()
+            .filter_map(|aor| Self::flow_binding(&loc, aor, &key))
+            .find(|b| from_user.is_some() && user_of(b.aor()) == from_user)
+            .map(LegRegistration::of)
+    }
+
+    /// Whether the flow `ingress` arrived on currently holds `reg`: the
+    /// flow index binds the AOR to that flow (and connection) and the AOR's
+    /// live binding is that flow, with the same instance-id / reg-id when
+    /// `reg` has them (RFC 5626 §4.4, §5.3). Only trusted when REGISTER is
+    /// authenticated; otherwise anyone could register the AOR from a flow
+    /// of their own.
+    ///
+    /// ## NIST 800-53 Rev5: SC-23, IA-3
+    async fn flow_holds_registration(&self, reg: &LegRegistration, ingress: &Ingress) -> bool {
+        if !self.register_auth_enabled() {
+            return false;
+        }
+        let key = crate::stir_binding::flow_key(
+            ingress.source.ip(),
+            ingress.source.port(),
+            ingress.transport,
+        );
+        let loc = self.location_service.read().await;
+        let flows = self.stir_flows.read().await;
+        flows
+            .get(&key, ingress.conn)
+            .is_some_and(|aors| aors.contains(&reg.aor))
+            && Self::flow_binding(&loc, &reg.aor, &key).is_some_and(|b| reg.same_instance(b))
     }
 
     /// Records that `aor` registered from `source` over `transport` in the
@@ -12993,15 +14230,16 @@ fn build_a_leg_response(
     }
     response.headers.set(HeaderName::From, &addrs.a_leg_from);
     // A UAS tags To on every non-100 response (RFC 3261 §8.2.6.2). Before the
-    // callee answered there is no learned tag, e.g. a 408 on Timer B.
-    let local_tag = addrs
-        .dialog_to_tag
-        .clone()
-        .or_else(|| (status.code() != 100).then(generate_tag));
-    response.headers.set(
-        HeaderName::To,
-        with_tag(&addrs.a_leg_to, local_tag.as_deref()),
-    );
+    // callee sent a tag (e.g. a 408 on Timer B) it is the SBC's own A-leg
+    // tag, the same on every response of the call.
+    let local_tag = if status.code() == 100 {
+        addrs.dialog_to_tag.as_deref()
+    } else {
+        Some(addrs.a_leg_tag())
+    };
+    response
+        .headers
+        .set(HeaderName::To, with_tag(&addrs.a_leg_to, local_tag));
     response
         .headers
         .set(HeaderName::CallId, &addrs.a_leg_sip_call_id);
@@ -13055,53 +14293,101 @@ fn parse_manipulation_action(action: &str, header: &str, value: &str) -> Manipul
     }
 }
 
-/// Resolves a SIP URI string to a socket address.
-///
-/// Parses the host and port from URIs like `sip:user@host:port` or `sip:host`.
-/// Defaults to port 5060 if not specified.
-/// Checks a BYE against the dialog it claims (RFC 3261 §12.2.2): the sender's
-/// From tag must be that leg's remote tag, its To tag (when the dialog is
-/// confirmed) our local tag, and the source IP must be the leg's peer.
-/// Returns the status to answer with on a mismatch.
-fn bye_dialog_mismatch(
-    req: &SipRequest,
-    addrs: &CallAddresses,
-    is_from_a_leg: bool,
+/// An INVITE being routed, keyed by its Call-ID in
+/// `SipStack::in_flight_invites`.
+struct InFlightInvite {
+    /// Its identity (`None`: RFC 2543 client): a CANCEL must repeat it to
+    /// mark the INVITE before its call record exists (SC-23).
+    identity: Option<InviteIdentity>,
+    /// Its flow: the marking CANCEL must come from that peer.
     source: SbcSocketAddr,
-) -> Option<StatusCode> {
-    let from_tag = req
-        .headers
-        .get_value(&HeaderName::From)
-        .and_then(|v| extract_param(v, "tag"));
-    let to_tag = req
-        .headers
-        .get_value(&HeaderName::To)
-        .and_then(|v| extract_param(v, "tag"));
+    transport: AddrTransport,
+    conn: Option<crate::stir_binding::ConnId>,
+    /// A matched CANCEL arrived while it was routed: answer 487 instead of
+    /// forwarding (`SipStack::invite_cancelled_while_routing`).
+    cancelled: bool,
+}
 
-    // (remote tag, our tag, peer address) as seen from the leg the BYE came in on.
-    let (expected_from, expected_to, peer) = if is_from_a_leg {
-        (
-            extract_param(&addrs.a_leg_from, "tag"),
-            addrs.dialog_to_tag.as_deref(),
-            addrs.a_leg_source,
-        )
-    } else {
-        (
-            addrs.dialog_to_tag.as_deref(),
-            extract_param(&addrs.b_leg_from, "tag"),
-            addrs.b_leg_destination,
-        )
-    };
+/// Outcome of `SipStack::claim_call_record`.
+enum Claim {
+    /// The record was removed; the caller owns the teardown.
+    Claimed(Box<CallAddresses>),
+    /// The record exists but its state no longer allows the teardown.
+    Refused,
+    /// No such record (already torn down, or not stored yet).
+    Gone,
+}
 
-    let tags_ok =
-        from_tag == expected_from && expected_to.is_none_or(|t| to_tag.is_none_or(|got| got == t));
-    if !tags_ok {
-        return Some(StatusCode::CALL_DOES_NOT_EXIST);
+/// Whether a handler's result only refuses the request: a final non-2xx
+/// toward its sender.
+fn is_rejection(result: &ProcessResult) -> bool {
+    matches!(
+        result,
+        ProcessResult::Response { message: SipMessage::Response(r), .. } if r.status.code() >= 300
+    )
+}
+
+/// How a request's source relates to a leg's dialog peer
+/// (`SipStack::peer_admits`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerMatch {
+    /// The leg's peer.
+    Same,
+    /// A new flow holding the leg's registration: admitted, and the leg
+    /// follows it (`SipStack::repin_leg`).
+    NewFlow,
+    /// Not the leg's peer.
+    No,
+}
+
+/// Same IP (canonical form) and port.
+fn same_socket(a: SbcSocketAddr, b: SbcSocketAddr) -> bool {
+    a.ip().to_canonical() == b.ip().to_canonical() && a.port() == b.port()
+}
+
+/// Replaces the `inbound_trunk_map` entries of trunk group `group` with
+/// `ips` (canonical) and `css`. An address already mapped to another group
+/// moves to `group`.
+///
+/// NIST 800-53 Rev5: AC-3, AC-4, CM-3
+fn replace_inbound_trunk(
+    map: &mut std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>,
+    group: &str,
+    css: Option<&str>,
+    ips: &HashSet<std::net::IpAddr>,
+) {
+    map.retain(|_, (g, _)| g != group);
+    for ip in ips {
+        if let Some((previous, _)) = map.insert(*ip, (group.to_string(), css.map(String::from))) {
+            // Only another group's entry can remain after the retain.
+            warn!(
+                trunk_group = group,
+                previous_trunk_group = %previous,
+                "Trunk host address moved from another trunk group"
+            );
+        }
     }
-    if source.ip().to_canonical() != peer.ip().to_canonical() {
-        return Some(StatusCode::FORBIDDEN);
+}
+
+/// Stores `ips` as the host set of trunk group `group`, warning when an
+/// address is also a host of another group: a dialog on either group then
+/// admits requests from it (SC-23).
+fn index_trunk_hosts(
+    map: &mut std::collections::HashMap<String, Arc<HashSet<std::net::IpAddr>>>,
+    group: &str,
+    ips: HashSet<std::net::IpAddr>,
+) {
+    for (other, hosts) in map.iter().filter(|(g, _)| g.as_str() != group) {
+        for ip in ips.iter().filter(|ip| hosts.contains(ip)) {
+            warn!(
+                ip = %ip,
+                trunk_group = group,
+                other_trunk_group = %other,
+                "Trunk host address is configured in two trunk groups; in-dialog requests from it are accepted on calls of both"
+            );
+        }
     }
-    None
+    map.insert(group.to_string(), Arc::new(ips));
 }
 
 /// Turns an SDP `c=`/`m=` address into a relay target, refusing addresses a
@@ -13516,6 +14802,9 @@ pub mod tests {
     mod recording;
     pub use recording::{rs_byes_queued_at_shutdown, rs_invite_for_server};
 
+    // Dialog and CANCEL matching (RFC 3261 §9.2, §12.2.2, §13.2.2.4, §15).
+    mod dialog_binding;
+
     /// For server tests: a stack with trunks t1 (127.0.0.2:5061) and t2
     /// (127.0.0.3:5061), both TLS, and a placed call's primary B-leg INVITE
     /// result (to t1).
@@ -13913,6 +15202,268 @@ pub mod tests {
         );
         assert!(stack.is_trunk_ip(mapped).await);
         assert!(stack.is_trunk_ip(std::net::IpAddr::V4(v4)).await);
+    }
+
+    /// Sends a minimal out-of-dialog INVITE from `ip:5060` and returns the
+    /// result (trunk-map pruning tests).
+    async fn invite_from(stack: &SipStack, ip: [u8; 4], tag: &str) -> ProcessResult {
+        let [a, b, c, d] = ip;
+        let invite = format!(
+            "INVITE sip:9999@sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {a}.{b}.{c}.{d}:5060;branch=z9hG4bK{tag}\r\n\
+             From: <sip:carrier@example.com>;tag={tag}\r\n\
+             To: <sip:9999@sbc.local>\r\n\
+             Call-ID: {tag}@example.com\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: <sip:carrier@{a}.{b}.{c}.{d}:5060>\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        );
+        let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(a, b, c, d), 5060);
+        stack
+            .process_message(&Bytes::from(invite), source, None)
+            .await
+    }
+
+    /// Whether `result` is the single 403 of source admission.
+    fn is_forbidden(result: &ProcessResult) -> bool {
+        matches!(
+            result,
+            ProcessResult::Response { message: SipMessage::Response(resp), .. }
+                if resp.status.code() == 403
+        )
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> std::net::IpAddr {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d))
+    }
+
+    // NIST 800-53 Rev5: AC-3, AC-4, CM-3
+    /// Once a trunk group is removed (gRPC `RemoveTrunkGroup`, which
+    /// sbc-api's REST delete calls), its former source IP is no longer a
+    /// trunk: the lookup is None and an INVITE from it gets the
+    /// source-admission 403.
+    #[tokio::test]
+    async fn test_removed_trunk_group_source_no_longer_admitted() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.ensure_router().await;
+        stack
+            .register_inbound_trunk(
+                "carrier",
+                Some("css-1"),
+                &[("203.0.113.9".to_string(), 5060)],
+            )
+            .await;
+        assert!(!is_forbidden(
+            &invite_from(&stack, [203, 0, 113, 9], "rm1").await
+        ));
+
+        stack.remove_trunk_group_from_router("carrier").await;
+
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
+        let mapped: std::net::IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+        assert_eq!(stack.lookup_inbound_trunk(mapped).await, None);
+        assert!(!stack.is_trunk_ip(v4(203, 0, 113, 9)).await);
+        let result = invite_from(&stack, [203, 0, 113, 9], "rm2").await;
+        assert!(
+            is_forbidden(&result),
+            "INVITE from a removed trunk group's IP must get 403, got {result:?}"
+        );
+    }
+
+    // NIST 800-53 Rev5: AC-3, AC-4, CM-3
+    /// Re-registering a group with different hosts replaces the
+    /// group's addresses: the old IP is no longer admitted, the new one is.
+    #[tokio::test]
+    async fn test_resync_with_changed_hosts_drops_old_ip() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk(
+                "carrier",
+                Some("css-1"),
+                &[("203.0.113.9".to_string(), 5060)],
+            )
+            .await;
+        stack
+            .register_inbound_trunk(
+                "carrier",
+                Some("css-1"),
+                &[("203.0.113.10".to_string(), 5060)],
+            )
+            .await;
+
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 10)).await,
+            Some(("carrier".to_string(), Some("css-1".to_string())))
+        );
+        assert!(!is_forbidden(
+            &invite_from(&stack, [203, 0, 113, 10], "ch1").await
+        ));
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await,
+            None,
+            "the group's old host must be dropped on re-sync"
+        );
+        let result = invite_from(&stack, [203, 0, 113, 9], "ch2").await;
+        assert!(
+            is_forbidden(&result),
+            "INVITE from a group's former host must get 403, got {result:?}"
+        );
+    }
+
+    // NIST 800-53 Rev5: AC-4, CM-3
+    /// Re-registering a group with a new CSS changes the CSS every
+    /// address of the group maps to, including after a host is dropped.
+    #[tokio::test]
+    async fn test_resync_with_new_css_replaces_css() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk(
+                "carrier",
+                Some("css-1"),
+                &[
+                    ("203.0.113.9".to_string(), 5060),
+                    ("203.0.113.10".to_string(), 5060),
+                ],
+            )
+            .await;
+        stack
+            .register_inbound_trunk(
+                "carrier",
+                Some("css-2"),
+                &[("203.0.113.9".to_string(), 5060)],
+            )
+            .await;
+
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await,
+            Some(("carrier".to_string(), Some("css-2".to_string())))
+        );
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 10)).await,
+            None,
+            "a dropped host must not keep the old CSS"
+        );
+
+        // CSS removed altogether: the group maps to no CSS.
+        stack
+            .register_inbound_trunk("carrier", None, &[("203.0.113.9".to_string(), 5060)])
+            .await;
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await,
+            Some(("carrier".to_string(), None))
+        );
+    }
+
+    // NIST 800-53 Rev5: AC-4, CM-3
+    /// An IP moved from group A to group B belongs only to B: a later
+    /// re-sync or removal of A leaves it with B, and removing B drops it.
+    #[tokio::test]
+    async fn test_ip_moved_between_groups_belongs_only_to_new_group() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk(
+                "a",
+                Some("css-a"),
+                &[
+                    ("203.0.113.9".to_string(), 5060),
+                    ("203.0.113.10".to_string(), 5060),
+                ],
+            )
+            .await;
+        // B synced first with the moved IP, then A re-synced without it.
+        stack
+            .register_inbound_trunk("b", Some("css-b"), &[("203.0.113.9".to_string(), 5060)])
+            .await;
+        stack
+            .register_inbound_trunk("a", Some("css-a"), &[("203.0.113.10".to_string(), 5060)])
+            .await;
+        let in_b = Some(("b".to_string(), Some("css-b".to_string())));
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, in_b);
+
+        // Removing A must not take B's address with it.
+        stack.remove_trunk_group_from_router("a").await;
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, in_b);
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 10)).await, None);
+
+        // Removing B drops it: nothing still maps it to A either.
+        stack.remove_trunk_group_from_router("b").await;
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
+    }
+
+    // NIST 800-53 Rev5: AC-3, AC-4, CM-3
+    /// Re-registering a group with no hosts clears its addresses.
+    #[tokio::test]
+    async fn test_resync_with_empty_hosts_clears_group() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk("carrier", None, &[("203.0.113.9".to_string(), 5060)])
+            .await;
+        stack
+            .register_inbound_trunk("other", None, &[("203.0.113.20".to_string(), 5060)])
+            .await;
+        stack.register_inbound_trunk("carrier", None, &[]).await;
+
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
+        assert!(is_forbidden(
+            &invite_from(&stack, [203, 0, 113, 9], "em1").await
+        ));
+        assert_eq!(
+            stack.lookup_inbound_trunk(v4(203, 0, 113, 20)).await,
+            Some(("other".to_string(), None)),
+            "other groups are untouched"
+        );
+    }
+
+    // NIST 800-53 Rev5: AC-4, CM-3
+    /// A removal that arrives while a sync holds the trunk-sync guard
+    /// (between its router add and its source-map update) runs after the
+    /// sync: the group ends with no source entries and no peer set.
+    #[tokio::test]
+    async fn test_remove_during_sync_waits_for_guard() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.ensure_router().await;
+        let stack = Arc::new(stack);
+        let body = serde_json::json!({"id": "carrier", "trunks": [
+            {"id": "t1", "host": "203.0.113.9", "port": 5060}
+        ]});
+        let group = crate::api_server::trunk_group_from_json(&body).unwrap();
+
+        let sync = stack.trunk_sync_guard().await;
+        stack.add_trunk_group_to_router(group).await;
+        let remover = {
+            let stack = Arc::clone(&stack);
+            tokio::spawn(async move { stack.remove_trunk_group_from_router("carrier").await })
+        };
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!remover.is_finished(), "removal waits for the sync");
+        stack
+            .register_inbound_trunk("carrier", None, &[("203.0.113.9".to_string(), 5060)])
+            .await;
+        stack
+            .index_trunk_group_hosts("carrier", &[("203.0.113.9".to_string(), 5060)])
+            .await;
+        drop(sync);
+        remover.await.unwrap();
+
+        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
+        assert!(!stack.is_trunk_ip(v4(203, 0, 113, 9)).await);
+        assert!(!stack.trunk_group_hosts.read().await.contains_key("carrier"));
+    }
+
+    // NIST 800-53 Rev5: AC-21, CM-3
+    /// Removing a trunk group drops its trust-domain membership, so a group
+    /// later re-created with the same id starts untrusted.
+    #[tokio::test]
+    async fn test_removed_trunk_group_leaves_trust_domain() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack.set_trunk_group_trust_domain("carrier", true).await;
+        stack.set_trunk_group_trust_domain("other", true).await;
+        stack.remove_trunk_group_from_router("carrier").await;
+        assert!(!stack.trunk_group_trusted("carrier").await);
+        assert!(stack.trunk_group_trusted("other").await);
     }
 
     /// The same INVITE is admitted once its source is a configured trunk.
@@ -14344,7 +15895,9 @@ pub mod tests {
             .await;
         assert_eq!(stack.call_count().await, 1);
 
-        // CANCEL from alice before bob answers
+        // CANCEL from alice before bob answers (after bob's 100 Trying:
+        // RFC 3261 §9.1)
+        callee_trying(&stack, "call-cancel-test@test").await;
         let cancel = b"CANCEL sip:bob@sbc.local SIP/2.0\r\n\
             Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK011\r\n\
             From: <sip:alice@example.com>;tag=c1\r\n\
@@ -14846,12 +16399,17 @@ pub mod tests {
 
     // A confirmed B2BUA dialog (remote tag learned), for the media-failure
     // teardown tests.
-    fn confirmed_call_addresses() -> CallAddresses {
+    pub(super) fn confirmed_call_addresses() -> CallAddresses {
         CallAddresses {
             a_leg_source: SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(10, 0, 0, 1), 5060),
             b_leg_destination: SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(10, 0, 0, 2), 5060),
             a_leg_flow: LegFlow::UDP,
             b_leg_flow: LegFlow::UDP,
+            a_leg_conn: None,
+            a_leg_trunk_group: None,
+            a_leg_registration: None,
+            b_leg_peer_kind: BLegPeerKind::Registered,
+            b_leg_registration: None,
             a_leg_local_addr: "10.0.0.9:5060".to_string(),
             a_leg_sip_call_id: "aleg-callid".to_string(),
             b_leg_sip_call_id: "bleg-callid".to_string(),
@@ -14868,6 +16426,9 @@ pub mod tests {
             a_leg_via: vec!["SIP/2.0/UDP 10.0.0.1;branch=z9hG4bK-a".to_string()],
             a_leg_from: "<sip:caller@10.0.0.1>;tag=callertag".to_string(),
             a_leg_to: "<sip:callee@sbc>".to_string(),
+            a_leg_ruri: "sip:callee@sbc".to_string(),
+            a_leg_local_tag: "sbcatag".to_string(),
+            a_leg_early_tags: Vec::new(),
             a_leg_cseq: "1 INVITE".to_string(),
             b_leg_from: "<sip:sbc@10.0.0.9>;tag=sbctag".to_string(),
             b_leg_to: "<sip:callee@10.0.0.2>".to_string(),
@@ -14881,6 +16442,8 @@ pub mod tests {
             media_b_leg_ip: "10.0.0.9".to_string(),
             media_b_leg_port: 16_386,
             b_leg_answered: true,
+            b_leg_answer_claimed: true,
+            bye_pending: None,
             a_leg_local_cseq: 1,
             b_leg_local_cseq: 2,
             a_leg_last_sdp: None,
@@ -15000,6 +16563,41 @@ pub mod tests {
 
     fn bob() -> SbcSocketAddr {
         SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060)
+    }
+
+    /// The callee's 100 Trying to the call's current B-leg INVITE (the call
+    /// with A-leg Call-ID `a_leg_call_id`), from where that INVITE went: a
+    /// CANCEL toward the callee goes out only after a provisional (RFC 3261
+    /// §9.1).
+    async fn callee_trying(stack: &SipStack, a_leg_call_id: &str) {
+        let branch = {
+            let corr = stack.call_correlation.read().await;
+            let id = corr.a_leg.get(a_leg_call_id).expect("call").clone();
+            corr.addresses
+                .get(&id)
+                .expect("record")
+                .b_leg_branch
+                .clone()
+        };
+        let (invite, dest, transport) = {
+            let txns = stack.transactions.read().await;
+            let st = txns
+                .client_invite
+                .get(&TransactionKey::client(&branch, "INVITE"))
+                .expect("B-leg INVITE transaction");
+            let SipMessage::Request(r) = &st.request else {
+                panic!("client INVITE transaction stores a request")
+            };
+            (r.clone(), st.destination, st.flow.transport)
+        };
+        let _ = stack
+            .process_message_on(
+                &response_to(&invite, 100, None, None),
+                dest,
+                None,
+                transport,
+            )
+            .await;
     }
 
     /// A request from alice (A-leg) on the test call's dialog.
@@ -17020,6 +18618,7 @@ pub mod tests {
         let stack = trunk_stack_protos([proto, proto]).await;
         let id = "nict@test";
         place_call_on(&stack, id, transport).await;
+        callee_trying(&stack, id).await;
         let out = flatten(
             stack
                 .process_message_on(
@@ -19754,24 +21353,31 @@ pub mod tests {
             id: "carriers".into(),
             name: String::new(),
             strategy: "priority".into(),
-            trunks: vec![
-                trunk(
-                    "t1",
-                    "127.0.0.2",
-                    sbc_config::TrunkStirConfig {
-                        sign: true,
-                        ..Default::default()
-                    },
-                ),
-                trunk(
-                    "alice-trunk",
-                    "192.168.1.1",
-                    sbc_config::TrunkStirConfig {
-                        verify: true,
-                        ..Default::default()
-                    },
-                ),
-            ],
+            trunks: vec![trunk(
+                "t1",
+                "127.0.0.2",
+                sbc_config::TrunkStirConfig {
+                    sign: true,
+                    ..Default::default()
+                },
+            )],
+            zone: None,
+            require_tls: false,
+            trust_domain: true,
+        });
+        // alice's ingress trunk, in the group the SIP stack maps her to.
+        c.trunk_groups.push(sbc_config::TrunkGroupConfig {
+            id: "pbx".into(),
+            name: String::new(),
+            strategy: "priority".into(),
+            trunks: vec![trunk(
+                "alice-trunk",
+                "192.168.1.1",
+                sbc_config::TrunkStirConfig {
+                    verify: true,
+                    ..Default::default()
+                },
+            )],
             zone: None,
             require_tls: false,
             trust_domain: true,
@@ -19975,16 +21581,25 @@ pub mod tests {
                         ..Default::default()
                     },
                 ),
-                trunk(
-                    "alice-trunk",
-                    "192.168.1.1",
-                    sbc_config::TrunkStirConfig {
-                        verify: true,
-                        strip_inbound_identity: true,
-                        ..Default::default()
-                    },
-                ),
             ],
+            zone: None,
+            require_tls: false,
+            trust_domain: true,
+        });
+        // alice's ingress trunk, in the group the SIP stack maps her to.
+        c.trunk_groups.push(sbc_config::TrunkGroupConfig {
+            id: "pbx".into(),
+            name: String::new(),
+            strategy: "priority".into(),
+            trunks: vec![trunk(
+                "alice-trunk",
+                "192.168.1.1",
+                sbc_config::TrunkStirConfig {
+                    verify: true,
+                    strip_inbound_identity: true,
+                    ..Default::default()
+                },
+            )],
             zone: None,
             require_tls: false,
             trust_domain: true,
@@ -20204,6 +21819,59 @@ pub mod tests {
         }
         assert!(responded(&cancel_res, 487).is_some() || responded(&inv_res, 487).is_some());
         assert_all_released(&q.stack).await;
+    }
+
+    /// SEC-8 / RFC-22: while the caller's INVITE is held in routing (cert
+    /// fetch), an admitted sender reuses its Call-ID with an INVITE of its
+    /// own branch and From tag (403), the same request on another branch
+    /// is a merged request (482), and a CANCEL repeating either gets 481;
+    /// the caller's INVITE is still forwarded.
+    #[tokio::test]
+    async fn qa_stir_foreign_cancel_in_routing_window_cannot_cancel() {
+        let q = qa_stir_stack(sbc_config::StirFailurePolicy::Mark, 300, 1000, false, false).await;
+        let id = qa_identity(&q.files, 0);
+        let cid = "qa-sec8@test";
+        let invite = qa_invite(cid, Some(&id));
+        let forge = |m: &Bytes| {
+            let t = String::from_utf8_lossy(m)
+                .replace(&format!("branch=z9hG4bK-{cid}-1"), "branch=z9hG4bK-other-1")
+                .replace(&format!("tag=a-{cid}"), "tag=other");
+            assert_ne!(t.as_bytes(), &m[..], "forged");
+            Bytes::from(t)
+        };
+        let other_invite = forge(&invite);
+        let other_cancel = forge(&caller_request("CANCEL", DIALED, cid, 1, None, None));
+        let rebranch = |m: &Bytes| {
+            Bytes::from(
+                String::from_utf8_lossy(m)
+                    .replace(&format!("branch=z9hG4bK-{cid}-1"), "branch=z9hG4bK-path2-1"),
+            )
+        };
+        let merged_invite = rebranch(&invite);
+        let merged_cancel = rebranch(&caller_request("CANCEL", DIALED, cid, 1, None, None));
+        let other = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5999);
+        let (inv_res, (o_inv, o_cancel, m_inv, m_cancel)) =
+            tokio::join!(q.stack.process_message(&invite, alice(), None), async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let mut out = Vec::new();
+                for m in [&other_invite, &other_cancel, &merged_invite, &merged_cancel] {
+                    out.push(flatten(q.stack.process_message(m, other, None).await));
+                }
+                let mut out = out.into_iter();
+                let mut next = || out.next().unwrap_or_default();
+                (next(), next(), next(), next())
+            });
+        assert_eq!(response_status(&o_inv).map(|(c, _)| c), Some(403));
+        assert_eq!(response_status(&o_cancel).map(|(c, _)| c), Some(481));
+        assert_eq!(response_status(&m_inv).map(|(c, _)| c), Some(482));
+        assert_eq!(response_status(&m_cancel).map(|(c, _)| c), Some(481));
+        let inv_res = flatten(inv_res);
+        assert!(
+            forwarded(&inv_res, &Method::Invite).is_some(),
+            "caller's INVITE forwarded: {inv_res:?}"
+        );
+        assert!(responded(&inv_res, 487).is_none());
+        assert_eq!(q.stack.call_count().await, 1);
     }
 
     /// RFC 8224 §6.2.2 at the daemon: malformed Identity values under
@@ -21675,6 +23343,7 @@ pub mod tests {
 
     /// CANCELs call `id` from alice and returns the B-leg CANCEL.
     async fn cancel_call(stack: &SipStack, id: &str) -> SipRequest {
+        callee_trying(stack, id).await;
         let out = flatten(
             stack
                 .process_message(
@@ -21788,6 +23457,7 @@ pub mod tests {
             let results = place_call_on(&stack, &id, caller).await;
             let (inv, inv_dest) = forwarded(&results, &Method::Invite).unwrap();
             let inv_branch = inv.headers.via_branch().unwrap();
+            callee_trying(&stack, &id).await;
             let out = flatten(
                 stack
                     .process_message_on(
@@ -22751,6 +24421,7 @@ pub mod tests {
         assert_no_internal(&results);
         let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
         let b_invite = b_invite.clone();
+        callee_trying(&stack, "th-cancel@test").await;
         let results = flatten(
             stack
                 .process_message(
@@ -24187,6 +25858,7 @@ pub mod tests {
         let results = place_call(stack, call_id).await;
         let (b_invite, _) = forwarded(&results, &Method::Invite).expect("INVITE");
         let b_invite = b_invite.clone();
+        callee_trying(stack, call_id).await;
         let results = flatten(
             stack
                 .process_message(
