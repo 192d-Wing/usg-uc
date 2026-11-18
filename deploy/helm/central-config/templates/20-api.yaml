@@ -82,15 +82,31 @@ spec:
             capabilities:
               drop: [ALL]
               add: [NET_BIND_SERVICE]
-          {{- if .Values.api.oidc.extraCaCert }}
+          {{- $pgCa := eq (.Values.postgres.mode | default "bundled") "cnpg" }}
+          {{- if or .Values.api.oidc.extraCaCert $pgCa }}
           volumeMounts:
+            {{- if .Values.api.oidc.extraCaCert }}
             - { name: extra-ca, mountPath: /etc/ssl/extra-ca, readOnly: true }
+            {{- end }}
+            {{- if $pgCa }}
+            # CNPG server CA for sslmode=verify-full (NIST 800-53 Rev5: SC-8)
+            - { name: pg-ca, mountPath: /etc/central-config/pg-ca, readOnly: true }
+            {{- end }}
           {{- end }}
-      {{- if .Values.api.oidc.extraCaCert }}
+      {{- if or .Values.api.oidc.extraCaCert $pgCa }}
       volumes:
+        {{- if .Values.api.oidc.extraCaCert }}
         - name: extra-ca
           configMap:
             name: {{ include "central-config.fullname" . }}-oidc-ca
+        {{- end }}
+        {{- if $pgCa }}
+        - name: pg-ca
+          secret:
+            secretName: {{ include "central-config.cnpgCaSecret" . }}
+            items:
+              - { key: ca.crt, path: ca.crt }
+        {{- end }}
       {{- end }}
 {{- if .Values.api.oidc.extraCaCert }}
 ---

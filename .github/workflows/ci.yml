@@ -82,6 +82,14 @@ jobs:
               - '.github/workflows/ci.yml'
             sbc:
               - 'crates/sbc/**'
+              # Read by sbc tests (chart preflights, realm import, shipped
+              # configs) or embedded at build time (central-db migrations via
+              # sqlx::migrate!), so a deploy-only change still runs them.
+              - 'deploy/central-db/**'
+              - 'deploy/helm/**'
+              - 'deploy/keycloak/**'
+              - 'deploy/config/**'
+              - 'deploy/test/**'
             client:
               - 'crates/client/**'
       - name: Compute workspace scope
@@ -211,6 +219,12 @@ jobs:
       # separately. Compiling the tests here also covers the "does it build"
       # signal the old standalone build job provided.
       - run: cargo nextest run --workspace --all-features ${{ needs.changes.outputs.exclude }}
+      # `--all-features` turns on `cluster`, which compiles out the
+      # not(cluster) gRPC server tests (grpc_server::tests, admin RPC audit).
+      # Run the daemon once more with gRPC and without cluster.
+      - name: Test sbc-daemon (grpc, cluster off)
+        if: ${{ !contains(needs.changes.outputs.exclude, 'sbc-daemon') }}
+        run: cargo nextest run -p sbc-daemon --features grpc
       # Default features: runs tls_only_surface.rs and the
       # not(insecure-transports) tests (POA&M-322).
       - name: Test client crates (default features)

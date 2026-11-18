@@ -28,6 +28,9 @@
 //! - **SC-13**: Cryptographic Protection (CNSA 2.0 compliant TLS)
 //! - **IA-3**: Device Identification (mTLS support)
 
+mod admin_audit;
+#[cfg(all(test, not(feature = "cluster")))]
+mod admin_audit_tests;
 mod call_service;
 mod cdr_service;
 #[cfg(feature = "cluster")]
@@ -79,7 +82,9 @@ pub use config_service::ConfigServiceImpl;
 pub use dial_plan_sync_service::DialPlanSyncServiceImpl;
 pub use did_mapping_sync_service::DidMappingSyncServiceImpl;
 pub use health_service::HealthServiceImpl;
-pub use peer_identity::{ClientCertGate, PeerPrincipal};
+pub use peer_identity::ClientCertGate;
+#[cfg(test)]
+pub use peer_identity::PeerPrincipal;
 pub use registration_service::RegistrationServiceImpl;
 pub use sbc_sync_service::SbcSyncServiceImpl;
 pub use system_service::SystemServiceImpl;
@@ -173,6 +178,19 @@ impl GrpcServer {
     pub async fn run(&self) -> Result<(), GrpcServerError> {
         let addr = self.config.listen_addr;
 
+        // NIST 800-53 Rev5: AC-3, IA-3, SC-7, SC-8 — a listener off loopback
+        // must authenticate every client, so it never starts without mTLS.
+        // `validate_grpc` enforces this at config load; this check covers
+        // configs built in code.
+        if !listener_permitted(&self.config) {
+            return Err(GrpcServerError::TlsError {
+                reason: format!(
+                    "grpc.listen_addr {addr} is not a loopback address; a non-loopback \
+                     gRPC listener requires grpc.require_mtls = true"
+                ),
+            });
+        }
+
         info!(
             address = %addr,
             tls = self.config.tls_cert_path.is_some(),
@@ -223,7 +241,7 @@ impl GrpcServer {
                 })?
                 .layer(tonic::service::InterceptorLayer::new(gate))
         } else {
-            warn!("gRPC server running WITHOUT TLS - not recommended for production");
+            info!(address = %addr, "gRPC server is loopback-only and plaintext (no mTLS)");
             Server::builder().layer(tonic::service::InterceptorLayer::new(gate))
         };
 
@@ -435,22 +453,30 @@ fn client_cert_gate(config: &GrpcConfig) -> ClientCertGate {
     ClientCertGate::new(config.require_mtls, &config.allowed_client_names)
 }
 
+/// A gRPC listener may start only when it requires mTLS or is bound to
+/// loopback.
+///
+/// ## NIST 800-53 Rev5: AC-3, IA-3, SC-7 (Boundary Protection)
+fn listener_permitted(config: &GrpcConfig) -> bool {
+    config.require_mtls || config.listen_addr.ip().is_loopback()
+}
+
 /// Whether `CdrService` may be mounted on this listener: only when every
 /// client is authenticated by certificate (`grpc.require_mtls`) or the
 /// listener is bound to loopback. Otherwise it is not registered (clients
-/// get `Unimplemented`) and a warning names the keys to change.
+/// get `Unimplemented`) and a warning is logged.
 ///
 /// ## NIST 800-53 Rev5: AC-3 (Access Enforcement), SC-8, SI-12
 fn cdr_service_permitted(config: &GrpcConfig) -> bool {
-    if config.require_mtls || config.listen_addr.ip().is_loopback() {
+    if listener_permitted(config) {
         return true;
     }
+    // Not reached from `run`, which refuses such a listener; kept so the
+    // PII service is never mounted on one.
     warn!(
         listen_addr = %config.listen_addr,
-        "CdrService NOT mounted: CDRs carry PII and this gRPC listener is neither \
-         mTLS-authenticated nor loopback. Set grpc.require_mtls = true (with \
-         grpc.tls_cert_path, grpc.tls_key_path, grpc.tls_ca_path) or bind \
-         grpc.listen_addr to 127.0.0.1/::1"
+        "CdrService NOT mounted: the gRPC listener is neither mTLS-authenticated \
+         nor loopback"
     );
     false
 }
@@ -463,10 +489,12 @@ mod cdr_gate_tests {
 
     #[test]
     fn cdr_service_only_on_mtls_or_loopback_listener() {
-        // SEC-1: the default listener (0.0.0.0, no mTLS) must not serve PII.
-        let default = GrpcConfig::default();
-        assert!(!default.require_mtls && !default.listen_addr.ip().is_loopback());
-        assert!(!cdr_service_permitted(&default));
+        // SEC-1: a wildcard listener without mTLS must not serve PII.
+        let public_v4 = GrpcConfig {
+            listen_addr: "0.0.0.0:9091".parse().unwrap(),
+            ..GrpcConfig::default()
+        };
+        assert!(!cdr_service_permitted(&public_v4));
         let public_v6 = GrpcConfig {
             listen_addr: "[::]:9091".parse().unwrap(),
             ..GrpcConfig::default()
@@ -480,6 +508,7 @@ mod cdr_gate_tests {
             assert!(cdr_service_permitted(&local), "{addr}");
         }
         let mtls = GrpcConfig {
+            listen_addr: "0.0.0.0:9091".parse().unwrap(),
             require_mtls: true,
             ..GrpcConfig::default()
         };
@@ -488,7 +517,7 @@ mod cdr_gate_tests {
 }
 
 #[cfg(all(test, not(feature = "cluster")))]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::server::ServerStats;
@@ -512,6 +541,27 @@ mod tests {
             server_with(config).configure_tls(),
             Err(GrpcServerError::TlsError { .. })
         ));
+    }
+
+    /// A plaintext listener off loopback is refused before it binds, even
+    /// when the config was built in code without validation.
+    #[tokio::test]
+    async fn qa_run_refuses_plaintext_wildcard_listener() {
+        for addr in ["0.0.0.0:0", "[::]:0"] {
+            let config = GrpcConfig {
+                enabled: true,
+                listen_addr: addr.parse().unwrap(),
+                ..GrpcConfig::default()
+            };
+            let server = server_with(config);
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), server.run())
+                .await
+                .unwrap_or_else(|_| panic!("run() on {addr} without mTLS kept serving"));
+            assert!(
+                matches!(outcome, Err(GrpcServerError::TlsError { .. })),
+                "{addr}: {outcome:?}"
+            );
+        }
     }
 
     #[test]

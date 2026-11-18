@@ -112,6 +112,7 @@ impl RegistrationService for RegistrationServiceImpl {
         &self,
         request: Request<DeleteRegistrationRequest>,
     ) -> Result<Response<DeleteRegistrationResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         let req = request.into_inner();
         info!(
             aor = %req.aor,
@@ -120,7 +121,7 @@ impl RegistrationService for RegistrationServiceImpl {
             "gRPC DeleteRegistration"
         );
 
-        if let Some(ref stack) = self.state.sip_stack {
+        let result = if let Some(ref stack) = self.state.sip_stack {
             match stack.delete_registration(&req.aor, &req.contact_uri).await {
                 Ok(()) => {
                     info!(aor = %req.aor, contact = %req.contact_uri, "Registration deleted");
@@ -134,7 +135,19 @@ impl RegistrationService for RegistrationServiceImpl {
             }
         } else {
             Err(Status::unavailable("SIP stack not available"))
-        }
+        };
+        let target = if req.contact_uri.is_empty() {
+            req.aor
+        } else {
+            format!("{} contact={}", req.aor, req.contact_uri)
+        };
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "RegistrationService/DeleteRegistration",
+            &target,
+            super::admin_audit::AdminOutcome::from_result(result.as_ref().map(|_| ())),
+        );
+        result
     }
 
     async fn get_registration_stats(

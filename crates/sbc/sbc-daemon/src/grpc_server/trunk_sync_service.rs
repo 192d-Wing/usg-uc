@@ -89,6 +89,7 @@ impl TrunkSyncService for TrunkSyncServiceImpl {
         &self,
         request: Request<RemoveTrunkGroupRequest>,
     ) -> Result<Response<RemoveTrunkGroupResponse>, Status> {
+        let admin = super::peer_identity::caller_principal(&request);
         let req = request.into_inner();
         let group_id = req.group_id;
         info!(group_id, "gRPC RemoveTrunkGroup");
@@ -96,12 +97,25 @@ impl TrunkSyncService for TrunkSyncServiceImpl {
         // Also clear from the SbcRouter for symmetry with the REST
         // delete handler — keeps both internal routers in step even
         // when only the SIP-stack sync was requested.
-        if let Some(ref sbc) = self.state.sbc_router {
+        let in_sbc_router = if let Some(ref sbc) = self.state.sbc_router {
             sbc.write().await.remove_route_group(&group_id);
-        }
-        if let Some(ref sip_stack) = self.state.sip_stack {
+            true
+        } else {
+            false
+        };
+        let in_sip_router = if let Some(ref sip_stack) = self.state.sip_stack {
             sip_stack.remove_trunk_group_from_router(&group_id).await;
-        }
+            true
+        } else {
+            false
+        };
+        let applied = in_sbc_router || in_sip_router;
+        super::admin_audit::audit_admin_rpc(
+            admin,
+            "TrunkSyncService/RemoveTrunkGroup",
+            &group_id,
+            super::admin_audit::AdminOutcome::applied(applied),
+        );
         Ok(Response::new(RemoveTrunkGroupResponse {
             success: true,
             message: "removed from SIP router".to_string(),

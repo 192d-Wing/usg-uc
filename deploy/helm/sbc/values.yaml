@@ -93,6 +93,16 @@ sbcFrontend:
     issuer: ""                           # e.g. https://icam.oopl.dev.mil/realms/dcim
     clientId: "usg-uc-config-admin"
     scopes: "openid config config-admin"
+  # Trusted edge proxies (ingress controller / Gateway) whose
+  # X-Forwarded-For is used as the client address (nginx set_real_ip_from).
+  # List ONLY the edge proxies' own addresses (e.g. the controller pod IPs
+  # or node addresses it SNATs from), never the whole pod CIDR: every
+  # listed address may assert any client address. With networkPolicy
+  # enabled, networkPolicy.edgeFrom must also be set (rendering fails
+  # otherwise) so only the edge proxies can reach the frontend. CIDRs only;
+  # each entry is validated. Empty = nginx sees the edge proxy address.
+  # Needed for sbcProvision.allowedSourceCidrs to see phone IPs.
+  realIpFrom: []
 
 # sbc-postgres — per-site Postgres for SBC config entities. PR1 stores
 # directory_numbers here; phones/trunks/dial-plans follow in subsequent
@@ -201,6 +211,12 @@ sbcApi:
     existingSecret: ""
     generate: false
     key: ha1-key
+  # Networks whose X-Real-IP header is trusted (SBC_TRUSTED_PROXIES), so the
+  # per-IP login limiter keys on the real client: the pod CIDR of the
+  # frontend nginx pods (recommended). Empty = trust no proxy (the limiter
+  # then keys on the nginx address: one shared bucket for every client).
+  # Same NetworkPolicy condition as sbcProvision.trustedProxies.
+  trustedProxies: []
 
 # sbc-provision-server — stand-alone phone-provisioning pod (PR6).
 # Owns /provision/<MAC>.{cfg,xml}: reads the phone record from Postgres
@@ -219,16 +235,33 @@ sbcProvision:
     limits:   { cpu: "200m", memory: "128Mi" }
   # Source-network restriction for provisioning (decision: phones are
   # gated by source network, not per-device auth). List the phone VLAN
-  # CIDRs; the server checks the client IP from nginx's X-Forwarded-For
-  # and 403s anything outside them. Empty = app-layer check disabled
-  # (rely on the NetworkPolicy / LB source ranges only).
+  # CIDRs; the server checks the client IP nginx relays in X-Real-IP and
+  # 403s anything outside them. Empty = app-layer check disabled (rely on
+  # the NetworkPolicy / LB source ranges only).
   allowedSourceCidrs: []
     # - "10.0.100.0/24"
+  # Networks whose X-Real-IP header is trusted (SBC_TRUSTED_PROXIES): the
+  # pod CIDR the frontend nginx pods run in. Required when
+  # allowedSourceCidrs is set (rendering fails otherwise); empty = trust no
+  # proxy, so the check would see the nginx address. The cluster pod CIDR
+  # is acceptable ONLY while networkPolicy.enabled (the policy admits this
+  # pod only from the frontend) on a CNI that enforces it; rendering fails
+  # with networkPolicy.enabled=false unless
+  # networkPolicy.trustedProxiesWithoutPolicy=true. For the phone address to
+  # reach nginx, the ingress must preserve it (see sbcFrontend.realIpFrom).
+  trustedProxies: []
+    # - "10.42.0.0/16"
+  # Provisioning URL token secret (SBC_PROVISION_SECRET): name of a Secret
+  # you manage whose `key` holds hex decoding to >= 32 bytes
+  # (`openssl rand -hex 48`). Empty = not set.
+  provisionSecret:
+    existingSecret: ""
+    key: provision-secret
   # The server refuses to start when neither allowedSourceCidrs nor
   # SBC_PROVISION_SECRET is set, because rendered phone configs carry SIP
   # and directory credentials. Set this to true only to run it open anyway.
-  # SBC_PROVISION_SECRET (not set by this chart) must be hex decoding to
-  # >= 32 bytes (`openssl rand -hex 48`); see DEPLOYING.md upgrade notes.
+  # SBC_PROVISION_SECRET comes from provisionSecret above; see DEPLOYING.md
+  # upgrade notes.
   allowUnauthenticated: false
 
 # sbc-client-config-server — soft-client discovery + provisioning pod
@@ -455,28 +488,37 @@ sbcDaemon:
       size: 1Gi
       storageClass: ""
       accessMode: ReadWriteOnce
-  # mTLS on the daemon gRPC listener. Required for sbc-api to serve the CDR
-  # API (CdrService carries PII and is mounted only on an mTLS or loopback
-  # listener); while disabled /api/v1/cdrs* answers 503. Provide either a
-  # cert-manager issuer (the chart then issues ECDSA P-384 server and client
-  # certificates, CNSA 2.0) or two existing Secrets holding tls.crt, tls.key
-  # and ca.crt. sbcTrunkAgent has no gRPC TLS client yet and cannot be
-  # enabled together with this (POAM).
+  # mTLS on the daemon gRPC listener (on by default). sbc-api and the trunk
+  # agent reach the daemon gRPC over the pod network, and the daemon refuses
+  # a plaintext gRPC listener off loopback, so every RPC on every service
+  # needs an allow-listed client certificate (NIST 800-53 Rev5: AC-3, IA-3,
+  # SC-8). Rendering fails unless you supply ONE of:
+  #   - clusterIssuer: a cert-manager issuer; the chart issues ECDSA P-384
+  #     (CNSA 2.0) server and client certificates (sbc-api, and the trunk
+  #     agent when sbcTrunkAgent.enabled), or
+  #   - serverSecretName + clientSecretName (+ trunkAgentClientSecretName
+  #     when sbcTrunkAgent.enabled): existing Secrets holding tls.crt,
+  #     tls.key and ca.crt (see DEPLOYING.md "Daemon gRPC mTLS").
+  # enabled: false is only for installs without sbc-api and the trunk agent
+  # (sbcApi.enabled=false, sbcTrunkAgent.enabled=false): gRPC then listens on
+  # 127.0.0.1 only and no -grpc Service is created.
   #
   # The daemon also checks the client certificate name on every RPC against
-  # allowedClientNames (grpc.allowed_client_names). Empty = only the chart's
-  # sbc-api client certificate (CN <release>-sbc-api). Use a DEDICATED
-  # issuer for this CA (issuerKind: Issuer, a namespaced CA Issuer used for
-  # nothing else): with a shared ClusterIssuer any workload that can request
-  # a certificate from it chains to the same CA. The `clusterIssuer` value
-  # holds the issuer name for either kind.
+  # allowedClientNames (grpc.allowed_client_names). Empty = the chart's
+  # client certificates (CN <fullname>-sbc-api, and <fullname>-sbc-trunk-agent
+  # when the trunk agent is enabled). Use a DEDICATED issuer for this CA
+  # (issuerKind: Issuer, a namespaced CA Issuer used for nothing else): with
+  # a shared ClusterIssuer any workload that can request a certificate from
+  # it can obtain an allow-listed name. The `clusterIssuer` value holds the
+  # issuer name for either kind.
   grpcMtls:
-    enabled: false
+    enabled: true
     clusterIssuer: ""
     issuerKind: ClusterIssuer   # Issuer recommended (dedicated, namespaced)
     allowedClientNames: []
-    serverSecretName: ""   # default <release>-grpc-server-tls
-    clientSecretName: ""   # default <release>-grpc-client-tls
+    serverSecretName: ""   # default <fullname>-grpc-server-tls
+    clientSecretName: ""   # default <fullname>-grpc-client-tls
+    trunkAgentClientSecretName: ""   # default <fullname>-grpc-trunk-agent-tls
   resources:
     requests: { cpu: "500m", memory: "512Mi" }
     limits:   { cpu: "2",    memory: "2Gi"   }
@@ -601,10 +643,11 @@ sbcDaemon:
     # Reserved: not rendered into sbc.toml. The daemon has no metrics
     # exporter yet and rejects a [monitoring] table (POA&M-191/195).
     metrics_listen: "0.0.0.0:9090"
-    # gRPC admin API — must be distinct from metrics_listen (both default
-    # to 9090 in the Rust schema, which collides). sbc-api dials this
-    # via the *-grpc ClusterIP Service to push SIP-router refresh RPCs.
-    grpc_listen: "0.0.0.0:9091"
+    # gRPC admin API listen address. Empty = 0.0.0.0:9091 with grpcMtls
+    # (sbc-api and the trunk agent dial it via the -grpc ClusterIP Service)
+    # and 127.0.0.1:9091 without; a non-loopback value without grpcMtls
+    # fails rendering. Keep it off metrics_listen (9090).
+    grpc_listen: ""
 
   # Topology hiding (NIST SC-7): anonymize the SBC's internal signaling host
   # in the Via/Contact/Record-Route of outbound trunk-facing initial INVITEs
@@ -658,3 +701,30 @@ services:
   # Off: the daemon has no metrics exporter on 9090 yet (POA&M-195);
   # enabling this creates a Service with no listener behind it.
   metrics: { enabled: false }
+
+# Ingress NetworkPolicies (28-sbc-networkpolicy.yaml): a default-deny
+# baseline for every pod of this release plus explicit allows: SIP and RTP
+# to the daemon from any source, daemon REST from the frontend and sbc-api,
+# daemon gRPC 9091 (only with grpcMtls) from sbc-api and the trunk agent,
+# sbc-api and provisioning from the frontend only, Postgres from the release
+# pods that use it. Ingress only (no egress policy). Requires a CNI that
+# enforces NetworkPolicy (Cilium) and Kubernetes >= 1.25 (endPort).
+# NIST 800-53 Rev5: SC-7, SC-7(5), CM-7, AC-3
+networkPolicy:
+  enabled: true
+  # Peers (NetworkPolicy `from` entries) allowed to reach the frontend
+  # (8080) and client-config (80) pods. Empty = any source (they are the
+  # HTTP edge behind the ingress controller or Gateway). Required when
+  # sbcFrontend.realIpFrom is set.
+  edgeFrom: []
+  # Acknowledge rendering sbcProvision/sbcApi trustedProxies with
+  # networkPolicy.enabled=false. Only when another control restricts who can
+  # reach sbc-api and provisioning to the frontend pods.
+  trustedProxiesWithoutPolicy: false
+  # Extra peers allowed to reach the daemon gRPC 9091 (only with grpcMtls;
+  # they still need an allow-listed client certificate).
+  daemonGrpcFrom: []
+  # ipBlock peers for kubelet probes on CNIs that enforce policy on
+  # host-originated traffic (e.g. the node CIDR). Cilium admits them by
+  # default; leave empty there.
+  probeFrom: []

@@ -1,4 +1,9 @@
 {{- if .Values.sbcFrontend.enabled }}
+{{- range .Values.sbcFrontend.realIpFrom }}
+{{- if not (regexMatch "^[0-9a-fA-F:.]+/[0-9]+$" (toString .)) }}
+{{- fail (printf "sbcFrontend.realIpFrom entry %q is not a CIDR" (toString .)) }}
+{{- end }}
+{{- end }}
 # sbc-frontend — operator dashboard pod (nginx + React bundle).
 #
 # Why it's a separate Deployment: previously the React bundle was embedded
@@ -108,6 +113,11 @@ spec:
               value: {{ .Values.sbcFrontend.oidc.clientId | default "" | quote }}
             - name: SBC_OIDC_SCOPES
               value: {{ .Values.sbcFrontend.oidc.scopes | default "" | quote }}
+            # nginx real_ip directives (sbcFrontend.realIpFrom). Always
+            # defined: envsubst leaves an undefined variable in place and
+            # nginx would not start. Entries are validated as CIDRs above.
+            - name: SBC_REAL_IP_CONF
+              value: {{ include "sbc.frontendRealIpConf" . | quote }}
             - name: NGINX_ENVSUBST_FILTER
               value: "^SBC_"
           ports:
@@ -191,6 +201,15 @@ spec:
     - { name: http, port: 80, targetPort: http, protocol: TCP }
 {{- end }}
 
+{{/* nginx real_ip directives for the frontend (empty when
+     sbcFrontend.realIpFrom is empty). */}}
+{{- define "sbc.frontendRealIpConf" -}}
+{{- with .Values.sbcFrontend.realIpFrom -}}
+{{- range . }}set_real_ip_from {{ . }}; {{ end -}}
+real_ip_header X-Forwarded-For; real_ip_recursive on;
+{{- end -}}
+{{- end }}
+
 {{/* Fallback inline nginx config — used when files/nginx.conf.template
      is not packaged with the chart. Kept in sync by hand with the
      standalone crates/sbc/sbc-dashboard/nginx.conf.template. */}}
@@ -198,6 +217,9 @@ spec:
 server {
     listen 8080;
     server_name _;
+
+    # Trusted edge proxies for the client address (sbcFrontend.realIpFrom).
+    ${SBC_REAL_IP_CONF}
 
     root /usr/share/nginx/html;
     index index.html;

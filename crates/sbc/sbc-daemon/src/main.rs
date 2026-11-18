@@ -167,11 +167,40 @@ fn peek_logging_config(args: &Args) -> sbc_config::schema::LoggingConfig {
     }
 }
 
+/// Builds the daemon log filter: `RUST_LOG` when set and valid, otherwise
+/// `sbc=<level>,warn`. An invalid `RUST_LOG` is reported once on stderr and
+/// the default is used.
+///
+/// The `audit` target (records written by `uc_audit::sink::TracingSink`) is
+/// always admitted at `info`, whatever `level` or `RUST_LOG` say:
+/// `add_directive` replaces a same-target directive, so neither `off` nor
+/// `audit=off` suppresses it. Audit is switched off only through
+/// `logging.audit_enabled = false`, which is visible in the configuration.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-12 (audit records always emitted)
+fn env_filter(level: &str, rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::filter::Directive;
+
+    let default = || EnvFilter::new(format!("sbc={level},warn"));
+    let base = match rust_log {
+        Some(raw) if !raw.trim().is_empty() => EnvFilter::try_new(raw).unwrap_or_else(|e| {
+            eprintln!("invalid RUST_LOG {raw:?}: {e}; using sbc={level},warn");
+            default()
+        }),
+        _ => default(),
+    };
+    match "audit=info".parse::<Directive>() {
+        Ok(directive) => base.add_directive(directive),
+        // A constant directive; parsing cannot fail, but never panic here.
+        Err(_) => base,
+    }
+}
+
 /// Initializes the tracing subscriber from `[logging]`: `level` (overridden
 /// upwards by `-v`/`-vv`, and by `RUST_LOG` when set), `format` (`json` or
 /// `text`) and `output` (`stdout`, `stderr` or a file that is appended to).
 fn init_tracing(verbose: u8, logging: &sbc_config::schema::LoggingConfig) {
-    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
     let level = match verbose {
@@ -179,8 +208,7 @@ fn init_tracing(verbose: u8, logging: &sbc_config::schema::LoggingConfig) {
         1 => "debug".to_string(),
         _ => "trace".to_string(),
     };
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("sbc={level},warn")));
+    let filter = env_filter(&level, std::env::var("RUST_LOG").ok().as_deref());
 
     let writer = match logging.output.trim() {
         "" | "stdout" => BoxMakeWriter::new(std::io::stdout),
@@ -209,5 +237,87 @@ fn init_tracing(verbose: u8, logging: &sbc_config::schema::LoggingConfig) {
         builder.json().init();
     } else {
         builder.init();
+    }
+}
+
+/// QA: audit records (`target: "audit"`, emitted by
+/// `uc_audit::sink::TracingSink`) always pass the daemon log filter,
+/// whatever `logging.level` or `RUST_LOG` say; other targets keep the
+/// default filtering.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-12
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod audit_filter_tests {
+    use super::env_filter;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use uc_audit::sink::{AuditSink, TracingSink};
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Buf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured(level: &str, rust_log: Option<&str>, emit: impl FnOnce()) -> String {
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(env_filter(level, rust_log))
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    fn record() -> uc_audit::AuditRecord {
+        let event =
+            uc_audit::AuditEvent::ConfigurationChange(uc_audit::event::ConfigurationChange {
+                admin: "qa".into(),
+                change_type: uc_audit::event::ConfigChangeType::Loaded,
+                description: "qa audit filter probe".into(),
+            });
+        uc_audit::AuditRecord::new(1, event, chrono::Utc::now(), [0u8; 48])
+    }
+
+    #[test]
+    fn qa_audit_record_passes_daemon_filter() {
+        let cases: [(&str, Option<&str>); 7] = [
+            ("info", None),
+            ("warn", None),
+            ("error", None),
+            ("info", Some("off")),
+            ("info", Some("audit=off")),
+            ("info", Some("sbc=trace")),
+            ("info", Some("not a filter")),
+        ];
+        for (level, rust_log) in cases {
+            let out = captured(level, rust_log, || {
+                TracingSink.write(&record()).unwrap();
+            });
+            assert!(
+                out.contains("audit event"),
+                "audit record dropped with level={level} RUST_LOG={rust_log:?}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qa_non_audit_info_still_filtered_by_default() {
+        let out = captured("info", None, || {
+            tracing::info!(target: "other", "qa non-audit probe");
+            tracing::info!(target: "sbc_daemon", "qa sbc probe");
+        });
+        assert!(!out.contains("qa non-audit probe"), "{out:?}");
+        assert!(out.contains("qa sbc probe"), "{out:?}");
     }
 }
