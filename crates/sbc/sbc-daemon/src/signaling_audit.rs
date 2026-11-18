@@ -36,11 +36,41 @@ const CTX_SEP: char = '\u{1f}';
 /// the per-key memory of the bounded tables small (SC-5).
 pub const MAX_AUDIT_FIELD_BYTES: usize = 256;
 
+/// Byte cap of the Call-ID inside an in-dialog reject record's resource.
+pub const MAX_AUDIT_CALL_ID_BYTES: usize = 64;
+
+/// `s` with every byte outside `[A-Za-z0-9-._~@:!+*'()]` written as `%XX`
+/// (pure ASCII output).
+fn percent_encode(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len().min(MAX_AUDIT_FIELD_BYTES));
+    for b in s.bytes() {
+        if out.len() >= MAX_AUDIT_FIELD_BYTES {
+            break;
+        }
+        if b.is_ascii_alphanumeric() || b"-._~@:!+*'()".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// `s` truncated to at most `max` bytes on a char boundary.
+fn capped(s: &str, max: usize) -> &str {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.get(..end).unwrap_or_default()
+}
+
 /// Sanitizes an attacker-supplied value for audit storage: drops control
 /// characters and truncates to [`MAX_AUDIT_FIELD_BYTES`] on a char boundary.
 ///
 /// ## NIST 800-53 Rev5: AU-3, AU-9, SC-5
-fn audit_field(s: &str) -> String {
+pub fn audit_field(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(MAX_AUDIT_FIELD_BYTES));
     for c in s.chars().filter(|c| !c.is_control()) {
         if out.len() + c.len_utf8() > MAX_AUDIT_FIELD_BYTES {
@@ -67,17 +97,32 @@ pub enum InDialogPolicy {
     PendingRelayCap,
     /// Per-call relay cap reached under the write lock (503, SC-5).
     PendingRelayCapRace,
+    /// The To tag is missing or is not a local tag of the dialog
+    /// (RFC 3261 §12.2.2, 481).
+    ToTagMismatch,
+    /// The tags name the dialog but the request did not come from the
+    /// leg's peer (403).
+    ForeignSource,
+    /// An ACK for a pending 2xx does not match its dialog, CSeq or peer
+    /// (RFC 3261 §13.2.2.4; absorbed, no response).
+    AckMismatch,
+    /// A CANCEL matches no INVITE transaction or call (RFC 3261 §9.2, 481).
+    CancelNoMatch,
 }
 
 impl InDialogPolicy {
     /// Every policy, for metric export.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 10] = [
         Self::UnknownDialog,
         Self::FromTagMismatch,
         Self::RackMismatch,
         Self::PrackFromCallee,
         Self::PendingRelayCap,
         Self::PendingRelayCapRace,
+        Self::ToTagMismatch,
+        Self::ForeignSource,
+        Self::AckMismatch,
+        Self::CancelNoMatch,
     ];
 
     /// Stable policy string.
@@ -90,6 +135,10 @@ impl InDialogPolicy {
             Self::PrackFromCallee => "in-dialog:prack-from-callee",
             Self::PendingRelayCap => "in-dialog:pending-relay-cap",
             Self::PendingRelayCapRace => "in-dialog:pending-relay-cap-race",
+            Self::ToTagMismatch => "in-dialog:to-tag-mismatch",
+            Self::ForeignSource => "in-dialog:foreign-source",
+            Self::AckMismatch => "in-dialog:ack-mismatch",
+            Self::CancelNoMatch => "in-dialog:cancel-no-match",
         }
     }
 
@@ -139,13 +188,17 @@ pub const DIGEST_METRIC_NAMES: [&str; DIGEST_OUTCOMES] = [
 ];
 
 /// Gauge names, one per in-dialog policy (order of [`InDialogPolicy::ALL`]).
-pub const IN_DIALOG_METRIC_NAMES: [&str; 6] = [
+pub const IN_DIALOG_METRIC_NAMES: [&str; InDialogPolicy::ALL.len()] = [
     "sbc_in_dialog_rejects_unknown_dialog_total",
     "sbc_in_dialog_rejects_from_tag_mismatch_total",
     "sbc_in_dialog_rejects_rack_mismatch_total",
     "sbc_in_dialog_rejects_prack_from_callee_total",
     "sbc_in_dialog_rejects_pending_relay_cap_total",
     "sbc_in_dialog_rejects_pending_relay_cap_race_total",
+    "sbc_in_dialog_rejects_to_tag_mismatch_total",
+    "sbc_in_dialog_rejects_foreign_source_total",
+    "sbc_in_dialog_rejects_ack_mismatch_total",
+    "sbc_in_dialog_rejects_cancel_no_match_total",
 ];
 
 /// Audit `failure_reason` of a digest failure backoff window opening.
@@ -282,7 +335,7 @@ impl SignalingAudit {
     /// gauges are refreshed through `&self`, which cannot set labels, so each
     /// bounded label value is its own gauge:
     /// `sbc_digest_verify_<outcome>_total` (14),
-    /// `sbc_in_dialog_rejects_<policy>_total` (6) and
+    /// `sbc_in_dialog_rejects_<policy>_total` (10) and
     /// `sbc_signaling_audit_dropped_total`.
     ///
     /// ## NIST 800-53 Rev5: SI-4, AU-5
@@ -357,7 +410,10 @@ impl SignalingAudit {
     }
 
     /// Audits an in-dialog rejection as a denied `AuthorizationDecision`
-    /// (rate limited per source IP and policy).
+    /// (rate limited per source IP and policy). The record's resource is the
+    /// Request-URI followed by the request's Call-ID (capped at
+    /// [`MAX_AUDIT_CALL_ID_BYTES`]) and source port, so the rejected request
+    /// can be tied to its call and flow (AU-3) without a schema change.
     ///
     /// ## NIST 800-53 Rev5: AU-2, AU-3, SI-4; RFC 3261 §12.2.2
     pub fn in_dialog_reject(
@@ -370,7 +426,20 @@ impl SignalingAudit {
         if let Some(c) = self.in_dialog_rejects.get(policy.index()) {
             c.fetch_add(1, Ordering::Relaxed);
         }
-        self.signaling_reject(req, source, policy.as_str(), now);
+        // Percent-encoded, so a Call-ID cannot imitate the record's own
+        // `key=value` fields (it may contain spaces and `=`).
+        let call_id = percent_encode(req.headers.call_id().unwrap_or(""));
+        let call_id = capped(&call_id, MAX_AUDIT_CALL_ID_BYTES);
+        let ruri = req.uri.to_string();
+        let ruri = capped(
+            &ruri,
+            MAX_AUDIT_FIELD_BYTES.saturating_sub(MAX_AUDIT_CALL_ID_BYTES + 32),
+        );
+        let resource = audit_field(&format!(
+            "{ruri} call-id={call_id} src-port={}",
+            source.port()
+        ));
+        self.reject_with_resource(req, source, policy.as_str(), now, resource);
     }
 
     /// Audits a rejected request under a `'static` policy (route
@@ -385,10 +454,21 @@ impl SignalingAudit {
         policy: &'static str,
         now: Instant,
     ) {
+        self.reject_with_resource(req, source, policy, now, audit_field(&req.uri.to_string()));
+    }
+
+    /// [`Self::signaling_reject`] with a caller-built (sanitized) resource.
+    fn reject_with_resource(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+        policy: &'static str,
+        now: Instant,
+        resource: String,
+    ) {
         let ip = source.ip();
         let key = ip.to_string();
         let subject = audit_field(&subject_of(req, source));
-        let resource = audit_field(&req.uri.to_string());
         let action = audit_field(req.method.as_str());
         let ctx = format!("{action}{CTX_SEP}{subject}{CTX_SEP}{resource}");
         let seen = Seen {
@@ -588,7 +668,67 @@ mod tests {
             .unwrap();
         assert_eq!(flushed.action, "MESSAGE");
         assert_eq!(flushed.identity, "sip:alice@example.com");
-        assert_eq!(flushed.resource, "sip:bob@192.0.2.10");
+        assert_eq!(
+            flushed.resource,
+            "sip:bob@192.0.2.10 call-id=x@test src-port=5060"
+        );
+    }
+
+    /// NIST-04: the in-dialog reject record names the Call-ID (capped) and
+    /// the source port, and stays within the field cap.
+    #[test]
+    fn in_dialog_reject_record_carries_bounded_call_id_and_port() {
+        let a = SignalingAudit::new(Duration::from_secs(60));
+        let cap = uc_audit::capture::start();
+        let long = format!("{}@test", "c".repeat(4000));
+        a.in_dialog_reject(
+            &req(&long),
+            src(2),
+            InDialogPolicy::ForeignSource,
+            Instant::now(),
+        );
+        let d = cap
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                AuditEvent::AuthorizationDecision(d) => Some(d),
+                _ => None,
+            })
+            .unwrap();
+        assert!(d.resource.len() <= MAX_AUDIT_FIELD_BYTES, "{}", d.resource);
+        let cid = d
+            .resource
+            .split("call-id=")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .unwrap();
+        assert_eq!(cid.len(), MAX_AUDIT_CALL_ID_BYTES);
+        assert!(d.resource.ends_with("src-port=5060"), "{}", d.resource);
+    }
+
+    /// SEC-12: a Call-ID with spaces and `=` cannot forge the port field.
+    #[test]
+    fn in_dialog_reject_call_id_cannot_forge_fields() {
+        let a = SignalingAudit::new(Duration::from_secs(60));
+        let cap = uc_audit::capture::start();
+        a.in_dialog_reject(
+            &req("x src-port=1 y"),
+            src(3),
+            InDialogPolicy::ForeignSource,
+            Instant::now(),
+        );
+        let d = cap
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                AuditEvent::AuthorizationDecision(d) => Some(d),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            d.resource,
+            "sip:bob@192.0.2.10 call-id=x%20src-port%3D1%20y src-port=5060"
+        );
     }
 
     /// Plan test 7: 50 digest failures from one IP → one event and a

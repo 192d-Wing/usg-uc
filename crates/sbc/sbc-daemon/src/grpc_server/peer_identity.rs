@@ -34,6 +34,22 @@ const OID_CN: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerPrincipal(pub String);
 
+/// The caller of `req` as recorded in audit: `<principal>@<peer>`, where the
+/// principal is the [`PeerPrincipal`] set by [`ClientCertGate`] under mTLS
+/// (`cert:<name>`) and `unauthenticated` otherwise (loopback listener).
+///
+/// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records)
+pub fn caller_principal<T>(req: &Request<T>) -> String {
+    let who = req
+        .extensions()
+        .get::<PeerPrincipal>()
+        .map_or("unauthenticated", |p| p.0.as_str());
+    let peer = req
+        .remote_addr()
+        .map_or_else(|| "local".to_string(), |a| a.to_string());
+    format!("{who}@{peer}")
+}
+
 /// One name from a client certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CertName {
@@ -162,6 +178,8 @@ fn authorize(certs: Option<&[CertificateDer<'_>]>, allowed: &[String]) -> Result
 /// (no [`PeerPrincipal`]); sbc-config rejects an allow-list without mTLS.
 ///
 /// ## NIST 800-53 Rev5: AC-3, IA-3, AU-2 (denials audited)
+// POAM: POA&M-380 (AC-3, AC-6) the gate is per listener: any allow-listed
+// certificate can call every gRPC service; no per-certificate service scoping.
 #[derive(Debug, Clone)]
 pub struct ClientCertGate {
     enforce: bool,

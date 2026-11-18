@@ -43,7 +43,7 @@
     },
     {
       "name": "config-admin",
-      "description": "Optional fleet-admin scope; presence => full-fleet ABAC + sbc-api SSO.",
+      "description": "Fleet-admin scope; issued only to holders of realm role fleet-admin. Grants nothing by itself.",
       "protocol": "openid-connect",
       "attributes": { "include.in.token.scope": "true", "display.on.consent.screen": "false" },
       "protocolMappers": [
@@ -68,6 +68,9 @@
       { "name": "dialplan-admin", "description": "central-config ABAC: dialplans:* + routing:*" }
     ]
   },
+  "scopeMappings": [
+    { "clientScope": "config-admin", "roles": ["fleet-admin"] }
+  ],
   "clients": [
     {
       "clientId": "usg-uc-site-sync-oopl-001",

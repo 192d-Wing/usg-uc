@@ -6191,9 +6191,12 @@ dependencies = [
 name = "sbc-api-server"
 version = "0.10.0"
 dependencies = [
+ "aws-lc-rs",
  "axum",
+ "base64 0.22.1",
  "hyper",
  "ipnet",
+ "jsonwebtoken",
  "nix 0.31.3",
  "proto-jwt",
  "reqwest 0.12.28",
@@ -6428,6 +6431,7 @@ dependencies = [
  "sbc-config",
  "sbc-grpc-api",
  "sbc-media-core",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -6449,8 +6453,13 @@ dependencies = [
 name = "sbc-media"
 version = "0.10.0"
 dependencies = [
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
  "sbc-grpc-api",
  "sbc-media-core",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -6512,6 +6521,7 @@ dependencies = [
 name = "sbc-trunk-agent"
 version = "0.10.0"
 dependencies = [
+ "rustls",
  "sbc-config-store",
  "sbc-grpc-api",
  "sbc-trunk-services",

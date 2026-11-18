@@ -1594,7 +1594,7 @@ _The daemon has no SCTP listener; this and Phase 25 describe the `uc-transport` 
 
 - ✅ `GrpcConfig` struct:
   - `enabled`: Enable/disable gRPC server
-  - `listen_addr`: Bind address (default: 0.0.0.0:9090)
+  - `listen_addr`: Bind address (default: 127.0.0.1:9091; a non-loopback address requires mTLS and a client allow-list)
   - `tls_cert_path`, `tls_key_path`, `tls_ca_path`: TLS configuration
   - `require_mtls`: Mutual TLS requirement
   - `max_connections`: Connection limit

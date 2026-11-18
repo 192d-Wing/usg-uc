@@ -115,8 +115,11 @@ jobs:
           exit 1
 
       - name: Run SIPp UAC with real RTP (G.711 pcap) — across the split
+        # --no-deps: the services are already up and healthy. Letting `run`
+        # recreate sbc-signaling would leave sbc-media in the old container's
+        # network namespace (network_mode: service:sbc-signaling).
         run: |
-          docker compose -f "$COMPOSE" run --rm sipp-uac \
+          docker compose -f "$COMPOSE" run --rm --no-deps sipp-uac \
             172.28.1.10:5060 -sf /scenarios/sipp-uac-media.xml \
             -r 5 -l 10 -m 10 -mi 172.28.2.30 -p 5070 \
             -recv_timeout 10000 -timeout 60s -trace_err
@@ -158,6 +161,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The pool's media control channel is mTLS; generate the throwaway
+      # P-384 test PKI (gitignored deploy/test/certs/media-mtls).
+      - name: Generate media mTLS test certificates
+        run: bash deploy/test/gen-media-mtls-certs.sh
 
       - name: Build image + start signaling, 2 media nodes, and SIPp UAS
         run: docker compose -f "$COMPOSE" up -d --build sbc-signaling sbc-media-1 sbc-media-2 sipp-uas
@@ -219,6 +227,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The pool's media control channel is mTLS; generate the throwaway
+      # P-384 test PKI (gitignored deploy/test/certs/media-mtls).
+      - name: Generate media mTLS test certificates
+        run: bash deploy/test/gen-media-mtls-certs.sh
 
       - name: Build image + start signaling, 2 media nodes, and SIPp UAS
         run: docker compose -f "$COMPOSE" up -d --build sbc-signaling sbc-media-1 sbc-media-2 sipp-uas

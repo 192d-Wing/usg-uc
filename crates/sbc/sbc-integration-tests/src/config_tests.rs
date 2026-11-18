@@ -331,7 +331,23 @@ fn qa_helm_grpc_allow_list_defaults_to_sbc_api_cert() {
         .split("{{- define \"sbc.grpcAllowedClientNames\" -}}")
         .nth(1)
         .expect("allow-list helper");
-    assert!(define.contains(&format!("default (list ({cn}))")));
+    // Up to the next helper (inner `{{- end }}`s may close if-blocks).
+    let define = &define[..define
+        .find("{{- define")
+        .or_else(|| define.find("{{/*"))
+        .unwrap_or(define.len())];
+    // Default list: the sbc-api client CN, plus the trunk-agent client CN
+    // when the trunk agent is enabled (it now has a gRPC TLS client).
+    assert!(define.contains(cn), "sbc-api CN in default list: {define}");
+    assert!(
+        define.contains(r#"printf "%s-sbc-trunk-agent" (include "sbc.fullname" .)"#),
+        "trunk-agent CN in default list: {define}"
+    );
+    assert!(
+        define.contains(".Values.sbcTrunkAgent.enabled"),
+        "trunk-agent CN only when the agent is enabled: {define}"
+    );
+    assert!(define.contains(".Values.sbcDaemon.grpcMtls.allowedClientNames"));
     let grpc = helpers.split("[grpc]").nth(1).expect("[grpc] block");
     let block = &grpc[..grpc.find("{{- end }}").expect("grpcMtls if")];
     assert!(
@@ -413,6 +429,11 @@ fn qa_helm_rendered_sbc_config_validates() {
             "{{ .Values.sbcDaemon.config.grpc_listen | quote }}",
             "\"0.0.0.0:9091\"",
         ),
+        // sbc.grpcListen with grpcMtls on (the chart default) is grpc_listen.
+        (
+            "{{ include \"sbc.grpcListen\" . | quote }}",
+            "\"0.0.0.0:9091\"",
+        ),
         (
             "{{ printf \"sbc.%s\" .Values.site.fqdn_base | quote }}",
             "\"sbc.example.mil\"",
@@ -467,7 +488,7 @@ fn qa_helm_rendered_sbc_config_validates() {
         ("{{ .Values.sbcDaemon.cdr.rotateSizeMb }}", "16"),
         ("{{ .Values.sbcDaemon.cdr.retentionDays }}", "90"),
         ("{{ .Values.sbcDaemon.cdr.retentionFiles }}", "48"),
-        ("{{ .Values.sbcDaemon.grpcMtls.enabled }}", "false"),
+        ("{{ .Values.sbcDaemon.grpcMtls.enabled }}", "true"),
         (
             "{{ include \"sbc.grpcAllowedClientNames\" . }}",
             "[\"sbc-sbc-api\"]",
@@ -508,18 +529,312 @@ fn qa_helm_rendered_sbc_config_validates() {
             out.push_str(&l);
             out.push('\n');
         }
-        match load_from_str(&out) {
-            Ok(cfg) => assert_eq!(cfg.media.default_mode, MediaMode::Relay),
-            Err(e) => {
-                let msg = e.to_string();
-                // With the TLS branch rendered, cert files do not exist on
-                // the test host; only non-media failures of that kind are
-                // tolerated.
-                assert!(
-                    keep_if_bodies && !msg.contains("media.") && !msg.contains("max_registrations"),
-                    "helm config (if-bodies={keep_if_bodies}) failed: {msg}\n{out}"
-                );
-            }
+        assert!(
+            out.contains("listen_addr = \"0.0.0.0:9091\"") && out.contains("require_mtls = true"),
+            "rendered [grpc] (if-bodies={keep_if_bodies}):\n{out}"
+        );
+        check_rendered_sbc_config_load(&out, keep_if_bodies);
+    }
+}
+
+/// Loads one rendering of the `sbc.config` helper and checks the outcome:
+/// without the if-bodies only the `require_mtls` check may fail; with them
+/// only missing TLS files on the test host are tolerated.
+fn check_rendered_sbc_config_load(out: &str, keep_if_bodies: bool) {
+    match load_from_str(out) {
+        Ok(cfg) => {
+            assert!(
+                keep_if_bodies,
+                "require_mtls without TLS paths must not load:\n{out}"
+            );
+            assert_eq!(cfg.media.default_mode, MediaMode::Relay);
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            // Without the if-bodies the [grpc] TLS paths are absent, so
+            // the only acceptable failure is the require_mtls check.
+            // With them rendered, cert files do not exist on the test
+            // host; only TLS-file failures are tolerated.
+            let tolerated = if keep_if_bodies {
+                !msg.contains("media.")
+                    && !msg.contains("max_registrations")
+                    && !msg.contains("grpc.listen_addr")
+            } else {
+                msg.contains("require_mtls")
+            };
+            assert!(
+                tolerated,
+                "helm config (if-bodies={keep_if_bodies}) failed: {msg}\n{out}"
+            );
+        }
+    }
+}
+
+// ── QA: containment hardening, chart and realm text checks ─────────────
+// Always run (no helm binary in CI); `helm_render` covers real renders.
+
+fn read_repo(rel: &str) -> String {
+    std::fs::read_to_string(repo_path(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+}
+
+/// The text of `{{- define "<name>" -}}` up to the next define or comment
+/// (inner `{{- end }}`s may close if-blocks, so they are not the boundary).
+fn helm_define<'a>(tpl: &'a str, name: &str) -> Option<&'a str> {
+    let open = tpl.find(&format!("define \"{name}\""))?;
+    let body = &tpl[open..];
+    let rest = &body[1..];
+    let end = [rest.find("{{- define"), rest.find("{{/*")]
+        .into_iter()
+        .flatten()
+        .min()
+        .map_or(body.len(), |i| i + 1);
+    Some(&body[..end])
+}
+
+#[test]
+fn qa_helm_grpc_mtls_on_by_default() {
+    let values = read_repo("deploy/helm/sbc/values.yaml");
+    let start = values
+        .find("\n  grpcMtls:\n")
+        .expect("sbcDaemon.grpcMtls block");
+    let enabled = values[start..]
+        .lines()
+        .skip(2)
+        .find(|l| l.trim_start().starts_with("enabled:"))
+        .expect("grpcMtls.enabled");
+    let v = enabled
+        .split(':')
+        .nth(1)
+        .unwrap()
+        .split('#')
+        .next()
+        .unwrap()
+        .trim();
+    assert_eq!(v, "true", "sbcDaemon.grpcMtls.enabled default: {enabled}");
+}
+
+#[test]
+fn qa_helm_grpc_listen_uses_loopback_helper() {
+    let helpers = read_repo("deploy/helm/sbc/templates/_helpers.tpl");
+    let grpc = helpers.split("\n[grpc]\n").nth(1).expect("[grpc] block");
+    let grpc = &grpc[..grpc.find("\n[").unwrap_or(grpc.len())];
+    assert!(
+        grpc.contains(r#"listen_addr = {{ include "sbc.grpcListen" . | quote }}"#),
+        "[grpc] listen_addr must come from sbc.grpcListen:\n{grpc}"
+    );
+    let define = helm_define(&helpers, "sbc.grpcListen").expect("sbc.grpcListen helper");
+    assert!(define.contains("127.0.0.1"), "loopback branch: {define}");
+    assert!(
+        define.contains(".Values.sbcDaemon.grpcMtls.enabled"),
+        "{define}"
+    );
+    assert!(
+        define.contains(".Values.sbcDaemon.config.grpc_listen"),
+        "{define}"
+    );
+}
+
+#[test]
+fn qa_helm_trunk_agent_grpc_mtls_supported() {
+    let mtls = read_repo("deploy/helm/sbc/templates/26-sbc-grpc-mtls.yaml");
+    assert!(
+        !mtls.contains("cannot be combined"),
+        "trunk agent and grpcMtls must be combinable"
+    );
+    assert!(
+        mtls.contains("-grpc-trunk-agent"),
+        "trunk-agent client Certificate"
+    );
+    let agent = read_repo("deploy/helm/sbc/templates/24-sbc-trunk-agent.yaml");
+    for needle in [
+        "SBC_DAEMON_GRPC_TLS_CA_FILE",
+        "SBC_DAEMON_GRPC_TLS_CERT_FILE",
+        "SBC_DAEMON_GRPC_TLS_KEY_FILE",
+        r#"include "sbc.daemonGrpcUrl" ."#,
+    ] {
+        assert!(
+            agent.contains(needle),
+            "24-sbc-trunk-agent.yaml lacks {needle}"
+        );
+    }
+    assert!(
+        !agent.contains("value: \"http://{{ include \"sbc.fullname\" . }}-grpc."),
+        "the agent URL must follow grpcMtls (sbc.daemonGrpcUrl), not hard-coded http"
+    );
+}
+
+#[test]
+fn qa_helm_sbc_media_binds_loopback() {
+    let deploy = read_repo("deploy/helm/sbc/templates/12-sbc-deployment.yaml");
+    let at = deploy
+        .find("- name: SBC_MEDIA_GRPC_LISTEN")
+        .expect("SBC_MEDIA_GRPC_LISTEN env");
+    let value = deploy[at..].lines().nth(1).unwrap().trim();
+    assert_eq!(value, "value: \"127.0.0.1:9096\"");
+    assert!(
+        !deploy.contains("containerPort: 9096"),
+        "the loopback media controller port is not advertised"
+    );
+}
+
+#[test]
+fn qa_helm_networkpolicy_template_present() {
+    let path = "deploy/helm/sbc/templates/28-sbc-networkpolicy.yaml";
+    assert!(repo_path(path).exists(), "{path} missing");
+    let np = read_repo(path);
+    assert!(np.contains("kind: NetworkPolicy"));
+    assert!(
+        np.contains(".Values.networkPolicy.enabled"),
+        "values switch"
+    );
+    assert!(np.contains("policyTypes"), "policyTypes");
+    assert!(np.contains("- Ingress"), "Ingress policy type");
+    assert!(np.contains("-default-deny"), "default-deny baseline");
+    let at = np.find("9091").expect("daemon gRPC rule");
+    let rule = &np[at.saturating_sub(800)..(at + 800).min(np.len())];
+    assert!(
+        rule.contains("sbc.apiSelectorLabels"),
+        "9091 is admitted from sbc-api pods: {rule}"
+    );
+}
+
+#[test]
+fn qa_helm_provision_trusted_proxies_rendered() {
+    let prov = read_repo("deploy/helm/sbc/templates/19-sbc-provision.yaml");
+    assert!(
+        prov.contains("SBC_TRUSTED_PROXIES"),
+        "19-sbc-provision.yaml"
+    );
+    assert!(prov.contains(".Values.sbcProvision.trustedProxies"));
+    let values = read_repo("deploy/helm/sbc/values.yaml");
+    let start = values
+        .find("\nsbcProvision:\n")
+        .expect("sbcProvision block");
+    // The sbcProvision block runs until the next top-level key.
+    let block = values[start + 1..]
+        .lines()
+        .enumerate()
+        .take_while(|(i, l)| *i == 0 || l.is_empty() || l.starts_with([' ', '#']))
+        .map(|(_, l)| l)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        block.contains("trustedProxies:"),
+        "sbcProvision.trustedProxies value"
+    );
+}
+
+#[test]
+fn qa_central_chart_has_no_default_db_password() {
+    let values = read_repo("deploy/helm/central-config/values.yaml");
+    for line in values.lines() {
+        let t = line.split('#').next().unwrap().trim();
+        if let Some(v) = t.strip_prefix("password:") {
+            let v = v.trim().trim_matches('"').trim_matches('\'');
+            assert!(
+                v.is_empty(),
+                "central-config default password must be empty: {line}"
+            );
+        }
+    }
+    assert!(!values.contains("\"change-me\""), "no change-me default");
+    for tpl in ["11-postgres-cnpg.yaml", "10-postgres.yaml"] {
+        let t = read_repo(&format!("deploy/helm/central-config/templates/{tpl}"));
+        assert!(
+            !t.contains("default \"change-me\""),
+            "{tpl} defaults the password"
+        );
+        assert!(t.contains("required"), "{tpl} must require a password");
+        assert!(
+            t.contains("change-me"),
+            "{tpl} must refuse the change-me placeholder"
+        );
+    }
+}
+
+#[test]
+fn qa_central_cnpg_dsn_verify_full() {
+    let t = read_repo("deploy/helm/central-config/templates/11-postgres-cnpg.yaml");
+    let dsns: Vec<&str> = t.lines().filter(|l| l.contains("postgres://")).collect();
+    assert!(dsns.len() >= 2, "rw and ro DSNs: {dsns:?}");
+    for l in dsns {
+        assert!(l.contains("sslmode=verify-full"), "{l}");
+        assert!(l.contains("sslrootcert="), "{l}");
+    }
+}
+
+#[test]
+fn qa_keycloak_config_admin_scope_role_bound() {
+    let realm: serde_json::Value = serde_json::from_str(&read_repo(
+        "deploy/keycloak/dcim-central-config-partial-import.json",
+    ))
+    .expect("realm JSON");
+    let mappings = realm["scopeMappings"]
+        .as_array()
+        .expect("scopeMappings: config-admin must be bound to a role");
+    assert!(
+        mappings.iter().any(|m| m["clientScope"] == "config-admin"
+            && m["roles"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|x| x == "fleet-admin"))),
+        "config-admin scope mapped to role fleet-admin: {mappings:?}"
+    );
+    for client in realm["clients"].as_array().expect("clients") {
+        let id = client["clientId"].as_str().unwrap_or_default();
+        let has = |k: &str| {
+            client[k]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|s| s == "config-admin"))
+        };
+        assert!(
+            !has("defaultClientScopes"),
+            "{id}: config-admin must not be a default scope"
+        );
+        if id == "usg-uc-config-admin" {
+            assert!(
+                has("optionalClientScopes"),
+                "{id} offers config-admin as optional"
+            );
+        } else {
+            assert!(
+                !has("optionalClientScopes"),
+                "{id} must not offer config-admin"
+            );
+        }
+    }
+}
+
+/// Client-address trust is refused at render time when the NetworkPolicy
+/// that makes it sound is off (`trustedProxies`) or the frontend edge is
+/// open (`realIpFrom`). Text check; `helm_render` renders it.
+#[test]
+fn helm_client_address_preflight_present() {
+    let helpers = read_repo("deploy/helm/sbc/templates/_helpers.tpl");
+    let define = helm_define(&helpers, "sbc.clientAddressPreflight").expect("preflight helper");
+    for needle in [
+        ".Values.sbcProvision.trustedProxies",
+        ".Values.sbcApi.trustedProxies",
+        "trustedProxiesWithoutPolicy",
+        ".Values.sbcFrontend.realIpFrom",
+        "edgeFrom",
+        "fail",
+    ] {
+        assert!(define.contains(needle), "{needle} in {define}");
+    }
+    let services = read_repo("deploy/helm/sbc/templates/13-sbc-services.yaml");
+    assert!(services.contains(r#"include "sbc.clientAddressPreflight" ."#));
+    let values = read_repo("deploy/helm/sbc/values.yaml");
+    assert!(values.contains("trustedProxiesWithoutPolicy: false"));
+}
+
+/// DSN passwords are percent-encoded; the raw value stays in `password`.
+#[test]
+fn central_dsn_password_url_encoded() {
+    for tpl in ["10-postgres.yaml", "11-postgres-cnpg.yaml"] {
+        let t = read_repo(&format!("deploy/helm/central-config/templates/{tpl}"));
+        assert!(t.contains("urlquery"), "{tpl}");
+        for l in t.lines().filter(|l| l.contains("postgres://")) {
+            assert!(l.contains("$passUrl"), "{tpl}: {l}");
         }
     }
 }
