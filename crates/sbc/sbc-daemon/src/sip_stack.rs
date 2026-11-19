@@ -7884,10 +7884,11 @@ impl SipStack {
                 Ok(true)
             }
             DigestVerdict::Stale => {
-                // A valid digest on an old nonce: the password was right.
-                if !in_backoff {
-                    lock_leaf(&digest.throttle).record_success(&creds.username);
-                }
+                // A correct digest on an old nonce proves nothing fresh: it
+                // can be a copy of an earlier request. It neither resets
+                // nor adds to the user's failure count; only a correct
+                // response on a fresh nonce (`Ok`) resets it.
+                // NIST 800-53 Rev5: AC-7
                 Err(reject(DigestOutcome::Stale))
             }
             DigestVerdict::Reject(proto_sip::digest_verifier::DigestReject::BadResponse)
@@ -27720,12 +27721,7 @@ pub mod tests {
         let cap = uc_audit::capture::start();
         let www = digest_challenge(&stack, "alice", 1).await;
         let nonce = www_param(&www, "nonce").unwrap();
-        stack
-            .digest
-            .as_ref()
-            .unwrap()
-            .clock_skew_secs
-            .store(301, Ordering::Relaxed);
+        age_digest_nonces(&stack);
         let r = register_with(
             &stack,
             "alice",
@@ -28187,6 +28183,178 @@ pub mod tests {
             3,
             "counted from zero again"
         );
+    }
+
+    /// Ages every nonce issued so far past the configured nonce lifetime
+    /// (`digest_nonce_ttl_secs`, at least 1 s as in `SipStack::new`).
+    fn age_digest_nonces(stack: &SipStack) {
+        let past_ttl = stack.config.digest_nonce_ttl_secs.max(1) + 1;
+        stack
+            .digest
+            .as_ref()
+            .unwrap()
+            .clock_skew_secs
+            .store(past_ttl, Ordering::Relaxed);
+    }
+
+    /// A random fixture password with no literal part (keeps test secrets
+    /// out of static analysis findings for hard-coded credentials).
+    fn random_secret() -> String {
+        rand::random::<u128>().to_string()
+    }
+
+    /// AC-7 (POA&M-316): a correct response on a stale nonce (for example
+    /// a captured Authorization sent again later) does not clear the
+    /// username's failure count. Wrong responses on either side of it add
+    /// up and open the backoff window.
+    #[tokio::test]
+    async fn digest_register_stale_nonce_response_keeps_failure_count() {
+        use crate::digest_throttle::FREE_FAILURES;
+        let pw = random_secret();
+        let wrong = random_secret();
+        let stack = digest_stack(&pw, &random_secret());
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+
+        // A correct Authorization on an early nonce, held back for later.
+        let www = digest_challenge(&stack, "alice", 1).await;
+        let early = www_param(&www, "nonce").unwrap();
+        let held = sha256_auth("alice", &pw, &early, "sip:sbc.local", 1);
+
+        for i in 0..FREE_FAILURES {
+            let r = digest_attempt(&stack, src, "alice", &wrong, 10 + i * 2).await;
+            assert!(responded(&r, 401).is_some(), "{r:?}");
+        }
+        let digest = stack.digest.as_ref().unwrap();
+        assert!(!lock_leaf(&digest.throttle).is_blocked("alice", true, Instant::now()));
+
+        // The held Authorization, now on a stale nonce.
+        age_digest_nonces(&stack);
+        let r = register_with(&stack, "alice", 30, &held).await;
+        let (resp, _) = responded(&r, 401).expect("401");
+        assert!(
+            resp.headers
+                .get_value(&HeaderName::WwwAuthenticate)
+                .is_some_and(|w| w.contains("stale=true")),
+            "{r:?}"
+        );
+        assert_eq!(digest_count(&stack, "stale"), 1);
+        // Not a failure either: no window yet.
+        assert!(!lock_leaf(&digest.throttle).is_blocked("alice", true, Instant::now()));
+
+        // One more wrong response opens the window.
+        let r = digest_attempt(&stack, src, "alice", &wrong, 40).await;
+        assert!(responded(&r, 401).is_some(), "{r:?}");
+        assert!(
+            lock_leaf(&digest.throttle).is_blocked("alice", true, Instant::now()),
+            "the stale-nonce response must not reset the failure count"
+        );
+        let r = digest_attempt(&stack, src, "alice", &pw, 42).await;
+        assert!(responded(&r, 200).is_none(), "{r:?}");
+        assert_eq!(digest_count(&stack, "throttled"), 1);
+    }
+
+    /// AC-7 (POA&M-316): a client whose nonce went stale answers the
+    /// `stale=true` challenge on the fresh nonce; that success clears the
+    /// failure count as before.
+    #[tokio::test]
+    async fn digest_register_fresh_nonce_after_stale_resets_failure_count() {
+        use crate::digest_throttle::FREE_FAILURES;
+        let pw = random_secret();
+        let wrong = random_secret();
+        let stack = digest_stack(&pw, &random_secret());
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+
+        let www = digest_challenge(&stack, "alice", 1).await;
+        let early = www_param(&www, "nonce").unwrap();
+        for i in 0..FREE_FAILURES {
+            let r = digest_attempt(&stack, src, "alice", &wrong, 10 + i * 2).await;
+            assert!(responded(&r, 401).is_some(), "{r:?}");
+        }
+        let digest = stack.digest.as_ref().unwrap();
+        assert_eq!(lock_leaf(&digest.throttle).tracked(), 1);
+
+        age_digest_nonces(&stack);
+        let r = register_with(
+            &stack,
+            "alice",
+            30,
+            &sha256_auth("alice", &pw, &early, "sip:sbc.local", 1),
+        )
+        .await;
+        let (resp, _) = responded(&r, 401).expect("401");
+        let www = resp
+            .headers
+            .get_value(&HeaderName::WwwAuthenticate)
+            .expect("challenge")
+            .to_string();
+        assert!(www.contains("stale=true"), "{www}");
+        let fresh = www_param(&www, "nonce").unwrap();
+        assert_ne!(fresh, early);
+
+        let r = register_with(
+            &stack,
+            "alice",
+            32,
+            &sha256_auth("alice", &pw, &fresh, "sip:sbc.local", 1),
+        )
+        .await;
+        assert!(responded(&r, 200).is_some(), "{r:?}");
+        assert_eq!(lock_leaf(&digest.throttle).tracked(), 0, "count cleared");
+
+        // Counted from zero again: one wrong response opens no window.
+        let r = digest_attempt(&stack, src, "alice", &wrong, 40).await;
+        assert!(responded(&r, 401).is_some(), "{r:?}");
+        assert!(!lock_leaf(&digest.throttle).is_blocked("alice", true, Instant::now()));
+        assert_eq!(digest_count(&stack, "throttled"), 0);
+    }
+
+    /// AC-7 (POA&M-316): a correct response on a stale nonce from the
+    /// registered source inside a backoff window gets `stale=true`, gives
+    /// its exemption unit back and does not reset the failure count.
+    #[tokio::test]
+    async fn digest_register_stale_nonce_through_exemption_keeps_budget_and_count() {
+        use crate::digest_throttle::{EXEMPT_FAILURES, FREE_FAILURES};
+        let pw = random_secret();
+        let wrong = random_secret();
+        let stack = digest_stack(&pw, &random_secret());
+        let phone = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 0, 2, 10), 5060);
+        let digest = stack.digest.as_ref().unwrap();
+
+        let r = digest_attempt(&stack, phone, "alice", &pw, 1).await;
+        assert!(responded(&r, 200).is_some(), "{r:?}");
+        let www = digest_challenge(&stack, "alice", 3).await;
+        let early = www_param(&www, "nonce").unwrap();
+        let held = sha256_auth("alice", &pw, &early, "sip:sbc.local", 1);
+        // A window of minutes, opened directly (the first ones last 1 s).
+        for _ in 0..(FREE_FAILURES + 9) {
+            lock_leaf(&digest.throttle).record_failure("alice", true, Instant::now());
+        }
+
+        age_digest_nonces(&stack);
+        let r = flatten(
+            stack
+                .process_message(&digest_register("alice", 10, Some(&held)), phone, None)
+                .await,
+        );
+        let (resp, _) = responded(&r, 401).expect("401");
+        assert!(
+            resp.headers
+                .get_value(&HeaderName::WwwAuthenticate)
+                .is_some_and(|w| w.contains("stale=true")),
+            "{r:?}"
+        );
+        assert_eq!(digest_count(&stack, "stale"), 1);
+        assert_eq!(digest_count(&stack, "throttled"), 0);
+        // Count not reset: the window is still open.
+        assert!(lock_leaf(&digest.throttle).is_blocked("alice", true, Instant::now()));
+        // The unit was given back: the whole budget is still there.
+        for i in 0..EXEMPT_FAILURES {
+            assert!(lock_leaf(&digest.throttle).exemption_open("alice", true));
+            let r = digest_attempt(&stack, phone, "alice", &wrong, 20 + i * 2).await;
+            assert!(responded(&r, 401).is_some(), "{r:?}");
+        }
+        assert!(!lock_leaf(&digest.throttle).exemption_open("alice", true));
+        assert_eq!(digest_count(&stack, "throttled"), 0);
     }
 
     /// SEC-001: the backoff cannot be used to cut off a registered phone.
