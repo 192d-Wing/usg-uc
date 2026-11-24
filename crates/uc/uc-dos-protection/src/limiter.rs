@@ -1049,12 +1049,18 @@ mod tests {
         // First 5 requests should be allowed (burst)
         for _ in 0..5 {
             let action = limiter.check(ip);
-            assert!(action.is_allowed(), "Expected allowed, got {action:?}");
+            assert!(
+                action.is_allowed(),
+                "expected the request within the burst to be allowed"
+            );
         }
 
         // Next request should be rejected (out of tokens)
         let action = limiter.check(ip);
-        assert!(action.is_rejected(), "Expected rejected, got {action:?}");
+        assert!(
+            action.is_rejected(),
+            "expected the request past the burst to be rejected"
+        );
     }
 
     #[test]
@@ -1463,7 +1469,10 @@ mod sr55_tests {
         for _ in 0..1_000 {
             let outcome = limiter.check_outcome(src);
             assert!(!outcome.block_started);
-            assert!(!is_block(outcome.action), "{:?}", outcome.action);
+            assert!(
+                !is_block(outcome.action),
+                "auto-block disabled: no block expected"
+            );
             if outcome.action == RateLimitAction::Reject {
                 rejects += 1;
             }
@@ -1508,7 +1517,10 @@ mod sr55_tests {
         for i in 0..5_000 {
             let outcome = limiter.check_outcome(t);
             assert!(!outcome.block_started);
-            assert!(!is_block(outcome.action), "check {i}: {:?}", outcome.action);
+            assert!(
+                !is_block(outcome.action),
+                "trusted source must never be blocked (check {i})"
+            );
             if i < 50 {
                 assert!(outcome.action.is_allowed(), "check {i} within burst");
             } else if outcome.action == RateLimitAction::Reject {
