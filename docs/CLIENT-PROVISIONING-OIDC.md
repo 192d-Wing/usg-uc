@@ -428,7 +428,7 @@ Check: decode a token from `Get-TestToken.ps1`; the header must show
 
 Tokens must carry `exp`, `iss` and `aud`; `nbf` is checked when present
 (30 s leeway, at most 300 s). A `crit` header, a header `typ` other than
-`JWT` / `at+jwt`, and a Keycloak `typ` claim other than `Bearer` (ID,
+`JWT` / `at+jwt` (also as `application/jwt` / `application/at+jwt`, case-insensitive), and a Keycloak `typ` claim other than `Bearer` (ID,
 refresh and logout tokens) are refused, as is a JWKS entry whose `use` is
 not `sig` or whose `key_ops` lacks `verify`. An empty issuer or audience
 set is refused when the validator is built: sbc-client-config-server exits

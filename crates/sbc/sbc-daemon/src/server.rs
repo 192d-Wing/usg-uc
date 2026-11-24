@@ -714,8 +714,18 @@ impl Server {
         if !bearer_mode_active(&mode) {
             return Ok(None);
         }
-        let fail = |reason: String| {
+        // `audit_reason` goes to the audit trail and must not carry a path
+        // or URL. NIST 800-53 Rev5: AU-2, AU-12 (startup refusal audited)
+        let fail = |audit_reason: &str, reason: String| {
             error!(error = %reason, "bearer REGISTER authentication cannot start — SBC cannot start");
+            uc_audit::log_event(uc_audit::AuditEvent::CryptoKeyOperation(
+                uc_audit::event::CryptoKeyOperation::failure(
+                    BEARER_AUDIT_KEY_ID,
+                    uc_audit::event::KeyOperationType::Loaded,
+                    "ES384",
+                    audit_reason,
+                ),
+            ));
             RuntimeError::InitFailed {
                 component: "bearer_auth".to_string(),
                 reason,
@@ -726,6 +736,7 @@ impl Server {
             Some(v) if !v.trim().is_empty() => v.trim().trim_end_matches('/').to_string(),
             _ => {
                 return Err(fail(
+                    "missing issuer",
                     "SBC_AUTH_MODE=bearer requires SBC_OIDC_ISSUER".to_string(),
                 ));
             }
@@ -739,6 +750,7 @@ impl Server {
             .collect();
         if audiences.is_empty() {
             return Err(fail(
+                "empty audience",
                 "SBC_OIDC_AUDIENCE resolved to an empty set".to_string(),
             ));
         }
@@ -754,22 +766,27 @@ impl Server {
             && !path.trim().is_empty()
         {
             let pem = std::fs::read(&path).map_err(|e| {
-                fail(format!(
-                    "failed to read SBC_OIDC_EXTRA_CA_CERT_FILE {path}: {e}"
-                ))
+                fail(
+                    "extra CA file unreadable",
+                    format!("failed to read SBC_OIDC_EXTRA_CA_CERT_FILE {path}: {e}"),
+                )
             })?;
             let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
-                fail(format!(
-                    "failed to parse SBC_OIDC_EXTRA_CA_CERT_FILE {path}: {e}"
-                ))
+                fail(
+                    "extra CA file invalid",
+                    format!("failed to parse SBC_OIDC_EXTRA_CA_CERT_FILE {path}: {e}"),
+                )
             })?;
             info!(path, "loaded extra CA certificate for IdP JWKS fetch");
             http_builder = http_builder.add_root_certificate(cert);
         }
 
-        let http = http_builder
-            .build()
-            .map_err(|e| fail(format!("failed to build IdP HTTP client: {e}")))?;
+        let http = http_builder.build().map_err(|e| {
+            fail(
+                "IdP HTTP client",
+                format!("failed to build IdP HTTP client: {e}"),
+            )
+        })?;
 
         let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer.clone()));
         // NIST 800-53 Rev5: IA-2, AC-3 (non-empty iss/aud enforced)
@@ -778,7 +795,12 @@ impl Server {
             proto_jwt::ValidatorConfig::new(issuer.clone(), audiences.clone()),
         )
         .map(Arc::new)
-        .map_err(|e| fail(format!("invalid OIDC validator config: {e}")))?;
+        .map_err(|e| {
+            fail(
+                "invalid validator config",
+                format!("invalid OIDC validator config: {e}"),
+            )
+        })?;
         info!(
             %issuer,
             ?audiences,
@@ -5158,6 +5180,51 @@ mod tests {
         assert!(reason.contains("SBC_OIDC_EXTRA_CA_CERT_FILE"), "{reason}");
     }
 
+    // SEC-R1-01: a bearer startup refusal is audited as a failure, with a
+    // reason that carries no path or URL.
+    #[test]
+    fn bearer_startup_refusal_is_audited_as_a_failure() {
+        use uc_audit::event::{KeyOperationOutcome, KeyOperationType};
+        let issuer = ("SBC_OIDC_ISSUER", "https://idp.example.test/realms/voice");
+        for (vars, needle) in [
+            (vec![("SBC_AUTH_MODE", "bearer")], "missing issuer"),
+            (
+                vec![
+                    ("SBC_AUTH_MODE", "bearer"),
+                    issuer,
+                    ("SBC_OIDC_AUDIENCE", " , "),
+                ],
+                "empty audience",
+            ),
+            (
+                vec![
+                    ("SBC_AUTH_MODE", "bearer"),
+                    issuer,
+                    ("SBC_OIDC_EXTRA_CA_CERT_FILE", "/nonexistent/idp-ca.pem"),
+                ],
+                "extra CA file unreadable",
+            ),
+        ] {
+            let capture = uc_audit::capture::start();
+            let _ = bearer_auth_err(&vars);
+            let events: Vec<_> = capture
+                .events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    uc_audit::AuditEvent::CryptoKeyOperation(k) => Some(k),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(events.len(), 1, "{needle}: {events:?}");
+            let f = &events[0];
+            assert_eq!(f.key_id, BEARER_AUDIT_KEY_ID);
+            assert_eq!(f.operation, KeyOperationType::Loaded);
+            assert_eq!(f.outcome, KeyOperationOutcome::Failure);
+            let reason = f.reason.as_deref().unwrap_or_default();
+            assert_eq!(reason, needle);
+        }
+    }
+
     #[test]
     fn bearer_mode_with_issuer_builds_authenticator() {
         let built = Server::build_bearer_authenticator_from(
@@ -5646,3 +5713,6 @@ mod tests {
         wipe_wire_bytes(other);
     }
 }
+
+/// Audit `key_id` for bearer (OIDC) REGISTER authentication startup.
+const BEARER_AUDIT_KEY_ID: &str = "bearer_auth.oidc";

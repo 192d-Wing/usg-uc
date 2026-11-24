@@ -25,7 +25,7 @@ REGISTER), sbc-client-config-server, sbc-api-server and central-config-api.
 - **Tokens must carry `exp`, `iss` and `aud`; `nbf` is checked when
   present.** (IA-2) Previously `iss` and `aud` were checked only when
   present, and `nbf` was not checked. A token with a `crit` header, a
-  header `typ` other than `JWT` / `at+jwt`, or a Keycloak `typ` claim other
+  header `typ` other than `JWT` / `at+jwt` (also as `application/jwt` / `application/at+jwt`, case-insensitive), or a Keycloak `typ` claim other
   than `Bearer` (ID, refresh, logout tokens) is refused.
 - **An empty issuer or audience set is refused.** (IA-2) sbc-api-server and
   central-config-api fail to start; sbc-client-config-server exits with

@@ -922,6 +922,9 @@ mod tests {
             Some("jwt"),
             Some("at+jwt"),
             Some("AT+JWT"),
+            Some("application/jwt"),
+            Some("application/at+jwt"),
+            Some("Application/AT+JWT"),
         ] {
             let mut header = es384_header();
             header.typ = typ.map(str::to_string);
