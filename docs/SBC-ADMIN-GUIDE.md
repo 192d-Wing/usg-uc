@@ -187,7 +187,32 @@ first_message_timeout_secs = 30       # a new connection must send an accepted S
                                       # message within this (1..=tcp_idle_timeout_secs)
 tcp_idle_timeout_secs = 300           # idle limit afterwards (30..=3600)
 ws_require_sip_subprotocol = true     # refuse WS upgrades without `sip` (RFC 7118 §4)
+v6_aggregate_prefix_len = 48          # IPv6 aggregate for the caps below (32..=64)
+max_connections_per_v6_aggregate = 1024  # per IPv6 aggregate, all listeners (0 = off)
+max_connections_per_v4_24 = 1024      # per IPv4 /24, all listeners (0 = off)
 ```
+
+Aggregate caps (SR-58): every stream connection counts against its
+source (`max_connections_per_source`) and also against the source's IPv6
+`/v6_aggregate_prefix_len` prefix or IPv4 /24, so one delegated /56 or /48
+cannot rotate through its /64s and take the listener pools. The
+per-source cap is checked first. A connection refused at the aggregate is
+closed at accept and audited as `per_prefix_conn` (source = the aggregate
+prefix or /24 network, threshold = the cap). Only a
+`v6_aggregate_prefix_len` outside 32..=64 fails the load; a prefix longer
+than `rate_limit.ipv6_prefix_len` is clamped to it, and a non-zero cap
+outside `max_connections_per_source..=max_connections_per_listener` is
+clamped into that range, each with a `warn!` at startup.
+
+> **Tuning for NAT and enterprise sites:** with the defaults, more than
+> 1024 concurrent TCP/TLS/WS connections from one IPv4 /24 or one IPv6 /48
+> are refused. Size `max_connections_per_v4_24` above the phone count
+> behind a large enterprise NAT or carrier-grade NAT pool in one /24, and
+> `max_connections_per_v6_aggregate` above the phone count of a site
+> delegated one /48 (raise `max_connections_per_source` as well when the
+> phones share one NAT address or one /64). A cap of 0 turns that level
+> off. The caps apply to every prefix; there is no per-prefix override
+> (POA&M-455). Watch for `per_prefix_conn` audit records after a change.
 
 Before a connection's first accepted message (one that parses as SIP),
 bare CRLF keep-alives, partial-message drips and unparseable frames do

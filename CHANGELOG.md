@@ -447,6 +447,42 @@ release") and `deploy/keycloak/central-config-clients.md`.
   sidecars and the dashboard's npm tree.** GitHub Actions updates are
   grouped into one weekly PR.
 
+### Security (SBC, aggregate stream connection caps per IPv6 prefix and IPv4 /24, SR-58, POA&M-454, 455)
+
+Tested locally on macOS arm64 only (unit tests); no CI run yet.
+
+- **Stream connections are also capped per IPv6 aggregate and per IPv4
+  /24.** (SC-5, SC-7) Besides the per-source cap
+  (`transport.max_connections_per_source`, one IPv4 address or IPv6 /64),
+  every TCP, TLS and WebSocket connection now counts against its source's
+  IPv6 `/v6_aggregate_prefix_len` prefix or IPv4 /24. New `[transport]`
+  keys: `v6_aggregate_prefix_len` (default 48, valid 32..=64),
+  `max_connections_per_v6_aggregate` and `max_connections_per_v4_24`
+  (default 1024 each, 0 = off). Before, one delegated /56 could open 128
+  connections from each of its 256 /64s and take whole listener pools.
+  A connection over an aggregate cap is closed at accept and audited as
+  `RateLimitTriggered` with `limit_name = "per_prefix_conn"`, the
+  aggregate key as source (`2001:db8:1::` for a /48, `192.0.2.0` for a
+  /24) and the cap as threshold.
+- **Behaviour change: large sites behind one prefix.** An enterprise NAT,
+  carrier-grade NAT or large site with more than 1024 concurrent stream
+  connections from one /48 or one IPv4 /24 is now refused past that
+  count. Raise the cap (or set it to 0) for such deployments; see
+  `docs/SBC-ADMIN-GUIDE.md` "Stream connection limits".
+- **Existing configs keep loading.** Only `v6_aggregate_prefix_len`
+  outside 32..=64 is rejected. A prefix longer than
+  `rate_limit.ipv6_prefix_len` is clamped to it, and a non-zero cap
+  outside `max_connections_per_source..=max_connections_per_listener` is
+  clamped into that range; both log a `warn!` at startup.
+- **POA&M-91 corrected.** Its text implied the rate limiter's shared
+  overflow bucket also bounded stream connections; it bounds rate-limited
+  messages only. The connection limiter had no aggregation before this
+  change. Rate-limiter prefix aggregation stays open under POA&M-91.
+- **Open items.** Rotation across many /48s or /24s is bounded only by
+  the listener and node pools, and no pool share is reserved for trunks
+  (POA&M-454, see also POA&M-453). The caps are static per prefix, with no
+  per-prefix override and no adaptive tightening under load (POA&M-455).
+
 ### Security (SBC, stream accept admission and accept errors; SR-22, SR-56, POA&M-440..443)
 
 Tested locally on macOS arm64 only; no CI run yet.

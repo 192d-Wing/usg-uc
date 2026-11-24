@@ -74,14 +74,29 @@ mod sr58_aggregate_keys {
         assert_eq!(defaults.transport.max_connections_per_v6_aggregate, 1024);
         assert_eq!(defaults.transport.max_connections_per_v4_24, 1024);
 
-        // Cross-section check: aggregate narrower than the per-source key.
-        assert!(
-            load_from_str(
-                "[rate_limit]\nipv6_prefix_len = 48\n[transport]\nudp_listen = \
-                 [\"0.0.0.0:5060\"]\nv6_aggregate_prefix_len = 56\n"
-            )
-            .is_err()
+        // Cross-section: an aggregate narrower than the per-source key
+        // still loads (configs that loaded before keep loading) and is
+        // clamped to the per-source prefix.
+        let clamped = load_from_str(
+            "[rate_limit]\nipv6_prefix_len = 48\n[transport]\nudp_listen = \
+             [\"0.0.0.0:5060\"]\nv6_aggregate_prefix_len = 56\n",
+        )
+        .unwrap();
+        assert_eq!(
+            clamped
+                .transport
+                .effective_v6_aggregate_prefix_len(clamped.rate_limit.ipv6_prefix_len),
+            48
         );
+        // Explicitly invalid prefixes are rejected.
+        for bad in [30, 72] {
+            assert!(
+                load_from_str(&format!(
+                    "[transport]\nudp_listen = [\"0.0.0.0:5060\"]\nv6_aggregate_prefix_len = {bad}\n"
+                ))
+                .is_err()
+            );
+        }
     }
 }
 

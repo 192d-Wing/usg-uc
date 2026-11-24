@@ -759,8 +759,10 @@ impl RateLimiter {
             // Still full: charge the shared overflow bucket instead of
             // rejecting outright, so genuinely new sources keep a share of
             // service during a flood. The overflow bucket never blocks.
-            // POAM: POA&M-91 — /48-scale IPv6 rotation is bounded only by
-            // this bucket; no adaptive prefix aggregation (SC-5).
+            // POAM: POA&M-91 — in this rate limiter, /48-scale IPv6
+            // rotation is bounded only by this bucket; no adaptive prefix
+            // aggregation (SC-5). Stream connections have their own
+            // aggregate caps in sbc-daemon `conn_limit.rs` (SR-58).
             if self.buckets.len() >= self.config.max_tracked_sources {
                 let (allowed, _) = self
                     .overflow_bucket

@@ -584,6 +584,16 @@ fn validate_stream_limits(config: &crate::schema::TransportConfig) -> ConfigResu
         config.first_message_timeout_secs,
         1,
         config.tcp_idle_timeout_secs,
+    )?;
+    // SR-58: only an explicitly invalid prefix is rejected. A prefix longer
+    // than `rate_limit.ipv6_prefix_len`, and aggregate caps outside
+    // per-source..=per-listener, are clamped (warned at daemon startup) so
+    // configs that loaded before these keys keep loading.
+    check_range(
+        "transport.v6_aggregate_prefix_len",
+        config.v6_aggregate_prefix_len,
+        32,
+        64,
     )
 }
 
@@ -5214,8 +5224,9 @@ mod sr56_accept_admission_keys {
 }
 
 /// SR-58: `[transport]` aggregate connection-cap keys, driven through the
-/// TOML loader only (existing API). Before the keys exist they are
-/// silently ignored, so the rejection cases fail on assertion.
+/// TOML loader. Only an explicitly invalid prefix (outside 32..=64) is
+/// rejected; everything else that loaded before keeps loading and is
+/// clamped to its effective value (D2 compatibility decision).
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod sr58_aggregate_keys_toml {
@@ -5231,25 +5242,64 @@ mod sr58_aggregate_keys_toml {
     fn v6_aggregate_prefix_out_of_range_rejected() {
         // Below 32.
         assert!(load("", "v6_aggregate_prefix_len = 30").is_err());
-        // Longer than the per-source key (rate_limit.ipv6_prefix_len 64):
-        // the aggregate must not be narrower than the source it contains.
+        // Above 64: an aggregate narrower than a /64 is explicitly invalid.
         assert!(load("", "v6_aggregate_prefix_len = 72").is_err());
-        // Cross-section: a /56 aggregate under a /48 per-source key.
-        assert!(load("ipv6_prefix_len = 48", "v6_aggregate_prefix_len = 56").is_err());
     }
 
     #[test]
-    fn aggregate_caps_below_per_source_rejected() {
+    fn v6_aggregate_prefix_longer_than_per_source_clamped() {
+        // Cross-section: a /56 aggregate under a /48 per-source key loads,
+        // and the aggregate in effect is the /48 (it must contain its
+        // sources).
+        let c = load("ipv6_prefix_len = 48", "v6_aggregate_prefix_len = 56").unwrap();
+        assert_eq!(c.transport.v6_aggregate_prefix_len, 56);
+        assert_eq!(
+            c.transport
+                .effective_v6_aggregate_prefix_len(c.rate_limit.ipv6_prefix_len),
+            48
+        );
+        // Not clamped when it fits.
+        let c = load("", "v6_aggregate_prefix_len = 56").unwrap();
+        assert_eq!(
+            c.transport
+                .effective_v6_aggregate_prefix_len(c.rate_limit.ipv6_prefix_len),
+            56
+        );
+    }
+
+    #[test]
+    fn aggregate_caps_below_per_source_clamped() {
         // Default per-source 128.
-        assert!(load("", "max_connections_per_v6_aggregate = 64").is_err());
-        assert!(load("", "max_connections_per_v4_24 = 64").is_err());
+        let c = load("", "max_connections_per_v6_aggregate = 64").unwrap();
+        assert_eq!(
+            c.transport.effective_max_connections_per_v6_aggregate(),
+            128
+        );
+        let c = load("", "max_connections_per_v4_24 = 64").unwrap();
+        assert_eq!(c.transport.effective_max_connections_per_v4_24(), 128);
     }
 
     #[test]
-    fn aggregate_caps_above_listener_pool_rejected() {
+    fn aggregate_caps_above_listener_pool_clamped() {
         // Default listener pool 10,000.
-        assert!(load("", "max_connections_per_v6_aggregate = 10001").is_err());
-        assert!(load("", "max_connections_per_v4_24 = 10001").is_err());
+        let c = load("", "max_connections_per_v6_aggregate = 10001").unwrap();
+        assert_eq!(
+            c.transport.effective_max_connections_per_v6_aggregate(),
+            10_000
+        );
+        let c = load("", "max_connections_per_v4_24 = 10001").unwrap();
+        assert_eq!(c.transport.effective_max_connections_per_v4_24(), 10_000);
+    }
+
+    #[test]
+    fn aggregate_caps_zero_and_in_range_not_clamped() {
+        let c = load(
+            "",
+            "max_connections_per_v6_aggregate = 0\nmax_connections_per_v4_24 = 2048",
+        )
+        .unwrap();
+        assert_eq!(c.transport.effective_max_connections_per_v6_aggregate(), 0);
+        assert_eq!(c.transport.effective_max_connections_per_v4_24(), 2048);
     }
 
     /// Guards (pass before and after): valid values still load.
@@ -5283,22 +5333,68 @@ mod sr58_aggregate_keys_api {
         assert_eq!(c.transport.max_connections_per_v4_24, 1024);
         validate_config(&c).unwrap();
 
-        let cases: Vec<fn(&mut SbcConfig)> = vec![
-            |c| c.transport.v6_aggregate_prefix_len = 30,
-            |c| c.transport.v6_aggregate_prefix_len = 72,
-            |c| {
-                c.rate_limit.ipv6_prefix_len = 48;
-                c.transport.v6_aggregate_prefix_len = 56;
-            },
-            |c| c.transport.max_connections_per_v6_aggregate = 127,
-            |c| c.transport.max_connections_per_v4_24 = 127,
-            |c| c.transport.max_connections_per_v6_aggregate = 10_001,
-            |c| c.transport.max_connections_per_v4_24 = 10_001,
-        ];
+        let cases: Vec<fn(&mut SbcConfig)> =
+            vec![|c| c.transport.v6_aggregate_prefix_len = 30, |c| {
+                c.transport.v6_aggregate_prefix_len = 72
+            }];
         for (i, mutate) in cases.into_iter().enumerate() {
             let mut c = SbcConfig::default();
             mutate(&mut c);
             assert!(validate_config(&c).is_err(), "case {i} should fail");
+        }
+
+        // Valid, clamped to their effective values (D2 compatibility
+        // decision): (mutate, effective prefix, effective v6 cap,
+        // effective v4 cap).
+        let clamped: Vec<(fn(&mut SbcConfig), u8, u32, u32)> = vec![
+            (
+                |c| {
+                    c.rate_limit.ipv6_prefix_len = 48;
+                    c.transport.v6_aggregate_prefix_len = 56;
+                },
+                48,
+                1024,
+                1024,
+            ),
+            (
+                |c| c.transport.max_connections_per_v6_aggregate = 127,
+                48,
+                128,
+                1024,
+            ),
+            (
+                |c| c.transport.max_connections_per_v4_24 = 127,
+                48,
+                1024,
+                128,
+            ),
+            (
+                |c| c.transport.max_connections_per_v6_aggregate = 10_001,
+                48,
+                10_000,
+                1024,
+            ),
+            (
+                |c| c.transport.max_connections_per_v4_24 = 10_001,
+                48,
+                1024,
+                10_000,
+            ),
+        ];
+        for (i, (mutate, prefix, v6, v4)) in clamped.into_iter().enumerate() {
+            let mut c = SbcConfig::default();
+            mutate(&mut c);
+            assert!(validate_config(&c).is_ok(), "clamped case {i} should load");
+            let t = &c.transport;
+            assert_eq!(
+                (
+                    t.effective_v6_aggregate_prefix_len(c.rate_limit.ipv6_prefix_len),
+                    t.effective_max_connections_per_v6_aggregate(),
+                    t.effective_max_connections_per_v4_24(),
+                ),
+                (prefix, v6, v4),
+                "clamped case {i}"
+            );
         }
 
         let ok: Vec<fn(&mut SbcConfig)> = vec![
