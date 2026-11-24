@@ -427,6 +427,54 @@ release") and `deploy/keycloak/central-config-clients.md`.
   sidecars and the dashboard's npm tree.** GitHub Actions updates are
   grouped into one weekly PR.
 
+### Security (SBC, sbc-api admin login lockout, POA&M-420, 421, 422)
+
+Affects `POST /api/v1/auth/login` (local admin password) only. OIDC SSO and
+API keys are unchanged. Tested in local runs on macOS. Operator details:
+`docs/API-REFERENCE.md` "Admin login" and `deploy/helm/sbc/DEPLOYING.md`.
+
+- **Behaviour change: longer lockout windows and a lock for the account.**
+  (AC-7) Before: 5 failures per client IP per 60 s. Now: 5 failures per
+  client IP and 10 failures from all sources together, each per 15 min
+  window. A window opens at the first failure, and a lock ends when its
+  window ends; no admin action is needed. A successful login resets the
+  counts for its IP and for the account. One source cannot lock the
+  account by itself. Failures count against the account whatever username
+  was submitted. Without `sbcApi.trustedProxies`, every client behind nginx
+  shares one IP bucket, so 5 failures by anyone lock the admin login for
+  up to 15 min (was 60 s).
+- **Concurrent guesses are counted exactly.** (AC-7) A failure is reserved
+  before the password is hashed. Parallel requests from one IP no longer
+  get more than 5 verifications per window.
+- **IPv6 clients are counted per /64.** IPv4-mapped IPv6 addresses count as
+  the IPv4 address. At most 4096 IPs are tracked; beyond that, new IPs share
+  one overflow bucket with the same limits (POA&M-422).
+- **Password verification is bounded.** (SC-5) At most 4 argon2 checks run
+  at once. The count is lowered at startup when the `SBC_ADMIN_PASSWORD_HASH`
+  memory cost (`m=`) times the slots would exceed 96 MiB; sbc-api logs a
+  warning when it does. With no free slot the login gets 429
+  `{"error":"login busy, retry shortly"}` with `Retry-After: 1`, and is not
+  counted.
+- **New login responses.** (SI-10, SC-5) `400 {"error":"invalid credentials
+  format"}` for a username over 256 bytes or a password over 1024 bytes (an
+  admin password longer than 1024 bytes can no longer log in); `413` for a
+  request body over 4 KiB (was axum's 2 MB default). Neither is counted.
+  The lockout 429 keeps its body and now carries `Retry-After` with the
+  seconds left in the window (RFC 6585 §4, RFC 9110 §10.2.3). 200 and 401
+  are unchanged.
+- **Logs.** sbc-api logs a `warn` with `client_ip` and `scope` (`ip`,
+  `ip-overflow` or `account`) when a bucket locks; no username. The failed
+  login line keeps the username, truncated to 64 characters. No audit
+  event, CDR or config schema change.
+- **Known limits.** Limits are kept per sbc-api replica and cleared on
+  restart, so N replicas allow N times the guesses (POA&M-420). Two or more
+  sources can keep the local admin login locked, one window after another
+  (POA&M-421, accepted risk; OIDC and API keys still work). A single stored
+  hash with `m=` above 96 MiB still exceeds the budget with 1 slot
+  (POA&M-422).
+- `sbc-api-server` dev-dependency: `tokio` feature `test-util` (paused clock
+  in tests). No new crate; `Cargo.lock` is unchanged.
+
 ### Security (client, SIP connect, DNS and send deadlines; RFC 4733 receive bounds; POA&M-374, 375, 377, 378)
 
 Tested locally on macOS arm64 only; no CI run yet.

@@ -20,6 +20,7 @@ mod authmw;
 mod config;
 mod ha1_key;
 mod handlers;
+mod login_guard;
 mod state;
 
 #[tokio::main(flavor = "multi_thread")]

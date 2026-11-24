@@ -19,6 +19,21 @@ curl -H "Authorization: Bearer <api-key>" \
   https://sbc.example.com:8443/api/v1/system/health
 ```
 
+### Admin login (`POST /api/v1/auth/login`)
+
+Body: `{"username": "...", "password": "..."}`. Responses:
+
+| Status | Body `error` | When |
+|---|---|---|
+| `200` | (token body) | Valid credentials. Returns `token`, `expires_in_secs` and an `sbc_session` cookie. Resets the failure counts. |
+| `400` | `invalid credentials format` | Username over 256 bytes or password over 1024 bytes. Not counted. |
+| `401` | `invalid credentials` | Wrong credentials. Counts as one failure. |
+| `413` | (none) | Request body over 4 KiB. Not counted. |
+| `429` | `too many login attempts, try again later` | The client IP has 5 failures, or all sources together have 10, in the current 15 min window. `Retry-After` is the seconds left in the window. |
+| `429` | `login busy, retry shortly` | All password-verification slots are in use. `Retry-After: 1`. Not counted. |
+
+Windows open at the first failure and are kept per sbc-api replica. The client IP is the TCP peer, or `X-Real-IP` when the peer is in `SBC_TRUSTED_PROXIES`. IPv6 clients are counted per /64. The number of verification slots (at most 4) is lowered at startup when the `SBC_ADMIN_PASSWORD_HASH` memory cost would exceed 96 MiB in total.
+
 ## API Versioning
 
 The API is versioned via URL path:
