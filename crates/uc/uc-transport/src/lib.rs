@@ -100,6 +100,42 @@ pub(crate) const fn canonical_peer(addr: std::net::SocketAddr) -> std::net::Sock
     std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+/// Reads one chunk of at most [`STREAM_READ_CHUNK`] bytes from a TCP or TLS
+/// stream into `buf` and splits it off as the returned `Bytes`.
+///
+/// Reads straight into the chunk buffer. The previous chunk was split off
+/// and, once the caller drops it, `reserve` reclaims the same allocation;
+/// `limit` keeps one read to one chunk.
+///
+/// ## Errors
+///
+/// `ReceiveFailed` on an I/O error; `ConnectionClosed` on EOF.
+///
+/// ## NIST 800-53 Rev5: SC-5 (one bounded chunk per read)
+#[cfg(any(feature = "tcp", feature = "tls"))]
+pub(crate) async fn read_stream_chunk<R>(
+    stream: &mut R,
+    buf: &mut bytes::BytesMut,
+) -> TransportResult<Bytes>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use bytes::BufMut;
+    use tokio::io::AsyncReadExt;
+
+    buf.reserve(STREAM_READ_CHUNK);
+    let n = stream
+        .read_buf(&mut (&mut *buf).limit(STREAM_READ_CHUNK))
+        .await
+        .map_err(|e| TransportError::ReceiveFailed {
+            reason: e.to_string(),
+        })?;
+    if n == 0 {
+        return Err(TransportError::ConnectionClosed);
+    }
+    Ok(buf.split().freeze())
+}
+
 /// Reports that a dual-stack test cannot run on this host. Skips (returns)
 /// normally; panics instead when `UC_REQUIRE_DUAL_STACK=1`, so a CI job
 /// that sets it cannot pass the canonical-peer tests by skipping them.

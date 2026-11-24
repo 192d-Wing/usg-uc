@@ -13,15 +13,15 @@ use crate::error::{TransportError, TransportResult};
 use crate::listener::ListenerConfig;
 use crate::{
     MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, STREAM_READ_CHUNK, StreamTransport, Transport,
-    canonical_peer,
+    canonical_peer, read_stream_chunk,
 };
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -177,30 +177,13 @@ impl Transport for TcpTransport {
             let data = {
                 let mut read_buffer = self.read_buffer.lock().await;
                 let mut stream = self.reader.lock().await;
-
-                // Read straight into the chunk buffer. The previous chunk was
-                // split off and, once the caller drops it, `reserve` reclaims
-                // the same allocation; `limit` keeps one read to one chunk.
-                read_buffer.reserve(STREAM_READ_CHUNK);
-                let n = stream
-                    .read_buf(&mut (&mut *read_buffer).limit(STREAM_READ_CHUNK))
-                    .await
-                    .map_err(|e| TransportError::ReceiveFailed {
-                        reason: e.to_string(),
-                    })?;
-                drop(stream);
-
-                if n == 0 {
-                    return Err(TransportError::ConnectionClosed);
-                }
-
-                trace!(size = n, "received TCP data");
-
-                // For SIP, we'd parse the Content-Length and wait for full message.
-                // For now, return whatever we received (simplified).
-                read_buffer.split().freeze()
+                read_stream_chunk(&mut *stream, &mut read_buffer).await?
             };
 
+            trace!(size = data.len(), "received TCP data");
+
+            // For SIP, we'd parse the Content-Length and wait for full message.
+            // For now, return whatever we received (simplified).
             Ok(ReceivedMessage {
                 data,
                 source: self.peer_addr,
