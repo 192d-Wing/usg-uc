@@ -9,7 +9,9 @@
 //! - the CRLFCRLF search resumes 3 bytes before the end of the previous
 //!   search, so a terminator split across reads is still found;
 //! - the total message length is cached once the head is complete;
-//! - more than `max_header_bytes` buffered without a terminator is an error.
+//! - more than `max_header_bytes` buffered without a terminator is an error;
+//! - the buffer never holds more than `MAX_STREAM_MESSAGE_SIZE` bytes of
+//!   capacity and is released to a small one once idle.
 //!
 //! One framer belongs to one connection task: no sharing, no locks.
 //!
@@ -17,12 +19,20 @@
 
 use bytes::{Buf, Bytes, BytesMut};
 use proto_sip::SipMessage;
+use uc_transport::MAX_STREAM_MESSAGE_SIZE;
 
 /// Charge unit for a partial message: one per-source token per this many
 /// bytes buffered beyond the first unit.
 ///
 /// ## NIST 800-53 Rev5: SC-5
 pub const UNFRAMED_CHARGE_BYTES: usize = 4096;
+
+/// An empty buffer holding more capacity than this is replaced after a
+/// frame is taken: twice the 4,096-byte stream read chunk (`uc_transport`
+/// TCP reader), so ordinary traffic does not reallocate per message.
+///
+/// ## NIST 800-53 Rev5: SC-5, SC-6
+pub const IDLE_RELEASE_CAPACITY: usize = 8_192;
 
 /// Length of the header/body separator.
 const TERMINATOR: &[u8] = b"\r\n\r\n";
@@ -58,6 +68,14 @@ impl std::fmt::Display for FramingError {
     }
 }
 
+/// A push would hold more than `MAX_STREAM_MESSAGE_SIZE` bytes without a
+/// complete message; the caller closes the connection (framing error).
+#[derive(Debug, Clone, Copy)]
+pub struct BufferFull {
+    /// Bytes buffered plus the refused chunk.
+    pub needed: usize,
+}
+
 /// Keep-alive CRLFs consumed by one [`StreamFramer::next_frame`] call.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KeepAlive {
@@ -71,6 +89,10 @@ pub struct KeepAlive {
 #[derive(Debug)]
 pub struct StreamFramer {
     buf: BytesMut,
+    /// Size of the allocation behind `buf`. After `split_to` the view's
+    /// capacity shrinks but the frame shares (and, once it is dropped, `buf`
+    /// still pins) the whole allocation, so the release check uses this.
+    allocated: usize,
     /// Bytes of `buf` already searched for CRLFCRLF without a match.
     scan_from: usize,
     /// Total length (head plus body) of the message at the front of `buf`,
@@ -92,6 +114,7 @@ impl StreamFramer {
     pub fn new(require_cl: bool, max_header_bytes: usize) -> Self {
         Self {
             buf: BytesMut::new(),
+            allocated: 0,
             scan_from: 0,
             total: None,
             require_cl,
@@ -103,9 +126,34 @@ impl StreamFramer {
         }
     }
 
-    /// Appends received bytes.
-    pub fn push(&mut self, data: &[u8]) {
+    /// Appends received bytes, or refuses them (nothing is buffered) when
+    /// the total would exceed `MAX_STREAM_MESSAGE_SIZE`.
+    ///
+    /// Growth allocates exactly min(max(2 x capacity, needed),
+    /// `MAX_STREAM_MESSAGE_SIZE`) and copies, instead of `BytesMut`'s
+    /// doubling, so capacity never exceeds 65,535 bytes.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-6
+    pub fn push(&mut self, data: &[u8]) -> Result<(), BufferFull> {
+        let len = self.buf.len();
+        let needed = len.saturating_add(data.len());
+        if needed > MAX_STREAM_MESSAGE_SIZE {
+            return Err(BufferFull { needed });
+        }
+        if self.buf.capacity() - len < data.len() {
+            let cap = self
+                .buf
+                .capacity()
+                .saturating_mul(2)
+                .max(needed)
+                .min(MAX_STREAM_MESSAGE_SIZE);
+            let mut grown = BytesMut::with_capacity(cap);
+            grown.extend_from_slice(&self.buf);
+            self.allocated = grown.capacity();
+            self.buf = grown;
+        }
         self.buf.extend_from_slice(data);
+        Ok(())
     }
 
     /// Bytes buffered and not yet framed.
@@ -123,6 +171,25 @@ impl StreamFramer {
         self.buf.clear();
         self.scan_from = 0;
         self.total = None;
+        self.release_if_idle();
+    }
+
+    /// Replaces an empty buffer backed by more than
+    /// [`IDLE_RELEASE_CAPACITY`] with an unallocated one, so an idle
+    /// connection does not keep a 64 KiB allocation after a large message.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-6
+    fn release_if_idle(&mut self) {
+        if self.buf.is_empty() && self.allocated > IDLE_RELEASE_CAPACITY {
+            self.buf = BytesMut::new();
+            self.allocated = 0;
+        }
+    }
+
+    /// Capacity of the buffer's allocation.
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.allocated.max(self.buf.capacity())
     }
 
     /// Total bytes compared by the CRLFCRLF search so far.
@@ -177,7 +244,9 @@ impl StreamFramer {
             return Ok(None);
         };
         self.total = None;
-        Ok(Some(self.consume(total).freeze()))
+        let frame = self.consume(total).freeze();
+        self.release_if_idle();
+        Ok(Some(frame))
     }
 
     /// Strips leading keep-alives and, once the head is complete, returns
@@ -198,6 +267,7 @@ impl StreamFramer {
                 break;
             }
         }
+        self.release_if_idle();
         // Empty, or a prefix of a ping still arriving.
         if TERMINATOR.starts_with(&self.buf) {
             return Ok(None);
@@ -262,7 +332,10 @@ impl StreamFramer {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{FramingError, KeepAlive, StreamFramer, UNFRAMED_CHARGE_BYTES};
+    use super::{
+        FramingError, IDLE_RELEASE_CAPACITY, KeepAlive, MAX_STREAM_MESSAGE_SIZE, StreamFramer,
+        UNFRAMED_CHARGE_BYTES,
+    };
 
     const MAX_HEAD: usize = 16_384;
 
@@ -284,7 +357,7 @@ mod tests {
         let mut out = Vec::new();
         let mut pings = 0;
         for part in parts {
-            f.push(part);
+            f.push(part).unwrap();
             loop {
                 let mut ka = KeepAlive::default();
                 let next = f.next_frame(&mut ka).expect("valid framing");
@@ -306,7 +379,7 @@ mod tests {
 
     fn frame_err(msg: &[u8], require_cl: bool) -> FramingError {
         let mut f = StreamFramer::new(require_cl, MAX_HEAD);
-        f.push(msg);
+        f.push(msg).unwrap();
         let mut ka = KeepAlive::default();
         f.next_frame(&mut ka).expect_err("framing error")
     }
@@ -314,7 +387,7 @@ mod tests {
     #[test]
     fn frame_complete_message() {
         let mut f = framer();
-        f.push(REGISTER);
+        f.push(REGISTER).unwrap();
         let frame_bytes = frame(&mut f).expect("complete message");
         assert_eq!(&frame_bytes[..], REGISTER);
         assert_eq!(f.buffered(), 0);
@@ -324,9 +397,10 @@ mod tests {
     #[test]
     fn frame_waits_for_full_body() {
         let mut f = framer();
-        f.push(b"MESSAGE sip:example.mil SIP/2.0\r\nContent-Length: 5\r\n\r\nhel");
+        f.push(b"MESSAGE sip:example.mil SIP/2.0\r\nContent-Length: 5\r\n\r\nhel")
+            .unwrap();
         assert!(frame(&mut f).is_none());
-        f.push(b"lo");
+        f.push(b"lo").unwrap();
         let got = frame(&mut f).expect("complete after body");
         assert!(got.ends_with(b"hello"));
         assert_eq!(f.buffered(), 0);
@@ -335,9 +409,9 @@ mod tests {
     #[test]
     fn frame_splits_pipelined_messages_and_skips_keepalives() {
         let mut f = framer();
-        f.push(b"\r\n\r\n"); // RFC 5626 keep-alive ping
-        f.push(REGISTER);
-        f.push(REGISTER);
+        f.push(b"\r\n\r\n").unwrap(); // RFC 5626 keep-alive ping
+        f.push(REGISTER).unwrap();
+        f.push(REGISTER).unwrap();
         let mut ka = KeepAlive::default();
         let first = f.next_frame(&mut ka).unwrap().unwrap();
         assert!(ka.seen);
@@ -349,7 +423,8 @@ mod tests {
     #[test]
     fn frame_partial_headers_returns_none() {
         let mut f = framer();
-        f.push(b"REGISTER sip:example.mil SIP/2.0\r\nVia: x");
+        f.push(b"REGISTER sip:example.mil SIP/2.0\r\nVia: x")
+            .unwrap();
         assert!(frame(&mut f).is_none());
         assert!(f.buffered() > 0); // kept for the next chunk
     }
@@ -358,7 +433,7 @@ mod tests {
     fn content_length_compact_form() {
         let msg = b"MESSAGE sip:a SIP/2.0\r\nl: 7\r\n\r\n1234567";
         let mut f = framer();
-        f.push(msg);
+        f.push(msg).unwrap();
         assert_eq!(frame(&mut f).unwrap().len(), msg.len());
     }
 
@@ -397,7 +472,7 @@ mod tests {
         let msg = b"OPTIONS sip:a SIP/2.0\r\nVia: SIP/2.0/WS h;branch=z9hG4bK1\r\n\r\nbody";
         assert!(matches!(frame_err(msg, true), FramingError::Missing));
         let mut f = StreamFramer::new(false, MAX_HEAD);
-        f.push(msg);
+        f.push(msg).unwrap();
         let mut ka = KeepAlive::default();
         let got = f.next_frame(&mut ka).unwrap().unwrap();
         assert_eq!(&got[..], &msg[..]);
@@ -415,7 +490,7 @@ mod tests {
             let mut f = framer();
             let mut out = Vec::new();
             for part in [&stream[..split], &stream[split..]] {
-                f.push(part);
+                f.push(part).unwrap();
                 while let Some(got) = frame(&mut f) {
                     out.push(got);
                 }
@@ -429,13 +504,13 @@ mod tests {
     #[test]
     fn keepalive_counts_pings_and_waits_on_a_lone_crlf() {
         let mut f = framer();
-        f.push(b"\r\n\r\n\r\n\r\n\r\n");
+        f.push(b"\r\n\r\n\r\n\r\n\r\n").unwrap();
         let mut ka = KeepAlive::default();
         assert!(f.next_frame(&mut ka).unwrap().is_none());
         assert_eq!(ka.pings, 2);
         assert_eq!(f.as_bytes(), b"\r\n");
         // A pong (lone CRLF) before a message is dropped, not a ping.
-        f.push(REGISTER);
+        f.push(REGISTER).unwrap();
         let mut ka = KeepAlive::default();
         assert!(f.next_frame(&mut ka).unwrap().is_some());
         assert_eq!((ka.seen, ka.pings), (true, 0));
@@ -454,7 +529,8 @@ mod tests {
             );
         }
         let mut f = framer();
-        f.push(b"OPTIONS sip:a SIP/2.0\r\nContent-Length:   0  \r\n\r\n");
+        f.push(b"OPTIONS sip:a SIP/2.0\r\nContent-Length:   0  \r\n\r\n")
+            .unwrap();
         assert!(frame(&mut f).is_some());
     }
 
@@ -468,7 +544,7 @@ mod tests {
         }
         msg.extend_from_slice(b"\r\n");
         let mut f = framer();
-        f.push(&msg);
+        f.push(&msg).unwrap();
         let mut ka = KeepAlive::default();
         assert!(matches!(
             f.next_frame(&mut ka),
@@ -492,7 +568,7 @@ mod tests {
         assert!(!head.windows(4).any(|w| w == b"\r\n\r\n"));
         let mut f = framer();
         for b in &head {
-            f.push(std::slice::from_ref(b));
+            f.push(std::slice::from_ref(b)).unwrap();
             let mut ka = KeepAlive::default();
             assert!(f.next_frame(&mut ka).unwrap().is_none());
         }
@@ -500,7 +576,7 @@ mod tests {
         let scanned = f.scanned_bytes();
         assert!(scanned <= 4 * MAX_HEAD as u64, "scanned {scanned}");
         // One byte past the cap without CRLFCRLF is an error.
-        f.push(b"a");
+        f.push(b"a").unwrap();
         let mut ka = KeepAlive::default();
         assert!(matches!(
             f.next_frame(&mut ka),
@@ -515,12 +591,12 @@ mod tests {
         let head_len = msg.len();
         msg.extend(std::iter::repeat_n(b'b', 100));
         let mut f = framer();
-        f.push(&msg[..head_len]);
+        f.push(&msg[..head_len]).unwrap();
         let mut ka = KeepAlive::default();
         assert!(f.next_frame(&mut ka).unwrap().is_none());
         let mut out = None;
         for b in &msg[head_len..] {
-            f.push(std::slice::from_ref(b));
+            f.push(std::slice::from_ref(b)).unwrap();
             let mut ka = KeepAlive::default();
             if let Some(frame) = f.next_frame(&mut ka).unwrap() {
                 assert!(out.is_none(), "framed twice");
@@ -531,7 +607,7 @@ mod tests {
         assert_eq!(f.head_parses(), 1);
         assert_eq!(f.buffered(), 0);
         // The next message parses its own head.
-        f.push(REGISTER);
+        f.push(REGISTER).unwrap();
         let mut ka = KeepAlive::default();
         assert_eq!(&f.next_frame(&mut ka).unwrap().unwrap()[..], REGISTER);
         assert_eq!(f.head_parses(), 2);
@@ -601,11 +677,11 @@ mod tests {
             first.extend_from_slice(&REGISTER[..i]);
             let mut f = framer();
             let mut ka = KeepAlive::default();
-            f.push(&first);
+            f.push(&first).unwrap();
             let got = f.next_frame(&mut ka).unwrap();
             assert!(got.is_none(), "split {i}");
             assert_eq!(ka.pings, 1, "split {i}");
-            f.push(&REGISTER[i..]);
+            f.push(&REGISTER[i..]).unwrap();
             let mut ka2 = KeepAlive::default();
             let frame = f.next_frame(&mut ka2).unwrap().expect("framed");
             assert_eq!(&frame[..], REGISTER, "split {i}");
@@ -618,21 +694,22 @@ mod tests {
     #[test]
     fn framer_clear_resets_state() {
         let mut f = framer();
-        f.push(b"OPTIONS sip:a SIP/2.0\r\nVia: x");
+        f.push(b"OPTIONS sip:a SIP/2.0\r\nVia: x").unwrap();
         let mut ka = KeepAlive::default();
         assert!(f.next_frame(&mut ka).unwrap().is_none());
         f.clear();
         assert_eq!(f.buffered(), 0);
         assert_eq!(f.as_bytes(), b"");
-        f.push(REGISTER);
+        f.push(REGISTER).unwrap();
         assert_eq!(&f.next_frame(&mut ka).unwrap().unwrap()[..], REGISTER);
 
         // Head complete, body short: the cached length must not survive.
         let mut f = framer();
-        f.push(b"MESSAGE sip:a SIP/2.0\r\nContent-Length: 50\r\n\r\nabc");
+        f.push(b"MESSAGE sip:a SIP/2.0\r\nContent-Length: 50\r\n\r\nabc")
+            .unwrap();
         assert!(f.next_frame(&mut ka).unwrap().is_none());
         f.clear();
-        f.push(REGISTER);
+        f.push(REGISTER).unwrap();
         assert_eq!(&f.next_frame(&mut ka).unwrap().unwrap()[..], REGISTER);
         assert_eq!(f.buffered(), 0);
     }
@@ -642,11 +719,11 @@ mod tests {
     fn framer_ws_missing_content_length_takes_rest() {
         let msg = b"OPTIONS sip:a SIP/2.0\r\nVia: SIP/2.0/WS h;branch=z9hG4bK1\r\n\r\nbody";
         let mut f = StreamFramer::new(false, MAX_HEAD);
-        f.push(msg);
+        f.push(msg).unwrap();
         let mut ka = KeepAlive::default();
         assert_eq!(&f.next_frame(&mut ka).unwrap().unwrap()[..], &msg[..]);
         let mut f = framer();
-        f.push(msg);
+        f.push(msg).unwrap();
         assert!(matches!(f.next_frame(&mut ka), Err(FramingError::Missing)));
     }
 
@@ -655,12 +732,79 @@ mod tests {
     fn framer_as_bytes_holds_unframed_input() {
         let bad = b"OPTIONS sip:a SIP/2.0\r\nContent-Length: 0\r\nContent-Length: 5\r\n\r\n";
         let mut f = framer();
-        f.push(bad);
+        f.push(bad).unwrap();
         let mut ka = KeepAlive::default();
         assert!(matches!(
             f.next_frame(&mut ka),
             Err(FramingError::Invalid(_))
         ));
         assert_eq!(f.as_bytes(), &bad[..]);
+    }
+
+    /// A `body_len`-byte MESSAGE with a valid head.
+    fn big_message(body_len: usize) -> Vec<u8> {
+        let mut msg =
+            format!("MESSAGE sip:a SIP/2.0\r\nContent-Length: {body_len}\r\n\r\n").into_bytes();
+        msg.extend(std::iter::repeat_n(b'b', body_len));
+        msg
+    }
+
+    // SEC-001: a 4,095-byte first read then the rest of a 65,000-byte
+    // message: growth is capped at MAX_STREAM_MESSAGE_SIZE (no doubling to
+    // 128 KiB) and the buffer is released once the frame drains.
+    #[test]
+    fn framer_capacity_is_capped_and_released_when_idle() {
+        let ceiling = MAX_STREAM_MESSAGE_SIZE + 4_096;
+        // Head length with a 5-digit Content-Length.
+        let head_len = big_message(10_000).len() - 10_000;
+        let msg = big_message(65_000 - head_len);
+        assert_eq!(msg.len(), 65_000);
+        let mut f = framer();
+        for split in [1, 7, 1_000, 4_095, 4_096, 16_384] {
+            let mut framed = 0;
+            let (first, rest) = msg.split_at(4_095);
+            for part in std::iter::once(first).chain(rest.chunks(split)) {
+                f.push(part).unwrap();
+                assert!(f.capacity() <= ceiling, "split {split}: {}", f.capacity());
+                while let Some(got) = frame(&mut f) {
+                    assert_eq!(&got[..], &msg[..]);
+                    framed += 1;
+                }
+                assert!(f.capacity() <= ceiling, "split {split}: {}", f.capacity());
+            }
+            assert_eq!(framed, 1, "split {split}");
+            assert_eq!(f.buffered(), 0);
+            assert!(
+                f.capacity() <= IDLE_RELEASE_CAPACITY,
+                "split {split}: {} after drain",
+                f.capacity()
+            );
+        }
+        // Small traffic afterwards still frames.
+        f.push(REGISTER).unwrap();
+        assert_eq!(&frame(&mut f).expect("framed")[..], REGISTER);
+    }
+
+    // SEC-001: a push that would exceed MAX_STREAM_MESSAGE_SIZE is refused
+    // before the buffer grows; nothing is appended.
+    #[test]
+    fn framer_refuses_push_over_max_before_growing() {
+        let mut f = framer();
+        let chunk = vec![b'x'; 4_096];
+        let mut pushed = 0;
+        while pushed + chunk.len() <= MAX_STREAM_MESSAGE_SIZE {
+            f.push(&chunk).unwrap();
+            pushed += chunk.len();
+        }
+        let before = f.capacity();
+        let err = f.push(&chunk).expect_err("over the cap");
+        assert_eq!(err.needed, pushed + chunk.len());
+        assert_eq!(f.buffered(), pushed);
+        assert_eq!(f.capacity(), before);
+        assert!(f.capacity() <= MAX_STREAM_MESSAGE_SIZE);
+        // Exactly MAX is accepted.
+        f.push(&chunk[..MAX_STREAM_MESSAGE_SIZE - pushed]).unwrap();
+        assert_eq!(f.buffered(), MAX_STREAM_MESSAGE_SIZE);
+        assert!(f.push(b"y").is_err());
     }
 }

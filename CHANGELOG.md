@@ -38,6 +38,11 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   400.
 - A stream buffer that exceeds 65,535 bytes without a complete message is
   counted in `framing_errors` and the `framing` audit record when closed.
+- **The stream framer buffer is capped and released.** (SC-5, SC-6) A read
+  that would take it past 65,535 bytes is refused before the buffer grows
+  (the connection closes as above), capacity never exceeds 65,535 bytes
+  (no doubling to 128 KiB), and an empty buffer over 8 KiB is released
+  after a frame.
 - New Debug-only counters `header_too_large` and `stream_rate_closed`
   (POA&M-93).
 

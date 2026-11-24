@@ -53,7 +53,9 @@ fn feed(stream: &[u8], chunk: usize) -> usize {
     let mut framer = StreamFramer::new(true, MAX_HEADER_BYTES);
     let mut taken = 0;
     for read in stream.chunks(chunk) {
-        framer.push(read);
+        if framer.push(read).is_err() {
+            return taken;
+        }
         loop {
             let mut keepalive = KeepAlive::default();
             match framer.next_frame(&mut keepalive) {

@@ -2569,15 +2569,16 @@ impl Server {
                     // one SIP message, so nothing is carried between WS
                     // messages: bytes after the first SIP message, or an
                     // incomplete one, are discarded below.
-                    framer.push(&chunk.data);
-                    if framer.buffered() > uc_transport::MAX_STREAM_MESSAGE_SIZE {
+                    // NIST 800-53 Rev5: SC-5, SC-6 — refused before the
+                    // buffer grows past MAX_STREAM_MESSAGE_SIZE.
+                    if let Err(full) = framer.push(&chunk.data) {
                         // NIST 800-53 Rev5: SI-10, AU-12 — counted and
                         // audited like any other framing close.
                         ctx.stats.framing_errors.fetch_add(1, Ordering::Relaxed);
                         ctx.conn_limiter.note_framing_error(peer.ip());
                         warn!(
                             peer = %peer,
-                            buffered = framer.buffered(),
+                            buffered = full.needed,
                             "No complete SIP message within size limit, closing connection"
                         );
                         break;
@@ -4925,7 +4926,7 @@ mod tests {
         let peer = SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, 20), 40000);
         let mut framer = StreamFramer::new(true, 16_384);
         // 6 units buffered: 5 owed beyond the first.
-        framer.push(&vec![b'x'; 6 * UNFRAMED_CHARGE_BYTES]);
+        framer.push(&vec![b'x'; 6 * UNFRAMED_CHARGE_BYTES]).unwrap();
         let mut charged = 0u32;
         assert!(Server::charge_unframed(&peer, &framer, &mut charged, &ctx).await);
         assert_eq!(charged, 2, "clamped to the burst");
