@@ -124,6 +124,12 @@ struct Fixture {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+/// Writes a test PEM file without blocking the runtime.
+async fn write_pem(path: std::path::PathBuf, pem: &str) -> std::io::Result<std::path::PathBuf> {
+    tokio::fs::write(&path, pem).await?;
+    Ok(path)
+}
+
 impl Fixture {
     async fn start() -> Result<Self, Box<dyn std::error::Error>> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -131,15 +137,10 @@ impl Fixture {
         let other_ca = Pki::new()?;
         let server = ca.leaf(&["127.0.0.1"], ExtendedKeyUsagePurpose::ServerAuth)?;
         let dir = tempfile::tempdir()?;
-        let w = |n: &str, s: &str| -> std::io::Result<std::path::PathBuf> {
-            let p = dir.path().join(n);
-            std::fs::write(&p, s)?;
-            Ok(p)
-        };
         let server_tls = ServerTls {
-            cert: w("srv.crt", &server.0)?,
-            key: w("srv.key", &server.1)?,
-            client_ca: w("ca.crt", &ca.pem)?,
+            cert: write_pem(dir.path().join("srv.crt"), &server.0).await?,
+            key: write_pem(dir.path().join("srv.key"), &server.1).await?,
+            client_ca: write_pem(dir.path().join("ca.crt"), &ca.pem).await?,
         };
         let port = free_port()?;
         let listen = SocketAddr::from(([127, 0, 0, 1], port));

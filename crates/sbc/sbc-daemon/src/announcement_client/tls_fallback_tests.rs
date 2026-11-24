@@ -91,6 +91,12 @@ struct Pod {
     _stop: tokio::sync::oneshot::Sender<()>,
 }
 
+/// Writes a test PEM file without blocking the runtime.
+async fn write_pem(path: std::path::PathBuf, pem: &str) -> std::io::Result<std::path::PathBuf> {
+    tokio::fs::write(&path, pem).await?;
+    Ok(path)
+}
+
 /// An mTLS stub pod whose server certificate comes from `server_ca` and
 /// which admits client certificates from `client_ca` named `sbc-sbc-daemon`.
 async fn pod(
@@ -100,15 +106,10 @@ async fn pod(
 ) -> Result<Pod, Box<dyn std::error::Error>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let (crt, key) = server_ca.leaf("127.0.0.1", ExtendedKeyUsagePurpose::ServerAuth)?;
-    let w = |n: &str, s: &str| -> std::io::Result<std::path::PathBuf> {
-        let p = dir.join(n);
-        std::fs::write(&p, s)?;
-        Ok(p)
-    };
     let tls = ServerTls {
-        cert: w("pod.crt", &crt)?,
-        key: w("pod.key", &key)?,
-        client_ca: w("pod-ca.crt", &client_ca.pem)?,
+        cert: write_pem(dir.join("pod.crt"), &crt).await?,
+        key: write_pem(dir.join("pod.key"), &key).await?,
+        client_ca: write_pem(dir.join("pod-ca.crt"), &client_ca.pem).await?,
     };
     let addr = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
     let gate = ClientNameGate::new(true, &["sbc-sbc-daemon".to_string()], "AnnouncementService");
