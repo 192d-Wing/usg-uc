@@ -179,7 +179,7 @@ impl std::fmt::Debug for Tls12GcmSealer {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::aead::Aes256GcmKey;
+    use crate::aead::{Aes256GcmKey, CachedAeadKey};
     use crate::hkdf::hmac_sha384_multi;
 
     /// Reference `P_SHA384` composed from HMAC (RFC 5246 §5), used only to
@@ -280,12 +280,13 @@ mod tests {
         let key_bytes = [0x42u8; KEY_LEN];
         let mut sealer = Tls12GcmSealer::new(&key_bytes).unwrap();
         let opener = Aes256GcmKey::new(key_bytes).unwrap();
+        let cached = CachedAeadKey::new(&key_bytes).unwrap();
         for seq in [0u64, 1, 2, 7, 1 << 40] {
             let nonce = dtls_nonce([1, 2, 3, 4], 1, seq);
             let record = sealer.seal(&nonce, b"aad", b"record").unwrap();
             assert_eq!(record.len(), 6 + TAG_LEN);
             assert_eq!(opener.open(&nonce, b"aad", &record).unwrap(), b"record");
-            assert_eq!(record, opener.seal(&nonce, b"aad", b"record").unwrap());
+            assert_eq!(record, cached.seal(&nonce, b"aad", b"record").unwrap());
         }
     }
 
