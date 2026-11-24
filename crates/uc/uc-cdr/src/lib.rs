@@ -15,7 +15,9 @@
 //!   (drop counting, health, fail closed at startup)
 //! - **AU-9 (partial) / AU-9(2)**: tamper-evident SHA-384 hash chain and per-file
 //!   digest (unkeyed, no AU-10 non-repudiation; see `chain`), optional off-host copy
-//! - **AU-11 / SI-12**: Retention and PII handling (mask, HMAC-SHA-384)
+//! - **AU-11 / SI-12**: Retention (age-authoritative, count cap as a safety
+//!   bound, every deletion reported; unanswered attempts in a separate
+//!   attempts stream) and PII handling (mask, HMAC-SHA-384)
 //! - **SC-5**: Bounded queue, ring, field lengths
 //!
 //! CNSA 2.0: SHA-384 and HMAC-SHA-384 through `uc-crypto` only.
@@ -45,12 +47,14 @@ pub use error::{CdrError, CdrResult};
 pub use format::CdrFormat;
 pub use pii::{HmacKey, PiiPolicy};
 pub use record::{
-    Attestation, CallRecord, Direction, Disposition, FileHeader, MAX_MEDIA_KINDS,
-    MIN_READ_SCHEMA_VERSION, MediaKindTag, RecordingTag, ReleaseCause, ReleaseSide, SCHEMA_VERSION,
-    Transport, TrunkAttempt, TrunkOutcome, Verstat, is_readable_schema, note_media_kind,
+    Attestation, CALLS_SCHEMA_VERSION, CallRecord, CdrStream, Direction, Disposition, FileHeader,
+    MAX_MEDIA_KINDS, MIN_READ_SCHEMA_VERSION, MediaKindTag, RecordingTag, ReleaseCause,
+    ReleaseSide, SCHEMA_VERSION, Transport, TrunkAttempt, TrunkOutcome, Verstat,
+    is_readable_schema, note_media_kind,
 };
 pub use ring::{CdrFilter, CdrPage, CdrRing};
 pub use sink::{
-    CdrObserver, CdrSink, FileSink, FileSinkConfig, SyslogConnector, SyslogSink, SyslogSinkConfig,
+    CdrDeleteReason, CdrObserver, CdrSink, FileSink, FileSinkConfig, SyslogConnector, SyslogSink,
+    SyslogSinkConfig,
 };
 pub use writer::{CdrEmitter, CdrEmitterConfig, CdrHealth, CdrReload, CdrStats};

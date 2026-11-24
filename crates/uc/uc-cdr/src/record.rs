@@ -24,7 +24,16 @@ use serde::{Deserialize, Serialize};
 /// v4 (SIPREC recording, POA&M-306) adds `recording` and
 /// `recording_session_id`, omitted when unset so v1..v3 records keep
 /// verifying, and the `recording_failure` disposition / release cause.
-pub const SCHEMA_VERSION: u16 = 4;
+///
+/// v5 (SR-43) adds `stream` to records and the file header. Only the
+/// attempts stream ([`CdrStream::Attempts`], unanswered attempts) is
+/// written as v5; the calls stream omits `stream` and stays
+/// [`CALLS_SCHEMA_VERSION`] (v4), so its files are unchanged for collectors.
+pub const SCHEMA_VERSION: u16 = 5;
+
+/// Schema version of calls-stream records and headers (see
+/// [`SCHEMA_VERSION`]).
+pub const CALLS_SCHEMA_VERSION: u16 = 4;
 
 /// Oldest schema version readers accept.
 pub const MIN_READ_SCHEMA_VERSION: u16 = 1;
@@ -562,6 +571,10 @@ pub struct CallRecord {
     /// `recording_*` audit events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording_session_id: Option<String>,
+    /// Stream the record belongs to (v5). Omitted for `calls`, so v1..v4
+    /// records re-serialise byte-identically and read as `calls`.
+    #[serde(default, skip_serializing_if = "CdrStream::is_calls")]
+    pub stream: CdrStream,
     /// This node took the dialog over from a failed peer; timing is partial.
     pub failover_takeover: bool,
     /// Hex SHA-384 of the previous record (empty when chaining is off).
@@ -571,6 +584,17 @@ pub struct CallRecord {
 }
 
 impl CallRecord {
+    /// Whether the call was never answered (no `answer_ms`): SBC rejects,
+    /// routed-but-failed, busy, no-answer and cancelled attempts. These go
+    /// to the attempts stream when it is enabled; answered calls stay in
+    /// the calls stream, so traffic that never completes a call cannot
+    /// rotate or evict answered-call CDRs.
+    ///
+    /// ## NIST 800-53 Rev5: AU-11, SC-5
+    pub const fn is_unanswered(&self) -> bool {
+        self.answer_ms.is_none()
+    }
+
     /// Derives `duration_ms` and `pdd_ms` from the timestamps.
     pub fn compute_durations(&mut self) {
         self.duration_ms = self.answer_ms.map_or(0, |a| self.end_ms.saturating_sub(a));
@@ -667,6 +691,71 @@ pub struct FileHeader {
     pub chain_start: String,
     /// Sequence of the first record in the file.
     pub first_sequence: u64,
+    /// Stream of the file (v5); omitted for `calls`.
+    #[serde(default, skip_serializing_if = "CdrStream::is_calls")]
+    pub stream: CdrStream,
+}
+
+/// CDR stream (v5).
+///
+/// `calls` holds answered calls in `cdr-{node}-*` files with `record_id`
+/// `{node}-{seq}`. `attempts` holds every unanswered attempt
+/// ([`CallRecord::is_unanswered`]) in `cdra-{node}-*` files with their own
+/// sequence, hash chain, sidecars, size and retention, and `record_id`
+/// `{node}-a{seq}`, so a flood of calls that are never answered rotates
+/// and evicts only attempts files.
+///
+/// ## NIST 800-53 Rev5: AU-11 (Audit Record Retention), AU-9, SC-5
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdrStream {
+    /// Answered calls.
+    #[default]
+    Calls,
+    /// Unanswered attempts.
+    Attempts,
+}
+
+impl CdrStream {
+    /// `"calls"` or `"attempts"`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Calls => "calls",
+            Self::Attempts => "attempts",
+        }
+    }
+
+    /// File name prefix before `-{node}-`: `cdr` or `cdra`.
+    pub const fn file_prefix(self) -> &'static str {
+        match self {
+            Self::Calls => "cdr",
+            Self::Attempts => "cdra",
+        }
+    }
+
+    /// Schema version written for this stream.
+    pub const fn schema_version(self) -> u16 {
+        match self {
+            Self::Calls => CALLS_SCHEMA_VERSION,
+            Self::Attempts => SCHEMA_VERSION,
+        }
+    }
+
+    /// Serde helper: `stream` is omitted for `calls`.
+    pub const fn is_calls(&self) -> bool {
+        matches!(self, Self::Calls)
+    }
+
+    /// Stream of a CDR file name (`cdra-` attempts, `cdr-` calls).
+    pub fn of_file_name(name: &str) -> Option<Self> {
+        if name.starts_with("cdra-") {
+            Some(Self::Attempts)
+        } else if name.starts_with("cdr-") {
+            Some(Self::Calls)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -724,10 +813,11 @@ mod tests {
 
     #[test]
     fn recording_fields_serde_and_omission() {
-        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(CALLS_SCHEMA_VERSION, 4);
         assert_eq!(MIN_READ_SCHEMA_VERSION, 1);
-        assert!((1..=4).all(is_readable_schema));
-        assert!(!is_readable_schema(0) && !is_readable_schema(5));
+        assert!((1..=5).all(is_readable_schema));
+        assert!(!is_readable_schema(0) && !is_readable_schema(6));
 
         // Unset: both keys are omitted, so v1..v3 records re-serialise
         // byte-identically.
@@ -875,5 +965,33 @@ mod tests {
                 format!("\"{}\"", d.as_str())
             );
         }
+    }
+
+    /// v5: `stream` is omitted for calls (v1..v4 records and headers are
+    /// unchanged) and present for attempts; the version follows the stream.
+    #[test]
+    fn stream_field_serde_and_versions() {
+        let json = serde_json::to_string(&CallRecord::default()).unwrap();
+        assert!(!json.contains("stream"), "{json}");
+        let r = CallRecord {
+            stream: CdrStream::Attempts,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""stream":"attempts""#), "{json}");
+        let back: CallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.stream, CdrStream::Attempts);
+        assert_eq!(CdrStream::Calls.schema_version(), 4);
+        assert_eq!(CdrStream::Attempts.schema_version(), 5);
+        assert_eq!(
+            CdrStream::of_file_name("cdra-n1-x.jsonl"),
+            Some(CdrStream::Attempts)
+        );
+        assert_eq!(
+            CdrStream::of_file_name("cdr-n1-x.jsonl"),
+            Some(CdrStream::Calls)
+        );
+        assert_eq!(CdrStream::of_file_name("audit.log"), None);
+        assert!(serde_json::from_str::<CdrStream>(r#""other""#).is_err());
     }
 }

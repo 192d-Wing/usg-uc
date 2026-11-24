@@ -870,6 +870,11 @@ impl Server {
         for w in sbc_config::validate::recording_warnings(config) {
             warn!(event = "config.recording_warning", "{w}");
         }
+        // NIST 800-53 Rev5: CM-6, AU-11 - a CDR count cap that cannot be
+        // checked against retention_days (size-only rotation).
+        for w in sbc_config::validate::cdr_warnings(config) {
+            warn!(event = "config.cdr_warning", "{w}");
+        }
 
         // Initialize router from config (if routing section present)
         if let Some(ref routing) = config.routing {

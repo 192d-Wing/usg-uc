@@ -175,9 +175,14 @@ format = "json"
 output = "stdout"
 audit_enabled = true
 # audit_path = "/var/log/sbc/audit.log"
+# Audit file rotation (AU-4/AU-5). On disk at most
+# (audit_max_files + 1) x audit_max_file_mb; ship rotated files off-box.
+audit_max_file_mb = 64              # 1..=4096; rotate before the file exceeds this
+audit_max_files = 16                # 1..=1024 rotated files kept (audit.log.<first seq>)
+audit_on_full = "overwrite_oldest"  # overwrite_oldest (audited) | stop (refuse records)
 
-# Call Detail Records (schema v1). One record per INVITE that reaches
-# admission. See docs/SBC-ADMIN-GUIDE.md "Call Detail Records".
+# Call Detail Records. One record per INVITE that reaches admission. See
+# docs/SBC-ADMIN-GUIDE.md "Call Detail Records".
 [cdr]
 enabled = true
 format = "jsonl"                    # jsonl | csv
@@ -186,8 +191,19 @@ directory = "/var/lib/usg-sbc/cdr"  # absolute; created 0750, files 0640. Must b
 # node_id = "sbc-a"                 # default: general.instance_name, then $HOSTNAME
 rotate_size_mb = 100                # 1..=4096
 rotate_interval = "1h"              # "0" = size only; 5m..=24h
-retention_files = 168               # 0 = unlimited
-retention_days = 90                 # 0 = unlimited
+retention_files = 2232              # safety cap, 0 = unlimited; x rotate_interval must
+                                    # cover retention_days (2232 x 1h = 93 days)
+retention_days = 90                 # authoritative age bound, 0 = unlimited
+# Unanswered attempts (SBC rejects, failed, busy, no answer, cancelled) go
+# to their own cdra-<node>-* files, chain, file size and retention, so
+# traffic that never completes a call cannot rotate or evict answered-call
+# CDRs. Worst case on disk: (retention_files + 1) x rotate_size_mb plus
+# (attempts_retention_files + 1) x attempts_rotate_size_mb
+# (2233 x 100 MiB + 2233 x 4 MiB here; logged at startup).
+separate_attempts = true
+attempts_rotate_size_mb = 4         # 1..=4096
+attempts_retention_files = 2232     # >= 1; same coverage rule as retention_files
+attempts_retention_days = 90
 fsync_interval_ms = 1000            # 0 = fsync every record
 queue_capacity = 8192               # 64..=1000000
 ring_capacity = 10000               # recent CDRs kept for the API, 0..=200000

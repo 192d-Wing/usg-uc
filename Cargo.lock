@@ -8527,6 +8527,7 @@ name = "uc-audit"
 version = "0.10.0"
 dependencies = [
  "chrono",
+ "criterion",
  "hex",
  "serde",
  "serde_json",
@@ -8770,6 +8771,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "uc-audit",
  "uc-crypto",
  "uc-transport",
  "uc-types",

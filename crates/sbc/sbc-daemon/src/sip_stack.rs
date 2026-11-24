@@ -2448,11 +2448,13 @@ fn invite_denied_event(
     policy: &str,
 ) -> uc_audit::AuditEvent {
     uc_audit::AuditEvent::AuthorizationDecision(uc_audit::event::AuthorizationDecision {
-        identity: req
-            .headers
-            .get_value(&HeaderName::From)
-            .map_or_else(|| source.to_string(), extract_uri_from_header),
-        resource: req.uri.to_string(),
+        // Attacker-supplied: capped and control-stripped (POA&M-431).
+        identity: crate::signaling_audit::audit_field(
+            &req.headers
+                .get_value(&HeaderName::From)
+                .map_or_else(|| source.to_string(), extract_uri_from_header),
+        ),
+        resource: crate::signaling_audit::audit_field(&req.uri.to_string()),
         action: "INVITE".to_string(),
         granted: false,
         policy: policy.to_string(),
@@ -10170,12 +10172,13 @@ impl SipStack {
                     // A challenge to a request that carried credentials is a
                     // failed attempt; without credentials it is just the
                     // initial challenge.
+                    // Aggregated per source prefix (SR-42, SC-5).
                     if auth_hdr.is_some() {
-                        audit_register_auth(
+                        self.signaling_audit.bearer_failure(
                             &aor,
                             source,
-                            uc_audit::event::AuthMethod::Jwt,
-                            Some(format!("{error:?}")),
+                            error.as_param(),
+                            Instant::now(),
                         );
                     }
                     let mut response = create_response_from_request(req, StatusCode::UNAUTHORIZED);
@@ -10189,14 +10192,23 @@ impl SipStack {
                         flow: Flow::Reply,
                     };
                 }
-                BearerResult::Forbidden { reason } => {
-                    warn!(aor = %aor, %reason, "REGISTER bearer authorization denied");
-                    audit_register_auth(
-                        &aor,
-                        source,
-                        uc_audit::event::AuthMethod::Jwt,
-                        Some(reason),
-                    );
+                BearerResult::Forbidden { reason, dn } => {
+                    if let Some(n) = crate::signaling_audit::BEARER_FORBIDDEN_LOG.allow() {
+                        warn!(aor = %aor, %reason, suppressed = n, "REGISTER bearer authorization denied");
+                    }
+                    // Identity is the token subject when known (SR-42, AU-3).
+                    match dn {
+                        Some(dn) => {
+                            self.signaling_audit
+                                .bearer_forbidden(&dn, &aor, source, Instant::now())
+                        }
+                        None => self.signaling_audit.bearer_failure(
+                            &aor,
+                            source,
+                            "forbidden",
+                            Instant::now(),
+                        ),
+                    }
                     return ProcessResult::Response {
                         message: SipMessage::Response(create_response_from_request(
                             req,
@@ -10589,18 +10601,18 @@ impl SipStack {
         // endpoints may place calls. Checked before any per-call state exists
         // and before route preprocessing, so an unadmitted source sees only
         // this 403, never the 482/404/400 of preprocessing (no own-address
-        // oracle, no audit state from spoofed sources). Admission reads the
+        // oracle; only bounded, aggregated audit state). Admission reads the
         // source IP only, so it cannot depend on the preprocessed URI; the
         // audit resource is the Request-URI as received.
         //
         // ## NIST 800-53 Rev5: AC-3 (Access Enforcement)
         if !self.is_admitted_source(source.ip()).await {
-            warn!(
-                call_id = %a_leg_call_id,
-                source = %source,
-                "INVITE from a source that is neither a trunk nor registered, rejecting"
-            );
-            audit_invite_denied(req, source, "source-admission");
+            if let Some(n) = crate::signaling_audit::SOURCE_ADMISSION_LOG.allow() {
+                warn!(call_id = %a_leg_call_id, source = %source, suppressed = n, "INVITE from a source that is neither a trunk nor registered, rejecting");
+            }
+            // Aggregated per (source prefix, policy) (SR-42, SC-5).
+            self.signaling_audit
+                .source_admission_reject(req, source, Instant::now());
             let forbidden = create_response_from_request(req, StatusCode::FORBIDDEN);
             return ProcessResult::Response {
                 message: SipMessage::Response(forbidden),
@@ -15039,6 +15051,8 @@ pub mod tests {
 
     // Dialog and CANCEL matching (RFC 3261 §9.2, §12.2.2, §13.2.2.4, §15).
     mod dialog_binding;
+    // SR-42a: aggregated audit of unauthenticated rejects (QA).
+    mod unauth_audit;
 
     /// For server tests: a stack with trunks t1 (127.0.0.2:5061) and t2
     /// (127.0.0.3:5061), both TLS, and a placed call's primary B-leg INVITE

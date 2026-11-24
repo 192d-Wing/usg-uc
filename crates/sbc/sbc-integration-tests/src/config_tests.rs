@@ -486,8 +486,16 @@ fn qa_helm_rendered_sbc_config_validates() {
         ),
         ("{{ .Values.sbcDaemon.cdr.format | quote }}", "\"jsonl\""),
         ("{{ .Values.sbcDaemon.cdr.rotateSizeMb }}", "16"),
+        (
+            "{{ .Values.sbcDaemon.cdr.rotateInterval | quote }}",
+            "\"6h\"",
+        ),
         ("{{ .Values.sbcDaemon.cdr.retentionDays }}", "90"),
-        ("{{ .Values.sbcDaemon.cdr.retentionFiles }}", "48"),
+        ("{{ .Values.sbcDaemon.cdr.retentionFiles }}", "372"),
+        ("{{ .Values.sbcDaemon.cdr.separateAttempts }}", "true"),
+        ("{{ .Values.sbcDaemon.cdr.attemptsRotateSizeMb }}", "4"),
+        ("{{ .Values.sbcDaemon.cdr.attemptsRetentionDays }}", "90"),
+        ("{{ .Values.sbcDaemon.cdr.attemptsRetentionFiles }}", "372"),
         ("{{ .Values.sbcDaemon.grpcMtls.enabled }}", "true"),
         (
             "{{ include \"sbc.grpcAllowedClientNames\" . }}",

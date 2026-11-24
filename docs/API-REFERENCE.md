@@ -376,7 +376,7 @@ The daemon mounts `CdrService` only on an mTLS listener (`grpc.require_mtls = tr
 
 Errors use the body `{"error": "<message>"}`. Status mapping: `400` for invalid parameters or an invalid argument from the daemon; `403` without the permission; `404` when the CDR is not found; `429` when an export is already running; `502` when the daemon is unreachable or returned an invalid CDR; `503` when the daemon does not expose CdrService or CDRs are disabled.
 
-Records use schema v1, the JSON form of `uc_cdr::CallRecord`. Times are UTC epoch milliseconds (`setup_ms`, `ring_ms`, `answer_ms`, `end_ms`). Caller and callee fields are stored after the daemon's `cdr.pii` policy, so they may be masked or HMAC-hashed.
+Records are the JSON form of `uc_cdr::CallRecord` (calls stream schema v4; unanswered attempts from the attempts stream are schema v5 and have `record_id` `{node}-a{sequence}`, see the admin guide "Attempts stream"). The `stream` field is not carried over gRPC; the `record_id` form tells the streams apart. Times are UTC epoch milliseconds (`setup_ms`, `ring_ms`, `answer_ms`, `end_ms`). Caller and callee fields are stored after the daemon's `cdr.pii` policy, so they may be masked or HMAC-hashed.
 
 ### List CDRs
 

@@ -33,30 +33,41 @@ impl Drop for TempDir {
 }
 
 /// Builds the emitter config from a parsed `[cdr]` table the way the
-/// daemon's `start_from_config` does (no PII key, ring + file).
+/// daemon's `start_from_config` does (no PII key, ring + file, and the
+/// attempts stream when `separate_attempts`).
 fn emitter_from(cfg: &sbc_config::schema::CdrConfig) -> CdrEmitterConfig {
     use sbc_config::schema::CdrFormatConfig;
+    let file = FileSinkConfig {
+        directory: cfg.directory.clone(),
+        format: match cfg.format {
+            CdrFormatConfig::Jsonl => CdrFormat::Jsonl,
+            CdrFormatConfig::Csv => CdrFormat::Csv,
+        },
+        rotate_size_bytes: u64::from(cfg.rotate_size_mb) * 1024 * 1024,
+        rotate_interval: cfg
+            .rotate_interval_secs()
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs),
+        retention_files: cfg.retention_files,
+        retention_days: cfg.retention_days,
+        fsync_interval: Duration::from_millis(u64::from(cfg.fsync_interval_ms)),
+        stream: uc_cdr::CdrStream::Calls,
+    };
+    let attempts = cfg.separate_attempts.then(|| FileSinkConfig {
+        rotate_size_bytes: u64::from(cfg.attempts_rotate_size_mb) * 1024 * 1024,
+        retention_files: cfg.attempts_retention_files,
+        retention_days: cfg.attempts_retention_days,
+        stream: uc_cdr::CdrStream::Attempts,
+        ..file.clone()
+    });
     CdrEmitterConfig {
         node_id: cfg.node_id.clone().unwrap_or_else(|| "it".into()),
         queue_capacity: cfg.queue_capacity,
         ring_capacity: cfg.ring_capacity,
         hash_chain: cfg.hash_chain,
         pii: PiiPolicy::Full,
-        file: Some(FileSinkConfig {
-            directory: cfg.directory.clone(),
-            format: match cfg.format {
-                CdrFormatConfig::Jsonl => CdrFormat::Jsonl,
-                CdrFormatConfig::Csv => CdrFormat::Csv,
-            },
-            rotate_size_bytes: u64::from(cfg.rotate_size_mb) * 1024 * 1024,
-            rotate_interval: cfg
-                .rotate_interval_secs()
-                .filter(|s| *s > 0)
-                .map(Duration::from_secs),
-            retention_files: cfg.retention_files,
-            retention_days: cfg.retention_days,
-            fsync_interval: Duration::from_millis(u64::from(cfg.fsync_interval_ms)),
-        }),
+        file: Some(file),
+        attempts,
     }
 }
 
@@ -115,7 +126,12 @@ fn config_to_file_to_verify_to_ring() {
     }
     assert!(em.shutdown(Duration::from_secs(10)));
 
-    let files = jsonl_files(&dir.0);
+    // Calls stream only: the attempts stream (separate_attempts, default
+    // on) has its own, here header-only, cdra- file.
+    let files: Vec<PathBuf> = jsonl_files(&dir.0)
+        .into_iter()
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("cdr-"))
+        .collect();
     assert_eq!(files.len(), 1);
     let rep = uc_cdr::verify_file(&files[0]).unwrap();
     assert_eq!(rep.records, 10);
@@ -172,4 +188,81 @@ fn disabled_config_needs_no_directory() {
         .unwrap()
         .cdr;
     assert!(!cfg.enabled);
+}
+
+/// SR-43 (QA-first, plan 8 / decision b, POA&M-432/433): from a TOML
+/// `[cdr]` with a small size rotation and a 3-file safety cap, a flood of
+/// SBC-generated rejects (unique Call-IDs, never routed) must not evict the
+/// answered-call CDR files written before it: rejects go to the separate
+/// attempts stream (`separate_attempts` defaults on). `emitter_from` must
+/// map the attempts stream the way the daemon's `start_from_config` does.
+/// NIST 800-53 Rev5: AU-11, AU-4, SC-5
+#[test]
+fn qa_cdr_reject_flood_keeps_answered_cdrs() {
+    let dir = TempDir::new("flood");
+    let toml = format!(
+        "[cdr]\ndirectory = \"{}\"\nnode_id = \"it-node\"\nrotate_interval = \"0\"\n\
+         rotate_size_mb = 1\nretention_files = 3\nretention_days = 90\n\
+         fsync_interval_ms = 60000\nqueue_capacity = 1000000\nring_capacity = 0\n",
+        dir.0.display()
+    );
+    let cfg = sbc_config::load_from_str(&toml).unwrap().cdr;
+    let em = CdrEmitter::start(emitter_from(&cfg), Vec::new(), None).unwrap();
+    let answered = 1_500u64;
+    for n in 1..=answered {
+        assert!(em.emit(call(n)));
+    }
+    assert!(em.flush(Duration::from_secs(30)));
+    let calls = |d: &Path| -> Vec<PathBuf> {
+        jsonl_files(d)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("cdr-it-node-")
+            })
+            .collect()
+    };
+    let sealed: Vec<PathBuf> = calls(&dir.0)
+        .into_iter()
+        .filter(|p| uc_cdr::chain::sidecar_path(p).exists())
+        .collect();
+    assert!(
+        !sealed.is_empty(),
+        "answered calls must fill a 1 MiB file first"
+    );
+
+    for n in 0..8_000u64 {
+        let mut r = CallRecord {
+            a_call_id: format!("flood-{n}@spoofed"),
+            caller: "+12025550199".into(),
+            callee_dialed: "+15551234567".into(),
+            source_ip: "198.51.100.77".into(),
+            source_port: 5060,
+            setup_ms: 2_000_000 + n,
+            end_ms: 2_000_000 + n,
+            disposition: Disposition::Rejected,
+            final_sip_status: 403,
+            release_side: ReleaseSide::Sbc,
+            release_cause: ReleaseCause::PolicyDenied,
+            ..Default::default()
+        };
+        r.compute_durations();
+        assert!(em.emit(r));
+    }
+    assert!(em.shutdown(Duration::from_secs(60)));
+
+    for p in &sealed {
+        assert!(p.exists(), "{} was evicted by a reject flood", p.display());
+        assert!(uc_cdr::verify_sidecar(p).unwrap(), "{}", p.display());
+    }
+    let left = calls(&dir.0);
+    let refs: Vec<&Path> = left.iter().map(PathBuf::as_path).collect();
+    let reps = uc_cdr::verify_files(&refs).unwrap();
+    assert_eq!(
+        reps.iter().map(|r| r.records).sum::<u64>(),
+        answered,
+        "every answered CDR is still on disk and no reject is in the calls stream"
+    );
 }

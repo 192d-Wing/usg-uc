@@ -14,6 +14,9 @@
 //! - **AU-5**: Response to Audit Logging Process Failures - queue drops and
 //!   sink write failures are counted, reported, and chained as
 //!   `AuditRecordsDropped` markers
+//! - **AU-4**: Audit Log Storage Capacity - [`sink::FileSink`] rotates at a
+//!   size bound and keeps a bounded set of rotated files; rotations and
+//!   capacity deletions are chained (`AuditFileRotated`, `AuditFileDeleted`)
 //!
 //! ## Features
 //!
@@ -43,6 +46,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+pub mod aggregate;
 pub mod event;
 pub mod record;
 pub mod sink;
@@ -95,6 +99,17 @@ struct AuditCounters {
     last_drop_ms: AtomicU64,
     /// Same, for sink write failures only.
     last_write_failure_ms: AtomicU64,
+    /// Audit files rotated at the size bound.
+    rotations: AtomicU64,
+    /// Rotated audit files deleted at the capacity bound.
+    capacity_deletions: AtomicU64,
+    /// The last write was refused for lack of space (`stop` capacity
+    /// action or a full volume); cleared by the next successful write.
+    capacity_halted: AtomicBool,
+    /// Sink notices dropped (pending queue full) and failed capacity
+    /// deletions, copied from the sink (AU-5).
+    notices_dropped: AtomicU64,
+    delete_failures: AtomicU64,
     epoch: Instant,
 }
 
@@ -111,6 +126,11 @@ impl AuditCounters {
             last_failure_report_ms: AtomicU64::new(0),
             last_drop_ms: AtomicU64::new(0),
             last_write_failure_ms: AtomicU64::new(0),
+            rotations: AtomicU64::new(0),
+            capacity_deletions: AtomicU64::new(0),
+            capacity_halted: AtomicBool::new(false),
+            notices_dropped: AtomicU64::new(0),
+            delete_failures: AtomicU64::new(0),
             epoch: Instant::now(),
         }
     }
@@ -195,6 +215,10 @@ pub struct AuditLogger {
     counters: Arc<AuditCounters>,
     /// Sink write failures not yet recorded in the chain by a marker.
     pending_sink_drops: u64,
+    /// Records refused at the capacity bound not yet recorded by a marker.
+    pending_capacity_drops: u64,
+    /// Records refused at the capacity bound since startup.
+    capacity_drops_total: u64,
     /// `Some(count)` until the torn-tail marker for the resumed file is
     /// chained.
     pending_torn: Option<u64>,
@@ -214,6 +238,8 @@ impl AuditLogger {
             last_hash: resume.last_hash,
             counters,
             pending_sink_drops: 0,
+            pending_capacity_drops: 0,
+            capacity_drops_total: 0,
             pending_torn: (!resume.clean).then_some(resume.skipped_lines.max(1)),
         }
     }
@@ -222,13 +248,122 @@ impl AuditLogger {
     /// when the sink persisted the record, so a failed write leaves no gap.
     ///
     /// ## NIST 800-53 Rev5: AU-3, AU-8 (timestamp at sequence assignment), AU-9
+    ///
+    /// When the sink rotates instead of writing, its notices are chained
+    /// first (so `AuditFileRotated` opens the new file) and the record is
+    /// re-sequenced after them.
     fn try_write(&mut self, event: AuditEvent) -> std::io::Result<()> {
-        let record = AuditRecord::new(self.sequence, event, chrono::Utc::now(), self.last_hash);
-        self.sink.write(&record)?;
+        // Notices left over from an earlier failed rotation (reopen error)
+        // go before this record.
+        self.chain_notices();
+        let mut record = AuditRecord::new(self.sequence, event, chrono::Utc::now(), self.last_hash);
+        let mut rotated = false;
+        loop {
+            // At most one rotation per record; then write through.
+            let outcome = if rotated {
+                self.sink
+                    .write(&record)
+                    .map(|()| sink::WriteOutcome::Written)
+            } else {
+                self.sink.write_or_rotate(&record)
+            }?;
+            match outcome {
+                sink::WriteOutcome::Written => break,
+                sink::WriteOutcome::Rotated => {
+                    rotated = true;
+                    self.chain_notices();
+                    record = AuditRecord::new(
+                        self.sequence,
+                        record.event,
+                        chrono::Utc::now(),
+                        self.last_hash,
+                    );
+                }
+            }
+        }
+        self.advance(&record);
+        self.chain_notices();
+        Ok(())
+    }
+
+    fn advance(&mut self, record: &AuditRecord) {
         self.sequence = self.sequence.wrapping_add(1);
         self.last_hash = record.hash_chain;
         self.counters.sink_failing.store(false, Ordering::Relaxed);
-        Ok(())
+        self.counters
+            .capacity_halted
+            .store(false, Ordering::Relaxed);
+    }
+
+    /// Chains the sink's file notices (rotation, capacity deletion) and
+    /// counts them. A notice that fails to write is counted as a lost
+    /// record. Bounded: at most 4 rounds of notices per call.
+    ///
+    /// ## NIST 800-53 Rev5: AU-4, AU-5 (capacity action is in the trail), AU-9
+    fn chain_notices(&mut self) {
+        let c = self.sink.sink_counters();
+        self.counters
+            .notices_dropped
+            .store(c.notices_dropped, Ordering::Relaxed);
+        self.counters
+            .delete_failures
+            .store(c.delete_failures, Ordering::Relaxed);
+        for _ in 0..4 {
+            let notices = self.sink.take_notices();
+            if notices.is_empty() {
+                return;
+            }
+            for notice in notices {
+                let event = match notice {
+                    sink::SinkNotice::Rotated {
+                        file,
+                        sha384,
+                        last_sequence,
+                    } => {
+                        self.counters.rotations.fetch_add(1, Ordering::Relaxed);
+                        AuditEvent::AuditFileRotated(event::AuditFileRotated {
+                            file: file.to_string_lossy().into_owned(),
+                            sha384: hex::encode(sha384),
+                            last_sequence,
+                        })
+                    }
+                    sink::SinkNotice::Deleted {
+                        file,
+                        reason,
+                        first_sequence,
+                        last_sequence,
+                    } => {
+                        self.counters
+                            .capacity_deletions
+                            .fetch_add(1, Ordering::Relaxed);
+                        AuditEvent::AuditFileDeleted(event::AuditFileDeleted {
+                            file: file.to_string_lossy().into_owned(),
+                            reason: reason.to_string(),
+                            first_sequence,
+                            last_sequence,
+                        })
+                    }
+                };
+                let record =
+                    AuditRecord::new(self.sequence, event, chrono::Utc::now(), self.last_hash);
+                match self.sink.write(&record) {
+                    Ok(()) => self.advance(&record),
+                    Err(e) => self.note_failure(&e),
+                }
+            }
+        }
+    }
+
+    /// Counts one record the sink failed to persist, by cause.
+    fn note_failure(&mut self, e: &std::io::Error) {
+        self.counters.record_write_failure(e, true);
+        if e.kind() == std::io::ErrorKind::StorageFull {
+            self.counters.capacity_halted.store(true, Ordering::Relaxed);
+            self.pending_capacity_drops = self.pending_capacity_drops.saturating_add(1);
+            self.capacity_drops_total = self.capacity_drops_total.saturating_add(1);
+        } else {
+            self.pending_sink_drops = self.pending_sink_drops.saturating_add(1);
+        }
     }
 
     /// Chains pending loss markers, then the event; a failed write is
@@ -248,10 +383,7 @@ impl AuditLogger {
         match self.try_write(event) {
             Ok(()) if failing => self.emit_pending(),
             Ok(()) => {}
-            Err(e) => {
-                self.counters.record_write_failure(&e, true);
-                self.pending_sink_drops = self.pending_sink_drops.saturating_add(1);
-            }
+            Err(e) => self.note_failure(&e),
         }
     }
 
@@ -297,12 +429,25 @@ impl AuditLogger {
                 self.pending_sink_drops = 0;
             }
         }
+        if self.pending_capacity_drops > 0 {
+            let marker = AuditRecordsDropped {
+                count: self.pending_capacity_drops,
+                total: self.capacity_drops_total,
+                reason: AuditDropReason::CapacityExhausted,
+            };
+            if self.write_marker(marker) {
+                self.pending_capacity_drops = 0;
+            }
+        }
     }
 
     fn write_marker(&mut self, marker: AuditRecordsDropped) -> bool {
         match self.try_write(AuditEvent::AuditRecordsDropped(marker)) {
             Ok(()) => true,
             Err(e) => {
+                if e.kind() == std::io::ErrorKind::StorageFull {
+                    self.counters.capacity_halted.store(true, Ordering::Relaxed);
+                }
                 self.counters.record_write_failure(&e, false);
                 false
             }
@@ -456,6 +601,17 @@ pub struct AuditStats {
     pub last_drop: Option<Duration>,
     /// Time since the most recent sink write failure.
     pub last_write_failure: Option<Duration>,
+    /// Audit files rotated at the size bound (AU-4).
+    pub rotations: u64,
+    /// Rotated audit files deleted at the capacity bound (`overwrite_oldest`).
+    pub capacity_deletions: u64,
+    /// The most recent write was refused for lack of space (`stop` at the
+    /// capacity bound, or a full volume): records are being lost.
+    pub capacity_halted: bool,
+    /// Sink notices (rotation, deletion) not chained: pending queue full.
+    pub notices_dropped: u64,
+    /// Rotated files the capacity action failed to delete.
+    pub delete_failures: u64,
 }
 
 /// Snapshot of the audit pipeline counters.
@@ -479,6 +635,11 @@ pub fn stats() -> AuditStats {
         sink_failing: c.sink_failing.load(Ordering::Relaxed),
         last_drop: elapsed_since(c.last_drop_ms.load(Ordering::Relaxed), now),
         last_write_failure: elapsed_since(c.last_write_failure_ms.load(Ordering::Relaxed), now),
+        rotations: c.rotations.load(Ordering::Relaxed),
+        capacity_deletions: c.capacity_deletions.load(Ordering::Relaxed),
+        capacity_halted: c.capacity_halted.load(Ordering::Relaxed),
+        notices_dropped: c.notices_dropped.load(Ordering::Relaxed),
+        delete_failures: c.delete_failures.load(Ordering::Relaxed),
     }
 }
 

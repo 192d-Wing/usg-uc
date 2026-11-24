@@ -64,6 +64,9 @@ pub enum BearerResult {
     Forbidden {
         /// Operator-facing reason (logged; not sent verbatim to the client).
         reason: String,
+        /// The authenticated subject (`dn` claim), when the token has one.
+        /// Audit identity of the denial (NIST 800-53 Rev5: AU-3).
+        dn: Option<String>,
     },
 }
 
@@ -126,6 +129,7 @@ impl BearerAuthenticator {
             // does not enforce `dn`), but map it defensively to Forbidden.
             Err(ValidateError::NotProvisioned) => BearerResult::Forbidden {
                 reason: "token not provisioned for voice".to_string(),
+                dn: None,
             },
             Err(ref e @ (ValidateError::MissingToken | ValidateError::InvalidToken(_))) => {
                 tracing::debug!(error = %e, aor_user, "bearer REGISTER rejected: invalid token");
@@ -138,12 +142,14 @@ impl BearerAuthenticator {
                     return BearerResult::Forbidden {
                         reason: "token has no `dn` claim — not a provisioned voice user"
                             .to_string(),
+                        dn: None,
                     };
                 };
                 // RFC 8898 §3: the authenticated identity must own the AOR.
                 if dn != aor_user {
                     return BearerResult::Forbidden {
                         reason: format!("token dn `{dn}` does not match AOR user `{aor_user}`"),
+                        dn: Some(dn),
                     };
                 }
                 BearerResult::Authorized {

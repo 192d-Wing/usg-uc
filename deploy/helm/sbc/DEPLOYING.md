@@ -172,6 +172,7 @@ sbcDaemon:
 | `auth` | Mgmt-plane admin | Fail-closed: `sbc-api`/`sbc-provision` won't start without a credential. Prefer `adminPasswordHash` (argon2 PHC) to keep plaintext out of values |
 | `sbcPostgres` | Config store | `enabled: true` for the in-chart StatefulSet (set `password`), or `enabled: false` + `existingSecret.name` (key `dsn`) for managed Postgres |
 | `sbcDaemon.config` | SIP tuning | `max_calls`, `max_registrations`, `media_mode`, `srtp_required`, listen addrs (`metrics_listen` is reserved and not rendered; the daemon rejects a `[monitoring]` table). The `-metrics` Service (`services.metrics`, port 9090) is off by default and has no listener behind it: no metrics exporter exists (POA&M-195) |
+| `sbcDaemon.cdr` | Call Detail Records | Own volume (`persistence.size`, default `8Gi`). `rotateInterval` `6h`, `retentionDays` 90 (authoritative), `retentionFiles` 372 (safety cap; must cover `retentionDays` at `rotateInterval` or the daemon refuses the config). `separateAttempts` puts every unanswered attempt in its own files with `attemptsRotateSizeMb` (4) / `attemptsRetentionFiles` / `attemptsRetentionDays`. Size the volume by traffic: worst case `(retentionFiles + 1) x rotateSizeMb + (attemptsRetentionFiles + 1) x attemptsRotateSizeMb`, plus about 5 %. See "Upgrading to the CDR retention release" in §8 |
 | `sbcDaemon.dtlsTerminate` | DTLS-SRTP termination (off by default) | `enabled` adds the Go DTLS sidecar to the daemon pod and sets `media.srtp.mode = Terminate`. `maxSessions` (`0` = 2 x `config.max_calls`) is the sidecar's session limit; `goMemLimit` (default `920MiB`) sets its `GOMEMLIMIT`; `resources.limits.memory` defaults to `1Gi`. Size the memory limit with `max_calls`: see "Upgrading to the client DTLS-SRTP release" in section 8 |
 | `sbcDaemon.sipTls` | SIP-over-TLS | `secretName` of a `kubernetes.io/tls` Secret covering the registrar domain; empty = UDP/TCP only |
 | `sbcDaemon.oidc` | REGISTER authz | RFC 8898 bearer-token REGISTER; requires an IdP (see `sbcClientConfig.oidc`) |
@@ -471,6 +472,31 @@ This upgrade has breaking changes. Check each point before you upgrade.
   value alone does not change the password of an initialised bundled
   Postgres. In cnpg mode the chart-owned DSNs now use `sslmode=verify-full`
   against `postgres.cnpg.caSecret` (default `<cluster>-ca`, key `ca.crt`).
+
+### Upgrading to the CDR retention release
+
+- **CDR retention is age-first.** `sbcDaemon.cdr.retentionDays` (90) now
+  decides what is deleted; `retentionFiles` is a safety cap. The chart now
+  renders `rotate_interval = "6h"` (was unset, so 1 h) and keeps 372 files
+  per stream (was 48, which held about 48 hours). The daemon refuses a
+  config whose `retentionFiles x rotateInterval` is shorter than
+  `retentionDays`: if you override `retentionFiles` or `rotateInterval`,
+  keep the product at or above `retentionDays`.
+- **The CDR volume default grows from `1Gi` to `8Gi`.** Worst case on disk
+  is `(retentionFiles + 1) x rotateSizeMb + (attemptsRetentionFiles + 1) x
+  attemptsRotateSizeMb` (373 x 16 MiB + 373 x 4 MiB = 7.3 GiB).
+  A PVC cannot shrink and may not grow in place: on a storage class without
+  volume expansion, set `sbcDaemon.cdr.persistence.size` to the existing size
+  and lower `rotateSizeMb` (and so the per-file size) instead, keeping the
+  file counts. Deletions before `retentionDays` are audited
+  (`cdr_file_deleted`, `early = true`) and counted
+  (`sbc_cdr_files_deleted_early_total`).
+- **Every unanswered attempt moves to `cdra-<node>-*` files** (rejects,
+  failed, busy, no answer, cancelled; schema v5, `record_id`
+  `<node>-a<seq>`, `"stream":"attempts"`). Only answered calls stay in
+  `cdr-<node>-*` files, unchanged (schema v4). Billing collectors that read
+  unanswered attempts must read both prefixes, or set
+  `separateAttempts: false` for the single stream.
 
 ### Upgrading to the client DTLS-SRTP release (feat/client-dtls-wiring)
 

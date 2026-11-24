@@ -383,13 +383,22 @@ audit_enabled = true
 # Call Detail Records (NIST 800-53 Rev5 AU-12). The directory is its own
 # volume (sbcDaemon.cdr.persistence, mounted at cdr.directory) so a CDR
 # burst cannot fill the user/config store on the data volume. Retention is
-# sized to it: retention_files * rotate_size_mb <= the CDR volume (AU-4).
+# sized to it: (retention_files + 1) * rotate_size_mb + (attempts_retention_files
+# + 1) * attempts_rotate_size_mb <= the CDR volume (AU-4); retention_days is
+# authoritative (AU-11).
 # The daemon refuses to start if it cannot write here.
 [cdr]
 enabled = {{ .Values.sbcDaemon.cdr.enabled }}
 directory = {{ .Values.sbcDaemon.cdr.directory | quote }}
 format = {{ .Values.sbcDaemon.cdr.format | quote }}
 rotate_size_mb = {{ .Values.sbcDaemon.cdr.rotateSizeMb }}
+rotate_interval = {{ .Values.sbcDaemon.cdr.rotateInterval | quote }}
 retention_days = {{ .Values.sbcDaemon.cdr.retentionDays }}
 retention_files = {{ .Values.sbcDaemon.cdr.retentionFiles }}
+separate_attempts = {{ .Values.sbcDaemon.cdr.separateAttempts }}
+{{- if .Values.sbcDaemon.cdr.separateAttempts }}
+attempts_rotate_size_mb = {{ .Values.sbcDaemon.cdr.attemptsRotateSizeMb }}
+attempts_retention_days = {{ .Values.sbcDaemon.cdr.attemptsRetentionDays }}
+attempts_retention_files = {{ .Values.sbcDaemon.cdr.attemptsRetentionFiles }}
+{{- end }}
 {{- end }}
