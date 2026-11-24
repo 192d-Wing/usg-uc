@@ -8,22 +8,30 @@
 # is unreachable. Same cargo-chef shape as sbc-client-config-server's
 # Dockerfile, plus protobuf for tonic/prost codegen (sbc-grpc-api).
 #
+# Builder and runtime follow the root Dockerfile: glibc (Debian) with Go,
+# because the binary links the FIPS-validated aws-lc module and
+# aws-lc-fips-sys does not build on musl. Do NOT change to Alpine;
+# ci/check-dockerfiles-fips.sh fails CI on an Alpine/musl Rust builder.
+#
 # Build (from repo root):
-#   docker build -t usg-sbc-announcement-server:local \
-#     -f crates/sbc/sbc-announcement-server/Dockerfile .
+#   docker build -t usg-sbc-announcement-server:local -f crates/sbc/sbc-announcement-server/Dockerfile .
 
-FROM rust:1-alpine AS chef
+# =============================================================================
+# Stage 1: Rust toolchain + build-deps + cargo-chef.
+# =============================================================================
+FROM rust:1-bookworm AS chef
 
-# build-base = gcc/make/musl-dev — aws-lc-sys (the non-FIPS aws-lc-rs
-# backend behind rustls/tonic TLS) compiles C and needs cmake; perl for
-# its assembly generation; protobuf for the gRPC codegen in sbc-grpc-api.
-RUN apk add --no-cache \
-    build-base \
+# cmake + Go for aws-lc-fips-sys (the FIPS module build needs both);
+# pkg-config for native build scripts.
+# protobuf for the tonic/prost gRPC codegen.
+# No openssl: the binary is rustls-only.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
-    perl \
-    pkgconfig \
-    protobuf \
-    protobuf-dev
+    pkg-config \
+    golang \
+    protobuf-compiler \
+    libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -31,10 +39,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 WORKDIR /app
 
+# =============================================================================
+# Stage 2: Cook just the deps the sbc-announcement-server binary needs.
+# =============================================================================
 FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
+# Embedded announcement audio (include_dir in sbc-announcement).
 COPY audio_files/ audio_files/
 
 RUN cargo chef prepare --recipe-path recipe.json
@@ -46,8 +58,11 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo chef cook --release --recipe-path recipe.json \
-    --package sbc-announcement-server
+        --package sbc-announcement-server
 
+# =============================================================================
+# Stage 3: Build the binary against the cooked deps.
+# =============================================================================
 FROM chef AS builder
 
 COPY --from=cacher /app/target /app/target
@@ -62,11 +77,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --package sbc-announcement-server \
     && cp target/release/sbc-announcement-server /tmp/sbc-announcement-server
 
-FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
+# =============================================================================
+# Stage 4: Runtime — same pinned Debian trixie-slim as the root Dockerfile.
+# ca-certificates: outbound HTTPS clients verify against the OS roots.
+# =============================================================================
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
 
-RUN apk add --no-cache ca-certificates \
-    && addgroup -g 1000 sbc \
-    && adduser -D -u 1000 -G sbc -s /bin/sh sbc
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && groupadd --gid 1000 sbc \
+    && useradd --uid 1000 --gid sbc --shell /usr/sbin/nologin --no-create-home sbc
 
 COPY --from=builder /tmp/sbc-announcement-server /usr/local/bin/sbc-announcement-server
 

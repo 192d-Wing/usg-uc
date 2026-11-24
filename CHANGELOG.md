@@ -368,6 +368,13 @@ release") and `deploy/keycloak/central-config-clients.md`.
 
 ### Changed (SBC, dependencies and CI)
 
+- **SBC images:** the eight Rust service images (sbc-api-server,
+  sbc-provision-server, sbc-client-config-server, sbc-announcement-server,
+  sbc-trunk-agent, central-config-api, central-config-import,
+  sbc-config-sync) now build on `rust:1-bookworm` and run on the pinned
+  `debian:trixie-slim`, like sbc-daemon, so they link the aws-lc FIPS
+  module. The Alpine builders could not build `aws-lc-fips-sys`.
+  `ci/check-dockerfiles-fips.sh` fails CI on an Alpine or musl Rust builder.
 - `central-config-store`: sqlx gains feature `tls-rustls-aws-lc-rs` (the
   feature `uc-storage` already enables), so a `verify-full` DSN can
   connect. No new crate enters `Cargo.lock`. sqlx builds its own rustls
