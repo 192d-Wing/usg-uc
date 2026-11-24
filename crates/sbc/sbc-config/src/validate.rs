@@ -5739,3 +5739,162 @@ mod sr55_rate_limit_keys_loader {
         crate::load_from_str("[rate_limit]\ntrunk_rps = 2000\n").unwrap();
     }
 }
+
+/// SR-59 (D3): `transport.ws_trusted_proxies` / `transport.ws_client_address`
+/// validation, driven through TOML so it runs against today's schema
+/// (unknown `[transport]` keys load and are ignored on main, so these fail
+/// on assertion, not compilation).
+///
+/// ## NIST 800-53 Rev5: CM-6, SC-7
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod sr59_ws_proxy_keys_toml {
+    use super::validate_config;
+    use crate::schema::SbcConfig;
+
+    /// Loads `[transport]` extras on top of one WS listener and validates.
+    fn check(extra: &str) -> Result<(), String> {
+        let text = format!("[transport]\nws_listen = [\"127.0.0.1:7080\"]\n{extra}\n");
+        let c: SbcConfig = toml::from_str(&text).map_err(|e| e.to_string())?;
+        validate_config(&c).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn ws_proxy_keys_validated_bad_cidr() {
+        for bad in [
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "not-an-ip",
+            "10.0.0.0/",
+            "",
+            "10.0.0.0/8 ",
+            "10.0.0.0/-1",
+            "proxy.example.mil",
+        ] {
+            let r = check(&format!(
+                "ws_trusted_proxies = [\"10.0.0.1\", \"{bad}\"]\n\
+                 ws_client_address = \"x_forwarded_for\""
+            ));
+            assert!(r.is_err(), "CIDR {bad:?} accepted");
+            let err = r.unwrap_err();
+            assert!(err.contains("ws_trusted_proxies"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn ws_proxy_keys_validated_mode_requires_list() {
+        for mode in ["proxy_v2", "x_forwarded_for", "forwarded"] {
+            for list in ["", "ws_trusted_proxies = []"] {
+                let r = check(&format!("{list}\nws_client_address = \"{mode}\""));
+                assert!(r.is_err(), "mode {mode} without a list accepted ({list:?})");
+                let err = r.unwrap_err();
+                assert!(
+                    err.contains("ws_trusted_proxies") && err.contains("ws_client_address"),
+                    "{mode}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ws_proxy_keys_validated_unknown_mode() {
+        for mode in ["x-real-ip", "X_FORWARDED_FOR", "proxy_v1", ""] {
+            let r = check(&format!(
+                "ws_trusted_proxies = [\"10.0.0.0/8\"]\nws_client_address = \"{mode}\""
+            ));
+            assert!(r.is_err(), "mode {mode:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn ws_proxy_keys_validated_type_errors() {
+        // A bare string instead of a list must fail the load (CM-6).
+        assert!(
+            check("ws_trusted_proxies = \"10.0.0.0/8\"\nws_client_address = \"proxy_v2\"").is_err()
+        );
+        assert!(check("ws_trusted_proxies = [\"10.0.0.0/8\"]\nws_client_address = 1").is_err());
+    }
+
+    // Guards (green on main and after): the default and valid configs load.
+    #[test]
+    fn ws_proxy_keys_valid_configs_accepted() {
+        check("").unwrap();
+        for mode in ["proxy_v2", "x_forwarded_for", "forwarded"] {
+            check(&format!(
+                "ws_trusted_proxies = [\"10.0.0.0/8\", \"2001:db8::/32\", \"192.0.2.7\", \"::1\"]\n\
+                 ws_client_address = \"{mode}\""
+            ))
+            .unwrap();
+        }
+        // A list with the default mode is accepted (startup warning only).
+        check("ws_trusted_proxies = [\"10.0.0.0/8\"]\nws_client_address = \"peer\"").unwrap();
+        check("ws_trusted_proxies = [\"10.0.0.0/8\"]").unwrap();
+    }
+
+    #[test]
+    fn wss_listen_message_points_to_trusted_proxies() {
+        let mut config = SbcConfig::default();
+        config.transport.wss_listen = vec!["0.0.0.0:7443".parse().unwrap()];
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("wss_listen"), "{err}");
+        assert!(err.contains("ws_trusted_proxies"), "{err}");
+        assert!(err.contains("ws_client_address"), "{err}");
+    }
+}
+
+/// SR-59 (D3): the new `TransportConfig` fields (compile-red until they
+/// exist).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod sr59_ws_proxy_keys_api {
+    use super::validate_config;
+    use crate::schema::{SbcConfig, WsClientAddress};
+
+    #[test]
+    fn ws_proxy_key_defaults() {
+        let c = SbcConfig::default();
+        assert_eq!(c.transport.ws_trusted_proxies, Vec::<String>::new());
+        assert_eq!(c.transport.ws_client_address, WsClientAddress::Peer);
+        assert_eq!(WsClientAddress::default(), WsClientAddress::Peer);
+        validate_config(&c).unwrap();
+    }
+
+    #[test]
+    fn ws_proxy_keys_load_and_round_trip() {
+        for (text, want) in [
+            ("peer", WsClientAddress::Peer),
+            ("proxy_v2", WsClientAddress::ProxyV2),
+            ("x_forwarded_for", WsClientAddress::XForwardedFor),
+            ("forwarded", WsClientAddress::Forwarded),
+        ] {
+            let c: SbcConfig = toml::from_str(&format!(
+                "[transport]\nws_listen = [\"127.0.0.1:7080\"]\n\
+                 ws_trusted_proxies = [\"10.0.0.0/8\", \"2001:db8::/32\"]\n\
+                 ws_client_address = \"{text}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(c.transport.ws_client_address, want);
+            assert_eq!(
+                c.transport.ws_trusted_proxies,
+                vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()]
+            );
+            let back: SbcConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+            assert_eq!(back.transport.ws_client_address, want);
+            assert_eq!(
+                back.transport.ws_trusted_proxies,
+                c.transport.ws_trusted_proxies
+            );
+        }
+    }
+
+    #[test]
+    fn ws_proxy_keys_struct_validation() {
+        let mut c = SbcConfig::default();
+        c.transport.ws_client_address = WsClientAddress::Forwarded;
+        assert!(validate_config(&c).is_err(), "mode without a list");
+        c.transport.ws_trusted_proxies = vec!["192.0.2.0/24".into()];
+        validate_config(&c).unwrap();
+        c.transport.ws_trusted_proxies.push("192.0.2.0/40".into());
+        assert!(validate_config(&c).is_err(), "bad CIDR");
+    }
+}
