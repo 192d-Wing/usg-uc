@@ -511,22 +511,21 @@ fn validate_transport(config: &crate::schema::TransportConfig) -> ConfigResult<(
 }
 
 /// `transport.ws_trusted_proxies` / `transport.ws_client_address`: every
-/// entry is a CIDR or bare IP, and a mode other than `peer` needs a list (a
+/// entry is a CIDR or bare IP with a non-zero prefix (see
+/// [`parse_trusted_proxy`]), and a mode other than `peer` needs a list (a
 /// mode with nobody trusted would never take effect). A list with mode
-/// `peer` is accepted; the daemon warns at startup that it is unused.
+/// `peer` is accepted; the daemon warns at startup that it is unused, and
+/// warns for entries broader than /16 (IPv4) or /48 (IPv6).
+/// `transport.ws_max_handshakes_per_proxy` is 1..=`max_connections_per_listener`.
 ///
-/// ## NIST 800-53 Rev5: CM-6, SC-7
+/// ## NIST 800-53 Rev5: CM-6, SC-5, SC-7
 fn validate_ws_client_address(config: &crate::schema::TransportConfig) -> ConfigResult<()> {
-    if let Some(bad) = config
-        .ws_trusted_proxies
-        .iter()
-        .find(|entry| !is_valid_cidr(entry))
-    {
-        return Err(ConfigError::Validation {
-            message: format!(
-                "transport.ws_trusted_proxies entry {bad:?} is not a valid IP address or CIDR"
-            ),
-        });
+    for entry in &config.ws_trusted_proxies {
+        if let Err(why) = parse_trusted_proxy(entry) {
+            return Err(ConfigError::Validation {
+                message: format!("transport.ws_trusted_proxies entry {entry:?} {why}"),
+            });
+        }
     }
     if config.ws_client_address != crate::schema::WsClientAddress::Peer
         && config.ws_trusted_proxies.is_empty()
@@ -537,7 +536,56 @@ fn validate_ws_client_address(config: &crate::schema::TransportConfig) -> Config
                 .to_string(),
         });
     }
-    Ok(())
+    check_range(
+        "transport.ws_max_handshakes_per_proxy",
+        config.ws_max_handshakes_per_proxy,
+        1,
+        config.max_connections_per_listener.max(1),
+    )
+}
+
+/// Parses one `transport.ws_trusted_proxies` entry (CIDR or bare IP).
+///
+/// Returns its canonical network address and prefix length. An IPv4-mapped
+/// IPv6 entry (`::ffff:a.b.c.d/p`, `p` >= 96) becomes the IPv4 network `/p-96`,
+/// so it matches the canonical peer addresses the transports report.
+///
+/// # Errors
+///
+/// A short reason (for the validation message) when the entry is not an IP
+/// or CIDR, has prefix length 0 (that would trust every address), or is
+/// an IPv4-mapped network shorter than /96.
+///
+/// ## NIST 800-53 Rev5: CM-6, SC-7; RFC 7239 §8.1
+pub fn parse_trusted_proxy(entry: &str) -> Result<(std::net::IpAddr, u8), &'static str> {
+    if !is_valid_cidr(entry) {
+        return Err("is not a valid IP address or CIDR");
+    }
+    let (addr, prefix) = entry
+        .split_once('/')
+        .map_or((entry, None), |(a, p)| (a, Some(p)));
+    let addr: std::net::IpAddr = addr
+        .parse()
+        .map_err(|_| "is not a valid IP address or CIDR")?;
+    let max = if addr.is_ipv4() { 32u8 } else { 128 };
+    let prefix = match prefix {
+        Some(p) => p
+            .parse::<u8>()
+            .map_err(|_| "is not a valid IP address or CIDR")?,
+        None => max,
+    };
+    let (addr, prefix) = match addr {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) if prefix >= 96 => (std::net::IpAddr::V4(v4), prefix - 96),
+            Some(_) => return Err("is an IPv4-mapped network shorter than /96"),
+            None => (addr, prefix),
+        },
+        std::net::IpAddr::V4(_) => (addr, prefix),
+    };
+    if prefix == 0 {
+        return Err("has prefix length 0, which would trust every address");
+    }
+    Ok((addr, prefix))
 }
 
 /// Range check helper for numeric settings.
@@ -5930,5 +5978,88 @@ mod sr59_ws_proxy_keys_api {
         validate_config(&c).unwrap();
         c.transport.ws_trusted_proxies.push("192.0.2.0/40".into());
         assert!(validate_config(&c).is_err(), "bad CIDR");
+    }
+}
+
+/// SR-59 fix round: trusted-proxy prefix rules and the per-proxy
+/// pre-handshake cap.
+///
+/// ## NIST 800-53 Rev5: CM-6, SC-5, SC-7
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
+mod sr59_ws_proxy_fix_round {
+    use super::{parse_trusted_proxy, validate_config};
+    use crate::schema::{SbcConfig, WsClientAddress};
+    use std::net::IpAddr;
+
+    fn with_proxies(list: &[&str]) -> SbcConfig {
+        let mut c = SbcConfig::default();
+        c.transport.ws_listen = vec!["127.0.0.1:7080".parse().unwrap()];
+        c.transport.ws_client_address = WsClientAddress::XForwardedFor;
+        c.transport.ws_trusted_proxies = list.iter().map(|s| (*s).to_string()).collect();
+        c
+    }
+
+    #[test]
+    fn ws_trusted_proxies_prefix_zero_refused() {
+        for bad in [
+            "0.0.0.0/0",
+            "10.0.0.0/0",
+            "::/0",
+            "2001:db8::/0",
+            "::ffff:0.0.0.0/96",
+        ] {
+            let err = validate_config(&with_proxies(&["192.0.2.7", bad]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("ws_trusted_proxies"), "{bad}: {err}");
+            assert!(err.contains(bad), "{bad}: {err}");
+        }
+        // Broad but non-zero prefixes load (the daemon warns at startup).
+        validate_config(&with_proxies(&["10.0.0.0/8", "2001:db8::/32", "1.0.0.0/1"])).unwrap();
+    }
+
+    #[test]
+    fn ws_trusted_proxies_v4_mapped_canonicalised() {
+        let v4 = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            parse_trusted_proxy("::ffff:10.0.0.0/104"),
+            Ok((v4("10.0.0.0"), 8))
+        );
+        assert_eq!(
+            parse_trusted_proxy("::ffff:192.0.2.7"),
+            Ok((v4("192.0.2.7"), 32))
+        );
+        assert_eq!(parse_trusted_proxy("192.0.2.7"), Ok((v4("192.0.2.7"), 32)));
+        assert_eq!(
+            parse_trusted_proxy("2001:db8::/32"),
+            Ok((v4("2001:db8::"), 32))
+        );
+        assert!(parse_trusted_proxy("::ffff:0.0.0.0/80").is_err());
+        assert!(validate_config(&with_proxies(&["::ffff:10.0.0.0/88"])).is_err());
+        validate_config(&with_proxies(&["::ffff:10.0.0.0/104"])).unwrap();
+    }
+
+    #[test]
+    fn ws_max_handshakes_per_proxy_default_and_range() {
+        let c = SbcConfig::default();
+        assert_eq!(c.transport.ws_max_handshakes_per_proxy, 1024);
+        validate_config(&c).unwrap();
+        let mut c = with_proxies(&["10.0.0.0/8"]);
+        c.transport.ws_max_handshakes_per_proxy = 0;
+        let err = validate_config(&c).unwrap_err().to_string();
+        assert!(err.contains("ws_max_handshakes_per_proxy"), "{err}");
+        c.transport.ws_max_handshakes_per_proxy = c.transport.max_connections_per_listener + 1;
+        assert!(validate_config(&c).is_err());
+        c.transport.ws_max_handshakes_per_proxy = c.transport.max_connections_per_listener;
+        validate_config(&c).unwrap();
+        let loaded = crate::load_from_str(
+            "[transport]\nws_listen = [\"127.0.0.1:7080\"]\n\
+             ws_trusted_proxies = [\"10.0.0.0/8\"]\nws_client_address = \"proxy_v2\"\n\
+             ws_max_handshakes_per_proxy = 64\n",
+        )
+        .unwrap();
+        assert_eq!(loaded.transport.ws_max_handshakes_per_proxy, 64);
+        assert!(crate::load_from_str("[transport]\nws_max_handshakes_per_proxy = 0\n").is_err());
     }
 }

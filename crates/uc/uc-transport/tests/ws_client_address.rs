@@ -125,7 +125,6 @@ fn xff_missing_and_malformed() {
     );
     for bad in [
         &b"198.51.100.7, garbage"[..],
-        b"198.51.100.7,",
         b"999.1.1.1",
         b"198.51.100",
         b"[2001:db8::1",
@@ -391,6 +390,7 @@ async fn default_listener_trusts_nobody() {
     assert_eq!(status, Some(StatusCode::SWITCHING_PROTOCOLS));
     let (_peer, ws) = server.await.unwrap().unwrap();
     assert_eq!(*ws.peer_addr(), SbcSocketAddr::from(me));
+    assert_eq!(ws.client_addr(), None);
 }
 
 #[tokio::test]
@@ -407,14 +407,17 @@ async fn xff_rightmost_used_only_when_trusted() {
     .await;
     assert_eq!(status, Some(StatusCode::SWITCHING_PROTOCOLS));
     let (_peer, ws) = server.await.unwrap().unwrap();
-    // Client IP from the header; the proxy-side TCP source port keeps the
-    // flow key unique (no port in XFF).
+    // The socket peer stays the flow key (unique per connection); the
+    // client IP from the header is carried separately, port 0 (XFF has no
+    // port).
+    assert_eq!(*ws.peer_addr(), SbcSocketAddr::from(me));
     assert_eq!(
-        *ws.peer_addr(),
-        SbcSocketAddr::from(SocketAddr::new(ip("198.51.100.7"), me.port()))
+        ws.client_addr(),
+        Some(SbcSocketAddr::from(SocketAddr::new(ip("198.51.100.7"), 0)))
     );
 
-    // The received message is attributed to the client too.
+    // The received message carries the socket source; the client address
+    // stays on the transport.
     let mut ws_client = ws_client.unwrap();
     ws_client
         .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -426,7 +429,8 @@ async fn xff_rightmost_used_only_when_trusted() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(msg.source.ip(), ip("198.51.100.7"));
+    assert_eq!(msg.source, SbcSocketAddr::from(me));
+    assert_eq!(ws.client_addr().map(|c| c.ip()), Some(ip("198.51.100.7")));
 }
 
 #[tokio::test]
@@ -437,6 +441,7 @@ async fn xff_from_untrusted_peer_is_ignored() {
     assert_eq!(status, Some(StatusCode::SWITCHING_PROTOCOLS));
     let (_peer, ws) = server.await.unwrap().unwrap();
     assert_eq!(*ws.peer_addr(), SbcSocketAddr::from(me));
+    assert_eq!(ws.client_addr(), None);
 }
 
 #[tokio::test]
@@ -447,6 +452,7 @@ async fn untrusted_peer_without_header_is_admitted_as_socket_address() {
     assert_eq!(status, Some(StatusCode::SWITCHING_PROTOCOLS));
     let (_peer, ws) = server.await.unwrap().unwrap();
     assert_eq!(*ws.peer_addr(), SbcSocketAddr::from(me));
+    assert_eq!(ws.client_addr(), None);
 }
 
 #[tokio::test]
@@ -486,7 +492,7 @@ async fn trusted_forwarded_mode_ignores_xff() {
 async fn forwarded_mode_uses_client_port() {
     let l = listener(Some((ClientAddressMode::Forwarded, loopback_trusted()))).await;
     let server = serve_one(&l);
-    let (_me, status, _ws) = upgrade(
+    let (me, status, _ws) = upgrade(
         local(&l),
         &[],
         &[("forwarded", r#"for="[2001:db8::1]:4711";proto=https"#)],
@@ -494,9 +500,12 @@ async fn forwarded_mode_uses_client_port() {
     .await;
     assert_eq!(status, Some(StatusCode::SWITCHING_PROTOCOLS));
     let (_peer, ws) = server.await.unwrap().unwrap();
+    assert_eq!(*ws.peer_addr(), SbcSocketAddr::from(me));
     assert_eq!(
-        *ws.peer_addr(),
-        SbcSocketAddr::from("[2001:db8::1]:4711".parse::<SocketAddr>().unwrap())
+        ws.client_addr(),
+        Some(SbcSocketAddr::from(
+            "[2001:db8::1]:4711".parse::<SocketAddr>().unwrap()
+        ))
     );
 }
 
@@ -522,10 +531,11 @@ async fn proxy_v2_trusted_sets_client_address() {
     let l = listener(Some((ClientAddressMode::ProxyV2, loopback_trusted()))).await;
     let server = serve_one(&l);
     let src: SocketAddr = "192.0.2.33:5000".parse().unwrap();
-    let (_me, status, _ws) = upgrade(local(&l), &proxy_v2_tcp4(src, local(&l), false), &[]).await;
+    let (me, status, _ws) = upgrade(local(&l), &proxy_v2_tcp4(src, local(&l), false), &[]).await;
     assert_eq!(status, Some(StatusCode::SWITCHING_PROTOCOLS));
     let (_peer, ws) = server.await.unwrap().unwrap();
-    assert_eq!(*ws.peer_addr(), SbcSocketAddr::from(src));
+    assert_eq!(*ws.peer_addr(), SbcSocketAddr::from(me));
+    assert_eq!(ws.client_addr(), Some(SbcSocketAddr::from(src)));
 }
 
 #[tokio::test]
@@ -537,6 +547,7 @@ async fn proxy_v2_local_keeps_proxy_address() {
     assert_eq!(status, Some(StatusCode::SWITCHING_PROTOCOLS));
     let (_peer, ws) = server.await.unwrap().unwrap();
     assert_eq!(*ws.peer_addr(), SbcSocketAddr::from(me));
+    assert_eq!(ws.client_addr(), None);
 }
 
 #[tokio::test]
@@ -566,4 +577,241 @@ async fn proxy_v2_untrusted_plain_upgrade_still_works() {
     assert_eq!(status, Some(StatusCode::SWITCHING_PROTOCOLS));
     let (_peer, ws) = server.await.unwrap().unwrap();
     assert_eq!(*ws.peer_addr(), SbcSocketAddr::from(me));
+    assert_eq!(ws.client_addr(), None);
+}
+
+// ---------------------------------------------------------------------------
+// SR-59 fix round
+// ---------------------------------------------------------------------------
+
+// RFC-010: empty XFF elements are list syntax, not hops.
+#[test]
+fn xff_empty_elements_are_skipped() {
+    let trusted = |a: IpAddr| a == ip("10.0.0.5");
+    for v in [
+        &b"198.51.100.7,"[..],
+        b",198.51.100.7",
+        b"198.51.100.7, ,",
+        b"203.0.113.9,, 198.51.100.7,, 10.0.0.5",
+        b" , 198.51.100.7 ,\t, 10.0.0.5",
+    ] {
+        assert_eq!(
+            client_from_x_forwarded_for(&[v], trusted),
+            Ok(fc("198.51.100.7", None)),
+            "{}",
+            String::from_utf8_lossy(v)
+        );
+    }
+    assert_eq!(
+        client_from_x_forwarded_for(&[&b",,"[..], &b" , "[..]], none_trusted),
+        Err(ForwardedError::Missing)
+    );
+}
+
+// RFC-002: empty pairs and elements are accepted (RFC 7239 §4, RFC 9110
+// §5.6.1.2).
+#[test]
+fn forwarded_empty_pairs_and_elements_accepted() {
+    for v in [
+        &b"for=192.0.2.60;"[..],
+        b";for=192.0.2.60",
+        b"for=192.0.2.60;;proto=https;",
+        b", for=192.0.2.60",
+        b"for=192.0.2.60,",
+        b"for=203.0.113.1,,for=192.0.2.60",
+        b" , ;, for=192.0.2.60 ; , ",
+    ] {
+        assert_eq!(
+            client_from_forwarded(&[v], none_trusted),
+            Ok(fc("192.0.2.60", None)),
+            "{}",
+            String::from_utf8_lossy(v)
+        );
+    }
+    assert_eq!(
+        client_from_forwarded(&[&b" , ;; ,"[..]], none_trusted),
+        Err(ForwardedError::Missing)
+    );
+}
+
+// RFC-002: elements left of the deciding hop are client-supplied and are
+// not parsed, so junk there does not refuse the header.
+#[test]
+fn forwarded_parses_right_to_left_only_to_deciding_hop() {
+    let trusted = |a: IpAddr| a == ip("10.0.0.5");
+    for v in [
+        &b"garbage!!, for=198.51.100.17"[..],
+        b"for=2001:db8::1, for=198.51.100.17, for=10.0.0.5",
+        b"for=x;for=y, for=198.51.100.17",
+        b"proto=https, for=198.51.100.17",
+    ] {
+        assert_eq!(
+            client_from_forwarded(&[v], trusted),
+            Ok(fc("198.51.100.17", None)),
+            "{}",
+            String::from_utf8_lossy(v)
+        );
+    }
+    // Across lines: a junk earlier line is never reached.
+    assert_eq!(
+        client_from_forwarded(
+            &[&b"for=\"unterminated"[..], &b"for=198.51.100.17"[..]],
+            trusted
+        ),
+        Ok(fc("198.51.100.17", None))
+    );
+    // An examined trusted hop followed (to its left) by junk is refused.
+    assert_eq!(
+        client_from_forwarded(&[&b"garbage!!, for=10.0.0.5"[..]], trusted),
+        Err(ForwardedError::Malformed)
+    );
+}
+
+// RFC-007: quoted-pair escapes are removed before the node is parsed.
+#[test]
+fn forwarded_quoted_pairs_unescaped() {
+    assert_eq!(
+        client_from_forwarded(&[&br#"for="\192.0.2.\43:\4711""#[..]], none_trusted),
+        Ok(fc("192.0.2.43", Some(4711)))
+    );
+    assert_eq!(
+        client_from_forwarded(&[&br#"for="[2001:db8::\1]""#[..]], none_trusted),
+        Ok(fc("2001:db8::1", None))
+    );
+    // An escaped quote is part of the value, so the node is malformed.
+    assert_eq!(
+        client_from_forwarded(&[&br#"for="192.0.2.43\"""#[..]], none_trusted),
+        Err(ForwardedError::Malformed)
+    );
+    // An over-long value is refused, never truncated.
+    let long = format!("for=\"_{}\"", "a".repeat(200));
+    assert_eq!(
+        client_from_forwarded(&[long.as_bytes()], none_trusted),
+        Err(ForwardedError::Malformed)
+    );
+}
+
+/// What [`serve_one_admitting`] saw: the address passed to the admission
+/// callback, and the handshake result.
+type Admitted = (
+    Option<SbcSocketAddr>,
+    TransportResult<(WebSocketTransport, Option<SbcSocketAddr>)>,
+);
+
+fn serve_one_admitting(
+    l: &Arc<WebSocketListener>,
+    allow: bool,
+) -> tokio::task::JoinHandle<Admitted> {
+    let l = Arc::clone(l);
+    tokio::spawn(async move {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let record = Arc::clone(&seen);
+        let (tcp, peer) = l.accept_tcp().await.unwrap();
+        let r = l
+            .complete_handshake_with(tcp, peer, move |client| {
+                *record.lock().unwrap() = Some(client);
+                allow.then_some(client)
+            })
+            .await;
+        let seen = *seen.lock().unwrap();
+        (seen, r)
+    })
+}
+
+// SR-59: header modes admit the client inside the upgrade check; a refusal
+// is HTTP 503 with Retry-After and no upgrade.
+#[tokio::test]
+async fn header_mode_admission_refusal_is_503_with_retry_after() {
+    let l = listener(Some((ClientAddressMode::XForwardedFor, loopback_trusted()))).await;
+    let server = serve_one_admitting(&l, false);
+    let mut tcp = tokio::net::TcpStream::connect(local(&l)).await.unwrap();
+    tcp.write_all(
+        b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Protocol: sip\r\nX-Forwarded-For: 192.0.2.77\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut head = Vec::new();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut tcp, &mut head),
+    )
+    .await;
+    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 503"), "{head}");
+    assert!(head.contains("retry-after: 5"), "{head}");
+    let (seen, r) = server.await.unwrap();
+    assert_eq!(
+        seen,
+        Some(SbcSocketAddr::from(SocketAddr::new(ip("192.0.2.77"), 0)))
+    );
+    assert!(matches!(
+        r,
+        Err(uc_transport::TransportError::ClientRefused { .. })
+    ));
+}
+
+#[tokio::test]
+async fn header_mode_admission_value_returned_with_transport() {
+    let l = listener(Some((ClientAddressMode::Forwarded, loopback_trusted()))).await;
+    let server = serve_one_admitting(&l, true);
+    let (me, status, _ws) =
+        upgrade(local(&l), &[], &[("forwarded", r#"for="192.0.2.8:5060""#)]).await;
+    assert_eq!(status, Some(StatusCode::SWITCHING_PROTOCOLS));
+    let (seen, r) = server.await.unwrap();
+    let (ws, admitted) = r.unwrap();
+    let client = SbcSocketAddr::from("192.0.2.8:5060".parse::<SocketAddr>().unwrap());
+    assert_eq!(seen, Some(client));
+    assert_eq!(admitted, Some(client));
+    assert_eq!(*ws.peer_addr(), SbcSocketAddr::from(me));
+}
+
+// SR-59: PROXY v2 admits right after the preamble, before any HTTP: a
+// refusal closes the socket without reading the upgrade.
+#[tokio::test]
+async fn proxy_v2_admission_runs_before_upgrade() {
+    let l = listener(Some((ClientAddressMode::ProxyV2, loopback_trusted()))).await;
+    let server = serve_one_admitting(&l, false);
+    let src: SocketAddr = "192.0.2.33:5000".parse().unwrap();
+    let mut tcp = tokio::net::TcpStream::connect(local(&l)).await.unwrap();
+    // Preamble only: no upgrade request is ever sent.
+    tcp.write_all(&proxy_v2_tcp4(src, local(&l), false))
+        .await
+        .unwrap();
+    let (seen, r) = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("admission must not wait for the upgrade")
+        .unwrap();
+    assert_eq!(seen, Some(SbcSocketAddr::from(src)));
+    assert!(matches!(
+        r,
+        Err(uc_transport::TransportError::ClientRefused { .. })
+    ));
+}
+
+// PROXY v2 LOCAL: admitted under the proxy address, no client address.
+#[tokio::test]
+async fn proxy_v2_local_admitted_under_proxy_without_client_addr() {
+    let l = listener(Some((ClientAddressMode::ProxyV2, loopback_trusted()))).await;
+    let server = serve_one_admitting(&l, true);
+    let src: SocketAddr = "192.0.2.33:5000".parse().unwrap();
+    let (me, status, _ws) = upgrade(local(&l), &proxy_v2_tcp4(src, local(&l), true), &[]).await;
+    assert_eq!(status, Some(StatusCode::SWITCHING_PROTOCOLS));
+    let (seen, r) = server.await.unwrap();
+    let (ws, _) = r.unwrap();
+    assert_eq!(seen, Some(SbcSocketAddr::from(me)));
+    assert_eq!(ws.client_addr(), None);
+}
+
+// Direct (untrusted) peers are not passed to the admission callback.
+#[tokio::test]
+async fn untrusted_peer_skips_admission_callback() {
+    let l = listener(Some((ClientAddressMode::XForwardedFor, nobody_trusted()))).await;
+    let server = serve_one_admitting(&l, false);
+    let (_me, status, _ws) = upgrade(local(&l), &[], &[("x-forwarded-for", "192.0.2.1")]).await;
+    assert_eq!(status, Some(StatusCode::SWITCHING_PROTOCOLS));
+    let (seen, r) = server.await.unwrap();
+    assert_eq!(seen, None);
+    assert!(r.unwrap().1.is_none());
 }

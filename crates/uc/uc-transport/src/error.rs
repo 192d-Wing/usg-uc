@@ -137,6 +137,16 @@ pub enum TransportError {
         /// Description of the error.
         reason: String,
     },
+
+    /// The caller's admission check refused the client a trusted proxy
+    /// named (per-client limits, SR-59); the upgrade was not completed.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    #[error("client refused by admission: {reason}")]
+    ClientRefused {
+        /// Description of the refusal.
+        reason: String,
+    },
 }
 
 impl TransportError {

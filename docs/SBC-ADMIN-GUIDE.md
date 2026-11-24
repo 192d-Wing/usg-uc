@@ -320,11 +320,13 @@ an IPv6 attacker that opens about 333 accepts per second from distinct /64s
 of one /48 keeps the table full, and every new source then shares the
 overflow bucket with it (POA&M-440, POA&M-441; see also POA&M-91).
 
-WebSocket listeners apply the blocked-source check and the connection caps
-but not the accept rate or the handshake slots: behind a WSS proxy the
-accept address is the proxy's, so one bucket would be shared by every
-client. The accept rate will apply to WebSocket once WS admission is keyed
-on the client address (SR-59).
+WebSocket listeners apply the blocked-source check, the accept rate and
+the connection caps, but not the node-wide handshake slots (the upgrade
+costs no crypto). A direct WebSocket peer is keyed on its own address;
+behind a proxy listed in `transport.ws_trusted_proxies` each client is
+keyed on the address the proxy reports, and also takes a per-source
+handshake slot until its upgrade completes (see "WebSocket behind a
+reverse proxy" below).
 
 Sizing: the accept bucket is per source key, so phones behind one NAT
 address share it. With the defaults, 1,000 phones behind one IPv4 address
@@ -354,7 +356,7 @@ load). WebSocket clients reach it through a TLS-terminating reverse proxy
 that forwards plain WS to a `ws_listen` address. Without further
 configuration every such client has the proxy's address as its source,
 so they all share one per-source connection slot, one rate-limit bucket
-and one audit identity. Two keys make the daemon use the real client
+and one audit identity. These keys make the daemon use the real client
 address instead (NIST SC-5, SC-7, AU-3):
 
 ```toml
@@ -362,14 +364,21 @@ address instead (NIST SC-5, SC-7, AU-3):
 ws_listen = ["10.0.5.10:7080"]
 ws_trusted_proxies = ["10.0.5.2/32", "10.0.5.3"]  # CIDR or bare IP; default []
 ws_client_address = "proxy_v2"  # peer (default) | proxy_v2 | x_forwarded_for | forwarded
+ws_max_handshakes_per_proxy = 1024  # 1..=max_connections_per_listener
 ```
 
 | `ws_client_address` | Client address taken from | Typical proxy |
 |---|---|---|
 | `peer` | the TCP peer (no proxy handling) | none |
-| `proxy_v2` | the PROXY protocol v2 preamble sent before the HTTP upgrade | L4 proxies and load balancers (HAProxy `mode tcp`, nginx `stream`, Envoy) |
-| `x_forwarded_for` | the `X-Forwarded-For` request header | HTTP ingress controllers |
+| `proxy_v2` | the PROXY protocol v2 preamble sent before the HTTP upgrade | L4 proxies and load balancers (HAProxy `send-proxy-v2`, Envoy PROXY protocol V2) |
+| `x_forwarded_for` | the `X-Forwarded-For` request header | HTTP ingress controllers, nginx `http` |
 | `forwarded` | the RFC 7239 `Forwarded` header, `for=` parameter | proxies that emit RFC 7239 |
+
+`ws_trusted_proxies` rules (checked at load): each entry is an IP address
+or a CIDR; prefix length 0 is refused (it would trust every address); an
+IPv4-mapped entry such as `::ffff:10.0.5.0/120` is treated as the IPv4
+network `10.0.5.0/24`. An entry broader than /16 (IPv4) or /48 (IPv6)
+loads, but the daemon logs a startup warning.
 
 How the address is chosen:
 
@@ -379,51 +388,90 @@ How the address is chosen:
 - For `x_forwarded_for` and `forwarded`, the hops are read right to left.
   Hops in `ws_trusted_proxies` are skipped, and the first hop that is not
   trusted is the client. Values a client puts to the left of that hop are
-  never used.
+  never parsed or used. If every hop is trusted, the leftmost is used.
+  Empty list elements (`a,,b`) and empty `Forwarded` pairs are ignored.
+  Quoted `Forwarded` values may use backslash escapes. Only `for=` is
+  read: `proto=`, `by=`, `host=` and `X-Forwarded-Proto` are ignored, so
+  a client that used WSS to the proxy is recorded as WS (POA&M-457).
 - A trusted proxy that sends no header or preamble, or an unparsable,
   `unknown` or obfuscated client address, is refused (HTTP 400 for the
-  header modes). The daemon never falls back to the proxy address. The
-  refusals are counted in the `ws_proxy_header_missing` and
-  `ws_proxy_header_invalid` statistics.
+  header modes). So is a PROXY v2 source with port 0 or an unspecified,
+  multicast or broadcast address, and a PROXY v2 header with no address
+  (`AF_UNSPEC`, UDP or `AF_UNIX`). The daemon never falls back to the
+  proxy address. A PROXY v2 header longer than 16 + 536 bytes is refused
+  without reading its body.
 - A PROXY v2 `LOCAL` header (proxy health check) is admitted under the
   proxy address.
-- The port is the client port when PROXY v2 or
-  `Forwarded: for="[ip]:port"` carries one. Otherwise it is the proxy-side
-  TCP source port, which keeps each connection's flow key unique.
-- The client address is the connection's source everywhere: the
-  per-source connection cap, rate limiting, the flow table, Via
-  `received`/`rport`, CDRs and audit records.
+
+How the connection is admitted and keyed:
+
+- Until the client address is known, a connection from a trusted proxy
+  holds a listener and node-wide pool permit and one of the proxy's
+  `ws_max_handshakes_per_proxy` pre-handshake slots. A proxy at that cap
+  has further connections dropped (`ws_proxy_handshake_busy`).
+- The client is admitted as soon as its address is known, before the
+  WebSocket upgrade completes: right after the PROXY v2 preamble, or while
+  checking the upgrade request for the header modes. Admission applies
+  the stream rate limiter's block, the accept bucket, the per-source and
+  aggregate connection caps, and the per-source handshake cap, all keyed
+  on the client. A refused client is closed before the upgrade (PROXY v2)
+  or answered `HTTP 503` with `Retry-After: 5` (header modes); other
+  clients behind the same proxy are not affected. A direct (unproxied)
+  WebSocket peer gets the same checks on its own address.
+- The flow table, registrations and response routing stay keyed on the
+  real socket (the proxy's address and source port), which is unique per
+  connection. Two connections that claim the same client address, even
+  through different proxies, never replace each other.
+- The client address keys per-source admission, stream rate limiting,
+  the unauthenticated per-user limiter, the VPS per-source checks,
+  framing and admission audit records, SIP audit records, and the CDR
+  `source_ip` / `source_port`. The CDR port is 0 when the proxy did not
+  carry the client port (`X-Forwarded-For`, or `Forwarded` without one).
+  Trunk classification and INVITE source admission stay on the socket, so
+  a trusted proxy cannot claim a trunk address. The daemon does not add
+  Via `received`/`rport` values; replies ride the connection.
+- Refusals are counted in the `ws_proxy_header_missing`,
+  `ws_proxy_header_invalid` and `ws_proxy_handshake_busy` statistics (not
+  yet exported on the REST or metrics API, POA&M-93; the debug log carries
+  each refusal) and audited once per flush as `RateLimitTriggered` records
+  under the proxy address (`limit_name` `ws_proxy_header`,
+  `ws_proxy_handshake_busy`). Client refusals are audited under the client
+  (`per_ip_conn`, `per_ip_accept_rate`, `handshake_busy`, `accept_blocked`,
+  and the `per_prefix_*` aggregates).
 
 A non-`peer` mode with an empty `ws_trusted_proxies` fails validation. A
 list with mode `peer` is accepted, and the daemon logs a warning at
 startup that the list has no effect.
 
-Proxy configuration, in generic terms:
+Proxy configuration, in generic terms. The proxy must replace or append
+to `X-Forwarded-For` / `Forwarded` on the same field line it received
+(rightmost element = the address it saw), never add a separate,
+earlier line of its own:
 
 - **HAProxy (TCP mode, PROXY v2):** a `mode tcp` frontend that terminates
   TLS, and a backend `server` line pointing at the `ws_listen` address
   with `send-proxy-v2`. Use `ws_client_address = "proxy_v2"`.
-- **nginx `stream` (PROXY v2):** a `stream` server with `ssl` on the
-  listen socket, `proxy_pass` to the `ws_listen` address, and
-  `proxy_protocol on;`. nginx emits PROXY v2 only in recent versions;
-  check yours, as the daemon does not accept the v1 text form.
-- **nginx `http` / ingress controllers (X-Forwarded-For):** a `location`
-  that proxies the WebSocket upgrade (`proxy_http_version 1.1`, the
-  `Upgrade` and `Connection` headers) and sets
-  `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`. Use
-  `ws_client_address = "x_forwarded_for"`.
+- **Envoy:** a TCP proxy with the PROXY protocol upstream transport
+  socket set to version V2. Use `ws_client_address = "proxy_v2"`.
+- **nginx:** nginx `stream` `proxy_protocol on;` sends only the PROXY v1
+  text form, which the daemon does not accept. Use an nginx `http`
+  `location` that proxies the WebSocket upgrade (`proxy_http_version 1.1`,
+  the `Upgrade` and `Connection` headers) and sets
+  `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` (this
+  appends), with `ws_client_address = "x_forwarded_for"`.
 - **RFC 7239 proxies:** configure the proxy to append a `Forwarded` element
   with `for=` (IPv6 quoted and bracketed, for example
   `for="[2001:db8::1]:4711"`). Use `ws_client_address = "forwarded"`.
 
 > **Security:** list in `ws_trusted_proxies` only proxies you operate, and
 > only their own addresses, never a client network. A trusted proxy can
-> claim any client address, so it can bypass the per-source connection
-> cap and rate limits and choose the source recorded in CDRs and audit
-> records. Do not expose `ws_listen` to clients directly when a proxy is
-> trusted; restrict it to the proxy network. PROXY v2 TLVs (TLS details,
-> unique ID) are ignored (POA&M-456). In-daemon WSS termination is
-> tracked as POA&M-457.
+> claim any client address, so it can choose the per-source key and the
+> rate-limit bucket, and the source recorded in CDRs and audit records.
+> Do not expose `ws_listen` to clients directly when a proxy is trusted;
+> restrict it to the proxy network. PROXY v2 TLVs (TLS details, unique
+> ID, CRC32c) are ignored, and CDRs do not record that a call came
+> through a proxy (POA&M-456). In-daemon WSS termination is tracked as
+> POA&M-457.
 
 > **Note:** setting `security.tls_cert_path` also activates HTTPS on the
 > REST API. Unless `transport.api_tls_listen` is set, the API server

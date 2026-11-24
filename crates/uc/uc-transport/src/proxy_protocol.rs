@@ -1,14 +1,15 @@
 //! PROXY protocol version 2 (haproxy.org `proxy-protocol.txt` §2.2).
 //!
-//! An L4 reverse proxy (`HAProxy`, nginx `stream`, Envoy, cloud load
-//! balancers) sends this binary preamble before any application bytes to
+//! An L4 reverse proxy (`HAProxy` `send-proxy-v2`, Envoy with PROXY
+//! protocol V2, cloud load balancers) sends this binary preamble before any application bytes to
 //! convey the original client address. The parser is pure and bounded: the
 //! declared length is capped from the 16-byte preamble before any body is
 //! read, and [`read_v2`] reads exactly the header, never the payload behind
 //! it.
 //!
 //! The preamble is only believed from a configured trusted proxy; the
-//! caller decides that before calling [`read_v2`].
+//! caller decides that before calling [`read_v2`]. The text PROXY v1 form
+//! (the only one nginx `stream` sends) is not accepted.
 //!
 //! ## NIST 800-53 Rev5: SC-5, SC-7, SI-10, AU-3
 
@@ -41,6 +42,10 @@ const TCP6_ADDR_LEN: usize = 36;
 const FAM_UNSPEC: u8 = 0x00;
 const FAM_TCP4: u8 = 0x11;
 const FAM_TCP6: u8 = 0x21;
+/// Valid family/protocol pairs this receiver does not implement (UDP over
+/// IPv4/IPv6, `AF_UNIX` stream/datagram). Spec §2.2: a receiver that does
+/// not support a combination handles it like `AF_UNSPEC` (no address).
+const FAM_UNIMPLEMENTED: [u8; 4] = [0x12, 0x22, 0x31, 0x32];
 
 /// The v2 command nibble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +62,8 @@ pub enum Command {
 pub struct ProxyV2 {
     /// `LOCAL` or `PROXY`.
     pub command: Command,
-    /// Original client address. `None` for `LOCAL` and for `AF_UNSPEC`.
+    /// Original client address. `None` for `LOCAL`, for `AF_UNSPEC` and for
+    /// the valid combinations not implemented here (UDP, `AF_UNIX`).
     pub source: Option<SocketAddr>,
     /// Address the client connected to at the proxy.
     pub destination: Option<SocketAddr>,
@@ -69,8 +75,8 @@ pub enum ProxyError {
     /// The bytes do not start with the v2 signature (no PROXY header).
     #[error("no PROXY v2 signature")]
     BadSignature,
-    /// Version other than 2, unknown command, or an address family /
-    /// transport protocol other than TCP over IPv4/IPv6 or `AF_UNSPEC`.
+    /// Version other than 2, unknown command, or a family / protocol byte
+    /// the spec does not define.
     #[error("unsupported PROXY v2 version, command or address family")]
     Unsupported,
     /// Declared length above [`MAX_V2_ADDR_LEN`].
@@ -115,6 +121,7 @@ fn parse_preamble(pre: &[u8; V2_HEADER_LEN]) -> Result<Preamble, ProxyError> {
             FAM_UNSPEC => 0,
             FAM_TCP4 => TCP4_ADDR_LEN,
             FAM_TCP6 => TCP6_ADDR_LEN,
+            f if FAM_UNIMPLEMENTED.contains(&f) => 0,
             _ => return Err(ProxyError::Unsupported),
         };
         if len < need {
@@ -135,38 +142,57 @@ fn array_at<const N: usize>(body: &[u8], at: usize) -> Result<[u8; N], ProxyErro
         .ok_or(ProxyError::Truncated)
 }
 
+/// Whether a claimed client address can key per-client state: not port 0
+/// and not an unspecified, multicast or broadcast IP (no TCP connection
+/// comes from one).
+///
+/// ## NIST 800-53 Rev5: SI-10, SC-7
+const fn usable_source(src: SocketAddr) -> bool {
+    let ip = src.ip().to_canonical();
+    let bad_ip = ip.is_unspecified()
+        || ip.is_multicast()
+        || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast());
+    src.port() != 0 && !bad_ip
+}
+
 /// Decodes the address block of a `PROXY` header. TLVs after the addresses
-/// are skipped, not interpreted.
+/// are skipped, not interpreted. A source that cannot be a TCP client
+/// (port 0, unspecified, multicast or broadcast) is
+/// [`ProxyError::Malformed`].
 // POAM: POA&M-456 - PROXY v2 TLVs (PP2_TYPE_SSL, PP2_TYPE_UNIQUE_ID, ...)
 // are skipped and not validated; only the address block is used.
 fn parse_addresses(
     family: u8,
     body: &[u8],
 ) -> Result<(Option<SocketAddr>, Option<SocketAddr>), ProxyError> {
-    match family {
+    let (src, dst) = match family {
         FAM_TCP4 => {
             let src = Ipv4Addr::from(array_at::<4>(body, 0)?);
             let dst = Ipv4Addr::from(array_at::<4>(body, 4)?);
             let sport = u16::from_be_bytes(array_at::<2>(body, 8)?);
             let dport = u16::from_be_bytes(array_at::<2>(body, 10)?);
-            Ok((
-                Some(SocketAddr::from((src, sport))),
-                Some(SocketAddr::from((dst, dport))),
-            ))
+            (
+                SocketAddr::from((src, sport)),
+                SocketAddr::from((dst, dport)),
+            )
         }
         FAM_TCP6 => {
             let src = Ipv6Addr::from(array_at::<16>(body, 0)?);
             let dst = Ipv6Addr::from(array_at::<16>(body, 16)?);
             let sport = u16::from_be_bytes(array_at::<2>(body, 32)?);
             let dport = u16::from_be_bytes(array_at::<2>(body, 34)?);
-            Ok((
-                Some(SocketAddr::from((src, sport))),
-                Some(SocketAddr::from((dst, dport))),
-            ))
+            (
+                SocketAddr::from((src, sport)),
+                SocketAddr::from((dst, dport)),
+            )
         }
-        FAM_UNSPEC => Ok((None, None)),
-        _ => Err(ProxyError::Unsupported),
+        f if f == FAM_UNSPEC || FAM_UNIMPLEMENTED.contains(&f) => return Ok((None, None)),
+        _ => return Err(ProxyError::Unsupported),
+    };
+    if !usable_source(src) {
+        return Err(ProxyError::Malformed);
     }
+    Ok((Some(src), Some(dst)))
 }
 
 /// Parses a v2 header at the start of `buf`.

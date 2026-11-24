@@ -295,6 +295,17 @@ pub trait Transport: Send + Sync {
     fn is_closed(&self) -> bool {
         false
     }
+
+    /// The client address a trusted reverse proxy reported for this
+    /// connection (SR-59), or `None` for a direct peer. The socket peer
+    /// stays the connection's flow, registration and response-routing key
+    /// (always unique); this address keys per-client admission, rate limits
+    /// and audit. Port 0 means the proxy did not carry the client port.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, AU-3
+    fn client_addr(&self) -> Option<SbcSocketAddr> {
+        None
+    }
 }
 
 /// Connection-oriented transport for stream protocols (TCP, TLS, WebSocket).

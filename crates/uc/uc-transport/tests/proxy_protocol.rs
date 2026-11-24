@@ -180,6 +180,54 @@ fn parse_v2_proxy_unspec_has_no_source() {
     assert_eq!(h.source, None);
 }
 
+// RFC-006: valid family/protocol pairs this receiver does not implement
+// (UDP over IPv4/IPv6, AF_UNIX stream/datagram) take the AF_UNSPEC path:
+// parsed, no source, address block skipped (spec §2.2).
+#[test]
+fn parse_v2_unimplemented_families_take_unspec_path() {
+    for fam in [0x12u8, 0x22, 0x31, 0x32] {
+        for body in [&[][..], &[0u8; 12][..], &[7u8; 216][..]] {
+            let buf = header(PROXY, fam, body);
+            let (h, n) = parse_v2(&buf).unwrap().unwrap();
+            assert_eq!(n, 16 + body.len(), "fam {fam:#x}");
+            assert_eq!(h.command, Command::Proxy);
+            assert_eq!(h.source, None, "fam {fam:#x}");
+            assert_eq!(h.destination, None, "fam {fam:#x}");
+        }
+    }
+}
+
+// SEC-005: a PROXY source of port 0 or an unspecified, multicast or
+// broadcast address cannot be a TCP client and is Malformed.
+#[test]
+fn parse_v2_unusable_source_is_malformed() {
+    let dst = v4([198, 51, 100, 1], 443);
+    for src in [
+        v4([192, 0, 2, 33], 0),
+        v4([0, 0, 0, 0], 5000),
+        v4([224, 0, 0, 1], 5000),
+        v4([239, 255, 255, 250], 5000),
+        v4([255, 255, 255, 255], 5000),
+    ] {
+        let buf = header(PROXY, TCP4, &tcp4_body(src, dst));
+        assert_eq!(parse_v2(&buf), Err(ProxyError::Malformed), "{src}");
+    }
+    let dst6 = v6("2001:db8::2", 443);
+    for src in [
+        v6("2001:db8::1", 0),
+        v6("::", 5000),
+        v6("ff02::1", 5000),
+        v6("::ffff:0.0.0.0", 5000),
+        v6("::ffff:255.255.255.255", 5000),
+    ] {
+        let buf = header(PROXY, TCP6, &tcp6_body(src, dst6));
+        assert_eq!(parse_v2(&buf), Err(ProxyError::Malformed), "{src}");
+    }
+    // LOCAL ignores the block, so the same bytes are accepted there.
+    let buf = header(LOCAL, TCP4, &tcp4_body(v4([0, 0, 0, 0], 0), dst));
+    assert_eq!(parse_v2(&buf).unwrap().unwrap().0.command, Command::Local);
+}
+
 #[test]
 fn parse_v2_rejects_bad_signature_version_family() {
     let good = header(
@@ -340,6 +388,16 @@ proptest! {
         let mut buf = header(PROXY, fam, &body);
         let hdr_len = buf.len();
         buf.extend_from_slice(&trailer);
+        // SEC-005: a source no TCP client can have is refused.
+        let ip = src.ip().to_canonical();
+        let unusable = src.port() == 0
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || ip == IpAddr::V4(Ipv4Addr::BROADCAST);
+        if unusable {
+            prop_assert_eq!(parse_v2(&buf), Err(ProxyError::Malformed));
+            return Ok(());
+        }
         let (h, n) = parse_v2(&buf).unwrap().unwrap();
         prop_assert_eq!(n, hdr_len);
         prop_assert_eq!(h.command, Command::Proxy);

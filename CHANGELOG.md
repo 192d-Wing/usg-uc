@@ -450,34 +450,58 @@ release") and `deploy/keycloak/central-config-clients.md`.
 ### Security (SBC, WebSocket client address behind a trusted reverse proxy, SR-59, POA&M-456, 457)
 
 Tested locally on macOS arm64 only; no CI run yet. Defaults keep today's
-behaviour: existing configurations load and behave unchanged.
+behaviour for proxied setups: with no `ws_trusted_proxies` nothing about
+proxies changes.
 
 - **SBC: WebSocket clients behind a reverse proxy are keyed on their own
   address.** (SC-5, SC-7, AU-3) New `transport.ws_trusted_proxies` (CIDR or
-  bare IP list, default empty) and `transport.ws_client_address` (`peer`
-  default, `proxy_v2`, `x_forwarded_for`, `forwarded`). From a listed proxy
-  the daemon takes the client address from the PROXY protocol v2 preamble,
-  the rightmost untrusted `X-Forwarded-For` hop, or the RFC 7239
-  `Forwarded` `for=` hop. That address is then the connection's source for
-  the per-source connection cap, rate limiting, the flow table, CDRs and
-  audit records. Before, every client behind one proxy shared the proxy's
-  per-source slot and rate-limit bucket. Headers from peers not in the list
-  are ignored.
+  bare IP list, default empty), `transport.ws_client_address` (`peer`
+  default, `proxy_v2`, `x_forwarded_for`, `forwarded`) and
+  `transport.ws_max_handshakes_per_proxy` (default 1024). From a listed
+  proxy the daemon takes the client address from the PROXY protocol v2
+  preamble, the rightmost untrusted `X-Forwarded-For` hop, or the RFC 7239
+  `Forwarded` `for=` hop. That address keys the blocked check, the accept
+  bucket, the per-source and aggregate connection caps, the per-source
+  handshake cap, rate limiting, CDRs and audit records. Before, every
+  client behind one proxy shared the proxy's per-source slot and
+  rate-limit bucket. Headers from peers not in the list are ignored.
+- **SBC: the client is admitted before the upgrade.** Right after the
+  PROXY v2 preamble, or while checking the upgrade request (refusal: HTTP
+  503 with `Retry-After`). Until then a connection counts against one of
+  its proxy's `ws_max_handshakes_per_proxy` slots.
+- **SBC: flows stay keyed on the socket.** The flow table, registrations
+  and response routing use the real socket address, so two connections
+  that claim the same client (for example through two proxies) never
+  replace each other. Trunk classification and INVITE source admission
+  also stay on the socket.
 - **SBC: a trusted proxy must send the client address.** A connection from
   a listed proxy with no header or preamble, or with an unusable, `unknown`
-  or obfuscated address, is refused (HTTP 400 for the header modes). It is
-  never keyed on the proxy address. The `ws_proxy_header_missing` and
-  `ws_proxy_header_invalid` statistics count the refusals. A PROXY v2
-  `LOCAL` health check is admitted under the proxy address.
-- **Configuration validation.** An invalid `ws_trusted_proxies` entry fails
-  the load. So does a `ws_client_address` other than `peer` with an empty
-  list. A list with mode `peer` loads, and the daemon logs a startup
-  warning that it has no effect. The `wss_listen` rejection message now
-  points to these keys.
-- **Residual risk.** A listed proxy can claim any client address, and
-  PROXY v2 TLVs are not validated (POA&M-456). List only proxies you
-  operate. WSS is still not terminated in the daemon (POA&M-457). See
-  `docs/SBC-ADMIN-GUIDE.md`, "WebSocket behind a reverse proxy".
+  or obfuscated address, is refused (HTTP 400 for the header modes). So is
+  a PROXY v2 source with port 0 or an unspecified, multicast or broadcast
+  address. It is never keyed on the proxy address. The
+  `ws_proxy_header_missing`, `ws_proxy_header_invalid` and
+  `ws_proxy_handshake_busy` statistics count the refusals (not yet
+  exported, POA&M-93; the debug log carries each refusal), and new
+  `RateLimitTriggered` `limit_name` values `ws_proxy_header` and
+  `ws_proxy_handshake_busy` audit them once per flush under the proxy. A
+  PROXY v2 `LOCAL` health check is admitted under the proxy address.
+- **SBC: direct WebSocket peers now use the accept bucket.** The SR-56
+  exemption for WebSocket listeners (POA&M-440) is removed: a direct peer
+  is charged on its socket address, like TCP and TLS.
+- **Configuration validation.** An invalid `ws_trusted_proxies` entry, or
+  one with prefix length 0, fails the load; IPv4-mapped entries are
+  treated as IPv4, and entries broader than /16 (IPv4) or /48 (IPv6) log a
+  startup warning. A `ws_client_address` other than `peer` with an empty
+  list fails, and so does `ws_max_handshakes_per_proxy` outside
+  1..=`max_connections_per_listener`. A list with mode `peer` loads with a
+  startup warning. The `wss_listen` rejection message now points to these
+  keys.
+- **Residual risk.** A listed proxy can claim any client address, PROXY
+  v2 TLVs are not validated, PROXY v1 is not accepted, and CDRs do not
+  record that a proxy was used (POA&M-456). List only proxies you operate.
+  WSS is still not terminated in the daemon, so a client using WSS to the
+  proxy is recorded as WS (POA&M-457). See `docs/SBC-ADMIN-GUIDE.md`,
+  "WebSocket behind a reverse proxy".
 
 ### Security (SBC, aggregate stream connection caps per IPv6 prefix and IPv4 /24, SR-58, POA&M-454, 455)
 

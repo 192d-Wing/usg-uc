@@ -1099,6 +1099,15 @@ pub struct TransportConfig {
     /// ## NIST 800-53 Rev5: SC-5, SC-7, AU-3
     pub ws_client_address: WsClientAddress,
 
+    /// Connections one trusted proxy (`ws_trusted_proxies`) may hold before
+    /// their client address is known and admitted: the PROXY v2 preamble
+    /// or upgrade request has not arrived yet. Bounds slow or stalled
+    /// upgrades through a proxy, which cannot be charged to a client yet.
+    /// Default 1024; valid 1..=`max_connections_per_listener`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub ws_max_handshakes_per_proxy: u32,
+
     /// External/public IP address for SIP Contact and SDP.
     /// Used when behind NAT. If unset, auto-detected from outgoing socket.
     pub external_ip: Option<String>,
@@ -1157,6 +1166,7 @@ impl Default for TransportConfig {
             max_connections_per_v4_24: 1024,
             ws_trusted_proxies: Vec::new(),
             ws_client_address: WsClientAddress::Peer,
+            ws_max_handshakes_per_proxy: 1024,
             external_ip: None,
             signaling_ip: None,
             media_ip: None,
