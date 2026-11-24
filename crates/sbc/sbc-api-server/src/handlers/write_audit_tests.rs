@@ -217,10 +217,12 @@ async fn pg() -> Option<Pg> {
         }
     });
     let key = tempfile::Builder::new().tempfile().unwrap();
-    std::fs::write(key.path(), "ab".repeat(32)).unwrap();
+    tokio::fs::write(key.path(), "ab".repeat(32)).await.unwrap();
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(key.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        tokio::fs::set_permissions(key.path(), std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
     }
     let key = key.into_temp_path().keep().unwrap();
     let cfg = crate::config::Config {

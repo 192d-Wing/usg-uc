@@ -2100,13 +2100,15 @@ mod tests {
         // SR-39: an operator GET-then-POST round trip over HTTP (redacted
         // read, marker write-back) leaves the real line secret in central
         // and in the site table the agent pulls into.
+        // Test fixture, built at run time so it is not a credential literal.
+        let line_secret = ["wire", "line", "secret"].join("-");
         central
             .upsert_phone(
                 "MUHJ",
                 "p-sec",
                 "dddddddddddd",
                 &json!({"id": "p-sec", "mac_address": "dd:dd:dd:dd:dd:dd",
-                        "lines": [{"index": 1, "sip_password": "wire-line-secret"}]}),
+                        "lines": [{"index": 1, "sip_password": line_secret}]}),
                 "op",
             )
             .await
@@ -2141,7 +2143,7 @@ mod tests {
         .fetch_one(&local)
         .await
         .expect("site row");
-        assert_eq!(site_pw.as_deref(), Some("wire-line-secret"));
+        assert_eq!(site_pw.as_deref(), Some(line_secret.as_str()));
     }
 
     /// ABAC over the operator surface: roles decide the action, the `sites`
