@@ -540,7 +540,8 @@ pub struct TlsTransport {
 }
 
 impl TlsTransport {
-    /// Creates a TLS transport from an established TLS connection.
+    /// Creates a TLS transport from an established client-side TLS
+    /// connection (peer address from `getpeername`).
     fn from_stream(stream: TlsStream<TcpStream>) -> TransportResult<Self> {
         let (io, _session) = stream.get_ref();
 
@@ -553,6 +554,39 @@ impl TlsTransport {
             reason: format!("failed to get peer address: {e}"),
         })?);
 
+        Ok(Self::with_addrs(
+            stream,
+            local_addr.into(),
+            peer_addr.into(),
+        ))
+    }
+
+    /// Creates a TLS transport for a server-side connection whose TCP
+    /// stream came from [`TlsListener::accept_tcp`].
+    ///
+    /// Infallible: `peer` is the canonical address `accept()` returned, so
+    /// a peer that resets right after the handshake cannot turn a
+    /// completed handshake into an error (no `getpeername`). The local
+    /// address comes from `getsockname`, or `listener_local` if that fails.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+    fn from_accepted(
+        stream: TlsStream<TcpStream>,
+        peer: SbcSocketAddr,
+        listener_local: SbcSocketAddr,
+    ) -> Self {
+        let (io, _session) = stream.get_ref();
+        let local_addr = io.local_addr().map_or(listener_local, SbcSocketAddr::from);
+        Self::with_addrs(stream, local_addr, peer)
+    }
+
+    /// Builds the transport from an established TLS stream and its
+    /// addresses.
+    fn with_addrs(
+        stream: TlsStream<TcpStream>,
+        local_addr: SbcSocketAddr,
+        peer_addr: SbcSocketAddr,
+    ) -> Self {
         debug!(
             local = %local_addr,
             peer = %peer_addr,
@@ -560,14 +594,14 @@ impl TlsTransport {
         );
 
         let (reader, writer) = tokio::io::split(stream);
-        Ok(Self {
+        Self {
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
-            local_addr: local_addr.into(),
-            peer_addr: peer_addr.into(),
+            local_addr,
+            peer_addr,
             read_buffer: Mutex::new(BytesMut::with_capacity(MAX_STREAM_MESSAGE_SIZE)),
             closed: AtomicBool::new(false),
-        })
+        }
     }
 
     /// Connects to a remote TLS endpoint.
@@ -907,8 +941,10 @@ impl TlsListener {
 
         debug!(peer = %peer_addr, "TLS handshake completed");
 
-        let transport = TlsTransport::from_stream(TlsStream::Server(tls_stream))?;
-        Ok((transport, peer_addr.into()))
+        let peer_addr = SbcSocketAddr::from(peer_addr);
+        let transport =
+            TlsTransport::from_accepted(TlsStream::Server(tls_stream), peer_addr, self.local_addr);
+        Ok((transport, peer_addr))
     }
 
     /// Accepts the next incoming TCP connection without performing the TLS
@@ -939,22 +975,33 @@ impl TlsListener {
         Ok((tcp_stream, peer_addr.into()))
     }
 
-    /// Completes the TLS handshake on an already-accepted TCP stream.
+    /// Completes the TLS handshake on a TCP stream from
+    /// [`accept_tcp`](Self::accept_tcp); `peer` is the address it returned
+    /// and becomes the transport's peer address.
     ///
     /// Intended to run inside a spawned task with a timeout so that one
     /// slow handshake does not block the accept loop.
     ///
     /// ## Errors
     ///
-    /// Returns an error if the TLS handshake fails.
-    pub async fn complete_handshake(&self, tcp_stream: TcpStream) -> TransportResult<TlsTransport> {
+    /// Returns an error if the TLS handshake fails. A peer that resets
+    /// after the handshake is not an error here (no `getpeername`).
+    pub async fn complete_handshake(
+        &self,
+        tcp_stream: TcpStream,
+        peer: SbcSocketAddr,
+    ) -> TransportResult<TlsTransport> {
         let tls_stream = self.acceptor.accept(tcp_stream).await.map_err(|e| {
             TransportError::TlsHandshakeFailed {
                 reason: e.to_string(),
             }
         })?;
 
-        TlsTransport::from_stream(TlsStream::Server(tls_stream))
+        Ok(TlsTransport::from_accepted(
+            TlsStream::Server(tls_stream),
+            peer,
+            self.local_addr,
+        ))
     }
 
     /// Returns the local address.
@@ -1523,5 +1570,41 @@ mod tests {
             "received message source must be plain IPv4, got {}",
             msg.source
         );
+    }
+
+    // SR-22 (NIST 800-53 Rev5: SC-5): the server transport takes its peer
+    // address from `accept_tcp`, not from `getpeername` after the
+    // handshake, so a peer that resets right after the handshake cannot
+    // fail the connection. A sentinel peer shows the socket is not asked.
+    #[tokio::test]
+    async fn tls_complete_handshake_uses_accept_peer() {
+        use std::net::Ipv4Addr;
+        let pki = pki();
+        let server = create_server_config(pki.chain.clone(), pki.key.clone_key()).unwrap();
+        let listener = Arc::new(
+            TlsListener::bind(
+                ListenerConfig::new(
+                    SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0),
+                    TransportType::Tls,
+                ),
+                Arc::new(server),
+            )
+            .await
+            .unwrap(),
+        );
+        let addr = *listener.local_addr();
+        let sentinel = SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, 77), 40_000);
+        let l = Arc::clone(&listener);
+        let accept = tokio::spawn(async move {
+            let (tcp, _peer) = l.accept_tcp().await?;
+            l.complete_handshake(tcp, sentinel).await
+        });
+        let client_cfg = Arc::new(create_client_config(roots(&pki)).unwrap());
+        let _client = TlsTransport::connect(addr, "localhost", client_cfg)
+            .await
+            .unwrap();
+        let server = accept.await.unwrap().unwrap();
+        assert_eq!(*server.peer_addr(), sentinel);
+        assert_eq!(server.local_addr().port(), addr.port());
     }
 }

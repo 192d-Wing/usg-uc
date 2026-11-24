@@ -182,7 +182,7 @@ fn rate_limit_c_trunk_rps_range_enforced_by_loader() {
     assert!(with(2_000).is_ok());
 }
 
-/// SR-56 accept-admission keys. Compile-red until the keys exist.
+/// SR-56 accept-admission keys.
 ///
 /// ## NIST 800-53 Rev5: SC-5, CM-6
 mod sr56_accept_keys {
@@ -217,10 +217,24 @@ mod sr56_accept_keys {
             "accept_burst_per_source = 0",
             "accept_rate_per_source = 60\naccept_burst_per_source = 50",
             "max_handshakes_per_source = 0",
-            "max_connections_per_source = 8\nmax_handshakes_per_source = 9",
         ] {
             let text = format!("[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n{bad}\n");
             assert!(load_from_str(&text).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    // NIST-002: lowering only max_connections_per_source below the
+    // default max_handshakes_per_source (16) still loads; the daemon
+    // clamps the handshake cap to 8 at startup with a warning.
+    #[test]
+    fn handshake_cap_above_connection_cap_loads() {
+        for extra in ["", "max_handshakes_per_source = 9\n"] {
+            let text = format!(
+                "[transport]\nudp_listen = [\"0.0.0.0:5060\"]\nmax_connections_per_source = 8\n{extra}"
+            );
+            let config = load_from_str(&text).unwrap();
+            assert_eq!(config.transport.max_connections_per_source, 8);
+            assert!(config.transport.max_handshakes_per_source > 8, "{extra:?}");
         }
     }
 }

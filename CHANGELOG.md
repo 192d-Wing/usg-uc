@@ -447,6 +447,57 @@ release") and `deploy/keycloak/central-config-clients.md`.
   sidecars and the dashboard's npm tree.** GitHub Actions updates are
   grouped into one weekly PR.
 
+### Security (SBC, stream accept admission and accept errors; SR-22, SR-56, POA&M-440..443)
+
+Tested locally on macOS arm64 only; no CI run yet.
+
+- **Accept errors no longer stall a listener.** (SC-5) Only resource
+  exhaustion (EMFILE, ENFILE, ENOBUFS, ENOMEM) backs off, 10 ms doubling to
+  1 s, with at most one warning per second. Other accept errors are counted
+  and the loop accepts again at once; only after 64 in a row with no
+  successful accept do they back off too. A peer that resets before the
+  accept no longer delays other clients by 100 ms. Plain TCP connections
+  take the peer address from `accept()` and are built only after admission;
+  TLS connections take it from `accept()` too, so a reset right after the
+  handshake no longer fails it.
+- **Blocked sources are dropped at accept**, before any TLS or WebSocket
+  handshake, on every TCP, TLS and WS listener. (SC-5, SC-7)
+- **New per-source accept rate on TCP and TLS listeners.** (SC-5)
+  `transport.accept_rate_per_source` (default 20 new connections/s, 0 = off)
+  and `accept_burst_per_source` (default 50), keyed like
+  `max_connections_per_source`. With the defaults, 1,000 phones behind one
+  NAT address reconnecting together all get in after about 48 s; raise both
+  for large NATs or PBXs. Configured trunks are not exempt, the check
+  applies with `rate_limit.enabled = false`, and limits are per node.
+  Sources past the tracking limit share an overflow bucket of 4x the rate.
+  WebSocket listeners are exempt until WS admission is keyed on the client
+  address (SR-59).
+- **TLS handshake limits.** (SC-5) `transport.max_handshakes_per_source`
+  (default 16; 0 is rejected; a value above `max_connections_per_source` is
+  clamped to it with a startup warning, and the cap is at most 1/32 of the
+  node-wide pool) and `transport.max_handshakes_in_flight` (default 0 = 64
+  per CPU core, at least 64, at most `max_connections_total`). A connection
+  takes a node-wide slot only after it sends data and waits at most a
+  quarter of `handshake_timeout_secs` (at most 1 s) for one. Both slots are
+  released when the handshake ends.
+- **Audit and stats.** New `RateLimitTriggered` `limit_name` values
+  `per_ip_accept_rate`, `accept_blocked` and `handshake_busy`, aggregated
+  per source. New `ServerStats` counters `accept_errors`,
+  `accept_resource_errors`, `accept_blocked`, `accept_rate_limited`,
+  `handshake_busy_per_source` and `handshake_slot_timeouts` (Debug output
+  only, POA&M-93).
+- **`uc-transport` API.** New `TransportError::AcceptFailed { reason,
+  resource_exhausted }` (the enum is not `#[non_exhaustive]`, so exhaustive
+  matches need an arm), `TransportError::is_resource_exhausted`,
+  `is_accept_resource_exhaustion`, `TcpListener::accept_tcp` and
+  `TcpTransport::from_accepted`. `TlsListener::complete_handshake` now
+  takes the peer address returned by `accept_tcp`. Listener accept errors
+  are `AcceptFailed` instead of `ReceiveFailed` (TCP, TLS) or `Io` (WS).
+- **Open items:** POA&M-440 (no node-wide accept or handshake rate),
+  POA&M-441 (accept admission keyed per address or prefix only), POA&M-442
+  (fixed listen backlog), POA&M-443 (TLS handshake failures logged per
+  connection, not counted).
+
 ### Security (client, SIP connect, DNS and send deadlines; RFC 4733 receive bounds; POA&M-374, 375, 377, 378)
 
 Tested locally on macOS arm64 only; no CI run yet.

@@ -245,8 +245,8 @@ pub trait StreamTransport: Transport {
     fn is_connected(&self) -> bool;
 }
 
-/// SR-22 tests for the accept-error classifier. Compile-red until
-/// `is_accept_resource_exhaustion` exists.
+/// SR-22 tests for the accept-error classifier
+/// (`is_accept_resource_exhaustion`).
 #[cfg(all(test, unix))]
 mod sr22_accept_classifier_tests {
     use super::is_accept_resource_exhaustion;

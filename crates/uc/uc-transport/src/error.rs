@@ -139,8 +139,8 @@ impl From<std::io::Error> for TransportError {
     }
 }
 
-/// SR-22 tests for `TransportError::AcceptFailed`. Compile-red until the
-/// variant and `is_resource_exhausted` exist.
+/// SR-22 tests for `TransportError::AcceptFailed` and
+/// `is_resource_exhausted`.
 #[cfg(test)]
 mod sr22_accept_error_tests {
     use super::*;

@@ -169,6 +169,17 @@ impl StreamTimeouts {
             idle: std::time::Duration::from_secs(config.transport.tcp_idle_timeout_secs),
         }
     }
+
+    /// Longest wait for a node-wide TLS handshake slot once the client has
+    /// sent its first bytes: a quarter of the handshake deadline, at most
+    /// 1 s. A connection that gets no slot in time is dropped and counted
+    /// (`handshake_slot_timeouts`), so a full pool sheds load quickly
+    /// instead of queueing clients up to the whole deadline.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    fn handshake_slot_wait(&self) -> std::time::Duration {
+        (self.handshake / 4).min(std::time::Duration::from_secs(1))
+    }
 }
 
 /// Resources one admitted stream connection holds for its whole life
@@ -208,9 +219,10 @@ struct StreamLoopContext {
     total_conns: Arc<tokio::sync::Semaphore>,
     /// Per-source connection cap, shared by all stream listeners.
     conn_limiter: Arc<crate::conn_limit::ConnLimiter>,
-    /// Node-wide TLS + WebSocket handshakes in progress
-    /// (`transport.max_handshakes_in_flight`). A permit is held only for
-    /// the handshake, never for the receive loop.
+    /// Node-wide TLS handshakes in progress
+    /// (`transport.max_handshakes_in_flight`). A permit is taken only once
+    /// the client has sent data and held only for the handshake, never
+    /// for the receive loop. WebSocket upgrades do not use it (no crypto).
     handshake_slots: Arc<tokio::sync::Semaphore>,
     timeouts: StreamTimeouts,
     flows: Arc<FlowTable>,
@@ -218,18 +230,22 @@ struct StreamLoopContext {
 
 /// Accept-loop back-off for `accept()` errors.
 ///
-/// Only resource exhaustion (fd table full, no buffer space, out of memory)
+/// Resource exhaustion (fd table full, no buffer space, out of memory)
 /// backs off, 10 ms doubling to 1 s, so a full fd table does not spin the
 /// loop. Any other accept error concerns one pending connection: the loop
 /// accepts again at once, so peers that reset before accept cannot stall
-/// the listener.
+/// the listener. Only when [`Self::PERSISTENT`] errors in a row arrive
+/// with no successful accept (a broken listener socket, not one peer) do
+/// those errors back off the same way.
 ///
 /// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
 #[derive(Debug)]
 struct AcceptBackoff {
-    /// Delay for the next resource error.
+    /// Delay for the next backed-off error.
     next: std::time::Duration,
-    /// Last resource-error warning, for one `warn!` per second at most.
+    /// Errors since the last successful accept.
+    consecutive: u32,
+    /// Last back-off warning, for one `warn!` per second at most.
     last_warn: Option<std::time::Instant>,
 }
 
@@ -237,10 +253,14 @@ impl AcceptBackoff {
     const INITIAL: std::time::Duration = std::time::Duration::from_millis(10);
     const MAX: std::time::Duration = std::time::Duration::from_secs(1);
     const WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Errors in a row, with no successful accept, after which
+    /// per-connection errors back off too.
+    const PERSISTENT: u32 = 64;
 
     const fn new() -> Self {
         Self {
             next: Self::INITIAL,
+            consecutive: 0,
             last_warn: None,
         }
     }
@@ -248,7 +268,8 @@ impl AcceptBackoff {
     /// The delay to sleep before the next accept, or `None` to continue at
     /// once.
     fn on_error(&mut self, err: &uc_transport::TransportError) -> Option<std::time::Duration> {
-        if !err.is_resource_exhausted() {
+        self.consecutive = self.consecutive.saturating_add(1);
+        if !err.is_resource_exhausted() && self.consecutive < Self::PERSISTENT {
             return None;
         }
         let delay = self.next;
@@ -256,13 +277,14 @@ impl AcceptBackoff {
         Some(delay)
     }
 
-    /// Resets the delay after a successful accept.
+    /// Resets the delay and the error run after a successful accept.
     const fn on_success(&mut self) {
         self.next = Self::INITIAL;
+        self.consecutive = 0;
     }
 
-    /// Whether a resource-error warning may be logged now (AU-4: bounded
-    /// log volume while the fd table stays full).
+    /// Whether a back-off warning may be logged now (AU-4: bounded log
+    /// volume while the fd table stays full or the listener stays broken).
     fn should_warn(&mut self) -> bool {
         let now = std::time::Instant::now();
         if self
@@ -297,6 +319,28 @@ fn handshake_slot_count(tc: &sbc_config::schema::TransportConfig) -> usize {
     }
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     cores.saturating_mul(64).max(64).min(total)
+}
+
+/// Effective per-source TLS handshake cap: `transport.max_handshakes_per_source`,
+/// at most `max_connections_per_source` (a source cannot hold more
+/// handshakes than connections) and at most 1/32 of the node-wide pool
+/// (`slots`), so at least 32 sources are needed to fill it.
+///
+/// ## NIST 800-53 Rev5: SC-5
+fn handshakes_per_source(tc: &sbc_config::schema::TransportConfig, slots: usize) -> u32 {
+    let pool_share = u32::try_from(slots / 32).unwrap_or(u32::MAX).max(1);
+    tc.max_handshakes_per_source
+        .min(tc.max_connections_per_source)
+        .min(pool_share)
+        .max(1)
+}
+
+/// How a TLS handshake under a node-wide slot ended.
+enum SlottedHandshake<T> {
+    /// The handshake ran; its result.
+    Done(uc_transport::TransportResult<T>),
+    /// No node-wide slot within [`StreamTimeouts::handshake_slot_wait`].
+    SlotWaitExpired,
 }
 
 /// Where the message that produced a result arrived: replies to that peer
@@ -2109,10 +2153,26 @@ impl Server {
         let total_conns = Arc::new(tokio::sync::Semaphore::new(
             tc.max_connections_total as usize,
         ));
-        // NIST 800-53 Rev5: SC-5 — per-source accept rate and in-handshake
-        // cap, checked at accept before any TLS or WebSocket handshake.
-        // POAM: POA&M-441 — both are keyed per `rate_limit.ipv6_prefix_len`
-        // prefix only; there is no wider IPv6 aggregate cap (SC-5).
+        // NIST 800-53 Rev5: SC-5 — per-source accept rate (TCP and TLS)
+        // and TLS in-handshake cap, checked at accept before any handshake.
+        // Accept buckets are tracked for at most `max_connections_total`
+        // sources; the rest share an overflow bucket of 4x the rate.
+        // POAM: POA&M-441 — the accept bucket and the per-source handshake
+        // cap are keyed per IPv4 address and per IPv6
+        // `rate_limit.ipv6_prefix_len` prefix only; no aggregate
+        // accept-rate key (SC-5).
+        let slot_count = handshake_slot_count(tc);
+        let per_source_handshakes = handshakes_per_source(tc, slot_count);
+        if tc.max_handshakes_per_source > tc.max_connections_per_source {
+            warn!(
+                configured = tc.max_handshakes_per_source,
+                max_connections_per_source = tc.max_connections_per_source,
+                effective = per_source_handshakes,
+                "transport.max_handshakes_per_source exceeds max_connections_per_source; clamped"
+            );
+        }
+        let accept_tracked = (self.config.rate_limit.max_tracked_sources as usize)
+            .min(tc.max_connections_total as usize);
         let conn_limiter = Arc::new(
             crate::conn_limit::ConnLimiter::new(
                 tc.max_connections_per_source,
@@ -2121,12 +2181,11 @@ impl Server {
             .with_accept_rate(
                 tc.accept_rate_per_source,
                 tc.accept_burst_per_source,
-                self.config.rate_limit.max_tracked_sources as usize,
-                self.config.rate_limit.effective_overflow_rps(),
+                accept_tracked,
             )
-            .with_handshake_cap(tc.max_handshakes_per_source),
+            .with_handshake_cap(per_source_handshakes),
         );
-        let handshake_slots = Arc::new(tokio::sync::Semaphore::new(handshake_slot_count(tc)));
+        let handshake_slots = Arc::new(tokio::sync::Semaphore::new(slot_count));
         let timeouts = StreamTimeouts::from_config(&self.config);
         let stream_ctx = |zone_name: Option<String>| StreamLoopContext {
             shutdown: self.shutdown.clone(),
@@ -2441,7 +2500,25 @@ impl Server {
         peer: &SbcSocketAddr,
         kind: &str,
     ) -> Option<ConnAdmission> {
-        let source = match ctx.conn_limiter.try_admit(peer.ip()) {
+        Self::admit_with(ctx, peer, kind, true)
+    }
+
+    /// [`Self::admit_connection`]; `metered` false skips the per-source
+    /// accept bucket (the caps still apply).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    fn admit_with(
+        ctx: &StreamLoopContext,
+        peer: &SbcSocketAddr,
+        kind: &str,
+        metered: bool,
+    ) -> Option<ConnAdmission> {
+        let admitted = if metered {
+            ctx.conn_limiter.try_admit(peer.ip())
+        } else {
+            ctx.conn_limiter.try_admit_unmetered(peer.ip())
+        };
+        let source = match admitted {
             Ok(source) => source,
             Err(crate::conn_limit::Rejection::AcceptRate) => {
                 ctx.stats
@@ -2515,29 +2592,58 @@ impl Server {
         guard
     }
 
-    /// Runs `handshake` while holding a node-wide handshake slot. The
-    /// caller wraps this in the handshake deadline, so time spent waiting
-    /// for a slot counts toward it. The slot and `guard` are released as
-    /// soon as the handshake ends, before any receive loop.
+    /// Runs `handshake` on `stream` while holding a node-wide handshake
+    /// slot.
+    ///
+    /// The slot is requested only once the client has sent data (peeked,
+    /// not consumed), so a silent socket never holds one; it waits at most `slot_wait` for a
+    /// slot. The caller wraps this in the handshake deadline, which bounds
+    /// the whole sequence. The slot and `guard` are released as soon as
+    /// the handshake ends, before any receive loop.
     ///
     /// ## NIST 800-53 Rev5: SC-5
-    async fn with_handshake_slot<T>(
+    async fn with_handshake_slot<T, F, Fut>(
         slots: Arc<tokio::sync::Semaphore>,
+        slot_wait: std::time::Duration,
         guard: crate::conn_limit::HandshakeGuard,
-        handshake: impl std::future::Future<Output = uc_transport::TransportResult<T>>,
-    ) -> uc_transport::TransportResult<T> {
-        let slot = slots
-            .acquire_owned()
-            .await
-            .map_err(|_| uc_transport::TransportError::ConnectionClosed)?;
-        let result = handshake.await;
+        stream: tokio::net::TcpStream,
+        handshake: F,
+    ) -> SlottedHandshake<T>
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut,
+        Fut: std::future::Future<Output = uc_transport::TransportResult<T>>,
+    {
+        // Wait for the first byte without consuming it. `readable()` alone
+        // is not enough: it can report ready on a socket with no data
+        // (seen with kqueue), which would let silent sockets take slots.
+        let mut first = [0u8; 1];
+        match stream.peek(&mut first).await {
+            Ok(0) => {
+                return SlottedHandshake::Done(Err(uc_transport::TransportError::ConnectionClosed));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return SlottedHandshake::Done(Err(uc_transport::TransportError::Io {
+                    reason: e.to_string(),
+                }));
+            }
+        }
+        let slot = match tokio::time::timeout(slot_wait, slots.acquire_owned()).await {
+            Ok(Ok(slot)) => slot,
+            Ok(Err(_)) => {
+                return SlottedHandshake::Done(Err(uc_transport::TransportError::ConnectionClosed));
+            }
+            Err(_) => return SlottedHandshake::SlotWaitExpired,
+        };
+        let result = handshake(stream).await;
         drop(slot);
         drop(guard);
-        result
+        SlottedHandshake::Done(result)
     }
 
     /// Handles an `accept()` error: per-connection errors are counted and
-    /// the loop continues at once; resource exhaustion backs off.
+    /// the loop continues at once; resource exhaustion, or a long run of
+    /// errors with no successful accept, backs off.
     ///
     /// ## NIST 800-53 Rev5: SC-5, AU-4
     async fn on_accept_error(
@@ -2551,21 +2657,26 @@ impl Server {
         {
             return AcceptNext::Stop;
         }
+        let resource_exhausted = err.is_resource_exhausted();
+        if resource_exhausted {
+            ctx.stats
+                .accept_resource_errors
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            ctx.stats.accept_errors.fetch_add(1, Ordering::Relaxed);
+        }
         match backoff.on_error(err) {
             None => {
-                ctx.stats.accept_errors.fetch_add(1, Ordering::Relaxed);
                 debug!(error = %err, kind, "Stream accept failed for one connection");
             }
             Some(delay) => {
-                ctx.stats
-                    .accept_resource_errors
-                    .fetch_add(1, Ordering::Relaxed);
                 if backoff.should_warn() {
                     warn!(
                         error = %err,
                         kind,
+                        resource_exhausted,
                         backoff_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                        "Stream accept failed: resources exhausted; backing off"
+                        "Stream accept failing (resources exhausted or persistent errors); backing off"
                     );
                 }
                 tokio::time::sleep(delay).await;
@@ -2625,11 +2736,15 @@ impl Server {
     ///
     /// The raw TCP accept and admission run inline; the HTTP upgrade runs
     /// in the spawned connection task under `transport.handshake_timeout_secs`,
-    /// which also bounds the wait for a node-wide handshake slot, so a
-    /// silent or slow client holds only its own slot and cannot stall the
-    /// listener.
+    /// so a silent or slow client holds only its own connection slot and
+    /// cannot stall the listener. The upgrade costs no crypto, so it takes
+    /// no handshake slot.
     ///
     /// ## NIST 800-53 Rev5: SC-5, SC-7, SC-10
+    // POAM: POA&M-440 — the per-source accept bucket is off on WebSocket
+    // listeners: behind the recommended WSS proxy the accept address is the
+    // proxy's, so one bucket would be shared by every client. It is enabled
+    // once SR-59 keys WS admission on the client address (SC-5).
     async fn ws_accept_loop(listener: Arc<WebSocketListener>, ctx: StreamLoopContext) {
         info!(address = %listener.local_addr(), "SIP WebSocket accept loop started");
         let mut backoff = AcceptBackoff::new();
@@ -2640,10 +2755,7 @@ impl Server {
                     if Self::accept_blocked(&ctx, &peer, "ws").await {
                         continue;
                     }
-                    let Some(admission) = Self::admit_connection(&ctx, &peer, "ws") else {
-                        continue;
-                    };
-                    let Some(handshake) = Self::begin_handshake(&ctx, &peer, "ws") else {
+                    let Some(admission) = Self::admit_with(&ctx, &peer, "ws", false) else {
                         continue;
                     };
                     let conn_ctx = ctx.clone();
@@ -2651,11 +2763,7 @@ impl Server {
                     tokio::spawn(async move {
                         match tokio::time::timeout(
                             conn_ctx.timeouts.handshake,
-                            Self::with_handshake_slot(
-                                Arc::clone(&conn_ctx.handshake_slots),
-                                handshake,
-                                listener.complete_handshake(tcp_stream, peer),
-                            ),
+                            listener.complete_handshake(tcp_stream, peer),
                         )
                         .await
                         {
@@ -2703,9 +2811,10 @@ impl Server {
     ///
     /// The raw TCP accept and admission run inline so the loop stays
     /// responsive and a refused source costs no crypto; the TLS handshake
-    /// is spawned under `transport.handshake_timeout_secs`, which also
-    /// bounds the wait for a node-wide handshake slot, so one slow client
-    /// cannot stall new connections on this listener.
+    /// is spawned under `transport.handshake_timeout_secs`, so one slow
+    /// client cannot stall new connections on this listener. The handshake
+    /// takes a node-wide slot only after the client sends data, and waits
+    /// for one at most [`StreamTimeouts::handshake_slot_wait`].
     ///
     /// ## NIST 800-53 Rev5: SC-5, SC-7
     async fn tls_accept_loop(listener: Arc<TlsListener>, ctx: StreamLoopContext) {
@@ -2734,13 +2843,15 @@ impl Server {
                             conn_ctx.timeouts.handshake,
                             Self::with_handshake_slot(
                                 Arc::clone(&conn_ctx.handshake_slots),
+                                conn_ctx.timeouts.handshake_slot_wait(),
                                 handshake,
-                                listener_clone.complete_handshake(tcp_stream),
+                                tcp_stream,
+                                |tcp| listener_clone.complete_handshake(tcp, peer),
                             ),
                         )
                         .await
                         {
-                            Ok(Ok(transport)) => {
+                            Ok(SlottedHandshake::Done(Ok(transport))) => {
                                 debug!(peer = %peer, "TLS handshake completed");
                                 Self::stream_connection_loop(
                                     Arc::new(transport),
@@ -2750,7 +2861,14 @@ impl Server {
                                 )
                                 .await;
                             }
-                            Ok(Err(e)) => {
+                            Ok(SlottedHandshake::SlotWaitExpired) => {
+                                conn_ctx
+                                    .stats
+                                    .handshake_slot_timeouts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                debug!(peer = %peer, "No TLS handshake slot in time, dropping");
+                            }
+                            Ok(SlottedHandshake::Done(Err(e))) => {
                                 // POAM: POA&M-443 — a failed TLS handshake
                                 // is still a per-connection warn! (AU-4).
                                 warn!(peer = %peer, error = %e, "TLS handshake failed");
@@ -3455,13 +3573,13 @@ pub struct ServerStats {
     pub conn_rejected_per_source: AtomicU64,
     /// WebSocket upgrades refused or failed (e.g. no `sip` subprotocol).
     pub ws_handshake_failures: AtomicU64,
-    /// TLS / WebSocket handshakes that hit `handshake_timeout_secs`
-    /// (including time spent waiting for a handshake slot).
+    /// TLS / WebSocket handshakes that hit `handshake_timeout_secs`.
     // POAM: POA&M-93 — these counters and the accept counters below are
     // not yet exported on the REST/metrics API (api_server.rs is owned
     // elsewhere); visible via the stats Debug output only (SI-4).
     pub handshake_timeouts: AtomicU64,
-    /// Stream `accept()` errors tied to one connection (no back-off).
+    /// Stream `accept()` errors other than resource exhaustion (backed
+    /// off only after a long run with no successful accept).
     pub accept_errors: AtomicU64,
     /// Stream `accept()` errors from resource exhaustion (backed off).
     pub accept_resource_errors: AtomicU64,
@@ -3469,9 +3587,11 @@ pub struct ServerStats {
     pub accept_blocked: AtomicU64,
     /// Stream accepts dropped by `transport.accept_rate_per_source`.
     pub accept_rate_limited: AtomicU64,
-    /// TLS / WebSocket accepts dropped by
-    /// `transport.max_handshakes_per_source`.
+    /// TLS accepts dropped by `transport.max_handshakes_per_source`.
     pub handshake_busy_per_source: AtomicU64,
+    /// TLS connections dropped because no node-wide handshake slot
+    /// (`transport.max_handshakes_in_flight`) freed within the slot wait.
+    pub handshake_slot_timeouts: AtomicU64,
 }
 
 /// Server error.
@@ -6579,9 +6699,9 @@ mod tests {
     }
 
     // SR-22 (NIST 800-53 Rev5: SC-5): connections reset before accept must
-    // not stall the listener. Today each one makes `TcpListener::accept`
-    // fail (getpeername) and the loop sleeps 100 ms, so 20 of them delay a
-    // good client by about 2 s.
+    // not stall the listener. Before SR-22 each one made
+    // `TcpListener::accept` fail (getpeername) and the loop slept 100 ms,
+    // so 20 of them delayed a good client by about 2 s.
     #[cfg(unix)]
     #[tokio::test]
     async fn tcp_accept_loop_does_not_stall_on_reset_connections() {
@@ -6621,7 +6741,8 @@ mod tests {
     }
 
     // SR-56 (NIST 800-53 Rev5: SC-5, SC-7): a blocked source is refused at
-    // accept, before the HTTP upgrade. Today the upgrade answers 101.
+    // accept, before the HTTP upgrade. Before SR-56 the upgrade answered
+    // 101.
     #[tokio::test]
     async fn blocked_source_dropped_at_ws_accept_before_upgrade() {
         let ctx = stream_test_ctx(short_timeouts());
@@ -6641,7 +6762,8 @@ mod tests {
     }
 
     // SR-56 (NIST 800-53 Rev5: SC-5, SC-7): a blocked source is refused
-    // before the TLS handshake, so it costs no crypto. Today it completes.
+    // before the TLS handshake, so it costs no crypto. Before SR-56 it
+    // completed.
     #[tokio::test]
     async fn blocked_source_dropped_at_tls_accept_before_handshake() {
         let ctx = stream_test_ctx(short_timeouts());
@@ -6700,11 +6822,9 @@ mod tests {
         );
     }
 
-    /// SR-22 / SR-56 tests against the new accept-path API
-    /// (`AcceptBackoff`, `StreamLoopContext::handshake_slots`,
-    /// `ConnLimiter::with_accept_rate` / `with_handshake_cap`, new
-    /// `ServerStats` counters and audit labels). Compile-red until the API
-    /// exists.
+    /// SR-22 / SR-56 tests for the accept-path API (`AcceptBackoff`,
+    /// `StreamLoopContext::handshake_slots`, `ConnLimiter::with_accept_rate`
+    /// / `with_handshake_cap`, `ServerStats` counters and audit labels).
     ///
     /// ## NIST 800-53 Rev5: SC-5, AU-12
     mod sr56_accept_api {
@@ -6728,23 +6848,29 @@ mod tests {
             }
         }
 
-        /// Completes a WS upgrade and keeps the connection open.
-        async fn ws_upgrade_open(addr: std::net::SocketAddr) -> (tokio::net::TcpStream, String) {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let req = format!(
-                "GET / HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\n\
-                 Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-                 Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: sip\r\n\r\n"
-            );
-            s.write_all(req.as_bytes()).await.unwrap();
-            let mut buf = [0u8; 256];
-            let n = tokio::time::timeout(D::from_secs(5), s.read(&mut buf))
+        /// Connects to `addr` and sends one byte: readable at the server,
+        /// so the TLS handshake takes a node-wide slot and then stalls.
+        async fn stalled_tls_client(addr: SbcSocketAddr) -> tokio::net::TcpStream {
+            use tokio::io::AsyncWriteExt;
+            let mut s = tokio::net::TcpStream::connect(std::net::SocketAddr::from(addr))
                 .await
-                .unwrap()
                 .unwrap();
-            let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
-            (s, reply)
+            s.write_all(&[0x16]).await.unwrap();
+            s
+        }
+
+        /// A connected, silent TCP socket to `addr` from 127.0.0.`host`, or
+        /// from 127.0.0.1 when that source address cannot be bound here.
+        async fn silent_socket_from(addr: SbcSocketAddr, host: u8) -> tokio::net::TcpStream {
+            let target = std::net::SocketAddr::from(addr);
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            let src = std::net::SocketAddr::from((Ipv4Addr::new(127, 0, 0, host), 0));
+            if socket.bind(src).is_ok()
+                && let Ok(s) = socket.connect(target).await
+            {
+                return s;
+            }
+            tokio::net::TcpStream::connect(target).await.unwrap()
         }
 
         // SR-22: only process-wide resource errors back off (10 ms doubling
@@ -6778,26 +6904,80 @@ mod tests {
             assert_eq!(b.on_error(&exhausted()), Some(D::from_millis(10)));
         }
 
-        // SR-56: the accept bucket refuses excess connections before the
-        // upgrade and counts them.
+        // SR-22 (PERF-002): a broken listener socket fails every accept
+        // with a non-resource error. After 64 in a row with no successful
+        // accept those errors back off too; a success resets the run.
+        #[test]
+        fn accept_backoff_after_consecutive_non_resource_errors() {
+            let mut b = AcceptBackoff::new();
+            for i in 1..AcceptBackoff::PERSISTENT {
+                assert_eq!(b.on_error(&transient()), None, "error {i}");
+            }
+            assert_eq!(b.on_error(&transient()), Some(D::from_millis(10)));
+            assert_eq!(b.on_error(&transient()), Some(D::from_millis(20)));
+            let capped: Vec<_> = (0..10).filter_map(|_| b.on_error(&transient())).collect();
+            assert_eq!(capped.last(), Some(&D::from_secs(1)), "capped at 1 s");
+            b.on_success();
+            assert_eq!(b.on_error(&transient()), None, "run reset on success");
+        }
+
+        // NIST-006: node-wide handshake pool sizing.
+        #[test]
+        fn handshake_slot_count_sizing() {
+            let mut tc = sbc_config::schema::TransportConfig {
+                max_connections_total: 10,
+                max_handshakes_in_flight: 0,
+                ..Default::default()
+            };
+            assert_eq!(
+                handshake_slot_count(&tc),
+                10,
+                "auto never exceeds the total"
+            );
+            tc.max_handshakes_in_flight = 5;
+            assert_eq!(handshake_slot_count(&tc), 5, "explicit value");
+            tc.max_handshakes_in_flight = 50;
+            assert_eq!(
+                handshake_slot_count(&tc),
+                10,
+                "explicit above total is clamped"
+            );
+            tc.max_connections_total = 1_000_000;
+            tc.max_handshakes_in_flight = 0;
+            let auto = handshake_slot_count(&tc);
+            let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+            assert_eq!(auto, (cores * 64).max(64), "64 per core, at least 64");
+        }
+
+        // NIST-002: the per-source handshake cap is clamped to
+        // max_connections_per_source and to 1/32 of the node-wide pool.
+        #[test]
+        fn handshakes_per_source_clamped() {
+            let mut tc = sbc_config::schema::TransportConfig::default();
+            assert_eq!(handshakes_per_source(&tc, 512), 16, "defaults");
+            tc.max_connections_per_source = 8;
+            assert_eq!(handshakes_per_source(&tc, 512), 8, "per-source connections");
+            tc.max_connections_per_source = 128;
+            assert_eq!(handshakes_per_source(&tc, 64), 2, "1/32 of the pool");
+            assert_eq!(handshakes_per_source(&tc, 10), 1, "at least 1");
+        }
+
+        // SR-56 (SEC-005): WebSocket accepts do not use the accept bucket
+        // (behind a WSS proxy the accept address is the proxy's) until
+        // SR-59 keys WS admission on the client address.
         #[tokio::test]
-        async fn accept_rate_drops_excess_ws_connections_before_upgrade() {
+        async fn ws_accept_not_rate_limited_by_accept_bucket() {
             let mut ctx = stream_test_ctx(short_timeouts());
-            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 2, 1_024, 100));
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024));
             let stats = Arc::clone(&ctx.stats);
             let (listener, addr) = ws_test_listener().await;
             let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
-            for i in 0..2 {
-                let reply = ws_upgrade_status(addr).await.expect("within burst");
+            for i in 0..3 {
+                let reply = ws_upgrade_status(addr).await.expect("upgrade answered");
                 assert!(reply.starts_with("HTTP/1.1 101"), "upgrade {i}: {reply}");
             }
-            assert_eq!(
-                ws_upgrade_status(addr).await,
-                None,
-                "third accept over the bucket"
-            );
             task.abort();
-            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 0);
         }
 
         // SR-56: the TLS listener applies the same bucket before the
@@ -6805,7 +6985,7 @@ mod tests {
         #[tokio::test]
         async fn accept_rate_drops_excess_tls_connections_before_handshake() {
             let mut ctx = stream_test_ctx(short_timeouts());
-            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024, 100));
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024));
             let stats = Arc::clone(&ctx.stats);
             let (listener, client) = tls_test_listener().await;
             let addr = *listener.local_addr();
@@ -6829,7 +7009,7 @@ mod tests {
                 .unwrap();
             let listen: std::net::SocketAddr = (*listener.local_addr()).into();
             let mut ctx = stream_test_ctx(short_timeouts());
-            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024, 100));
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024));
             let stats = Arc::clone(&ctx.stats);
             let flows = Arc::clone(&ctx.flows);
             let task = tokio::spawn(Server::tcp_accept_loop(Arc::new(listener), ctx));
@@ -6843,31 +7023,35 @@ mod tests {
             assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
         }
 
-        // SR-56: with the node-wide handshake pool full, a new connection
-        // waits for a slot (it is not dropped) and proceeds once one frees.
+        // SR-56: with the node-wide handshake pool full, a new TLS
+        // connection waits for a slot (it is not dropped) and proceeds once
+        // one frees within the slot wait (1 s here).
         #[tokio::test]
-        async fn ws_handshake_slot_waits_then_proceeds() {
-            let mut ctx = stream_test_ctx(short_timeouts());
+        async fn tls_handshake_slot_waits_then_proceeds() {
+            let mut ctx = stream_test_ctx(StreamTimeouts {
+                handshake: D::from_secs(4),
+                ..short_timeouts()
+            });
             ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(8));
             ctx.handshake_slots = Arc::new(Semaphore::new(1));
-            let (listener, addr) = ws_test_listener().await;
-            let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
-            let silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            let holder = stalled_tls_client(addr).await;
             tokio::time::sleep(D::from_millis(100)).await;
-            let second = tokio::spawn(ws_upgrade_status(addr));
+            let second = tokio::spawn(async move { tls_handshake_ok(addr, &client).await });
             tokio::time::sleep(D::from_millis(200)).await;
             assert!(
                 !second.is_finished(),
-                "second upgrade answered while the only handshake slot was held"
+                "second handshake finished while the only handshake slot was held"
             );
-            drop(silent);
-            let reply = tokio::time::timeout(D::from_secs(3), second)
+            drop(holder);
+            let done = tokio::time::timeout(D::from_secs(3), second)
                 .await
-                .expect("second upgrade proceeds once the slot frees")
-                .unwrap()
-                .expect("upgrade answered");
+                .expect("second handshake proceeds once the slot frees")
+                .unwrap();
             task.abort();
-            assert!(reply.starts_with("HTTP/1.1 101"), "{reply}");
+            assert!(done, "second handshake completes");
         }
 
         // SR-56: the handshake slot is released when the handshake ends,
@@ -6878,10 +7062,18 @@ mod tests {
             ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(8));
             ctx.handshake_slots = Arc::new(Semaphore::new(2));
             let slots = Arc::clone(&ctx.handshake_slots);
-            let (listener, addr) = ws_test_listener().await;
-            let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
-            let (mut open, reply) = ws_upgrade_open(addr).await;
-            assert!(reply.starts_with("HTTP/1.1 101"), "{reply}");
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            let connector = tokio_rustls::TlsConnector::from(client);
+            let name = rustls_pki_types::ServerName::try_from("sbc.example.test").unwrap();
+            let tcp = tokio::net::TcpStream::connect(std::net::SocketAddr::from(addr))
+                .await
+                .unwrap();
+            let mut open = tokio::time::timeout(D::from_secs(5), connector.connect(name, tcp))
+                .await
+                .unwrap()
+                .unwrap();
             let t0 = std::time::Instant::now();
             while slots.available_permits() != 2 && t0.elapsed() < D::from_secs(1) {
                 tokio::time::sleep(D::from_millis(5)).await;
@@ -6889,7 +7081,7 @@ mod tests {
             assert_eq!(
                 slots.available_permits(),
                 2,
-                "handshake slot still held by an upgraded connection"
+                "handshake slot still held by an established connection"
             );
             let mut buf = [0u8; 1];
             let read = tokio::time::timeout(
@@ -6899,18 +7091,19 @@ mod tests {
             .await;
             assert!(
                 read.is_err(),
-                "upgraded connection must stay open: {read:?}"
+                "established connection must stay open: {read:?}"
             );
             task.abort();
         }
 
-        // SR-56: time spent waiting for a handshake slot counts toward the
-        // handshake deadline. A holds the only slot until its 500 ms
-        // deadline; B arrives 100 ms later and must time out at about
-        // 600 ms, not 1 000 ms. Real time: paused time auto-advances past
-        // socket I/O.
+        // SR-56 (SEC-001, PERF-001): the slot wait has its own budget
+        // (handshake/4, at most 1 s) inside the handshake deadline. A sends
+        // a byte and holds the only slot until its 500 ms deadline; B
+        // arrives 100 ms later and is dropped after a 125 ms slot wait
+        // (about 225 ms), counted as a slot timeout, not a handshake
+        // timeout. Real time: paused time auto-advances past socket I/O.
         #[tokio::test]
-        async fn qa_handshake_wait_counts_toward_deadline() {
+        async fn qa_handshake_slot_wait_has_own_budget() {
             let mut ctx = stream_test_ctx(StreamTimeouts {
                 handshake: D::from_millis(500),
                 ..short_timeouts()
@@ -6922,23 +7115,80 @@ mod tests {
             let total = Arc::clone(&ctx.total_conns);
             let limiter = Arc::clone(&ctx.conn_limiter);
             let slots = Arc::clone(&ctx.handshake_slots);
-            let (listener, addr) = ws_test_listener().await;
-            let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
+            let (listener, _client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
             let t0 = std::time::Instant::now();
-            let _a = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let _a = stalled_tls_client(addr).await;
             tokio::time::sleep(D::from_millis(100)).await;
-            let _b = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let _b = stalled_tls_client(addr).await;
+            tokio::time::sleep(D::from_millis(420).saturating_sub(t0.elapsed())).await;
+            assert_eq!(
+                stats.handshake_slot_timeouts.load(Ordering::Relaxed),
+                1,
+                "B gives up on the slot after its own budget"
+            );
+            assert_eq!(stats.handshake_timeouts.load(Ordering::Relaxed), 0);
             tokio::time::sleep(D::from_millis(850).saturating_sub(t0.elapsed())).await;
             assert_eq!(
                 stats.handshake_timeouts.load(Ordering::Relaxed),
-                2,
-                "B's slot wait must count toward its handshake deadline"
+                1,
+                "A hits the handshake deadline"
             );
             assert_eq!(listener_pool.available_permits(), 4);
             assert_eq!(total.available_permits(), 4);
             assert_eq!(limiter.active(LOCALHOST_IP), 0);
             assert_eq!(slots.available_permits(), 1);
             task.abort();
+        }
+
+        // SR-56 (SEC-001, PERF-001): silent sockets hold no node-wide
+        // handshake slot. Slot-count silent TLS sockets (from 127.0.0.1-4
+        // where the host allows binding them, else all from 127.0.0.1
+        // with the per-source caps raised) leave every slot free, and a
+        // real TLS handshake completes within 1 s.
+        #[tokio::test]
+        async fn silent_tls_sockets_do_not_starve_handshake_slots() {
+            const SLOTS: usize = 8;
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(64, 64).with_handshake_cap(64));
+            ctx.conn_semaphore = Arc::new(Semaphore::new(64));
+            ctx.total_conns = Arc::new(Semaphore::new(64));
+            ctx.handshake_slots = Arc::new(Semaphore::new(SLOTS));
+            let slots = Arc::clone(&ctx.handshake_slots);
+            let listener_pool = Arc::clone(&ctx.conn_semaphore);
+            let stats = Arc::clone(&ctx.stats);
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            let mut silent = Vec::new();
+            for i in 0..SLOTS {
+                let host = u8::try_from(i % 4).unwrap() + 1;
+                silent.push(silent_socket_from(addr, host).await);
+            }
+            let t0 = std::time::Instant::now();
+            while listener_pool.available_permits() != 64 - SLOTS && t0.elapsed() < D::from_secs(1)
+            {
+                tokio::time::sleep(D::from_millis(5)).await;
+            }
+            assert_eq!(
+                listener_pool.available_permits(),
+                64 - SLOTS,
+                "every silent socket admitted"
+            );
+            assert_eq!(
+                slots.available_permits(),
+                SLOTS,
+                "silent sockets hold no slot"
+            );
+            let ok = tokio::time::timeout(D::from_secs(1), tls_handshake_ok(addr, &client)).await;
+            task.abort();
+            assert!(
+                matches!(ok, Ok(true)),
+                "real TLS handshake behind {SLOTS} silent sockets did not complete within 1 s"
+            );
+            assert_eq!(stats.handshake_slot_timeouts.load(Ordering::Relaxed), 0);
+            drop(silent);
         }
 
         // SR-56 (AU-12): accept-rate and blocked-source drops are counted
@@ -6948,19 +7198,19 @@ mod tests {
             let capture = uc_audit::capture::start();
             let config = SbcConfig::default();
             let mut ctx = stream_test_ctx(short_timeouts());
-            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024, 100));
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024));
             let stats = Arc::clone(&ctx.stats);
             let per_ip = Arc::clone(&ctx.rate_limiter);
             let global = Arc::clone(&ctx.global_limiter);
             let conns = Arc::clone(&ctx.conn_limiter);
-            let (listener, addr) = ws_test_listener().await;
-            let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
-            let reply = ws_upgrade_status(addr).await.expect("first upgrade");
-            assert!(reply.starts_with("HTTP/1.1 101"), "{reply}");
-            assert_eq!(ws_upgrade_status(addr).await, None, "over the bucket");
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            assert!(tls_handshake_ok(addr, &client).await, "first handshake");
+            assert!(!tls_handshake_ok(addr, &client).await, "over the bucket");
             assert!(per_ip.lock().await.block(LOCALHOST_IP, D::from_secs(60)));
-            assert_eq!(ws_upgrade_status(addr).await, None, "blocked");
-            assert_eq!(ws_upgrade_status(addr).await, None, "blocked");
+            assert!(!tls_handshake_ok(addr, &client).await, "blocked");
+            assert!(!tls_handshake_ok(addr, &client).await, "blocked");
             task.abort();
             assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
             assert_eq!(stats.accept_blocked.load(Ordering::Relaxed), 2);

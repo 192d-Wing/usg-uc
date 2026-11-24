@@ -199,30 +199,52 @@ and WS messages and frames are capped at 65,535 bytes. Each WS message
 must hold one complete SIP message (RFC 7118 §5); an incomplete one is
 discarded (counted as a framing error) and never joined to the next.
 
-Accept admission (NIST SC-5, SC-7). Every TCP, TLS and WebSocket accept is
-checked in this order before any TLS or WebSocket handshake: a source
-blocked by the per-source rate limiter (`[rate_limit]`) is dropped; then
-the per-source accept rate; then the connection caps above. TLS and
-WebSocket connections then take a per-source and a node-wide handshake
-slot, released as soon as the handshake ends:
+Accept admission (NIST SC-5, SC-7). Every stream accept is checked in
+this order before any TLS or WebSocket handshake: a source blocked by the
+per-source rate limiter (`[rate_limit]`) is dropped; then, on TCP and TLS
+listeners, the per-source accept rate; then the connection caps above. TLS
+connections then take a per-source handshake slot, and a node-wide slot
+once the client has sent its first bytes; both are released as soon as the
+handshake ends:
 
 ```toml
 [transport]
-accept_rate_per_source = 20     # new connections/s per IPv4 address / IPv6 prefix,
-                                # all listeners (0..=100000; 0 = off)
+accept_rate_per_source = 20     # new TCP/TLS connections/s per IPv4 address /
+                                # IPv6 prefix, all listeners (0..=100000; 0 = off)
 accept_burst_per_source = 50    # accepts at once (accept_rate_per_source..=1000000, >= 1)
-max_handshakes_in_flight = 0    # node-wide TLS + WS handshakes in progress
+max_handshakes_in_flight = 0    # node-wide TLS handshakes in progress
                                 # (0..=max_connections_total; 0 = 64 per CPU core,
                                 # at least 64, at most max_connections_total)
-max_handshakes_per_source = 16  # per source (1..=max_connections_per_source)
+max_handshakes_per_source = 16  # TLS handshakes per source (>= 1; clamped to
+                                # max_connections_per_source with a startup warning)
 ```
 
-An accept over the source's rate, or over `max_handshakes_per_source`, is
-closed at once. A connection that finds the node-wide handshake pool full
-waits for a slot; the wait counts toward `handshake_timeout_secs`. Drops are
-audited in aggregate per source as `per_ip_accept_rate`, `accept_blocked`
-and `handshake_busy` `RateLimitTriggered` records, not one log line per
-socket.
+These checks apply even with `rate_limit.enabled = false`, and configured
+trunks are not exempt: a trunk that opens many TLS connections at once
+needs `accept_rate_per_source` / `accept_burst_per_source` sized for it.
+
+An accept over the source's rate, or over the per-source handshake cap, is
+closed at once. The effective per-source handshake cap is the smallest of
+`max_handshakes_per_source`, `max_connections_per_source` and 1/32 of the
+node-wide pool, so at least 32 sources are needed to fill the pool. A
+silent connection holds no node-wide slot. A connection that has sent data
+and finds the pool full waits for a slot for a quarter of
+`handshake_timeout_secs`, at most 1 s, and is then dropped (counted as
+`handshake_slot_timeouts`). Drops are audited in aggregate per source as
+`per_ip_accept_rate`, `accept_blocked` and `handshake_busy`
+`RateLimitTriggered` records, not one log line per socket; waits for a
+node-wide slot are not audited.
+
+Sources beyond the accept-bucket tracking limit (the smaller of
+`rate_limit.max_tracked_sources` and `max_connections_total`) share one
+overflow bucket of four times `accept_rate_per_source` with burst
+`accept_burst_per_source`.
+
+WebSocket listeners apply the blocked-source check and the connection caps
+but not the accept rate or the handshake slots: behind a WSS proxy the
+accept address is the proxy's, so one bucket would be shared by every
+client. The accept rate will apply to WebSocket once WS admission is keyed
+on the client address (SR-59).
 
 Sizing: the accept bucket is per source key, so phones behind one NAT
 address share it. With the defaults, 1,000 phones behind one IPv4 address
@@ -232,9 +254,11 @@ large NATs or PBXs; `max_connections_per_source` still bounds the total they
 hold. Limits are per node: N nodes admit N times the rate.
 
 `accept()` errors tied to one connection (for example a peer that reset
-before the accept) do not slow the listener. Only resource exhaustion (file
+before the accept) do not slow the listener. Resource exhaustion (file
 descriptor table full, no buffer space, out of memory) backs off, from
-10 ms doubling to 1 s, with at most one warning per second.
+10 ms doubling to 1 s, with at most one warning per second; so do other
+errors once 64 arrive in a row with no successful accept (a broken
+listener socket).
 
 > **Note:** `ws_require_sip_subprotocol = false` admits WebSocket upgrades
 > that offer no subprotocol. This is **not conformant with RFC 7118 §4**
@@ -1429,6 +1453,12 @@ limiter),
 (accepts dropped on a full listener or node-wide pool; source `0.0.0.0`,
 one warning logged per interval), `framing` (stream Content-Length
 framing rejections and discarded partial WS messages, per source),
+`per_ip_accept_rate` (TCP and TLS accepts over
+`transport.accept_rate_per_source`, per source; `threshold` = that rate),
+`accept_blocked` (stream accepts dropped because the source is blocked;
+`threshold` 0), `handshake_busy` (TLS accepts over the effective
+per-source handshake cap; `threshold` = the configured
+`max_handshakes_per_source`),
 `per_ip_block:/<prefix>:<secs>s` (immediate; source is the blocked
 address or IPv6 prefix, `request_count` 0), `per_ip_unblock` (immediate)
 and `per_ip_rps_suppressed` (sum beyond the per-interval cap; `threshold`

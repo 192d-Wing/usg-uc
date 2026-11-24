@@ -708,11 +708,11 @@ mod tests {
     }
 
     // SR-22 (NIST 800-53 Rev5: SC-5): a peer that sends RST before the
-    // server accepts must not turn `accept()` into an error. Today
-    // `from_stream` calls `getpeername` on the accepted socket, which fails
-    // (ENOTCONN on Linux, EINVAL on macOS) once the peer has reset, and the
-    // daemon accept loop then sleeps 100 ms. Both kernels keep the reset
-    // connection in the accept queue.
+    // server accepts must not turn `accept()` into an error. Before SR-22
+    // `accept()` used `from_stream`, which calls `getpeername` on the
+    // accepted socket; that fails (ENOTCONN on Linux, EINVAL on macOS) once
+    // the peer has reset, and the daemon accept loop then slept 100 ms.
+    // Both kernels keep the reset connection in the accept queue.
     #[cfg(unix)]
     #[tokio::test]
     async fn tcp_accept_survives_peer_reset_before_accept() {
@@ -733,7 +733,7 @@ mod tests {
 }
 
 /// SR-22 tests against the new accept API (`TcpListener::accept_tcp`,
-/// `TcpTransport::from_accepted`). Compile-red until the API exists.
+/// `TcpTransport::from_accepted`).
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod sr22_accept_api_tests {

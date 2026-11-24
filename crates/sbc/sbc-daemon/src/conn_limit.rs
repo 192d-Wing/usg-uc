@@ -121,25 +121,22 @@ impl ConnLimiter {
     }
 
     /// Adds a per-source accept bucket: `rate` new connections per second,
-    /// `burst` at once. At most `max_tracked` sources get their own bucket;
-    /// further sources share one bucket of `overflow_rps`. `rate` 0 leaves
-    /// the bucket off.
+    /// `burst` at once. At most `max_tracked` sources (at least 1) get their
+    /// own bucket; further sources share one overflow bucket of
+    /// `4 * rate` per second and `burst` at once, so a source past the
+    /// tracking cap cannot outpace the per-source rate by more than four
+    /// times. `rate` 0 leaves the bucket off.
     ///
     /// ## NIST 800-53 Rev5: SC-5
     #[must_use]
-    pub fn with_accept_rate(
-        mut self,
-        rate: u32,
-        burst: u32,
-        max_tracked: usize,
-        overflow_rps: u32,
-    ) -> Self {
+    pub fn with_accept_rate(mut self, rate: u32, burst: u32, max_tracked: usize) -> Self {
         self.accept = (rate > 0).then(|| {
-            let config = RateLimiterConfig::new(rate, burst.max(1))
+            let burst = burst.max(1);
+            let config = RateLimiterConfig::new(rate, burst)
                 .with_per_ip(true)
                 .with_ipv6_prefix_len(self.v6_prefix_len)
-                .with_max_tracked_sources(max_tracked)
-                .with_overflow(overflow_rps, overflow_rps.saturating_mul(2).max(1))
+                .with_max_tracked_sources(max_tracked.max(1))
+                .with_overflow(rate.saturating_mul(4), burst)
                 // Never blocks: an over-rate accept is dropped, nothing more.
                 .with_block_threshold(f64::INFINITY)
                 .with_max_blocked_sources(0);
@@ -179,7 +176,9 @@ impl ConnLimiter {
 
     /// Like [`Self::try_acquire`], but reports why a connection was refused
     /// ([`Rejection::AcceptRate`] or [`Rejection::PerSource`]). The accept
-    /// bucket is charged first; a bucket reject takes no slot.
+    /// bucket is charged first; a bucket reject takes no slot. A token
+    /// spent on an accept that a later cap (per source, pool, handshake)
+    /// refuses is not refunded: such a source is at a cap already.
     ///
     /// ## NIST 800-53 Rev5: SC-5
     pub fn try_admit(self: &Arc<Self>, ip: IpAddr) -> Result<ConnGuard, Rejection> {
@@ -192,6 +191,22 @@ impl ConnLimiter {
                 return Err(Rejection::AcceptRate);
             }
         }
+        self.take_slot(key)
+    }
+
+    /// Takes a connection slot for `ip` without charging the accept
+    /// bucket ([`Rejection::PerSource`] at the cap). For listeners whose
+    /// accept address is not the client's, such as WebSocket behind a
+    /// proxy, where one bucket would be shared by every client.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub fn try_admit_unmetered(self: &Arc<Self>, ip: IpAddr) -> Result<ConnGuard, Rejection> {
+        self.take_slot(uc_dos_protection::source_key(ip, self.v6_prefix_len))
+    }
+
+    /// Takes a connection slot for source `key`, or counts a
+    /// [`Rejection::PerSource`].
+    fn take_slot(self: &Arc<Self>, key: IpAddr) -> Result<ConnGuard, Rejection> {
         let mut inner = self.lock();
         let count = inner.active.entry(key).or_insert(0);
         if *count >= self.max_per_source {
@@ -443,9 +458,6 @@ mod tests {
 }
 
 /// SR-56: per-source accept token bucket and per-source in-handshake cap.
-/// Compile-red until `with_accept_rate`, `with_handshake_cap`,
-/// `try_begin_handshake`, `sweep_accept` and the `AcceptRate` /
-/// `HandshakeBusy` rejections exist.
 ///
 /// ## NIST 800-53 Rev5: SC-5
 #[cfg(test)]
@@ -466,7 +478,7 @@ mod sr56_accept_admission_tests {
 
     #[test]
     fn accept_rate_limits_new_connections_per_source() {
-        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(1, 3, 1_024, 100));
+        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(1, 3, 1_024));
         let a = ip("192.0.2.1");
         let b = ip("192.0.2.2");
         for i in 0..3 {
@@ -485,7 +497,7 @@ mod sr56_accept_admission_tests {
 
     #[test]
     fn accept_rate_reject_takes_no_slot() {
-        let limiter = Arc::new(ConnLimiter::new(4, 64).with_accept_rate(1, 1, 1_024, 100));
+        let limiter = Arc::new(ConnLimiter::new(4, 64).with_accept_rate(1, 1, 1_024));
         let a = ip("192.0.2.1");
         let held = limiter.try_acquire(a).unwrap();
         assert!(limiter.try_acquire(a).is_none());
@@ -506,7 +518,7 @@ mod sr56_accept_admission_tests {
 
     #[test]
     fn accept_rate_keys_by_prefix_and_unmaps_v4() {
-        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(1, 1, 1_024, 100));
+        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(1, 1, 1_024));
         drop(limiter.try_acquire(ip("2001:db8:0:1::1")).unwrap());
         assert!(
             limiter.try_acquire(ip("2001:db8:0:1::2")).is_none(),
@@ -525,7 +537,7 @@ mod sr56_accept_admission_tests {
 
     #[test]
     fn accept_rate_zero_disables() {
-        let limiter = Arc::new(ConnLimiter::new(1, 64).with_accept_rate(0, 1, 1_024, 100));
+        let limiter = Arc::new(ConnLimiter::new(1, 64).with_accept_rate(0, 1, 1_024));
         let a = ip("192.0.2.1");
         for i in 0..10_000 {
             assert!(limiter.try_acquire(a).is_some(), "cycle {i}");
@@ -535,7 +547,7 @@ mod sr56_accept_admission_tests {
 
     #[test]
     fn accept_rate_refills() {
-        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(20, 1, 1_024, 100));
+        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(20, 1, 1_024));
         let a = ip("192.0.2.1");
         drop(limiter.try_acquire(a).unwrap());
         assert!(limiter.try_acquire(a).is_none(), "burst of 1 is spent");
@@ -577,7 +589,8 @@ mod sr56_accept_admission_tests {
         let l = Arc::clone(&limiter);
         let r = std::thread::spawn(move || {
             let _g = l.try_begin_handshake(a).unwrap();
-            panic!("handshake task panicked");
+            // Unwind like a panicking handshake task.
+            std::panic::resume_unwind(Box::new("handshake task panicked"));
         })
         .join();
         assert!(r.is_err());
@@ -586,7 +599,7 @@ mod sr56_accept_admission_tests {
 
     #[test]
     fn sweep_accept_evicts_idle_and_reports_rejections() {
-        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(1, 1, 1_024, 100));
+        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(1, 1, 1_024));
         let a = ip("192.0.2.1");
         drop(limiter.try_acquire(a).unwrap());
         for _ in 0..3 {
@@ -598,5 +611,45 @@ mod sr56_accept_admission_tests {
         seen.clear();
         limiter.sweep_accept(|k, n| seen.push((k, n)));
         assert!(seen.is_empty(), "rejections are reported once");
+    }
+
+    // SR-56 (PERF-003): sources past the tracking cap share an overflow
+    // bucket of 4 x the per-source rate with the per-source burst, not the
+    // message limiter's overflow (1,000/s, burst 2,000).
+    #[test]
+    fn accept_overflow_uses_own_rate_and_burst() {
+        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(1, 2, 1));
+        // The only tracked bucket.
+        drop(limiter.try_acquire(ip("192.0.2.1")).unwrap());
+        // Untracked sources share the overflow burst of 2.
+        drop(limiter.try_acquire(ip("192.0.2.2")).unwrap());
+        drop(limiter.try_acquire(ip("192.0.2.3")).unwrap());
+        assert!(
+            limiter.try_acquire(ip("192.0.2.4")).is_none(),
+            "overflow burst is accept_burst_per_source"
+        );
+        // 4/s refills one overflow token within 300 ms.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(limiter.try_acquire(ip("192.0.2.5")).is_some());
+    }
+
+    // SR-56: the WebSocket path takes a connection slot without charging
+    // the accept bucket; the per-source cap still applies.
+    #[test]
+    fn unmetered_admit_skips_bucket_keeps_cap() {
+        let limiter = Arc::new(ConnLimiter::new(2, 64).with_accept_rate(1, 1, 1_024));
+        let a = ip("192.0.2.1");
+        let g1 = limiter.try_admit_unmetered(a).unwrap();
+        let g2 = limiter.try_admit_unmetered(a).unwrap();
+        assert_eq!(
+            limiter.try_admit_unmetered(a).err(),
+            Some(Rejection::PerSource)
+        );
+        drop((g1, g2));
+        for _ in 0..10 {
+            drop(limiter.try_admit_unmetered(a).unwrap());
+        }
+        // The bucket was never charged: a metered accept still passes.
+        assert!(limiter.try_admit(a).is_ok());
     }
 }

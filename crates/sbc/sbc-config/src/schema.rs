@@ -991,9 +991,10 @@ pub struct TransportConfig {
     pub max_connections_per_source: u32,
 
     /// New stream connections per second accepted from one source (same
-    /// keying as `max_connections_per_source`), across all listeners.
-    /// Checked at accept, before any TLS or WebSocket handshake. 0 turns
-    /// the check off. Valid 0..=100,000.
+    /// keying as `max_connections_per_source`), across the TCP and TLS
+    /// listeners. Checked at accept, before any TLS handshake. 0 turns
+    /// the check off. Valid 0..=100,000. Not applied on WebSocket
+    /// listeners until their admission is keyed on the client address.
     ///
     /// ## NIST 800-53 Rev5: SC-5
     pub accept_rate_per_source: u32,
@@ -1002,17 +1003,20 @@ pub struct TransportConfig {
     /// `accept_rate_per_source`..=1,000,000 and at least 1.
     pub accept_burst_per_source: u32,
 
-    /// Node-wide TLS and WebSocket handshakes in progress. A connection
-    /// over the limit waits for a slot within `handshake_timeout_secs`.
-    /// 0 sizes it from the CPU count (64 per core, at least 64, at most
-    /// `max_connections_total`). Valid 0..=`max_connections_total`.
+    /// Node-wide TLS handshakes in progress. A connection takes a slot
+    /// only once it has sent data; over the limit it waits for one at most
+    /// `handshake_timeout_secs / 4` (at most 1 s) and is then dropped.
+    /// WebSocket upgrades do not use it. 0 sizes it from the CPU count
+    /// (64 per core, at least 64, at most `max_connections_total`). Valid
+    /// 0..=`max_connections_total`.
     ///
     /// ## NIST 800-53 Rev5: SC-5
     pub max_handshakes_in_flight: u32,
 
-    /// TLS and WebSocket handshakes in progress from one source. A
-    /// connection over the limit is dropped. Valid
-    /// 1..=`max_connections_per_source`.
+    /// TLS handshakes in progress from one source. A connection over the
+    /// limit is dropped. 0 is rejected; the effective cap is at most
+    /// `max_connections_per_source` (clamped at startup with a warning)
+    /// and at most 1/32 of the node-wide handshake pool.
     ///
     /// ## NIST 800-53 Rev5: SC-5
     pub max_handshakes_per_source: u32,

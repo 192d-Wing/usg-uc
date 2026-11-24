@@ -565,11 +565,13 @@ fn validate_stream_limits(config: &crate::schema::TransportConfig) -> ConfigResu
         0,
         config.max_connections_total,
     )?;
+    // Above `max_connections_per_source` is clamped at startup with a
+    // warning, so a file that lowers only the connection cap still loads.
     check_range(
         "transport.max_handshakes_per_source",
         config.max_handshakes_per_source,
         1,
-        config.max_connections_per_source,
+        u32::MAX,
     )?;
     check_range(
         "transport.handshake_timeout_secs",
@@ -5126,7 +5128,7 @@ mod transport_dos_limits {
 
 /// SR-56 accept-admission keys (`accept_rate_per_source`,
 /// `accept_burst_per_source`, `max_handshakes_in_flight`,
-/// `max_handshakes_per_source`). Compile-red until the keys exist.
+/// `max_handshakes_per_source`).
 ///
 /// ## NIST 800-53 Rev5: SC-5, CM-6
 #[cfg(test)]
@@ -5165,6 +5167,9 @@ mod sr56_accept_admission_keys {
             },
             |c| c.transport.max_handshakes_per_source = 1,
             |c| c.transport.max_handshakes_per_source = c.transport.max_connections_per_source,
+            // Above the per-source connection cap: clamped at startup.
+            |c| c.transport.max_handshakes_per_source = c.transport.max_connections_per_source + 1,
+            |c| c.transport.max_connections_per_source = 8,
             |c| c.transport.max_handshakes_in_flight = c.transport.max_connections_total,
             |c| c.transport.max_handshakes_in_flight = 1,
         ];
@@ -5187,9 +5192,6 @@ mod sr56_accept_admission_keys {
                 c.transport.accept_burst_per_source = 50;
             },
             |c| c.transport.max_handshakes_per_source = 0,
-            |c| {
-                c.transport.max_handshakes_per_source = c.transport.max_connections_per_source + 1;
-            },
             |c| c.transport.max_handshakes_in_flight = c.transport.max_connections_total + 1,
         ];
         for (i, mutate) in cases.into_iter().enumerate() {
