@@ -3113,9 +3113,14 @@ impl Server {
                                     a.handshake = None;
                                     a
                                 });
-                                if let (Some(client), Some(a)) = (client, &client_admission)
+                                if let Some(a) = &client_admission
                                     && a.recheck_blocked
-                                    && Self::accept_blocked(&conn_ctx, &client, "ws").await
+                                    && Self::accept_blocked(
+                                        &conn_ctx,
+                                        &client.unwrap_or(peer),
+                                        "ws",
+                                    )
+                                    .await
                                 {
                                     return;
                                 }
@@ -8801,8 +8806,10 @@ mod tests {
 
         // SEC-001 (BLOCKER): two trusted proxies (127.0.0.1 and ::1) present
         // the same client ip:port. Both connections stay registered under
-        // their own socket, and each request, response and flow send reaches
-        // its own socket.
+        // their own socket, and a request on each is answered on that
+        // socket. SBC-originated flow sends to these keys are not exercised
+        // here (they land with SR-60). Skipped, with a note on stderr, where
+        // the host has no IPv6 loopback.
         #[tokio::test]
         async fn ws_two_proxies_same_client_flows_stay_distinct() {
             let ctx = stream_test_ctx(short_timeouts());
@@ -8815,7 +8822,9 @@ mod tests {
             )
             .await
             else {
-                eprintln!("skipping: no IPv6 loopback");
+                eprintln!(
+                    "skipping ws_two_proxies_same_client_flows_stay_distinct: no IPv6 loopback"
+                );
                 return;
             };
             let l6 =

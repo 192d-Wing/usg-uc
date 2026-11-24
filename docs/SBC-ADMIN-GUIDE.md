@@ -414,10 +414,13 @@ How the connection is admitted and keyed:
   checking the upgrade request for the header modes. Admission applies
   the stream rate limiter's block, the accept bucket, the per-source and
   aggregate connection caps, and the per-source handshake cap, all keyed
-  on the client. A refused client is closed before the upgrade (PROXY v2)
-  or answered `HTTP 503` with `Retry-After: 5` (header modes); other
-  clients behind the same proxy are not affected. A direct (unproxied)
-  WebSocket peer gets the same checks on its own address.
+  on the client. When the stream rate limiter is busy at that moment, the
+  blocked check is repeated on the client once the upgrade completes. A
+  refused client is closed before the upgrade (PROXY v2) or answered
+  `HTTP 503` with `Retry-After: 5` (header modes); other clients behind
+  the same proxy are not affected. A direct (unproxied) WebSocket peer
+  gets the blocked check, accept bucket and connection caps on its own
+  address, with no handshake slot.
 - The flow table, registrations and response routing stay keyed on the
   real socket (the proxy's address and source port), which is unique per
   connection. Two connections that claim the same client address, even
@@ -442,6 +445,15 @@ How the connection is admitted and keyed:
 A non-`peer` mode with an empty `ws_trusted_proxies` fails validation. A
 list with mode `peer` is accepted, and the daemon logs a warning at
 startup that the list has no effect.
+
+**Upgrade note (SR-59):** WebSocket listeners no longer skip the accept
+bucket (the SR-56 exemption is removed). A reverse proxy in front of
+`ws_listen` that is not in `ws_trusted_proxies` is an ordinary direct
+peer, so every client behind it is charged to the proxy address's accept
+bucket (default 20/s, burst 50). List the proxy in `ws_trusted_proxies`
+with a `ws_client_address` other than `peer`, or raise
+`accept_rate_per_source` / `accept_burst_per_source` to cover the proxy's
+connection rate.
 
 Proxy configuration, in generic terms. The proxy must replace or append
 to `X-Forwarded-For` / `Forwarded` on the same field line it received

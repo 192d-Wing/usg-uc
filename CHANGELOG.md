@@ -449,9 +449,16 @@ release") and `deploy/keycloak/central-config-clients.md`.
 
 ### Security (SBC, WebSocket client address behind a trusted reverse proxy, SR-59, POA&M-456, 457)
 
-Tested locally on macOS arm64 only; no CI run yet. Defaults keep today's
-behaviour for proxied setups: with no `ws_trusted_proxies` nothing about
-proxies changes.
+Tested locally on macOS arm64 only; no CI run yet. With no
+`ws_trusted_proxies` no client address is taken from a proxy, but the
+SR-56 WebSocket accept-bucket exemption is gone (below), so a proxy in
+front of `ws_listen` that is not listed now has every client charged to
+the proxy address's accept bucket (default 20/s, burst 50).
+
+**Upgrade:** if `ws_listen` sits behind a reverse proxy, list the proxy in
+`ws_trusted_proxies` with a `ws_client_address` other than `peer`, or raise
+`accept_rate_per_source` / `accept_burst_per_source` to cover the proxy's
+connection rate.
 
 - **SBC: WebSocket clients behind a reverse proxy are keyed on their own
   address.** (SC-5, SC-7, AU-3) New `transport.ws_trusted_proxies` (CIDR or
@@ -487,7 +494,8 @@ proxies changes.
   PROXY v2 `LOCAL` health check is admitted under the proxy address.
 - **SBC: direct WebSocket peers now use the accept bucket.** The SR-56
   exemption for WebSocket listeners (POA&M-440) is removed: a direct peer
-  is charged on its socket address, like TCP and TLS.
+  is charged on its socket address, like TCP and TLS. An unlisted proxy is
+  such a peer: all its clients share its bucket (see **Upgrade** above).
 - **Configuration validation.** An invalid `ws_trusted_proxies` entry, or
   one with prefix length 0, fails the load; IPv4-mapped entries are
   treated as IPv4, and entries broader than /16 (IPv4) or /48 (IPv6) log a

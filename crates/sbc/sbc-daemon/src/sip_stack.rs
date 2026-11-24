@@ -4461,7 +4461,10 @@ impl SipStack {
             return 0;
         }
         // NIST-002: these came from relaying the trigger's message.
+        // NIST 800-53 Rev5: AU-3 (SR-59: the client behind a trusted proxy,
+        // not the proxy).
         if let Some((_, src)) = trigger {
+            let src = client_of(src);
             for f in &mut failures {
                 f.source = Some(src);
             }
