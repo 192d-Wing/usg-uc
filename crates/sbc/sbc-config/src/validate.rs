@@ -558,6 +558,13 @@ fn validate_stream_limits(config: &crate::schema::TransportConfig) -> ConfigResu
         config.first_message_timeout_secs,
         1,
         config.tcp_idle_timeout_secs,
+    )?;
+    // SI-10: header block cap, at most one stream message (65,535).
+    check_range(
+        "transport.max_header_bytes",
+        config.max_header_bytes,
+        1024,
+        65_535,
     )
 }
 
@@ -5086,6 +5093,31 @@ mod transport_dos_limits {
             mutate(&mut c);
             assert!(validate_config(&c).is_err(), "case {i} should fail");
         }
+    }
+
+    // SR-54: bytes buffered before CRLFCRLF on a stream connection.
+    #[test]
+    fn max_header_bytes_default_and_range() {
+        let c = SbcConfig::default();
+        assert_eq!(c.transport.max_header_bytes, 16_384);
+        validate_config(&c).unwrap();
+        for ok in [1_024, 65_535] {
+            let mut c = SbcConfig::default();
+            c.transport.max_header_bytes = ok;
+            validate_config(&c).unwrap();
+        }
+        for bad in [0, 1_023, 65_536] {
+            let mut c = SbcConfig::default();
+            c.transport.max_header_bytes = bad;
+            assert!(validate_config(&c).is_err(), "{bad} accepted");
+        }
+        let old: SbcConfig =
+            toml::from_str("[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n").unwrap();
+        assert_eq!(old.transport.max_header_bytes, 16_384);
+        let mut c = SbcConfig::default();
+        c.transport.max_header_bytes = 32_768;
+        let back: SbcConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.transport.max_header_bytes, 32_768);
     }
 }
 

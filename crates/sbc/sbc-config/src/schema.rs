@@ -1000,6 +1000,14 @@ pub struct TransportConfig {
     /// ## NIST 800-53 Rev5: SC-10
     pub first_message_timeout_secs: u64,
 
+    /// Bytes a stream connection may buffer before the blank line that ends
+    /// the SIP header block; past this the connection is closed. Whole
+    /// messages (head plus body) are bounded separately at 65,535 bytes.
+    /// Valid 1024..=65535.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SI-10
+    pub max_header_bytes: u32,
+
     /// Refuse WebSocket upgrades that do not offer the `sip` subprotocol
     /// (RFC 7118 §4 MUST). When false, an upgrade with no
     /// `Sec-WebSocket-Protocol` header is admitted.
@@ -1053,6 +1061,7 @@ impl Default for TransportConfig {
             max_connections_per_source: 128,
             handshake_timeout_secs: 10,
             first_message_timeout_secs: 30,
+            max_header_bytes: 16_384,
             ws_require_sip_subprotocol: true,
             external_ip: None,
             signaling_ip: None,

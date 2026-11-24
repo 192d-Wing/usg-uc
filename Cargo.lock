@@ -6329,6 +6329,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "criterion",
  "hyper",
  "hyper-util",
  "nix 0.31.3",

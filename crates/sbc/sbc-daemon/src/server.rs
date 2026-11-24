@@ -17,6 +17,7 @@ use crate::flow::{Flow, LegFlow};
 use crate::flows::{FlowKey, FlowTable};
 use crate::shutdown::ShutdownSignal;
 use crate::sip_stack::{ProcessResult, SipStack, SipStackConfig};
+use crate::stream_framer::{FramingError, KeepAlive, StreamFramer, UNFRAMED_CHARGE_BYTES};
 use proto_registrar::BearerAuthenticator;
 use proto_sip::{Method, SipMessage};
 use sbc_config::SbcConfig;
@@ -148,6 +149,16 @@ fn wipe_wire_bytes(bytes: bytes::Bytes) {
     }
 }
 
+/// Result of a per-source plus global rate-limit check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RateVerdict {
+    Allow,
+    /// Over a limit; the source is not blocked.
+    Reject,
+    /// The source is blocked (`RateLimitAction::Block`).
+    Block,
+}
+
 /// Stream connection deadlines from `[transport]`.
 #[derive(Clone, Copy, Debug)]
 struct StreamTimeouts {
@@ -199,6 +210,8 @@ struct StreamLoopContext {
     conn_limiter: Arc<crate::conn_limit::ConnLimiter>,
     timeouts: StreamTimeouts,
     flows: Arc<FlowTable>,
+    /// `transport.max_header_bytes`: bytes buffered before CRLFCRLF.
+    max_header_bytes: usize,
 }
 
 /// Where the message that produced a result arrived: replies to that peer
@@ -1940,6 +1953,7 @@ impl Server {
             conn_limiter: Arc::clone(&conn_limiter),
             timeouts,
             flows: Arc::clone(&self.flows),
+            max_header_bytes: tc.max_header_bytes as usize,
         };
         // Readers for SBC-dialled trunk connections: trunk responses and
         // in-dialog requests enter the SIP stack like any received message.
@@ -2177,11 +2191,50 @@ impl Server {
         global_limiter: &Mutex<RateLimiter>,
         stats: &ServerStats,
     ) -> bool {
+        Self::rate_limit_verdict(source_ip, rate_limiter, global_limiter, stats).await
+            == RateVerdict::Allow
+    }
+
+    /// [`Self::rate_limit_allows`], also telling a rejection from a block.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, AU-12
+    async fn rate_limit_verdict(
+        source_ip: std::net::IpAddr,
+        rate_limiter: &Mutex<RateLimiter>,
+        global_limiter: &Mutex<RateLimiter>,
+        stats: &ServerStats,
+    ) -> RateVerdict {
+        let verdict = Self::per_source_verdict(source_ip, rate_limiter, stats, 1).await;
+        if verdict != RateVerdict::Allow {
+            return verdict;
+        }
+        let global_action = global_limiter.lock().await.check(source_ip);
+        if global_action.is_rejected() {
+            stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+            debug!(source = %source_ip, "Global rate limit exceeded, rejecting message");
+            return RateVerdict::Reject;
+        }
+        RateVerdict::Allow
+    }
+
+    /// Per-source half of [`Self::rate_limit_verdict`], charging `tokens`
+    /// in one limiter acquisition. Stream work that completes no message
+    /// (keep-alive pings, partial messages) is charged here only: the
+    /// global bucket is shared with spoofable UDP, and draining it must not
+    /// close honest stream connections mid-message or withhold pongs.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, AU-12
+    async fn per_source_verdict(
+        source_ip: std::net::IpAddr,
+        rate_limiter: &Mutex<RateLimiter>,
+        stats: &ServerStats,
+        tokens: u32,
+    ) -> RateVerdict {
         let (outcome, per_ip_rps, v6_prefix) = {
             let mut limiter = rate_limiter.lock().await;
             let config = limiter.config();
             let (rps, v6_prefix) = (config.rps, config.ipv6_prefix_len);
-            (limiter.check_outcome(source_ip), rps, v6_prefix)
+            (limiter.check_outcome_n(source_ip, tokens), rps, v6_prefix)
         };
         match outcome.action {
             RateLimitAction::Allow => {}
@@ -2191,7 +2244,7 @@ impl Server {
             RateLimitAction::Reject => {
                 stats.rate_limited.fetch_add(1, Ordering::Relaxed);
                 debug!(source = %source_ip, "Rate limit exceeded, rejecting message");
-                return false;
+                return RateVerdict::Reject;
             }
             RateLimitAction::Block { duration_secs } => {
                 stats.rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -2213,17 +2266,10 @@ impl Server {
                         u64::from(per_ip_rps),
                     );
                 }
-                return false;
+                return RateVerdict::Block;
             }
         }
-
-        let global_action = global_limiter.lock().await.check(source_ip);
-        if global_action.is_rejected() {
-            stats.rate_limited.fetch_add(1, Ordering::Relaxed);
-            debug!(source = %source_ip, "Global rate limit exceeded, rejecting message");
-            return false;
-        }
-        true
+        RateVerdict::Allow
     }
 
     /// Admits one accepted stream connection: per-source cap, then this
@@ -2441,7 +2487,6 @@ impl Server {
         ctx: StreamLoopContext,
         egress: Option<FlowKey>,
     ) {
-        let mut buf = bytes::BytesMut::new();
         let dialled = egress.is_some();
         let key = egress.unwrap_or_else(|| {
             ctx.flows
@@ -2478,6 +2523,17 @@ impl Server {
             transport.transport_type(),
             TransportType::WebSocket | TransportType::WebSocketSecure
         );
+        // NIST 800-53 Rev5: SC-5, SI-10 — incremental framing: linear
+        // CRLFCRLF search, one head parse per message, header block capped.
+        let mut framer = StreamFramer::new(require_cl, ctx.max_header_bytes);
+        // Unframed-byte tokens already paid for the partial message now
+        // buffered (see `charge_unframed`).
+        let mut unframed_charged = 0u32;
+        // RFC 5626 §4.4.1: the first ping run in each window is free, so a
+        // compliant UA keeps its flow even when its (possibly NATed)
+        // source's bucket is drained; only faster ping runs are charged.
+        let free_ping_window = (ctx.timeouts.idle / 4).max(std::time::Duration::from_secs(15));
+        let mut last_free_ping: Option<tokio::time::Instant> = None;
         // The reader wakes this often to notice a connection the flow table
         // closed (stalled write, SC-5) and to enforce the deadlines below.
         let tick = std::time::Duration::from_secs(2);
@@ -2511,52 +2567,138 @@ impl Server {
                 Ok(Ok(chunk)) => {
                     // RFC 7118 §5: one WebSocket message carries exactly
                     // one SIP message, so nothing is carried between WS
-                    // messages (the remainder of the previous one was
-                    // discarded below).
-                    buf.extend_from_slice(&chunk.data);
-                    if buf.len() > uc_transport::MAX_STREAM_MESSAGE_SIZE {
+                    // messages: bytes after the first SIP message, or an
+                    // incomplete one, are discarded below.
+                    framer.push(&chunk.data);
+                    if framer.buffered() > uc_transport::MAX_STREAM_MESSAGE_SIZE {
+                        // NIST 800-53 Rev5: SI-10, AU-12 — counted and
+                        // audited like any other framing close.
+                        ctx.stats.framing_errors.fetch_add(1, Ordering::Relaxed);
+                        ctx.conn_limiter.note_framing_error(peer.ip());
                         warn!(
                             peer = %peer,
-                            buffered = buf.len(),
+                            buffered = framer.buffered(),
                             "No complete SIP message within size limit, closing connection"
                         );
                         break;
                     }
 
+                    let mut got_frame = false;
                     loop {
                         let mut keepalive = KeepAlive::default();
-                        let next = next_sip_frame(&mut buf, require_cl, &mut keepalive);
-                        if keepalive.seen && seen_message {
-                            // RFC 5626 §4.4.1: keep-alive on an established flow.
-                            last_activity = tokio::time::Instant::now();
+                        let next = framer.next_frame(&mut keepalive);
+                        // SEC-007: on WS a message holding only CR/LF
+                        // (a lone CRLF, or ping residue) is a ping run too,
+                        // so it cannot hold the flow open for free.
+                        let ws_crlf_only = !require_cl
+                            && keepalive.pings == 0
+                            && matches!(next, Ok(None))
+                            && (keepalive.seen || framer.buffered() > 0)
+                            && only_crlf(framer.as_bytes());
+                        let ping_run = keepalive.pings > 0 || ws_crlf_only;
+                        let mut ping_allowed = true;
+                        if ping_run {
+                            // NIST 800-53 Rev5: SC-5 — one per-source token
+                            // per run of pings, except the first run in each
+                            // `free_ping_window`; a blocked source is closed
+                            // even then.
+                            // POAM: POA&M-447
+                            // RFC 5626 §5.4 MUST deviation: a CRLFCRLF ping
+                            // from a source over its per-source rate gets no
+                            // pong (Reject), or the connection is closed
+                            // (Block). An RFC 5626 UA treats the flow as
+                            // failed after 10 s (§4.4.1) and recovers it
+                            // (§4.5); the reconnect is itself subject to the
+                            // connection and rate limiters.
+                            // POAM: POA&M-458 — WebSocket ping/pong control frames are answered in uc-transport and not yet charged to the per-source limiter.
+                            let now = tokio::time::Instant::now();
+                            let free = last_free_ping
+                                .is_none_or(|at| now.duration_since(at) >= free_ping_window);
+                            let verdict = if free {
+                                Self::stream_block_verdict(&peer, &ctx).await
+                            } else {
+                                Self::stream_rate_verdict(&peer, &ctx, 1).await
+                            };
+                            if free && verdict == RateVerdict::Allow {
+                                last_free_ping = Some(now);
+                            }
+                            match verdict {
+                                RateVerdict::Allow if require_cl => {
+                                    // RFC 5626 §4.4.1: answer a double-CRLF
+                                    // ping with a single CRLF pong (TCP/TLS
+                                    // only; WS uses its own ping frames). One
+                                    // pong per run of pings, bounded by the
+                                    // stream write deadline.
+                                    let _ = tokio::time::timeout(
+                                        crate::flows::STREAM_WRITE_TIMEOUT,
+                                        transport.send(b"\r\n", &peer),
+                                    )
+                                    .await;
+                                }
+                                RateVerdict::Allow => {}
+                                RateVerdict::Reject => ping_allowed = false,
+                                RateVerdict::Block => {
+                                    ctx.stats.stream_rate_closed.fetch_add(1, Ordering::Relaxed);
+                                    debug!(
+                                        peer = %peer,
+                                        "Keep-alive ping from a blocked source, closing connection"
+                                    );
+                                    break 'conn;
+                                }
+                            }
                         }
-                        if keepalive.pings > 0 && require_cl {
-                            // RFC 5626 §4.4.1: answer a double-CRLF ping with
-                            // a single CRLF pong (TCP/TLS only; WS uses its
-                            // own ping frames). One pong per run of pings,
-                            // bounded by the stream write deadline.
-                            let _ = tokio::time::timeout(
-                                crate::flows::STREAM_WRITE_TIMEOUT,
-                                transport.send(b"\r\n", &peer),
-                            )
-                            .await;
+                        // RFC 5626 §4.4.1: keep-alive on an established
+                        // flow. Idle credit needs an allowed ping run; an
+                        // over-rate ping earns none. A lone CRLF (pong)
+                        // earns credit only on TCP/TLS, where the framer
+                        // strips at most one per message.
+                        let keepalive_credit = if ping_run {
+                            ping_allowed
+                        } else {
+                            require_cl && keepalive.seen
+                        };
+                        if keepalive_credit && seen_message {
+                            last_activity = tokio::time::Instant::now();
                         }
                         let frame = match next {
                             Ok(Some(frame)) => frame,
                             Ok(None) => {
-                                if !require_cl && !buf.is_empty() && &buf[..] != b"\r\n" {
-                                    // RFC 7118 §5: an incomplete SIP message
-                                    // in a WS message is discarded, never
-                                    // spliced onto the next WS message.
-                                    Self::discard_partial_ws_message(&peer, &mut buf, &ctx);
+                                if !require_cl && framer.buffered() > 0 {
+                                    if only_crlf(framer.as_bytes()) {
+                                        // Keep-alive residue, charged above
+                                        // as a ping run.
+                                        framer.clear();
+                                    } else if !Self::discard_partial_ws_message(
+                                        &peer,
+                                        &mut framer,
+                                        &ctx,
+                                    )
+                                    .await
+                                    {
+                                        break 'conn;
+                                    }
                                 }
                                 break;
                             }
                             Err(e) => {
-                                Self::reject_bad_framing(&*transport, &peer, &buf, &e, &ctx).await;
+                                Self::reject_bad_framing(
+                                    &*transport,
+                                    &peer,
+                                    framer.as_bytes(),
+                                    &e,
+                                    &ctx,
+                                    dialled,
+                                )
+                                .await;
                                 break 'conn;
                             }
                         };
+                        got_frame = true;
+                        if !require_cl {
+                            // RFC 7118 §5, RFC 3261 §18.3: one SIP message
+                            // per WS message; the rest of it is discarded.
+                            Self::discard_ws_trailing(&peer, &mut framer, &ctx);
+                        }
                         // PERF-010: stop parsing once the flow table has
                         // closed this connection (stalled write, SC-5).
                         if transport.is_closed() {
@@ -2612,6 +2754,12 @@ impl Server {
                         // their lanes so this reader keeps reading.
                         Self::dispatch(result, &send_ctx).await;
                     }
+                    if got_frame {
+                        unframed_charged = 0;
+                    }
+                    if !Self::charge_unframed(&peer, &framer, &mut unframed_charged, &ctx).await {
+                        break;
+                    }
                 }
                 Ok(Err(uc_transport::TransportError::ConnectionClosed)) => {
                     debug!(peer = %peer, "Stream connection closed by peer");
@@ -2636,28 +2784,136 @@ impl Server {
     }
 
     /// Drops the remainder of a WebSocket message that held no complete
-    /// SIP message (RFC 7118 §5). The connection stays open: the WS
-    /// message boundary resynchronises the stream.
+    /// SIP message (RFC 7118 §5). The WS message boundary resynchronises
+    /// the stream, so the connection stays open unless the discard is over
+    /// the source's rate limit. Returns `false` when it must close.
     ///
-    /// ## NIST 800-53 Rev5: SI-10, AU-12
-    fn discard_partial_ws_message(
+    /// ## NIST 800-53 Rev5: SC-5, SI-10, AU-12
+    async fn discard_partial_ws_message(
         peer: &SbcSocketAddr,
-        buf: &mut bytes::BytesMut,
+        framer: &mut StreamFramer,
         ctx: &StreamLoopContext,
-    ) {
+    ) -> bool {
         ctx.stats.framing_errors.fetch_add(1, Ordering::Relaxed);
         ctx.conn_limiter.note_framing_error(peer.ip());
         debug!(
             peer = %peer,
-            discarded = buf.len(),
+            discarded = framer.buffered(),
             "Incomplete SIP message in WebSocket message, discarding"
         );
-        buf.clear();
+        framer.clear();
+        // SC-5: a discarded partial costs one per-source token, like a
+        // message, whatever its size.
+        if Self::stream_rate_verdict(peer, ctx, 1).await == RateVerdict::Allow {
+            return true;
+        }
+        ctx.stats.stream_rate_closed.fetch_add(1, Ordering::Relaxed);
+        debug!(peer = %peer, "Partial WebSocket messages over rate limit, closing connection");
+        false
+    }
+
+    /// Drops whatever follows the first SIP message of a WebSocket message
+    /// (RFC 7118 §5: one SIP message per WS message; RFC 3261 §18.3: extra
+    /// bytes on a message transport are discarded). Anything other than
+    /// CRLFs is a framing error; the connection stays open and nothing
+    /// more is charged (the message already paid its token).
+    ///
+    /// ## NIST 800-53 Rev5: SI-10, AU-12
+    fn discard_ws_trailing(
+        peer: &SbcSocketAddr,
+        framer: &mut StreamFramer,
+        ctx: &StreamLoopContext,
+    ) {
+        if !only_crlf(framer.as_bytes()) {
+            ctx.stats.framing_errors.fetch_add(1, Ordering::Relaxed);
+            ctx.conn_limiter.note_framing_error(peer.ip());
+            debug!(
+                peer = %peer,
+                discarded = framer.buffered(),
+                "Bytes after the SIP message in a WebSocket message, discarding"
+            );
+        }
+        framer.clear();
+    }
+
+    /// Per-source limit check, charging `tokens`, for stream work that is
+    /// not a complete message (keep-alive pings, partial messages). The
+    /// global limiter is not charged (see [`Self::per_source_verdict`]).
+    /// Always allowed when rate limiting is disabled.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    async fn stream_rate_verdict(
+        peer: &SbcSocketAddr,
+        ctx: &StreamLoopContext,
+        tokens: u32,
+    ) -> RateVerdict {
+        if !ctx.rate_limit_enabled {
+            return RateVerdict::Allow;
+        }
+        Self::per_source_verdict(peer.ip(), &ctx.rate_limiter, &ctx.stats, tokens).await
+    }
+
+    /// `Block` for a source the per-source limiter has blocked, else
+    /// `Allow`; charges nothing (the free keep-alive ping).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    async fn stream_block_verdict(peer: &SbcSocketAddr, ctx: &StreamLoopContext) -> RateVerdict {
+        if ctx.rate_limit_enabled && ctx.rate_limiter.lock().await.is_blocked(peer.ip()) {
+            RateVerdict::Block
+        } else {
+            RateVerdict::Allow
+        }
+    }
+
+    /// Charges one per-source token per [`UNFRAMED_CHARGE_BYTES`] buffered
+    /// for a message not yet complete, beyond the first
+    /// `UNFRAMED_CHARGE_BYTES` (which the message's own token covers);
+    /// `charged` counts tokens already paid for the current partial. Owed
+    /// tokens are taken in one limiter acquisition of at most the burst;
+    /// any remainder stays owed for the next read. Bytes cannot be dropped
+    /// from a stream, so any rejection closes. Returns `false` when the
+    /// connection must close.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    // POAM: POA&M-446 — a peer sending large messages back-to-back above
+    // `rate_limit.per_ip_rps` is closed; there is no separate byte budget.
+    async fn charge_unframed(
+        peer: &SbcSocketAddr,
+        framer: &StreamFramer,
+        charged: &mut u32,
+        ctx: &StreamLoopContext,
+    ) -> bool {
+        let due = framer.buffered().saturating_sub(UNFRAMED_CHARGE_BYTES) / UNFRAMED_CHARGE_BYTES;
+        let due = u32::try_from(due).unwrap_or(u32::MAX);
+        if due <= *charged {
+            return true;
+        }
+        let mut owed = due - *charged;
+        if ctx.rate_limit_enabled {
+            // SEC-008: the limiter clamps a charge to its burst, so only
+            // the tokens it can actually take are recorded as paid; the
+            // rest stay owed and are charged on the next read.
+            owed = owed.min(ctx.rate_limiter.lock().await.config().burst.max(1));
+        }
+        if Self::stream_rate_verdict(peer, ctx, owed).await == RateVerdict::Allow {
+            *charged = charged.saturating_add(owed);
+            return true;
+        }
+        ctx.stats.stream_rate_closed.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            peer = %peer,
+            buffered = framer.buffered(),
+            "Unframed bytes over rate limit, closing connection"
+        );
+        false
     }
 
     /// Handles a stream framing error: the stream cannot be resynchronised,
-    /// so the connection is closed. A request gets a minimal 400 first
-    /// (RFC 3261 §21.4.1), written inline under the stream write deadline.
+    /// so the connection is closed. A request gets a minimal 513 (declared
+    /// Content-Length over the size limit, RFC 3261 §21.5.14) or 400
+    /// (RFC 3261 §21.4.1) first, written inline under the stream write
+    /// deadline. `dialled` marks an SBC-dialled trunk connection, which the
+    /// header cap also applies to.
     ///
     /// ## NIST 800-53 Rev5: SI-10
     async fn reject_bad_framing(
@@ -2666,11 +2922,30 @@ impl Server {
         buf: &[u8],
         err: &FramingError,
         ctx: &StreamLoopContext,
+        dialled: bool,
     ) {
         ctx.stats.framing_errors.fetch_add(1, Ordering::Relaxed);
         ctx.conn_limiter.note_framing_error(peer.ip());
-        warn!(peer = %peer, error = %err, "Invalid stream framing, closing connection");
-        if let Some(response) = framing_error_response(buf) {
+        warn!(
+            peer = %peer,
+            dialled,
+            error = %err,
+            "Invalid stream framing, closing connection"
+        );
+        if matches!(err, FramingError::HeaderTooLarge { .. }) {
+            // POAM: POA&M-445 — no 513/400 without a parsed head.
+            ctx.stats.header_too_large.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let status = if matches!(
+            err,
+            FramingError::Invalid(proto_sip::SipError::MessageTooLarge { .. })
+        ) {
+            proto_sip::StatusCode::MESSAGE_TOO_LARGE
+        } else {
+            proto_sip::StatusCode::BAD_REQUEST
+        };
+        if let Some(response) = framing_error_response(buf, status) {
             let _ = tokio::time::timeout(
                 crate::flows::STREAM_WRITE_TIMEOUT,
                 transport.send(&response, peer),
@@ -3087,6 +3362,10 @@ pub struct ServerStats {
     /// (persistent recv errors). Readiness flips to not-ready at 0 so a
     /// daemon deaf on all transports stops reporting healthy.
     pub live_transports: AtomicU64,
+    // POAM: POA&M-93 — the six counters from `framing_errors` through
+    // `stream_rate_closed` are not yet exported on the REST/metrics API
+    // (api_server.rs is owned elsewhere); visible via the stats Debug
+    // output only (SI-4).
     /// Stream connections closed for invalid Content-Length framing
     /// (SI-10).
     pub framing_errors: AtomicU64,
@@ -3095,10 +3374,16 @@ pub struct ServerStats {
     /// WebSocket upgrades refused or failed (e.g. no `sip` subprotocol).
     pub ws_handshake_failures: AtomicU64,
     /// TLS / WebSocket handshakes that hit `handshake_timeout_secs`.
-    // POAM: POA&M-93 — these four counters are not yet exported on the
-    // REST/metrics API (api_server.rs is owned elsewhere); visible via the
-    // stats Debug output only (SI-4).
     pub handshake_timeouts: AtomicU64,
+    /// Stream connections closed for a header block over
+    /// `transport.max_header_bytes` (SI-10; also counted in
+    /// `framing_errors`).
+    pub header_too_large: AtomicU64,
+    /// Stream connections closed by the per-source rate limit for work
+    /// that completed no message: unframed bytes or a discarded partial WS
+    /// message over rate, or a keep-alive ping from a blocked source
+    /// (SC-5).
+    pub stream_rate_closed: AtomicU64,
 }
 
 /// Server error.
@@ -3149,113 +3434,21 @@ impl std::fmt::Display for ServerError {
 
 impl std::error::Error for ServerError {}
 
-/// Why a stream could not be framed. The connection is closed: once two
-/// parties may disagree on a message boundary the stream cannot be
-/// resynchronised (request smuggling).
-#[derive(Debug)]
-enum FramingError {
-    /// No Content-Length on a stream transport (RFC 3261 §18.3, §20.14).
-    Missing,
-    /// Duplicate, malformed or oversized Content-Length, or a malformed
-    /// header block (RFC 3261 §7.3.1, §20.14).
-    Invalid(proto_sip::SipError),
+/// Whether `bytes` holds nothing but CR and LF (keep-alive residue).
+fn only_crlf(bytes: &[u8]) -> bool {
+    bytes.iter().all(|&b| b == b'\r' || b == b'\n')
 }
 
-impl std::fmt::Display for FramingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Missing => f.write_str("missing Content-Length on a stream transport"),
-            Self::Invalid(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-/// Keep-alive CRLFs consumed by one [`next_sip_frame`] call.
-#[derive(Debug, Default, Clone, Copy)]
-struct KeepAlive {
-    /// Any keep-alive CRLF was consumed.
-    seen: bool,
-    /// Double-CRLF pings consumed (RFC 5626 §4.4.1).
-    pings: u32,
-}
-
-/// Extracts the next complete SIP message from a stream reassembly buffer.
-///
-/// SIP over stream transports is framed by Content-Length (RFC 3261 §18.3):
-/// a message is complete at end-of-headers (`\r\n\r\n`) plus the declared
-/// body length. The length comes from
-/// [`SipMessage::stream_message_len`], so the framer and the parser apply
-/// identical header rules (duplicates, compact `l`, `1*DIGIT`) and cannot
-/// cut at different offsets.
-///
-/// Leading CRLFs (RFC 5626 keep-alive pings/pongs) are discarded and
-/// reported through `keepalive`: each `CRLFCRLF` is a ping that the caller
-/// answers on TCP/TLS; a lone CRLF (a pong) is discarded once more bytes
-/// follow it, so a ping split across reads is still recognised. With `require_cl` false
-/// (message-framed WebSocket, RFC 7118 §5) a missing Content-Length means
-/// the body is the rest of the buffer; a duplicate or malformed one is
-/// still an error.
-///
-/// Returns `Ok(None)` until a full message is buffered.
-///
-/// ## NIST 800-53 Rev5: SI-10
-fn next_sip_frame(
-    buf: &mut bytes::BytesMut,
-    require_cl: bool,
-    keepalive: &mut KeepAlive,
-) -> Result<Option<bytes::Bytes>, FramingError> {
-    // Discard keep-alive CRLFs between messages.
-    loop {
-        if buf.starts_with(b"\r\n\r\n") {
-            let _ = buf.split_to(4);
-            keepalive.seen = true;
-            keepalive.pings = keepalive.pings.saturating_add(1);
-        } else if buf.starts_with(b"\r\n") && buf.len() > 2 {
-            let _ = buf.split_to(2);
-            keepalive.seen = true;
-        } else {
-            break;
-        }
-    }
-    if buf.is_empty() || &buf[..] == b"\r\n" {
-        return Ok(None);
-    }
-
-    let Some(headers_end) = buf
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .and_then(|p| p.checked_add(4))
-    else {
-        return Ok(None);
-    };
-    let total = match SipMessage::stream_message_len(&buf[..headers_end]) {
-        Ok(total) => total,
-        Err(proto_sip::SipError::MissingHeader { name })
-            if name.eq_ignore_ascii_case("content-length") =>
-        {
-            if require_cl {
-                return Err(FramingError::Missing);
-            }
-            buf.len()
-        }
-        Err(e) => return Err(FramingError::Invalid(e)),
-    };
-    if buf.len() < total {
-        return Ok(None);
-    }
-    Ok(Some(buf.split_to(total).freeze()))
-}
-
-/// Builds a minimal `400 Bad Request` for a request whose framing failed,
-/// or `None` for a response or an unparseable head (then the connection is
-/// closed silently).
+/// Builds a minimal `status` response (400 or 513) for a request whose
+/// framing failed, or `None` for a response or an unparseable head (then
+/// the connection is closed silently).
 ///
 /// Only Via/From/To/Call-ID/CSeq are taken from the request, and only after
 /// they pass the proto-sip parser, so nothing else from the hostile message
 /// is echoed.
 ///
 /// ## NIST 800-53 Rev5: SI-10; RFC 3261 §8.2.6.2, §21.4.1
-fn framing_error_response(buf: &[u8]) -> Option<bytes::Bytes> {
+fn framing_error_response(buf: &[u8], status: proto_sip::StatusCode) -> Option<bytes::Bytes> {
     let head_end = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -3299,7 +3492,7 @@ fn framing_error_response(buf: &[u8]) -> Option<bytes::Bytes> {
     else {
         return None;
     };
-    let mut resp = proto_sip::message::SipResponse::new(proto_sip::StatusCode::BAD_REQUEST);
+    let mut resp = proto_sip::message::SipResponse::new(status);
     for via in req.headers.get_all(&proto_sip::HeaderName::Via) {
         resp.add_header(proto_sip::Header::new(
             proto_sip::HeaderName::Via,
@@ -3809,135 +4002,6 @@ mod tests {
         assert_eq!(sbc_addr.port(), 5060);
     }
 
-    const REGISTER: &[u8] = b"REGISTER sip:example.mil SIP/2.0\r\n\
-        Via: SIP/2.0/TLS host:5061;branch=z9hG4bK1\r\n\
-        Content-Length: 0\r\n\
-        \r\n";
-
-    /// Frames with stream (Content-Length required) rules.
-    fn frame(buf: &mut bytes::BytesMut) -> Option<bytes::Bytes> {
-        let mut ka = KeepAlive::default();
-        next_sip_frame(buf, true, &mut ka).expect("valid framing")
-    }
-
-    fn frame_err(msg: &[u8], require_cl: bool) -> FramingError {
-        let mut buf = bytes::BytesMut::from(msg);
-        let mut ka = KeepAlive::default();
-        next_sip_frame(&mut buf, require_cl, &mut ka).expect_err("framing error")
-    }
-
-    #[test]
-    fn frame_complete_message() {
-        let mut buf = bytes::BytesMut::from(REGISTER);
-        let frame_bytes = frame(&mut buf).expect("complete message");
-        assert_eq!(&frame_bytes[..], REGISTER);
-        assert!(buf.is_empty());
-        assert!(frame(&mut buf).is_none());
-    }
-
-    #[test]
-    fn frame_waits_for_full_body() {
-        let msg = b"MESSAGE sip:example.mil SIP/2.0\r\nContent-Length: 5\r\n\r\nhel";
-        let mut buf = bytes::BytesMut::from(&msg[..]);
-        assert!(frame(&mut buf).is_none());
-        buf.extend_from_slice(b"lo");
-        let f = frame(&mut buf).expect("complete after body");
-        assert!(f.ends_with(b"hello"));
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn frame_splits_pipelined_messages_and_skips_keepalives() {
-        let mut buf = bytes::BytesMut::new();
-        buf.extend_from_slice(b"\r\n\r\n"); // RFC 5626 keep-alive ping
-        buf.extend_from_slice(REGISTER);
-        buf.extend_from_slice(REGISTER);
-        let mut ka = KeepAlive::default();
-        let first = next_sip_frame(&mut buf, true, &mut ka).unwrap().unwrap();
-        assert!(ka.seen);
-        assert_eq!(first.len(), REGISTER.len());
-        assert_eq!(frame(&mut buf).expect("second").len(), REGISTER.len());
-        assert!(frame(&mut buf).is_none());
-    }
-
-    #[test]
-    fn frame_partial_headers_returns_none() {
-        let mut buf = bytes::BytesMut::from(&b"REGISTER sip:example.mil SIP/2.0\r\nVia: x"[..]);
-        assert!(frame(&mut buf).is_none());
-        assert!(!buf.is_empty()); // kept for the next chunk
-    }
-
-    #[test]
-    fn content_length_compact_form() {
-        let msg = b"MESSAGE sip:a SIP/2.0\r\nl: 7\r\n\r\n1234567";
-        let mut buf = bytes::BytesMut::from(&msg[..]);
-        assert_eq!(frame(&mut buf).unwrap().len(), msg.len());
-    }
-
-    #[test]
-    fn duplicate_content_length_rejected() {
-        let equal = b"OPTIONS sip:a SIP/2.0\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n";
-        assert!(matches!(
-            frame_err(equal, true),
-            FramingError::Invalid(proto_sip::SipError::DuplicateHeader { .. })
-        ));
-        let conflicting = b"OPTIONS sip:a SIP/2.0\r\nContent-Length: 5\r\nl: 7\r\n\r\n";
-        assert!(matches!(
-            frame_err(conflicting, true),
-            FramingError::Invalid(proto_sip::SipError::DuplicateHeader { .. })
-        ));
-        // Still rejected on message-framed WS.
-        assert!(matches!(
-            frame_err(conflicting, false),
-            FramingError::Invalid(_)
-        ));
-    }
-
-    #[test]
-    fn malformed_content_length_rejected() {
-        for value in ["-1", "5x", "+5", "", "12345678901", "70000"] {
-            let msg = format!("OPTIONS sip:a SIP/2.0\r\nContent-Length: {value}\r\n\r\n");
-            assert!(
-                matches!(frame_err(msg.as_bytes(), true), FramingError::Invalid(_)),
-                "{value:?} accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn missing_content_length_rejected_on_stream_framed_on_ws() {
-        let msg = b"OPTIONS sip:a SIP/2.0\r\nVia: SIP/2.0/WS h;branch=z9hG4bK1\r\n\r\nbody";
-        assert!(matches!(frame_err(msg, true), FramingError::Missing));
-        let mut buf = bytes::BytesMut::from(&msg[..]);
-        let mut ka = KeepAlive::default();
-        let f = next_sip_frame(&mut buf, false, &mut ka).unwrap().unwrap();
-        assert_eq!(&f[..], &msg[..]);
-    }
-
-    // Round-trip: well-formed pipelined messages split at every offset
-    // reframe to the identical bytes.
-    #[test]
-    fn reframing_any_split_is_identical() {
-        let invite: &[u8] = b"INVITE sip:b@example.mil SIP/2.0\r\nl: 4\r\n\r\nv=0\n";
-        let mut stream = Vec::new();
-        stream.extend_from_slice(REGISTER);
-        stream.extend_from_slice(b"\r\n");
-        stream.extend_from_slice(invite);
-        for split in 0..=stream.len() {
-            let mut buf = bytes::BytesMut::new();
-            let mut out = Vec::new();
-            for part in [&stream[..split], &stream[split..]] {
-                buf.extend_from_slice(part);
-                while let Some(f) = frame(&mut buf) {
-                    out.push(f);
-                }
-            }
-            assert_eq!(out.len(), 2, "split {split}");
-            assert_eq!(&out[0][..], REGISTER);
-            assert_eq!(&out[1][..], invite);
-        }
-    }
-
     #[test]
     fn framing_error_response_is_minimal_400() {
         let msg = b"INVITE sip:b@example.mil SIP/2.0\r\n\
@@ -3945,15 +4009,28 @@ mod tests {
             From: <sip:a@example.mil>;tag=1\r\nTo: <sip:b@example.mil>\r\n\
             Call-ID: abc\r\nCSeq: 1 INVITE\r\nX-Evil: inject\r\n\
             Content-Length: 0\r\nContent-Length: 40\r\n\r\n";
-        let resp = framing_error_response(msg).expect("400 for a request");
+        let resp = framing_error_response(msg, proto_sip::StatusCode::BAD_REQUEST)
+            .expect("400 for a request");
         let text = std::str::from_utf8(&resp).unwrap();
         assert!(text.starts_with("SIP/2.0 400"));
         assert!(text.contains("Call-ID: abc"));
         assert!(text.contains("branch=z9hG4bKx"));
         assert!(!text.contains("X-Evil"));
         // A response, or garbage, gets no reply.
-        assert!(framing_error_response(b"SIP/2.0 200 OK\r\nl: 1\r\nl: 2\r\n\r\n").is_none());
-        assert!(framing_error_response(b"\x00\x01garbage\r\n\r\n").is_none());
+        assert!(
+            framing_error_response(
+                b"SIP/2.0 200 OK\r\nl: 1\r\nl: 2\r\n\r\n",
+                proto_sip::StatusCode::BAD_REQUEST
+            )
+            .is_none()
+        );
+        assert!(
+            framing_error_response(
+                b"\x00\x01garbage\r\n\r\n",
+                proto_sip::StatusCode::BAD_REQUEST
+            )
+            .is_none()
+        );
     }
 
     /// In-memory stream transport for driving `stream_connection_loop`.
@@ -4037,6 +4114,7 @@ mod tests {
             conn_limiter: Arc::new(crate::conn_limit::ConnLimiter::new(2, 64)),
             timeouts,
             flows: Arc::new(FlowTable::new(4)),
+            max_header_bytes: config.transport.max_header_bytes as usize,
         }
     }
 
@@ -4245,20 +4323,6 @@ mod tests {
         task.abort();
     }
 
-    #[test]
-    fn keepalive_counts_pings_and_waits_on_a_lone_crlf() {
-        let mut buf = bytes::BytesMut::from(&b"\r\n\r\n\r\n\r\n\r\n"[..]);
-        let mut ka = KeepAlive::default();
-        assert!(next_sip_frame(&mut buf, true, &mut ka).unwrap().is_none());
-        assert_eq!(ka.pings, 2);
-        assert_eq!(&buf[..], b"\r\n");
-        // A pong (lone CRLF) before a message is dropped, not a ping.
-        buf.extend_from_slice(REGISTER);
-        let mut ka = KeepAlive::default();
-        assert!(next_sip_frame(&mut buf, true, &mut ka).unwrap().is_some());
-        assert_eq!((ka.seen, ka.pings), (true, 0));
-    }
-
     // RFC-002: an incomplete SIP message in one WebSocket message is
     // discarded on its own; the next WS message is framed alone.
     #[tokio::test]
@@ -4308,6 +4372,676 @@ mod tests {
         let sent = fake.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert!(sent[0].starts_with(b"SIP/2.0 400"));
+    }
+
+    // SR-54 helpers.
+
+    /// Stream ctx whose per-source limiter uses the given rate and burst
+    /// multiplier.
+    fn stream_test_ctx_rl(per_ip_rps: u32, burst_multiplier: f32) -> StreamLoopContext {
+        let mut config = SbcConfig::default();
+        config.rate_limit.per_ip_rps = per_ip_rps;
+        config.rate_limit.burst_multiplier = burst_multiplier;
+        let mut ctx = stream_test_ctx(short_timeouts());
+        ctx.rate_limiter = Server::build_rate_limiter(&config);
+        ctx.global_limiter = Server::build_global_limiter(&config);
+        ctx
+    }
+
+    /// `len` bytes of SIP header lines with no CRLFCRLF.
+    fn unterminated_head(len: usize) -> Vec<u8> {
+        let mut head = b"OPTIONS sip:sbc@example.mil SIP/2.0\r\n".to_vec();
+        while head.len() < len {
+            head.extend_from_slice(b"X-Pad: ");
+            head.extend(std::iter::repeat_n(b'a', 1_000));
+            head.extend_from_slice(b"\r\n");
+        }
+        head.truncate(len);
+        assert!(!head.windows(4).any(|w| w == b"\r\n\r\n"));
+        head
+    }
+
+    /// A valid OPTIONS whose head (through CRLFCRLF) is exactly `len` bytes.
+    fn options_of_head_len(len: usize, tag: &str) -> Vec<u8> {
+        let mut msg = format!(
+            "OPTIONS sip:sbc@example.mil SIP/2.0\r\n\
+             Via: SIP/2.0/TCP 192.0.2.20:40000;branch=z9hG4bK{tag}\r\n\
+             From: <sip:a@example.mil>;tag=1\r\nTo: <sip:sbc@example.mil>\r\n\
+             Call-ID: {tag}\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\n\
+             Content-Length: 0\r\n"
+        )
+        .into_bytes();
+        let mut remaining = len - msg.len() - 2;
+        while remaining >= 1_010 {
+            msg.extend_from_slice(b"X-Pad: ");
+            msg.extend(std::iter::repeat_n(b'a', 991));
+            msg.extend_from_slice(b"\r\n");
+            remaining -= 1_000;
+        }
+        msg.extend_from_slice(b"X-Pad: ");
+        msg.extend(std::iter::repeat_n(b'a', remaining - 9));
+        msg.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(msg.len(), len);
+        msg
+    }
+
+    fn small_options(tag: &str) -> Vec<u8> {
+        format!(
+            "OPTIONS sip:sbc@example.mil SIP/2.0\r\n\
+             Via: SIP/2.0/TCP 192.0.2.20:40000;branch=z9hG4bK{tag}\r\n\
+             From: <sip:a@example.mil>;tag=1\r\nTo: <sip:sbc@example.mil>\r\n\
+             Call-ID: {tag}\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\n\
+             Content-Length: 0\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // SR-54: header bytes past `max_header_bytes` with no CRLFCRLF close
+    // the connection without a reply.
+    #[tokio::test(start_paused = true)]
+    async fn header_without_blank_line_over_cap_closes() {
+        let ctx = stream_test_ctx(short_timeouts());
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream(ctx);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        for chunk in unterminated_head(17 * 1_024).chunks(1_024) {
+            let _ = tx.send(chunk.to_vec());
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("connection closed past max_header_bytes")
+            .unwrap();
+        assert!(fake.closed.load(Ordering::Relaxed));
+        assert_eq!(stats.framing_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.header_too_large.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 0);
+        assert!(fake.sent.lock().unwrap().is_empty());
+    }
+
+    // SR-54 boundary: a head of exactly `max_header_bytes` (default 16384)
+    // is framed and processed.
+    #[tokio::test]
+    async fn header_at_cap_is_kept() {
+        let ctx = stream_test_ctx(short_timeouts());
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream(ctx);
+        let msg = options_of_head_len(16_384, "cap1");
+        // 16383 bytes end in "\r\n\r": no CRLFCRLF until the last byte.
+        tx.send(msg[..16_383].to_vec()).unwrap();
+        settle().await;
+        assert!(!task.is_finished());
+        tx.send(msg[16_383..].to_vec()).unwrap();
+        for _ in 0..500 {
+            tokio::task::yield_now().await;
+            if !fake.sent.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(stats.framing_errors.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 1);
+        let sent = fake.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].starts_with(b"SIP/2.0 "));
+        assert!(!fake.closed.load(Ordering::Relaxed));
+        task.abort();
+    }
+
+    // SR-54 / RFC 5626 §4.4.1: each ping run after the first in a free
+    // window costs a limiter token; an over-rate ping gets no pong.
+    #[tokio::test]
+    async fn crlf_ping_flood_is_rate_limited() {
+        let ctx = stream_test_ctx_rl(2, 1.0);
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream(ctx);
+        tx.send(OPTIONS_KA.to_vec()).unwrap();
+        for _ in 0..500 {
+            tokio::task::yield_now().await;
+            if !fake.sent.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 1);
+        for _ in 0..30 {
+            let _ = tx.send(b"\r\n\r\n".to_vec());
+            settle().await;
+        }
+        let pongs = fake
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| &b[..] == b"\r\n")
+            .count();
+        assert!(pongs <= 3, "{pongs} pongs for 30 pings at 2 rps burst 2");
+        assert!(stats.rate_limited.load(Ordering::Relaxed) >= 1);
+        task.abort();
+    }
+
+    // SR-54: body bytes that do not complete a frame are charged per
+    // UNFRAMED_CHARGE_BYTES; over rate closes the connection.
+    #[tokio::test(start_paused = true)]
+    async fn unframed_bytes_charge_rate_limiter() {
+        let ctx = stream_test_ctx_rl(1, 2.0);
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream(ctx);
+        let head = b"MESSAGE sip:sbc@example.mil SIP/2.0\r\n\
+            Via: SIP/2.0/TCP 192.0.2.20:40000;branch=z9hG4bKub1\r\n\
+            From: <sip:a@example.mil>;tag=1\r\nTo: <sip:sbc@example.mil>\r\n\
+            Call-ID: ub1\r\nCSeq: 1 MESSAGE\r\nMax-Forwards: 70\r\n\
+            Content-Type: text/plain\r\nContent-Length: 60000\r\n\r\n";
+        tx.send(head.to_vec()).unwrap();
+        // 14 x 4096 = 57344 body bytes: the message never completes.
+        for _ in 0..14 {
+            let _ = tx.send(vec![b'x'; 4_096]);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("connection closed by the unframed-byte charge")
+            .unwrap();
+        assert!(fake.closed.load(Ordering::Relaxed));
+        assert!(stats.rate_limited.load(Ordering::Relaxed) >= 1);
+        assert!(stats.stream_rate_closed.load(Ordering::Relaxed) >= 1);
+        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 0);
+    }
+
+    // SR-54 / RFC 7118 §5: each discarded partial WS message costs a token;
+    // over rate closes the connection.
+    #[tokio::test(start_paused = true)]
+    async fn ws_partial_discards_charge_rate_limiter() {
+        let ctx = stream_test_ctx_rl(1, 2.0);
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream_kind(ctx, TransportType::WebSocket);
+        for _ in 0..5 {
+            let _ = tx.send(b"OPTIONS sip:a@example.mil SIP/2.0\r\nVia: SIP/2.0/WS h".to_vec());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("connection closed by the partial-discard charge")
+            .unwrap();
+        assert!(fake.closed.load(Ordering::Relaxed));
+        assert!(stats.rate_limited.load(Ordering::Relaxed) >= 1);
+        assert!(stats.stream_rate_closed.load(Ordering::Relaxed) >= 1);
+        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 0);
+    }
+
+    // SR-54 guard: messages under UNFRAMED_CHARGE_BYTES split across reads
+    // cost one token each, as before.
+    #[tokio::test]
+    async fn segmented_small_messages_are_not_charged_extra() {
+        let ctx = stream_test_ctx_rl(10, 1.0);
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream(ctx);
+        for i in 0..10 {
+            let msg = small_options(&format!("seg{i}"));
+            let (a, b) = (msg.len() / 3, 2 * msg.len() / 3);
+            for part in [&msg[..a], &msg[a..b], &msg[b..]] {
+                tx.send(part.to_vec()).unwrap();
+                settle().await;
+            }
+        }
+        for _ in 0..2_000 {
+            if fake.sent.lock().unwrap().len() >= 10 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 10);
+        assert_eq!(stats.rate_limited.load(Ordering::Relaxed), 0);
+        let sent = fake.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 10, "{sent:?}");
+        assert!(sent.iter().all(|b| b.starts_with(b"SIP/2.0 ")));
+        assert!(!fake.closed.load(Ordering::Relaxed));
+        task.abort();
+    }
+
+    // SR-54 / AU-12: a header-too-large close shares the aggregated
+    // `framing` record.
+    #[tokio::test(start_paused = true)]
+    async fn header_too_large_is_audited_as_framing() {
+        let capture = uc_audit::capture::start();
+        let ctx = stream_test_ctx(short_timeouts());
+        let conn_limiter = Arc::clone(&ctx.conn_limiter);
+        let (tx, _fake, task) = spawn_stream(ctx);
+        for chunk in unterminated_head(17 * 1_024).chunks(1_024) {
+            let _ = tx.send(chunk.to_vec());
+        }
+        if tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .is_err()
+        {
+            eprintln!("connection still open after 5 s");
+        }
+        let mut audit = RateLimitAudit::new(&SbcConfig::default());
+        audit.collect_conns(&conn_limiter);
+        audit.flush();
+        let framing: Vec<_> = rate_limit_records(&capture.events())
+            .into_iter()
+            .filter(|r| r.limit_name == "framing")
+            .collect();
+        assert_eq!(framing.len(), 1, "{framing:?}");
+        let peer: std::net::IpAddr = "192.0.2.20".parse().unwrap();
+        assert_eq!((framing[0].source_ip, framing[0].request_count), (peer, 1));
+    }
+
+    // SR-54 fix round 1 helpers.
+
+    /// Per-source limiter of `rps`/`burst` that never blocks (Reject only).
+    fn reject_only_limiter(rps: u32, burst: u32) -> Arc<Mutex<RateLimiter>> {
+        Arc::new(Mutex::new(RateLimiter::new(
+            RateLimiterConfig::new(rps, burst).with_block_threshold(f64::INFINITY),
+        )))
+    }
+
+    fn test_peer_ip() -> std::net::IpAddr {
+        "192.0.2.20".parse().unwrap()
+    }
+
+    /// A MESSAGE of exactly `len` bytes (head plus body).
+    fn message_of_len(len: usize, tag: &str) -> Vec<u8> {
+        let head_without_cl = format!(
+            "MESSAGE sip:sbc@example.mil SIP/2.0\r\n\
+             Via: SIP/2.0/TCP 192.0.2.20:40000;branch=z9hG4bK{tag}\r\n\
+             From: <sip:a@example.mil>;tag=1\r\nTo: <sip:sbc@example.mil>\r\n\
+             Call-ID: {tag}\r\nCSeq: 1 MESSAGE\r\nMax-Forwards: 70\r\n\
+             Content-Type: text/plain\r\n"
+        );
+        // Content-Length below 100000 has at most 5 digits; solve for it.
+        let mut body_len = len - head_without_cl.len() - "Content-Length: \r\n\r\n".len();
+        while head_without_cl.len() + format!("Content-Length: {body_len}\r\n\r\n").len() + body_len
+            > len
+        {
+            body_len -= 1;
+        }
+        let mut msg = format!("{head_without_cl}Content-Length: {body_len}\r\n\r\n").into_bytes();
+        msg.extend(std::iter::repeat_n(b'x', body_len));
+        assert_eq!(msg.len(), len);
+        msg
+    }
+
+    fn pong_count(fake: &FakeStream) -> usize {
+        fake.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| &b[..] == b"\r\n")
+            .count()
+    }
+
+    fn reply_count(fake: &FakeStream) -> usize {
+        fake.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.starts_with(b"SIP/2.0 "))
+            .count()
+    }
+
+    async fn wait_for(mut done: impl FnMut() -> bool) {
+        for _ in 0..2_000 {
+            if done() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // SEC-001: non-frame stream charges never touch the global bucket. With
+    // the global bucket drained (e.g. by a spoofed UDP flood), a peer within
+    // its per-source rate whose message spans reads is not closed, and its
+    // pings (free and charged) are still answered.
+    #[tokio::test]
+    async fn drained_global_limiter_does_not_close_stream_partials() {
+        let mut ctx = stream_test_ctx(short_timeouts());
+        ctx.rate_limiter = reject_only_limiter(100, 100);
+        ctx.global_limiter = Arc::new(Mutex::new(RateLimiter::new(
+            RateLimiterConfig::new(1, 1).with_per_ip(false),
+        )));
+        let global = Arc::clone(&ctx.global_limiter);
+        assert!(global.lock().await.check(test_peer_ip()).is_allowed());
+        assert!(global.lock().await.check(test_peer_ip()).is_rejected());
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream(ctx);
+        // 6 KiB across two reads, then 12 KiB with 10 KiB in the first read
+        // (one unframed token charged, per source only).
+        for (len, split, tag) in [(6_144, 4_096, "g6"), (12_288, 10_240, "g12")] {
+            let msg = message_of_len(len, tag);
+            tx.send(msg[..split].to_vec()).unwrap();
+            settle().await;
+            tx.send(msg[split..].to_vec()).unwrap();
+            settle().await;
+        }
+        wait_for(|| stats.messages_received.load(Ordering::Relaxed) >= 2).await;
+        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.stream_rate_closed.load(Ordering::Relaxed), 0);
+        assert!(!task.is_finished());
+        // First ping is free; the second is charged to the per-source
+        // bucket only. Both get pongs.
+        for _ in 0..2 {
+            tx.send(b"\r\n\r\n".to_vec()).unwrap();
+            settle().await;
+        }
+        wait_for(|| pong_count(&fake) >= 2).await;
+        assert_eq!(pong_count(&fake), 2);
+        assert!(!fake.closed.load(Ordering::Relaxed));
+        // With the global bucket refilled the connection carries on.
+        *global.lock().await =
+            RateLimiter::new(RateLimiterConfig::new(100, 100).with_per_ip(false));
+        tx.send(small_options("g-after")).unwrap();
+        wait_for(|| reply_count(&fake) >= 1).await;
+        assert_eq!(reply_count(&fake), 1);
+        task.abort();
+    }
+
+    // SEC-002 / SEC-003: messages over UNFRAMED_CHARGE_BYTES but under two
+    // units, split across reads, cost one token each: 20 x 6 KiB within
+    // `per_ip_rps` = 20 are all processed.
+    #[tokio::test]
+    async fn twenty_6k_messages_within_rate_are_processed() {
+        let mut ctx = stream_test_ctx(short_timeouts());
+        ctx.rate_limiter = Server::build_rate_limiter(&{
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 20;
+            config.rate_limit.burst_multiplier = 1.0;
+            config
+        });
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream(ctx);
+        for i in 0..20 {
+            let msg = options_of_head_len(6_144, &format!("six{i}"));
+            for part in [&msg[..5_120], &msg[5_120..]] {
+                tx.send(part.to_vec()).unwrap();
+                settle().await;
+            }
+        }
+        wait_for(|| reply_count(&fake) >= 20).await;
+        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 20);
+        assert_eq!(stats.rate_limited.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.stream_rate_closed.load(Ordering::Relaxed), 0);
+        assert_eq!(reply_count(&fake), 20);
+        assert!(!fake.closed.load(Ordering::Relaxed));
+        task.abort();
+    }
+
+    // RFC-001: RFC 7118 §5 / RFC 3261 §18.3 — one SIP message per WS
+    // message; a second complete message in the same WS message is
+    // discarded as a framing error and the connection stays open.
+    #[tokio::test]
+    async fn ws_second_message_in_one_ws_message_is_discarded() {
+        let ctx = stream_test_ctx(short_timeouts());
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream_kind(ctx, TransportType::WebSocket);
+        let mut two = small_options("ws1");
+        two.extend_from_slice(&small_options("ws2"));
+        tx.send(two).unwrap();
+        wait_for(|| reply_count(&fake) >= 1).await;
+        settle().await;
+        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.framing_errors.load(Ordering::Relaxed), 1);
+        let sent = fake.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(String::from_utf8_lossy(&sent[0]).contains("ws1"));
+        // The next WS message is framed on its own.
+        tx.send(small_options("ws3")).unwrap();
+        wait_for(|| reply_count(&fake) >= 2).await;
+        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.framing_errors.load(Ordering::Relaxed), 1);
+        assert!(!fake.closed.load(Ordering::Relaxed));
+        task.abort();
+    }
+
+    // RFC-001: trailing CRLFs after the SIP message in a WS message are not
+    // a framing error.
+    #[tokio::test]
+    async fn ws_trailing_crlf_is_not_a_framing_error() {
+        let ctx = stream_test_ctx(short_timeouts());
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream_kind(ctx, TransportType::WebSocket);
+        let mut msg = small_options("wscrlf");
+        msg.extend_from_slice(b"\r\n\r\n");
+        tx.send(msg).unwrap();
+        wait_for(|| reply_count(&fake) >= 1).await;
+        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.framing_errors.load(Ordering::Relaxed), 0);
+        task.abort();
+    }
+
+    // RFC-003: a compliant UA pinging once per free window always gets its
+    // pong and keeps its flow past the idle timeout, even with its source's
+    // bucket empty.
+    #[tokio::test(start_paused = true)]
+    async fn slow_pings_get_pongs_with_empty_bucket() {
+        let mut ctx = stream_test_ctx(short_timeouts());
+        let limiter = reject_only_limiter(1, 1);
+        ctx.rate_limiter = Arc::clone(&limiter);
+        let (tx, fake, task) = spawn_stream(ctx);
+        tx.send(OPTIONS_KA.to_vec()).unwrap();
+        wait_for(|| reply_count(&fake) >= 1).await;
+        // idle 300 s -> free window 75 s; ping every 80 s for 480 s.
+        for i in 1..=6 {
+            assert!(limiter.lock().await.check(test_peer_ip()).is_rejected());
+            tokio::time::sleep(std::time::Duration::from_secs(80)).await;
+            tx.send(b"\r\n\r\n".to_vec()).unwrap();
+            wait_for(|| pong_count(&fake) >= i).await;
+            assert_eq!(pong_count(&fake), i, "ping {i}");
+        }
+        assert!(!task.is_finished(), "flow closed despite compliant pings");
+        assert!(!fake.closed.load(Ordering::Relaxed));
+        task.abort();
+    }
+
+    // NIST-005: pings over the per-source rate earn no idle credit; the
+    // connection closes at the idle deadline despite them.
+    #[tokio::test(start_paused = true)]
+    async fn over_rate_ping_earns_no_idle_credit() {
+        let mut ctx = stream_test_ctx(StreamTimeouts {
+            handshake: std::time::Duration::from_secs(10),
+            first_message: std::time::Duration::from_secs(10),
+            // Free window is max(15 s, 10 s / 4) = 15 s: longer than idle.
+            idle: std::time::Duration::from_secs(10),
+        });
+        ctx.rate_limiter = reject_only_limiter(1, 1);
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream(ctx);
+        tx.send(OPTIONS_KA.to_vec()).unwrap();
+        wait_for(|| reply_count(&fake) >= 1).await;
+        let t0 = tokio::time::Instant::now();
+        let pinger = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if tx.send(b"\r\n\r\n".to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(60), task)
+            .await
+            .expect("closed at the idle deadline")
+            .unwrap();
+        // The free ping at ~1 s earns credit; the charged ones do not.
+        let elapsed = t0.elapsed();
+        assert!(elapsed >= std::time::Duration::from_secs(10), "{elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(15), "{elapsed:?}");
+        assert_eq!(pong_count(&fake), 1);
+        assert!(stats.rate_limited.load(Ordering::Relaxed) >= 1);
+        assert!(fake.closed.load(Ordering::Relaxed));
+        pinger.abort();
+    }
+
+    // SEC-007: on WS a CRLF-only message ("\r\n\n", "\r\n") is a ping
+    // run: after the free one it is charged and, over rate, earns no idle
+    // credit, so the connection still closes at the idle deadline.
+    #[tokio::test(start_paused = true)]
+    async fn ws_crlf_only_messages_are_charged_and_earn_no_credit() {
+        let mut ctx = stream_test_ctx(StreamTimeouts {
+            handshake: std::time::Duration::from_secs(10),
+            first_message: std::time::Duration::from_secs(10),
+            // Free window is max(15 s, 10 s / 4) = 15 s: longer than idle.
+            idle: std::time::Duration::from_secs(10),
+        });
+        // The OPTIONS takes the only token; std time does not advance
+        // under a paused tokio clock, so the bucket stays drained.
+        ctx.rate_limiter = reject_only_limiter(1, 1);
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream_kind(ctx, TransportType::WebSocket);
+        tx.send(OPTIONS_KA.to_vec()).unwrap();
+        wait_for(|| reply_count(&fake) >= 1).await;
+        let t0 = tokio::time::Instant::now();
+        let pinger = tokio::spawn(async move {
+            for i in 0u32.. {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let msg: &[u8] = if i % 2 == 0 { b"\r\n\n" } else { b"\r\n" };
+                if tx.send(msg.to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(60), task)
+            .await
+            .expect("closed at the idle deadline")
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert!(elapsed >= std::time::Duration::from_secs(10), "{elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(15), "{elapsed:?}");
+        assert!(stats.rate_limited.load(Ordering::Relaxed) >= 5);
+        assert_eq!(stats.framing_errors.load(Ordering::Relaxed), 0);
+        assert_eq!(pong_count(&fake), 0, "no CRLF pong on WS");
+        assert!(fake.closed.load(Ordering::Relaxed));
+        pinger.abort();
+    }
+
+    // SEC-008: a partial owing more tokens than the burst records only the
+    // tokens the limiter took, so the remainder is charged on the next read.
+    #[tokio::test]
+    async fn charge_unframed_records_only_tokens_taken() {
+        // per_ip_rps 1, burst 2.
+        let ctx = stream_test_ctx_rl(1, 2.0);
+        let peer = SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, 20), 40000);
+        let mut framer = StreamFramer::new(true, 16_384);
+        // 6 units buffered: 5 owed beyond the first.
+        framer.push(&vec![b'x'; 6 * UNFRAMED_CHARGE_BYTES]);
+        let mut charged = 0u32;
+        assert!(Server::charge_unframed(&peer, &framer, &mut charged, &ctx).await);
+        assert_eq!(charged, 2, "clamped to the burst");
+        // The 3 still owed hit an empty bucket: over rate closes.
+        assert!(!Server::charge_unframed(&peer, &framer, &mut charged, &ctx).await);
+        assert_eq!(charged, 2);
+        assert_eq!(ctx.stats.stream_rate_closed.load(Ordering::Relaxed), 1);
+    }
+
+    // NIST-005: a ping from a blocked source closes the connection, even
+    // the otherwise free one.
+    #[tokio::test]
+    async fn blocked_source_ping_closes() {
+        let ctx = stream_test_ctx(short_timeouts());
+        let limiter = Arc::clone(&ctx.rate_limiter);
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream(ctx);
+        tx.send(OPTIONS_KA.to_vec()).unwrap();
+        wait_for(|| reply_count(&fake) >= 1).await;
+        assert!(
+            limiter
+                .lock()
+                .await
+                .block(test_peer_ip(), std::time::Duration::from_secs(60))
+        );
+        tx.send(b"\r\n\r\n".to_vec()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("blocked source closed")
+            .unwrap();
+        assert!(fake.closed.load(Ordering::Relaxed));
+        assert_eq!(pong_count(&fake), 0);
+        assert_eq!(stats.stream_rate_closed.load(Ordering::Relaxed), 1);
+    }
+
+    // SEC-003: with blocking disabled, an over-rate ping is rejected (no
+    // pong) but the connection stays open and later frames are processed.
+    #[tokio::test]
+    async fn rejected_ping_keeps_connection_open() {
+        let mut ctx = stream_test_ctx(short_timeouts());
+        let limiter = reject_only_limiter(1, 1);
+        ctx.rate_limiter = Arc::clone(&limiter);
+        let stats = Arc::clone(&ctx.stats);
+        let (tx, fake, task) = spawn_stream(ctx);
+        tx.send(OPTIONS_KA.to_vec()).unwrap();
+        wait_for(|| reply_count(&fake) >= 1).await;
+        // Free ping: pong. Second, charged against an empty bucket: none.
+        for _ in 0..2 {
+            tx.send(b"\r\n\r\n".to_vec()).unwrap();
+            settle().await;
+        }
+        assert_eq!(pong_count(&fake), 1);
+        assert!(stats.rate_limited.load(Ordering::Relaxed) >= 1);
+        assert_eq!(stats.stream_rate_closed.load(Ordering::Relaxed), 0);
+        assert!(!task.is_finished());
+        *limiter.lock().await = RateLimiter::new(RateLimiterConfig::new(100, 100));
+        tx.send(small_options("after-reject")).unwrap();
+        wait_for(|| reply_count(&fake) >= 2).await;
+        assert_eq!(reply_count(&fake), 2);
+        assert!(!fake.closed.load(Ordering::Relaxed));
+        task.abort();
+    }
+
+    // NIST-002: with max_header_bytes = 65535 a header flood hits the
+    // whole-buffer cap first; that close is counted as a framing error.
+    #[tokio::test(start_paused = true)]
+    async fn whole_buffer_cap_close_is_a_framing_error() {
+        let mut ctx = stream_test_ctx(short_timeouts());
+        ctx.max_header_bytes = 65_535;
+        let stats = Arc::clone(&ctx.stats);
+        let conn_limiter = Arc::clone(&ctx.conn_limiter);
+        let capture = uc_audit::capture::start();
+        let (tx, fake, task) = spawn_stream(ctx);
+        for chunk in unterminated_head(66 * 1_024).chunks(1_024) {
+            let _ = tx.send(chunk.to_vec());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("closed at the whole-buffer cap")
+            .unwrap();
+        assert!(fake.closed.load(Ordering::Relaxed));
+        assert_eq!(stats.framing_errors.load(Ordering::Relaxed), 1);
+        assert!(fake.sent.lock().unwrap().is_empty());
+        let mut audit = RateLimitAudit::new(&SbcConfig::default());
+        audit.collect_conns(&conn_limiter);
+        audit.flush();
+        let framing = rate_limit_records(&capture.events())
+            .into_iter()
+            .filter(|r| r.limit_name == "framing")
+            .count();
+        assert_eq!(framing, 1);
+    }
+
+    // RFC-004: a declared Content-Length over the size limit gets a 513
+    // (RFC 3261 §21.5.14), not a 400, then the connection closes.
+    #[tokio::test]
+    async fn oversized_content_length_gets_513() {
+        let ctx = stream_test_ctx(short_timeouts());
+        let (tx, fake, task) = spawn_stream(ctx);
+        tx.send(
+            b"MESSAGE sip:sbc@example.mil SIP/2.0\r\n\
+              Via: SIP/2.0/TCP 192.0.2.20:40000;branch=z9hG4bKbig\r\n\
+              From: <sip:a@example.mil>;tag=1\r\nTo: <sip:sbc@example.mil>\r\n\
+              Call-ID: big\r\nCSeq: 1 MESSAGE\r\n\
+              Content-Length: 70000\r\n\r\n"
+                .to_vec(),
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("connection closed")
+            .unwrap();
+        let sent = fake.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].starts_with(b"SIP/2.0 513"), "{sent:?}");
+        assert!(fake.closed.load(Ordering::Relaxed));
     }
 
     // Item 1: a flooding source exhausts only its own bucket; the global
@@ -4735,28 +5469,19 @@ mod tests {
     #[test]
     fn qa_framing_error_response_only_for_parseable_requests() {
         assert!(
-            framing_error_response(b"SIP/2.0 200 OK\r\nContent-Length: 1\r\nl: 2\r\n\r\n")
-                .is_none()
+            framing_error_response(
+                b"SIP/2.0 200 OK\r\nContent-Length: 1\r\nl: 2\r\n\r\n",
+                proto_sip::StatusCode::BAD_REQUEST
+            )
+            .is_none()
         );
-        assert!(framing_error_response(b"\x00\x01garbage\r\n\r\n").is_none());
-    }
-
-    // QA (plan item 6): CRLF between pipelined messages is still a
-    // keep-alive and never desynchronises framing; a whitespace or empty
-    // Content-Length is malformed.
-    #[test]
-    fn qa_content_length_whitespace_variants() {
-        for value in ["", " ", "1 2", "0x10"] {
-            let msg = format!("OPTIONS sip:a SIP/2.0\r\nContent-Length:{value}\r\n\r\n");
-            assert!(
-                matches!(frame_err(msg.as_bytes(), true), FramingError::Invalid(_)),
-                "{value:?} accepted"
-            );
-        }
-        let ok = b"OPTIONS sip:a SIP/2.0\r\nContent-Length:   0  \r\n\r\n";
-        let mut buf = bytes::BytesMut::from(&ok[..]);
-        let mut ka = KeepAlive::default();
-        assert!(next_sip_frame(&mut buf, true, &mut ka).unwrap().is_some());
+        assert!(
+            framing_error_response(
+                b"\x00\x01garbage\r\n\r\n",
+                proto_sip::StatusCode::BAD_REQUEST
+            )
+            .is_none()
+        );
     }
 
     // SEC-001/PERF-001 (fix round 1): a stream peer that stops reading does

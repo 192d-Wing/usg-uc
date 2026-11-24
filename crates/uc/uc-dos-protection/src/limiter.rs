@@ -215,6 +215,14 @@ impl TokenBucket {
 
     /// Updates the token bucket and tries to consume a token.
     fn try_consume(&mut self, rps: u32, burst: u32) -> (bool, f64) {
+        self.try_consume_n(rps, burst, 1)
+    }
+
+    /// Updates the token bucket and tries to consume `n` tokens at once
+    /// (all or nothing). `n` is clamped to `1..=burst`, so a charge larger
+    /// than the bucket can still succeed from a full bucket.
+    fn try_consume_n(&mut self, rps: u32, burst: u32, n: u32) -> (bool, f64) {
+        let n = n.clamp(1, burst.max(1));
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update);
 
@@ -228,11 +236,11 @@ impl TokenBucket {
             self.request_count = 0;
             self.window_start = now;
         }
-        self.request_count = self.request_count.saturating_add(1);
+        self.request_count = self.request_count.saturating_add(n);
 
-        // Try to consume a token
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        // Try to consume the tokens
+        if self.tokens >= f64::from(n) {
+            self.tokens -= f64::from(n);
             (true, self.request_count as f64)
         } else {
             self.rejected = self.rejected.saturating_add(1);
@@ -472,6 +480,15 @@ impl RateLimiter {
     ///
     /// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
     pub fn check_outcome(&mut self, source: IpAddr) -> CheckOutcome {
+        self.check_outcome_n(source, 1)
+    }
+
+    /// [`Self::check_outcome`] charging `tokens` in one acquisition (all or
+    /// nothing; clamped to `1..=burst`). Rejections count once; the
+    /// block-threshold count adds the clamped charge.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+    pub fn check_outcome_n(&mut self, source: IpAddr, tokens: u32) -> CheckOutcome {
         let pass = |action| CheckOutcome {
             action,
             block_started: false,
@@ -480,9 +497,9 @@ impl RateLimiter {
         // A global limiter never consults or populates the block list: the
         // source that trips a global flood is often an innocent trunk.
         if !self.config.per_ip {
-            let (allowed, rate) = self
-                .global_bucket
-                .try_consume(self.config.rps, self.config.burst);
+            let (allowed, rate) =
+                self.global_bucket
+                    .try_consume_n(self.config.rps, self.config.burst, tokens);
             if allowed {
                 return pass(self.allow_or_throttle(rate));
             }
@@ -523,9 +540,11 @@ impl RateLimiter {
             // POAM: POA&M-91 — /48-scale IPv6 rotation is bounded only by
             // this bucket; no adaptive prefix aggregation (SC-5).
             if self.buckets.len() >= self.config.max_tracked_sources {
-                let (allowed, _) = self
-                    .overflow_bucket
-                    .try_consume(self.config.overflow_rps, self.config.overflow_burst);
+                let (allowed, _) = self.overflow_bucket.try_consume_n(
+                    self.config.overflow_rps,
+                    self.config.overflow_burst,
+                    tokens,
+                );
                 if allowed {
                     return pass(RateLimitAction::Allow);
                 }
@@ -538,7 +557,7 @@ impl RateLimiter {
             .buckets
             .entry(key)
             .or_insert_with(|| TokenBucket::new(self.config.burst))
-            .try_consume(self.config.rps, self.config.burst);
+            .try_consume_n(self.config.rps, self.config.burst, tokens);
 
         if allowed {
             return pass(self.allow_or_throttle(rate));
@@ -761,6 +780,30 @@ mod tests {
         // Next request should be rejected (out of tokens)
         let action = limiter.check(ip);
         assert!(action.is_rejected(), "Expected rejected, got {action:?}");
+    }
+
+    #[test]
+    fn check_outcome_n_charges_all_or_nothing() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(1, 5).with_block_threshold(f64::INFINITY));
+        let ip = test_ip();
+        assert!(limiter.check_outcome_n(ip, 3).action.is_allowed());
+        // 2 tokens left: a 3-token charge fails and takes nothing.
+        assert!(limiter.check_outcome_n(ip, 3).action.is_rejected());
+        assert!(limiter.check_outcome_n(ip, 2).action.is_allowed());
+        assert!(limiter.check(ip).is_rejected());
+        // A charge above the burst is clamped to the burst.
+        let other = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 101));
+        assert!(limiter.check_outcome_n(other, 50).action.is_allowed());
+        assert!(limiter.token_count(other).is_some_and(|t| t < 1.0));
+        // Zero is charged as one.
+        let third = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 102));
+        assert!(limiter.check_outcome_n(third, 0).action.is_allowed());
+        assert!(
+            limiter
+                .token_count(third)
+                .is_some_and(|t| (t - 4.0).abs() < 0.1)
+        );
     }
 
     #[test]
