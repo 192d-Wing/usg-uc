@@ -45,6 +45,46 @@ fn transport_dos_keys_load_from_toml() {
     );
 }
 
+/// SR-58: the aggregate connection-cap keys load from TOML and are
+/// validated. Compile-red until the `[transport]` fields exist.
+mod sr58_aggregate_keys {
+    use sbc_config::load_from_str;
+
+    #[test]
+    fn sr58_aggregate_keys_load_from_toml() {
+        let config = load_from_str(
+            r#"
+            [rate_limit]
+            ipv6_prefix_len = 64
+
+            [transport]
+            udp_listen = ["0.0.0.0:5060"]
+            v6_aggregate_prefix_len = 56
+            max_connections_per_v6_aggregate = 2048
+            max_connections_per_v4_24 = 512
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.transport.v6_aggregate_prefix_len, 56);
+        assert_eq!(config.transport.max_connections_per_v6_aggregate, 2048);
+        assert_eq!(config.transport.max_connections_per_v4_24, 512);
+
+        let defaults = load_from_str("[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n").unwrap();
+        assert_eq!(defaults.transport.v6_aggregate_prefix_len, 48);
+        assert_eq!(defaults.transport.max_connections_per_v6_aggregate, 1024);
+        assert_eq!(defaults.transport.max_connections_per_v4_24, 1024);
+
+        // Cross-section check: aggregate narrower than the per-source key.
+        assert!(
+            load_from_str(
+                "[rate_limit]\nipv6_prefix_len = 48\n[transport]\nudp_listen = \
+                 [\"0.0.0.0:5060\"]\nv6_aggregate_prefix_len = 56\n"
+            )
+            .is_err()
+        );
+    }
+}
+
 /// A global flood from A rejects but never blocks; B is not blocked either.
 #[test]
 fn global_flood_from_a_does_not_block_b() {

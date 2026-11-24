@@ -5213,6 +5213,128 @@ mod sr56_accept_admission_keys {
     }
 }
 
+/// SR-58: `[transport]` aggregate connection-cap keys, driven through the
+/// TOML loader only (existing API). Before the keys exist they are
+/// silently ignored, so the rejection cases fail on assertion.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod sr58_aggregate_keys_toml {
+    use crate::load_from_str;
+
+    fn load(rate_limit: &str, transport: &str) -> crate::error::ConfigResult<crate::SbcConfig> {
+        load_from_str(&format!(
+            "[rate_limit]\n{rate_limit}\n[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n{transport}\n"
+        ))
+    }
+
+    #[test]
+    fn v6_aggregate_prefix_out_of_range_rejected() {
+        // Below 32.
+        assert!(load("", "v6_aggregate_prefix_len = 30").is_err());
+        // Longer than the per-source key (rate_limit.ipv6_prefix_len 64):
+        // the aggregate must not be narrower than the source it contains.
+        assert!(load("", "v6_aggregate_prefix_len = 72").is_err());
+        // Cross-section: a /56 aggregate under a /48 per-source key.
+        assert!(load("ipv6_prefix_len = 48", "v6_aggregate_prefix_len = 56").is_err());
+    }
+
+    #[test]
+    fn aggregate_caps_below_per_source_rejected() {
+        // Default per-source 128.
+        assert!(load("", "max_connections_per_v6_aggregate = 64").is_err());
+        assert!(load("", "max_connections_per_v4_24 = 64").is_err());
+    }
+
+    #[test]
+    fn aggregate_caps_above_listener_pool_rejected() {
+        // Default listener pool 10,000.
+        assert!(load("", "max_connections_per_v6_aggregate = 10001").is_err());
+        assert!(load("", "max_connections_per_v4_24 = 10001").is_err());
+    }
+
+    /// Guards (pass before and after): valid values still load.
+    #[test]
+    fn aggregate_keys_valid_values_load() {
+        load("", "v6_aggregate_prefix_len = 56").unwrap();
+        load("", "v6_aggregate_prefix_len = 32").unwrap();
+        load("", "v6_aggregate_prefix_len = 64").unwrap();
+        load("ipv6_prefix_len = 56", "v6_aggregate_prefix_len = 56").unwrap();
+        load("", "max_connections_per_v6_aggregate = 0").unwrap();
+        load("", "max_connections_per_v4_24 = 0").unwrap();
+        load("", "max_connections_per_v6_aggregate = 128").unwrap();
+        load("", "max_connections_per_v4_24 = 10000").unwrap();
+    }
+}
+
+/// SR-58: the aggregate keys on `TransportConfig`. Compile-red until the
+/// fields `v6_aggregate_prefix_len: u8`, `max_connections_per_v6_aggregate:
+/// u32` and `max_connections_per_v4_24: u32` exist.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
+mod sr58_aggregate_keys_api {
+    use super::validate_config;
+    use crate::schema::SbcConfig;
+
+    #[test]
+    fn aggregate_keys_defaults_and_ranges() {
+        let c = SbcConfig::default();
+        assert_eq!(c.transport.v6_aggregate_prefix_len, 48);
+        assert_eq!(c.transport.max_connections_per_v6_aggregate, 1024);
+        assert_eq!(c.transport.max_connections_per_v4_24, 1024);
+        validate_config(&c).unwrap();
+
+        let cases: Vec<fn(&mut SbcConfig)> = vec![
+            |c| c.transport.v6_aggregate_prefix_len = 30,
+            |c| c.transport.v6_aggregate_prefix_len = 72,
+            |c| {
+                c.rate_limit.ipv6_prefix_len = 48;
+                c.transport.v6_aggregate_prefix_len = 56;
+            },
+            |c| c.transport.max_connections_per_v6_aggregate = 127,
+            |c| c.transport.max_connections_per_v4_24 = 127,
+            |c| c.transport.max_connections_per_v6_aggregate = 10_001,
+            |c| c.transport.max_connections_per_v4_24 = 10_001,
+        ];
+        for (i, mutate) in cases.into_iter().enumerate() {
+            let mut c = SbcConfig::default();
+            mutate(&mut c);
+            assert!(validate_config(&c).is_err(), "case {i} should fail");
+        }
+
+        let ok: Vec<fn(&mut SbcConfig)> = vec![
+            |c| c.transport.v6_aggregate_prefix_len = 32,
+            |c| c.transport.v6_aggregate_prefix_len = 64,
+            |c| c.transport.max_connections_per_v6_aggregate = 0,
+            |c| c.transport.max_connections_per_v4_24 = 0,
+            |c| c.transport.max_connections_per_v6_aggregate = 128,
+            |c| c.transport.max_connections_per_v4_24 = 10_000,
+        ];
+        for (i, mutate) in ok.into_iter().enumerate() {
+            let mut c = SbcConfig::default();
+            mutate(&mut c);
+            assert!(validate_config(&c).is_ok(), "ok case {i} should pass");
+        }
+    }
+
+    #[test]
+    fn aggregate_keys_round_trip_and_old_config_defaults() {
+        let mut c = SbcConfig::default();
+        c.transport.v6_aggregate_prefix_len = 56;
+        c.transport.max_connections_per_v6_aggregate = 2048;
+        c.transport.max_connections_per_v4_24 = 512;
+        let back: SbcConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.transport.v6_aggregate_prefix_len, 56);
+        assert_eq!(back.transport.max_connections_per_v6_aggregate, 2048);
+        assert_eq!(back.transport.max_connections_per_v4_24, 512);
+
+        let old: SbcConfig =
+            toml::from_str("[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n").unwrap();
+        assert_eq!(old.transport.v6_aggregate_prefix_len, 48);
+        assert_eq!(old.transport.max_connections_per_v6_aggregate, 1024);
+        assert_eq!(old.transport.max_connections_per_v4_24, 1024);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod topology_mode {

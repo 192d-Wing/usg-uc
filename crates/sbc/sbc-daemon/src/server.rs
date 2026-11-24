@@ -7623,4 +7623,115 @@ mod tests {
             assert_eq!(busy[0].threshold, u64::from(effective));
         }
     }
+
+    /// SR-58: aggregate connection caps are wired from config and audited
+    /// as `per_prefix_conn` with the aggregate key as source. Compile-red
+    /// until `ConnLimiter::with_aggregate_caps`, `Rejection::PerAggregate`,
+    /// `Server::build_conn_limiter` and the `[transport]` keys exist.
+    mod sr58_aggregate_audit {
+        use super::*;
+
+        fn ip(s: &str) -> std::net::IpAddr {
+            s.parse().unwrap()
+        }
+
+        #[test]
+        fn per_prefix_conn_is_audited() {
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.transport.max_connections_per_v6_aggregate = 4;
+            config.transport.max_connections_per_v4_24 = 2;
+            let conns = Arc::new(
+                crate::conn_limit::ConnLimiter::new(128, 64).with_aggregate_caps(48, 4, 2),
+            );
+            let mut held = Vec::new();
+            for n in 1..=4u16 {
+                held.push(
+                    conns
+                        .try_acquire(ip(&format!("2001:db8:1:{n:x}::1")))
+                        .unwrap(),
+                );
+            }
+            assert!(conns.try_acquire(ip("2001:db8:1:5::1")).is_none());
+            assert!(conns.try_acquire(ip("2001:db8:1:6::1")).is_none());
+            held.push(conns.try_acquire(ip("192.0.2.1")).unwrap());
+            held.push(conns.try_acquire(ip("192.0.2.2")).unwrap());
+            assert!(conns.try_acquire(ip("192.0.2.3")).is_none());
+
+            let mut audit = RateLimitAudit::new(&config);
+            audit.collect_conns(&conns);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let prefix: Vec<_> = records
+                .iter()
+                .filter(|r| r.limit_name == "per_prefix_conn")
+                .collect();
+            assert_eq!(prefix.len(), 2, "{records:?}");
+            let v6 = prefix
+                .iter()
+                .find(|r| r.source_ip == ip("2001:db8:1::"))
+                .expect("v6 aggregate record keyed on the /48");
+            assert_eq!((v6.request_count, v6.threshold), (2, 4));
+            let v4 = prefix
+                .iter()
+                .find(|r| r.source_ip == ip("192.0.2.0"))
+                .expect("v4 aggregate record keyed on the /24");
+            assert_eq!((v4.request_count, v4.threshold), (1, 2));
+            // No per-source record: no /64 or host was at its own cap.
+            assert!(!records.iter().any(|r| r.limit_name == "per_ip_conn"));
+        }
+
+        /// Decision 9 defaults through the daemon's construction path: one
+        /// /56 with 128 connections per /64 gets exactly 1024.
+        #[test]
+        fn build_conn_limiter_defaults_bound_a_slash56() {
+            let conns = Arc::new(Server::build_conn_limiter(&SbcConfig::default()));
+            let mut held = Vec::new();
+            for sub in 0..=255u16 {
+                let a = ip(&format!("2001:db8:1:{:x}::1", 0xab00 | sub));
+                for _ in 0..128 {
+                    if let Some(g) = conns.try_acquire(a) {
+                        held.push(g);
+                    }
+                }
+            }
+            assert_eq!(held.len(), 1024);
+            let v4: Vec<_> = (0..=255u8)
+                .flat_map(|h| {
+                    let c = Arc::clone(&conns);
+                    (0..8).filter_map(move |_| c.try_acquire(ip(&format!("198.51.100.{h}"))))
+                })
+                .collect();
+            assert_eq!(v4.len(), 1024);
+        }
+
+        /// Every `[transport]` aggregate key reaches the limiter.
+        #[test]
+        fn build_conn_limiter_applies_aggregate_keys() {
+            let mut config = SbcConfig::default();
+            config.transport.max_connections_per_source = 1;
+            config.transport.v6_aggregate_prefix_len = 56;
+            config.transport.max_connections_per_v6_aggregate = 2;
+            config.transport.max_connections_per_v4_24 = 3;
+            let conns = Arc::new(Server::build_conn_limiter(&config));
+            let _a = conns.try_acquire(ip("2001:db8:1:100::1")).unwrap();
+            let _b = conns.try_acquire(ip("2001:db8:1:101::1")).unwrap();
+            assert!(conns.try_acquire(ip("2001:db8:1:102::1")).is_none());
+            // Next /56 in the same /48: the prefix key is /56, not /48.
+            let _c = conns.try_acquire(ip("2001:db8:1:200::1")).unwrap();
+            let v4: Vec<_> = (1..=4u8)
+                .filter_map(|h| conns.try_acquire(ip(&format!("192.0.2.{h}"))))
+                .collect();
+            assert_eq!(v4.len(), 3);
+
+            // 0 turns both aggregate levels off.
+            config.transport.max_connections_per_v6_aggregate = 0;
+            config.transport.max_connections_per_v4_24 = 0;
+            let off = Arc::new(Server::build_conn_limiter(&config));
+            let all: Vec<_> = (1..=200u8)
+                .filter_map(|h| off.try_acquire(ip(&format!("192.0.2.{h}"))))
+                .collect();
+            assert_eq!(all.len(), 200);
+        }
+    }
 }

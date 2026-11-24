@@ -653,3 +653,221 @@ mod sr56_accept_admission_tests {
         assert!(limiter.try_admit(a).is_ok());
     }
 }
+
+/// SR-58 (POA&M-454/455): hierarchical connection caps. Besides the /64
+/// per-source key, every connection also counts against an aggregate: the
+/// IPv6 `v6_aggregate_prefix_len` prefix (default /48) or the IPv4 /24.
+/// Compile-red until `ConnLimiter::with_aggregate_caps` and
+/// `Rejection::PerAggregate` exist.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod sr58_aggregate_tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// Drains the limiter and returns every (key, kind, count), sorted.
+    fn drained(limiter: &ConnLimiter) -> Vec<(IpAddr, Rejection, u64)> {
+        let mut seen = Vec::new();
+        let _ = limiter.drain_rejections(|k, kind, n| seen.push((k, kind, n)));
+        seen.sort_by_key(|(k, kind, _)| (*k, format!("{kind:?}")));
+        seen
+    }
+
+    #[test]
+    fn v6_aggregate_caps_many_64s_in_one_48() {
+        let limiter = Arc::new(ConnLimiter::new(128, 64).with_aggregate_caps(48, 4, 1024));
+        let mut held = Vec::new();
+        for n in 1..=4u16 {
+            let a = ip(&format!("2001:db8:1:{n:x}::1"));
+            held.push(limiter.try_acquire(a).expect("within /48 cap"));
+        }
+        // Fifth distinct /64 in the same /48.
+        assert!(limiter.try_acquire(ip("2001:db8:1:5::1")).is_none());
+        // A /64 in another /48 is unaffected.
+        held.push(limiter.try_acquire(ip("2001:db8:2:1::1")).unwrap());
+        assert_eq!(
+            drained(&limiter),
+            vec![(ip("2001:db8:1::"), Rejection::PerAggregate, 1)]
+        );
+    }
+
+    #[test]
+    fn v4_24_caps_many_hosts() {
+        let limiter = Arc::new(ConnLimiter::new(128, 64).with_aggregate_caps(48, 1024, 3));
+        let g: Vec<_> = (1..=3u8)
+            .map(|n| limiter.try_acquire(ip(&format!("192.0.2.{n}"))).unwrap())
+            .collect();
+        assert!(limiter.try_acquire(ip("192.0.2.4")).is_none());
+        let other = limiter.try_acquire(ip("198.51.100.1")).unwrap();
+        assert_eq!(
+            drained(&limiter),
+            vec![(ip("192.0.2.0"), Rejection::PerAggregate, 1)]
+        );
+        drop((g, other));
+    }
+
+    #[test]
+    fn aggregate_reject_takes_no_per_source_slot() {
+        let limiter = Arc::new(ConnLimiter::new(128, 64).with_aggregate_caps(48, 2, 2));
+        let _a = limiter.try_acquire(ip("2001:db8:1:1::1")).unwrap();
+        let _b = limiter.try_acquire(ip("2001:db8:1:2::1")).unwrap();
+        let victim = ip("2001:db8:1:3::1");
+        assert_eq!(limiter.active(victim), 0);
+        for _ in 0..5 {
+            assert!(limiter.try_acquire(victim).is_none());
+        }
+        assert_eq!(limiter.active(victim), 0, "no per-source slot leaked");
+        // Same for IPv4.
+        let _c = limiter.try_acquire(ip("192.0.2.1")).unwrap();
+        let _d = limiter.try_acquire(ip("192.0.2.2")).unwrap();
+        assert!(limiter.try_acquire(ip("192.0.2.3")).is_none());
+        assert_eq!(limiter.active(ip("192.0.2.3")), 0);
+    }
+
+    #[test]
+    fn per_source_cap_still_applies_below_aggregate() {
+        let limiter = Arc::new(ConnLimiter::new(2, 64).with_aggregate_caps(48, 100, 100));
+        let a = ip("2001:db8:1:1::1");
+        let _g1 = limiter.try_acquire(a).unwrap();
+        let _g2 = limiter.try_acquire(ip("2001:db8:1:1::2")).unwrap();
+        assert!(limiter.try_acquire(a).is_none());
+        // The per-source reject must not consume an aggregate slot: 98 more
+        // /64s fit in the /48 (100 - 2).
+        let more: Vec<_> = (2..=99u16)
+            .map(|n| {
+                limiter
+                    .try_acquire(ip(&format!("2001:db8:1:{n:x}::1")))
+                    .unwrap()
+            })
+            .collect();
+        assert!(limiter.try_acquire(ip("2001:db8:1:ff::1")).is_none());
+        assert_eq!(
+            drained(&limiter),
+            vec![
+                (ip("2001:db8:1::"), Rejection::PerAggregate, 1),
+                (ip("2001:db8:1:1::"), Rejection::PerSource, 1),
+            ]
+        );
+        drop(more);
+    }
+
+    #[test]
+    fn aggregate_released_on_drop() {
+        let limiter = Arc::new(ConnLimiter::new(128, 64).with_aggregate_caps(48, 2, 2));
+        let g1 = limiter.try_acquire(ip("2001:db8:1:1::1")).unwrap();
+        let g2 = limiter.try_acquire(ip("2001:db8:1:2::1")).unwrap();
+        let g3 = limiter.try_acquire(ip("192.0.2.1")).unwrap();
+        let g4 = limiter.try_acquire(ip("192.0.2.2")).unwrap();
+        assert!(limiter.try_acquire(ip("2001:db8:1:3::1")).is_none());
+        assert!(limiter.try_acquire(ip("192.0.2.3")).is_none());
+        drop(g1);
+        drop(g3);
+        // One slot back at each aggregate.
+        let g5 = limiter.try_acquire(ip("2001:db8:1:3::1")).unwrap();
+        let g6 = limiter.try_acquire(ip("192.0.2.3")).unwrap();
+        drop((g2, g4, g5, g6));
+        assert_eq!(limiter.sources(), 0, "every level released");
+    }
+
+    #[test]
+    fn aggregate_released_on_panic() {
+        let limiter = Arc::new(ConnLimiter::new(128, 64).with_aggregate_caps(48, 1, 1));
+        let l = Arc::clone(&limiter);
+        let r = std::thread::spawn(move || {
+            let _g = l.try_acquire("2001:db8:1:1::1".parse().unwrap()).unwrap();
+            let _h = l.try_acquire("192.0.2.1".parse().unwrap()).unwrap();
+            panic!("task died holding the slots");
+        })
+        .join();
+        assert!(r.is_err());
+        assert_eq!(limiter.sources(), 0);
+        assert!(limiter.try_acquire(ip("2001:db8:1:2::1")).is_some());
+        assert!(limiter.try_acquire(ip("192.0.2.2")).is_some());
+    }
+
+    #[test]
+    fn aggregate_zero_disables() {
+        let limiter = Arc::new(ConnLimiter::new(128, 64).with_aggregate_caps(48, 0, 0));
+        let v6: Vec<_> = (1..=100u16)
+            .map(|n| {
+                limiter
+                    .try_acquire(ip(&format!("2001:db8:1:{n:x}::1")))
+                    .unwrap()
+            })
+            .collect();
+        let v4: Vec<_> = (1..=100u8)
+            .map(|n| limiter.try_acquire(ip(&format!("192.0.2.{n}"))).unwrap())
+            .collect();
+        assert_eq!((v6.len(), v4.len()), (100, 100));
+        assert!(drained(&limiter).is_empty());
+    }
+
+    #[test]
+    fn aggregate_levels_are_independent() {
+        // v6 aggregate off, v4 /24 capped at 2.
+        let limiter = Arc::new(ConnLimiter::new(128, 64).with_aggregate_caps(48, 0, 2));
+        let _v6: Vec<_> = (1..=50u16)
+            .map(|n| {
+                limiter
+                    .try_acquire(ip(&format!("2001:db8:1:{n:x}::1")))
+                    .unwrap()
+            })
+            .collect();
+        let _a = limiter.try_acquire(ip("192.0.2.1")).unwrap();
+        let _b = limiter.try_acquire(ip("192.0.2.2")).unwrap();
+        assert!(limiter.try_acquire(ip("192.0.2.3")).is_none());
+    }
+
+    #[test]
+    fn aggregate_unmaps_v4_mapped() {
+        let limiter = Arc::new(ConnLimiter::new(128, 64).with_aggregate_caps(48, 1024, 2));
+        let _a = limiter.try_acquire(ip("::ffff:192.0.2.1")).unwrap();
+        let _b = limiter.try_acquire(ip("192.0.2.2")).unwrap();
+        assert!(limiter.try_acquire(ip("::ffff:192.0.2.3")).is_none());
+        assert_eq!(
+            drained(&limiter),
+            vec![(ip("192.0.2.0"), Rejection::PerAggregate, 1)]
+        );
+    }
+
+    #[test]
+    fn v6_aggregate_prefix_is_configurable() {
+        // /56 aggregate: two /64s per /56.
+        let limiter = Arc::new(ConnLimiter::new(128, 64).with_aggregate_caps(56, 2, 1024));
+        let _a = limiter.try_acquire(ip("2001:db8:1:100::1")).unwrap();
+        let _b = limiter.try_acquire(ip("2001:db8:1:101::1")).unwrap();
+        assert!(limiter.try_acquire(ip("2001:db8:1:1ff::1")).is_none());
+        // Another /56 inside the same /48 is a different aggregate.
+        assert!(limiter.try_acquire(ip("2001:db8:1:200::1")).is_some());
+        assert_eq!(
+            drained(&limiter),
+            vec![(ip("2001:db8:1:100::"), Rejection::PerAggregate, 1)]
+        );
+    }
+
+    /// SR-58 scenario: one IPv6 /56 (256 /64s) opening 128 connections per
+    /// /64 under the decision-9 defaults (128 per /64, 1024 per /48, 1024
+    /// per /24) gets exactly 1024 slots, not 32,768.
+    #[test]
+    fn slash56_cannot_fill_listener_pool() {
+        let limiter = Arc::new(ConnLimiter::new(128, 64).with_aggregate_caps(48, 1024, 1024));
+        let mut held = Vec::new();
+        let mut rejected = 0u32;
+        for sub in 0..=255u16 {
+            let a = ip(&format!("2001:db8:1:{:x}::1", 0xab00 | sub));
+            for _ in 0..128 {
+                match limiter.try_acquire(a) {
+                    Some(g) => held.push(g),
+                    None => rejected += 1,
+                }
+            }
+        }
+        assert_eq!(held.len(), 1024);
+        assert_eq!(rejected, 256 * 128 - 1024);
+        drop(held);
+        assert_eq!(limiter.sources(), 0);
+    }
+}
