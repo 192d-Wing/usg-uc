@@ -1473,7 +1473,7 @@ mod tests {
                     && supported_algorithms.as_slice()
                         == [rustls::pki_types::alg_id::ECDSA_SHA384]
             ),
-            "{r:?}"
+            "chain was not refused as UnsupportedSignatureAlgorithmContext (ECDSA_SHA384 only)"
         );
     }
 
