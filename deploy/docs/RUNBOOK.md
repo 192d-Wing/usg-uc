@@ -70,10 +70,23 @@ docker run -d \
 ### Kubernetes (Helm)
 
 ```bash
-# Install
-helm install sbc ./deploy/helm/sbc -n sbc-system --create-namespace
+# Install. The chart does not render without these values:
+# - sbcClientConfig.ingressTlsSecretName: kubernetes.io/tls Secret for the
+#   dashboard/login/client-config ingress host (edge TLS, SR-53)
+# - sbcDaemon.grpcMtls.clusterIssuer: cert-manager ClusterIssuer for the
+#   daemon gRPC mTLS certificates
+# - sbcPostgres.password: site Postgres password (prefer a values file over
+#   --set, which leaves it in shell history)
+# - sbcApi.ha1Key.existingSecret: Secret holding the SIP user HA1 key
+#   (see "SIP User HA1 Key" below)
+# See deploy/helm/sbc/DEPLOYING.md for the full list.
+helm install sbc ./deploy/helm/sbc -n sbc-system --create-namespace \
+  --set sbcClientConfig.ingressTlsSecretName=<ingress-tls-secret> \
+  --set sbcDaemon.grpcMtls.clusterIssuer=<cluster-issuer> \
+  --set sbcPostgres.password=<postgres-password> \
+  --set sbcApi.ha1Key.existingSecret=<ha1-key-secret>
 
-# Install with custom values
+# Install with custom values (the values file must set the same keys)
 helm install sbc ./deploy/helm/sbc \
   -n sbc-system \
   --create-namespace \

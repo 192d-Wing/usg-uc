@@ -1051,3 +1051,104 @@ fn qa_stir_max_fetches_per_source_toml_bounds() {
         4
     );
 }
+
+// ── QA SR-53: dashboard / login edge TLS (text checks; `helm_render` renders)
+// NIST 800-53 Rev5: SC-8, SC-13, CM-6, CM-7
+
+/// The top-level `<key>:` block of a values file, up to the next top-level key.
+fn top_level_block<'a>(values: &'a str, key: &str) -> Option<&'a str> {
+    let start = values.find(&format!("\n{key}:\n"))? + 1;
+    let body = &values[start..];
+    let end = body
+        .match_indices('\n')
+        .map(|(i, _)| i + 1)
+        .find(|&i| {
+            body[i..]
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_whitespace() && c != '#')
+        })
+        .unwrap_or(body.len());
+    Some(&body[..end])
+}
+
+/// `key: value` within a block, without trailing comments.
+fn block_value<'a>(block: &'a str, key: &str) -> Option<&'a str> {
+    block.lines().find_map(|l| {
+        let v = l.trim_start().strip_prefix(&format!("{key}:"))?;
+        Some(v.split(" #").next().unwrap_or("").trim())
+    })
+}
+
+/// True when some `fail` call in `tpl` names `needle` within its message.
+fn fail_names(tpl: &str, needle: &str) -> bool {
+    tpl.match_indices("fail ").any(|(i, _)| {
+        let tail = &tpl[i..];
+        let end = tail.find("}}").unwrap_or(tail.len());
+        tail[..end].contains(needle)
+    })
+}
+
+#[test]
+fn qa_helm_edge_tls_defaults_secure() {
+    let values = read_repo("deploy/helm/sbc/values.yaml");
+    let edge = top_level_block(&values, "edge").expect("top-level edge: block in values.yaml");
+    assert_eq!(
+        block_value(edge, "insecureLabHttp"),
+        Some("false"),
+        "{edge}"
+    );
+    assert_eq!(block_value(edge, "entryPoint"), Some("websecure"), "{edge}");
+    assert_eq!(block_value(edge, "createTlsOption"), Some("true"), "{edge}");
+    assert_eq!(block_value(edge, "httpRedirect"), Some("true"), "{edge}");
+    assert_eq!(
+        block_value(edge, "allowHttpProvisioning"),
+        Some("false"),
+        "{edge}"
+    );
+}
+
+#[test]
+fn qa_helm_ingress_template_fails_without_tls() {
+    let ing = read_repo("deploy/helm/sbc/templates/22-sbc-ingress.yaml");
+    assert!(ing.contains("router.entrypoints"), "entrypoint pin");
+    assert!(
+        fail_names(&ing, "ingressTlsSecretName"),
+        "22-sbc-ingress.yaml must fail naming ingressTlsSecretName"
+    );
+    let fe = read_repo("deploy/helm/sbc/templates/16-sbc-frontend.yaml");
+    assert!(
+        fail_names(&fe, "edge.insecureLabHttp"),
+        "16-sbc-frontend.yaml must fail naming edge.insecureLabHttp"
+    );
+}
+
+#[test]
+fn qa_helm_edge_tlsoption_template_tls13_p384() {
+    let t = read_repo("deploy/helm/sbc/templates/29-sbc-edge-tls.yaml");
+    assert!(t.contains("apiVersion: traefik.io/v1alpha1"), "{t}");
+    assert!(
+        t.matches("VersionTLS13").count() >= 2,
+        "min and max TLS 1.3"
+    );
+    assert!(t.contains("CurveP384"));
+    assert!(t.contains("TLS_AES_256_GCM_SHA384"));
+    assert!(!t.contains("VersionTLS12"));
+}
+
+#[test]
+fn qa_helm_edge_text_helpers_self_test() {
+    let v = "a: 1\nedge:\n  insecureLabHttp: false   # lab\n  # c\n  traefik:\n    entryPoint: websecure\nnext:\n  x: 1\n";
+    let e = top_level_block(v, "edge").unwrap();
+    assert_eq!(block_value(e, "insecureLabHttp"), Some("false"));
+    assert_eq!(block_value(e, "entryPoint"), Some("websecure"));
+    assert!(block_value(e, "x").is_none());
+    assert!(fail_names(
+        "{{- fail \"set sbcClientConfig.ingressTlsSecretName\" }}",
+        "ingressTlsSecretName"
+    ));
+    assert!(!fail_names(
+        "{{ fail \"x\" }} ingressTlsSecretName",
+        "ingressTlsSecretName"
+    ));
+}
