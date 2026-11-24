@@ -17,8 +17,9 @@ Affects every SBC at startup and every Helm upgrade. Operator details:
 
 - **The daemon checks its fd budget at startup.** (SC-5, SC-6, CM-6)
   Before opening any listener or RTP socket it raises the soft
-  `RLIMIT_NOFILE` to the hard limit (on macOS, to the highest value the
-  kernel accepts). It then checks that `transport.max_connections_total` +
+  `RLIMIT_NOFILE` to the hard limit. If the kernel refuses the hard limit
+  (macOS reports `RLIM_INFINITY`), it uses the highest value between the
+  current soft limit and the hard limit that the kernel accepts. It then checks that `transport.max_connections_total` +
   1024 egress connections + the RTP port range
   (`media.rtp_port_max - rtp_port_min + 1`, zero with an out-of-process
   media plane) + the SIP listeners + 256 REST HTTPS connections + 512 fds
@@ -26,8 +27,10 @@ Affects every SBC at startup and every Helm upgrade. Operator details:
   fit, and `max_connections_per_listener` and `max_connections_per_source`
   to at most that. It logs an `error!` and records a `ConfigurationChange`
   (`Modified`, admin `startup`) audit event naming the old and new values.
-  The runtime configuration then shows the caps in effect; a reload keeps
-  them and reports a different file value as restart-required.
+  The runtime configuration then shows the caps in effect. A reload
+  (SIGHUP) keeps them. It reports `transport.max_connections` as
+  restart-required only when the caps in the file differ from the file at
+  startup, so an unedited file reports no change.
 - **The daemon refuses to start when fewer than 64 connections fit**
   (POA&M-453). The refusal is audited as `SystemShutdown` (not graceful).
   With in-process media and the default RTP range (16384..32768) that
@@ -45,8 +48,8 @@ Affects every SBC at startup and every Helm upgrade. Operator details:
   Sites with more than 8000 concurrent TCP/TLS connections must raise both
   values and `sbcDaemon.resources.limits.memory` together
   (`max_connections_total <= memory limit / 2 / 128 KiB`); size WebSocket
-  deployments at 200 KiB per connection. The schema defaults are
-  unchanged.
+  deployments at 256 KiB (WS) or 300 KiB (WSS) per connection (arithmetic
+  in `DEPLOYING.md`). The schema defaults are unchanged.
 - **Smaller per-connection buffers.** (SC-5, SC-6) Each TCP and TLS
   connection reads into one reusable 4 KiB buffer instead of 64 KiB, and
   the extra copy per read is gone. Each WebSocket connection uses an 8 KiB
@@ -54,8 +57,8 @@ Affects every SBC at startup and every Helm upgrade. Operator details:
   outbound bytes are capped at 2 x 65,535, so a peer that stops reading
   cannot grow the queue (the 2 s write deadline still closes it). This
   saves about 60 KiB of resident memory per idle TCP/TLS connection. A
-  WebSocket connection can still hold about 200 KiB after a maximum-size
-  message (tungstenite buffers do not shrink).
+  WebSocket connection can still hold about 256 KiB (WS) or 300 KiB (WSS)
+  after maximum-size messages (tungstenite buffers do not shrink).
 - There is still no node-wide budget on buffered bytes (POA&M-452), and no
   part of the connection pool is reserved for trunks or authenticated
   flows (POA&M-453).

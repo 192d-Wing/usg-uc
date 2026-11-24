@@ -179,35 +179,38 @@ pub fn apply_plan(config: &mut SbcConfig, plan: &FdPlan) -> Result<(), String> {
     Ok(())
 }
 
-/// Finds the highest soft limit in `soft..=target` that `set` accepts:
-/// `target` first, then halving from [`FALLBACK_SOFT_START`]; after a halved
-/// value is accepted, a binary search between it and the last refused value.
+/// Finds the highest soft limit in `soft..=target` that `set` accepts.
+/// Tries `target` first, then halves from [`FALLBACK_SOFT_START`] while the
+/// candidate is above `soft`, then binary-searches between the last
+/// accepted value (`soft` when none was) and the last refused value.
 /// Returns the last accepted value (`soft` when none was).
 fn search_soft(soft: u64, target: u64, mut set: impl FnMut(u64) -> bool) -> u64 {
     if set(target) {
         return target;
     }
     let mut refused = target;
+    // `soft` is in effect already; refused calls leave the limit unchanged,
+    // so the last accepted value (`lo`) is the one in effect.
+    let mut lo = soft;
     let mut candidate = FALLBACK_SOFT_START.min(target / 2);
     while candidate > soft {
         if set(candidate) {
-            // Refused calls leave the limit unchanged, so the last accepted
-            // value (`lo`) is the one in effect.
-            let (mut lo, mut hi) = (candidate, refused);
-            while hi - lo > 1 {
-                let mid = lo + (hi - lo) / 2;
-                if set(mid) {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
-            }
-            return lo;
+            lo = candidate;
+            break;
         }
         refused = candidate;
         candidate /= 2;
     }
-    soft
+    let mut hi = refused;
+    while hi.saturating_sub(lo) > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if set(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 /// Sets the soft `RLIMIT_NOFILE` to `target`, falling back to the highest
@@ -537,6 +540,15 @@ mod tests {
             4096
         );
         assert_eq!(cur, 4096);
+    }
+
+    // SEC-R1-3: the first halved candidate is already at or below soft; the
+    // search still finds the kernel cap between soft and the refused target.
+    #[test]
+    fn search_soft_searches_between_soft_and_refused_target() {
+        let mut cur = 4096;
+        assert_eq!(search_soft(4096, 6000, fake_kernel(5000, &mut cur)), 5000);
+        assert_eq!(cur, 5000, "value in effect is the one returned");
     }
 
     // ---- apply: real getrlimit/setrlimit ----

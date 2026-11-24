@@ -201,15 +201,29 @@ The 2Gi default gives 8000 x 128 KiB = 1 GiB. Raise both caps only with the
 memory limit. Keep the other half free: the pod's cgroup (v2) memory limit
 also charges kernel socket buffers, which this budget does not count.
 
-WebSocket connections (`ws_listen`, `wss_listen`) can hold up to about
-200 KiB each in the worst case: tungstenite keeps up to about 2 x 64 KiB of
-buffers after a maximum-size message, plus the message buffer, plus TLS for
-WSS. Size WebSocket deployments at 200 KiB per connection
-(`max_connections_total <= memory limit / 2 / 200 KiB`). At startup the daemon raises its soft `RLIMIT_NOFILE`
-to the hard limit; if the caps plus the egress pool, the RTP port range, the
-listeners and 512 fds of headroom do not fit, it lowers the caps to fit, logs
-an error and records a configuration-change audit event. It refuses to start
-when fewer than 64 connections would fit.
+WebSocket connections (`ws_listen`, `wss_listen`) hold more in the worst
+case, because tungstenite buffers do not shrink after a maximum-size
+message:
+
+```text
+WS:  64 KiB in-buffer + 2 x 64 KiB out-buffer cap + 64 KiB message buffer = 256 KiB
+WSS: 256 KiB + ~40 KiB TLS state                                          ~ 300 KiB
+```
+
+Size WebSocket deployments at 256 KiB (WS) or 300 KiB (WSS) per connection
+(`max_connections_total <= memory limit / 2 / 300 KiB` for WSS).
+
+At startup the daemon raises its soft `RLIMIT_NOFILE` to the hard limit and
+checks that its fds fit:
+
+```text
+max_connections_total + 1024 egress + (rtp_port_max - rtp_port_min + 1)
+  + SIP listeners + 256 REST HTTPS connections + 512 headroom <= RLIMIT_NOFILE
+```
+
+The RTP term is zero with an out-of-process media plane. If they do not fit,
+it lowers the caps to fit, logs an error and records a configuration-change
+audit event. It refuses to start when fewer than 64 connections would fit.
 
 ### SIP user HA1 encryption key (`sbcApi.ha1Key`)
 

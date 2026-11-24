@@ -642,9 +642,10 @@ sbcDaemon:
     # 4 KiB read chunk, a 64 KiB message buffer, ~40 KiB of TLS state and
     # the task), so 8000 x 128 KiB = 1 GiB, half of the 2Gi limit; the rest
     # is for calls, media and the registrar. WebSocket connections
-    # (ws_listen / wss_listen) can hold about 200 KiB each in the worst
-    # case: size WS deployments at 200 KiB per connection. Scale both caps
-    # with the memory limit: total <= limit / 2 / 128 KiB (200 KiB for WS).
+    # (ws_listen / wss_listen) can hold about 256 KiB (WS) or 300 KiB (WSS)
+    # each in the worst case (DEPLOYING.md shows the arithmetic). Scale both
+    # caps with the memory limit: total <= limit / 2 / 128 KiB (256 KiB for
+    # WS, 300 KiB for WSS).
     # The daemon also clamps them to RLIMIT_NOFILE at startup.
     max_connections_per_listener: 6000
     max_connections_total: 8000

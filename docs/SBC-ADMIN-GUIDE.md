@@ -213,9 +213,10 @@ REST HTTPS connection cap (256) is counted too; the plain-HTTP API is not
 higher with in-process media). Each idle TCP/TLS connection holds a 4 KiB
 read buffer and each idle WebSocket connection 8 KiB of buffers. In the
 worst case a TLS connection holds about 128 KiB (a 64 KiB message buffer
-plus TLS state) and a WebSocket connection about 200 KiB (tungstenite
-keeps up to about 2 x 64 KiB after a maximum-size message); size the caps
-against memory at those figures (the Helm chart's 6000 / 8000 fit a 2Gi
+plus TLS state) and a WebSocket connection about 256 KiB (WS) or 300 KiB
+(WSS), because tungstenite buffers do not shrink after a maximum-size
+message (`deploy/helm/sbc/DEPLOYING.md` shows the arithmetic); size the
+caps against memory at those figures (the Helm chart's 6000 / 8000 fit a 2Gi
 pod for TLS).
 
 > **Note:** `ws_require_sip_subprotocol = false` admits WebSocket upgrades
