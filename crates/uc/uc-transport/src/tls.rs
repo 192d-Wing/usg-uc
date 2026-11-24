@@ -889,13 +889,11 @@ impl TlsListener {
             return Err(TransportError::AlreadyClosed);
         }
 
-        let (tcp_stream, peer_addr) =
-            self.listener
-                .accept()
-                .await
-                .map_err(|e| TransportError::ReceiveFailed {
-                    reason: format!("accept failed: {e}"),
-                })?;
+        let (tcp_stream, peer_addr) = self
+            .listener
+            .accept()
+            .await
+            .map_err(|e| crate::accept_error(&e))?;
 
         // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 - IPv4-mapped peers reported as plain IPv4.
         let peer_addr = canonical_peer(peer_addr);
@@ -929,13 +927,11 @@ impl TlsListener {
             return Err(TransportError::AlreadyClosed);
         }
 
-        let (tcp_stream, peer_addr) =
-            self.listener
-                .accept()
-                .await
-                .map_err(|e| TransportError::ReceiveFailed {
-                    reason: format!("accept failed: {e}"),
-                })?;
+        let (tcp_stream, peer_addr) = self
+            .listener
+            .accept()
+            .await
+            .map_err(|e| crate::accept_error(&e))?;
 
         // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 - IPv4-mapped peers reported as plain IPv4.
         let peer_addr = canonical_peer(peer_addr);

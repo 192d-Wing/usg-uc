@@ -208,8 +208,95 @@ struct StreamLoopContext {
     total_conns: Arc<tokio::sync::Semaphore>,
     /// Per-source connection cap, shared by all stream listeners.
     conn_limiter: Arc<crate::conn_limit::ConnLimiter>,
+    /// Node-wide TLS + WebSocket handshakes in progress
+    /// (`transport.max_handshakes_in_flight`). A permit is held only for
+    /// the handshake, never for the receive loop.
+    handshake_slots: Arc<tokio::sync::Semaphore>,
     timeouts: StreamTimeouts,
     flows: Arc<FlowTable>,
+}
+
+/// Accept-loop back-off for `accept()` errors.
+///
+/// Only resource exhaustion (fd table full, no buffer space, out of memory)
+/// backs off, 10 ms doubling to 1 s, so a full fd table does not spin the
+/// loop. Any other accept error concerns one pending connection: the loop
+/// accepts again at once, so peers that reset before accept cannot stall
+/// the listener.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+#[derive(Debug)]
+struct AcceptBackoff {
+    /// Delay for the next resource error.
+    next: std::time::Duration,
+    /// Last resource-error warning, for one `warn!` per second at most.
+    last_warn: Option<std::time::Instant>,
+}
+
+impl AcceptBackoff {
+    const INITIAL: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(1);
+    const WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    const fn new() -> Self {
+        Self {
+            next: Self::INITIAL,
+            last_warn: None,
+        }
+    }
+
+    /// The delay to sleep before the next accept, or `None` to continue at
+    /// once.
+    fn on_error(&mut self, err: &uc_transport::TransportError) -> Option<std::time::Duration> {
+        if !err.is_resource_exhausted() {
+            return None;
+        }
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(Self::MAX);
+        Some(delay)
+    }
+
+    /// Resets the delay after a successful accept.
+    const fn on_success(&mut self) {
+        self.next = Self::INITIAL;
+    }
+
+    /// Whether a resource-error warning may be logged now (AU-4: bounded
+    /// log volume while the fd table stays full).
+    fn should_warn(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if self
+            .last_warn
+            .is_some_and(|t| now.duration_since(t) < Self::WARN_INTERVAL)
+        {
+            return false;
+        }
+        self.last_warn = Some(now);
+        true
+    }
+}
+
+/// What an accept loop does after an `accept()` error.
+enum AcceptNext {
+    /// Accept again (after any back-off sleep).
+    Continue,
+    /// Shutdown or closed listener: end the loop.
+    Stop,
+}
+
+/// Node-wide handshake slots for `transport.max_handshakes_in_flight`; 0
+/// sizes it from the CPU count.
+// POAM: POA&M-440 — handshake admission is per source plus this node-wide
+// concurrency bound; there is no node-wide accept or handshake rate, so a
+// flood spread over many sources is bounded only by rate x sources and by
+// this pool (SC-5).
+fn handshake_slot_count(tc: &sbc_config::schema::TransportConfig) -> usize {
+    let total = (tc.max_connections_total as usize).max(1);
+    if tc.max_handshakes_in_flight > 0 {
+        return (tc.max_handshakes_in_flight as usize).min(total);
+    }
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    cores.saturating_mul(64).max(64).min(total)
 }
 
 /// Where the message that produced a result arrived: replies to that peer
@@ -2022,10 +2109,24 @@ impl Server {
         let total_conns = Arc::new(tokio::sync::Semaphore::new(
             tc.max_connections_total as usize,
         ));
-        let conn_limiter = Arc::new(crate::conn_limit::ConnLimiter::new(
-            tc.max_connections_per_source,
-            self.config.rate_limit.ipv6_prefix_len,
-        ));
+        // NIST 800-53 Rev5: SC-5 — per-source accept rate and in-handshake
+        // cap, checked at accept before any TLS or WebSocket handshake.
+        // POAM: POA&M-441 — both are keyed per `rate_limit.ipv6_prefix_len`
+        // prefix only; there is no wider IPv6 aggregate cap (SC-5).
+        let conn_limiter = Arc::new(
+            crate::conn_limit::ConnLimiter::new(
+                tc.max_connections_per_source,
+                self.config.rate_limit.ipv6_prefix_len,
+            )
+            .with_accept_rate(
+                tc.accept_rate_per_source,
+                tc.accept_burst_per_source,
+                self.config.rate_limit.max_tracked_sources as usize,
+                self.config.rate_limit.effective_overflow_rps(),
+            )
+            .with_handshake_cap(tc.max_handshakes_per_source),
+        );
+        let handshake_slots = Arc::new(tokio::sync::Semaphore::new(handshake_slot_count(tc)));
         let timeouts = StreamTimeouts::from_config(&self.config);
         let stream_ctx = |zone_name: Option<String>| StreamLoopContext {
             shutdown: self.shutdown.clone(),
@@ -2038,6 +2139,7 @@ impl Server {
             conn_semaphore: Arc::new(tokio::sync::Semaphore::new(per_listener)),
             total_conns: Arc::clone(&total_conns),
             conn_limiter: Arc::clone(&conn_limiter),
+            handshake_slots: Arc::clone(&handshake_slots),
             timeouts,
             flows: Arc::clone(&self.flows),
         };
@@ -2329,9 +2431,9 @@ impl Server {
         true
     }
 
-    /// Admits one accepted stream connection: per-source cap, then this
-    /// listener's pool, then the node-wide ceiling. `None` means the
-    /// connection must be dropped (closing the socket).
+    /// Admits one accepted stream connection: per-source accept rate and
+    /// cap, then this listener's pool, then the node-wide ceiling. `None`
+    /// means the connection must be dropped (closing the socket).
     ///
     /// ## NIST 800-53 Rev5: SC-5, SC-7
     fn admit_connection(
@@ -2339,12 +2441,22 @@ impl Server {
         peer: &SbcSocketAddr,
         kind: &str,
     ) -> Option<ConnAdmission> {
-        let Some(source) = ctx.conn_limiter.try_acquire(peer.ip()) else {
-            ctx.stats
-                .conn_rejected_per_source
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(peer = %peer, kind, "Per-source connection limit reached, dropping");
-            return None;
+        let source = match ctx.conn_limiter.try_admit(peer.ip()) {
+            Ok(source) => source,
+            Err(crate::conn_limit::Rejection::AcceptRate) => {
+                ctx.stats
+                    .accept_rate_limited
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Per-source accept rate exceeded, dropping");
+                return None;
+            }
+            Err(_) => {
+                ctx.stats
+                    .conn_rejected_per_source
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Per-source connection limit reached, dropping");
+                return None;
+            }
         };
         // Pool-full drops are counted and audited in aggregate
         // (`listener_conn` / `total_conn`) by RateLimitMaintenance, which
@@ -2367,15 +2479,127 @@ impl Server {
         })
     }
 
+    /// Whether `peer`'s source is blocked by the per-source rate limiter.
+    /// A blocked source is dropped at accept, before admission and before
+    /// any handshake; drops are counted and audited in aggregate
+    /// (`accept_blocked`).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    async fn accept_blocked(ctx: &StreamLoopContext, peer: &SbcSocketAddr, kind: &str) -> bool {
+        // Lock held for the lookup only.
+        let blocked = ctx.rate_limiter.lock().await.is_blocked(peer.ip());
+        if blocked {
+            ctx.stats.accept_blocked.fetch_add(1, Ordering::Relaxed);
+            ctx.conn_limiter.note_accept_blocked(peer.ip());
+            debug!(peer = %peer, kind, "Source blocked, dropping at accept");
+        }
+        blocked
+    }
+
+    /// Takes a per-source handshake slot (`max_handshakes_per_source`), or
+    /// `None` when the source already has that many handshakes running.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    fn begin_handshake(
+        ctx: &StreamLoopContext,
+        peer: &SbcSocketAddr,
+        kind: &str,
+    ) -> Option<crate::conn_limit::HandshakeGuard> {
+        let guard = ctx.conn_limiter.try_begin_handshake(peer.ip());
+        if guard.is_none() {
+            ctx.stats
+                .handshake_busy_per_source
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(peer = %peer, kind, "Per-source handshake limit reached, dropping");
+        }
+        guard
+    }
+
+    /// Runs `handshake` while holding a node-wide handshake slot. The
+    /// caller wraps this in the handshake deadline, so time spent waiting
+    /// for a slot counts toward it. The slot and `guard` are released as
+    /// soon as the handshake ends, before any receive loop.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    async fn with_handshake_slot<T>(
+        slots: Arc<tokio::sync::Semaphore>,
+        guard: crate::conn_limit::HandshakeGuard,
+        handshake: impl std::future::Future<Output = uc_transport::TransportResult<T>>,
+    ) -> uc_transport::TransportResult<T> {
+        let slot = slots
+            .acquire_owned()
+            .await
+            .map_err(|_| uc_transport::TransportError::ConnectionClosed)?;
+        let result = handshake.await;
+        drop(slot);
+        drop(guard);
+        result
+    }
+
+    /// Handles an `accept()` error: per-connection errors are counted and
+    /// the loop continues at once; resource exhaustion backs off.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, AU-4
+    async fn on_accept_error(
+        ctx: &StreamLoopContext,
+        backoff: &mut AcceptBackoff,
+        err: &uc_transport::TransportError,
+        kind: &str,
+    ) -> AcceptNext {
+        if ctx.shutdown.is_shutdown_requested()
+            || matches!(err, uc_transport::TransportError::AlreadyClosed)
+        {
+            return AcceptNext::Stop;
+        }
+        match backoff.on_error(err) {
+            None => {
+                ctx.stats.accept_errors.fetch_add(1, Ordering::Relaxed);
+                debug!(error = %err, kind, "Stream accept failed for one connection");
+            }
+            Some(delay) => {
+                ctx.stats
+                    .accept_resource_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                if backoff.should_warn() {
+                    warn!(
+                        error = %err,
+                        kind,
+                        backoff_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "Stream accept failed: resources exhausted; backing off"
+                    );
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+        AcceptNext::Continue
+    }
+
     /// Accept loop for a SIP-over-TCP listener.
+    ///
+    /// The connection is admitted (blocked check, accept rate, caps) before
+    /// its transport is built, so a refused accept allocates nothing.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    // POAM: POA&M-442 — the listen backlog is fixed (`ListenerConfig`
+    // default 128; tokio default for WS) and not configurable (SC-5).
     async fn tcp_accept_loop(listener: Arc<TcpListener>, ctx: StreamLoopContext) {
         info!(address = %listener.local_addr(), "SIP TCP accept loop started");
+        let mut backoff = AcceptBackoff::new();
         loop {
-            match listener.accept().await {
-                Ok((transport, peer)) => {
+            match listener.accept_tcp().await {
+                Ok((stream, peer)) => {
+                    backoff.on_success();
+                    if Self::accept_blocked(&ctx, &peer, "tcp").await {
+                        continue;
+                    }
                     let Some(admission) = Self::admit_connection(&ctx, &peer, "tcp") else {
                         continue;
                     };
+                    let transport = uc_transport::tcp::TcpTransport::from_accepted(
+                        stream,
+                        peer,
+                        *listener.local_addr(),
+                    );
                     debug!(peer = %peer, "Accepted SIP TCP connection");
                     let conn_ctx = ctx.clone();
                     tokio::spawn(async move {
@@ -2385,11 +2609,12 @@ impl Server {
                     });
                 }
                 Err(e) => {
-                    if ctx.shutdown.is_shutdown_requested() {
+                    if matches!(
+                        Self::on_accept_error(&ctx, &mut backoff, &e, "tcp").await,
+                        AcceptNext::Stop
+                    ) {
                         break;
                     }
-                    warn!(error = %e, "TCP accept failed");
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
         }
@@ -2398,18 +2623,27 @@ impl Server {
     /// Accept loop for a SIP-over-WebSocket listener (RFC 7118). Each
     /// WebSocket message is a complete SIP message.
     ///
-    /// The raw TCP accept runs inline; the HTTP upgrade runs in the spawned
-    /// connection task under `transport.handshake_timeout_secs`, after the
-    /// connection is admitted, so a silent or slow client holds only its own
-    /// slot and cannot stall the listener.
+    /// The raw TCP accept and admission run inline; the HTTP upgrade runs
+    /// in the spawned connection task under `transport.handshake_timeout_secs`,
+    /// which also bounds the wait for a node-wide handshake slot, so a
+    /// silent or slow client holds only its own slot and cannot stall the
+    /// listener.
     ///
-    /// ## NIST 800-53 Rev5: SC-5, SC-10
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, SC-10
     async fn ws_accept_loop(listener: Arc<WebSocketListener>, ctx: StreamLoopContext) {
         info!(address = %listener.local_addr(), "SIP WebSocket accept loop started");
+        let mut backoff = AcceptBackoff::new();
         loop {
             match listener.accept_tcp().await {
                 Ok((tcp_stream, peer)) => {
+                    backoff.on_success();
+                    if Self::accept_blocked(&ctx, &peer, "ws").await {
+                        continue;
+                    }
                     let Some(admission) = Self::admit_connection(&ctx, &peer, "ws") else {
+                        continue;
+                    };
+                    let Some(handshake) = Self::begin_handshake(&ctx, &peer, "ws") else {
                         continue;
                     };
                     let conn_ctx = ctx.clone();
@@ -2417,7 +2651,11 @@ impl Server {
                     tokio::spawn(async move {
                         match tokio::time::timeout(
                             conn_ctx.timeouts.handshake,
-                            listener.complete_handshake(tcp_stream, peer),
+                            Self::with_handshake_slot(
+                                Arc::clone(&conn_ctx.handshake_slots),
+                                handshake,
+                                listener.complete_handshake(tcp_stream, peer),
+                            ),
                         )
                         .await
                         {
@@ -2450,11 +2688,12 @@ impl Server {
                     });
                 }
                 Err(e) => {
-                    if ctx.shutdown.is_shutdown_requested() {
+                    if matches!(
+                        Self::on_accept_error(&ctx, &mut backoff, &e, "ws").await,
+                        AcceptNext::Stop
+                    ) {
                         break;
                     }
-                    warn!(error = %e, "WebSocket accept failed");
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
         }
@@ -2462,16 +2701,28 @@ impl Server {
 
     /// Accept loop for a SIP-over-TLS listener.
     ///
-    /// The raw TCP accept runs inline so the loop stays responsive; the TLS
-    /// handshake is spawned under `transport.handshake_timeout_secs` so one
-    /// slow client cannot stall new connections on this listener.
+    /// The raw TCP accept and admission run inline so the loop stays
+    /// responsive and a refused source costs no crypto; the TLS handshake
+    /// is spawned under `transport.handshake_timeout_secs`, which also
+    /// bounds the wait for a node-wide handshake slot, so one slow client
+    /// cannot stall new connections on this listener.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
     async fn tls_accept_loop(listener: Arc<TlsListener>, ctx: StreamLoopContext) {
         info!(address = %listener.local_addr(), "SIP TLS accept loop started");
+        let mut backoff = AcceptBackoff::new();
         loop {
             // Step 1: accept the raw TCP connection (fast, no crypto).
             match listener.accept_tcp().await {
                 Ok((tcp_stream, peer)) => {
+                    backoff.on_success();
+                    if Self::accept_blocked(&ctx, &peer, "tls").await {
+                        continue;
+                    }
                     let Some(admission) = Self::admit_connection(&ctx, &peer, "tls") else {
+                        continue;
+                    };
+                    let Some(handshake) = Self::begin_handshake(&ctx, &peer, "tls") else {
                         continue;
                     };
                     // Step 2: spawn the TLS handshake so the accept loop
@@ -2481,7 +2732,11 @@ impl Server {
                     tokio::spawn(async move {
                         match tokio::time::timeout(
                             conn_ctx.timeouts.handshake,
-                            listener_clone.complete_handshake(tcp_stream),
+                            Self::with_handshake_slot(
+                                Arc::clone(&conn_ctx.handshake_slots),
+                                handshake,
+                                listener_clone.complete_handshake(tcp_stream),
+                            ),
                         )
                         .await
                         {
@@ -2496,6 +2751,8 @@ impl Server {
                                 .await;
                             }
                             Ok(Err(e)) => {
+                                // POAM: POA&M-443 — a failed TLS handshake
+                                // is still a per-connection warn! (AU-4).
                                 warn!(peer = %peer, error = %e, "TLS handshake failed");
                             }
                             Err(_) => {
@@ -2510,11 +2767,12 @@ impl Server {
                     });
                 }
                 Err(e) => {
-                    if ctx.shutdown.is_shutdown_requested() {
+                    if matches!(
+                        Self::on_accept_error(&ctx, &mut backoff, &e, "tls").await,
+                        AcceptNext::Stop
+                    ) {
                         break;
                     }
-                    warn!(error = %e, "TLS TCP accept failed");
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
         }
@@ -3197,11 +3455,23 @@ pub struct ServerStats {
     pub conn_rejected_per_source: AtomicU64,
     /// WebSocket upgrades refused or failed (e.g. no `sip` subprotocol).
     pub ws_handshake_failures: AtomicU64,
-    /// TLS / WebSocket handshakes that hit `handshake_timeout_secs`.
-    // POAM: POA&M-93 — these four counters are not yet exported on the
-    // REST/metrics API (api_server.rs is owned elsewhere); visible via the
-    // stats Debug output only (SI-4).
+    /// TLS / WebSocket handshakes that hit `handshake_timeout_secs`
+    /// (including time spent waiting for a handshake slot).
+    // POAM: POA&M-93 — these counters and the accept counters below are
+    // not yet exported on the REST/metrics API (api_server.rs is owned
+    // elsewhere); visible via the stats Debug output only (SI-4).
     pub handshake_timeouts: AtomicU64,
+    /// Stream `accept()` errors tied to one connection (no back-off).
+    pub accept_errors: AtomicU64,
+    /// Stream `accept()` errors from resource exhaustion (backed off).
+    pub accept_resource_errors: AtomicU64,
+    /// Stream accepts dropped because the source is blocked.
+    pub accept_blocked: AtomicU64,
+    /// Stream accepts dropped by `transport.accept_rate_per_source`.
+    pub accept_rate_limited: AtomicU64,
+    /// TLS / WebSocket accepts dropped by
+    /// `transport.max_handshakes_per_source`.
+    pub handshake_busy_per_source: AtomicU64,
 }
 
 /// Server error.
@@ -3470,6 +3740,8 @@ struct RateLimitAudit {
     per_source_conns: u64,
     /// Effective `trunk_rps` (threshold of `trunk_rps` records).
     trunk_rps: u64,
+    accept_rate: u64,
+    per_source_handshakes: u64,
 }
 
 impl RateLimitAudit {
@@ -3493,6 +3765,8 @@ impl RateLimitAudit {
             overflow_rps: u64::from(config.rate_limit.effective_overflow_rps()),
             per_source_conns: u64::from(config.transport.max_connections_per_source),
             trunk_rps: u64::from(config.rate_limit.effective_trunk_rps()),
+            accept_rate: u64::from(config.transport.accept_rate_per_source),
+            per_source_handshakes: u64::from(config.transport.max_handshakes_per_source),
         }
     }
 
@@ -3571,6 +3845,9 @@ impl RateLimitAudit {
             let limit = match kind {
                 crate::conn_limit::Rejection::PerSource => "per_ip_conn",
                 crate::conn_limit::Rejection::Framing => "framing",
+                crate::conn_limit::Rejection::AcceptRate => "per_ip_accept_rate",
+                crate::conn_limit::Rejection::HandshakeBusy => "handshake_busy",
+                crate::conn_limit::Rejection::AcceptBlocked => "accept_blocked",
             };
             self.add(key, limit, n);
         });
@@ -3580,6 +3857,13 @@ impl RateLimitAudit {
         }
         self.listener_full = self.listener_full.saturating_add(totals.listener_full);
         self.total_full = self.total_full.saturating_add(totals.total_full);
+    }
+
+    /// Drains the connection limiter's counters, then evicts idle accept
+    /// buckets (picking up any accept-rate rejections counted in between).
+    fn sweep_conns(&mut self, limiter: &crate::conn_limit::ConnLimiter) {
+        self.collect_conns(limiter);
+        limiter.sweep_accept(|key, n| self.add(key, "per_ip_accept_rate", n));
     }
 
     /// Emits one record per pending (source, limit), the global and
@@ -3596,7 +3880,9 @@ impl RateLimitAudit {
         for ((source, limit), count) in self.pending.drain() {
             let threshold = match limit {
                 "per_ip_conn" => self.per_source_conns,
-                "framing" => 0,
+                "per_ip_accept_rate" => self.accept_rate,
+                "handshake_busy" => self.per_source_handshakes,
+                "framing" | "accept_blocked" => 0,
                 _ => self.per_ip_rps,
             };
             audit_rate_limit(source, limit, count, threshold);
@@ -3699,7 +3985,7 @@ impl RateLimitMaintenance {
             let mut global = self.global_limiter.lock().await;
             self.audit.collect_global(&mut global);
         }
-        self.audit.collect_conns(&self.conn_limiter);
+        self.audit.sweep_conns(&self.conn_limiter);
         for key in self.unblocked.drain(..) {
             audit_rate_limit(key, "per_ip_unblock", 0, self.audit.per_ip_rps);
         }
@@ -4195,6 +4481,7 @@ mod tests {
             conn_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             total_conns: Arc::new(tokio::sync::Semaphore::new(4)),
             conn_limiter: Arc::new(crate::conn_limit::ConnLimiter::new(2, 64)),
+            handshake_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             timeouts,
             flows: Arc::new(FlowTable::new(4)),
         }

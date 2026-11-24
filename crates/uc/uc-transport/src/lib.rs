@@ -100,6 +100,54 @@ pub(crate) const fn canonical_peer(addr: std::net::SocketAddr) -> std::net::Sock
     std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+/// Returns true when an `accept()` error is a process- or system-wide
+/// resource exhaustion (EMFILE, ENFILE, ENOBUFS, ENOMEM, or
+/// [`std::io::ErrorKind::OutOfMemory`]).
+///
+/// Only these call for an accept-loop back-off: accepting again at once
+/// would fail the same way. Any other accept error concerns one pending
+/// connection (for example ECONNABORTED or EPROTO) and the loop should
+/// continue immediately.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+#[must_use]
+pub fn is_accept_resource_exhaustion(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::OutOfMemory {
+        return true;
+    }
+    let Some(code) = err.raw_os_error() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        matches!(
+            Errno::from_raw(code),
+            Errno::EMFILE | Errno::ENFILE | Errno::ENOBUFS | Errno::ENOMEM
+        )
+    }
+    #[cfg(windows)]
+    {
+        // WSAEMFILE, WSAENOBUFS.
+        matches!(code, 10024 | 10055)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = code;
+        false
+    }
+}
+
+/// Maps a listener `accept()` error to [`TransportError::AcceptFailed`],
+/// keeping the resource-exhaustion class.
+#[cfg(any(feature = "tcp", feature = "tls", feature = "websocket"))]
+pub(crate) fn accept_error(err: &std::io::Error) -> TransportError {
+    TransportError::AcceptFailed {
+        reason: err.to_string(),
+        resource_exhausted: is_accept_resource_exhaustion(err),
+    }
+}
+
 /// Reports that a dual-stack test cannot run on this host. Skips (returns)
 /// normally; panics instead when `UC_REQUIRE_DUAL_STACK=1`, so a CI job
 /// that sets it cannot pass the canonical-peer tests by skipping them.

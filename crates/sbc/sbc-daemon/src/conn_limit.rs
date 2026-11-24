@@ -6,8 +6,14 @@
 //! all TCP, TLS and WebSocket listeners. Without it one host can take the
 //! whole listener pool with idle sockets.
 //!
-//! The critical section is O(1), never spans an `.await`, and runs only on
-//! accept and close, so a `std::sync::Mutex` is used.
+//! It also holds accept-time admission state shared by the listeners: an
+//! optional per-source accept token bucket
+//! (`transport.accept_rate_per_source`) and a per-source cap on handshakes
+//! in progress (`transport.max_handshakes_per_source`).
+//!
+//! The critical sections are O(1), never span an `.await`, and run only on
+//! accept, handshake end and close, so `std::sync::Mutex` is used. The
+//! accept bucket has its own lock; no path holds both locks at once.
 //!
 //! ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection), SC-7
 
@@ -16,6 +22,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tracing::warn;
+use uc_dos_protection::{RateLimiter, RateLimiterConfig};
 
 /// Distinct sources whose connection rejections are tracked between audit
 /// flushes; rejections from further sources are summed without a key.
@@ -27,6 +34,10 @@ struct Inner {
     /// source holds a connection, so the map is bounded by the connection
     /// pools.
     active: HashMap<IpAddr, u32>,
+    /// Handshakes in progress per source key. An entry exists only while a
+    /// handshake runs, and each runs under a connection slot, so the map is
+    /// bounded by the connection pools.
+    handshakes: HashMap<IpAddr, u32>,
     /// Rejections per (source key, kind) since the last drain.
     rejected: HashMap<(IpAddr, Rejection), u64>,
     /// Rejections from sources past `MAX_REJECTED_SOURCES`.
@@ -41,6 +52,13 @@ pub enum Rejection {
     PerSource,
     /// The stream carried invalid Content-Length framing (SI-10).
     Framing,
+    /// The source was over `accept_rate_per_source`.
+    AcceptRate,
+    /// The source was at `max_handshakes_per_source`.
+    HandshakeBusy,
+    /// The source is blocked by the per-source rate limiter; the accept
+    /// was dropped before any handshake.
+    AcceptBlocked,
 }
 
 /// Totals drained by [`ConnLimiter::drain_rejections`].
@@ -64,6 +82,20 @@ pub struct ConnLimiter {
     total_full: AtomicU64,
     max_per_source: u32,
     v6_prefix_len: u8,
+    /// Per-source accept bucket; `None` when the accept rate is off. A
+    /// `RateLimiter` that never blocks, reused for its bounded bucket map,
+    /// overflow bucket and idle sweep.
+    accept: Option<Mutex<RateLimiter>>,
+    /// Handshakes in progress allowed per source.
+    max_handshakes_per_source: u32,
+}
+
+/// Holds one handshake slot for a source; released on drop (including on
+/// panic or task abort).
+#[derive(Debug)]
+pub struct HandshakeGuard {
+    limiter: Arc<ConnLimiter>,
+    key: IpAddr,
 }
 
 /// Holds one connection slot for a source; released on drop (including on
@@ -83,7 +115,44 @@ impl ConnLimiter {
             total_full: AtomicU64::new(0),
             max_per_source: max_per_source.max(1),
             v6_prefix_len,
+            accept: None,
+            max_handshakes_per_source: u32::MAX,
         }
+    }
+
+    /// Adds a per-source accept bucket: `rate` new connections per second,
+    /// `burst` at once. At most `max_tracked` sources get their own bucket;
+    /// further sources share one bucket of `overflow_rps`. `rate` 0 leaves
+    /// the bucket off.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    #[must_use]
+    pub fn with_accept_rate(
+        mut self,
+        rate: u32,
+        burst: u32,
+        max_tracked: usize,
+        overflow_rps: u32,
+    ) -> Self {
+        self.accept = (rate > 0).then(|| {
+            let config = RateLimiterConfig::new(rate, burst.max(1))
+                .with_per_ip(true)
+                .with_ipv6_prefix_len(self.v6_prefix_len)
+                .with_max_tracked_sources(max_tracked)
+                .with_overflow(overflow_rps, overflow_rps.saturating_mul(2).max(1))
+                // Never blocks: an over-rate accept is dropped, nothing more.
+                .with_block_threshold(f64::INFINITY)
+                .with_max_blocked_sources(0);
+            Mutex::new(RateLimiter::new(config))
+        });
+        self
+    }
+
+    /// Caps handshakes in progress per source at `per_source` (at least 1).
+    #[must_use]
+    pub fn with_handshake_cap(mut self, per_source: u32) -> Self {
+        self.max_handshakes_per_source = per_source.max(1);
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -95,22 +164,100 @@ impl ConnLimiter {
             })
     }
 
+    fn lock_accept(accept: &Mutex<RateLimiter>) -> MutexGuard<'_, RateLimiter> {
+        accept.lock().unwrap_or_else(|poisoned: PoisonError<_>| {
+            warn!("Accept rate limiter lock poisoned; recovering");
+            poisoned.into_inner()
+        })
+    }
+
     /// Takes a connection slot for `ip`, or `None` (counted for audit) when
-    /// the source is at its cap.
+    /// the source is over its accept rate or at its cap.
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<ConnGuard> {
+        self.try_admit(ip).ok()
+    }
+
+    /// Like [`Self::try_acquire`], but reports why a connection was refused
+    /// ([`Rejection::AcceptRate`] or [`Rejection::PerSource`]). The accept
+    /// bucket is charged first; a bucket reject takes no slot.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub fn try_admit(self: &Arc<Self>, ip: IpAddr) -> Result<ConnGuard, Rejection> {
         let key = uc_dos_protection::source_key(ip, self.v6_prefix_len);
+        if let Some(accept) = &self.accept {
+            // The bucket lock is released before `inner` is taken.
+            let rejected = Self::lock_accept(accept).check(key).is_rejected();
+            if rejected {
+                Self::count(&mut self.lock(), key, Rejection::AcceptRate);
+                return Err(Rejection::AcceptRate);
+            }
+        }
         let mut inner = self.lock();
         let count = inner.active.entry(key).or_insert(0);
         if *count >= self.max_per_source {
             Self::count(&mut inner, key, Rejection::PerSource);
-            return None;
+            return Err(Rejection::PerSource);
         }
         *count += 1;
         drop(inner);
-        Some(ConnGuard {
+        Ok(ConnGuard {
             limiter: Arc::clone(self),
             key,
         })
+    }
+
+    /// Takes a handshake slot for `ip`, or `None` (counted for audit as
+    /// [`Rejection::HandshakeBusy`]) when the source is at
+    /// `max_handshakes_per_source`. Hold the guard only for the handshake.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub fn try_begin_handshake(self: &Arc<Self>, ip: IpAddr) -> Option<HandshakeGuard> {
+        let key = uc_dos_protection::source_key(ip, self.v6_prefix_len);
+        let mut inner = self.lock();
+        let count = inner.handshakes.get(&key).copied().unwrap_or(0);
+        if count >= self.max_handshakes_per_source {
+            Self::count(&mut inner, key, Rejection::HandshakeBusy);
+            return None;
+        }
+        inner.handshakes.insert(key, count.saturating_add(1));
+        drop(inner);
+        Some(HandshakeGuard {
+            limiter: Arc::clone(self),
+            key,
+        })
+    }
+
+    /// Counts an accept dropped because the source is blocked.
+    ///
+    /// ## NIST 800-53 Rev5: AU-12, SC-7
+    pub fn note_accept_blocked(&self, ip: IpAddr) {
+        let key = uc_dos_protection::source_key(ip, self.v6_prefix_len);
+        Self::count(&mut self.lock(), key, Rejection::AcceptBlocked);
+    }
+
+    /// Accept-bucket maintenance: evicts idle buckets, then reports and
+    /// resets `f(key, count)` for accept-rate rejections not yet taken by
+    /// [`Self::drain_rejections`]. Each rejection is reported once, by
+    /// whichever call sees it first.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, AU-4
+    pub fn sweep_accept(&self, mut f: impl FnMut(IpAddr, u64)) {
+        if let Some(accept) = &self.accept {
+            let mut bucket = Self::lock_accept(accept);
+            // Rejections are counted in `Inner`; the bucket's own counters
+            // are only reset here.
+            let _ = bucket.sweep_with(|_| {});
+            let _ = bucket.take_overflow_rejections();
+        }
+        let mut inner = self.lock();
+        inner.rejected.retain(|(key, kind), n| {
+            if *kind == Rejection::AcceptRate {
+                f(*key, *n);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Adds one rejection for `(key, kind)` within the tracking cap.
@@ -167,6 +314,18 @@ impl ConnLimiter {
     #[cfg(test)]
     pub fn sources(&self) -> usize {
         self.lock().active.len()
+    }
+}
+
+impl Drop for HandshakeGuard {
+    fn drop(&mut self) {
+        let mut inner = self.limiter.lock();
+        if let Some(count) = inner.handshakes.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                inner.handshakes.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -371,7 +530,7 @@ mod sr56_accept_admission_tests {
         for i in 0..10_000 {
             assert!(limiter.try_acquire(a).is_some(), "cycle {i}");
         }
-        assert!(rejections(&limiter).is_empty());
+        assert_eq!(rejections(&limiter), Vec::new());
     }
 
     #[test]

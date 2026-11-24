@@ -990,6 +990,33 @@ pub struct TransportConfig {
     /// ## NIST 800-53 Rev5: SC-5, SC-7
     pub max_connections_per_source: u32,
 
+    /// New stream connections per second accepted from one source (same
+    /// keying as `max_connections_per_source`), across all listeners.
+    /// Checked at accept, before any TLS or WebSocket handshake. 0 turns
+    /// the check off. Valid 0..=100,000.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub accept_rate_per_source: u32,
+
+    /// Burst size of the per-source accept bucket. Valid
+    /// `accept_rate_per_source`..=1,000,000 and at least 1.
+    pub accept_burst_per_source: u32,
+
+    /// Node-wide TLS and WebSocket handshakes in progress. A connection
+    /// over the limit waits for a slot within `handshake_timeout_secs`.
+    /// 0 sizes it from the CPU count (64 per core, at least 64, at most
+    /// `max_connections_total`). Valid 0..=`max_connections_total`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub max_handshakes_in_flight: u32,
+
+    /// TLS and WebSocket handshakes in progress from one source. A
+    /// connection over the limit is dropped. Valid
+    /// 1..=`max_connections_per_source`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub max_handshakes_per_source: u32,
+
     /// TLS / WebSocket handshake deadline in seconds. Valid 1..=60.
     pub handshake_timeout_secs: u64,
 
@@ -1051,6 +1078,10 @@ impl Default for TransportConfig {
             max_connections_per_listener: 10_000,
             max_connections_total: 20_000,
             max_connections_per_source: 128,
+            accept_rate_per_source: 20,
+            accept_burst_per_source: 50,
+            max_handshakes_in_flight: 0,
+            max_handshakes_per_source: 16,
             handshake_timeout_secs: 10,
             first_message_timeout_secs: 30,
             ws_require_sip_subprotocol: true,

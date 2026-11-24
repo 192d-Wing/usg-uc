@@ -548,6 +548,30 @@ fn validate_stream_limits(config: &crate::schema::TransportConfig) -> ConfigResu
         config.max_connections_per_listener,
     )?;
     check_range(
+        "transport.accept_rate_per_source",
+        config.accept_rate_per_source,
+        0,
+        100_000,
+    )?;
+    check_range(
+        "transport.accept_burst_per_source",
+        config.accept_burst_per_source,
+        config.accept_rate_per_source.max(1),
+        1_000_000,
+    )?;
+    check_range(
+        "transport.max_handshakes_in_flight",
+        config.max_handshakes_in_flight,
+        0,
+        config.max_connections_total,
+    )?;
+    check_range(
+        "transport.max_handshakes_per_source",
+        config.max_handshakes_per_source,
+        1,
+        config.max_connections_per_source,
+    )?;
+    check_range(
         "transport.handshake_timeout_secs",
         config.handshake_timeout_secs,
         1,
@@ -5120,8 +5144,7 @@ mod sr56_accept_admission_keys {
         assert_eq!(c.transport.max_handshakes_per_source, 16);
         validate_config(&c).unwrap();
         // Old files without the keys get the defaults (#[serde(default)]).
-        let old: SbcConfig =
-            toml::from_str("[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n").unwrap();
+        let old: SbcConfig = toml::from_str("[transport]\nudp_listen = [\"[::]:5060\"]\n").unwrap();
         assert_eq!(old.transport, c.transport);
     }
 

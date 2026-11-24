@@ -199,6 +199,43 @@ and WS messages and frames are capped at 65,535 bytes. Each WS message
 must hold one complete SIP message (RFC 7118 §5); an incomplete one is
 discarded (counted as a framing error) and never joined to the next.
 
+Accept admission (NIST SC-5, SC-7). Every TCP, TLS and WebSocket accept is
+checked in this order before any TLS or WebSocket handshake: a source
+blocked by the per-source rate limiter (`[rate_limit]`) is dropped; then
+the per-source accept rate; then the connection caps above. TLS and
+WebSocket connections then take a per-source and a node-wide handshake
+slot, released as soon as the handshake ends:
+
+```toml
+[transport]
+accept_rate_per_source = 20     # new connections/s per IPv4 address / IPv6 prefix,
+                                # all listeners (0..=100000; 0 = off)
+accept_burst_per_source = 50    # accepts at once (accept_rate_per_source..=1000000, >= 1)
+max_handshakes_in_flight = 0    # node-wide TLS + WS handshakes in progress
+                                # (0..=max_connections_total; 0 = 64 per CPU core,
+                                # at least 64, at most max_connections_total)
+max_handshakes_per_source = 16  # per source (1..=max_connections_per_source)
+```
+
+An accept over the source's rate, or over `max_handshakes_per_source`, is
+closed at once. A connection that finds the node-wide handshake pool full
+waits for a slot; the wait counts toward `handshake_timeout_secs`. Drops are
+audited in aggregate per source as `per_ip_accept_rate`, `accept_blocked`
+and `handshake_busy` `RateLimitTriggered` records, not one log line per
+socket.
+
+Sizing: the accept bucket is per source key, so phones behind one NAT
+address share it. With the defaults, 1,000 phones behind one IPv4 address
+reconnecting together get 50 connections at once and then 20 per second, so
+the last waits about 48 s. Raise `accept_rate_per_source` (and the burst) for
+large NATs or PBXs; `max_connections_per_source` still bounds the total they
+hold. Limits are per node: N nodes admit N times the rate.
+
+`accept()` errors tied to one connection (for example a peer that reset
+before the accept) do not slow the listener. Only resource exhaustion (file
+descriptor table full, no buffer space, out of memory) backs off, from
+10 ms doubling to 1 s, with at most one warning per second.
+
 > **Note:** `ws_require_sip_subprotocol = false` admits WebSocket upgrades
 > that offer no subprotocol. This is **not conformant with RFC 7118 §4**
 > (the client MUST offer `sip`) and exists only for legacy clients; an

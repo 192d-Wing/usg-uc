@@ -97,6 +97,38 @@ pub enum TransportError {
     /// Timeout.
     #[error("operation timed out")]
     Timeout,
+
+    /// A listener `accept()` failed.
+    ///
+    /// `resource_exhausted` is set for process- or system-wide resource
+    /// errors (fd table full, no buffer space, out of memory), where the
+    /// caller should back off; otherwise the failure concerns one pending
+    /// connection and the caller can accept again at once.
+    #[error("accept failed: {reason}")]
+    AcceptFailed {
+        /// Error description.
+        reason: String,
+        /// The error is a resource exhaustion (see
+        /// [`crate::is_accept_resource_exhaustion`]).
+        resource_exhausted: bool,
+    },
+}
+
+impl TransportError {
+    /// Returns true for an [`Self::AcceptFailed`] caused by resource
+    /// exhaustion.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+    #[must_use]
+    pub const fn is_resource_exhausted(&self) -> bool {
+        matches!(
+            self,
+            Self::AcceptFailed {
+                resource_exhausted: true,
+                ..
+            }
+        )
+    }
 }
 
 impl From<std::io::Error> for TransportError {
@@ -116,8 +148,8 @@ mod sr22_accept_error_tests {
     // NIST 800-53 Rev5: SC-5
     #[test]
     fn accept_failed_carries_resource_flag() {
-        const TIMEOUT_EXHAUSTED: bool = TransportError::Timeout.is_resource_exhausted();
-        assert!(!TIMEOUT_EXHAUSTED, "is_resource_exhausted is a const fn");
+        // Evaluated at compile time: is_resource_exhausted is a const fn.
+        const { assert!(!TransportError::Timeout.is_resource_exhausted()) };
         let exhausted = TransportError::AcceptFailed {
             reason: "Too many open files".into(),
             resource_exhausted: true,

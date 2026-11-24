@@ -540,13 +540,11 @@ impl WebSocketListener {
     ///
     /// Returns an error if accepting fails.
     pub async fn accept_tcp(&self) -> TransportResult<(TcpStream, SbcSocketAddr)> {
-        let (tcp_stream, peer_addr) =
-            self.listener
-                .accept()
-                .await
-                .map_err(|e| TransportError::Io {
-                    reason: format!("Accept failed: {e}"),
-                })?;
+        let (tcp_stream, peer_addr) = self
+            .listener
+            .accept()
+            .await
+            .map_err(|e| crate::accept_error(&e))?;
         // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 - IPv4-mapped peers reported as plain IPv4.
         Ok((
             tcp_stream,

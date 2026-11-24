@@ -51,14 +51,12 @@ pub struct TcpTransport {
 impl TcpTransport {
     /// Creates a TCP transport from an established connection.
     ///
-    /// This is typically called after accepting a connection from a listener.
+    /// Used for connections this side dialled; accepted connections use
+    /// [`Self::from_accepted`], which needs no `getpeername`.
+    ///
+    /// # Errors
+    /// Returns an error if the local or peer address cannot be read.
     #[instrument(skip(stream))]
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn from_stream(stream: TcpStream) -> TransportResult<Self> {
         let local_addr = stream
             .local_addr()
@@ -73,17 +71,42 @@ impl TcpTransport {
         })?)
         .into();
 
+        Ok(Self::with_addrs(stream, local_addr, peer_addr))
+    }
+
+    /// Creates a TCP transport for a connection returned by
+    /// [`TcpListener::accept_tcp`].
+    ///
+    /// Infallible: `peer` is the address `accept()` returned, so a peer
+    /// that has already reset cannot turn this into an error. The local
+    /// address comes from `getsockname`, or `listener_local` if that fails.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+    #[must_use]
+    pub fn from_accepted(
+        stream: TcpStream,
+        peer: SbcSocketAddr,
+        listener_local: SbcSocketAddr,
+    ) -> Self {
+        let local_addr = stream
+            .local_addr()
+            .map_or(listener_local, SbcSocketAddr::from);
+        Self::with_addrs(stream, local_addr, peer)
+    }
+
+    /// Builds the transport from a connected stream and its addresses.
+    fn with_addrs(stream: TcpStream, local_addr: SbcSocketAddr, peer_addr: SbcSocketAddr) -> Self {
         debug!(local = %local_addr, peer = %peer_addr, "TCP transport created");
 
         let (reader, writer) = stream.into_split();
-        Ok(Self {
+        Self {
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
             local_addr,
             peer_addr,
             read_buffer: Mutex::new(BytesMut::with_capacity(MAX_STREAM_MESSAGE_SIZE)),
             closed: AtomicBool::new(false),
-        })
+        }
     }
 
     /// Connects to a remote TCP endpoint.
@@ -405,24 +428,38 @@ impl TcpListener {
     ///
     /// Returns an error if accept fails.
     pub async fn accept(&self) -> TransportResult<(TcpTransport, SbcSocketAddr)> {
+        let (stream, peer) = self.accept_tcp().await?;
+        let transport = TcpTransport::from_accepted(stream, peer, self.local_addr);
+        Ok((transport, peer))
+    }
+
+    /// Accepts the next incoming connection without building a
+    /// [`TcpTransport`], so the caller can admit it first and allocate
+    /// nothing for a refused connection.
+    ///
+    /// The peer is the address `accept()` returned, in canonical form.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`TransportError::AlreadyClosed`] once the listener is
+    /// closed, or [`TransportError::AcceptFailed`] if `accept()` fails.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+    pub async fn accept_tcp(&self) -> TransportResult<(TcpStream, SbcSocketAddr)> {
         if self.closed.load(Ordering::Acquire) {
             return Err(TransportError::AlreadyClosed);
         }
 
-        let (stream, peer_addr) =
-            self.listener
-                .accept()
-                .await
-                .map_err(|e| TransportError::ReceiveFailed {
-                    reason: format!("accept failed: {e}"),
-                })?;
+        let (stream, peer_addr) = self
+            .listener
+            .accept()
+            .await
+            .map_err(|e| crate::accept_error(&e))?;
 
         // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 - IPv4-mapped peers reported as plain IPv4.
         let peer_addr = canonical_peer(peer_addr);
         debug!(peer = %peer_addr, "accepted TCP connection");
-
-        let transport = TcpTransport::from_stream(stream)?;
-        Ok((transport, peer_addr.into()))
+        Ok((stream, peer_addr.into()))
     }
 
     /// Returns the local address.
