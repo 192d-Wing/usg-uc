@@ -1210,6 +1210,17 @@ fn validate_rate_limit(config: &crate::schema::RateLimitConfig) -> ConfigResult<
                 config.global_rps.max(config.per_ip_rps),
             )?;
         }
+
+        // NIST 800-53 Rev5: SC-5, CM-6 — a trunk's own bucket sits between
+        // one source's and the whole node's budget.
+        if config.trunk_rps != 0 {
+            check_range(
+                "rate_limit.trunk_rps",
+                config.trunk_rps,
+                config.per_ip_rps,
+                config.global_rps.max(config.per_ip_rps),
+            )?;
+        }
     }
 
     // Checked even when disabled: the keying prefix also feeds the
@@ -5331,5 +5342,76 @@ mod cluster_auth_storage_tests {
     #[test]
     fn memory_backend_accepted() {
         validate_config(&with_storage(StorageConfig::in_memory())).expect("valid");
+    }
+}
+
+// SR-55: `[rate_limit] udp_auto_block` / `trunk_rps` and
+// `effective_trunk_rps()`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
+mod sr55_rate_limit_keys {
+    use super::validate_config;
+    use crate::schema::SbcConfig;
+
+    #[test]
+    fn udp_auto_block_defaults_false() {
+        let c = SbcConfig::default();
+        assert!(!c.rate_limit.udp_auto_block);
+        assert_eq!(c.rate_limit.trunk_rps, 0);
+        let old: SbcConfig =
+            toml::from_str("[rate_limit]\nenabled = true\nper_ip_rps = 100\n").unwrap();
+        assert!(!old.rate_limit.udp_auto_block);
+        let on: SbcConfig = toml::from_str("[rate_limit]\nudp_auto_block = true\n").unwrap();
+        assert!(on.rate_limit.udp_auto_block);
+    }
+
+    #[test]
+    fn trunk_rps_auto_and_range() {
+        let c = SbcConfig::default();
+        // Auto: max(per_ip_rps * 10, 1000) clamped to global_rps.
+        assert_eq!(c.rate_limit.effective_trunk_rps(), 1_000);
+        let mut r = c.rate_limit;
+        r.per_ip_rps = 500;
+        assert_eq!(r.effective_trunk_rps(), 5_000);
+        r.per_ip_rps = 100;
+        r.global_rps = 600;
+        assert_eq!(r.effective_trunk_rps(), 600);
+        r.trunk_rps = 300;
+        assert_eq!(r.effective_trunk_rps(), 300);
+
+        let mut ok = SbcConfig::default();
+        ok.rate_limit.trunk_rps = 2_000;
+        validate_config(&ok).unwrap();
+        ok.rate_limit.trunk_rps = 0;
+        validate_config(&ok).unwrap();
+        let mut low = SbcConfig::default();
+        low.rate_limit.trunk_rps = 5;
+        assert!(validate_config(&low).is_err(), "below per_ip_rps accepted");
+        let mut high = SbcConfig::default();
+        high.rate_limit.trunk_rps = 1_000_000;
+        assert!(validate_config(&high).is_err(), "above global_rps accepted");
+    }
+}
+
+// SR-55: the same keys through the TOML loader.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod sr55_rate_limit_keys_loader {
+    use crate::schema::SbcConfig;
+
+    #[test]
+    fn sr55_keys_survive_round_trip() {
+        let c: SbcConfig =
+            toml::from_str("[rate_limit]\nudp_auto_block = true\ntrunk_rps = 2000\n").unwrap();
+        let text = toml::to_string(&c).unwrap();
+        assert!(text.contains("udp_auto_block = true"), "{text}");
+        assert!(text.contains("trunk_rps = 2000"), "{text}");
+    }
+
+    #[test]
+    fn trunk_rps_out_of_range_rejected_by_loader() {
+        assert!(crate::load_from_str("[rate_limit]\ntrunk_rps = 5\n").is_err());
+        assert!(crate::load_from_str("[rate_limit]\ntrunk_rps = 1000000\n").is_err());
+        crate::load_from_str("[rate_limit]\ntrunk_rps = 2000\n").unwrap();
     }
 }

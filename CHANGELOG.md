@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### Changed (SBC, UDP and stream rate limiters, trunk buckets, POA&M-448..451)
+
+- **UDP sources over the per-source rate are rejected, no longer
+  auto-blocked, unless `rate_limit.udp_auto_block = true`.** (SC-5) UDP
+  source addresses can be spoofed. UDP and stream (TCP, TLS, WebSocket)
+  signaling now use separate per-source limiters, so a block earned on one
+  does not apply to the other. Stream sources are still blocked.
+- New key `rate_limit.udp_auto_block` (default `false`).
+- New key `rate_limit.trunk_rps` (default `0` = `max(per_ip_rps × 10,
+  1000)` clamped to `global_rps`; otherwise `per_ip_rps..=global_rps`).
+  Configured trunk addresses (at most 4096) get their own bucket on both
+  limiters, matched on the exact address. They are rejected over it, never
+  auto-blocked, and a block on their IPv6 prefix does not apply to them.
+  They still count against `global_rps`.
+- New `RateLimitTriggered` `limit_name` values `trunk_rps_udp` and
+  `trunk_rps_stream`, not limited by `audit_max_records_per_interval`
+  (at most one per trusted address per limiter per interval).
+  `max_tracked_sources` and `max_blocked_sources` now apply to each
+  per-source limiter.
+
 ### BREAKING (soft client, smart-card login and provisioning trust, POA&M-370, 371)
 
 Tested locally on macOS arm64; Windows covered by the CI cross-target build only.

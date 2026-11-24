@@ -1337,6 +1337,10 @@ max_blocked_sources = 16384     # blocked-source cap (1..=max_tracked_sources)
 overflow_rps = 0                # shared bucket for new sources past the cap;
                                 # 0 = auto (1000 clamped to per_ip_rps..=global_rps)
 block_duration_secs = 60        # block after exceeding 2x per_ip_rps (1..=86400)
+udp_auto_block = false          # true = UDP sources over 2x per_ip_rps are blocked too
+trunk_rps = 0                   # per configured trunk address, never blocked;
+                                # 0 = auto (max(per_ip_rps*10, 1000) clamped to global_rps),
+                                # else per_ip_rps..=global_rps
 sweep_interval_secs = 10        # expired blocks / idle buckets sweep (1..=300)
 audit_interval_secs = 60        # rejection audit aggregation interval (1..=3600)
 audit_max_records_per_interval = 1024  # per-interval audit record cap (1..=65536)
@@ -1344,9 +1348,45 @@ audit_max_records_per_interval = 1024  # per-interval audit record cap (1..=6553
 
 The per-source limiter runs first; the global limiter is consulted only
 for messages the per-source limiter allowed, and it never blocks a source.
+
+UDP and stream (TCP, TLS, WebSocket) traffic use separate per-source
+limiters with the same `per_ip_rps`. A block earned on one does not affect
+the other. UDP source addresses can be spoofed, so by default a UDP source
+over 2x `per_ip_rps` has its excess messages rejected but is not blocked.
+Set `udp_auto_block = true` for the earlier behaviour. Stream sources are
+still blocked for `block_duration_secs`. `max_tracked_sources` and
+`max_blocked_sources` apply per limiter: the UDP and stream limiters can
+each hold that many entries.
+
+The resolved host addresses of configured trunk groups (config file and
+API) are trusted sources on both limiters, regardless of `trust_domain`.
+Trust affects rate limiting only, not source admission or privacy handling
+(AC-21). Each address has its own bucket of `trunk_rps` (burst
+`trunk_rps × burst_multiplier`), matched on the exact address, not its IPv6
+prefix. A trunk over its bucket is rejected, never auto-blocked, and a
+block on its IPv6 prefix (`ipv6_prefix_len`) does not apply to it. An
+explicit block of the source made before it was trusted is bypassed while
+it is trusted and applies again when it is untrusted; on untrust, an
+explicit block made while trusted moves to the block map and, for IPv6,
+covers the whole prefix. Trust extends to every host that
+sends from a configured address, for example all hosts behind a shared NAT
+address. At most 4096 addresses are trusted; past that the lowest addresses
+are kept, the rest use `per_ip_rps`, and a warning is logged. Trunk traffic
+still counts against `global_rps` (POA&M-451). Spoofed UDP using a trunk's
+exact address can still exhaust that trunk's bucket; use TLS trunks or edge
+uRPF/ACLs (POA&M-448). Registered endpoints are not trusted (POA&M-449).
+A hostname trunk is trusted at the addresses resolved when its group was
+loaded (POA&M-450). `udp_auto_block` and `trunk_rps` apply only when
+`enabled = true`.
 Rate-limit audit records (`RateLimitTriggered`) are aggregated, not per
 packet. `limit_name` values: `per_ip_rps` (rejections per source per
-interval), `global_rps` (source `0.0.0.0`), `overflow_rps` (source `::`),
+interval, from either limiter), `trunk_rps_udp` / `trunk_rps_stream`
+(rejections of a trusted trunk address on the UDP or stream limiter;
+`threshold` = effective `trunk_rps`; UDP-sourced records can be spoofed,
+so `trunk_rps_udp` does not prove the trunk sent the traffic; not subject to
+`audit_max_records_per_interval`, at most one per trusted address per
+limiter),
+`global_rps` (source `0.0.0.0`), `overflow_rps` (source `::`),
 `per_ip_blocked_drops` (messages dropped while the source was blocked),
 `per_ip_conn` (connection-cap rejections), `listener_conn` / `total_conn`
 (accepts dropped on a full listener or node-wide pool; source `0.0.0.0`,
@@ -1357,11 +1397,11 @@ address or IPv6 prefix, `request_count` 0), `per_ip_unblock` (immediate)
 and `per_ip_rps_suppressed` (sum beyond the per-interval cap; `threshold`
 = number of suppressed entries).
 
-`global_rps` and `per_ip_rps` feed two `uc-dos-protection` token-bucket limiters in `sbc-daemon/src/server.rs`. `general.max_calls` additionally rejects INVITEs with 503 once the concurrent-call limit is reached. When rate limits are exceeded:
+`global_rps` and `per_ip_rps` feed three `uc-dos-protection` token-bucket limiters in `sbc-daemon/src/server.rs` (UDP per-source, stream per-source, global). `general.max_calls` additionally rejects INVITEs with 503 once the concurrent-call limit is reached. When rate limits are exceeded:
 
 - **Throttle**: Suggested delay (logged at debug level, message still processed)
 - **Reject**: Message silently dropped (`rate_limited` stat incremented)
-- **Block**: Message dropped and the source remains blocked for the limiter's block duration
+- **Block**: Message dropped and the source remains blocked for the limiter's block duration (stream sources; UDP sources only with `udp_auto_block = true`; never trusted trunk addresses)
 
 `per_user_rps` is enforced in `sbc-daemon` (`sip_stack.rs::user_rate_limit`, `user_limiter.rs`):
 

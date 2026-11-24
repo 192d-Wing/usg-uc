@@ -180,6 +180,17 @@ struct ConnAdmission {
     _total: tokio::sync::OwnedSemaphorePermit,
 }
 
+/// Which transport family a per-source rate limiter serves.
+///
+/// NIST 800-53 Rev5: SC-5 — UDP and stream sources are limited separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimiterKind {
+    /// UDP signaling (spoofable source addresses).
+    Udp,
+    /// TCP, TLS and WebSocket signaling (handshake-proven addresses).
+    Stream,
+}
+
 /// Shared handles a stream (TCP/TLS) accept loop and its per-connection
 /// receive loops need for their lifetime.
 #[derive(Clone)]
@@ -251,8 +262,14 @@ pub struct Server {
     /// Live transports per flow (UDP sockets, accepted and egress stream
     /// connections). NIST 800-53 Rev5: SC-8.
     flows: Arc<FlowTable>,
-    /// Per-source rate limiter for `DoS` protection.
-    rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Per-source rate limiter for UDP signaling. Source addresses are
+    /// spoofable, so by default it rejects but does not block
+    /// (`rate_limit.udp_auto_block`).
+    udp_rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Per-source rate limiter for stream (TCP/TLS/WS) signaling. Separate
+    /// from the UDP one so a UDP-earned block never reaches a peer that
+    /// completed a handshake. NIST 800-53 Rev5: SC-5.
+    stream_rate_limiter: Arc<Mutex<RateLimiter>>,
     /// Global (all-sources) rate limiter — backstop against distributed
     /// floods that stay under the per-IP limit.
     global_limiter: Arc<Mutex<RateLimiter>>,
@@ -363,7 +380,8 @@ impl Server {
         Self::warn_if_register_unauthenticated(&sip_stack);
         Self::warn_if_digest_over_cleartext(&config);
         let sip_stack = Arc::new(sip_stack);
-        let rate_limiter = Self::build_rate_limiter(&config);
+        let udp_rate_limiter = Self::build_rate_limiter(&config, LimiterKind::Udp);
+        let stream_rate_limiter = Self::build_rate_limiter(&config, LimiterKind::Stream);
         let global_limiter = Self::build_global_limiter(&config);
 
         Self {
@@ -378,7 +396,8 @@ impl Server {
             ws_listeners: RwLock::new(Vec::new()),
             sip_stack,
             flows: Arc::new(FlowTable::new(crate::flows::DEFAULT_MAX_EGRESS_CONNECTIONS)),
-            rate_limiter,
+            udp_rate_limiter,
+            stream_rate_limiter,
             global_limiter,
             zone_registry: None,
             media_failure_rx,
@@ -486,7 +505,8 @@ impl Server {
         Self::warn_if_digest_over_cleartext(&config);
         let sip_stack = Arc::new(sip_stack);
 
-        let rate_limiter = Self::build_rate_limiter(&config);
+        let udp_rate_limiter = Self::build_rate_limiter(&config, LimiterKind::Udp);
+        let stream_rate_limiter = Self::build_rate_limiter(&config, LimiterKind::Stream);
         let global_limiter = Self::build_global_limiter(&config);
 
         Self {
@@ -501,7 +521,8 @@ impl Server {
             ws_listeners: RwLock::new(Vec::new()),
             sip_stack,
             flows: Arc::new(FlowTable::new(crate::flows::DEFAULT_MAX_EGRESS_CONNECTIONS)),
-            rate_limiter,
+            udp_rate_limiter,
+            stream_rate_limiter,
             global_limiter,
             zone_registry: None,
             media_failure_rx,
@@ -785,8 +806,11 @@ impl Server {
         );
     }
 
-    /// Builds the per-source rate limiter from config.
-    fn build_rate_limiter(config: &SbcConfig) -> Arc<Mutex<RateLimiter>> {
+    /// Builds a per-source rate limiter from config. The UDP limiter blocks
+    /// only with `rate_limit.udp_auto_block`; both give configured trunk
+    /// addresses (see [`Self::apply_trusted_sources`]) their own
+    /// `trunk_rps` bucket.
+    fn build_rate_limiter(config: &SbcConfig, kind: LimiterKind) -> Arc<Mutex<RateLimiter>> {
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -811,8 +835,34 @@ impl Server {
             .with_max_tracked_sources(rl.max_tracked_sources as usize)
             .with_max_blocked_sources(rl.max_blocked_sources as usize)
             .with_overflow(rl.effective_overflow_rps(), overflow_burst.max(1));
+        // NIST 800-53 Rev5: SC-5 — spoofable UDP sources are rejected, not
+        // blocked, unless the operator opts in.
+        let auto_block = match kind {
+            LimiterKind::Udp => rl.udp_auto_block,
+            LimiterKind::Stream => true,
+        };
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let trunk_burst =
+            (f64::from(rl.effective_trunk_rps()) * f64::from(rl.burst_multiplier)) as u32;
+        // NIST 800-53 Rev5: SC-5, SC-5(2) — configured trunks get their own
+        // bucket and are rejected over it, never auto-blocked.
+        // POAM: POA&M-448 — spoofed UDP carrying a trunk's exact address can
+        // still exhaust that trunk's bucket (reject only), and is admitted
+        // at up to `trunk_rps` per trunk address instead of `per_ip_rps`,
+        // bounded only by `global_rps`; edge uRPF/ACL or TLS trunks are
+        // needed for full protection (SC-5).
+        let rate_limit_config = rate_limit_config
+            .with_auto_block(auto_block)
+            .with_trusted_bucket(rl.effective_trunk_rps(), trunk_burst.max(1));
 
         info!(
+            limiter = ?kind,
+            auto_block,
+            trunk_rps = rl.effective_trunk_rps(),
             enabled = config.rate_limit.enabled,
             per_ip_rps = config.rate_limit.per_ip_rps,
             global_rps = config.rate_limit.global_rps,
@@ -821,6 +871,43 @@ impl Server {
         );
 
         Arc::new(Mutex::new(RateLimiter::new(rate_limit_config)))
+    }
+
+    /// Applies the configured trunk address set (sorted and capped at
+    /// [`uc_dos_protection::MAX_TRUSTED_SOURCES`] by the SIP stack) as
+    /// trusted sources to both per-source limiters, one lock at a time.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    // POAM: POA&M-449 — registered endpoints and NAT addresses are not
+    // trusted; a stream-earned block on their prefix still applies (SC-5).
+    // POAM: POA&M-450 — the set holds addresses resolved when the trunk
+    // group was loaded; a hostname trunk whose DNS changes is not
+    // re-trusted until the group is re-synced. An address configured in
+    // two trunk groups is held for the group that registered it last;
+    // removing that group untrusts it while the other group still lists
+    // it, until that group is re-synced (see POA&M-392) (SC-5, CM-3).
+    async fn apply_trusted_sources(
+        set: &[std::net::IpAddr],
+        udp: &Mutex<RateLimiter>,
+        stream: &Mutex<RateLimiter>,
+    ) {
+        let _ = udp.lock().await.set_trusted_sources(set.iter().copied());
+        let _ = stream.lock().await.set_trusted_sources(set.iter().copied());
+    }
+
+    /// Re-applies the trunk address set to both limiters on every change
+    /// published by the SIP stack. Updates coalesce; the newest set wins.
+    async fn trusted_source_sync(
+        mut rx: tokio::sync::watch::Receiver<Arc<[std::net::IpAddr]>>,
+        udp: Arc<Mutex<RateLimiter>>,
+        stream: Arc<Mutex<RateLimiter>>,
+    ) {
+        while rx.changed().await.is_ok() {
+            // Clone the Arc so the watch borrow is released before locking.
+            let set = Arc::clone(&rx.borrow_and_update());
+            Self::apply_trusted_sources(&set, &udp, &stream).await;
+            debug!(trusted = set.len(), "Trusted rate-limit sources updated");
+        }
     }
 
     /// Builds the global (all-sources) rate limiter from config.
@@ -1863,14 +1950,27 @@ impl Server {
             return Ok(());
         }
 
-        // Spawn receive tasks for each transport
+        // Configured trunks are trusted on both per-source limiters before
+        // any receive loop runs, then kept in step with trunk changes.
+        // NIST 800-53 Rev5: SC-5
         let mut handles = Vec::new();
+        {
+            let mut rx = self.sip_stack.trunk_sources();
+            let set = Arc::clone(&rx.borrow_and_update());
+            Self::apply_trusted_sources(&set, &self.udp_rate_limiter, &self.stream_rate_limiter)
+                .await;
+            let udp = Arc::clone(&self.udp_rate_limiter);
+            let stream = Arc::clone(&self.stream_rate_limiter);
+            handles.push(tokio::spawn(Self::trusted_source_sync(rx, udp, stream)));
+        }
+
+        // Spawn receive tasks for each transport
         for (idx, transport) in transports.iter().enumerate() {
             let transport = Arc::clone(transport);
             let shutdown = self.shutdown.clone();
             let stats = Arc::clone(&self.stats);
             let sip_stack = Arc::clone(&self.sip_stack);
-            let rate_limiter = Arc::clone(&self.rate_limiter);
+            let rate_limiter = Arc::clone(&self.udp_rate_limiter);
             let global_limiter = Arc::clone(&self.global_limiter);
             let rate_limit_enabled = self.config.rate_limit.enabled;
             let flows = Arc::clone(&self.flows);
@@ -1931,7 +2031,7 @@ impl Server {
             shutdown: self.shutdown.clone(),
             stats: Arc::clone(&self.stats),
             sip_stack: Arc::clone(&self.sip_stack),
-            rate_limiter: Arc::clone(&self.rate_limiter),
+            rate_limiter: Arc::clone(&self.stream_rate_limiter),
             global_limiter: Arc::clone(&self.global_limiter),
             rate_limit_enabled: self.config.rate_limit.enabled,
             zone_name,
@@ -1985,10 +2085,11 @@ impl Server {
             let maint = RateLimitMaintenance::new(
                 &self.config,
                 self.shutdown.clone(),
-                Arc::clone(&self.rate_limiter),
+                Arc::clone(&self.stream_rate_limiter),
                 Arc::clone(&self.global_limiter),
                 Arc::clone(&conn_limiter),
-            );
+            )
+            .with_per_ip_limiter(LimiterKind::Udp, Arc::clone(&self.udp_rate_limiter));
             handles.push(tokio::spawn(maint.run()));
         }
 
@@ -2217,6 +2318,8 @@ impl Server {
             }
         }
 
+        // POAM: POA&M-451 — trusted trunks are charged here too, so a
+        // distributed flood at `global_rps` can reject trunk traffic (SC-5).
         let global_action = global_limiter.lock().await.check(source_ip);
         if global_action.is_rejected() {
             stats.rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -3342,7 +3445,14 @@ struct RateLimitAudit {
     /// Per-source rejections (`per_ip_rps`, `per_ip_conn`), at most
     /// `max_records` keys.
     pending: std::collections::HashMap<(std::net::IpAddr, &'static str), u64>,
-    /// Rejections whose source did not fit in `pending`.
+    /// Trusted-trunk rejections (`trunk_rps_udp`, `trunk_rps_stream`),
+    /// kept apart from `pending` so a flood of per-source records across
+    /// the sweeps of one audit interval cannot crowd them out. At most
+    /// [`Self::MAX_TRUNK_RECORDS`] keys: one per trusted address per
+    /// limiter.
+    trunk_pending: std::collections::HashMap<(std::net::IpAddr, &'static str), u64>,
+    /// Rejections whose source did not fit in `pending` (or, after a
+    /// trusted-set change within the interval, `trunk_pending`).
     suppressed_count: u64,
     /// Number of drained (source, count) entries folded into
     /// `suppressed_count` (upper bound on distinct sources).
@@ -3358,12 +3468,19 @@ struct RateLimitAudit {
     global_rps: u64,
     overflow_rps: u64,
     per_source_conns: u64,
+    /// Effective `trunk_rps` (threshold of `trunk_rps` records).
+    trunk_rps: u64,
 }
 
 impl RateLimitAudit {
+    /// Bound on `trunk_pending`: [`uc_dos_protection::MAX_TRUSTED_SOURCES`]
+    /// addresses on each of the two per-source limiters (SC-5).
+    const MAX_TRUNK_RECORDS: usize = 2 * uc_dos_protection::MAX_TRUSTED_SOURCES;
+
     fn new(config: &SbcConfig) -> Self {
         Self {
             pending: std::collections::HashMap::new(),
+            trunk_pending: std::collections::HashMap::new(),
             suppressed_count: 0,
             suppressed_sources: 0,
             global: 0,
@@ -3375,6 +3492,7 @@ impl RateLimitAudit {
             global_rps: u64::from(config.rate_limit.global_rps),
             overflow_rps: u64::from(config.rate_limit.effective_overflow_rps()),
             per_source_conns: u64::from(config.transport.max_connections_per_source),
+            trunk_rps: u64::from(config.rate_limit.effective_trunk_rps()),
         }
     }
 
@@ -3390,14 +3508,43 @@ impl RateLimitAudit {
         }
     }
 
-    /// One pass over the per-source limiter: aggregates rejections and
-    /// blocked drops, evicts idle buckets and expired blocks, and pushes
-    /// each ended block onto `unblocked`.
-    fn sweep_per_ip(&mut self, limiter: &mut RateLimiter, unblocked: &mut Vec<std::net::IpAddr>) {
+    /// Adds `count` trusted-trunk rejections for `(source, limit)`. Not
+    /// subject to `audit_max_records_per_interval`; bounded by
+    /// [`Self::MAX_TRUNK_RECORDS`] instead.
+    // NIST 800-53 Rev5: AU-12, SC-5 — trunk records always reach the log.
+    fn add_trunk(&mut self, source: std::net::IpAddr, limit: &'static str, count: u64) {
+        if let Some(n) = self.trunk_pending.get_mut(&(source, limit)) {
+            *n = n.saturating_add(count);
+        } else if self.trunk_pending.len() < Self::MAX_TRUNK_RECORDS {
+            self.trunk_pending.insert((source, limit), count);
+        } else {
+            // Only reachable when the trusted set changed within the
+            // interval; still counted in the suppressed summary.
+            self.suppressed_count = self.suppressed_count.saturating_add(count);
+            self.suppressed_sources = self.suppressed_sources.saturating_add(1);
+        }
+    }
+
+    /// One pass over the `kind` per-source limiter: aggregates rejections
+    /// and blocked drops, evicts idle buckets and expired blocks, and
+    /// pushes each ended block onto `unblocked`.
+    fn sweep_per_ip(
+        &mut self,
+        limiter: &mut RateLimiter,
+        kind: LimiterKind,
+        unblocked: &mut Vec<std::net::IpAddr>,
+    ) {
+        let trunk_label = match kind {
+            LimiterKind::Udp => "trunk_rps_udp",
+            LimiterKind::Stream => "trunk_rps_stream",
+        };
         let _ = limiter.sweep_with(|event| match event {
             SweepEvent::Rejected(key, n) => self.add(key, "per_ip_rps", n),
             SweepEvent::BlockedDrops(key, n) => self.add(key, "per_ip_blocked_drops", n),
             SweepEvent::Unblocked(key) => unblocked.push(key),
+            // NIST 800-53 Rev5: AU-12 — a trusted trunk over its own
+            // bucket, by exact address and transport family.
+            SweepEvent::TrustedRejected(ip, n) => self.add_trunk(ip, trunk_label, n),
         });
         self.overflow = self
             .overflow
@@ -3437,11 +3584,15 @@ impl RateLimitAudit {
 
     /// Emits one record per pending (source, limit), the global and
     /// overflow totals, and one summary for anything suppressed; then
-    /// resets. At most `max_records + 5` records per flush.
+    /// resets. At most `max_records + MAX_TRUNK_RECORDS + 5` records per
+    /// flush; trunk records are emitted first.
     // POAM: POA&M-92 — global/overflow records carry the placeholder
     // sources 0.0.0.0 / :: because RateLimitTriggered requires a source
     // address; a dedicated aggregate event needs a uc-audit change (AU-3).
     fn flush(&mut self) {
+        for ((source, limit), count) in self.trunk_pending.drain() {
+            audit_rate_limit(source, limit, count, self.trunk_rps);
+        }
         for ((source, limit), count) in self.pending.drain() {
             let threshold = match limit {
                 "per_ip_conn" => self.per_source_conns,
@@ -3498,7 +3649,9 @@ impl RateLimitAudit {
 /// ## NIST 800-53 Rev5: SC-5, AU-4, AU-12
 struct RateLimitMaintenance {
     shutdown: ShutdownSignal,
-    rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Per-source limiters (stream, then UDP) and the transport family
+    /// each serves, swept one at a time.
+    per_ip_limiters: Vec<(LimiterKind, Arc<Mutex<RateLimiter>>)>,
     global_limiter: Arc<Mutex<RateLimiter>>,
     conn_limiter: Arc<crate::conn_limit::ConnLimiter>,
     sweep_interval: std::time::Duration,
@@ -3518,7 +3671,7 @@ impl RateLimitMaintenance {
     ) -> Self {
         Self {
             shutdown,
-            rate_limiter,
+            per_ip_limiters: vec![(LimiterKind::Stream, rate_limiter)],
             global_limiter,
             conn_limiter,
             sweep_interval: std::time::Duration::from_secs(config.rate_limit.sweep_interval_secs),
@@ -3528,12 +3681,19 @@ impl RateLimitMaintenance {
         }
     }
 
+    /// Adds another per-source limiter, serving `kind`, to the sweep.
+    fn with_per_ip_limiter(mut self, kind: LimiterKind, limiter: Arc<Mutex<RateLimiter>>) -> Self {
+        self.per_ip_limiters.push((kind, limiter));
+        self
+    }
+
     /// One sweep; flushes the audit aggregate when `flush` is set.
     async fn sweep(&mut self, flush: bool) {
-        {
-            let mut limiter = self.rate_limiter.lock().await;
+        for (kind, limiter) in &self.per_ip_limiters {
+            let mut limiter = limiter.lock().await;
             // One pass: counts are reported before an idle bucket is evicted.
-            self.audit.sweep_per_ip(&mut limiter, &mut self.unblocked);
+            self.audit
+                .sweep_per_ip(&mut limiter, *kind, &mut self.unblocked);
         }
         {
             let mut global = self.global_limiter.lock().await;
@@ -4028,7 +4188,7 @@ mod tests {
             shutdown: ShutdownSignal::new(),
             stats: Arc::new(ServerStats::default()),
             sip_stack: Arc::new(SipStack::new(crate::sip_stack::SipStackConfig::default())),
-            rate_limiter: Server::build_rate_limiter(&config),
+            rate_limiter: Server::build_rate_limiter(&config, LimiterKind::Stream),
             global_limiter: Server::build_global_limiter(&config),
             rate_limit_enabled: true,
             zone_name: None,
@@ -4060,6 +4220,20 @@ mod tests {
         Arc<FakeStream>,
         tokio::task::JoinHandle<()>,
     ) {
+        let peer = SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, 20), 40000);
+        spawn_stream_from(ctx, kind, peer)
+    }
+
+    /// [`spawn_stream_kind`] with the connection's peer address.
+    fn spawn_stream_from(
+        ctx: StreamLoopContext,
+        kind: TransportType,
+        peer: SbcSocketAddr,
+    ) -> (
+        tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        Arc<FakeStream>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = Arc::new(FakeStream {
             local: SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, 10), 5060),
@@ -4068,7 +4242,6 @@ mod tests {
             closed: std::sync::atomic::AtomicBool::new(false),
             kind,
         });
-        let peer = SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, 20), 40000);
         let conn: Arc<dyn Transport> = Arc::clone(&fake) as Arc<dyn Transport>;
         let task = tokio::spawn(Server::stream_connection_loop(conn, peer, ctx, None));
         (tx, fake, task)
@@ -4318,7 +4491,7 @@ mod tests {
         let mut config = SbcConfig::default();
         config.rate_limit.per_ip_rps = 5;
         config.rate_limit.global_rps = 1_000;
-        let per_ip = Server::build_rate_limiter(&config);
+        let per_ip = Server::build_rate_limiter(&config, LimiterKind::Stream);
         let global = Server::build_global_limiter(&config);
         let stats = ServerStats::default();
         let flooder: std::net::IpAddr = "192.0.2.66".parse().unwrap();
@@ -4352,7 +4525,7 @@ mod tests {
         let mut config = SbcConfig::default();
         config.rate_limit.per_ip_rps = 1_000;
         config.rate_limit.global_rps = 5;
-        let per_ip = Server::build_rate_limiter(&config);
+        let per_ip = Server::build_rate_limiter(&config, LimiterKind::Stream);
         let global = Server::build_global_limiter(&config);
         let stats = ServerStats::default();
         let trunk: std::net::IpAddr = "192.0.2.5".parse().unwrap();
@@ -4427,7 +4600,7 @@ mod tests {
         let mut config = SbcConfig::default();
         config.rate_limit.per_ip_rps = 2;
         config.rate_limit.block_duration_secs = 1;
-        let per_ip = Server::build_rate_limiter(&config);
+        let per_ip = Server::build_rate_limiter(&config, LimiterKind::Stream);
         let global = Server::build_global_limiter(&config);
         let stats = ServerStats::default();
         let src: std::net::IpAddr = "192.0.2.99".parse().unwrap();
@@ -4609,7 +4782,7 @@ mod tests {
         let capture = uc_audit::capture::start();
         let mut config = SbcConfig::default();
         config.rate_limit.per_ip_rps = 1;
-        let per_ip = Server::build_rate_limiter(&config);
+        let per_ip = Server::build_rate_limiter(&config, LimiterKind::Stream);
         let global = Server::build_global_limiter(&config);
         let src: std::net::IpAddr = "192.0.2.45".parse().unwrap();
         {
@@ -4649,7 +4822,7 @@ mod tests {
         config.rate_limit.per_ip_rps = 1;
         config.rate_limit.sweep_interval_secs = 10;
         config.rate_limit.audit_interval_secs = 60;
-        let per_ip = Server::build_rate_limiter(&config);
+        let per_ip = Server::build_rate_limiter(&config, LimiterKind::Stream);
         let global = Server::build_global_limiter(&config);
         // Each batch uses a fresh source: packets dropped while a source is
         // blocked are not counted in the aggregate.
@@ -5540,5 +5713,484 @@ mod tests {
         wipe_wire_bytes(shared);
         assert_eq!(&other[..], &[7u8; 32][..]);
         wipe_wire_bytes(other);
+    }
+
+    // SR-55: separate UDP and stream limiters, UDP reject-not-block, and
+    // configured trunk IPs as trusted sources. Written against the planned
+    // API (`LimiterKind`, `udp_rate_limiter` / `stream_rate_limiter`,
+    // `SipStack::trunk_sources`, `Server::apply_trusted_sources`,
+    // `rate_limit.udp_auto_block` / `trunk_rps`).
+    mod sr55 {
+        use super::*;
+        use std::collections::HashSet;
+        use std::net::IpAddr;
+
+        fn ip(s: &str) -> IpAddr {
+            s.parse().unwrap()
+        }
+
+        fn trusted_set(ips: &[IpAddr]) -> HashSet<IpAddr> {
+            ips.iter().copied().collect()
+        }
+
+        #[tokio::test]
+        async fn udp_limiter_from_default_config_never_auto_blocks() {
+            let config = SbcConfig::default();
+            assert!(!config.rate_limit.udp_auto_block);
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let global = Server::build_global_limiter(&config);
+            let stats = ServerStats::default();
+            let src = ip("192.0.2.66");
+            let mut rejected = 0;
+            for _ in 0..1_000 {
+                if !Server::rate_limit_allows(src, &udp, &global, &stats).await {
+                    rejected += 1;
+                }
+            }
+            assert!(rejected > 0);
+            let l = udp.lock().await;
+            assert_eq!(l.blocked_sources(), 0);
+            assert!(!l.is_blocked(src));
+        }
+
+        #[tokio::test]
+        async fn udp_auto_block_true_restores_blocking() {
+            let mut config = SbcConfig::default();
+            config.rate_limit.udp_auto_block = true;
+            config.rate_limit.per_ip_rps = 2;
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let global = Server::build_global_limiter(&config);
+            let stats = ServerStats::default();
+            let src = ip("192.0.2.67");
+            for _ in 0..50 {
+                let _ = Server::rate_limit_allows(src, &udp, &global, &stats).await;
+            }
+            assert!(udp.lock().await.is_blocked(src));
+        }
+
+        #[tokio::test]
+        async fn stream_limiter_still_auto_blocks() {
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 2;
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let global = Server::build_global_limiter(&config);
+            let stats = ServerStats::default();
+            let src = ip("192.0.2.68");
+            for _ in 0..50 {
+                let _ = Server::rate_limit_allows(src, &stream, &global, &stats).await;
+            }
+            assert!(stream.lock().await.is_blocked(src));
+        }
+
+        #[tokio::test]
+        async fn udp_flood_does_not_reject_stream_frames() {
+            let config = SbcConfig::default();
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let global = Server::build_global_limiter(&config);
+            let stats = ServerStats::default();
+            let src = ip("192.0.2.69");
+            let mut rejected = 0;
+            for _ in 0..1_000 {
+                if !Server::rate_limit_allows(src, &udp, &global, &stats).await {
+                    rejected += 1;
+                }
+            }
+            assert!(rejected > 0);
+            assert!(Server::rate_limit_allows(src, &stream, &global, &stats).await);
+        }
+
+        // The daemon wires two distinct limiters; a UDP-earned block does
+        // not stop an established stream connection from that address.
+        #[tokio::test]
+        async fn stream_connection_ignores_udp_block() {
+            let mut config = SbcConfig::default();
+            config.rate_limit.udp_auto_block = true;
+            config.rate_limit.per_ip_rps = 2;
+            let server = Server::new(config, ShutdownSignal::new(), None);
+            assert!(!Arc::ptr_eq(
+                &server.udp_rate_limiter,
+                &server.stream_rate_limiter
+            ));
+            // spawn_stream's peer address.
+            let peer = ip("192.0.2.20");
+            {
+                let mut udp = server.udp_rate_limiter.lock().await;
+                for _ in 0..50 {
+                    let _ = udp.check(peer);
+                }
+                assert!(udp.is_blocked(peer), "UDP limiter did not block");
+            }
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.rate_limiter = Arc::clone(&server.stream_rate_limiter);
+            ctx.global_limiter = Arc::clone(&server.global_limiter);
+            let stats = Arc::clone(&ctx.stats);
+            let (tx, fake, task) = spawn_stream(ctx);
+            tx.send(OPTIONS_KA.to_vec()).unwrap();
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                if !fake.sent.lock().unwrap().is_empty() {
+                    break;
+                }
+            }
+            let sent = fake.sent.lock().unwrap().clone();
+            assert_eq!(sent.len(), 1, "no response on the stream: {sent:?}");
+            assert!(sent[0].starts_with(b"SIP/2.0 "));
+            assert_eq!(stats.rate_limited.load(Ordering::Relaxed), 0);
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn trunk_ip_trusted_on_both_limiters_after_sync() {
+            let config = SbcConfig::default();
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            let mut rx = stack.trunk_sources();
+            let t = ip("203.0.113.9");
+            stack
+                .register_inbound_trunk_ips("g", None, &trusted_set(&[t]))
+                .await;
+            assert!(rx.has_changed().unwrap(), "no snapshot published");
+            let set = rx.borrow_and_update().clone();
+            assert!(set.contains(&t));
+            Server::apply_trusted_sources(&set, &udp, &stream).await;
+            assert!(udp.lock().await.is_trusted(t));
+            assert!(stream.lock().await.is_trusted(t));
+        }
+
+        #[tokio::test]
+        async fn trunk_removal_untrusts() {
+            let config = SbcConfig::default();
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            let mut rx = stack.trunk_sources();
+            let t = ip("203.0.113.10");
+            stack
+                .register_inbound_trunk_ips("g", None, &trusted_set(&[t]))
+                .await;
+            let set = rx.borrow_and_update().clone();
+            Server::apply_trusted_sources(&set, &udp, &stream).await;
+            assert!(udp.lock().await.is_trusted(t));
+
+            stack.remove_trunk_group_from_router("g").await;
+            assert!(rx.has_changed().unwrap(), "removal not published");
+            let set = rx.borrow_and_update().clone();
+            assert!(!set.contains(&t));
+            Server::apply_trusted_sources(&set, &udp, &stream).await;
+            assert!(!udp.lock().await.is_trusted(t));
+            assert!(!stream.lock().await.is_trusted(t));
+        }
+
+        #[tokio::test]
+        async fn config_file_trunks_trusted_at_start() {
+            let config = sbc_config::load_from_str(
+                r#"
+                [[trunk_groups]]
+                id = "g"
+                name = "g"
+                [[trunk_groups.trunks]]
+                id = "a"
+                host = "192.0.2.1"
+            "#,
+            )
+            .unwrap();
+            let server = Server::new(config, ShutdownSignal::new(), None);
+            let t = ip("192.0.2.1");
+            let set = server.sip_stack.trunk_sources().borrow().clone();
+            assert!(set.contains(&t), "config trunk missing from snapshot");
+            Server::apply_trusted_sources(
+                &set,
+                &server.udp_rate_limiter,
+                &server.stream_rate_limiter,
+            )
+            .await;
+            assert!(server.udp_rate_limiter.lock().await.is_trusted(t));
+            assert!(server.stream_rate_limiter.lock().await.is_trusted(t));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn trunk_rps_rejections_audited_by_transport() {
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 1;
+            config.rate_limit.trunk_rps = 2;
+            let t = ip("203.0.113.11");
+            let mut unblocked = Vec::new();
+            let mut audit = RateLimitAudit::new(&config);
+            for kind in [LimiterKind::Udp, LimiterKind::Stream] {
+                let limiter = Server::build_rate_limiter(&config, kind);
+                let mut l = limiter.lock().await;
+                let _ = l.set_trusted_sources([t]);
+                for _ in 0..100 {
+                    let _ = l.check(t);
+                }
+                audit.sweep_per_ip(&mut l, kind, &mut unblocked);
+            }
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            for label in ["trunk_rps_udp", "trunk_rps_stream"] {
+                let trunk: Vec<_> = records.iter().filter(|r| r.limit_name == label).collect();
+                assert_eq!(trunk.len(), 1, "{label}: {records:?}");
+                assert_eq!(trunk[0].source_ip, t);
+                assert!(trunk[0].request_count > 0);
+                assert_eq!(
+                    trunk[0].threshold,
+                    u64::from(config.rate_limit.effective_trunk_rps())
+                );
+            }
+            assert!(
+                !records
+                    .iter()
+                    .any(|r| r.source_ip == t && r.limit_name.starts_with("per_ip")),
+                "{records:?}"
+            );
+        }
+
+        // NIST-004: with a record cap of 1, both the trunk record and one
+        // per-source record are kept.
+        #[tokio::test(flavor = "current_thread")]
+        async fn trunk_record_survives_audit_cap() {
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 1;
+            config.rate_limit.trunk_rps = 2;
+            config.rate_limit.audit_max_records_per_interval = 1;
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let t = ip("203.0.113.14");
+            let other = ip("198.51.100.7");
+            let mut unblocked = Vec::new();
+            {
+                let mut l = udp.lock().await;
+                let _ = l.set_trusted_sources([t]);
+                for _ in 0..100 {
+                    let _ = l.check(other);
+                    let _ = l.check(t);
+                }
+                let mut audit = RateLimitAudit::new(&config);
+                audit.sweep_per_ip(&mut l, LimiterKind::Udp, &mut unblocked);
+                audit.flush();
+            }
+            let records = rate_limit_records(&capture.events());
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r.source_ip == t && r.limit_name == "trunk_rps_udp"),
+                "{records:?}"
+            );
+            // The trunk record does not take a per-source slot.
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r.source_ip == other && r.limit_name == "per_ip_rps"),
+                "{records:?}"
+            );
+        }
+
+        // SEC-006: per-source records from an earlier sweep fill the cap;
+        // trunk records reported by later sweeps of the same interval, on
+        // either limiter, are still emitted.
+        #[tokio::test(flavor = "current_thread")]
+        async fn trunk_records_survive_cap_filled_by_earlier_sweep() {
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 1;
+            config.rate_limit.trunk_rps = 2;
+            config.rate_limit.audit_max_records_per_interval = 1;
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let t = ip("203.0.113.15");
+            let others = [ip("198.51.100.8"), ip("198.51.100.9")];
+            let mut unblocked = Vec::new();
+            let mut audit = RateLimitAudit::new(&config);
+            // Sweep 1: only untrusted sources reject; they fill the cap.
+            for (kind, limiter) in [(LimiterKind::Udp, &udp), (LimiterKind::Stream, &stream)] {
+                let mut l = limiter.lock().await;
+                let _ = l.set_trusted_sources([t]);
+                for other in others {
+                    for _ in 0..100 {
+                        let _ = l.check(other);
+                    }
+                }
+                audit.sweep_per_ip(&mut l, kind, &mut unblocked);
+            }
+            // Sweep 2: the trunk rejects on both limiters.
+            for (kind, limiter) in [(LimiterKind::Udp, &udp), (LimiterKind::Stream, &stream)] {
+                let mut l = limiter.lock().await;
+                for _ in 0..100 {
+                    let _ = l.check(t);
+                }
+                audit.sweep_per_ip(&mut l, kind, &mut unblocked);
+            }
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let per_source = records
+                .iter()
+                .filter(|r| r.limit_name == "per_ip_rps")
+                .count();
+            assert_eq!(per_source, 1, "cap not filled first: {records:?}");
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r.limit_name == "per_ip_rps_suppressed"),
+                "{records:?}"
+            );
+            for label in ["trunk_rps_udp", "trunk_rps_stream"] {
+                assert!(
+                    records
+                        .iter()
+                        .any(|r| r.source_ip == t && r.limit_name == label),
+                    "{label}: {records:?}"
+                );
+            }
+        }
+
+        // SEC-005: a stream-limiter flood from a /64 neighbour blocks the
+        // prefix, but the trusted trunk's stream connection is still
+        // answered.
+        #[tokio::test]
+        async fn trusted_trunk_stream_answered_under_prefix_block() {
+            let trunk = ip("2001:db8::5");
+            let neighbour = ip("2001:db8::66");
+            let mut ctx = stream_test_ctx(short_timeouts());
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            stack
+                .register_inbound_trunk_ips("g", None, &trusted_set(&[trunk]))
+                .await;
+            let trunks = stack.trunk_sources().borrow().clone();
+            let other = Server::build_rate_limiter(&SbcConfig::default(), LimiterKind::Udp);
+            Server::apply_trusted_sources(&trunks, &other, &ctx.rate_limiter).await;
+            {
+                let mut l = ctx.rate_limiter.lock().await;
+                assert!(l.is_trusted(trunk));
+                let mut blocked = false;
+                for _ in 0..10_000 {
+                    if matches!(l.check(neighbour), RateLimitAction::Block { .. }) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                assert!(blocked, "/64 not blocked by the flood");
+                assert!(l.is_blocked(ip("2001:db8::77")));
+                assert!(!l.is_blocked(trunk));
+            }
+            ctx.global_limiter = Arc::new(Mutex::new(RateLimiter::new(
+                RateLimiterConfig::new(1_000_000, 1_000_000).with_per_ip(false),
+            )));
+            let stats = Arc::clone(&ctx.stats);
+            let peer = SbcSocketAddr::from(std::net::SocketAddr::new(trunk, 40000));
+            let (tx, fake, task) = spawn_stream_from(ctx, TransportType::Tcp, peer);
+            tx.send(OPTIONS_KA.to_vec()).unwrap();
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                if !fake.sent.lock().unwrap().is_empty() {
+                    break;
+                }
+            }
+            let sent = fake.sent.lock().unwrap().clone();
+            assert_eq!(sent.len(), 1, "trunk not answered: {sent:?}");
+            assert!(sent[0].starts_with(b"SIP/2.0 "));
+            assert_eq!(stats.rate_limited.load(Ordering::Relaxed), 0);
+            task.abort();
+        }
+
+        // SEC-004 / PERF-004: an unchanged key set is not republished.
+        #[tokio::test]
+        async fn unchanged_trunk_set_not_republished() {
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            let mut rx = stack.trunk_sources();
+            let t = ip("203.0.113.15");
+            stack
+                .register_inbound_trunk_ips("g", None, &trusted_set(&[t]))
+                .await;
+            assert!(rx.has_changed().unwrap());
+            let _ = rx.borrow_and_update();
+            stack
+                .register_inbound_trunk_ips("g", None, &trusted_set(&[t]))
+                .await;
+            assert!(!rx.has_changed().unwrap(), "unchanged set republished");
+        }
+
+        // SEC-004: the published set is capped, keeping the lowest
+        // addresses.
+        #[tokio::test]
+        async fn trunk_set_capped_deterministically() {
+            let max = uc_dos_protection::MAX_TRUSTED_SOURCES;
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            let ips: HashSet<IpAddr> = (0..u32::try_from(max).unwrap() + 5)
+                .map(|n| IpAddr::V4(Ipv4Addr::from(0x0A00_0000 | n)))
+                .collect();
+            stack.register_inbound_trunk_ips("g", None, &ips).await;
+            let set = stack.trunk_sources().borrow().clone();
+            assert_eq!(set.len(), max);
+            assert!(set.is_sorted());
+            assert_eq!(set[0], IpAddr::V4(Ipv4Addr::from(0x0A00_0000)));
+            assert!(!set.contains(&IpAddr::V4(Ipv4Addr::from(
+                0x0A00_0000 | u32::try_from(max).unwrap()
+            ))));
+        }
+
+        // The sync task applies each published snapshot to both limiters.
+        #[tokio::test]
+        async fn trusted_source_sync_task_follows_trunk_changes() {
+            let config = SbcConfig::default();
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            let task = tokio::spawn(Server::trusted_source_sync(
+                stack.trunk_sources(),
+                Arc::clone(&udp),
+                Arc::clone(&stream),
+            ));
+            let t = ip("203.0.113.13");
+            stack
+                .register_inbound_trunk_ips("g", None, &trusted_set(&[t]))
+                .await;
+            let mut synced = false;
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                if udp.lock().await.is_trusted(t) && stream.lock().await.is_trusted(t) {
+                    synced = true;
+                    break;
+                }
+            }
+            assert!(synced, "sync task did not apply the snapshot");
+            stack.remove_trunk_group_from_router("g").await;
+            let mut cleared = false;
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                if !udp.lock().await.is_trusted(t) && !stream.lock().await.is_trusted(t) {
+                    cleared = true;
+                    break;
+                }
+            }
+            assert!(cleared, "sync task did not apply the removal");
+            task.abort();
+        }
+
+        // POA&M-451: trusted sources still draw from the global bucket.
+        #[tokio::test]
+        async fn trusted_trunk_still_charged_to_global() {
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 1;
+            config.rate_limit.trunk_rps = 1_000;
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let global = Arc::new(Mutex::new(RateLimiter::new(
+                RateLimiterConfig::new(5, 5).with_per_ip(false),
+            )));
+            let stats = ServerStats::default();
+            let t = ip("203.0.113.12");
+            udp.lock().await.set_trusted_sources([t]);
+            let mut allowed = 0;
+            for _ in 0..100 {
+                if Server::rate_limit_allows(t, &udp, &global, &stats).await {
+                    allowed += 1;
+                }
+            }
+            assert!(allowed < 100);
+            assert!(global.lock().await.take_global_rejections() > 0);
+            assert!(!udp.lock().await.is_blocked(t));
+        }
     }
 }

@@ -105,3 +105,79 @@ async fn ws_upgrade_without_sip_subprotocol_is_refused() {
             .contains("sec-websocket-protocol: sip")
     );
 }
+
+// SR-55: spoofable UDP cannot block a configured trunk (limiter trust and
+// auto-block switches, `[rate_limit]` keys).
+mod sr55 {
+    use super::*;
+    use uc_dos_protection::RateLimitAction;
+
+    /// Built as the daemon wires its UDP limiter: auto-block off, trunk IP
+    /// trusted with its own bucket.
+    #[test]
+    fn spoofed_udp_flood_cannot_block_trunk() {
+        let (trunk_rps, trunk_burst) = (1_000, 2_000);
+        let mut udp = RateLimiter::new(
+            RateLimiterConfig::new(100, 200)
+                .with_auto_block(false)
+                .with_trusted_bucket(trunk_rps, trunk_burst),
+        );
+        let trunk: IpAddr = "2001:db8::5".parse().unwrap();
+        let spoofed: IpAddr = "2001:db8::66".parse().unwrap();
+        udp.set_trusted_sources([trunk]);
+        let (mut trunk_allowed, mut trunk_rejected) = (0u32, 0u32);
+        for _ in 0..10_000 {
+            let s = udp.check(spoofed);
+            assert!(!matches!(s, RateLimitAction::Block { .. }), "{s:?}");
+            let t = udp.check(trunk);
+            assert!(!matches!(t, RateLimitAction::Block { .. }), "{t:?}");
+            if t.is_allowed() {
+                trunk_allowed += 1;
+            } else {
+                trunk_rejected += 1;
+            }
+        }
+        assert!(
+            trunk_allowed >= trunk_burst,
+            "trunk rejected within its burst"
+        );
+        assert!(trunk_rejected > 0, "trunk never rejected over trunk_rps");
+        assert!(!udp.is_blocked(trunk));
+        assert!(!udp.is_blocked(spoofed));
+        assert_eq!(udp.blocked_sources(), 0);
+    }
+
+    #[test]
+    fn rate_limit_c_keys_load_from_toml() {
+        let config = load_from_str(
+            r#"
+            [rate_limit]
+            udp_auto_block = true
+            trunk_rps = 2000
+
+            [transport]
+            udp_listen = ["0.0.0.0:5060"]
+        "#,
+        )
+        .unwrap();
+        assert!(config.rate_limit.udp_auto_block);
+        assert_eq!(config.rate_limit.trunk_rps, 2_000);
+        assert_eq!(config.rate_limit.effective_trunk_rps(), 2_000);
+        let defaults = load_from_str("[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n").unwrap();
+        assert!(!defaults.rate_limit.udp_auto_block);
+        assert_eq!(defaults.rate_limit.effective_trunk_rps(), 1_000);
+    }
+}
+
+/// SR-55: out-of-range `trunk_rps` fails the load.
+#[test]
+fn rate_limit_c_trunk_rps_range_enforced_by_loader() {
+    let with = |v: u32| {
+        load_from_str(&format!(
+            "[rate_limit]\ntrunk_rps = {v}\n[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n"
+        ))
+    };
+    assert!(with(5).is_err(), "below per_ip_rps accepted");
+    assert!(with(1_000_000).is_err(), "above global_rps accepted");
+    assert!(with(2_000).is_ok());
+}

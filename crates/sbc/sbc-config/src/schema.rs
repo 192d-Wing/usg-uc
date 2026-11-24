@@ -1723,11 +1723,12 @@ pub struct RateLimitConfig {
     /// on (one /64 is one source). Valid 32..=128.
     pub ipv6_prefix_len: u8,
 
-    /// Cap on per-source token buckets. Valid 1024..=4,194,304.
+    /// Cap on per-source token buckets, per limiter (UDP and stream each
+    /// hold up to this many). Valid 1024..=4,194,304.
     pub max_tracked_sources: u32,
 
-    /// Cap on simultaneously blocked sources. Valid
-    /// 1..=`max_tracked_sources`.
+    /// Cap on simultaneously blocked sources, per limiter (UDP and stream
+    /// each). Valid 1..=`max_tracked_sources`.
     pub max_blocked_sources: u32,
 
     /// Rate of the shared bucket that new sources use once
@@ -1738,6 +1739,24 @@ pub struct RateLimitConfig {
 
     /// How long a source over 2x `per_ip_rps` stays blocked. Valid 1..=86400.
     pub block_duration_secs: u64,
+
+    /// Whether a UDP source over 2x `per_ip_rps` is blocked (`true`) or
+    /// only has its excess requests rejected (`false`, default). UDP source
+    /// addresses are spoofable, so a block earned over UDP could silence
+    /// another host. Stream transports keep their own limiter and still
+    /// block.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, CM-6 (secure default)
+    pub udp_auto_block: bool,
+
+    /// Per-address rate of each configured trunk host, which has its own
+    /// bucket and is never blocked (requests over it are rejected). `0`
+    /// (default) means automatic: `max(per_ip_rps * 10, 1000)` clamped to
+    /// `global_rps`. A non-zero value must lie in `per_ip_rps..=global_rps`.
+    /// Trunk traffic still counts against `global_rps`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-5(2)
+    pub trunk_rps: u32,
 
     /// Interval of the limiter maintenance sweep (expired blocks, idle
     /// buckets). Valid 1..=300.
@@ -1765,6 +1784,17 @@ impl RateLimitConfig {
         let ceiling = self.global_rps.max(self.per_ip_rps);
         1_000u32.clamp(self.per_ip_rps.min(ceiling), ceiling)
     }
+
+    /// The per-trunk-address rate in effect (resolves the `0` = automatic
+    /// setting of `trunk_rps`).
+    #[must_use]
+    pub fn effective_trunk_rps(&self) -> u32 {
+        if self.trunk_rps != 0 {
+            return self.trunk_rps;
+        }
+        let ceiling = self.global_rps.max(self.per_ip_rps);
+        self.per_ip_rps.saturating_mul(10).max(1_000).min(ceiling)
+    }
 }
 
 impl Default for RateLimitConfig {
@@ -1780,6 +1810,8 @@ impl Default for RateLimitConfig {
             max_blocked_sources: 16_384,
             overflow_rps: 0,
             block_duration_secs: 60,
+            udp_auto_block: false,
+            trunk_rps: 0,
             sweep_interval_secs: 10,
             audit_interval_secs: 60,
             audit_max_records_per_interval: 1_024,
