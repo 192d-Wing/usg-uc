@@ -331,6 +331,12 @@ epoch), which the journal handles naturally and lets you do staged rollout
   for the four SBC routing entities, `PUT /v1/sites/{site}/config`) —
   **implemented**, each driving one transactional store write (epoch +
   revision + journal), attributed to the token subject.
+- Secrets on the operator surface: phone line and LDAP bind passwords and
+  trunk SIP passwords are read back as `***REDACTED***`; a write that sends
+  the marker keeps the stored value, and one that keeps it while changing
+  the secret's destination gets 422 `secret_reentry_required` with `field`
+  (see SBC-ADMIN-GUIDE "Stored secrets in management API responses"). The
+  sync API carries the real values (plaintext at rest, POA&M-425).
 - Operator authz is a second OIDC scope, `config-admin`, validated by a
   separate validator sharing the same issuer/JWKS as the sync validator —
   so a site's `config-sync` pull token can never write and an operator
