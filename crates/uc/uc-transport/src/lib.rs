@@ -130,6 +130,21 @@ pub const MAX_UDP_RECV_SIZE: usize = 65535;
 /// Maximum message size for stream transports (TCP/TLS/WS).
 pub const MAX_STREAM_MESSAGE_SIZE: usize = 65535;
 
+/// Bytes read per `recv` on a TCP or TLS stream.
+///
+/// This is also the resident size of each connection's read buffer. Framing
+/// above the transport accumulates chunks up to [`MAX_STREAM_MESSAGE_SIZE`];
+/// the transport itself keeps one chunk per connection. The buffer is reused
+/// only once the caller has dropped the previous chunk (see
+/// [`Transport::recv`]).
+///
+/// ## NIST 800-53 Rev5: SC-5, SC-6
+// POAM: POA&M-452 - no node-wide budget on buffered bytes; each connection
+// may still hold one message (up to MAX_STREAM_MESSAGE_SIZE) in its framer,
+// and a WebSocket connection up to about 2 x 64 KiB in tungstenite after a
+// maximum-size message, bounded only by the connection caps.
+pub const STREAM_READ_CHUNK: usize = 4096;
+
 /// Received message with source information.
 #[derive(Debug, Clone)]
 pub struct ReceivedMessage {
@@ -159,6 +174,11 @@ pub trait Transport: Send + Sync {
     /// Receives the next message.
     ///
     /// This is a blocking call that waits for the next message.
+    ///
+    /// Stream transports (TCP, TLS) return a view into one reused chunk
+    /// buffer of [`STREAM_READ_CHUNK`] bytes. Copy or drop the returned
+    /// `data` before the next `recv`: while it is alive the buffer cannot be
+    /// reclaimed and each read allocates a new one.
     ///
     /// ## Errors
     ///

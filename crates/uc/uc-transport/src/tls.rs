@@ -28,8 +28,11 @@
 
 use crate::error::{TransportError, TransportResult};
 use crate::listener::ListenerConfig;
-use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport, canonical_peer};
-use bytes::BytesMut;
+use crate::{
+    MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, STREAM_READ_CHUNK, StreamTransport, Transport,
+    canonical_peer,
+};
+use bytes::{BufMut, BytesMut};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, ServerConfig};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -565,7 +568,9 @@ impl TlsTransport {
             writer: Mutex::new(writer),
             local_addr: local_addr.into(),
             peer_addr: peer_addr.into(),
-            read_buffer: Mutex::new(BytesMut::with_capacity(MAX_STREAM_MESSAGE_SIZE)),
+            // NIST 800-53 Rev5: SC-5, SC-6 - one read chunk resident per
+            // connection, not a message-sized buffer.
+            read_buffer: Mutex::new(BytesMut::with_capacity(STREAM_READ_CHUNK)),
             closed: AtomicBool::new(false),
         })
     }
@@ -681,19 +686,21 @@ impl Transport for TlsTransport {
                 let mut read_buffer = self.read_buffer.lock().await;
                 let mut stream = self.reader.lock().await;
 
-                let mut temp_buffer = [0u8; 4096];
-                let n = stream.read(&mut temp_buffer).await.map_err(|e| {
-                    TransportError::ReceiveFailed {
+                // Read straight into the chunk buffer. The previous chunk was
+                // split off and, once the caller drops it, `reserve` reclaims
+                // the same allocation; `limit` keeps one read to one chunk.
+                read_buffer.reserve(STREAM_READ_CHUNK);
+                let n = stream
+                    .read_buf(&mut (&mut *read_buffer).limit(STREAM_READ_CHUNK))
+                    .await
+                    .map_err(|e| TransportError::ReceiveFailed {
                         reason: e.to_string(),
-                    }
-                })?;
+                    })?;
                 drop(stream);
 
                 if n == 0 {
                     return Err(TransportError::ConnectionClosed);
                 }
-
-                read_buffer.extend_from_slice(&temp_buffer[..n]);
 
                 trace!(size = n, "received TLS data");
 
@@ -1527,5 +1534,80 @@ mod tests {
             "received message source must be plain IPv4, got {}",
             msg.source
         );
+    }
+
+    // ---- SR-57: per-connection read buffer is one read chunk ----
+    // NIST 800-53 Rev5: SC-5, SC-6
+
+    /// Upper bound on the resident read buffer per connection (one 4 KiB
+    /// chunk, with allocator slack).
+    const QA_MAX_RESIDENT_READ_BUFFER: usize = 8 * 1024;
+
+    async fn qa_tls_pair() -> (TlsTransport, TlsTransport, SbcSocketAddr) {
+        let pki = pki();
+        let server_cfg = create_server_config(pki.chain.clone(), pki.key.clone_key()).unwrap();
+        let cfg = ListenerConfig::new(
+            SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 0),
+            TransportType::Tls,
+        );
+        let listener = TlsListener::bind(cfg, Arc::new(server_cfg)).await.unwrap();
+        let addr = *listener.local_addr();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client_cfg = Arc::new(create_client_config(roots(&pki)).unwrap());
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TlsTransport::connect(addr, "localhost", client_cfg),
+        )
+        .await
+        .expect("TLS connect timed out")
+        .unwrap();
+        let server = accept.await.unwrap();
+        (client, server, addr)
+    }
+
+    async fn qa_tls_recv_exact(t: &TlsTransport, len: usize) -> Vec<u8> {
+        let mut got = Vec::with_capacity(len);
+        while got.len() < len {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), t.recv())
+                .await
+                .expect("recv timed out")
+                .unwrap();
+            got.extend_from_slice(&msg.data);
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn tls_transport_read_buffer_is_one_chunk() {
+        let (client, server, addr) = qa_tls_pair().await;
+        for (name, t) in [("client", &client), ("server", &server)] {
+            let cap = t.read_buffer.lock().await.capacity();
+            assert!(
+                cap <= QA_MAX_RESIDENT_READ_BUFFER,
+                "{name} TLS read buffer after handshake is {cap} bytes, want <= {QA_MAX_RESIDENT_READ_BUFFER}"
+            );
+        }
+
+        let payload = vec![b'a'; 4096];
+        client.send(&payload, &addr).await.unwrap();
+        let got = qa_tls_recv_exact(&server, payload.len()).await;
+        assert_eq!(got, payload);
+        let cap = server.read_buffer.lock().await.capacity();
+        assert!(
+            cap <= QA_MAX_RESIDENT_READ_BUFFER,
+            "server TLS read buffer after a 4 KiB round trip is {cap} bytes, want <= {QA_MAX_RESIDENT_READ_BUFFER}"
+        );
+    }
+
+    // Regression guard for reading straight into the chunk buffer over TLS.
+    #[tokio::test]
+    async fn tls_recv_large_message_in_chunks_is_intact() {
+        let (client, server, addr) = qa_tls_pair().await;
+        let payload: Vec<u8> = (0..60 * 1024_u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        client.send(&payload, &addr).await.unwrap();
+        let got = qa_tls_recv_exact(&server, payload.len()).await;
+        assert!(got == payload, "60 KiB TLS payload corrupted or reordered");
     }
 }

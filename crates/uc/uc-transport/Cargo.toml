@@ -62,5 +62,9 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 name = "transport_rtt"
 harness = false
 
+[[bench]]
+name = "stream_recv"
+harness = false
+
 [lints]
 workspace = true

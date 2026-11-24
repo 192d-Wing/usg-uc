@@ -171,7 +171,7 @@ sbcDaemon:
 | `image` + `<component>.image` | Image refs | Model A: `localhost/*:local` + `Never`; Model B: `ghcr.io/192d-wing/*:<tag>` + `IfNotPresent` |
 | `auth` | Mgmt-plane admin | Fail-closed: `sbc-api`/`sbc-provision` won't start without a credential. Prefer `adminPasswordHash` (argon2 PHC) to keep plaintext out of values |
 | `sbcPostgres` | Config store | `enabled: true` for the in-chart StatefulSet (set `password`), or `enabled: false` + `existingSecret.name` (key `dsn`) for managed Postgres |
-| `sbcDaemon.config` | SIP tuning | `max_calls`, `max_registrations`, `media_mode`, `srtp_required`, listen addrs (`metrics_listen` is reserved and not rendered; the daemon rejects a `[monitoring]` table). The `-metrics` Service (`services.metrics`, port 9090) is off by default and has no listener behind it: no metrics exporter exists (POA&M-195) |
+| `sbcDaemon.config` | SIP tuning | `max_calls`, `max_registrations`, `max_connections_per_listener` / `max_connections_total` (stream connection caps, default 6000 / 8000; see "Sizing the connection caps" below), `media_mode`, `srtp_required`, listen addrs (`metrics_listen` is reserved and not rendered; the daemon rejects a `[monitoring]` table). The `-metrics` Service (`services.metrics`, port 9090) is off by default and has no listener behind it: no metrics exporter exists (POA&M-195) |
 | `sbcDaemon.dtlsTerminate` | DTLS-SRTP termination (off by default) | `enabled` adds the Go DTLS sidecar to the daemon pod and sets `media.srtp.mode = Terminate`. `maxSessions` (`0` = 2 x `config.max_calls`) is the sidecar's session limit; `goMemLimit` (default `920MiB`) sets its `GOMEMLIMIT`; `resources.limits.memory` defaults to `1Gi`. Size the memory limit with `max_calls`: see "Upgrading to the client DTLS-SRTP release" in section 8 |
 | `sbcDaemon.sipTls` | SIP-over-TLS | `secretName` of a `kubernetes.io/tls` Secret covering the registrar domain; empty = UDP/TCP only |
 | `sbcDaemon.oidc` | REGISTER authz | RFC 8898 bearer-token REGISTER; requires an IdP (see `sbcClientConfig.oidc`) |
@@ -184,6 +184,32 @@ from a CSV/YAML inventory + template for many sites — the only
 per-site differences are `site.*` and `bgp.upstream.ip`.
 
 ---
+
+### Sizing the connection caps
+
+`sbcDaemon.config.max_connections_per_listener` and `max_connections_total`
+are rendered into `[transport]`. Budget 128 KiB per TLS connection in the
+worst case (a 4 KiB read chunk, a 64 KiB message buffer, about 40 KiB of TLS
+state and the task) and keep connections under half of the daemon's
+`resources.limits.memory`:
+
+```text
+max_connections_total <= memory limit / 2 / 128 KiB
+```
+
+The 2Gi default gives 8000 x 128 KiB = 1 GiB. Raise both caps only with the
+memory limit. Keep the other half free: the pod's cgroup (v2) memory limit
+also charges kernel socket buffers, which this budget does not count.
+
+WebSocket connections (`ws_listen`, `wss_listen`) can hold up to about
+200 KiB each in the worst case: tungstenite keeps up to about 2 x 64 KiB of
+buffers after a maximum-size message, plus the message buffer, plus TLS for
+WSS. Size WebSocket deployments at 200 KiB per connection
+(`max_connections_total <= memory limit / 2 / 200 KiB`). At startup the daemon raises its soft `RLIMIT_NOFILE`
+to the hard limit; if the caps plus the egress pool, the RTP port range, the
+listeners and 512 fds of headroom do not fit, it lowers the caps to fit, logs
+an error and records a configuration-change audit event. It refuses to start
+when fewer than 64 connections would fit.
 
 ### SIP user HA1 encryption key (`sbcApi.ha1Key`)
 

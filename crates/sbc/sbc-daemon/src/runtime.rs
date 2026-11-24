@@ -404,8 +404,20 @@ impl Runtime {
 
         // Compare with current config to identify changes
         let current = self.config.read().await;
-        let changes = Self::detect_config_changes(&current, &new_config);
-        let restart_required = Self::detect_restart_required(&current, &new_config);
+        // NIST 800-53 Rev5: CM-6 - the stream connection caps are read at
+        // startup only (and may be clamped to RLIMIT_NOFILE there): keep the
+        // caps in effect and report a different file value as needing a
+        // restart.
+        let mut new_config = new_config;
+        let caps_pending = Self::keep_stream_caps(&current, &mut new_config);
+        let mut changes = Self::detect_config_changes(&current, &new_config);
+        let mut restart_required = Self::detect_restart_required(&current, &new_config);
+        if caps_pending {
+            if !changes.iter().any(|c| c == "transport") {
+                changes.push("transport".to_string());
+            }
+            restart_required.push("transport.max_connections".to_string());
+        }
 
         // Log what changed
         if changes.is_empty() {
@@ -454,6 +466,19 @@ impl Runtime {
         };
         Self::apply_credential_reload(&mut result, credentials);
         Ok(result)
+    }
+
+    /// Copies the stream connection caps in effect (`from`) into `to`.
+    /// Returns whether `to` had different values.
+    fn keep_stream_caps(from: &SbcConfig, to: &mut SbcConfig) -> bool {
+        let (f, t) = (&from.transport, &mut to.transport);
+        let differ = f.max_connections_total != t.max_connections_total
+            || f.max_connections_per_listener != t.max_connections_per_listener
+            || f.max_connections_per_source != t.max_connections_per_source;
+        t.max_connections_total = f.max_connections_total;
+        t.max_connections_per_listener = f.max_connections_per_listener;
+        t.max_connections_per_source = f.max_connections_per_source;
+        differ
     }
 
     /// Changed settings a reload does not apply to the running SIP stack.
@@ -542,7 +567,7 @@ impl Runtime {
 
         // Create and start SIP server
         let signal = self.shutdown.signal().clone();
-        let config = self.config.read().await.clone();
+        let mut config = self.config.read().await.clone();
 
         // Save instance name before config is moved to server
         let instance_name = config.general.instance_name.clone();
@@ -631,6 +656,30 @@ impl Runtime {
                 reason,
             }
         })?;
+
+        // Fd budget: raise the soft RLIMIT_NOFILE and clamp the connection
+        // caps to it before any listener or RTP socket is opened.
+        //
+        // ## NIST 800-53 Rev5: SC-5, SC-6, CM-6, AU-5
+        let local_media = Server::remote_media_urls().is_empty();
+        if let Err(reason) = crate::fd_limit::apply(&mut config, local_media) {
+            error!(error = %reason, "File descriptor limit too low — SBC cannot start");
+            // `apply` queued a SystemShutdown record; let the audit writer
+            // drain it before the process exits.
+            if !tokio::task::spawn_blocking(|| uc_audit::flush(std::time::Duration::from_secs(2)))
+                .await
+                .unwrap_or(false)
+            {
+                warn!("Audit queue not drained before exit");
+            }
+            return Err(RuntimeError::InitFailed {
+                component: "fd_limit".to_string(),
+                reason,
+            });
+        }
+        // Config views (API, reload diff) report the caps in effect, not the
+        // file values (CM-6).
+        Self::keep_stream_caps(&config, &mut *self.config.write().await);
 
         // Pass cluster manager to server if available
         #[cfg(feature = "cluster")]
@@ -1855,6 +1904,20 @@ mod tests {
         config2.general.instance_name = "changed-sbc".to_string();
         let changes = Runtime::detect_config_changes(&config1, &config2);
         assert!(changes.contains(&"general".to_string()));
+    }
+
+    // SR-57: the stored config keeps the stream caps in effect (possibly
+    // clamped to RLIMIT_NOFILE at startup); a reload does not revert them.
+    #[test]
+    fn keep_stream_caps_copies_effective_caps_and_reports_a_difference() {
+        let mut effective = SbcConfig::default();
+        effective.transport.max_connections_total = 6397;
+        effective.transport.max_connections_per_listener = 6397;
+        effective.transport.max_connections_per_source = 100;
+        let mut file = SbcConfig::default();
+        assert!(Runtime::keep_stream_caps(&effective, &mut file));
+        assert_eq!(file.transport, effective.transport);
+        assert!(!Runtime::keep_stream_caps(&effective, &mut file));
     }
 
     // SEC-001 / QA-1: require_tls and trunk-group edits are restart-only.

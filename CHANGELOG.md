@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, connection memory and file-descriptor budget, POA&M-452, 453)
+
+Affects every SBC at startup and every Helm upgrade. Operator details:
+`docs/SBC-ADMIN-GUIDE.md` (file descriptors, after the stream limits) and
+`deploy/helm/sbc/DEPLOYING.md` "Sizing the connection caps".
+
+- **The daemon checks its fd budget at startup.** (SC-5, SC-6, CM-6)
+  Before opening any listener or RTP socket it raises the soft
+  `RLIMIT_NOFILE` to the hard limit (on macOS, to the highest value the
+  kernel accepts). It then checks that `transport.max_connections_total` +
+  1024 egress connections + the RTP port range
+  (`media.rtp_port_max - rtp_port_min + 1`, zero with an out-of-process
+  media plane) + the SIP listeners + 256 REST HTTPS connections + 512 fds
+  of headroom fit. If they do not, it lowers `max_connections_total` to
+  fit, and `max_connections_per_listener` and `max_connections_per_source`
+  to at most that. It logs an `error!` and records a `ConfigurationChange`
+  (`Modified`, admin `startup`) audit event naming the old and new values.
+  The runtime configuration then shows the caps in effect; a reload keeps
+  them and reports a different file value as restart-required.
+- **The daemon refuses to start when fewer than 64 connections fit**
+  (POA&M-453). The refusal is audited as `SystemShutdown` (not graceful).
+  With in-process media and the default RTP range (16384..32768) that
+  means a hard fd limit below about 18,250. A host that ran with a low
+  limit before (for example `ulimit -Hn 4096`) must raise it (systemd
+  `LimitNOFILE=65536` or higher), narrow the RTP range, or run media out of
+  process.
+- **Helm: stream connection caps are now set explicitly and are lower.**
+  New values `sbcDaemon.config.max_connections_per_listener` (default
+  6000) and `sbcDaemon.config.max_connections_total` (default 8000) are
+  rendered into `[transport]` as integers. The chart previously left the
+  schema defaults (10,000 / 20,000) in effect. The new defaults fit the
+  daemon's 2Gi memory limit at 128 KiB per TLS connection in the worst
+  case (the 64 KiB message buffer assumes the SR-54 stream framer bound).
+  Sites with more than 8000 concurrent TCP/TLS connections must raise both
+  values and `sbcDaemon.resources.limits.memory` together
+  (`max_connections_total <= memory limit / 2 / 128 KiB`); size WebSocket
+  deployments at 200 KiB per connection. The schema defaults are
+  unchanged.
+- **Smaller per-connection buffers.** (SC-5, SC-6) Each TCP and TLS
+  connection reads into one reusable 4 KiB buffer instead of 64 KiB, and
+  the extra copy per read is gone. Each WebSocket connection uses an 8 KiB
+  read and write buffer instead of tungstenite's 128 KiB. Its queued
+  outbound bytes are capped at 2 x 65,535, so a peer that stops reading
+  cannot grow the queue (the 2 s write deadline still closes it). This
+  saves about 60 KiB of resident memory per idle TCP/TLS connection. A
+  WebSocket connection can still hold about 200 KiB after a maximum-size
+  message (tungstenite buffers do not shrink).
+- There is still no node-wide budget on buffered bytes (POA&M-452), and no
+  part of the connection pool is reserved for trunks or authenticated
+  flows (POA&M-453).
+
 ### BREAKING (soft client, smart-card login and provisioning trust, POA&M-370, 371)
 
 Tested locally on macOS arm64; Windows covered by the CI cross-target build only.
