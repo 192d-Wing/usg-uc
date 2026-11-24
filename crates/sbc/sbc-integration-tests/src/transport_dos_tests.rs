@@ -220,9 +220,15 @@ mod sr55 {
         let (mut trunk_allowed, mut trunk_rejected) = (0u32, 0u32);
         for _ in 0..10_000 {
             let s = udp.check(spoofed);
-            assert!(!matches!(s, RateLimitAction::Block { .. }), "{s:?}");
+            assert!(
+                !matches!(s, RateLimitAction::Block { .. }),
+                "spoofed source must not be blocked"
+            );
             let t = udp.check(trunk);
-            assert!(!matches!(t, RateLimitAction::Block { .. }), "{t:?}");
+            assert!(
+                !matches!(t, RateLimitAction::Block { .. }),
+                "trunk must not be blocked"
+            );
             if t.is_allowed() {
                 trunk_allowed += 1;
             } else {
