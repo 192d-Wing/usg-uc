@@ -7200,18 +7200,14 @@ mod tests {
             s
         }
 
-        /// A connected, silent TCP socket to `addr` from 127.0.0.`host`, or
-        /// from 127.0.0.1 when that source address cannot be bound here.
-        async fn silent_socket_from(addr: SbcSocketAddr, host: u8) -> tokio::net::TcpStream {
-            let target = std::net::SocketAddr::from(addr);
-            let socket = tokio::net::TcpSocket::new_v4().unwrap();
-            let src = std::net::SocketAddr::from((Ipv4Addr::new(127, 0, 0, host), 0));
-            if socket.bind(src).is_ok()
-                && let Ok(s) = socket.connect(target).await
-            {
-                return s;
-            }
-            tokio::net::TcpStream::connect(target).await.unwrap()
+        /// A connected, silent TCP socket to `addr` from 127.0.0.1. The
+        /// slot-pool tests raise the per-source caps above the pool size
+        /// instead of binding loopback aliases (127.0.0.2+), which macOS
+        /// does not configure by default, so they run the same everywhere.
+        async fn silent_socket(addr: SbcSocketAddr) -> tokio::net::TcpStream {
+            tokio::net::TcpStream::connect(std::net::SocketAddr::from(addr))
+                .await
+                .unwrap()
         }
 
         // SR-22: only process-wide resource errors back off (10 ms doubling
@@ -7559,13 +7555,16 @@ mod tests {
         }
 
         // SR-56 (SEC-001): one-byte clients cannot hold the node-wide pool.
-        // Slot-count clients from 127.0.0.1-4 (or all from 127.0.0.1 where
-        // the host cannot bind those, with the per-source caps raised)
-        // each send one byte and stall, taking every slot. Each loses its
-        // slot at the hold budget (500 ms with a 1 s handshake deadline),
-        // and a real TLS client, retrying as a client would after a
-        // dropped attempt, completes its handshake within hold budget +
-        // slot wait of the pool filling.
+        // Slot-count clients from 127.0.0.1 (per-source caps raised above
+        // the pool so only the pool limits them) each send one byte and
+        // stall, taking every slot. Each loses its slot at the hold budget
+        // (500 ms with a 1 s handshake deadline), and a real TLS client,
+        // retrying as a client would after a dropped attempt, completes
+        // its handshake within hold budget + slot wait of the pool
+        // filling. The real handshake can take the first freed slot and
+        // finish before the other stalled clients' hold timers fire, so
+        // the hold-timeout count is awaited, bounded by the handshake
+        // deadline (a missed hold would count as a handshake timeout).
         #[tokio::test]
         async fn one_byte_tls_clients_do_not_starve_handshake_slots() {
             use tokio::io::AsyncWriteExt;
@@ -7585,9 +7584,8 @@ mod tests {
             let addr = *listener.local_addr();
             let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
             let mut stalled = Vec::new();
-            for i in 0..SLOTS {
-                let host = u8::try_from(i % 4).unwrap() + 1;
-                let mut s = silent_socket_from(addr, host).await;
+            for _ in 0..SLOTS {
+                let mut s = silent_socket(addr).await;
                 s.write_all(&[0x16]).await.unwrap();
                 stalled.push(s);
             }
@@ -7607,12 +7605,18 @@ mod tests {
                 ok = tls_handshake_ok(addr, &client).await;
             }
             let took = filled.elapsed();
-            task.abort();
             assert!(
                 ok,
                 "real TLS handshake behind {SLOTS} one-byte clients did not complete \
                  within {budget:?} (took {took:?})"
             );
+            let deadline = timeouts.handshake + D::from_millis(250);
+            while stats.handshake_slot_hold_timeouts.load(Ordering::Relaxed) < SLOTS as u64
+                && filled.elapsed() < deadline
+            {
+                tokio::time::sleep(D::from_millis(5)).await;
+            }
+            task.abort();
             assert_eq!(
                 stats.handshake_slot_hold_timeouts.load(Ordering::Relaxed),
                 SLOTS as u64,
@@ -7623,10 +7627,9 @@ mod tests {
         }
 
         // SR-56 (SEC-001, PERF-001): silent sockets hold no node-wide
-        // handshake slot. Slot-count silent TLS sockets (from 127.0.0.1-4
-        // where the host allows binding them, else all from 127.0.0.1
-        // with the per-source caps raised) leave every slot free, and a
-        // real TLS handshake completes within 1 s.
+        // handshake slot. Slot-count silent TLS sockets from 127.0.0.1
+        // (per-source caps raised above the pool) leave every slot free,
+        // and a real TLS handshake completes within 1 s.
         #[tokio::test]
         async fn silent_tls_sockets_do_not_starve_handshake_slots() {
             const SLOTS: usize = 8;
@@ -7642,9 +7645,8 @@ mod tests {
             let addr = *listener.local_addr();
             let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
             let mut silent = Vec::new();
-            for i in 0..SLOTS {
-                let host = u8::try_from(i % 4).unwrap() + 1;
-                silent.push(silent_socket_from(addr, host).await);
+            for _ in 0..SLOTS {
+                silent.push(silent_socket(addr).await);
             }
             let t0 = std::time::Instant::now();
             while listener_pool.available_permits() != 64 - SLOTS && t0.elapsed() < D::from_secs(1)
