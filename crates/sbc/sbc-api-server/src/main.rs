@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+mod auth_audit;
 mod authmw;
 mod config;
 mod ha1_key;
@@ -60,6 +61,18 @@ async fn main() -> ExitCode {
         error!(error = %e, "audit logger init failed; refusing to start");
         return ExitCode::from(5);
     }
+
+    // SR-40: emit suppressed auth-failure counts and aggregator drops once
+    // the window closes. Ends with the runtime.
+    // NIST 800-53 Rev5: AU-5, SC-5
+    tokio::spawn(async {
+        let mut tick =
+            tokio::time::interval(sbc_http_util::mgmt_audit::AUTH_FAILURE_FLUSH_INTERVAL);
+        loop {
+            tick.tick().await;
+            sbc_http_util::mgmt_audit::flush_auth_failures(std::time::Instant::now());
+        }
+    });
 
     let app_state = match state::AppState::build(&cfg).await {
         Ok(s) => s,

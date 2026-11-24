@@ -22,6 +22,7 @@ pub mod directory;
 pub mod error;
 pub mod migration;
 pub mod model;
+pub mod origin;
 pub mod phones;
 pub mod redact;
 pub mod sbc;

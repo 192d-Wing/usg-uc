@@ -54,6 +54,11 @@ pub trait LoginVerifier: Send + Sync + 'static {
     fn login(&self, username: &str, password: &str) -> Option<String>;
     /// Token lifetime in seconds (cookie `Max-Age`).
     fn token_ttl_secs(&self) -> u64;
+    /// True if `name` is the configured admin username (audit records
+    /// name only that, else `unknown`).
+    fn is_admin_user(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 impl LoginVerifier for uc_auth::Authenticator {
@@ -62,6 +67,9 @@ impl LoginVerifier for uc_auth::Authenticator {
     }
     fn token_ttl_secs(&self) -> u64 {
         Self::token_ttl_secs(self)
+    }
+    fn is_admin_user(&self, name: &str) -> bool {
+        Self::is_admin_user(self, name)
     }
 }
 
@@ -124,6 +132,9 @@ pub async fn login_with<V: LoginVerifier>(
 ) -> Response {
     // NIST 800-53 Rev5: SI-10 — bound input before it is counted or hashed.
     if body.username.len() > MAX_USERNAME_LEN || body.password.len() > MAX_PASSWORD_LEN {
+        // SR-40: audited (aggregated) as a failure.
+        let ip = sbc_http_util::resolve_client_ip(headers, peer, trusted_proxies);
+        crate::auth_audit::login_invalid_format(ip);
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "invalid credentials format" })),
@@ -143,9 +154,13 @@ pub async fn login_with<V: LoginVerifier>(
         // left in the longest active lock, so it can differ between them;
         // neither depends on the submitted username.
         Admission::Locked { retry_after_secs } => {
+            crate::auth_audit::login_rate_limited(client_ip);
             return too_many(retry_after_secs, "too many login attempts, try again later");
         }
-        Admission::Busy => return too_many(1, "login busy, retry shortly"),
+        Admission::Busy => {
+            crate::auth_audit::login_busy(client_ip);
+            return too_many(1, "login busy, retry shortly");
+        }
     };
 
     // argon2 verification is deliberately slow; keep it off the async
@@ -165,6 +180,7 @@ pub async fn login_with<V: LoginVerifier>(
     // Failure (or a verifier panic): the reservation stands.
     let Some(token) = token else {
         warn!(user = %log_prefix(&body.username), "failed admin login");
+        crate::auth_audit::login_failed(auth, client_ip, &body.username);
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "invalid credentials" })),
@@ -174,6 +190,7 @@ pub async fn login_with<V: LoginVerifier>(
 
     // Success: refund the reservation and reset the failure counts.
     guard.on_success(client_ip);
+    crate::auth_audit::login_succeeded(auth, client_ip, &body.username);
 
     let max_age = auth.token_ttl_secs();
     // Secure: TLS terminates at the ingress, so the browser connection is
@@ -206,6 +223,7 @@ pub async fn logout() -> Response {
 /// valid (the dashboard uses this to decide whether to show login).
 pub async fn session(
     State(state): State<Arc<AppState>>,
+    connect_info: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     // Legacy cookie / HMAC / API key.
@@ -231,6 +249,17 @@ pub async fn session(
     if legacy_ok || oidc_ok {
         Json(serde_json::json!({ "authenticated": true })).into_response()
     } else {
+        // SR-40: a presented credential that failed is audited
+        // (aggregated); none at all is not.
+        if let Some(cred) = uc_auth::extract_credential(&headers) {
+            let ip = connect_info.map_or(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                |axum::Extension(axum::extract::ConnectInfo(peer))| {
+                    sbc_http_util::resolve_client_ip(&headers, peer.ip(), &state.trusted_proxies)
+                },
+            );
+            crate::auth_audit::session_rejected(ip, &cred, &headers);
+        }
         (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "authenticated": false })),

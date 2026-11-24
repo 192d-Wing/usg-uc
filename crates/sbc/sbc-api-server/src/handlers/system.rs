@@ -13,14 +13,17 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use sbc_grpc_api::prelude::{
     GetMetricsRequest, GetStatsRequest, GetTlsStatusRequest, GetVersionRequest, ReloadTlsRequest,
 };
+use sbc_http_util::mgmt_audit::{Op, Outcome};
 use tracing::warn;
 
+use super::write_audit::{audited, daemon_outcome, grpc_reason};
+use crate::authmw::Principal;
 use crate::state::AppState;
 
 pub async fn liveness() -> impl IntoResponse {
@@ -217,24 +220,42 @@ pub async fn tls_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
     }
 }
 
-pub async fn tls_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn tls_reload(
+    State(state): State<Arc<AppState>>,
+    principal: Option<Extension<Principal>>,
+) -> Response {
+    let p = principal.as_ref().map(|Extension(p)| p);
     let mut client = state.system.clone();
-    match client.reload_tls(ReloadTlsRequest::default()).await {
+    let (outcome, body) = match client.reload_tls(ReloadTlsRequest::default()).await {
         Ok(resp) => {
             let r = resp.into_inner();
-            Json(serde_json::json!({
-                "success": r.success,
-                "message": r.message,
-            }))
+            (
+                daemon_outcome(r.success),
+                serde_json::json!({
+                    "success": r.success,
+                    "message": r.message,
+                }),
+            )
         }
         Err(status) => {
             warn!(error = %status, "SystemService.ReloadTls failed");
-            Json(serde_json::json!({
-                "success": false,
-                "error": status.message(),
-            }))
+            (
+                Outcome::Failed(grpc_reason(&status)),
+                serde_json::json!({
+                    "success": false,
+                    "error": status.message(),
+                }),
+            )
         }
-    }
+    };
+    audited(
+        p,
+        "tls",
+        "server",
+        Op::Action("tls_reload"),
+        outcome,
+        Json(body),
+    )
 }
 
 #[cfg(test)]

@@ -48,7 +48,9 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 # HTTP server
 axum.workspace = true
 tower.workspace = true
-tower-http = { workspace = true, features = ["trace"] }
+# catch-panic: a panicking write handler still yields a 500 the write
+# audit backstop records (SR-40).
+tower-http = { workspace = true, features = ["trace", "catch-panic"] }
 hyper.workspace = true
 
 # Serde
@@ -84,3 +86,5 @@ uc-audit = { workspace = true, features = ["test-capture"] }
 jsonwebtoken.workspace = true
 aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
 base64 = "0.22"
+# SR-40 write-audit tests read updated_by back from Postgres.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }

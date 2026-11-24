@@ -96,6 +96,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/templates/{kind}/{id}/materialize",
             post(materialize_template),
         )
+        // SR-40: client IP scope + operator write audit.
+        .layer(axum::middleware::from_fn(crate::write_audit::layer))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -218,9 +220,15 @@ async fn sync_upload(
     };
     // Attribute the adoption to the uploading site's service account.
     let actor = format!("site:{}", claims.sub);
+    let audit_actor = sbc_http_util::mgmt_audit::Actor {
+        id: actor.clone(),
+        issuer: Some(state.sync_validator.issuer().to_string()),
+        display: None,
+        source_ip: Some(crate::auth::peer_ip()),
+    };
     let mut last_epoch = None;
     for change in &batch.changes {
-        match state
+        let result = state
             .store
             .apply_change(
                 &site_code,
@@ -230,8 +238,9 @@ async fn sync_upload(
                 change.payload.as_ref(),
                 &actor,
             )
-            .await
-        {
+            .await;
+        audit_upload_change(&audit_actor, &site_code, change, &result);
+        match result {
             Ok(epoch) => last_epoch = Some(epoch),
             // A delete of an already-absent row is fine during reconcile
             // (idempotent re-upload); keep going.
@@ -247,6 +256,53 @@ async fn sync_upload(
         },
     };
     Json(json!({ "epoch": epoch, "applied": batch.changes.len() })).into_response()
+}
+
+/// One `ConfigurationChange` per uploaded change, attributed to the site's
+/// service account.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-3, AU-12, CM-3
+fn audit_upload_change(
+    actor: &sbc_http_util::mgmt_audit::Actor,
+    site: &str,
+    change: &central_config_store::UploadChange,
+    result: &Result<i64, CentralError>,
+) {
+    use sbc_http_util::mgmt_audit::{Op, Outcome, config_change_detail};
+    let op = match change.op {
+        central_config_store::ChangeOp::Upsert => Op::Update,
+        central_config_store::ChangeOp::Delete => Op::Delete,
+    };
+    let outcome = match result {
+        Ok(_) => Outcome::Ok,
+        Err(e) => Outcome::Failed(central_reason(e)),
+    };
+    // The site-local writer as the site claims it (NIST-007), keyed as a
+    // claim and capped like an actor id (SEC-010); the actor is still the
+    // uploading site's service account.
+    let mut detail = vec![("table", change.table.name())];
+    if let Some(origin) = change.origin_actor.as_deref() {
+        detail.push(("claimed_origin_actor", origin));
+    }
+    config_change_detail(
+        actor,
+        "sync_change",
+        &change.id,
+        op,
+        outcome,
+        Some(site),
+        &detail,
+    );
+}
+
+/// Audit reason token for a store error.
+const fn central_reason(e: &CentralError) -> &'static str {
+    match e {
+        CentralError::UnknownSite(_) | CentralError::NotFound => "not_found",
+        CentralError::DidConflict { .. } | CentralError::Conflict(_) => "conflict",
+        CentralError::InvalidSiteCode(_) | CentralError::Serialization(_) => "invalid",
+        CentralError::Storage(_) => "storage",
+    }
 }
 
 /// Map a store error to an HTTP response. An unknown site is a clean 404;
@@ -532,6 +588,7 @@ async fn register_site(
     let Some(site) = body.get("site_code").and_then(Value::as_str) else {
         return bad_request("site_code is required");
     };
+    crate::write_audit::target(site);
     let display = body
         .get("display_name")
         .and_then(Value::as_str)
@@ -574,6 +631,7 @@ async fn upsert_phone(
         return bad_request("phone id is required");
     };
     let id = id.to_string();
+    crate::write_audit::target(&id);
     let Some(mac) = body
         .get("mac_address")
         .and_then(Value::as_str)
@@ -643,6 +701,7 @@ async fn upsert_did(
     let Some(did) = obj.get("did").and_then(Value::as_str) else {
         return bad_request("did is required");
     };
+    crate::write_audit::target(did);
     let str_field = |k: &str| obj.get(k).and_then(Value::as_str).map(str::to_string);
     let (user, partition, description) = (
         str_field("user"),
@@ -712,6 +771,7 @@ async fn upsert_trunk_group(
         Ok(c) => c,
         Err(e) => return bad_request(format!("invalid trunk group: {e}")),
     };
+    crate::write_audit::target(&cfg.id);
     // Semantic validation: reject values the daemon would silently mishandle.
     if let Err(msg) = validate_trunk_group_fields(&cfg) {
         return bad_request(msg);
@@ -812,6 +872,7 @@ async fn upsert_dial_plan(
         Ok(c) => c,
         Err(e) => return bad_request(format!("invalid dial plan: {e}")),
     };
+    crate::write_audit::target(&cfg.id);
     // Semantic validation: reject values the daemon would silently mishandle.
     if let Err(msg) = validate_dial_plan_fields(&cfg) {
         return bad_request(msg);
@@ -1024,6 +1085,7 @@ async fn upsert_routing(
     let Some(id) = body.get("id").and_then(Value::as_str) else {
         return bad_request("routing entity id is required");
     };
+    crate::write_audit::target(id);
     match state
         .store
         .upsert_json(table, &site, id, &body, &actor)
@@ -1230,6 +1292,9 @@ mod tests {
 
     /// SR-39: operator reads redact secrets; marker writes keep them.
     mod secret_redaction;
+
+    /// SR-40: every write is audited with the actor.
+    mod write_audit;
 
     const TEST_KID: &str = "test-key-1";
     const TEST_ISSUER: &str = "https://idp.example.mil/realms/config";

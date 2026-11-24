@@ -39,6 +39,10 @@ sbc-config-store = { workspace = true }
 # Config-change audit records for trunk-group transport policy edits
 # (POA&M-48; NIST 800-53 Rev5: AU-2, CM-3).
 uc-audit.workspace = true
+# Shared management-plane audit records and trusted-proxy client-IP
+# resolution (SR-40), the same helpers sbc-api-server uses.
+sbc-http-util = { workspace = true }
+ipnet.workspace = true
 # OIDC bearer-token validation (JWKS cache + JWT validator), shared with
 # the SIP registrar and provisioning pods so the fleet authorizes tokens
 # identically.

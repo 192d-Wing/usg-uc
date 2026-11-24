@@ -22,6 +22,9 @@ use crate::model::DirectoryNumber;
 use crate::phones::PostgresPhoneStore;
 use crate::trunk_groups::PostgresTrunkGroupStore;
 
+/// Principal recorded in `updated_by` for rows imported from legacy JSON.
+const MIGRATION_ACTOR: &str = "system:json-migration";
+
 /// Migrate `directory_numbers.json` into the Postgres store.
 ///
 /// Returns the number of rows imported. `Ok(0)` is the steady-state happy
@@ -65,7 +68,7 @@ pub async fn migrate_directory_json_to_postgres(
         }
         match DirectoryNumber::from_json(value) {
             Ok(dn) => {
-                store.upsert(&dn).await?;
+                store.upsert(&dn, MIGRATION_ACTOR).await?;
                 imported += 1;
             }
             Err(e) => {
@@ -121,7 +124,7 @@ pub async fn migrate_phones_json_to_postgres(
     for (id, value) in map {
         match serde_json::from_value::<Phone>(value) {
             Ok(phone) => {
-                if let Err(e) = store.upsert(&phone).await {
+                if let Err(e) = store.upsert(&phone, MIGRATION_ACTOR).await {
                     warn!(phone_id = %id, error = %e, "Skipping phone — upsert failed");
                     skipped += 1;
                 } else {
@@ -178,7 +181,7 @@ pub async fn migrate_trunk_groups_json_to_postgres(
     let mut imported = 0usize;
     let mut skipped = 0usize;
     for (id, value) in map {
-        if let Err(e) = store.upsert(&id, &value).await {
+        if let Err(e) = store.upsert(&id, &value, MIGRATION_ACTOR).await {
             warn!(group_id = %id, error = %e, "Skipping trunk group — upsert failed");
             skipped += 1;
         } else {

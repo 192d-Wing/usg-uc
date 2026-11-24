@@ -209,6 +209,20 @@ impl TokenSigner {
         Some(claims)
     }
 
+    /// Audit id for a configured API-key digest: the first
+    /// [`API_KEY_ID_HEX`] hex digits of HMAC-SHA-384(signing key,
+    /// `"sbc-api-key-id:" || digest`). Keyed, so it cannot be computed from
+    /// the key (or its digest) alone; stable for as long as the signing key.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3, IA-5, SC-13
+    fn api_key_id(&self, digest: &str) -> String {
+        let mut input = Vec::with_capacity(API_KEY_ID_LABEL.len() + digest.len());
+        input.extend_from_slice(API_KEY_ID_LABEL);
+        input.extend_from_slice(digest.as_bytes());
+        let mac = self.sign(&input);
+        hex::encode(mac.get(..API_KEY_ID_HEX / 2).unwrap_or_default())
+    }
+
     fn sign(&self, data: &[u8]) -> Vec<u8> {
         // HMAC accepts keys of any length, so this never fails; return an
         // empty MAC (which never verifies) rather than panic.
@@ -438,19 +452,73 @@ impl Authenticator {
     /// Returns true if `credential` is a valid session token or API key.
     #[must_use]
     pub fn authorize(&self, credential: &str) -> bool {
-        if self.signer.verify(credential).is_some() {
-            return true;
+        self.identify(credential).is_some()
+    }
+
+    /// Identifies a valid session token or API key, for audit attribution.
+    ///
+    /// An API key is named by a keyed id derived from its configured digest
+    /// and the signing key, never by the key or its digest.
+    ///
+    /// ## NIST 800-53 Rev5: IA-2, AU-3 (actor in audit records)
+    #[must_use]
+    pub fn identify(&self, credential: &str) -> Option<CredentialId> {
+        if let Some(claims) = self.signer.verify(credential) {
+            return Some(CredentialId::Session {
+                subject: claims.sub,
+            });
         }
         if self.api_key_hashes.is_empty() {
-            return false;
+            return None;
         }
         // POAM: POA&M-211 — API-key lookup digests are SHA-256
         // (SBC_API_KEY_SHA256); migrate to SHA-384 with dual-accept.
         let digest = hex::encode(Sha256::digest(credential.as_bytes()));
-        self.api_key_hashes
-            .iter()
-            .any(|h| h.as_bytes().ct_eq(digest.as_bytes()).unwrap_u8() == 1)
+        // Every configured digest is compared (no early exit).
+        let mut matched: Option<&String> = None;
+        for h in self.api_key_hashes.iter() {
+            if h.as_bytes().ct_eq(digest.as_bytes()).unwrap_u8() == 1 {
+                matched = Some(h);
+            }
+        }
+        matched.map(|h| CredentialId::ApiKey {
+            key_id: self.signer.api_key_id(h),
+        })
     }
+
+    /// True if `name` is the configured admin username (audit only: an
+    /// unknown name is recorded as `unknown`, so a password typed into the
+    /// username field is never stored).
+    #[must_use]
+    pub fn is_admin_user(&self, name: &str) -> bool {
+        self.admin
+            .username
+            .as_bytes()
+            .ct_eq(name.as_bytes())
+            .unwrap_u8()
+            == 1
+    }
+}
+
+/// Hex digits of the keyed API-key audit id (64 bits).
+const API_KEY_ID_HEX: usize = 16;
+/// Domain-separation label for the API-key audit id MAC (token MACs start
+/// with `v2.`, so the two inputs never coincide).
+const API_KEY_ID_LABEL: &[u8] = b"sbc-api-key-id:";
+
+/// Who a valid credential belongs to ([`Authenticator::identify`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialId {
+    /// A session token minted by [`Authenticator::login`].
+    Session {
+        /// The token's `sub` claim (the admin username).
+        subject: String,
+    },
+    /// A configured API key.
+    ApiKey {
+        /// Keyed audit id (16 hex digits; see [`Authenticator::identify`]).
+        key_id: String,
+    },
 }
 
 /// Extracts a credential from request headers: `Authorization: Bearer <t>`
@@ -819,5 +887,85 @@ mod tests {
         assert!(parse_token_ttl("18446744073709551616").is_err());
         assert!(parse_token_ttl("3600s").is_err());
         assert_eq!(parse_token_ttl(" 3600 ").ok(), Some(3600));
+    }
+
+    // ---- SR-40: credential identity for audit attribution ----------------
+
+    /// `test_auth()` plus one accepted API key; returns (auth, key, digest).
+    fn auth_with_api_key() -> (Authenticator, String, String) {
+        let key = format!("qa-api-key-{}", std::process::id());
+        let digest = hex::encode(Sha256::digest(key.as_bytes()));
+        let auth = Authenticator {
+            api_key_hashes: Arc::new(vec![digest.clone()]),
+            ..test_auth()
+        };
+        (auth, key, digest)
+    }
+
+    #[test]
+    fn identify_session_token_returns_subject() {
+        let auth = test_auth();
+        let token = auth.login("admin", "correct horse").expect("login");
+        match auth.identify(&token) {
+            Some(CredentialId::Session { subject }) => assert_eq!(subject, "admin"),
+            other => panic!("expected a session credential, got {other:?}"),
+        }
+        assert!(auth.authorize(&token), "authorize delegates to identify");
+    }
+
+    /// SR-40 round 1 (SEC-006): the id is keyed by the signing key, so it
+    /// cannot be derived from the key or its digest alone.
+    #[test]
+    fn identify_api_key_returns_keyed_id_not_key() {
+        let (auth, key, digest) = auth_with_api_key();
+        let id = |a: &Authenticator| match a.identify(&key) {
+            Some(CredentialId::ApiKey { key_id }) => key_id,
+            other => panic!("expected an API-key credential, got {other:?}"),
+        };
+        let key_id = id(&auth);
+        assert_eq!(key_id.len(), 16);
+        assert!(key_id.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!key_id.contains(&key), "the key itself is never the id");
+        assert_ne!(key_id, digest[..16], "not the unkeyed digest prefix");
+        assert_eq!(key_id, id(&auth), "stable for one signing key");
+        let other_signer = Authenticator {
+            signer: TokenSigner::new(b"another-signing-key-32-bytes-ok!!".to_vec()).expect("key"),
+            ..auth.clone()
+        };
+        assert_ne!(key_id, id(&other_signer), "keyed by the signing key");
+        assert!(auth.authorize(&key));
+    }
+
+    #[test]
+    fn identify_rejects_unknown_credential() {
+        let (auth, key, _) = auth_with_api_key();
+        for cred in [
+            "",
+            "garbage",
+            "v2.aaaa.bbbb",
+            &format!("{key}x"),
+            &test_signer().mint("admin", 0),
+        ] {
+            assert!(auth.identify(cred).is_none(), "{cred:?}");
+            assert_eq!(auth.authorize(cred), auth.identify(cred).is_some());
+        }
+        // A token minted with another key does not identify.
+        let other = Authenticator::new(
+            "admin",
+            &hash_password("correct horse").expect("hash"),
+            b"another-signing-key-32-bytes-ok!!".to_vec(),
+        )
+        .expect("auth");
+        let foreign = other.login("admin", "correct horse").expect("login");
+        assert!(auth.identify(&foreign).is_none());
+    }
+
+    #[test]
+    fn is_admin_user_matches_only_configured_name() {
+        let auth = test_auth();
+        assert!(auth.is_admin_user("admin"));
+        for name in ["", "Admin", "admin ", " admin", "admin\0", "root", "adm"] {
+            assert!(!auth.is_admin_user(name), "{name:?}");
+        }
     }
 }

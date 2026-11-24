@@ -30,6 +30,15 @@ mod system;
 mod trunk_groups;
 mod trunks;
 mod users;
+mod write_audit;
+
+pub use write_audit::{WriteAudited, write_audit_backstop};
+
+// SR-40: write and login audit tests (kept out of SR-38's auth.rs).
+#[cfg(test)]
+pub(crate) mod login_audit_tests;
+#[cfg(test)]
+mod write_audit_tests;
 
 // Flat route table; one line per endpoint is clearer than splitting it up.
 #[allow(clippy::too_many_lines)]
@@ -178,9 +187,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/{*path}",
             get(proxy::proxy_get)
-                .post(proxy::proxy_post)
-                .put(proxy::proxy_put)
-                .delete(proxy::proxy_delete),
+                .post(proxy::refuse_write)
+                .put(proxy::refuse_write)
+                .delete(proxy::refuse_write),
         )
         .with_state(Arc::clone(&state));
 
@@ -188,7 +197,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     // also covers the reverse-proxy catch-all (which forwards unowned
     // paths to the daemon) — a nest-level layer would miss it. Exemptions
     // are full paths: health probes, sbc-api's own version, and login.
-    let auth_layer = crate::authmw::AuthState::new(
+    let mut auth_layer = crate::authmw::AuthState::new(
         Arc::clone(&state.auth),
         state.oidc.clone(),
         &[
@@ -199,6 +208,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/auth/session",
         ],
     );
+    auth_layer.trusted_proxies = Arc::clone(&state.trusted_proxies);
 
     Router::new()
         .route("/healthz", get(system::liveness))
@@ -206,6 +216,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/system/version", get(system::version))
         .nest("/api/v1", api_v1)
         .merge(api_proxy)
+        // SR-40: a panicking handler becomes a 500 the backstop records.
+        .layer(tower_http::catch_panic::CatchPanicLayer::new())
+        // SR-40: inside the auth layer, so the principal is known.
+        .layer(axum::middleware::from_fn(write_audit_backstop))
         .layer(axum::middleware::from_fn_with_state(
             auth_layer,
             crate::authmw::require_auth,

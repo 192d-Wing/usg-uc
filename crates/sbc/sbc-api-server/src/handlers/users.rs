@@ -86,6 +86,15 @@ where
         .with_state(state)
 }
 
+/// Marks a write handler's response: every path through `create`, `update`
+/// and `delete` emits an `AccountManagement` record, so the router write
+/// backstop skips it. Extractor rejections and permission denials never
+/// reach a handler and are left to the backstop.
+fn mark_audited(mut resp: Response) -> Response {
+    resp.extensions_mut().insert(super::WriteAudited);
+    resp
+}
+
 fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -140,7 +149,9 @@ impl Actor {
         ci: Option<&Extension<ConnectInfo<SocketAddr>>>,
     ) -> Self {
         Self {
-            user: p.map_or_else(|| "anonymous".to_string(), |Extension(p)| p.user.clone()),
+            // NIST 800-53 Rev5: AU-3 — the stable actor id (`oidc:<sub>@<iss>`,
+            // `admin:<subject>`, `apikey:<id>`), never the IdP-mutable name.
+            user: p.map_or_else(|| "anonymous".to_string(), |Extension(p)| p.actor_id()),
             issuer: p.and_then(|Extension(p)| p.issuer.clone()),
             ip: source_ip(st, headers, ci),
         }
@@ -268,79 +279,84 @@ pub async fn create<U: UserStore>(
     headers: HeaderMap,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let who = Actor::new(&st, principal.as_ref(), &headers, ci.as_ref());
-    let id = uuid::Uuid::new_v4().to_string();
-    let body = match body {
-        Ok(Json(b)) => b,
-        Err(rej) => return reject_body(&who, AccountAction::Create, &id, &rej),
-    };
-    let username = body_str(&body, "username").unwrap_or("").to_string();
-    if username.is_empty() {
-        audit(
-            &who,
-            AccountAction::Create,
-            &id,
-            "",
-            Err(&UserMgmtError::InvalidCredentials),
-            &[],
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"success": false, "error": "username required"})),
-        )
-            .into_response();
-    }
-    let display_name = body_str(&body, "display_name").unwrap_or("").to_string();
-    let email = body_str(&body, "email").unwrap_or("").to_string();
-    let sip_uri = body_str(&body, "sip_uri").unwrap_or(&username).to_string();
-    let digest_ha1 = body_str(&body, "password")
-        .filter(|p| !p.is_empty())
-        .map(|password| {
-            let realm = body_str(&body, "sip_domain").unwrap_or("sbc-local");
-            compute_ha1(&username, realm, password)
-        });
-    let certificate_dn = body_str(&body, "certificate_dn").map(String::from);
-    let calling_search_space = body_str(&body, "calling_search_space").map(String::from);
-
-    let user = User {
-        id: id.clone(),
-        username: username.clone(),
-        display_name,
-        email,
-        sip_uri,
-        auth_type: AuthType::Digest,
-        digest_ha1,
-        certificate_dn,
-        certificate_san: None,
-        calling_search_space,
-        device_ids: Vec::new(),
-        partition: None,
-        enabled: true,
-        created_at: now_epoch_secs(),
-        updated_at: 0,
-        last_login: None,
-        metadata: HashMap::new(),
-    };
-
-    match st.store.create_user(user).await {
-        Ok(created) => {
-            audit(&who, AccountAction::Create, &id, &username, Ok(()), &[]);
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({"success": true, "user": created})),
+    // SR-40 round 1 (SEC-005): marked only where it audits.
+    let resp = async {
+        let who = Actor::new(&st, principal.as_ref(), &headers, ci.as_ref());
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = match body {
+            Ok(Json(b)) => b,
+            Err(rej) => return reject_body(&who, AccountAction::Create, &id, &rej),
+        };
+        let username = body_str(&body, "username").unwrap_or("").to_string();
+        if username.is_empty() {
+            audit(
+                &who,
+                AccountAction::Create,
+                &id,
+                "",
+                Err(&UserMgmtError::InvalidCredentials),
+                &[],
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"success": false, "error": "username required"})),
             )
-                .into_response()
+                .into_response();
         }
-        Err(e) => {
-            audit(&who, AccountAction::Create, &id, &username, Err(&e), &[]);
-            let (code, msg) = client_error("create_user", &e);
-            (
-                code,
-                Json(serde_json::json!({"success": false, "error": msg})),
-            )
-                .into_response()
+        let display_name = body_str(&body, "display_name").unwrap_or("").to_string();
+        let email = body_str(&body, "email").unwrap_or("").to_string();
+        let sip_uri = body_str(&body, "sip_uri").unwrap_or(&username).to_string();
+        let digest_ha1 = body_str(&body, "password")
+            .filter(|p| !p.is_empty())
+            .map(|password| {
+                let realm = body_str(&body, "sip_domain").unwrap_or("sbc-local");
+                compute_ha1(&username, realm, password)
+            });
+        let certificate_dn = body_str(&body, "certificate_dn").map(String::from);
+        let calling_search_space = body_str(&body, "calling_search_space").map(String::from);
+
+        let user = User {
+            id: id.clone(),
+            username: username.clone(),
+            display_name,
+            email,
+            sip_uri,
+            auth_type: AuthType::Digest,
+            digest_ha1,
+            certificate_dn,
+            certificate_san: None,
+            calling_search_space,
+            device_ids: Vec::new(),
+            partition: None,
+            enabled: true,
+            created_at: now_epoch_secs(),
+            updated_at: 0,
+            last_login: None,
+            metadata: HashMap::new(),
+        };
+
+        match st.store.create_user(user).await {
+            Ok(created) => {
+                audit(&who, AccountAction::Create, &id, &username, Ok(()), &[]);
+                (
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({"success": true, "user": created})),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                audit(&who, AccountAction::Create, &id, &username, Err(&e), &[]);
+                let (code, msg) = client_error("create_user", &e);
+                (
+                    code,
+                    Json(serde_json::json!({"success": false, "error": msg})),
+                )
+                    .into_response()
+            }
         }
     }
+    .await;
+    mark_audited(resp)
 }
 
 pub async fn get_one<U: UserStore>(
@@ -364,86 +380,91 @@ pub async fn update<U: UserStore>(
     Path(id): Path<String>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let who = Actor::new(&st, principal.as_ref(), &headers, ci.as_ref());
-    let body = match body {
-        Ok(Json(b)) => b,
-        Err(rej) => return reject_body(&who, AccountAction::Update, &id, &rej),
-    };
-    let fail = |username: &str, changed: &[&str], e: &UserMgmtError| {
-        audit(&who, AccountAction::Update, &id, username, Err(e), changed);
-        let (code, msg) = client_error("update_user", e);
-        (
-            code,
-            Json(serde_json::json!({"success": false, "error": msg})),
-        )
-            .into_response()
-    };
-    let existing = match st.store.get_user(&id).await {
-        Ok(u) => u,
-        Err(e) => return fail("", &[], &e),
-    };
+    // SR-40 round 1 (SEC-005): marked only where it audits.
+    let resp = async {
+        let who = Actor::new(&st, principal.as_ref(), &headers, ci.as_ref());
+        let body = match body {
+            Ok(Json(b)) => b,
+            Err(rej) => return reject_body(&who, AccountAction::Update, &id, &rej),
+        };
+        let fail = |username: &str, changed: &[&str], e: &UserMgmtError| {
+            audit(&who, AccountAction::Update, &id, username, Err(e), changed);
+            let (code, msg) = client_error("update_user", e);
+            (
+                code,
+                Json(serde_json::json!({"success": false, "error": msg})),
+            )
+                .into_response()
+        };
+        let existing = match st.store.get_user(&id).await {
+            Ok(u) => u,
+            Err(e) => return fail("", &[], &e),
+        };
 
-    let username = body_str(&body, "username")
-        .unwrap_or(&existing.username)
-        .to_string();
-    let new_ha1 = body_str(&body, "password")
-        .filter(|p| !p.is_empty())
-        .map(|password| {
-            let realm = body_str(&body, "sip_domain").unwrap_or("sbc-local");
-            compute_ha1(&username, realm, password)
-        });
-    let password_set = new_ha1.is_some();
-    let existing_snapshot = Snapshot::of(&existing);
-    let digest_ha1 = new_ha1.or(existing.digest_ha1);
+        let username = body_str(&body, "username")
+            .unwrap_or(&existing.username)
+            .to_string();
+        let new_ha1 = body_str(&body, "password")
+            .filter(|p| !p.is_empty())
+            .map(|password| {
+                let realm = body_str(&body, "sip_domain").unwrap_or("sbc-local");
+                compute_ha1(&username, realm, password)
+            });
+        let password_set = new_ha1.is_some();
+        let existing_snapshot = Snapshot::of(&existing);
+        let digest_ha1 = new_ha1.or(existing.digest_ha1);
 
-    let updated = User {
-        id: id.clone(),
-        username: username.clone(),
-        display_name: body_str(&body, "display_name")
-            .unwrap_or(&existing.display_name)
-            .to_string(),
-        email: body_str(&body, "email")
-            .unwrap_or(&existing.email)
-            .to_string(),
-        sip_uri: body_str(&body, "sip_uri")
-            .unwrap_or(&existing.sip_uri)
-            .to_string(),
-        auth_type: existing.auth_type,
-        digest_ha1,
-        certificate_dn: body_str(&body, "certificate_dn")
-            .map(String::from)
-            .or(existing.certificate_dn),
-        certificate_san: existing.certificate_san,
-        calling_search_space: body_str(&body, "calling_search_space")
-            .map(String::from)
-            .or(existing.calling_search_space),
-        device_ids: existing.device_ids,
-        partition: existing.partition,
-        enabled: body
-            .get("enabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(existing.enabled),
-        created_at: existing.created_at,
-        updated_at: now_epoch_secs(),
-        last_login: existing.last_login,
-        metadata: existing.metadata,
-    };
+        let updated = User {
+            id: id.clone(),
+            username: username.clone(),
+            display_name: body_str(&body, "display_name")
+                .unwrap_or(&existing.display_name)
+                .to_string(),
+            email: body_str(&body, "email")
+                .unwrap_or(&existing.email)
+                .to_string(),
+            sip_uri: body_str(&body, "sip_uri")
+                .unwrap_or(&existing.sip_uri)
+                .to_string(),
+            auth_type: existing.auth_type,
+            digest_ha1,
+            certificate_dn: body_str(&body, "certificate_dn")
+                .map(String::from)
+                .or(existing.certificate_dn),
+            certificate_san: existing.certificate_san,
+            calling_search_space: body_str(&body, "calling_search_space")
+                .map(String::from)
+                .or(existing.calling_search_space),
+            device_ids: existing.device_ids,
+            partition: existing.partition,
+            enabled: body
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(existing.enabled),
+            created_at: existing.created_at,
+            updated_at: now_epoch_secs(),
+            last_login: existing.last_login,
+            metadata: existing.metadata,
+        };
 
-    let changed = changed_groups(&existing_snapshot, &updated, password_set);
-    match st.store.update_user(updated).await {
-        Ok(u) => {
-            audit(
-                &who,
-                AccountAction::Update,
-                &id,
-                &username,
-                Ok(()),
-                &changed,
-            );
-            Json(serde_json::json!({"success": true, "user": u})).into_response()
+        let changed = changed_groups(&existing_snapshot, &updated, password_set);
+        match st.store.update_user(updated).await {
+            Ok(u) => {
+                audit(
+                    &who,
+                    AccountAction::Update,
+                    &id,
+                    &username,
+                    Ok(()),
+                    &changed,
+                );
+                Json(serde_json::json!({"success": true, "user": u})).into_response()
+            }
+            Err(e) => fail(&username, &changed, &e),
         }
-        Err(e) => fail(&username, &changed, &e),
     }
+    .await;
+    mark_audited(resp)
 }
 
 /// Non-secret attributes compared to classify an update for audit.
@@ -496,29 +517,34 @@ pub async fn delete<U: UserStore>(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let who = Actor::new(&st, principal.as_ref(), &headers, ci.as_ref());
-    // Best-effort username for the audit record; the delete is by id.
-    let username = st
-        .store
-        .get_user(&id)
-        .await
-        .map(|u| u.username)
-        .unwrap_or_default();
-    match st.store.delete_user(&id).await {
-        Ok(()) => {
-            audit(&who, AccountAction::Delete, &id, &username, Ok(()), &[]);
-            Json(serde_json::json!({"success": true})).into_response()
-        }
-        Err(e) => {
-            audit(&who, AccountAction::Delete, &id, &username, Err(&e), &[]);
-            let (code, msg) = client_error("delete_user", &e);
-            (
-                code,
-                Json(serde_json::json!({"success": false, "error": msg})),
-            )
-                .into_response()
+    // SR-40 round 1 (SEC-005): marked only where it audits.
+    let resp = async {
+        let who = Actor::new(&st, principal.as_ref(), &headers, ci.as_ref());
+        // Best-effort username for the audit record; the delete is by id.
+        let username = st
+            .store
+            .get_user(&id)
+            .await
+            .map(|u| u.username)
+            .unwrap_or_default();
+        match st.store.delete_user(&id).await {
+            Ok(()) => {
+                audit(&who, AccountAction::Delete, &id, &username, Ok(()), &[]);
+                Json(serde_json::json!({"success": true})).into_response()
+            }
+            Err(e) => {
+                audit(&who, AccountAction::Delete, &id, &username, Err(&e), &[]);
+                let (code, msg) = client_error("delete_user", &e);
+                (
+                    code,
+                    Json(serde_json::json!({"success": false, "error": msg})),
+                )
+                    .into_response()
+            }
         }
     }
+    .await;
+    mark_audited(resp)
 }
 
 #[cfg(test)]
@@ -578,6 +604,53 @@ mod tests {
             code,
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         )
+    }
+
+    /// SR-40 round 1 (SEC-005): an audited account write is marked, so the
+    /// router backstop adds nothing; a refusal that never reaches the
+    /// handler (permission denial) is left to the backstop.
+    #[tokio::test]
+    async fn only_handler_audited_writes_skip_the_backstop() {
+        let (app, _) = app();
+        let app = app.layer(axum::middleware::from_fn(
+            super::super::write_audit_backstop,
+        ));
+        let route_records = |c: &uc_audit::capture::CaptureGuard| {
+            c.events()
+                .into_iter()
+                .filter(|e| {
+                    matches!(e, uc_audit::AuditEvent::ConfigurationChange(c)
+                        if c.description.starts_with("entity=route"))
+                })
+                .count()
+        };
+        let capture = uc_audit::capture::start();
+        let admin = Some(principal(&["users-admin"]));
+        let (code, _) = call(
+            &app,
+            "POST",
+            "/users",
+            Some(serde_json::json!({"username": "bob"})),
+            admin,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED);
+        assert_eq!(route_records(&capture), 0, "handler-audited");
+        let reader = Some(principal(&["users-reader"]));
+        let (code, _) = call(
+            &app,
+            "POST",
+            "/users",
+            Some(serde_json::json!({"username": "eve"})),
+            reader,
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            route_records(&capture),
+            1,
+            "denial recorded by the backstop"
+        );
     }
 
     fn account_events(c: &uc_audit::capture::CaptureGuard) -> Vec<AccountManagement> {
@@ -806,7 +879,8 @@ mod tests {
                 (AccountAction::Delete, false),
             ]
         );
-        assert!(ev.iter().all(|e| e.actor == "op1"));
+        // SR-40: the actor is the stable `sub`-based id, not the display name.
+        assert!(ev.iter().all(|e| e.actor == "oidc:s-1@"), "{ev:?}");
         assert_eq!(ev[0].target_username, "alice");
         assert_eq!(ev[1].failure_reason.as_deref(), Some("already_exists"));
         let json = serde_json::to_string(&ev).unwrap();
