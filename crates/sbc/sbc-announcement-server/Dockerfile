@@ -27,10 +27,10 @@ FROM rust:1-bookworm AS chef
 # No openssl: the binary is rustls-only.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
-    pkg-config \
     golang \
-    protobuf-compiler \
     libprotobuf-dev \
+    pkg-config \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

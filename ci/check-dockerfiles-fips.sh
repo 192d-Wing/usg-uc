@@ -21,7 +21,7 @@ while IFS= read -r f; do
     fi
 done < <(git ls-files | grep -E '(^|/)Dockerfile[^/]*$')
 
-if [ "$status" -eq 0 ]; then
+if [[ "$status" -eq 0 ]]; then
     echo "ok: no Rust Dockerfile uses an Alpine or musl builder"
 fi
 exit "$status"
