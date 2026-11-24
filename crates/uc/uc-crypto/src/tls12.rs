@@ -266,7 +266,8 @@ mod tests {
     }
 
     fn dtls_nonce(iv: [u8; 4], epoch: u16, seq: u64) -> [u8; NONCE_LEN] {
-        let mut nonce = [0u8; NONCE_LEN];
+        // Every byte is overwritten; start from random bytes, not a literal.
+        let mut nonce: [u8; NONCE_LEN] = crate::random::generate_random().unwrap();
         nonce[..4].copy_from_slice(&iv);
         nonce[4..6].copy_from_slice(&epoch.to_be_bytes());
         nonce[6..].copy_from_slice(&seq.to_be_bytes()[2..]);
@@ -277,12 +278,13 @@ mod tests {
     /// output opens with the plain AES-256-GCM opener.
     #[test]
     fn sealer_accepts_dtls_nonces_and_interoperates_with_opener() {
-        let key_bytes = [0x42u8; KEY_LEN];
+        let key_bytes = crate::random::generate_key_256().unwrap();
         let mut sealer = Tls12GcmSealer::new(&key_bytes).unwrap();
         let opener = Aes256GcmKey::new(key_bytes).unwrap();
         let cached = CachedAeadKey::new(&key_bytes).unwrap();
+        let iv: [u8; 4] = crate::random::generate_random().unwrap();
         for seq in [0u64, 1, 2, 7, 1 << 40] {
-            let nonce = dtls_nonce([1, 2, 3, 4], 1, seq);
+            let nonce = dtls_nonce(iv, 1, seq);
             let record = sealer.seal(&nonce, b"aad", b"record").unwrap();
             assert_eq!(record.len(), 6 + TAG_LEN);
             assert_eq!(opener.open(&nonce, b"aad", &record).unwrap(), b"record");
@@ -292,17 +294,18 @@ mod tests {
 
     #[test]
     fn sealer_refuses_repeated_or_decreasing_nonce() {
-        let mut sealer = Tls12GcmSealer::new(&[7u8; KEY_LEN]).unwrap();
-        let n5 = dtls_nonce([0; 4], 1, 5);
+        let mut sealer = Tls12GcmSealer::new(&crate::random::generate_key_256().unwrap()).unwrap();
+        let iv: [u8; 4] = crate::random::generate_random().unwrap();
+        let n5 = dtls_nonce(iv, 1, 5);
         sealer.seal(&n5, b"", b"x").unwrap();
         assert!(sealer.seal(&n5, b"", b"x").is_err());
-        assert!(sealer.seal(&dtls_nonce([0; 4], 1, 4), b"", b"x").is_err());
-        sealer.seal(&dtls_nonce([0; 4], 1, 6), b"", b"x").unwrap();
+        assert!(sealer.seal(&dtls_nonce(iv, 1, 4), b"", b"x").is_err());
+        sealer.seal(&dtls_nonce(iv, 1, 6), b"", b"x").unwrap();
     }
 
     #[test]
     fn sealer_debug_is_redacted() {
-        let sealer = Tls12GcmSealer::new(&[0xAAu8; KEY_LEN]).unwrap();
+        let sealer = Tls12GcmSealer::new(&crate::random::generate_key_256().unwrap()).unwrap();
         let text = format!("{sealer:?}");
         assert!(text.contains("REDACTED"));
         assert!(!text.to_lowercase().contains("aaaa"));
