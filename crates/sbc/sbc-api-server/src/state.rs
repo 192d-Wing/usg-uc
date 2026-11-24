@@ -42,6 +42,8 @@ pub enum StateError {
     Grpc(String),
     #[error("daemon http client build failed: {0}")]
     Http(String),
+    #[error("operator OIDC http client setup failed: {0}")]
+    OidcHttp(String),
     #[error("authentication setup failed: {0}")]
     Auth(String),
     #[error("HA1 encryption key: {0}")]
@@ -287,32 +289,13 @@ impl AppState {
         // central config API takes, so the dashboard signs in once.
         let oidc = match (&cfg.oidc_issuer, &cfg.oidc_audience) {
             (Some(issuer), Some(audience)) => {
-                // Trust an extra CA for the JWKS fetch when the IdP is
-                // fronted by an internal CA (SBC_OIDC_EXTRA_CA_CERT_FILE),
-                // mirroring the daemon. Without it the rustls webpki roots
-                // can't verify e.g. icam.oopl.dev.mil and every bearer 401s.
-                let mut http_builder = reqwest::Client::builder();
-                if let Ok(path) = std::env::var("SBC_OIDC_EXTRA_CA_CERT_FILE")
-                    && !path.trim().is_empty()
-                {
-                    match std::fs::read(&path) {
-                        Ok(pem) => match reqwest::Certificate::from_pem(&pem) {
-                            Ok(cert) => {
-                                info!(path, "loaded extra CA certificate for OIDC JWKS fetch");
-                                http_builder = http_builder.add_root_certificate(cert);
-                            }
-                            Err(e) => {
-                                tracing::error!(path, error = %e, "failed to parse SBC_OIDC_EXTRA_CA_CERT_FILE");
-                            }
-                        },
-                        Err(e) => {
-                            tracing::error!(path, error = %e, "failed to read SBC_OIDC_EXTRA_CA_CERT_FILE");
-                        }
-                    }
-                }
-                let http = http_builder
-                    .build()
-                    .unwrap_or_else(|_| reqwest::Client::new());
+                let extra_ca = std::env::var("SBC_OIDC_EXTRA_CA_CERT_FILE")
+                    .ok()
+                    .filter(|p| !p.trim().is_empty());
+                // Fail closed: a client build error stops startup
+                // rather than falling back to a client with no extra CA and
+                // no timeouts.
+                let http = oidc_http_client(extra_ca.as_deref())?;
                 let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer.clone()));
                 let validator = proto_jwt::Validator::new(
                     jwks,
@@ -362,6 +345,67 @@ impl AppState {
     }
 }
 
+/// Connect bound for the operator OIDC discovery / JWKS client.
+// NIST 800-53 Rev5: SC-5 (a slow IdP cannot hold the fetch open)
+const OIDC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-request bound for the operator OIDC client. `JwksCache` also bounds
+/// a whole refresh (both requests) to `proto_jwt::jwks::DEFAULT_FETCH_TIMEOUT`.
+const OIDC_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// HTTP client for the operator OIDC discovery and JWKS fetch, with the
+/// standard timeouts. See [`oidc_http_client_with`].
+fn oidc_http_client(extra_ca_path: Option<&str>) -> Result<reqwest::Client, StateError> {
+    oidc_http_client_with(extra_ca_path, OIDC_CONNECT_TIMEOUT, OIDC_TOTAL_TIMEOUT)
+}
+
+/// Builds the OIDC client: connect and total timeouts, no redirects, and
+/// an optional extra trust anchor (PEM, one or more certificates). An
+/// extra CA path that cannot be read or holds no certificate is an error.
+///
+/// Trust an extra CA for the JWKS fetch when the `IdP` is fronted by an
+/// internal CA (`SBC_OIDC_EXTRA_CA_CERT_FILE`), mirroring the daemon.
+/// Without it the rustls webpki roots can't verify an internal-CA `IdP` and
+/// every bearer 401s.
+// NIST 800-53 Rev5: SC-5, SC-8 (bounded fetch; keys only from the
+// configured issuer URLs, never a redirect target)
+fn oidc_http_client_with(
+    extra_ca_path: Option<&str>,
+    connect_timeout: Duration,
+    total_timeout: Duration,
+) -> Result<reqwest::Client, StateError> {
+    let mut http_builder = reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(total_timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    // Fail closed: a configured extra CA that cannot be used would leave
+    // every bearer token failing TLS to the IdP with no startup signal.
+    if let Some(path) = extra_ca_path {
+        let pem = std::fs::read(path).map_err(|e| {
+            StateError::OidcHttp(format!("SBC_OIDC_EXTRA_CA_CERT_FILE {path}: {e}"))
+        })?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+            StateError::OidcHttp(format!("SBC_OIDC_EXTRA_CA_CERT_FILE {path}: {e}"))
+        })?;
+        if certs.is_empty() {
+            return Err(StateError::OidcHttp(format!(
+                "SBC_OIDC_EXTRA_CA_CERT_FILE {path}: no PEM certificate found"
+            )));
+        }
+        info!(
+            path,
+            count = certs.len(),
+            "loaded extra CA certificate(s) for OIDC JWKS fetch"
+        );
+        for cert in certs {
+            http_builder = http_builder.add_root_certificate(cert);
+        }
+    }
+    http_builder
+        .build()
+        .map_err(|e| StateError::OidcHttp(e.to_string()))
+}
+
 /// Strip the password from a Postgres DSN so it can be safely logged.
 fn scrub_dsn(dsn: &str) -> String {
     // Naive: replace `user:pass@host` with `user:***@host`. Doesn't
@@ -380,4 +424,121 @@ fn scrub_dsn(dsn: &str) -> String {
         }
     }
     dsn.to_string()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn oidc_http_client_timeout_consts() {
+        assert_eq!(OIDC_CONNECT_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(OIDC_TOTAL_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn oidc_http_client_builds_with_defaults() {
+        assert!(oidc_http_client(None).is_ok());
+    }
+
+    /// Accepts and never answers: the total timeout must end the request.
+    #[tokio::test]
+    async fn oidc_http_client_has_connect_and_total_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                // Keep the connection open, never answer.
+                tokio::spawn(async move {
+                    let _sock = sock;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let total = Duration::from_millis(200);
+        let http = oidc_http_client_with(None, Duration::from_millis(100), total).unwrap();
+        let started = std::time::Instant::now();
+        let err = http
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_timeout(), "{err}");
+        assert!(started.elapsed() < total + Duration::from_secs(2));
+    }
+
+    /// A 3xx is handed back to the caller; the target is never requested.
+    #[tokio::test]
+    async fn oidc_http_client_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let elsewhere = Arc::new(AtomicUsize::new(0));
+        let seen = elsewhere.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let resp: &[u8] = if buf.starts_with(b"GET /elsewhere ") {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = sock.write_all(resp).await;
+            }
+        });
+        let http = oidc_http_client(None).unwrap();
+        let resp = http
+            .get(format!("http://{addr}/.well-known/openid-configuration"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(elsewhere.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn oidc_http_client_missing_extra_ca_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.pem");
+        let err = oidc_http_client(Some(path.to_str().unwrap())).unwrap_err();
+        assert!(matches!(err, StateError::OidcHttp(_)), "{err}");
+    }
+
+    #[test]
+    fn oidc_http_client_extra_ca_without_certificate_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-cert.pem");
+        std::fs::write(&path, b"not a certificate\n").unwrap();
+        let err = oidc_http_client(Some(path.to_str().unwrap())).unwrap_err();
+        assert!(matches!(err, StateError::OidcHttp(_)), "{err}");
+    }
+
+    #[test]
+    fn oidc_http_client_extra_ca_with_bad_pem_body_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.pem");
+        std::fs::write(
+            &path,
+            b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            oidc_http_client(Some(path.to_str().unwrap())),
+            Err(StateError::OidcHttp(_))
+        ));
+    }
 }

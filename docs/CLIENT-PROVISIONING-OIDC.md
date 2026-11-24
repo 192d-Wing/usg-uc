@@ -481,6 +481,26 @@ with the cached set if Keycloak is briefly unreachable — IdP downtime must not
 take down re-registration. (With ephemeral-digest mode, IdP downtime only
 blocks *new* sign-ins, which is another argument for shipping it first.)
 
+How `proto-jwt` `JwksCache` does this (all four validators: SBC daemon,
+provisioning, central config, sbc-api):
+
+- Tokens signed with a cached key validate without waiting for any fetch,
+  and `/readyz` does not wait either.
+- An unknown `kid` triggers one refresh (discovery document, then JWKS).
+  Concurrent unknown-`kid` requests share that one fetch, and at most one
+  fetch starts per 30 s per process. A key the IdP rotates in can therefore
+  be rejected for up to 30 s after the previous fetch (NIST POA&M-423).
+- One refresh is bounded to 10 s in total. On timeout or any error the
+  cached set stays in service; with no cached set the request fails.
+- The discovery document may be at most 64 KiB and the JWKS 256 KiB. A
+  redirected or non-2xx response is refused, and the `jwks_uri` must be
+  https unless the issuer itself is http.
+- The SBC daemon, provisioning and central clients still follow redirects
+  before the response is refused (NIST POA&M-424). The sbc-api client does
+  not follow redirects, times out after 5 s connect and 10 s per request,
+  and sbc-api does not start if `SBC_OIDC_EXTRA_CA_CERT_FILE` is set but
+  cannot be read or holds no PEM certificate.
+
 ## Client State Machine
 
 ```mermaid
