@@ -15,6 +15,7 @@ use crate::cluster::ClusterManager;
 use crate::digest_credentials::DigestCredentialStore;
 use crate::flow::{Flow, LegFlow};
 use crate::flows::{FlowKey, FlowTable};
+use crate::runtime::RuntimeError;
 use crate::shutdown::ShutdownSignal;
 use crate::sip_stack::{ProcessResult, SipStack, SipStackConfig};
 use proto_registrar::BearerAuthenticator;
@@ -336,11 +337,15 @@ pub fn digest_cleartext_transports(config: &SbcConfig) -> Vec<&'static str> {
 impl Server {
     /// Creates a new server. `digest_credentials` is the `[digest_auth]`
     /// credential store the runtime loaded (`None` when digest is off).
+    ///
+    /// # Errors
+    /// [`RuntimeError::InitFailed`] when `SBC_AUTH_MODE=bearer` is set and
+    /// the bearer authorizer cannot be built (fail closed).
     pub fn new(
         config: SbcConfig,
         shutdown: ShutdownSignal,
         digest_credentials: Option<Arc<DigestCredentialStore>>,
-    ) -> Self {
+    ) -> Result<Self, RuntimeError> {
         // Use standard SBC metrics
         let metrics = SbcMetrics::standard();
 
@@ -357,7 +362,7 @@ impl Server {
         let mut sip_stack = SipStack::new(sip_config);
         let media_failure_rx = Self::init_sip_stack_from_config(&mut sip_stack, &config);
         Self::init_user_rate_limiter(&mut sip_stack, &config);
-        if let Some(bearer) = Self::build_bearer_authenticator(&config) {
+        if let Some(bearer) = Self::build_bearer_authenticator(&config)? {
             sip_stack.set_bearer_authenticator(bearer);
         }
         Self::warn_if_register_unauthenticated(&sip_stack);
@@ -366,7 +371,7 @@ impl Server {
         let rate_limiter = Self::build_rate_limiter(&config);
         let global_limiter = Self::build_global_limiter(&config);
 
-        Self {
+        Ok(Self {
             config,
             shutdown,
             health,
@@ -388,7 +393,7 @@ impl Server {
             media_pool: None,
             #[cfg(feature = "cluster")]
             cluster: None,
-        }
+        })
     }
 
     /// Sets the zone registry for interface-based binding.
@@ -452,13 +457,16 @@ impl Server {
     }
 
     /// Creates a new server with cluster support.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
     #[cfg(feature = "cluster")]
     pub fn new_with_cluster(
         config: SbcConfig,
         shutdown: ShutdownSignal,
         cluster: Option<Arc<ClusterManager>>,
         digest_credentials: Option<Arc<DigestCredentialStore>>,
-    ) -> Self {
+    ) -> Result<Self, RuntimeError> {
         let metrics = SbcMetrics::standard();
 
         let mut health = HealthChecker::new(HealthCheckerConfig::default())
@@ -479,7 +487,7 @@ impl Server {
         };
         let media_failure_rx = Self::init_sip_stack_from_config(&mut sip_stack, &config);
         Self::init_user_rate_limiter(&mut sip_stack, &config);
-        if let Some(bearer) = Self::build_bearer_authenticator(&config) {
+        if let Some(bearer) = Self::build_bearer_authenticator(&config)? {
             sip_stack.set_bearer_authenticator(bearer);
         }
         Self::warn_if_register_unauthenticated(&sip_stack);
@@ -489,7 +497,7 @@ impl Server {
         let rate_limiter = Self::build_rate_limiter(&config);
         let global_limiter = Self::build_global_limiter(&config);
 
-        Self {
+        Ok(Self {
             config,
             shutdown,
             health,
@@ -510,7 +518,7 @@ impl Server {
             #[cfg(feature = "grpc")]
             media_pool: None,
             cluster,
-        }
+        })
     }
 
     /// Builds `SipStackConfig` from `SbcConfig`. `digest_credentials` is
@@ -684,80 +692,100 @@ impl Server {
     /// over a rustls client that optionally trusts an extra CA (the internal
     /// IdP). The JWKS cache lazy-loads on the first REGISTER, so no async
     /// work is needed here.
-    fn build_bearer_authenticator(config: &SbcConfig) -> Option<Arc<BearerAuthenticator>> {
-        let mode = std::env::var("SBC_AUTH_MODE").unwrap_or_default();
-        if !bearer_mode_active(&mode) {
-            return None;
-        }
+    ///
+    /// # Errors
+    /// [`RuntimeError::InitFailed`] (`bearer_auth`) when bearer mode is on
+    /// but the authorizer cannot be built. The runtime refuses digest in
+    /// bearer mode, so continuing would leave REGISTER unauthenticated.
+    ///
+    /// ## NIST 800-53 Rev5: IA-2, CM-6, SC-24 (fail closed)
+    fn build_bearer_authenticator(
+        config: &SbcConfig,
+    ) -> Result<Option<Arc<BearerAuthenticator>>, RuntimeError> {
+        Self::build_bearer_authenticator_from(config, |k| std::env::var(k).ok())
+    }
 
-        let issuer = match std::env::var("SBC_OIDC_ISSUER") {
-            Ok(v) if !v.trim().is_empty() => v.trim().trim_end_matches('/').to_string(),
-            _ => {
-                error!("SBC_AUTH_MODE=bearer but SBC_OIDC_ISSUER is unset — bearer auth disabled");
-                return None;
+    /// [`Self::build_bearer_authenticator`] over an explicit variable lookup.
+    fn build_bearer_authenticator_from(
+        config: &SbcConfig,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<Arc<BearerAuthenticator>>, RuntimeError> {
+        let mode = env("SBC_AUTH_MODE").unwrap_or_default();
+        if !bearer_mode_active(&mode) {
+            return Ok(None);
+        }
+        let fail = |reason: String| {
+            error!(error = %reason, "bearer REGISTER authentication cannot start — SBC cannot start");
+            RuntimeError::InitFailed {
+                component: "bearer_auth".to_string(),
+                reason,
             }
         };
 
-        let audiences: Vec<String> = std::env::var("SBC_OIDC_AUDIENCE")
-            .unwrap_or_else(|_| "sbc".to_string())
+        let issuer = match env("SBC_OIDC_ISSUER") {
+            Some(v) if !v.trim().is_empty() => v.trim().trim_end_matches('/').to_string(),
+            _ => {
+                return Err(fail(
+                    "SBC_AUTH_MODE=bearer requires SBC_OIDC_ISSUER".to_string(),
+                ));
+            }
+        };
+
+        let audiences: Vec<String> = env("SBC_OIDC_AUDIENCE")
+            .unwrap_or_else(|| "sbc".to_string())
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
         if audiences.is_empty() {
-            error!("SBC_OIDC_AUDIENCE resolved to an empty set — bearer auth disabled");
-            return None;
+            return Err(fail(
+                "SBC_OIDC_AUDIENCE resolved to an empty set".to_string(),
+            ));
         }
 
-        let realm = std::env::var("SBC_OIDC_REALM")
-            .ok()
+        let realm = env("SBC_OIDC_REALM")
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| config.general.instance_name.clone());
 
         let mut http_builder = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10));
-        if let Ok(path) = std::env::var("SBC_OIDC_EXTRA_CA_CERT_FILE")
+        if let Some(path) = env("SBC_OIDC_EXTRA_CA_CERT_FILE")
             && !path.trim().is_empty()
         {
-            match std::fs::read(&path) {
-                Ok(pem) => match reqwest::Certificate::from_pem(&pem) {
-                    Ok(cert) => {
-                        info!(path, "loaded extra CA certificate for IdP JWKS fetch");
-                        http_builder = http_builder.add_root_certificate(cert);
-                    }
-                    Err(e) => {
-                        error!(path, error = %e, "failed to parse SBC_OIDC_EXTRA_CA_CERT_FILE — bearer auth disabled");
-                        return None;
-                    }
-                },
-                Err(e) => {
-                    error!(path, error = %e, "failed to read SBC_OIDC_EXTRA_CA_CERT_FILE — bearer auth disabled");
-                    return None;
-                }
-            }
+            let pem = std::fs::read(&path).map_err(|e| {
+                fail(format!(
+                    "failed to read SBC_OIDC_EXTRA_CA_CERT_FILE {path}: {e}"
+                ))
+            })?;
+            let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
+                fail(format!(
+                    "failed to parse SBC_OIDC_EXTRA_CA_CERT_FILE {path}: {e}"
+                ))
+            })?;
+            info!(path, "loaded extra CA certificate for IdP JWKS fetch");
+            http_builder = http_builder.add_root_certificate(cert);
         }
 
-        let http = match http_builder.build() {
-            Ok(c) => c,
-            Err(e) => {
-                error!(error = %e, "failed to build IdP HTTP client — bearer auth disabled");
-                return None;
-            }
-        };
+        let http = http_builder
+            .build()
+            .map_err(|e| fail(format!("failed to build IdP HTTP client: {e}")))?;
 
         let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer.clone()));
-        let validator = Arc::new(proto_jwt::Validator::new(
+        // NIST 800-53 Rev5: IA-2, AC-3 (non-empty iss/aud enforced)
+        let validator = proto_jwt::Validator::new(
             jwks,
             proto_jwt::ValidatorConfig::new(issuer.clone(), audiences.clone()),
-        ));
+        )
+        .map(Arc::new)
+        .map_err(|e| fail(format!("invalid OIDC validator config: {e}")))?;
         info!(
             %issuer,
             ?audiences,
             %realm,
             "RFC 8898 Bearer-token REGISTER authorization enabled"
         );
-        Some(Arc::new(BearerAuthenticator::new(validator, realm)))
+        Ok(Some(Arc::new(BearerAuthenticator::new(validator, realm))))
     }
 
     /// Installs the per-user limiter (`rate_limit.per_user_rps`) on the SIP
@@ -3763,7 +3791,7 @@ mod tests {
     fn test_server_creation() {
         let config = SbcConfig::default();
         let shutdown = ShutdownSignal::new();
-        let server = Server::new(config, shutdown, None);
+        let server = Server::new(config, shutdown, None).unwrap();
 
         assert_eq!(server.config().general.instance_name, "sbc-01");
     }
@@ -3772,7 +3800,7 @@ mod tests {
     async fn test_server_health() {
         let config = SbcConfig::default();
         let shutdown = ShutdownSignal::new();
-        let mut server = Server::new(config, shutdown, None);
+        let mut server = Server::new(config, shutdown, None).unwrap();
 
         assert!(server.is_alive());
         assert!(server.is_ready());
@@ -3785,7 +3813,7 @@ mod tests {
     async fn test_server_stats() {
         let config = SbcConfig::default();
         let shutdown = ShutdownSignal::new();
-        let server = Server::new(config, shutdown, None);
+        let server = Server::new(config, shutdown, None).unwrap();
 
         assert_eq!(server.stats().calls_total.load(Ordering::Relaxed), 0);
         assert_eq!(server.stats().messages_received.load(Ordering::Relaxed), 0);
@@ -5051,9 +5079,9 @@ mod tests {
                 .is_some_and(|s| Arc::ptr_eq(&s, &store))
         );
         // No "UNAUTHENTICATED" state once configured.
-        let server = Server::new(config, ShutdownSignal::new(), Some(store));
+        let server = Server::new(config, ShutdownSignal::new(), Some(store)).unwrap();
         assert!(server.sip_stack().register_auth_enabled());
-        let off = Server::new(SbcConfig::default(), ShutdownSignal::new(), None);
+        let off = Server::new(SbcConfig::default(), ShutdownSignal::new(), None).unwrap();
         assert!(!off.sip_stack().register_auth_enabled());
     }
 
@@ -5074,6 +5102,82 @@ mod tests {
             "bearer,digest",
         ] {
             assert!(!bearer_mode_active(off), "{off:?}");
+        }
+    }
+
+    fn bearer_env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    fn bearer_auth_err(vars: &[(&str, &str)]) -> String {
+        let Err(err) =
+            Server::build_bearer_authenticator_from(&SbcConfig::default(), bearer_env(vars))
+        else {
+            unreachable!("bearer authorizer built; expected startup refusal");
+        };
+        match err {
+            RuntimeError::InitFailed { component, reason } => {
+                assert_eq!(component, "bearer_auth");
+                reason
+            }
+            other => unreachable!("unexpected error {other:?}"),
+        }
+    }
+
+    // SEC-001 / NIST-03: bearer mode that cannot be built refuses startup
+    // instead of leaving REGISTER unauthenticated.
+    #[test]
+    fn bearer_mode_without_issuer_refuses_startup() {
+        let reason = bearer_auth_err(&[("SBC_AUTH_MODE", "bearer")]);
+        assert!(reason.contains("SBC_OIDC_ISSUER"), "{reason}");
+        let reason = bearer_auth_err(&[("SBC_AUTH_MODE", "bearer"), ("SBC_OIDC_ISSUER", "  ")]);
+        assert!(reason.contains("SBC_OIDC_ISSUER"), "{reason}");
+    }
+
+    #[test]
+    fn bearer_mode_with_empty_audience_refuses_startup() {
+        let reason = bearer_auth_err(&[
+            ("SBC_AUTH_MODE", "bearer"),
+            ("SBC_OIDC_ISSUER", "https://idp.example.test/realms/voice"),
+            ("SBC_OIDC_AUDIENCE", " , "),
+        ]);
+        assert!(reason.contains("SBC_OIDC_AUDIENCE"), "{reason}");
+    }
+
+    #[test]
+    fn bearer_mode_with_unreadable_extra_ca_refuses_startup() {
+        let reason = bearer_auth_err(&[
+            ("SBC_AUTH_MODE", "bearer"),
+            ("SBC_OIDC_ISSUER", "https://idp.example.test/realms/voice"),
+            ("SBC_OIDC_EXTRA_CA_CERT_FILE", "/nonexistent/idp-ca.pem"),
+        ]);
+        assert!(reason.contains("SBC_OIDC_EXTRA_CA_CERT_FILE"), "{reason}");
+    }
+
+    #[test]
+    fn bearer_mode_with_issuer_builds_authenticator() {
+        let built = Server::build_bearer_authenticator_from(
+            &SbcConfig::default(),
+            bearer_env(&[
+                ("SBC_AUTH_MODE", "bearer"),
+                ("SBC_OIDC_ISSUER", "https://idp.example.test/realms/voice/"),
+            ]),
+        )
+        .unwrap();
+        assert!(built.is_some());
+    }
+
+    #[test]
+    fn bearer_mode_off_builds_nothing() {
+        for vars in [&[][..], &[("SBC_AUTH_MODE", "digest")][..]] {
+            let built =
+                Server::build_bearer_authenticator_from(&SbcConfig::default(), bearer_env(vars))
+                    .unwrap();
+            assert!(built.is_none());
         }
     }
 
@@ -5165,7 +5269,7 @@ mod tests {
 
     #[tokio::test]
     async fn recording_off_wires_nothing() {
-        let mut server = Server::new(SbcConfig::default(), ShutdownSignal::new(), None);
+        let mut server = Server::new(SbcConfig::default(), ShutdownSignal::new(), None).unwrap();
         server.wire_recording().await.unwrap();
         assert!(!server.sip_stack().recording_enabled());
         assert!(
@@ -5207,7 +5311,7 @@ mod tests {
                 "key" => config.security.tls_key_path = None,
                 _ => config.transport.tls_listen.clear(),
             }
-            let mut server = Server::new(config, ShutdownSignal::new(), None);
+            let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
             let err = startup_error(server.start().await);
             assert!(
                 err.contains("TLS listener with a certificate"),
@@ -5224,13 +5328,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ca = dir.path().join("sbc.crt");
         let config = recording_config(dir.path(), "sips:srs.recorder.invalid:5061", &ca);
-        let mut server = Server::new(config, ShutdownSignal::new(), None);
+        let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
         let err = startup_error(server.wire_recording().await);
         assert!(err.contains("does not resolve"), "{err}");
         assert!(!server.sip_stack().recording_enabled());
         // Not a sips: URI (validation rejects it first; the daemon too).
         let config = recording_config(dir.path(), "sip:127.0.0.1:5060", &ca);
-        let mut server = Server::new(config, ShutdownSignal::new(), None);
+        let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
         let err = startup_error(server.wire_recording().await);
         assert!(err.contains("sips:"), "{err}");
     }
@@ -5246,7 +5350,7 @@ mod tests {
         let missing = dir.path().join("missing.pem");
         for ca in [&empty, &missing] {
             let config = recording_config(dir.path(), "sips:127.0.0.1:5061", ca);
-            let mut server = Server::new(config, ShutdownSignal::new(), None);
+            let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
             let err = startup_error(server.wire_recording().await);
             assert!(err.contains("recording.srs_tls_ca_file"), "{err}");
             assert!(!server.sip_stack().recording_enabled());
@@ -5262,7 +5366,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ca = dir.path().join("sbc.crt");
         let config = recording_config(dir.path(), "sips:127.0.0.1:59", &ca);
-        let mut server = Server::new(config, ShutdownSignal::new(), None);
+        let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
         let capture = uc_audit::capture::start();
         server.wire_recording().await.unwrap();
         assert!(server.sip_stack().recording_enabled());

@@ -34,7 +34,7 @@ The following algorithms are **explicitly forbidden** and not exposed by the `uc
 | Curves | P-256 (secp256r1) | Key size too small |
 | Symmetric | AES-128, AES-192, 3DES | Key size too small |
 | RSA | Any RSA < 3072 bits | Key size too small |
-| JWT | ES256, RS256, PS256, HS256 | Based on forbidden algorithms |
+| JWT | ES256, RS256, PS256, HS256 | Based on forbidden algorithms. `proto-jwt` rejects every algorithm except ES384 (see JWT below) |
 
 Note: "not exposed by `uc-crypto`" does not mean "not negotiable by the SBC". rustls (TLS) and `jsonwebtoken` (JWT) carry their own algorithm sets; see the protocol sections for what the shipped binaries actually accept.
 
@@ -179,9 +179,10 @@ Wired since SIPREC phase 3, off by default (`[recording]`). Tested against a fak
 
 ### JWT (OIDC Bearer REGISTER and Management API)
 
-- **Accepted algorithms**: `proto-jwt::validator::ALLOWED_ALGS` = `RS256, PS256, ES256, ES384`. Only symmetric (HS*) algorithms are rejected. This validator **is wired** in `sbc-daemon` for RFC 8898 Bearer REGISTER (`SBC_AUTH_MODE=bearer`) and in `sbc-client-config-server`.
-- **CNSA status**: **Non-compliant / Planned.** Restricting the allow-list to ES384 (and ES512) requires the IdP to issue ES384 tokens; until then RS256/ES256 tokens from the IdP are accepted.
-- **Implementation**: `proto-jwt` (JWKS cache + `jsonwebtoken`).
+- **Accepted algorithms**: `proto-jwt::validator::ALLOWED_ALGS` = `ES384` only (SR-30). RS256, PS256, ES256 and HS* tokens are rejected before key lookup. The signing JWK must be an EC P-384 key, and its `alg`, when present, must equal the token header `alg` (`validator.rs` `check_jwk`). Wired in `sbc-daemon` (RFC 8898 Bearer REGISTER, `SBC_AUTH_MODE=bearer`), `sbc-client-config-server`, `sbc-api-server` (operator OIDC) and `central-config-api`.
+- **CNSA status**: **Compliant (ES384 / P-384 / SHA-384).** Tests (`crates/proto/proto-jwt/src/validator.rs`): `allowed_algs_is_es384_only`, `es384_p384_token_is_accepted`, `es256_token_is_rejected`, `rs256_token_is_rejected`, `ps256_token_is_rejected`, `hs256_symmetric_alg_is_rejected`, `p256_jwk_labelled_es384_is_rejected`, `rsa_jwk_for_es384_token_is_rejected`, `jwk_alg_differing_from_header_alg_is_rejected`, `p384_jwk_without_alg_is_accepted`. ES512 is not accepted.
+- **Operator impact**: the IdP must sign access tokens with ES384 from an EC P-384 key. Keycloak's default is RS256; see `docs/CLIENT-PROVISIONING-OIDC.md` "Token signing". Tokens signed otherwise get 401.
+- **Implementation**: `proto-jwt` (JWKS cache + `jsonwebtoken`, aws-lc-rs backend). Signature verification runs in aws-lc-rs; proto-jwt enables `aws-lc-rs/fips`, so every binary that links it (including sbc-client-config-server, which links no other FIPS crate) verifies in aws-lc-fips-sys (see FIPS 140-3 Validation). The JWK `use` (when present) must be `sig` and `key_ops` (when present) must include `verify`; header `jwk`/`jku`/`x5u`/`x5c` are never used.
 
 ### Storage TLS (uc-storage, dormant) - known gap
 

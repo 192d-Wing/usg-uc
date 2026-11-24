@@ -34,6 +34,10 @@ pub enum StateError {
     /// would be uselessly up. Fail fast instead.
     #[error("oidc CA cert: {0}")]
     OidcCa(String),
+    /// The OIDC issuer/audience policy was refused (empty issuer or
+    /// audience). Fatal: audience checking cannot be disabled.
+    #[error("oidc validator config: {0}")]
+    OidcConfig(String),
 }
 
 /// Handler-shared state: the store and the two scope-specific validators.
@@ -92,8 +96,9 @@ impl AppState {
             tracing::warn!(error = %e, issuer = %cfg.oidc_issuer,
                 "initial JWKS prime failed; will refresh on first token use");
         }
+        // NIST 800-53 Rev5: IA-2, AC-3 (non-empty iss/aud enforced)
         let validator_for = |scope: &'static str| {
-            Arc::new(Validator::new(
+            Validator::new(
                 Arc::clone(&jwks),
                 ValidatorConfig {
                     issuer: cfg.oidc_issuer.clone(),
@@ -101,13 +106,15 @@ impl AppState {
                     required_scope: scope,
                     leeway_secs: 30,
                 },
-            ))
+            )
+            .map(Arc::new)
+            .map_err(|e| StateError::OidcConfig(e.to_string()))
         };
 
         Ok(Arc::new(Self {
             store,
-            sync_validator: validator_for(SYNC_SCOPE),
-            admin_validator: validator_for(OPERATOR_SCOPE),
+            sync_validator: validator_for(SYNC_SCOPE)?,
+            admin_validator: validator_for(OPERATOR_SCOPE)?,
             start_time: Instant::now(),
         }))
     }

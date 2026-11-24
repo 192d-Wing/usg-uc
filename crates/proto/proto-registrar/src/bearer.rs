@@ -198,26 +198,26 @@ mod tests {
 
     fn test_key() -> &'static TestKey {
         use aws_lc_rs::rand::SystemRandom;
-        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
+        use aws_lc_rs::signature::{ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
         use base64::Engine as _;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
         static KEY: std::sync::OnceLock<TestKey> = std::sync::OnceLock::new();
         KEY.get_or_init(|| {
             let pkcs8 = EcdsaKeyPair::generate_pkcs8(
-                &ECDSA_P256_SHA256_FIXED_SIGNING,
+                &ECDSA_P384_SHA384_FIXED_SIGNING,
                 &SystemRandom::new(),
             )
             .expect("generate test key");
-            let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
+            let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, pkcs8.as_ref())
                 .expect("parse test key");
             let point = pair.public_key().as_ref();
             assert_eq!(point[0], 4);
             let jwks = serde_json::from_value(serde_json::json!({
                 "keys": [{
-                    "kty": "EC", "crv": "P-256", "kid": TEST_KID, "alg": "ES256", "use": "sig",
-                    "x": URL_SAFE_NO_PAD.encode(&point[1..33]),
-                    "y": URL_SAFE_NO_PAD.encode(&point[33..65]),
+                    "kty": "EC", "crv": "P-384", "kid": TEST_KID, "alg": "ES384", "use": "sig",
+                    "x": URL_SAFE_NO_PAD.encode(&point[1..49]),
+                    "y": URL_SAFE_NO_PAD.encode(&point[49..97]),
                 }]
             }))
             .expect("test jwks");
@@ -236,7 +236,7 @@ mod tests {
     }
 
     fn sign(claims: &serde_json::Value) -> String {
-        let mut header = Header::new(Algorithm::ES256);
+        let mut header = Header::new(Algorithm::ES384);
         header.kid = Some(TEST_KID.to_string());
         encode(&header, claims, &test_key().encoding).expect("sign")
     }
@@ -257,7 +257,8 @@ mod tests {
         let validator = Validator::new(
             Arc::new(JwksCache::with_static(test_key().jwks.clone())),
             ValidatorConfig::new(TEST_ISSUER, vec!["sbc".to_string()]),
-        );
+        )
+        .expect("validator config");
         BearerAuthenticator::new(Arc::new(validator), "sbc.example.mil")
     }
 

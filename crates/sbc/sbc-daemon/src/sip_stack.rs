@@ -28489,10 +28489,13 @@ pub mod tests {
         let bearer = || {
             let issuer = "https://idp.example.test";
             let jwks = Arc::new(proto_jwt::JwksCache::new(reqwest::Client::new(), issuer));
-            let validator = Arc::new(proto_jwt::Validator::new(
-                jwks,
-                proto_jwt::ValidatorConfig::new(issuer, vec!["sbc".to_string()]),
-            ));
+            let validator = Arc::new(
+                proto_jwt::Validator::new(
+                    jwks,
+                    proto_jwt::ValidatorConfig::new(issuer, vec!["sbc".to_string()]),
+                )
+                .expect("validator config"),
+            );
             Arc::new(BearerAuthenticator::new(
                 validator,
                 "example.com".to_string(),

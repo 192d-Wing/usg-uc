@@ -314,6 +314,7 @@ impl AppState {
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new());
                 let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer.clone()));
+                // NIST 800-53 Rev5: IA-2, AC-3 (non-empty iss/aud enforced)
                 let validator = proto_jwt::Validator::new(
                     jwks,
                     proto_jwt::ValidatorConfig {
@@ -322,7 +323,8 @@ impl AppState {
                         required_scope: crate::authmw::ADMIN_SCOPE,
                         leeway_secs: 30,
                     },
-                );
+                )
+                .map_err(|e| StateError::Auth(format!("OIDC validator config: {e}")))?;
                 info!(issuer = %issuer, "operator OIDC bearer auth enabled");
                 Some(Arc::new(validator))
             }
