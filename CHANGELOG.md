@@ -461,7 +461,10 @@ Tested locally on macOS arm64 only; no CI run yet.
   TLS connections take it from `accept()` too, so a reset right after the
   handshake no longer fails it.
 - **Blocked sources are dropped at accept**, before any TLS or WebSocket
-  handshake, on every TCP, TLS and WS listener. (SC-5, SC-7)
+  handshake, on every TCP, TLS and WS listener. (SC-5, SC-7) The check uses
+  the stream limiter: a block earned over UDP does not refuse a stream
+  connection, and a configured trunk is not refused for a block on its
+  IPv6 prefix.
 - **New per-source accept rate on TCP and TLS listeners.** (SC-5)
   `transport.accept_rate_per_source` (default 20 new connections/s, 0 = off)
   and `accept_burst_per_source` (default 50), keyed like

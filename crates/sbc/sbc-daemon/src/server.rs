@@ -2556,10 +2556,14 @@ impl Server {
         })
     }
 
-    /// Whether `peer`'s source is blocked by the per-source rate limiter.
+    /// Whether `peer`'s source is blocked by the stream per-source rate
+    /// limiter (`ctx.rate_limiter` is `Server::stream_rate_limiter`, SR-55).
     /// A blocked source is dropped at accept, before admission and before
     /// any handshake; drops are counted and audited in aggregate
-    /// (`accept_blocked`).
+    /// (`accept_blocked`). Blocks earned on the UDP limiter do not apply,
+    /// and `is_blocked` is trust-aware: a configured trunk is refused only
+    /// for an explicit block of its exact address, never for a block on its
+    /// IPv6 prefix.
     ///
     /// ## NIST 800-53 Rev5: SC-5, SC-7
     async fn accept_blocked(ctx: &StreamLoopContext, peer: &SbcSocketAddr, kind: &str) -> bool {
@@ -6650,6 +6654,13 @@ mod tests {
     /// A TLS listener on 127.0.0.1 with a fresh P-384 certificate for
     /// `sbc.example.test`, and a client config that trusts it.
     async fn tls_test_listener() -> (Arc<TlsListener>, Arc<rustls::ClientConfig>) {
+        tls_test_listener_on(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0)).await
+    }
+
+    /// [`tls_test_listener`] bound to `bind`.
+    async fn tls_test_listener_on(
+        bind: SbcSocketAddr,
+    ) -> (Arc<TlsListener>, Arc<rustls::ClientConfig>) {
         let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
         let cert = rcgen::CertificateParams::new(vec!["sbc.example.test".to_string()])
             .unwrap()
@@ -6672,10 +6683,7 @@ mod tests {
         )
         .unwrap();
         let listener = TlsListener::bind(
-            ListenerConfig::new(
-                SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0),
-                TransportType::Tls,
-            ),
+            ListenerConfig::new(bind, TransportType::Tls),
             Arc::new(server),
         )
         .await
@@ -6782,6 +6790,71 @@ mod tests {
             !completed,
             "blocked source completed a TLS handshake: is_blocked not checked at accept (SR-56)"
         );
+    }
+
+    // SR-56 / SR-55 (NIST 800-53 Rev5: SC-5): the accept check reads the
+    // stream limiter. A block on the daemon's UDP limiter does not refuse a
+    // TLS accept from the same address.
+    #[tokio::test]
+    async fn udp_block_does_not_refuse_tls_accept() {
+        let mut config = SbcConfig::default();
+        config.rate_limit.udp_auto_block = true;
+        let server = Server::new(config, ShutdownSignal::new(), None);
+        assert!(
+            server
+                .udp_rate_limiter
+                .lock()
+                .await
+                .block(LOCALHOST_IP, std::time::Duration::from_secs(60))
+        );
+        assert!(
+            server
+                .udp_rate_limiter
+                .lock()
+                .await
+                .is_blocked(LOCALHOST_IP)
+        );
+        let mut ctx = stream_test_ctx(short_timeouts());
+        ctx.rate_limiter = Arc::clone(&server.stream_rate_limiter);
+        let stats = Arc::clone(&ctx.stats);
+        let (listener, client) = tls_test_listener().await;
+        let addr = *listener.local_addr();
+        let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+        let completed = tls_handshake_ok(addr, &client).await;
+        task.abort();
+        assert!(
+            completed,
+            "UDP-limiter block refused a TLS accept: accept_blocked must use the stream limiter"
+        );
+        assert_eq!(stats.accept_blocked.load(Ordering::Relaxed), 0);
+    }
+
+    // SR-56 / SR-55 (NIST 800-53 Rev5: SC-5): a stream block on a /64
+    // refuses the neighbour but not the configured trunk inside it.
+    #[tokio::test]
+    async fn trusted_trunk_accepted_under_prefix_block() {
+        let trunk = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let neighbour: std::net::IpAddr = "::2".parse().unwrap();
+        let ctx = stream_test_ctx(short_timeouts());
+        {
+            let mut l = ctx.rate_limiter.lock().await;
+            assert_eq!(l.set_trusted_sources([trunk]), 0);
+            assert!(l.block(neighbour, std::time::Duration::from_secs(60)));
+            assert!(l.is_blocked("::3".parse().unwrap()), "/64 not blocked");
+            assert!(!l.is_blocked(trunk));
+        }
+        let stats = Arc::clone(&ctx.stats);
+        let (listener, client) =
+            tls_test_listener_on(SbcSocketAddr::from(std::net::SocketAddr::new(trunk, 0))).await;
+        let addr = *listener.local_addr();
+        let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+        let completed = tls_handshake_ok(addr, &client).await;
+        task.abort();
+        assert!(
+            completed,
+            "trusted trunk refused at accept for a prefix block"
+        );
+        assert_eq!(stats.accept_blocked.load(Ordering::Relaxed), 0);
     }
 
     // SR-56 (NIST 800-53 Rev5: SC-5, SC-7): a blocked source's plain TCP

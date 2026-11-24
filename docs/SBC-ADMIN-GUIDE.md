@@ -201,7 +201,9 @@ discarded (counted as a framing error) and never joined to the next.
 
 Accept admission (NIST SC-5, SC-7). Every stream accept is checked in
 this order before any TLS or WebSocket handshake: a source blocked by the
-per-source rate limiter (`[rate_limit]`) is dropped; then, on TCP and TLS
+stream per-source rate limiter (`[rate_limit]`) is dropped (a block earned
+over UDP does not apply, and a configured trunk is not refused for a block
+on its IPv6 prefix); then, on TCP and TLS
 listeners, the per-source accept rate; then the connection caps above. TLS
 connections then take a per-source handshake slot, and a node-wide slot
 once the client has sent its first bytes; both are released as soon as the
