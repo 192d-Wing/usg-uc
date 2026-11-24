@@ -121,16 +121,15 @@ pub struct AppState {
     /// dashboard authenticates once for both the central and per-site APIs.
     pub oidc: Option<Arc<proto_jwt::Validator>>,
 
-    /// In-memory rate limiter for login attempts, keyed by client IP.
-    /// Maps to (`attempt_count`, `window_start`).
-    pub login_rate_limiter: Arc<
-        std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
-    >,
+    /// Admin login limits (per client IP and account, bounded tables) and
+    /// the argon2 verify-slot pool. Per process, not shared across
+    /// replicas (POA&M-420).
+    pub login_guard: Arc<crate::login_guard::LoginGuard>,
 
     /// Networks from which the `X-Real-IP` header is trusted (the nginx
-    /// pod range). Used to resolve the real client IP for the login rate
-    /// limiter without letting a direct caller spoof it. Empty = trust
-    /// no proxy (the TCP peer is the client).
+    /// pod range). Used to resolve the real client IP for the login guard
+    /// without letting a direct caller spoof it. Empty = trust no proxy
+    /// (the TCP peer is the client).
     pub trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
 
@@ -273,10 +272,34 @@ impl AppState {
         );
         info!("management-plane authentication enabled");
 
+        // NIST 800-53 Rev5: SC-5 — size the argon2 verify slots from the
+        // stored hash's memory cost (verification uses the hash's own
+        // parameters; SBC_ADMIN_PASSWORD is hashed with the defaults).
+        let admin_m_cost_kib = std::env::var("SBC_ADMIN_PASSWORD_HASH")
+            .ok()
+            .and_then(|h| crate::login_guard::argon2_m_cost_kib(&h));
+        let verify_slots = crate::login_guard::verify_slots_for_m_cost(admin_m_cost_kib);
+        if verify_slots < crate::login_guard::MAX_CONCURRENT_VERIFY {
+            tracing::warn!(
+                m_cost_kib = ?admin_m_cost_kib,
+                verify_slots,
+                budget_kib = crate::login_guard::VERIFY_MEMORY_BUDGET_KIB,
+                "admin password hash memory cost lowers concurrent login verifications"
+            );
+        }
+        // POAM: POA&M-420 (AC-7, SC-5) login limits are per replica and
+        // cleared on restart.
+        let login_guard = Arc::new(crate::login_guard::LoginGuard::new(
+            crate::login_guard::LoginGuardConfig {
+                max_concurrent_verify: verify_slots,
+                ..crate::login_guard::LoginGuardConfig::default()
+            },
+        ));
+
         if cfg.trusted_proxies.is_empty() {
             info!(
                 "SBC_TRUSTED_PROXIES unset: X-Real-IP is ignored; the client IP is the TCP \
-                 peer (the login rate limiter keys on the proxy address behind nginx). Set it \
+                 peer (the login guard keys on the proxy address behind nginx). Set it \
                  to the frontend nginx pod network."
             );
         } else {
@@ -356,7 +379,7 @@ impl AppState {
             start_time: std::time::Instant::now(),
             auth,
             oidc,
-            login_rate_limiter: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            login_guard,
             trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
         }))
     }

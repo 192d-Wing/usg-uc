@@ -104,6 +104,55 @@ fn audit_transport_change(
     ));
 }
 
+/// 422 `secret_reentry_required` when a write keeps a trunk `sip_password`
+/// marker (or, for a single-trunk update, omits it) while changing where the
+/// stored secret is sent. Names the field, never a value.
+///
+/// ## NIST 800-53 Rev5: IA-5
+fn reentry_rejection(
+    body: &serde_json::Value,
+    existing: Option<&serde_json::Value>,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let field = redact::trunk_group_reentry_field(body, existing)?;
+    warn!(field = %field, "trunk group write refused: secret re-entry required");
+    Some((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "success": false,
+            "error": "secret_reentry_required",
+            "field": field,
+        })),
+    ))
+}
+
+/// [`reentry_rejection`] for a single-trunk update: `merged` is the trunk
+/// after applying the update, `body` the update. The stored secret is kept
+/// when the update sends the marker or no `sip_password` at all.
+fn trunk_update_reentry_rejection(
+    old_group: &serde_json::Value,
+    merged: &serde_json::Value,
+    body: &serde_json::Value,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let keeps = body
+        .get("sip_password")
+        .is_none_or(|v| v.as_str() == Some(redact::REDACTED));
+    if !keeps {
+        return None;
+    }
+    let mut probe = merged.clone();
+    probe["sip_password"] = serde_json::json!(redact::REDACTED);
+    let (status, Json(mut err)) =
+        reentry_rejection(&serde_json::json!({"trunks": [probe]}), Some(old_group))?;
+    // The probe group has one trunk: report the bare field name.
+    if let Some(f) = err["field"]
+        .as_str()
+        .and_then(|f| f.strip_prefix("trunks[0]."))
+    {
+        err["field"] = serde_json::json!(f);
+    }
+    Some((status, Json(err)))
+}
+
 /// Adds `warnings` to a success body when there are any.
 fn with_warnings(mut body: serde_json::Value, warnings: &[String]) -> serde_json::Value {
     if !warnings.is_empty() {
@@ -154,6 +203,9 @@ pub async fn add_group(
         Err(rej) => return rej,
     };
     let existing = lookup(&state, &id).await;
+    if let Some(rej) = reentry_rejection(&body, existing.as_ref()) {
+        return rej;
+    }
     redact::restore_passwords(&mut body, existing.as_ref());
     if !persist(&state, &id, &body).await {
         return (
@@ -185,6 +237,9 @@ pub async fn update_group(
         Err(rej) => return rej,
     };
     let existing = lookup(&state, &group_id).await;
+    if let Some(rej) = reentry_rejection(&body, existing.as_ref()) {
+        return rej;
+    }
     redact::restore_passwords(&mut body, existing.as_ref());
     if !persist(&state, &group_id, &body).await {
         return (
@@ -321,6 +376,9 @@ pub async fn update_trunk(
         }
     }
     let mut updated = trunk.clone();
+    if let Some(rej) = trunk_update_reentry_rejection(&old, &updated, &body) {
+        return rej;
+    }
     let warnings = match check_policy(&group_json) {
         Ok(w) => w,
         Err(rej) => return rej,
@@ -460,6 +518,48 @@ mod tests {
         assert_eq!(
             changes[0].description,
             "trunk_group=g1 require_tls=false->true trunk_protocols=[a:udp->tls] outcome=success"
+        );
+    }
+
+    // SR-39: a kept (or, on a single-trunk update, omitted) trunk secret
+    // with a changed destination is refused with the field named.
+    #[test]
+    fn trunk_destination_change_with_kept_secret_is_422() {
+        let stored = json!({"id": "g1", "trunks": [
+            {"id": "t1", "host": "a.example.mil", "protocol": "tls", "sip_password": "trunk-pw"},
+        ]});
+        // Group write: marker kept, host changed.
+        let mut body = redact::redacted(stored.clone());
+        assert!(reentry_rejection(&body, Some(&stored)).is_none());
+        body["trunks"][0]["host"] = json!("evil.example");
+        let (status, Json(err)) = reentry_rejection(&body, Some(&stored)).unwrap();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err["error"], "secret_reentry_required");
+        assert_eq!(err["field"], "trunks[0].host");
+        assert!(!err.to_string().contains("trunk-pw"), "{err}");
+        body["trunks"][0]["sip_password"] = json!("trunk-new");
+        assert!(reentry_rejection(&body, Some(&stored)).is_none());
+
+        // Single-trunk update: the merged trunk holds the stored secret.
+        let mut merged = stored["trunks"][0].clone();
+        merged["host"] = json!("evil.example");
+        for update in [
+            json!({"host": "evil.example"}),
+            json!({"host": "evil.example", "sip_password": redact::REDACTED}),
+        ] {
+            let (status, Json(err)) =
+                trunk_update_reentry_rejection(&stored, &merged, &update).unwrap();
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(err["field"], "host", "{update}");
+            assert!(!err.to_string().contains("trunk-pw"), "{err}");
+        }
+        let update = json!({"host": "evil.example", "sip_password": "trunk-new"});
+        merged["sip_password"] = json!("trunk-new");
+        assert!(trunk_update_reentry_rejection(&stored, &merged, &update).is_none());
+        // Same destination, other edits: allowed.
+        let merged = stored["trunks"][0].clone();
+        assert!(
+            trunk_update_reentry_rejection(&stored, &merged, &json!({"priority": 2})).is_none()
         );
     }
 

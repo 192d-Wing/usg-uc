@@ -15,7 +15,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
 
-mod auth;
+pub mod auth;
 mod calls;
 mod cdrs;
 mod dial_plans;
@@ -36,7 +36,10 @@ mod users;
 pub fn router(state: Arc<AppState>) -> Router {
     let api_v1 = Router::new()
         // Authentication (login/session are exempt from the auth layer below)
-        .route("/auth/login", post(auth::login))
+        .route(
+            "/auth/login",
+            auth::with_login_body_limit(post(auth::login)),
+        )
         .route("/auth/logout", post(auth::logout))
         .route("/auth/session", get(auth::session))
         // Phones

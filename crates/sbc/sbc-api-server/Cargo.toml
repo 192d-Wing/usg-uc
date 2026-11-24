@@ -75,6 +75,8 @@ ipnet.workspace = true
 nix = { workspace = true, features = ["fs", "user"] }
 
 [dev-dependencies]
+# Paused clock for the login lockout window tests.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 uc-user-mgmt = { path = "../../uc/uc-user-mgmt", default-features = false, features = ["postgres", "encryption", "sqlite"] }
 uc-audit = { workspace = true, features = ["test-capture"] }
