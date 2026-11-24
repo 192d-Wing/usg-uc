@@ -41,7 +41,7 @@ Helm release. The architecture is **FQDN-first and L3-routed**:
 | Provisioning | `sbcProvision` | on | Renders `/provision/<MAC>.{cfg,xml}` from Postgres |
 | Client-config | `sbcClientConfig` | on | Soft-client discovery + OIDC `/v1/client-config` |
 | Per-site Postgres | `sbcPostgres` | on | Config store (DIDs, phones, trunk groups, dial plans) |
-| Announcement server | `sbcAnnouncement` | **off** | Dedicated announcement RTP playback pod |
+| Announcement server | `sbcAnnouncement` | **off** | Dedicated announcement RTP playback pod; mTLS only, needs `sbcDaemon.grpcMtls` (§6 "Announcement server mTLS") |
 | Trunk agent | `sbcTrunkAgent` | **off** | Carrier REGISTER + OPTIONS health loops (exactly 1 replica) |
 | Config-sync | `sbcConfigSync` | **off** | Pulls this site's shard from the central config plane |
 | Edge Gateway (TLS) | `gateway` | **off** | Gateway API + cert-manager HTTPS termination |
@@ -314,6 +314,92 @@ supply one of:
 (no `-grpc` Service), reachable from inside the pod, e.g. `kubectl exec ...
 sbc-cli`.
 
+### Announcement server mTLS
+
+With `sbcAnnouncement.enabled`, the announcement pod serves Play (port 9095)
+over mTLS only. The daemon connects to
+`https://<fullname>-announcement.<namespace>.svc.cluster.local:9095` with its
+own client certificate, and the pod admits only client certificates with a SAN
+in `sbcAnnouncement.grpcMtls.allowedClientNames` (default
+`<fullname>-sbc-daemon`). It requires `sbcDaemon.grpcMtls.enabled`, plus one
+of:
+
+- **cert-manager:** `sbcDaemon.grpcMtls.clusterIssuer` (the same issuer as the
+  daemon gRPC). The chart issues two ECDSA P-384 certificates: the pod's
+  server certificate (`<fullname>-announcement[.<ns>.svc[.cluster.local]]`)
+  and the daemon's client certificate (SAN DNS `<fullname>-sbc-daemon`).
+- **Your own Secrets:** `sbcAnnouncement.grpcMtls.serverSecretName` and
+  `daemonClientSecretName`, each holding `tls.crt`, `tls.key` and `ca.crt`
+  from one CA. With the `issue` helper above:
+
+  ```sh
+  issue "$F-announcement" "subjectAltName=DNS:$F-announcement,DNS:$F-announcement.sbc-system.svc,DNS:$F-announcement.sbc-system.svc.cluster.local
+  extendedKeyUsage=serverAuth"
+  issue "$F-sbc-daemon" "subjectAltName=DNS:$F-sbc-daemon
+  extendedKeyUsage=clientAuth"
+  ```
+
+  then set `serverSecretName: $F-announcement-tls` and
+  `daemonClientSecretName: $F-sbc-daemon-tls`. The client certificate needs
+  the name as a SAN; a CN alone is not matched.
+
+Rendering fails without one of the two. The pod serves TLS 1.3 with
+`TLS_AES_256_GCM_SHA384` and ML-KEM-1024 / P-384 key exchange only (CNSA 2.0),
+with a 5 s handshake timeout, and verifies ECDSA P-384 / SHA-384 signatures
+only: the client certificate and its CA must be ECDSA P-384 (as the chart
+issues them); an RSA or P-256 client certificate is refused. It reads its
+certificate at start and checks the files every 30 s: when a renewal
+changes them, it waits a random 0-10 s (so replicas do not restart
+together), exits with code 3, and the kubelet restarts it with the new
+certificate. The daemon keeps one
+connection for all plays and rebuilds it when its client certificate file
+changes or after a connection failure.
+
+With a shared `ClusterIssuer`, any workload in any namespace that can request
+a certificate from it can obtain `<fullname>-sbc-daemon` and call Play. Use a
+dedicated namespaced `Issuer` (`sbcDaemon.grpcMtls.issuerKind: Issuer`);
+`helm install` prints a warning otherwise.
+
+Limits per replica (the fleet limit is `replicas` x the value):
+
+| Value | Default | Effect |
+|-------|---------|--------|
+| `maxPlays` | 128 | Concurrent plays (1..4096). Over it, Play is refused |
+| `maxPlaysPerDestination` | 32 | Concurrent plays to one destination IP (at most `maxPlays`) |
+| `maxPlaySeconds` | 30 | Longest play, initial delay included (1..120) |
+| `allowedMediaCidrs` | `[]` | Media networks RTP may go to (at most 256). Empty = any unicast address. **Recommended:** set it (see below) |
+| `defaultDelayMs` | 200 | Delay before the first packet (at most 2000) |
+
+Unspecified, broadcast, multicast, loopback and link-local destinations and
+port 0 are always refused, also when they are embedded in a NAT64
+(`64:ff9b::/96`, `64:ff9b:1::/48` in the /96 layout) or 6to4 (`2002::/16`)
+address. An IPv6 destination is refused when the pod binds RTP on IPv4
+(`bindIp` unset or IPv4). With `allowedMediaCidrs` set, the network and
+broadcast addresses of each listed IPv4 range of /30 or shorter are refused
+too, and the IPv4 address embedded in a NAT64 / 6to4 destination must be in
+the list as well. Playback stops when the daemon drops the call's stream or
+the connection dies, and at the first permanent send error.
+
+**Set `allowedMediaCidrs`.** With the default empty list the pod sends RTP to
+any unicast address the caller's SDP names, including the cluster's pod,
+service and node networks, so it cannot tell a subnet broadcast from a host
+either. List the phone and carrier media networks; the chart passes the same
+list to the daemon (`SBC_ANNOUNCEMENT_ALLOWED_DEST_CIDRS`) for in-process
+playback. Pod egress is not restricted by the NetworkPolicy (POA&M-381).
+
+When the pod refuses a Play, the daemon does not play the announcement
+in-process: the caller gets 503 when a limit is reached, and 480 otherwise.
+A TLS handshake or certificate failure (an expired or untrusted pod
+certificate, a rejected client certificate) and a client PEM error are also
+refusals (480). The daemon falls back to in-process playback only on a DNS
+failure, a TCP connection refused or reset before TLS, or no answer within
+2 s. In-process playback has the pod's default limits (128 concurrent plays,
+32 per destination IP, 30 s per play; 503 beyond a cap) and the same
+destination checks. Refusals appear in the pod log only, not in
+the audit trail (POA&M-434). The pod serves only the AnnouncementService (no
+gRPC Health service); liveness and readiness probes are TCP checks on 9095,
+because a kubelet gRPC probe has no client certificate.
+
 ---
 
 ## 7. Verify
@@ -384,6 +470,49 @@ helm uninstall sbc-<site-id> -n sbc-system
 > app.kubernetes.io/instance=sbc-<site-id>`) only when you intend to discard the
 > site's config/registration state. The SBC daemon runs a single replica per
 > site (`ReadWriteOnce`); upgrades are a brief restart, not a rolling handover.
+
+### Upgrading to the announcement server hardening release (SR-41)
+
+This upgrade has breaking changes for sites with `sbcAnnouncement.enabled`.
+Sites with the pod off (the default) are not affected.
+
+- **mTLS is required.** The chart fails to render unless
+  `sbcDaemon.grpcMtls.enabled` is on and either `clusterIssuer` or the two
+  `sbcAnnouncement.grpcMtls` Secret names are set (§6 "Announcement server
+  mTLS"). The daemon URL is now `https://`.
+- **The pod refuses to start** (exit 2) on a non-loopback
+  `SBC_ANN_GRPC_LISTEN` without `SBC_ANN_GRPC_TLS_{CERT,KEY,CLIENT_CA}_FILE`
+  and `SBC_ANN_GRPC_ALLOWED_CLIENT_NAMES`, or on an invalid limit. An
+  unparseable or over-2000 `SBC_ANN_DEFAULT_DELAY_MS` is now an error
+  instead of being ignored. A request `initial_delay_ms` over 2000 is
+  refused.
+- **The daemon refuses to start** (exit 2) when `SBC_ANNOUNCEMENT_URL` is a
+  plaintext URL that is not on loopback, when `SBC_ANNOUNCEMENT_TLS_*` is
+  incomplete, or when it is set with an `http://` URL.
+- **No fallback on refusal.** Over a limit, for a refused destination, or
+  on a TLS / certificate failure between daemon and pod, the caller gets 503
+  or 480 instead of an in-process announcement. Watch the pod certificate:
+  an expired one now stops announcements instead of degrading to
+  in-process playback.
+- **In-process playback is capped** at 128 concurrent plays and 32 per
+  destination IP (503 beyond), 30 s per play, and refuses the same
+  destination classes; `SBC_ANNOUNCEMENT_ALLOWED_DEST_CIDRS`
+  restricts it to media networks.
+- **CNSA-only listener.** The pod accepts TLS 1.3 `TLS_AES_256_GCM_SHA384`
+  with ML-KEM-1024 or P-384 only, and ECDSA P-384 / SHA-384 certificate
+  signatures only (no RSA, no P-256 client certificates). The daemon's
+  client negotiates this.
+- **Certificate renewal restarts the pod** (exit code 3, after a random
+  0-10 s delay, when its certificate files change).
+- **Probes** changed from gRPC to TCP on 9095, and the gRPC Health service
+  was removed from the pod.
+
+Check after the upgrade:
+
+```bash
+kubectl -n sbc-system get certificate sbc-<site-id>-announcement-server sbc-<site-id>-announcement-client
+kubectl -n sbc-system logs deploy/sbc-<site-id>-announcement | grep '"mtls":true'
+```
 
 ### Upgrading to the management-API hardening release (fix/mgmt-api-hardening)
 

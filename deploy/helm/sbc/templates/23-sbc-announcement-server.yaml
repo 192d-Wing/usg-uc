@@ -1,3 +1,4 @@
+{{- include "sbc.announcementPreflight" . }}
 {{- if .Values.sbcAnnouncement.enabled }}
 # sbc-announcement-server — announcement playback pod.
 #
@@ -6,8 +7,60 @@
 # SBC_ANNOUNCEMENT_URL; this pod binds the RTP socket, streams PCMU
 # audio to the caller, and reports completion back to the daemon.
 # Stateless — the daemon falls back to in-process playback when the pod
-# is absent or unreachable, so it can be enabled per-site without
-# changing any daemon logic. Docs: docs/architecture.md.
+# is unreachable; a pod refusal (cap, destination policy) is final.
+# Docs: docs/architecture.md.
+#
+# Play is mTLS only: the daemon's client certificate must chain to the
+# issuer CA and carry an allow-listed SAN (SBC_ANN_GRPC_ALLOWED_CLIENT_NAMES).
+# Caps, the duration bound and the destination policy limit what an
+# admitted client can send (NIST 800-53 Rev5: IA-3, SC-8, SC-5, SC-7).
+{{- if .Values.sbcDaemon.grpcMtls.clusterIssuer }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "sbc.fullname" . }}-announcement-server
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "sbc.announcementServerTlsSecret" . }}
+  dnsNames:
+    - {{ printf "%s-announcement" (include "sbc.fullname" .) }}
+    - {{ printf "%s-announcement.%s.svc" (include "sbc.fullname" .) .Release.Namespace }}
+    - {{ printf "%s-announcement.%s.svc.cluster.local" (include "sbc.fullname" .) .Release.Namespace }}
+  usages: [server auth]
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+    rotationPolicy: Always
+  issuerRef:
+    name: {{ .Values.sbcDaemon.grpcMtls.clusterIssuer | quote }}
+    kind: {{ .Values.sbcDaemon.grpcMtls.issuerKind | default "ClusterIssuer" }}
+---
+# The daemon's client certificate for Play. The pod matches SAN DNS names,
+# so the name is in dnsNames, not only the CN.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "sbc.fullname" . }}-announcement-client
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "sbc.announcementClientTlsSecret" . }}
+  commonName: {{ printf "%s-sbc-daemon" (include "sbc.fullname" .) }}
+  dnsNames:
+    - {{ printf "%s-sbc-daemon" (include "sbc.fullname" .) }}
+  usages: [client auth]
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+    rotationPolicy: Always
+  issuerRef:
+    name: {{ .Values.sbcDaemon.grpcMtls.clusterIssuer | quote }}
+    kind: {{ .Values.sbcDaemon.grpcMtls.issuerKind | default "ClusterIssuer" }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -61,18 +114,38 @@ spec:
             {{- end }}
             - name: SBC_ANN_DEFAULT_DELAY_MS
               value: {{ .Values.sbcAnnouncement.defaultDelayMs | quote }}
+            # mTLS listener and the client SAN allow-list.
+            - name: SBC_ANN_GRPC_TLS_CERT_FILE
+              value: /etc/sbc/announcement-tls/tls.crt
+            - name: SBC_ANN_GRPC_TLS_KEY_FILE
+              value: /etc/sbc/announcement-tls/tls.key
+            - name: SBC_ANN_GRPC_TLS_CLIENT_CA_FILE
+              value: /etc/sbc/announcement-tls/ca.crt
+            - name: SBC_ANN_GRPC_ALLOWED_CLIENT_NAMES
+              value: {{ include "sbc.announcementAllowedClientNames" . | quote }}
+            # Caps per replica and the destination allow-list.
+            - name: SBC_ANN_MAX_PLAYS
+              value: {{ .Values.sbcAnnouncement.maxPlays | quote }}
+            - name: SBC_ANN_MAX_PLAYS_PER_DEST
+              value: {{ .Values.sbcAnnouncement.maxPlaysPerDestination | quote }}
+            - name: SBC_ANN_MAX_PLAY_SECS
+              value: {{ .Values.sbcAnnouncement.maxPlaySeconds | quote }}
+            {{- with .Values.sbcAnnouncement.allowedMediaCidrs }}
+            - name: SBC_ANN_ALLOWED_DEST_CIDRS
+              value: {{ join "," . | quote }}
+            {{- end }}
           ports:
             - { name: grpc, containerPort: 9095, protocol: TCP }
+          # TCP probes: a kubelet gRPC probe presents no client certificate
+          # and cannot pass the mTLS listener.
           livenessProbe:
-            grpc:
+            tcpSocket:
               port: 9095
-              service: ""
             initialDelaySeconds: 5
             periodSeconds: 20
           readinessProbe:
-            grpc:
+            tcpSocket:
               port: 9095
-              service: ""
             initialDelaySeconds: 2
             periodSeconds: 5
           resources:
@@ -82,6 +155,13 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
+          volumeMounts:
+            - { name: announcement-tls, mountPath: /etc/sbc/announcement-tls, readOnly: true }
+      volumes:
+        - name: announcement-tls
+          secret:
+            secretName: {{ include "sbc.announcementServerTlsSecret" . }}
+            defaultMode: 0440
 ---
 apiVersion: v1
 kind: Service

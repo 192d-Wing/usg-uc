@@ -17,13 +17,23 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["json"] }
 
 tonic.workspace = true
-sbc-grpc-api.workspace = true
+# `mtls`: the shared listener rule and client-name gate (as sbc-media).
+sbc-grpc-api = { workspace = true, features = ["mtls"] }
 sbc-announcement.workspace = true
+# Media CIDR allow-list (SBC_ANN_ALLOWED_DEST_CIDRS).
+ipnet.workspace = true
+# Process-level CryptoProvider selection (aws-lc, as the daemon).
+rustls.workspace = true
 
 rand = "0.8"
+
+[dev-dependencies]
+# SR-41 QA: P-384 test PKI for the in-process mTLS handshake tests.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+tempfile.workspace = true

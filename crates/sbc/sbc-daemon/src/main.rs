@@ -55,6 +55,7 @@
 
 #[cfg(feature = "grpc")]
 mod announcement_client;
+mod announcement_local;
 mod api_server;
 mod args;
 mod cdr;
@@ -124,6 +125,21 @@ fn main() {
         .is_err()
     {
         eprintln!("rustls CryptoProvider was already installed");
+    }
+
+    // NIST 800-53 Rev5: CM-6, SC-7 -- the in-process announcement
+    // destination allow-list (SBC_ANNOUNCEMENT_ALLOWED_DEST_CIDRS).
+    if let Err(e) = announcement_local::init_local_policy() {
+        tracing::error!("Announcement destination configuration: {e}");
+        std::process::exit(2);
+    }
+    // NIST 800-53 Rev5: CM-6, SC-8 -- the announcement pod channel is mTLS
+    // with an https:// URL (plaintext only to loopback); a bad setting stops
+    // startup instead of degrading at the first announcement.
+    #[cfg(feature = "grpc")]
+    if let Err(e) = announcement_client::init_announcement_tls() {
+        tracing::error!("Announcement client configuration: {e}");
+        std::process::exit(2);
     }
 
     // Create tokio runtime and run the daemon

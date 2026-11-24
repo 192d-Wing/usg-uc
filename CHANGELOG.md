@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, announcement server mTLS, destination policy and caps, SR-41, POA&M-434, 435)
+
+Tested in local runs on macOS (2026-11-23); the rendered-chart tests need
+the helm binary and ran locally only. Operator details:
+`deploy/helm/sbc/DEPLOYING.md` "Announcement server mTLS" and "Upgrading to
+the announcement server hardening release (SR-41)".
+
+- **`sbcAnnouncement.enabled` requires `sbcDaemon.grpcMtls.enabled`**
+  (IA-3, SC-8) and either `sbcDaemon.grpcMtls.clusterIssuer` or both
+  `sbcAnnouncement.grpcMtls.serverSecretName` and `daemonClientSecretName`.
+  Rendering fails otherwise. With an issuer the chart issues ECDSA P-384
+  server and daemon client certificates (daemon SAN
+  `<fullname>-sbc-daemon`) and sets an `https://` URL.
+- **The pod refuses to start off loopback without certificates.** A
+  non-loopback `SBC_ANN_GRPC_LISTEN` (the default is `0.0.0.0:9095`) needs
+  all of `SBC_ANN_GRPC_TLS_{CERT,KEY,CLIENT_CA}_FILE` and a non-empty
+  `SBC_ANN_GRPC_ALLOWED_CLIENT_NAMES`; otherwise it exits 2. Every Play
+  needs a client certificate whose SAN DNS or URI is allow-listed (not the
+  CN). The listener is TLS 1.3 CNSA only (`TLS_AES_256_GCM_SHA384`,
+  ML-KEM-1024 / P-384, ECDSA P-384 signatures). Out-of-range cap, delay,
+  CIDR or lab-flag values also exit 2.
+- **Daemon TLS variables.** `SBC_ANNOUNCEMENT_TLS_{CA,CERT,KEY}_FILE` are all
+  or none. With them `SBC_ANNOUNCEMENT_URL` must be `https://`; without them
+  only a loopback `http://` URL is accepted. TLS variables without a URL,
+  and a bad `SBC_ANNOUNCEMENT_ALLOWED_DEST_CIDRS`, stop the daemon at
+  startup (exit 2).
+- **The pod exits on a certificate change.** It checks its certificate, key
+  and client CA files every 30 s and, after a change and a random 0-10 s
+  delay, exits with code 3 so Kubernetes restarts it with the new files.
+- **gRPC Health is removed from the pod.** Liveness and readiness probes are
+  now `tcpSocket` on 9095. External gRPC health checks against the pod no
+  longer work.
+- **Refusals are final: 503 or 480, no in-process fallback.** (SC-5, SC-7) A
+  pod refusal gets 503 for a cap (`RESOURCE_EXHAUSTED`) and 480 otherwise. A
+  TLS handshake or certificate failure, or a client PEM error, gets 480.
+  The daemon plays in-process only on DNS failure, a TCP connect
+  refused or reset before TLS, or the 2 s setup timeout (POA&M-435).
+- **Caps and destination policy.** The pod allows 128 concurrent plays per
+  replica, 32 per destination IP and 30 s per play by default
+  (`sbcAnnouncement.maxPlays`, `maxPlaysPerDestination`,
+  `maxPlaySeconds`); `initial_delay_ms` is at most 2000. In-process
+  playback has fixed limits of 128 / 32 / 30 s and answers 503 when full.
+  Unspecified, broadcast, multicast, link-local and loopback destinations
+  are refused, including inside NAT64 / 6to4 addresses. Set
+  `sbcAnnouncement.allowedMediaCidrs`: empty admits any unicast address.
+  Refusals are logged, not audited (POA&M-434).
+- **sbc-media log text.** The MediaController refusal line is now
+  `"gRPC call refused"` with `service = "MediaControllerService"` (was
+  `"MediaController call refused"`). Update log alerts that match the old
+  text.
+
 ### BREAKING (soft client, smart-card login and provisioning trust, POA&M-370, 371)
 
 Tested locally on macOS arm64; Windows covered by the CI cross-target build only.

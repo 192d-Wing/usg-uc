@@ -110,6 +110,23 @@ Daemon gRPC (9091):
 {{- else }}
   plaintext, loopback only (127.0.0.1); no -grpc Service.
 {{- end }}
+{{- if .Values.sbcAnnouncement.enabled }}
+Announcement server (9095): mTLS only; allowed client names: {{ include "sbc.announcementAllowedClientNames" . }}
+  Limits per replica: {{ .Values.sbcAnnouncement.maxPlays }} plays, {{ .Values.sbcAnnouncement.maxPlaysPerDestination }} per destination IP, {{ .Values.sbcAnnouncement.maxPlaySeconds }} s each.
+  {{- if .Values.sbcAnnouncement.allowedMediaCidrs }}
+  RTP only to: {{ join ", " .Values.sbcAnnouncement.allowedMediaCidrs }}
+  {{- else }}
+  RECOMMENDED: RTP goes to any unicast address, including cluster and node
+  networks. Set sbcAnnouncement.allowedMediaCidrs to the phone/carrier media
+  networks.
+  {{- end }}
+{{- if and .Values.sbcDaemon.grpcMtls.clusterIssuer (eq (.Values.sbcDaemon.grpcMtls.issuerKind | default "ClusterIssuer") "ClusterIssuer") }}
+  WARNING: the announcement client certificate (SAN {{ printf "%s-sbc-daemon" (include "sbc.fullname" .) }}) comes from
+  ClusterIssuer {{ .Values.sbcDaemon.grpcMtls.clusterIssuer }}. A workload in any namespace that can request a
+  certificate from it can obtain that name and call Play. Use a dedicated
+  namespaced Issuer (sbcDaemon.grpcMtls.issuerKind: Issuer).
+{{- end }}
+{{- end }}
 {{- if not .Values.sbcApi.trustedProxies }}
 {{- if .Values.sbcApi.enabled }}
 RECOMMENDED: set sbcApi.trustedProxies to the frontend pod CIDR. Without it

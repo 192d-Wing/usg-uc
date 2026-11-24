@@ -7,40 +7,29 @@
 //! listed in `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES` on every RPC. There is no
 //! plaintext opt-in off loopback.
 //!
-//! The certificate is peer-supplied DER: it is parsed by `webpki` and a
-//! malformed one is refused, never a panic.
+//! A thin wrapper over the shared [`sbc_grpc_api::mtls`] helper that fixes
+//! this binary's variable names.
 //!
 //! ## NIST 800-53 Rev5: IA-3, SC-8, AC-3, SC-7
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
 
-use rustls_pki_types::CertificateDer;
+use sbc_grpc_api::mtls::{self, MtlsEnvNames};
 use tonic::service::Interceptor;
-use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Status};
-use tracing::warn;
 
-/// Most entries accepted in `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES`.
-pub const MAX_ALLOWED_CLIENT_NAMES: usize = 64;
+#[cfg(test)]
+use rustls_pki_types::CertificateDer;
+#[cfg(test)]
+use sbc_grpc_api::mtls::{CertName, authorize};
+pub use sbc_grpc_api::mtls::{ServerTls, load_server_tls};
 
-/// Longest allow-list entry (DNS name limit).
-pub const MAX_CLIENT_NAME_LEN: usize = 253;
-
-/// Most names taken from one client certificate.
-const MAX_CERT_NAMES: usize = 32;
-
-/// Server mTLS material (PEM file paths).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerTls {
-    /// Server certificate chain.
-    pub cert: PathBuf,
-    /// Server private key.
-    pub key: PathBuf,
-    /// CA that client certificates must chain to.
-    pub client_ca: PathBuf,
-}
+/// The sbc-media listener variables.
+const NAMES: MtlsEnvNames = MtlsEnvNames {
+    listen: "SBC_MEDIA_GRPC_LISTEN",
+    tls_prefix: "SBC_MEDIA_GRPC_TLS",
+    allowed: "SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES",
+};
 
 /// `SBC_MEDIA_GRPC_TLS_{CERT,KEY,CLIENT_CA}_FILE`: all three or none; an
 /// empty value counts as unset.
@@ -52,16 +41,7 @@ pub fn server_tls_from(
     key: Option<String>,
     client_ca: Option<String>,
 ) -> Result<Option<ServerTls>, String> {
-    let set = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
-    match (set(cert), set(key), set(client_ca)) {
-        (None, None, None) => Ok(None),
-        (Some(cert), Some(key), Some(client_ca)) => Ok(Some(ServerTls {
-            cert: cert.into(),
-            key: key.into(),
-            client_ca: client_ca.into(),
-        })),
-        _ => Err("SBC_MEDIA_GRPC_TLS_{CERT,KEY,CLIENT_CA}_FILE: set all three or none".to_string()),
-    }
+    mtls::server_tls_from(&NAMES, cert, key, client_ca)
 }
 
 /// `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES`: comma-separated SAN DNS names or
@@ -70,28 +50,7 @@ pub fn server_tls_from(
 /// # Errors
 /// A message naming the offending entry.
 pub fn parse_allowed_client_names(raw: Option<&str>) -> Result<Vec<String>, String> {
-    let names: Vec<String> = raw
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect();
-    if names.len() > MAX_ALLOWED_CLIENT_NAMES {
-        return Err(format!(
-            "SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES has more than {MAX_ALLOWED_CLIENT_NAMES} entries"
-        ));
-    }
-    for n in &names {
-        let printable = n.bytes().all(|b| (0x21..=0x7e).contains(&b));
-        if n.len() > MAX_CLIENT_NAME_LEN || !printable {
-            return Err(format!(
-                "SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES entry {n:?} must be 1..={MAX_CLIENT_NAME_LEN} \
-                 printable ASCII characters"
-            ));
-        }
-    }
-    Ok(names)
+    mtls::parse_allowed_client_names(&NAMES, raw)
 }
 
 /// The listener rule: off loopback only with mTLS and a non-empty client
@@ -104,141 +63,29 @@ pub fn check_listener(
     tls: Option<&ServerTls>,
     allowed: &[String],
 ) -> Result<(), String> {
-    if tls.is_none() && !allowed.is_empty() {
-        return Err("SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES is only enforced with \
-             SBC_MEDIA_GRPC_TLS_{CERT,KEY,CLIENT_CA}_FILE"
-            .to_string());
-    }
-    if addr.ip().is_loopback() {
-        return Ok(());
-    }
-    if tls.is_none() {
-        return Err(format!(
-            "SBC_MEDIA_GRPC_LISTEN {addr} must be a loopback address unless \
-             SBC_MEDIA_GRPC_TLS_{{CERT,KEY,CLIENT_CA}}_FILE are set (mTLS)"
-        ));
-    }
-    if allowed.is_empty() {
-        return Err(format!(
-            "SBC_MEDIA_GRPC_LISTEN {addr} is not a loopback address: \
-             SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES must list the permitted client names"
-        ));
-    }
-    Ok(())
-}
-
-/// Builds the tonic server TLS config: server identity plus a required
-/// client certificate chaining to the client CA.
-///
-/// # Errors
-/// The unreadable file.
-pub fn load_server_tls(tls: &ServerTls) -> Result<ServerTlsConfig, String> {
-    let read =
-        |p: &PathBuf| std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
-    Ok(ServerTlsConfig::new()
-        .identity(Identity::from_pem(read(&tls.cert)?, read(&tls.key)?))
-        .client_ca_root(Certificate::from_pem(read(&tls.client_ca)?)))
-}
-
-/// One name from a client certificate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CertName {
-    Dns(String),
-    Uri(String),
-}
-
-impl CertName {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::Dns(s) | Self::Uri(s) => s,
-        }
-    }
-
-    /// DNS names compare ASCII case-insensitively, URIs exactly.
-    fn matches(&self, allowed: &str) -> bool {
-        match self {
-            Self::Dns(s) => s.eq_ignore_ascii_case(allowed),
-            Self::Uri(s) => s == allowed,
-        }
-    }
-}
-
-/// SAN DNS names and URIs of a client leaf certificate, or `None` if it
-/// does not parse.
-fn cert_names(der: &CertificateDer<'_>) -> Option<Vec<CertName>> {
-    let cert = webpki::EndEntityCert::try_from(der).ok()?;
-    let short = |n: &&str| n.len() <= MAX_CLIENT_NAME_LEN;
-    Some(
-        cert.valid_dns_names()
-            .filter(short)
-            .map(|n| CertName::Dns(n.to_string()))
-            .chain(
-                cert.valid_uri_names()
-                    .filter(short)
-                    .map(|n| CertName::Uri(n.to_string())),
-            )
-            .take(MAX_CERT_NAMES)
-            .collect(),
-    )
-}
-
-/// Decides one RPC: `Ok` when the leaf has an allow-listed name (DNS names
-/// compare ASCII case-insensitively, URIs exactly). An empty list admits any certificate
-/// that chained to the client CA (loopback listeners only, see
-/// [`check_listener`]).
-fn authorize(certs: Option<&[CertificateDer<'_>]>, allowed: &[String]) -> Result<(), String> {
-    let leaf = certs
-        .and_then(<[_]>::first)
-        .ok_or_else(|| "no client certificate".to_string())?;
-    let names = cert_names(leaf).ok_or_else(|| "unparseable client certificate".to_string())?;
-    if allowed.is_empty() {
-        return Ok(());
-    }
-    if names.iter().any(|n| allowed.iter().any(|a| n.matches(a))) {
-        return Ok(());
-    }
-    let shown: Vec<&str> = names.iter().map(CertName::as_str).take(4).collect();
-    Err(format!(
-        "client certificate {shown:?} not in SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES"
-    ))
+    mtls::check_listener(&NAMES, addr, tls, allowed)
 }
 
 /// Interceptor enforcing the client allow-list under mTLS. Without TLS it
 /// passes requests through (the listener is then loopback-only).
-// POAM: POA&M-383 denials are logged, not written to the uc-audit trail
-// (sbc-media has no audit sink).
 #[derive(Debug, Clone)]
-pub struct ClientNameGate {
-    enforce: bool,
-    allowed: Arc<[String]>,
-}
+pub struct ClientNameGate(mtls::ClientNameGate);
 
 impl ClientNameGate {
     /// `enforce` is true when the listener runs mTLS.
     #[must_use]
     pub fn new(enforce: bool, allowed: &[String]) -> Self {
-        Self {
+        Self(mtls::ClientNameGate::new(
             enforce,
-            allowed: allowed.into(),
-        }
+            allowed,
+            "MediaControllerService",
+        ))
     }
 }
 
 impl Interceptor for ClientNameGate {
     fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
-        if !self.enforce {
-            return Ok(req);
-        }
-        let certs = req.peer_certs();
-        match authorize(certs.as_deref().map(Vec::as_slice), &self.allowed) {
-            Ok(()) => Ok(req),
-            Err(reason) => {
-                warn!(peer = ?req.remote_addr(), %reason, "MediaController call refused");
-                Err(Status::permission_denied(
-                    "client certificate is not allowed on this listener",
-                ))
-            }
-        }
+        self.0.call(req)
     }
 }
 

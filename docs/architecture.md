@@ -52,7 +52,8 @@ and media relay together. Supporting crates:
 - `sbc-announcement` (lib), `sbc-announcement-server` (pod) —
   announcement playback engine and the gRPC-fronted pod that streams
   announcements ("number not in service", "all circuits busy") on the
-  daemon's behalf
+  daemon's behalf (mTLS from the daemon only; concurrency, duration and
+  destination limits per replica, see `deploy/helm/sbc/DEPLOYING.md`)
 - `sbc-trunk-services` (lib), `sbc-trunk-agent` (pod) — OPTIONS trunk
   health monitoring and outbound carrier registration, runnable
   in-process or as a dedicated single-replica pod
@@ -89,7 +90,7 @@ flowchart LR
     carriers <-->|"SIP + RTP"| daemon
     carriers <-->|"announcement RTP"| ann
     carriers <-->|"OPTIONS / REGISTER"| trunk
-    daemon -->|"gRPC AnnouncementService<br>(SBC_ANNOUNCEMENT_URL)"| ann
+    daemon -->|"gRPC AnnouncementService, mTLS<br>(SBC_ANNOUNCEMENT_URL)"| ann
     trunk -->|"gRPC TrunkStatusPublishService<br>(daemon: SBC_TRUNK_SERVICES=external)"| daemon
     api -->|"gRPC sync services :9091"| daemon
     api --> pg
