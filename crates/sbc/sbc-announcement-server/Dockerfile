@@ -9,7 +9,7 @@
 # Dockerfile, plus protobuf for tonic/prost codegen (sbc-grpc-api).
 #
 # Builder and runtime follow the root Dockerfile: glibc (Debian) with Go,
-# because the binary links the FIPS-validated aws-lc module and
+# because the binary links the aws-lc FIPS module and
 # aws-lc-fips-sys does not build on musl. Do NOT change to Alpine;
 # ci/check-dockerfiles-fips.sh fails CI on an Alpine/musl Rust builder.
 #

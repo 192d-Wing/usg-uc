@@ -26,7 +26,7 @@
 # layers cache once.
 #
 # NOTE: this image, like every Rust SBC image, is glibc (Debian).
-# sbc-daemon links the FIPS-validated aws-lc module
+# sbc-daemon links the aws-lc FIPS module
 # (rustls `fips` + uc-crypto, see docs/CNSA-2-COMPLIANCE.md), and
 # aws-lc-fips-sys does not support musl — an Alpine build would fail or
 # silently drop the FIPS posture. Same applies to ci/image (FIPS builds
