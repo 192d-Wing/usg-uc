@@ -10,10 +10,12 @@
 //!   (plus, for TCP/TLS, the [`ConnId`] it arrived on) -> the AORs it bound.
 //!   Filled by the registrar path. Entries are hints:
 //!   the caller re-checks the AOR's live bindings, so an expired or removed
-//!   registration is never trusted even if its entry is still here.
+//!   registration is never trusted even if its entry is still here. The
+//!   same index also gates INVITE source admission (AC-3): a non-trunk
+//!   INVITE is admitted only from a flow with a live registration.
 //! - [`DidMap`]: DID -> user, plus user -> canonical TN -> DID.
 //!
-//! ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection), IA-3
+//! ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection), IA-3, AC-3
 
 use proto_stir_shaken::canonicalize_tn;
 use std::collections::{BTreeMap, HashMap};
@@ -23,8 +25,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use uc_types::address::TransportType;
 
-/// Most AORs one flow may bind (a multi-line phone registers several).
-pub const MAX_AORS_PER_FLOW: usize = 8;
+/// Most AORs one flow may bind (a multi-line phone or a small IP PBX
+/// registers several). The index also gates INVITE admission, so an AOR
+/// past the cap cannot place calls from that flow (logged, counted). The
+/// whole table stays bounded by `general.max_registrations` flows (SC-5).
+pub const MAX_AORS_PER_FLOW: usize = 64;
 
 /// The received flow of a REGISTER or INVITE: canonical source IP, source
 /// port and the transport the packet actually arrived on.
@@ -79,6 +84,29 @@ struct FlowEntry {
     aors: Vec<String>,
 }
 
+/// Why [`StirFlows::get`] found nothing for a flow, when that is cheap to
+/// tell (deny-path log hint only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowMiss {
+    /// The flow is indexed, but on another stream connection (or none).
+    ConnMismatch,
+    /// The same `ip:port` is indexed under another transport.
+    TransportMismatch,
+    /// Nothing cheap to report (includes a UDP port mismatch: finding it
+    /// would need an IP index or a scan).
+    None,
+}
+
+/// Transports [`StirFlows::miss_reason`] probes for a transport mismatch
+/// (every listener transport but SCTP).
+const MISS_PROBE_TRANSPORTS: [TransportType; 5] = [
+    TransportType::Udp,
+    TransportType::Tcp,
+    TransportType::Tls,
+    TransportType::WebSocket,
+    TransportType::WebSocketSecure,
+];
+
 /// Received flow -> AORs registered from it. Bounded by `cap` flows
 /// (`general.max_registrations`); std `HashMap` (keyed `SipHash`).
 ///
@@ -92,6 +120,43 @@ pub struct StirFlows {
     /// `by_flow`.
     by_conn: HashMap<ConnId, FlowKey>,
     last_sweep: Option<Instant>,
+    /// Rate limits of the two refusal logs (table full, flow full).
+    table_full_log: LogGate,
+    flow_full_log: LogGate,
+}
+
+/// Why [`StirFlows::bind`] refused to index a flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindRefusal {
+    /// The table holds `cap` live flows.
+    TableFull,
+    /// The flow already binds [`MAX_AORS_PER_FLOW`] live AORs.
+    FlowFull,
+}
+
+/// Rate limit for one kind of log line: at most one per
+/// [`SWEEP_MIN_INTERVAL`], with the count of the ones suppressed in
+/// between (SC-5: a REGISTER flood at capacity cannot flood the log).
+#[derive(Debug, Default)]
+struct LogGate {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl LogGate {
+    /// `Some(suppressed since the last emitted line)` when a line is due at
+    /// `now`; otherwise counts this one as suppressed.
+    fn due(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last
+            .is_some_and(|t| now.saturating_duration_since(t) < SWEEP_MIN_INTERVAL)
+        {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
 }
 
 impl StirFlows {
@@ -113,6 +178,53 @@ impl StirFlows {
             return None;
         }
         Some(entry.aors.as_slice())
+    }
+
+    /// Why [`Self::get`] returned `None` for `key` and `conn`: at most six
+    /// hash probes (the key, then up to five other transports), no
+    /// allocation. Deny path only.
+    #[must_use]
+    pub fn miss_reason(&self, key: &FlowKey, conn: Option<ConnId>) -> FlowMiss {
+        let (ip, port, transport) = *key;
+        if self.by_flow.contains_key(key) {
+            // `get` failed on an indexed key: only the connection check does.
+            return if self.get(key, conn).is_none() {
+                FlowMiss::ConnMismatch
+            } else {
+                FlowMiss::None
+            };
+        }
+        if MISS_PROBE_TRANSPORTS
+            .iter()
+            .any(|t| *t != transport && self.by_flow.contains_key(&(ip, port, *t)))
+        {
+            return FlowMiss::TransportMismatch;
+        }
+        FlowMiss::None
+    }
+
+    /// Why a [`Self::bind`] of `aor` on `key`/`conn` that returned `false`
+    /// was refused: the flow's own AOR cap, or the table cap. One probe.
+    #[must_use]
+    pub fn refusal(&self, key: &FlowKey, conn: Option<ConnId>) -> BindRefusal {
+        if self
+            .by_flow
+            .get(key)
+            .is_some_and(|e| e.conn == conn && e.aors.len() >= MAX_AORS_PER_FLOW)
+        {
+            BindRefusal::FlowFull
+        } else {
+            BindRefusal::TableFull
+        }
+    }
+
+    /// Whether the log line for `refusal` is due at `now` (see `LogGate`):
+    /// `Some(suppressed count)` when it is.
+    pub fn refusal_log_due(&mut self, refusal: BindRefusal, now: Instant) -> Option<u64> {
+        match refusal {
+            BindRefusal::TableFull => self.table_full_log.due(now),
+            BindRefusal::FlowFull => self.flow_full_log.due(now),
+        }
     }
 
     /// Records that `aor` registered from `key` on `conn`. When the table is
@@ -375,6 +487,60 @@ mod tests {
                 TransportType::Tcp
             ) == k(1),
             "mapped v4 canonicalised"
+        );
+    }
+
+    #[test]
+    fn refusal_names_flow_or_table_cap_and_logs_are_rate_limited() {
+        let mut f = StirFlows::default();
+        let c = Some(ConnId::next());
+        let t0 = Instant::now();
+        for i in 0..MAX_AORS_PER_FLOW {
+            assert!(f.bind_at(k(1), c, &format!("sip:l{i}@x"), 4, |_, _| true, t0));
+        }
+        assert!(!f.bind_at(k(1), c, "sip:extra@x", 4, |_, _| true, t0));
+        assert_eq!(f.refusal(&k(1), c), BindRefusal::FlowFull);
+        assert!(f.bind_at(k(2), Some(ConnId::next()), "sip:b@x", 2, |_, _| true, t0));
+        assert!(!f.bind_at(k(3), Some(ConnId::next()), "sip:c@x", 2, |_, _| true, t0));
+        assert_eq!(f.refusal(&k(3), None), BindRefusal::TableFull);
+        // First line due, the rest suppressed and counted until the interval.
+        assert_eq!(f.refusal_log_due(BindRefusal::TableFull, t0), Some(0));
+        assert_eq!(f.refusal_log_due(BindRefusal::TableFull, t0), None);
+        assert_eq!(f.refusal_log_due(BindRefusal::TableFull, t0), None);
+        // Independent gate per kind.
+        assert_eq!(f.refusal_log_due(BindRefusal::FlowFull, t0), Some(0));
+        let t1 = t0 + SWEEP_MIN_INTERVAL;
+        assert_eq!(f.refusal_log_due(BindRefusal::TableFull, t1), Some(2));
+        assert_eq!(f.refusal_log_due(BindRefusal::TableFull, t1), None);
+    }
+
+    #[test]
+    fn miss_reason_conn_transport_none() {
+        let mut f = StirFlows::default();
+        let c1 = ConnId::next();
+        assert!(f.bind(k(1), Some(c1), "sip:a@x", 4, |_, _| true));
+        assert_eq!(
+            f.miss_reason(&k(1), Some(ConnId::next())),
+            FlowMiss::ConnMismatch
+        );
+        assert_eq!(f.miss_reason(&k(1), None), FlowMiss::ConnMismatch);
+        let ip = IpAddr::from([198, 51, 100, 7]);
+        // Same ip:port, other transport.
+        assert_eq!(
+            f.miss_reason(&flow_key(ip, 1, TransportType::Udp), None),
+            FlowMiss::TransportMismatch
+        );
+        // Same ip, other port: not reported by design.
+        assert_eq!(f.miss_reason(&k(2), Some(c1)), FlowMiss::None);
+        let u = flow_key(ip, 5060, TransportType::Udp);
+        assert!(f.bind(u, None, "sip:b@x", 4, |_, _| true));
+        assert_eq!(
+            f.miss_reason(&flow_key(ip, 5062, TransportType::Udp), None),
+            FlowMiss::None
+        );
+        assert_eq!(
+            f.miss_reason(&flow_key(ip, 5060, TransportType::Tls), Some(c1)),
+            FlowMiss::TransportMismatch
         );
     }
 

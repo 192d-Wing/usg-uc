@@ -1404,7 +1404,15 @@ async fn tls_fixture(on_failure: RecordingFailureAction) -> Fixture {
     }
     stack.init_router_from_config(&routing, &dial_plans, &groups);
     stack
-        .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+        .register_inbound_trunk(
+            "pbx",
+            None,
+            // The PBX calls over UDP and TLS (SR-04: trunk keyed per transport).
+            &[
+                ("192.168.1.1".to_string(), AddrTransport::Udp),
+                ("192.168.1.1".to_string(), AddrTransport::Tls),
+            ],
+        )
         .await;
     let cdr = cdr_emitter();
     stack.set_cdr(Arc::new(crate::cdr::CdrContext::new(
@@ -1713,7 +1721,15 @@ async fn cross_group_fixture(tweak: impl FnOnce(&mut RecordingSettings)) -> Fixt
     sbc.set_default_css("css");
     stack.set_sbc_router(Arc::new(RwLock::new(sbc)));
     stack
-        .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+        .register_inbound_trunk(
+            "pbx",
+            None,
+            // The PBX calls over UDP and TLS (SR-04: trunk keyed per transport).
+            &[
+                ("192.168.1.1".to_string(), AddrTransport::Udp),
+                ("192.168.1.1".to_string(), AddrTransport::Tls),
+            ],
+        )
         .await;
     let cdr = cdr_emitter();
     stack.set_cdr(Arc::new(crate::cdr::CdrContext::new(

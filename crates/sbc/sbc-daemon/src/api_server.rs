@@ -468,6 +468,12 @@ pub const ROUTING_METRICS: &[(&str, &str)] = &[
         "sbc_deferred_send_dropped_total",
         "SBC-originated requests (e.g. post-announcement BYE) dropped because the deferred-send queue was full",
     ),
+    // NIST 800-53 Rev5: SI-4, SC-5, AC-3 - registration flow index
+    // overflow (SR-04: an unindexed flow cannot place calls; POA&M-398).
+    (
+        "sbc_flow_index_overflow_total",
+        "REGISTERs whose flow was not indexed (flow index full or per-flow AOR limit); that flow cannot place calls",
+    ),
 ];
 /// Gauge: CDRs accepted onto the writer queue.
 pub const METRIC_CDR_EMITTED: &str = "cdr_emitted_total";
@@ -826,6 +832,7 @@ impl AppState {
                 load(&c.header_manipulation_failures),
                 load(&c.late_2xx_teardowns),
                 stack.deferred_send_dropped(),
+                load(&c.flow_index_overflow),
             ];
             for (&(name, _), v) in ROUTING_METRICS.iter().zip(values) {
                 if let Some(g) = self.metrics.gauge(name) {
@@ -1695,6 +1702,22 @@ fn trunk_json_port(trunk: &serde_json::Value) -> Option<u16> {
     trunk_port(trunk, transport).ok()
 }
 
+/// Arrival transport of a trunk JSON body's `protocol` (falling back to
+/// `transport`; absent means UDP). `None` for an unknown protocol.
+///
+/// ## NIST 800-53 Rev5: SI-10, SC-7
+fn trunk_json_source_transport(
+    trunk: &serde_json::Value,
+) -> Option<uc_types::address::TransportType> {
+    use sbc_config_store::trunk_policy::{TrunkTransport, trunk_transport};
+    use uc_types::address::TransportType;
+    Some(match trunk_transport(trunk).ok()? {
+        TrunkTransport::Udp => TransportType::Udp,
+        TrunkTransport::Tcp => TransportType::Tcp,
+        TrunkTransport::Tls => TransportType::Tls,
+    })
+}
+
 /// Builds a router trunk group from a MemStore / config-store JSON body
 /// (API, TrunkSync, central config). `None` when the body has no `id`.
 ///
@@ -1834,7 +1857,8 @@ fn tls_trunk_without_ca(group: &uc_routing::TrunkGroup, ca_configured: bool) -> 
     !ca_configured && group.non_tls_count() as usize != group.trunk_count()
 }
 
-/// Syncs a trunk group from MemStore JSON to the SipStack router.
+/// Syncs a trunk group from MemStore JSON to the SipStack router, and
+/// its inbound mapping (source IP and transport → trunk group + CSS).
 ///
 /// Returns `Err` (nothing is installed) when a trunk `max_calls` is
 /// invalid for this node's `cluster.admission` split.
@@ -1862,24 +1886,26 @@ pub async fn sync_trunk_group_to_router(
         );
     }
 
-    // Register inbound trunk mapping (source IP → trunk group + CSS)
+    // Register inbound trunk mapping (source IP and transport → trunk
+    // group + CSS). Each host is a source only over its trunk's protocol
+    // (NIST 800-53 Rev5: AC-3, SC-7); the port only filters out the same
+    // invalid trunks the router skips.
     let css_id = group_json.get("css_id").and_then(|v| v.as_str());
-    let hosts: Vec<(String, u16)> = group_json
+    let hosts: Vec<(String, uc_types::address::TransportType)> = group_json
         .get("trunks")
         .and_then(|v| v.as_array())
-        .map(|trunks| {
+        .map_or_default(|trunks| {
             trunks
                 .iter()
                 .filter_map(|t| {
                     let h = t.get("host").and_then(|v| v.as_str())?;
-                    let p = trunk_json_port(t)?;
-                    Some((h.to_string(), p))
+                    trunk_json_port(t)?;
+                    Some((h.to_string(), trunk_json_source_transport(t)?))
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     // Names are resolved before the trunk-sync guard is taken.
-    let ips = crate::sip_stack::SipStack::resolve_trunk_hosts(&hosts).await;
+    let sources = crate::sip_stack::SipStack::resolve_trunk_sources(&hosts).await;
 
     // NIST 800-53 Rev5: AC-3, AC-4, CM-3 - router add, source map and peer
     // set change under the trunk-sync guard, so a concurrent removal runs
@@ -1892,8 +1918,33 @@ pub async fn sync_trunk_group_to_router(
     // store under the guard in grpc_server.
     let sync = sip_stack.trunk_sync_guard().await;
     sip_stack.add_trunk_group_to_router(group).await;
-    sip_stack.register_inbound_trunk_ips(id, css_id, &ips).await;
+    sip_stack
+        .register_inbound_trunk_sources(id, css_id, &sources)
+        .await;
+    // The config-file load warning (`routing_warnings`) for a trusted group
+    // with a non-TLS trunk, also for a group synced over REST/gRPC: its PAI
+    // is kept on source address and transport alone.
+    // NIST 800-53 Rev5: CM-6, AC-21
+    // POAM: POA&M-397 trunk identity is source IP and transport, not a peer
+    // certificate.
+    if sip_stack.trunk_group_trusted(id).await {
+        for key in sources
+            .iter()
+            .filter(|k| k.transport() != uc_types::address::TransportType::Tls)
+        {
+            tracing::warn!(
+                trunk_group = id,
+                address = %key.ip(),
+                transport = %key.transport(),
+                "Synced trunk group has trust_domain = true but this trunk source is not TLS; its P-Asserted-Identity is kept on source address and transport alone (POA&M-397)"
+            );
+        }
+    }
     // In-dialog peer set of the group's calls (NIST 800-53 Rev5: SC-23).
+    let ips = sources
+        .iter()
+        .map(crate::sip_stack::TrunkSourceKey::ip)
+        .collect();
     sip_stack.index_trunk_group_ips(id, ips).await;
     drop(sync);
 
@@ -2364,11 +2415,45 @@ mod tests {
         assert!(sync_trunk_group_to_router(&state, &g).await.is_err());
     }
 
+    /// Inbound trunk of `ip` over UDP (the JSON default protocol).
     async fn inbound(state: &Arc<AppState>, ip: [u8; 4]) -> Option<(String, Option<String>)> {
+        inbound_on(state, ip, uc_types::address::TransportType::Udp).await
+    }
+
+    async fn inbound_on(
+        state: &Arc<AppState>,
+        ip: [u8; 4],
+        transport: uc_types::address::TransportType,
+    ) -> Option<(String, Option<String>)> {
         let stack = state.sip_stack.as_ref().expect("stack");
         stack
-            .lookup_inbound_trunk(std::net::Ipv4Addr::from(ip).into())
+            .lookup_inbound_trunk(std::net::Ipv4Addr::from(ip).into(), transport)
             .await
+    }
+
+    // NIST 800-53 Rev5: AC-3, SC-7 - a synced trunk is a source only over
+    // its configured protocol (`protocol`, else `transport`); an unknown
+    // protocol is skipped as before.
+    #[tokio::test]
+    async fn sync_keys_trunk_sources_by_protocol() {
+        use uc_types::address::TransportType as T;
+        let state = divided_state(1).await;
+        let g = serde_json::json!({"id": "g", "trunks": [
+            {"id": "a", "host": "127.0.0.21", "protocol": "tls"},
+            {"id": "b", "host": "127.0.0.22", "transport": "tcp"},
+            {"id": "c", "host": "127.0.0.23", "protocol": "carrier-pigeon"}
+        ]});
+        sync_trunk_group_to_router(&state, &g)
+            .await
+            .expect("synced");
+        assert!(inbound_on(&state, [127, 0, 0, 21], T::Tls).await.is_some());
+        assert_eq!(inbound_on(&state, [127, 0, 0, 21], T::Udp).await, None);
+        assert_eq!(inbound_on(&state, [127, 0, 0, 21], T::Tcp).await, None);
+        assert!(inbound_on(&state, [127, 0, 0, 22], T::Tcp).await.is_some());
+        assert_eq!(inbound_on(&state, [127, 0, 0, 22], T::Udp).await, None);
+        for t in [T::Udp, T::Tcp, T::Tls] {
+            assert_eq!(inbound_on(&state, [127, 0, 0, 23], t).await, None, "{t}");
+        }
     }
 
     // NIST 800-53 Rev5: AC-3, AC-4, CM-3
