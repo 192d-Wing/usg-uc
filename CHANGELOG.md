@@ -455,33 +455,59 @@ Tested locally on macOS arm64 only (unit tests); no CI run yet.
   /24.** (SC-5, SC-7) Besides the per-source cap
   (`transport.max_connections_per_source`, one IPv4 address or IPv6 /64),
   every TCP, TLS and WebSocket connection now counts against its source's
-  IPv6 `/v6_aggregate_prefix_len` prefix or IPv4 /24. New `[transport]`
-  keys: `v6_aggregate_prefix_len` (default 48, valid 32..=64),
-  `max_connections_per_v6_aggregate` and `max_connections_per_v4_24`
-  (default 1024 each, 0 = off). Before, one delegated /56 could open 128
-  connections from each of its 256 /64s and take whole listener pools.
-  A connection over an aggregate cap is closed at accept and audited as
-  `RateLimitTriggered` with `limit_name = "per_prefix_conn"`, the
-  aggregate key as source (`2001:db8:1::` for a /48, `192.0.2.0` for a
-  /24) and the cap as threshold.
+  IPv6 `/v6_aggregate_prefix_len` prefix or IPv4 /24. 6to4 (`2002::/16`)
+  and NAT64 (`64:ff9b::/96`) sources count in the /24 of their embedded
+  IPv4 address. New `[transport]` keys: `v6_aggregate_prefix_len`
+  (default 48, valid 32..=64), `max_connections_per_v6_aggregate` and
+  `max_connections_per_v4_24` (default 1024 each, 0 = off). Before, one
+  delegated /56 could open 128 connections from each of its 256 /64s and
+  take whole listener pools. A connection over an aggregate cap is closed
+  at accept and audited as `RateLimitTriggered` with
+  `limit_name = "per_prefix_conn"`, the aggregate key as source
+  (`2001:db8:1::` for a /48, `192.0.2.0` for a /24) and the cap as
+  threshold.
+- **Accept rate and handshakes are also limited per aggregate.** (SC-5)
+  Each aggregate has an accept bucket of 16 times
+  `accept_rate_per_source` and `accept_burst_per_source` (320/s, burst 800
+  at the defaults) and at most 1/8 of the node-wide handshake pool in
+  handshakes at once. Refusals are audited as `per_prefix_accept_rate` and
+  `per_prefix_handshake_busy`.
+- **Configured trunks skip the aggregate level.** (SC-5) A trunk address
+  (the set SR-55 trusts on the rate limiters) is not counted against, or
+  refused by, its /24 or /48 aggregate, so a co-tenant filling the
+  aggregate cannot lock the trunk out. Its per-source cap and accept rate
+  still apply.
 - **Behaviour change: large sites behind one prefix.** An enterprise NAT,
   carrier-grade NAT or large site with more than 1024 concurrent stream
-  connections from one /48 or one IPv4 /24 is now refused past that
-  count. Raise the cap (or set it to 0) for such deployments; see
-  `docs/SBC-ADMIN-GUIDE.md` "Stream connection limits".
+  connections, or more than 800 new connections at once, from one /48 or
+  one IPv4 /24 is now refused past that count. Raise the caps (or set them
+  to 0) for such deployments; see `docs/SBC-ADMIN-GUIDE.md` "Stream
+  connection limits".
 - **Existing configs keep loading.** Only `v6_aggregate_prefix_len`
   outside 32..=64 is rejected. A prefix longer than
-  `rate_limit.ipv6_prefix_len` is clamped to it, and a non-zero cap
-  outside `max_connections_per_source..=max_connections_per_listener` is
-  clamped into that range; both log a `warn!` at startup.
+  `rate_limit.ipv6_prefix_len` is clamped to it, and a cap above
+  `max_connections_per_listener` is clamped to it; each clamp logs a
+  `warn!` and emits a `ConfigurationChange` (`Modified`, admin
+  `startup`). A cap below `max_connections_per_source` is applied as
+  configured.
+- **Reload.** A SIGHUP that changes any `[transport]` connection-limit key
+  (the three new keys, `max_connections_*`, `accept_*_per_source`,
+  `max_handshakes_*`) now reports it as restart-required.
+- **Stats.** New `ServerStats` counters `conn_rejected_per_aggregate` and
+  `handshake_busy_per_aggregate` (Debug output only, POA&M-93); aggregate
+  accept-rate refusals count in `accept_rate_limited`.
 - **POA&M-91 corrected.** Its text implied the rate limiter's shared
   overflow bucket also bounded stream connections; it bounds rate-limited
   messages only. The connection limiter had no aggregation before this
   change. Rate-limiter prefix aggregation stays open under POA&M-91.
+- **POA&M-441 corrected.** Accept admission is now keyed per source and
+  per aggregate; what stays open is the per-node, static keying.
 - **Open items.** Rotation across many /48s or /24s is bounded only by
-  the listener and node pools, and no pool share is reserved for trunks
-  (POA&M-454, see also POA&M-453). The caps are static per prefix, with no
-  per-prefix override and no adaptive tightening under load (POA&M-455).
+  the listener and node pools: about `max_connections_per_listener /
+  max_connections_per_v6_aggregate` /48s (10 at the defaults) fill one
+  listener pool (POA&M-454; the trunk reserve is POA&M-453). The caps are
+  static per prefix, with no per-prefix override and no adaptive
+  tightening under load (POA&M-455).
 
 ### Security (SBC, stream accept admission and accept errors; SR-22, SR-56, POA&M-440..443)
 

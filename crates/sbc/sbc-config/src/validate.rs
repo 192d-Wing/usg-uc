@@ -586,9 +586,10 @@ fn validate_stream_limits(config: &crate::schema::TransportConfig) -> ConfigResu
         config.tcp_idle_timeout_secs,
     )?;
     // SR-58: only an explicitly invalid prefix is rejected. A prefix longer
-    // than `rate_limit.ipv6_prefix_len`, and aggregate caps outside
-    // per-source..=per-listener, are clamped (warned at daemon startup) so
-    // configs that loaded before these keys keep loading.
+    // than `rate_limit.ipv6_prefix_len`, and an aggregate cap above
+    // `max_connections_per_listener`, are clamped (warned and audited at
+    // daemon startup); a cap below `max_connections_per_source` is
+    // stricter and kept as configured.
     check_range(
         "transport.v6_aggregate_prefix_len",
         config.v6_aggregate_prefix_len,
@@ -5225,8 +5226,8 @@ mod sr56_accept_admission_keys {
 
 /// SR-58: `[transport]` aggregate connection-cap keys, driven through the
 /// TOML loader. Only an explicitly invalid prefix (outside 32..=64) is
-/// rejected; everything else that loaded before keeps loading and is
-/// clamped to its effective value (D2 compatibility decision).
+/// rejected. A prefix longer than the per-source prefix and a cap above
+/// the listener pool are clamped; a cap below the per-source cap is kept.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod sr58_aggregate_keys_toml {
@@ -5268,15 +5269,13 @@ mod sr58_aggregate_keys_toml {
     }
 
     #[test]
-    fn aggregate_caps_below_per_source_clamped() {
-        // Default per-source 128.
+    fn aggregate_caps_below_per_source_honoured() {
+        // Default per-source 128: a stricter aggregate cap is applied as
+        // configured (SEC-003), never raised.
         let c = load("", "max_connections_per_v6_aggregate = 64").unwrap();
-        assert_eq!(
-            c.transport.effective_max_connections_per_v6_aggregate(),
-            128
-        );
-        let c = load("", "max_connections_per_v4_24 = 64").unwrap();
-        assert_eq!(c.transport.effective_max_connections_per_v4_24(), 128);
+        assert_eq!(c.transport.effective_max_connections_per_v6_aggregate(), 64);
+        let c = load("", "max_connections_per_v4_24 = 1").unwrap();
+        assert_eq!(c.transport.effective_max_connections_per_v4_24(), 1);
     }
 
     #[test]
@@ -5325,6 +5324,9 @@ mod sr58_aggregate_keys_api {
     use super::validate_config;
     use crate::schema::SbcConfig;
 
+    /// (mutate, effective prefix, effective v6 cap, effective v4 cap).
+    type ClampCase = (fn(&mut SbcConfig), u8, u32, u32);
+
     #[test]
     fn aggregate_keys_defaults_and_ranges() {
         let c = SbcConfig::default();
@@ -5333,20 +5335,16 @@ mod sr58_aggregate_keys_api {
         assert_eq!(c.transport.max_connections_per_v4_24, 1024);
         validate_config(&c).unwrap();
 
-        let cases: Vec<fn(&mut SbcConfig)> =
-            vec![|c| c.transport.v6_aggregate_prefix_len = 30, |c| {
-                c.transport.v6_aggregate_prefix_len = 72
-            }];
-        for (i, mutate) in cases.into_iter().enumerate() {
+        for bad in [30u8, 72] {
             let mut c = SbcConfig::default();
-            mutate(&mut c);
-            assert!(validate_config(&c).is_err(), "case {i} should fail");
+            c.transport.v6_aggregate_prefix_len = bad;
+            assert!(validate_config(&c).is_err(), "prefix {bad} should fail");
         }
 
-        // Valid, clamped to their effective values (D2 compatibility
-        // decision): (mutate, effective prefix, effective v6 cap,
-        // effective v4 cap).
-        let clamped: Vec<(fn(&mut SbcConfig), u8, u32, u32)> = vec![
+        // Valid; clamped only where wider than the per-source prefix or the
+        // listener pool (a stricter cap is kept): (mutate, effective
+        // prefix, effective v6 cap, effective v4 cap).
+        let clamped: Vec<ClampCase> = vec![
             (
                 |c| {
                     c.rate_limit.ipv6_prefix_len = 48;
@@ -5359,15 +5357,10 @@ mod sr58_aggregate_keys_api {
             (
                 |c| c.transport.max_connections_per_v6_aggregate = 127,
                 48,
-                128,
+                127,
                 1024,
             ),
-            (
-                |c| c.transport.max_connections_per_v4_24 = 127,
-                48,
-                1024,
-                128,
-            ),
+            (|c| c.transport.max_connections_per_v4_24 = 1, 48, 1024, 1),
             (
                 |c| c.transport.max_connections_per_v6_aggregate = 10_001,
                 48,

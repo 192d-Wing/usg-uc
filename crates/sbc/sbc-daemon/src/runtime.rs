@@ -496,6 +496,56 @@ impl Runtime {
         if old.digest_auth != new.digest_auth {
             keys.push("digest_auth".to_string());
         }
+        // NIST 800-53 Rev5: CM-6, SC-5 - the stream connection limiter,
+        // listener pools and handshake pool are built from these keys once
+        // at startup (`Server::build_conn_limiter`, SR-56, SR-58).
+        let (o, n) = (&old.transport, &new.transport);
+        for (key, changed) in [
+            (
+                "transport.max_connections_per_listener",
+                o.max_connections_per_listener != n.max_connections_per_listener,
+            ),
+            (
+                "transport.max_connections_total",
+                o.max_connections_total != n.max_connections_total,
+            ),
+            (
+                "transport.max_connections_per_source",
+                o.max_connections_per_source != n.max_connections_per_source,
+            ),
+            (
+                "transport.accept_rate_per_source",
+                o.accept_rate_per_source != n.accept_rate_per_source,
+            ),
+            (
+                "transport.accept_burst_per_source",
+                o.accept_burst_per_source != n.accept_burst_per_source,
+            ),
+            (
+                "transport.max_handshakes_in_flight",
+                o.max_handshakes_in_flight != n.max_handshakes_in_flight,
+            ),
+            (
+                "transport.max_handshakes_per_source",
+                o.max_handshakes_per_source != n.max_handshakes_per_source,
+            ),
+            (
+                "transport.v6_aggregate_prefix_len",
+                o.v6_aggregate_prefix_len != n.v6_aggregate_prefix_len,
+            ),
+            (
+                "transport.max_connections_per_v6_aggregate",
+                o.max_connections_per_v6_aggregate != n.max_connections_per_v6_aggregate,
+            ),
+            (
+                "transport.max_connections_per_v4_24",
+                o.max_connections_per_v4_24 != n.max_connections_per_v4_24,
+            ),
+        ] {
+            if changed {
+                keys.push(key.to_string());
+            }
+        }
         keys
     }
 
@@ -1936,6 +1986,63 @@ mod tests {
             Runtime::detect_restart_required(&old, &old.clone()),
             Vec::<String>::new()
         );
+    }
+
+    // SR-58 (NIST-004): `[transport]` connection-limit keys are read at
+    // startup only; a reload that changes one says so.
+    #[test]
+    fn reload_reports_connection_limits_as_restart_required() {
+        let old = SbcConfig::default();
+        let setters: [(fn(&mut SbcConfig), &str); 10] = [
+            (
+                |c| c.transport.max_connections_per_listener = 5,
+                "transport.max_connections_per_listener",
+            ),
+            (
+                |c| c.transport.max_connections_total = 5,
+                "transport.max_connections_total",
+            ),
+            (
+                |c| c.transport.max_connections_per_source = 5,
+                "transport.max_connections_per_source",
+            ),
+            (
+                |c| c.transport.accept_rate_per_source = 5,
+                "transport.accept_rate_per_source",
+            ),
+            (
+                |c| c.transport.accept_burst_per_source = 5,
+                "transport.accept_burst_per_source",
+            ),
+            (
+                |c| c.transport.max_handshakes_in_flight = 5,
+                "transport.max_handshakes_in_flight",
+            ),
+            (
+                |c| c.transport.max_handshakes_per_source = 5,
+                "transport.max_handshakes_per_source",
+            ),
+            (
+                |c| c.transport.v6_aggregate_prefix_len = 56,
+                "transport.v6_aggregate_prefix_len",
+            ),
+            (
+                |c| c.transport.max_connections_per_v6_aggregate = 5,
+                "transport.max_connections_per_v6_aggregate",
+            ),
+            (
+                |c| c.transport.max_connections_per_v4_24 = 5,
+                "transport.max_connections_per_v4_24",
+            ),
+        ];
+        for (set, key) in setters {
+            let mut new = old.clone();
+            set(&mut new);
+            assert_eq!(
+                Runtime::detect_restart_required(&old, &new),
+                vec![key.to_string()]
+            );
+        }
     }
 
     fn digest_config(path: &Path) -> SbcConfig {

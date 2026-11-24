@@ -1043,22 +1043,24 @@ pub struct TransportConfig {
     /// connection also counts against its source's `/v6_aggregate_prefix_len`
     /// prefix, so one delegated /48 or /56 cannot rotate through its /64s
     /// and take whole pools. Valid 32..=64; a value longer than
-    /// `rate_limit.ipv6_prefix_len` is clamped to it (warned at startup).
+    /// `rate_limit.ipv6_prefix_len` is clamped to it (warned and audited at
+    /// startup).
     ///
     /// ## NIST 800-53 Rev5: SC-5, SC-7
     pub v6_aggregate_prefix_len: u8,
 
     /// Concurrent stream connections allowed from one IPv6 aggregate
-    /// (`v6_aggregate_prefix_len`), across all listeners. 0 = off. Values
-    /// outside `max_connections_per_source..=max_connections_per_listener`
-    /// are clamped to that range (warned at startup). A large site behind
-    /// one /48 may need more.
+    /// (`v6_aggregate_prefix_len`), across all listeners. 0 = off. A value
+    /// above `max_connections_per_listener` is clamped to it (warned and
+    /// audited at startup); a value below `max_connections_per_source` is
+    /// applied as configured. A large site behind one /48 may need more.
     ///
     /// ## NIST 800-53 Rev5: SC-5, SC-7
     pub max_connections_per_v6_aggregate: u32,
 
     /// Concurrent stream connections allowed from one IPv4 /24, across all
-    /// listeners. 0 = off; clamped like `max_connections_per_v6_aggregate`.
+    /// listeners. 0 = off; clamped like `max_connections_per_v6_aggregate`
+    /// (to the listener pool only).
     /// An enterprise or carrier-grade NAT pool in one /24 may need more.
     ///
     /// ## NIST 800-53 Rev5: SC-5, SC-7
@@ -1140,8 +1142,9 @@ impl TransportConfig {
         self.v6_aggregate_prefix_len.min(per_source_prefix_len)
     }
 
-    /// The IPv6 aggregate cap in effect (0 = off): clamped to
-    /// `max_connections_per_source..=max_connections_per_listener`.
+    /// The IPv6 aggregate cap in effect (0 = off): at most
+    /// `max_connections_per_listener`. A cap below
+    /// `max_connections_per_source` is kept: it is stricter, not invalid.
     #[must_use]
     pub fn effective_max_connections_per_v6_aggregate(&self) -> u32 {
         self.clamp_aggregate_cap(self.max_connections_per_v6_aggregate)
@@ -1155,11 +1158,7 @@ impl TransportConfig {
     }
 
     fn clamp_aggregate_cap(&self, cap: u32) -> u32 {
-        if cap == 0 {
-            return 0;
-        }
-        let low = self.max_connections_per_source;
-        cap.clamp(low, self.max_connections_per_listener.max(low))
+        cap.min(self.max_connections_per_listener.max(1))
     }
 }
 
