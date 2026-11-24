@@ -28,6 +28,8 @@ sbc-config-store = { workspace = true }
 uc-health.workspace = true
 uc-metrics.workspace = true
 uc-transport = { workspace = true, features = ["websocket"] }
+# CIDR match of `transport.ws_trusted_proxies` (WS client address, SR-59).
+ipnet.workspace = true
 uc-audit.workspace = true
 # Call Detail Records (schema v1, file/syslog sinks, ring).
 uc-cdr.workspace = true

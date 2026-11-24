@@ -33,7 +33,9 @@ use uc_transport::listener::ListenerConfig;
 use uc_transport::tcp::TcpListener;
 use uc_transport::tls::TlsListener;
 use uc_transport::udp::UdpTransport;
-use uc_transport::websocket::{WebSocketListener, WebSocketListenerOptions};
+use uc_transport::websocket::{
+    ClientAddressMode, TrustedProxyFn, WebSocketListener, WebSocketListenerOptions,
+};
 use uc_types::address::{SbcSocketAddr, TransportType};
 
 /// Records a rate-limit event on the audit trail (no-op when auditing is
@@ -202,9 +204,10 @@ impl StreamTimeouts {
 
 /// Resources one admitted stream connection holds for its whole life
 /// (handshake and receive loop). All RAII: released on return, panic or
-/// abort.
+/// abort. `_source` is `None` only while a connection from a trusted WS
+/// proxy waits for its client address (SR-59).
 struct ConnAdmission {
-    _source: crate::conn_limit::ConnGuard,
+    _source: Option<crate::conn_limit::ConnGuard>,
     _listener: tokio::sync::OwnedSemaphorePermit,
     _total: tokio::sync::OwnedSemaphorePermit,
 }
@@ -2213,19 +2216,75 @@ impl Server {
         Ok(())
     }
 
+    /// WS client-address mode and trusted-proxy predicate from
+    /// `transport.ws_client_address` / `transport.ws_trusted_proxies`. Each
+    /// entry is a CIDR or a bare IP (a host route); an IPv4-mapped IPv6 peer
+    /// matches IPv4 entries. Entries were validated at load; one that still
+    /// fails to parse is skipped with an error log, so it trusts nobody.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7, AU-3; RFC 7239 §8.1
+    fn ws_client_address(
+        transport: &sbc_config::schema::TransportConfig,
+    ) -> (ClientAddressMode, TrustedProxyFn) {
+        use sbc_config::schema::WsClientAddress;
+        let mode = match transport.ws_client_address {
+            WsClientAddress::Peer => ClientAddressMode::Peer,
+            WsClientAddress::ProxyV2 => ClientAddressMode::ProxyV2,
+            WsClientAddress::XForwardedFor => ClientAddressMode::XForwardedFor,
+            WsClientAddress::Forwarded => ClientAddressMode::Forwarded,
+        };
+        let nets: Arc<[ipnet::IpNet]> = transport
+            .ws_trusted_proxies
+            .iter()
+            .filter_map(|entry| {
+                let net = entry.parse::<ipnet::IpNet>().ok().or_else(|| {
+                    entry
+                        .parse::<std::net::IpAddr>()
+                        .ok()
+                        .map(ipnet::IpNet::from)
+                });
+                if net.is_none() {
+                    error!(entry = %entry, "Ignoring invalid transport.ws_trusted_proxies entry");
+                }
+                net
+            })
+            .collect();
+        let trusted: TrustedProxyFn = Arc::new(move |ip: std::net::IpAddr| {
+            let ip = ip.to_canonical();
+            nets.iter().any(|net| net.contains(&ip))
+        });
+        (mode, trusted)
+    }
+
     /// Binds SIP-over-WebSocket listeners from `transport.ws_listen`
     /// (RFC 7118). Plain `ws` only: the WebSocket transport does not
     /// terminate TLS, and `validate_config` rejects `wss_listen`.
     async fn bind_ws_listeners(&mut self) -> Result<(), ServerError> {
         let mut listeners = self.ws_listeners.write().await;
+        let (mode, trusted) = Self::ws_client_address(&self.config.transport);
+        if mode == ClientAddressMode::Peer
+            && !self.config.transport.ws_trusted_proxies.is_empty()
+            && !self.config.transport.ws_listen.is_empty()
+        {
+            warn!(
+                "transport.ws_trusted_proxies is set but transport.ws_client_address is \
+                 \"peer\": the list has no effect"
+            );
+        }
         for socket_addr in &self.config.transport.ws_listen {
             let addr = SbcSocketAddr::from(*socket_addr);
             match WebSocketListener::bind(&addr, false).await {
                 Ok(listener) => {
                     // RFC 7118 §4; NIST 800-53 Rev5: SC-7.
-                    let listener = listener.with_options(WebSocketListenerOptions {
-                        require_sip_subprotocol: self.config.transport.ws_require_sip_subprotocol,
-                    });
+                    let listener = listener
+                        .with_options(WebSocketListenerOptions {
+                            require_sip_subprotocol: self
+                                .config
+                                .transport
+                                .ws_require_sip_subprotocol,
+                        })
+                        // SR-59; NIST 800-53 Rev5: SC-5, SC-7, AU-3.
+                        .with_client_address(mode, Arc::clone(&trusted));
                     info!(address = %listener.local_addr(), "WebSocket listener bound");
                     listeners.push(Arc::new(listener));
                 }
@@ -2671,42 +2730,75 @@ impl Server {
         kind: &str,
         metered: bool,
     ) -> Option<ConnAdmission> {
+        let source = Self::admit_source(ctx, peer, kind, metered)?;
+        let pools = Self::admit_pools(ctx, peer, kind)?;
+        Some(ConnAdmission {
+            _source: Some(source),
+            ..pools
+        })
+    }
+
+    /// Per-source half of [`Self::admit_connection`]: the accept buckets
+    /// (when `metered`) and one slot of `transport.max_connections_per_source`
+    /// and of the aggregate caps for `source`, or `None` (counted, and
+    /// audited under `source`).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, AU-3
+    fn admit_source(
+        ctx: &StreamLoopContext,
+        source: &SbcSocketAddr,
+        kind: &str,
+        metered: bool,
+    ) -> Option<crate::conn_limit::ConnGuard> {
         let admitted = if metered {
-            ctx.conn_limiter.try_admit(peer.ip())
+            ctx.conn_limiter.try_admit(source.ip())
         } else {
-            ctx.conn_limiter.try_admit_unmetered(peer.ip())
+            ctx.conn_limiter.try_admit_unmetered(source.ip())
         };
-        let source = match admitted {
-            Ok(source) => source,
+        match admitted {
+            Ok(guard) => Some(guard),
             Err(crate::conn_limit::Rejection::AcceptRate) => {
                 ctx.stats
                     .accept_rate_limited
                     .fetch_add(1, Ordering::Relaxed);
-                debug!(peer = %peer, kind, "Per-source accept rate exceeded, dropping");
-                return None;
+                debug!(peer = %source, kind, "Per-source accept rate exceeded, dropping");
+                None
             }
             Err(crate::conn_limit::Rejection::AggregateAcceptRate) => {
                 ctx.stats
                     .accept_rate_limited
                     .fetch_add(1, Ordering::Relaxed);
-                debug!(peer = %peer, kind, "Aggregate accept rate exceeded, dropping");
-                return None;
+                debug!(peer = %source, kind, "Aggregate accept rate exceeded, dropping");
+                None
             }
             Err(crate::conn_limit::Rejection::PerAggregate) => {
                 ctx.stats
                     .conn_rejected_per_aggregate
                     .fetch_add(1, Ordering::Relaxed);
-                debug!(peer = %peer, kind, "Aggregate connection limit reached, dropping");
-                return None;
+                debug!(peer = %source, kind, "Aggregate connection limit reached, dropping");
+                None
             }
             Err(_) => {
                 ctx.stats
                     .conn_rejected_per_source
                     .fetch_add(1, Ordering::Relaxed);
-                debug!(peer = %peer, kind, "Per-source connection limit reached, dropping");
-                return None;
+                debug!(peer = %source, kind, "Per-source connection limit reached, dropping");
+                None
             }
-        };
+        }
+    }
+
+    /// Pool half of [`Self::admit_connection`]: this listener's pool and the
+    /// node-wide ceiling, with no per-source slot yet. Used on its own for a
+    /// trusted WS proxy, whose per-source slot is taken on the client
+    /// address once the handshake has named it (SR-59).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    fn admit_pools(
+        ctx: &StreamLoopContext,
+        peer: &SbcSocketAddr,
+        kind: &str,
+    ) -> Option<ConnAdmission> {
         // Pool-full drops are counted and audited in aggregate
         // (`listener_conn` / `total_conn`) by RateLimitMaintenance, which
         // also logs one warning per flush; a per-socket warn! would be an
@@ -2722,7 +2814,7 @@ impl Server {
             return None;
         };
         Some(ConnAdmission {
-            _source: source,
+            _source: None,
             _listener: listener,
             _total: total,
         })
@@ -2929,22 +3021,38 @@ impl Server {
     /// cannot stall the listener. The upgrade costs no crypto, so it takes
     /// no handshake slot.
     ///
-    /// ## NIST 800-53 Rev5: SC-5, SC-7, SC-10
+    /// Behind a trusted reverse proxy (`transport.ws_trusted_proxies`, mode
+    /// not `peer`) the accept takes only the pool permits; the per-source
+    /// slot is taken on the client address the handshake learnt, and that
+    /// address is the connection's source for flows, rate limiting, Via
+    /// `received`/`rport`, CDRs and audit. A missing or invalid client
+    /// address refuses the connection (counted) and never falls back to the
+    /// proxy's own key.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, SC-10, AU-3
     // POAM: POA&M-440 — the per-source accept bucket is off on WebSocket
     // listeners: behind the recommended WSS proxy the accept address is the
     // proxy's, so one bucket would be shared by every client. It is enabled
     // once SR-59 keys WS admission on the client address (SC-5).
     async fn ws_accept_loop(listener: Arc<WebSocketListener>, ctx: StreamLoopContext) {
+        use uc_transport::StreamTransport;
         info!(address = %listener.local_addr(), "SIP WebSocket accept loop started");
         let mut backoff = AcceptBackoff::new();
         loop {
             match listener.accept_tcp().await {
                 Ok((tcp_stream, peer)) => {
                     backoff.on_success();
-                    if Self::accept_blocked(&ctx, &peer, "ws").await {
+                    // SR-59: a trusted proxy's per-source slot is deferred
+                    // to the client address.
+                    let deferred = listener.learns_client_address(peer.ip());
+                    let admission = if deferred {
+                        Self::admit_pools(&ctx, &peer, "ws")
+                    } else if Self::accept_blocked(&ctx, &peer, "ws").await {
                         continue;
-                    }
-                    let Some(admission) = Self::admit_with(&ctx, &peer, "ws", false) else {
+                    } else {
+                        Self::admit_with(&ctx, &peer, "ws", false)
+                    };
+                    let Some(admission) = admission else {
                         continue;
                     };
                     let conn_ctx = ctx.clone();
@@ -2957,20 +3065,53 @@ impl Server {
                         .await
                         {
                             Ok(Ok(transport)) => {
-                                debug!(peer = %peer, "Accepted SIP WebSocket connection");
+                                let client = *transport.peer_addr();
+                                // Deferred per-source slot on the client
+                                // address; refusal drops the upgraded socket
+                                // and every permit (RAII).
+                                let client_slot = if deferred {
+                                    if Self::accept_blocked(&conn_ctx, &client, "ws").await {
+                                        return;
+                                    }
+                                    let Some(slot) =
+                                        Self::admit_source(&conn_ctx, &client, "ws", true)
+                                    else {
+                                        return;
+                                    };
+                                    Some(slot)
+                                } else {
+                                    None
+                                };
+                                debug!(
+                                    peer = %peer,
+                                    client = %client,
+                                    "Accepted SIP WebSocket connection"
+                                );
                                 Self::stream_connection_loop(
                                     Arc::new(transport),
-                                    peer,
+                                    client,
                                     conn_ctx,
                                     None,
                                 )
                                 .await;
+                                drop(client_slot);
                             }
                             Ok(Err(e)) => {
-                                conn_ctx
-                                    .stats
-                                    .ws_handshake_failures
-                                    .fetch_add(1, Ordering::Relaxed);
+                                let stats = &conn_ctx.stats;
+                                stats.ws_handshake_failures.fetch_add(1, Ordering::Relaxed);
+                                match e {
+                                    uc_transport::TransportError::ProxyHeaderMissing { .. } => {
+                                        stats
+                                            .ws_proxy_header_missing
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    uc_transport::TransportError::ProxyHeaderInvalid { .. } => {
+                                        stats
+                                            .ws_proxy_header_invalid
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    _ => {}
+                                }
                                 debug!(peer = %peer, error = %e, "WebSocket handshake failed");
                             }
                             Err(_) => {
@@ -3774,6 +3915,14 @@ pub struct ServerStats {
     pub conn_rejected_per_aggregate: AtomicU64,
     /// WebSocket upgrades refused or failed (e.g. no `sip` subprotocol).
     pub ws_handshake_failures: AtomicU64,
+    /// WS connections from a trusted proxy refused because the configured
+    /// forwarding header or PROXY v2 preamble was absent (subset of
+    /// `ws_handshake_failures`; SR-59).
+    pub ws_proxy_header_missing: AtomicU64,
+    /// WS connections from a trusted proxy refused because the client
+    /// address was malformed, obfuscated or unusable (subset of
+    /// `ws_handshake_failures`; SR-59).
+    pub ws_proxy_header_invalid: AtomicU64,
     /// TLS / WebSocket handshakes that hit `handshake_timeout_secs`.
     // POAM: POA&M-93 — these counters and the accept counters below are
     // not yet exported on the REST/metrics API (api_server.rs is owned

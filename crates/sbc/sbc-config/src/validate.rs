@@ -489,12 +489,16 @@ fn validate_transport(config: &crate::schema::TransportConfig) -> ConfigResult<(
     // advertise security that is not there.
     if !config.wss_listen.is_empty() {
         return Err(ConfigError::Validation {
+            // POAM: POA&M-457 - no in-daemon WSS termination.
             message: "transport.wss_listen is not supported by this build: the WebSocket \
-                      transport does not terminate TLS. Terminate TLS at a reverse proxy and \
-                      use transport.ws_listen, or use transport.tls_listen."
+                      transport does not terminate TLS. Terminate TLS at a reverse proxy, \
+                      use transport.ws_listen, list the proxy in transport.ws_trusted_proxies \
+                      and set transport.ws_client_address; or use transport.tls_listen."
                 .to_string(),
         });
     }
+
+    validate_ws_client_address(config)?;
 
     // Validate timeouts
     if config.tcp_timeout_secs == 0 {
@@ -504,6 +508,36 @@ fn validate_transport(config: &crate::schema::TransportConfig) -> ConfigResult<(
     }
 
     validate_stream_limits(config)
+}
+
+/// `transport.ws_trusted_proxies` / `transport.ws_client_address`: every
+/// entry is a CIDR or bare IP, and a mode other than `peer` needs a list (a
+/// mode with nobody trusted would never take effect). A list with mode
+/// `peer` is accepted; the daemon warns at startup that it is unused.
+///
+/// ## NIST 800-53 Rev5: CM-6, SC-7
+fn validate_ws_client_address(config: &crate::schema::TransportConfig) -> ConfigResult<()> {
+    if let Some(bad) = config
+        .ws_trusted_proxies
+        .iter()
+        .find(|entry| !is_valid_cidr(entry))
+    {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "transport.ws_trusted_proxies entry {bad:?} is not a valid IP address or CIDR"
+            ),
+        });
+    }
+    if config.ws_client_address != crate::schema::WsClientAddress::Peer
+        && config.ws_trusted_proxies.is_empty()
+    {
+        return Err(ConfigError::Validation {
+            message: "transport.ws_client_address other than \"peer\" requires \
+                      transport.ws_trusted_proxies to list the reverse proxies"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Range check helper for numeric settings.

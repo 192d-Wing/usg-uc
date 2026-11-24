@@ -447,6 +447,38 @@ release") and `deploy/keycloak/central-config-clients.md`.
   sidecars and the dashboard's npm tree.** GitHub Actions updates are
   grouped into one weekly PR.
 
+### Security (SBC, WebSocket client address behind a trusted reverse proxy, SR-59, POA&M-456, 457)
+
+Tested locally on macOS arm64 only; no CI run yet. Defaults keep today's
+behaviour: existing configurations load and behave unchanged.
+
+- **SBC: WebSocket clients behind a reverse proxy are keyed on their own
+  address.** (SC-5, SC-7, AU-3) New `transport.ws_trusted_proxies` (CIDR or
+  bare IP list, default empty) and `transport.ws_client_address` (`peer`
+  default, `proxy_v2`, `x_forwarded_for`, `forwarded`). From a listed proxy
+  the daemon takes the client address from the PROXY protocol v2 preamble,
+  the rightmost untrusted `X-Forwarded-For` hop, or the RFC 7239
+  `Forwarded` `for=` hop. That address is then the connection's source for
+  the per-source connection cap, rate limiting, the flow table, CDRs and
+  audit records. Before, every client behind one proxy shared the proxy's
+  per-source slot and rate-limit bucket. Headers from peers not in the list
+  are ignored.
+- **SBC: a trusted proxy must send the client address.** A connection from
+  a listed proxy with no header or preamble, or with an unusable, `unknown`
+  or obfuscated address, is refused (HTTP 400 for the header modes). It is
+  never keyed on the proxy address. The `ws_proxy_header_missing` and
+  `ws_proxy_header_invalid` statistics count the refusals. A PROXY v2
+  `LOCAL` health check is admitted under the proxy address.
+- **Configuration validation.** An invalid `ws_trusted_proxies` entry fails
+  the load. So does a `ws_client_address` other than `peer` with an empty
+  list. A list with mode `peer` loads, and the daemon logs a startup
+  warning that it has no effect. The `wss_listen` rejection message now
+  points to these keys.
+- **Residual risk.** A listed proxy can claim any client address, and
+  PROXY v2 TLVs are not validated (POA&M-456). List only proxies you
+  operate. WSS is still not terminated in the daemon (POA&M-457). See
+  `docs/SBC-ADMIN-GUIDE.md`, "WebSocket behind a reverse proxy".
+
 ### Security (SBC, aggregate stream connection caps per IPv6 prefix and IPv4 /24, SR-58, POA&M-454, 455)
 
 Tested locally on macOS arm64 only (unit tests); no CI run yet.

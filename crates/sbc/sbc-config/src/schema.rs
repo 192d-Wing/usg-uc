@@ -939,6 +939,24 @@ impl Default for GeneralConfig {
     }
 }
 
+/// Source of the WebSocket client address behind a trusted reverse proxy
+/// (`transport.ws_client_address`).
+///
+/// ## NIST 800-53 Rev5: SC-5, SC-7, AU-3
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WsClientAddress {
+    /// The TCP peer is the client.
+    #[default]
+    Peer,
+    /// PROXY protocol v2 preamble (L4 proxies).
+    ProxyV2,
+    /// `X-Forwarded-For` request header (HTTP ingress controllers).
+    XForwardedFor,
+    /// RFC 7239 `Forwarded` request header.
+    Forwarded,
+}
+
 /// Transport layer configuration.
 ///
 /// Supports dual-interface deployment where signaling (SIP) and media (RTP)
@@ -1066,6 +1084,21 @@ pub struct TransportConfig {
     /// ## NIST 800-53 Rev5: SC-5, SC-7
     pub max_connections_per_v4_24: u32,
 
+    /// Reverse proxies (CIDR or bare IP) in front of `ws_listen` whose
+    /// client-address information is believed. Empty (default): every WS
+    /// peer is the client. List only proxies you operate.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, AU-3; RFC 7239 §8.1
+    pub ws_trusted_proxies: Vec<String>,
+
+    /// Where the WS client address comes from when the peer is in
+    /// `ws_trusted_proxies`: `peer` (default, the TCP peer), `proxy_v2`,
+    /// `x_forwarded_for` or `forwarded` (RFC 7239). A mode other than
+    /// `peer` requires a non-empty `ws_trusted_proxies`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, AU-3
+    pub ws_client_address: WsClientAddress,
+
     /// External/public IP address for SIP Contact and SDP.
     /// Used when behind NAT. If unset, auto-detected from outgoing socket.
     pub external_ip: Option<String>,
@@ -1122,6 +1155,8 @@ impl Default for TransportConfig {
             v6_aggregate_prefix_len: 48,
             max_connections_per_v6_aggregate: 1024,
             max_connections_per_v4_24: 1024,
+            ws_trusted_proxies: Vec::new(),
+            ws_client_address: WsClientAddress::Peer,
             external_ip: None,
             signaling_ip: None,
             media_ip: None,

@@ -347,6 +347,84 @@ socket).
 > (the client MUST offer `sip`) and exists only for legacy clients; an
 > offer that lists only other subprotocols is still refused.
 
+#### WebSocket behind a reverse proxy (client address)
+
+The daemon does not terminate WSS (`transport.wss_listen` is refused at
+load). WebSocket clients reach it through a TLS-terminating reverse proxy
+that forwards plain WS to a `ws_listen` address. Without further
+configuration every such client has the proxy's address as its source,
+so they all share one per-source connection slot, one rate-limit bucket
+and one audit identity. Two keys make the daemon use the real client
+address instead (NIST SC-5, SC-7, AU-3):
+
+```toml
+[transport]
+ws_listen = ["10.0.5.10:7080"]
+ws_trusted_proxies = ["10.0.5.2/32", "10.0.5.3"]  # CIDR or bare IP; default []
+ws_client_address = "proxy_v2"  # peer (default) | proxy_v2 | x_forwarded_for | forwarded
+```
+
+| `ws_client_address` | Client address taken from | Typical proxy |
+|---|---|---|
+| `peer` | the TCP peer (no proxy handling) | none |
+| `proxy_v2` | the PROXY protocol v2 preamble sent before the HTTP upgrade | L4 proxies and load balancers (HAProxy `mode tcp`, nginx `stream`, Envoy) |
+| `x_forwarded_for` | the `X-Forwarded-For` request header | HTTP ingress controllers |
+| `forwarded` | the RFC 7239 `Forwarded` header, `for=` parameter | proxies that emit RFC 7239 |
+
+How the address is chosen:
+
+- The header or preamble is read only when the TCP peer is in
+  `ws_trusted_proxies`. From any other peer it is ignored and the peer
+  address is used, as with `peer`.
+- For `x_forwarded_for` and `forwarded`, the hops are read right to left.
+  Hops in `ws_trusted_proxies` are skipped, and the first hop that is not
+  trusted is the client. Values a client puts to the left of that hop are
+  never used.
+- A trusted proxy that sends no header or preamble, or an unparsable,
+  `unknown` or obfuscated client address, is refused (HTTP 400 for the
+  header modes). The daemon never falls back to the proxy address. The
+  refusals are counted in the `ws_proxy_header_missing` and
+  `ws_proxy_header_invalid` statistics.
+- A PROXY v2 `LOCAL` header (proxy health check) is admitted under the
+  proxy address.
+- The port is the client port when PROXY v2 or
+  `Forwarded: for="[ip]:port"` carries one. Otherwise it is the proxy-side
+  TCP source port, which keeps each connection's flow key unique.
+- The client address is the connection's source everywhere: the
+  per-source connection cap, rate limiting, the flow table, Via
+  `received`/`rport`, CDRs and audit records.
+
+A non-`peer` mode with an empty `ws_trusted_proxies` fails validation. A
+list with mode `peer` is accepted, and the daemon logs a warning at
+startup that the list has no effect.
+
+Proxy configuration, in generic terms:
+
+- **HAProxy (TCP mode, PROXY v2):** a `mode tcp` frontend that terminates
+  TLS, and a backend `server` line pointing at the `ws_listen` address
+  with `send-proxy-v2`. Use `ws_client_address = "proxy_v2"`.
+- **nginx `stream` (PROXY v2):** a `stream` server with `ssl` on the
+  listen socket, `proxy_pass` to the `ws_listen` address, and
+  `proxy_protocol on;`. nginx emits PROXY v2 only in recent versions;
+  check yours, as the daemon does not accept the v1 text form.
+- **nginx `http` / ingress controllers (X-Forwarded-For):** a `location`
+  that proxies the WebSocket upgrade (`proxy_http_version 1.1`, the
+  `Upgrade` and `Connection` headers) and sets
+  `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`. Use
+  `ws_client_address = "x_forwarded_for"`.
+- **RFC 7239 proxies:** configure the proxy to append a `Forwarded` element
+  with `for=` (IPv6 quoted and bracketed, for example
+  `for="[2001:db8::1]:4711"`). Use `ws_client_address = "forwarded"`.
+
+> **Security:** list in `ws_trusted_proxies` only proxies you operate, and
+> only their own addresses, never a client network. A trusted proxy can
+> claim any client address, so it can bypass the per-source connection
+> cap and rate limits and choose the source recorded in CDRs and audit
+> records. Do not expose `ws_listen` to clients directly when a proxy is
+> trusted; restrict it to the proxy network. PROXY v2 TLVs (TLS details,
+> unique ID) are ignored (POA&M-456). In-daemon WSS termination is
+> tracked as POA&M-457.
+
 > **Note:** setting `security.tls_cert_path` also activates HTTPS on the
 > REST API. Unless `transport.api_tls_listen` is set, the API server
 > switches its main listener to HTTPS-only; set `api_tls_listen` (e.g.

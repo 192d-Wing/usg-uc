@@ -7,6 +7,10 @@
 //!
 //! - **SC-8**: Transmission Confidentiality and Integrity (WSS encryption)
 //! - **SC-23**: Session Authenticity (TLS client verification)
+//! - **SC-5, SC-7, AU-3**: behind a configured trusted reverse proxy the
+//!   client address comes from PROXY v2, `X-Forwarded-For` or `Forwarded`
+//!   (RFC 7239), so per-source limits, flows and audit name the client
+//!   ([`ClientAddressMode`], [`WebSocketListener::with_client_address`])
 //!
 //! ## RFC 7118 Compliance
 //!
@@ -19,9 +23,10 @@ use crate::error::{TransportError, TransportResult};
 use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
 use bytes::Bytes;
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::handshake::server::{
@@ -102,6 +107,381 @@ impl Callback for SubprotocolCheck {
         Err(reject_upgrade(
             "the 'sip' WebSocket subprotocol is required",
         ))
+    }
+}
+
+/// Where a [`WebSocketListener`] takes the client address from when the TCP
+/// peer is a trusted reverse proxy.
+///
+/// Whatever the mode, a header or preamble is believed only from a peer the
+/// listener's trusted-proxy predicate accepts; from any other peer the TCP
+/// source address is the client, as with [`ClientAddressMode::Peer`].
+///
+/// ## NIST 800-53 Rev5: SC-5, SC-7, AU-3
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClientAddressMode {
+    /// The TCP peer is the client (no proxy).
+    #[default]
+    Peer,
+    /// A PROXY protocol v2 preamble precedes the HTTP upgrade (L4 proxies).
+    ProxyV2,
+    /// The `X-Forwarded-For` request header (HTTP ingress controllers).
+    XForwardedFor,
+    /// The RFC 7239 `Forwarded` request header, `for=` parameter.
+    Forwarded,
+}
+
+/// A client address taken from a forwarding header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardedClient {
+    /// Client IP (IPv4-mapped IPv6 reported as plain IPv4).
+    pub ip: IpAddr,
+    /// Client port, when the header carries one (`Forwarded` only).
+    pub port: Option<u16>,
+}
+
+/// Why no client address could be taken from a forwarding header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ForwardedError {
+    /// The header is absent or empty.
+    #[error("forwarding header missing")]
+    Missing,
+    /// The hop that decides the client address does not parse.
+    #[error("forwarding header malformed")]
+    Malformed,
+    /// The deciding hop is `unknown` or an obfuscated identifier
+    /// (RFC 7239 §6.2, §6.3), so it cannot key per-client limits.
+    #[error("forwarding header names an obfuscated or unknown client")]
+    Obfuscated,
+}
+
+/// Predicate naming the reverse proxies whose forwarding information is
+/// believed (`transport.ws_trusted_proxies` in the daemon).
+pub type TrustedProxyFn = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
+
+/// Most hops examined in one forwarding header. A chain longer than this
+/// with every hop trusted is refused rather than walked.
+///
+/// ## NIST 800-53 Rev5: SC-5
+const MAX_FORWARDED_HOPS: usize = 64;
+
+/// A non-zero decimal port of at most five digits.
+fn parse_port(p: &[u8]) -> Option<u16> {
+    if p.is_empty() || p.len() > 5 || !p.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(p)
+        .ok()?
+        .parse::<u16>()
+        .ok()
+        .filter(|&n| n != 0)
+}
+
+/// One `X-Forwarded-For` element: an IP literal, optionally bracketed (IPv6)
+/// and optionally with a port, which is discarded.
+fn parse_xff_node(element: &[u8]) -> Result<IpAddr, ForwardedError> {
+    let s = std::str::from_utf8(element.trim_ascii()).map_err(|_| ForwardedError::Malformed)?;
+    let ip = if let Some(rest) = s.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']').ok_or(ForwardedError::Malformed)?;
+        let ip = inner
+            .parse::<Ipv6Addr>()
+            .map_err(|_| ForwardedError::Malformed)?;
+        if !after.is_empty() {
+            let port = after.strip_prefix(':').ok_or(ForwardedError::Malformed)?;
+            parse_port(port.as_bytes()).ok_or(ForwardedError::Malformed)?;
+        }
+        IpAddr::V6(ip)
+    } else if let Ok(ip) = s.parse::<IpAddr>() {
+        ip
+    } else {
+        let (host, port) = s.split_once(':').ok_or(ForwardedError::Malformed)?;
+        parse_port(port.as_bytes()).ok_or(ForwardedError::Malformed)?;
+        IpAddr::V4(
+            host.parse::<Ipv4Addr>()
+                .map_err(|_| ForwardedError::Malformed)?,
+        )
+    };
+    Ok(ip.to_canonical())
+}
+
+/// Client address from `X-Forwarded-For` field lines (in arrival order;
+/// RFC 9110 §5.3 combines them into one list, the last line rightmost).
+///
+/// Walks right to left: hops `is_trusted` accepts are proxies and skipped,
+/// and the first untrusted hop is the client. Elements left of it were
+/// supplied by the client and are never parsed. If every hop is trusted the
+/// leftmost is used. The port, if any, is dropped.
+///
+/// # Errors
+///
+/// [`ForwardedError::Missing`] when there is no non-empty line,
+/// [`ForwardedError::Malformed`] when a hop that must be examined is not an
+/// IP literal, or the chain exceeds the hop limit.
+///
+/// ## NIST 800-53 Rev5: SC-7, SI-10; RFC 7239 §8.1 (trust only known proxies)
+pub fn client_from_x_forwarded_for(
+    values: &[&[u8]],
+    is_trusted: impl Fn(IpAddr) -> bool,
+) -> Result<ForwardedClient, ForwardedError> {
+    let mut leftmost = None;
+    let mut hops = 0usize;
+    for line in values.iter().rev() {
+        if line.trim_ascii().is_empty() {
+            continue;
+        }
+        for element in line.rsplit(|&b| b == b',') {
+            hops += 1;
+            if hops > MAX_FORWARDED_HOPS {
+                return Err(ForwardedError::Malformed);
+            }
+            let ip = parse_xff_node(element)?;
+            if !is_trusted(ip) {
+                return Ok(ForwardedClient { ip, port: None });
+            }
+            leftmost = Some(ip);
+        }
+    }
+    leftmost
+        .map(|ip| ForwardedClient { ip, port: None })
+        .ok_or(ForwardedError::Missing)
+}
+
+/// RFC 9110 §5.6.2 `tchar`.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// RFC 9110 §5.6.4 `qdtext`.
+const fn is_qdtext(b: u8) -> bool {
+    matches!(b, b'\t' | b' ' | 0x21 | 0x23..=0x5B | 0x5D..=0x7E | 0x80..=0xFF)
+}
+
+/// RFC 9110 §5.6.4 `quoted-pair` octet: HTAB, SP, VCHAR or obs-text.
+const fn is_quoted_pair_octet(b: u8) -> bool {
+    matches!(b, b'\t' | b' '..=0x7E | 0x80..=0xFF)
+}
+
+/// Skips optional whitespace (SP / HTAB) from `i`.
+fn skip_ows(line: &[u8], mut i: usize) -> usize {
+    while matches!(line.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    i
+}
+
+/// Reads a `token` or `quoted-string` value at `i`; returns the value bytes
+/// (quotes removed, escapes left in place) and the index after it.
+fn forwarded_value(line: &[u8], mut i: usize) -> Result<(&[u8], usize), ForwardedError> {
+    if line.get(i) != Some(&b'"') {
+        let start = i;
+        while line.get(i).copied().is_some_and(is_tchar) {
+            i += 1;
+        }
+        let v = line.get(start..i).unwrap_or_default();
+        return if v.is_empty() {
+            Err(ForwardedError::Malformed)
+        } else {
+            Ok((v, i))
+        };
+    }
+    i += 1;
+    let start = i;
+    loop {
+        match line.get(i).copied() {
+            Some(b'"') => break,
+            Some(b'\\') if line.get(i + 1).copied().is_some_and(is_quoted_pair_octet) => i += 2,
+            Some(b) if is_qdtext(b) => i += 1,
+            _ => return Err(ForwardedError::Malformed),
+        }
+    }
+    Ok((line.get(start..i).unwrap_or_default(), i + 1))
+}
+
+/// Parses one `Forwarded` field line (RFC 7239 §4) into its elements' `for`
+/// values (raw `node` bytes, quotes removed; `None` for an element without
+/// `for`). Strict: any syntax error refuses the whole line.
+fn parse_forwarded_line<'a>(
+    line: &'a [u8],
+    out: &mut Vec<Option<&'a [u8]>>,
+) -> Result<(), ForwardedError> {
+    let mut i = 0;
+    loop {
+        let mut for_value: Option<&'a [u8]> = None;
+        loop {
+            i = skip_ows(line, i);
+            let name_start = i;
+            while line.get(i).copied().is_some_and(is_tchar) {
+                i += 1;
+            }
+            let name = line.get(name_start..i).unwrap_or_default();
+            if name.is_empty() || line.get(i) != Some(&b'=') {
+                return Err(ForwardedError::Malformed);
+            }
+            let (value, next) = forwarded_value(line, i + 1)?;
+            i = next;
+            // RFC 7239 §4: a parameter MUST NOT occur twice in one element.
+            if name.eq_ignore_ascii_case(b"for") {
+                if for_value.is_some() {
+                    return Err(ForwardedError::Malformed);
+                }
+                for_value = Some(value);
+            }
+            i = skip_ows(line, i);
+            if line.get(i) == Some(&b';') {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if out.len() >= MAX_FORWARDED_HOPS {
+            return Err(ForwardedError::Malformed);
+        }
+        out.push(for_value);
+        match line.get(i) {
+            None => return Ok(()),
+            Some(b',') => i += 1,
+            Some(_) => return Err(ForwardedError::Malformed),
+        }
+    }
+}
+
+/// RFC 7239 §6.3 `obfnode` / `obfport`: `_` followed by ALPHA / DIGIT / `.`
+/// / `_` / `-`.
+fn is_obfuscated(v: &[u8]) -> bool {
+    v.split_first().is_some_and(|(&first, rest)| {
+        first == b'_'
+            && !rest.is_empty()
+            && rest
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    })
+}
+
+/// RFC 7239 §6 `node-port`: a port, or an obfuscated port (`None`).
+fn parse_node_port(p: &[u8]) -> Result<Option<u16>, ForwardedError> {
+    if is_obfuscated(p) {
+        return Ok(None);
+    }
+    parse_port(p).map(Some).ok_or(ForwardedError::Malformed)
+}
+
+/// RFC 7239 §6 `node`: `nodename [ ":" node-port ]`, where the nodename is
+/// an IPv4 literal, a bracketed IPv6 literal, `unknown` or an `obfnode`.
+fn parse_forwarded_node(v: &[u8]) -> Result<ForwardedClient, ForwardedError> {
+    let (ip, port) = if let Some(rest) = v.strip_prefix(b"[") {
+        let close = rest
+            .iter()
+            .position(|&b| b == b']')
+            .ok_or(ForwardedError::Malformed)?;
+        let (inner, after) = rest.split_at(close);
+        let ip = std::str::from_utf8(inner)
+            .ok()
+            .and_then(|s| s.parse::<Ipv6Addr>().ok())
+            .ok_or(ForwardedError::Malformed)?;
+        let port = match after.get(1..).unwrap_or_default().split_first() {
+            None => None,
+            Some((b':', p)) => parse_node_port(p)?,
+            Some(_) => return Err(ForwardedError::Malformed),
+        };
+        (IpAddr::V6(ip), port)
+    } else {
+        let mut parts = v.splitn(2, |&b| b == b':');
+        let name = parts.next().unwrap_or_default();
+        let port = parts.next();
+        let port = port.map(parse_node_port).transpose()?.flatten();
+        if name.eq_ignore_ascii_case(b"unknown") || is_obfuscated(name) {
+            return Err(ForwardedError::Obfuscated);
+        }
+        let ip = std::str::from_utf8(name)
+            .ok()
+            .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            .ok_or(ForwardedError::Malformed)?;
+        (IpAddr::V4(ip), port)
+    };
+    Ok(ForwardedClient {
+        ip: ip.to_canonical(),
+        port,
+    })
+}
+
+/// Client address from RFC 7239 `Forwarded` field lines (in arrival order).
+///
+/// Parameter names are case-insensitive and values may be quoted-strings,
+/// so `,` and `;` inside quotes do not split. The header is parsed strictly
+/// as a whole; then the `for=` hops are walked right to left, skipping hops
+/// `is_trusted` accepts, and the first untrusted hop is the client (all
+/// trusted: the leftmost). A quoted `"[v6]:port"` or `"v4:port"` keeps its
+/// port; an obfuscated port gives `None`.
+///
+/// # Errors
+///
+/// [`ForwardedError::Missing`] when there is no non-empty line,
+/// [`ForwardedError::Obfuscated`] when the deciding hop is `unknown` or an
+/// obfuscated identifier, [`ForwardedError::Malformed`] for any syntax error,
+/// an element without `for=` on the walked path, or too many elements.
+///
+/// ## NIST 800-53 Rev5: SC-7, SI-10; RFC 7239 §4, §5.2, §6, §8.1
+pub fn client_from_forwarded(
+    values: &[&[u8]],
+    is_trusted: impl Fn(IpAddr) -> bool,
+) -> Result<ForwardedClient, ForwardedError> {
+    let mut elements = Vec::new();
+    for line in values {
+        if line.trim_ascii().is_empty() {
+            continue;
+        }
+        parse_forwarded_line(line, &mut elements)?;
+    }
+    let mut leftmost = None;
+    for value in elements.iter().rev() {
+        let client = parse_forwarded_node(value.ok_or(ForwardedError::Malformed)?)?;
+        if !is_trusted(client.ip) {
+            return Ok(client);
+        }
+        leftmost = Some(client);
+    }
+    leftmost.ok_or(ForwardedError::Missing)
+}
+
+/// Upgrade-request check for a trusted proxy: takes the client address from
+/// the configured forwarding header, refusing the upgrade with 400 when it
+/// is missing or unusable (never a fallback to the proxy address), then
+/// applies the subprotocol check. The outcome is left in `outcome` for the
+/// listener.
+///
+/// ## NIST 800-53 Rev5: SC-5, SC-7, AU-3
+struct ForwardedCheck {
+    subprotocol: SubprotocolCheck,
+    forwarded: bool,
+    trusted: TrustedProxyFn,
+    outcome: Arc<OnceLock<Result<ForwardedClient, ForwardedError>>>,
+}
+
+impl Callback for ForwardedCheck {
+    fn on_request(self, req: &Request, resp: Response) -> Result<Response, ErrorResponse> {
+        let header = if self.forwarded {
+            "forwarded"
+        } else {
+            "x-forwarded-for"
+        };
+        // Bounded by the request parser's header limit.
+        let lines: Vec<&[u8]> = req
+            .headers()
+            .get_all(header)
+            .iter()
+            .map(HeaderValue::as_bytes)
+            .collect();
+        let trusted = |ip| (self.trusted)(ip);
+        let outcome = if self.forwarded {
+            client_from_forwarded(&lines, trusted)
+        } else {
+            client_from_x_forwarded_for(&lines, trusted)
+        };
+        let _ = self.outcome.set(outcome);
+        if outcome.is_err() {
+            return Err(reject_upgrade("a valid client address header is required"));
+        }
+        self.subprotocol.on_request(req, resp)
     }
 }
 
@@ -490,6 +870,10 @@ pub struct WebSocketListener {
     secure: bool,
     /// Handshake options.
     options: WebSocketListenerOptions,
+    /// Where the client address comes from behind a trusted proxy.
+    client_address: ClientAddressMode,
+    /// Peers whose forwarding information is believed; `None` trusts nobody.
+    trusted: Option<TrustedProxyFn>,
 }
 
 impl WebSocketListener {
@@ -522,6 +906,8 @@ impl WebSocketListener {
             listener,
             secure,
             options: WebSocketListenerOptions::default(),
+            client_address: ClientAddressMode::Peer,
+            trusted: None,
         })
     }
 
@@ -530,6 +916,37 @@ impl WebSocketListener {
     pub const fn with_options(mut self, options: WebSocketListenerOptions) -> Self {
         self.options = options;
         self
+    }
+
+    /// Takes the client address from `mode` when the TCP peer satisfies
+    /// `trusted` (the configured reverse proxies). Other peers keep their
+    /// socket address and their forwarding headers are ignored.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, AU-3; RFC 7239 §8.1
+    #[must_use]
+    pub fn with_client_address(mut self, mode: ClientAddressMode, trusted: TrustedProxyFn) -> Self {
+        // POAM: POA&M-456 - forwarding information is trusted exactly as far
+        // as `trusted`: a listed proxy can claim any client address.
+        self.client_address = mode;
+        self.trusted = Some(trusted);
+        self
+    }
+
+    /// Whether `ip` is one of the configured trusted proxies (false when
+    /// none are configured).
+    #[must_use]
+    pub fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
+        self.trusted
+            .as_ref()
+            .is_some_and(|trusted| trusted(ip.to_canonical()))
+    }
+
+    /// Whether the client address of a connection from `peer` is learnt
+    /// during the handshake (a trusted proxy and a mode other than
+    /// [`ClientAddressMode::Peer`]) rather than being the peer itself.
+    #[must_use]
+    pub fn learns_client_address(&self, peer: IpAddr) -> bool {
+        self.client_address != ClientAddressMode::Peer && self.is_trusted_proxy(peer)
     }
 
     /// Accepts the raw TCP connection only (no HTTP upgrade). Pair with
@@ -554,22 +971,132 @@ impl WebSocketListener {
 
     /// Completes the WebSocket upgrade on a stream from [`Self::accept_tcp`].
     ///
+    /// From a trusted proxy (see [`Self::learns_client_address`]) the
+    /// transport's peer address is the client: the PROXY v2 source, or the
+    /// forwarding-header IP with its port when `Forwarded` carries one and
+    /// the proxy-side TCP source port otherwise (keeps flow keys unique). A
+    /// missing or invalid client address refuses the connection; it never
+    /// falls back to the proxy address. PROXY v2 `LOCAL` (health checks)
+    /// keeps the proxy address.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the handshake fails or is refused.
+    /// Returns an error if the handshake fails or is refused;
+    /// [`TransportError::ProxyHeaderMissing`] /
+    /// [`TransportError::ProxyHeaderInvalid`] when a trusted proxy sent no
+    /// or an unusable client address.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, AU-3
     pub async fn complete_handshake(
         &self,
-        tcp_stream: TcpStream,
+        mut tcp_stream: TcpStream,
         peer: SbcSocketAddr,
     ) -> TransportResult<WebSocketTransport> {
-        WebSocketTransport::accept_with_options(
-            tcp_stream,
-            self.local_addr,
-            peer,
-            self.secure,
-            self.options,
+        let trusted = match &self.trusted {
+            Some(trusted) if self.learns_client_address(peer.ip()) => Arc::clone(trusted),
+            _ => {
+                return WebSocketTransport::accept_with_options(
+                    tcp_stream,
+                    self.local_addr,
+                    peer,
+                    self.secure,
+                    self.options,
+                )
+                .await;
+            }
+        };
+        let forwarded = match self.client_address {
+            ClientAddressMode::ProxyV2 => {
+                let client = Self::proxy_v2_client(&mut tcp_stream, peer).await?;
+                return WebSocketTransport::accept_with_options(
+                    tcp_stream,
+                    self.local_addr,
+                    client,
+                    self.secure,
+                    self.options,
+                )
+                .await;
+            }
+            ClientAddressMode::Forwarded => true,
+            ClientAddressMode::XForwardedFor | ClientAddressMode::Peer => false,
+        };
+        let outcome = Arc::new(OnceLock::new());
+        let callback = ForwardedCheck {
+            subprotocol: SubprotocolCheck {
+                require_sip: self.options.require_sip_subprotocol,
+            },
+            forwarded,
+            trusted,
+            outcome: Arc::clone(&outcome),
+        };
+        let result = accept_hdr_async_with_config(
+            MaybeTlsStream::Plain(tcp_stream),
+            callback,
+            Some(sip_ws_config()),
         )
-        .await
+        .await;
+        let client = match outcome.get().copied() {
+            Some(Ok(client)) => Some(client),
+            Some(Err(ForwardedError::Missing)) => {
+                return Err(TransportError::ProxyHeaderMissing {
+                    reason: ForwardedError::Missing.to_string(),
+                });
+            }
+            Some(Err(e)) => {
+                return Err(TransportError::ProxyHeaderInvalid {
+                    reason: e.to_string(),
+                });
+            }
+            None => None,
+        };
+        let stream = result.map_err(|e| TransportError::ConnectFailed {
+            address: peer,
+            reason: format!("WebSocket accept failed: {e}"),
+        })?;
+        // The callback ran (the upgrade succeeded), so `client` is set.
+        let client = client.ok_or_else(|| TransportError::ProxyHeaderMissing {
+            reason: ForwardedError::Missing.to_string(),
+        })?;
+        let client = SbcSocketAddr::from(SocketAddr::new(
+            client.ip,
+            client.port.unwrap_or_else(|| peer.port()),
+        ));
+        info!(
+            local = %self.local_addr,
+            proxy = %peer,
+            client = %client,
+            "Accepted WebSocket connection from trusted proxy"
+        );
+        Ok(WebSocketTransport::new(
+            stream,
+            self.local_addr,
+            client,
+            self.secure,
+        ))
+    }
+
+    /// Reads the PROXY v2 preamble from a trusted proxy and returns the
+    /// client address: the header source for `PROXY`, the proxy itself for
+    /// `LOCAL` (health checks).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, AU-3
+    async fn proxy_v2_client(
+        tcp_stream: &mut TcpStream,
+        peer: SbcSocketAddr,
+    ) -> TransportResult<SbcSocketAddr> {
+        use crate::proxy_protocol::{Command, read_v2};
+        let header = read_v2(tcp_stream).await?;
+        match (header.command, header.source) {
+            (Command::Local, _) => Ok(peer),
+            (Command::Proxy, Some(source)) => {
+                Ok(SbcSocketAddr::from(crate::canonical_peer(source)))
+            }
+            // AF_UNSPEC under PROXY names no client: refuse rather than key
+            // the client on the proxy address.
+            (Command::Proxy, None) => Err(TransportError::ProxyHeaderInvalid {
+                reason: "PROXY v2 header carries no client address".to_string(),
+            }),
+        }
     }
 
     /// Accepts the next WebSocket connection (TCP accept and handshake

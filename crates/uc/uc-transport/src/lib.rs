@@ -35,6 +35,7 @@
 
 pub mod error;
 pub mod listener;
+pub mod proxy_protocol;
 pub mod qos;
 pub mod udp;
 
