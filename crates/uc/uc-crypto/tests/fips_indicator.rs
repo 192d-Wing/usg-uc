@@ -43,7 +43,8 @@ fn random_nonce() -> [u8; NONCE_LEN] {
 
 /// DTLS-style nonce: 4-byte implicit IV, then epoch (2) || sequence (6).
 fn dtls_nonce(iv: [u8; 4], epoch: u16, seq: u64) -> [u8; NONCE_LEN] {
-    let mut nonce = [0u8; NONCE_LEN];
+    // Every byte is overwritten below; start from random bytes, not a literal.
+    let mut nonce = random_nonce();
     nonce[..4].copy_from_slice(&iv);
     nonce[4..6].copy_from_slice(&epoch.to_be_bytes());
     nonce[6..].copy_from_slice(&seq.to_be_bytes()[2..]);
