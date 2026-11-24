@@ -282,3 +282,162 @@ mod tests {
         assert!(limiter.try_acquire(a).is_none());
     }
 }
+
+/// SR-56: per-source accept token bucket and per-source in-handshake cap.
+/// Compile-red until `with_accept_rate`, `with_handshake_cap`,
+/// `try_begin_handshake`, `sweep_accept` and the `AcceptRate` /
+/// `HandshakeBusy` rejections exist.
+///
+/// ## NIST 800-53 Rev5: SC-5
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod sr56_accept_admission_tests {
+    use super::*;
+
+    fn rejections(limiter: &ConnLimiter) -> Vec<(IpAddr, Rejection, u64)> {
+        let mut seen = Vec::new();
+        let _ = limiter.drain_rejections(|k, kind, n| seen.push((k, kind, n)));
+        seen.sort_by_key(|(k, kind, _)| (*k, format!("{kind:?}")));
+        seen
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn accept_rate_limits_new_connections_per_source() {
+        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(1, 3, 1_024, 100));
+        let a = ip("192.0.2.1");
+        let b = ip("192.0.2.2");
+        for i in 0..3 {
+            assert!(limiter.try_acquire(a).is_some(), "burst accept {i}");
+        }
+        assert!(
+            limiter.try_acquire(a).is_none(),
+            "4th accept within a second must be refused by the bucket"
+        );
+        assert!(
+            limiter.try_acquire(b).is_some(),
+            "another source is unaffected"
+        );
+        assert_eq!(rejections(&limiter), vec![(a, Rejection::AcceptRate, 1)]);
+    }
+
+    #[test]
+    fn accept_rate_reject_takes_no_slot() {
+        let limiter = Arc::new(ConnLimiter::new(4, 64).with_accept_rate(1, 1, 1_024, 100));
+        let a = ip("192.0.2.1");
+        let held = limiter.try_acquire(a).unwrap();
+        assert!(limiter.try_acquire(a).is_none());
+        assert_eq!(limiter.active(a), 1, "bucket reject must not take a slot");
+        let c = ip("192.0.2.3");
+        drop(limiter.try_acquire(c).unwrap());
+        assert!(limiter.try_acquire(c).is_none());
+        assert_eq!(limiter.active(c), 0);
+        assert_eq!(limiter.sources(), 1, "no entry for the refused source");
+        // A bucket reject is AcceptRate, never PerSource.
+        assert_eq!(
+            rejections(&limiter),
+            vec![(a, Rejection::AcceptRate, 1), (c, Rejection::AcceptRate, 1)]
+        );
+        drop(held);
+        assert_eq!(limiter.sources(), 0);
+    }
+
+    #[test]
+    fn accept_rate_keys_by_prefix_and_unmaps_v4() {
+        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(1, 1, 1_024, 100));
+        drop(limiter.try_acquire(ip("2001:db8:0:1::1")).unwrap());
+        assert!(
+            limiter.try_acquire(ip("2001:db8:0:1::2")).is_none(),
+            "same /64 shares one bucket"
+        );
+        assert!(limiter.try_acquire(ip("2001:db8:0:2::1")).is_some());
+        drop(limiter.try_acquire(ip("192.0.2.1")).unwrap());
+        assert!(
+            limiter.try_acquire(ip("::ffff:192.0.2.1")).is_none(),
+            "v4-mapped shares the plain-v4 bucket"
+        );
+        let seen = rejections(&limiter);
+        assert!(seen.contains(&(ip("2001:db8:0:1::"), Rejection::AcceptRate, 1)));
+        assert!(seen.contains(&(ip("192.0.2.1"), Rejection::AcceptRate, 1)));
+    }
+
+    #[test]
+    fn accept_rate_zero_disables() {
+        let limiter = Arc::new(ConnLimiter::new(1, 64).with_accept_rate(0, 1, 1_024, 100));
+        let a = ip("192.0.2.1");
+        for i in 0..10_000 {
+            assert!(limiter.try_acquire(a).is_some(), "cycle {i}");
+        }
+        assert!(rejections(&limiter).is_empty());
+    }
+
+    #[test]
+    fn accept_rate_refills() {
+        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(20, 1, 1_024, 100));
+        let a = ip("192.0.2.1");
+        drop(limiter.try_acquire(a).unwrap());
+        assert!(limiter.try_acquire(a).is_none(), "burst of 1 is spent");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            limiter.try_acquire(a).is_some(),
+            "20/s refills a token within 100 ms"
+        );
+    }
+
+    #[test]
+    fn handshake_cap_per_source_and_release_on_drop() {
+        let limiter = Arc::new(ConnLimiter::new(100, 64).with_handshake_cap(2));
+        let a = ip("2001:db8:0:1::1");
+        let a_same_prefix = ip("2001:db8:0:1::2");
+        let b = ip("192.0.2.2");
+        let h1: HandshakeGuard = limiter.try_begin_handshake(a).unwrap();
+        let h2 = limiter.try_begin_handshake(a_same_prefix).unwrap();
+        assert!(limiter.try_begin_handshake(a).is_none(), "third handshake");
+        let hb = limiter.try_begin_handshake(b).unwrap();
+        // Handshake slots are separate from connection slots.
+        assert_eq!(limiter.active(a), 0);
+        assert_eq!(
+            rejections(&limiter),
+            vec![(ip("2001:db8:0:1::"), Rejection::HandshakeBusy, 1)]
+        );
+        drop(h1);
+        let h3 = limiter.try_begin_handshake(a).unwrap();
+        drop((h2, h3, hb));
+        // Every guard released: the source can start a full set again.
+        let _x = limiter.try_begin_handshake(a).unwrap();
+        let _y = limiter.try_begin_handshake(a).unwrap();
+    }
+
+    #[test]
+    fn handshake_guard_releases_on_panic() {
+        let limiter = Arc::new(ConnLimiter::new(100, 64).with_handshake_cap(1));
+        let a = ip("192.0.2.1");
+        let l = Arc::clone(&limiter);
+        let r = std::thread::spawn(move || {
+            let _g = l.try_begin_handshake(a).unwrap();
+            panic!("handshake task panicked");
+        })
+        .join();
+        assert!(r.is_err());
+        assert!(limiter.try_begin_handshake(a).is_some());
+    }
+
+    #[test]
+    fn sweep_accept_evicts_idle_and_reports_rejections() {
+        let limiter = Arc::new(ConnLimiter::new(100, 64).with_accept_rate(1, 1, 1_024, 100));
+        let a = ip("192.0.2.1");
+        drop(limiter.try_acquire(a).unwrap());
+        for _ in 0..3 {
+            assert!(limiter.try_acquire(a).is_none());
+        }
+        let mut seen = Vec::new();
+        limiter.sweep_accept(|k, n| seen.push((k, n)));
+        assert_eq!(seen, vec![(a, 3)]);
+        seen.clear();
+        limiter.sweep_accept(|k, n| seen.push((k, n)));
+        assert!(seen.is_empty(), "rejections are reported once");
+    }
+}

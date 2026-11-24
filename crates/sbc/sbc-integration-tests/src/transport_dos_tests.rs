@@ -181,3 +181,46 @@ fn rate_limit_c_trunk_rps_range_enforced_by_loader() {
     assert!(with(1_000_000).is_err(), "above global_rps accepted");
     assert!(with(2_000).is_ok());
 }
+
+/// SR-56 accept-admission keys. Compile-red until the keys exist.
+///
+/// ## NIST 800-53 Rev5: SC-5, CM-6
+mod sr56_accept_keys {
+    use sbc_config::load_from_str;
+
+    #[test]
+    fn accept_rate_and_handshake_keys_load_from_toml() {
+        let config = load_from_str(
+            r#"
+            [transport]
+            udp_listen = ["0.0.0.0:5060"]
+            max_connections_per_source = 32
+            accept_rate_per_source = 40
+            accept_burst_per_source = 80
+            max_handshakes_in_flight = 512
+            max_handshakes_per_source = 8
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.transport.accept_rate_per_source, 40);
+        assert_eq!(config.transport.accept_burst_per_source, 80);
+        assert_eq!(config.transport.max_handshakes_in_flight, 512);
+        assert_eq!(config.transport.max_handshakes_per_source, 8);
+
+        let defaults = load_from_str("[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n").unwrap();
+        assert_eq!(defaults.transport.accept_rate_per_source, 20);
+        assert_eq!(defaults.transport.accept_burst_per_source, 50);
+        assert_eq!(defaults.transport.max_handshakes_in_flight, 0);
+        assert_eq!(defaults.transport.max_handshakes_per_source, 16);
+
+        for bad in [
+            "accept_burst_per_source = 0",
+            "accept_rate_per_source = 60\naccept_burst_per_source = 50",
+            "max_handshakes_per_source = 0",
+            "max_connections_per_source = 8\nmax_handshakes_per_source = 9",
+        ] {
+            let text = format!("[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n{bad}\n");
+            assert!(load_from_str(&text).is_err(), "{bad:?} must be rejected");
+        }
+    }
+}

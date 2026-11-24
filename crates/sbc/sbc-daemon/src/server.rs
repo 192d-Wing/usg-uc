@@ -6193,4 +6193,553 @@ mod tests {
             assert!(!udp.lock().await.is_blocked(t));
         }
     }
+
+    // ---- SR-22 / SR-56 accept path (behaviour tests on existing APIs) ----
+
+    const LOCALHOST_IP: std::net::IpAddr = std::net::IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    /// Connects to `listen` and resets the connection (`SO_LINGER` 0)
+    /// before the server accepts it. The kernel keeps it in the accept
+    /// queue; `getpeername` on the accepted socket then fails.
+    #[cfg(unix)]
+    fn reset_before_accept(listen: std::net::SocketAddr) {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        sock.connect(&listen.into()).unwrap();
+        sock.set_linger(Some(std::time::Duration::ZERO)).unwrap();
+        drop(sock);
+    }
+
+    /// Polls the flow table for an inbound TCP flow to `peer` for up to
+    /// `within`; returns whether a `ping` could be sent on it.
+    async fn tcp_flow_registered(
+        flows: &FlowTable,
+        peer: &SbcSocketAddr,
+        within: std::time::Duration,
+    ) -> bool {
+        let flow = LegFlow::inbound(TransportType::Tcp);
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < within {
+            if flows.send(&flow, peer, b"ping", None).await.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    async fn ws_test_listener() -> (Arc<WebSocketListener>, std::net::SocketAddr) {
+        let bind = SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0);
+        let listener = WebSocketListener::bind(&bind, false)
+            .await
+            .unwrap()
+            .with_options(WebSocketListenerOptions {
+                require_sip_subprotocol: true,
+            });
+        let addr = listener.bound_addr().unwrap();
+        (Arc::new(listener), addr)
+    }
+
+    /// A TLS listener on 127.0.0.1 with a fresh P-384 certificate for
+    /// `sbc.example.test`, and a client config that trusts it.
+    async fn tls_test_listener() -> (Arc<TlsListener>, Arc<rustls::ClientConfig>) {
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["sbc.example.test".to_string()])
+            .unwrap()
+            .self_signed(&kp)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client =
+            uc_transport::tls::create_client_config_with(uc_transport::tls::TlsClientOptions {
+                roots,
+                min_version: uc_transport::tls::MinTlsVersion::V1_3,
+                client_auth: None,
+            })
+            .unwrap();
+        let server = uc_transport::tls::create_server_config(
+            vec![cert.der().clone()],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(
+                kp.serialize_der(),
+            )),
+        )
+        .unwrap();
+        let listener = TlsListener::bind(
+            ListenerConfig::new(
+                SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0),
+                TransportType::Tls,
+            ),
+            Arc::new(server),
+        )
+        .await
+        .unwrap();
+        (Arc::new(listener), Arc::new(client))
+    }
+
+    /// Runs a TLS client handshake against `addr` (5 s bound); `true` when
+    /// it completes.
+    async fn tls_handshake_ok(addr: SbcSocketAddr, client: &Arc<rustls::ClientConfig>) -> bool {
+        let connector = tokio_rustls::TlsConnector::from(Arc::clone(client));
+        let name = rustls_pki_types::ServerName::try_from("sbc.example.test").unwrap();
+        let attempt = async {
+            let tcp = tokio::net::TcpStream::connect(std::net::SocketAddr::from(addr)).await?;
+            connector.connect(name, tcp).await
+        };
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), attempt).await,
+            Ok(Ok(_))
+        )
+    }
+
+    // SR-22 (NIST 800-53 Rev5: SC-5): connections reset before accept must
+    // not stall the listener. Today each one makes `TcpListener::accept`
+    // fail (getpeername) and the loop sleeps 100 ms, so 20 of them delay a
+    // good client by about 2 s.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_accept_loop_does_not_stall_on_reset_connections() {
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let listen: std::net::SocketAddr = (*listener.local_addr()).into();
+        let mut ctx = stream_test_ctx(short_timeouts());
+        // All clients share 127.0.0.1: give the source room so admission
+        // caps do not interfere with what is measured.
+        ctx.conn_limiter = Arc::new(crate::conn_limit::ConnLimiter::new(64, 64));
+        ctx.conn_semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        ctx.total_conns = Arc::new(tokio::sync::Semaphore::new(64));
+        let flows = Arc::clone(&ctx.flows);
+        for _ in 0..20 {
+            reset_before_accept(listen);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let accept = tokio::spawn(Server::tcp_accept_loop(Arc::new(listener), ctx));
+        let t0 = std::time::Instant::now();
+        let mut client = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let peer = SbcSocketAddr::from(client.local_addr().unwrap());
+        let served =
+            tcp_flow_registered(&flows, &peer, std::time::Duration::from_millis(300)).await;
+        let waited = t0.elapsed();
+        accept.abort();
+        assert!(
+            served,
+            "good client not registered within 300 ms behind 20 reset connections \
+             (waited {waited:?}): accept errors stall the listener (SR-22)"
+        );
+        let mut buf = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
+    // SR-56 (NIST 800-53 Rev5: SC-5, SC-7): a blocked source is refused at
+    // accept, before the HTTP upgrade. Today the upgrade answers 101.
+    #[tokio::test]
+    async fn blocked_source_dropped_at_ws_accept_before_upgrade() {
+        let ctx = stream_test_ctx(short_timeouts());
+        {
+            let mut limiter = ctx.rate_limiter.lock().await;
+            assert!(limiter.block(LOCALHOST_IP, std::time::Duration::from_secs(60)));
+            assert!(limiter.is_blocked(LOCALHOST_IP));
+        }
+        let (listener, addr) = ws_test_listener().await;
+        let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
+        let reply = ws_upgrade_status(addr).await;
+        task.abort();
+        assert_eq!(
+            reply, None,
+            "blocked source got an upgrade reply: is_blocked not checked at accept (SR-56)"
+        );
+    }
+
+    // SR-56 (NIST 800-53 Rev5: SC-5, SC-7): a blocked source is refused
+    // before the TLS handshake, so it costs no crypto. Today it completes.
+    #[tokio::test]
+    async fn blocked_source_dropped_at_tls_accept_before_handshake() {
+        let ctx = stream_test_ctx(short_timeouts());
+        assert!(
+            ctx.rate_limiter
+                .lock()
+                .await
+                .block(LOCALHOST_IP, std::time::Duration::from_secs(60))
+        );
+        let (listener, client) = tls_test_listener().await;
+        let addr = *listener.local_addr();
+        let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+        let completed = tls_handshake_ok(addr, &client).await;
+        task.abort();
+        assert!(
+            !completed,
+            "blocked source completed a TLS handshake: is_blocked not checked at accept (SR-56)"
+        );
+    }
+
+    // SR-56 (NIST 800-53 Rev5: SC-5, SC-7): a blocked source's plain TCP
+    // connection is dropped at accept and never reaches the flow table.
+    #[tokio::test]
+    async fn blocked_source_dropped_at_tcp_accept() {
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let listen: std::net::SocketAddr = (*listener.local_addr()).into();
+        let ctx = stream_test_ctx(short_timeouts());
+        assert!(
+            ctx.rate_limiter
+                .lock()
+                .await
+                .block(LOCALHOST_IP, std::time::Duration::from_secs(60))
+        );
+        let flows = Arc::clone(&ctx.flows);
+        let task = tokio::spawn(Server::tcp_accept_loop(Arc::new(listener), ctx));
+        let mut client = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let peer = SbcSocketAddr::from(client.local_addr().unwrap());
+        let registered =
+            tcp_flow_registered(&flows, &peer, std::time::Duration::from_millis(300)).await;
+        assert!(
+            !registered,
+            "blocked source's TCP connection was admitted (SR-56)"
+        );
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read(&mut client, &mut buf),
+        )
+        .await;
+        task.abort();
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "blocked connection must be closed by the server, got {read:?}"
+        );
+    }
+
+    /// SR-22 / SR-56 tests against the new accept-path API
+    /// (`AcceptBackoff`, `StreamLoopContext::handshake_slots`,
+    /// `ConnLimiter::with_accept_rate` / `with_handshake_cap`, new
+    /// `ServerStats` counters and audit labels). Compile-red until the API
+    /// exists.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, AU-12
+    mod sr56_accept_api {
+        use super::*;
+        use crate::conn_limit::ConnLimiter;
+        use std::time::Duration as D;
+        use tokio::sync::Semaphore;
+        use uc_transport::TransportError as E;
+
+        fn transient() -> E {
+            E::AcceptFailed {
+                reason: "Software caused connection abort".into(),
+                resource_exhausted: false,
+            }
+        }
+
+        fn exhausted() -> E {
+            E::AcceptFailed {
+                reason: "Too many open files".into(),
+                resource_exhausted: true,
+            }
+        }
+
+        /// Completes a WS upgrade and keeps the connection open.
+        async fn ws_upgrade_open(addr: std::net::SocketAddr) -> (tokio::net::TcpStream, String) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!(
+                "GET / HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                 Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: sip\r\n\r\n"
+            );
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 256];
+            let n = tokio::time::timeout(D::from_secs(5), s.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
+            (s, reply)
+        }
+
+        // SR-22: only process-wide resource errors back off (10 ms doubling
+        // to 1 s); a per-connection error continues at once.
+        #[test]
+        fn accept_backoff_only_on_resource_exhaustion() {
+            let mut b = AcceptBackoff::new();
+            for e in [
+                transient(),
+                E::Io {
+                    reason: "Too many open files".into(),
+                },
+                E::ReceiveFailed {
+                    reason: "accept failed".into(),
+                },
+            ] {
+                assert_eq!(b.on_error(&e), None, "{e:?} must not back off");
+            }
+            let seq: Vec<Option<D>> = (0..9).map(|_| b.on_error(&exhausted())).collect();
+            let want: Vec<Option<D>> = [10, 20, 40, 80, 160, 320, 640, 1_000, 1_000]
+                .into_iter()
+                .map(|ms| Some(D::from_millis(ms)))
+                .collect();
+            assert_eq!(seq, want);
+            assert_eq!(
+                b.on_error(&transient()),
+                None,
+                "a per-connection error never sleeps, even mid-backoff"
+            );
+            b.on_success();
+            assert_eq!(b.on_error(&exhausted()), Some(D::from_millis(10)));
+        }
+
+        // SR-56: the accept bucket refuses excess connections before the
+        // upgrade and counts them.
+        #[tokio::test]
+        async fn accept_rate_drops_excess_ws_connections_before_upgrade() {
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 2, 1_024, 100));
+            let stats = Arc::clone(&ctx.stats);
+            let (listener, addr) = ws_test_listener().await;
+            let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
+            for i in 0..2 {
+                let reply = ws_upgrade_status(addr).await.expect("within burst");
+                assert!(reply.starts_with("HTTP/1.1 101"), "upgrade {i}: {reply}");
+            }
+            assert_eq!(
+                ws_upgrade_status(addr).await,
+                None,
+                "third accept over the bucket"
+            );
+            task.abort();
+            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
+        }
+
+        // SR-56: the TLS listener applies the same bucket before the
+        // handshake.
+        #[tokio::test]
+        async fn accept_rate_drops_excess_tls_connections_before_handshake() {
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024, 100));
+            let stats = Arc::clone(&ctx.stats);
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            assert!(tls_handshake_ok(addr, &client).await, "first handshake");
+            assert!(
+                !tls_handshake_ok(addr, &client).await,
+                "second over the bucket"
+            );
+            task.abort();
+            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.handshake_timeouts.load(Ordering::Relaxed), 0);
+        }
+
+        // SR-56: plain TCP is admitted (bucket included) before the
+        // transport is built; a refused accept never reaches the flow table.
+        #[tokio::test]
+        async fn accept_rate_drops_excess_tcp_connections() {
+            let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let listen: std::net::SocketAddr = (*listener.local_addr()).into();
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024, 100));
+            let stats = Arc::clone(&ctx.stats);
+            let flows = Arc::clone(&ctx.flows);
+            let task = tokio::spawn(Server::tcp_accept_loop(Arc::new(listener), ctx));
+            let first = tokio::net::TcpStream::connect(listen).await.unwrap();
+            let p1 = SbcSocketAddr::from(first.local_addr().unwrap());
+            assert!(tcp_flow_registered(&flows, &p1, D::from_secs(1)).await);
+            let second = tokio::net::TcpStream::connect(listen).await.unwrap();
+            let p2 = SbcSocketAddr::from(second.local_addr().unwrap());
+            assert!(!tcp_flow_registered(&flows, &p2, D::from_millis(300)).await);
+            task.abort();
+            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
+        }
+
+        // SR-56: with the node-wide handshake pool full, a new connection
+        // waits for a slot (it is not dropped) and proceeds once one frees.
+        #[tokio::test]
+        async fn ws_handshake_slot_waits_then_proceeds() {
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(8));
+            ctx.handshake_slots = Arc::new(Semaphore::new(1));
+            let (listener, addr) = ws_test_listener().await;
+            let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
+            let silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(D::from_millis(100)).await;
+            let second = tokio::spawn(ws_upgrade_status(addr));
+            tokio::time::sleep(D::from_millis(200)).await;
+            assert!(
+                !second.is_finished(),
+                "second upgrade answered while the only handshake slot was held"
+            );
+            drop(silent);
+            let reply = tokio::time::timeout(D::from_secs(3), second)
+                .await
+                .expect("second upgrade proceeds once the slot frees")
+                .unwrap()
+                .expect("upgrade answered");
+            task.abort();
+            assert!(reply.starts_with("HTTP/1.1 101"), "{reply}");
+        }
+
+        // SR-56: the handshake slot is released when the handshake ends,
+        // not when the connection closes.
+        #[tokio::test]
+        async fn handshake_slot_released_before_receive_loop() {
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(8));
+            ctx.handshake_slots = Arc::new(Semaphore::new(2));
+            let slots = Arc::clone(&ctx.handshake_slots);
+            let (listener, addr) = ws_test_listener().await;
+            let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
+            let (mut open, reply) = ws_upgrade_open(addr).await;
+            assert!(reply.starts_with("HTTP/1.1 101"), "{reply}");
+            let t0 = std::time::Instant::now();
+            while slots.available_permits() != 2 && t0.elapsed() < D::from_secs(1) {
+                tokio::time::sleep(D::from_millis(5)).await;
+            }
+            assert_eq!(
+                slots.available_permits(),
+                2,
+                "handshake slot still held by an upgraded connection"
+            );
+            let mut buf = [0u8; 1];
+            let read = tokio::time::timeout(
+                D::from_millis(200),
+                tokio::io::AsyncReadExt::read(&mut open, &mut buf),
+            )
+            .await;
+            assert!(
+                read.is_err(),
+                "upgraded connection must stay open: {read:?}"
+            );
+            task.abort();
+        }
+
+        // SR-56: time spent waiting for a handshake slot counts toward the
+        // handshake deadline. A holds the only slot until its 500 ms
+        // deadline; B arrives 100 ms later and must time out at about
+        // 600 ms, not 1 000 ms. Real time: paused time auto-advances past
+        // socket I/O.
+        #[tokio::test]
+        async fn qa_handshake_wait_counts_toward_deadline() {
+            let mut ctx = stream_test_ctx(StreamTimeouts {
+                handshake: D::from_millis(500),
+                ..short_timeouts()
+            });
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(8));
+            ctx.handshake_slots = Arc::new(Semaphore::new(1));
+            let stats = Arc::clone(&ctx.stats);
+            let listener_pool = Arc::clone(&ctx.conn_semaphore);
+            let total = Arc::clone(&ctx.total_conns);
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let slots = Arc::clone(&ctx.handshake_slots);
+            let (listener, addr) = ws_test_listener().await;
+            let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
+            let t0 = std::time::Instant::now();
+            let _a = tokio::net::TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(D::from_millis(100)).await;
+            let _b = tokio::net::TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(D::from_millis(850).saturating_sub(t0.elapsed())).await;
+            assert_eq!(
+                stats.handshake_timeouts.load(Ordering::Relaxed),
+                2,
+                "B's slot wait must count toward its handshake deadline"
+            );
+            assert_eq!(listener_pool.available_permits(), 4);
+            assert_eq!(total.available_permits(), 4);
+            assert_eq!(limiter.active(LOCALHOST_IP), 0);
+            assert_eq!(slots.available_permits(), 1);
+            task.abort();
+        }
+
+        // SR-56 (AU-12): accept-rate and blocked-source drops are counted
+        // and audited in aggregate, one record per source per flush.
+        #[tokio::test]
+        async fn accept_rate_and_blocked_are_audited_in_aggregate() {
+            let capture = uc_audit::capture::start();
+            let config = SbcConfig::default();
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024, 100));
+            let stats = Arc::clone(&ctx.stats);
+            let per_ip = Arc::clone(&ctx.rate_limiter);
+            let global = Arc::clone(&ctx.global_limiter);
+            let conns = Arc::clone(&ctx.conn_limiter);
+            let (listener, addr) = ws_test_listener().await;
+            let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
+            let reply = ws_upgrade_status(addr).await.expect("first upgrade");
+            assert!(reply.starts_with("HTTP/1.1 101"), "{reply}");
+            assert_eq!(ws_upgrade_status(addr).await, None, "over the bucket");
+            assert!(per_ip.lock().await.block(LOCALHOST_IP, D::from_secs(60)));
+            assert_eq!(ws_upgrade_status(addr).await, None, "blocked");
+            assert_eq!(ws_upgrade_status(addr).await, None, "blocked");
+            task.abort();
+            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.accept_blocked.load(Ordering::Relaxed), 2);
+
+            let mut maint = RateLimitMaintenance::new(
+                &config,
+                ShutdownSignal::new(),
+                Arc::clone(&per_ip),
+                global,
+                conns,
+            );
+            maint.sweep(true).await;
+            let records = rate_limit_records(&capture.events());
+            let named = |name: &str| -> Vec<_> {
+                records
+                    .iter()
+                    .filter(|r| r.limit_name == name)
+                    .cloned()
+                    .collect()
+            };
+            let rate = named("per_ip_accept_rate");
+            assert_eq!(rate.len(), 1, "{records:?}");
+            assert_eq!(rate[0].source_ip, LOCALHOST_IP);
+            assert_eq!(rate[0].request_count, 1, "counted once, not per path");
+            assert_eq!(
+                rate[0].threshold,
+                u64::from(config.transport.accept_rate_per_source)
+            );
+            let blocked = named("accept_blocked");
+            assert_eq!(blocked.len(), 1, "{records:?}");
+            assert_eq!(blocked[0].source_ip, LOCALHOST_IP);
+            assert_eq!(blocked[0].request_count, 2);
+
+            maint.sweep(true).await;
+            let again = rate_limit_records(&capture.events());
+            assert_eq!(
+                again
+                    .iter()
+                    .filter(|r| r.limit_name == "per_ip_accept_rate"
+                        || r.limit_name == "accept_blocked")
+                    .count(),
+                2,
+                "an idle interval emits no new accept records"
+            );
+        }
+
+        // SR-56 (AU-12): per-source handshake-cap rejections are audited as
+        // `handshake_busy`.
+        #[test]
+        fn handshake_busy_is_audited_in_aggregate() {
+            let capture = uc_audit::capture::start();
+            let limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(1));
+            let src: std::net::IpAddr = "192.0.2.60".parse().unwrap();
+            let _held = limiter.try_begin_handshake(src).unwrap();
+            assert!(limiter.try_begin_handshake(src).is_none());
+            assert!(limiter.try_begin_handshake(src).is_none());
+            let mut audit = RateLimitAudit::new(&SbcConfig::default());
+            audit.collect_conns(&limiter);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let busy: Vec<_> = records
+                .iter()
+                .filter(|r| r.limit_name == "handshake_busy")
+                .collect();
+            assert_eq!(busy.len(), 1, "{records:?}");
+            assert_eq!((busy[0].source_ip, busy[0].request_count), (src, 2));
+        }
+    }
 }

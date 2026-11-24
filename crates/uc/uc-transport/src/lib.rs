@@ -196,3 +196,46 @@ pub trait StreamTransport: Transport {
     /// Returns true if the connection is still open.
     fn is_connected(&self) -> bool;
 }
+
+/// SR-22 tests for the accept-error classifier. Compile-red until
+/// `is_accept_resource_exhaustion` exists.
+#[cfg(all(test, unix))]
+mod sr22_accept_classifier_tests {
+    use super::is_accept_resource_exhaustion;
+    use nix::errno::Errno;
+    use std::io::Error;
+
+    // NIST 800-53 Rev5: SC-5
+    // Only process- or system-wide resource errors back off; a failure tied
+    // to one connection lets the accept loop continue at once.
+    #[test]
+    fn accept_error_classification() {
+        for errno in [Errno::EMFILE, Errno::ENFILE, Errno::ENOBUFS, Errno::ENOMEM] {
+            let err = Error::from_raw_os_error(errno as i32);
+            assert!(
+                is_accept_resource_exhaustion(&err),
+                "{errno:?} must back off"
+            );
+        }
+        for errno in [
+            Errno::ECONNABORTED,
+            Errno::ENOTCONN,
+            Errno::EPROTO,
+            Errno::EPERM,
+            Errno::ECONNRESET,
+            Errno::EINTR,
+            Errno::EAGAIN,
+            Errno::EINVAL,
+        ] {
+            let err = Error::from_raw_os_error(errno as i32);
+            assert!(
+                !is_accept_resource_exhaustion(&err),
+                "{errno:?} must not back off"
+            );
+        }
+        assert!(is_accept_resource_exhaustion(&Error::from(
+            std::io::ErrorKind::OutOfMemory
+        )));
+        assert!(!is_accept_resource_exhaustion(&Error::other("custom")));
+    }
+}

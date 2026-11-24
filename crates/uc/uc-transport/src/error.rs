@@ -106,3 +106,71 @@ impl From<std::io::Error> for TransportError {
         }
     }
 }
+
+/// SR-22 tests for `TransportError::AcceptFailed`. Compile-red until the
+/// variant and `is_resource_exhausted` exist.
+#[cfg(test)]
+mod sr22_accept_error_tests {
+    use super::*;
+
+    // NIST 800-53 Rev5: SC-5
+    #[test]
+    fn accept_failed_carries_resource_flag() {
+        const TIMEOUT_EXHAUSTED: bool = TransportError::Timeout.is_resource_exhausted();
+        assert!(!TIMEOUT_EXHAUSTED, "is_resource_exhausted is a const fn");
+        let exhausted = TransportError::AcceptFailed {
+            reason: "Too many open files".into(),
+            resource_exhausted: true,
+        };
+        assert!(exhausted.is_resource_exhausted());
+        let transient = TransportError::AcceptFailed {
+            reason: "Software caused connection abort".into(),
+            resource_exhausted: false,
+        };
+        assert!(!transient.is_resource_exhausted());
+        let addr = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        let others = [
+            TransportError::BindFailed {
+                address: addr,
+                reason: String::new(),
+            },
+            TransportError::ConnectFailed {
+                address: addr,
+                reason: String::new(),
+            },
+            TransportError::SendFailed {
+                address: addr,
+                reason: String::new(),
+            },
+            TransportError::ReceiveFailed {
+                reason: "accept failed: Too many open files".into(),
+            },
+            TransportError::ConnectionClosed,
+            TransportError::MessageTooLarge {
+                size: 2,
+                max_size: 1,
+            },
+            TransportError::TlsHandshakeFailed {
+                reason: String::new(),
+            },
+            TransportError::TlsCertificateError {
+                reason: String::new(),
+            },
+            TransportError::InvalidAddress {
+                reason: String::new(),
+            },
+            TransportError::NotConnected,
+            TransportError::AlreadyClosed,
+            TransportError::Io {
+                reason: "Too many open files".into(),
+            },
+            TransportError::Timeout,
+        ];
+        for e in &others {
+            assert!(
+                !e.is_resource_exhausted(),
+                "{e:?} must not be resource-exhausted"
+            );
+        }
+    }
+}

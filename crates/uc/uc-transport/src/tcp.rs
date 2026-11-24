@@ -651,4 +651,124 @@ mod tests {
             msg.source
         );
     }
+
+    /// Connects a client to `listen` and resets it (`SO_LINGER` 0) before
+    /// the server calls `accept`, so the kernel queues a connection whose
+    /// peer is already gone. Returns the client's local address.
+    #[cfg(unix)]
+    pub(super) fn reset_before_accept(listen: SocketAddr) -> SocketAddr {
+        let domain = if listen.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        sock.connect(&listen.into()).unwrap();
+        let local = sock.local_addr().unwrap().as_socket().unwrap();
+        sock.set_linger(Some(std::time::Duration::ZERO)).unwrap();
+        drop(sock);
+        local
+    }
+
+    // SR-22 (NIST 800-53 Rev5: SC-5): a peer that sends RST before the
+    // server accepts must not turn `accept()` into an error. Today
+    // `from_stream` calls `getpeername` on the accepted socket, which fails
+    // (ENOTCONN on Linux, EINVAL on macOS) once the peer has reset, and the
+    // daemon accept loop then sleeps 100 ms. Both kernels keep the reset
+    // connection in the accept queue.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_accept_survives_peer_reset_before_accept() {
+        use std::net::Ipv4Addr;
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let listen: SocketAddr = (*listener.local_addr()).into();
+        let client: SbcSocketAddr = reset_before_accept(listen).into();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accept did not return within 2 s");
+        let (transport, peer) = accepted.expect("accept of a reset connection must be Ok (SR-22)");
+        assert_eq!(peer, client, "peer must be the address accept() returned");
+        assert_eq!(*transport.peer_addr(), client);
+    }
+}
+
+/// SR-22 tests against the new accept API (`TcpListener::accept_tcp`,
+/// `TcpTransport::from_accepted`). Compile-red until the API exists.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod sr22_accept_api_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // NIST 800-53 Rev5: SC-5, SI-10
+    #[tokio::test]
+    async fn tcp_accept_tcp_returns_canonical_peer_without_transport() {
+        let Ok(listener) = TcpListener::bind(SbcSocketAddr::new_v6(Ipv6Addr::UNSPECIFIED, 0)).await
+        else {
+            crate::skip_dual_stack("cannot bind [::]:0 (no IPv6)");
+            return;
+        };
+        let port = listener.local_addr().port();
+        let connect = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+        )
+        .await;
+        let Ok(Ok(client)) = connect else {
+            crate::skip_dual_stack("127.0.0.1 cannot reach a [::] listener (no dual-stack)");
+            return;
+        };
+        let (stream, peer): (TcpStream, SbcSocketAddr) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept_tcp())
+                .await
+                .expect("accept_tcp timed out")
+                .unwrap();
+        assert!(
+            peer.is_ipv4(),
+            "accept_tcp peer must be plain IPv4, got {peer}"
+        );
+        assert_eq!(peer.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(peer.port(), client.local_addr().unwrap().port());
+        drop(stream);
+    }
+
+    // NIST 800-53 Rev5: SC-5
+    // `from_accepted` takes the peer from accept() and never calls
+    // getpeername, so a reset peer still yields a transport with that peer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_from_accepted_never_fails() {
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let listen_local = *listener.local_addr();
+        let reset_client: SbcSocketAddr =
+            super::tests::reset_before_accept(listen_local.into()).into();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (stream, peer) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept_tcp())
+                .await
+                .expect("accept_tcp timed out")
+                .expect("accept_tcp of a reset connection must be Ok");
+        assert_eq!(peer, reset_client);
+        let transport: TcpTransport = TcpTransport::from_accepted(stream, peer, listen_local);
+        assert_eq!(*transport.peer_addr(), peer);
+        assert_eq!(transport.local_addr().ip(), listen_local.ip());
+    }
+
+    // `accept()` keeps its signature (accept_tcp + from_accepted).
+    #[tokio::test]
+    async fn tcp_accept_still_returns_transport_and_peer() {
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = *listener.local_addr();
+        let client = TcpStream::connect(SocketAddr::from(addr)).await.unwrap();
+        let (transport, peer): (TcpTransport, SbcSocketAddr) = listener.accept().await.unwrap();
+        assert_eq!(peer, SbcSocketAddr::from(client.local_addr().unwrap()));
+        assert_eq!(*transport.peer_addr(), peer);
+    }
 }
