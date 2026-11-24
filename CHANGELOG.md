@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, management-plane HTTPS is CNSA-only; no ring, SR-16, POA&M-402, 403)
+
+- **IdP / JWKS and central sync HTTPS offer CNSA suites only.** (SC-8,
+  SC-13) sbc-daemon, sbc-api-server, sbc-client-config-server,
+  central-config-api and sbc-config-sync offer TLS 1.3
+  `TLS_AES_256_GCM_SHA384` and TLS 1.2 `ECDHE-ECDSA-AES256-GCM-SHA384`,
+  with ML-KEM-1024 or P-384. The sbc-daemon IdP client is not tied to
+  `security.min_tls_version`. An IdP or central API without one of these
+  fails the handshake.
+- **Server certificates must be ECDSA P-384 once SR-14 (#241) lands.**
+  These clients verify signatures with `cnsa_provider()`, so the IdP,
+  central API and token endpoint leaf and chain must be ECDSA P-384 /
+  SHA-384; RSA or P-256 servers are refused (POA&M-404). This applies to
+  soft client provisioning too.
+- **Trust comes from the OS store** plus the existing extra-CA variables,
+  not compiled-in webpki roots. Images need `ca-certificates`;
+  `SSL_CERT_FILE` / `SSL_CERT_DIR` are honoured. An empty store fails at
+  startup. An unreadable or bad sbc-api-server OIDC extra CA now disables
+  operator OIDC instead of being ignored. sbc-config-sync exits 4 if its
+  HTTP client cannot be built.
+- **HMAC moves into the FIPS module.** uc-auth tokens and provisioning
+  device tokens use `uc_crypto::hash`; output is unchanged, existing tokens
+  stay valid. Every SBC and central binary links `aws-lc-fips-sys`; the
+  sbc-provision-server, sbc-client-config-server and central-config-import
+  images build only with the images PR (#247).
+- **Supply chain:** `ring` is banned (`deny.toml`); CI runs
+  `ci/check-crypto-deps.sh` and `cargo deny check bans`. Still outside the
+  module: admin password argon2id (POA&M-402) and sqlx-postgres Postgres
+  client authentication (POA&M-403).
+
 ### BREAKING (soft client, smart-card login and provisioning trust, POA&M-370, 371)
 
 Tested locally on macOS arm64; Windows covered by the CI cross-target build only.

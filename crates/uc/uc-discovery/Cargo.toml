@@ -37,7 +37,8 @@ uc-cluster.workspace = true
 uc-dns = { path = "../uc-dns" }
 
 # Kubernetes (optional)
-kube = { version = "3.1", features = ["runtime", "client"], optional = true }
+# aws-lc-rs, not kube's default ring provider (ring is banned, deny.toml).
+kube = { version = "3.1", default-features = false, features = ["client", "runtime", "rustls-tls", "aws-lc-rs"], optional = true }
 k8s-openapi = { version = "0.27", features = ["v1_35"], optional = true }
 
 [dev-dependencies]

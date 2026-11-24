@@ -18,6 +18,9 @@ pqc = []
 # CNSA-EXCEPTION: ATIS-1000074 mandates ES256 for SHAKEN PASSporTs. Enables
 # `interop::ecdsa_p256` and STI certificate path validation (`x509`).
 stir-shaken-es256 = ["dep:webpki", "dep:rustls-pki-types"]
+# CNSA-EXCEPTION: POA&M-211. Enables `interop::sha256` for the stored
+# SHA-256 API-key digest format (uc-auth).
+legacy-sha256 = []
 
 [dependencies]
 aws-lc-rs.workspace = true

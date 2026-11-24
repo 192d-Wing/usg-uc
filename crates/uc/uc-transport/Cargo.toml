@@ -16,6 +16,9 @@ tcp = []
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:arc-swap"]
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 sctp = ["dep:crc32c", "dep:rand"]  # SCTP transport (RFC 9260)
+# CNSA rustls client config for management-plane HTTPS (reqwest
+# `use_preconfigured_tls`); OS trust store. Off by default (client-ffi/iOS).
+https-client = ["tls", "dep:rustls-native-certs"]
 
 [dependencies]
 uc-types.workspace = true
@@ -32,6 +35,7 @@ rustls = { workspace = true, optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 arc-swap = { version = "1.9", optional = true }
+rustls-native-certs = { workspace = true, optional = true }
 
 # WebSocket support
 tokio-tungstenite = { version = "0.28", optional = true }

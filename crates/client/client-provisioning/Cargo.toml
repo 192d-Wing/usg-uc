@@ -23,10 +23,11 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["time"] }
 url = "2"
 base64 = "0.22"
-# Discovery / OIDC-metadata / token / JWKS-less config fetches. rustls only;
-# native-roots so the workstation trust store is consulted, plus an explicit
-# extra-CA path for the internal IdP (mirrors the server pods).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+# Discovery / OIDC-metadata / token / JWKS-less config fetches. No bundled
+# crypto provider (keeps ring out): every client gets a preconfigured CNSA
+# rustls config built here from the workstation trust store
+# (rustls-native-certs) plus an optional extra CA (mirrors the server pods).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-no-provider"] }
 # SHA-256 (PKCE S256) + CSPRNG (verifier/state/nonce) via the workspace FIPS
 # crypto module — same one the TLS stack links.
 # CNSA 2.0 rustls config handed to reqwest via `use_preconfigured_tls`

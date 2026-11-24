@@ -260,10 +260,7 @@ impl AppState {
         let cdrs = CdrServiceClient::new(channel.clone());
         let sbc_sync = SbcSyncServiceClient::new(channel);
 
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| StateError::Http(e.to_string()))?;
+        let http_client = build_daemon_http_client()?;
 
         // Fail closed: without admin credentials the management plane
         // cannot authenticate anyone, so refuse to start (forces the Helm
@@ -286,33 +283,37 @@ impl AppState {
         // Optional operator OIDC: accept the same config-admin tokens the
         // central config API takes, so the dashboard signs in once.
         let oidc = match (&cfg.oidc_issuer, &cfg.oidc_audience) {
-            (Some(issuer), Some(audience)) => {
+            (Some(issuer), Some(audience)) => 'oidc: {
                 // Trust an extra CA for the JWKS fetch when the IdP is
                 // fronted by an internal CA (SBC_OIDC_EXTRA_CA_CERT_FILE),
-                // mirroring the daemon. Without it the rustls webpki roots
-                // can't verify e.g. icam.oopl.dev.mil and every bearer 401s.
-                let mut http_builder = reqwest::Client::builder();
+                // mirroring the daemon. Without it the OS roots can't verify
+                // e.g. icam.oopl.dev.mil and every bearer 401s.
+                let mut extra_ca = None;
                 if let Ok(path) = std::env::var("SBC_OIDC_EXTRA_CA_CERT_FILE")
                     && !path.trim().is_empty()
                 {
                     match std::fs::read(&path) {
-                        Ok(pem) => match reqwest::Certificate::from_pem(&pem) {
-                            Ok(cert) => {
-                                info!(path, "loaded extra CA certificate for OIDC JWKS fetch");
-                                http_builder = http_builder.add_root_certificate(cert);
-                            }
-                            Err(e) => {
-                                tracing::error!(path, error = %e, "failed to parse SBC_OIDC_EXTRA_CA_CERT_FILE");
-                            }
-                        },
+                        Ok(pem) => {
+                            info!(path, "loaded extra CA certificate for OIDC JWKS fetch");
+                            extra_ca = Some(pem);
+                        }
                         Err(e) => {
-                            tracing::error!(path, error = %e, "failed to read SBC_OIDC_EXTRA_CA_CERT_FILE");
+                            // Fail closed, like a bad PEM: without the CA
+                            // every bearer would fail anyway.
+                            tracing::error!(path, error = %e, "failed to read SBC_OIDC_EXTRA_CA_CERT_FILE — operator OIDC disabled");
+                            break 'oidc None;
                         }
                     }
                 }
-                let http = http_builder
-                    .build()
-                    .unwrap_or_else(|_| reqwest::Client::new());
+                // Fail closed: no fallback client (it would drop the extra
+                // CA and the CNSA policy); bearer auth stays off instead.
+                let http = match build_oidc_http_client(extra_ca.as_deref()) {
+                    Ok(http) => http,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to build OIDC HTTP client — operator OIDC disabled");
+                        break 'oidc None;
+                    }
+                };
                 let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer.clone()));
                 let validator = proto_jwt::Validator::new(
                     jwks,
@@ -362,6 +363,41 @@ impl AppState {
     }
 }
 
+/// HTTP client for the reverse proxy to the daemon REST endpoint. HTTPS
+/// uses the CNSA config on the OS trust store; reqwest has no default
+/// crypto provider, so plain-HTTP use needs it too.
+///
+/// ## NIST 800-53 Rev5: SC-8(1), SC-13
+fn build_daemon_http_client() -> Result<reqwest::Client, StateError> {
+    let tls = uc_transport::https_client::create_https_client_config(
+        None,
+        uc_transport::tls::MinTlsVersion::V1_2,
+    )
+    .map_err(|e| StateError::Http(e.to_string()))?;
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(|e| StateError::Http(e.to_string()))
+}
+
+/// HTTP client for the operator OIDC metadata / JWKS fetch: CNSA suites
+/// and groups only, OS trust store plus the optional extra CA bundle
+/// (`SBC_OIDC_EXTRA_CA_CERT_FILE`).
+///
+/// ## NIST 800-53 Rev5: SC-8(1), SC-13, IA-5(2)
+fn build_oidc_http_client(extra_ca_pem: Option<&[u8]>) -> Result<reqwest::Client, String> {
+    let tls = uc_transport::https_client::create_https_client_config(
+        extra_ca_pem,
+        uc_transport::tls::MinTlsVersion::V1_2,
+    )
+    .map_err(|e| e.to_string())?;
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 /// Strip the password from a Postgres DSN so it can be safely logged.
 fn scrub_dsn(dsn: &str) -> String {
     // Naive: replace `user:pass@host` with `user:***@host`. Doesn't
@@ -380,4 +416,46 @@ fn scrub_dsn(dsn: &str) -> String {
         }
     }
     dsn.to_string()
+}
+
+// SR-16: management-plane HTTP clients are CNSA-only (uc-transport
+// `create_https_client_config` via reqwest `use_preconfigured_tls`).
+#[cfg(test)]
+#[path = "../../../uc/uc-transport/tests/common/cnsa_reqwest_checks.rs"]
+mod cnsa_reqwest_checks;
+
+#[cfg(test)]
+mod sr16_http_client_tests {
+    use super::cnsa_reqwest_checks as checks;
+
+    #[tokio::test]
+    async fn sbc_api_server_oidc_http_client_trusts_extra_ca() {
+        checks::assert_trusts_extra_ca(super::build_oidc_http_client).await;
+    }
+
+    #[tokio::test]
+    async fn sbc_api_server_oidc_http_client_refuses_non_cnsa_server() {
+        checks::assert_refuses_non_cnsa(super::build_oidc_http_client).await;
+    }
+
+    /// Child half (no-op unless re-executed with `SSL_CERT_FILE`).
+    #[tokio::test]
+    async fn proxy_client_os_roots_child() {
+        checks::os_roots_child(super::build_daemon_http_client).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sbc_api_server_proxy_http_client_refuses_non_cnsa_server() {
+        let child = checks::fx::test_name(module_path!(), "proxy_client_os_roots_child");
+        checks::assert_os_roots_trusted_and_non_cnsa_refused(child, true).await;
+    }
+
+    #[test]
+    fn sbc_api_server_proxy_http_client_builds_for_plain_http() -> Result<(), super::StateError> {
+        // The proxy talks plain HTTP to the daemon in dev setups; building
+        // it must not need a process-default provider (reqwest without a
+        // provider panics in `build()`).
+        super::build_daemon_http_client()?;
+        Ok(())
+    }
 }
