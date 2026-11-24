@@ -102,8 +102,11 @@ pub enum TransportError {
     ///
     /// `resource_exhausted` is set for process- or system-wide resource
     /// errors (fd table full, no buffer space, out of memory), where the
-    /// caller should back off; otherwise the failure concerns one pending
-    /// connection and the caller can accept again at once.
+    /// caller should back off. `per_connection` is set when the failure
+    /// concerns one pending connection only, so the caller can accept
+    /// again at once. With neither set the error is listener-level or
+    /// unknown (for example EBADF or EINVAL): a long run of those means a
+    /// broken listener.
     #[error("accept failed: {reason}")]
     AcceptFailed {
         /// Error description.
@@ -111,6 +114,9 @@ pub enum TransportError {
         /// The error is a resource exhaustion (see
         /// [`crate::is_accept_resource_exhaustion`]).
         resource_exhausted: bool,
+        /// The error concerns one pending connection only (see
+        /// [`crate::is_accept_per_connection_error`]).
+        per_connection: bool,
     },
 }
 
@@ -125,6 +131,21 @@ impl TransportError {
             self,
             Self::AcceptFailed {
                 resource_exhausted: true,
+                ..
+            }
+        )
+    }
+
+    /// Returns true for an [`Self::AcceptFailed`] that concerns one pending
+    /// connection only (never a sign of a broken listener).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+    #[must_use]
+    pub const fn is_per_connection_accept_error(&self) -> bool {
+        matches!(
+            self,
+            Self::AcceptFailed {
+                per_connection: true,
                 ..
             }
         )
@@ -153,13 +174,17 @@ mod sr22_accept_error_tests {
         let exhausted = TransportError::AcceptFailed {
             reason: "Too many open files".into(),
             resource_exhausted: true,
+            per_connection: false,
         };
         assert!(exhausted.is_resource_exhausted());
         let transient = TransportError::AcceptFailed {
             reason: "Software caused connection abort".into(),
             resource_exhausted: false,
+            per_connection: true,
         };
         assert!(!transient.is_resource_exhausted());
+        assert!(transient.is_per_connection_accept_error());
+        assert!(!exhausted.is_per_connection_accept_error());
         let addr = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
         let others = [
             TransportError::BindFailed {
@@ -202,6 +227,10 @@ mod sr22_accept_error_tests {
             assert!(
                 !e.is_resource_exhausted(),
                 "{e:?} must not be resource-exhausted"
+            );
+            assert!(
+                !e.is_per_connection_accept_error(),
+                "{e:?} is not a per-connection accept error"
             );
         }
     }

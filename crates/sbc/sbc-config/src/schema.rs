@@ -1005,10 +1005,13 @@ pub struct TransportConfig {
 
     /// Node-wide TLS handshakes in progress. A connection takes a slot
     /// only once it has sent data; over the limit it waits for one at most
-    /// `handshake_timeout_secs / 4` (at most 1 s) and is then dropped.
-    /// WebSocket upgrades do not use it. 0 sizes it from the CPU count
-    /// (64 per core, at least 64, at most `max_connections_total`). Valid
-    /// 0..=`max_connections_total`.
+    /// `handshake_timeout_secs / 4` (at most 1 s) and is then dropped. A
+    /// handshake holding a slot must finish within
+    /// `handshake_timeout_secs / 2` (at most 2 s) or is dropped.
+    /// WebSocket upgrades do not use it. 0 sizes it as
+    /// `max(64 x CPU count, max_connections_total / 8)`, at least 64 and at
+    /// most `max_connections_total` (2,500 with the defaults up to 39
+    /// cores). Valid 0..=`max_connections_total`.
     ///
     /// ## NIST 800-53 Rev5: SC-5
     pub max_handshakes_in_flight: u32,

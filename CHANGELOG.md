@@ -455,8 +455,11 @@ Tested locally on macOS arm64 only; no CI run yet.
   exhaustion (EMFILE, ENFILE, ENOBUFS, ENOMEM) backs off, 10 ms doubling to
   1 s, with at most one warning per second. Other accept errors are counted
   and the loop accepts again at once; only after 64 in a row with no
-  successful accept do they back off too. A peer that resets before the
-  accept no longer delays other clients by 100 ms. Plain TCP connections
+  successful accept do they back off too; per-connection errors
+  (ECONNABORTED, ECONNRESET, EPROTO, EPERM, ...) never count toward the 64,
+  only listener-level or unknown ones (EBADF, EINVAL, ENOTSOCK, EOPNOTSUPP,
+  EFAULT, ...). A peer that resets before the accept no longer delays
+  other clients by 100 ms. Plain TCP connections
   take the peer address from `accept()` and are built only after admission;
   TLS connections take it from `accept()` too, so a reset right after the
   handshake no longer fails it.
@@ -478,28 +481,44 @@ Tested locally on macOS arm64 only; no CI run yet.
 - **TLS handshake limits.** (SC-5) `transport.max_handshakes_per_source`
   (default 16; 0 is rejected; a value above `max_connections_per_source` is
   clamped to it with a startup warning, and the cap is at most 1/32 of the
-  node-wide pool) and `transport.max_handshakes_in_flight` (default 0 = 64
-  per CPU core, at least 64, at most `max_connections_total`). A connection
-  takes a node-wide slot only after it sends data and waits at most a
-  quarter of `handshake_timeout_secs` (at most 1 s) for one. Both slots are
-  released when the handshake ends.
+  node-wide pool) and `transport.max_handshakes_in_flight` (default 0 =
+  the larger of 64 per CPU core and `max_connections_total` / 8, at least
+  64, at most `max_connections_total`: 2,500 with the defaults up to 39
+  cores). A connection takes a node-wide slot only after it sends data,
+  waits at most a quarter of `handshake_timeout_secs` (at most 1 s) for
+  one, and must finish the handshake within half of
+  `handshake_timeout_secs` (at most 2 s) once it has one, so a client that
+  sends one byte and stalls frees its slot after 2 s. Both slots are
+  released when the handshake ends. The effective pool size and per-source
+  cap are logged at startup when they differ from the configured values,
+  and the `handshake_busy` audit threshold is the effective cap. Residual:
+  with the defaults, 157 or more sources opening about 1,250 one-byte
+  connections per second between them still keep the pool full
+  (POA&M-440).
 - **Audit and stats.** New `RateLimitTriggered` `limit_name` values
   `per_ip_accept_rate`, `accept_blocked` and `handshake_busy`, aggregated
   per source. New `ServerStats` counters `accept_errors`,
   `accept_resource_errors`, `accept_blocked`, `accept_rate_limited`,
-  `handshake_busy_per_source` and `handshake_slot_timeouts` (Debug output
-  only, POA&M-93).
+  `handshake_busy_per_source`, `handshake_slot_timeouts` and
+  `handshake_slot_hold_timeouts` (Debug output only, POA&M-93).
 - **`uc-transport` API.** New `TransportError::AcceptFailed { reason,
-  resource_exhausted }` (the enum is not `#[non_exhaustive]`, so exhaustive
-  matches need an arm), `TransportError::is_resource_exhausted`,
-  `is_accept_resource_exhaustion`, `TcpListener::accept_tcp` and
+  resource_exhausted, per_connection }` (the enum is not
+  `#[non_exhaustive]`, so exhaustive matches need an arm),
+  `TransportError::is_resource_exhausted`,
+  `TransportError::is_per_connection_accept_error`,
+  `is_accept_resource_exhaustion`, `is_accept_per_connection_error`, `TcpListener::accept_tcp` and
   `TcpTransport::from_accepted`. `TlsListener::complete_handshake` now
   takes the peer address returned by `accept_tcp`. Listener accept errors
   are `AcceptFailed` instead of `ReceiveFailed` (TCP, TLS) or `Io` (WS).
-- **Open items:** POA&M-440 (no node-wide accept or handshake rate),
-  POA&M-441 (accept admission keyed per address or prefix only), POA&M-442
-  (fixed listen backlog), POA&M-443 (TLS handshake failures logged per
-  connection, not counted).
+- **Open items:** POA&M-440 (no node-wide accept or handshake rate; with
+  the defaults about 333 accepts/s from one IPv6 /48 keep the 20,000-entry
+  accept-bucket table full, so new sources share the 80/s overflow bucket,
+  see POA&M-91), POA&M-441 (accept admission keyed per address or prefix
+  only), POA&M-442 (fixed listen backlog), POA&M-443 (TLS handshake
+  failures logged per connection, not counted).
+- **Known follow-up:** an opaque `AcceptedTcp { stream, peer }` type
+  consumed by `complete_handshake` / `from_accepted`, so the accept peer
+  cannot be paired with the wrong stream (not in this change).
 
 ### Security (client, SIP connect, DNS and send deadlines; RFC 4733 receive bounds; POA&M-374, 375, 377, 378)
 

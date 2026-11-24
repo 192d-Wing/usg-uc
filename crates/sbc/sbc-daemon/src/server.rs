@@ -180,6 +180,22 @@ impl StreamTimeouts {
     fn handshake_slot_wait(&self) -> std::time::Duration {
         (self.handshake / 4).min(std::time::Duration::from_secs(1))
     }
+
+    /// Longest a TLS handshake may hold a node-wide slot once it has one:
+    /// half the handshake deadline, at most 2 s. A client that sends one
+    /// byte and stalls loses the slot after this and is dropped and
+    /// counted (`handshake_slot_hold_timeouts`), so each slot turns over
+    /// at least every 2 s whatever `handshake_timeout_secs` is. A real
+    /// handshake takes a few round trips, well inside the budget.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    // POAM: POA&M-440 — the pool can still be kept full by about
+    // slots / hold one-byte connections per second spread over at least
+    // slots / per-source-cap sources (defaults on 2 cores: 2,500 slots,
+    // 16 per source, 2 s hold: 1,250 conn/s from 157 sources) (SC-5).
+    fn handshake_slot_hold(&self) -> std::time::Duration {
+        (self.handshake / 2).min(std::time::Duration::from_secs(2))
+    }
 }
 
 /// Resources one admitted stream connection holds for its whole life
@@ -232,18 +248,21 @@ struct StreamLoopContext {
 ///
 /// Resource exhaustion (fd table full, no buffer space, out of memory)
 /// backs off, 10 ms doubling to 1 s, so a full fd table does not spin the
-/// loop. Any other accept error concerns one pending connection: the loop
-/// accepts again at once, so peers that reset before accept cannot stall
-/// the listener. Only when [`Self::PERSISTENT`] errors in a row arrive
-/// with no successful accept (a broken listener socket, not one peer) do
-/// those errors back off the same way.
+/// loop. A per-connection error (peer aborted or reset, EPROTO, EPERM, ...;
+/// [`uc_transport::is_accept_per_connection_error`]) never backs off and
+/// never counts: the loop accepts again at once, so peers that reset
+/// before accept cannot stall the listener. Listener-level or unknown
+/// errors (EBADF, EINVAL, ENOTSOCK, EOPNOTSUPP, EFAULT, ...) also continue
+/// at once until [`Self::PERSISTENT`] of them arrive with no successful
+/// accept (a broken listener socket, not one peer); then they back off
+/// the same way.
 ///
 /// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
 #[derive(Debug)]
 struct AcceptBackoff {
     /// Delay for the next backed-off error.
     next: std::time::Duration,
-    /// Errors since the last successful accept.
+    /// Listener-level or unknown errors since the last successful accept.
     consecutive: u32,
     /// Last back-off warning, for one `warn!` per second at most.
     last_warn: Option<std::time::Instant>,
@@ -253,8 +272,8 @@ impl AcceptBackoff {
     const INITIAL: std::time::Duration = std::time::Duration::from_millis(10);
     const MAX: std::time::Duration = std::time::Duration::from_secs(1);
     const WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-    /// Errors in a row, with no successful accept, after which
-    /// per-connection errors back off too.
+    /// Listener-level or unknown errors, with no successful accept, after
+    /// which those errors back off too.
     const PERSISTENT: u32 = 64;
 
     const fn new() -> Self {
@@ -268,9 +287,14 @@ impl AcceptBackoff {
     /// The delay to sleep before the next accept, or `None` to continue at
     /// once.
     fn on_error(&mut self, err: &uc_transport::TransportError) -> Option<std::time::Duration> {
-        self.consecutive = self.consecutive.saturating_add(1);
-        if !err.is_resource_exhausted() && self.consecutive < Self::PERSISTENT {
+        if err.is_per_connection_accept_error() {
             return None;
+        }
+        if !err.is_resource_exhausted() {
+            self.consecutive = self.consecutive.saturating_add(1);
+            if self.consecutive < Self::PERSISTENT {
+                return None;
+            }
         }
         let delay = self.next;
         self.next = self.next.saturating_mul(2).min(Self::MAX);
@@ -307,18 +331,49 @@ enum AcceptNext {
 }
 
 /// Node-wide handshake slots for `transport.max_handshakes_in_flight`; 0
-/// sizes it from the CPU count.
+/// sizes it as `max(64 x cores, max_connections_total / 8)`, at most
+/// `max_connections_total` (defaults: 2,500 slots up to 39 cores).
 // POAM: POA&M-440 — handshake admission is per source plus this node-wide
-// concurrency bound; there is no node-wide accept or handshake rate, so a
-// flood spread over many sources is bounded only by rate x sources and by
-// this pool (SC-5).
+// concurrency bound and the per-slot hold budget
+// (`StreamTimeouts::handshake_slot_hold`); there is no node-wide accept or
+// handshake rate, so a flood spread over many sources is bounded only by
+// rate x sources and by this pool (SC-5).
 fn handshake_slot_count(tc: &sbc_config::schema::TransportConfig) -> usize {
     let total = (tc.max_connections_total as usize).max(1);
     if tc.max_handshakes_in_flight > 0 {
         return (tc.max_handshakes_in_flight as usize).min(total);
     }
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    cores.saturating_mul(64).max(64).min(total)
+    cores.saturating_mul(64).max(total / 8).max(64).min(total)
+}
+
+/// Effective TLS handshake limits derived from `[transport]` at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HandshakeLimits {
+    /// Node-wide slots ([`handshake_slot_count`]).
+    slots: usize,
+    /// Per-source cap ([`handshakes_per_source`]).
+    per_source: u32,
+}
+
+impl HandshakeLimits {
+    fn from_config(tc: &sbc_config::schema::TransportConfig) -> Self {
+        let slots = handshake_slot_count(tc);
+        Self {
+            slots,
+            per_source: handshakes_per_source(tc, slots),
+        }
+    }
+
+    /// Whether the effective limits differ from the configured values
+    /// (an auto-sized pool, or a clamped per-source cap), so the startup
+    /// log must state the values in force.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3, CM-6
+    fn differ_from(&self, tc: &sbc_config::schema::TransportConfig) -> bool {
+        self.per_source != tc.max_handshakes_per_source
+            || self.slots != tc.max_handshakes_in_flight as usize
+    }
 }
 
 /// Effective per-source TLS handshake cap: `transport.max_handshakes_per_source`,
@@ -341,6 +396,9 @@ enum SlottedHandshake<T> {
     Done(uc_transport::TransportResult<T>),
     /// No node-wide slot within [`StreamTimeouts::handshake_slot_wait`].
     SlotWaitExpired,
+    /// The handshake held a slot for [`StreamTimeouts::handshake_slot_hold`]
+    /// without finishing.
+    HoldExpired,
 }
 
 /// Where the message that produced a result arrived: replies to that peer
@@ -2161,14 +2219,28 @@ impl Server {
         // cap are keyed per IPv4 address and per IPv6
         // `rate_limit.ipv6_prefix_len` prefix only; no aggregate
         // accept-rate key (SC-5).
-        let slot_count = handshake_slot_count(tc);
-        let per_source_handshakes = handshakes_per_source(tc, slot_count);
-        if tc.max_handshakes_per_source > tc.max_connections_per_source {
+        let limits = HandshakeLimits::from_config(tc);
+        let slot_count = limits.slots;
+        let per_source_handshakes = limits.per_source;
+        // NIST 800-53 Rev5: AU-3, CM-6 — the values in force are logged
+        // whenever they differ from the configured ones.
+        if per_source_handshakes < tc.max_handshakes_per_source {
             warn!(
                 configured = tc.max_handshakes_per_source,
                 max_connections_per_source = tc.max_connections_per_source,
+                handshake_slots = slot_count,
                 effective = per_source_handshakes,
-                "transport.max_handshakes_per_source exceeds max_connections_per_source; clamped"
+                "transport.max_handshakes_per_source clamped to \
+                 min(max_connections_per_source, handshake slots / 32)"
+            );
+        }
+        if limits.differ_from(tc) {
+            info!(
+                configured_in_flight = tc.max_handshakes_in_flight,
+                handshake_slots = slot_count,
+                configured_per_source = tc.max_handshakes_per_source,
+                per_source = per_source_handshakes,
+                "Effective TLS handshake limits"
             );
         }
         let accept_tracked = (self.config.rate_limit.max_tracked_sources as usize)
@@ -2600,15 +2672,19 @@ impl Server {
     /// slot.
     ///
     /// The slot is requested only once the client has sent data (peeked,
-    /// not consumed), so a silent socket never holds one; it waits at most `slot_wait` for a
-    /// slot. The caller wraps this in the handshake deadline, which bounds
-    /// the whole sequence. The slot and `guard` are released as soon as
-    /// the handshake ends, before any receive loop.
+    /// not consumed), so a silent socket never holds one; it waits at most
+    /// `slot_wait` for a slot, and the handshake then has at most `hold`
+    /// to finish while holding it, so a client that sends one byte and
+    /// stalls frees the slot after `hold`. The caller wraps this in the
+    /// handshake deadline, which bounds the whole sequence. The slot and
+    /// `guard` are released as soon as the handshake ends, before any
+    /// receive loop.
     ///
     /// ## NIST 800-53 Rev5: SC-5
     async fn with_handshake_slot<T, F, Fut>(
         slots: Arc<tokio::sync::Semaphore>,
         slot_wait: std::time::Duration,
+        hold: std::time::Duration,
         guard: crate::conn_limit::HandshakeGuard,
         stream: tokio::net::TcpStream,
         handshake: F,
@@ -2639,10 +2715,10 @@ impl Server {
             }
             Err(_) => return SlottedHandshake::SlotWaitExpired,
         };
-        let result = handshake(stream).await;
+        let result = tokio::time::timeout(hold, handshake(stream)).await;
         drop(slot);
         drop(guard);
-        SlottedHandshake::Done(result)
+        result.map_or(SlottedHandshake::HoldExpired, SlottedHandshake::Done)
     }
 
     /// Handles an `accept()` error: per-connection errors are counted and
@@ -2818,7 +2894,8 @@ impl Server {
     /// is spawned under `transport.handshake_timeout_secs`, so one slow
     /// client cannot stall new connections on this listener. The handshake
     /// takes a node-wide slot only after the client sends data, and waits
-    /// for one at most [`StreamTimeouts::handshake_slot_wait`].
+    /// for one at most [`StreamTimeouts::handshake_slot_wait`], then holds
+    /// it at most [`StreamTimeouts::handshake_slot_hold`].
     ///
     /// ## NIST 800-53 Rev5: SC-5, SC-7
     async fn tls_accept_loop(listener: Arc<TlsListener>, ctx: StreamLoopContext) {
@@ -2848,6 +2925,7 @@ impl Server {
                             Self::with_handshake_slot(
                                 Arc::clone(&conn_ctx.handshake_slots),
                                 conn_ctx.timeouts.handshake_slot_wait(),
+                                conn_ctx.timeouts.handshake_slot_hold(),
                                 handshake,
                                 tcp_stream,
                                 |tcp| listener_clone.complete_handshake(tcp, peer),
@@ -2871,6 +2949,13 @@ impl Server {
                                     .handshake_slot_timeouts
                                     .fetch_add(1, Ordering::Relaxed);
                                 debug!(peer = %peer, "No TLS handshake slot in time, dropping");
+                            }
+                            Ok(SlottedHandshake::HoldExpired) => {
+                                conn_ctx
+                                    .stats
+                                    .handshake_slot_hold_timeouts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                debug!(peer = %peer, "TLS handshake held its slot too long, dropping");
                             }
                             Ok(SlottedHandshake::Done(Err(e))) => {
                                 // POAM: POA&M-443 — a failed TLS handshake
@@ -3596,6 +3681,10 @@ pub struct ServerStats {
     /// TLS connections dropped because no node-wide handshake slot
     /// (`transport.max_handshakes_in_flight`) freed within the slot wait.
     pub handshake_slot_timeouts: AtomicU64,
+    /// TLS connections dropped because their handshake held a node-wide
+    /// slot for the hold budget (`min(2 s, handshake_timeout_secs / 2)`)
+    /// without finishing.
+    pub handshake_slot_hold_timeouts: AtomicU64,
 }
 
 /// Server error.
@@ -3890,7 +3979,10 @@ impl RateLimitAudit {
             per_source_conns: u64::from(config.transport.max_connections_per_source),
             trunk_rps: u64::from(config.rate_limit.effective_trunk_rps()),
             accept_rate: u64::from(config.transport.accept_rate_per_source),
-            per_source_handshakes: u64::from(config.transport.max_handshakes_per_source),
+            // Effective cap (after the clamp), the limit actually enforced.
+            per_source_handshakes: u64::from(
+                HandshakeLimits::from_config(&config.transport).per_source,
+            ),
         }
     }
 
@@ -6911,6 +7003,17 @@ mod tests {
             E::AcceptFailed {
                 reason: "Software caused connection abort".into(),
                 resource_exhausted: false,
+                per_connection: true,
+            }
+        }
+
+        /// A listener-level error (EBADF-like): neither resource nor
+        /// per-connection.
+        fn listener_fault() -> E {
+            E::AcceptFailed {
+                reason: "Bad file descriptor".into(),
+                resource_exhausted: false,
+                per_connection: false,
             }
         }
 
@@ -6918,6 +7021,7 @@ mod tests {
             E::AcceptFailed {
                 reason: "Too many open files".into(),
                 resource_exhausted: true,
+                per_connection: false,
             }
         }
 
@@ -6977,21 +7081,34 @@ mod tests {
             assert_eq!(b.on_error(&exhausted()), Some(D::from_millis(10)));
         }
 
-        // SR-22 (PERF-002): a broken listener socket fails every accept
-        // with a non-resource error. After 64 in a row with no successful
-        // accept those errors back off too; a success resets the run.
+        // SR-22 (PERF-002, SEC-009): a broken listener socket fails every
+        // accept with a listener-level error. After 64 in a row with no
+        // successful accept those errors back off too; a success resets the
+        // run. Per-connection errors (peer aborts) never count and never
+        // back off, however many arrive.
         #[test]
         fn accept_backoff_after_consecutive_non_resource_errors() {
             let mut b = AcceptBackoff::new();
-            for i in 1..AcceptBackoff::PERSISTENT {
-                assert_eq!(b.on_error(&transient()), None, "error {i}");
+            for i in 0..10_000 {
+                assert_eq!(b.on_error(&transient()), None, "per-connection {i}");
             }
-            assert_eq!(b.on_error(&transient()), Some(D::from_millis(10)));
-            assert_eq!(b.on_error(&transient()), Some(D::from_millis(20)));
-            let capped: Vec<_> = (0..10).filter_map(|_| b.on_error(&transient())).collect();
+            for i in 1..AcceptBackoff::PERSISTENT {
+                assert_eq!(b.on_error(&listener_fault()), None, "error {i}");
+                assert_eq!(b.on_error(&transient()), None, "interleaved abort");
+            }
+            assert_eq!(b.on_error(&listener_fault()), Some(D::from_millis(10)));
+            assert_eq!(b.on_error(&listener_fault()), Some(D::from_millis(20)));
+            assert_eq!(
+                b.on_error(&transient()),
+                None,
+                "a per-connection error never sleeps, even mid-backoff"
+            );
+            let capped: Vec<_> = (0..10)
+                .filter_map(|_| b.on_error(&listener_fault()))
+                .collect();
             assert_eq!(capped.last(), Some(&D::from_secs(1)), "capped at 1 s");
             b.on_success();
-            assert_eq!(b.on_error(&transient()), None, "run reset on success");
+            assert_eq!(b.on_error(&listener_fault()), None, "run reset on success");
         }
 
         // NIST-006: node-wide handshake pool sizing.
@@ -7015,11 +7132,63 @@ mod tests {
                 10,
                 "explicit above total is clamped"
             );
-            tc.max_connections_total = 1_000_000;
             tc.max_handshakes_in_flight = 0;
-            let auto = handshake_slot_count(&tc);
             let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-            assert_eq!(auto, (cores * 64).max(64), "64 per core, at least 64");
+            for total in [1_000_u32, 20_000, 1_000_000] {
+                tc.max_connections_total = total;
+                let total = total as usize;
+                assert_eq!(
+                    handshake_slot_count(&tc),
+                    (cores * 64).max(total / 8).max(64).min(total),
+                    "max(64 per core, total / 8), at most the total"
+                );
+            }
+            // SEC-001: the default total gives at least 2,500 slots on any
+            // core count, so 157 sources are needed to fill the pool.
+            let defaults = sbc_config::schema::TransportConfig::default();
+            let limits = HandshakeLimits::from_config(&defaults);
+            assert!(limits.slots >= 2_500, "{limits:?}");
+            assert_eq!(limits.per_source, 16, "{limits:?}");
+        }
+
+        // SEC-001: a slot is held at most min(2 s, handshake / 2); the slot
+        // wait stays min(1 s, handshake / 4).
+        #[test]
+        fn handshake_slot_hold_budget() {
+            let t = |ms| StreamTimeouts {
+                handshake: D::from_millis(ms),
+                ..short_timeouts()
+            };
+            assert_eq!(t(10_000).handshake_slot_hold(), D::from_secs(2));
+            assert_eq!(t(60_000).handshake_slot_hold(), D::from_secs(2));
+            assert_eq!(t(1_000).handshake_slot_hold(), D::from_millis(500));
+            assert_eq!(t(10_000).handshake_slot_wait(), D::from_secs(1));
+            assert_eq!(t(1_000).handshake_slot_wait(), D::from_millis(250));
+        }
+
+        // SEC-008: the startup log states the values in force whenever they
+        // differ from the configured ones (auto pool, clamped cap).
+        #[test]
+        fn handshake_limits_differ_from_config() {
+            let mut tc = sbc_config::schema::TransportConfig {
+                max_connections_total: 1_024,
+                max_connections_per_source: 128,
+                max_handshakes_in_flight: 512,
+                max_handshakes_per_source: 16,
+                ..Default::default()
+            };
+            let limits = HandshakeLimits::from_config(&tc);
+            assert_eq!((limits.slots, limits.per_source), (512, 16));
+            assert!(!limits.differ_from(&tc), "explicit and unclamped");
+            tc.max_handshakes_in_flight = 64;
+            let limits = HandshakeLimits::from_config(&tc);
+            assert_eq!(limits.per_source, 2, "1/32 of 64 slots");
+            assert!(limits.differ_from(&tc), "clamped per-source cap");
+            tc.max_handshakes_in_flight = 0;
+            assert!(
+                HandshakeLimits::from_config(&tc).differ_from(&tc),
+                "auto-sized pool"
+            );
         }
 
         // NIST-002: the per-source handshake cap is clamped to
@@ -7169,16 +7338,18 @@ mod tests {
             task.abort();
         }
 
-        // SR-56 (SEC-001, PERF-001): the slot wait has its own budget
-        // (handshake/4, at most 1 s) inside the handshake deadline. A sends
-        // a byte and holds the only slot until its 500 ms deadline; B
-        // arrives 100 ms later and is dropped after a 125 ms slot wait
-        // (about 225 ms), counted as a slot timeout, not a handshake
-        // timeout. Real time: paused time auto-advances past socket I/O.
+        // SR-56 (SEC-001, PERF-001): the slot wait and the slot hold have
+        // their own budgets inside the handshake deadline (1 s here: wait
+        // 250 ms, hold 500 ms). A sends a byte and holds the only slot; B
+        // arrives 100 ms later and is dropped after its 250 ms slot wait
+        // (about 350 ms), counted as a slot timeout. A loses the slot at
+        // its 500 ms hold budget, counted as a hold timeout, long before
+        // the handshake deadline. Real time: paused time auto-advances past
+        // socket I/O.
         #[tokio::test]
         async fn qa_handshake_slot_wait_has_own_budget() {
             let mut ctx = stream_test_ctx(StreamTimeouts {
-                handshake: D::from_millis(500),
+                handshake: D::from_secs(1),
                 ..short_timeouts()
             });
             ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(8));
@@ -7195,24 +7366,96 @@ mod tests {
             let _a = stalled_tls_client(addr).await;
             tokio::time::sleep(D::from_millis(100)).await;
             let _b = stalled_tls_client(addr).await;
-            tokio::time::sleep(D::from_millis(420).saturating_sub(t0.elapsed())).await;
+            tokio::time::sleep(D::from_millis(440).saturating_sub(t0.elapsed())).await;
             assert_eq!(
                 stats.handshake_slot_timeouts.load(Ordering::Relaxed),
                 1,
                 "B gives up on the slot after its own budget"
             );
-            assert_eq!(stats.handshake_timeouts.load(Ordering::Relaxed), 0);
-            tokio::time::sleep(D::from_millis(850).saturating_sub(t0.elapsed())).await;
+            assert_eq!(
+                stats.handshake_slot_hold_timeouts.load(Ordering::Relaxed),
+                0
+            );
+            tokio::time::sleep(D::from_millis(800).saturating_sub(t0.elapsed())).await;
+            assert_eq!(
+                stats.handshake_slot_hold_timeouts.load(Ordering::Relaxed),
+                1,
+                "A loses the slot at its hold budget"
+            );
             assert_eq!(
                 stats.handshake_timeouts.load(Ordering::Relaxed),
-                1,
-                "A hits the handshake deadline"
+                0,
+                "the hold budget fires before the handshake deadline"
             );
             assert_eq!(listener_pool.available_permits(), 4);
             assert_eq!(total.available_permits(), 4);
             assert_eq!(limiter.active(LOCALHOST_IP), 0);
             assert_eq!(slots.available_permits(), 1);
             task.abort();
+        }
+
+        // SR-56 (SEC-001): one-byte clients cannot hold the node-wide pool.
+        // Slot-count clients from 127.0.0.1-4 (or all from 127.0.0.1 where
+        // the host cannot bind those, with the per-source caps raised)
+        // each send one byte and stall, taking every slot. Each loses its
+        // slot at the hold budget (500 ms with a 1 s handshake deadline),
+        // and a real TLS client, retrying as a client would after a
+        // dropped attempt, completes its handshake within hold budget +
+        // slot wait of the pool filling.
+        #[tokio::test]
+        async fn one_byte_tls_clients_do_not_starve_handshake_slots() {
+            use tokio::io::AsyncWriteExt;
+            const SLOTS: usize = 8;
+            let timeouts = StreamTimeouts {
+                handshake: D::from_secs(1),
+                ..short_timeouts()
+            };
+            let mut ctx = stream_test_ctx(timeouts);
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(64, 64).with_handshake_cap(64));
+            ctx.conn_semaphore = Arc::new(Semaphore::new(64));
+            ctx.total_conns = Arc::new(Semaphore::new(64));
+            ctx.handshake_slots = Arc::new(Semaphore::new(SLOTS));
+            let slots = Arc::clone(&ctx.handshake_slots);
+            let stats = Arc::clone(&ctx.stats);
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            let mut stalled = Vec::new();
+            for i in 0..SLOTS {
+                let host = u8::try_from(i % 4).unwrap() + 1;
+                let mut s = silent_socket_from(addr, host).await;
+                s.write_all(&[0x16]).await.unwrap();
+                stalled.push(s);
+            }
+            let t0 = std::time::Instant::now();
+            while slots.available_permits() != 0 && t0.elapsed() < D::from_secs(1) {
+                tokio::time::sleep(D::from_millis(2)).await;
+            }
+            assert_eq!(
+                slots.available_permits(),
+                0,
+                "one-byte clients hold every slot"
+            );
+            let filled = std::time::Instant::now();
+            let budget = timeouts.handshake_slot_hold() + timeouts.handshake_slot_wait();
+            let mut ok = false;
+            while !ok && filled.elapsed() < budget {
+                ok = tls_handshake_ok(addr, &client).await;
+            }
+            let took = filled.elapsed();
+            task.abort();
+            assert!(
+                ok,
+                "real TLS handshake behind {SLOTS} one-byte clients did not complete \
+                 within {budget:?} (took {took:?})"
+            );
+            assert_eq!(
+                stats.handshake_slot_hold_timeouts.load(Ordering::Relaxed),
+                SLOTS as u64,
+                "every one-byte client lost its slot at the hold budget"
+            );
+            assert_eq!(stats.handshake_timeouts.load(Ordering::Relaxed), 0);
+            drop(stalled);
         }
 
         // SR-56 (SEC-001, PERF-001): silent sockets hold no node-wide
@@ -7350,6 +7593,34 @@ mod tests {
                 .collect();
             assert_eq!(busy.len(), 1, "{records:?}");
             assert_eq!((busy[0].source_ip, busy[0].request_count), (src, 2));
+        }
+
+        // SEC-008: the handshake_busy threshold is the effective per-source
+        // cap enforced at accept, not the configured value.
+        #[test]
+        fn handshake_busy_audit_threshold_is_effective_cap() {
+            let mut config = SbcConfig::default();
+            config.transport.max_connections_total = 1_024;
+            config.transport.max_handshakes_in_flight = 64;
+            config.transport.max_handshakes_per_source = 16;
+            let effective = HandshakeLimits::from_config(&config.transport).per_source;
+            assert_eq!(effective, 2, "1/32 of 64 slots");
+            let capture = uc_audit::capture::start();
+            let limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(effective));
+            let src: std::net::IpAddr = "192.0.2.61".parse().unwrap();
+            let _a = limiter.try_begin_handshake(src).unwrap();
+            let _b = limiter.try_begin_handshake(src).unwrap();
+            assert!(limiter.try_begin_handshake(src).is_none());
+            let mut audit = RateLimitAudit::new(&config);
+            audit.collect_conns(&limiter);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let busy: Vec<_> = records
+                .iter()
+                .filter(|r| r.limit_name == "handshake_busy" && r.source_ip == src)
+                .collect();
+            assert_eq!(busy.len(), 1, "{records:?}");
+            assert_eq!(busy[0].threshold, u64::from(effective));
         }
     }
 }
