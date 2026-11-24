@@ -427,6 +427,26 @@ release") and `deploy/keycloak/central-config-clients.md`.
   sidecars and the dashboard's npm tree.** GitHub Actions updates are
   grouped into one weekly PR.
 
+### Security (SBC, WebSocket transport send and close; SR-60, POA&M-458, 459)
+
+- **SBC: WebSocket sends no longer wait on a pending receive.** (SC-5,
+  SC-10) `uc-transport` `WebSocketTransport` splits the stream into reader
+  and writer halves with separate locks. Before, a send, ping or close
+  could wait up to the 2 s reader tick, the same as the 2 s stream write
+  timeout. `close()` now waits at most 1 s for the Close frame write. A
+  flow-table close of a WS flow ends its reader on the next 2 s tick
+  (`Transport::is_closed`); before, the reader ran until the idle timeout.
+  After `close()`, `send`, `ping` and `recv` return `AlreadyClosed`, as on
+  TCP. Pongs are sent by tungstenite; the transport no longer writes its
+  own.
+- **uc-transport: `Transport::take_control_frames` (additive).** Returns
+  and resets the per-connection Ping/Pong count; the default is 0. The
+  daemon does not yet charge the count to the per-source limiter
+  (POA&M-458).
+- **Open items.** The `secure` flag of `WebSocketListener::bind` and
+  `WebSocketTransport::new` only labels the transport as WSS and adds no
+  TLS; the daemon never sets it (POA&M-459).
+
 ### Security (client, SIP connect, DNS and send deadlines; RFC 4733 receive bounds; POA&M-374, 375, 377, 378)
 
 Tested locally on macOS arm64 only; no CI run yet.
