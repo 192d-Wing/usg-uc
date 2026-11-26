@@ -42,8 +42,8 @@ uc-siprec.workspace = true
 # Wipes the serialized RS INVITE (it carries SDES keys) after the send.
 zeroize.workspace = true
 # O_NOFOLLOW / O_NONBLOCK open and owner check of the digest credentials
-# file (no unsafe in this crate).
-nix = { workspace = true, features = ["fs", "user"] }
+# file (no unsafe in this crate); RLIMIT_NOFILE budget at startup.
+nix = { workspace = true, features = ["fs", "resource", "user"] }
 chrono.workspace = true
 uc-telemetry.workspace = true
 proto-sip = { workspace = true, features = ["digest-auth"] }
