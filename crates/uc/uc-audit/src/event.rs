@@ -285,6 +285,11 @@ pub enum AuthMethod {
     ApiKey,
     /// JWT token.
     Jwt,
+    /// Username and password (management-plane admin login).
+    Password,
+    /// Management-plane session token (HMAC bearer or `sbc_session`
+    /// cookie).
+    Session,
 }
 
 /// Authorization decision event.
@@ -819,6 +824,9 @@ pub enum AuditDropReason {
     /// The sink refused the record because the audit capacity bound was
     /// reached (`stop` capacity action) or the volume is full.
     CapacityExhausted,
+    /// The aggregator's key table was full of live keys, so a rate-limited
+    /// failure record was not emitted (SC-5).
+    Aggregated,
 }
 
 /// Signing key loaded.
@@ -1596,5 +1604,34 @@ mod tests {
         );
         let back: AuditDropReason = serde_json::from_str(r#""capacity_exhausted""#).unwrap();
         assert_eq!(back, AuditDropReason::CapacityExhausted);
+    }
+
+    /// SR-40: admin password login is its own method; additive serde token.
+    #[test]
+    fn auth_method_password_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&AuthMethod::Password).unwrap(),
+            r#""Password""#
+        );
+        let e = AuditEvent::AuthenticationAttempt(AuthenticationAttempt {
+            identity: "admin".into(),
+            source_ip: std::net::IpAddr::from([192, 0, 2, 1]),
+            success: false,
+            failure_reason: Some("invalid_credentials".into()),
+            method: AuthMethod::Password,
+        });
+        let json = serde_json::to_string(&e).unwrap();
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            AuditEvent::AuthenticationAttempt(AuthenticationAttempt {
+                method: AuthMethod::Password,
+                success: false,
+                ..
+            })
+        ));
+        // Existing tokens are unchanged.
+        let m: AuthMethod = serde_json::from_str(r#""Jwt""#).unwrap();
+        assert_eq!(m, AuthMethod::Jwt);
     }
 }

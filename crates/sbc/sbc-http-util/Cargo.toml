@@ -1,6 +1,6 @@
 [package]
 name = "sbc-http-util"
-description = "Small shared HTTP helpers for the USG SBC front-facing pods (sbc-api-server, sbc-provision-server): trusted-proxy-aware client-IP resolution."
+description = "Small shared HTTP helpers for the USG SBC front-facing pods (sbc-api-server, sbc-provision-server, central-config-api): trusted-proxy-aware client-IP resolution and management-plane audit records."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,3 +15,9 @@ workspace = true
 [dependencies]
 http.workspace = true
 ipnet.workspace = true
+# Management-plane audit records (mgmt_audit, SR-40).
+uc-audit.workspace = true
+
+[dev-dependencies]
+# Thread-local capture of audit records (SR-40 mgmt_audit tests).
+uc-audit = { workspace = true, features = ["test-capture"] }

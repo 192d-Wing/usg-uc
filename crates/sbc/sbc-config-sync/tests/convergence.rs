@@ -523,3 +523,299 @@ async fn reconcile_refreshes_changed_entities() {
         "delta refresh"
     );
 }
+
+// ---- SR-40: local rows carry the writer's principal ----------------------
+//
+// sbc-api now stamps `updated_by = 'local:<actor>'`. Every sync origin test
+// must treat both the legacy `'local'` and `'local:%'` as local-origin:
+// preserved by snapshot/delta, collected for upload, re-stamped after.
+// NIST 800-53 Rev5: AU-3, CM-3, CP-10 (DDIL)
+
+const OIDC_ACTOR: &str = "local:oidc:s-1@https://idp.example/realms/qa";
+
+async fn origin(pool: &PgPool, table: &str, key: &str, id: &str) -> String {
+    sqlx::query_scalar(&format!("SELECT updated_by FROM {table} WHERE {key} = $1"))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("updated_by")
+}
+
+async fn phone_label(pool: &PgPool, id: &str) -> Option<String> {
+    sqlx::query_scalar::<_, serde_json::Value>("SELECT data FROM phones WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("phone data")
+        .get("label")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Central with one site and phone p1 (label "hq"), wrapped as a source.
+async fn central_with_p1(admin: &str, name: &str) -> DirectSource {
+    let central = CentralConfigStore::from_pool(make_db(admin, name).await)
+        .await
+        .expect("central migrate");
+    central
+        .register_site(SITE, "MUHJ", "muhj.x", "UTC", "active")
+        .await
+        .expect("register");
+    central
+        .upsert_phone(
+            SITE,
+            "p1",
+            "aaaaaaaaaaaa",
+            &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa", "label": "hq"}),
+            "op",
+        )
+        .await
+        .expect("central p1");
+    DirectSource(central)
+}
+
+async fn local_edit(pool: &PgPool, id: &str, mac: &str, label: &str, by: &str) {
+    sqlx::query(
+        "INSERT INTO phones (id, mac_normalized, data, updated_by, revision)
+         VALUES ($1, $2, $3, $4, 0)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data,
+             updated_by = EXCLUDED.updated_by, revision = 0, updated_at = NOW()",
+    )
+    .bind(id)
+    .bind(mac.replace(':', ""))
+    .bind(json!({"id": id, "mac_address": mac, "label": label}))
+    .bind(by)
+    .execute(pool)
+    .await
+    .expect("local edit");
+}
+
+#[tokio::test]
+async fn local_principal_rows_survive_snapshot_and_upload() {
+    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+        return;
+    };
+    let source = central_with_p1(&admin, "scs_sr40_keep_central").await;
+    let local = make_db(&admin, "scs_sr40_keep_local").await;
+    sbc_config_store::ensure_schema(&local)
+        .await
+        .expect("local schema");
+    reconcile(&local, &source, &NoopRefresher, SITE)
+        .await
+        .expect("initial sync");
+    assert_eq!(origin(&local, "phones", "id", "p1").await, "central");
+
+    // Partitioned: an operator edits p1 and adds p-field through sbc-api;
+    // a DID and a trunk group are tombstoned/edited by an API key.
+    local_edit(
+        &local,
+        "p1",
+        "aa:aa:aa:aa:aa:aa",
+        "edited at edge",
+        OIDC_ACTOR,
+    )
+    .await;
+    local_edit(
+        &local,
+        "p-field",
+        "bb:bb:bb:bb:bb:bb",
+        "forward TOC",
+        OIDC_ACTOR,
+    )
+    .await;
+    sqlx::query("INSERT INTO trunk_groups (id, data, updated_by) VALUES ('tg-edge', $1, $2)")
+        .bind(json!({"id": "tg-edge", "trunks": []}))
+        .bind("local:apikey:0123456789abcdef")
+        .execute(&local)
+        .await
+        .expect("local tg");
+
+    // A snapshot reload must not clobber local-principal rows.
+    let snap = source.0.snapshot(SITE).await.expect("snapshot");
+    sbc_config_sync::apply::apply_snapshot(&local, SITE, &snap)
+        .await
+        .expect("apply snapshot");
+    assert_eq!(
+        phone_label(&local, "p1").await.as_deref(),
+        Some("edited at edge")
+    );
+    assert_eq!(origin(&local, "phones", "id", "p1").await, OIDC_ACTOR);
+    assert_eq!(origin(&local, "phones", "id", "p-field").await, OIDC_ACTOR);
+    assert_eq!(
+        origin(&local, "trunk_groups", "id", "tg-edge").await,
+        "local:apikey:0123456789abcdef"
+    );
+
+    // Nor a same-id central delta (central edits p1 meanwhile).
+    source
+        .0
+        .upsert_phone(
+            SITE,
+            "p1",
+            "aaaaaaaaaaaa",
+            &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa", "label": "hq v2"}),
+            "op",
+        )
+        .await
+        .expect("central p1 v2");
+
+    // Local-principal rows are collected for upload.
+    let pending = sbc_config_sync::apply::collect_local_changes(&local, SITE)
+        .await
+        .expect("collect");
+    let mut ids: Vec<_> = pending.iter().map(|c| c.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["p-field", "p1", "tg-edge"], "{pending:?}");
+
+    // Reconnect: local wins at central, nothing is left local-marked.
+    reconcile(&local, &source, &NoopRefresher, SITE)
+        .await
+        .expect("reconnect");
+    let snap = source.0.snapshot(SITE).await.expect("snapshot");
+    let rows: std::collections::HashMap<String, serde_json::Value> = snap
+        .tables
+        .iter()
+        .find(|t| t.table == ConfigTable::Phones)
+        .expect("phones")
+        .rows
+        .iter()
+        .map(|r| (r.id.clone(), r.payload.clone()))
+        .collect();
+    assert_eq!(rows["p1"]["label"], "edited at edge", "local edit won");
+    assert!(rows.contains_key("p-field"));
+    assert_eq!(
+        phone_label(&local, "p1").await.as_deref(),
+        Some("edited at edge")
+    );
+}
+
+#[tokio::test]
+async fn restamp_clears_local_principal_marker() {
+    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+        return;
+    };
+    let local = make_db(&admin, "scs_sr40_restamp").await;
+    sbc_config_store::ensure_schema(&local)
+        .await
+        .expect("local schema");
+    local_edit(&local, "p-a", "aa:00:00:00:00:01", "a", OIDC_ACTOR).await;
+    local_edit(&local, "p-b", "aa:00:00:00:00:02", "b", "local:admin:admin").await;
+
+    let collected_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&local)
+            .await
+            .expect("clock");
+    let pending = sbc_config_sync::apply::collect_local_changes(&local, SITE)
+        .await
+        .expect("collect");
+    assert_eq!(pending.len(), 2, "{pending:?}");
+
+    // An edit after the collect keeps its marker (TOCTOU guard).
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    local_edit(
+        &local,
+        "p-b",
+        "aa:00:00:00:00:02",
+        "b2",
+        "local:admin:admin",
+    )
+    .await;
+
+    sbc_config_sync::apply::restamp_uploaded(&local, &pending, 7, collected_at)
+        .await
+        .expect("restamp");
+    assert_eq!(origin(&local, "phones", "id", "p-a").await, "central");
+    let rev: i64 = sqlx::query_scalar("SELECT revision FROM phones WHERE id = 'p-a'")
+        .fetch_one(&local)
+        .await
+        .expect("revision");
+    assert_eq!(rev, 7);
+    assert_eq!(
+        origin(&local, "phones", "id", "p-b").await,
+        "local:admin:admin",
+        "edited after collect: still local"
+    );
+    let marked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM phones WHERE updated_by = 'local' OR updated_by LIKE 'local:%'",
+    )
+    .fetch_one(&local)
+    .await
+    .expect("count");
+    assert_eq!(marked, 1);
+}
+
+#[tokio::test]
+async fn legacy_local_rows_still_uploaded() {
+    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+        return;
+    };
+    let source = central_with_p1(&admin, "scs_sr40_legacy_central").await;
+    let local = make_db(&admin, "scs_sr40_legacy_local").await;
+    sbc_config_store::ensure_schema(&local)
+        .await
+        .expect("local schema");
+    reconcile(&local, &source, &NoopRefresher, SITE)
+        .await
+        .expect("initial sync");
+
+    // A row written before the upgrade, and one after, side by side.
+    local_edit(&local, "p-old", "cc:00:00:00:00:01", "legacy", "local").await;
+    local_edit(&local, "p-new", "cc:00:00:00:00:02", "new", OIDC_ACTOR).await;
+    // A look-alike that is not local-origin must not be uploaded.
+    sqlx::query("UPDATE phones SET updated_by = 'localhost' WHERE id = 'p1'")
+        .execute(&local)
+        .await
+        .expect("look-alike");
+
+    let snap = source.0.snapshot(SITE).await.expect("snapshot");
+    sbc_config_sync::apply::apply_snapshot(&local, SITE, &snap)
+        .await
+        .expect("apply snapshot");
+    assert_eq!(origin(&local, "phones", "id", "p-old").await, "local");
+    assert_eq!(origin(&local, "phones", "id", "p-new").await, OIDC_ACTOR);
+    assert_eq!(
+        origin(&local, "phones", "id", "p1").await,
+        "central",
+        "a non-local marker is replaced by the snapshot"
+    );
+
+    let pending = sbc_config_sync::apply::collect_local_changes(&local, SITE)
+        .await
+        .expect("collect");
+    let mut ids: Vec<_> = pending.iter().map(|c| c.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["p-new", "p-old"]);
+
+    reconcile(&local, &source, &NoopRefresher, SITE)
+        .await
+        .expect("reconnect");
+    let still_local: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM phones WHERE updated_by = 'local' OR updated_by LIKE 'local:%'",
+    )
+    .fetch_one(&local)
+    .await
+    .expect("count");
+    assert_eq!(still_local, 0, "both re-stamped central-origin");
+}
+
+/// SR-40 round 1 (NIST-007): each collected change carries the row's
+/// `updated_by`, so central can name the site-local writer.
+#[tokio::test]
+async fn collected_changes_carry_origin_actor() {
+    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+        return;
+    };
+    let local = make_db(&admin, "scs_sr40_origin_local").await;
+    sbc_config_store::ensure_schema(&local)
+        .await
+        .expect("local schema");
+    local_edit(&local, "p-old", "cc:00:00:00:00:11", "legacy", "local").await;
+    local_edit(&local, "p-new", "cc:00:00:00:00:12", "new", OIDC_ACTOR).await;
+    let mut pending = sbc_config_sync::apply::collect_local_changes(&local, SITE)
+        .await
+        .expect("collect");
+    pending.sort_by(|a, b| a.id.cmp(&b.id));
+    let origins: Vec<_> = pending.iter().map(|c| c.origin_actor.as_deref()).collect();
+    assert_eq!(origins, [Some(OIDC_ACTOR), Some("local")]);
+}
