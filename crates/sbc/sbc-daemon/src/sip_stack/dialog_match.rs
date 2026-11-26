@@ -303,7 +303,9 @@ impl CallAddresses {
         } else {
             DialogPeer::a_leg(
                 self.a_leg_source,
-                self.a_leg_flow.transport,
+                // Trunk leg: the matched trunk's configured transport (RFC-9).
+                self.a_leg_trunk_transport
+                    .unwrap_or(self.a_leg_flow.transport),
                 self.a_leg_conn,
                 self.a_leg_trunk_group.as_deref(),
                 self.a_leg_registration.as_ref(),

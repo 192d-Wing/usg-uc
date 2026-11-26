@@ -86,8 +86,13 @@ struct VerifySide {
 pub struct StirService {
     signing: Option<SigningSide>,
     verifying: Option<VerifySide>,
-    /// Ingress trunk by source IP: (trunk group id, trunk id, settings).
-    trunk_by_ip: HashMap<IpAddr, (String, String, TrunkStirConfig)>,
+    /// Ingress trunk by source key (canonical IP and the trunk's configured
+    /// transport, the same key SIP-stack trunk admission resolves):
+    /// (trunk group id, trunk id, settings). Two trunks of one group on one
+    /// key are merged to the most restrictive settings (load warning).
+    ///
+    /// ## NIST 800-53 Rev5: AC-4, SC-7, IA-9
+    trunk_by_source: HashMap<crate::sip_stack::TrunkSourceKey, (String, String, TrunkStirConfig)>,
     /// Egress trunk settings by trunk id.
     trunk_by_id: HashMap<String, TrunkStirConfig>,
     /// Verification-failure audit limiter (ingress trunk, reason).
@@ -422,25 +427,22 @@ impl StirService {
             None
         };
 
-        let mut ingress = HashMap::new();
         let mut egress = HashMap::new();
         // POAM: POA&M-34, trunks registered through the API have no STIR
         // settings; only `[[trunk_groups]]` trunks sign or verify.
         for g in &config.trunk_groups {
             for t in &g.trunks {
                 egress.insert(t.id.clone(), t.stir_shaken);
-                for ip in crate::sip_stack::resolve_trunk_host_ips(&t.host) {
-                    ingress.insert(ip, (g.id.clone(), t.id.clone(), t.stir_shaken));
-                }
             }
         }
+        let ingress = ingress_trunks(config);
         if let Some(msg) = allow_list_warning(config) {
             warn!("{msg}");
         }
         Ok(Some(Self {
             signing,
             verifying,
-            trunk_by_ip: ingress,
+            trunk_by_source: ingress,
             trunk_by_id: egress,
             agg: FailureAggregator::new(AUDIT_WINDOW),
             sign_agg: FailureAggregator::new(AUDIT_WINDOW),
@@ -593,24 +595,25 @@ impl StirService {
         });
     }
 
-    /// Verifies the inbound INVITE (RFC 8224 §6.2). `trunk_group` is the
-    /// source's current trunk group (`SipStack::lookup_inbound_trunk`): the
-    /// configured trunk settings apply only while the source is still a
-    /// trunk of the group they were loaded for.
+    /// Verifies the inbound INVITE (RFC 8224 §6.2). `trunk` is the trunk
+    /// entry SIP-stack admission resolved for the source (its key, i.e.
+    /// canonical IP and the trunk's configured transport, and its current
+    /// trunk group); `None` for an endpoint, including a UDP datagram from a
+    /// TLS trunk's address. The configured settings are those of that key
+    /// and apply only while it is still a trunk of the group they were
+    /// loaded for. `source` is the packet's address (fetch attribution).
     ///
-    /// NIST 800-53 Rev5: AC-4, CM-3
+    /// NIST 800-53 Rev5: AC-4, CM-3, SC-7
     pub async fn inbound(
         &self,
         req: &SipRequest,
         source: IpAddr,
-        trunk_group: Option<&str>,
+        trunk: Option<(crate::sip_stack::TrunkSourceKey, &str)>,
         call_id: &str,
     ) -> InboundStir {
         let mut out = InboundStir::default();
-        let Some((_, trunk_id, trunk)) = self
-            .trunk_by_ip
-            .get(&source.to_canonical())
-            .filter(|(group, _, _)| trunk_group == Some(group.as_str()))
+        let Some((trunk_id, trunk)) =
+            trunk.and_then(|(key, group)| self.ingress_settings(key, group))
         else {
             return out;
         };
@@ -734,6 +737,56 @@ impl StirService {
             }
         }
         out
+    }
+
+    /// Inbound settings for the trunk entry admission resolved: the exact
+    /// key's entry when it belongs to `group`. On a miss (for example an API
+    /// resync changed a config trunk's protocol, so admission resolves a key
+    /// the config-built table lacks), the entries of the same `group` on the
+    /// same canonical IP under the other trunk transports, merged to the
+    /// strictest settings (verify on if any verifies), with strip always
+    /// on: a sibling's passthrough is never extended to another transport.
+    /// Never another group's entry. At most three probes, no
+    /// allocation.
+    ///
+    /// ## NIST 800-53 Rev5: AC-4, SC-7, IA-9 (SEC-005)
+    fn ingress_settings(
+        &self,
+        key: crate::sip_stack::TrunkSourceKey,
+        group: &str,
+    ) -> Option<(&String, TrunkStirConfig)> {
+        if let Some((g, id, cfg)) = self.trunk_by_source.get(&key)
+            && g == group
+        {
+            return Some((id, *cfg));
+        }
+        [
+            uc_types::address::TransportType::Udp,
+            uc_types::address::TransportType::Tcp,
+            uc_types::address::TransportType::Tls,
+        ]
+        .into_iter()
+        .filter(|t| *t != key.transport())
+        .filter_map(|t| crate::sip_stack::TrunkSourceKey::new(key.ip(), t))
+        .filter_map(|k| self.trunk_by_source.get(&k))
+        .filter(|(g, _, _)| g == group)
+        .fold(None, |acc, (_, id, cfg)| {
+            Some(match acc {
+                None => (id, *cfg),
+                Some((first, merged)) => (first, strictest(merged, *cfg)),
+            })
+        })
+        // A sibling's passthrough trust is for its own transport only: a
+        // fallback hit always strips (SEC-R2-2).
+        .map(|(id, cfg)| {
+            (
+                id,
+                TrunkStirConfig {
+                    strip_inbound_identity: true,
+                    ..cfg
+                },
+            )
+        })
     }
 
     /// Whether egress trunk `trunk_id` has `stir_shaken.sign` (and signing
@@ -983,6 +1036,65 @@ fn rewrite_verstat(value: &str, verstat: Option<Verstat>) -> String {
         new_uri.push_str(v.as_param());
     }
     format!("{prefix}{new_uri}{suffix}")
+}
+
+/// The stricter inbound settings of `a` and `b`: verify on if either
+/// verifies, strip on if either strips (`sign` is egress-only; `a`'s kept).
+const fn strictest(a: TrunkStirConfig, b: TrunkStirConfig) -> TrunkStirConfig {
+    TrunkStirConfig {
+        sign: a.sign,
+        verify: a.verify || b.verify,
+        strip_inbound_identity: a.strip_inbound_identity || b.strip_inbound_identity,
+    }
+}
+
+/// Ingress STIR settings by trunk source key (see
+/// `StirService::trunk_by_source`). A key configured on two trunks of one
+/// group takes the most restrictive settings (verify on if either verifies,
+/// strip on if either strips) and is warned about: a trunk's Identity is
+/// never relayed or left unverified because a sibling on the same address
+/// and transport is trusted. A key in a later group replaces an earlier
+/// group's, as the SIP-stack trunk map does.
+///
+/// ## NIST 800-53 Rev5: AC-4, SC-7, IA-9, CM-6
+fn ingress_trunks(
+    config: &SbcConfig,
+) -> HashMap<crate::sip_stack::TrunkSourceKey, (String, String, TrunkStirConfig)> {
+    let mut ingress: HashMap<crate::sip_stack::TrunkSourceKey, (String, String, TrunkStirConfig)> =
+        HashMap::new();
+    for g in &config.trunk_groups {
+        for t in &g.trunks {
+            for ip in crate::sip_stack::resolve_trunk_host_ips(&t.host) {
+                let Some(key) = crate::sip_stack::config_trunk_key(ip, &t.protocol) else {
+                    continue;
+                };
+                match ingress.get_mut(&key) {
+                    Some((group, first, cfg)) if *group == g.id => {
+                        let ours = t.stir_shaken;
+                        let merged = strictest(*cfg, ours);
+                        if cfg.verify != ours.verify
+                            || cfg.strip_inbound_identity != ours.strip_inbound_identity
+                        {
+                            warn!(
+                                trunk_group = %g.id,
+                                trunk = %t.id,
+                                other_trunk = %first,
+                                transport = %key.transport(),
+                                verify = merged.verify,
+                                strip_inbound_identity = merged.strip_inbound_identity,
+                                "Two trunks of one group share a host and protocol with different inbound STIR settings; using the most restrictive"
+                            );
+                        }
+                        *cfg = merged;
+                    }
+                    _ => {
+                        ingress.insert(key, (g.id.clone(), t.id.clone(), t.stir_shaken));
+                    }
+                }
+            }
+        }
+    }
+    ingress
 }
 
 /// Test fixtures: an rcgen STI PKI on disk and a config using it.
@@ -1320,16 +1432,213 @@ mod tests {
             "e30.e30.sig;info=<https://x/a.pem>",
         ));
         let ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let key = crate::sip_stack::config_trunk_key(ip, "udp");
+        let at = |group| key.map(|k| (k, group));
 
-        let same = svc.inbound(&req, ip, Some("g"), "c1").await;
+        let same = svc.inbound(&req, ip, at("g"), "c1").await;
         assert_eq!(same.passthrough_identity.len(), 1, "configured group");
-        let moved = svc.inbound(&req, ip, Some("other"), "c2").await;
+        let moved = svc.inbound(&req, ip, at("other"), "c2").await;
         assert!(
             moved.passthrough_identity.is_empty(),
             "moved to another group"
         );
         let removed = svc.inbound(&req, ip, None, "c3").await;
         assert!(removed.passthrough_identity.is_empty(), "no longer a trunk");
+    }
+
+    /// A verification-only config whose groups are `(group id, [(trunk id,
+    /// protocol, verify, strip)])`, every trunk on host 192.0.2.20.
+    fn shared_host_config(
+        f: &test_support::StiFiles,
+        groups: &[(&str, &[(&str, &str, bool, bool)])],
+    ) -> SbcConfig {
+        let mut c = SbcConfig::default();
+        c.stir_shaken.verification_enabled = true;
+        c.stir_shaken.verification.trust_anchors_path = Some(f.anchors.clone());
+        for (gid, trunks) in groups {
+            c.trunk_groups.push(sbc_config::TrunkGroupConfig {
+                id: (*gid).into(),
+                name: String::new(),
+                strategy: "priority".into(),
+                trunks: trunks
+                    .iter()
+                    .map(|(id, proto, verify, strip)| sbc_config::TrunkConfigSchema {
+                        id: (*id).into(),
+                        host: "192.0.2.20".into(),
+                        protocol: (*proto).into(),
+                        stir_shaken: TrunkStirConfig {
+                            sign: false,
+                            verify: *verify,
+                            strip_inbound_identity: *strip,
+                        },
+                        ..Default::default()
+                    })
+                    .collect(),
+                zone: None,
+                require_tls: false,
+                trust_domain: true,
+            });
+        }
+        c
+    }
+
+    fn invite_with(identity: Option<&str>) -> SipRequest {
+        let uri: proto_sip::uri::SipUri = "sip:+12025550100@sbc.test".parse().unwrap();
+        let mut req = SipRequest::new(proto_sip::Method::Invite, uri);
+        if let Some(id) = identity {
+            req.headers.add(Header::new(HeaderName::Identity, id));
+        }
+        req
+    }
+
+    fn shared_key(proto: &str) -> crate::sip_stack::TrunkSourceKey {
+        crate::sip_stack::config_trunk_key("192.0.2.20".parse().unwrap(), proto).unwrap()
+    }
+
+    // NIST 800-53 Rev5: AC-4, SC-7, IA-9 (SEC-001 / RFC-3)
+    /// (a) One group, one host: `c-udp` verifies and strips, `c-tls` is
+    /// trusted (passthrough). A UDP INVITE gets c-udp's settings: its
+    /// Identity is verified and never relayed; TLS gets c-tls's.
+    #[tokio::test]
+    async fn inbound_settings_follow_trunk_transport_in_one_group() {
+        let f = test_support::sti_files();
+        let c = shared_host_config(
+            &f,
+            &[(
+                "g",
+                &[("c-udp", "udp", true, true), ("c-tls", "tls", false, false)],
+            )],
+        );
+        let svc = test_support::service(&c);
+        let ip: IpAddr = "192.0.2.20".parse().unwrap();
+        let req = invite_with(Some("e30.e30.sig;info=<https://x/a.pem>"));
+        let udp = svc
+            .inbound(&req, ip, Some((shared_key("udp"), "g")), "c1")
+            .await;
+        assert!(
+            udp.passthrough_identity.is_empty(),
+            "UDP Identity not relayed"
+        );
+        assert!(udp.cdr_verstat.is_some(), "UDP Identity verified");
+        let tls = svc
+            .inbound(&req, ip, Some((shared_key("tls"), "g")), "c2")
+            .await;
+        assert_eq!(tls.passthrough_identity.len(), 1, "TLS trunk is trusted");
+        assert!(tls.cdr_verstat.is_none(), "TLS trunk does not verify");
+    }
+
+    // NIST 800-53 Rev5: AC-4, SC-7, IA-9 (SEC-001 / RFC-3)
+    /// (b) Two groups on one host: UDP group `ga` verifies, TLS group `gb`
+    /// does not. With `require_identity`, a UDP INVITE without Identity is
+    /// rejected under ga's policy (never skipped because gb's entry won).
+    #[tokio::test]
+    async fn inbound_two_groups_on_one_host_keep_their_policy() {
+        let f = test_support::sti_files();
+        let mut c = shared_host_config(
+            &f,
+            &[
+                ("ga", &[("a-udp", "udp", true, true)]),
+                ("gb", &[("b-tls", "tls", false, true)]),
+            ],
+        );
+        c.stir_shaken.verification.require_identity = true;
+        let svc = test_support::service(&c);
+        let ip: IpAddr = "192.0.2.20".parse().unwrap();
+        let req = invite_with(None);
+        let udp = svc
+            .inbound(&req, ip, Some((shared_key("udp"), "ga")), "c1")
+            .await;
+        assert_eq!(udp.reject, Some(FailureReason::Missing));
+        let tls = svc
+            .inbound(&req, ip, Some((shared_key("tls"), "gb")), "c2")
+            .await;
+        assert_eq!(tls.reject, None, "gb does not verify");
+        // A mismatched group never borrows another group's entry.
+        let wrong = svc
+            .inbound(&req, ip, Some((shared_key("udp"), "gb")), "c3")
+            .await;
+        assert_eq!(wrong.reject, None);
+    }
+
+    // NIST 800-53 Rev5: AC-4, SC-7, IA-9 (SEC-005)
+    /// Exact-key miss: fall back to the same group on the same address
+    /// (strictest wins), never to another group's entry.
+    #[tokio::test]
+    async fn inbound_miss_falls_back_within_group_only() {
+        let f = test_support::sti_files();
+        let mut c = shared_host_config(
+            &f,
+            &[
+                ("ga", &[("a-udp", "udp", true, true)]),
+                ("gb", &[("b-tls", "tls", false, false)]),
+            ],
+        );
+        c.stir_shaken.verification.require_identity = true;
+        let svc = test_support::service(&c);
+        let ip: IpAddr = "192.0.2.20".parse().unwrap();
+        let req = invite_with(None);
+        // ga resynced to TCP: ga's UDP entry applies (verify, require).
+        let ga = svc
+            .inbound(&req, ip, Some((shared_key("tcp"), "ga")), "c1")
+            .await;
+        assert_eq!(ga.reject, Some(FailureReason::Missing));
+        // gb on TCP: gb's own TLS entry (no verify); ga's is never borrowed.
+        let gb = svc
+            .inbound(&req, ip, Some((shared_key("tcp"), "gb")), "c2")
+            .await;
+        assert_eq!(gb.reject, None);
+        // gb's TLS entry is passthrough (strip off), but a fallback hit
+        // always strips: a TCP Identity is not relayed (SEC-R2-2). The exact
+        // TLS key still relays.
+        let signed = invite_with(Some("e30.e30.sig;info=<https://x/a.pem>"));
+        let gb_tcp = svc
+            .inbound(&signed, ip, Some((shared_key("tcp"), "gb")), "c4")
+            .await;
+        assert!(
+            gb_tcp.passthrough_identity.is_empty(),
+            "fallback never relays"
+        );
+        let gb_tls = svc
+            .inbound(&signed, ip, Some((shared_key("tls"), "gb")), "c5")
+            .await;
+        assert_eq!(gb_tls.passthrough_identity.len(), 1, "exact key relays");
+        // A group with no entry on this address: nothing.
+        let gc = svc
+            .inbound(&req, ip, Some((shared_key("tcp"), "gc")), "c3")
+            .await;
+        assert_eq!(gc.reject, None);
+        assert!(gc.cdr_verstat.is_none(), "no settings applied");
+    }
+
+    /// Two trunks of one group on one host and protocol with different
+    /// settings: the most restrictive (verify on, strip on) is used.
+    #[tokio::test]
+    async fn inbound_same_key_in_one_group_takes_most_restrictive() {
+        let f = test_support::sti_files();
+        let c = shared_host_config(
+            &f,
+            &[(
+                "g",
+                &[("open", "udp", false, false), ("strict", "udp", true, true)],
+            )],
+        );
+        let svc = test_support::service(&c);
+        let (_, _, cfg) = svc.trunk_by_source.get(&shared_key("udp")).unwrap();
+        assert!(cfg.verify && cfg.strip_inbound_identity, "{cfg:?}");
+        let req = invite_with(Some("e30.e30.sig;info=<https://x/a.pem>"));
+        let out = svc
+            .inbound(
+                &req,
+                "192.0.2.20".parse().unwrap(),
+                Some((shared_key("udp"), "g")),
+                "c1",
+            )
+            .await;
+        assert!(
+            out.passthrough_identity.is_empty(),
+            "stricter sibling strips"
+        );
+        assert!(out.cdr_verstat.is_some(), "stricter sibling verifies");
     }
 
     fn sign_failures(events: &[uc_audit::AuditEvent]) -> Vec<(String, String, u64)> {

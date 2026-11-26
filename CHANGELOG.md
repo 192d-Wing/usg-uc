@@ -239,6 +239,61 @@ on macOS (2026-11-17). Operator details: `docs/SBC-ADMIN-GUIDE.md`
 - Docs: `docs/SBC-ADMIN-GUIDE.md` example used `media.srtp.mode = "Relay"`,
   which does not load; valid values are `"Passthrough"` and `"Terminate"`.
 
+### BREAKING (SBC, INVITE admission by registered flow; trunk identity includes transport, POA&M-271, 397, 398)
+
+The config schema is unchanged; what it means is narrower. Tests:
+`sip_stack/tests/source_admission.rs`, unit tests in
+`sip_stack/trunk_source.rs`, `stir_binding.rs` and `stir.rs` (local runs).
+CI evidence: PR TBD.
+
+- **Endpoint INVITEs are admitted only from the registered flow.** (AC-3,
+  IA-3, SC-23) The INVITE must arrive on the source IP, port and transport
+  the REGISTER arrived on, and for TCP/TLS/WS/WSS on the same connection.
+  Before, any INVITE from an IP with a live registration was admitted.
+  These now get 403 (audit policy `source-admission`, unchanged): another
+  host behind the same NAT address; another UDP port (NAT rebinding); a UDP
+  REGISTER then a TCP INVITE (RFC 3261 §18.1.1); a new TCP/TLS connection
+  until the UA registers on it; an expired, de-registered or deleted
+  registration. Emergency INVITEs included (POA&M-398). Admission is one
+  keyed lookup instead of a scan of all registrations.
+- **Trunks match on a transport floor.** (SC-7, AC-21) A trunk's source IP
+  matches traffic on its `protocol` or a stronger transport: `udp` also
+  TCP and TLS, `tcp` also TLS, `tls` TLS only; WS/WSS/SCTP never. Source
+  port is still not checked. A UDP datagram from a `tls` trunk's address is
+  not that trunk: no PAI trust, no per-user limiter exemption, no STIR
+  `source_trunk` or Identity passthrough, no trunk CSS, and an INVITE gets
+  403 unless it is a registered flow. Applies to config-file and REST/gRPC
+  synced trunks. Inbound STIR settings follow the matched trunk; two trunks
+  of one group on one address and protocol get the stricter settings, and
+  on a miss the same group's entries on that address are used (verify if
+  any verifies, Identity always stripped; never another group's). A trunk
+  call's in-dialog transport floor is the trunk's `protocol`, not the
+  INVITE's arrival transport, unless the INVITE arrived over TLS or had a
+  `sips:` Request-URI: then in-dialog requests must use TLS (or WSS).
+- **REGISTER re-latches only the bindings it carried** (same Call-ID, CSeq
+  and Contact URI), so a UA using one Call-ID on two flows keeps both. A
+  flow stays indexed while a live binding is latched to it.
+- **Flow index limits.** At most 64 AORs per flow (was 8) and
+  `general.max_registrations` flows. A REGISTER beyond either still gets
+  200 but is not indexed, is counted in `sbc_flow_index_overflow_total`,
+  and is logged at `warn` at most once per second with a suppressed count.
+  An unindexed flow cannot place calls.
+- **New warning.** `trust_domain = true` on a group with a non-`tls` trunk
+  is a `config.routing_warning` at load, and is logged on REST/gRPC sync
+  of such a group (POA&M-397).
+- **Operator action.** Set each trunk's `protocol` to the weakest transport
+  the peer sends on. Use `protocol = "tls"` for `trust_domain` peers.
+  Register UAs over TCP or TLS (the SBC answers RFC 5626 CRLF keep-alives);
+  on UDP use the UA's NAT keep-alives or a short registration interval (no
+  STUN keep-alive or `outbound` support on the SBC).
+- **Known limits.** A registered UDP flow can be spoofed off-path by a
+  sender who knows its NAT port, and with `require_auth = false` (default)
+  registration is unauthenticated (POA&M-271). Trunks are not bound to a
+  TLS peer certificate (POA&M-397). Registrations are node-local; the
+  denial audit record carries the source IP only (POA&M-398).
+
+No config key, CDR field, audit event type or REST/gRPC API is changed.
+
 ### BREAKING (SBC, in-dialog request and CANCEL matching, POA&M-390..395)
 
 Affects every SBC call. Peers that follow RFC 3261 see no change on
