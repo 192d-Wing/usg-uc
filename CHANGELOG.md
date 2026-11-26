@@ -111,6 +111,43 @@ The bundled Postgres `sslmode: disable` is unchanged (POA&M-384).
   `save-if: false`. No Rust dependency changes, and `Cargo.lock` is
   unchanged.
 
+### Security (SBC, stream framing and stream rate limiting, POA&M-445, 446, 447)
+
+- **Stream framing is incremental.** (SC-5, SI-10) Framing work is linear in
+  bytes received: the end-of-headers search resumes where it stopped and
+  each message head is parsed once.
+- **New `transport.max_header_bytes`** (default 16384, validated
+  1024..=65535). (SI-10, CM-6) A stream connection, including an
+  SBC-dialled trunk connection, that buffers more than this before the
+  blank line is closed with no response (POA&M-445). It counts as a framing
+  error.
+- **Over-rate keep-alive pings get no pong.** (SC-5, POA&M-447) The first
+  ping run per connection in each max(15 s, idle/4) window is free. A
+  faster run over `rate_limit.per_ip_rps` gets no pong and no activity
+  credit; a blocked source is closed. On WS a message holding only CR/LF
+  bytes is charged as a ping run. Deviates from RFC 5626 §5.4.
+- **Over-rate partial data closes the connection.** (SC-5, POA&M-446) A
+  partial message costs one per-source token per 4,096 bytes beyond the
+  first 4,096, at most the per-source burst per read, with the remainder
+  owed on the next read. A discarded partial WS message costs one token.
+  Charged to the per-source limiter only, never `global_rps`, and nothing
+  is charged when `rate_limit.enabled = false`. Peers sending large
+  messages back-to-back may need a higher `per_ip_rps`.
+- **WebSocket: one SIP message per WS message.** (SI-10, RFC 7118 §5,
+  RFC 3261 §18.3) Bytes after the first SIP message are discarded and
+  counted as a framing error unless they are only CRLFs.
+- **An oversized Content-Length gets 513** (RFC 3261 §21.5.14) instead of
+  400.
+- A stream buffer that exceeds 65,535 bytes without a complete message is
+  counted in `framing_errors` and the `framing` audit record when closed.
+- **The stream framer buffer is capped and released.** (SC-5, SC-6) A read
+  that would take it past 65,535 bytes is refused before the buffer grows
+  (the connection closes as above), capacity never exceeds 65,535 bytes
+  (no doubling to 128 KiB), and an empty buffer over 8 KiB is released
+  after a frame.
+- New Debug-only counters `header_too_large` and `stream_rate_closed`
+  (POA&M-93).
+
 ### BREAKING (SBC, API-key digests are SHA-384 only, POA&M-211)
 
 SBC only (sbc-api, sbc-daemon REST). Affects every deployment that uses API
