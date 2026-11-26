@@ -226,7 +226,11 @@ async fn media_trunk_stack(protos: [&str; 2]) -> (SipStack, Arc<RelayLog>) {
 async fn sdes_offer_from_tls_to_udp_leg_is_refused_488() {
     let stack = SipStack::new(SipStackConfig::default());
     stack
-        .register_inbound_trunk("t", None, &[("192.168.1.1".to_string(), 5061)])
+        .register_inbound_trunk(
+            "t",
+            None,
+            &[("192.168.1.1".to_string(), AddrTransport::Tls)],
+        )
         .await;
     let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
         Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\
@@ -3186,7 +3190,11 @@ async fn image_answer_to_audio_offer_is_refused() {
 async fn no_route_with_required_srtp_is_480_not_announcement() {
     let stack = SipStack::new(SipStackConfig::default());
     stack
-        .register_inbound_trunk("test-trunk", None, &[("127.0.0.1".to_string(), 5060)])
+        .register_inbound_trunk(
+            "test-trunk",
+            None,
+            &[("127.0.0.1".to_string(), AddrTransport::Udp)],
+        )
         .await;
     let invite = format!(
         "INVITE sip:bob@nonexistent.invalid SIP/2.0\r\n\
