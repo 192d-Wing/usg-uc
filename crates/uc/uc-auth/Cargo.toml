@@ -12,11 +12,16 @@ serde_json = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
 axum = { workspace = true }
+# POAM: POA&M-402 — argon2id is outside the FIPS module.
 argon2 = "0.5"
-hmac = "0.12"
-sha2 = "0.10"
-subtle = "2.6"
+# HMAC-SHA-384 tokens and the legacy SHA-256 API-key digest (POA&M-211)
+# run in the aws-lc FIPS module.
+uc-crypto = { workspace = true, features = ["legacy-sha256"] }
 base64 = "0.22"
 hex = "0.4"
 rand = "0.8"
 zeroize.workspace = true
+
+[dev-dependencies]
+# HMAC-SHA-256 for the rejected v1 token vector only.
+aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
