@@ -588,13 +588,17 @@ async fn two_group_call() -> SipStack {
             "test-trunk",
             None,
             &[
-                ("192.168.1.1".to_string(), 5060),
-                ("192.168.1.2".to_string(), 5060),
+                ("192.168.1.1".to_string(), AddrTransport::Udp),
+                ("192.168.1.2".to_string(), AddrTransport::Udp),
             ],
         )
         .await;
     stack
-        .register_inbound_trunk("other-trunk", None, &[("192.168.1.9".to_string(), 5060)])
+        .register_inbound_trunk(
+            "other-trunk",
+            None,
+            &[("192.168.1.9".to_string(), AddrTransport::Udp)],
+        )
         .await;
     let reg_bob = b"REGISTER sip:sbc.local SIP/2.0\r\n\
         Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\
@@ -1639,7 +1643,11 @@ async fn trunk_peer_set_is_the_groups_configured_hosts() {
 async fn rfc2543_cancel_ends_the_invite_with_one_to_tag() {
     let stack = SipStack::new(SipStackConfig::default());
     stack
-        .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+        .register_inbound_trunk(
+            "test-trunk",
+            None,
+            &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+        )
         .await;
     let register = Bytes::from_static(
         b"REGISTER sip:sbc.local SIP/2.0\r\n\
