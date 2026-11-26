@@ -25,6 +25,14 @@ wss_listen = []
 tcp_timeout_secs = 30
 tcp_idle_timeout_secs = 300
 
+# Stream (TCP/TLS/WS) connection caps (defaults 10000 / 20000). At startup
+# the daemon lowers them to fit RLIMIT_NOFILE (after the egress pool, the
+# RTP port range, the listeners and headroom) and refuses to start below 64.
+# Size against memory too: about 128 KiB per TLS connection and 256 KiB (WS)
+# or 300 KiB (WSS) per WebSocket connection in the worst case.
+# max_connections_per_listener = 10000
+# max_connections_total = 20000
+
 # Dual-interface deployment (optional):
 # Bind SIP signaling and RTP media to separate interfaces
 # signaling_ip = "10.0.1.10"    # SIP signaling interface

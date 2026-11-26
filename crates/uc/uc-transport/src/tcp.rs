@@ -11,14 +11,17 @@
 
 use crate::error::{TransportError, TransportResult};
 use crate::listener::ListenerConfig;
-use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport, canonical_peer};
+use crate::{
+    MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, STREAM_READ_CHUNK, StreamTransport, Transport,
+    canonical_peer, read_stream_chunk,
+};
 use bytes::BytesMut;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -81,7 +84,9 @@ impl TcpTransport {
             writer: Mutex::new(writer),
             local_addr,
             peer_addr,
-            read_buffer: Mutex::new(BytesMut::with_capacity(MAX_STREAM_MESSAGE_SIZE)),
+            // NIST 800-53 Rev5: SC-5, SC-6 - one read chunk resident per
+            // connection, not a message-sized buffer.
+            read_buffer: Mutex::new(BytesMut::with_capacity(STREAM_READ_CHUNK)),
             closed: AtomicBool::new(false),
         })
     }
@@ -172,29 +177,13 @@ impl Transport for TcpTransport {
             let data = {
                 let mut read_buffer = self.read_buffer.lock().await;
                 let mut stream = self.reader.lock().await;
-
-                // Read available data
-                let mut temp_buffer = [0u8; 4096];
-                let n = stream.read(&mut temp_buffer).await.map_err(|e| {
-                    TransportError::ReceiveFailed {
-                        reason: e.to_string(),
-                    }
-                })?;
-                drop(stream);
-
-                if n == 0 {
-                    return Err(TransportError::ConnectionClosed);
-                }
-
-                read_buffer.extend_from_slice(&temp_buffer[..n]);
-
-                trace!(size = n, "received TCP data");
-
-                // For SIP, we'd parse the Content-Length and wait for full message.
-                // For now, return whatever we received (simplified).
-                read_buffer.split().freeze()
+                read_stream_chunk(&mut *stream, &mut read_buffer).await?
             };
 
+            trace!(size = data.len(), "received TCP data");
+
+            // For SIP, we'd parse the Content-Length and wait for full message.
+            // For now, return whatever we received (simplified).
             Ok(ReceivedMessage {
                 data,
                 source: self.peer_addr,
@@ -650,5 +639,100 @@ mod tests {
             "received message source must be plain IPv4, got {}",
             msg.source
         );
+    }
+
+    // ---- SR-57: per-connection read buffer is one read chunk ----
+    // NIST 800-53 Rev5: SC-5, SC-6
+    // An idle connection keeps one 4 KiB read chunk resident, not a 64 KiB
+    // message-sized buffer.
+
+    /// Upper bound on the resident read buffer per connection (one 4 KiB
+    /// chunk, with allocator slack).
+    const QA_MAX_RESIDENT_READ_BUFFER: usize = 8 * 1024;
+
+    async fn qa_tcp_pair() -> (TcpTransport, TcpTransport, SbcSocketAddr) {
+        let listener = TcpListener::bind(SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = *listener.local_addr();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client = TcpTransport::connect(addr).await.unwrap();
+        let server = accept.await.unwrap();
+        (client, server, addr)
+    }
+
+    /// Receives until `len` bytes have arrived; returns them concatenated.
+    async fn qa_recv_exact(t: &TcpTransport, len: usize) -> Vec<u8> {
+        let mut got = Vec::with_capacity(len);
+        while got.len() < len {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), t.recv())
+                .await
+                .expect("recv timed out")
+                .unwrap();
+            got.extend_from_slice(&msg.data);
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn tcp_transport_read_buffer_is_one_chunk() {
+        let (client, server, addr) = qa_tcp_pair().await;
+        for (name, t) in [("client", &client), ("server", &server)] {
+            let cap = t.read_buffer.lock().await.capacity();
+            assert!(
+                cap <= QA_MAX_RESIDENT_READ_BUFFER,
+                "{name} read buffer after connect is {cap} bytes, want <= {QA_MAX_RESIDENT_READ_BUFFER}"
+            );
+        }
+
+        let payload = vec![b'a'; 4096];
+        client.send(&payload, &addr).await.unwrap();
+        let got = qa_recv_exact(&server, payload.len()).await;
+        assert_eq!(got, payload);
+        let cap = server.read_buffer.lock().await.capacity();
+        assert!(
+            cap <= QA_MAX_RESIDENT_READ_BUFFER,
+            "server read buffer after a 4 KiB round trip is {cap} bytes, want <= {QA_MAX_RESIDENT_READ_BUFFER}"
+        );
+    }
+
+    // Regression guard for reading straight into the chunk buffer: a
+    // message much larger than one chunk arrives intact and in order over
+    // several recv calls.
+    #[tokio::test]
+    async fn tcp_recv_large_message_in_chunks_is_intact() {
+        let (client, server, addr) = qa_tcp_pair().await;
+        let payload: Vec<u8> = (0..60 * 1024_u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        client.send(&payload, &addr).await.unwrap();
+        let got = qa_recv_exact(&server, payload.len()).await;
+        assert_eq!(got.len(), payload.len());
+        assert!(got == payload, "60 KiB payload corrupted or reordered");
+        let cap = server.read_buffer.lock().await.capacity();
+        assert!(
+            cap <= QA_MAX_RESIDENT_READ_BUFFER,
+            "server read buffer after a 60 KiB message is {cap} bytes, want <= {QA_MAX_RESIDENT_READ_BUFFER}"
+        );
+    }
+
+    // A recv returns at most one chunk, so a single read never grows the
+    // buffer past it.
+    #[tokio::test]
+    async fn tcp_recv_returns_at_most_one_chunk() {
+        let (client, server, addr) = qa_tcp_pair().await;
+        let payload = vec![b'z'; 32 * 1024];
+        client.send(&payload, &addr).await.unwrap();
+        let mut total = 0;
+        while total < payload.len() {
+            let msg = server.recv().await.unwrap();
+            assert!(
+                msg.data.len() <= 4096,
+                "one recv returned {} bytes, want <= 4096",
+                msg.data.len()
+            );
+            total += msg.data.len();
+        }
+        assert_eq!(total, payload.len());
     }
 }

@@ -107,9 +107,59 @@ pub struct Runtime {
     ///
     /// ## NIST 800-53 Rev5: IA-5
     digest_credentials: Option<Arc<DigestCredentialStore>>,
+    /// Stream connection caps as read from the file at startup, before any
+    /// clamp to `RLIMIT_NOFILE`. A reload compares the file against these.
+    ///
+    /// ## NIST 800-53 Rev5: CM-6
+    file_stream_caps: StreamCaps,
     /// Cluster manager (when cluster feature is enabled).
     #[cfg(feature = "cluster")]
     cluster: Option<Arc<ClusterManager>>,
+}
+
+/// Stream connection caps (`[transport] max_connections_*`). Read at
+/// startup only; the fd budget may clamp them there (SR-57).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamCaps {
+    total: u32,
+    per_listener: u32,
+    per_source: u32,
+}
+
+impl StreamCaps {
+    /// The caps in `config`.
+    const fn of(config: &SbcConfig) -> Self {
+        let t = &config.transport;
+        Self {
+            total: t.max_connections_total,
+            per_listener: t.max_connections_per_listener,
+            per_source: t.max_connections_per_source,
+        }
+    }
+
+    /// Writes these caps into `config`.
+    const fn store(self, config: &mut SbcConfig) {
+        let t = &mut config.transport;
+        t.max_connections_total = self.total;
+        t.max_connections_per_listener = self.per_listener;
+        t.max_connections_per_source = self.per_source;
+    }
+}
+
+/// What the SIGHUP reload loop needs besides the shared config.
+struct ReloadLoopDeps {
+    /// Command-line arguments (config path).
+    args: Args,
+    /// Stream caps as read from the file at startup.
+    file_stream_caps: StreamCaps,
+    /// CDR pipeline, reconfigured on reload.
+    cdr: Option<Arc<crate::cdr::CdrContext>>,
+    /// STIR service whose trust anchors are re-read on reload.
+    stir: Option<Arc<crate::stir::StirService>>,
+    /// Digest credential store, re-read on reload.
+    digest_credentials: Option<Arc<DigestCredentialStore>>,
+    /// Receives the outcome of each config file reload (one slot).
+    last_result: Option<tokio::sync::watch::Sender<Option<ConfigReloadResult>>>,
 }
 
 impl Runtime {
@@ -151,6 +201,7 @@ impl Runtime {
             None
         };
 
+        let file_stream_caps = StreamCaps::of(&config);
         Ok(Self {
             args,
             config: Arc::new(RwLock::new(config)),
@@ -159,6 +210,7 @@ impl Runtime {
             reload_check_interval: Duration::from_millis(500),
             telemetry,
             digest_credentials,
+            file_stream_caps,
             #[cfg(feature = "cluster")]
             cluster,
         })
@@ -422,28 +474,52 @@ impl Runtime {
             reason: e.to_string(),
         })?;
 
-        // Compare with current config to identify changes
-        let current = self.config.read().await;
-        let changes = Self::detect_config_changes(&current, &new_config);
-        let restart_required = Self::detect_restart_required(&current, &new_config);
+        let mut result =
+            Self::store_reloaded_config(&self.config, self.file_stream_caps, new_config).await;
+        Self::apply_credential_reload(&mut result, credentials);
+        Ok(result)
+    }
 
-        // Log what changed
+    /// Stores a configuration re-read from the file and reports what
+    /// changed. Shared by [`Self::reload_config`] and the SIGHUP loop.
+    ///
+    /// NIST 800-53 Rev5: CM-6 - the stream connection caps are read at
+    /// startup only (and may be clamped to `RLIMIT_NOFILE` there): the
+    /// stored config keeps the caps in effect. A file whose caps differ
+    /// from the file at startup (`file_caps`) is reported as needing a
+    /// restart (`transport.max_connections`); an untouched file reports no
+    /// change.
+    async fn store_reloaded_config(
+        config: &RwLock<SbcConfig>,
+        file_caps: StreamCaps,
+        mut new_config: SbcConfig,
+    ) -> ConfigReloadResult {
+        let mut current = config.write().await;
+        let caps_edited = StreamCaps::of(&new_config) != file_caps;
+        StreamCaps::of(&current).store(&mut new_config);
+        let mut changes = Self::detect_config_changes(&current, &new_config);
+        let mut restart_required = Self::detect_restart_required(&current, &new_config);
+        if caps_edited {
+            if !changes.iter().any(|c| c == "transport") {
+                changes.push("transport".to_string());
+            }
+            restart_required.push("transport.max_connections".to_string());
+        }
+
+        // Stored even when no reported section changed: sections such as
+        // `[cdr]` are applied live but not listed in `changes`.
+        *current = new_config;
+        drop(current);
+
         if changes.is_empty() {
             info!("Configuration reload requested, but no changes detected");
-            let mut result = ConfigReloadResult {
+            return ConfigReloadResult {
                 success: true,
                 changes: Vec::new(),
                 restart_required: Vec::new(),
                 message: "No changes detected".to_string(),
             };
-            Self::apply_credential_reload(&mut result, credentials);
-            return Ok(result);
         }
-
-        drop(current); // Release read lock before acquiring write lock
-
-        // Apply the new configuration
-        *self.config.write().await = new_config;
 
         info!(
             changes = ?changes,
@@ -466,14 +542,12 @@ impl Runtime {
             )
         };
 
-        let mut result = ConfigReloadResult {
+        ConfigReloadResult {
             success: true,
             changes,
             restart_required,
             message,
-        };
-        Self::apply_credential_reload(&mut result, credentials);
-        Ok(result)
+        }
     }
 
     /// Changed settings a reload does not apply to the running SIP stack.
@@ -581,7 +655,7 @@ impl Runtime {
 
         // Create and start SIP server
         let signal = self.shutdown.signal().clone();
-        let config = self.config.read().await.clone();
+        let mut config = self.config.read().await.clone();
 
         // Save instance name before config is moved to server
         let instance_name = config.general.instance_name.clone();
@@ -670,6 +744,30 @@ impl Runtime {
                 reason,
             }
         })?;
+
+        // Fd budget: raise the soft RLIMIT_NOFILE and clamp the connection
+        // caps to it before any listener or RTP socket is opened.
+        //
+        // ## NIST 800-53 Rev5: SC-5, SC-6, CM-6, AU-5
+        let local_media = Server::remote_media_urls().is_empty();
+        if let Err(reason) = crate::fd_limit::apply(&mut config, local_media) {
+            error!(error = %reason, "File descriptor limit too low — SBC cannot start");
+            // `apply` queued a SystemShutdown record; let the audit writer
+            // drain it before the process exits.
+            if !tokio::task::spawn_blocking(|| uc_audit::flush(std::time::Duration::from_secs(2)))
+                .await
+                .unwrap_or(false)
+            {
+                warn!("Audit queue not drained before exit");
+            }
+            return Err(RuntimeError::InitFailed {
+                component: "fd_limit".to_string(),
+                reason,
+            });
+        }
+        // Config views (API, reload diff) report the caps in effect, not the
+        // file values (CM-6).
+        StreamCaps::of(&config).store(&mut *self.config.write().await);
 
         // Pass cluster manager to server if available
         #[cfg(feature = "cluster")]
@@ -1400,23 +1498,17 @@ impl Runtime {
         // Spawn configuration reload monitor task
         let reload_signal = signal.clone();
         let config_ref = Arc::clone(&self.config);
-        let args = self.args.clone();
         let reload_interval = self.reload_check_interval;
-
-        let reload_cdr = cdr.clone();
-        let reload_stir = stir.clone();
-        let reload_digest = self.digest_credentials.clone();
+        let reload_deps = ReloadLoopDeps {
+            args: self.args.clone(),
+            file_stream_caps: self.file_stream_caps,
+            cdr: cdr.clone(),
+            stir: stir.clone(),
+            digest_credentials: self.digest_credentials.clone(),
+            last_result: None,
+        };
         let reload_handle = tokio::spawn(async move {
-            Self::config_reload_loop(
-                reload_signal,
-                config_ref,
-                args,
-                reload_interval,
-                reload_cdr,
-                reload_stir,
-                reload_digest,
-            )
-            .await;
+            Self::config_reload_loop(reload_signal, config_ref, reload_interval, reload_deps).await;
         });
 
         // Run main SIP server loop
@@ -1534,12 +1626,17 @@ impl Runtime {
     async fn config_reload_loop(
         signal: ShutdownSignal,
         config: Arc<RwLock<SbcConfig>>,
-        args: Args,
         poll_interval: Duration,
-        cdr: Option<Arc<crate::cdr::CdrContext>>,
-        stir: Option<Arc<crate::stir::StirService>>,
-        digest_credentials: Option<Arc<DigestCredentialStore>>,
+        deps: ReloadLoopDeps,
     ) {
+        let ReloadLoopDeps {
+            args,
+            file_stream_caps,
+            cdr,
+            stir,
+            digest_credentials,
+            last_result,
+        } = deps;
         let mut interval = tokio::time::interval(poll_interval);
 
         loop {
@@ -1578,9 +1675,18 @@ impl Runtime {
                                             "[digest_auth] setting changes need a restart; only the credentials file contents are reloaded"
                                         );
                                     }
-                                    *config.write().await = new_config;
-                                    info!("Configuration reloaded successfully");
-                                    warn!("Note: running Server and SipStack retain their original config snapshots; a full restart is required for all settings to take effect");
+                                    let result = Self::store_reloaded_config(
+                                        &config,
+                                        file_stream_caps,
+                                        new_config,
+                                    )
+                                    .await;
+                                    if !result.changes.is_empty() {
+                                        warn!("Note: running Server and SipStack retain their original config snapshots; a full restart is required for all settings to take effect");
+                                    }
+                                    if let Some(ref tx) = last_result {
+                                        tx.send_replace(Some(result));
+                                    }
                                 }
                                 Err(e) => {
                                     error!(error = %e, "Failed to reload configuration");
@@ -1951,6 +2057,121 @@ mod tests {
         config2.general.instance_name = "changed-sbc".to_string();
         let changes = Runtime::detect_config_changes(&config1, &config2);
         assert!(changes.contains(&"general".to_string()));
+    }
+
+    /// Caps as if clamped to `RLIMIT_NOFILE` at startup (SR-57).
+    fn clamped_caps() -> StreamCaps {
+        StreamCaps {
+            total: 6397,
+            per_listener: 6397,
+            per_source: 100,
+        }
+    }
+
+    // SR-57 / SEC-R1-1: a reload keeps the caps in effect; only a file whose
+    // caps differ from the file at startup is reported as restart-required.
+    #[tokio::test]
+    async fn store_reloaded_config_keeps_clamped_caps_and_compares_with_the_file() {
+        let file = SbcConfig::default();
+        let file_caps = StreamCaps::of(&file);
+        let mut running = file.clone();
+        clamped_caps().store(&mut running);
+        let config = RwLock::new(running);
+
+        let r = Runtime::store_reloaded_config(&config, file_caps, file.clone()).await;
+        assert!(r.success);
+        assert_eq!(r.changes, Vec::<String>::new());
+        assert_eq!(r.restart_required, Vec::<String>::new());
+        assert_eq!(StreamCaps::of(&*config.read().await), clamped_caps());
+
+        let mut edited = file.clone();
+        edited.transport.max_connections_total -= 1;
+        let r = Runtime::store_reloaded_config(&config, file_caps, edited).await;
+        assert_eq!(r.changes, vec!["transport".to_string()]);
+        assert_eq!(
+            r.restart_required,
+            vec!["transport.max_connections".to_string()]
+        );
+        assert_eq!(StreamCaps::of(&*config.read().await), clamped_caps());
+
+        // Reverting the edit reports no change again.
+        let r = Runtime::store_reloaded_config(&config, file_caps, file).await;
+        assert_eq!(r.restart_required, Vec::<String>::new());
+    }
+
+    // SEC-R1-1: the SIGHUP loop goes through the same path: clamped caps
+    // survive a reload, an untouched file reports no change, and an edited
+    // cap is reported as restart-required.
+    #[tokio::test]
+    async fn sighup_reload_keeps_clamped_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("sbc.toml");
+        std::fs::write(&toml_path, "[general]\ninstance_name = \"sbc-a\"\n").unwrap();
+        let file = load_from_file(&toml_path).unwrap();
+        let file_caps = StreamCaps::of(&file);
+        let mut running = file;
+        clamped_caps().store(&mut running);
+        let config = Arc::new(RwLock::new(running));
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let signal = ShutdownSignal::new();
+        let task = tokio::spawn(Runtime::config_reload_loop(
+            signal.clone(),
+            Arc::clone(&config),
+            Duration::from_millis(5),
+            ReloadLoopDeps {
+                args: Args {
+                    config_path: Some(toml_path.clone()),
+                    ..Args::default()
+                },
+                file_stream_caps: file_caps,
+                cdr: None,
+                stir: None,
+                digest_credentials: None,
+                last_result: Some(tx),
+            },
+        ));
+        let mut reload = async || {
+            rx.borrow_and_update();
+            signal.request_reload();
+            tokio::time::timeout(Duration::from_secs(5), rx.changed())
+                .await
+                .expect("reload ran")
+                .unwrap();
+            rx.borrow().clone().expect("reload result")
+        };
+
+        // Untouched file: no change, caps still clamped.
+        let r = reload().await;
+        assert!(r.success, "{}", r.message);
+        assert_eq!(r.changes, Vec::<String>::new());
+        assert_eq!(r.restart_required, Vec::<String>::new());
+        assert_eq!(StreamCaps::of(&*config.read().await), clamped_caps());
+
+        // Another section edited: applied, caps still clamped.
+        std::fs::write(&toml_path, "[general]\ninstance_name = \"sbc-b\"\n").unwrap();
+        let r = reload().await;
+        assert_eq!(r.changes, vec!["general".to_string()]);
+        assert_eq!(r.restart_required, Vec::<String>::new());
+        assert_eq!(config.read().await.general.instance_name, "sbc-b");
+        assert_eq!(StreamCaps::of(&*config.read().await), clamped_caps());
+
+        // A cap edited in the file: restart-required, caps still clamped.
+        std::fs::write(
+            &toml_path,
+            format!(
+                "[general]\ninstance_name = \"sbc-b\"\n[transport]\nmax_connections_total = {}\n",
+                file_caps.total - 1
+            ),
+        )
+        .unwrap();
+        let r = reload().await;
+        assert_eq!(r.changes, vec!["transport".to_string()]);
+        assert_eq!(
+            r.restart_required,
+            vec!["transport.max_connections".to_string()]
+        );
+        assert_eq!(StreamCaps::of(&*config.read().await), clamped_caps());
+        task.abort();
     }
 
     // SEC-001 / QA-1: require_tls and trunk-group edits are restart-only.
@@ -2369,11 +2590,15 @@ mod tests {
         let task = tokio::spawn(Runtime::config_reload_loop(
             signal.clone(),
             Arc::new(RwLock::new(SbcConfig::default())),
-            args,
             Duration::from_millis(5),
-            None,
-            None,
-            Some(Arc::clone(&store)),
+            ReloadLoopDeps {
+                args,
+                file_stream_caps: StreamCaps::of(&SbcConfig::default()),
+                cdr: None,
+                stir: None,
+                digest_credentials: Some(Arc::clone(&store)),
+                last_result: None,
+            },
         ));
         // The reload runs on the loop task: wait for its effect.
         let wait_until = |done: fn(&DigestCredentialStore) -> bool| {
