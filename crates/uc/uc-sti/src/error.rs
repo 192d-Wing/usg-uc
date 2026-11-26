@@ -15,6 +15,10 @@ pub enum FetchError {
     /// DNS, TCP, TLS or HTTP failure.
     #[error("certificate fetch failed: {0}")]
     Transport(&'static str),
+    /// The repository's TLS certificate chain or handshake signature was
+    /// refused by the CNSA peer profile (ECDSA P-384 / SHA-384, SR-14).
+    #[error("certificate fetch failed: x5u server TLS certificate refused by CNSA profile")]
+    TlsCertPolicy,
     /// Non-200 response.
     #[error("certificate fetch HTTP status {0}")]
     Status(u16),
@@ -41,7 +45,9 @@ impl FetchError {
             Self::Timeout => FailureReason::CertFetchTimeout,
             Self::Busy => FailureReason::CertFetchBusy,
             Self::Untrusted(_) => FailureReason::CertUntrusted,
-            Self::Transport(_) | Self::Status(_) | Self::TooLarge => FailureReason::CertFetchFailed,
+            Self::Transport(_) | Self::TlsCertPolicy | Self::Status(_) | Self::TooLarge => {
+                FailureReason::CertFetchFailed
+            }
         }
     }
 
@@ -51,6 +57,7 @@ impl FetchError {
         match self {
             Self::Policy(_) => "policy",
             Self::Transport(_) => "transport",
+            Self::TlsCertPolicy => "tls-cert-policy",
             Self::Status(_) => "status",
             Self::TooLarge => "too-large",
             Self::Timeout => "timeout",

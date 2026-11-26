@@ -13,7 +13,7 @@ categories.workspace = true
 default = ["udp", "tcp", "tls"]
 udp = []
 tcp = []
-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:arc-swap"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:arc-swap", "dep:webpki"]
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 sctp = ["dep:crc32c", "dep:rand"]  # SCTP transport (RFC 9260)
 # CNSA rustls client config for management-plane HTTPS (reqwest
@@ -36,6 +36,10 @@ tokio-rustls = { version = "0.26", optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 arc-swap = { version = "1.9", optional = true }
 rustls-native-certs = { workspace = true, optional = true }
+# ECDSA P-384/SHA-384 verifier for cnsa_provider() (SR-14). Already in the tree
+# via rustls; same FIPS backend as rustls and uc-crypto. `aws-lc-rs` gates the
+# `webpki::aws_lc_rs` module; `aws-lc-rs-fips` selects the FIPS module.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "aws-lc-rs", "aws-lc-rs-fips"], optional = true }
 
 # WebSocket support
 tokio-tungstenite = { version = "0.28", optional = true }
