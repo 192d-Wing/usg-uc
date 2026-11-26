@@ -161,6 +161,43 @@ async fn ws_upgrade_without_sip_subprotocol_is_refused() {
     );
 }
 
+/// SR-59 (D3): the WS client-address keys load from TOML and are enforced
+/// by `load_from_str` validation (compile-red until the fields exist).
+mod sr59_ws_proxy_keys {
+    use sbc_config::load_from_str;
+    use sbc_config::schema::WsClientAddress;
+
+    #[test]
+    fn ws_proxy_keys_load_from_toml() {
+        let config = load_from_str(
+            "[transport]\nws_listen = [\"0.0.0.0:7080\"]\n\
+             ws_trusted_proxies = [\"10.0.0.0/8\", \"2001:db8::/32\"]\n\
+             ws_client_address = \"x_forwarded_for\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.transport.ws_client_address,
+            WsClientAddress::XForwardedFor
+        );
+        assert_eq!(config.transport.ws_trusted_proxies.len(), 2);
+
+        // Mode without a trusted list, and a bad CIDR, fail the load.
+        assert!(
+            load_from_str(
+                "[transport]\nws_listen = [\"0.0.0.0:7080\"]\nws_client_address = \"proxy_v2\"\n"
+            )
+            .is_err()
+        );
+        assert!(
+            load_from_str(
+                "[transport]\nws_listen = [\"0.0.0.0:7080\"]\n\
+                 ws_trusted_proxies = [\"10.0.0.0/33\"]\nws_client_address = \"forwarded\"\n"
+            )
+            .is_err()
+        );
+    }
+}
+
 // SR-55: spoofable UDP cannot block a configured trunk (limiter trust and
 // auto-block switches, `[rate_limit]` keys).
 mod sr55 {
