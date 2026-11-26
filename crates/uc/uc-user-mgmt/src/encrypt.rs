@@ -7,6 +7,9 @@
 //! ## Storage Format
 //!
 //! Encrypted HA1 is stored as `enc:v1:` + `base64(nonce[12] || ciphertext || tag[16])`.
+//! The nonce is generated inside the FIPS module ([`RandomNonceKey`], the
+//! approved internal-IV AES-GCM service); rows sealed earlier with a
+//! caller-drawn random nonce use the same format and open unchanged.
 //! The AAD is `uc-user-mgmt/digest_ha1/v1:` followed by the user's `id`, so a
 //! ciphertext copied onto another row fails authentication. `id` is used
 //! (not username/realm) because it is assigned by the caller before
@@ -28,7 +31,7 @@
 // marker parser below rejects unknown versions so that slot stays free.
 
 use base64::prelude::*;
-use uc_crypto::aead::{self, Aes256GcmKey, NONCE_LEN, TAG_LEN};
+use uc_crypto::aead::{NONCE_LEN, RandomNonceKey, TAG_LEN};
 
 use crate::error::UserMgmtError;
 use crate::model::{AuthType, User, UserFilter};
@@ -69,12 +72,12 @@ pub struct ReencryptReport {
 /// A key is mandatory; there is no pass-through mode.
 pub struct EncryptedUserStore<S: UserStore> {
     inner: S,
-    key: Aes256GcmKey,
+    key: RandomNonceKey,
 }
 
 impl<S: UserStore> EncryptedUserStore<S> {
     /// Wrap a store with HA1 encryption.
-    pub fn new(inner: S, key: Aes256GcmKey) -> Self {
+    pub fn new(inner: S, key: RandomNonceKey) -> Self {
         Self { inner, key }
     }
 
@@ -100,9 +103,11 @@ impl<S: UserStore> EncryptedUserStore<S> {
 
     /// Seal an HA1 value for `user_id`.
     fn encrypt_ha1(&self, user_id: &str, ha1: &str) -> store::Result<String> {
-        let (nonce, ciphertext) =
-            aead::seal_with_random_nonce(&self.key, &Self::aad(user_id), ha1.as_bytes())
-                .map_err(|e| UserMgmtError::StorageError(format!("HA1 encryption failed: {e}")))?;
+        // NIST 800-53 Rev5: SC-13, SC-28(1): the module generates the IV (IG C.H).
+        let (nonce, ciphertext) = self
+            .key
+            .seal(&Self::aad(user_id), ha1.as_bytes())
+            .map_err(|e| UserMgmtError::StorageError(format!("HA1 encryption failed: {e}")))?;
 
         let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
         blob.extend_from_slice(&nonce);
@@ -240,7 +245,7 @@ impl<S: UserStore> EncryptedUserStore<S> {
 }
 
 /// Parse a hex-encoded AES-256-GCM key (64 hex chars = 32 bytes).
-pub fn parse_hex_key(hex_key: &str) -> store::Result<Aes256GcmKey> {
+pub fn parse_hex_key(hex_key: &str) -> store::Result<RandomNonceKey> {
     let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
     if hex_key.len() != 64 {
         return Err(UserMgmtError::StorageError(
@@ -249,7 +254,7 @@ pub fn parse_hex_key(hex_key: &str) -> store::Result<Aes256GcmKey> {
     }
     hex::decode_to_slice(hex_key, bytes.as_mut_slice())
         .map_err(|_| UserMgmtError::StorageError("invalid hex encryption key".to_owned()))?;
-    Aes256GcmKey::new(*bytes)
+    RandomNonceKey::new(&bytes)
         .map_err(|e| UserMgmtError::StorageError(format!("invalid AES-256-GCM key: {e}")))
 }
 
@@ -367,7 +372,7 @@ mod tests {
     const HA1: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
 
     fn store() -> EncryptedUserStore<DummyStore> {
-        EncryptedUserStore::new(DummyStore, Aes256GcmKey::generate().unwrap())
+        EncryptedUserStore::new(DummyStore, RandomNonceKey::generate().unwrap())
     }
 
     #[test]
@@ -531,7 +536,7 @@ mod tests {
                 .create_user(user("u-x", "nohash", None))
                 .await
                 .unwrap();
-            let s = EncryptedUserStore::new(inner, Aes256GcmKey::generate().unwrap());
+            let s = EncryptedUserStore::new(inner, RandomNonceKey::generate().unwrap());
 
             // Before migration the plaintext row fails closed.
             assert!(s.get_user("u-0").await.is_err());
@@ -587,7 +592,7 @@ mod tests {
             assert_eq!(raw.digest_ha1.as_deref(), Some("enc:v1:x"));
             assert!(!raw.enabled);
             // Not offered through the wrapper.
-            let s = EncryptedUserStore::new(inner, Aes256GcmKey::generate().unwrap());
+            let s = EncryptedUserStore::new(inner, RandomNonceKey::generate().unwrap());
             assert!(s.replace_digest_ha1("u-0", "x", "y").await.is_err());
         }
 
@@ -598,7 +603,7 @@ mod tests {
                 .create_user(user("u-0", "bad", Some("not-a-hash")))
                 .await
                 .unwrap();
-            let s = EncryptedUserStore::new(inner, Aes256GcmKey::generate().unwrap());
+            let s = EncryptedUserStore::new(inner, RandomNonceKey::generate().unwrap());
             assert!(s.reencrypt_plaintext_rows().await.is_err());
         }
 
@@ -606,7 +611,7 @@ mod tests {
         async fn writes_through_wrapper_are_ciphertext_at_rest() {
             let s = EncryptedUserStore::new(
                 SqliteUserStore::in_memory().unwrap(),
-                Aes256GcmKey::generate().unwrap(),
+                RandomNonceKey::generate().unwrap(),
             );
             let created = s
                 .create_user(user("u-1", "alice", Some(HA1)))
@@ -621,6 +626,157 @@ mod tests {
             s.update_user(u).await.unwrap();
             assert_eq!(s.authenticate_digest("alice", "r").await.unwrap(), None);
             assert_eq!(s.authenticate_digest("nobody", "r").await.unwrap(), None);
+        }
+    }
+}
+
+/// SR-15: HA1 rows keep the `enc:v1:` wire format across the switch to the
+/// module-internal-IV seal (`RandomNonceKey`). Random runtime keys only.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod sr15_wire_compat_tests {
+    use super::*;
+    use uc_crypto::aead::{Aes256GcmKey, CachedAeadKey, KEY_LEN, RandomNonceKey};
+    use zeroize::Zeroizing;
+
+    const HA1: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+    /// The v1 AAD prefix as written by earlier releases (wire format pin).
+    const V1_AAD_PREFIX: &[u8] = b"uc-user-mgmt/digest_ha1/v1:";
+
+    fn key_bytes() -> Zeroizing<[u8; KEY_LEN]> {
+        Zeroizing::new(uc_crypto::random::generate_key_256().unwrap())
+    }
+
+    fn v1_aad(id: &str) -> Vec<u8> {
+        [V1_AAD_PREFIX, id.as_bytes()].concat()
+    }
+
+    fn store_with(bytes: &[u8; KEY_LEN]) -> EncryptedUserStore<NoStore> {
+        let key: RandomNonceKey = RandomNonceKey::new(bytes).unwrap();
+        EncryptedUserStore::new(NoStore, key)
+    }
+
+    /// A row written by the previous release: caller nonce, same AAD,
+    /// `enc:v1:` + base64(nonce || ct || tag). `CachedAeadKey::seal` gives the
+    /// same bytes as the removed `Aes256GcmKey::seal`.
+    #[test]
+    fn legacy_v1_blob_opens() {
+        let bytes = key_bytes();
+        let nonce = uc_crypto::random::generate_nonce().unwrap();
+        let ct = CachedAeadKey::new(&bytes)
+            .unwrap()
+            .seal(&nonce, &v1_aad("u-1"), HA1.as_bytes())
+            .unwrap();
+        let stored = format!(
+            "{MARKER_V1}{}",
+            BASE64_STANDARD.encode([&nonce[..], &ct].concat())
+        );
+
+        let s = store_with(&bytes);
+        assert_eq!(s.decrypt_ha1("u-1", &stored).unwrap(), HA1);
+        assert!(s.decrypt_ha1("u-2", &stored).is_err());
+        assert!(
+            store_with(&key_bytes())
+                .decrypt_ha1("u-1", &stored)
+                .is_err()
+        );
+    }
+
+    /// Rolling upgrade: a row written by the new release opens with the
+    /// pre-change opener (`Aes256GcmKey::open`, same AAD).
+    #[test]
+    fn new_blob_opens_with_pre_change_opener() {
+        let bytes = key_bytes();
+        let stored = store_with(&bytes).encrypt_ha1("u-1", HA1).unwrap();
+        let blob = BASE64_STANDARD
+            .decode(stored.strip_prefix(MARKER_V1).unwrap())
+            .unwrap();
+        let (nonce, ct) = blob.split_at(NONCE_LEN);
+        let nonce: [u8; NONCE_LEN] = nonce.try_into().unwrap();
+
+        let old = Aes256GcmKey::new(*bytes).unwrap();
+        assert_eq!(
+            old.open(&nonce, &v1_aad("u-1"), ct).unwrap(),
+            HA1.as_bytes()
+        );
+        assert!(old.open(&nonce, &v1_aad("u-2"), ct).is_err());
+    }
+
+    #[test]
+    fn v1_layout_unchanged() {
+        let bytes = key_bytes();
+        let s = store_with(&bytes);
+        let a = s.encrypt_ha1("u-1", HA1).unwrap();
+        let b = s.encrypt_ha1("u-1", HA1).unwrap();
+        for stored in [&a, &b] {
+            assert!(stored.starts_with("enc:v1:"), "{stored}");
+            let blob = BASE64_STANDARD
+                .decode(stored.strip_prefix("enc:v1:").unwrap())
+                .unwrap();
+            assert_eq!(blob.len(), 12 + 64 + 16);
+            assert!(stored.len() <= MAX_STORED_LEN);
+        }
+        // Fresh IV per seal.
+        assert_ne!(a, b);
+        assert_eq!(s.decrypt_ha1("u-1", &a).unwrap(), HA1);
+        // Row binding: a different id fails.
+        assert!(s.decrypt_ha1("u-10", &a).is_err());
+        assert!(s.decrypt_ha1("", &a).is_err());
+    }
+
+    /// `parse_hex_key` yields the internal-IV key and opens previous-release rows.
+    #[test]
+    fn parse_hex_key_returns_random_nonce_key() {
+        let bytes = key_bytes();
+        let hex_key = Zeroizing::new(hex::encode(*bytes));
+        let key: RandomNonceKey = parse_hex_key(&hex_key).unwrap();
+        let nonce = uc_crypto::random::generate_nonce().unwrap();
+        let ct = CachedAeadKey::new(&bytes)
+            .unwrap()
+            .seal(&nonce, &v1_aad("u-9"), HA1.as_bytes())
+            .unwrap();
+        assert_eq!(
+            key.open(&nonce, &v1_aad("u-9"), &ct).unwrap(),
+            HA1.as_bytes()
+        );
+    }
+
+    /// Store that is never called; the tests use the HA1 helpers only.
+    struct NoStore;
+
+    impl UserStore for NoStore {
+        async fn create_user(&self, _: User) -> store::Result<User> {
+            unimplemented!()
+        }
+        async fn get_user(&self, _: &str) -> store::Result<User> {
+            unimplemented!()
+        }
+        async fn get_user_by_username(&self, _: &str) -> store::Result<User> {
+            unimplemented!()
+        }
+        async fn get_user_by_certificate_dn(&self, _: &str) -> store::Result<User> {
+            unimplemented!()
+        }
+        async fn list_users(&self, _: &UserFilter) -> store::Result<Vec<User>> {
+            unimplemented!()
+        }
+        async fn update_user(&self, _: User) -> store::Result<User> {
+            unimplemented!()
+        }
+        async fn delete_user(&self, _: &str) -> store::Result<()> {
+            unimplemented!()
+        }
+        async fn authenticate_digest(&self, _: &str, _: &str) -> store::Result<Option<String>> {
+            unimplemented!()
+        }
+        async fn authenticate_certificate(&self, _: &str, _: &str) -> store::Result<Option<User>> {
+            unimplemented!()
+        }
+        async fn count_users(&self) -> store::Result<usize> {
+            unimplemented!()
+        }
+        async fn replace_digest_ha1(&self, _: &str, _: &str, _: &str) -> store::Result<bool> {
+            unimplemented!()
         }
     }
 }

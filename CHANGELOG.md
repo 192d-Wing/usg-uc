@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (uc-crypto API, AES-GCM seal services, SR-15, POA&M-400)
+
+- **uc-crypto: `Aes256GcmKey::seal` and `aead::seal_with_random_nonce` are
+  removed.** (SC-13, SC-28(1)) Seal with a caller-built IV is not an approved
+  FIPS 140-3 service. New `aead::RandomNonceKey` seals with an IV generated
+  inside the module; `Aes256GcmKey` is open-only. `CachedAeadKey` is for
+  RFC 7714 SRTP only.
+- **HA1 at rest is sealed with `RandomNonceKey`.** `EncryptedUserStore::new`,
+  `parse_hex_key` and sbc-api-server `load_ha1_key` take or return it. The
+  `enc:v1:` format is unchanged: old rows open, and older replicas open new
+  rows. No migration.
+- **proto-dtls legacy `RecordLayer`** seals with `Tls12GcmSealer`
+  (`activate_cipher` signature changed); record bytes are unchanged.
+- SRTP/SRTCP seal and the sidecar's pion DTLS record seal have no approved
+  service and are tracked as POA&M-400; docs no longer claim every primitive
+  is approved or that the Go module is certified.
+
 ### BREAKING (SBC, connection memory and file-descriptor budget, POA&M-452, 453)
 
 Affects every SBC at startup and every Helm upgrade. Operator details:
