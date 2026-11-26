@@ -2,7 +2,8 @@
 
 Status: **design only, not implemented.** Tracked as POA&M-401 in
 [NIST 800-53 Controls](NIST-800-53-CONTROLS.md). No TLS path in the SBC checks
-certificate revocation today. Implementation waits for decisions D1-D6 below.
+certificate revocation today. Decisions D1-D6 below were accepted on 2026-11-25;
+phase (a) is next.
 
 Versions checked: rustls 0.23.46, rustls-webpki 0.103.16, rustls-pki-types
 1.15.1, tonic 0.14.6.
@@ -173,11 +174,11 @@ Separate PRs, each mergeable after (a).
   fallback.
 - Bench: TLS handshake with 0, 1k and 100k CRL entries.
 
-## Open decisions
+## Decisions
 
-Each changes runtime behaviour and needs a decision before phase (a) starts.
+Accepted 2026-11-25 as recommended. Each changes runtime behaviour.
 
-| # | Question | Recommended default |
+| # | Question | Decision |
 |---|---|---|
 | D1 | Expired CRL (`now >= nextUpdate`): reject (fail closed) or ignore (fail open, logged)? At startup, refuse to start or fail only that path? | `reject`. At startup, start, log, audit and fail only that TLS path closed. Until b1 ships, a fresh CRL needs a restart, or b1 is pulled into the first PR. |
 | D2 | Unknown status for server certificates (trunk, SRS, syslog): deny or allow? | `deny` for SRS and syslog; explicit operator setting for trunks, default `deny`. Clients (V1): `deny`. |
