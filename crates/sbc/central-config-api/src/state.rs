@@ -72,7 +72,8 @@ impl AppState {
         // CA the OS trust store doesn't include.
         let extra_ca = match cfg.oidc_extra_ca_cert_file.as_deref() {
             Some(path) => {
-                let pem = std::fs::read(path)
+                let pem = tokio::fs::read(path)
+                    .await
                     .map_err(|e| StateError::OidcCa(format!("read {path}: {e}")))?;
                 tracing::info!(path, "loaded extra CA certificate for IdP JWKS fetch");
                 Some(pem)
