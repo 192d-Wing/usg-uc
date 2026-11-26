@@ -27,7 +27,7 @@ fn set_paths(path: &Path) -> Vec<PathBuf> {
         .map(|e| e.unwrap().path())
         .filter(|p| {
             p.file_name()
-                .and_then(|n| n.to_str())
+                .and_then(std::ffi::OsStr::to_str)
                 .and_then(|n| n.strip_prefix("audit.log."))
                 .is_some_and(|d| d.len() == 20 && d.bytes().all(|b| b.is_ascii_digit()))
         })

@@ -804,7 +804,7 @@ impl CdrObserver for AuditObserver {
     fn on_deleted(&self, file: &Path, reason: uc_cdr::CdrDeleteReason, age: Duration, early: bool) {
         let stream = file
             .file_name()
-            .and_then(|n| n.to_str())
+            .and_then(std::ffi::OsStr::to_str)
             .and_then(CdrStream::of_file_name)
             .unwrap_or_default();
         uc_audit::log_event(uc_audit::AuditEvent::CdrFileDeleted(

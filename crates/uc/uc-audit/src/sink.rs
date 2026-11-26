@@ -840,7 +840,7 @@ fn open_current(path: &Path) -> io::Result<std::fs::File> {
 }
 
 fn file_name(path: &Path) -> Option<&str> {
-    path.file_name().and_then(|n| n.to_str())
+    path.file_name().and_then(std::ffi::OsStr::to_str)
 }
 
 /// `<name>.<n:020>` next to `path`. `n` is a monotonic rotation number, at
