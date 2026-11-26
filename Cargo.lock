@@ -6379,6 +6379,7 @@ dependencies = [
  "chrono",
  "hyper",
  "hyper-util",
+ "ipnet",
  "nix 0.31.3",
  "prost",
  "prost-types",

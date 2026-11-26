@@ -2482,8 +2482,27 @@ fn invite_denied_event(
         action: "INVITE".to_string(),
         granted: false,
         policy: policy.to_string(),
-        source_ip: Some(source.ip()),
+        source_ip: Some(client_of(source).ip()),
     })
+}
+
+tokio::task_local! {
+    /// SR-59: `(socket peer, client)` of the stream message being processed,
+    /// when its connection came through a trusted WebSocket proxy (set by
+    /// [`SipStack::process_message_from`] for that message only).
+    static WS_CLIENT: (SbcSocketAddr, SbcSocketAddr);
+}
+
+/// The address that names `source` in audit records, CDRs and per-client
+/// keys: the client a trusted WebSocket proxy reported when `source` is
+/// the socket peer of the message being processed, otherwise `source`.
+/// Port 0 means the proxy did not carry the client port.
+///
+/// ## NIST 800-53 Rev5: AU-3
+fn client_of(source: SbcSocketAddr) -> SbcSocketAddr {
+    WS_CLIENT
+        .try_with(|&(socket, client)| if socket == source { client } else { source })
+        .unwrap_or(source)
 }
 
 /// `AuthorizationDecision` (granted) for an emergency call admitted past
@@ -2502,7 +2521,7 @@ fn audit_emergency_bypass(req: &SipRequest, source: SbcSocketAddr) {
             action: "INVITE".to_string(),
             granted: true,
             policy: "emergency-bypass".to_string(),
-            source_ip: Some(source.ip()),
+            source_ip: Some(client_of(source).ip()),
         },
     ));
 }
@@ -2520,7 +2539,7 @@ fn audit_emergency_route(req: &SipRequest, source: SbcSocketAddr, subject: Strin
             action: "INVITE".to_string(),
             granted: policy != "emergency_unrouted",
             policy: policy.to_string(),
-            source_ip: Some(source.ip()),
+            source_ip: Some(client_of(source).ip()),
         },
     ));
 }
@@ -2538,7 +2557,7 @@ fn audit_route_blocked(req: &SipRequest, source: SbcSocketAddr, subject: String,
             action: "INVITE".to_string(),
             granted: false,
             policy: "route:blocked".to_string(),
-            source_ip: Some(source.ip()),
+            source_ip: Some(client_of(source).ip()),
         },
     ));
 }
@@ -2768,7 +2787,7 @@ fn audit_register_auth(
     audit(uc_audit::AuditEvent::AuthenticationAttempt(
         uc_audit::event::AuthenticationAttempt {
             identity: aor.to_string(),
-            source_ip: source.ip(),
+            source_ip: client_of(source).ip(),
             success: failure_reason.is_none(),
             failure_reason,
             method,
@@ -4388,7 +4407,7 @@ impl SipStack {
                 action: "BYE".to_string(),
                 granted: true,
                 policy: "sip.late_2xx.teardown".to_string(),
-                source_ip: Some(source.ip()),
+                source_ip: Some(client_of(source).ip()),
             },
         ));
         let bye = send(build_late_2xx_request(
@@ -4462,7 +4481,10 @@ impl SipStack {
             return 0;
         }
         // NIST-002: these came from relaying the trigger's message.
+        // NIST 800-53 Rev5: AU-3 (SR-59: the client behind a trusted proxy,
+        // not the proxy).
         if let Some((_, src)) = trigger {
+            let src = client_of(src);
             for f in &mut failures {
                 f.source = Some(src);
             }
@@ -8118,7 +8140,10 @@ impl SipStack {
         let key = self
             .flow_bound_aor(source, transport, conn, &user)
             .await
-            .map_or_else(|| UserKey::unauth(source.ip(), &user), UserKey::Auth);
+            .map_or_else(
+                || UserKey::unauth(client_of(source).ip(), &user),
+                UserKey::Auth,
+            );
         let (outcome, warn_overflow, threshold) = {
             // Synchronous critical section, no `.await` under the guard.
             let mut l = limiter
@@ -8147,7 +8172,7 @@ impl SipStack {
         warn!(limit = %limit_name, source = %source, method = %req.method, "Per-user rate limit exceeded, 503");
         uc_audit::log_event(uc_audit::AuditEvent::RateLimitTriggered(
             uc_audit::event::RateLimitTriggered {
-                source_ip: source.ip(),
+                source_ip: client_of(source).ip(),
                 limit_name,
                 request_count: u64::from(threshold),
                 threshold: u64::from(threshold),
@@ -8886,6 +8911,32 @@ impl SipStack {
     #[cfg(feature = "cluster")]
     pub fn has_async_location_service(&self) -> bool {
         self.async_location_service.is_some()
+    }
+
+    /// [`Self::process_message_conn`] for a stream message whose
+    /// connection came through a trusted WebSocket proxy (SR-59). `source`
+    /// is the socket peer and stays the flow, registration and
+    /// response-routing key; `client` (the address the proxy reported) names
+    /// the sender in audit records and CDRs, keys the unauthenticated
+    /// per-user limiter and the VPS per-source checks (see [`client_of`]).
+    /// Trunk classification and INVITE source admission stay on the socket
+    /// peer, so a proxy cannot claim a trunk address.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3, SC-5, SC-7
+    pub async fn process_message_from(
+        &self,
+        data: &Bytes,
+        source: SbcSocketAddr,
+        client: Option<SbcSocketAddr>,
+        receiving_zone: Option<&str>,
+        transport: AddrTransport,
+        conn: Option<crate::stir_binding::ConnId>,
+    ) -> ProcessResult {
+        let processing = self.process_message_conn(data, source, receiving_zone, transport, conn);
+        match client {
+            Some(client) => WS_CLIENT.scope((source, client), processing).await,
+            None => processing.await,
+        }
     }
 
     /// Processes an incoming SIP message received over UDP.
@@ -10374,7 +10425,7 @@ impl SipStack {
                         action: "REGISTER".to_string(),
                         granted: false,
                         policy: "max-registrations".to_string(),
-                        source_ip: Some(source.ip()),
+                        source_ip: Some(client_of(source).ip()),
                     },
                 ));
                 let mut unavailable =
@@ -11112,7 +11163,7 @@ impl SipStack {
             } else {
                 uc_vps::CallDirection::Unknown
             };
-            let mut attempt = uc_vps::CallAttempt::new(source_ip)
+            let mut attempt = uc_vps::CallAttempt::new(client_of(source).ip().to_canonical())
                 .with_callee(dialed.screening_key())
                 .with_request_uri(req.uri.to_string())
                 .with_direction(direction)
@@ -12061,8 +12112,8 @@ impl SipStack {
                 caller_translated,
                 callee_dialed: dest_user.clone(),
                 callee_translated: (b_leg_user != dest_user).then(|| b_leg_user.clone()),
-                source_ip: source.ip().to_string(),
-                source_port: source.port(),
+                source_ip: client_of(source).ip().to_string(),
+                source_port: client_of(source).port(),
                 transport: crate::cdr::transport_of(transport),
                 ingress_zone: receiving_zone.map(str::to_string),
                 egress_zone: egress_zone.clone(),
@@ -20642,6 +20693,45 @@ pub mod tests {
         assert_eq!(authz[0].policy, "vps:blocklist");
         assert_eq!(authz[0].source_ip, Some(alice().ip()));
         assert_eq!(stack.emergency_admissions(), 0);
+    }
+
+    // SR-59 (AU-3): behind a trusted WS proxy the audit record names the
+    // client the proxy reported, while source admission (and every routing
+    // decision) stays on the socket peer; outside the scope nothing changes.
+    #[tokio::test]
+    async fn ws_proxied_message_audits_client_admits_on_socket() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let socket = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 40_001);
+        let client = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 0, 2, 77), 0);
+        let capture = uc_audit::capture::start();
+        let r = flatten(
+            stack
+                .process_message_from(
+                    &caller_request("INVITE", DIALED, "ws-proxy@acl", 1, None, Some(ALICE_SDP)),
+                    socket,
+                    Some(client),
+                    None,
+                    AddrTransport::WebSocket,
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&r, 403).is_some());
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1, "{authz:?}");
+        assert_eq!(authz[0].policy, "source-admission");
+        assert_eq!(authz[0].source_ip, Some(client.ip()));
+        drop(capture);
+
+        assert_eq!(client_of(socket), socket, "no scope: unchanged");
+        WS_CLIENT
+            .scope((socket, client), async {
+                assert_eq!(client_of(socket), client);
+                // Another address (a trunk, a callee) is never rewritten.
+                let other = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 1), 5060);
+                assert_eq!(client_of(other), other);
+            })
+            .await;
     }
 
     #[tokio::test]

@@ -59,6 +59,9 @@ enum Level {
     Source,
     /// The aggregate key (IPv6 `v6_aggregate_prefix_len` prefix or IPv4 /24).
     Aggregate,
+    /// A trusted WebSocket reverse proxy (exact address), for its
+    /// pre-handshake cap (SR-59).
+    Proxy,
 }
 
 #[derive(Debug, Default)]
@@ -67,9 +70,10 @@ struct Inner {
     /// key holds a connection, so the map is bounded by twice the
     /// connection pools.
     active: HashMap<(Level, IpAddr), u32>,
-    /// Handshakes in progress per (level, key). An entry exists only while
-    /// a handshake runs, and each runs under a connection slot, so the map
-    /// is bounded by twice the connection pools.
+    /// Handshakes in progress per (level, key), plus trusted-proxy
+    /// pre-handshake slots ([`Level::Proxy`]). An entry exists only while a
+    /// handshake runs, and each runs under a pool permit, so the map is
+    /// bounded by three times the connection pools.
     handshakes: HashMap<(Level, IpAddr), u32>,
     /// Rejections per (key, kind) since the last drain.
     rejected: HashMap<(IpAddr, Rejection), u64>,
@@ -100,6 +104,12 @@ pub enum Rejection {
     /// The source is blocked by the per-source rate limiter; the accept
     /// was dropped before any handshake.
     AcceptBlocked,
+    /// A trusted WebSocket proxy was at `ws_max_handshakes_per_proxy`
+    /// (keyed on the proxy, SR-59).
+    ProxyHandshakeBusy,
+    /// A trusted WebSocket proxy sent no, or an unusable, client address
+    /// (keyed on the proxy, SR-59).
+    ProxyHeader,
 }
 
 /// Totals drained by [`ConnLimiter::drain_rejections`].
@@ -150,6 +160,9 @@ pub struct ConnLimiter {
     max_handshakes_per_source: u32,
     /// Handshakes in progress allowed per aggregate.
     max_handshakes_per_aggregate: u32,
+    /// Connections from one trusted WebSocket proxy allowed before their
+    /// client is known (SR-59).
+    max_handshakes_per_proxy: u32,
     /// Configured trunk addresses (canonical), exempt from the aggregate
     /// level. At most [`MAX_TRUSTED_SOURCES`] entries.
     trusted: RwLock<HashSet<IpAddr>>,
@@ -163,6 +176,14 @@ pub struct HandshakeGuard {
     key: IpAddr,
     /// Aggregate key also charged, if that level applied.
     aggregate: Option<IpAddr>,
+}
+
+/// Holds one pre-handshake slot of a trusted WebSocket proxy; released on
+/// drop (including on panic or task abort).
+#[derive(Debug)]
+pub struct ProxyHandshakeGuard {
+    limiter: Arc<ConnLimiter>,
+    key: IpAddr,
 }
 
 /// Holds one connection slot for a source (and its aggregate); released on
@@ -234,6 +255,7 @@ impl ConnLimiter {
             aggregate_accept_rate: 0,
             max_handshakes_per_source: u32::MAX,
             max_handshakes_per_aggregate: u32::MAX,
+            max_handshakes_per_proxy: u32::MAX,
             trusted: RwLock::new(HashSet::new()),
         }
     }
@@ -307,6 +329,17 @@ impl ConnLimiter {
     #[must_use]
     pub fn with_aggregate_handshake_cap(mut self, per_aggregate: u32) -> Self {
         self.max_handshakes_per_aggregate = per_aggregate.max(1);
+        self
+    }
+
+    /// Caps the connections one trusted WebSocket proxy may hold before
+    /// their client address is known (`transport.ws_max_handshakes_per_proxy`,
+    /// at least 1; SR-59).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    #[must_use]
+    pub fn with_proxy_handshake_cap(mut self, per_proxy: u32) -> Self {
+        self.max_handshakes_per_proxy = per_proxy.max(1);
         self
     }
 
@@ -445,20 +478,6 @@ impl ConnLimiter {
         self.take_slot(key, aggregate)
     }
 
-    /// Takes a connection slot for `ip` without charging the accept
-    /// buckets ([`Rejection::PerSource`] or [`Rejection::PerAggregate`] at
-    /// a cap). For listeners whose accept address is not the client's,
-    /// such as WebSocket behind a proxy, where one bucket would be shared
-    /// by every client.
-    ///
-    /// ## NIST 800-53 Rev5: SC-5
-    pub fn try_admit_unmetered(self: &Arc<Self>, ip: IpAddr) -> Result<ConnGuard, Rejection> {
-        self.take_slot(
-            uc_dos_protection::source_key(ip, self.v6_prefix_len),
-            self.aggregate_of(ip),
-        )
-    }
-
     /// Takes a connection slot for source `key` and its aggregate, or
     /// counts a [`Rejection::PerSource`] / [`Rejection::PerAggregate`].
     /// The per-source cap is checked first; a rejection at either level
@@ -532,6 +551,51 @@ impl ConnLimiter {
             key,
             aggregate,
         })
+    }
+
+    /// Takes one pre-handshake slot for trusted WebSocket proxy `proxy`
+    /// (its exact canonical address), or `None` (counted as
+    /// [`Rejection::ProxyHandshakeBusy`] under the proxy) when it already
+    /// holds `max_handshakes_per_proxy`. Hold the guard until the client
+    /// address is known and admitted, or the handshake ends. Entries live
+    /// only while a slot is held, each under a pool permit, so the map stays
+    /// bounded by the connection pools.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub fn try_proxy_handshake(self: &Arc<Self>, proxy: IpAddr) -> Option<ProxyHandshakeGuard> {
+        let key = proxy.to_canonical();
+        let mut inner = self.lock();
+        if !take(
+            &mut inner.handshakes,
+            (Level::Proxy, key),
+            self.max_handshakes_per_proxy,
+        ) {
+            Self::count(&mut inner, key, Rejection::ProxyHandshakeBusy);
+            return None;
+        }
+        drop(inner);
+        Some(ProxyHandshakeGuard {
+            limiter: Arc::clone(self),
+            key,
+        })
+    }
+
+    /// Pre-handshake connections from one trusted proxy allowed.
+    pub fn max_handshakes_per_proxy(&self) -> u32 {
+        self.max_handshakes_per_proxy
+    }
+
+    /// Counts a connection from trusted proxy `proxy` refused because it
+    /// sent no, or an unusable, client address; aggregated per flush under
+    /// the proxy's address (`ws_proxy_header`).
+    ///
+    /// ## NIST 800-53 Rev5: AU-12, SC-7
+    pub fn note_proxy_header(&self, proxy: IpAddr) {
+        Self::count(
+            &mut self.lock(),
+            proxy.to_canonical(),
+            Rejection::ProxyHeader,
+        );
     }
 
     /// Counts an accept dropped because the source is blocked.
@@ -654,6 +718,15 @@ impl Drop for HandshakeGuard {
         if let Some(agg) = self.aggregate {
             release(&mut inner.handshakes, (Level::Aggregate, agg));
         }
+    }
+}
+
+impl Drop for ProxyHandshakeGuard {
+    fn drop(&mut self) {
+        release(
+            &mut self.limiter.lock().handshakes,
+            (Level::Proxy, self.key),
+        );
     }
 }
 
@@ -944,24 +1017,34 @@ mod sr56_accept_admission_tests {
         assert!(limiter.try_acquire(ip("192.0.2.5")).is_some());
     }
 
-    // SR-56: the WebSocket path takes a connection slot without charging
-    // the accept bucket; the per-source cap still applies.
+    // SR-59: the per-proxy pre-handshake cap counts per exact proxy
+    // address, releases on drop and is audited under the proxy.
     #[test]
-    fn unmetered_admit_skips_bucket_keeps_cap() {
-        let limiter = Arc::new(ConnLimiter::new(2, 64).with_accept_rate(1, 1, 1_024));
-        let a = ip("192.0.2.1");
-        let g1 = limiter.try_admit_unmetered(a).unwrap();
-        let g2 = limiter.try_admit_unmetered(a).unwrap();
+    fn proxy_handshake_cap_per_proxy_and_released() {
+        let limiter = Arc::new(ConnLimiter::new(2, 64).with_proxy_handshake_cap(2));
+        assert_eq!(limiter.max_handshakes_per_proxy(), 2);
+        let p = ip("10.0.0.1");
+        let g1 = limiter.try_proxy_handshake(p).unwrap();
+        let g2 = limiter.try_proxy_handshake(ip("::ffff:10.0.0.1")).unwrap();
+        assert!(limiter.try_proxy_handshake(p).is_none());
+        // Another proxy is unaffected, and no per-source slot is held.
+        let other = limiter.try_proxy_handshake(ip("10.0.0.2")).unwrap();
+        assert_eq!(limiter.active(p), 0);
+        drop(g1);
+        let g3 = limiter.try_proxy_handshake(p).unwrap();
+        limiter.note_proxy_header(p);
+        drop((g2, g3, other));
+        let mut seen = Vec::new();
+        let _ = limiter.drain_rejections(|k, kind, n| seen.push((k, kind, n)));
+        seen.sort_by_key(|(_, kind, _)| format!("{kind:?}"));
         assert_eq!(
-            limiter.try_admit_unmetered(a).err(),
-            Some(Rejection::PerSource)
+            seen,
+            vec![
+                (p, Rejection::ProxyHandshakeBusy, 1),
+                (p, Rejection::ProxyHeader, 1)
+            ]
         );
-        drop((g1, g2));
-        for _ in 0..10 {
-            drop(limiter.try_admit_unmetered(a).unwrap());
-        }
-        // The bucket was never charged: a metered accept still passes.
-        assert!(limiter.try_admit(a).is_ok());
+        assert_eq!(limiter.lock().handshakes.len(), 0);
     }
 }
 
