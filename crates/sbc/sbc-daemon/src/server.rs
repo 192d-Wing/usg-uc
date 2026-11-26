@@ -15,6 +15,7 @@ use crate::cluster::ClusterManager;
 use crate::digest_credentials::DigestCredentialStore;
 use crate::flow::{Flow, LegFlow};
 use crate::flows::{FlowKey, FlowTable};
+use crate::runtime::RuntimeError;
 use crate::shutdown::ShutdownSignal;
 use crate::sip_stack::{ProcessResult, SipStack, SipStackConfig};
 use proto_registrar::BearerAuthenticator;
@@ -566,6 +567,32 @@ pub fn bearer_mode_active(auth_mode: &str) -> bool {
     auth_mode.trim().eq_ignore_ascii_case("bearer")
 }
 
+/// Builds the `IdP` (OIDC metadata / JWKS) HTTP client: CNSA suites and
+/// groups only, OS trust store plus the optional `extra_ca_pem` bundle
+/// (`SBC_OIDC_EXTRA_CA_CERT_FILE`). An `IdP` that offers no CNSA suite fails
+/// the handshake, so bearer auth reports unready rather than falling back.
+///
+/// ## NIST 800-53 Rev5: SC-8(1), SC-13, IA-5(2)
+///
+/// # Errors
+/// Returns a description if the extra CA holds no usable certificate, the
+/// trust store is empty, or the client cannot be built.
+pub fn build_idp_http_client(extra_ca_pem: Option<&[u8]>) -> Result<reqwest::Client, String> {
+    // TLS 1.2 + 1.3 (CNSA suites only), like the other management-plane
+    // clients; independent of `security.min_tls_version` (SIP-TLS).
+    let tls = uc_transport::https_client::create_https_client_config(
+        extra_ca_pem,
+        uc_transport::tls::MinTlsVersion::V1_2,
+    )
+    .map_err(|e| e.to_string())?;
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 /// The configured SIP listener transports that carry REGISTER in cleartext
 /// (`udp`, `tcp`, `ws`) while digest authentication is required; empty
 /// when digest is off or every SIP listener is TLS / WSS.
@@ -597,11 +624,15 @@ pub fn digest_cleartext_transports(config: &SbcConfig) -> Vec<&'static str> {
 impl Server {
     /// Creates a new server. `digest_credentials` is the `[digest_auth]`
     /// credential store the runtime loaded (`None` when digest is off).
+    ///
+    /// # Errors
+    /// [`RuntimeError::InitFailed`] when `SBC_AUTH_MODE=bearer` is set and
+    /// the bearer authorizer cannot be built (fail closed).
     pub fn new(
         config: SbcConfig,
         shutdown: ShutdownSignal,
         digest_credentials: Option<Arc<DigestCredentialStore>>,
-    ) -> Self {
+    ) -> Result<Self, RuntimeError> {
         // Use standard SBC metrics
         let metrics = SbcMetrics::standard();
 
@@ -618,7 +649,7 @@ impl Server {
         let mut sip_stack = SipStack::new(sip_config);
         let media_failure_rx = Self::init_sip_stack_from_config(&mut sip_stack, &config);
         Self::init_user_rate_limiter(&mut sip_stack, &config);
-        if let Some(bearer) = Self::build_bearer_authenticator(&config) {
+        if let Some(bearer) = Self::build_bearer_authenticator(&config)? {
             sip_stack.set_bearer_authenticator(bearer);
         }
         Self::warn_if_register_unauthenticated(&sip_stack);
@@ -628,7 +659,7 @@ impl Server {
         let stream_rate_limiter = Self::build_rate_limiter(&config, LimiterKind::Stream);
         let global_limiter = Self::build_global_limiter(&config);
 
-        Self {
+        Ok(Self {
             config,
             shutdown,
             health,
@@ -651,7 +682,7 @@ impl Server {
             media_pool: None,
             #[cfg(feature = "cluster")]
             cluster: None,
-        }
+        })
     }
 
     /// Sets the zone registry for interface-based binding.
@@ -715,13 +746,16 @@ impl Server {
     }
 
     /// Creates a new server with cluster support.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
     #[cfg(feature = "cluster")]
     pub fn new_with_cluster(
         config: SbcConfig,
         shutdown: ShutdownSignal,
         cluster: Option<Arc<ClusterManager>>,
         digest_credentials: Option<Arc<DigestCredentialStore>>,
-    ) -> Self {
+    ) -> Result<Self, RuntimeError> {
         let metrics = SbcMetrics::standard();
 
         let mut health = HealthChecker::new(HealthCheckerConfig::default())
@@ -742,7 +776,7 @@ impl Server {
         };
         let media_failure_rx = Self::init_sip_stack_from_config(&mut sip_stack, &config);
         Self::init_user_rate_limiter(&mut sip_stack, &config);
-        if let Some(bearer) = Self::build_bearer_authenticator(&config) {
+        if let Some(bearer) = Self::build_bearer_authenticator(&config)? {
             sip_stack.set_bearer_authenticator(bearer);
         }
         Self::warn_if_register_unauthenticated(&sip_stack);
@@ -753,7 +787,7 @@ impl Server {
         let stream_rate_limiter = Self::build_rate_limiter(&config, LimiterKind::Stream);
         let global_limiter = Self::build_global_limiter(&config);
 
-        Self {
+        Ok(Self {
             config,
             shutdown,
             health,
@@ -775,7 +809,7 @@ impl Server {
             #[cfg(feature = "grpc")]
             media_pool: None,
             cluster,
-        }
+        })
     }
 
     /// Builds `SipStackConfig` from `SbcConfig`. `digest_credentials` is
@@ -949,80 +983,115 @@ impl Server {
     /// over a rustls client that optionally trusts an extra CA (the internal
     /// IdP). The JWKS cache lazy-loads on the first REGISTER, so no async
     /// work is needed here.
-    fn build_bearer_authenticator(config: &SbcConfig) -> Option<Arc<BearerAuthenticator>> {
-        let mode = std::env::var("SBC_AUTH_MODE").unwrap_or_default();
-        if !bearer_mode_active(&mode) {
-            return None;
-        }
+    ///
+    /// # Errors
+    /// [`RuntimeError::InitFailed`] (`bearer_auth`) when bearer mode is on
+    /// but the authorizer cannot be built. The runtime refuses digest in
+    /// bearer mode, so continuing would leave REGISTER unauthenticated.
+    ///
+    /// ## NIST 800-53 Rev5: IA-2, CM-6, SC-24 (fail closed)
+    fn build_bearer_authenticator(
+        config: &SbcConfig,
+    ) -> Result<Option<Arc<BearerAuthenticator>>, RuntimeError> {
+        Self::build_bearer_authenticator_from(config, |k| std::env::var(k).ok())
+    }
 
-        let issuer = match std::env::var("SBC_OIDC_ISSUER") {
-            Ok(v) if !v.trim().is_empty() => v.trim().trim_end_matches('/').to_string(),
-            _ => {
-                error!("SBC_AUTH_MODE=bearer but SBC_OIDC_ISSUER is unset — bearer auth disabled");
-                return None;
+    /// [`Self::build_bearer_authenticator`] over an explicit variable lookup.
+    fn build_bearer_authenticator_from(
+        config: &SbcConfig,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<Arc<BearerAuthenticator>>, RuntimeError> {
+        let mode = env("SBC_AUTH_MODE").unwrap_or_default();
+        if !bearer_mode_active(&mode) {
+            return Ok(None);
+        }
+        // `audit_reason` goes to the audit trail and must not carry a path
+        // or URL. NIST 800-53 Rev5: AU-2, AU-12 (startup refusal audited)
+        let fail = |audit_reason: &str, reason: String| {
+            error!(error = %reason, "bearer REGISTER authentication cannot start — SBC cannot start");
+            uc_audit::log_event(uc_audit::AuditEvent::CryptoKeyOperation(
+                uc_audit::event::CryptoKeyOperation::failure(
+                    BEARER_AUDIT_KEY_ID,
+                    uc_audit::event::KeyOperationType::Loaded,
+                    "ES384",
+                    audit_reason,
+                ),
+            ));
+            RuntimeError::InitFailed {
+                component: "bearer_auth".to_string(),
+                reason,
             }
         };
 
-        let audiences: Vec<String> = std::env::var("SBC_OIDC_AUDIENCE")
-            .unwrap_or_else(|_| "sbc".to_string())
+        let issuer = match env("SBC_OIDC_ISSUER") {
+            Some(v) if !v.trim().is_empty() => v.trim().trim_end_matches('/').to_string(),
+            _ => {
+                return Err(fail(
+                    "missing issuer",
+                    "SBC_AUTH_MODE=bearer requires SBC_OIDC_ISSUER".to_string(),
+                ));
+            }
+        };
+
+        let audiences: Vec<String> = env("SBC_OIDC_AUDIENCE")
+            .unwrap_or_else(|| "sbc".to_string())
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
         if audiences.is_empty() {
-            error!("SBC_OIDC_AUDIENCE resolved to an empty set — bearer auth disabled");
-            return None;
+            return Err(fail(
+                "empty audience",
+                "SBC_OIDC_AUDIENCE resolved to an empty set".to_string(),
+            ));
         }
 
-        let realm = std::env::var("SBC_OIDC_REALM")
-            .ok()
+        let realm = env("SBC_OIDC_REALM")
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| config.general.instance_name.clone());
 
-        let mut http_builder = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10));
-        if let Ok(path) = std::env::var("SBC_OIDC_EXTRA_CA_CERT_FILE")
+        let mut extra_ca = None;
+        if let Some(path) = env("SBC_OIDC_EXTRA_CA_CERT_FILE")
             && !path.trim().is_empty()
         {
-            match std::fs::read(&path) {
-                Ok(pem) => match reqwest::Certificate::from_pem(&pem) {
-                    Ok(cert) => {
-                        info!(path, "loaded extra CA certificate for IdP JWKS fetch");
-                        http_builder = http_builder.add_root_certificate(cert);
-                    }
-                    Err(e) => {
-                        error!(path, error = %e, "failed to parse SBC_OIDC_EXTRA_CA_CERT_FILE — bearer auth disabled");
-                        return None;
-                    }
-                },
-                Err(e) => {
-                    error!(path, error = %e, "failed to read SBC_OIDC_EXTRA_CA_CERT_FILE — bearer auth disabled");
-                    return None;
-                }
-            }
+            let pem = std::fs::read(&path).map_err(|e| {
+                fail(
+                    "extra CA file unreadable",
+                    format!("failed to read SBC_OIDC_EXTRA_CA_CERT_FILE {path}: {e}"),
+                )
+            })?;
+            info!(path, "loaded extra CA certificate for IdP JWKS fetch");
+            extra_ca = Some(pem);
         }
 
-        let http = match http_builder.build() {
-            Ok(c) => c,
-            Err(e) => {
-                error!(error = %e, "failed to build IdP HTTP client — bearer auth disabled");
-                return None;
-            }
-        };
+        // Fails closed on an unparsable extra CA (`create_https_client_config`).
+        let http = build_idp_http_client(extra_ca.as_deref()).map_err(|e| {
+            fail(
+                "IdP HTTP client",
+                format!("failed to build IdP HTTP client: {e}"),
+            )
+        })?;
 
         let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer.clone()));
-        let validator = Arc::new(proto_jwt::Validator::new(
+        // NIST 800-53 Rev5: IA-2, AC-3 (non-empty iss/aud enforced)
+        let validator = proto_jwt::Validator::new(
             jwks,
             proto_jwt::ValidatorConfig::new(issuer.clone(), audiences.clone()),
-        ));
+        )
+        .map(Arc::new)
+        .map_err(|e| {
+            fail(
+                "invalid validator config",
+                format!("invalid OIDC validator config: {e}"),
+            )
+        })?;
         info!(
             %issuer,
             ?audiences,
             %realm,
             "RFC 8898 Bearer-token REGISTER authorization enabled"
         );
-        Some(Arc::new(BearerAuthenticator::new(validator, realm)))
+        Ok(Some(Arc::new(BearerAuthenticator::new(validator, realm))))
     }
 
     /// Installs the per-user limiter (`rate_limit.per_user_rps`) on the SIP
@@ -4749,6 +4818,9 @@ impl Drop for StirConnGuard {
     }
 }
 
+/// Audit `key_id` for bearer (OIDC) REGISTER authentication startup.
+const BEARER_AUDIT_KEY_ID: &str = "bearer_auth.oidc";
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -4875,7 +4947,7 @@ mod tests {
     fn test_server_creation() {
         let config = SbcConfig::default();
         let shutdown = ShutdownSignal::new();
-        let server = Server::new(config, shutdown, None);
+        let server = Server::new(config, shutdown, None).unwrap();
 
         assert_eq!(server.config().general.instance_name, "sbc-01");
     }
@@ -4884,7 +4956,7 @@ mod tests {
     async fn test_server_health() {
         let config = SbcConfig::default();
         let shutdown = ShutdownSignal::new();
-        let mut server = Server::new(config, shutdown, None);
+        let mut server = Server::new(config, shutdown, None).unwrap();
 
         assert!(server.is_alive());
         assert!(server.is_ready());
@@ -4897,7 +4969,7 @@ mod tests {
     async fn test_server_stats() {
         let config = SbcConfig::default();
         let shutdown = ShutdownSignal::new();
-        let server = Server::new(config, shutdown, None);
+        let server = Server::new(config, shutdown, None).unwrap();
 
         assert_eq!(server.stats().calls_total.load(Ordering::Relaxed), 0);
         assert_eq!(server.stats().messages_received.load(Ordering::Relaxed), 0);
@@ -6177,9 +6249,9 @@ mod tests {
                 .is_some_and(|s| Arc::ptr_eq(&s, &store))
         );
         // No "UNAUTHENTICATED" state once configured.
-        let server = Server::new(config, ShutdownSignal::new(), Some(store));
+        let server = Server::new(config, ShutdownSignal::new(), Some(store)).unwrap();
         assert!(server.sip_stack().register_auth_enabled());
-        let off = Server::new(SbcConfig::default(), ShutdownSignal::new(), None);
+        let off = Server::new(SbcConfig::default(), ShutdownSignal::new(), None).unwrap();
         assert!(!off.sip_stack().register_auth_enabled());
     }
 
@@ -6200,6 +6272,127 @@ mod tests {
             "bearer,digest",
         ] {
             assert!(!bearer_mode_active(off), "{off:?}");
+        }
+    }
+
+    fn bearer_env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    fn bearer_auth_err(vars: &[(&str, &str)]) -> String {
+        let Err(err) =
+            Server::build_bearer_authenticator_from(&SbcConfig::default(), bearer_env(vars))
+        else {
+            unreachable!("bearer authorizer built; expected startup refusal");
+        };
+        match err {
+            RuntimeError::InitFailed { component, reason } => {
+                assert_eq!(component, "bearer_auth");
+                reason
+            }
+            other => unreachable!("unexpected error {other:?}"),
+        }
+    }
+
+    // SEC-001 / NIST-03: bearer mode that cannot be built refuses startup
+    // instead of leaving REGISTER unauthenticated.
+    #[test]
+    fn bearer_mode_without_issuer_refuses_startup() {
+        let reason = bearer_auth_err(&[("SBC_AUTH_MODE", "bearer")]);
+        assert!(reason.contains("SBC_OIDC_ISSUER"), "{reason}");
+        let reason = bearer_auth_err(&[("SBC_AUTH_MODE", "bearer"), ("SBC_OIDC_ISSUER", "  ")]);
+        assert!(reason.contains("SBC_OIDC_ISSUER"), "{reason}");
+    }
+
+    #[test]
+    fn bearer_mode_with_empty_audience_refuses_startup() {
+        let reason = bearer_auth_err(&[
+            ("SBC_AUTH_MODE", "bearer"),
+            ("SBC_OIDC_ISSUER", "https://idp.example.test/realms/voice"),
+            ("SBC_OIDC_AUDIENCE", " , "),
+        ]);
+        assert!(reason.contains("SBC_OIDC_AUDIENCE"), "{reason}");
+    }
+
+    #[test]
+    fn bearer_mode_with_unreadable_extra_ca_refuses_startup() {
+        let reason = bearer_auth_err(&[
+            ("SBC_AUTH_MODE", "bearer"),
+            ("SBC_OIDC_ISSUER", "https://idp.example.test/realms/voice"),
+            ("SBC_OIDC_EXTRA_CA_CERT_FILE", "/nonexistent/idp-ca.pem"),
+        ]);
+        assert!(reason.contains("SBC_OIDC_EXTRA_CA_CERT_FILE"), "{reason}");
+    }
+
+    // SEC-R1-01: a bearer startup refusal is audited as a failure, with a
+    // reason that carries no path or URL.
+    #[test]
+    fn bearer_startup_refusal_is_audited_as_a_failure() {
+        use uc_audit::event::{KeyOperationOutcome, KeyOperationType};
+        let issuer = ("SBC_OIDC_ISSUER", "https://idp.example.test/realms/voice");
+        for (vars, needle) in [
+            (vec![("SBC_AUTH_MODE", "bearer")], "missing issuer"),
+            (
+                vec![
+                    ("SBC_AUTH_MODE", "bearer"),
+                    issuer,
+                    ("SBC_OIDC_AUDIENCE", " , "),
+                ],
+                "empty audience",
+            ),
+            (
+                vec![
+                    ("SBC_AUTH_MODE", "bearer"),
+                    issuer,
+                    ("SBC_OIDC_EXTRA_CA_CERT_FILE", "/nonexistent/idp-ca.pem"),
+                ],
+                "extra CA file unreadable",
+            ),
+        ] {
+            let capture = uc_audit::capture::start();
+            let _ = bearer_auth_err(&vars);
+            let events: Vec<_> = capture
+                .events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    uc_audit::AuditEvent::CryptoKeyOperation(k) => Some(k),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(events.len(), 1, "{needle}: {events:?}");
+            let f = &events[0];
+            assert_eq!(f.key_id, BEARER_AUDIT_KEY_ID);
+            assert_eq!(f.operation, KeyOperationType::Loaded);
+            assert_eq!(f.outcome, KeyOperationOutcome::Failure);
+            let reason = f.reason.as_deref().unwrap_or_default();
+            assert_eq!(reason, needle);
+        }
+    }
+
+    #[test]
+    fn bearer_mode_with_issuer_builds_authenticator() {
+        let built = Server::build_bearer_authenticator_from(
+            &SbcConfig::default(),
+            bearer_env(&[
+                ("SBC_AUTH_MODE", "bearer"),
+                ("SBC_OIDC_ISSUER", "https://idp.example.test/realms/voice/"),
+            ]),
+        )
+        .unwrap();
+        assert!(built.is_some());
+    }
+
+    #[test]
+    fn bearer_mode_off_builds_nothing() {
+        for vars in [&[][..], &[("SBC_AUTH_MODE", "digest")][..]] {
+            let built =
+                Server::build_bearer_authenticator_from(&SbcConfig::default(), bearer_env(vars))
+                    .unwrap();
+            assert!(built.is_none());
         }
     }
 
@@ -6291,7 +6484,7 @@ mod tests {
 
     #[tokio::test]
     async fn recording_off_wires_nothing() {
-        let mut server = Server::new(SbcConfig::default(), ShutdownSignal::new(), None);
+        let mut server = Server::new(SbcConfig::default(), ShutdownSignal::new(), None).unwrap();
         server.wire_recording().await.unwrap();
         assert!(!server.sip_stack().recording_enabled());
         assert!(
@@ -6333,7 +6526,7 @@ mod tests {
                 "key" => config.security.tls_key_path = None,
                 _ => config.transport.tls_listen.clear(),
             }
-            let mut server = Server::new(config, ShutdownSignal::new(), None);
+            let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
             let err = startup_error(server.start().await);
             assert!(
                 err.contains("TLS listener with a certificate"),
@@ -6350,13 +6543,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ca = dir.path().join("sbc.crt");
         let config = recording_config(dir.path(), "sips:srs.recorder.invalid:5061", &ca);
-        let mut server = Server::new(config, ShutdownSignal::new(), None);
+        let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
         let err = startup_error(server.wire_recording().await);
         assert!(err.contains("does not resolve"), "{err}");
         assert!(!server.sip_stack().recording_enabled());
         // Not a sips: URI (validation rejects it first; the daemon too).
         let config = recording_config(dir.path(), "sip:127.0.0.1:5060", &ca);
-        let mut server = Server::new(config, ShutdownSignal::new(), None);
+        let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
         let err = startup_error(server.wire_recording().await);
         assert!(err.contains("sips:"), "{err}");
     }
@@ -6372,7 +6565,7 @@ mod tests {
         let missing = dir.path().join("missing.pem");
         for ca in [&empty, &missing] {
             let config = recording_config(dir.path(), "sips:127.0.0.1:5061", ca);
-            let mut server = Server::new(config, ShutdownSignal::new(), None);
+            let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
             let err = startup_error(server.wire_recording().await);
             assert!(err.contains("recording.srs_tls_ca_file"), "{err}");
             assert!(!server.sip_stack().recording_enabled());
@@ -6388,7 +6581,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ca = dir.path().join("sbc.crt");
         let config = recording_config(dir.path(), "sips:127.0.0.1:59", &ca);
-        let mut server = Server::new(config, ShutdownSignal::new(), None);
+        let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
         let capture = uc_audit::capture::start();
         server.wire_recording().await.unwrap();
         assert!(server.sip_stack().recording_enabled());
@@ -6686,6 +6879,18 @@ mod tests {
             ips.iter().copied().collect()
         }
 
+        /// UDP trunk source keys for `ips` (SR-04 keys trunks by transport).
+        fn trunk_keys(ips: &HashSet<IpAddr>) -> HashSet<crate::sip_stack::TrunkSourceKey> {
+            ips.iter()
+                .filter_map(|ip| {
+                    crate::sip_stack::TrunkSourceKey::new(
+                        *ip,
+                        uc_types::address::TransportType::Udp,
+                    )
+                })
+                .collect()
+        }
+
         #[tokio::test]
         async fn udp_limiter_from_default_config_never_auto_blocks() {
             let config = SbcConfig::default();
@@ -6760,7 +6965,7 @@ mod tests {
             let mut config = SbcConfig::default();
             config.rate_limit.udp_auto_block = true;
             config.rate_limit.per_ip_rps = 2;
-            let server = Server::new(config, ShutdownSignal::new(), None);
+            let server = Server::new(config, ShutdownSignal::new(), None).unwrap();
             assert!(!Arc::ptr_eq(
                 &server.udp_rate_limiter,
                 &server.stream_rate_limiter
@@ -6802,7 +7007,7 @@ mod tests {
             let mut rx = stack.trunk_sources();
             let t = ip("203.0.113.9");
             stack
-                .register_inbound_trunk_ips("g", None, &trusted_set(&[t]))
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[t])))
                 .await;
             assert!(rx.has_changed().unwrap(), "no snapshot published");
             let set = rx.borrow_and_update().clone();
@@ -6821,7 +7026,7 @@ mod tests {
             let mut rx = stack.trunk_sources();
             let t = ip("203.0.113.10");
             stack
-                .register_inbound_trunk_ips("g", None, &trusted_set(&[t]))
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[t])))
                 .await;
             let set = rx.borrow_and_update().clone();
             Server::apply_trusted_sources(&set, &udp, &stream).await;
@@ -6849,7 +7054,7 @@ mod tests {
             "#,
             )
             .unwrap();
-            let server = Server::new(config, ShutdownSignal::new(), None);
+            let server = Server::new(config, ShutdownSignal::new(), None).unwrap();
             let t = ip("192.0.2.1");
             let set = server.sip_stack.trunk_sources().borrow().clone();
             assert!(set.contains(&t), "config trunk missing from snapshot");
@@ -7009,7 +7214,7 @@ mod tests {
             let mut ctx = stream_test_ctx(short_timeouts());
             let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
             stack
-                .register_inbound_trunk_ips("g", None, &trusted_set(&[trunk]))
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[trunk])))
                 .await;
             let trunks = stack.trunk_sources().borrow().clone();
             let other = Server::build_rate_limiter(&SbcConfig::default(), LimiterKind::Udp);
@@ -7055,12 +7260,12 @@ mod tests {
             let mut rx = stack.trunk_sources();
             let t = ip("203.0.113.15");
             stack
-                .register_inbound_trunk_ips("g", None, &trusted_set(&[t]))
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[t])))
                 .await;
             assert!(rx.has_changed().unwrap());
             let _ = rx.borrow_and_update();
             stack
-                .register_inbound_trunk_ips("g", None, &trusted_set(&[t]))
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[t])))
                 .await;
             assert!(!rx.has_changed().unwrap(), "unchanged set republished");
         }
@@ -7074,7 +7279,9 @@ mod tests {
             let ips: HashSet<IpAddr> = (0..u32::try_from(max).unwrap() + 5)
                 .map(|n| IpAddr::V4(Ipv4Addr::from(0x0A00_0000 | n)))
                 .collect();
-            stack.register_inbound_trunk_ips("g", None, &ips).await;
+            stack
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&ips))
+                .await;
             let set = stack.trunk_sources().borrow().clone();
             assert_eq!(set.len(), max);
             assert!(set.is_sorted());
@@ -7100,7 +7307,7 @@ mod tests {
             ));
             let t = ip("203.0.113.13");
             stack
-                .register_inbound_trunk_ips("g", None, &trusted_set(&[t]))
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[t])))
                 .await;
             let mut synced = false;
             for _ in 0..200 {
@@ -7349,7 +7556,7 @@ mod tests {
     async fn udp_block_does_not_refuse_tls_accept() {
         let mut config = SbcConfig::default();
         config.rate_limit.udp_auto_block = true;
-        let server = Server::new(config, ShutdownSignal::new(), None);
+        let server = Server::new(config, ShutdownSignal::new(), None).unwrap();
         assert!(
             server
                 .udp_rate_limiter
@@ -8793,7 +9000,7 @@ mod tests {
             config.transport.ws_listen = vec!["127.0.0.1:0".parse().unwrap()];
             config.transport.ws_trusted_proxies = vec!["127.0.0.0/8".to_string()];
             config.transport.ws_client_address = sbc_config::schema::WsClientAddress::XForwardedFor;
-            let mut server = Server::new(config, ShutdownSignal::new(), None);
+            let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
             server.bind_ws_listeners().await.unwrap();
             let listeners = server.ws_listeners.read().await;
             assert_eq!(listeners.len(), 1);
@@ -9077,5 +9284,26 @@ mod tests {
             assert!(trusted(ip("::ffff:10.1.2.3")));
             assert!(!trusted(ip("11.0.0.1")));
         }
+    }
+}
+
+// SR-16: the IdP/JWKS HTTP client is CNSA-only (uc-transport
+// `create_https_client_config` via reqwest `use_preconfigured_tls`).
+#[cfg(test)]
+#[path = "../../../uc/uc-transport/tests/common/cnsa_reqwest_checks.rs"]
+mod cnsa_reqwest_checks;
+
+#[cfg(test)]
+mod sr16_idp_http_client_tests {
+    use super::cnsa_reqwest_checks as checks;
+
+    #[tokio::test]
+    async fn sbc_daemon_http_client_trusts_extra_ca() {
+        checks::assert_trusts_extra_ca(super::build_idp_http_client).await;
+    }
+
+    #[tokio::test]
+    async fn sbc_daemon_http_client_refuses_non_cnsa_server() {
+        checks::assert_refuses_non_cnsa(super::build_idp_http_client).await;
     }
 }

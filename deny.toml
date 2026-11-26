@@ -57,6 +57,33 @@ multiple-versions = "warn"
 # published to crates.io, so path wildcards are expected; registry
 # dependencies in this tree all carry versions.
 wildcards = "allow"
+# SR-16: first-party crypto goes through uc-crypto (aws-lc FIPS module).
+# The wrappers are the remaining users, each tracked: third-party sqlx-postgres
+# Postgres client auth (SCRAM / MD5) is POA&M-403.
+# NIST 800-53 Rev5: SC-13, SR-3, CM-7
+deny = [
+    { crate = "ring", reason = "non-FIPS crypto; use aws-lc-rs (SR-16)" },
+    { crate = "hmac", wrappers = ["hkdf", "radius-proto", "sqlx-postgres"], reason = "use uc_crypto::hash (SR-16); sqlx-postgres SCRAM is POA&M-403" },
+    { crate = "hkdf", wrappers = ["dbus-secret-service", "sqlx-postgres"], reason = "use uc_crypto::hkdf (SR-16); sqlx-postgres SCRAM is POA&M-403" },
+    { crate = "sha2", wrappers = ["dbus-secret-service", "radius-proto", "sqlx-core", "sqlx-macros-core", "sqlx-postgres", "tauri-codegen", "wry", "uc-user-mgmt"], reason = "use uc_crypto (SR-16); uc-user-mgmt SIP digest HA1 is POA&M-110; sqlx-postgres SCRAM is POA&M-403" },
+    { crate = "sha1", wrappers = ["tungstenite"], reason = "WebSocket accept key only (RFC 6455), not a security function" },
+    { crate = "aes", wrappers = ["dbus-secret-service"], reason = "use uc_crypto::aead (SR-16); Linux keyring transport is POA&M-373" },
+    { crate = "aes-gcm", reason = "use uc_crypto::aead (SR-16)" },
+    { crate = "cbc", wrappers = ["dbus-secret-service"], reason = "Linux keyring transport only, POA&M-373" },
+    { crate = "chacha20poly1305", reason = "not CNSA (SR-16)" },
+    { crate = "rsa", reason = "use aws-lc-rs (SR-16)" },
+    { crate = "p256", reason = "use uc_crypto / aws-lc-rs (SR-16)" },
+    { crate = "p384", reason = "use uc_crypto::ecdsa / ecdh (SR-16)" },
+    { crate = "ed25519-dalek", reason = "not CNSA (SR-16)" },
+    { crate = "x25519-dalek", reason = "not CNSA (SR-16)" },
+    { crate = "blake2", wrappers = ["argon2"], reason = "argon2id admin passwords only, POA&M-402" },
+    { crate = "argon2", wrappers = ["uc-auth"], reason = "POA&M-402" },
+    { crate = "md5", wrappers = ["proto-sip", "proto-registrar", "radius-proto"], reason = "SIP digest MD5 interop only, POA&M-276" },
+    { crate = "md-5", wrappers = ["radius-proto", "sqlx-postgres"], reason = "third-party only; sqlx-postgres MD5 auth is POA&M-403" },
+    { crate = "native-tls", wrappers = ["diameter", "ldap3", "tokio-native-tls"], reason = "OpenSSL TLS outside the aws-lc module; only dormant uc-aaa diameter / uc-user-mgmt LDAP features, in no shipped binary; use rustls on cnsa_provider (SR-16)" },
+    { crate = "openssl", wrappers = ["native-tls"], reason = "only via native-tls (SR-16)" },
+    { crate = "openssl-sys", wrappers = ["native-tls", "openssl"], reason = "only via native-tls (SR-16)" },
+]
 
 [sources]
 unknown-registry = "deny"

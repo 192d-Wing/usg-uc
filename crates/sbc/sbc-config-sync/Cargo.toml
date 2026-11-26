@@ -36,8 +36,10 @@ central-config-store = { path = "../central-config-store" }
 # The site-local schema/migrations + MAC normalization the apply engine
 # writes against.
 sbc-config-store = { workspace = true }
-# HTTP client for the central sync API. rustls only.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# HTTP client for the central sync API. No bundled crypto provider: TLS is
+# the CNSA config from uc-transport `https-client`.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-no-provider"] }
+uc-transport = { workspace = true, default-features = false, features = ["https-client"] }
 # gRPC clients for the best-effort daemon refresh after an apply (so
 # dial-plan/trunk/routing changes take effect without a daemon restart).
 sbc-grpc-api = { workspace = true }
@@ -47,3 +49,10 @@ tonic = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 # Serve the mock daemon's gRPC services on an ephemeral port in the wire test.
 tokio-stream = { version = "0.1", features = ["net"] }
+# SR-16 HTTPS client tests (uc-transport/tests/common/cnsa_*.rs): random
+# P-384 PKI + in-process TLS server. rustls is not `workspace = true` on
+# purpose: the workspace entry enables `fips`, which would mask the
+# binary's own FIPS posture in tests.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio-rustls.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }

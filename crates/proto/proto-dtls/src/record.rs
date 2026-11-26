@@ -186,8 +186,8 @@ impl RecordHeader {
 ///
 /// Handles AES-256-GCM encryption with CNSA 2.0 compliance.
 pub struct RecordLayer {
-    /// Write key for encryption.
-    write_key: Option<Aes256GcmKey>,
+    /// Write key: the module's TLS 1.2 GCM seal.
+    write_key: Option<Tls12GcmSealer>,
     /// Read key for decryption.
     read_key: Option<Aes256GcmKey>,
     /// Write implicit IV (first 4 bytes of nonce).
@@ -225,7 +225,7 @@ impl RecordLayer {
     /// This should be called after the `ChangeCipherSpec` message.
     pub fn activate_cipher(
         &mut self,
-        write_key: Aes256GcmKey,
+        write_key: Tls12GcmSealer,
         read_key: Aes256GcmKey,
         write_iv: [u8; 4],
         read_iv: [u8; 4],
@@ -250,7 +250,8 @@ impl RecordLayer {
     ///
     /// ## Errors
     ///
-    /// Returns an error if encryption fails.
+    /// Returns an error if encryption fails, including a non-increasing
+    /// explicit nonce (refused by the module's TLS 1.2 seal).
     pub fn encrypt_record(
         &mut self,
         content_type: ContentType,
@@ -273,7 +274,7 @@ impl RecordLayer {
             length: 0, // Will be set after encryption
         };
 
-        let output = if let Some(ref key) = self.write_key {
+        let output = if let Some(ref mut key) = self.write_key {
             // Build nonce: 4 byte implicit IV + 8 byte explicit nonce
             let explicit_nonce = header.explicit_nonce();
             let mut nonce = [0u8; NONCE_LEN];
@@ -291,7 +292,8 @@ impl RecordLayer {
             #[allow(clippy::cast_possible_truncation)]
             aad[11..13].copy_from_slice(&(fragment.len() as u16).to_be_bytes());
 
-            // Encrypt
+            // Encrypt. RFC 5288 §3: the explicit nonce (epoch || seq) only
+            // increases, which the module's TLS 1.2 seal enforces.
             let ciphertext =
                 key.seal(&nonce, &aad, fragment)
                     .map_err(|e| DtlsError::EncryptionFailed {
@@ -1053,8 +1055,9 @@ mod tests {
         let mut layer = RecordLayer::new();
 
         // Generate keys
-        let write_key = Aes256GcmKey::generate().unwrap();
-        let read_key = Aes256GcmKey::new(*write_key.as_bytes()).unwrap();
+        let key_bytes = zeroize::Zeroizing::new(uc_crypto::random::generate_key_256().unwrap());
+        let write_key = Tls12GcmSealer::new(&key_bytes).unwrap();
+        let read_key = Aes256GcmKey::new(*key_bytes).unwrap();
         let write_iv = [1u8, 2, 3, 4];
         let read_iv = write_iv;
 
@@ -1269,5 +1272,100 @@ mod tests {
         a.raise_plaintext_write_sequence(5);
         let rec = a.seal(0, ContentType::Handshake, b"x").unwrap();
         assert_eq!(only_record(&rec).sequence_number, 5);
+    }
+}
+
+/// SR-15: the legacy `RecordLayer` write key is the module's TLS 1.2 GCM
+/// sealer (`Tls12GcmSealer`); the record bytes do not change. Random runtime
+/// keys only.
+///
+/// Note: the legacy layer's AAD is `type || version || epoch || seq || len`,
+/// not the RFC 5246 §6.2.3.3 order used by `AssociationRecordLayer`
+/// (`epoch || seq || type || version || len`), so legacy records do not open
+/// with the association reader before or after SR-15. The reference below
+/// pins the legacy layout instead.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod sr15_legacy_record_layer_tests {
+    use super::*;
+    use uc_crypto::aead::CachedAeadKey;
+    use zeroize::Zeroizing;
+
+    /// The record the pre-SR-15 `RecordLayer` produced (caller-IV GCM seal,
+    /// legacy AAD order), built independently of the production helpers.
+    fn reference_record(
+        key: &[u8; KEY_LEN],
+        iv: [u8; 4],
+        content_type: ContentType,
+        epoch: u16,
+        seq: u64,
+        fragment: &[u8],
+    ) -> Vec<u8> {
+        let seq6 = &seq.to_be_bytes()[2..];
+        let mut explicit = Vec::with_capacity(8);
+        explicit.extend_from_slice(&epoch.to_be_bytes());
+        explicit.extend_from_slice(seq6);
+        let nonce: [u8; NONCE_LEN] = [&iv[..], &explicit].concat().try_into().unwrap();
+        let mut aad = vec![content_type as u8];
+        aad.extend_from_slice(&DTLS_1_2_VERSION.to_be_bytes());
+        aad.extend_from_slice(&epoch.to_be_bytes());
+        aad.extend_from_slice(seq6);
+        aad.extend_from_slice(&u16::try_from(fragment.len()).unwrap().to_be_bytes());
+        let ct = CachedAeadKey::new(key)
+            .unwrap()
+            .seal(&nonce, &aad, fragment)
+            .unwrap();
+        let mut out = vec![content_type as u8];
+        out.extend_from_slice(&DTLS_1_2_VERSION.to_be_bytes());
+        out.extend_from_slice(&epoch.to_be_bytes());
+        out.extend_from_slice(seq6);
+        out.extend_from_slice(&u16::try_from(8 + ct.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(&explicit);
+        out.extend_from_slice(&ct);
+        out
+    }
+
+    #[test]
+    fn legacy_record_layer_record_bytes_unchanged() {
+        let key = Zeroizing::new(uc_crypto::random::generate_key_256().unwrap());
+        let iv: [u8; 4] = uc_crypto::random::generate_random::<4>().unwrap();
+
+        let mut writer = RecordLayer::new();
+        writer.activate_cipher(
+            Tls12GcmSealer::new(&key).unwrap(),
+            Aes256GcmKey::new(*key).unwrap(),
+            iv,
+            iv,
+        );
+        assert!(writer.is_encrypted());
+        let mut reader = RecordLayer::new();
+        reader.activate_cipher(
+            Tls12GcmSealer::new(&key).unwrap(),
+            Aes256GcmKey::new(*key).unwrap(),
+            iv,
+            iv,
+        );
+
+        // Several records: the TLS 1.2 sealer's monotonic-nonce check must
+        // accept the layer's increasing sequence numbers.
+        let cases: [(ContentType, &[u8]); 4] = [
+            (ContentType::Handshake, b"finished"),
+            (ContentType::ApplicationData, b""),
+            (ContentType::ApplicationData, &[0xA5; 1200]),
+            (ContentType::Alert, &[1, 0]),
+        ];
+        for (seq, (ct, frag)) in (0u64..).zip(cases) {
+            assert_eq!(writer.write_sequence(), (1, seq));
+            let record = writer.encrypt_record(ct, frag).unwrap();
+            assert_eq!(
+                record,
+                reference_record(&key, iv, ct, 1, seq, frag),
+                "record bytes changed at seq {seq}"
+            );
+            let (got_type, got) = reader.decrypt_record(&record).unwrap();
+            assert_eq!(got_type, ct);
+            assert_eq!(got, frag);
+        }
+        assert_eq!(writer.write_sequence(), (1, 4));
     }
 }

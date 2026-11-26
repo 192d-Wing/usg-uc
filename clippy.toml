@@ -1,0 +1,8 @@
+# reqwest is built without a crypto provider (`rustls-tls-no-provider`):
+# `Client::new()` panics, and a default client would bypass the CNSA TLS
+# config. Build clients with `use_preconfigured_tls` on
+# `uc_transport::https_client::create_https_client_config` (SR-16).
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "panics without a crypto provider; use use_preconfigured_tls with uc_transport::https_client (SR-16)" },
+    { path = "reqwest::get", reason = "builds a default client, which panics without a crypto provider; use use_preconfigured_tls with uc_transport::https_client (SR-16)" },
+]
