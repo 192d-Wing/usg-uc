@@ -13,7 +13,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use uc_crypto::aead::Aes256GcmKey;
+use uc_crypto::aead::RandomNonceKey;
 use zeroize::Zeroizing;
 
 use crate::state::StateError;
@@ -23,7 +23,7 @@ const MAX_LEN: usize = 65;
 
 /// Load and validate the HA1 key file.
 #[cfg(unix)]
-pub fn load_ha1_key(path: &Path) -> Result<Aes256GcmKey, StateError> {
+pub fn load_ha1_key(path: &Path) -> Result<RandomNonceKey, StateError> {
     use nix::fcntl::OFlag;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -78,7 +78,7 @@ pub fn load_ha1_key(path: &Path) -> Result<Aes256GcmKey, StateError> {
 
 /// sbc-api-server is Linux-only; refuse to run without owner checks.
 #[cfg(not(unix))]
-pub fn load_ha1_key(_path: &Path) -> Result<Aes256GcmKey, StateError> {
+pub fn load_ha1_key(_path: &Path) -> Result<RandomNonceKey, StateError> {
     Err(StateError::Ha1Key(
         "HA1 key loading is only supported on unix".into(),
     ))
@@ -145,5 +145,116 @@ mod tests {
         }
         let e = load_ha1_key(&write(&d, key().as_bytes(), 0o644)).unwrap_err();
         assert!(!format!("{e} {e:?}").contains(&key()));
+    }
+}
+
+/// SR-15: the loaded key is the module-internal-IV `RandomNonceKey` and
+/// still opens rows sealed by the previous release (`enc:v1:`, caller IV).
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod sr15_tests {
+    use super::*;
+    use base64::prelude::*;
+    use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+    use uc_crypto::aead::{CachedAeadKey, NONCE_LEN, RandomNonceKey};
+    use uc_user_mgmt::encrypt::{EncryptedUserStore, MARKER_V1};
+    use uc_user_mgmt::model::{AuthType, User};
+    use uc_user_mgmt::sqlite::SqliteUserStore;
+    use uc_user_mgmt::store::UserStore;
+
+    const HA1: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0";
+    /// v1 AAD prefix as written by earlier releases (wire format pin).
+    const V1_AAD_PREFIX: &[u8] = b"uc-user-mgmt/digest_ha1/v1:";
+
+    fn user(id: &str, name: &str, ha1: &str) -> User {
+        User {
+            id: id.into(),
+            username: name.into(),
+            display_name: String::new(),
+            email: String::new(),
+            sip_uri: format!("sip:{name}@example.invalid"),
+            auth_type: AuthType::Digest,
+            digest_ha1: Some(ha1.into()),
+            certificate_dn: None,
+            certificate_san: None,
+            calling_search_space: None,
+            device_ids: Vec::new(),
+            partition: None,
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+            last_login: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn loaded_key_opens_rows_sealed_by_previous_release() {
+        let bytes = Zeroizing::new(uc_crypto::random::generate_key_256().unwrap());
+        let hex: Zeroizing<String> =
+            Zeroizing::new(bytes.iter().fold(String::with_capacity(64), |mut out, b| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{b:02x}");
+                out
+            }));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ha1.key");
+        std::fs::write(&path, format!("{}\n", *hex)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let key: RandomNonceKey = load_ha1_key(&path).unwrap();
+
+        // Row as the previous release wrote it: caller nonce, v1 AAD.
+        let nonce = uc_crypto::random::generate_nonce().unwrap();
+        let aad = [V1_AAD_PREFIX, b"u-old"].concat();
+        let ct = CachedAeadKey::new(&bytes)
+            .unwrap()
+            .seal(&nonce, &aad, HA1.as_bytes())
+            .unwrap();
+        let legacy_row = format!(
+            "{MARKER_V1}{}",
+            BASE64_STANDARD.encode([&nonce[..], &ct].concat())
+        );
+
+        let inner = SqliteUserStore::in_memory().unwrap();
+        inner
+            .create_user(user("u-old", "olduser", &legacy_row))
+            .await
+            .unwrap();
+        let store = EncryptedUserStore::new(inner, key);
+
+        assert_eq!(
+            store.get_user("u-old").await.unwrap().digest_ha1.as_deref(),
+            Some(HA1)
+        );
+        assert_eq!(
+            store
+                .authenticate_digest("olduser", "realm")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(HA1)
+        );
+
+        // A row the new key writes opens with the previous release's opener.
+        store
+            .create_user(user("u-new", "newuser", HA1))
+            .await
+            .unwrap();
+        let raw = store.inner().get_user("u-new").await.unwrap();
+        let blob = BASE64_STANDARD
+            .decode(raw.digest_ha1.unwrap().strip_prefix(MARKER_V1).unwrap())
+            .unwrap();
+        let (n, c) = blob.split_at(NONCE_LEN);
+        let old = uc_crypto::aead::Aes256GcmKey::new(*bytes).unwrap();
+        let pt = old
+            .open(
+                &n.try_into().unwrap(),
+                &[V1_AAD_PREFIX, b"u-new"].concat(),
+                c,
+            )
+            .unwrap();
+        assert_eq!(pt, HA1.as_bytes());
     }
 }

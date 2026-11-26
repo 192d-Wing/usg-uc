@@ -31,3 +31,27 @@ pub use refresh::{GrpcRefresher, NoopRefresher, RefreshItem, Refresher};
 pub use source::{CentralClient, ConfigSource, Outcome, reconcile};
 pub use status::SyncStatus;
 pub use token::{Auth, TokenProvider};
+
+/// Builds the HTTP client for the central sync API and the OIDC token
+/// endpoint.
+///
+/// CNSA suites and groups only (uc-transport `https-client`), OS trust
+/// store (`SSL_CERT_FILE` / `SSL_CERT_DIR` honoured), 30 s timeout.
+///
+/// ## NIST 800-53 Rev5: SC-8(1), SC-13, IA-5(2)
+///
+/// # Errors
+/// [`SyncError::Central`] if the trust store is empty or the client cannot
+/// be built.
+pub fn build_http_client() -> Result<reqwest::Client, SyncError> {
+    let tls = uc_transport::https_client::create_https_client_config(
+        None,
+        uc_transport::tls::MinTlsVersion::V1_2,
+    )
+    .map_err(|e| SyncError::Central(format!("TLS config: {e}")))?;
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(SyncError::from)
+}

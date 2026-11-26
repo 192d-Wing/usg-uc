@@ -196,7 +196,13 @@ mod tests {
     async fn fetches_caches_and_refreshes() {
         // Long expiry → the second call must hit the cache, not the server.
         let (url, hits) = mock_token_server(3600).await;
-        let p = TokenProvider::new(reqwest::Client::new(), url, "svc", "secret", "config-sync");
+        let p = TokenProvider::new(
+            crate::build_http_client().expect("http"),
+            url,
+            "svc",
+            "secret",
+            "config-sync",
+        );
         assert_eq!(p.token().await.expect("t1"), "tok-1");
         assert_eq!(p.token().await.expect("t2"), "tok-1", "served from cache");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "endpoint hit once");
@@ -207,7 +213,13 @@ mod tests {
         // expires_in below the refresh margin → cache lifetime is the 5s
         // floor; force expiry by overwriting refresh_at in the past.
         let (url, hits) = mock_token_server(1).await;
-        let p = TokenProvider::new(reqwest::Client::new(), url, "svc", "secret", "config-sync");
+        let p = TokenProvider::new(
+            crate::build_http_client().expect("http"),
+            url,
+            "svc",
+            "secret",
+            "config-sync",
+        );
         assert_eq!(p.token().await.expect("t1"), "tok-1");
         // Simulate the cached token going stale.
         p.cached.lock().await.as_mut().unwrap().refresh_at =

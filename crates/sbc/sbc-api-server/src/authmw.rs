@@ -643,15 +643,18 @@ mod tests {
     }
 
     fn qa_app(jwks: jsonwebtoken::jwk::JwkSet) -> Router {
-        let validator = Arc::new(Validator::new(
-            Arc::new(proto_jwt::JwksCache::with_static(jwks)),
-            proto_jwt::ValidatorConfig {
-                issuer: QA_ISSUER.to_string(),
-                audiences: vec![QA_AUD.to_string()],
-                required_scope: ADMIN_SCOPE,
-                leeway_secs: 30,
-            },
-        ));
+        let validator = Arc::new(
+            Validator::new(
+                Arc::new(proto_jwt::JwksCache::with_static(jwks)),
+                proto_jwt::ValidatorConfig {
+                    issuer: QA_ISSUER.to_string(),
+                    audiences: vec![QA_AUD.to_string()],
+                    required_scope: ADMIN_SCOPE,
+                    leeway_secs: 30,
+                },
+            )
+            .unwrap(),
+        );
         let authenticator = Arc::new(
             uc_auth::Authenticator::new("admin", "not-a-phc-hash", vec![7u8; 48]).unwrap(),
         );

@@ -1262,7 +1262,7 @@ async fn materialize_template(
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::option_if_let_else)]
 mod tests {
     //! End-to-end HTTP tests over the real router, store, and OIDC
-    //! validator. The bearer tokens are minted with a fresh ES256 key
+    //! validator. The bearer tokens are minted with a fresh ES384 (P-384) key
     //! (no private material in the tree) and a static JWKS. Skipped
     //! unless `CENTRAL_STORE_TEST_DSN` (CREATE DATABASE rights) is set:
     //!
@@ -1305,28 +1305,28 @@ mod tests {
         jwks: JwkSet,
     }
 
-    /// Fresh ES256 keypair, once per process.
+    /// Fresh ES384 (P-384) keypair, once per process.
     fn test_key() -> &'static TestKey {
         use aws_lc_rs::rand::SystemRandom;
-        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
+        use aws_lc_rs::signature::{ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
         use base64::Engine as _;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
         static KEY: std::sync::OnceLock<TestKey> = std::sync::OnceLock::new();
         KEY.get_or_init(|| {
             let pkcs8 = EcdsaKeyPair::generate_pkcs8(
-                &ECDSA_P256_SHA256_FIXED_SIGNING,
+                &ECDSA_P384_SHA384_FIXED_SIGNING,
                 &SystemRandom::new(),
             )
             .expect("generate key");
-            let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
+            let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, pkcs8.as_ref())
                 .expect("parse key");
             let point = pair.public_key().as_ref();
             let jwks = serde_json::from_value(serde_json::json!({
                 "keys": [{
-                    "kty": "EC", "crv": "P-256", "kid": TEST_KID, "alg": "ES256", "use": "sig",
-                    "x": URL_SAFE_NO_PAD.encode(&point[1..33]),
-                    "y": URL_SAFE_NO_PAD.encode(&point[33..65]),
+                    "kty": "EC", "crv": "P-384", "kid": TEST_KID, "alg": "ES384", "use": "sig",
+                    "x": URL_SAFE_NO_PAD.encode(&point[1..49]),
+                    "y": URL_SAFE_NO_PAD.encode(&point[49..97]),
                 }]
             }))
             .expect("jwks");
@@ -1375,7 +1375,7 @@ mod tests {
         if !sites.is_empty() {
             claims.insert("sites".into(), json!(sites));
         }
-        let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
+        let mut header = Header::new(jsonwebtoken::Algorithm::ES384);
         header.kid = Some(TEST_KID.to_string());
         encode(&header, &Value::Object(claims), &test_key().encoding).expect("encode token")
     }
@@ -1440,15 +1440,18 @@ mod tests {
             .expect("seed phone");
         let jwks = Arc::new(JwksCache::with_static(test_key().jwks.clone()));
         let validator_for = |scope: &'static str| {
-            Arc::new(Validator::new(
-                Arc::clone(&jwks),
-                ValidatorConfig {
-                    issuer: TEST_ISSUER.to_string(),
-                    audiences: vec![TEST_AUDIENCE.to_string()],
-                    required_scope: scope,
-                    leeway_secs: 30,
-                },
-            ))
+            Arc::new(
+                Validator::new(
+                    Arc::clone(&jwks),
+                    ValidatorConfig {
+                        issuer: TEST_ISSUER.to_string(),
+                        audiences: vec![TEST_AUDIENCE.to_string()],
+                        required_scope: scope,
+                        leeway_secs: 30,
+                    },
+                )
+                .expect("validator config"),
+            )
         };
         router(Arc::new(AppState {
             store,
@@ -1979,15 +1982,18 @@ mod tests {
         // Boot the real router on an ephemeral port.
         let jwks = Arc::new(JwksCache::with_static(test_key().jwks.clone()));
         let validator_for = |scope: &'static str| {
-            Arc::new(Validator::new(
-                Arc::clone(&jwks),
-                ValidatorConfig {
-                    issuer: TEST_ISSUER.to_string(),
-                    audiences: vec![TEST_AUDIENCE.to_string()],
-                    required_scope: scope,
-                    leeway_secs: 30,
-                },
-            ))
+            Arc::new(
+                Validator::new(
+                    Arc::clone(&jwks),
+                    ValidatorConfig {
+                        issuer: TEST_ISSUER.to_string(),
+                        audiences: vec![TEST_AUDIENCE.to_string()],
+                        required_scope: scope,
+                        leeway_secs: 30,
+                    },
+                )
+                .expect("validator config"),
+            )
         };
         let app = router(Arc::new(AppState {
             store: central.clone(),
@@ -2007,7 +2013,7 @@ mod tests {
 
         // The real sync-agent client over real HTTP, with a static token.
         let client = sbc_config_sync::CentralClient::new(
-            reqwest::Client::new(),
+            sbc_config_sync::build_http_client().expect("http client"),
             base_url,
             sbc_config_sync::Auth::Static(good_token("MUHJ")),
         );

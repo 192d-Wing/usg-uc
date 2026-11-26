@@ -1,18 +1,22 @@
 # syntax=docker/dockerfile:1.7
 # DTLS-SRTP terminator sidecar — the SBC's DTLS endpoint per media leg.
 #
-# Built in FIPS 140-3 mode with the Go Cryptographic Module (GOFIPS140): every
-# crypto primitive runs in the certified module. Unlike sbc-daemon (which must
-# stay glibc for aws-lc-fips), Go's FIPS module is pure Go, so a CGO-free static
-# binary runs on any base — we use Alpine for a small image with a shell (the
-# pod's startupProbe execs `test -f` on the published fingerprint file).
+# Built in FIPS 140-3 mode with the Go Cryptographic Module (GOFIPS140): the
+# crypto primitives come from the Go module. pion's DTLS record GCM seal
+# (cipher.NewGCM, caller IV) is a non-approved service (POA&M-400).
+# Unlike sbc-daemon (which must stay glibc for aws-lc-fips), Go's FIPS module
+# is pure Go, so a CGO-free static binary runs on any base — we use Alpine for
+# a small image with a shell (the pod's startupProbe execs `test -f` on the
+# published fingerprint file).
 #
 # Build (context = this directory):
 #   docker build -t localhost/usg-dtls-terminator:local sidecar/dtls-terminator
 #
 # ## NIST 800-53 Rev5 / CNSA 2.0
-# - SC-13 Cryptographic Protection: FIPS 140-3 module (GOFIPS140=v1.26.0)
+# - SC-13 Cryptographic Protection: Go FIPS 140-3 module (GOFIPS140=v1.26.0)
 # - CM-7 Least Functionality: single static binary, nonroot, no shell in PID 1
+#
+# POAM: POA&M-400 DTLS record AES-GCM seal with an external IV (pion cipher.NewGCM).
 
 FROM golang:1.26-bookworm AS build
 WORKDIR /src

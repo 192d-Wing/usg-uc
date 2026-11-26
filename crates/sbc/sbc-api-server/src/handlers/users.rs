@@ -525,8 +525,7 @@ pub async fn delete<U: UserStore>(
             .store
             .get_user(&id)
             .await
-            .map(|u| u.username)
-            .unwrap_or_default();
+            .map_or_else(|_| String::new(), |u| u.username);
         match st.store.delete_user(&id).await {
             Ok(()) => {
                 audit(&who, AccountAction::Delete, &id, &username, Ok(()), &[]);
@@ -553,7 +552,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use tower::ServiceExt;
-    use uc_crypto::aead::Aes256GcmKey;
+    use uc_crypto::aead::RandomNonceKey;
     use uc_user_mgmt::encrypt::EncryptedUserStore;
     use uc_user_mgmt::sqlite::SqliteUserStore;
 
@@ -562,7 +561,7 @@ mod tests {
     fn app() -> (Router, Arc<Store>) {
         let store = Arc::new(EncryptedUserStore::new(
             SqliteUserStore::in_memory().unwrap(),
-            Aes256GcmKey::generate().unwrap(),
+            RandomNonceKey::generate().unwrap(),
         ));
         let r = routes(UsersState {
             store: Arc::clone(&store),

@@ -30,14 +30,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use base64::Engine;
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha384};
-use subtle::ConstantTimeEq;
 use tracing::{info, warn};
+use uc_crypto::hash::{SHA384_OUTPUT_LEN, hmac_sha384, sha384, verify_hmac_sha384};
 use zeroize::Zeroizing;
-
-type HmacSha384 = Hmac<Sha384>;
 
 /// Default admin username when `SBC_ADMIN_USER` is unset.
 const DEFAULT_ADMIN_USER: &str = "admin";
@@ -182,9 +178,9 @@ impl TokenSigner {
         let presented = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(mac_b64)
             .ok()?;
-        let expected = self.sign(signing_input.as_bytes());
-        // Constant-time comparison.
-        if expected.ct_eq(&presented).unwrap_u8() != 1 {
+        // NIST 800-53 Rev5: SC-13 — HMAC-SHA-384 in the FIPS module;
+        // aws-lc compares the tag in constant time.
+        if !verify_hmac_sha384(&self.key, signing_input.as_bytes(), &presented) {
             return None;
         }
         let claims_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -223,14 +219,9 @@ impl TokenSigner {
         hex::encode(mac.get(..API_KEY_ID_HEX / 2).unwrap_or_default())
     }
 
-    fn sign(&self, data: &[u8]) -> Vec<u8> {
-        // HMAC accepts keys of any length, so this never fails; return an
-        // empty MAC (which never verifies) rather than panic.
-        let Ok(mut mac) = HmacSha384::new_from_slice(&self.key) else {
-            return Vec::new();
-        };
-        mac.update(data);
-        mac.finalize().into_bytes().to_vec()
+    /// HMAC-SHA-384 over `data` (aws-lc FIPS module via uc-crypto).
+    fn sign(&self, data: &[u8]) -> [u8; SHA384_OUTPUT_LEN] {
+        hmac_sha384(&self.key, data)
     }
 }
 
@@ -335,6 +326,8 @@ struct AdminCredentials {
 impl AdminCredentials {
     /// Verifies a username/password against the stored hash (constant-ish
     /// time: the hash is computed even on username mismatch).
+    // POAM: POA&M-402 — argon2id runs outside the FIPS module (RustCrypto);
+    // migrate to PBKDF2-HMAC-SHA-384 via uc-crypto with argon2 dual-accept.
     fn verify(&self, username: &str, password: &str) -> bool {
         let parsed = match PasswordHash::new(&self.password_hash) {
             Ok(p) => p,
@@ -354,6 +347,7 @@ impl AdminCredentials {
 /// # Errors
 ///
 /// Returns [`AuthError::Hashing`] if hashing fails.
+// POAM: POA&M-402 (argon2id outside the FIPS module).
 pub fn hash_password(password: &str) -> Result<String, AuthError> {
     let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
     Argon2::default()
@@ -517,11 +511,11 @@ impl Authenticator {
         // (POA&M-211 closed). API keys are random 256-bit values
         // (docs/API-REFERENCE.md), so a fast digest is sufficient; a slow
         // password KDF per configured key per request would be a DoS lever.
-        let digest = hex::encode(Sha384::digest(credential.as_bytes()));
+        let digest = hex::encode(sha384(credential.as_bytes()));
         // Every configured digest is compared (no early exit).
         let mut matched: Option<&String> = None;
         for h in self.api_key_hashes.iter() {
-            if h.as_bytes().ct_eq(digest.as_bytes()).unwrap_u8() == 1 {
+            if uc_crypto::constant_time::eq(h.as_bytes(), digest.as_bytes()) {
                 matched = Some(h);
             }
         }
@@ -535,12 +529,7 @@ impl Authenticator {
     /// username field is never stored).
     #[must_use]
     pub fn is_admin_user(&self, name: &str) -> bool {
-        self.admin
-            .username
-            .as_bytes()
-            .ct_eq(name.as_bytes())
-            .unwrap_u8()
-            == 1
+        uc_crypto::constant_time::eq(self.admin.username.as_bytes(), name.as_bytes())
     }
 }
 
@@ -774,9 +763,12 @@ mod tests {
         let signer = TokenSigner::new(key.clone()).expect("signer");
         let claims = serde_json::json!({ "sub": "admin", "exp": now_secs() + 300 });
         let input = format!("v1.{}", b64(&serde_json::to_vec(&claims).expect("json")));
-        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).expect("hmac");
-        mac.update(input.as_bytes());
-        let token = format!("{input}.{}", b64(&mac.finalize().into_bytes()));
+        // v1 MACs were HMAC-SHA-256 (aws-lc-rs dev-dep; not in uc-crypto).
+        let mac = aws_lc_rs::hmac::sign(
+            &aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, &key),
+            input.as_bytes(),
+        );
+        let token = format!("{input}.{}", b64(mac.as_ref()));
         assert!(signer.verify(&token).is_none());
     }
 
@@ -938,7 +930,7 @@ mod tests {
     /// `test_auth()` plus one accepted API key; returns (auth, key, digest).
     fn auth_with_api_key() -> (Authenticator, String, String) {
         let key = format!("qa-api-key-{}", std::process::id());
-        let digest = hex::encode(Sha384::digest(key.as_bytes()));
+        let digest = hex::encode(sha384(key.as_bytes()));
         let auth = Authenticator {
             api_key_hashes: Arc::new(vec![digest.clone()]),
             ..test_auth()
@@ -1006,11 +998,19 @@ mod tests {
 
     // ---- POA&M-211: SHA-384 API-key digests only -------------------------
 
+    /// SHA-256 for building the rejected legacy digests (aws-lc-rs dev-dep;
+    /// uc-auth no longer links `uc_crypto::interop::sha256`).
+    fn test_sha256(data: &[u8]) -> Vec<u8> {
+        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data)
+            .as_ref()
+            .to_vec()
+    }
+
     #[test]
     fn api_key_sha256_digest_no_longer_identifies() {
         let key = format!("qa-api-key-{}", std::process::id());
         let auth = Authenticator {
-            api_key_hashes: Arc::new(vec![hex::encode(sha2::Sha256::digest(key.as_bytes()))]),
+            api_key_hashes: Arc::new(vec![hex::encode(test_sha256(key.as_bytes()))]),
             ..test_auth()
         };
         assert!(auth.identify(&key).is_none());
@@ -1018,14 +1018,14 @@ mod tests {
 
     #[test]
     fn api_key_digest_parsing() {
-        let d = hex::encode(Sha384::digest(b"k"));
+        let d = hex::encode(sha384(b"k"));
         assert_eq!(parse_api_key_digests(None, None).ok(), Some(Vec::new()));
         assert_eq!(
             parse_api_key_digests(Some(" "), Some(&format!(" {}, ,", d.to_uppercase()))).ok(),
             Some(vec![d.clone()])
         );
         // The removed SHA-256 variable fails startup when set.
-        let sha256 = hex::encode(sha2::Sha256::digest(b"k"));
+        let sha256 = hex::encode(test_sha256(b"k"));
         assert!(matches!(
             parse_api_key_digests(Some(&sha256), None),
             Err(AuthError::Invalid {
@@ -1056,5 +1056,42 @@ mod tests {
         for name in ["", "Admin", "admin ", " admin", "admin\0", "root", "adm"] {
             assert!(!auth.is_admin_user(name), "{name:?}");
         }
+    }
+
+    // SR-16 golden vectors: MACs captured from the RustCrypto
+    // implementation (cross-checked with openssl / Python hmac) so the
+    // move to uc_crypto::hash::hmac_sha384 is proven byte-identical and
+    // tokens minted before the upgrade keep verifying.
+
+    /// v2 token for fixed claims under key `0x5a * 48`.
+    const GOLDEN_V2_TOKEN: &str = "v2.eyJzdWIiOiJhZG1pbiIsImlhdCI6MTcwMDAwMDAwMCwiZXhwIjoxNzAwMDAwMzAwLCJhdWQiOiJzYmMtYXBpIn0.X_7kn_JCspkesoHaqn4aZjZGqj2ZxxN9k-TqDdlSfqL53NzgNx4sJGNEAlZQ8mPx";
+
+    #[test]
+    fn v2_token_golden_vector() {
+        let signer = test_signer();
+        let token = signer.mint_claims(&Claims {
+            sub: "admin".to_string(),
+            iat: 1_700_000_000,
+            exp: 1_700_000_300,
+            aud: TOKEN_AUDIENCE.to_string(),
+        });
+        assert_eq!(token, GOLDEN_V2_TOKEN);
+        let (input, mac_b64) = GOLDEN_V2_TOKEN.rsplit_once('.').expect("mac");
+        assert_eq!(b64(&signer.sign(input.as_bytes())), mac_b64);
+        // Same signing input under a different key must not match.
+        let other = TokenSigner::new(vec![0x5b; RECOMMENDED_SIGNING_KEY_BYTES]).expect("signer");
+        assert_ne!(b64(&other.sign(input.as_bytes())), mac_b64);
+    }
+
+    #[test]
+    fn hmac_sha384_rfc4231_test_case_6() {
+        // RFC 4231 section 4.7: 131-byte key (above the 32-byte floor).
+        let signer = TokenSigner::new(vec![0xaa; 131]).expect("signer");
+        let mac = signer.sign(b"Test Using Larger Than Block-Size Key - Hash Key First");
+        assert_eq!(
+            hex::encode(mac),
+            "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f\
+             3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952"
+        );
     }
 }

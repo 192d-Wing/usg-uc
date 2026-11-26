@@ -187,6 +187,84 @@ API trunk-group endpoints. Tested locally against Postgres 16 (2026-11-23).
   `ORDER BY id` ignores `-`; it passes with `--locale=C`. That test is not
   touched by this change.
 
+### BREAKING (SBC, management-plane HTTPS is CNSA-only; no ring, SR-16, POA&M-402, 403)
+
+- **IdP / JWKS and central sync HTTPS offer CNSA suites only.** (SC-8,
+  SC-13) sbc-daemon, sbc-api-server, sbc-client-config-server,
+  central-config-api and sbc-config-sync offer TLS 1.3
+  `TLS_AES_256_GCM_SHA384` and TLS 1.2 `ECDHE-ECDSA-AES256-GCM-SHA384`,
+  with ML-KEM-1024 or P-384. The sbc-daemon IdP client is not tied to
+  `security.min_tls_version`. An IdP or central API without one of these
+  fails the handshake.
+- **Server certificates must be ECDSA P-384 once SR-14 (#241) lands.**
+  These clients verify signatures with `cnsa_provider()`, so the IdP,
+  central API and token endpoint leaf and chain must be ECDSA P-384 /
+  SHA-384; RSA or P-256 servers are refused (POA&M-404). This applies to
+  soft client provisioning too.
+- **Trust comes from the OS store** plus the existing extra-CA variables,
+  not compiled-in webpki roots. Images need `ca-certificates`;
+  `SSL_CERT_FILE` / `SSL_CERT_DIR` are honoured. An empty store fails at
+  startup. An unreadable or bad sbc-api-server OIDC extra CA now disables
+  operator OIDC instead of being ignored. sbc-config-sync exits 4 if its
+  HTTP client cannot be built.
+- **HMAC moves into the FIPS module.** uc-auth tokens and provisioning
+  device tokens use `uc_crypto::hash`; output is unchanged, existing tokens
+  stay valid. Every SBC and central binary links `aws-lc-fips-sys`; the
+  sbc-provision-server, sbc-client-config-server and central-config-import
+  images build only with the images PR (#247).
+- **Supply chain:** `ring` is banned (`deny.toml`); CI runs
+  `ci/check-crypto-deps.sh` and `cargo deny check bans`. Still outside the
+  module: admin password argon2id (POA&M-402) and sqlx-postgres Postgres
+  client authentication (POA&M-403).
+
+### BREAKING (SBC, OIDC access tokens: ES384 only; exp/iss/aud required; SR-30, SR-34)
+
+Affects every service that validates OIDC tokens: sbc-daemon (bearer
+REGISTER), sbc-client-config-server, sbc-api-server and central-config-api.
+
+- **The IdP must sign access tokens with ES384 from an EC P-384 key.**
+  (SC-13, IA-5(2)) RS256, PS256 and ES256 tokens get 401. Keycloak defaults
+  to RS256: add an `ecdsa-generated` P-384 key provider and set the realm
+  default signature algorithm to `ES384` before upgrading.
+  `Configure-Voice.ps1` does not do this. A JWK that is not EC P-384, or
+  whose `alg` differs from the token's, whose `use` is not `sig`, or whose
+  `key_ops` lacks `verify`, is refused. Operator steps:
+  `docs/CLIENT-PROVISIONING-OIDC.md` "Token signing".
+- **Tokens must carry `exp`, `iss` and `aud`; `nbf` is checked when
+  present.** (IA-2) Previously `iss` and `aud` were checked only when
+  present, and `nbf` was not checked. A token with a `crit` header, a
+  header `typ` other than `JWT` / `at+jwt` (also as `application/jwt` / `application/at+jwt`, case-insensitive), or a Keycloak `typ` claim other
+  than `Bearer` (ID, refresh, logout tokens) is refused.
+- **An empty issuer or audience set is refused.** (IA-2) sbc-api-server and
+  central-config-api fail to start; sbc-client-config-server exits with
+  code 2. sbc-daemon with `SBC_AUTH_MODE=bearer` no longer starts when the
+  bearer authorizer cannot be built (issuer unset, empty audience set,
+  unreadable or invalid `SBC_OIDC_EXTRA_CA_CERT_FILE`); it used to log an
+  error and run with REGISTER unauthenticated. (IA-2, SC-24)
+- **`proto-jwt`: `Validator::new` returns `Result<Validator, ConfigError>`**
+  (`EmptyIssuer`, `EmptyAudiences`, `BlankAudience`, `Leeway` above
+  `MAX_LEEWAY_SECS` = 300) and is no longer `const`; it trims the issuer
+  and audience entries. `ALLOWED_ALGS` is `[ES384]`. proto-jwt enables the
+  aws-lc-rs `fips` feature, so sbc-client-config-server now links
+  aws-lc-fips-sys. sbc-daemon `Server::new` returns `Result`.
+
+### BREAKING (uc-crypto API, AES-GCM seal services, SR-15, POA&M-400)
+
+- **uc-crypto: `Aes256GcmKey::seal` and `aead::seal_with_random_nonce` are
+  removed.** (SC-13, SC-28(1)) Seal with a caller-built IV is not an approved
+  FIPS 140-3 service. New `aead::RandomNonceKey` seals with an IV generated
+  inside the module; `Aes256GcmKey` is open-only. `CachedAeadKey` is for
+  RFC 7714 SRTP only.
+- **HA1 at rest is sealed with `RandomNonceKey`.** `EncryptedUserStore::new`,
+  `parse_hex_key` and sbc-api-server `load_ha1_key` take or return it. The
+  `enc:v1:` format is unchanged: old rows open, and older replicas open new
+  rows. No migration.
+- **proto-dtls legacy `RecordLayer`** seals with `Tls12GcmSealer`
+  (`activate_cipher` signature changed); record bytes are unchanged.
+- SRTP/SRTCP seal and the sidecar's pion DTLS record seal have no approved
+  service and are tracked as POA&M-400; docs no longer claim every primitive
+  is approved or that the Go module is certified.
+
 ### BREAKING (SBC, connection memory and file-descriptor budget, POA&M-452, 453)
 
 Affects every SBC at startup and every Helm upgrade. Operator details:
