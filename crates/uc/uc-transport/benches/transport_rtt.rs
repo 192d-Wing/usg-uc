@@ -12,27 +12,15 @@
 // no end-to-end INVITE-to-180 bench (sbc-daemon).
 #![allow(missing_docs, clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
+use common::{StreamPairs, loopback, msg, runtime};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::hint::black_box;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::runtime::Runtime;
-use uc_transport::listener::ListenerConfig;
-use uc_transport::tcp::{TcpListener, TcpTransport};
-use uc_transport::tls::{TlsListener, TlsTransport, create_client_config, create_server_config};
 use uc_transport::udp::UdpTransport;
-use uc_transport::{SbcSocketAddr, Transport, TransportType};
+use uc_transport::{SbcSocketAddr, Transport};
 
 const SIZES: [usize; 2] = [600, 4096];
-
-fn loopback() -> SbcSocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 0)).into()
-}
-
-fn msg(n: usize) -> Vec<u8> {
-    (b'a'..=b'z').cycle().take(n).collect()
-}
 
 async fn recv_exact(t: &dyn Transport, n: usize) {
     let mut got = 0;
@@ -49,46 +37,9 @@ async fn rtt(client: &dyn Transport, server: &dyn Transport, data: &[u8], dest: 
     recv_exact(client, data.len()).await;
 }
 
-fn tcp_pair(rt: &Runtime) -> (TcpTransport, TcpTransport) {
-    rt.block_on(async {
-        let l = TcpListener::bind(loopback()).await.unwrap();
-        let addr = *l.local_addr();
-        let (c, s) = tokio::join!(TcpTransport::connect(addr), l.accept());
-        (c.unwrap(), s.unwrap().0)
-    })
-}
-
-fn tls_pair(rt: &Runtime) -> (TlsTransport, TlsTransport) {
-    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
-    let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
-        .unwrap()
-        .self_signed(&key)
-        .unwrap();
-    let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-    let server_cfg = Arc::new(create_server_config(vec![cert_der.clone()], key_der).unwrap());
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert_der).unwrap();
-    let client_cfg = Arc::new(create_client_config(roots).unwrap());
-    rt.block_on(async {
-        let l = TlsListener::bind(
-            ListenerConfig::new(loopback(), TransportType::Tls),
-            server_cfg,
-        )
-        .await
-        .unwrap();
-        let addr = *l.local_addr();
-        let (c, s) = tokio::join!(
-            TlsTransport::connect(addr, "localhost", client_cfg),
-            l.accept()
-        );
-        (c.unwrap(), s.unwrap().0)
-    })
-}
-
 #[cfg(feature = "websocket")]
 fn ws_pair(
-    rt: &Runtime,
+    rt: &tokio::runtime::Runtime,
 ) -> (
     uc_transport::websocket::WebSocketTransport,
     uc_transport::websocket::WebSocketTransport,
@@ -112,24 +63,19 @@ fn ws_pair(
 }
 
 fn bench(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = runtime();
     let mut g = c.benchmark_group("transport_rtt");
 
-    let (tc, ts) = tcp_pair(&rt);
-    let (lc, ls) = tls_pair(&rt);
-    let dest = *tc.local_addr(); // ignored by stream transports
+    let pairs = StreamPairs::new(&rt);
+    let dest = pairs.dest();
     for n in SIZES {
         let data = msg(n);
         g.throughput(Throughput::Bytes(n as u64 * 2));
-        g.bench_with_input(BenchmarkId::new("tcp", n), &data, |b, d| {
-            b.iter(|| rt.block_on(rtt(&tc, &ts, black_box(d), &dest)));
-        });
-        g.bench_with_input(BenchmarkId::new("tls13", n), &data, |b, d| {
-            b.iter(|| rt.block_on(rtt(&lc, &ls, black_box(d), &dest)));
-        });
+        for (id, client, server) in pairs.each() {
+            g.bench_with_input(BenchmarkId::new(id, n), &data, |b, d| {
+                b.iter(|| rt.block_on(rtt(client, server, black_box(d), &dest)));
+            });
+        }
     }
 
     #[cfg(feature = "websocket")]

@@ -63,11 +63,28 @@ pub const MAX_WS_MESSAGE_SIZE: usize = MAX_STREAM_MESSAGE_SIZE;
 // NIST 800-53 Rev5: SC-5, SC-10 (bounded teardown)
 const CLOSE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// tungstenite read buffer per connection (default 128 KiB).
+const WS_READ_BUFFER_SIZE: usize = 8 * 1024;
+
+/// Bytes queued before tungstenite writes to the socket (default 128 KiB).
+/// Must stay below [`WS_MAX_WRITE_BUFFER_SIZE`] by at least one full frame.
+const WS_WRITE_BUFFER_SIZE: usize = 8 * 1024;
+
+/// Hard cap on queued outbound bytes per connection (default unbounded): one
+/// pending threshold plus one maximum-size message fits; a peer that stops
+/// reading cannot grow it further.
+const WS_MAX_WRITE_BUFFER_SIZE: usize = 2 * MAX_WS_MESSAGE_SIZE;
+
 /// WebSocket protocol limits for SIP-over-WebSocket.
+///
+/// ## NIST 800-53 Rev5: SC-5, SC-6
 fn sip_ws_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_WS_MESSAGE_SIZE))
+        .read_buffer_size(WS_READ_BUFFER_SIZE)
+        .write_buffer_size(WS_WRITE_BUFFER_SIZE)
+        .max_write_buffer_size(WS_MAX_WRITE_BUFFER_SIZE)
 }
 
 /// Whether a `Sec-WebSocket-Protocol` value offers the exact `sip` token
@@ -1201,5 +1218,66 @@ mod tests {
             .unwrap();
         assert!(server.is_closed());
         pending.abort();
+    }
+
+    // ---- SR-57: WebSocket buffers sized for many connections ----
+    // NIST 800-53 Rev5: SC-5, SC-6
+
+    /// Largest WebSocket frame header (RFC 6455 §5.2: 2 + 8 length + 4 mask).
+    const QA_MAX_WS_FRAME_HEADER: usize = 14;
+
+    #[test]
+    fn ws_config_read_buffer_is_small() {
+        let cfg = sip_ws_config();
+        assert!(
+            cfg.read_buffer_size <= 8 * 1024,
+            "tungstenite read_buffer_size is {} bytes, want <= 8 KiB",
+            cfg.read_buffer_size
+        );
+        assert!(
+            cfg.max_write_buffer_size <= 2 * MAX_WS_MESSAGE_SIZE,
+            "tungstenite max_write_buffer_size is {}, want <= {}",
+            cfg.max_write_buffer_size,
+            2 * MAX_WS_MESSAGE_SIZE
+        );
+        // tungstenite panics at accept unless max_write_buffer_size >
+        // write_buffer_size, and one full message must fit past the
+        // write threshold or a max-size send fails with WriteBufferFull.
+        assert!(
+            cfg.write_buffer_size + MAX_WS_MESSAGE_SIZE + QA_MAX_WS_FRAME_HEADER
+                <= cfg.max_write_buffer_size,
+            "write_buffer_size {} + one message does not fit max_write_buffer_size {}",
+            cfg.write_buffer_size,
+            cfg.max_write_buffer_size
+        );
+        // The message and frame caps are unchanged.
+        assert_eq!(cfg.max_message_size, Some(MAX_WS_MESSAGE_SIZE));
+        assert_eq!(cfg.max_frame_size, Some(MAX_WS_MESSAGE_SIZE));
+    }
+
+    // Regression guard: with the bounded write buffer the server still sends
+    // back-to-back messages at the 64 KiB limit.
+    #[tokio::test]
+    async fn ws_server_sends_messages_at_limit() {
+        use futures_util::StreamExt;
+        let l = listener(true).await;
+        let server = serve_one(&l);
+        let (mut ws, _) = tokio_tungstenite::connect_async(request(local(&l), Some("sip")))
+            .await
+            .unwrap();
+        let transport = server.await.unwrap().unwrap();
+        let dest = *transport.peer_addr();
+        let exact = vec![b'a'; MAX_WS_MESSAGE_SIZE];
+        for _ in 0..3 {
+            transport.send(&exact, &dest).await.unwrap();
+        }
+        for _ in 0..3 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                .await
+                .expect("client recv timed out")
+                .expect("stream ended")
+                .unwrap();
+            assert_eq!(msg.into_data().len(), MAX_WS_MESSAGE_SIZE);
+        }
     }
 }
