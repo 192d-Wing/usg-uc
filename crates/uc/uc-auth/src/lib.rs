@@ -514,7 +514,9 @@ impl Authenticator {
             return None;
         }
         // NIST 800-53 Rev5: IA-5, SC-13 — CNSA 2.0 SHA-384 lookup digest
-        // (POA&M-211 closed).
+        // (POA&M-211 closed). API keys are random 256-bit values
+        // (docs/API-REFERENCE.md), so a fast digest is sufficient; a slow
+        // password KDF per configured key per request would be a DoS lever.
         let digest = hex::encode(Sha384::digest(credential.as_bytes()));
         // Every configured digest is compared (no early exit).
         let mut matched: Option<&String> = None;

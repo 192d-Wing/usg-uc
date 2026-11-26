@@ -23,6 +23,9 @@ API keys are configured by digest, never in clear:
 `SBC_API_KEY_SHA384` is a comma-separated list of SHA-384 hex digests
 (`printf %s "$KEY" | sha384sum | cut -d' ' -f1`). The former
 `SBC_API_KEY_SHA256` is no longer accepted and stops startup if set.
+An API key must be a random value of at least 256 bits (for example
+`openssl rand -hex 32`), never a chosen password: the server stores only
+a fast SHA-384 digest, which protects a random key but not a guessable one.
 
 ### Admin login (`POST /api/v1/auth/login`)
 
