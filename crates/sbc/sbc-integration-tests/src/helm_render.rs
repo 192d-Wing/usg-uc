@@ -430,7 +430,8 @@ fn qa_helm_render_connection_caps() {
         ])
         .arg("-f")
         .arg(&values);
-    push_sets(&mut cmd, &[SBC_MIN[0], SBC_MIN[1], SBC_ISSUER]);
+    let sets: Vec<&str> = SBC_MIN.iter().copied().chain([SBC_ISSUER]).collect();
+    push_sets(&mut cmd, &sets);
     let res = cmd.output().expect("run helm");
     let _ = std::fs::remove_file(&values);
     assert!(
