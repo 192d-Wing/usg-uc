@@ -9004,6 +9004,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "rustls-webpki",
  "socket2",
  "tempfile",
  "thiserror 2.0.21",
