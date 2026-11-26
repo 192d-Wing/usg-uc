@@ -103,6 +103,116 @@ pub(crate) const fn canonical_peer(addr: std::net::SocketAddr) -> std::net::Sock
     std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+/// Returns true when an `accept()` error is a process- or system-wide
+/// resource exhaustion (EMFILE, ENFILE, ENOBUFS, ENOMEM, or
+/// [`std::io::ErrorKind::OutOfMemory`]).
+///
+/// Only these call for an accept-loop back-off: accepting again at once
+/// would fail the same way. Any other accept error concerns one pending
+/// connection (for example ECONNABORTED or EPROTO) and the loop should
+/// continue immediately.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+#[must_use]
+pub fn is_accept_resource_exhaustion(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::OutOfMemory {
+        return true;
+    }
+    let Some(code) = err.raw_os_error() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        matches!(
+            Errno::from_raw(code),
+            Errno::EMFILE | Errno::ENFILE | Errno::ENOBUFS | Errno::ENOMEM
+        )
+    }
+    #[cfg(windows)]
+    {
+        // WSAEMFILE, WSAENOBUFS.
+        matches!(code, 10024 | 10055)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = code;
+        false
+    }
+}
+
+/// Returns true when an `accept()` error concerns one pending connection.
+///
+/// For example the peer aborted or reset, a protocol or network error on
+/// that connection, a firewall refusal, an interrupted or would-block call.
+/// Such errors say nothing about the listener: the accept loop continues
+/// at once and they never count toward a persistent-error back-off.
+/// Listener-level errors (EBADF, EINVAL, ENOTSOCK, EOPNOTSUPP, EFAULT) and
+/// unknown errors return false.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+#[must_use]
+pub fn is_accept_per_connection_error(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        err.kind(),
+        ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+    ) {
+        return true;
+    }
+    let Some(code) = err.raw_os_error() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        // accept(2): errors the kernel reports for the connection being
+        // accepted, not for the listening socket.
+        matches!(
+            Errno::from_raw(code),
+            Errno::ECONNABORTED
+                | Errno::ECONNRESET
+                | Errno::EPROTO
+                | Errno::EPERM
+                | Errno::EINTR
+                | Errno::EAGAIN
+                | Errno::ETIMEDOUT
+                | Errno::ENETDOWN
+                | Errno::ENETUNREACH
+                | Errno::EHOSTDOWN
+                | Errno::EHOSTUNREACH
+                | Errno::ENOPROTOOPT
+        )
+    }
+    #[cfg(windows)]
+    {
+        // WSAECONNABORTED, WSAECONNRESET, WSAEINTR, WSAEWOULDBLOCK,
+        // WSAENETDOWN, WSAETIMEDOUT.
+        matches!(code, 10053 | 10054 | 10004 | 10035 | 10050 | 10060)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = code;
+        false
+    }
+}
+
+/// Maps a listener `accept()` error to [`TransportError::AcceptFailed`],
+/// keeping the resource-exhaustion and per-connection classes.
+#[cfg(any(feature = "tcp", feature = "tls", feature = "websocket"))]
+pub(crate) fn accept_error(err: &std::io::Error) -> TransportError {
+    let resource_exhausted = is_accept_resource_exhaustion(err);
+    TransportError::AcceptFailed {
+        reason: err.to_string(),
+        resource_exhausted,
+        per_connection: !resource_exhausted && is_accept_per_connection_error(err),
+    }
+}
+
 /// Reads one chunk of at most [`STREAM_READ_CHUNK`] bytes from a TCP or TLS
 /// stream into `buf` and splits it off as the returned `Bytes`.
 ///
@@ -261,4 +371,102 @@ pub trait StreamTransport: Transport {
 
     /// Returns true if the connection is still open.
     fn is_connected(&self) -> bool;
+}
+
+/// SR-22 tests for the accept-error classifier
+/// (`is_accept_resource_exhaustion`, `is_accept_per_connection_error`).
+#[cfg(all(test, unix))]
+mod sr22_accept_classifier_tests {
+    use super::{is_accept_per_connection_error, is_accept_resource_exhaustion};
+    use nix::errno::Errno;
+    use std::io::Error;
+
+    // NIST 800-53 Rev5: SC-5
+    // Only process- or system-wide resource errors back off; a failure tied
+    // to one connection lets the accept loop continue at once.
+    #[test]
+    fn accept_error_classification() {
+        for errno in [Errno::EMFILE, Errno::ENFILE, Errno::ENOBUFS, Errno::ENOMEM] {
+            let err = Error::from_raw_os_error(errno as i32);
+            assert!(
+                is_accept_resource_exhaustion(&err),
+                "{errno:?} must back off"
+            );
+        }
+        for errno in [
+            Errno::ECONNABORTED,
+            Errno::ENOTCONN,
+            Errno::EPROTO,
+            Errno::EPERM,
+            Errno::ECONNRESET,
+            Errno::EINTR,
+            Errno::EAGAIN,
+            Errno::EINVAL,
+        ] {
+            let err = Error::from_raw_os_error(errno as i32);
+            assert!(
+                !is_accept_resource_exhaustion(&err),
+                "{errno:?} must not back off"
+            );
+        }
+        assert!(is_accept_resource_exhaustion(&Error::from(
+            std::io::ErrorKind::OutOfMemory
+        )));
+        assert!(!is_accept_resource_exhaustion(&Error::other("custom")));
+    }
+
+    // NIST 800-53 Rev5: SC-5
+    // SEC-009: only errors about the pending connection are per-connection;
+    // listener-level and unknown errors count toward the persistent-error
+    // back-off.
+    #[test]
+    fn accept_error_per_connection_classification() {
+        for errno in [
+            Errno::ECONNABORTED,
+            Errno::ECONNRESET,
+            Errno::EPROTO,
+            Errno::EPERM,
+            Errno::EINTR,
+            Errno::EAGAIN,
+            Errno::ETIMEDOUT,
+            Errno::ENETUNREACH,
+            Errno::EHOSTUNREACH,
+        ] {
+            let err = Error::from_raw_os_error(errno as i32);
+            assert!(
+                is_accept_per_connection_error(&err),
+                "{errno:?} is per-connection"
+            );
+        }
+        for errno in [
+            Errno::EBADF,
+            Errno::EINVAL,
+            Errno::ENOTSOCK,
+            Errno::EOPNOTSUPP,
+            Errno::EFAULT,
+            Errno::EMFILE,
+        ] {
+            let err = Error::from_raw_os_error(errno as i32);
+            assert!(
+                !is_accept_per_connection_error(&err),
+                "{errno:?} is listener-level"
+            );
+        }
+        assert!(!is_accept_per_connection_error(&Error::other("custom")));
+    }
+
+    // SEC-009: the mapped error carries both classes.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn accept_error_maps_classes() {
+        let per_conn = super::accept_error(&Error::from_raw_os_error(Errno::ECONNABORTED as i32));
+        assert!(per_conn.is_per_connection_accept_error());
+        assert!(!per_conn.is_resource_exhausted());
+        let listener = super::accept_error(&Error::from_raw_os_error(Errno::EBADF as i32));
+        assert!(!listener.is_per_connection_accept_error());
+        assert!(!listener.is_resource_exhausted());
+        let exhausted = super::accept_error(&Error::from_raw_os_error(Errno::EMFILE as i32));
+        assert!(!exhausted.is_per_connection_accept_error());
+        assert!(exhausted.is_resource_exhausted());
+    }
 }

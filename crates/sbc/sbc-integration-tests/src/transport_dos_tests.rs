@@ -45,6 +45,61 @@ fn transport_dos_keys_load_from_toml() {
     );
 }
 
+/// SR-58: the aggregate connection-cap keys load from TOML and are
+/// validated. Compile-red until the `[transport]` fields exist.
+mod sr58_aggregate_keys {
+    use sbc_config::load_from_str;
+
+    #[test]
+    fn sr58_aggregate_keys_load_from_toml() {
+        let config = load_from_str(
+            r#"
+            [rate_limit]
+            ipv6_prefix_len = 64
+
+            [transport]
+            udp_listen = ["0.0.0.0:5060"]
+            v6_aggregate_prefix_len = 56
+            max_connections_per_v6_aggregate = 2048
+            max_connections_per_v4_24 = 512
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.transport.v6_aggregate_prefix_len, 56);
+        assert_eq!(config.transport.max_connections_per_v6_aggregate, 2048);
+        assert_eq!(config.transport.max_connections_per_v4_24, 512);
+
+        let defaults = load_from_str("[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n").unwrap();
+        assert_eq!(defaults.transport.v6_aggregate_prefix_len, 48);
+        assert_eq!(defaults.transport.max_connections_per_v6_aggregate, 1024);
+        assert_eq!(defaults.transport.max_connections_per_v4_24, 1024);
+
+        // Cross-section: an aggregate narrower than the per-source key
+        // still loads (configs that loaded before keep loading) and is
+        // clamped to the per-source prefix.
+        let clamped = load_from_str(
+            "[rate_limit]\nipv6_prefix_len = 48\n[transport]\nudp_listen = \
+             [\"0.0.0.0:5060\"]\nv6_aggregate_prefix_len = 56\n",
+        )
+        .unwrap();
+        assert_eq!(
+            clamped
+                .transport
+                .effective_v6_aggregate_prefix_len(clamped.rate_limit.ipv6_prefix_len),
+            48
+        );
+        // Explicitly invalid prefixes are rejected.
+        for bad in [30, 72] {
+            assert!(
+                load_from_str(&format!(
+                    "[transport]\nudp_listen = [\"0.0.0.0:5060\"]\nv6_aggregate_prefix_len = {bad}\n"
+                ))
+                .is_err()
+            );
+        }
+    }
+}
+
 /// A global flood from A rejects but never blocks; B is not blocked either.
 #[test]
 fn global_flood_from_a_does_not_block_b() {
@@ -187,4 +242,61 @@ fn rate_limit_c_trunk_rps_range_enforced_by_loader() {
     assert!(with(5).is_err(), "below per_ip_rps accepted");
     assert!(with(1_000_000).is_err(), "above global_rps accepted");
     assert!(with(2_000).is_ok());
+}
+
+/// SR-56 accept-admission keys.
+///
+/// ## NIST 800-53 Rev5: SC-5, CM-6
+mod sr56_accept_keys {
+    use sbc_config::load_from_str;
+
+    #[test]
+    fn accept_rate_and_handshake_keys_load_from_toml() {
+        let config = load_from_str(
+            r#"
+            [transport]
+            udp_listen = ["0.0.0.0:5060"]
+            max_connections_per_source = 32
+            accept_rate_per_source = 40
+            accept_burst_per_source = 80
+            max_handshakes_in_flight = 512
+            max_handshakes_per_source = 8
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.transport.accept_rate_per_source, 40);
+        assert_eq!(config.transport.accept_burst_per_source, 80);
+        assert_eq!(config.transport.max_handshakes_in_flight, 512);
+        assert_eq!(config.transport.max_handshakes_per_source, 8);
+
+        let defaults = load_from_str("[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n").unwrap();
+        assert_eq!(defaults.transport.accept_rate_per_source, 20);
+        assert_eq!(defaults.transport.accept_burst_per_source, 50);
+        assert_eq!(defaults.transport.max_handshakes_in_flight, 0);
+        assert_eq!(defaults.transport.max_handshakes_per_source, 16);
+
+        for bad in [
+            "accept_burst_per_source = 0",
+            "accept_rate_per_source = 60\naccept_burst_per_source = 50",
+            "max_handshakes_per_source = 0",
+        ] {
+            let text = format!("[transport]\nudp_listen = [\"0.0.0.0:5060\"]\n{bad}\n");
+            assert!(load_from_str(&text).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    // NIST-002: lowering only max_connections_per_source below the
+    // default max_handshakes_per_source (16) still loads; the daemon
+    // clamps the handshake cap to 8 at startup with a warning.
+    #[test]
+    fn handshake_cap_above_connection_cap_loads() {
+        for extra in ["", "max_handshakes_per_source = 9\n"] {
+            let text = format!(
+                "[transport]\nudp_listen = [\"0.0.0.0:5060\"]\nmax_connections_per_source = 8\n{extra}"
+            );
+            let config = load_from_str(&text).unwrap();
+            assert_eq!(config.transport.max_connections_per_source, 8);
+            assert!(config.transport.max_handshakes_per_source > 8, "{extra:?}");
+        }
+    }
 }
