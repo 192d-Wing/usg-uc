@@ -76,6 +76,9 @@ impl PostgresPhoneStore {
         // NIST 800-53 Rev5: SI-10 -- reject malformed fields before any write.
         crate::validate::validate_phone(phone)?;
         let mac_normalized = Self::normalize_mac(&phone.mac_address);
+        // POAM: POA&M-426 — `Phone` skips serializing line and LDAP
+        // passwords, so this row loses them (and a DDIL upload carries the
+        // loss to central).
         let data = serde_json::to_value(phone)?;
         sqlx::query(
             "INSERT INTO phones (id, mac_normalized, data)
