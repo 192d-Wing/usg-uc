@@ -5338,8 +5338,12 @@ impl SipStack {
             match self.match_dialog(req, &ingress, DialogRule::InDialog).await {
                 Ok(found) => found,
                 Err((status, policy)) => {
-                    self.signaling_audit
-                        .in_dialog_reject(req, source, policy, Instant::now());
+                    self.signaling_audit.in_dialog_reject(
+                        req,
+                        client_of(source),
+                        policy,
+                        Instant::now(),
+                    );
                     return respond(status);
                 }
             };
@@ -5624,7 +5628,7 @@ impl SipStack {
         // per source (POA&M-252; NIST 800-53 Rev5: AU-2, SI-4, SC-23).
         let audit_reject = |policy: InDialogPolicy| {
             self.signaling_audit
-                .in_dialog_reject(req, source, policy, Instant::now());
+                .in_dialog_reject(req, client_of(source), policy, Instant::now());
         };
         let (internal_id, from_a_leg, addrs, new_flow) =
             match self.match_dialog(req, &ingress, DialogRule::InDialog).await {
@@ -5664,7 +5668,7 @@ impl SipStack {
         };
         let audit_reject = |policy: InDialogPolicy| {
             self.signaling_audit
-                .in_dialog_reject(req, source, policy, Instant::now());
+                .in_dialog_reject(req, client_of(source), policy, Instant::now());
         };
 
         // Method-specific headers that cross the B2BUA, validated (SI-10).
@@ -7535,7 +7539,7 @@ impl SipStack {
     ) -> Result<(Option<SipRequest>, Option<PrivacyHeader>), Box<ProcessResult>> {
         let reject = |status: StatusCode, policy: &'static str| {
             self.signaling_audit
-                .signaling_reject(req, source, policy, Instant::now());
+                .signaling_reject(req, client_of(source), policy, Instant::now());
             let resp = if status == StatusCode::LOOP_DETECTED {
                 proto_sip::create_loop_detected_response(req)
             } else {
@@ -7852,7 +7856,7 @@ impl SipStack {
         };
         let reject = |outcome: DigestOutcome| -> Box<SipResponse> {
             self.signaling_audit
-                .digest(aor, source, outcome, Instant::now());
+                .digest(aor, client_of(source), outcome, Instant::now());
             challenge(outcome == DigestOutcome::Stale)
         };
         let scheme_ok = auth
@@ -7944,8 +7948,12 @@ impl SipStack {
                         StatusCode::FORBIDDEN,
                     )));
                 }
-                self.signaling_audit
-                    .digest(aor, source, DigestOutcome::Ok, Instant::now());
+                self.signaling_audit.digest(
+                    aor,
+                    client_of(source),
+                    DigestOutcome::Ok,
+                    Instant::now(),
+                );
                 Ok(true)
             }
             DigestVerdict::Stale => {
@@ -7994,8 +8002,11 @@ impl SipStack {
                         shared = tripped.shared,
                         "digest failure backoff started"
                     );
-                    self.signaling_audit
-                        .digest_throttle_tripped(aor, source, Instant::now());
+                    self.signaling_audit.digest_throttle_tripped(
+                        aor,
+                        client_of(source),
+                        Instant::now(),
+                    );
                 }
                 Err(reject(DigestOutcome::Reject(r)))
             }
@@ -10269,7 +10280,7 @@ impl SipStack {
                     if auth_hdr.is_some() {
                         self.signaling_audit.bearer_failure(
                             &aor,
-                            source,
+                            client_of(source),
                             error.as_param(),
                             Instant::now(),
                         );
@@ -10291,13 +10302,15 @@ impl SipStack {
                     }
                     // Identity is the token subject when known (SR-42, AU-3).
                     match dn {
-                        Some(dn) => {
-                            self.signaling_audit
-                                .bearer_forbidden(&dn, &aor, source, Instant::now())
-                        }
+                        Some(dn) => self.signaling_audit.bearer_forbidden(
+                            &dn,
+                            &aor,
+                            client_of(source),
+                            Instant::now(),
+                        ),
                         None => self.signaling_audit.bearer_failure(
                             &aor,
-                            source,
+                            client_of(source),
                             "forbidden",
                             Instant::now(),
                         ),
@@ -10787,8 +10800,11 @@ impl SipStack {
                         );
                     }
                     // Aggregated per (source prefix, policy) (SR-42, SC-5).
-                    self.signaling_audit
-                        .source_admission_reject(req, source, Instant::now());
+                    self.signaling_audit.source_admission_reject(
+                        req,
+                        client_of(source),
+                        Instant::now(),
+                    );
                     let forbidden = create_response_from_request(req, StatusCode::FORBIDDEN);
                     return ProcessResult::Response {
                         message: SipMessage::Response(forbidden),
@@ -12516,8 +12532,12 @@ impl SipStack {
                         status = status.code(),
                         "Rejecting BYE that does not match the dialog"
                     );
-                    self.signaling_audit
-                        .in_dialog_reject(req, source, policy, Instant::now());
+                    self.signaling_audit.in_dialog_reject(
+                        req,
+                        client_of(source),
+                        policy,
+                        Instant::now(),
+                    );
                     let response = create_response_from_request(req, status);
                     return ProcessResult::Response {
                         message: SipMessage::Response(response),
@@ -12959,8 +12979,12 @@ impl SipStack {
             st.cancel_target = false;
         }
         debug!(call_id = req.headers.call_id().unwrap_or(""), source = %source, status = status.code(), "INVITE reuses the Call-ID of an INVITE being routed");
-        self.signaling_audit
-            .signaling_reject(req, source, "invite:merged-request", Instant::now());
+        self.signaling_audit.signaling_reject(
+            req,
+            client_of(source),
+            "invite:merged-request",
+            Instant::now(),
+        );
         ProcessResult::Response {
             message: SipMessage::Response(create_response_from_request(req, status)),
             destination: source,
