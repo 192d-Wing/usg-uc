@@ -9,7 +9,7 @@
 # Build: docker build -t registry.gitlab.com/<your-group>/<your-project>/ci-image:latest .
 # Push:  docker push registry.gitlab.com/<your-group>/<your-project>/ci-image:latest
 
-FROM rust:1.93-trixie
+FROM rust:1.99-trixie
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
