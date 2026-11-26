@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, connection memory and file-descriptor budget, POA&M-452, 453)
+
+Affects every SBC at startup and every Helm upgrade. Operator details:
+`docs/SBC-ADMIN-GUIDE.md` (file descriptors, after the stream limits) and
+`deploy/helm/sbc/DEPLOYING.md` "Sizing the connection caps".
+
+- **The daemon checks its fd budget at startup.** (SC-5, SC-6, CM-6)
+  Before opening any listener or RTP socket it raises the soft
+  `RLIMIT_NOFILE` to the hard limit. If the kernel refuses the hard limit
+  (macOS reports `RLIM_INFINITY`), it uses the highest value between the
+  current soft limit and the hard limit that the kernel accepts. It then checks that `transport.max_connections_total` +
+  1024 egress connections + the RTP port range
+  (`media.rtp_port_max - rtp_port_min + 1`, zero with an out-of-process
+  media plane) + the SIP listeners + 256 REST HTTPS connections + 512 fds
+  of headroom fit. If they do not, it lowers `max_connections_total` to
+  fit, and `max_connections_per_listener` and `max_connections_per_source`
+  to at most that. It logs an `error!` and records a `ConfigurationChange`
+  (`Modified`, admin `startup`) audit event naming the old and new values.
+  The runtime configuration then shows the caps in effect. A reload
+  (SIGHUP) keeps them. It reports `transport.max_connections` as
+  restart-required only when the caps in the file differ from the file at
+  startup, so an unedited file reports no change.
+- **The daemon refuses to start when fewer than 64 connections fit**
+  (POA&M-453). The refusal is audited as `SystemShutdown` (not graceful).
+  With in-process media and the default RTP range (16384..32768) that
+  means a hard fd limit below about 18,250. A host that ran with a low
+  limit before (for example `ulimit -Hn 4096`) must raise it (systemd
+  `LimitNOFILE=65536` or higher), narrow the RTP range, or run media out of
+  process.
+- **Helm: stream connection caps are now set explicitly and are lower.**
+  New values `sbcDaemon.config.max_connections_per_listener` (default
+  6000) and `sbcDaemon.config.max_connections_total` (default 8000) are
+  rendered into `[transport]` as integers. The chart previously left the
+  schema defaults (10,000 / 20,000) in effect. The new defaults fit the
+  daemon's 2Gi memory limit at 128 KiB per TLS connection in the worst
+  case (the 64 KiB message buffer assumes the SR-54 stream framer bound).
+  Sites with more than 8000 concurrent TCP/TLS connections must raise both
+  values and `sbcDaemon.resources.limits.memory` together
+  (`max_connections_total <= memory limit / 2 / 128 KiB`); size WebSocket
+  deployments at 256 KiB (WS) or 300 KiB (WSS) per connection (arithmetic
+  in `DEPLOYING.md`). The schema defaults are unchanged.
+- **Smaller per-connection buffers.** (SC-5, SC-6) Each TCP and TLS
+  connection reads into one reusable 4 KiB buffer instead of 64 KiB, and
+  the extra copy per read is gone. Each WebSocket connection uses an 8 KiB
+  read and write buffer instead of tungstenite's 128 KiB. Its queued
+  outbound bytes are capped at 2 x 65,535, so a peer that stops reading
+  cannot grow the queue (the 2 s write deadline still closes it). This
+  saves about 60 KiB of resident memory per idle TCP/TLS connection. A
+  WebSocket connection can still hold about 256 KiB (WS) or 300 KiB (WSS)
+  after maximum-size messages (tungstenite buffers do not shrink).
+- There is still no node-wide budget on buffered bytes (POA&M-452), and no
+  part of the connection pool is reserved for trunks or authenticated
+  flows (POA&M-453).
+
 ### BREAKING (SBC and soft client, TLS peer certificates ECDSA P-384 / SHA-384 only, SR-14)
 
 - **TLS peers must use ECDSA P-384 / SHA-384 end to end.** (SC-13, IA-3,
@@ -392,6 +446,13 @@ release") and `deploy/keycloak/central-config-clients.md`.
 
 ### Changed (SBC, dependencies and CI)
 
+- **SBC images:** the eight Rust service images (sbc-api-server,
+  sbc-provision-server, sbc-client-config-server, sbc-announcement-server,
+  sbc-trunk-agent, central-config-api, central-config-import,
+  sbc-config-sync) now build on `rust:1-bookworm` and run on the pinned
+  `debian:trixie-slim`, like sbc-daemon, so they link the aws-lc FIPS
+  module. The Alpine builders could not build `aws-lc-fips-sys`.
+  `ci/check-dockerfiles-fips.sh` fails CI on an Alpine or musl Rust builder.
 - `central-config-store`: sqlx gains feature `tls-rustls-aws-lc-rs` (the
   feature `uc-storage` already enables), so a `verify-full` DSN can
   connect. No new crate enters `Cargo.lock`. sqlx builds its own rustls
@@ -1909,6 +1970,9 @@ Effects for SBC operators:
 
 ### Documentation
 
+- **SBC:** TLS certificate revocation is not checked on SIP mTLS, trunk,
+  SRS or CDR syslog connections; design for CRL support in
+  `docs/TLS-REVOCATION-DESIGN.md` (POA&M-401).
 - **SBC:** `uc-api` `Router::authorize` is not yet called by sbc-daemon;
   the default-deny route permissions are not enforced on the SBC HTTP API
   (POA&M-261).

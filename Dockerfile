@@ -25,8 +25,8 @@
 # planner / cacher / builder stages so the apt-install + cargo-install
 # layers cache once.
 #
-# NOTE: this image deliberately stays glibc (Debian) while the other SBC
-# pods are Alpine. sbc-daemon links the FIPS-validated aws-lc module
+# NOTE: this image, like every Rust SBC image, is glibc (Debian).
+# sbc-daemon links the aws-lc FIPS module
 # (rustls `fips` + uc-crypto, see docs/CNSA-2-COMPLIANCE.md), and
 # aws-lc-fips-sys does not support musl — an Alpine build would fail or
 # silently drop the FIPS posture. Same applies to ci/image (FIPS builds
