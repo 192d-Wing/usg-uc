@@ -369,8 +369,8 @@ Notes:
 Bearer authentication applies to **all** SIP requests, not only REGISTER:
 
 - REGISTER carries `Authorization: Bearer <access_token>`. The registrar
-  validates the JWT (signature via JWKS, `iss`/`aud`/`exp`) and requires the
-  To-URI user part to equal the `dn` claim.
+  validates the JWT (ES384 signature via JWKS, `iss`/`aud`/`exp`, `nbf` when
+  present) and requires the To-URI user part to equal the `dn` claim.
 - Out-of-dialog requests (INVITE, SUBSCRIBE, MESSAGE) proactively carry the
   current access token the same way. On `401` with
   `WWW-Authenticate: Bearer` or `407` with `Proxy-Authenticate: Bearer`, the
@@ -407,6 +407,39 @@ Ephemeral-digest mode **MUST use RFC 8760 hash algorithms**:
 | Offline session (with `offline_access`) | 30 d idle | Mobile clients survive long idle periods |
 | Refresh token rotation | enabled (revoke on reuse) | Public client hardening |
 | Required actions | configure per policy (WebAuthn, OTP) | Client is agnostic — it only sees the browser |
+| Default signature algorithm | `ES384` | CNSA 2.0; the SBC rejects every other algorithm (see Token signing) |
+
+### Token signing (required)
+
+`proto-jwt` accepts only ES384 access tokens signed by an EC P-384 key.
+RS256, PS256 and ES256 tokens get 401. Keycloak signs with RS256 by default,
+and `Configure-Voice.ps1` does not change that. Set it on the realm:
+
+1. Realm settings → Keys → Providers → Add provider `ecdsa-generated`,
+   elliptic curve `P-384`, enabled and active.
+2. Realm settings → Tokens → Default signature algorithm `ES384`
+   (realm field `defaultSignatureAlgorithm`).
+3. Leave the clients' access-token signature algorithm unset or `ES384`
+   (client attribute `access.token.signed.response.alg`).
+
+Check: decode a token from `Get-TestToken.ps1`; the header must show
+`"alg":"ES384"`, and the JWKS entry for its `kid` must be `kty` `EC`,
+`crv` `P-384`. A JWKS entry whose `alg` differs from the token's is refused.
+
+Tokens must carry `exp`, `iss` and `aud`; `nbf` is checked when present
+(30 s leeway, at most 300 s). A `crit` header, a header `typ` other than
+`JWT` / `at+jwt` (also as `application/jwt` / `application/at+jwt`, case-insensitive), and a Keycloak `typ` claim other than `Bearer` (ID,
+refresh and logout tokens) are refused, as is a JWKS entry whose `use` is
+not `sig` or whose `key_ops` lacks `verify`. An empty issuer or audience
+set is refused when the validator is built: sbc-client-config-server exits
+with code 2, and sbc-api-server, central-config-api and sbc-daemon (with
+`SBC_AUTH_MODE=bearer`) do not start.
+
+A token whose `aud` names several relying parties (for example
+`usg-uc-provisioning` and `sbc`) is accepted by each of them. Map only the
+audiences a client needs. `nbf` is optional and `iat` is not checked, so
+the realm's access-token lifespan bounds how long a stolen token is
+usable.
 
 ### Client 1: `usg-uc-softclient` (the soft client)
 
@@ -455,8 +488,8 @@ Resulting access-token payload (trimmed):
 ```
 
 With `dn` in the token, the **SBC can authorize REGISTER without calling the
-provisioning service**: validate signature against cached JWKS, check
-`iss`/`aud`/`exp`, then require that the To-URI user part equals the `dn`
+provisioning service**: validate the ES384 signature against cached JWKS,
+check `iss`/`aud`/`exp` (and `nbf` when present), then require that the To-URI user part equals the `dn`
 claim. The provisioning API uses the same claim to build the config response.
 
 ### Trust relationships
@@ -471,8 +504,8 @@ flowchart LR
 
     SC -->|"device grant (desktop)<br/>auth code + PKCE (App Link)"| KC
     KC -->|"JWT with dn claim"| SC
-    PR -->|"fetch JWKS, validate iss/aud/exp"| KC
-    SBC -->|"fetch JWKS, validate iss/aud/exp"| KC
+    PR -->|"fetch JWKS, validate ES384, iss/aud/exp"| KC
+    SBC -->|"fetch JWKS, validate ES384, iss/aud/exp"| KC
     KC --- DIR
 ```
 
@@ -580,7 +613,8 @@ straight to `Refreshing` on launch is therefore not active.
    domain, preferring IPv6) and RFC 5626 outbound (reg-id, instance-id,
    keepalives) — until those land, transport selection comes from the
    provisioned account, not DNS.
-3. **Keycloak**: `voice` realm, two clients, `sip` scope and mappers as above.
+3. **Keycloak**: `voice` realm, two clients, `sip` scope and mappers as above,
+   and an ES384 / P-384 signing key (manual step, see Token signing).
 4. **Bearer SIP auth (RFC 8898)** — implemented for REGISTER on both sides:
    the client attaches `Authorization: Bearer` and reacts to 401 rejection
    with a token refresh + re-register; the SBC validates the JWT against

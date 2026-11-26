@@ -47,6 +47,9 @@ pub mod tls;
 #[cfg(feature = "tls")]
 pub mod cert_reload;
 
+#[cfg(feature = "https-client")]
+pub mod https_client;
+
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
@@ -239,6 +242,13 @@ pub trait Transport: Send + Sync {
     /// parked in `recv` does not wake on close; it polls this to stop.
     fn is_closed(&self) -> bool {
         false
+    }
+
+    /// Control frames (e.g. WebSocket ping/pong) received since the last
+    /// call. Transports without control frames return 0.
+    // POAM: POA&M-458: not yet consumed by the daemon reader.
+    fn take_control_frames(&self) -> u64 {
+        0
     }
 }
 

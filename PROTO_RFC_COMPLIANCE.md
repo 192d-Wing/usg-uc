@@ -620,7 +620,7 @@ Since SIPREC phase 3 (2026-11-09) `sbc-daemon` calls `uc-siprec` to record calls
 | RFC 6665 | SIP Events | proto-sip, proto-dialog | library |
 | RFC 6910 | Auto-Configuration | proto-dialog | library |
 | RFC 7092 | B2BUA Taxonomy | proto-b2bua | sbc-daemon |
-| RFC 7118 | WebSocket Transport for SIP | proto-sip, uc-transport | sbc-daemon (ws); wss library |
+| RFC 7118 | WebSocket Transport for SIP | proto-sip, uc-transport | sbc-daemon (ws); wss flag only, no TLS (POA&M-459) |
 | RFC 7614 | Location Conveyance | proto-dialog | library |
 | RFC 7616 | HTTP Digest (SHA-256, SHA-512-256) | proto-sip, proto-registrar | sbc-daemon REGISTER via proto-sip `DigestVerifier`, enabled by `[digest_auth]` (off by default); one challenge for the configured algorithm, SHA-256 or SHA-512-256; HA1 file credentials; no INVITE challenge (POA&M-271) |
 | RFC 7627 | Extended Master Secret | proto-dtls (mandatory in `DtlsAssociation`) | soft client (since 2026-11-17); required by the SBC Go sidecar |
