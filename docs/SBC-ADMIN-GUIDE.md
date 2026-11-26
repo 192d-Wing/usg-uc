@@ -1323,6 +1323,7 @@ Notes on what the daemon actually does with these keys:
 - `curve` only constrains the configuration enum; the key type of the loaded certificate is not checked (P-256/RSA certificates are accepted by rustls).
 - `trunk_tls_ca_path` (wired): PEM bundle of the CAs that issue trunk server certificates. Required when any trunk uses `protocol = "tls"`; separate from `tls_ca_path` (client CA for the listener). See Trunk Groups.
 - `require_mtls` (wired for SIP-TLS and gRPC): the SIP-TLS listener requires a client certificate chaining to `tls_ca_path`; `validate_config` rejects `require_mtls = true` without `tls_cert_path` and `tls_ca_path`. The gRPC listener has its own `[grpc] require_mtls` / `tls_ca_path`.
+- Certificate revocation is not checked. A revoked client, trunk, recorder or syslog collector certificate that chains to the configured CA is accepted (POA&M-401). Remove the CA from the bundle to cut off a compromised issuer.
 
 **Peer certificate requirements (changed by SR-14, breaking).** Every TLS
 connection built on the CNSA provider accepts a peer only if it signs with
