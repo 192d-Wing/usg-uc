@@ -185,6 +185,8 @@ max_connections_per_source = 128      # per IPv4 address / IPv6 prefix, all list
 handshake_timeout_secs = 10           # TLS and WebSocket handshake deadline (1..=60)
 first_message_timeout_secs = 30       # a new connection must send an accepted SIP
                                       # message within this (1..=tcp_idle_timeout_secs)
+max_header_bytes = 16384              # bytes before the blank line ending the SIP
+                                      # headers; over this closes (1024..=65535)
 tcp_idle_timeout_secs = 300           # idle limit afterwards (30..=3600)
 ws_require_sip_subprotocol = true     # refuse WS upgrades without `sip` (RFC 7118 §4)
 v6_aggregate_prefix_len = 48          # IPv6 aggregate for the caps below (32..=64)
@@ -235,11 +237,36 @@ Before a connection's first accepted message (one that parses as SIP),
 bare CRLF keep-alives, partial-message drips and unparseable frames do
 not count as activity; afterwards CRLF keep-alives keep an RFC 5626 flow
 alive. On TCP/TLS a double-CRLF ping is answered with a single-CRLF pong
-(RFC 5626 §4.4.1). WebSocket upgrades run off the accept loop under
-`handshake_timeout_secs`, the reply echoes `Sec-WebSocket-Protocol: sip`,
-and WS messages and frames are capped at 65,535 bytes. Each WS message
-must hold one complete SIP message (RFC 7118 §5); an incomplete one is
-discarded (counted as a framing error) and never joined to the next.
+(RFC 5626 §4.4.1). `max_header_bytes` applies to every stream connection,
+including trunk connections the SBC dials; a header block that does not
+end within it closes the connection with no response.
+
+Stream work that completes no message is charged to the source's
+`rate_limit.per_ip_rps` bucket only, never to the `global_rps` bucket.
+Nothing is charged when `rate_limit.enabled = false`.
+
+- **Keep-alive pings.** The first run of pings on a connection in each
+  window of max(15 s, `tcp_idle_timeout_secs` / 4) is free, so a UA that
+  pings at the RFC 5626 interval always gets its pong. Each faster run
+  costs one token. An over-rate ping gets no pong and does not count as
+  activity; a blocked source's connection is closed. This is a deviation
+  from the RFC 5626 §5.4 MUST: the UA treats the flow as failed after
+  10 s (§4.4.1) and recovers it (§4.5), and the reconnect is itself
+  subject to the connection and rate limiters.
+- **Partial messages.** The first 4,096 bytes buffered for a message not
+  yet complete are covered by the message's own token; each further
+  4,096 bytes costs one token. Over rate, the connection is closed, so a
+  peer sending large messages back-to-back may need a higher
+  `per_ip_rps`.
+- **WebSocket.** A WS message pays one token whatever its size.
+
+WebSocket upgrades run off the accept loop under `handshake_timeout_secs`,
+the reply echoes `Sec-WebSocket-Protocol: sip`, and WS messages and frames
+are capped at 65,535 bytes. Each WS message must hold one complete SIP
+message (RFC 7118 §5). An incomplete one is discarded, counted as a
+framing error, costs one token (over rate closes the connection) and is
+never joined to the next. Bytes after the first SIP message in a WS
+message are discarded and counted as a framing error.
 
 Accept admission (NIST SC-5, SC-7). Every stream accept is checked in
 this order before any TLS or WebSocket handshake: a source blocked by the
