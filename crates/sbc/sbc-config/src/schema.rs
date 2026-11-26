@@ -2102,6 +2102,15 @@ pub struct TrunkGroupConfig {
     /// is `false` or unset is a load warning: privacy wins and Identity is dropped when
     /// From is anonymized.
     ///
+    /// A trunk is recognised by source IP on its configured `protocol` or a
+    /// stronger transport (see `protocol`), so `true` with any trunk whose
+    /// `protocol` is not `"tls"` is a load
+    /// warning: that peer's identity rests on a spoofable (UDP) or
+    /// unauthenticated (TCP) source address (POA&M-397).
+    ///
+    /// The warning does not enforce transmission protection (SC-8); it only
+    /// steers trust-domain peers to TLS.
+    ///
     /// ## NIST 800-53 Rev5: AC-21, SC-4, CM-6 (secure default); RFC 3325 §5, §7, §9.1
     #[serde(default)]
     pub trust_domain: bool,
@@ -2117,7 +2126,14 @@ pub struct TrunkConfigSchema {
     pub host: String,
     /// SIP port.
     pub port: u16,
-    /// Transport protocol: "udp", "tcp", "tls".
+    /// Transport protocol: "udp", "tcp", "tls". Used for egress, and as
+    /// the floor of the transports inbound traffic from `host` is
+    /// recognised as this trunk on: `udp` also over TCP and TLS (RFC 3261
+    /// §18.1.1 large requests), `tcp` also over TLS, `tls` over TLS only. A
+    /// UDP datagram from a `tls` trunk's address is not the trunk. Set it to
+    /// the weakest transport the peer actually sends on.
+    ///
+    /// ## NIST 800-53 Rev5: AC-3, SC-7
     pub protocol: String,
     /// Selection priority (lower = preferred).
     pub priority: u32,
