@@ -23,6 +23,7 @@ pub mod error;
 pub mod migration;
 pub mod model;
 pub mod phones;
+pub mod redact;
 pub mod sbc;
 pub mod schema;
 pub mod trunk_groups;

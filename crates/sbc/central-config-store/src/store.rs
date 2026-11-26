@@ -276,6 +276,8 @@ impl CentralConfigStore {
         data: &Value,
         actor: &str,
     ) -> CentralResult<i64> {
+        // POAM: POA&M-425 — line and LDAP passwords in `data` are stored in
+        // plaintext here and in the change journal (no sealing at rest).
         let mut tx = self.primary.begin().await?;
         let epoch = bump_epoch(&mut tx, site_code).await?;
         let res = sqlx::query(
@@ -439,6 +441,8 @@ impl CentralConfigStore {
             "upsert_json called for typed table {}",
             table.name()
         );
+        // POAM: POA&M-425 — trunk SIP passwords in `data` are stored in
+        // plaintext here and in the change journal (no sealing at rest).
         let mut tx = self.primary.begin().await?;
         let epoch = bump_epoch(&mut tx, site_code).await?;
         let sql = format!(

@@ -824,6 +824,17 @@ trust_domain = true             # default false
 - B-leg transaction timers follow the trunk's protocol, not the caller's: a TCP caller to a UDP trunk now gets UDP retransmissions on the B-leg.
 - Calls to registered phones use the transport the phone registered on (see SIP Registration).
 
+### Stored secrets in management API responses
+
+Applies to the site API (`/api/v1/trunkgroups`, `/api/v1/trunkgroups/{group_id}/trunks/{trunk_id}`) and the central API (`/v1/sites/{site}/trunkgroups`, `/v1/sites/{site}/phones`).
+
+- Reads return `"***REDACTED***"` in place of a non-empty trunk `sip_password`, phone line `sip_password` or phone `directory.ldap_password`, for every role. Empty and `null` values are returned as-is.
+- On write, send the marker back to keep the stored value. A new value replaces it; `""` or `null` clears it. A marker on a new entry (no stored value) is cleared, never stored.
+- A phone line marker is kept only for the stored line with the same `index`, `sip_username` and `directory_number`.
+- If a write keeps the marker but changes where the secret is sent, it is refused with **422** and `"error": "secret_reentry_required"`, with `field` naming the changed field (for example `trunks[0].host`, `lines[0].sip_server`, `directory.ldap_server`, `mac_address`; a single-trunk update names the bare field, such as `host`). Re-enter the secret in the same request. Destination fields: trunk `host`, `port`, `protocol`/`transport`, `tls_server_name`, `sip_username`; phone `mac_address`; line `sip_username`, `sip_server`, `sip_port`, `transport`; LDAP `ldap_server`, `ldap_port`, `ldap_tls`, `ldap_bind_dn`. On a single-trunk update, omitting `sip_password` counts as keeping it.
+- Central template writes (`PUT /v1/templates/trunk_group/{id}`) drop markers.
+- Central still stores these secrets in plaintext and sends them to sites over the sync API (POA&M-425). Set `ldap_tls = true` wherever an LDAP bind password is configured; it is not enforced.
+
 ### Selection Strategies
 
 | Strategy | Behavior |

@@ -19,6 +19,7 @@ use tower_http::trace::TraceLayer;
 use tracing::warn;
 
 use central_config_store::{CentralError, ConfigTable, DeltaResult};
+use sbc_config_store::redact;
 
 use crate::auth::{authorize_action, authorize_site};
 use crate::policy::{Action, Entity, Verb};
@@ -349,6 +350,27 @@ const fn entity_for_table(table: ConfigTable) -> Entity {
     }
 }
 
+/// Replace stored secrets in an operator read payload with the marker
+/// (phone line and LDAP passwords, trunk SIP passwords). Every operator
+/// read goes through this, for every role; the sync surface does not.
+///
+/// ## NIST 800-53 Rev5: IA-5, AC-3, AC-6, SI-12
+fn redact_for_read(table: ConfigTable, payload: &mut Value) {
+    match table {
+        ConfigTable::Phones => redact::phone(payload),
+        ConfigTable::TrunkGroups => redact::trunk_group(payload),
+        // No secret fields. Exhaustive on purpose: a new table must be
+        // classified here (see `secret_redaction::redact_for_read_*`).
+        ConfigTable::DirectoryNumbers
+        | ConfigTable::DialPlans
+        | ConfigTable::SiteTelephonyConfig
+        | ConfigTable::SbcPartitions
+        | ConfigTable::SbcCallingSearchSpaces
+        | ConfigTable::SbcRoutePatterns
+        | ConfigTable::SbcRouteLists => {}
+    }
+}
+
 /// List a table's live rows for a site as `{ "items": [...] }`.
 async fn do_list(
     state: &AppState,
@@ -362,7 +384,14 @@ async fn do_list(
     }
     match state.store.list_rows(table, site).await {
         Ok(rows) => {
-            let items: Vec<Value> = rows.into_iter().map(|r| r.payload).collect();
+            let items: Vec<Value> = rows
+                .into_iter()
+                .map(|r| {
+                    let mut payload = r.payload;
+                    redact_for_read(table, &mut payload);
+                    payload
+                })
+                .collect();
             Json(json!({ "items": items })).into_response()
         }
         Err(e) => write_error(&e),
@@ -381,8 +410,13 @@ async fn do_get(
     if let Err(rej) = authorize_action(&state.admin_validator, headers, action, Some(site)).await {
         return rej.into_response();
     }
+    // POAM: POA&M-425 — secrets are redacted on read but stored in
+    // plaintext in the live rows and the change journal (no sealing at rest).
     match state.store.get_row(table, site, id).await {
-        Ok(Some(v)) => Json(v).into_response(),
+        Ok(Some(mut v)) => {
+            redact_for_read(table, &mut v);
+            Json(v).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))).into_response(),
         Err(e) => write_error(&e),
     }
@@ -528,7 +562,7 @@ async fn upsert_phone(
     State(state): State<Arc<AppState>>,
     Path(site): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
     let action = Action::new(Entity::Phones, Verb::Write);
     let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
@@ -539,12 +573,28 @@ async fn upsert_phone(
     let Some(id) = body.get("id").and_then(Value::as_str) else {
         return bad_request("phone id is required");
     };
-    let Some(mac) = body.get("mac_address").and_then(Value::as_str) else {
+    let id = id.to_string();
+    let Some(mac) = body
+        .get("mac_address")
+        .and_then(Value::as_str)
+        .map(normalize_mac)
+    else {
         return bad_request("mac_address is required");
     };
+    // Marker round-trip: restore secrets the client sent back as the marker
+    // from this row only (same site, same id; primary read).
+    // NIST 800-53 Rev5: IA-5
+    let existing = match state.store.get_row(ConfigTable::Phones, &site, &id).await {
+        Ok(v) => v,
+        Err(e) => return write_error(&e),
+    };
+    if let Some(field) = redact::phone_reentry_field(&body, existing.as_ref()) {
+        return secret_reentry_required(&field);
+    }
+    redact::restore_phone_secrets(&mut body, existing.as_ref());
     match state
         .store
-        .upsert_phone(&site, id, &normalize_mac(mac), &body, &actor)
+        .upsert_phone(&site, &id, &mac, &body, &actor)
         .await
     {
         Ok(epoch) => ok_epoch(epoch),
@@ -650,7 +700,7 @@ async fn upsert_trunk_group(
     State(state): State<Arc<AppState>>,
     Path(site): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
     let action = Action::new(Entity::TrunkGroups, Verb::Write);
     let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
@@ -673,8 +723,9 @@ async fn upsert_trunk_group(
     if let Some(resp) = trunk_group_policy_rejection(&body) {
         return resp;
     }
-    // Prior version, for the transport-policy audit record. A failed read
-    // only weakens the diff (treated as absent); it never blocks the write.
+    // Prior version (primary read), for marker restore and the
+    // transport-policy audit record. A failed read refuses the write: treating
+    // it as absent would clear every round-tripped trunk secret.
     let old = match state
         .store
         .get_row(ConfigTable::TrunkGroups, &site, &cfg.id)
@@ -683,9 +734,15 @@ async fn upsert_trunk_group(
         Ok(v) => v,
         Err(e) => {
             warn!(site, group_id = %cfg.id, error = %e, "trunk group prior-version read failed");
-            None
+            return write_error(&e);
         }
     };
+    // NIST 800-53 Rev5: IA-5 — marker round-trip, same group and trunk id
+    // only; a kept marker with a changed trunk destination must re-enter it.
+    if let Some(field) = redact::trunk_group_reentry_field(&body, old.as_ref()) {
+        return secret_reentry_required(&field);
+    }
+    redact::restore_passwords(&mut body, old.as_ref());
     match state
         .store
         .upsert_json(ConfigTable::TrunkGroups, &site, &cfg.id, &body, &actor)
@@ -881,6 +938,20 @@ fn audit_trunk_group_change(
     ));
 }
 
+/// 422 for a write that keeps a secret marker while changing where that
+/// secret is sent. Names the changed field, never a value.
+fn secret_reentry_required(field: &str) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "error": "secret_reentry_required",
+            "field": field,
+            "detail": format!("re-enter the stored secret when {field} changes"),
+        })),
+    )
+        .into_response()
+}
+
 /// 422 for a well-formed body that violates a policy.
 fn unprocessable(detail: impl Into<String>) -> Response {
     (
@@ -1022,7 +1093,7 @@ async fn put_template(
     State(state): State<Arc<AppState>>,
     Path((kind, id)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
     let action = Action::new(Entity::Templates, Verb::Write);
     let actor = match authorize_action(&state.admin_validator, &headers, action, None).await {
@@ -1033,6 +1104,11 @@ async fn put_template(
         Ok(k) => k,
         Err(r) => return r,
     };
+    // Templates have no read surface, so a marker has nothing to restore:
+    // drop it rather than materialize it into sites as a password.
+    if kind == central_config_store::TemplateKind::TrunkGroup {
+        redact::restore_passwords(&mut body, None);
+    }
     match state.store.upsert_template(kind, &id, &body, &actor).await {
         Ok(()) => (StatusCode::OK, Json(json!({ "id": id }))).into_response(),
         Err(e) => write_error(&e),
@@ -1151,6 +1227,9 @@ mod tests {
 
     use super::*;
     use crate::state::{AppState, OPERATOR_SCOPE, SYNC_SCOPE};
+
+    /// SR-39: operator reads redact secrets; marker writes keep them.
+    mod secret_redaction;
 
     const TEST_KID: &str = "test-key-1";
     const TEST_ISSUER: &str = "https://idp.example.mil/realms/config";
@@ -1865,6 +1944,7 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         let base_url = format!("http://{addr}");
+        let base_url_ops = base_url.clone();
 
         // The real sync-agent client over real HTTP, with a static token.
         let client = sbc_config_sync::CentralClient::new(
@@ -1957,6 +2037,54 @@ mod tests {
             .find(|t| t.table == ConfigTable::Phones)
             .is_some_and(|t| t.rows.iter().any(|r| r.id == "p-edge"));
         assert!(has_edge, "local edit uploaded to central over HTTP");
+
+        // SR-39: an operator GET-then-POST round trip over HTTP (redacted
+        // read, marker write-back) leaves the real line secret in central
+        // and in the site table the agent pulls into.
+        // Test fixture, built at run time so it is not a credential literal.
+        let line_secret = ["wire", "line", "secret"].join("-");
+        central
+            .upsert_phone(
+                "MUHJ",
+                "p-sec",
+                "dddddddddddd",
+                &json!({"id": "p-sec", "mac_address": "dd:dd:dd:dd:dd:dd",
+                        "lines": [{"index": 1, "sip_password": line_secret}]}),
+                "op",
+            )
+            .await
+            .expect("p-sec");
+        let http = crate::state::build_jwks_http_client(None).expect("http client");
+        let op = operator_token(&["config-admin"], &["MUHJ"]);
+        let got: Value = http
+            .get(format!("{base_url_ops}/v1/sites/MUHJ/phones/p-sec"))
+            .bearer_auth(&op)
+            .send()
+            .await
+            .expect("operator GET")
+            .json()
+            .await
+            .expect("GET json");
+        assert_eq!(got["lines"][0]["sip_password"], "***REDACTED***", "{got}");
+        let status = http
+            .post(format!("{base_url_ops}/v1/sites/MUHJ/phones"))
+            .bearer_auth(&op)
+            .json(&got)
+            .send()
+            .await
+            .expect("operator POST")
+            .status();
+        assert_eq!(status, reqwest::StatusCode::OK);
+        sbc_config_sync::reconcile(&local, &client, &sbc_config_sync::NoopRefresher, "MUHJ")
+            .await
+            .expect("pull after round trip");
+        let site_pw: Option<String> = sqlx::query_scalar(
+            "SELECT data->'lines'->0->>'sip_password' FROM phones WHERE id = 'p-sec' AND NOT deleted",
+        )
+        .fetch_one(&local)
+        .await
+        .expect("site row");
+        assert_eq!(site_pw.as_deref(), Some(line_secret.as_str()));
     }
 
     /// ABAC over the operator surface: roles decide the action, the `sites`
