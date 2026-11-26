@@ -10,11 +10,12 @@
 use crate::chain::{self, GENESIS, HASH_LEN, from_hex, to_hex};
 use crate::error::{CdrError, CdrResult};
 use crate::format::{self, CdrFormat};
-use crate::record::CallRecord;
+use crate::record::{CallRecord, CdrStream};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use uc_crypto::hash::Sha384;
 
@@ -27,7 +28,29 @@ const RESUME_MAX_FILES: usize = 8;
 /// Delay between syslog reconnect attempts.
 const SYSLOG_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
-/// Notifications from the writer thread (rotation, write failures).
+/// Why retention deleted a CDR file.
+///
+/// ## NIST 800-53 Rev5: AU-11 (Audit Record Retention)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdrDeleteReason {
+    /// Older than `retention_days` (the authoritative rule).
+    Age,
+    /// Beyond `retention_files`, the safety cap on file count.
+    CountCap,
+}
+
+impl CdrDeleteReason {
+    /// `"age"` or `"count_cap"`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Age => "age",
+            Self::CountCap => "count_cap",
+        }
+    }
+}
+
+/// Notifications from the writer thread (rotation, deletion, write
+/// failures).
 ///
 /// Called on the writer thread, except `on_drop` which runs on the emitting task and
 /// must not block. Implementations typically raise uc-audit events.
@@ -36,6 +59,10 @@ const SYSLOG_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 pub trait CdrObserver: Send + Sync {
     /// A file was closed and its `.sha384` sidecar written.
     fn on_rotated(&self, _file: &Path, _sha384_hex: &str) {}
+    /// Retention deleted `file` (and its sidecar). `age` is the file's age
+    /// by mtime; `early` marks a count-cap deletion of a file younger than
+    /// `retention_days`.
+    fn on_deleted(&self, _file: &Path, _reason: CdrDeleteReason, _age: Duration, _early: bool) {}
     /// The file sink failed to write or open a file.
     fn on_write_error(&self, _error: &io::Error) {}
     /// Records are being dropped (rate-limited; called at most once per
@@ -66,12 +93,18 @@ pub struct FileSinkConfig {
     pub rotate_size_bytes: u64,
     /// Rotate a non-empty file after this long (`None` = size only).
     pub rotate_interval: Option<Duration>,
-    /// Keep at most this many closed files (0 = unlimited).
+    /// Safety cap: keep at most this many closed files (0 = unlimited).
+    /// Size it so `retention_files x rotate_interval` covers
+    /// `retention_days`; a cap deletion inside `retention_days` is reported
+    /// as early.
     pub retention_files: u32,
-    /// Delete closed files older than this many days (0 = unlimited).
+    /// Delete closed files older than this many days (0 = unlimited). This
+    /// is the authoritative retention rule.
     pub retention_days: u32,
     /// fsync at most this often (zero = after every record).
     pub fsync_interval: Duration,
+    /// Stream written by this sink (file prefix `cdr-` or `cdra-`).
+    pub stream: CdrStream,
 }
 
 impl Default for FileSinkConfig {
@@ -81,9 +114,11 @@ impl Default for FileSinkConfig {
             format: CdrFormat::Jsonl,
             rotate_size_bytes: 100 * 1024 * 1024,
             rotate_interval: Some(Duration::from_secs(3600)),
-            retention_files: 168,
+            // 93 days of hourly files: covers retention_days with margin.
+            retention_files: 2232,
             retention_days: 90,
             fsync_interval: Duration::from_secs(1),
+            stream: CdrStream::Calls,
         }
     }
 }
@@ -113,9 +148,10 @@ struct OpenCdrFile {
 
 /// Rotating file sink.
 ///
-/// Files are `cdr-{node}-{YYYYmmddTHHMMSS}[_NNN].{jsonl|csv}`, mode 0640 in a
-/// 0750 directory. Each closed file gets a `.sha384` sidecar (`sha384sum`
-/// format).
+/// Files are `cdr-{node}-{YYYYmmddTHHMMSS}[_NNN].{jsonl|csv}` (calls) or
+/// `cdra-{node}-...` (attempts), mode 0640 in a 0750 directory. Each closed
+/// file gets a `.sha384` sidecar (`sha384sum` format). A sink lists,
+/// resumes from and deletes only its own stream's files.
 ///
 /// ## NIST 800-53 Rev5: AU-4, AU-9 (Protection of Audit Information), AU-11 (Retention)
 pub struct FileSink {
@@ -124,6 +160,9 @@ pub struct FileSink {
     current: Option<OpenCdrFile>,
     observer: Option<Arc<dyn CdrObserver>>,
     rotations: u64,
+    deleted_age: AtomicU64,
+    deleted_cap: AtomicU64,
+    deleted_early: AtomicU64,
 }
 
 impl std::fmt::Debug for FileSink {
@@ -177,6 +216,9 @@ impl FileSink {
             current: None,
             observer,
             rotations: 0,
+            deleted_age: AtomicU64::new(0),
+            deleted_cap: AtomicU64::new(0),
+            deleted_early: AtomicU64::new(0),
         };
         let resume = sink.resume_point()?;
         let start = if hash_chain {
@@ -193,6 +235,20 @@ impl FileSink {
         self.rotations
     }
 
+    /// Files deleted so far: `(by age, by count cap, of which early)`.
+    pub fn deletions(&self) -> (u64, u64, u64) {
+        (
+            self.deleted_age.load(Ordering::Relaxed),
+            self.deleted_cap.load(Ordering::Relaxed),
+            self.deleted_early.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Stream this sink writes.
+    pub const fn stream(&self) -> CdrStream {
+        self.cfg.stream
+    }
+
     /// Path of the open file, if any.
     pub fn current_path(&self) -> Option<&Path> {
         self.current.as_ref().map(|c| c.path.as_path())
@@ -205,7 +261,7 @@ impl FileSink {
     }
 
     fn prefix(&self) -> String {
-        format!("cdr-{}-", self.node_id)
+        format!("{}-{}-", self.cfg.stream.file_prefix(), self.node_id)
     }
 
     /// Closed and open CDR files of this node and format, oldest first.
@@ -295,7 +351,7 @@ impl FileSink {
     fn file_name(&self, now: SystemTime) -> PathBuf {
         let ts = chrono::DateTime::<chrono::Utc>::from(now).format("%Y%m%dT%H%M%S");
         let ext = self.cfg.format.extension();
-        let base = format!("cdr-{}-{ts}", self.node_id);
+        let base = format!("{}{ts}", self.prefix());
         let mut path = self.cfg.directory.join(format!("{base}.{ext}"));
         let mut n = 1u32;
         // `_NNN` sorts after `.ext`, keeping lexical order chronological.
@@ -321,7 +377,8 @@ impl FileSink {
             opts.mode(0o640);
         }
         let file = opts.open(&path)?;
-        let header = format::new_header(
+        let header = format::stream_header(
+            self.cfg.stream,
             &self.node_id,
             now_ms(now),
             chain_start.to_string(),
@@ -458,29 +515,48 @@ impl FileSink {
     // POAM: NIST-05 (AU-5(1)) no free-space check or capacity-threshold
     // alert; capacity is bounded only by retention vs. volume size (config
     // rejects 0/0 and the Helm chart sizes retention to its CDR volume).
-    /// Deletes closed files beyond `retention_files` or older than
-    /// `retention_days`. The open file is never deleted.
+    // POAM: POA&M-432 -- the retention_files safety cap still deletes files
+    // younger than retention_days when size rotation outpaces
+    // rotate_interval: for the calls stream only at an answered-call rate
+    // above the volume sizing (unanswered attempts go to their own stream).
+    // Each such deletion is reported early (audited, counted, error log),
+    // not prevented.
+    /// Applies retention to this stream's closed files; the open file is
+    /// never deleted.
     ///
-    /// There is no free-space check or capacity alert: the volume must be
-    /// sized for `retention_files` x `rotate_size_mb`.
+    /// `retention_days` is authoritative: every closed file older than it
+    /// is deleted. `retention_files` is a safety cap on what remains (it
+    /// bounds the volume, AU-4); a cap deletion of a file younger than
+    /// `retention_days` is reported `early` and logged at error level.
+    /// Every deletion is reported to [`CdrObserver::on_deleted`].
     ///
-    /// ## NIST 800-53 Rev5: AU-11 (Audit Record Retention), SI-12
+    /// ## NIST 800-53 Rev5: AU-11 (Audit Record Retention), AU-4, AU-5, SI-12
     pub fn apply_retention(&self, now: SystemTime) -> io::Result<()> {
         let open = self.current_path().map(Path::to_path_buf);
-        let mut closed: Vec<PathBuf> = self
+        let age_of = |p: &Path| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .map_or(Duration::ZERO, |m| {
+                    now.duration_since(m).unwrap_or(Duration::ZERO)
+                })
+        };
+        let mut closed: Vec<(PathBuf, Duration)> = self
             .list_files()?
             .into_iter()
             .filter(|p| Some(p) != open.as_ref())
+            .map(|p| {
+                let age = age_of(&p);
+                (p, age)
+            })
             .collect();
+        let max_age = (self.cfg.retention_days > 0)
+            .then(|| Duration::from_secs(u64::from(self.cfg.retention_days) * 86_400));
         let mut doomed = Vec::new();
-        if self.cfg.retention_days > 0 {
-            let max_age = Duration::from_secs(u64::from(self.cfg.retention_days) * 86_400);
-            closed.retain(|p| {
-                let old = std::fs::metadata(p)
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|m| now.duration_since(m).unwrap_or(Duration::ZERO) > max_age);
+        if let Some(max_age) = max_age {
+            closed.retain(|(p, age)| {
+                let old = *age > max_age;
                 if old {
-                    doomed.push(p.clone());
+                    doomed.push((p.clone(), *age, CdrDeleteReason::Age));
                 }
                 !old
             });
@@ -488,15 +564,46 @@ impl FileSink {
         let keep = self.cfg.retention_files as usize;
         if keep > 0 && closed.len() > keep {
             let excess = closed.len() - keep;
-            doomed.extend(closed.drain(..excess));
+            doomed.extend(
+                closed
+                    .drain(..excess)
+                    .map(|(p, age)| (p, age, CdrDeleteReason::CountCap)),
+            );
         }
-        for p in doomed {
+        for (p, age, reason) in doomed {
             std::fs::remove_file(&p)?;
             let side = chain::sidecar_path(&p);
             if side.exists() {
                 std::fs::remove_file(side)?;
             }
-            tracing::info!(file = %p.display(), "CDR retention: deleted file");
+            let early = reason == CdrDeleteReason::CountCap && max_age.is_some_and(|m| age < m);
+            let counter = match reason {
+                CdrDeleteReason::Age => &self.deleted_age,
+                CdrDeleteReason::CountCap => &self.deleted_cap,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            if early {
+                self.deleted_early.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    file = %p.display(),
+                    stream = self.cfg.stream.as_str(),
+                    age_secs = age.as_secs(),
+                    retention_files = self.cfg.retention_files,
+                    retention_days = self.cfg.retention_days,
+                    "CDR retention: file deleted by the count cap before retention_days; \
+                     size the CDR volume and retention_files for the call rate"
+                );
+            } else {
+                tracing::info!(
+                    file = %p.display(),
+                    stream = self.cfg.stream.as_str(),
+                    reason = reason.as_str(),
+                    "CDR retention: deleted file"
+                );
+            }
+            if let Some(obs) = &self.observer {
+                obs.on_deleted(&p, reason, age, early);
+            }
         }
         Ok(())
     }
@@ -832,7 +939,7 @@ impl CdrSink for SyslogSink {
 mod tests {
     use super::*;
     use crate::chain::seal;
-    use crate::record::SCHEMA_VERSION;
+    use crate::record::{CALLS_SCHEMA_VERSION, CdrStream};
     use std::sync::Mutex;
 
     fn cfg(dir: &Path) -> FileSinkConfig {
@@ -844,13 +951,14 @@ mod tests {
             retention_files: 0,
             retention_days: 0,
             fsync_interval: Duration::from_secs(60),
+            stream: CdrStream::Calls,
         }
     }
 
     fn write_n(sink: &mut FileSink, start: u64, prev: &mut [u8; 48], n: u64) {
         for i in start..start + n {
             let mut r = CallRecord {
-                schema_version: SCHEMA_VERSION,
+                schema_version: CALLS_SCHEMA_VERSION,
                 node_id: "n1".into(),
                 sequence: i,
                 record_id: format!("n1-{i}"),
@@ -1026,7 +1134,7 @@ mod tests {
     #[test]
     fn csv_resume_parses_quoted_newlines_and_skips_torn_row() {
         let mut r = CallRecord {
-            schema_version: SCHEMA_VERSION,
+            schema_version: CALLS_SCHEMA_VERSION,
             node_id: "n1".into(),
             sequence: 7,
             callee_dialed: "x\r\ny,\"z\"".into(),
@@ -1065,7 +1173,7 @@ mod tests {
             let (mut sink, _) = FileSink::open(c.clone(), "n1", true, None).unwrap();
             for i in 0..3u64 {
                 let mut r = CallRecord {
-                    schema_version: SCHEMA_VERSION,
+                    schema_version: CALLS_SCHEMA_VERSION,
                     node_id: "n1".into(),
                     sequence: i,
                     record_id: format!("n1-{i}"),
@@ -1097,7 +1205,7 @@ mod tests {
     #[test]
     fn csv_resume_accepts_only_known_widths() {
         let mut r = CallRecord {
-            schema_version: SCHEMA_VERSION,
+            schema_version: CALLS_SCHEMA_VERSION,
             node_id: "n1".into(),
             sequence: 41,
             ..Default::default()
@@ -1209,5 +1317,202 @@ mod tests {
         assert_eq!(e1.kind(), io::ErrorKind::ConnectionRefused);
         let e2 = s.write(&CallRecord::default(), "{}").unwrap_err();
         assert_eq!(e2.kind(), io::ErrorKind::NotConnected);
+    }
+
+    // ── SR-43: age-authoritative retention, audited deletions (QA-first) ──
+
+    type Deletion = (PathBuf, CdrDeleteReason, Duration, bool);
+
+    #[derive(Default)]
+    struct DelObs(Mutex<Vec<Deletion>>);
+    impl DelObs {
+        fn take(&self) -> Vec<Deletion> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+    impl CdrObserver for DelObs {
+        fn on_deleted(&self, file: &Path, reason: CdrDeleteReason, age: Duration, early: bool) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((file.to_path_buf(), reason, age, early));
+        }
+    }
+
+    fn set_mtime(p: &Path, t: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    const DAY: Duration = Duration::from_hours(24);
+
+    /// Plan 8 (SR-43): `retention_days` is authoritative; `retention_files`
+    /// is a safety cap whose deletions of files younger than
+    /// `retention_days` are reported `early`. An expired file is deleted
+    /// even when the cap is not reached.
+    /// NIST 800-53 Rev5: AU-11, AU-4, AU-5
+    #[test]
+    fn age_retention_is_authoritative_count_cap_reports_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.rotate_size_bytes = 1;
+        c.retention_files = 3;
+        c.retention_days = 1;
+        let obs = Arc::new(DelObs::default());
+        let (mut sink, _) =
+            FileSink::open(c, "n1", true, Some(obs.clone() as Arc<dyn CdrObserver>)).unwrap();
+        let mut prev = GENESIS;
+        write_n(&mut sink, 0, &mut prev, 6);
+        let files = sink.list_files().unwrap();
+        assert_eq!(files.len(), 3);
+
+        // The cap removed three files that were younger than retention_days.
+        let capped = obs.take();
+        assert_eq!(capped.len(), 3);
+        for (p, reason, age, early) in &capped {
+            assert!(matches!(reason, CdrDeleteReason::CountCap));
+            assert!(*early, "{} was inside retention_days", p.display());
+            assert!(*age < DAY);
+            assert!(!p.exists() && !chain::sidecar_path(p).exists());
+        }
+
+        // Age pass: two files are past retention_days, the newest is not.
+        let now = SystemTime::now();
+        set_mtime(&files[0], now - 2 * DAY);
+        set_mtime(&files[1], now - DAY - Duration::from_secs(3600));
+        sink.apply_retention(now).unwrap();
+        assert_eq!(sink.list_files().unwrap(), vec![files[2].clone()]);
+        let aged = obs.take();
+        assert_eq!(aged.len(), 2);
+        for (p, reason, age, early) in &aged {
+            assert!(matches!(reason, CdrDeleteReason::Age), "{}", p.display());
+            assert!(!*early);
+            assert!(*age > DAY);
+        }
+
+        // Far below the cap, an expired file still goes (age wins).
+        sink.set_retention(1000, 1);
+        set_mtime(&files[2], now - 3 * DAY);
+        sink.apply_retention(now).unwrap();
+        assert_eq!(sink.list_files().unwrap(), [] as [PathBuf; 0]);
+        let last = obs.take();
+        assert_eq!(last.len(), 1);
+        assert!(matches!(last[0].1, CdrDeleteReason::Age));
+    }
+
+    /// Plan 8: every deletion reaches the observer with the deleted path,
+    /// the reason and the file age; the sidecar goes with it, and a file
+    /// that is kept is never reported.
+    /// NIST 800-53 Rev5: AU-11, AU-12
+    #[test]
+    fn retention_deletion_calls_on_deleted_with_reason_and_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.retention_days = 30;
+        let obs = Arc::new(DelObs::default());
+        let (mut sink, _) =
+            FileSink::open(c, "n1", true, Some(obs.clone() as Arc<dyn CdrObserver>)).unwrap();
+        let mut prev = GENESIS;
+        let mut closed = Vec::new();
+        for i in 0..3 {
+            write_n(&mut sink, i, &mut prev, 1);
+            closed.push(sink.current_path().unwrap().to_path_buf());
+            sink.close_current().unwrap();
+        }
+        assert!(obs.take().is_empty(), "nothing expired yet");
+        let now = SystemTime::now();
+        set_mtime(&closed[0], now - 45 * DAY);
+        sink.apply_retention(now).unwrap();
+        let d = obs.take();
+        assert_eq!(d.len(), 1);
+        let (p, reason, age, early) = &d[0];
+        assert_eq!(p, &closed[0]);
+        assert!(matches!(reason, CdrDeleteReason::Age));
+        assert!(!*early);
+        let secs = age.as_secs();
+        assert!(
+            (45 * 86_400 - 60..=45 * 86_400 + 60).contains(&secs),
+            "{secs}"
+        );
+        assert!(!closed[0].exists());
+        assert!(!chain::sidecar_path(&closed[0]).exists());
+        assert!(closed[1].exists() && closed[2].exists());
+    }
+
+    /// Plan 8: the attempts stream (`cdra-{node}-`) and the calls stream
+    /// (`cdr-{node}-`) never list, resume from or delete each other's
+    /// files, including node `x` against node `x-a`.
+    /// NIST 800-53 Rev5: AU-11, AU-9
+    #[test]
+    fn attempts_prefix_never_matches_calls_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = [
+            "cdr-x-20260101T000000.jsonl",
+            "cdra-x-20260101T000000.jsonl",
+            "cdr-x-a-20260101T000000.jsonl",
+            "cdra-x-a-20260101T000000.jsonl",
+        ];
+        for n in names {
+            std::fs::write(dir.path().join(n), "junk\n").unwrap();
+        }
+        let open = |node: &str, stream: CdrStream| {
+            let mut c = cfg(dir.path());
+            c.stream = stream;
+            FileSink::open(c, node, true, None).unwrap().0
+        };
+        for (node, stream, own) in [
+            ("x", CdrStream::Calls, names[0]),
+            ("x", CdrStream::Attempts, names[1]),
+            ("x-a", CdrStream::Calls, names[2]),
+            ("x-a", CdrStream::Attempts, names[3]),
+        ] {
+            let mut sink = open(node, stream);
+            let new = sink
+                .current_path()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let want = own.split("2026").next().unwrap();
+            assert!(new.starts_with(want), "{node} {stream:?}: {new}");
+            sink.close_current().unwrap();
+            let listed: Vec<String> = sink
+                .list_files()
+                .unwrap()
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                listed.contains(&own.to_string()),
+                "{node} {stream:?}: {listed:?}"
+            );
+            for other in names.iter().filter(|n| **n != own) {
+                assert!(
+                    !listed.contains(&(*other).to_string()),
+                    "{node} {stream:?}: {listed:?}"
+                );
+            }
+        }
+        // An age pass of the node-x calls stream deletes only its own files.
+        let now = SystemTime::now();
+        for n in names {
+            set_mtime(&dir.path().join(n), now - 10 * DAY);
+        }
+        let mut c = cfg(dir.path());
+        c.retention_days = 1;
+        let (sink, _) = FileSink::open(c, "x", true, None).unwrap();
+        sink.apply_retention(now).unwrap();
+        assert!(!dir.path().join(names[0]).exists());
+        for n in &names[1..] {
+            assert!(
+                dir.path().join(n).exists(),
+                "{n} was deleted by node x calls"
+            );
+        }
     }
 }

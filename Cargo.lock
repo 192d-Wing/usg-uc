@@ -8605,6 +8605,7 @@ name = "uc-audit"
 version = "0.10.0"
 dependencies = [
  "chrono",
+ "criterion",
  "hex",
  "serde",
  "serde_json",

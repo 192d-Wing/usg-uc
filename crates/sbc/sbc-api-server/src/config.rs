@@ -73,9 +73,9 @@ pub struct Config {
     /// Unset (or empty): audit records go to the tracing output (target
     /// `audit`) and must be shipped off-host by the log pipeline.
     ///
-    /// ## NIST 800-53 Rev5: AU-9, AU-12 (capacity, AU-4, is the platform's:
-    /// volume sizing, rotation and retention)
-    // POAM: POA&M-133 -- no in-process audit file rotation or retention.
+    /// The file is rotated within the bound read by [`audit_sink_from_env`].
+    ///
+    /// ## NIST 800-53 Rev5: AU-9, AU-12
     pub audit_path: Option<std::path::PathBuf>,
 }
 
@@ -177,6 +177,36 @@ impl Config {
     }
 }
 
+/// Audit file size bound: `SBC_API_AUDIT_MAX_FILE_MB` 1..=4096 (default
+/// 64), `SBC_API_AUDIT_MAX_FILES` 1..=1024 (default 16) and
+/// `SBC_API_AUDIT_ON_FULL` `overwrite_oldest` (default) or `stop`. On disk
+/// at most `(max files + 1) x max file size`.
+///
+/// ## NIST 800-53 Rev5: AU-4, AU-5, CM-6
+///
+/// # Errors
+/// [`ConfigError::Invalid`] for an out-of-range or unknown value.
+pub fn audit_sink_from_env() -> Result<uc_audit::sink::FileSinkOptions, ConfigError> {
+    parse_audit_sink(|k| std::env::var(k).ok())
+}
+
+/// [`audit_sink_from_env`] over a lookup.
+///
+/// ## NIST 800-53 Rev5: AU-4, AU-5, CM-6
+fn parse_audit_sink(
+    get: impl Fn(&'static str) -> Option<String>,
+) -> Result<uc_audit::sink::FileSinkOptions, ConfigError> {
+    uc_audit::sink::FileSinkOptions::from_env_values(
+        [
+            "SBC_API_AUDIT_MAX_FILE_MB",
+            "SBC_API_AUDIT_MAX_FILES",
+            "SBC_API_AUDIT_ON_FULL",
+        ],
+        get,
+    )
+    .map_err(|(var, reason)| ConfigError::Invalid { var, reason })
+}
+
 /// Parses an optional audit-file path: empty means unset; a set value must
 /// be absolute (no working-directory-relative audit trail).
 ///
@@ -201,6 +231,32 @@ fn parse_audit_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SR-42: the audit rotation variables reach the sink options or are
+    /// rejected. NIST 800-53 Rev5: AU-4, CM-6
+    #[test]
+    fn audit_sink_vars_parsed_and_rejected() {
+        let o = parse_audit_sink(|_| None).ok().unwrap_or_default();
+        assert_eq!(o, uc_audit::sink::FileSinkOptions::default());
+        let o = parse_audit_sink(|k| match k {
+            "SBC_API_AUDIT_MAX_FILE_MB" => Some("8".into()),
+            "SBC_API_AUDIT_MAX_FILES" => Some("4".into()),
+            "SBC_API_AUDIT_ON_FULL" => Some("stop".into()),
+            _ => None,
+        })
+        .ok();
+        assert_eq!(
+            o.map(|o| (o.max_file_bytes, o.max_rotated_files, o.on_full)),
+            Some((8 * 1024 * 1024, 4, uc_audit::sink::CapacityAction::Stop))
+        );
+        assert!(matches!(
+            parse_audit_sink(|k| (k == "SBC_API_AUDIT_MAX_FILES").then(|| "0".into())),
+            Err(ConfigError::Invalid {
+                var: "SBC_API_AUDIT_MAX_FILES",
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn audit_path_empty_is_unset_and_relative_rejected() {

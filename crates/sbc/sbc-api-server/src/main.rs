@@ -129,13 +129,16 @@ async fn main() -> ExitCode {
 }
 
 /// Starts the audit logger on the configured file (chain resumed, 0640 in
-/// a 0750 directory) or the tracing output.
+/// a 0750 directory, rotated within the `SBC_API_AUDIT_*` bound) or the
+/// tracing output.
 ///
-/// ## NIST 800-53 Rev5: AU-5, AU-9, AU-12
+/// ## NIST 800-53 Rev5: AU-4, AU-5, AU-9, AU-12
 fn init_audit(path: Option<&std::path::Path>) -> Result<(), String> {
+    // Validated even without a path: a bad value is refused, not ignored.
+    let options = config::audit_sink_from_env().map_err(|e| e.to_string())?;
     match path {
         Some(p) => {
-            let sink = uc_audit::sink::FileSink::open(p)
+            let sink = uc_audit::sink::FileSink::open_with(p, options)
                 .map_err(|e| format!("cannot open audit file {}: {e}", p.display()))?;
             uc_audit::init_with_sink(Box::new(sink)).map_err(|e| e.to_string())?;
             info!(path = %p.display(), "audit log enabled");

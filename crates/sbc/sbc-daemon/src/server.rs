@@ -1256,6 +1256,25 @@ impl Server {
         Arc::new(Mutex::new(RateLimiter::new(rate_limit_config)))
     }
 
+    /// Logs the non-fatal configuration warnings (T.38, recording, CDR).
+    fn log_config_warnings(config: &SbcConfig) {
+        for w in sbc_config::validate::t38_warnings(config) {
+            warn!(event = "config.t38_warning", "{w}");
+        }
+        // NIST 800-53 Rev5: CM-6, AU-14 - non-fatal `[recording]` problems
+        // (e.g. SRTP passthrough: only cleartext-RTP calls can be recorded).
+        // The settings themselves are attached in `start` (they need the
+        // SRS address and CA; see `wire_recording`).
+        for w in sbc_config::validate::recording_warnings(config) {
+            warn!(event = "config.recording_warning", "{w}");
+        }
+        // NIST 800-53 Rev5: CM-6, AU-11 - a CDR count cap that cannot be
+        // checked against retention_days (size-only rotation).
+        for w in sbc_config::validate::cdr_warnings(config) {
+            warn!(event = "config.cdr_warning", "{w}");
+        }
+    }
+
     /// Initializes SipStack routing, manipulation, and topology hiding from config.
     fn init_sip_stack_from_config(
         sip_stack: &mut SipStack,
@@ -1278,16 +1297,7 @@ impl Server {
         sip_stack.set_t38_config(config.media.t38.clone());
         // NIST 800-53 Rev5: SC-8, CM-6 - media.srtp.required on call legs.
         sip_stack.set_media_security_policy(&config.media.srtp);
-        for w in sbc_config::validate::t38_warnings(config) {
-            warn!(event = "config.t38_warning", "{w}");
-        }
-        // NIST 800-53 Rev5: CM-6, AU-14 - non-fatal `[recording]` problems
-        // (e.g. SRTP passthrough: only cleartext-RTP calls can be recorded).
-        // The settings themselves are attached in `start` (they need the
-        // SRS address and CA; see `wire_recording`).
-        for w in sbc_config::validate::recording_warnings(config) {
-            warn!(event = "config.recording_warning", "{w}");
-        }
+        Self::log_config_warnings(config);
 
         // Initialize router from config (if routing section present)
         if let Some(ref routing) = config.routing {

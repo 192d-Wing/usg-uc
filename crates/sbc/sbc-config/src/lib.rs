@@ -413,6 +413,8 @@ media:
 format = "csv"
 directory = "/srv/cdr"
 rotate_interval = "15m"
+retention_files = 8640
+attempts_retention_files = 8640
 record_unanswered = "routed"
 pii = "mask_caller"
 on_failure = "reject_new_calls"

@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, audit file rotation and capacity; CDR retention and attempts stream, SR-42, SR-43, POA&M-133 closed, POA&M-430..433)
+
+Operator details: `docs/SBC-ADMIN-GUIDE.md` (audit file rotation and
+capacity; CDR retention and attempts stream) and `deploy/helm/sbc/DEPLOYING.md`
+"Upgrading to the CDR retention release".
+
+- **Audit files rotate and are bounded.** (AU-4, AU-5) With an audit path
+  set, the file rotates to `<path>.<20-digit number>` and at most
+  `(audit_max_files + 1) x audit_max_file_mb` stays on disk (default
+  17 x 64 MiB). New `[logging]` keys: `audit_max_file_mb` (1..=4096,
+  default 64), `audit_max_files` (1..=1024, default 16), `audit_on_full`
+  (`overwrite_oldest` default, or `stop`). sbc-api-server:
+  `SBC_API_AUDIT_MAX_FILE_MB`, `SBC_API_AUDIT_MAX_FILES`,
+  `SBC_API_AUDIT_ON_FULL`; central-config-api: `CENTRAL_API_AUDIT_*`, same
+  ranges and defaults. An invalid value stops startup. `overwrite_oldest`
+  deletes the oldest rotated file: ship rotated files off-box first.
+- **New audit events.** `audit_file_rotated` (first record of each new
+  file), `audit_file_deleted`, `cdr_file_deleted`, and drop reason
+  `capacity_exhausted`. Parsers must accept them.
+- **`sbc-cli audit verify <path>*`** checks a rotated set as one chain and
+  cross-checks each rotated file's SHA-384.
+- **Unauthenticated rejects are aggregated.** (AU-3, SC-5) Source-admission
+  403s and bearer REGISTER failures are recorded per source /24 or /64 per
+  window, with `;count=<n>;prefix=<prefix>`; `source_ip` is a sample. Each
+  signalling class writes at most 256 records per window; the rest become
+  one `<class>:over-budget;count=..;keys=..;top=..` summary. Bearer
+  failures use `bearer:<RFC 6750 code>` or `bearer:forbidden`.
+- **CDR: unanswered attempts move to their own stream.** (AU-11) With
+  `separate_attempts = true` (default), only answered calls stay in
+  `cdr-{node}-*` (schema v4, unchanged). Every unanswered attempt (rejects,
+  failed, busy, no answer, cancelled) goes to `cdra-{node}-*`, schema v5
+  with `"stream":"attempts"` and `record_id` `{node}-a{sequence}`. Billing
+  and reporting that read unanswered attempts must also read `cdra-*`.
+  `sbc-cli cdrs verify` runs per stream (`cdr-*` and `cdra-*` separately).
+  `separate_attempts = false` keeps the single v4 stream.
+- **CDR retention by age.** `retention_days` is authoritative;
+  `retention_files` is a safety cap. Config is rejected when
+  `files x rotate_interval` does not cover `days` for a stream. Defaults:
+  `retention_files` 2232 (was 168). New keys: `attempts_retention_files`
+  (default 2232, at least 1 with `separate_attempts`),
+  `attempts_retention_days` (90), `attempts_rotate_size_mb` (1..=4096,
+  default 4). Early cap deletions are audited and counted in
+  `sbc_cdr_files_deleted_early_total`.
+- **Helm.** `sbcDaemon.cdr`: `rotateInterval: 6h` (was unset, 1 h),
+  `retentionFiles: 372` (was 48), `attemptsRetentionFiles: 372`,
+  `attemptsRetentionDays: 90`, `attemptsRotateSizeMb: 4`,
+  `separateAttempts: true`; `persistence.size` grows from 1Gi to 8Gi
+  (worst case 7.3 GiB). Without volume expansion, keep the existing size
+  and lower `rotateSizeMb`.
+- **Restart-only keys.** `logging.audit_path`, `audit_max_file_mb`,
+  `audit_max_files`, `audit_on_full`, `cdr.separate_attempts` and
+  `cdr.attempts_rotate_size_mb` need a restart; a SIGHUP reports them.
+- **Still open:** post-admission INVITE denials are audited per request
+  (POA&M-431); capacity is configured, not measured (POA&M-430, POA&M-14).
+
 ### BREAKING (SBC, sbc chart: dashboard, login and client-config edge TLS, SR-53, POA&M-436, 437)
 
 Only the sbc Helm chart changes. No crate, image, config file, REST/gRPC API,
