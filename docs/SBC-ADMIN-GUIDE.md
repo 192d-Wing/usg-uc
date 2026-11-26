@@ -575,6 +575,8 @@ strategy = "least_connections"   # selection strategy
 >   tls_client_cert = false              # true: present security.tls_cert_path (mTLS)
 > ```
 >
+> The trunk's server certificate and its CA chain must be ECDSA P-384 / SHA-384; RSA and P-256 trunk certificates are refused (see Security > TLS Configuration).
+>
 > `tls_server_name` and `tls_client_cert` are accepted only on `tls` trunks. `tls_server_name` must be a DNS name or IP address without a port. `tls_client_cert = true` needs `security.tls_cert_path` / `tls_key_path`. `security.min_tls_version` applies to trunk connections too. Cipher suites and key exchange are limited to CNSA 2.0 (TLS 1.3 `TLS_AES_256_GCM_SHA384`, ML-KEM-1024 or P-384). A TLS handshake or verify failure is logged as a warning and counted in `sip_egress_connect_failures_total`; it does not produce its own audit event. Trunk connects time out after 5 s, and the SBC holds at most 1024 trunk connections.
 >
 > A group may mix `tls` and `udp`/`tcp` trunks. Without `require_tls`, failover from a TLS trunk to a UDP trunk is allowed and sends that attempt in clear. Set `require_tls` (below) if plaintext failover is not acceptable.
@@ -1342,6 +1344,30 @@ Notes on what the daemon actually does with these keys:
 - `trunk_tls_ca_path` (wired): PEM bundle of the CAs that issue trunk server certificates. Required when any trunk uses `protocol = "tls"`; separate from `tls_ca_path` (client CA for the listener). See Trunk Groups.
 - `require_mtls` (wired for SIP-TLS and gRPC): the SIP-TLS listener requires a client certificate chaining to `tls_ca_path`; `validate_config` rejects `require_mtls = true` without `tls_cert_path` and `tls_ca_path`. The gRPC listener has its own `[grpc] require_mtls` / `tls_ca_path`.
 
+**Peer certificate requirements (changed by SR-14, breaking).** Every TLS
+connection built on the CNSA provider accepts a peer only if it signs with
+ECDSA P-384 / SHA-384 and every issuing CA key and certificate signature
+below the trust anchor is ECDSA P-384 / ecdsa-with-SHA384 (the anchor's
+self-signature is not checked). This applies to:
+
+- SIP-TLS clients presenting a certificate under `require_mtls` (CAs in `tls_ca_path`);
+- TLS trunks (`trunk_tls_ca_path`), with or without `tls_client_cert`;
+- the SIPREC recorder (`recording.srs_tls_ca_file`);
+- the RFC 5425 CDR syslog collector (`[cdr.syslog]`);
+- STIR/SHAKEN `x5u` certificate repositories (HTTPS, system web PKI);
+- soft clients connecting to the SBC (they check the SBC certificate the same way).
+
+RSA (any size), P-256, P-521 and Ed25519 leaves are refused, and so is a
+P-384 leaf issued by an RSA or P-256 CA. There is no override. Reissue peer
+certificates and intermediate CAs as P-384 before upgrading. A failed
+handshake is not audited (POA&M-49). Revocation is not checked (POA&M-401).
+ML-DSA-87 peers are not accepted yet (POA&M-404). The daemon gRPC channels and the
+sbc-media controller channel do not use this provider and are unchanged.
+
+The SBC's own certificate (`tls_cert_path`) is not checked at load beyond
+its key curve (POA&M-404). Use a P-384 key and a P-384 / SHA-384 chain: soft clients and
+other usg-uc SBCs refuse a P-521 SBC certificate.
+
 ### Rate Limiting
 
 ```toml
@@ -1483,7 +1509,7 @@ Per-trunk `sign`/`verify` require the global switch; validation rejects them oth
 - At registration capacity a new flow may not be indexed (the full-table cleanup runs at most once per second); such a caller is unauthenticated until a later REGISTER.
 - On failover the Identity is removed and the step is redone for the next trunk: re-signed with a fresh `iat` if it signs, no Identity or added PAI if it does not (a relayed Identity from a trusted ingress trunk is relayed again).
 
-**Verification.** The certificate named by `info`/`x5u` is fetched over HTTPS only, after an SSRF check (loopback, private, link-local/metadata, CGNAT, multicast, ULA, documentation and mapped forms are refused; the connection goes to the vetted address; no redirects; body and time limits), validated to the trust anchors, and cached. A cache miss waits up to `cert_fetch_timeout_ms`. The result sets `verstat` on the B-leg P-Asserted-Identity URI (on the From only when there is no PAI), is passed to `[vps.stir_shaken]` screening (so `mode = "enforce"` with `minimum_attestation` can block), and is recorded in the CDR. `reject` answers 436 Bad Identity Info (bad info / certificate unobtainable), 437 Unsupported Credential (untrusted certificate / algorithm), 403 Stale Date (`iat` outside `max_passport_age_secs`) or 438 Invalid Identity Header (any other failure), with `Reason: SIP;cause=<code>;text="..."`; 428 Use Identity Header with `require_identity`. `ppt=div` PASSporTs are ignored (RFC 8946 is not implemented). There is no replay cache and no revocation checking. National-format numbers (no leading `+`) are compared and signed as received, without country-code normalisation (POA&M-44). `orig` is accepted if it matches either the PAI or the From (POA&M-45). Identity headers from a trunk with `strip_inbound_identity = false` are relayed whatever the verification result (POA&M-42).
+**Verification.** The certificate named by `info`/`x5u` is fetched over HTTPS only, after an SSRF check (loopback, private, link-local/metadata, CGNAT, multicast, ULA, documentation and mapped forms are refused; the connection goes to the vetted address; no redirects; body and time limits), validated to the trust anchors, and cached. The repository's HTTPS certificate and web-PKI chain must be ECDSA P-384 / SHA-384 (TLS 1.2 or 1.3). **A public STI certificate repository that serves an RSA or P-256 web-PKI chain cannot be fetched from, and calls signed with its certificates fail verification (436 with `reject`).** Check each repository you depend on before upgrading. There is no override (accepted risk, POA&M-404). Such refusals log a warning naming the repository host (at most once a minute). The STI certificate itself may still be P-256 (ES256). A cache miss waits up to `cert_fetch_timeout_ms`. The result sets `verstat` on the B-leg P-Asserted-Identity URI (on the From only when there is no PAI), is passed to `[vps.stir_shaken]` screening (so `mode = "enforce"` with `minimum_attestation` can block), and is recorded in the CDR. `reject` answers 436 Bad Identity Info (bad info / certificate unobtainable), 437 Unsupported Credential (untrusted certificate / algorithm), 403 Stale Date (`iat` outside `max_passport_age_secs`) or 438 Invalid Identity Header (any other failure), with `Reason: SIP;cause=<code>;text="..."`; 428 Use Identity Header with `require_identity`. `ppt=div` PASSporTs are ignored (RFC 8946 is not implemented). There is no replay cache and no revocation checking. National-format numbers (no leading `+`) are compared and signed as received, without country-code normalisation (POA&M-44). `orig` is accepted if it matches either the PAI or the From (POA&M-45). Identity headers from a trunk with `strip_inbound_identity = false` are relayed whatever the verification result (POA&M-42).
 
 `[stir_shaken]` and its `signing`, `attestation` and `verification` tables reject unknown keys. A deprecated flat key that disagrees with its nested replacement (including `max_passport_age_secs` and `default_attestation`) is an error.
 
@@ -1612,7 +1638,7 @@ Other `recordpref` values (`on`, `pause`, `nopreference`) have no effect.
 
 ### Recorder requirements and interoperability limits
 
-- **TLS 1.3 only.** The SBC connects to the recorder with TLS 1.3 regardless of `security.min_tls_version`. The recorder's certificate must chain to `srs_tls_ca_file` and match the server name. If the recorder asks for a client certificate the SBC presents its SIP TLS certificate (this path is not covered by a test).
+- **TLS 1.3 only.** The SBC connects to the recorder with TLS 1.3 regardless of `security.min_tls_version`. The recorder's certificate must chain to `srs_tls_ca_file`, match the server name, and be ECDSA P-384 / SHA-384 with a P-384 / SHA-384 CA chain; RSA and P-256 recorder certificates are refused. If the recorder asks for a client certificate the SBC presents its SIP TLS certificate (this path is not covered by a test).
 - **SRTP with SDES `AEAD_AES_256_GCM` only.** The recording offer carries one `a=crypto:1 AEAD_AES_256_GCM` line per stream and nothing else. A recorder that supports only `AES_CM_128_HMAC_SHA1_80` answers 488 and every matched call fails recording (`srs_not_acceptable_488`). Confirm AES-256-GCM support before enabling.
 - **The recorder must accept both streams and every offered payload format.** Its answer must keep both `m=audio` lines (`RTP/SAVP`, `a=recvonly`, a unicast address) and list exactly the payload formats the SBC offered. A recorder that drops a codec, declines a stream or answers `a=inactive` fails the recording (`srs_bad_answer`).
 - **No RTCP.** The SBC sends RTP only on the recording session: no sender reports and no CNAME (POA&M-301). The offer carries `a=rtcp-mux`. A recorder that requires RTCP for synchronisation or liveness will not work correctly.
@@ -1784,6 +1810,8 @@ facility = 16
 ```
 
 The table rejects unknown keys. Validation also rejects a relative `directory` or key path, `pii = "hash"` without `pii_hash_key_file`, a key file given with any other `pii` mode, out-of-range sizes and intervals, a `node_id` outside `[A-Za-z0-9._-]{1,64}`, a syslog `target` that is not `tls://host:port`, and `retention_files = 0` together with `retention_days = 0`. The `[cdr.syslog]` keys are validated even while `syslog.enabled = false`. When CDRs are enabled and the directory cannot be created or written, the daemon refuses to start (AU-5).
+
+The syslog connection is TLS 1.3 with the CNSA provider; the collector's certificate and its CA chain must be ECDSA P-384 / SHA-384. RSA and P-256 collector certificates are refused.
 
 **Files.** Files are named `cdr-{node}-{YYYYmmddTHHMMSS}.{jsonl|csv}` (UTC), with `_NNN` added if the name already exists. A JSONL file starts with a header line `{"schema_version":1,"type":"header","node_id":..,"created_ms":..,"chain_start":..,"first_sequence":..}`, followed by one record per line. A CSV file starts with a `# usg-sbc cdr ...` comment line carrying the same values, then a fixed header row. A CSV value that starts with `= + - @`, TAB or CR gets a leading `'` so spreadsheets do not run it as a formula, so E.164 numbers appear as `'+1...`. When a file is closed by rotation or shutdown, a `<file>.sha384` sidecar in `sha384sum` format is written next to it. Retention deletes the oldest closed files and their sidecars. The open file is never deleted.
 
@@ -2031,7 +2059,7 @@ pool_size = 10                   # cluster_mode = true is refused
 
 The SBC is designed for CNSA 2.0 compliance:
 
-- SIP-over-TLS is TLS 1.3 only (cipher suites are not further restricted; P-384 certificate type is recommended but not enforced)
+- SIP-over-TLS is TLS 1.3 by default (1.2 with `min_tls_version = "1.2"`); CNSA 2.0 suites and groups only; peer certificates and chains must be ECDSA P-384 / SHA-384
 - SRTP with AEAD_AES_256_GCM (256-bit) — the only profile the media plane accepts
 - DTLS-SRTP (DTLS 1.2, Go terminator sidecar) with SHA-384 fingerprint and a self-signed P-384 SBC identity
 - Call-leg SDP: only `sha-384` / `sha-512` DTLS fingerprints and `AEAD_AES_256_GCM` SDES keys cross the SBC
