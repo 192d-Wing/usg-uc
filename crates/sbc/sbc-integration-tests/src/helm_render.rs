@@ -375,6 +375,75 @@ fn qa_helm_render_media_split_loopback() {
     );
 }
 
+// ── SR-57: connection caps sized for the pod ───────────────────
+// NIST 800-53 Rev5: SC-5, SC-6, CM-6
+
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_connection_caps() {
+    let out = must_render(sbc(&[SBC_ISSUER]), "minimal + clusterIssuer");
+    let rendered = daemon_config(&out);
+    assert!(
+        rendered.contains("max_connections_total = 8000"),
+        "default render sets max_connections_total = 8000:\n{rendered}"
+    );
+    let cfg = sbc_config::load_from_str(&rendered).expect("rendered config loads");
+    assert_eq!(cfg.transport.max_connections_total, 8000);
+    assert_eq!(cfg.transport.max_connections_per_listener, 6000);
+
+    let out = must_render(
+        sbc(&[
+            SBC_ISSUER,
+            "sbcDaemon.config.max_connections_total=4000",
+            "sbcDaemon.config.max_connections_per_listener=3000",
+        ]),
+        "caps overridden",
+    );
+    let cfg = sbc_config::load_from_str(&daemon_config(&out)).expect("rendered config loads");
+    assert_eq!(cfg.transport.max_connections_total, 4000);
+    assert_eq!(cfg.transport.max_connections_per_listener, 3000);
+
+    // A values file parses large numbers as floats; `| int64` keeps them
+    // integers (`4e+06` would fail to load as a u32).
+    let values = std::env::temp_dir().join(format!(
+        "qa-helm-connection-caps-{}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &values,
+        "sbcDaemon:\n  config:\n    max_connections_per_listener: 1000000\n    \
+         max_connections_total: 4000000\n",
+    )
+    .expect("write values file");
+    let mut cmd = Command::new("helm");
+    cmd.current_dir(repo_root())
+        .args([
+            "template",
+            "t",
+            "deploy/helm/sbc",
+            "--kube-version",
+            "1.30.0",
+        ])
+        .arg("-f")
+        .arg(&values);
+    push_sets(&mut cmd, &[SBC_MIN[0], SBC_MIN[1], SBC_ISSUER]);
+    let res = cmd.output().expect("run helm");
+    let _ = std::fs::remove_file(&values);
+    assert!(
+        res.status.success(),
+        "values-file render failed:\n{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let rendered = daemon_config(&String::from_utf8_lossy(&res.stdout));
+    assert!(
+        rendered.contains("max_connections_total = 4000000"),
+        "values-file caps render as integers:\n{rendered}"
+    );
+    let cfg = sbc_config::load_from_str(&rendered).expect("values-file config loads");
+    assert_eq!(cfg.transport.max_connections_total, 4_000_000);
+    assert_eq!(cfg.transport.max_connections_per_listener, 1_000_000);
+}
+
 // ── trusted proxies, provisioning secret, nginx real IP ────────
 
 /// An edge peer for the frontend policy (ingress controller namespace).

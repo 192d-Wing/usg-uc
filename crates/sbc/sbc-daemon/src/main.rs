@@ -63,6 +63,7 @@ mod cluster;
 mod conn_limit;
 mod digest_credentials;
 mod digest_throttle;
+mod fd_limit;
 mod flow;
 mod flows;
 #[cfg(feature = "grpc")]
