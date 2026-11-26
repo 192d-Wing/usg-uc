@@ -2054,7 +2054,7 @@ mod tests {
             )
             .await
             .expect("p-sec");
-        let http = reqwest::Client::new();
+        let http = crate::state::build_jwks_http_client(None).expect("http client");
         let op = operator_token(&["config-admin"], &["MUHJ"]);
         let got: Value = http
             .get(format!("{base_url_ops}/v1/sites/MUHJ/phones/p-sec"))
