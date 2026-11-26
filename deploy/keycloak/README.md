@@ -118,6 +118,16 @@ builds are not what the release workflow signs or packages.
   (`POST /admin/realms {"realm":"voice","enabled":true}` or console),
   configure its identity-provider/CAC federation, then run the script.
 
+### Signing algorithm (manual, required)
+
+The SBC services accept only ES384 access tokens signed by an EC P-384 key.
+Keycloak signs with RS256 by default, and `Configure-Voice.ps1` does not set
+the algorithm. On the realm: add a key provider `ecdsa-generated` with curve
+`P-384` (Realm settings → Keys → Providers), then set Realm settings →
+Tokens → Default signature algorithm to `ES384`. Without this every token
+gets 401. Details:
+[CLIENT-PROVISIONING-OIDC.md → Token signing](../../docs/CLIENT-PROVISIONING-OIDC.md#token-signing-required).
+
 ## Local dev loop
 
 Validated against Keycloak 26 in a container:
@@ -138,6 +148,8 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8081/admin/realms `
   -AdminUser admin -AdminPassword admin -SipDomain example.mil `
   -TestUser jdoe -TestUserDn 1455550100 -TestUserPassword test-only
 ```
+
+Then set the ES384 signing key as in "Signing algorithm" above.
 
 ## Handing off to a central ICAM team
 

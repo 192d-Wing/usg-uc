@@ -28962,11 +28962,21 @@ pub mod tests {
     fn bearer_authenticator_is_refused_while_digest_is_on() {
         let bearer = || {
             let issuer = "https://idp.example.test";
-            let jwks = Arc::new(proto_jwt::JwksCache::new(reqwest::Client::new(), issuer));
-            let validator = Arc::new(proto_jwt::Validator::new(
-                jwks,
-                proto_jwt::ValidatorConfig::new(issuer, vec!["sbc".to_string()]),
-            ));
+            // Never fetches; reqwest without a provider needs preconfigured TLS.
+            let tls = uc_transport::tls::create_client_config(rustls::RootCertStore::empty())
+                .expect("tls config");
+            let http = reqwest::Client::builder()
+                .use_preconfigured_tls(tls)
+                .build()
+                .expect("http client");
+            let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer));
+            let validator = Arc::new(
+                proto_jwt::Validator::new(
+                    jwks,
+                    proto_jwt::ValidatorConfig::new(issuer, vec!["sbc".to_string()]),
+                )
+                .expect("validator config"),
+            );
             Arc::new(BearerAuthenticator::new(
                 validator,
                 "example.com".to_string(),

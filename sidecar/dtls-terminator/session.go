@@ -160,6 +160,9 @@ func Run(ctx context.Context, conn net.PacketConn, rAddr net.Addr, p Params) (*R
 		return nil, fmt.Errorf("unsupported peer fingerprint algorithm (CNSA 2.0 requires sha-384): %q", p.PeerFingerprint)
 	}
 
+	// POAM: POA&M-400 pion seals DTLS records with cipher.NewGCM and a caller
+	// IV, a non-approved service in the Go module (crypto/internal/fips140/aes/gcm
+	// Seal records it); crypto/cipher NewGCM refuses it under fips140=only.
 	cfg := &dtls.Config{
 		Certificates:           []tls.Certificate{p.Identity.cert},
 		CipherSuites:           []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384},
