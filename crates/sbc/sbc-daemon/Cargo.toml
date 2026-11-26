@@ -120,6 +120,10 @@ rand = "0.8"
 name = "sbc-daemon"
 path = "src/main.rs"
 
+[[bench]]
+name = "stream_framer"
+harness = false
+
 [dev-dependencies]
 # Recording MediaController in the T.38 switchover tests.
 async-trait.workspace = true
@@ -130,3 +134,5 @@ uc-audit = { workspace = true, features = ["test-capture"] }
 tempfile.workspace = true
 # Paused-clock tests for stream idle / first-message deadlines.
 tokio = { workspace = true, features = ["test-util"] }
+# StreamFramer benchmark (benches/stream_framer.rs, PERF-001).
+criterion.workspace = true
