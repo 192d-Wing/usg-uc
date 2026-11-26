@@ -353,6 +353,13 @@ pub trait Transport: Send + Sync {
     fn is_closed(&self) -> bool {
         false
     }
+
+    /// Control frames (e.g. WebSocket ping/pong) received since the last
+    /// call. Transports without control frames return 0.
+    // POAM: POA&M-458: not yet consumed by the daemon reader.
+    fn take_control_frames(&self) -> u64 {
+        0
+    }
 }
 
 /// Connection-oriented transport for stream protocols (TCP, TLS, WebSocket).

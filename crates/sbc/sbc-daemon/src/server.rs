@@ -8257,6 +8257,206 @@ mod tests {
             drop(held);
         }
     }
+
+    /// Raw WebSocket client: upgrades with `sip` and returns the socket
+    /// (past the 101 response) and its local address.
+    async fn ws_raw_client(addr: std::net::SocketAddr) -> (tokio::net::TcpStream, SbcSocketAddr) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let local = s.local_addr().unwrap();
+        let req = format!(
+            "GET / HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: sip\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tokio::time::timeout(std::time::Duration::from_secs(5), s.read_exact(&mut b))
+                .await
+                .unwrap()
+                .unwrap();
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"), "{head:?}");
+        (s, SbcSocketAddr::from(local))
+    }
+
+    /// Reads one short unmasked server frame; returns (opcode, payload).
+    async fn ws_raw_read_frame(s: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let mut h = [0u8; 2];
+        s.read_exact(&mut h).await.unwrap();
+        let len = usize::from(h[1] & 0x7f);
+        assert!(len < 126, "short frame expected");
+        let mut payload = vec![0u8; len];
+        s.read_exact(&mut payload).await.unwrap();
+        (h[0] & 0x0f, payload)
+    }
+
+    // NIST 800-53 Rev5: SC-5
+    // A flow-table send to an accepted WS flow is not delayed by the
+    // reader's pending recv.
+    #[tokio::test]
+    async fn ws_flow_send_not_delayed_by_reader_tick() {
+        let ctx = stream_test_ctx(short_timeouts());
+        let flows = Arc::clone(&ctx.flows);
+        let (listener, _) = ws_test_listener().await;
+        let addr = listener.bound_addr().unwrap();
+        let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
+        let (mut client, peer) = ws_raw_client(addr).await;
+        let flow = LegFlow::inbound(TransportType::WebSocket);
+        let msg = b"OPTIONS sip:a@192.0.2.1 SIP/2.0\r\nContent-Length: 0\r\n\r\n";
+        // Let the reader park in recv.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut elapsed = None;
+        for _ in 0..100 {
+            let t0 = std::time::Instant::now();
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                flows.send(&flow, &peer, msg, None),
+            )
+            .await
+            .expect("send bounded");
+            if r.is_ok() {
+                elapsed = Some(t0.elapsed());
+                break;
+            }
+            assert!(
+                matches!(r, Err(crate::flows::FlowError::NoConnection)),
+                "send failed: {r:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let elapsed = elapsed.expect("WS flow registered");
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "send waited {elapsed:?}"
+        );
+        let (op, payload) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ws_raw_read_frame(&mut client),
+        )
+        .await
+        .expect("client receives the message");
+        assert_eq!(op, 0x1);
+        assert_eq!(&payload[..], &msg[..]);
+        task.abort();
+    }
+
+    // NIST 800-53 Rev5: SC-5, SC-10
+    // Removing and closing a WS flow ends its reader within one tick.
+    #[tokio::test]
+    async fn ws_flow_table_close_ends_reader() {
+        let ctx = stream_test_ctx(short_timeouts());
+        let flows = Arc::clone(&ctx.flows);
+        let (listener, _) = ws_test_listener().await;
+        let addr = listener.bound_addr().unwrap();
+        let accept = {
+            let l = Arc::clone(&listener);
+            tokio::spawn(async move {
+                let (tcp, peer) = l.accept_tcp().await.unwrap();
+                (l.complete_handshake(tcp, peer).await.unwrap(), peer)
+            })
+        };
+        // The client stays connected and never reads.
+        let (_client, _) = ws_raw_client(addr).await;
+        let (ws, peer) = accept.await.unwrap();
+        let conn: Arc<dyn Transport> = Arc::new(ws);
+        let reader = tokio::spawn(Server::stream_connection_loop(
+            Arc::clone(&conn),
+            peer,
+            ctx,
+            None,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let key: FlowKey = (
+            TransportType::WebSocket,
+            peer,
+            None,
+            crate::flow::FlowProfile::Plain,
+        );
+        flows.remove(&key, &conn);
+        let closer = {
+            let c = Arc::clone(&conn);
+            tokio::spawn(async move { c.close().await })
+        };
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(3), reader).await;
+        closer.abort();
+        assert!(ended.is_ok(), "reader still running 3 s after close");
+    }
+
+    // NIST 800-53 Rev5: SC-5, SC-10
+    // WS ping frames earn no first-message credit: a client that only pings
+    // is closed at the first-message deadline (plus at most one reader tick).
+    #[tokio::test]
+    async fn ws_ping_only_connection_closes_at_first_message_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ctx = stream_test_ctx(StreamTimeouts {
+            first_message: std::time::Duration::from_millis(500),
+            ..short_timeouts()
+        });
+        let (listener, _) = ws_test_listener().await;
+        let addr = listener.bound_addr().unwrap();
+        let accept = {
+            let l = Arc::clone(&listener);
+            tokio::spawn(async move {
+                let (tcp, peer) = l.accept_tcp().await.unwrap();
+                (l.complete_handshake(tcp, peer).await.unwrap(), peer)
+            })
+        };
+        let (client, _) = ws_raw_client(addr).await;
+        let (ws, peer) = accept.await.unwrap();
+        let conn: Arc<dyn Transport> = Arc::new(ws);
+        let t0 = tokio::time::Instant::now();
+        let reader = tokio::spawn(Server::stream_connection_loop(
+            Arc::clone(&conn),
+            peer,
+            ctx,
+            None,
+        ));
+        let (mut rd, mut wr) = client.into_split();
+        // Masked, empty Ping (RFC 6455 §5.2, §5.5.2) every 100 ms.
+        let pinger = tokio::spawn(async move {
+            while wr.write_all(&[0x89, 0x80, 0, 0, 0, 0]).await.is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("ping-only connection closed by the first-message deadline")
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(500),
+            "{elapsed:?}"
+        );
+        pinger.abort();
+        // The client saw pongs, then the server's Close (or EOF).
+        let mut pongs = 0;
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut h = [0u8; 2];
+            loop {
+                if rd.read_exact(&mut h).await.is_err() {
+                    return;
+                }
+                let mut payload = vec![0u8; usize::from(h[1] & 0x7f)];
+                if rd.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                let op = h[0] & 0x0f;
+                assert!(op == 0xA || op == 0x8, "unexpected opcode {op:#x}");
+                if op == 0x8 {
+                    return;
+                }
+                pongs += 1;
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "client did not see the close");
+        assert!(pongs > 0, "pings were not answered");
+    }
 }
 
 // SR-16: the IdP/JWKS HTTP client is CNSA-only (uc-transport
