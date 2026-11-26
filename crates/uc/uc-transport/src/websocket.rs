@@ -5,23 +5,32 @@
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-8**: Transmission Confidentiality and Integrity (WSS encryption)
-//! - **SC-23**: Session Authenticity (TLS client verification)
+//! - **SC-5**: Denial-of-Service Protection (bounded frames; send and close
+//!   do not wait on a pending receive)
+//!
+//! This module carries plain WS only. It does not provide TLS, so SC-8 and
+//! SC-23 are not met here. `transport.wss_listen` is rejected by
+//! `validate_config`; TLS must be terminated by a reverse proxy in front of
+//! `ws_listen`.
 //!
 //! ## RFC 7118 Compliance
 //!
 //! - SIP subprotocol negotiation ("sip")
 //! - UTF-8 text frames for SIP messages
 //! - Binary frames support for SDP bodies
-//! - Ping/pong keepalive handling
+//! - Ping/pong keepalive handling (pong sent by tungstenite, RFC 6455 §5.5.3)
+
+// POAM: POA&M-459: `WebSocketListener::bind(addr, true)` only sets a flag (no
+// TLS) and `WebSocketTransport::connect` reports a placeholder peer address.
 
 use crate::error::{TransportError, TransportResult};
 use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
 use bytes::Bytes;
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::handshake::server::{
@@ -35,6 +44,9 @@ use tokio_tungstenite::{
 use tracing::{debug, info, warn};
 use uc_types::address::{SbcSocketAddr, TransportType};
 
+/// Stream type carried by [`WebSocketTransport`].
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
 /// SIP WebSocket subprotocol per RFC 7118.
 pub const SIP_SUBPROTOCOL: &str = "sip";
 
@@ -44,6 +56,12 @@ pub const SIP_SUBPROTOCOL: &str = "sip";
 ///
 /// ## NIST 800-53 Rev5: SC-5, SI-10; RFC 6455 §10.4
 pub const MAX_WS_MESSAGE_SIZE: usize = MAX_STREAM_MESSAGE_SIZE;
+
+/// Upper bound on writing the Close frame in [`Transport::close`]. A peer
+/// that stops reading (zero receive window) cannot hold the caller, the
+/// writer lock or the connection slot past this.
+// NIST 800-53 Rev5: SC-5, SC-10 (bounded teardown)
+const CLOSE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// tungstenite read buffer per connection (default 128 KiB).
 const WS_READ_BUFFER_SIZE: usize = 8 * 1024;
@@ -152,18 +170,25 @@ pub enum WebSocketState {
 
 /// WebSocket transport for SIP messages.
 ///
-/// Implements RFC 7118 SIP-over-WebSocket with support for both
-/// secure (WSS) and insecure (WS) connections.
+/// Implements RFC 7118 SIP-over-WebSocket over plain WS. The `secure` flag
+/// only labels the transport; no TLS is applied (POA&M-459).
 pub struct WebSocketTransport {
     /// Local address.
     local_addr: SbcSocketAddr,
     /// Remote peer address.
     peer_addr: SbcSocketAddr,
-    /// WebSocket stream (wrapped in mutex for interior mutability).
-    stream: Arc<Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
+    /// Read and write halves are locked separately so a send or close from
+    /// another task never waits behind a pending `recv` on the reader task.
+    // NIST 800-53 Rev5: SC-5 (no head-of-line blocking on the send path)
+    reader: Mutex<SplitStream<WsStream>>,
+    writer: Mutex<SplitSink<WsStream, Message>>,
     /// Connection state.
     connected: AtomicBool,
-    /// Whether this is a secure connection (WSS).
+    /// Set by [`Transport::close`]; polled by the daemon reader.
+    closed: AtomicBool,
+    /// Ping and pong frames read since the last `take_control_frames`.
+    control_frames: AtomicU64,
+    /// WSS label only; no TLS is applied (POA&M-459).
     secure: bool,
 }
 
@@ -175,18 +200,22 @@ impl WebSocketTransport {
     /// * `stream` - The WebSocket stream from an accepted connection
     /// * `local_addr` - Local address
     /// * `peer_addr` - Remote peer address
-    /// * `secure` - Whether this is a WSS connection
+    /// * `secure` - WSS label only; no TLS (POA&M-459)
     pub fn new(
-        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        stream: WsStream,
         local_addr: SbcSocketAddr,
         peer_addr: SbcSocketAddr,
         secure: bool,
     ) -> Self {
+        let (writer, reader) = stream.split();
         Self {
             local_addr,
             peer_addr,
-            stream: Arc::new(Mutex::new(Some(stream))),
+            reader: Mutex::new(reader),
+            writer: Mutex::new(writer),
             connected: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+            control_frames: AtomicU64::new(0),
             secure,
         }
     }
@@ -214,16 +243,10 @@ impl WebSocketTransport {
                     reason: format!("WebSocket connect failed: {e}"),
                 })?;
 
-        // Extract peer address from URL (simplified)
-        let peer_addr = local_addr; // Placeholder - should parse from URL
+        // POAM: POA&M-459: the peer address is a placeholder, not parsed from the URL.
+        let peer_addr = local_addr;
 
-        Ok(Self {
-            local_addr,
-            peer_addr,
-            stream: Arc::new(Mutex::new(Some(stream))),
-            connected: AtomicBool::new(true),
-            secure,
-        })
+        Ok(Self::new(stream, local_addr, peer_addr, secure))
     }
 
     /// Accepts a WebSocket connection from a TCP stream.
@@ -233,7 +256,7 @@ impl WebSocketTransport {
     /// * `tcp_stream` - TCP stream to upgrade
     /// * `local_addr` - Local address
     /// * `peer_addr` - Remote peer address
-    /// * `secure` - Whether this is a WSS connection
+    /// * `secure` - WSS label only; no TLS (POA&M-459)
     ///
     /// # Errors
     ///
@@ -301,7 +324,8 @@ impl WebSocketTransport {
         }
     }
 
-    /// Returns true if this is a secure (WSS) connection.
+    /// Returns the `secure` flag. This is a label only; the stream is plain
+    /// WS (POA&M-459).
     #[must_use]
     pub const fn is_wss(&self) -> bool {
         self.secure
@@ -313,19 +337,18 @@ impl WebSocketTransport {
     ///
     /// Returns an error if the ping cannot be sent.
     pub async fn ping(&self, payload: &[u8]) -> TransportResult<()> {
-        use futures_util::SinkExt;
-
-        let mut guard = self.stream.lock().await;
-        if let Some(stream) = guard.as_mut() {
-            stream
-                .send(Message::Ping(payload.to_vec().into()))
-                .await
-                .map_err(|e| TransportError::Io {
-                    reason: format!("Ping failed: {e}"),
-                })?;
-            debug!("Sent WebSocket ping");
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportError::AlreadyClosed);
         }
-        drop(guard);
+        let mut writer = self.writer.lock().await;
+        writer
+            .send(Message::Ping(payload.to_vec().into()))
+            .await
+            .map_err(|e| TransportError::Io {
+                reason: format!("Ping failed: {e}"),
+            })?;
+        drop(writer);
+        debug!("Sent WebSocket ping");
         Ok(())
     }
 }
@@ -337,8 +360,9 @@ impl Transport for WebSocketTransport {
         dest: &'a SbcSocketAddr,
     ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            use futures_util::SinkExt;
-
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TransportError::AlreadyClosed);
+            }
             if !self.connected.load(Ordering::Relaxed) {
                 return Err(TransportError::NotConnected);
             }
@@ -350,32 +374,31 @@ impl Transport for WebSocketTransport {
                 });
             }
 
-            let mut guard = self.stream.lock().await;
-            if let Some(stream) = guard.as_mut() {
-                // RFC 7118: SIP messages are sent as text frames
-                let message = if data.is_ascii() {
-                    // Safe to use lossy here since we checked is_ascii
-                    Message::Text(String::from_utf8_lossy(data).into_owned().into())
-                } else {
-                    // Binary data (e.g., SDP with binary content)
-                    Message::Binary(data.to_vec().into())
-                };
+            // RFC 7118: SIP messages are sent as text frames
+            let message = if data.is_ascii() {
+                // Safe to use lossy here since we checked is_ascii
+                Message::Text(String::from_utf8_lossy(data).into_owned().into())
+            } else {
+                // Binary data (e.g., SDP with binary content)
+                Message::Binary(data.to_vec().into())
+            };
 
-                stream.send(message).await.map_err(|e| {
-                    self.connected.store(false, Ordering::Relaxed);
-                    TransportError::SendFailed {
-                        address: *dest,
-                        reason: format!("WebSocket send failed: {e}"),
-                    }
-                })?;
+            // Only the writer half is locked; a parked `recv` holds the reader.
+            let mut writer = self.writer.lock().await;
+            writer.send(message).await.map_err(|e| {
+                self.connected.store(false, Ordering::Relaxed);
+                TransportError::SendFailed {
+                    address: *dest,
+                    reason: format!("WebSocket send failed: {e}"),
+                }
+            })?;
+            drop(writer);
 
-                debug!(
-                    size = data.len(),
-                    peer = %self.peer_addr,
-                    "Sent WebSocket message"
-                );
-            }
-            drop(guard);
+            debug!(
+                size = data.len(),
+                peer = %self.peer_addr,
+                "Sent WebSocket message"
+            );
 
             Ok(())
         })
@@ -383,67 +406,63 @@ impl Transport for WebSocketTransport {
 
     fn recv(&self) -> Pin<Box<dyn Future<Output = TransportResult<ReceivedMessage>> + Send + '_>> {
         Box::pin(async move {
-            use futures_util::StreamExt;
-
-            let mut guard = self.stream.lock().await;
-            if let Some(stream) = guard.as_mut() {
-                loop {
-                    match stream.next().await {
-                        Some(Ok(message)) => {
-                            let data = match message {
-                                Message::Text(text) => Bytes::from(text.as_bytes().to_vec()),
-                                Message::Binary(data) => Bytes::from(data.to_vec()),
-                                Message::Ping(payload) => {
-                                    // Respond with pong
-                                    use futures_util::SinkExt;
-                                    let _ = stream.send(Message::Pong(payload)).await;
-                                    continue;
-                                }
-                                Message::Pong(_) => {
-                                    debug!("Received WebSocket pong");
-                                    continue;
-                                }
-                                Message::Close(_) => {
-                                    self.connected.store(false, Ordering::Relaxed);
-                                    info!(peer = %self.peer_addr, "WebSocket connection closed");
-                                    return Err(TransportError::ConnectionClosed);
-                                }
-                                Message::Frame(_) => continue,
-                            };
-
-                            debug!(
-                                size = data.len(),
-                                peer = %self.peer_addr,
-                                "Received WebSocket message"
-                            );
-
-                            return Ok(ReceivedMessage {
-                                data,
-                                source: self.peer_addr,
-                                transport: if self.secure {
-                                    TransportType::WebSocketSecure
-                                } else {
-                                    TransportType::WebSocket
-                                },
-                            });
-                        }
-                        Some(Err(e)) => {
-                            warn!(error = %e, "WebSocket receive error");
-                            self.connected.store(false, Ordering::Relaxed);
-                            return Err(TransportError::ReceiveFailed {
-                                reason: format!("WebSocket error: {e}"),
-                            });
-                        }
-                        None => {
-                            self.connected.store(false, Ordering::Relaxed);
-                            return Err(TransportError::ConnectionClosed);
-                        }
-                    }
-                }
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TransportError::AlreadyClosed);
             }
-            drop(guard);
 
-            Err(TransportError::NotConnected)
+            // Cancel-safe: tokio-tungstenite keeps partial frames in the
+            // shared WebSocket state, so dropping this future loses no data.
+            let mut reader = self.reader.lock().await;
+            loop {
+                let Some(next) = reader.next().await else {
+                    self.connected.store(false, Ordering::Relaxed);
+                    return Err(TransportError::ConnectionClosed);
+                };
+                let message = match next {
+                    Ok(message) => message,
+                    Err(e) => {
+                        warn!(error = %e, "WebSocket receive error");
+                        self.connected.store(false, Ordering::Relaxed);
+                        return Err(TransportError::ReceiveFailed {
+                            reason: format!("WebSocket error: {e}"),
+                        });
+                    }
+                };
+                let data = match message {
+                    // Zero-copy: both payloads are already `Bytes`.
+                    Message::Text(text) => Bytes::from(text),
+                    Message::Binary(data) => data,
+                    // RFC 6455 §5.5.2/§5.5.3: tungstenite queues the Pong and
+                    // flushes it on the next poll; only count the frame here.
+                    Message::Ping(_) | Message::Pong(_) => {
+                        self.control_frames.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Message::Close(_) => {
+                        self.connected.store(false, Ordering::Relaxed);
+                        info!(peer = %self.peer_addr, "WebSocket connection closed");
+                        return Err(TransportError::ConnectionClosed);
+                    }
+                    Message::Frame(_) => continue,
+                };
+                drop(reader);
+
+                debug!(
+                    size = data.len(),
+                    peer = %self.peer_addr,
+                    "Received WebSocket message"
+                );
+
+                return Ok(ReceivedMessage {
+                    data,
+                    source: self.peer_addr,
+                    transport: if self.secure {
+                        TransportType::WebSocketSecure
+                    } else {
+                        TransportType::WebSocket
+                    },
+                });
+            }
         })
     }
 
@@ -461,17 +480,40 @@ impl Transport for WebSocketTransport {
 
     fn close(&self) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + '_>> {
         Box::pin(async move {
-            use futures_util::SinkExt;
-
-            let mut guard = self.stream.lock().await;
-            if let Some(stream) = guard.as_mut() {
-                let _ = stream.send(Message::Close(None)).await;
-                self.connected.store(false, Ordering::Relaxed);
-                info!(peer = %self.peer_addr, "Closed WebSocket connection");
+            // The flag is set before the Close frame is written, so a
+            // concurrent `send` after this point fails with AlreadyClosed.
+            if self.closed.swap(true, Ordering::AcqRel) {
+                return Ok(());
             }
-            drop(guard);
+            self.connected.store(false, Ordering::Relaxed);
+            // The lock wait and the write share one deadline: a send stalled
+            // on a non-reading peer holds the writer, and so does our own
+            // Close write. On timeout the frame is dropped; the socket is
+            // released when the transport is dropped.
+            // NIST 800-53 Rev5: SC-5, SC-10 (bounded Close write)
+            let flushed = tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, async {
+                let mut writer = self.writer.lock().await;
+                writer.send(Message::Close(None)).await
+            })
+            .await;
+            if flushed.is_err() {
+                info!(peer = %self.peer_addr, "WebSocket Close write timed out");
+            }
+            info!(peer = %self.peer_addr, "Closed WebSocket connection");
             Ok(())
         })
+    }
+
+    // NIST 800-53 Rev5: SC-10 (the daemon reader observes a local close on
+    // its next tick)
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    // POAM: POA&M-458: counted here but not yet charged to the per-source
+    // limiter by the daemon reader.
+    fn take_control_frames(&self) -> u64 {
+        self.control_frames.swap(0, Ordering::Relaxed)
     }
 }
 
@@ -490,9 +532,15 @@ impl std::fmt::Debug for WebSocketTransport {
         f.debug_struct("WebSocketTransport")
             .field("local_addr", &self.local_addr)
             .field("peer_addr", &self.peer_addr)
-            .field("stream", &"<WebSocketStream>")
+            .field("reader", &"<mutex>")
+            .field("writer", &"<mutex>")
             .field("secure", &self.secure)
             .field("connected", &self.connected.load(Ordering::Relaxed))
+            .field("closed", &self.closed.load(Ordering::Relaxed))
+            .field(
+                "control_frames",
+                &self.control_frames.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -503,7 +551,7 @@ pub struct WebSocketListener {
     local_addr: SbcSocketAddr,
     /// TCP listener.
     listener: tokio::net::TcpListener,
-    /// Whether to use TLS (WSS).
+    /// WSS label only; no TLS (POA&M-459).
     secure: bool,
     /// Handshake options.
     options: WebSocketListenerOptions,
@@ -515,7 +563,7 @@ impl WebSocketListener {
     /// # Arguments
     ///
     /// * `addr` - Address to bind to
-    /// * `secure` - Whether to use WSS (TLS)
+    /// * `secure` - WSS label only; no TLS (POA&M-459)
     ///
     /// # Errors
     ///
@@ -621,6 +669,7 @@ impl WebSocketListener {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_websocket_state() {
@@ -906,6 +955,267 @@ mod tests {
             transport_peer.is_ipv4(),
             "transport peer_addr must be plain IPv4, got {transport_peer}"
         );
+    }
+
+    type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    /// Upgraded server-side transport and its `sip` client.
+    async fn ws_pair() -> (Arc<WebSocketTransport>, Client) {
+        let l = listener(true).await;
+        let server = serve_one(&l);
+        let (ws, _) = tokio_tungstenite::connect_async(request(local(&l), Some("sip")))
+            .await
+            .unwrap();
+        (Arc::new(server.await.unwrap().unwrap()), ws)
+    }
+
+    fn spawn_recv(
+        t: &Arc<WebSocketTransport>,
+    ) -> tokio::task::JoinHandle<TransportResult<ReceivedMessage>> {
+        let t = Arc::clone(t);
+        tokio::spawn(async move { t.recv().await })
+    }
+
+    const fn ms(v: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(v)
+    }
+
+    // NIST 800-53 Rev5: SC-5
+    // Sends from other tasks complete while a recv is pending, and the
+    // pending recv still gets its data. Twin of
+    // `test_tcp_send_not_blocked_by_pending_recv`.
+    #[tokio::test]
+    async fn ws_send_not_blocked_by_pending_recv() {
+        use futures_util::{SinkExt, StreamExt};
+        let (server, mut client) = ws_pair().await;
+        let dest = *server.peer_addr();
+        let reader = spawn_recv(&server);
+        tokio::time::sleep(ms(50)).await;
+        assert!(!reader.is_finished(), "recv is pending");
+        let mut senders = Vec::new();
+        for i in 0..4u8 {
+            let s = Arc::clone(&server);
+            senders.push(tokio::spawn(async move {
+                tokio::time::timeout(ms(500), s.send(&[b'A' + i], &dest)).await
+            }));
+        }
+        for s in senders {
+            s.await
+                .unwrap()
+                .expect("send must not wait on the pending recv")
+                .unwrap();
+        }
+        let mut got = Vec::new();
+        while got.len() < 4 {
+            let m = tokio::time::timeout(ms(1000), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            got.extend_from_slice(&m.into_data());
+        }
+        got.sort_unstable();
+        assert_eq!(got, b"ABCD");
+        client.send(Message::text("200")).await.unwrap();
+        let r = tokio::time::timeout(ms(1000), reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&r.data[..], b"200");
+    }
+
+    // NIST 800-53 Rev5: SC-5, SC-10
+    // close() does not wait on a pending recv, marks the transport closed,
+    // and the peer sees a Close frame.
+    #[tokio::test]
+    async fn ws_close_not_blocked_by_pending_recv() {
+        use futures_util::StreamExt;
+        let (server, mut client) = ws_pair().await;
+        let _reader = spawn_recv(&server);
+        tokio::time::sleep(ms(50)).await;
+        tokio::time::timeout(ms(500), server.close())
+            .await
+            .expect("close must not wait on the pending recv")
+            .unwrap();
+        assert!(server.is_closed(), "is_closed after close()");
+        let m = tokio::time::timeout(ms(1000), client.next())
+            .await
+            .expect("peer sees a frame")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(m, Message::Close(_)), "got {m:?}");
+    }
+
+    // RFC 6455 §5.5.2, §5.5.3: one Pong per Ping.
+    #[tokio::test]
+    async fn ws_ping_gets_exactly_one_pong() {
+        use futures_util::{SinkExt, StreamExt};
+        let (server, mut client) = ws_pair().await;
+        let _reader = spawn_recv(&server);
+        client
+            .send(Message::Ping(b"x".to_vec().into()))
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(ms(300), client.next())
+            .await
+            .expect("pong within 300 ms")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, Message::Pong(b"x".to_vec().into()));
+        let second = tokio::time::timeout(ms(200), client.next()).await;
+        assert!(second.is_err(), "second frame: {second:?}");
+    }
+
+    // A message split into fragments arriving across several cancelled
+    // recv calls is delivered once and intact.
+    #[tokio::test]
+    async fn ws_recv_cancel_safe_across_ticks() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+        let (server, mut client) = ws_pair().await;
+        let body: Vec<u8> = (0..60 * 1024u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let parts: Vec<Vec<u8>> = body.chunks(body.len() / 4).map(<[u8]>::to_vec).collect();
+        assert_eq!(parts.len(), 4);
+        let sender = tokio::spawn(async move {
+            for (i, p) in parts.into_iter().enumerate() {
+                let op = if i == 0 {
+                    OpCode::Data(Data::Text)
+                } else {
+                    OpCode::Data(Data::Continue)
+                };
+                client
+                    .send(Message::Frame(Frame::message(p, op, i == 3)))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(ms(30)).await;
+            }
+            client
+        });
+        let mut got = Vec::new();
+        let deadline = tokio::time::Instant::now() + ms(1500);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(ms(20), server.recv()).await {
+                Err(_) => {}
+                Ok(r) => got.push(r.unwrap().data),
+            }
+        }
+        let _client = sender.await.unwrap();
+        assert_eq!(got.len(), 1, "messages delivered: {}", got.len());
+        assert_eq!(&got[0][..], &body[..]);
+    }
+
+    // NIST 800-53 Rev5: SC-10
+    // A peer close ends a pending recv with ConnectionClosed.
+    #[tokio::test]
+    async fn ws_pending_recv_ends_on_peer_close() {
+        let (server, mut client) = ws_pair().await;
+        let reader = spawn_recv(&server);
+        tokio::time::sleep(ms(50)).await;
+        client.close(None).await.unwrap();
+        let r = tokio::time::timeout(ms(1000), reader)
+            .await
+            .expect("pending recv ends within 1 s")
+            .unwrap();
+        assert!(
+            matches!(r, Err(TransportError::ConnectionClosed)),
+            "got {r:?}"
+        );
+    }
+
+    // NIST 800-53 Rev5: SC-10
+    // is_closed reports a local close (the daemon reader polls it).
+    #[tokio::test]
+    async fn ws_is_closed_after_close() {
+        let (server, _client) = ws_pair().await;
+        assert!(!server.is_closed());
+        tokio::time::timeout(ms(500), server.close())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(server.is_closed(), "is_closed after close()");
+    }
+
+    // A send after close() fails.
+    #[tokio::test]
+    async fn ws_send_after_close_fails() {
+        let (server, _client) = ws_pair().await;
+        let dest = *server.peer_addr();
+        tokio::time::timeout(ms(500), server.close())
+            .await
+            .unwrap()
+            .unwrap();
+        let r = tokio::time::timeout(ms(500), server.send(b"x", &dest))
+            .await
+            .unwrap();
+        assert!(matches!(r, Err(TransportError::AlreadyClosed)), "got {r:?}");
+        let p = tokio::time::timeout(ms(500), server.ping(b"x"))
+            .await
+            .unwrap();
+        assert!(matches!(p, Err(TransportError::AlreadyClosed)), "got {p:?}");
+        let rx = tokio::time::timeout(ms(500), server.recv()).await.unwrap();
+        assert!(
+            matches!(rx, Err(TransportError::AlreadyClosed)),
+            "got {rx:?}"
+        );
+    }
+
+    // NIST 800-53 Rev5: SC-5, SC-10
+    // close() returns within the Close-write bound when the peer never reads
+    // and the server's send path is already full.
+    #[tokio::test]
+    async fn ws_close_bounded_when_peer_never_reads() {
+        let (server, _client) = ws_pair().await;
+        let dest = *server.peer_addr();
+        let chunk = vec![b'a'; 60 * 1024];
+        let mut stalled = false;
+        for _ in 0..10_000 {
+            if tokio::time::timeout(ms(200), server.send(&chunk, &dest))
+                .await
+                .is_err()
+            {
+                stalled = true;
+                break;
+            }
+        }
+        assert!(stalled, "send path never filled");
+        tokio::time::timeout(ms(2000), server.close())
+            .await
+            .expect("close must return within the Close-write bound")
+            .unwrap();
+        assert!(server.is_closed());
+    }
+
+    // NIST 800-53 Rev5: SC-5, SC-10
+    // close() returns within the Close-write bound while a spawned send,
+    // stalled on a full send path, still holds the writer lock.
+    #[tokio::test]
+    async fn ws_close_bounded_while_send_holds_writer() {
+        let (server, _client) = ws_pair().await;
+        let dest = *server.peer_addr();
+        let chunk = vec![b'a'; 60 * 1024];
+        let mut stalled = None;
+        for _ in 0..10_000 {
+            let s = Arc::clone(&server);
+            let c = chunk.clone();
+            let h = tokio::spawn(async move { s.send(&c, &dest).await });
+            tokio::time::sleep(ms(20)).await;
+            if !h.is_finished() {
+                stalled = Some(h);
+                break;
+            }
+            h.await.unwrap().unwrap();
+        }
+        let pending = stalled.expect("send path never filled");
+        tokio::time::sleep(ms(200)).await;
+        assert!(!pending.is_finished(), "send still pending on the writer");
+        tokio::time::timeout(ms(2000), server.close())
+            .await
+            .expect("close must return while a send holds the writer")
+            .unwrap();
+        assert!(server.is_closed());
+        pending.abort();
     }
 
     // ---- SR-57: WebSocket buffers sized for many connections ----
