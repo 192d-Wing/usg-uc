@@ -1,10 +1,55 @@
 {{- if .Values.sbcClientConfig.enabled }}
-# Traefik Ingress for the soft-client config endpoint.
-# Exposes sbc.<site.fqdn_base> → sbc-client-config ClusterIP Service.
-# Uses the standard Kubernetes Ingress API (className: traefik); no
-# cert-manager or Gateway API required. TLS termination is handled by the
-# upstream edge (or left to Traefik's default self-signed cert) — adjust
-# tls: to suit when cert-manager is available.
+{{- /*
+Traefik Ingress for the soft-client config endpoint and the operator
+dashboard (/, /api incl. /api/v1/auth/login, /provision via nginx).
+Exposes sbc.<site.fqdn_base> -> sbc-client-config / sbc-frontend ClusterIP
+Services.
+
+SR-53 edge TLS (NIST 800-53 Rev5: SC-8, SC-8(1), AC-17(2), CM-6, CM-7;
+IA-5(1)(c) except the opt-in edge.traefik.allowHttpProvisioning router,
+POA&M-437): the router is bound to edge.traefik.entryPoint (websecure) only, so
+no cleartext router serves content for this host. It uses the -cnsa
+TLSOption and the -hsts middleware from 29-sbc-edge-tls.yaml. Rendering
+fails without a TLS secret unless edge.insecureLabHttp is set; the lab flag
+renders the pre-SR-53 Ingress (any entrypoint, no TLS policy).
+*/ -}}
+{{- include "sbc.edgePreflight" . -}}
+{{- $edge := .Values.edge.traefik -}}
+{{- $secure := eq (include "sbc.edgeTlsEnabled" .) "true" -}}
+{{- $host := include "sbc.ingressHost" . -}}
+{{- $epRe := "^[A-Za-z0-9_-]+$" -}}
+{{- if $secure }}
+{{- if not .Values.sbcClientConfig.ingressTlsSecretName }}
+{{- fail "sbcClientConfig.ingressTlsSecretName is required: the dashboard, /api/v1/auth/login and /v1/client-config are served only over TLS. Create a kubernetes.io/tls Secret for the ingress host and name it here (edge.insecureLabHttp=true serves cleartext HTTP; lab only)" }}
+{{- end }}
+{{- if not (regexMatch $epRe (toString $edge.entryPoint)) }}
+{{- fail (printf "edge.traefik.entryPoint %q is not a Traefik entrypoint name" (toString $edge.entryPoint)) }}
+{{- end }}
+{{- if and (or $edge.httpRedirect $edge.allowHttpProvisioning) (not (regexMatch $epRe (toString $edge.httpEntryPoint))) }}
+{{- fail (printf "edge.traefik.httpEntryPoint %q is not a Traefik entrypoint name" (toString $edge.httpEntryPoint)) }}
+{{- end }}
+{{- if and (not $edge.createTlsOption) (not (regexMatch "^[A-Za-z0-9._-]+(@[A-Za-z0-9]+)?$" (toString $edge.tlsOption))) }}
+{{- fail "edge.traefik.tlsOption must name an existing Traefik TLSOption (\"<namespace>-<name>@kubernetescrd\") when edge.traefik.createTlsOption=false" }}
+{{- end }}
+{{- /* The cluster default TLSOption is whatever Traefik was given (TLS 1.2
+     and its default suites unless the operator changed it). */}}
+{{- if and (not $edge.createTlsOption) (regexMatch "^default(@.*)?$" (toString $edge.tlsOption)) }}
+{{- fail (printf "edge.traefik.tlsOption %q is Traefik's cluster default TLSOption, not a dedicated TLS 1.3 / P-384 policy: name a dedicated TLSOption" (toString $edge.tlsOption)) }}
+{{- end }}
+{{- /* One-year HSTS floor for the management edge (RFC 6797 §6.1.1). */}}
+{{- if lt (int64 $edge.hsts.maxAgeSeconds) 31536000 }}
+{{- fail (printf "edge.traefik.hsts.maxAgeSeconds must be at least 31536000 (one year), got %v" $edge.hsts.maxAgeSeconds) }}
+{{- end }}
+{{- if not (kindIs "bool" $edge.hsts.includeSubdomains) }}
+{{- fail "edge.traefik.hsts.includeSubdomains must be true or false" }}
+{{- end }}
+{{- if and (or $edge.httpRedirect $edge.allowHttpProvisioning) (eq (toString $edge.entryPoint) (toString $edge.httpEntryPoint)) }}
+{{- fail (printf "edge.traefik.entryPoint and edge.traefik.httpEntryPoint are both %q: the TLS router and the cleartext redirect/provisioning routers need different entrypoints" (toString $edge.entryPoint)) }}
+{{- end }}
+{{- if and $edge.allowHttpProvisioning (not .Values.sbcFrontend.enabled) }}
+{{- fail "edge.traefik.allowHttpProvisioning requires sbcFrontend.enabled (provisioning is served through the frontend nginx)" }}
+{{- end }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -13,20 +58,25 @@ metadata:
   labels:
     {{- include "sbc.labels" . | nindent 4 }}
     app.kubernetes.io/component: client-config
+  {{- if $secure }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: {{ $edge.entryPoint | quote }}
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.tls.options: {{ include "sbc.edgeTlsOptionRef" . | quote }}
+    traefik.ingress.kubernetes.io/router.middlewares: {{ include "sbc.edgeHstsRef" . | quote }}
+  {{- end }}
 spec:
   ingressClassName: traefik
   {{- if .Values.sbcClientConfig.ingressTlsSecretName }}
   # TLS termination at Traefik with an operator-provided kubernetes.io/tls
-  # secret (e.g. a leaf signed by the site's internal CA). Without this,
-  # Traefik serves its self-signed default cert and clients that pin the
-  # internal CA refuse the discovery fetch.
+  # secret (e.g. a leaf signed by the site's internal CA).
   tls:
     - hosts:
-        - {{ .Values.sbcClientConfig.ingressHost | default (printf "sbc.%s" .Values.site.fqdn_base) | quote }}
+        - {{ $host | quote }}
       secretName: {{ .Values.sbcClientConfig.ingressTlsSecretName }}
   {{- end }}
   rules:
-    - host: {{ .Values.sbcClientConfig.ingressHost | default (printf "sbc.%s" .Values.site.fqdn_base) | quote }}
+    - host: {{ $host | quote }}
       http:
         paths:
           # Soft-client provisioning endpoints stay pinned to client-config
@@ -64,4 +114,70 @@ spec:
                 port:
                   name: http
           {{- end }}
+{{- if and $secure $edge.httpRedirect }}
+---
+# Redirect-only router on the cleartext entrypoint: every request gets a
+# permanent redirect to https and never reaches a backend. HSTS is not sent
+# here (RFC 6797 §7.2).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "sbc.fullname" . }}-client-config-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: {{ $edge.httpEntryPoint | quote }}
+    traefik.ingress.kubernetes.io/router.middlewares: {{ include "sbc.edgeCrdRef" (dict "ctx" . "suffix" "https-redirect") | quote }}
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sbc.fullname" . }}-client-config
+                port:
+                  name: http
+{{- end }}
+{{- if and $secure $edge.allowHttpProvisioning }}
+---
+# Opt-in legacy exception (edge.traefik.allowHttpProvisioning): phones that
+# fetch /provision/ over plain HTTP. This path only, through the frontend
+# nginx; /, /api and /v1 stay TLS-only. The -provision-marker middleware
+# tags these requests and the frontend nginx refuses (403) anything outside
+# /provision/ for tagged requests, after its own path normalisation, so the
+# confinement does not depend on the Traefik version.
+# POAM: the device token (?token=, static per device, POA&M-120) and the
+# provisioning documents (SIP digest and LDAP bind passwords) cross this
+# router in cleartext and are replayable (POA&M-437, allowHttpProvisioning
+# clause). Rotate SBC_PROVISION_SECRET and the affected SIP credentials
+# after turning it off.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "sbc.fullname" . }}-provision-http
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: {{ $edge.httpEntryPoint | quote }}
+    traefik.ingress.kubernetes.io/router.middlewares: {{ include "sbc.edgeCrdRef" (dict "ctx" . "suffix" "provision-marker") | quote }}
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /provision/
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sbc.fullname" . }}-frontend
+                port:
+                  name: http
+{{- end }}
 {{- end }}

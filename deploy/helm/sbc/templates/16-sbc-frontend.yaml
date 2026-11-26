@@ -170,6 +170,12 @@ metadata:
     {{- include "sbc.labels" . | nindent 4 }}
     app.kubernetes.io/component: frontend
   {{- $behindEdge := or .Values.gateway.enabled .Values.sbcClientConfig.enabled }}
+  {{- /* SR-53 (NIST 800-53 Rev5: SC-8, AC-17(2), CM-6): with no edge the
+       dashboard and login would be a cleartext LoadBalancer on port 80. */}}
+  {{- include "sbc.edgePreflight" . }}
+  {{- if and (not $behindEdge) (not .Values.edge.insecureLabHttp) }}
+  {{- fail "sbcFrontend.enabled with neither gateway.enabled nor sbcClientConfig.enabled exposes the dashboard and login over cleartext HTTP: enable a TLS edge (gateway.enabled or sbcClientConfig.enabled with sbcClientConfig.ingressTlsSecretName), or set edge.insecureLabHttp=true (lab only)" }}
+  {{- end }}
   annotations:
     {{- if and .Values.externalDns.enabled (not $behindEdge) }}
     external-dns.alpha.kubernetes.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
@@ -214,9 +220,31 @@ real_ip_header X-Forwarded-For; real_ip_recursive on;
      is not packaged with the chart. Kept in sync by hand with the
      standalone crates/sbc/sbc-dashboard/nginx.conf.template. */}}
 {{- define "sbc.frontendNginxConf" -}}
+# SR-53: requests from the opt-in plain-HTTP provisioning router
+# (edge.traefik.allowHttpProvisioning) carry X-Sbc-Edge-Route, set by a
+# Traefik middleware on that router only and removed on the TLS routers.
+# With the marker, everything outside /provision/ is refused. The check uses
+# $uri, i.e. after nginx has decoded and normalised the path, so it does not
+# depend on how the edge handles encoded dot-segments.
+# NIST 800-53 Rev5: SC-7, CM-7, IA-5(1)(c)
+map $http_x_sbc_edge_route $sbc_edge_marked {
+    ""      0;
+    default 1;
+}
+map "$sbc_edge_marked$uri" $sbc_edge_deny {
+    "~^1/provision/" 0;
+    "~^1"            1;
+    default          0;
+}
+
 server {
     listen 8080;
     server_name _;
+
+    # Marked (plain-HTTP provisioning) requests reach /provision/ only.
+    if ($sbc_edge_deny) {
+        return 403;
+    }
 
     # Trusted edge proxies for the client address (sbcFrontend.realIpFrom).
     ${SBC_REAL_IP_CONF}

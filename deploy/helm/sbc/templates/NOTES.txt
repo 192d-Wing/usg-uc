@@ -27,7 +27,8 @@ chart. Point each phone VLAN's `ip helper-address` at the usg-dora relay
 target (see the usg-dora deployment, not this chart).
 
 OPERATOR DASHBOARD:
-  http://sbc.{{ .Values.site.fqdn_base }}/
+{{- $dashHost := ternary (include "sbc.ingressHost" .) (.Values.gateway.hostname | default (printf "sbc.%s" .Values.site.fqdn_base)) .Values.sbcClientConfig.enabled }}
+  {{ if .Values.edge.insecureLabHttp }}http{{ else }}https{{ end }}://{{ $dashHost }}/
   Served by the sbc-frontend nginx pod.
 {{- if .Values.sbcApi.enabled }}
   /api/* → sbc-api-server pod
@@ -47,6 +48,23 @@ OPERATOR DASHBOARD:
              the SIP daemon)
 {{- else }}
   /provision/* → daemon legacy code path (sbcProvision disabled)
+{{- end }}
+{{- if .Values.edge.insecureLabHttp }}
+
+WARNING: edge.insecureLabHttp=true. The dashboard, /api/v1/auth/login and
+  /v1/client-config accept cleartext HTTP: passwords and tokens cross the
+  network unencrypted. Lab use only; unset it and set
+  sbcClientConfig.ingressTlsSecretName before any other use.
+{{- else if .Values.sbcClientConfig.enabled }}
+  Edge TLS: Traefik entrypoint {{ .Values.edge.traefik.entryPoint }} only, TLSOption {{ include "sbc.edgeTlsOptionRef" . }}{{ if not .Values.edge.traefik.createTlsOption }} (operator-supplied){{ end }},
+  HSTS. {{ if .Values.edge.traefik.httpRedirect }}HTTP on {{ .Values.edge.traefik.httpEntryPoint }} redirects to https.{{ else }}No router on {{ .Values.edge.traefik.httpEntryPoint }}.{{ end }}
+{{- if .Values.edge.traefik.allowHttpProvisioning }}
+  WARNING: edge.traefik.allowHttpProvisioning=true serves /provision/ over
+  cleartext HTTP (legacy phones only). Device provisioning tokens and the
+  phones' SIP digest and LDAP bind passwords cross the network unencrypted,
+  and a captured token can be replayed (POA&M-437). After turning it off,
+  rotate SBC_PROVISION_SECRET and those phones' SIP/LDAP credentials.
+{{- end }}
 {{- end }}
 
 CONFIG STORE:
@@ -69,7 +87,7 @@ CONFIG STORE:
 {{- end }}
 
 PROVISIONING URL (TEO TSG / Polycom / Cisco MPP — all accept FQDN):
-  http://sbc.{{ .Values.site.fqdn_base }}/provision/<mac>.<ext>
+  {{ if or .Values.edge.insecureLabHttp .Values.edge.traefik.allowHttpProvisioning }}http{{ else }}https{{ end }}://{{ $dashHost }}/provision/<mac>.<ext>
 
 Verify on this cluster:
   microk8s kubectl -n {{ .Release.Namespace }} get pods,svc -l app.kubernetes.io/instance={{ .Release.Name }}

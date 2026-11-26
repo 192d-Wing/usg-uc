@@ -1,0 +1,89 @@
+{{- if eq (include "sbc.edgeTlsEnabled" .) "true" }}
+{{- $edge := .Values.edge.traefik -}}
+{{- /*
+SR-53 edge TLS policy for the Traefik Ingress in 22-sbc-ingress.yaml
+(traefik.io/v1alpha1, Traefik v3 kubernetescrd provider).
+
+NIST 800-53 Rev5: SC-8(1), SC-13, SC-23. CNSA 2.0: TLS 1.3 only, P-384
+key exchange; use an ECDSA P-384 / SHA-384 leaf in
+sbcClientConfig.ingressTlsSecretName.
+*/ -}}
+{{- if $edge.createTlsOption }}
+# TLS 1.3 only with P-384 ECDHE. sniStrict refuses a handshake whose SNI
+# matches no certificate instead of serving Traefik's default certificate;
+# handshakes with no SNI fall under the cluster's default TLSOption
+# (DEPLOYING.md).
+# POAM: Go crypto/tls ignores cipherSuites for TLS 1.3 (RFC 8446 §9.1
+# mandates TLS_AES_128_GCM_SHA256), so a client that prefers AES-128 or
+# ChaCha20 negotiates it; no ML-KEM group is available (POA&M-436).
+apiVersion: traefik.io/v1alpha1
+kind: TLSOption
+metadata:
+  name: {{ include "sbc.fullname" . }}-cnsa
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  minVersion: VersionTLS13
+  maxVersion: VersionTLS13
+  cipherSuites:
+    - TLS_AES_256_GCM_SHA384
+  curvePreferences:
+    - CurveP384
+  sniStrict: true
+---
+{{- end }}
+# HSTS on the TLS router only (RFC 6797 §7.2: not sent over HTTP). Preload
+# stays off: the hosts are internal names.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "sbc.fullname" . }}-hsts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  headers:
+    stsSeconds: {{ int $edge.hsts.maxAgeSeconds }}
+    stsIncludeSubdomains: {{ $edge.hsts.includeSubdomains }}
+    stsPreload: false
+    forceSTSHeader: true
+    # Remove any client-sent provisioning marker on the TLS router (an empty
+    # value deletes the header; see the -provision-marker middleware).
+    customRequestHeaders:
+      X-Sbc-Edge-Route: ""
+{{- if $edge.httpRedirect }}
+---
+# Scheme-only redirect for the cleartext router; Host and path are kept,
+# and the Host is pinned by the Ingress rule.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "sbc.fullname" . }}-https-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+{{- end }}
+{{- if $edge.allowHttpProvisioning }}
+---
+# Marker for the plain-HTTP provisioning router: overwrites any client value,
+# and the frontend nginx then serves /provision/ only for marked requests.
+# POAM: provisioning over plain HTTP is a legacy exception (POA&M-437,
+# allowHttpProvisioning clause).
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "sbc.fullname" . }}-provision-marker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  headers:
+    customRequestHeaders:
+      X-Sbc-Edge-Route: provision-http
+{{- end }}
+{{- end }}
