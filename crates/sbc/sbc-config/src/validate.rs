@@ -1705,11 +1705,17 @@ pub fn t38_warnings(config: &SbcConfig) -> Vec<String> {
     out
 }
 
-/// Non-fatal routing configuration problems, for the daemon to log at
-/// load: a dial-plan `source_trunk` naming no trunk group or trunk (the
-/// entry can then never match).
+/// Non-fatal routing configuration problems, for the daemon to log at load.
 ///
-/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings)
+/// - a dial-plan `source_trunk` naming no trunk group or trunk (the entry
+///   can then never match);
+/// - a signing trunk outside the trust domain;
+/// - a `trust_domain = true` group with a non-TLS trunk (its asserted
+///   identity rests on source address and transport alone). The warning
+///   only steers such peers to TLS; transmission protection (SC-8) is not
+///   enforced by it (POA&M-397).
+///
+/// ## NIST 800-53 Rev5: CM-6, AC-21
 #[must_use]
 pub fn routing_warnings(config: &SbcConfig) -> Vec<String> {
     let mut out = Vec::new();
@@ -1739,6 +1745,31 @@ pub fn routing_warnings(config: &SbcConfig) -> Vec<String> {
                  this peer is inside the RFC 3325 trust domain); RFC 3323 privacy is applied after signing and the \
                  Identity header is dropped when From is anonymized",
                 group.id, trunk.id
+            ));
+        }
+    }
+    // RFC 3325 §9.1: a trust-domain peer's identity is only as strong as
+    // the way it is recognised. Inbound trunks match on source IP and
+    // arrival transport; only TLS cannot be spoofed off-path. Allowed (Q3)
+    // but surfaced at load. SC-8 is not enforced here: the warning only
+    // steers trust-domain peers to TLS.
+    //
+    // NIST 800-53 Rev5: CM-6, AC-21
+    // POAM: POA&M-397 trunk identity is source IP and transport, not a peer
+    // certificate.
+    for group in config.trunk_groups.iter().filter(|g| g.trust_domain) {
+        for trunk in group.trunks.iter().filter(|t| t.protocol != "tls") {
+            let udp_note = if trunk.protocol == "udp" {
+                " (UDP source addresses can be spoofed off-path)"
+            } else {
+                ""
+            };
+            out.push(format!(
+                "trunk group '{}': trunk '{}' uses protocol = \"{}\" but the group has \
+                 trust_domain = true; its P-Asserted-Identity is kept and may be STIR-signed on \
+                 source address and transport alone{udp_note}. Use protocol = \"tls\" for \
+                 trust-domain peers (POA&M-397)",
+                group.id, trunk.id, trunk.protocol
             ));
         }
     }
@@ -3808,7 +3839,10 @@ max_passport_age_secs = 120
     #[test]
     fn source_trunk_resolves_group_or_trunk_and_warns_on_unknown() {
         let mut config = SbcConfig::default();
-        config.trunk_groups = vec![trunk_group("carriers")];
+        let mut g = trunk_group("carriers");
+        // TLS: a trusted non-TLS trunk would add its own warning (SR-04).
+        g.trunks[0].protocol = "tls".to_string();
+        config.trunk_groups = vec![g];
         assert_eq!(resolve_source_trunk(&config, "carriers"), Some("carriers"));
         assert_eq!(resolve_source_trunk(&config, "t1"), Some("carriers"));
         assert_eq!(resolve_source_trunk(&config, "x"), None);
@@ -3864,6 +3898,8 @@ max_passport_age_secs = 120
         let mut config = SbcConfig::default();
         let mut g = trunk_group("carriers");
         g.trunks[0].stir_shaken.sign = true;
+        // TLS: a trusted non-TLS trunk would add its own warning (SR-04).
+        g.trunks[0].protocol = "tls".to_string();
         config.trunk_groups = vec![g.clone()];
         assert_eq!(routing_warnings(&config), Vec::<String>::new());
         g.trust_domain = false;
@@ -3900,6 +3936,125 @@ max_passport_age_secs = 120
         assert_eq!(w.len(), 2, "{w:?}");
         assert!(w[0].contains("'s1'") && w[1].contains("'s2'"));
         assert!(!w.iter().any(|x| x.contains("'plain'")));
+    }
+
+    /// Builds a one-trunk group with `trust_domain` and trunk `protocol`.
+    fn trust_group(trust_domain: bool, protocol: &str) -> SbcConfig {
+        let mut config = SbcConfig::default();
+        let mut g = trunk_group("carriers");
+        g.trust_domain = trust_domain;
+        g.trunks[0].protocol = protocol.to_string();
+        if protocol == "tls" {
+            // A TLS trunk needs trunk trust anchors (POA&M-5).
+            g.trunks[0].port = 5061;
+            config.security.trunk_tls_ca_path = Some("/etc/sbc/trunk-ca.pem".into());
+        }
+        config.trunk_groups = vec![g];
+        config
+    }
+
+    /// SR-04 (Q3), CM-6/AC-21: a trust-domain trunk recognised by a
+    /// spoofable source (UDP) is a load warning naming the spoofing risk.
+    #[test]
+    fn trust_domain_on_udp_trunk_warns() {
+        let config = trust_group(true, "udp");
+        let w = routing_warnings(&config);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("trust_domain = true")
+                && w[0].contains("udp")
+                && w[0].contains("spoofed")
+                && w[0].contains("'t1'")
+                && w[0].contains("POA&M-397"),
+            "{w:?}"
+        );
+        assert!(validate_config(&config).is_ok(), "a warning, not an error");
+    }
+
+    /// TCP is warned about too (no peer identity), without the UDP note.
+    #[test]
+    fn trust_domain_on_tcp_trunk_warns() {
+        let config = trust_group(true, "tcp");
+        let w = routing_warnings(&config);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("protocol = \"tcp\"") && !w[0].contains("spoofed"));
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn trust_domain_on_tls_trunk_no_warning() {
+        let config = trust_group(true, "tls");
+        assert_eq!(routing_warnings(&config), Vec::<String>::new());
+        assert!(validate_config(&config).is_ok());
+    }
+
+    /// Known-answer text of the SR-04 `trust_domain` warning (operators grep
+    /// for it; the log field is the full string).
+    #[test]
+    fn trust_domain_warning_known_answer_text() {
+        let w = routing_warnings(&trust_group(true, "udp"));
+        assert_eq!(
+            w,
+            vec![
+                "trunk group 'carriers': trunk 't1' uses protocol = \"udp\" but the group has \
+                 trust_domain = true; its P-Asserted-Identity is kept and may be STIR-signed on \
+                 source address and transport alone (UDP source addresses can be spoofed \
+                 off-path). Use protocol = \"tls\" for trust-domain peers (POA&M-397)"
+                    .to_string()
+            ]
+        );
+        let w = routing_warnings(&trust_group(true, "tcp"));
+        assert_eq!(
+            w,
+            vec![
+                "trunk group 'carriers': trunk 't1' uses protocol = \"tcp\" but the group has \
+                 trust_domain = true; its P-Asserted-Identity is kept and may be STIR-signed on \
+                 source address and transport alone. Use protocol = \"tls\" for trust-domain \
+                 peers (POA&M-397)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// One warning per non-TLS trunk of each trusted group; TLS trunks and
+    /// untrusted groups add none.
+    #[test]
+    fn trust_domain_warns_once_per_non_tls_trunk() {
+        let mut config = SbcConfig::default();
+        config.security.trunk_tls_ca_path = Some("/etc/sbc/trunk-ca.pem".into());
+        let mut trusted = trunk_group("carriers");
+        let mut t2 = trusted.trunks[0].clone();
+        t2.id = "t2".to_string();
+        t2.protocol = "tls".to_string();
+        t2.port = 5061;
+        let mut t3 = trusted.trunks[0].clone();
+        t3.id = "t3".to_string();
+        t3.protocol = "tcp".to_string();
+        trusted.trunks.push(t2);
+        trusted.trunks.push(t3);
+        let mut untrusted = trunk_group("plain-carriers");
+        untrusted.trust_domain = false;
+        untrusted.trunks[0].id = "u1".to_string();
+        config.trunk_groups = vec![trusted, untrusted];
+        let w = routing_warnings(&config);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(
+            w[0].contains("trunk 't1'") && w[0].contains("spoofed"),
+            "{w:?}"
+        );
+        assert!(
+            w[1].contains("trunk 't3'") && !w[1].contains("spoofed"),
+            "{w:?}"
+        );
+        assert!(!w.iter().any(|x| x.contains("'t2'") || x.contains("'u1'")));
+        assert!(validate_config(&config).is_ok(), "warnings, not errors");
+    }
+
+    #[test]
+    fn untrusted_udp_trunk_no_warning() {
+        let config = trust_group(false, "udp");
+        assert_eq!(routing_warnings(&config), Vec::<String>::new());
+        assert!(validate_config(&config).is_ok());
     }
 
     #[test]

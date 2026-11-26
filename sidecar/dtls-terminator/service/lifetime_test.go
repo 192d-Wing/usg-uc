@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -322,7 +323,11 @@ func readToEnd(t *testing.T, ft ipc.FrameTransport) [][]byte {
 	for {
 		raw, err := recvWithin(t, ft, 5*time.Second)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			// Linux reports a Unix-socket close with unread data as
+			// ECONNRESET rather than EOF; both mean the sidecar's end is
+			// closed. The caller still checks every frame it expects.
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+				errors.Is(err, syscall.ECONNRESET) {
 				return frames
 			}
 			t.Fatalf("reading the IPC connection to its end: %v", err)

@@ -25,7 +25,14 @@ serde_json = { workspace = true }
 thiserror.workspace = true
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 central-config-store = { path = "../central-config-store" }
+# Not referenced in code: feature unification only. The workspace rustls
+# entry enables `fips`, so sqlx's rustls TLS runs on the aws-lc FIPS module
+# (NIST 800-53 Rev5: SC-13).
+rustls.workspace = true
 
 [dev-dependencies]
 sbc-config-store = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# SR-16 FIPS posture test. Not `workspace = true` on purpose: the workspace
+# entry enables `fips`, which would mask the binary's own FIPS posture.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }

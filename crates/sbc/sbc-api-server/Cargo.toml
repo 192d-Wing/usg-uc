@@ -60,8 +60,10 @@ tonic = { workspace = true }
 
 # HTTP reverse-proxy fallback. Anything sbc-api doesn't own a handler
 # for (partitions, CSS, route patterns/lists, CDRs, dial-plan reads)
-# gets proxied to the daemon's still-running REST endpoint.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# gets proxied to the daemon's still-running REST endpoint. No bundled
+# crypto provider: TLS is the CNSA config from uc-transport `https-client`.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-no-provider"] }
+uc-transport = { workspace = true, default-features = false, features = ["https-client"] }
 
 # CDR schema v1 formatting (JSONL/CSV export) and the CdrExport audit event.
 uc-cdr.workspace = true
@@ -82,3 +84,10 @@ uc-audit = { workspace = true, features = ["test-capture"] }
 jsonwebtoken.workspace = true
 aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
 base64 = "0.22"
+# SR-16 HTTPS client tests (uc-transport/tests/common/cnsa_*.rs): random
+# P-384 PKI + in-process TLS server. rustls is not `workspace = true` on
+# purpose: the workspace entry enables `fips`, which would mask the
+# binary's own FIPS posture in tests.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio-rustls.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }

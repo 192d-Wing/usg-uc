@@ -65,7 +65,7 @@ use uc_audit::event::{SwitchoverOutcome, SwitchoverReason};
 use uc_routing::{
     Admission, CallRouteContext, DestinationType, DialPattern, DialPlan, DialPlanEntry, Direction,
     NumberTransform, Router, RouterConfig, RoutingError, SbcRouteOutcome, SelectionStrategy, Trunk,
-    TrunkConfig, TrunkGroup, TrunkOutcome, TrunkProtocol,
+    TrunkConfig, TrunkGroup, TrunkOutcome,
 };
 use uc_types::address::SbcSocketAddr;
 use uc_types::address::TransportType as AddrTransport;
@@ -83,6 +83,12 @@ use dialog_match::{
     BLegPeerKind, DialogPeer, DialogRule, Ingress, InviteIdentity, LegRegistration, PeerVerdict,
     RequestIdentity,
 };
+
+// Inbound trunk identity by (canonical source IP, arrival transport): pure.
+mod trunk_source;
+pub use trunk_source::TrunkSourceKey;
+pub use trunk_source::config_trunk_key;
+use trunk_source::{InboundTrunk, InboundTrunkMap};
 
 /// SIP stack for processing SIP messages.
 pub struct SipStack {
@@ -135,11 +141,12 @@ pub struct SipStack {
     config: SipStackConfig,
     /// Resolved zone registry for interface-based binding.
     zone_registry: Option<Arc<crate::zone::ResolvedZoneRegistry>>,
-    /// Inbound trunk identification: maps source IP → (trunk_group_id, css_id).
-    /// Used to resolve which CSS to use for routing inbound calls from trunks.
-    inbound_trunk_map:
-        RwLock<std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>>,
-    /// Key set of `inbound_trunk_map` (sorted, at most
+    /// Inbound trunk identification: (canonical source IP, arrival
+    /// transport) → (trunk_group_id, css_id). A trunk matches only traffic
+    /// on its configured `protocol` (SR-04). Used for source admission,
+    /// RFC 3325 trust, the per-user limiter exemption, STIR and CSS routing.
+    inbound_trunk_map: RwLock<InboundTrunkMap>,
+    /// Source IPs of `inbound_trunk_map` over any transport (sorted, at most
     /// `uc_dos_protection::MAX_TRUSTED_SOURCES`), republished when a write
     /// changes it. The server applies it to the per-source rate limiters as
     /// trusted sources.
@@ -148,8 +155,8 @@ pub struct SipStack {
     trunk_sources: tokio::sync::watch::Sender<Arc<[std::net::IpAddr]>>,
     /// Trunk group → canonical IPs of its configured hosts, resolved when
     /// the group is loaded. A trunk leg's dialog peer is any of them (see
-    /// `dialog_match`); unlike `inbound_trunk_map` an address may belong to
-    /// several groups. Keyed by configured group ids, bounded by the
+    /// `dialog_match`); unlike the IP-and-transport keys of
+    /// `inbound_trunk_map` an address may belong to several groups. Keyed by configured group ids, bounded by the
     /// configuration (SC-5).
     trunk_group_hosts: RwLock<std::collections::HashMap<String, Arc<HashSet<std::net::IpAddr>>>>,
     /// Directory number mapping: DID → username for inbound call routing,
@@ -355,6 +362,11 @@ pub struct RoutingCounters {
     /// were ACKed and BYE'd (`sbc_late_invite_2xx_teardown_total`,
     /// RFC 3261 §13.2.2.4).
     pub late_2xx_teardowns: AtomicU64,
+    /// REGISTERs whose flow could not be indexed, because the flow index was
+    /// full (`general.max_registrations`) or the flow already bound
+    /// `MAX_AORS_PER_FLOW` AORs (`sbc_flow_index_overflow_total`). Such a
+    /// flow cannot place calls (SR-04, POA&M-398).
+    pub flow_index_overflow: AtomicU64,
 }
 
 /// Route patterns rejected (unknown `pattern_type`) at seed or sync time.
@@ -1079,6 +1091,13 @@ struct CallAddresses {
     /// Trunk group the caller's address belonged to at INVITE; `None` for
     /// an endpoint. Selects the A-leg peer rule (see `dialog_match`).
     a_leg_trunk_group: Option<String>,
+    /// Configured transport of the trunk the caller's INVITE matched (its
+    /// trunk-map key): the A-leg peer's transport floor for a trunk leg, so
+    /// a `udp` trunk whose large INVITE came over TCP may send later small
+    /// in-dialog requests over UDP (RFC 3261 §18.1.1; RFC-9). `None` for an
+    /// endpoint, and for a trunk INVITE that arrived over TLS or has a
+    /// `sips:` Request-URI: their floor is the arrival transport.
+    a_leg_trunk_transport: Option<AddrTransport>,
     /// Registration the endpoint caller's INVITE flow held, if any: a new
     /// flow holding it is still the caller (RFC 5626 §4.4, §5.3).
     a_leg_registration: Option<Arc<LegRegistration>>,
@@ -3105,7 +3124,7 @@ impl SipStack {
             cdr: None,
             config,
             zone_registry: None,
-            inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
+            inbound_trunk_map: RwLock::new(InboundTrunkMap::default()),
             trunk_sources: tokio::sync::watch::Sender::new(Arc::from([])),
             trunk_group_hosts: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(crate::stir_binding::DidMap::default()),
@@ -3194,7 +3213,7 @@ impl SipStack {
             cdr: None,
             config,
             zone_registry: None,
-            inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
+            inbound_trunk_map: RwLock::new(InboundTrunkMap::default()),
             trunk_sources: tokio::sync::watch::Sender::new(Arc::from([])),
             trunk_group_hosts: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(crate::stir_binding::DidMap::default()),
@@ -4254,13 +4273,14 @@ impl SipStack {
     }
 
     /// Hiding decision for traffic with no call record (out-of-dialog
-    /// responses, the announcement BYE): hide toward a trunk or any address
-    /// outside `topology_hiding.internal_networks`.
+    /// responses, the announcement BYE): hide toward a trunk (over any of
+    /// its transports: hiding more is fail-safe) or any address outside
+    /// `topology_hiding.internal_networks`.
     async fn destination_hidden(&self, dest: SbcSocketAddr) -> bool {
         let Some(ref hider) = self.topology_hider else {
             return false;
         };
-        if self.is_trunk_ip(dest.ip()).await {
+        if self.inbound_trunk_map.read().await.contains_ip(dest.ip()) {
             return true;
         }
         !hider.read().await.config().is_internal_ip(dest.ip())
@@ -4523,7 +4543,8 @@ impl SipStack {
                     && let Some((_, dest)) = wire_parts(el)
                     && let Some(slot) = trunk_dest.get_mut(i)
                 {
-                    *slot = trunk_map_contains(&map, dest.ip());
+                    // Destination side: a trunk host over any transport.
+                    *slot = map.contains_ip(dest.ip());
                 }
                 i += 1;
             });
@@ -5039,12 +5060,16 @@ impl SipStack {
         Ok((internal_id, from_a_leg, addrs, new_flow))
     }
 
-    /// Trunk group whose configured address is `ip` (canonical form).
-    async fn trunk_group_of(&self, ip: std::net::IpAddr) -> Option<String> {
+    /// Trunk group whose configured address is `ip` over `transport`.
+    async fn trunk_group_of(
+        &self,
+        ip: std::net::IpAddr,
+        transport: AddrTransport,
+    ) -> Option<String> {
         self.inbound_trunk_map
             .read()
             .await
-            .get(&ip.to_canonical())
+            .get(ip, transport)
             .map(|(group, _)| group.clone())
     }
 
@@ -5067,17 +5092,20 @@ impl SipStack {
             PeerVerdict::Resolve => {
                 if let Some(group) = peer.trunk_group() {
                     let ip = ingress.source.ip().to_canonical();
-                    let in_group = self
+                    // Sequential, never nested: each guard is dropped at the
+                    // end of its statement.
+                    let in_hosts = self
                         .trunk_group_hosts
                         .read()
                         .await
                         .get(group)
-                        .is_some_and(|hosts| hosts.contains(&ip))
+                        .is_some_and(|hosts| hosts.contains(&ip));
+                    let in_group = in_hosts
                         || self
                             .inbound_trunk_map
                             .read()
                             .await
-                            .get(&ip)
+                            .get(ip, ingress.transport)
                             .is_some_and(|(g, _)| g == group);
                     return if in_group {
                         PeerMatch::Same
@@ -5179,7 +5207,7 @@ impl SipStack {
         };
         let Some(peer) = leg else {
             let (source, transport, conn) = invite;
-            let group = self.trunk_group_of(source.ip()).await;
+            let group = self.trunk_group_of(source.ip(), transport).await;
             let peer = DialogPeer::a_leg(source, transport, conn, group.as_deref(), None);
             return self.peer_admits(&peer, ingress).await == PeerMatch::Same;
         };
@@ -7375,15 +7403,19 @@ impl SipStack {
 
     /// Whether trunk group `group_id` is inside the RFC 3325 trust domain.
     /// Only groups explicitly set to `true` are (allow-set).
-    async fn trunk_group_trusted(&self, group_id: &str) -> bool {
+    pub(crate) async fn trunk_group_trusted(&self, group_id: &str) -> bool {
         self.trusted_trunk_groups.read().await.contains(group_id)
     }
 
-    /// Whether a request from `ip` comes from inside the trust domain: only
-    /// a configured trunk of a `trust_domain = true` group. Registered
-    /// endpoints never are (RFC 3325 §5).
-    async fn ingress_trusted(&self, ip: std::net::IpAddr) -> bool {
-        match self.lookup_inbound_trunk(ip.to_canonical()).await {
+    /// Whether a request from `ip` over `transport` comes from inside the
+    /// trust domain: only a configured trunk of a `trust_domain = true`
+    /// group, on the trunk's configured transport or a stronger one (a UDP
+    /// datagram from a TLS trunk's address is not trusted). Registered endpoints never are
+    /// (RFC 3325 §5, §9.1).
+    ///
+    /// ## NIST 800-53 Rev5: AC-21, SC-7
+    async fn ingress_trusted(&self, ip: std::net::IpAddr, transport: AddrTransport) -> bool {
+        match self.lookup_inbound_trunk(ip, transport).await {
             Some((group, _)) => self.trunk_group_trusted(&group).await,
             None => false,
         }
@@ -7584,7 +7616,7 @@ impl SipStack {
         let current = routed.as_ref().unwrap_or(req);
         if (current.headers.contains(&HeaderName::PAssertedIdentity)
             || current.headers.contains(&HeaderName::PPreferredIdentity))
-            && !self.ingress_trusted(source.ip()).await
+            && !self.ingress_trusted(source.ip(), transport).await
         {
             let mut copy = routed.take().unwrap_or_else(|| req.clone());
             let removed = proto_sip::sanitize_inbound_identity(&mut copy.headers, false);
@@ -8075,8 +8107,9 @@ impl SipStack {
         }
         // Trunk sources are exempt from the per-user limiter: they carry
         // many users on one peering, and are bounded instead by the trunk
-        // `max_calls` admission cap and VPS call limits (SC-5).
-        if self.is_trunk_ip(source.ip()).await {
+        // `max_calls` admission cap and VPS call limits (SC-5). Only on the
+        // trunk's configured transport or a stronger one (SC-7).
+        if self.is_trunk_source(source.ip(), transport).await {
             return None;
         }
         let user = req.headers.from_parsed().and_then(|f| f.uri.user)?;
@@ -8539,11 +8572,7 @@ impl SipStack {
                 .with_require_tls(tg_config.require_tls);
 
             for t_config in &tg_config.trunks {
-                let protocol = match t_config.protocol.as_str() {
-                    "tcp" => TrunkProtocol::Tcp,
-                    "tls" => TrunkProtocol::Tls,
-                    _ => TrunkProtocol::Udp,
-                };
+                let protocol = trunk_source::trunk_protocol_from_config(&t_config.protocol);
 
                 let trunk_config = TrunkConfig::new(&t_config.id, &t_config.host)
                     .with_port(t_config.port)
@@ -8584,17 +8613,20 @@ impl SipStack {
 
             // Config-file trunks are admitted INVITE sources too (the API
             // path does this in register_inbound_trunk). No CSS for these.
-            let hosts: HashSet<std::net::IpAddr> = tg_config
-                .trunks
-                .iter()
-                .flat_map(|t| resolve_trunk_host_ips(&t.host))
-                .collect();
-            replace_inbound_trunk(
-                self.inbound_trunk_map.get_mut(),
-                &tg_config.id,
-                None,
-                &hosts,
-            );
+            // Each host is a source only over its trunk's `protocol`.
+            // NIST 800-53 Rev5: AC-3, SC-7
+            let mut sources: HashSet<TrunkSourceKey> = HashSet::new();
+            for t in &tg_config.trunks {
+                sources.extend(
+                    resolve_trunk_host_ips(&t.host)
+                        .into_iter()
+                        .filter_map(|ip| config_trunk_key(ip, &t.protocol)),
+                );
+            }
+            self.inbound_trunk_map
+                .get_mut()
+                .replace_group(&tg_config.id, None, &sources);
+            let hosts: HashSet<std::net::IpAddr> = sources.iter().map(TrunkSourceKey::ip).collect();
             index_trunk_hosts(self.trunk_group_hosts.get_mut(), &tg_config.id, hosts);
         }
         publish_trunk_sources(&self.trunk_sources, self.inbound_trunk_map.get_mut());
@@ -10245,6 +10277,13 @@ impl SipStack {
         for contact in &mut contacts {
             latch_unspecified_contact(contact, &source);
         }
+        // A query REGISTER (no Contact) changes no binding's flow. The
+        // Contact URIs as the registrar stores them (it compares and stores
+        // `ContactInfo::uri` verbatim, also when an RFC 5626 instance/reg-id
+        // match replaces a binding), to tell which bindings this REGISTER
+        // carried. REGISTER path only; bounded by the Contact count.
+        let carried_uris: Vec<String> = contacts.iter().map(|c| c.uri.clone()).collect();
+        let carries_contacts = !carried_uris.is_empty();
 
         // Parse Expires header
         let expires: Option<u32> = req
@@ -10415,15 +10454,26 @@ impl SipStack {
                     // NIST 800-53 Rev5: SC-8 — a binding learned over TLS is
                     // only ever reached over that TLS connection.
                     let recv_transport = LegFlow::inbound(transport).name();
+                    // Carried: stamped with this request's Call-ID and CSeq
+                    // and named by one of its Contact URIs (SEC-006).
+                    let carried = |b: &proto_registrar::Binding| {
+                        b.call_id() == call_id
+                            && b.cseq() == cseq
+                            && carried_uris.iter().any(|u| u == b.contact_uri())
+                    };
                     for binding in &reg_response.contacts {
-                        // Only the binding created/refreshed by *this*
-                        // REGISTER (same Call-ID) is reachable via the source
-                        // pinhole. Another device's wildcard Contact is not
-                        // latched to this source (SEC-008: that would hand
-                        // this peer's flow to the other device's AOR binding);
-                        // it stays unroutable (see `binding_target`).
+                        // Only a binding this REGISTER carried (the registrar
+                        // stamps each one it creates or refreshes with this
+                        // request's Call-ID and CSeq) is reachable via the
+                        // source pinhole. Another device's wildcard Contact
+                        // is not latched to this source (SEC-008: that would
+                        // hand this peer's flow to the other device's AOR
+                        // binding); it stays unroutable (see
+                        // `binding_target`). A binding the same UA registered
+                        // earlier from another flow with the same Call-ID
+                        // (RFC 3261 §10.2) keeps that flow (RFC-5).
                         // NIST 800-53 Rev5: SC-8, AC-3
-                        let is_this_device = binding.call_id() == call_id;
+                        let is_this_device = carried(binding);
                         if is_this_device {
                             // SipUri's display brackets IPv6 hosts.
                             let contact_uri = proto_sip::uri::SipUri::new(src_ip.clone())
@@ -10444,7 +10494,9 @@ impl SipStack {
                             latched.set_source_transport(recv_transport);
                             let _ = loc.add_binding(latched);
                         } else if let Some(prev) = previous.iter().find(|p| {
-                            p.call_id() == binding.call_id() && p.source_transport().is_some()
+                            p.call_id() == binding.call_id()
+                                && p.cseq() == binding.cseq()
+                                && p.source_transport().is_some()
                         }) {
                             let mut kept = proto_registrar::Binding::new(
                                 &aor,
@@ -10471,10 +10523,17 @@ impl SipStack {
                     // TCP/TLS the entry is also bound to the connection id,
                     // so a later connection on a reused address does not
                     // inherit it (RFC 5626 §3.1, §5.2; IA-3, SC-23).
-                    {
+                    // A query REGISTER leaves the index alone; otherwise the
+                    // flow binds the AOR iff this REGISTER carried a binding
+                    // that is still live (not iff any binding shares its
+                    // Call-ID: RFC-5), or the AOR still holds a live binding
+                    // latched to this flow by an earlier REGISTER (removing
+                    // one of two contacts on a flow keeps the flow: RFC-8).
+                    if carries_contacts {
                         let key = crate::stir_binding::flow_key(source.ip(), src_port, transport);
-                        let this_bound =
-                            reg_response.contacts.iter().any(|b| b.call_id() == call_id);
+                        let this_bound = reg_response.contacts.iter().any(carried)
+                            || Self::flow_binding(&loc, &aor, &key)
+                                .is_some_and(|b| b.source_transport().is_some());
                         let mut flows = self.stir_flows.write().await;
                         if this_bound {
                             let cap = self.config.max_registrations as usize;
@@ -10482,7 +10541,33 @@ impl SipStack {
                                 Self::flow_has_binding(&loc, a, k)
                             });
                             if !indexed {
-                                debug!(aor = %aor, "STIR flow index full; flow not indexed");
+                                // The index also gates INVITE admission:
+                                // this flow cannot place calls. Counted;
+                                // logged at most once per interval (SC-5).
+                                // POAM: POA&M-398 a full flow index, or a
+                                // flow at its AOR cap, blocks calling from
+                                // that flow until space frees.
+                                self.routing_counters
+                                    .flow_index_overflow
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let refusal = flows.refusal(&key, conn);
+                                if let Some(suppressed) =
+                                    flows.refusal_log_due(refusal, Instant::now())
+                                {
+                                    match refusal {
+                                        crate::stir_binding::BindRefusal::FlowFull => warn!(
+                                            aor = %aor,
+                                            max_aors_per_flow = crate::stir_binding::MAX_AORS_PER_FLOW,
+                                            suppressed,
+                                            "Per-flow AOR limit reached; AOR {aor} on this flow is not indexed (no STIR binding) and cannot place calls from it once the flow's indexed AORs expire"
+                                        ),
+                                        crate::stir_binding::BindRefusal::TableFull => warn!(
+                                            aor = %aor,
+                                            suppressed,
+                                            "Flow index full; this registration's flow cannot place calls until space frees"
+                                        ),
+                                    }
+                                }
                             }
                         } else {
                             flows.unbind(&key, conn, &aor);
@@ -10595,29 +10680,55 @@ impl SipStack {
             return self.handle_in_dialog_request(req, ingress).await;
         }
 
-        // Source admission: only configured trunks and currently registered
-        // endpoints may place calls. Checked before any per-call state exists
-        // and before route preprocessing, so an unadmitted source sees only
-        // this 403, never the 482/404/400 of preprocessing (no own-address
-        // oracle, no audit state from spoofed sources). Admission reads the
-        // source IP only, so it cannot depend on the preprocessed URI; the
-        // audit resource is the Request-URI as received.
+        // Source admission: only configured trunks (source IP on the trunk's
+        // configured transport or a stronger one) and endpoints calling from the exact flow of
+        // a live registration (IP, port, transport and, for TCP/TLS/WS, the
+        // connection) may place calls. Checked before any per-call state
+        // exists and before route preprocessing, so an unadmitted source
+        // sees only this 403, never the 482/404/400 of preprocessing (no
+        // own-address oracle, no audit state from spoofed sources).
+        // Admission reads the arrival flow (IP, port, transport, connection)
+        // only, so it cannot depend on the preprocessed URI; the audit
+        // resource is the Request-URI as received. The trunk identity
+        // resolved here is reused for the rest of this INVITE (one lookup,
+        // no admission/routing TOCTOU).
         //
-        // ## NIST 800-53 Rev5: AC-3 (Access Enforcement)
-        if !self.is_admitted_source(source.ip()).await {
-            warn!(
-                call_id = %a_leg_call_id,
-                source = %source,
-                "INVITE from a source that is neither a trunk nor registered, rejecting"
-            );
-            audit_invite_denied(req, source, "source-admission");
-            let forbidden = create_response_from_request(req, StatusCode::FORBIDDEN);
-            return ProcessResult::Response {
-                message: SipMessage::Response(forbidden),
-                destination: source,
-                flow: Flow::Reply,
+        // ## NIST 800-53 Rev5: AC-3 (Access Enforcement), IA-3, SC-7
+        // POAM: POA&M-271 without a per-INVITE challenge, admission rests on
+        // the registered flow; a UDP flow can be spoofed off-path by a sender
+        // who knows or guesses the NAT port.
+        // POAM: POA&M-398 a UA that registered on one flow and calls on
+        // another (UDP REGISTER then TCP INVITE, NAT rebinding, reconnect;
+        // emergency calls included) gets 403 until it re-registers.
+        let ingress = Ingress {
+            source,
+            transport,
+            conn,
+        };
+        // `inbound_trunk_key` is the matched trunk entry's key (configured
+        // transport, which may be weaker than `transport`): the STIR trunk
+        // settings are looked up by it.
+        let (inbound_trunk_key, inbound_trunk): (Option<TrunkSourceKey>, Option<InboundTrunk>) =
+            match self.admit_invite_source(&ingress).await {
+                SourceAdmission::Trunk(key, t) => (Some(key), Some(t)),
+                SourceAdmission::RegisteredFlow => (None, None),
+                SourceAdmission::Denied(hint) => {
+                    warn!(
+                        call_id = %a_leg_call_id,
+                        source = %source,
+                        transport = %transport,
+                        hint = hint.as_str(),
+                        "INVITE from a source that is neither a trunk nor a registered flow, rejecting"
+                    );
+                    audit_invite_denied(req, source, "source-admission");
+                    let forbidden = create_response_from_request(req, StatusCode::FORBIDDEN);
+                    return ProcessResult::Response {
+                        message: SipMessage::Response(forbidden),
+                        destination: source,
+                        flow: Flow::Reply,
+                    };
+                }
             };
-        }
 
         // Loop protection (RFC 3261 §16.3 item 3, before the item 4 loop
         // check in preprocessing): honor the incoming Max-Forwards
@@ -10938,9 +11049,12 @@ impl SipStack {
         // ## NIST 800-53 Rev5: IA-9, SI-10, SC-5
         let stir_in = match self.stir.as_ref() {
             Some(stir) => {
-                let group = self.lookup_inbound_trunk(source.ip()).await.map(|(g, _)| g);
-                stir.inbound(req, source.ip(), group.as_deref(), &a_leg_call_id)
-                    .await
+                // The matched trunk entry (key and group), so the STIR
+                // settings are those of the trunk admission resolved.
+                let trunk = inbound_trunk_key
+                    .zip(inbound_trunk.as_ref())
+                    .map(|(key, (g, _))| (key, g.as_str()));
+                stir.inbound(req, source.ip(), trunk, &a_leg_call_id).await
             }
             None => crate::stir::InboundStir::default(),
         };
@@ -10993,7 +11107,7 @@ impl SipStack {
         let mut vps_callee: Option<String> = None;
         if let Some(ref vps) = self.vps {
             let source_ip = source.ip().to_canonical();
-            let direction = if self.is_trunk_ip(source_ip).await {
+            let direction = if inbound_trunk.is_some() {
                 uc_vps::CallDirection::Inbound
             } else {
                 uc_vps::CallDirection::Unknown
@@ -11156,18 +11270,12 @@ impl SipStack {
                 // Not registered — route to a trunk: SBC router (CSS-based),
                 // then dial plan.
                 //
-                // Identify which trunk group this inbound call came from (by
-                // source IP) and get its assigned CSS for routing
-                let source_ip = match source.ip() {
-                    std::net::IpAddr::V6(v6) => v6
-                        .to_ipv4_mapped()
-                        .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
-                    ip @ std::net::IpAddr::V4(_) => ip,
-                };
-                let inbound_trunk = self.lookup_inbound_trunk(source_ip).await;
-                let css_id_owned = inbound_trunk.as_ref().and_then(|(_, css)| css.clone());
+                // The trunk group this inbound call came from (resolved at
+                // admission from source IP and transport) and its CSS.
+                let source_ip = source.ip().to_canonical();
+                let css_id = inbound_trunk.as_ref().and_then(|(_, css)| css.as_deref());
 
-                if let Some((ref tg_id, ref css)) = inbound_trunk {
+                if let Some((tg_id, css)) = inbound_trunk.as_ref() {
                     info!(
                         trunk_group = %tg_id,
                         css = ?css,
@@ -11187,7 +11295,7 @@ impl SipStack {
                     raw_user: &dest_user,
                     domain: &domain,
                     inbound_trunk_group: inbound_trunk.as_ref().map(|(tg, _)| tg.as_str()),
-                    css: css_id_owned.as_deref(),
+                    css: css_id,
                     admission,
                     tls_only: req.uri.scheme.requires_tls(),
                     emergency,
@@ -11433,7 +11541,7 @@ impl SipStack {
         // ## NIST 800-53 Rev5: AU-14, AU-5, SC-5, SC-24; 47 CFR 9.16;
         // RFC 3261 §15 (no call is answered only to be cut)
         let mut recording = if self.recording.is_some() {
-            let ingress_group = self.lookup_inbound_trunk(source.ip()).await.map(|(g, _)| g);
+            let ingress_group = inbound_trunk.as_ref().map(|(g, _)| g.clone());
             let egress_zone = self.egress_media_zone(receiving_zone, b_leg_external);
             let may_terminate = self.dtls_fingerprint_source.is_some()
                 && offer_body.is_some_and(|body| {
@@ -11808,10 +11916,7 @@ impl SipStack {
         let mut stir_signed: Option<proto_stir_shaken::Attestation> = None;
         let mut stir_egress: Option<Arc<crate::stir::StirEgress>> = None;
         if let Some(stir) = self.stir.as_ref() {
-            let source_trunk = self
-                .lookup_inbound_trunk(source.ip())
-                .await
-                .map(|(group, _)| group);
+            let source_trunk = inbound_trunk.as_ref().map(|(group, _)| group.clone());
             // Endpoint callers are "authenticated" only when this INVITE is
             // bound to a registration from this flow and REGISTER auth is
             // on; the caller TN is then the one provisioned for that AOR,
@@ -11939,7 +12044,7 @@ impl SipStack {
                 .map(extract_uri_from_header)
                 .map(|u| crate::cdr::uri_user(&u).to_string())
                 .filter(|u| !u.is_empty() && *u != caller && *u != self.config.instance_name);
-            let from_trunk = self.is_trunk_ip(source.ip()).await;
+            let from_trunk = inbound_trunk.is_some();
             crate::cdr::CdrDraft {
                 setup_ms: invite_received_ms,
                 a_call_id: a_leg_call_id.clone(),
@@ -11996,7 +12101,7 @@ impl SipStack {
         }
         // The caller's trunk group binds the A-leg dialog peer (SC-23); an
         // endpoint caller is also bound to the registration its flow holds.
-        let a_leg_trunk_group = self.trunk_group_of(source.ip()).await;
+        let a_leg_trunk_group = inbound_trunk.as_ref().map(|(g, _)| g.clone());
         let a_leg_registration = if a_leg_trunk_group.is_none() {
             self.flow_registration(source, transport, conn, &from_uri)
                 .await
@@ -12056,6 +12161,14 @@ impl SipStack {
                     b_leg_flow: b_leg_flow.clone(),
                     a_leg_conn: conn,
                     a_leg_trunk_group,
+                    // Configured-transport floor only for a plaintext
+                    // INVITE: a dialog set up over TLS or for a sips:
+                    // Request-URI keeps its arrival (TLS) floor, so
+                    // plaintext in-dialog requests are refused (RFC 3261
+                    // §8.1.1.8, §12.1.1, §26.2.2; SC-8; SEC-R2-1).
+                    a_leg_trunk_transport: inbound_trunk_key
+                        .filter(|_| !transport.is_secure() && !req.uri.scheme.requires_tls())
+                        .map(|k| k.transport()),
                     a_leg_registration,
                     b_leg_peer_kind: if b_leg_external {
                         BLegPeerKind::Trunk
@@ -12741,7 +12854,7 @@ impl SipStack {
         let Some((source, transport, conn)) = flow else {
             return false;
         };
-        let group = self.trunk_group_of(source.ip()).await;
+        let group = self.trunk_group_of(source.ip(), transport).await;
         let peer = DialogPeer::a_leg(source, transport, conn, group.as_deref(), None);
         if self.peer_admits(&peer, ingress).await != PeerMatch::Same {
             return false;
@@ -13374,7 +13487,7 @@ impl SipStack {
         // are no longer admitted as trunk sources.
         {
             let mut map = self.inbound_trunk_map.write().await;
-            map.retain(|_, (group, _)| group != id);
+            map.remove_group(id);
             publish_trunk_sources(&self.trunk_sources, &map);
         }
         self.trunk_group_hosts.write().await.remove(id);
@@ -13410,83 +13523,154 @@ impl SipStack {
         index_trunk_hosts(&mut *self.trunk_group_hosts.write().await, group_id, ips);
     }
 
+    /// Resolves trunk hosts to canonical (IP, transport) source keys off the
+    /// async workers. A transport no trunk can use yields no key.
+    pub async fn resolve_trunk_sources(
+        hosts: &[(String, AddrTransport)],
+    ) -> HashSet<TrunkSourceKey> {
+        let hosts: Vec<(String, AddrTransport)> = hosts.to_vec();
+        tokio::task::spawn_blocking(move || {
+            hosts
+                .iter()
+                .flat_map(|(h, t)| {
+                    resolve_trunk_host_ips(h)
+                        .into_iter()
+                        .filter_map(|ip| TrunkSourceKey::new(ip, *t))
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// Registers a trunk group for inbound call identification.
-    /// Maps each trunk's host IP to the trunk group ID and CSS, replacing
-    /// the group's earlier entries; empty `hosts` clears the group.
+    /// Maps each trunk host's IPs, over that trunk's transport, to the trunk
+    /// group ID and CSS, replacing the group's earlier entries; empty
+    /// `hosts` clears the group.
     ///
-    /// NIST 800-53 Rev5: AC-3, AC-4, CM-3
+    /// NIST 800-53 Rev5: AC-3, AC-4, CM-3, SC-7
     pub async fn register_inbound_trunk(
         &self,
         trunk_group_id: &str,
         css_id: Option<&str>,
-        hosts: &[(String, u16)],
+        hosts: &[(String, AddrTransport)],
     ) {
-        let ips = Self::resolve_trunk_hosts(hosts).await;
-        self.register_inbound_trunk_ips(trunk_group_id, css_id, &ips)
+        let sources = Self::resolve_trunk_sources(hosts).await;
+        self.register_inbound_trunk_sources(trunk_group_id, css_id, &sources)
             .await;
     }
 
-    /// [`Self::register_inbound_trunk`] with the addresses already resolved
-    /// (canonical form).
+    /// [`Self::register_inbound_trunk`] with the sources already resolved.
     ///
-    /// NIST 800-53 Rev5: AC-3, AC-4, CM-3
-    pub async fn register_inbound_trunk_ips(
+    /// NIST 800-53 Rev5: AC-3, AC-4, CM-3, SC-7
+    pub async fn register_inbound_trunk_sources(
         &self,
         trunk_group_id: &str,
         css_id: Option<&str>,
-        ips: &HashSet<std::net::IpAddr>,
+        sources: &HashSet<TrunkSourceKey>,
     ) {
         {
             let mut map = self.inbound_trunk_map.write().await;
-            replace_inbound_trunk(&mut map, trunk_group_id, css_id, ips);
+            map.replace_group(trunk_group_id, css_id, sources);
             publish_trunk_sources(&self.trunk_sources, &map);
         }
-        info!(trunk_group = trunk_group_id, css = ?css_id, addresses = ips.len(), "Registered inbound trunk for CSS routing");
+        info!(trunk_group = trunk_group_id, css = ?css_id, sources = sources.len(), "Registered inbound trunk for CSS routing");
     }
 
-    /// Receiver of the configured trunk address set (the keys of the
-    /// inbound trunk map, canonical form, sorted and capped), updated after
+    /// Receiver of the configured trunk address set (the source IPs of
+    /// the inbound trunk map over any transport, canonical form, sorted
+    /// and capped), updated after
     /// each change.
     pub fn trunk_sources(&self) -> tokio::sync::watch::Receiver<Arc<[std::net::IpAddr]>> {
         self.trunk_sources.subscribe()
     }
 
-    /// Looks up which trunk group and CSS an inbound call belongs to by source IP.
+    /// Looks up which trunk group and CSS an inbound call belongs to by
+    /// source IP (either IPv4 or IPv4-mapped form) and arrival transport.
+    ///
+    /// NIST 800-53 Rev5: AC-4, SC-7, SI-10
     pub async fn lookup_inbound_trunk(
         &self,
         source_ip: std::net::IpAddr,
-    ) -> Option<(String, Option<String>)> {
-        // NIST 800-53 Rev5: AC-4, SI-10 - an IPv4-mapped source matches its IPv4 trunk.
-        let ip = source_ip.to_canonical();
-        self.inbound_trunk_map.read().await.get(&ip).cloned()
+        transport: AddrTransport,
+    ) -> Option<InboundTrunk> {
+        self.inbound_trunk_map
+            .read()
+            .await
+            .get(source_ip, transport)
+            .cloned()
     }
 
     /// Whether `ip` (either IPv4 or IPv4-mapped form) is a configured trunk
-    /// peer. Takes and releases the `inbound_trunk_map` read lock.
+    /// peer over `transport`. Takes and releases the `inbound_trunk_map`
+    /// read lock.
     ///
-    /// NIST 800-53 Rev5: AC-4, SI-10
-    async fn is_trunk_ip(&self, ip: std::net::IpAddr) -> bool {
-        trunk_map_contains(&*self.inbound_trunk_map.read().await, ip)
+    /// NIST 800-53 Rev5: AC-4, SC-7, SI-10
+    async fn is_trunk_source(&self, ip: std::net::IpAddr, transport: AddrTransport) -> bool {
+        self.inbound_trunk_map.read().await.contains(ip, transport)
     }
 
-    /// Whether an INVITE from `source_ip` may be admitted: the address must
-    /// belong to a configured trunk or to a current (unexpired) registration.
-    async fn is_admitted_source(&self, source_ip: std::net::IpAddr) -> bool {
-        let ip = source_ip.to_canonical();
-        if self.is_trunk_ip(ip).await {
-            return true;
+    /// INVITE source admission: a configured trunk on (canonical source IP,
+    /// arrival transport at or above the trunk's configured `protocol`, see
+    /// `trunk_source`), or a live registration whose received flow is
+    /// exactly `ingress` (IP, port, transport and, for stream transports,
+    /// the connection). At most three trunk probes and one flow-index probe, then
+    /// the live bindings of at most [`crate::stir_binding::MAX_AORS_PER_FLOW`]
+    /// AORs: O(1) in the number of registrations (SC-5). The flow index is a
+    /// hint; liveness is always re-checked against the location service, so
+    /// an expired, removed or re-latched binding is denied.
+    ///
+    /// Lock order: `inbound_trunk_map` alone (released), then
+    /// `location_service` → `stir_flows` (the REGISTER order). The deny path
+    /// takes `inbound_trunk_map` again, alone, for its log hint; a trunk on
+    /// another transport is the hint first, before any flow hint.
+    ///
+    /// ## NIST 800-53 Rev5: AC-3, IA-3, SC-5, SC-7, SC-23
+    /// POAM: POA&M-271 no per-INVITE challenge: a UDP flow can be spoofed
+    /// off-path by a sender who knows or guesses the NAT port.
+    async fn admit_invite_source(&self, ingress: &Ingress) -> SourceAdmission {
+        let ip = ingress.source.ip();
+        let trunk = self
+            .inbound_trunk_map
+            .read()
+            .await
+            .resolve(ip, ingress.transport)
+            .map(|(key, trunk)| (key, trunk.clone()));
+        if let Some((key, trunk)) = trunk {
+            return SourceAdmission::Trunk(key, trunk);
         }
-        let loc = self.location_service.read().await;
-        loc.aors().any(|aor| {
-            loc.lookup(aor).iter().any(|binding| {
-                binding
-                    .contact_uri()
-                    .parse::<SipUri>()
-                    .ok()
-                    .and_then(|uri| uri.host.parse::<std::net::IpAddr>().ok())
-                    .is_some_and(|contact_ip| contact_ip.to_canonical() == ip)
-            })
-        })
+        let key = crate::stir_binding::flow_key(ip, ingress.source.port(), ingress.transport);
+        let hint = {
+            let loc = self.location_service.read().await;
+            let flows = self.stir_flows.read().await;
+            match flows.get(&key, ingress.conn) {
+                Some(aors)
+                    if aors
+                        .iter()
+                        .any(|aor| Self::flow_has_binding(&loc, aor, &key)) =>
+                {
+                    return SourceAdmission::RegisteredFlow;
+                }
+                Some(_) => DenyHint::FlowNotLive,
+                None => match flows.miss_reason(&key, ingress.conn) {
+                    crate::stir_binding::FlowMiss::ConnMismatch => DenyHint::FlowOtherConnection,
+                    crate::stir_binding::FlowMiss::TransportMismatch => {
+                        DenyHint::FlowOtherTransport
+                    }
+                    crate::stir_binding::FlowMiss::None => DenyHint::None,
+                },
+            }
+        };
+        // Deny path only: an address that is a trunk over another
+        // (stronger) transport is named as such first, whatever the flow
+        // index says (a spoofed UDP datagram from a TLS trunk's address is
+        // the case worth seeing in the log).
+        let other = self
+            .inbound_trunk_map
+            .read()
+            .await
+            .configured_transport(ip, ingress.transport);
+        SourceAdmission::Denied(other.map_or(hint, DenyHint::TrunkOtherTransport))
     }
 
     /// Whether `aor` still has a live binding whose contact is the flow
@@ -14590,50 +14774,67 @@ enum PeerMatch {
     No,
 }
 
+/// Outcome of INVITE source admission ([`SipStack::admit_invite_source`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceAdmission {
+    /// A configured trunk: the key it matched (source IP and the trunk's
+    /// configured transport, see `trunk_source`), its group and CSS.
+    Trunk(TrunkSourceKey, InboundTrunk),
+    /// A live registration was received on exactly this flow.
+    RegisteredFlow,
+    /// Neither: 403 `source-admission`.
+    Denied(DenyHint),
+}
+
+/// Why an INVITE source was denied, when that is cheap to tell. A log field
+/// only, never sent on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenyHint {
+    /// Nothing cheap to report (includes a UDP port mismatch).
+    None,
+    /// The address is a trunk, but over this other configured transport.
+    TrunkOtherTransport(AddrTransport),
+    /// The flow is registered, but on another stream connection.
+    FlowOtherConnection,
+    /// The `ip:port` is registered, but over another transport.
+    FlowOtherTransport,
+    /// The flow is indexed but its registration is no longer live.
+    FlowNotLive,
+}
+
+impl DenyHint {
+    /// Fixed log text for the hint.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::TrunkOtherTransport(_) => "trunk-address-other-transport",
+            Self::FlowOtherConnection => "registered-address-other-connection",
+            Self::FlowOtherTransport => "registered-address-other-transport",
+            Self::FlowNotLive => "registration-not-live",
+        }
+    }
+}
+
 /// Same IP (canonical form) and port.
 fn same_socket(a: SbcSocketAddr, b: SbcSocketAddr) -> bool {
     a.ip().to_canonical() == b.ip().to_canonical() && a.port() == b.port()
 }
 
-/// Replaces the `inbound_trunk_map` entries of trunk group `group` with
-/// `ips` (canonical) and `css`. An address already mapped to another group
-/// moves to `group`.
-///
-/// NIST 800-53 Rev5: AC-3, AC-4, CM-3
-fn replace_inbound_trunk(
-    map: &mut std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>,
-    group: &str,
-    css: Option<&str>,
-    ips: &HashSet<std::net::IpAddr>,
-) {
-    map.retain(|_, (g, _)| g != group);
-    for ip in ips {
-        if let Some((previous, _)) = map.insert(*ip, (group.to_string(), css.map(String::from))) {
-            // Only another group's entry can remain after the retain.
-            warn!(
-                trunk_group = group,
-                previous_trunk_group = %previous,
-                "Trunk host address moved from another trunk group"
-            );
-        }
-    }
-}
-
-/// Publishes the key set of an already-locked `inbound_trunk_map` when it
-/// differs from the last snapshot. Called with the map's write lock held so
+/// Publishes the source IPs of an already-locked `inbound_trunk_map`
+/// (deduplicated across transports: the per-source rate limiters are keyed
+/// by IP only) when they differ from the last snapshot. Called with the map's write lock held so
 /// snapshots follow write order; no await and no other lock. The set is
 /// sorted and capped at `MAX_TRUSTED_SOURCES` here, outside any limiter
 /// lock, so the addresses kept on overflow are deterministic (lowest
 /// first).
 ///
 /// NIST 800-53 Rev5: SC-5
-fn publish_trunk_sources<V>(
+fn publish_trunk_sources(
     tx: &tokio::sync::watch::Sender<Arc<[std::net::IpAddr]>>,
-    map: &std::collections::HashMap<std::net::IpAddr, V>,
+    map: &InboundTrunkMap,
 ) {
     let max = uc_dos_protection::MAX_TRUSTED_SOURCES;
-    let mut next: Vec<std::net::IpAddr> = map.keys().copied().collect();
-    next.sort_unstable();
+    let mut next: Vec<std::net::IpAddr> = map.source_ips();
     if next.len() > max {
         warn!(
             configured = next.len(),
@@ -14684,17 +14885,6 @@ fn admitted_media_addr(media: &MediaAddress) -> Option<SbcSocketAddr> {
     Some(SbcSocketAddr::from(std::net::SocketAddr::new(
         ip, media.port,
     )))
-}
-
-/// Whether `ip` is a key of an already-locked `inbound_trunk_map`, after
-/// folding an IPv4-mapped address (`::ffff:a.b.c.d`) to plain IPv4.
-///
-/// NIST 800-53 Rev5: AC-4, SI-10
-fn trunk_map_contains<V>(
-    map: &std::collections::HashMap<std::net::IpAddr, V>,
-    ip: std::net::IpAddr,
-) -> bool {
-    map.contains_key(&ip.to_canonical())
 }
 
 /// Resolves a trunk host (IP literal or hostname) to every address it names.
@@ -15070,6 +15260,7 @@ fn extract_param<'a>(header_value: &'a str, name: &str) -> Option<&'a str> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub mod tests {
     use super::*;
+    use uc_routing::TrunkProtocol;
 
     /// A digest credential store for tests, built from cleartext test
     /// passwords (the stack itself only ever holds the HA1).
@@ -15088,6 +15279,8 @@ pub mod tests {
 
     // Dialog and CANCEL matching (RFC 3261 §9.2, §12.2.2, §13.2.2.4, §15).
     mod dialog_binding;
+    // INVITE source admission by exact flow; trunk identity by transport (SR-04).
+    mod source_admission;
 
     /// For server tests: a stack with trunks t1 (127.0.0.2:5061) and t2
     /// (127.0.0.3:5061), both TLS, and a placed call's primary B-leg INVITE
@@ -15275,7 +15468,11 @@ pub mod tests {
         let stack = SipStack::new(config);
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
-            .register_inbound_trunk("test-trunk", None, &[("127.0.0.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("127.0.0.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
 
         let invite = b"INVITE sip:9999@sbc.local SIP/2.0\r\n\
@@ -15469,23 +15666,35 @@ pub mod tests {
             .register_inbound_trunk(
                 "carrier",
                 Some("css-1"),
-                &[("203.0.113.9".to_string(), 5060)],
+                &[("203.0.113.9".to_string(), AddrTransport::Udp)],
             )
             .await;
         let v4 = std::net::Ipv4Addr::new(203, 0, 113, 9);
         let expected = Some(("carrier".to_string(), Some("css-1".to_string())));
         assert_eq!(
-            stack.lookup_inbound_trunk(std::net::IpAddr::V4(v4)).await,
+            stack
+                .lookup_inbound_trunk(std::net::IpAddr::V4(v4), AddrTransport::Udp)
+                .await,
             expected
         );
         let mapped: std::net::IpAddr = "::ffff:203.0.113.9".parse().unwrap();
         assert_eq!(
-            stack.lookup_inbound_trunk(mapped).await,
+            stack.lookup_inbound_trunk(mapped, AddrTransport::Udp).await,
             expected,
             "IPv4-mapped source must resolve to the IPv4 trunk"
         );
-        assert!(stack.is_trunk_ip(mapped).await);
-        assert!(stack.is_trunk_ip(std::net::IpAddr::V4(v4)).await);
+        assert!(stack.is_trunk_source(mapped, AddrTransport::Udp).await);
+        assert!(
+            stack
+                .is_trunk_source(std::net::IpAddr::V4(v4), AddrTransport::Udp)
+                .await
+        );
+        // SR-04 transport floor: a UDP trunk also matches TCP and TLS.
+        assert_eq!(
+            stack.lookup_inbound_trunk(mapped, AddrTransport::Tls).await,
+            expected
+        );
+        assert!(stack.is_trunk_source(mapped, AddrTransport::Tcp).await);
     }
 
     /// Sends a minimal out-of-dialog INVITE from `ip:5060` and returns the
@@ -15535,7 +15744,7 @@ pub mod tests {
             .register_inbound_trunk(
                 "carrier",
                 Some("css-1"),
-                &[("203.0.113.9".to_string(), 5060)],
+                &[("203.0.113.9".to_string(), AddrTransport::Udp)],
             )
             .await;
         assert!(!is_forbidden(
@@ -15544,10 +15753,22 @@ pub mod tests {
 
         stack.remove_trunk_group_from_router("carrier").await;
 
-        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
+        assert_eq!(
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 9), AddrTransport::Udp)
+                .await,
+            None
+        );
         let mapped: std::net::IpAddr = "::ffff:203.0.113.9".parse().unwrap();
-        assert_eq!(stack.lookup_inbound_trunk(mapped).await, None);
-        assert!(!stack.is_trunk_ip(v4(203, 0, 113, 9)).await);
+        assert_eq!(
+            stack.lookup_inbound_trunk(mapped, AddrTransport::Udp).await,
+            None
+        );
+        assert!(
+            !stack
+                .is_trunk_source(v4(203, 0, 113, 9), AddrTransport::Udp)
+                .await
+        );
         let result = invite_from(&stack, [203, 0, 113, 9], "rm2").await;
         assert!(
             is_forbidden(&result),
@@ -15565,26 +15786,30 @@ pub mod tests {
             .register_inbound_trunk(
                 "carrier",
                 Some("css-1"),
-                &[("203.0.113.9".to_string(), 5060)],
+                &[("203.0.113.9".to_string(), AddrTransport::Udp)],
             )
             .await;
         stack
             .register_inbound_trunk(
                 "carrier",
                 Some("css-1"),
-                &[("203.0.113.10".to_string(), 5060)],
+                &[("203.0.113.10".to_string(), AddrTransport::Udp)],
             )
             .await;
 
         assert_eq!(
-            stack.lookup_inbound_trunk(v4(203, 0, 113, 10)).await,
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 10), AddrTransport::Udp)
+                .await,
             Some(("carrier".to_string(), Some("css-1".to_string())))
         );
         assert!(!is_forbidden(
             &invite_from(&stack, [203, 0, 113, 10], "ch1").await
         ));
         assert_eq!(
-            stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await,
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 9), AddrTransport::Udp)
+                .await,
             None,
             "the group's old host must be dropped on re-sync"
         );
@@ -15606,8 +15831,8 @@ pub mod tests {
                 "carrier",
                 Some("css-1"),
                 &[
-                    ("203.0.113.9".to_string(), 5060),
-                    ("203.0.113.10".to_string(), 5060),
+                    ("203.0.113.9".to_string(), AddrTransport::Udp),
+                    ("203.0.113.10".to_string(), AddrTransport::Udp),
                 ],
             )
             .await;
@@ -15615,26 +15840,36 @@ pub mod tests {
             .register_inbound_trunk(
                 "carrier",
                 Some("css-2"),
-                &[("203.0.113.9".to_string(), 5060)],
+                &[("203.0.113.9".to_string(), AddrTransport::Udp)],
             )
             .await;
 
         assert_eq!(
-            stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await,
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 9), AddrTransport::Udp)
+                .await,
             Some(("carrier".to_string(), Some("css-2".to_string())))
         );
         assert_eq!(
-            stack.lookup_inbound_trunk(v4(203, 0, 113, 10)).await,
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 10), AddrTransport::Udp)
+                .await,
             None,
             "a dropped host must not keep the old CSS"
         );
 
         // CSS removed altogether: the group maps to no CSS.
         stack
-            .register_inbound_trunk("carrier", None, &[("203.0.113.9".to_string(), 5060)])
+            .register_inbound_trunk(
+                "carrier",
+                None,
+                &[("203.0.113.9".to_string(), AddrTransport::Udp)],
+            )
             .await;
         assert_eq!(
-            stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await,
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 9), AddrTransport::Udp)
+                .await,
             Some(("carrier".to_string(), None))
         );
     }
@@ -15650,29 +15885,57 @@ pub mod tests {
                 "a",
                 Some("css-a"),
                 &[
-                    ("203.0.113.9".to_string(), 5060),
-                    ("203.0.113.10".to_string(), 5060),
+                    ("203.0.113.9".to_string(), AddrTransport::Udp),
+                    ("203.0.113.10".to_string(), AddrTransport::Udp),
                 ],
             )
             .await;
         // B synced first with the moved IP, then A re-synced without it.
         stack
-            .register_inbound_trunk("b", Some("css-b"), &[("203.0.113.9".to_string(), 5060)])
+            .register_inbound_trunk(
+                "b",
+                Some("css-b"),
+                &[("203.0.113.9".to_string(), AddrTransport::Udp)],
+            )
             .await;
         stack
-            .register_inbound_trunk("a", Some("css-a"), &[("203.0.113.10".to_string(), 5060)])
+            .register_inbound_trunk(
+                "a",
+                Some("css-a"),
+                &[("203.0.113.10".to_string(), AddrTransport::Udp)],
+            )
             .await;
         let in_b = Some(("b".to_string(), Some("css-b".to_string())));
-        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, in_b);
+        assert_eq!(
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 9), AddrTransport::Udp)
+                .await,
+            in_b
+        );
 
         // Removing A must not take B's address with it.
         stack.remove_trunk_group_from_router("a").await;
-        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, in_b);
-        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 10)).await, None);
+        assert_eq!(
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 9), AddrTransport::Udp)
+                .await,
+            in_b
+        );
+        assert_eq!(
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 10), AddrTransport::Udp)
+                .await,
+            None
+        );
 
         // Removing B drops it: nothing still maps it to A either.
         stack.remove_trunk_group_from_router("b").await;
-        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
+        assert_eq!(
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 9), AddrTransport::Udp)
+                .await,
+            None
+        );
     }
 
     // NIST 800-53 Rev5: AC-3, AC-4, CM-3
@@ -15681,19 +15944,34 @@ pub mod tests {
     async fn test_resync_with_empty_hosts_clears_group() {
         let stack = SipStack::new(SipStackConfig::default());
         stack
-            .register_inbound_trunk("carrier", None, &[("203.0.113.9".to_string(), 5060)])
+            .register_inbound_trunk(
+                "carrier",
+                None,
+                &[("203.0.113.9".to_string(), AddrTransport::Udp)],
+            )
             .await;
         stack
-            .register_inbound_trunk("other", None, &[("203.0.113.20".to_string(), 5060)])
+            .register_inbound_trunk(
+                "other",
+                None,
+                &[("203.0.113.20".to_string(), AddrTransport::Udp)],
+            )
             .await;
         stack.register_inbound_trunk("carrier", None, &[]).await;
 
-        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
+        assert_eq!(
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 9), AddrTransport::Udp)
+                .await,
+            None
+        );
         assert!(is_forbidden(
             &invite_from(&stack, [203, 0, 113, 9], "em1").await
         ));
         assert_eq!(
-            stack.lookup_inbound_trunk(v4(203, 0, 113, 20)).await,
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 20), AddrTransport::Udp)
+                .await,
             Some(("other".to_string(), None)),
             "other groups are untouched"
         );
@@ -15724,7 +16002,11 @@ pub mod tests {
         }
         assert!(!remover.is_finished(), "removal waits for the sync");
         stack
-            .register_inbound_trunk("carrier", None, &[("203.0.113.9".to_string(), 5060)])
+            .register_inbound_trunk(
+                "carrier",
+                None,
+                &[("203.0.113.9".to_string(), AddrTransport::Udp)],
+            )
             .await;
         stack
             .index_trunk_group_hosts("carrier", &[("203.0.113.9".to_string(), 5060)])
@@ -15732,8 +16014,17 @@ pub mod tests {
         drop(sync);
         remover.await.unwrap();
 
-        assert_eq!(stack.lookup_inbound_trunk(v4(203, 0, 113, 9)).await, None);
-        assert!(!stack.is_trunk_ip(v4(203, 0, 113, 9)).await);
+        assert_eq!(
+            stack
+                .lookup_inbound_trunk(v4(203, 0, 113, 9), AddrTransport::Udp)
+                .await,
+            None
+        );
+        assert!(
+            !stack
+                .is_trunk_source(v4(203, 0, 113, 9), AddrTransport::Udp)
+                .await
+        );
         assert!(!stack.trunk_group_hosts.read().await.contains_key("carrier"));
     }
 
@@ -15755,7 +16046,11 @@ pub mod tests {
     async fn test_invite_from_trunk_source_is_admitted() {
         let stack = SipStack::new(SipStackConfig::default());
         stack
-            .register_inbound_trunk("carrier", None, &[("203.0.113.9".to_string(), 5060)])
+            .register_inbound_trunk(
+                "carrier",
+                None,
+                &[("203.0.113.9".to_string(), AddrTransport::Udp)],
+            )
             .await;
 
         let invite = b"INVITE sip:9999@sbc.local SIP/2.0\r\n\
@@ -15781,7 +16076,7 @@ pub mod tests {
     }
 
     /// A currently registered endpoint is admitted from its registered
-    /// address, and refused from a different one.
+    /// flow, and refused from a different address or port (SR-04).
     #[tokio::test]
     async fn test_invite_from_registered_source_is_admitted() {
         let stack = SipStack::new(SipStackConfig::default());
@@ -15801,12 +16096,26 @@ pub mod tests {
             .process_message(&Bytes::from_static(register), bob, None)
             .await;
 
-        assert!(stack.is_admitted_source(bob.ip()).await);
-        assert!(
-            !stack
-                .is_admitted_source(std::net::Ipv4Addr::new(198, 51, 100, 8).into())
-                .await
+        let udp = |source| Ingress {
+            source,
+            transport: AddrTransport::Udp,
+            conn: None,
+        };
+        assert_eq!(
+            stack.admit_invite_source(&udp(bob)).await,
+            SourceAdmission::RegisteredFlow
         );
+        let other_host = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 8), 5060);
+        assert!(matches!(
+            stack.admit_invite_source(&udp(other_host)).await,
+            SourceAdmission::Denied(_)
+        ));
+        // SR-04: the same IP on another port is another flow.
+        let other_port = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 7), 5062);
+        assert!(matches!(
+            stack.admit_invite_source(&udp(other_port)).await,
+            SourceAdmission::Denied(_)
+        ));
     }
 
     #[tokio::test]
@@ -15814,7 +16123,11 @@ pub mod tests {
         let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
-            .register_inbound_trunk("test-trunk", None, &[("127.0.0.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("127.0.0.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
 
         // INVITE to unresolvable host → should get 200 OK (announcement playback)
@@ -15854,7 +16167,11 @@ pub mod tests {
         let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
-            .register_inbound_trunk("test-trunk", None, &[("192.168.1.100".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("192.168.1.100".to_string(), AddrTransport::Udp)],
+            )
             .await;
 
         // First, register bob at 127.0.0.1:5060
@@ -15969,7 +16286,11 @@ pub mod tests {
         let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
-            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
 
         // Register bob
@@ -16052,7 +16373,11 @@ pub mod tests {
     /// `call-bye-guard@test`, From tag `g1`), returning alice's address.
     async fn call_from_alice(stack: &SipStack) -> SbcSocketAddr {
         stack
-            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK041\r\n\
@@ -16149,7 +16474,11 @@ pub mod tests {
         let stack = delayed_offer_stack();
         // The caller is a configured trunk, so the INVITE passes source admission.
         stack
-            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
 
         // Register bob
@@ -16493,16 +16822,40 @@ pub mod tests {
 
         // Router should be set
         assert!(stack.router.is_some());
-        // Config-file trunks are admitted sources for INVITE.
-        assert!(
+        // Config-file trunks are admitted sources for INVITE, over their
+        // configured protocol or a stronger one (SR-04, RFC 3261 §18.1.1
+        // transport floor).
+        let ingress = |ip: std::net::Ipv4Addr, transport| Ingress {
+            source: SbcSocketAddr::new_v4(ip, 5060),
+            transport,
+            conn: None,
+        };
+        assert!(matches!(
             stack
-                .is_admitted_source(std::net::Ipv4Addr::LOCALHOST.into())
-                .await
-        );
-        assert!(
-            !stack
-                .is_admitted_source(std::net::Ipv4Addr::new(10, 9, 9, 9).into())
-                .await
+                .admit_invite_source(&ingress(std::net::Ipv4Addr::LOCALHOST, AddrTransport::Udp))
+                .await,
+            SourceAdmission::Trunk(..)
+        ));
+        assert!(matches!(
+            stack
+                .admit_invite_source(&ingress(
+                    std::net::Ipv4Addr::new(10, 9, 9, 9),
+                    AddrTransport::Udp
+                ))
+                .await,
+            SourceAdmission::Denied(_)
+        ));
+        assert_eq!(
+            stack
+                .admit_invite_source(&Ingress {
+                    conn: Some(crate::stir_binding::ConnId::next()),
+                    ..ingress(std::net::Ipv4Addr::LOCALHOST, AddrTransport::Tls)
+                })
+                .await,
+            SourceAdmission::Trunk(
+                config_trunk_key(std::net::Ipv4Addr::LOCALHOST.into(), "udp").unwrap(),
+                ("emergency".to_string(), None)
+            )
         );
     }
 
@@ -16734,6 +17087,7 @@ pub mod tests {
             b_leg_flow: LegFlow::UDP,
             a_leg_conn: None,
             a_leg_trunk_group: None,
+            a_leg_trunk_transport: None,
             a_leg_registration: None,
             b_leg_peer_kind: BLegPeerKind::Registered,
             b_leg_registration: None,
@@ -17066,7 +17420,11 @@ pub mod tests {
     async fn ringing_call() -> (SipStack, proto_sip::message::SipRequest) {
         let stack = SipStack::new(SipStackConfig::default());
         stack
-            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\
@@ -18160,7 +18518,16 @@ pub mod tests {
             stack.set_vps_engine(engine);
         }
         stack
-            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "pbx",
+                None,
+                // The PBX places calls over UDP, TCP and TLS (SR-04: per transport).
+                &[
+                    ("192.168.1.1".to_string(), AddrTransport::Udp),
+                    ("192.168.1.1".to_string(), AddrTransport::Tcp),
+                    ("192.168.1.1".to_string(), AddrTransport::Tls),
+                ],
+            )
             .await;
         stack
     }
@@ -18332,7 +18699,11 @@ pub mod tests {
         stack.set_vps_engine(vps_with_callee_cap(5));
         stack.set_sbc_router(blocking_sbc_router(blocked));
         stack
-            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "pbx",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         stack
     }
@@ -18540,7 +18911,11 @@ pub mod tests {
         });
         stack.init_router_from_config(&routing, &dial_plans, &groups);
         stack
-            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "pbx",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         stack
     }
@@ -20746,7 +21121,11 @@ pub mod tests {
             stack.set_vps_engine(engine);
         }
         stack
-            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "pbx",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         stack
     }
@@ -21529,7 +21908,11 @@ pub mod tests {
             &sbc_config::schema::CdrConfig::default(),
         )));
         stack
-            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "pbx",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         let r = place_call(&stack, "noroute@cdr").await;
         let status = [200, 480]
@@ -22445,6 +22828,12 @@ pub mod tests {
         (attest.as_ref().map(|a| a.0), attest.map(|a| a.1))
     }
 
+    /// Whether `results` is the source-admission 403 alone (nothing
+    /// forwarded): the INVITE's flow holds no live registration (SR-04).
+    fn admission_denied(results: &[ProcessResult]) -> bool {
+        results.iter().any(is_forbidden) && forwarded(results, &Method::Invite).is_none()
+    }
+
     /// Sends an endpoint INVITE and flattens the results.
     async fn send(
         stack: &SipStack,
@@ -22568,12 +22957,15 @@ pub mod tests {
         assert_eq!(a, Some(proto_stir_shaken::Attestation::Full));
         assert_eq!(orig.as_deref(), Some("12025550100"));
 
-        // Same IP, different port: not bound to the registration, no A.
+        // Same IP, different port: not the registered flow, so not
+        // admitted at all (SR-04), let alone attested.
         let other_port = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 7), 5070);
-        let (a, _) = forwarded_attest(
-            &send(&q.stack, "sec1-port@test", other_port, "+12025550100", None).await,
+        let r = send(&q.stack, "sec1-port@test", other_port, "+12025550100", None).await;
+        assert!(admission_denied(&r), "{r:?}");
+        assert_ne!(
+            forwarded_attest(&r).0,
+            Some(proto_stir_shaken::Attestation::Full)
         );
-        assert_ne!(a, Some(proto_stir_shaken::Attestation::Full));
 
         // Extension AOR: the DID provisioned for it is asserted and A.
         let (a, orig) = forwarded_attest(&send(&q.stack, "sec1-ext@test", src, "bob", None).await);
@@ -22581,19 +22973,21 @@ pub mod tests {
         assert_eq!(orig.as_deref(), Some("12025550142"));
 
         // Bound over TCP, INVITE over UDP from the same address: a different
-        // flow, so unbound.
-        let (a, _) = forwarded_attest(
-            &send_on(
-                &q.stack,
-                "sec1-flow@test",
-                src,
-                "+12025550100",
-                None,
-                AddrTransport::Udp,
-            )
-            .await,
+        // flow, so not admitted (SR-04).
+        let r = send_on(
+            &q.stack,
+            "sec1-flow@test",
+            src,
+            "+12025550100",
+            None,
+            AddrTransport::Udp,
+        )
+        .await;
+        assert!(admission_denied(&r), "{r:?}");
+        assert_ne!(
+            forwarded_attest(&r).0,
+            Some(proto_stir_shaken::Attestation::Full)
         );
-        assert_ne!(a, Some(proto_stir_shaken::Attestation::Full));
 
         // REGISTER auth off: nobody is "authenticated", so no A.
         q.stack.config.require_auth = false;
@@ -22629,13 +23023,14 @@ pub mod tests {
             .unwrap();
 
         // In the location service but never indexed (no REGISTER seen on
-        // this flow): unbound, so not signed with this number.
+        // this flow): not a registered flow, so not admitted (SR-04).
         let udp = |id: &'static str| {
             let stack = &q.stack;
             async move { send_on(stack, id, src, "+12025550100", None, AddrTransport::Udp).await }
         };
-        let (a, _) = forwarded_attest(&udp("sec9-unindexed@test").await);
-        assert_eq!(a, None);
+        let r = udp("sec9-unindexed@test").await;
+        assert!(admission_denied(&r), "{r:?}");
+        assert_eq!(forwarded_attest(&r).0, None);
 
         // Indexed UDP flow: B with the caller's own TN, never A.
         q.stack
@@ -22646,10 +23041,11 @@ pub mod tests {
         assert_eq!(orig.as_deref(), Some("12025550100"));
 
         // The binding is removed (expiry, API delete): the stale index entry
-        // is not trusted.
+        // is not trusted, for admission either.
         q.stack.delete_registration(aor, contact).await.unwrap();
-        let (a, _) = forwarded_attest(&udp("sec9-stale@test").await);
-        assert_eq!(a, None);
+        let r = udp("sec9-stale@test").await;
+        assert!(admission_denied(&r), "{r:?}");
+        assert_eq!(forwarded_attest(&r).0, None);
     }
 
     /// Item 2: with a cluster `AsyncLocationService` attached the REGISTER
@@ -22803,19 +23199,22 @@ pub mod tests {
                 .await,
             None
         );
-        let (a, _) = forwarded_attest(
-            &send_conn(
-                &q.stack,
-                "p36-open@test",
-                src,
-                "+12025550100",
-                AddrTransport::Tls,
-                c2,
-                None,
-            )
-            .await,
+        // Not the registered flow: not admitted (SR-04).
+        let r = send_conn(
+            &q.stack,
+            "p36-open@test",
+            src,
+            "+12025550100",
+            AddrTransport::Tls,
+            c2,
+            None,
+        )
+        .await;
+        assert!(admission_denied(&r), "{r:?}");
+        assert_ne!(
+            forwarded_attest(&r).0,
+            Some(proto_stir_shaken::Attestation::Full)
         );
-        assert_ne!(a, Some(proto_stir_shaken::Attestation::Full));
         // c1 closes, c2 still has not registered: unauthenticated.
         if let Some(c) = c1 {
             q.stack.connection_closed(c).await;
@@ -22826,19 +23225,21 @@ pub mod tests {
                 .await,
             None
         );
-        let (a, _) = forwarded_attest(
-            &send_conn(
-                &q.stack,
-                "p36-closed@test",
-                src,
-                "+12025550100",
-                AddrTransport::Tls,
-                c2,
-                None,
-            )
-            .await,
+        let r = send_conn(
+            &q.stack,
+            "p36-closed@test",
+            src,
+            "+12025550100",
+            AddrTransport::Tls,
+            c2,
+            None,
+        )
+        .await;
+        assert!(admission_denied(&r), "{r:?}");
+        assert_ne!(
+            forwarded_attest(&r).0,
+            Some(proto_stir_shaken::Attestation::Full)
         );
-        assert_ne!(a, Some(proto_stir_shaken::Attestation::Full));
     }
 
     /// Connection binding (b): REGISTER and INVITE on the same connection attest A.
@@ -22973,6 +23374,18 @@ pub mod tests {
                 .await,
             None
         );
+        // De-registered: the flow no longer places calls (SR-04).
+        let r = send_conn(
+            &q.stack,
+            "p36-dereg@test",
+            src,
+            "+12025550100",
+            AddrTransport::Tls,
+            c1,
+            None,
+        )
+        .await;
+        assert!(admission_denied(&r), "{r:?}");
     }
 
     /// QA (POA&M-36): the binding moves to a new connection on the same address;
@@ -23040,6 +23453,30 @@ pub mod tests {
                 .await,
             None
         );
+        // An INVITE on the new connection is not admitted (SR-04); one on the
+        // registered connection is.
+        let r = send_conn(
+            &q.stack,
+            "p36-tcp-c2@test",
+            src,
+            "+12025550100",
+            AddrTransport::Tcp,
+            c2,
+            None,
+        )
+        .await;
+        assert!(admission_denied(&r), "{r:?}");
+        let r = send_conn(
+            &q.stack,
+            "p36-tcp-c1@test",
+            src,
+            "+12025550100",
+            AddrTransport::Tcp,
+            c1,
+            None,
+        )
+        .await;
+        assert!(!admission_denied(&r), "{r:?}");
     }
 
     /// NIST-009: verification failures are audited once per (trunk, reason)
@@ -24063,7 +24500,11 @@ pub mod tests {
         let (routing, dial_plans, groups) = carrier_routing(10, ("none", ""), ["udp", "tls"]);
         stack.init_router_from_config(&routing, &dial_plans, &groups);
         stack
-            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "pbx",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         let results = place_call(&stack, "rt-global@test").await;
         let (_, dest) = forwarded(&results, &Method::Invite).unwrap();
@@ -24866,7 +25307,11 @@ pub mod tests {
         let mut stack = SipStack::new(SipStackConfig::default());
         enable_hider(&mut stack).await;
         stack
-            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\
@@ -25088,7 +25533,11 @@ pub mod tests {
         let mut stack = SipStack::new(SipStackConfig::default());
         enable_hider(&mut stack).await;
         stack
-            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         let remote = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(203, 0, 113, 20), 5060);
         let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
@@ -26050,7 +26499,15 @@ pub mod tests {
             ..sbc_config::schema::SrtpConfig::default()
         });
         stack
-            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "pbx",
+                None,
+                // The PBX calls over TLS here (SR-04: trunk keyed per transport).
+                &[
+                    ("192.168.1.1".to_string(), AddrTransport::Udp),
+                    ("192.168.1.1".to_string(), AddrTransport::Tls),
+                ],
+            )
             .await;
         let tls_port = stack.config.tls_port;
         let result = flatten(
@@ -26856,7 +27313,11 @@ pub mod tests {
     ) -> (SipStack, proto_sip::message::SipRequest) {
         let stack = SipStack::new(SipStackConfig::default());
         stack
-            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\
@@ -28537,11 +28998,21 @@ pub mod tests {
     fn bearer_authenticator_is_refused_while_digest_is_on() {
         let bearer = || {
             let issuer = "https://idp.example.test";
-            let jwks = Arc::new(proto_jwt::JwksCache::new(reqwest::Client::new(), issuer));
-            let validator = Arc::new(proto_jwt::Validator::new(
-                jwks,
-                proto_jwt::ValidatorConfig::new(issuer, vec!["sbc".to_string()]),
-            ));
+            // Never fetches; reqwest without a provider needs preconfigured TLS.
+            let tls = uc_transport::tls::create_client_config(rustls::RootCertStore::empty())
+                .expect("tls config");
+            let http = reqwest::Client::builder()
+                .use_preconfigured_tls(tls)
+                .build()
+                .expect("http client");
+            let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer));
+            let validator = Arc::new(
+                proto_jwt::Validator::new(
+                    jwks,
+                    proto_jwt::ValidatorConfig::new(issuer, vec!["sbc".to_string()]),
+                )
+                .expect("validator config"),
+            );
             Arc::new(BearerAuthenticator::new(
                 validator,
                 "example.com".to_string(),
@@ -28941,7 +29412,11 @@ pub mod tests {
     async fn qa_api_registered_group_untrusted_strips_pai() {
         let stack = trunk_stack(10, ("none", ""), None).await;
         stack
-            .register_inbound_trunk("api-grp", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "api-grp",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         assert!(!stack.trunk_group_trusted("api-grp").await);
         let raw = with_extra(
@@ -29582,7 +30057,11 @@ pub mod tests {
         stack.set_t38_config(t38);
         stack.set_media_security_policy(&srtp_not_required());
         stack
-            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\
@@ -30083,7 +30562,11 @@ pub mod tests {
         let mut stack = SipStack::new(SipStackConfig::default());
         stack.set_media_pipeline(Arc::clone(&media) as _);
         stack
-            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         let image_only = ALICE_T38.replace("m=audio 0 RTP/AVP 0\r\n", "");
         let results = flatten(
@@ -30131,7 +30614,11 @@ pub mod tests {
         stack.set_media_pipeline(Arc::clone(&media) as _);
         stack.set_t38_config(t38_enabled());
         stack
-            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .register_inbound_trunk(
+                "test-trunk",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
             .await;
         let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\

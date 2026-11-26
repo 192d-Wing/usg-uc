@@ -8,6 +8,12 @@
 //!
 //! AES key schedules are pre-expanded in [`SrtpContext`] and reused across
 //! all `protect`/`unprotect` calls, avoiding ~100ns of key expansion per packet.
+//!
+//! ## FIPS 140-3
+//!
+//! Seal uses the RFC 7714 §8.1 IV built here, so `protect_*` is not an
+//! approved AES-GCM service (IG C.H); `unprotect_*` is.
+// POAM: POA&M-400 (SRTP/SRTCP seal with an external IV; no approved aws-lc service fits RFC 7714).
 
 use crate::MAX_PACKET_INDEX;
 use crate::context::SrtpContext;

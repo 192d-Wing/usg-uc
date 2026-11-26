@@ -33,14 +33,23 @@ thiserror.workspace = true
 # SIP registrar so both authorize the same tokens identically.
 proto-jwt.workspace = true
 # Building the HTTP client (rustls, optional extra CA) the JWKS cache fetches
-# with. rustls only, no native-tls.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# with. No bundled crypto provider: TLS is the CNSA config from uc-transport
+# `https-client`, which also links the FIPS module (workspace rustls `fips`).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-no-provider"] }
+uc-transport = { workspace = true, default-features = false, features = ["https-client"] }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
-# Test-only token signing: ES256 keypair generation + JWT encode. No static
+# Test-only token signing: ES384 (P-384) keypair generation + JWT encode. No static
 # private key in the tree.
 jsonwebtoken.workspace = true
 aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
 base64 = "0.22"
+# SR-16 HTTPS client tests (uc-transport/tests/common/cnsa_*.rs): random
+# P-384 PKI + in-process TLS server. rustls is not `workspace = true` on
+# purpose: the workspace entry enables `fips`, which would mask the
+# binary's own FIPS posture in tests.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio-rustls.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
