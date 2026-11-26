@@ -618,7 +618,7 @@ Since SIPREC phase 3 (2026-11-09) `sbc-daemon` calls `uc-siprec` to record calls
 | RFC 6665 | SIP Events | proto-sip, proto-dialog | library |
 | RFC 6910 | Auto-Configuration | proto-dialog | library |
 | RFC 7092 | B2BUA Taxonomy | proto-b2bua | sbc-daemon |
-| RFC 7118 | WebSocket Transport for SIP | proto-sip, uc-transport | sbc-daemon (ws); wss library |
+| RFC 7118 | WebSocket Transport for SIP | proto-sip, uc-transport | sbc-daemon (ws); wss flag only, no TLS (POA&M-459) |
 | RFC 7239 | Forwarded HTTP Extension (`for=`) | uc-transport (`websocket.rs` `client_from_forwarded`) | sbc-daemon (Partial; WS behind a trusted proxy, `transport.ws_client_address = "forwarded"`) |
 | PROXY protocol v2 (haproxy.org, not an RFC) | Client address preamble from L4 proxies | uc-transport (`proxy_protocol.rs`) | sbc-daemon (Partial; WS behind a trusted proxy, `ws_client_address = "proxy_v2"`; v1 unsupported) |
 | `X-Forwarded-For` (de facto, no RFC) | Client address header | uc-transport (`websocket.rs` `client_from_x_forwarded_for`) | sbc-daemon (WS behind a trusted proxy, `ws_client_address = "x_forwarded_for"`) |
