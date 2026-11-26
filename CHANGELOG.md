@@ -9,6 +9,130 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, API-key digests are SHA-384 only, POA&M-211)
+
+SBC only (sbc-api, sbc-daemon REST). Affects every deployment that uses API
+keys.
+
+- **`SBC_API_KEY_SHA256` is replaced by `SBC_API_KEY_SHA384`.** (IA-5,
+  SC-13, CNSA 2.0) API keys are matched by their SHA-384 hex digest. A
+  non-blank `SBC_API_KEY_SHA256` now stops startup, and so does any
+  `SBC_API_KEY_SHA384` entry that is not 96 hex characters. There is no
+  dual-accept period. **Adapt:** for each key, set
+  `SBC_API_KEY_SHA384` to the output of
+  `printf %s "$KEY" | sha384sum | cut -d' ' -f1` (comma-separated), and
+  remove `SBC_API_KEY_SHA256`. The keys themselves do not change.
+- `apikey:<id>` audit ids are derived from the digest, so each key gets a
+  new id after the upgrade. **Adapt:** re-map API-key ids in the SIEM.
+
+### BREAKING (SBC, management-API audit names the actor; `updated_by = 'local:<actor>'`, POA&M-386, 427, 428, 429)
+
+SBC only; the soft client is not affected. No config key or CDR field
+changes; one new optional variable (`CENTRAL_API_TRUSTED_PROXIES`). Affects
+site databases, the upgrade order of `sbc-config-sync` and `sbc-api`, API
+clients that write through the sbc-api proxy, and SIEM parsers of the audit
+log. Tested locally against Postgres 16 (2026-11-23). Operator details:
+`docs/API-REFERENCE.md` "Audit of logins and writes".
+
+- **Locally written rows carry `updated_by = 'local:<actor>'`.** (AU-3,
+  CM-3, CM-5) Before, every row written through sbc-api carried `'local'`.
+  Now the value is `local:` plus the writer's actor id, capped at 250 bytes
+  (256 with the prefix): for example `local:admin:admin`,
+  `local:oidc:<sub>@<iss>`, `local:apikey:<id>`. The legacy JSON migration
+  writes `local:system:json-migration` and the daemon DID seed
+  `local:system:seed`. Rows written before this release keep `'local'`; both
+  forms are treated as local origin. **Adapt:** a report or script that
+  matches `updated_by = 'local'` must also match `LIKE 'local:%'`.
+- **Upgrade order: `sbc-config-sync` at or before `sbc-api`.** An older
+  `sbc-config-sync` treats a `local:%` row as central, so central would
+  overwrite the local edit, and the edit would not be uploaded. The chart
+  rolls both in one release; when the images are pinned separately
+  (`sbcConfigSync.image.tag`, `sbcApi.image.tag`), upgrade sync first or in
+  the same release.
+- **Downgrade rule.** Keep `sbc-config-sync` at this version, or, before
+  rolling it back, rewrite the local markers on the site database:
+
+  ```sql
+  UPDATE directory_numbers         SET updated_by = 'local' WHERE updated_by LIKE 'local:%';
+  UPDATE phones                    SET updated_by = 'local' WHERE updated_by LIKE 'local:%';
+  UPDATE trunk_groups              SET updated_by = 'local' WHERE updated_by LIKE 'local:%';
+  UPDATE dial_plans                SET updated_by = 'local' WHERE updated_by LIKE 'local:%';
+  UPDATE sbc_partitions            SET updated_by = 'local' WHERE updated_by LIKE 'local:%';
+  UPDATE sbc_calling_search_spaces SET updated_by = 'local' WHERE updated_by LIKE 'local:%';
+  UPDATE sbc_route_patterns        SET updated_by = 'local' WHERE updated_by LIKE 'local:%';
+  UPDATE sbc_route_lists           SET updated_by = 'local' WHERE updated_by LIKE 'local:%';
+  UPDATE site_telephony_config     SET updated_by = 'local' WHERE updated_by LIKE 'local:%';
+  ```
+
+  This drops the recorded actor from those rows; the audit log keeps it.
+- **The sbc-api proxy catch-all is read-only.** (AC-3, CM-5) Paths under
+  `/api/v1` that sbc-api does not own still forward `GET` to the daemon.
+  `POST`, `PUT` and `DELETE` now answer `405` with `Allow: GET`
+  (`{"error":"method not allowed"}`) and no body is forwarded. The refusal
+  is audited (`entity=route ... reason=rejected status=405`). The dashboard
+  and `sbc-cli` do not write through the catch-all. **Adapt:** send such
+  writes to central-config-api, or to the sbc-api route that owns them.
+- **Audit record changes for SIEM parsers.** (AU-2, AU-3, AU-12) The event
+  types are unchanged; their values change:
+  - `AuthMethod` gains `"Password"` (admin login) and `"Session"` (HMAC
+    session token or `sbc_session` cookie). A rejected credential is tagged
+    `Session`, `Jwt` (three segments) or `ApiKey`. Parsers with a closed
+    list of methods must accept both.
+  - `AuditDropReason` gains `"aggregated"`, on the `AuditRecordsDropped`
+    record a flush emits for failures not written because a table was full
+    or the 256 records/s first-emission budget was spent.
+  - Login and token failures are aggregated per client (IPv4 address or
+    IPv6 /64) and reason over 60 s: the first is written at once, later ones
+    as `"<reason> count=<n>"` by a 5 s flush capped at 256 records. A failed
+    login records the username only when it is the configured admin name,
+    otherwise `unknown`. A lockout writes `RateLimitTriggered` with
+    `limit_name = admin-login-lockout:<ip|ip-overflow|account>`. Logins and
+    logout are now audited.
+  - Every `POST`, `PUT` and `DELETE` on sbc-api and central-config-api writes
+    one `ConfigurationChange` whose `admin` is the actor id:
+    `oidc:<sub>@<iss>`, `admin:<subject>`, `apikey:<id>`, `site:<sub>`
+    (central sync), `system:<task>`, or `unauthenticated` (central write
+    refused at the body extractor, aggregated per client). The
+    `description` grammar is `entity=<e> id=<id> op=<op>
+    outcome=<ok|failed> [reason=<r>] ... [iss=] [user=] [src=]`. Trunk ids
+    are `<group>/<trunk>`. A delete of an absent id still answers `200` but
+    is recorded `outcome=failed reason=not_found`. Central `sync_change`
+    records add `claimed_origin_actor=<updated_by>`, the site's unverified
+    claim.
+  - **RBAC and OIDC denials** (`AuthorizationDecision`) on sbc-api and
+    central ABAC now set `identity` to the actor id (was the username, for
+    example `op1`, now `oidc:<sub>@<iss>`) and carry `source_ip`
+    (closes POA&M-386). `AccountManagement.actor` is the actor id too.
+    **Adapt:** correlation rules keyed on the bare username must key on the
+    actor id.
+- **API-key audit ids are derived from the signing key.** (IA-5, AU-3,
+  SC-13) The `apikey:<id>` id is the first 16 hex digits of
+  HMAC-SHA-384(`SBC_AUTH_SIGNING_KEY`, `"sbc-api-key-id:" || digest`), no
+  longer a prefix of the key digest, so it cannot be computed from a leaked
+  key list. Ids recorded before this release do not match. The id changes
+  when `SBC_AUTH_SIGNING_KEY` rotates, and on every restart when the
+  variable is unset (random per-process key). **Adapt:** set
+  `SBC_AUTH_SIGNING_KEY` and re-map API-key ids in the SIEM after upgrade
+  and after each rotation.
+- **Added: `CENTRAL_API_TRUSTED_PROXIES`** (comma-separated CIDRs, default
+  empty) on central-config-api: networks whose `X-Real-IP` is trusted for
+  the audit `src`. An invalid value stops startup. The `central-config`
+  chart does not set it yet, so central records the ingress peer address
+  (POA&M-428). sbc-api uses its existing `SBC_TRUSTED_PROXIES` for the same
+  purpose.
+- A panicking sbc-api write handler now answers `500` and is audited
+  (tower-http `catch-panic`). A write body that is not a JSON object
+  (including `null`) answers `400` and is audited.
+- **Follow-ups:** POA&M-427 (entity, id, op, outcome and issuer are
+  `key=value` text in `description`, not structured fields), POA&M-428
+  (Helm does not set `CENTRAL_API_TRUSTED_PROXIES`), POA&M-429 (the legacy
+  admin credential and API keys are shared identities, so records name
+  `admin:<subject>` or `apikey:<id>`, not an operator). The first-emission
+  budget lives in `sbc-http-util` until the shared `FailureAggregator`
+  budget lands, and budget refusals share the `aggregated` drop reason.
+  Bearer and API-key guessing is audited and aggregated but not
+  attempt-limited.
+
 ### BREAKING (SBC, central config API redacts phone and trunk secrets on read, POA&M-425, 426)
 
 SBC only; the soft client is not affected. No config key, CDR field or audit
@@ -718,6 +842,54 @@ release") and `deploy/keycloak/central-config-clients.md`.
 - **Dependabot now watches every Dockerfile, the Go modules of both
   sidecars and the dashboard's npm tree.** GitHub Actions updates are
   grouped into one weekly PR.
+
+### Security (SBC, sbc-api admin login lockout, POA&M-420, 421, 422)
+
+Affects `POST /api/v1/auth/login` (local admin password) only. OIDC SSO and
+API keys are unchanged. Tested in local runs on macOS. Operator details:
+`docs/API-REFERENCE.md` "Admin login" and `deploy/helm/sbc/DEPLOYING.md`.
+
+- **Behaviour change: longer lockout windows and a lock for the account.**
+  (AC-7) Before: 5 failures per client IP per 60 s. Now: 5 failures per
+  client IP and 10 failures from all sources together, each per 15 min
+  window. A window opens at the first failure, and a lock ends when its
+  window ends; no admin action is needed. A successful login resets the
+  counts for its IP and for the account. One source cannot lock the
+  account by itself. Failures count against the account whatever username
+  was submitted. Without `sbcApi.trustedProxies`, every client behind nginx
+  shares one IP bucket, so 5 failures by anyone lock the admin login for
+  up to 15 min (was 60 s).
+- **Concurrent guesses are counted exactly.** (AC-7) A failure is reserved
+  before the password is hashed. Parallel requests from one IP no longer
+  get more than 5 verifications per window.
+- **IPv6 clients are counted per /64.** IPv4-mapped IPv6 addresses count as
+  the IPv4 address. At most 4096 IPs are tracked; beyond that, new IPs share
+  one overflow bucket with the same limits (POA&M-422).
+- **Password verification is bounded.** (SC-5) At most 4 argon2 checks run
+  at once. The count is lowered at startup when the `SBC_ADMIN_PASSWORD_HASH`
+  memory cost (`m=`) times the slots would exceed 96 MiB; sbc-api logs a
+  warning when it does. With no free slot the login gets 429
+  `{"error":"login busy, retry shortly"}` with `Retry-After: 1`, and is not
+  counted.
+- **New login responses.** (SI-10, SC-5) `400 {"error":"invalid credentials
+  format"}` for a username over 256 bytes or a password over 1024 bytes (an
+  admin password longer than 1024 bytes can no longer log in); `413` for a
+  request body over 4 KiB (was axum's 2 MB default). Neither is counted.
+  The lockout 429 keeps its body and now carries `Retry-After` with the
+  seconds left in the window (RFC 6585 §4, RFC 9110 §10.2.3). 200 and 401
+  are unchanged.
+- **Logs.** sbc-api logs a `warn` with `client_ip` and `scope` (`ip`,
+  `ip-overflow` or `account`) when a bucket locks; no username. The failed
+  login line keeps the username, truncated to 64 characters. No audit
+  event, CDR or config schema change.
+- **Known limits.** Limits are kept per sbc-api replica and cleared on
+  restart, so N replicas allow N times the guesses (POA&M-420). Two or more
+  sources can keep the local admin login locked, one window after another
+  (POA&M-421, accepted risk; OIDC and API keys still work). A single stored
+  hash with `m=` above 96 MiB still exceeds the budget with 1 slot
+  (POA&M-422).
+- `sbc-api-server` dev-dependency: `tokio` feature `test-util` (paused clock
+  in tests). No new crate; `Cargo.lock` is unchanged.
 
 ### Security (SBC, WebSocket client address behind a trusted reverse proxy, SR-59, POA&M-456, 457)
 

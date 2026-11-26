@@ -1133,7 +1133,7 @@ impl Runtime {
                             if let Some(ref ds) = app_state.directory_store {
                                 match sbc_config_store::DirectoryNumber::from_json(dn.clone()) {
                                     Ok(typed) => {
-                                        if let Err(e) = ds.upsert(&typed).await {
+                                        if let Err(e) = ds.upsert(&typed, "system:seed").await {
                                             warn!(did = %did, error = %e, "Failed to seed DID into Postgres");
                                         }
                                     }

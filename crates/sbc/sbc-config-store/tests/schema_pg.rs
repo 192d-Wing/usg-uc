@@ -17,9 +17,10 @@ use std::str::FromStr;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
+use sbc_config_store::sbc::SbcJsonStore;
 use sbc_config_store::{
-    ConfigStoreError, DirectoryNumber, PostgresDirectoryNumberStore, PostgresPhoneStore,
-    ensure_schema,
+    ConfigStoreError, DirectoryNumber, PostgresDialPlanStore, PostgresDirectoryNumberStore,
+    PostgresPartitionStore, PostgresPhoneStore, PostgresTrunkGroupStore, ensure_schema,
 };
 use uc_phone_mgmt::model::{Phone, PhoneModel};
 
@@ -188,7 +189,10 @@ async fn adopts_legacy_database_and_preserves_rows() {
 
     // delete() writes a tombstone: invisible to reads, but the physical
     // row (and the fact a deletion happened) survives.
-    store.delete("legacy-1").await.expect("tombstone delete");
+    store
+        .delete("legacy-1", "qa")
+        .await
+        .expect("tombstone delete");
     assert!(
         store.get_by_mac("aabbccddeeff").await.is_err(),
         "tombstone visible"
@@ -198,7 +202,7 @@ async fn adopts_legacy_database_and_preserves_rows() {
         "tombstone listed"
     );
     assert!(
-        store.delete("legacy-1").await.is_err(),
+        store.delete("legacy-1", "qa").await.is_err(),
         "double delete must be NotFound"
     );
     let row = sqlx::query("SELECT deleted, updated_by FROM phones WHERE id = 'legacy-1'")
@@ -208,7 +212,7 @@ async fn adopts_legacy_database_and_preserves_rows() {
     assert!(row.try_get::<bool, _>("deleted").expect("deleted"));
     assert_eq!(
         row.try_get::<String, _>("updated_by").expect("updated_by"),
-        "local"
+        "local:qa"
     );
 
     // The legacy-JSON import guard must NOT see an all-tombstoned table
@@ -224,7 +228,7 @@ async fn adopts_legacy_database_and_preserves_rows() {
     let mut replacement = Phone::new("AA:BB:CC:DD:EE:FF", PhoneModel::PolycomVVX150, "repl");
     replacement.id = "replacement-2".to_string();
     store
-        .upsert(&replacement)
+        .upsert(&replacement, "qa")
         .await
         .expect("MAC reuse after tombstone");
     assert_eq!(
@@ -236,7 +240,7 @@ async fn adopts_legacy_database_and_preserves_rows() {
     // but first move its MAC aside so the live-MAC uniqueness holds.
     let mut revived = phone.clone();
     revived.mac_address = "AA:BB:CC:DD:EE:00".to_string();
-    store.upsert(&revived).await.expect("revive upsert");
+    store.upsert(&revived, "qa").await.expect("revive upsert");
     let row = sqlx::query("SELECT deleted, revision, updated_by FROM phones WHERE id = 'legacy-1'")
         .fetch_one(&pool)
         .await
@@ -245,7 +249,7 @@ async fn adopts_legacy_database_and_preserves_rows() {
     assert_eq!(row.try_get::<i64, _>("revision").expect("revision"), 0);
     assert_eq!(
         row.try_get::<String, _>("updated_by").expect("updated_by"),
-        "local"
+        "local:qa"
     );
 }
 
@@ -309,7 +313,7 @@ async fn upsert_rejects_invalid_and_writes_nothing() {
         .expect("phone store");
     let mut phone = Phone::new("aa:bb:cc:dd:ee:01", PhoneModel::PolycomVVX450, "bad\nname");
     phone.name = "bad\nname".to_string();
-    match phones.upsert(&phone).await {
+    match phones.upsert(&phone, "qa").await {
         Err(ConfigStoreError::Invalid { field, .. }) => assert_eq!(field, "name"),
         other => panic!("expected Invalid, got {other:?}"),
     }
@@ -325,9 +329,279 @@ async fn upsert_rejects_invalid_and_writes_nothing() {
         description: None,
         extra: std::collections::HashMap::new(),
     };
-    match dirs.upsert(&dn).await {
+    match dirs.upsert(&dn, "qa").await {
         Err(ConfigStoreError::Invalid { field, .. }) => assert_eq!(field, "did"),
         other => panic!("expected Invalid, got {other:?}"),
     }
     assert_eq!(dirs.list().await.expect("list dids").len(), 0);
+}
+
+// ---- SR-40: the local writer's principal is recorded in updated_by ------
+//
+// Stores take the actor and write `updated_by = 'local:' || actor`; the
+// store adds the prefix so a caller can never stamp a central origin.
+// NIST 800-53 Rev5: AU-3, CM-3, CM-5
+
+async fn updated_by(pool: &PgPool, table: &str, key_col: &str, id: &str) -> String {
+    sqlx::query_scalar(&format!(
+        "SELECT updated_by FROM {table} WHERE {key_col} = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("updated_by")
+}
+
+async fn deleted(pool: &PgPool, table: &str, key_col: &str, id: &str) -> bool {
+    sqlx::query_scalar(&format!("SELECT deleted FROM {table} WHERE {key_col} = $1"))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("deleted")
+}
+
+const QA_ACTOR: &str = "oidc:s-1@https://idp.example/realms/qa";
+
+fn qa_phone(id: &str) -> Phone {
+    // MAC derived from the id: distinct phones never share one.
+    let n = id
+        .bytes()
+        .fold(0u8, |a, b| a.wrapping_mul(31).wrapping_add(b));
+    let mac = format!("aa:bb:cc:dd:{:02x}:{n:02x}", id.len());
+    let mut p = Phone::new(&mac, PhoneModel::PolycomVVX450, "qa phone");
+    p.id = id.to_string();
+    p
+}
+
+fn qa_dn(did: &str) -> DirectoryNumber {
+    DirectoryNumber {
+        did: did.to_string(),
+        user: None,
+        partition: None,
+        description: None,
+        extra: std::collections::HashMap::new(),
+    }
+}
+
+#[tokio::test]
+async fn upsert_stamps_local_principal_in_updated_by() {
+    let Some(admin) = admin_dsn() else { return };
+    let pool = scratch_db(&admin, "csmt_actor_upsert").await;
+    let want = format!("local:{QA_ACTOR}");
+    let doc = serde_json::json!({"id": "x1"});
+
+    let phones = PostgresPhoneStore::from_pool(pool.clone())
+        .await
+        .expect("phones");
+    phones
+        .upsert(&qa_phone("ph1"), QA_ACTOR)
+        .await
+        .expect("phone upsert");
+    assert_eq!(updated_by(&pool, "phones", "id", "ph1").await, want);
+
+    let dirs = PostgresDirectoryNumberStore::from_pool(pool.clone())
+        .await
+        .expect("dirs");
+    dirs.upsert(&qa_dn("2001"), QA_ACTOR)
+        .await
+        .expect("did upsert");
+    assert_eq!(
+        updated_by(&pool, "directory_numbers", "did", "2001").await,
+        want
+    );
+
+    let plans = PostgresDialPlanStore::from_pool(pool.clone())
+        .await
+        .expect("plans");
+    plans
+        .upsert("x1", &doc, QA_ACTOR)
+        .await
+        .expect("plan upsert");
+    assert_eq!(updated_by(&pool, "dial_plans", "id", "x1").await, want);
+
+    let tgs = PostgresTrunkGroupStore::from_pool(pool.clone())
+        .await
+        .expect("tgs");
+    tgs.upsert("x1", &doc, QA_ACTOR).await.expect("tg upsert");
+    assert_eq!(updated_by(&pool, "trunk_groups", "id", "x1").await, want);
+
+    let sbc = SbcJsonStore::from_pool(pool.clone(), "sbc_route_patterns")
+        .await
+        .expect("sbc");
+    sbc.upsert("x1", &doc, QA_ACTOR).await.expect("sbc upsert");
+    assert_eq!(
+        updated_by(&pool, "sbc_route_patterns", "id", "x1").await,
+        want
+    );
+
+    let parts = PostgresPartitionStore::from_pool(pool.clone())
+        .await
+        .expect("parts");
+    parts
+        .upsert("x1", &doc, QA_ACTOR)
+        .await
+        .expect("partition upsert");
+    assert_eq!(updated_by(&pool, "sbc_partitions", "id", "x1").await, want);
+
+    // A second writer replaces the principal.
+    phones
+        .upsert(&qa_phone("ph1"), "admin:admin")
+        .await
+        .expect("re-upsert");
+    assert_eq!(
+        updated_by(&pool, "phones", "id", "ph1").await,
+        "local:admin:admin"
+    );
+}
+
+#[tokio::test]
+async fn delete_tombstone_stamps_local_principal() {
+    let Some(admin) = admin_dsn() else { return };
+    let pool = scratch_db(&admin, "csmt_actor_delete").await;
+    let doc = serde_json::json!({"id": "x1"});
+
+    let phones = PostgresPhoneStore::from_pool(pool.clone())
+        .await
+        .expect("phones");
+    phones
+        .upsert(&qa_phone("ph1"), "admin:admin")
+        .await
+        .expect("upsert");
+    phones.delete("ph1", QA_ACTOR).await.expect("delete");
+    assert!(deleted(&pool, "phones", "id", "ph1").await);
+    assert_eq!(
+        updated_by(&pool, "phones", "id", "ph1").await,
+        format!("local:{QA_ACTOR}")
+    );
+    // A second delete finds no live row; the tombstone keeps its principal.
+    assert!(matches!(
+        phones.delete("ph1", "admin:other").await,
+        Err(ConfigStoreError::NotFound)
+    ));
+    assert_eq!(
+        updated_by(&pool, "phones", "id", "ph1").await,
+        format!("local:{QA_ACTOR}")
+    );
+
+    let dirs = PostgresDirectoryNumberStore::from_pool(pool.clone())
+        .await
+        .expect("dirs");
+    dirs.upsert(&qa_dn("2001"), "admin:admin")
+        .await
+        .expect("upsert");
+    dirs.delete("2001", "apikey:0123456789abcdef")
+        .await
+        .expect("delete");
+    assert_eq!(
+        updated_by(&pool, "directory_numbers", "did", "2001").await,
+        "local:apikey:0123456789abcdef"
+    );
+
+    let plans = PostgresDialPlanStore::from_pool(pool.clone())
+        .await
+        .expect("plans");
+    plans
+        .upsert("x1", &doc, "admin:admin")
+        .await
+        .expect("upsert");
+    plans.delete("x1", QA_ACTOR).await.expect("delete");
+    assert_eq!(
+        updated_by(&pool, "dial_plans", "id", "x1").await,
+        format!("local:{QA_ACTOR}")
+    );
+
+    let tgs = PostgresTrunkGroupStore::from_pool(pool.clone())
+        .await
+        .expect("tgs");
+    tgs.upsert("x1", &doc, "admin:admin").await.expect("upsert");
+    tgs.delete("x1", QA_ACTOR).await.expect("delete");
+    assert_eq!(
+        updated_by(&pool, "trunk_groups", "id", "x1").await,
+        format!("local:{QA_ACTOR}")
+    );
+
+    let sbc = SbcJsonStore::from_pool(pool.clone(), "sbc_route_lists")
+        .await
+        .expect("sbc");
+    sbc.upsert("x1", &doc, "admin:admin").await.expect("upsert");
+    sbc.delete("x1", QA_ACTOR).await.expect("delete");
+    assert_eq!(
+        updated_by(&pool, "sbc_route_lists", "id", "x1").await,
+        format!("local:{QA_ACTOR}")
+    );
+}
+
+#[tokio::test]
+async fn actor_cannot_forge_central_origin() {
+    let Some(admin) = admin_dsn() else { return };
+    let pool = scratch_db(&admin, "csmt_actor_forge").await;
+    let phones = PostgresPhoneStore::from_pool(pool.clone())
+        .await
+        .expect("phones");
+    let tgs = PostgresTrunkGroupStore::from_pool(pool.clone())
+        .await
+        .expect("tgs");
+    let doc = serde_json::json!({"id": "x1"});
+    for (i, actor) in [
+        "central",
+        "template",
+        "",
+        "local",
+        "x' OR updated_by = 'central",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("ph{i}");
+        phones.upsert(&qa_phone(&id), actor).await.expect("upsert");
+        let got = updated_by(&pool, "phones", "id", &id).await;
+        assert!(got.starts_with("local:"), "{actor:?} -> {got:?}");
+        assert_eq!(got, format!("local:{actor}"), "bound parameter, verbatim");
+        tgs.upsert("x1", &doc, actor).await.expect("tg upsert");
+        let got = updated_by(&pool, "trunk_groups", "id", "x1").await;
+        assert!(got.starts_with("local:"), "{actor:?} -> {got:?}");
+    }
+    let central: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM phones WHERE updated_by IN ('central', 'template')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(central, 0);
+}
+
+#[tokio::test]
+async fn updated_by_is_capped() {
+    let Some(admin) = admin_dsn() else { return };
+    let pool = scratch_db(&admin, "csmt_actor_cap").await;
+    let phones = PostgresPhoneStore::from_pool(pool.clone())
+        .await
+        .expect("phones");
+    let dirs = PostgresDirectoryNumberStore::from_pool(pool.clone())
+        .await
+        .expect("dirs");
+    let long = format!("oidc:{}@https://idp.example", "s".repeat(4000));
+    phones
+        .upsert(&qa_phone("ph1"), &long)
+        .await
+        .expect("upsert");
+    let got = updated_by(&pool, "phones", "id", "ph1").await;
+    assert!(got.len() <= 256, "{}", got.len());
+    assert!(got.starts_with("local:oidc:sss"), "{got:.40}");
+    // Multi-byte actors are cut on a char boundary (valid text column).
+    let wide = "\u{e9}".repeat(300);
+    dirs.upsert(&qa_dn("2001"), &wide).await.expect("upsert");
+    let got = updated_by(&pool, "directory_numbers", "did", "2001").await;
+    assert!(
+        got.len() <= 256 && got.starts_with("local:\u{e9}"),
+        "{}",
+        got.len()
+    );
+    dirs.delete("2001", &long).await.expect("delete");
+    assert!(
+        updated_by(&pool, "directory_numbers", "did", "2001")
+            .await
+            .len()
+            <= 256
+    );
 }
