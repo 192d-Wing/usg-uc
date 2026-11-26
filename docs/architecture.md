@@ -163,7 +163,8 @@ direction of travel is described in the
 ## Security posture
 
 Cryptography targets CNSA 2.0: TLS and SRTP use the AWS-LC FIPS module
-(`uc-crypto`, rustls with its FIPS posture enabled). Not every TLS channel
+(`uc-crypto`, rustls with its FIPS posture enabled; SRTP sealing is not an
+approved service, POA&M-400). Not every TLS channel
 restricts its suites to CNSA 2.0. The daemon gRPC / sbc-api channel uses
 tonic's default suites, and the SIP-TLS and CDR syslog configs pin the TLS
 version but not the suites. These gaps are tracked in the CNSA and NIST

@@ -11,7 +11,7 @@ categories.workspace = true
 
 [features]
 default = ["fips"]
-# Enable FIPS 140-3 validated mode via aws-lc-rs
+# Build against the aws-lc FIPS 140-3 module via aws-lc-rs
 fips = ["aws-lc-rs/fips"]
 # Prepare for post-quantum (ML-KEM) integration
 pqc = []
@@ -32,6 +32,10 @@ rustls-pki-types = { workspace = true, optional = true }
 
 [dev-dependencies]
 # For testing with known test vectors
+# FIPS service-indicator FFI for tests/fips_indicator.rs (SR-15). Same
+# `links` crate aws-lc-rs already uses under `fips`. Pinned: must track the
+# aws-lc-fips-sys version aws-lc-rs links (bump both together).
+aws-lc-fips-sys = "=0.14.2"
 
 [lints]
 workspace = true

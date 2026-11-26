@@ -20,8 +20,9 @@ import (
 )
 
 // TestFIPSModeActive is the FIPS gate: this sidecar must be built with
-// GOFIPS140 and run in FIPS mode so every crypto primitive uses the certified
-// Go module. Run: GOFIPS140=v1.26.0 GODEBUG=fips140=on go test ./...
+// GOFIPS140 and run in FIPS mode so the crypto primitives come from the Go
+// FIPS module (the DTLS record GCM seal is non-approved, POA&M-400).
+// Run: GOFIPS140=v1.26.0 GODEBUG=fips140=on go test ./...
 func TestFIPSModeActive(t *testing.T) {
 	if !fips140.Enabled() {
 		t.Fatal("FIPS mode is not active — build with GOFIPS140=v1.26.0 " +
