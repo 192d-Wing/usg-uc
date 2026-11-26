@@ -364,31 +364,31 @@ mod tests {
         jwks: JwkSet,
     }
 
-    /// Fresh ES256 keypair per test run — no private key material lives
+    /// Fresh ES384 (P-384) keypair per test run — no private key material lives
     /// in the tree.
     fn test_key() -> &'static TestKey {
         use aws_lc_rs::rand::SystemRandom;
-        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
+        use aws_lc_rs::signature::{ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
         use base64::Engine as _;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
         static KEY: std::sync::OnceLock<TestKey> = std::sync::OnceLock::new();
         KEY.get_or_init(|| {
             let pkcs8 = EcdsaKeyPair::generate_pkcs8(
-                &ECDSA_P256_SHA256_FIXED_SIGNING,
+                &ECDSA_P384_SHA384_FIXED_SIGNING,
                 &SystemRandom::new(),
             )
             .expect("generate test key");
-            let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
+            let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, pkcs8.as_ref())
                 .expect("parse test key");
             // Uncompressed SEC1 point: 0x04 || X (32 bytes) || Y (32 bytes).
             let point = pair.public_key().as_ref();
             assert_eq!(point[0], 4, "expected uncompressed EC point");
             let jwks = serde_json::from_value(serde_json::json!({
                 "keys": [{
-                    "kty": "EC", "crv": "P-256", "kid": TEST_KID, "alg": "ES256", "use": "sig",
-                    "x": URL_SAFE_NO_PAD.encode(&point[1..33]),
-                    "y": URL_SAFE_NO_PAD.encode(&point[33..65]),
+                    "kty": "EC", "crv": "P-384", "kid": TEST_KID, "alg": "ES384", "use": "sig",
+                    "x": URL_SAFE_NO_PAD.encode(&point[1..49]),
+                    "y": URL_SAFE_NO_PAD.encode(&point[49..97]),
                 }]
             }))
             .expect("test jwks");
@@ -423,7 +423,8 @@ mod tests {
         let verifier = Validator::new(
             Arc::new(JwksCache::with_static(test_key().jwks.clone())),
             ValidatorConfig::new(TEST_ISSUER, vec![TEST_AUDIENCE.to_string()]),
-        );
+        )
+        .expect("validator config");
         router(AppState {
             cfg: Arc::new(test_config()),
             verifier: Arc::new(verifier),
@@ -439,7 +440,7 @@ mod tests {
     }
 
     fn sign(claims: &serde_json::Value) -> String {
-        let mut header = Header::new(Algorithm::ES256);
+        let mut header = Header::new(Algorithm::ES384);
         header.kid = Some(TEST_KID.to_string());
         encode(&header, claims, &test_key().encoding).expect("sign")
     }
@@ -600,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_kid_is_unauthorized() {
-        let mut header = Header::new(Algorithm::ES256);
+        let mut header = Header::new(Algorithm::ES384);
         header.kid = Some("rotated-away".to_string());
         let token = encode(&header, &valid_claims(), &test_key().encoding).expect("sign");
         let (status, _, _) = get_json(test_app(), "/v1/client-config", Some(&token)).await;
