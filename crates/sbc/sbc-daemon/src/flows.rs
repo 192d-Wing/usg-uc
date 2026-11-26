@@ -350,6 +350,16 @@ impl FlowTable {
         self.conns.read().ok().and_then(|c| c.get(key).cloned())
     }
 
+    /// The accepted connection registered under `(transport, peer)`.
+    #[cfg(test)]
+    pub fn accepted(
+        &self,
+        transport: AddrTransport,
+        peer: SbcSocketAddr,
+    ) -> Option<Arc<dyn Transport>> {
+        self.lookup(&(transport, peer, None, FlowProfile::Plain))
+    }
+
     /// Writes `bytes` to `dest` on `flow`. `udp` is the socket the
     /// triggering message arrived on, if any.
     ///
