@@ -3,6 +3,10 @@
 // Generic variant as { Generic: "..." }. Keep this file in sync when Rust
 // gains new models.
 
+/** Marker the APIs return in place of a stored secret. Sending it back
+ * unchanged keeps the stored value. Mirrors `sbc_config_store::redact::REDACTED`. */
+export const REDACTED_SECRET = '***REDACTED***';
+
 export type PhoneFamily =
   | 'polycom_vvx'
   | 'polycom_trio'

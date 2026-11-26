@@ -60,6 +60,60 @@ the announcement server hardening release (SR-41)".
   `"MediaController call refused"`). Update log alerts that match the old
   text.
 
+### BREAKING (SBC, central config API redacts phone and trunk secrets on read, POA&M-425, 426)
+
+SBC only; the soft client is not affected. No config key, CDR field or audit
+event type changes. Affects API clients of `central-config-api` and the site
+API trunk-group endpoints. Tested locally against Postgres 16 (2026-11-23).
+
+- **Central reads return the marker, not the secret, for every role.**
+  (IA-5, AC-6, SC-28) `GET /v1/sites/{site_code}/phones[/{id}]` returns
+  `***REDACTED***` for each non-empty `lines[].sip_password` and
+  `directory.ldap_password`. `GET /v1/sites/{site_code}/trunkgroups[/{id}]`
+  does the same for `trunks[].sip_password`. Fleet admins see the marker too.
+  **Adapt:** a script that read a secret back from central must keep its own
+  copy (or a vault reference). The sync surface (`/v1/sync/{site_code}/*`)
+  is unchanged and still carries real secrets to site sync tokens only.
+- **Writes keep a stored secret when the marker is sent back.** A phone or
+  trunk-group upsert (`POST /v1/sites/{site_code}/phones`, `.../trunkgroups`)
+  that sends `***REDACTED***` keeps the stored value. A phone
+  line keeps it only when `index`, `sip_username` and `directory_number` all
+  match the stored line; otherwise the password becomes `""`. A marker with
+  no stored value becomes `""` (LDAP: `null`). `PUT /v1/templates/trunk_group/{id}`
+  drops markers.
+- **New 422 `secret_reentry_required` when a kept secret's destination
+  changes.** The body is
+  `{"error":"secret_reentry_required","field":"<name>","detail":...}` and
+  never contains a value. Triggers, when the marker is kept: phone
+  `mac_address`; a line's `sip_username`, `sip_server`, `sip_port` or
+  `transport` (`field` is `lines[i].<f>`); `directory.ldap_server`,
+  `ldap_port`, `ldap_tls` (either direction) or `ldap_bind_dn`; a trunk's
+  `host`, `port`, `protocol`, `transport`, `tls_server_name` or
+  `sip_username` (`trunks[i].<f>`). **Adapt:** send the real secret in the
+  same request as the destination change.
+- **Site API trunk groups get the same check.** `POST`/`PUT
+  /api/v1/trunkgroups[/{group_id}]` return 422 `secret_reentry_required`
+  (`{"success":false,...,"field":...}`). `PUT
+  /api/v1/trunkgroups/{group_id}/trunks/{trunk_id}` does too when the
+  update changes a destination field and sends the marker or omits
+  `sip_password` (`field` is the bare name, e.g. `host`).
+- **Central trunk-group writes fail closed when the prior read fails.**
+  A store error reading the existing row now returns 500 instead of writing
+  as if the row were absent, which would have cleared every round-tripped
+  trunk secret. The site API still treats a read error as absent
+  (follow-up).
+- **Dashboard:** SIP and LDAP bind password fields that hold the marker show
+  hint text saying to re-enter the password when the MAC or a destination
+  field changes. Removing a line clears the marker on renumbered lines.
+- Secrets remain plaintext at rest in central (POA&M-425). Site-API phone
+  writes still lose secrets (POA&M-426).
+- **Follow-ups:** the central DSN tests (`CENTRAL_STORE_TEST_DSN`) do not
+  run in CI yet; CI needs a Postgres service. The `sbc-config-sync`
+  `convergence::ddil_local_edit_survives_and_syncs_up` test fails on
+  non-C-collation Postgres (for example `en_US.utf8`) because its
+  `ORDER BY id` ignores `-`; it passes with `--locale=C`. That test is not
+  touched by this change.
+
 ### Changed (SBC, UDP and stream rate limiters, trunk buckets, POA&M-448..451)
 
 - **UDP sources over the per-source rate are rejected, no longer
