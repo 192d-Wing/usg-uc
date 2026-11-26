@@ -127,6 +127,45 @@ gateway:
   hostname: ""
   tlsSecretName: ""
 
+# Edge TLS for the dashboard, /api/v1/auth/login and /v1/client-config
+# (22-sbc-ingress.yaml, 29-sbc-edge-tls.yaml). The Traefik Ingress router is
+# bound to the TLS entrypoint only, with a TLS 1.3 / P-384 TLSOption and an
+# HSTS middleware. Rendering fails without sbcClientConfig.ingressTlsSecretName,
+# and fails when the frontend would be a cleartext LoadBalancer (no Gateway
+# and no Ingress). Requires Traefik v3 with the kubernetescrd provider
+# (traefik.io/v1alpha1 CRDs); see DEPLOYING.md. The flags below must be
+# booleans: a quoted "false" fails the render.
+# NIST 800-53 Rev5: SC-8, SC-8(1), SC-13, SC-23, AC-17(2), CM-6, CM-7
+edge:
+  # Lab only: serve the dashboard, login and client-config over cleartext
+  # HTTP (no TLS requirement, no entrypoint pin, no HSTS). Never in production.
+  insecureLabHttp: false
+  traefik:
+    # Traefik TLS entrypoint for the Ingress router.
+    entryPoint: websecure
+    # Redirect-only router (301 to https) on httpEntryPoint. Off = no router
+    # on that entrypoint for this host (Traefik answers 404).
+    httpRedirect: true
+    httpEntryPoint: web
+    # Ship the <fullname>-cnsa TLSOption. Set false to use an operator-supplied
+    # TLSOption named in tlsOption (the Traefik CRDs are still required for the
+    # HSTS and redirect Middlewares; the TLS profile is then operator-asserted).
+    createTlsOption: true
+    # Existing TLSOption ref ("<namespace>-<name>@kubernetescrd"); required
+    # when createTlsOption is false.
+    tlsOption: ""
+    # Legacy phones that fetch /provision/ over plain HTTP: an extra router
+    # on httpEntryPoint for that path only (never /, /api or /v1; the
+    # frontend nginx refuses anything else for these requests). Lab or
+    # legacy exception; requires sbcFrontend.enabled. Device tokens and the
+    # phones' SIP digest and LDAP bind passwords then cross in cleartext and
+    # tokens are replayable (POA&M-437): after turning it off, rotate
+    # SBC_PROVISION_SECRET and those phones' SIP/LDAP credentials.
+    allowHttpProvisioning: false
+    hsts:
+      maxAgeSeconds: 31536000   # minimum 31536000 (one year)
+      includeSubdomains: true
+
 # Management-plane authentication (sbc-api / sbc-provision). These pods
 # are fail-closed: they refuse to start without an admin credential. The
 # 00-sbc-auth-secret.yaml template generates and preserves a shared HMAC
@@ -310,9 +349,9 @@ sbcClientConfig:
   # Override when the ingress hostname differs from the FQDN base.
   ingressHost: ""
   # Name of a kubernetes.io/tls Secret (in the release namespace) holding the
-  # cert/key for ingressHost. Empty = no tls block on the Ingress (Traefik
-  # falls back to its self-signed default cert — soft clients that pin the
-  # internal CA will refuse the discovery fetch).
+  # cert/key for ingressHost (ECDSA P-384 / SHA-384 leaf). Required while
+  # enabled: the chart fails to render without it unless
+  # edge.insecureLabHttp is set.
   ingressTlsSecretName: ""
   # PEM-encoded CA certificate(s) to trust when fetching OIDC metadata / JWKS.
   # Required when the IdP uses a private CA (e.g. OOPL Internal CA) that is
