@@ -797,6 +797,8 @@ These are deviations in the shipped code from the guidance above. They are recor
    - **Single SRTP context per association (RFC 3711 §3.2.3).** A relay leg has one receive context for the association, not one per SSRC. A peer that changes its SSRC after its sequence number has wrapped is not followed on that leg. The soft client therefore keeps its SSRC across audio pipeline restarts and, as a deliberate deviation from RFC 7160 §4.1, across a clock-rate change (NIST POA&M-338).
    - Operator guidance (sidecar restart, session limit, memory sizing, log records): `docs/SBC-ADMIN-GUIDE.md`, "DTLS sidecar operation".
 
+5. **SIP over WebSocket behind a reverse proxy (RFC 7118, RFC 7239, PROXY protocol v2; 2026-11-24).** The daemon serves plain WS only; WSS is terminated by an operator-run proxy (POA&M-457), so a client that used WSS to the proxy is handled as WS. From a proxy in `transport.ws_trusted_proxies` the client address comes from PROXY v2, `X-Forwarded-For` or `Forwarded` (`for=` only) and keys per-client admission, rate limits, CDRs and audit; the flow table and response routing stay on the real socket. PROXY v1 is not accepted, PROXY v2 TLVs are ignored, and the daemon adds no Via `received`/`rport` (POA&M-456). See `docs/RFC_COMPLIANCE_GAPS.md`, section "sbc-daemon stream and WebSocket transport", and `docs/SBC-ADMIN-GUIDE.md`, "WebSocket behind a reverse proxy".
+
 ---
 
 ## Sources
