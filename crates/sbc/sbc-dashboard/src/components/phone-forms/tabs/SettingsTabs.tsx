@@ -7,6 +7,7 @@ import SpaceBetween from '@cloudscape-design/components/space-between';
 import Toggle from '@cloudscape-design/components/toggle';
 
 import type { HeadsetMode, Phone } from '../../../lib/phoneModel';
+import { REDACTED_SECRET } from '../../../lib/phoneModel';
 
 type Props = Readonly<{ form: Phone; onChange: (next: Phone) => void }>;
 
@@ -218,7 +219,14 @@ export function DirectoryTab({ form, onChange }: Props) {
               onChange={({ detail }) => setD({ ldap_bind_dn: detail.value || null })}
             />
           </FormField>
-          <FormField label="Bind password">
+          <FormField
+            label="Bind password"
+            constraintText={
+              d.ldap_password === REDACTED_SECRET
+                ? 'Stored. Leave unchanged to keep it; re-enter it if the MAC address, server, port, TLS or bind DN changes.'
+                : undefined
+            }
+          >
             <Input
               type="password"
               value={d.ldap_password ?? ''}
