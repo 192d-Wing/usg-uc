@@ -285,6 +285,8 @@ ws_listen = []
 wss_listen = []
 tcp_timeout_secs = 30
 tcp_idle_timeout_secs = 300
+max_connections_per_listener = {{ .Values.sbcDaemon.config.max_connections_per_listener | int64 }}
+max_connections_total = {{ .Values.sbcDaemon.config.max_connections_total | int64 }}
 api_listen = {{ .Values.sbcDaemon.config.api_listen | quote }}
 {{- if .Values.sbcDaemon.sipTls.secretName }}
 # With security.tls_cert_path set, the API server would otherwise switch its

@@ -412,6 +412,15 @@ fn qa_helm_rendered_sbc_config_validates() {
         ("{{ .Values.site.name | quote }}", "\"site-a\""),
         ("{{ .Values.sbcDaemon.config.max_calls }}", "5000"),
         ("{{ .Values.sbcDaemon.config.max_registrations }}", "10000"),
+        // SR-57: values.yaml sbcDaemon.config connection caps.
+        (
+            "{{ .Values.sbcDaemon.config.max_connections_per_listener | int64 }}",
+            "6000",
+        ),
+        (
+            "{{ .Values.sbcDaemon.config.max_connections_total | int64 }}",
+            "8000",
+        ),
         (
             "{{ .Values.sbcDaemon.config.api_listen | quote }}",
             "\"0.0.0.0:80\"",
@@ -1151,4 +1160,115 @@ fn qa_helm_edge_text_helpers_self_test() {
         "{{ fail \"x\" }} ingressTlsSecretName",
         "ingressTlsSecretName"
     ));
+}
+
+// ── SR-57: Helm connection caps fit the daemon pod ─────────────────────
+// NIST 800-53 Rev5: SC-5, SC-6, CM-6
+
+/// Worst-case resident KiB per TLS connection after the SR-57 buffer cuts:
+/// one 4 KiB read chunk, a 64 KiB message buffer (assumes the SR-54 stream
+/// framer bound), ~40 KiB of rustls state and the task, rounded up.
+const QA_WORST_CASE_CONN_KIB: u64 = 128;
+
+/// `key: <int>` inside `block` (first match, comment stripped).
+fn yaml_int(block: &str, key: &str) -> Option<u64> {
+    let prefix = format!("{key}:");
+    let line = block
+        .lines()
+        .find(|l| l.trim_start().starts_with(&prefix))?;
+    line.split_once(':')?
+        .1
+        .split('#')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The `sbcDaemon:` top-level block of the sbc chart values.
+fn sbc_daemon_values() -> String {
+    let values = read_repo("deploy/helm/sbc/values.yaml");
+    let mut out = String::new();
+    let mut inside = false;
+    for line in values.lines() {
+        if line == "sbcDaemon:" {
+            inside = true;
+        } else if inside && line.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            break;
+        }
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    assert!(inside, "sbcDaemon block");
+    out
+}
+
+#[test]
+fn qa_helm_connection_caps_fit_pod_memory() {
+    let daemon = sbc_daemon_values();
+    let cfg_at = daemon.find("\n  config:\n").expect("sbcDaemon.config");
+    let config = &daemon[cfg_at..];
+    let per_listener = yaml_int(config, "max_connections_per_listener")
+        .expect("sbcDaemon.config.max_connections_per_listener is set");
+    let total = yaml_int(config, "max_connections_total")
+        .expect("sbcDaemon.config.max_connections_total is set");
+    assert_eq!(per_listener, 6000);
+    assert_eq!(total, 8000);
+    assert!(per_listener <= total);
+
+    // The daemon memory limit (first `resources:` under sbcDaemon).
+    let res_at = daemon
+        .find("\n  resources:\n")
+        .expect("sbcDaemon.resources");
+    let limits = daemon[res_at..]
+        .lines()
+        .find(|l| l.trim_start().starts_with("limits:"))
+        .expect("resources.limits");
+    let mem = limits
+        .split("memory:")
+        .nth(1)
+        .expect("limits.memory")
+        .trim()
+        .trim_start_matches('"');
+    let limit_mib: u64 = if let Some((gi, _)) = mem.split_once("Gi") {
+        gi.parse::<u64>().unwrap() * 1024
+    } else {
+        mem.split_once("Mi").unwrap().0.parse().unwrap()
+    };
+    // Worst-case connection memory stays under half the pod limit, leaving
+    // the rest for calls, media and the registrar.
+    let conn_mib = total * QA_WORST_CASE_CONN_KIB / 1024;
+    assert!(
+        conn_mib * 2 <= limit_mib,
+        "{total} connections x {QA_WORST_CASE_CONN_KIB} KiB = {conn_mib} MiB on a {limit_mib} MiB pod"
+    );
+
+    // The sizing formula is documented next to the keys.
+    let doc_window = &config[..config.find("max_connections_total").unwrap()];
+    assert!(
+        doc_window.contains("KiB"),
+        "values.yaml documents the per-connection sizing (KiB) next to the caps"
+    );
+}
+
+#[test]
+fn qa_helm_connection_caps_rendered_into_transport() {
+    let tpl = read_repo("deploy/helm/sbc/templates/_helpers.tpl");
+    let start = tpl
+        .find("\n[transport]\n")
+        .expect("[transport] in sbc.config");
+    let section = &tpl[start + 1..];
+    let end = section[1..].find("\n[").map_or(section.len(), |i| i + 1);
+    let section = &section[..end];
+    for line in [
+        "max_connections_per_listener = {{ .Values.sbcDaemon.config.max_connections_per_listener | int64 }}",
+        "max_connections_total = {{ .Values.sbcDaemon.config.max_connections_total | int64 }}",
+    ] {
+        assert!(
+            section.contains(line),
+            "[transport] must render `{line}`:\n{section}"
+        );
+    }
 }

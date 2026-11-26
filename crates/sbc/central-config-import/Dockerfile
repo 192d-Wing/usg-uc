@@ -3,21 +3,28 @@
 # the central config DB and imports its existing site-local Postgres config
 # into the central shard. Run as a Kubernetes Job, not a long-lived service.
 #
+# Builder and runtime follow the root Dockerfile: glibc (Debian) with Go.
+# This binary does not link aws-lc-fips today; the shared toolchain keeps a
+# FIPS crypto dependency buildable here (aws-lc-fips-sys does not build on
+# musl). Do NOT change to Alpine;
+# ci/check-dockerfiles-fips.sh fails CI on an Alpine/musl Rust builder.
+#
 # Build (from repo root):
 #   docker build -t usg-central-config-import:local -f crates/sbc/central-config-import/Dockerfile .
 
 # =============================================================================
 # Stage 1: Rust toolchain + build-deps + cargo-chef.
 # =============================================================================
-FROM rust:1-alpine AS chef
+FROM rust:1-bookworm AS chef
 
-RUN apk add --no-cache \
-    build-base \
+# cmake + Go for aws-lc-fips-sys (the FIPS module build needs both);
+# pkg-config for native build scripts.
+# No openssl: the binary is rustls-only.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
-    perl \
-    pkgconfig \
-    protobuf \
-    protobuf-dev
+    golang \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -64,13 +71,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/central-config-import /tmp/central-config-import
 
 # =============================================================================
-# Stage 4: Runtime — alpine with the bare libs the binary needs.
+# Stage 4: Runtime — same pinned Debian trixie-slim as the root Dockerfile.
+# ca-certificates: outbound HTTPS clients verify against the OS roots.
 # =============================================================================
-FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
 
-RUN apk add --no-cache ca-certificates \
-    && addgroup -g 1000 importer \
-    && adduser -D -u 1000 -G importer -s /bin/sh importer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && groupadd --gid 1000 importer \
+    && useradd --uid 1000 --gid importer --shell /usr/sbin/nologin --no-create-home importer
 
 COPY --from=builder /tmp/central-config-import /usr/local/bin/central-config-import
 

@@ -157,6 +157,8 @@ jobs:
           toolchain: stable
           components: rustfmt
       - run: cargo fmt --all --check
+      # SC-13: Rust images must build on glibc so they carry the aws-lc FIPS module.
+      - run: ci/check-dockerfiles-fips.sh
 
   clippy:
     name: Clippy
