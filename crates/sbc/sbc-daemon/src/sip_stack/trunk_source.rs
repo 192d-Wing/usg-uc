@@ -165,6 +165,18 @@ impl InboundTrunkMap {
         }
     }
 
+    /// Every source IP with an entry over any transport, sorted and
+    /// deduplicated (the per-source rate limiters' trusted set).
+    ///
+    /// NIST 800-53 Rev5: SC-5
+    #[must_use]
+    pub fn source_ips(&self) -> Vec<IpAddr> {
+        let mut ips: Vec<IpAddr> = self.by_source.keys().map(TrunkSourceKey::ip).collect();
+        ips.sort_unstable();
+        ips.dedup();
+        ips
+    }
+
     /// Drops every entry of trunk group `group`.
     pub fn remove_group(&mut self, group: &str) {
         self.by_source.retain(|_, (g, _)| g != group);
@@ -356,6 +368,25 @@ mod tests {
         assert_eq!(resolved(&m, AddrTransport::Tls), Some(AddrTransport::Tls));
         assert_eq!(resolved(&m, AddrTransport::Tcp), Some(AddrTransport::Udp));
         assert_eq!(resolved(&m, AddrTransport::Udp), Some(AddrTransport::Udp));
+    }
+
+    // NIST 800-53 Rev5: SC-5 - the limiters' trusted set is per IP: an
+    // address that is a trunk over two transports appears once.
+    #[test]
+    fn source_ips_dedups_across_transports() {
+        let mut m = InboundTrunkMap::default();
+        let a = v4(203, 0, 113, 1);
+        let b = v4(203, 0, 113, 2);
+        m.replace_group(
+            "g1",
+            None,
+            &set(&[key(b, AddrTransport::Udp), key(a, AddrTransport::Tls)]),
+        );
+        m.replace_group("g2", None, &set(&[key(a, AddrTransport::Udp)]));
+        assert_eq!(m.source_ips(), vec![a, b]);
+        m.remove_group("g1");
+        m.remove_group("g2");
+        assert!(m.source_ips().is_empty());
     }
 
     #[test]

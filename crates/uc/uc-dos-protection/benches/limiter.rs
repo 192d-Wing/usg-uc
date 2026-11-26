@@ -1,7 +1,7 @@
 //! `limiter`: per-packet `RateLimiter::check_outcome` costs on the SIP
 //! receive path: allow, over-rate reject, the overflow bucket at the
-//! tracked-source cap, and new offenders against a full block map
-//! (PERF-001).
+//! tracked-source cap, new offenders against a full block map
+//! (PERF-001), and trusted-source checks (SR-55).
 #![allow(missing_docs)]
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -60,6 +60,20 @@ fn bench_check(c: &mut Criterion) {
             let _ = full.check_outcome(ip(m));
             full.check_outcome(black_box(ip(m)))
         });
+    });
+
+    // SR-55: a trusted (configured trunk) source among 64 trusted entries,
+    // and an untrusted source paying the extra trusted-set lookup.
+    let mut trusted = RateLimiter::new(
+        RateLimiterConfig::new(u32::MAX / 2, u32::MAX / 2)
+            .with_trusted_bucket(u32::MAX / 2, u32::MAX / 2),
+    );
+    trusted.set_trusted_sources((0..64).map(|n| ip(300_000 + n)));
+    g.bench_function("trusted_allow", |b| {
+        b.iter(|| trusted.check_outcome(black_box(ip(300_007))));
+    });
+    g.bench_function("untrusted_with_trusted_set", |b| {
+        b.iter(|| trusted.check_outcome(black_box(ip(1))));
     });
     g.finish();
 }
