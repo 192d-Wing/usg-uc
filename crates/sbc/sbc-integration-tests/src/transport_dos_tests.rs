@@ -109,8 +109,9 @@ async fn ws_upgrade_without_sip_subprotocol_is_refused() {
 // SR-55: spoofable UDP cannot block a configured trunk (limiter trust and
 // auto-block switches, `[rate_limit]` keys).
 mod sr55 {
-    use super::*;
-    use uc_dos_protection::RateLimitAction;
+    use sbc_config::load_from_str;
+    use std::net::IpAddr;
+    use uc_dos_protection::{RateLimitAction, RateLimiter, RateLimiterConfig};
 
     /// Built as the daemon wires its UDP limiter: auto-block off, trunk IP
     /// trusted with its own bucket.
