@@ -990,6 +990,40 @@ pub struct TransportConfig {
     /// ## NIST 800-53 Rev5: SC-5, SC-7
     pub max_connections_per_source: u32,
 
+    /// New stream connections per second accepted from one source (same
+    /// keying as `max_connections_per_source`), across the TCP and TLS
+    /// listeners. Checked at accept, before any TLS handshake. 0 turns
+    /// the check off. Valid 0..=100,000. Not applied on WebSocket
+    /// listeners until their admission is keyed on the client address.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub accept_rate_per_source: u32,
+
+    /// Burst size of the per-source accept bucket. Valid
+    /// `accept_rate_per_source`..=1,000,000 and at least 1.
+    pub accept_burst_per_source: u32,
+
+    /// Node-wide TLS handshakes in progress. A connection takes a slot
+    /// only once it has sent data; over the limit it waits for one at most
+    /// `handshake_timeout_secs / 4` (at most 1 s) and is then dropped. A
+    /// handshake holding a slot must finish within
+    /// `handshake_timeout_secs / 2` (at most 2 s) or is dropped.
+    /// WebSocket upgrades do not use it. 0 sizes it as
+    /// `max(64 x CPU count, max_connections_total / 8)`, at least 64 and at
+    /// most `max_connections_total` (2,500 with the defaults up to 39
+    /// cores). Valid 0..=`max_connections_total`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub max_handshakes_in_flight: u32,
+
+    /// TLS handshakes in progress from one source. A connection over the
+    /// limit is dropped. 0 is rejected; the effective cap is at most
+    /// `max_connections_per_source` (clamped at startup with a warning)
+    /// and at most 1/32 of the node-wide handshake pool.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    pub max_handshakes_per_source: u32,
+
     /// TLS / WebSocket handshake deadline in seconds. Valid 1..=60.
     pub handshake_timeout_secs: u64,
 
@@ -1004,6 +1038,33 @@ pub struct TransportConfig {
     /// (RFC 7118 §4 MUST). When false, an upgrade with no
     /// `Sec-WebSocket-Protocol` header is admitted.
     pub ws_require_sip_subprotocol: bool,
+
+    /// IPv6 prefix length of the connection aggregate (SR-58): every
+    /// connection also counts against its source's `/v6_aggregate_prefix_len`
+    /// prefix, so one delegated /48 or /56 cannot rotate through its /64s
+    /// and take whole pools. Valid 32..=64; a value longer than
+    /// `rate_limit.ipv6_prefix_len` is clamped to it (warned and audited at
+    /// startup).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    pub v6_aggregate_prefix_len: u8,
+
+    /// Concurrent stream connections allowed from one IPv6 aggregate
+    /// (`v6_aggregate_prefix_len`), across all listeners. 0 = off. A value
+    /// above `max_connections_per_listener` is clamped to it (warned and
+    /// audited at startup); a value below `max_connections_per_source` is
+    /// applied as configured. A large site behind one /48 may need more.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    pub max_connections_per_v6_aggregate: u32,
+
+    /// Concurrent stream connections allowed from one IPv4 /24, across all
+    /// listeners. 0 = off; clamped like `max_connections_per_v6_aggregate`
+    /// (to the listener pool only).
+    /// An enterprise or carrier-grade NAT pool in one /24 may need more.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    pub max_connections_per_v4_24: u32,
 
     /// External/public IP address for SIP Contact and SDP.
     /// Used when behind NAT. If unset, auto-detected from outgoing socket.
@@ -1051,9 +1112,16 @@ impl Default for TransportConfig {
             max_connections_per_listener: 10_000,
             max_connections_total: 20_000,
             max_connections_per_source: 128,
+            accept_rate_per_source: 20,
+            accept_burst_per_source: 50,
+            max_handshakes_in_flight: 0,
+            max_handshakes_per_source: 16,
             handshake_timeout_secs: 10,
             first_message_timeout_secs: 30,
             ws_require_sip_subprotocol: true,
+            v6_aggregate_prefix_len: 48,
+            max_connections_per_v6_aggregate: 1024,
+            max_connections_per_v4_24: 1024,
             external_ip: None,
             signaling_ip: None,
             media_ip: None,
@@ -1061,6 +1129,36 @@ impl Default for TransportConfig {
             api_tls_listen: None,
             stun_refresh_interval_secs: None,
         }
+    }
+}
+
+impl TransportConfig {
+    /// The IPv6 aggregate prefix in effect: `v6_aggregate_prefix_len`, but
+    /// never longer than the per-source key `per_source_prefix_len`
+    /// (`rate_limit.ipv6_prefix_len`), since an aggregate must contain its
+    /// sources.
+    #[must_use]
+    pub fn effective_v6_aggregate_prefix_len(&self, per_source_prefix_len: u8) -> u8 {
+        self.v6_aggregate_prefix_len.min(per_source_prefix_len)
+    }
+
+    /// The IPv6 aggregate cap in effect (0 = off): at most
+    /// `max_connections_per_listener`. A cap below
+    /// `max_connections_per_source` is kept: it is stricter, not invalid.
+    #[must_use]
+    pub fn effective_max_connections_per_v6_aggregate(&self) -> u32 {
+        self.clamp_aggregate_cap(self.max_connections_per_v6_aggregate)
+    }
+
+    /// The IPv4 /24 cap in effect (0 = off): clamped like
+    /// [`Self::effective_max_connections_per_v6_aggregate`].
+    #[must_use]
+    pub fn effective_max_connections_per_v4_24(&self) -> u32 {
+        self.clamp_aggregate_cap(self.max_connections_per_v4_24)
+    }
+
+    fn clamp_aggregate_cap(&self, cap: u32) -> u32 {
+        cap.min(self.max_connections_per_listener.max(1))
     }
 }
 
@@ -1723,11 +1821,12 @@ pub struct RateLimitConfig {
     /// on (one /64 is one source). Valid 32..=128.
     pub ipv6_prefix_len: u8,
 
-    /// Cap on per-source token buckets. Valid 1024..=4,194,304.
+    /// Cap on per-source token buckets, per limiter (UDP and stream each
+    /// hold up to this many). Valid 1024..=4,194,304.
     pub max_tracked_sources: u32,
 
-    /// Cap on simultaneously blocked sources. Valid
-    /// 1..=`max_tracked_sources`.
+    /// Cap on simultaneously blocked sources, per limiter (UDP and stream
+    /// each). Valid 1..=`max_tracked_sources`.
     pub max_blocked_sources: u32,
 
     /// Rate of the shared bucket that new sources use once
@@ -1738,6 +1837,24 @@ pub struct RateLimitConfig {
 
     /// How long a source over 2x `per_ip_rps` stays blocked. Valid 1..=86400.
     pub block_duration_secs: u64,
+
+    /// Whether a UDP source over 2x `per_ip_rps` is blocked (`true`) or
+    /// only has its excess requests rejected (`false`, default). UDP source
+    /// addresses are spoofable, so a block earned over UDP could silence
+    /// another host. Stream transports keep their own limiter and still
+    /// block.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, CM-6 (secure default)
+    pub udp_auto_block: bool,
+
+    /// Per-address rate of each configured trunk host, which has its own
+    /// bucket and is never blocked (requests over it are rejected). `0`
+    /// (default) means automatic: `max(per_ip_rps * 10, 1000)` clamped to
+    /// `global_rps`. A non-zero value must lie in `per_ip_rps..=global_rps`.
+    /// Trunk traffic still counts against `global_rps`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-5(2)
+    pub trunk_rps: u32,
 
     /// Interval of the limiter maintenance sweep (expired blocks, idle
     /// buckets). Valid 1..=300.
@@ -1765,6 +1882,17 @@ impl RateLimitConfig {
         let ceiling = self.global_rps.max(self.per_ip_rps);
         1_000u32.clamp(self.per_ip_rps.min(ceiling), ceiling)
     }
+
+    /// The per-trunk-address rate in effect (resolves the `0` = automatic
+    /// setting of `trunk_rps`).
+    #[must_use]
+    pub fn effective_trunk_rps(&self) -> u32 {
+        if self.trunk_rps != 0 {
+            return self.trunk_rps;
+        }
+        let ceiling = self.global_rps.max(self.per_ip_rps);
+        self.per_ip_rps.saturating_mul(10).max(1_000).min(ceiling)
+    }
 }
 
 impl Default for RateLimitConfig {
@@ -1780,6 +1908,8 @@ impl Default for RateLimitConfig {
             max_blocked_sources: 16_384,
             overflow_rps: 0,
             block_duration_secs: 60,
+            udp_auto_block: false,
+            trunk_rps: 0,
             sweep_interval_secs: 10,
             audit_interval_secs: 60,
             audit_max_records_per_interval: 1_024,

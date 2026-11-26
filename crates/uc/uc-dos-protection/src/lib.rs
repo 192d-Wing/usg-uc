@@ -43,7 +43,8 @@ pub mod tracker;
 pub use error::{DosError, DosResult};
 pub use key::{DEFAULT_IPV6_PREFIX_LEN, source_key};
 pub use limiter::{
-    CheckOutcome, KeyedRateLimiter, RateLimitAction, RateLimiter, RateLimiterConfig, SweepEvent,
+    CheckOutcome, KeyedRateLimiter, MAX_TRUSTED_SOURCES, RateLimitAction, RateLimiter,
+    RateLimiterConfig, SweepEvent,
 };
 pub use tracker::{RequestTracker, SourceStats};
 

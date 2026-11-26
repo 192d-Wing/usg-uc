@@ -60,6 +60,26 @@ the announcement server hardening release (SR-41)".
   `"MediaController call refused"`). Update log alerts that match the old
   text.
 
+### Changed (SBC, UDP and stream rate limiters, trunk buckets, POA&M-448..451)
+
+- **UDP sources over the per-source rate are rejected, no longer
+  auto-blocked, unless `rate_limit.udp_auto_block = true`.** (SC-5) UDP
+  source addresses can be spoofed. UDP and stream (TCP, TLS, WebSocket)
+  signaling now use separate per-source limiters, so a block earned on one
+  does not apply to the other. Stream sources are still blocked.
+- New key `rate_limit.udp_auto_block` (default `false`).
+- New key `rate_limit.trunk_rps` (default `0` = `max(per_ip_rps × 10,
+  1000)` clamped to `global_rps`; otherwise `per_ip_rps..=global_rps`).
+  Configured trunk addresses (at most 4096) get their own bucket on both
+  limiters, matched on the exact address. They are rejected over it, never
+  auto-blocked, and a block on their IPv6 prefix does not apply to them.
+  They still count against `global_rps`.
+- New `RateLimitTriggered` `limit_name` values `trunk_rps_udp` and
+  `trunk_rps_stream`, not limited by `audit_max_records_per_interval`
+  (at most one per trusted address per limiter per interval).
+  `max_tracked_sources` and `max_blocked_sources` now apply to each
+  per-source limiter.
+
 ### BREAKING (SBC, management-plane HTTPS is CNSA-only; no ring, SR-16, POA&M-402, 403)
 
 - **IdP / JWKS and central sync HTTPS offer CNSA suites only.** (SC-8,
@@ -695,6 +715,141 @@ release") and `deploy/keycloak/central-config-clients.md`.
 - **Dependabot now watches every Dockerfile, the Go modules of both
   sidecars and the dashboard's npm tree.** GitHub Actions updates are
   grouped into one weekly PR.
+
+### Security (SBC, aggregate stream connection caps per IPv6 prefix and IPv4 /24, SR-58, POA&M-454, 455)
+
+Tested locally on macOS arm64 only (unit tests); no CI run yet.
+
+- **Stream connections are also capped per IPv6 aggregate and per IPv4
+  /24.** (SC-5, SC-7) Besides the per-source cap
+  (`transport.max_connections_per_source`, one IPv4 address or IPv6 /64),
+  every TCP, TLS and WebSocket connection now counts against its source's
+  IPv6 `/v6_aggregate_prefix_len` prefix or IPv4 /24. 6to4 (`2002::/16`)
+  and NAT64 (`64:ff9b::/96`) sources count in the /24 of their embedded
+  IPv4 address. New `[transport]` keys: `v6_aggregate_prefix_len`
+  (default 48, valid 32..=64), `max_connections_per_v6_aggregate` and
+  `max_connections_per_v4_24` (default 1024 each, 0 = off). Before, one
+  delegated /56 could open 128 connections from each of its 256 /64s and
+  take whole listener pools. A connection over an aggregate cap is closed
+  at accept and audited as `RateLimitTriggered` with
+  `limit_name = "per_prefix_conn"`, the aggregate key as source
+  (`2001:db8:1::` for a /48, `192.0.2.0` for a /24) and the cap as
+  threshold.
+- **Accept rate and handshakes are also limited per aggregate.** (SC-5)
+  Each aggregate has an accept bucket of 16 times
+  `accept_rate_per_source` and `accept_burst_per_source` (320/s, burst 800
+  at the defaults) and at most 1/8 of the node-wide handshake pool in
+  handshakes at once. Refusals are audited as `per_prefix_accept_rate` and
+  `per_prefix_handshake_busy`.
+- **Configured trunks skip the aggregate level.** (SC-5) A trunk address
+  (the set SR-55 trusts on the rate limiters) is not counted against, or
+  refused by, its /24 or /48 aggregate, so a co-tenant filling the
+  aggregate cannot lock the trunk out. Its per-source cap and accept rate
+  still apply.
+- **Behaviour change: large sites behind one prefix.** An enterprise NAT,
+  carrier-grade NAT or large site with more than 1024 concurrent stream
+  connections, or more than 800 new connections at once, from one /48 or
+  one IPv4 /24 is now refused past that count. Raise the caps (or set them
+  to 0) for such deployments; see `docs/SBC-ADMIN-GUIDE.md` "Stream
+  connection limits".
+- **Existing configs keep loading.** Only `v6_aggregate_prefix_len`
+  outside 32..=64 is rejected. A prefix longer than
+  `rate_limit.ipv6_prefix_len` is clamped to it, and a cap above
+  `max_connections_per_listener` is clamped to it; each clamp logs a
+  `warn!` and emits a `ConfigurationChange` (`Modified`, admin
+  `startup`). A cap below `max_connections_per_source` is applied as
+  configured.
+- **Reload.** A SIGHUP that changes any `[transport]` connection-limit key
+  (the three new keys, `max_connections_*`, `accept_*_per_source`,
+  `max_handshakes_*`) now reports it as restart-required.
+- **Stats.** New `ServerStats` counters `conn_rejected_per_aggregate` and
+  `handshake_busy_per_aggregate` (Debug output only, POA&M-93); aggregate
+  accept-rate refusals count in `accept_rate_limited`.
+- **POA&M-91 corrected.** Its text implied the rate limiter's shared
+  overflow bucket also bounded stream connections; it bounds rate-limited
+  messages only. The connection limiter had no aggregation before this
+  change. Rate-limiter prefix aggregation stays open under POA&M-91.
+- **POA&M-441 corrected.** Accept admission is now keyed per source and
+  per aggregate; what stays open is the per-node, static keying.
+- **Open items.** Rotation across many /48s or /24s is bounded only by
+  the listener and node pools: about `max_connections_per_listener /
+  max_connections_per_v6_aggregate` /48s (10 at the defaults) fill one
+  listener pool (POA&M-454; the trunk reserve is POA&M-453). The caps are
+  static per prefix, with no per-prefix override and no adaptive
+  tightening under load (POA&M-455).
+
+### Security (SBC, stream accept admission and accept errors; SR-22, SR-56, POA&M-440..443)
+
+Tested locally on macOS arm64 only; no CI run yet.
+
+- **Accept errors no longer stall a listener.** (SC-5) Only resource
+  exhaustion (EMFILE, ENFILE, ENOBUFS, ENOMEM) backs off, 10 ms doubling to
+  1 s, with at most one warning per second. Other accept errors are counted
+  and the loop accepts again at once; only after 64 in a row with no
+  successful accept do they back off too; per-connection errors
+  (ECONNABORTED, ECONNRESET, EPROTO, EPERM, ...) never count toward the 64,
+  only listener-level or unknown ones (EBADF, EINVAL, ENOTSOCK, EOPNOTSUPP,
+  EFAULT, ...). A peer that resets before the accept no longer delays
+  other clients by 100 ms. Plain TCP connections
+  take the peer address from `accept()` and are built only after admission;
+  TLS connections take it from `accept()` too, so a reset right after the
+  handshake no longer fails it.
+- **Blocked sources are dropped at accept**, before any TLS or WebSocket
+  handshake, on every TCP, TLS and WS listener. (SC-5, SC-7) The check uses
+  the stream limiter: a block earned over UDP does not refuse a stream
+  connection, and a configured trunk is not refused for a block on its
+  IPv6 prefix.
+- **New per-source accept rate on TCP and TLS listeners.** (SC-5)
+  `transport.accept_rate_per_source` (default 20 new connections/s, 0 = off)
+  and `accept_burst_per_source` (default 50), keyed like
+  `max_connections_per_source`. With the defaults, 1,000 phones behind one
+  NAT address reconnecting together all get in after about 48 s; raise both
+  for large NATs or PBXs. Configured trunks are not exempt, the check
+  applies with `rate_limit.enabled = false`, and limits are per node.
+  Sources past the tracking limit share an overflow bucket of 4x the rate.
+  WebSocket listeners are exempt until WS admission is keyed on the client
+  address (SR-59).
+- **TLS handshake limits.** (SC-5) `transport.max_handshakes_per_source`
+  (default 16; 0 is rejected; a value above `max_connections_per_source` is
+  clamped to it with a startup warning, and the cap is at most 1/32 of the
+  node-wide pool) and `transport.max_handshakes_in_flight` (default 0 =
+  the larger of 64 per CPU core and `max_connections_total` / 8, at least
+  64, at most `max_connections_total`: 2,500 with the defaults up to 39
+  cores). A connection takes a node-wide slot only after it sends data,
+  waits at most a quarter of `handshake_timeout_secs` (at most 1 s) for
+  one, and must finish the handshake within half of
+  `handshake_timeout_secs` (at most 2 s) once it has one, so a client that
+  sends one byte and stalls frees its slot after 2 s. Both slots are
+  released when the handshake ends. The effective pool size and per-source
+  cap are logged at startup when they differ from the configured values,
+  and the `handshake_busy` audit threshold is the effective cap. Residual:
+  with the defaults, 157 or more sources opening about 1,250 one-byte
+  connections per second between them still keep the pool full
+  (POA&M-440).
+- **Audit and stats.** New `RateLimitTriggered` `limit_name` values
+  `per_ip_accept_rate`, `accept_blocked` and `handshake_busy`, aggregated
+  per source. New `ServerStats` counters `accept_errors`,
+  `accept_resource_errors`, `accept_blocked`, `accept_rate_limited`,
+  `handshake_busy_per_source`, `handshake_slot_timeouts` and
+  `handshake_slot_hold_timeouts` (Debug output only, POA&M-93).
+- **`uc-transport` API.** New `TransportError::AcceptFailed { reason,
+  resource_exhausted, per_connection }` (the enum is not
+  `#[non_exhaustive]`, so exhaustive matches need an arm),
+  `TransportError::is_resource_exhausted`,
+  `TransportError::is_per_connection_accept_error`,
+  `is_accept_resource_exhaustion`, `is_accept_per_connection_error`, `TcpListener::accept_tcp` and
+  `TcpTransport::from_accepted`. `TlsListener::complete_handshake` now
+  takes the peer address returned by `accept_tcp`. Listener accept errors
+  are `AcceptFailed` instead of `ReceiveFailed` (TCP, TLS) or `Io` (WS).
+- **Open items:** POA&M-440 (no node-wide accept or handshake rate; with
+  the defaults about 333 accepts/s from one IPv6 /48 keep the 20,000-entry
+  accept-bucket table full, so new sources share the 80/s overflow bucket,
+  see POA&M-91), POA&M-441 (accept admission keyed per address or prefix
+  only), POA&M-442 (fixed listen backlog), POA&M-443 (TLS handshake
+  failures logged per connection, not counted).
+- **Known follow-up:** an opaque `AcceptedTcp { stream, peer }` type
+  consumed by `complete_handshake` / `from_accepted`, so the accept peer
+  cannot be paired with the wrong stream (not in this change).
 
 ### Security (SBC, WebSocket transport send and close; SR-60, POA&M-458, 459)
 

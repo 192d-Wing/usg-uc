@@ -54,14 +54,12 @@ pub struct TcpTransport {
 impl TcpTransport {
     /// Creates a TCP transport from an established connection.
     ///
-    /// This is typically called after accepting a connection from a listener.
+    /// Used for connections this side dialled; accepted connections use
+    /// [`Self::from_accepted`], which needs no `getpeername`.
+    ///
+    /// # Errors
+    /// Returns an error if the local or peer address cannot be read.
     #[instrument(skip(stream))]
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn from_stream(stream: TcpStream) -> TransportResult<Self> {
         let local_addr = stream
             .local_addr()
@@ -76,10 +74,35 @@ impl TcpTransport {
         })?)
         .into();
 
+        Ok(Self::with_addrs(stream, local_addr, peer_addr))
+    }
+
+    /// Creates a TCP transport for a connection returned by
+    /// [`TcpListener::accept_tcp`].
+    ///
+    /// Infallible: `peer` is the address `accept()` returned, so a peer
+    /// that has already reset cannot turn this into an error. The local
+    /// address comes from `getsockname`, or `listener_local` if that fails.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+    #[must_use]
+    pub fn from_accepted(
+        stream: TcpStream,
+        peer: SbcSocketAddr,
+        listener_local: SbcSocketAddr,
+    ) -> Self {
+        let local_addr = stream
+            .local_addr()
+            .map_or(listener_local, SbcSocketAddr::from);
+        Self::with_addrs(stream, local_addr, peer)
+    }
+
+    /// Builds the transport from a connected stream and its addresses.
+    fn with_addrs(stream: TcpStream, local_addr: SbcSocketAddr, peer_addr: SbcSocketAddr) -> Self {
         debug!(local = %local_addr, peer = %peer_addr, "TCP transport created");
 
         let (reader, writer) = stream.into_split();
-        Ok(Self {
+        Self {
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
             local_addr,
@@ -88,7 +111,7 @@ impl TcpTransport {
             // connection, not a message-sized buffer.
             read_buffer: Mutex::new(BytesMut::with_capacity(STREAM_READ_CHUNK)),
             closed: AtomicBool::new(false),
-        })
+        }
     }
 
     /// Connects to a remote TCP endpoint.
@@ -394,24 +417,38 @@ impl TcpListener {
     ///
     /// Returns an error if accept fails.
     pub async fn accept(&self) -> TransportResult<(TcpTransport, SbcSocketAddr)> {
+        let (stream, peer) = self.accept_tcp().await?;
+        let transport = TcpTransport::from_accepted(stream, peer, self.local_addr);
+        Ok((transport, peer))
+    }
+
+    /// Accepts the next incoming connection without building a
+    /// [`TcpTransport`], so the caller can admit it first and allocate
+    /// nothing for a refused connection.
+    ///
+    /// The peer is the address `accept()` returned, in canonical form.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`TransportError::AlreadyClosed`] once the listener is
+    /// closed, or [`TransportError::AcceptFailed`] if `accept()` fails.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+    pub async fn accept_tcp(&self) -> TransportResult<(TcpStream, SbcSocketAddr)> {
         if self.closed.load(Ordering::Acquire) {
             return Err(TransportError::AlreadyClosed);
         }
 
-        let (stream, peer_addr) =
-            self.listener
-                .accept()
-                .await
-                .map_err(|e| TransportError::ReceiveFailed {
-                    reason: format!("accept failed: {e}"),
-                })?;
+        let (stream, peer_addr) = self
+            .listener
+            .accept()
+            .await
+            .map_err(|e| crate::accept_error(&e))?;
 
         // NIST 800-53 Rev5: SI-10; supports SC-7, AC-4 - IPv4-mapped peers reported as plain IPv4.
         let peer_addr = canonical_peer(peer_addr);
         debug!(peer = %peer_addr, "accepted TCP connection");
-
-        let transport = TcpTransport::from_stream(stream)?;
-        Ok((transport, peer_addr.into()))
+        Ok((stream, peer_addr.into()))
     }
 
     /// Returns the local address.
@@ -641,6 +678,48 @@ mod tests {
         );
     }
 
+    /// Connects a client to `listen` and resets it (`SO_LINGER` 0) before
+    /// the server calls `accept`, so the kernel queues a connection whose
+    /// peer is already gone. Returns the client's local address.
+    #[cfg(unix)]
+    pub(super) fn reset_before_accept(listen: SocketAddr) -> SocketAddr {
+        let domain = if listen.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        sock.connect(&listen.into()).unwrap();
+        let local = sock.local_addr().unwrap().as_socket().unwrap();
+        sock.set_linger(Some(std::time::Duration::ZERO)).unwrap();
+        drop(sock);
+        local
+    }
+
+    // SR-22 (NIST 800-53 Rev5: SC-5): a peer that sends RST before the
+    // server accepts must not turn `accept()` into an error. Before SR-22
+    // `accept()` used `from_stream`, which calls `getpeername` on the
+    // accepted socket; that fails (ENOTCONN on Linux, EINVAL on macOS) once
+    // the peer has reset, and the daemon accept loop then slept 100 ms.
+    // Both kernels keep the reset connection in the accept queue.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_accept_survives_peer_reset_before_accept() {
+        use std::net::Ipv4Addr;
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let listen: SocketAddr = (*listener.local_addr()).into();
+        let client: SbcSocketAddr = reset_before_accept(listen).into();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accept did not return within 2 s");
+        let (transport, peer) = accepted.expect("accept of a reset connection must be Ok (SR-22)");
+        assert_eq!(peer, client, "peer must be the address accept() returned");
+        assert_eq!(*transport.peer_addr(), client);
+    }
+
     // ---- SR-57: per-connection read buffer is one read chunk ----
     // NIST 800-53 Rev5: SC-5, SC-6
     // An idle connection keeps one 4 KiB read chunk resident, not a 64 KiB
@@ -734,5 +813,83 @@ mod tests {
             total += msg.data.len();
         }
         assert_eq!(total, payload.len());
+    }
+}
+
+/// SR-22 tests against the new accept API (`TcpListener::accept_tcp`,
+/// `TcpTransport::from_accepted`).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod sr22_accept_api_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // NIST 800-53 Rev5: SC-5, SI-10
+    #[tokio::test]
+    async fn tcp_accept_tcp_returns_canonical_peer_without_transport() {
+        let Ok(listener) = TcpListener::bind(SbcSocketAddr::new_v6(Ipv6Addr::UNSPECIFIED, 0)).await
+        else {
+            crate::skip_dual_stack("cannot bind [::]:0 (no IPv6)");
+            return;
+        };
+        let port = listener.local_addr().port();
+        let connect = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+        )
+        .await;
+        let Ok(Ok(client)) = connect else {
+            crate::skip_dual_stack("127.0.0.1 cannot reach a [::] listener (no dual-stack)");
+            return;
+        };
+        let (stream, peer): (TcpStream, SbcSocketAddr) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept_tcp())
+                .await
+                .expect("accept_tcp timed out")
+                .unwrap();
+        assert!(
+            peer.is_ipv4(),
+            "accept_tcp peer must be plain IPv4, got {peer}"
+        );
+        assert_eq!(peer.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(peer.port(), client.local_addr().unwrap().port());
+        drop(stream);
+    }
+
+    // NIST 800-53 Rev5: SC-5
+    // `from_accepted` takes the peer from accept() and never calls
+    // getpeername, so a reset peer still yields a transport with that peer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_from_accepted_never_fails() {
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let listen_local = *listener.local_addr();
+        let reset_client: SbcSocketAddr =
+            super::tests::reset_before_accept(listen_local.into()).into();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (stream, peer) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept_tcp())
+                .await
+                .expect("accept_tcp timed out")
+                .expect("accept_tcp of a reset connection must be Ok");
+        assert_eq!(peer, reset_client);
+        let transport: TcpTransport = TcpTransport::from_accepted(stream, peer, listen_local);
+        assert_eq!(*transport.peer_addr(), peer);
+        assert_eq!(transport.local_addr().ip(), listen_local.ip());
+    }
+
+    // `accept()` keeps its signature (accept_tcp + from_accepted).
+    #[tokio::test]
+    async fn tcp_accept_still_returns_transport_and_peer() {
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = *listener.local_addr();
+        let client = TcpStream::connect(SocketAddr::from(addr)).await.unwrap();
+        let (transport, peer): (TcpTransport, SbcSocketAddr) = listener.accept().await.unwrap();
+        assert_eq!(peer, SbcSocketAddr::from(client.local_addr().unwrap()));
+        assert_eq!(*transport.peer_addr(), peer);
     }
 }
