@@ -3,8 +3,10 @@
 // DTLS-SRTP handshake for one media leg over any net.PacketConn (later backed
 // by the IPC channel to the Rust relay), returning the exported SRTP keys.
 //
-// Built with GOFIPS140=v1.26.0 / GODEBUG=fips140=on, every primitive here runs
-// in the Go FIPS 140-3 module. Restricted to P-384 + AES-256-GCM (CNSA 2.0).
+// Built with GOFIPS140=v1.26.0 / GODEBUG=fips140=on, the primitives come from
+// the Go FIPS 140-3 module; pion's DTLS record GCM seal (cipher.NewGCM, caller
+// IV) is a non-approved service (POA&M-400). Restricted to P-384 +
+// AES-256-GCM (CNSA 2.0).
 package dtlssession
 
 import (

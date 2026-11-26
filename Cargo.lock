@@ -8738,6 +8738,7 @@ dependencies = [
 name = "uc-crypto"
 version = "0.10.0"
 dependencies = [
+ "aws-lc-fips-sys",
  "aws-lc-rs",
  "rustls-pki-types",
  "rustls-webpki",
