@@ -30,6 +30,25 @@ use config::Config;
 use handlers::AppState;
 use proto_jwt::{JwksCache, Validator, ValidatorConfig};
 
+/// Builds the `IdP` (OIDC metadata / JWKS) HTTP client: CNSA suites and
+/// groups only, OS trust store plus the optional extra CA bundle
+/// (`SBC_CLIENT_CONFIG_EXTRA_CA_CERT_FILE`).
+///
+/// ## NIST 800-53 Rev5: SC-8(1), SC-13, IA-5(2)
+fn build_http_client(extra_ca_pem: Option<&[u8]>) -> Result<reqwest::Client, String> {
+    let tls = uc_transport::https_client::create_https_client_config(
+        extra_ca_pem,
+        uc_transport::tls::MinTlsVersion::V1_2,
+    )
+    .map_err(|e| e.to_string())?;
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 // Linear startup sequence (logging, config, JWKS, router, listener).
 #[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "multi_thread")]
@@ -54,22 +73,13 @@ async fn main() -> ExitCode {
         }
     };
 
-    let mut http_builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10));
-
+    let mut extra_ca = None;
     if let Some(ref path) = cfg.extra_ca_cert_file {
         match std::fs::read(path) {
-            Ok(pem) => match reqwest::Certificate::from_pem(&pem) {
-                Ok(cert) => {
-                    info!(path, "loaded extra CA certificate");
-                    http_builder = http_builder.add_root_certificate(cert);
-                }
-                Err(e) => {
-                    error!(path, error = %e, "failed to parse extra CA cert PEM");
-                    return ExitCode::from(3);
-                }
-            },
+            Ok(pem) => {
+                info!(path, "loaded extra CA certificate");
+                extra_ca = Some(pem);
+            }
             Err(e) => {
                 error!(path, error = %e, "failed to read extra CA cert file");
                 return ExitCode::from(3);
@@ -77,7 +87,7 @@ async fn main() -> ExitCode {
         }
     }
 
-    let http = match http_builder.build() {
+    let http = match build_http_client(extra_ca.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             error!(error = %e, "http client build failed");
@@ -156,4 +166,36 @@ async fn main() -> ExitCode {
     }
     info!("clean shutdown");
     ExitCode::SUCCESS
+}
+
+// SR-16: the JWKS HTTP client is CNSA-only (uc-transport
+// `create_https_client_config` via reqwest `use_preconfigured_tls`), and
+// the binary links the FIPS module.
+#[cfg(test)]
+#[path = "../../../uc/uc-transport/tests/common/cnsa_reqwest_checks.rs"]
+mod cnsa_reqwest_checks;
+
+#[cfg(test)]
+mod sr16_http_client_tests {
+    use super::cnsa_reqwest_checks as checks;
+
+    #[tokio::test]
+    async fn sbc_client_config_server_http_client_trusts_extra_ca() {
+        checks::assert_trusts_extra_ca(super::build_http_client).await;
+    }
+
+    #[tokio::test]
+    async fn sbc_client_config_server_http_client_refuses_non_cnsa_server() {
+        checks::assert_refuses_non_cnsa(super::build_http_client).await;
+    }
+
+    #[test]
+    fn sbc_client_config_server_links_fips_provider() {
+        // The dev-dep rustls does not enable `fips`; only the binary's own
+        // dependency graph (uc-transport `https-client`) can turn it on.
+        assert!(
+            rustls::crypto::aws_lc_rs::default_provider().fips(),
+            "rustls aws-lc-rs provider is not the FIPS module"
+        );
+    }
 }

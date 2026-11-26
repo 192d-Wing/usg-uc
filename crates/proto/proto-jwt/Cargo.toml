@@ -26,8 +26,10 @@ jsonwebtoken.workspace = true
 # FIPS module uc-crypto and rustls use) even where nothing else turns it on.
 # NIST 800-53 Rev5: SC-13
 aws-lc-rs = { workspace = true, features = ["fips"] }
-# JWKS / OIDC-metadata fetch from the IdP. rustls only, no native-tls.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# JWKS / OIDC-metadata fetch from the IdP. rustls only, no bundled crypto
+# provider: callers pass a client built with `use_preconfigured_tls` on the
+# CNSA provider (uc-transport `https-client`). Keeps ring out of the graph.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-no-provider"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -35,3 +37,5 @@ serde_json = { workspace = true }
 # Test-only keypair generation (P-384, plus P-256/RSA to prove rejection)
 # uses the aws-lc-rs dependency above; no static private key in the tree.
 base64 = "0.22"
+# CNSA reqwest TLS config for the fetch test and the live example.
+uc-transport = { workspace = true, features = ["https-client"] }

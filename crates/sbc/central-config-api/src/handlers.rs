@@ -1868,7 +1868,7 @@ mod tests {
 
         // The real sync-agent client over real HTTP, with a static token.
         let client = sbc_config_sync::CentralClient::new(
-            reqwest::Client::new(),
+            sbc_config_sync::build_http_client().expect("http client"),
             base_url,
             sbc_config_sync::Auth::Static(good_token("MUHJ")),
         );

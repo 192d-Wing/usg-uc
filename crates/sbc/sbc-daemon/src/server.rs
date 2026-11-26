@@ -306,6 +306,32 @@ pub fn bearer_mode_active(auth_mode: &str) -> bool {
     auth_mode.trim().eq_ignore_ascii_case("bearer")
 }
 
+/// Builds the `IdP` (OIDC metadata / JWKS) HTTP client: CNSA suites and
+/// groups only, OS trust store plus the optional `extra_ca_pem` bundle
+/// (`SBC_OIDC_EXTRA_CA_CERT_FILE`). An `IdP` that offers no CNSA suite fails
+/// the handshake, so bearer auth reports unready rather than falling back.
+///
+/// ## NIST 800-53 Rev5: SC-8(1), SC-13, IA-5(2)
+///
+/// # Errors
+/// Returns a description if the extra CA holds no usable certificate, the
+/// trust store is empty, or the client cannot be built.
+pub fn build_idp_http_client(extra_ca_pem: Option<&[u8]>) -> Result<reqwest::Client, String> {
+    // TLS 1.2 + 1.3 (CNSA suites only), like the other management-plane
+    // clients; independent of `security.min_tls_version` (SIP-TLS).
+    let tls = uc_transport::https_client::create_https_client_config(
+        extra_ca_pem,
+        uc_transport::tls::MinTlsVersion::V1_2,
+    )
+    .map_err(|e| e.to_string())?;
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 /// The configured SIP listener transports that carry REGISTER in cleartext
 /// (`udp`, `tcp`, `ws`) while digest authentication is required; empty
 /// when digest is off or every SIP listener is TLS / WSS.
@@ -759,9 +785,7 @@ impl Server {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| config.general.instance_name.clone());
 
-        let mut http_builder = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10));
+        let mut extra_ca = None;
         if let Some(path) = env("SBC_OIDC_EXTRA_CA_CERT_FILE")
             && !path.trim().is_empty()
         {
@@ -771,17 +795,12 @@ impl Server {
                     format!("failed to read SBC_OIDC_EXTRA_CA_CERT_FILE {path}: {e}"),
                 )
             })?;
-            let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
-                fail(
-                    "extra CA file invalid",
-                    format!("failed to parse SBC_OIDC_EXTRA_CA_CERT_FILE {path}: {e}"),
-                )
-            })?;
             info!(path, "loaded extra CA certificate for IdP JWKS fetch");
-            http_builder = http_builder.add_root_certificate(cert);
+            extra_ca = Some(pem);
         }
 
-        let http = http_builder.build().map_err(|e| {
+        // Fails closed on an unparsable extra CA (`create_https_client_config`).
+        let http = build_idp_http_client(extra_ca.as_deref()).map_err(|e| {
             fail(
                 "IdP HTTP client",
                 format!("failed to build IdP HTTP client: {e}"),
@@ -5720,5 +5739,26 @@ mod tests {
         wipe_wire_bytes(shared);
         assert_eq!(&other[..], &[7u8; 32][..]);
         wipe_wire_bytes(other);
+    }
+}
+
+// SR-16: the IdP/JWKS HTTP client is CNSA-only (uc-transport
+// `create_https_client_config` via reqwest `use_preconfigured_tls`).
+#[cfg(test)]
+#[path = "../../../uc/uc-transport/tests/common/cnsa_reqwest_checks.rs"]
+mod cnsa_reqwest_checks;
+
+#[cfg(test)]
+mod sr16_idp_http_client_tests {
+    use super::cnsa_reqwest_checks as checks;
+
+    #[tokio::test]
+    async fn sbc_daemon_http_client_trusts_extra_ca() {
+        checks::assert_trusts_extra_ca(super::build_idp_http_client).await;
+    }
+
+    #[tokio::test]
+    async fn sbc_daemon_http_client_refuses_non_cnsa_server() {
+        checks::assert_refuses_non_cnsa(super::build_idp_http_client).await;
     }
 }
