@@ -5,23 +5,30 @@
 # surface over the central, site_code-sharded Postgres. Same cargo-chef
 # shape as the other SBC binaries, scoped to this one package.
 #
+# Builder and runtime follow the root Dockerfile: glibc (Debian) with Go,
+# because the binary links the aws-lc FIPS module and
+# aws-lc-fips-sys does not build on musl. Do NOT change to Alpine;
+# ci/check-dockerfiles-fips.sh fails CI on an Alpine/musl Rust builder.
+#
 # Build (from repo root):
 #   docker build -t usg-central-config-api:local -f crates/sbc/central-config-api/Dockerfile .
 
 # =============================================================================
 # Stage 1: Rust toolchain + build-deps + cargo-chef.
 # =============================================================================
-FROM rust:1-alpine AS chef
+FROM rust:1-bookworm AS chef
 
-# build-base = gcc/make/musl-dev; cmake + perl for aws-lc-sys; protobuf for
-# any tonic/prost codegen pulled transitively. No openssl: rustls-only.
-RUN apk add --no-cache \
-    build-base \
+# cmake + Go for aws-lc-fips-sys (the FIPS module build needs both);
+# pkg-config for native build scripts.
+# protobuf for the tonic/prost gRPC codegen.
+# No openssl: the binary is rustls-only.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
-    perl \
-    pkgconfig \
-    protobuf \
-    protobuf-dev
+    golang \
+    libprotobuf-dev \
+    pkg-config \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -68,20 +75,28 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/central-config-api /tmp/central-config-api
 
 # =============================================================================
-# Stage 4: Runtime — alpine with the bare libs the binary needs.
+# Stage 4: Runtime — same pinned Debian trixie-slim as the root Dockerfile.
+# ca-certificates: outbound HTTPS clients verify against the OS roots.
 # =============================================================================
-FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
 
-RUN apk add --no-cache ca-certificates libcap \
-    && addgroup -g 1000 central \
-    && adduser -D -u 1000 -G central -s /bin/sh central
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libcap2-bin \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && groupadd --gid 1000 central \
+    && useradd --uid 1000 --gid central --shell /usr/sbin/nologin --no-create-home central
 
 COPY --from=builder /tmp/central-config-api /usr/local/bin/central-config-api
 
 # CAP_NET_BIND_SERVICE so the non-root user can bind to :80
 # (CENTRAL_API_LISTEN_ADDR defaults to 0.0.0.0:80).
+# libcap2-bin is only needed for setcap; it is purged in the same layer.
 RUN chown central:central /usr/local/bin/central-config-api \
-    && setcap 'cap_net_bind_service=+ep' /usr/local/bin/central-config-api
+    && setcap 'cap_net_bind_service=+ep' /usr/local/bin/central-config-api \
+    && apt-get purge -y --auto-remove libcap2-bin \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
 
 USER central
 
