@@ -8717,6 +8717,7 @@ name = "uc-dos-protection"
 version = "0.10.0"
 dependencies = [
  "criterion",
+ "tracing",
  "uc-types",
 ]
 
