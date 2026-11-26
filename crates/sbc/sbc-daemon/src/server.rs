@@ -1432,7 +1432,7 @@ impl Server {
     /// single-node form (co-located split), honored when the list is unset. Only
     /// read in `grpc` builds. One URL → a single node; many → a load-balanced pool.
     #[cfg(feature = "grpc")]
-    fn remote_media_urls() -> Vec<String> {
+    pub(crate) fn remote_media_urls() -> Vec<String> {
         let parse = |raw: String| -> Vec<String> {
             raw.split(',')
                 .map(str::trim)
@@ -1453,7 +1453,7 @@ impl Server {
     }
 
     #[cfg(not(feature = "grpc"))]
-    fn remote_media_urls() -> Vec<String> {
+    pub(crate) fn remote_media_urls() -> Vec<String> {
         Vec::new()
     }
 
@@ -2332,6 +2332,11 @@ impl Server {
         // ceiling bounds the fd budget and a per-source cap stops one host
         // from taking a whole pool; aggregate caps stop one IPv6 /48 (or
         // IPv4 /24) from doing the same across many sources (SR-58).
+        // POAM: POA&M-453 - no part of a pool is reserved for trunks or
+        // authenticated flows: any parseable request (e.g. OPTIONS) from an
+        // unadmitted source earns first-message and idle credit, so such
+        // connections can fill a pool up to the per-source and per-listener
+        // caps (extends POA&M-94).
         let tc = &self.config.transport;
         let per_listener = tc.max_connections_per_listener as usize;
         let total_conns = Arc::new(tokio::sync::Semaphore::new(
@@ -3279,6 +3284,7 @@ impl Server {
                         // POAM: POA&M-94 — a request that parses but lacks
                         // mandatory headers still earns credit; closing this
                         // needs sip_stack.rs to report it as an error.
+                        // Pool share for unadmitted flows: POA&M-453.
                         if !matches!(result, ProcessResult::Error { .. }) {
                             seen_message = true;
                             last_activity = tokio::time::Instant::now();
