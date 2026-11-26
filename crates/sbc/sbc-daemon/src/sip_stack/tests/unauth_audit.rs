@@ -89,11 +89,24 @@ async fn qa_source_admission_flood_is_aggregated() {
 /// test, so the JWKS URL is never fetched.
 fn bearer_stack() -> SipStack {
     let issuer = "https://idp.example.test";
-    let jwks = Arc::new(proto_jwt::JwksCache::new(reqwest::Client::new(), issuer));
-    let validator = Arc::new(proto_jwt::Validator::new(
-        jwks,
-        proto_jwt::ValidatorConfig::new(issuer, vec!["sbc".to_string()]),
-    ));
+    // reqwest has no default crypto provider (SR-16): CNSA preconfigured TLS.
+    let tls = uc_transport::https_client::create_https_client_config(
+        None,
+        uc_transport::tls::MinTlsVersion::V1_2,
+    )
+    .expect("tls config");
+    let http = reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .build()
+        .expect("http client");
+    let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer));
+    let validator = Arc::new(
+        proto_jwt::Validator::new(
+            jwks,
+            proto_jwt::ValidatorConfig::new(issuer, vec!["sbc".to_string()]),
+        )
+        .expect("validator config"),
+    );
     let mut stack = SipStack::new(SipStackConfig::default());
     stack.set_bearer_authenticator(Arc::new(BearerAuthenticator::new(
         validator,
