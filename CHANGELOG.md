@@ -1916,6 +1916,9 @@ Effects for SBC operators:
 
 ### Documentation
 
+- **SBC:** TLS certificate revocation is not checked on SIP mTLS, trunk,
+  SRS or CDR syslog connections; design for CRL support in
+  `docs/TLS-REVOCATION-DESIGN.md` (POA&M-401).
 - **SBC:** `uc-api` `Router::authorize` is not yet called by sbc-daemon;
   the default-deny route permissions are not enforced on the SBC HTTP API
   (POA&M-261).
