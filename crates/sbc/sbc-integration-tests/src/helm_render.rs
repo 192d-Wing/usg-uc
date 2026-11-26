@@ -1306,6 +1306,15 @@ fn qa_helm_render_gateway_cert_ecdsa_p384() {
     );
     let fname = fullname(&out);
     let cert = get(&out, "Certificate", &format!("{fname}-tls"));
-    assert_eq!(scalar(cert, "algorithm"), Some("ECDSA"), "{cert}");
-    assert_eq!(scalar(cert, "size"), Some("384"), "{cert}");
+    // The manifest is not echoed into the failure message.
+    assert_eq!(
+        scalar(cert, "algorithm"),
+        Some("ECDSA"),
+        "Gateway Certificate privateKey.algorithm"
+    );
+    assert_eq!(
+        scalar(cert, "size"),
+        Some("384"),
+        "Gateway Certificate privateKey.size"
+    );
 }
