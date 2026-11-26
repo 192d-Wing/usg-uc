@@ -369,7 +369,7 @@ pub(crate) mod legacy_fixture {
     /// Old key: `HKDF-SHA384`(salt = fixed constant,
     /// ikm = `"hostname:username:config_dir"`, info = "aes-256-gcm-key").
     /// Every input is public or guessable (SR-47).
-    fn legacy_key(config_dir: &Path) -> uc_crypto::aead::Aes256GcmKey {
+    fn legacy_key(config_dir: &Path) -> uc_crypto::aead::RandomNonceKey {
         let hostname = hostname::get().map_or_else(
             |_| "unknown".to_string(),
             |h| h.to_string_lossy().to_string(),
@@ -384,7 +384,9 @@ pub(crate) mod legacy_fixture {
             &mut key_bytes,
         )
         .unwrap();
-        uc_crypto::aead::Aes256GcmKey::new(key_bytes).unwrap()
+        let key = uc_crypto::aead::RandomNonceKey::new(&key_bytes).unwrap();
+        zeroize::Zeroize::zeroize(&mut key_bytes);
+        key
     }
 
     /// Writes `<config_dir>/credentials.enc` as the old code would have:
@@ -395,10 +397,7 @@ pub(crate) mod legacy_fixture {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         let json = serde_json::to_string(&map).unwrap();
-        let nonce = uc_crypto::random::generate_nonce().unwrap();
-        let ciphertext = legacy_key(config_dir)
-            .seal(&nonce, AAD, json.as_bytes())
-            .unwrap();
+        let (nonce, ciphertext) = legacy_key(config_dir).seal(AAD, json.as_bytes()).unwrap();
         let mut out = nonce.to_vec();
         out.extend_from_slice(&ciphertext);
         let path = config_dir.join(LEGACY_FILE);

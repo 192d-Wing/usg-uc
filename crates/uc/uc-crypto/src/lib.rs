@@ -8,7 +8,9 @@
 //! in the SBC. By centralizing crypto here, we ensure:
 //!
 //! 1. **CNSA 2.0 Compliance**: Non-compliant algorithms cannot be used
-//! 2. **FIPS 140-3 Validation**: All operations use aws-lc-rs FIPS module
+//! 2. **FIPS 140-3 module**: All operations use the aws-lc FIPS module via
+//!    aws-lc-rs; not every operation is an approved service (see [`aead`],
+//!    [`tls12`])
 //! 3. **Auditability**: Single place to verify cryptographic compliance
 //! 4. **Future-Proofing**: Easy migration to post-quantum algorithms (ML-KEM)
 //!
@@ -36,6 +38,7 @@
 //!   ([`aead::Aes256GcmKey`]), the PKCS#8 DER held by
 //!   [`ecdsa::P384KeyPair`], and ECDH shared-secret bytes.
 //! - **Relies on aws-lc**: opaque aws-lc objects (AES key schedules,
+//!   including [`aead::RandomNonceKey`], which holds no Rust key bytes;
 //!   `EVP_PKEY` private keys, ECDH ephemeral keys). aws-lc cleanses these
 //!   when it frees them; Rust code cannot reach them.
 //! - **Not covered**: copies the caller keeps (inputs to constructors,
@@ -59,9 +62,9 @@
 //! // Hash data with SHA-384 (minimum CNSA 2.0 hash)
 //! let digest = hash::sha384(b"data to hash");
 //!
-//! // Encrypt with AES-256-GCM
-//! let key = aead::Aes256GcmKey::generate()?;
-//! let ciphertext = key.seal(nonce, aad, plaintext)?;
+//! // Encrypt with AES-256-GCM (the module generates the IV)
+//! let key = aead::RandomNonceKey::generate()?;
+//! let (nonce, ciphertext) = key.seal(aad, plaintext)?;
 //!
 //! // Sign with ECDSA P-384
 //! let keypair = ecdsa::P384KeyPair::generate()?;
@@ -103,7 +106,7 @@ pub mod x509;
 
 pub use error::{CryptoError, CryptoResult};
 
-/// Initialize the FIPS 140-3 validated crypto module.
+/// Initialize the aws-lc FIPS 140-3 crypto module.
 ///
 /// This should be called once at application startup.
 ///

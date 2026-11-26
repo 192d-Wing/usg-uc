@@ -1005,7 +1005,7 @@ impl DigestHasher for Md5DigestHasher {
 /// SHA-256 hasher for digest authentication (RFC 7616 §3.2).
 ///
 /// NIST 800-53 Rev5: SC-13 (Cryptographic Protection) - computed by
-/// aws-lc-rs (the FIPS 140-3 validated module only when the build enables
+/// aws-lc-rs (built against the aws-lc FIPS module only when the build enables
 /// the `aws-lc-rs/fips` feature, e.g. via the workspace `fips` feature). Not a CNSA 2.0 hash; SIP digest stays under the
 /// existing CNSA exception (POA&M-110) because RFC 7616 defines no SHA-384.
 #[cfg(feature = "digest-auth")]
