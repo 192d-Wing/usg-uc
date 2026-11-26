@@ -7,22 +7,30 @@
 # to the daemon's gRPC TrunkStatusPublishService. Deploy exactly ONE
 # replica: two agents would double-REGISTER to carriers.
 #
+# Builder and runtime follow the root Dockerfile: glibc (Debian) with Go,
+# because the binary links the aws-lc FIPS module and
+# aws-lc-fips-sys does not build on musl. Do NOT change to Alpine;
+# ci/check-dockerfiles-fips.sh fails CI on an Alpine/musl Rust builder.
+#
 # Build (from repo root):
-#   docker build -t usg-sbc-trunk-agent:local \
-#     -f crates/sbc/sbc-trunk-agent/Dockerfile .
+#   docker build -t usg-sbc-trunk-agent:local -f crates/sbc/sbc-trunk-agent/Dockerfile .
 
-FROM rust:1-alpine AS chef
+# =============================================================================
+# Stage 1: Rust toolchain + build-deps + cargo-chef.
+# =============================================================================
+FROM rust:1-bookworm AS chef
 
-# build-base = gcc/make/musl-dev — aws-lc-sys (the non-FIPS aws-lc-rs
-# backend behind rustls/tonic TLS) compiles C and needs cmake; perl for
-# its assembly generation; protobuf for the gRPC codegen in sbc-grpc-api.
-RUN apk add --no-cache \
-    build-base \
+# cmake + Go for aws-lc-fips-sys (the FIPS module build needs both);
+# pkg-config for native build scripts.
+# protobuf for the tonic/prost gRPC codegen.
+# No openssl: the binary is rustls-only.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
-    perl \
-    pkgconfig \
-    protobuf \
-    protobuf-dev
+    golang \
+    libprotobuf-dev \
+    pkg-config \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -30,6 +38,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 WORKDIR /app
 
+# =============================================================================
+# Stage 2: Cook just the deps the sbc-trunk-agent binary needs.
+# =============================================================================
 FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -44,8 +55,11 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo chef cook --release --recipe-path recipe.json \
-    --package sbc-trunk-agent
+        --package sbc-trunk-agent
 
+# =============================================================================
+# Stage 3: Build the binary against the cooked deps.
+# =============================================================================
 FROM chef AS builder
 
 COPY --from=cacher /app/target /app/target
@@ -58,18 +72,29 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --package sbc-trunk-agent \
     && cp target/release/sbc-trunk-agent /tmp/sbc-trunk-agent
 
-FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
+# =============================================================================
+# Stage 4: Runtime — same pinned Debian trixie-slim as the root Dockerfile.
+# ca-certificates: outbound HTTPS clients verify against the OS roots.
+# =============================================================================
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
 
-RUN apk add --no-cache ca-certificates libcap \
-    && addgroup -g 1000 sbc \
-    && adduser -D -u 1000 -G sbc -s /bin/sh sbc
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libcap2-bin \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && groupadd --gid 1000 sbc \
+    && useradd --uid 1000 --gid sbc --shell /usr/sbin/nologin --no-create-home sbc
 
 COPY --from=builder /tmp/sbc-trunk-agent /usr/local/bin/sbc-trunk-agent
 
 # CAP_NET_BIND_SERVICE: the registrar/monitor bind local UDP :5060 when
 # SBC_TRUNK_BIND_IP is set, so the carrier's NAT mapping matches.
+# libcap2-bin is only needed for setcap; it is purged in the same layer.
 RUN chown sbc:sbc /usr/local/bin/sbc-trunk-agent \
-    && setcap 'cap_net_bind_service=+ep' /usr/local/bin/sbc-trunk-agent
+    && setcap 'cap_net_bind_service=+ep' /usr/local/bin/sbc-trunk-agent \
+    && apt-get purge -y --auto-remove libcap2-bin \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
 
 USER sbc
 
