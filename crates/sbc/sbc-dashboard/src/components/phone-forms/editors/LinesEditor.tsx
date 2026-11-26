@@ -11,7 +11,7 @@ import SpaceBetween from '@cloudscape-design/components/space-between';
 import Toggle from '@cloudscape-design/components/toggle';
 
 import type { CallForward, PhoneLine } from '../../../lib/phoneModel';
-import { emptyCallForward, emptyLine } from '../../../lib/phoneModel';
+import { emptyCallForward, emptyLine, REDACTED_SECRET } from '../../../lib/phoneModel';
 
 const TRANSPORT_OPTIONS = [
   { value: 'udp', label: 'UDP' },
@@ -51,7 +51,13 @@ export function LinesEditor({
   const removeLine = (idx: number) => {
     const next = items
       .filter((_, i) => i !== idx)
-      .map((it, i) => ({ ...it, index: i + 1 }));
+      .map((it, i) => {
+        if (it.index === i + 1) return it;
+        // A renumbered line no longer matches its stored password, so the
+        // server would clear a kept marker anyway; make that visible here.
+        const sip_password = it.sip_password === REDACTED_SECRET ? '' : it.sip_password;
+        return { ...it, index: i + 1, sip_password };
+      });
     onChange(next);
   };
 
@@ -102,7 +108,14 @@ export function LinesEditor({
                     onChange={({ detail }) => updateLine(idx, { sip_username: detail.value })}
                   />
                 </FormField>
-                <FormField label="SIP password">
+                <FormField
+                  label="SIP password"
+                  constraintText={
+                    line.sip_password === REDACTED_SECRET
+                      ? 'Stored. Leave unchanged to keep it; re-enter it if the MAC address, username, server, port or transport changes.'
+                      : undefined
+                  }
+                >
                   <Input
                     type="password"
                     value={line.sip_password}
