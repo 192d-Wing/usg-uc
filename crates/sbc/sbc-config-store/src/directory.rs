@@ -63,13 +63,15 @@ impl PostgresDirectoryNumberStore {
     /// `ConfigStoreError::Serialization` if the `extra` map cannot be
     /// JSON-encoded, or `ConfigStoreError::Invalid` if a field fails
     /// [`crate::validate::validate_directory_number`].
-    pub async fn upsert(&self, dn: &DirectoryNumber) -> ConfigStoreResult<()> {
+    /// `actor` is the writer's principal; the row's `updated_by` becomes
+    /// `local:<actor>` ([`crate::origin::local_updated_by`]).
+    pub async fn upsert(&self, dn: &DirectoryNumber, actor: &str) -> ConfigStoreResult<()> {
         // NIST 800-53 Rev5: SI-10 -- reject malformed fields before any write.
         crate::validate::validate_directory_number(dn)?;
         let extra_json = serde_json::to_value(&dn.extra)?;
         sqlx::query(
-            "INSERT INTO directory_numbers (did, sip_user, partition, description, extra)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO directory_numbers (did, sip_user, partition, description, extra, updated_by)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (did) DO UPDATE SET
                  sip_user    = EXCLUDED.sip_user,
                  partition   = EXCLUDED.partition,
@@ -77,7 +79,7 @@ impl PostgresDirectoryNumberStore {
                  extra       = EXCLUDED.extra,
                  deleted     = FALSE,
                  revision    = 0,
-                 updated_by  = 'local',
+                 updated_by  = EXCLUDED.updated_by,
                  updated_at  = NOW()",
         )
         .bind(&dn.did)
@@ -85,6 +87,7 @@ impl PostgresDirectoryNumberStore {
         .bind(&dn.partition)
         .bind(&dn.description)
         .bind(&extra_json)
+        .bind(crate::origin::local_updated_by(actor))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -97,13 +100,16 @@ impl PostgresDirectoryNumberStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors, or
     /// `ConfigStoreError::NotFound` if no live row matched.
-    pub async fn delete(&self, did: &str) -> ConfigStoreResult<()> {
+    /// `actor` is the writer's principal; the row's `updated_by` becomes
+    /// `local:<actor>` ([`crate::origin::local_updated_by`]).
+    pub async fn delete(&self, did: &str, actor: &str) -> ConfigStoreResult<()> {
         let result = sqlx::query(
             "UPDATE directory_numbers
-             SET deleted = TRUE, revision = 0, updated_by = 'local', updated_at = NOW()
+             SET deleted = TRUE, revision = 0, updated_by = $2, updated_at = NOW()
              WHERE did = $1 AND NOT deleted",
         )
         .bind(did)
+        .bind(crate::origin::local_updated_by(actor))
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {

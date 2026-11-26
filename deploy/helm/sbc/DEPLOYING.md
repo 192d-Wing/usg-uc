@@ -496,6 +496,10 @@ This upgrade has breaking changes. Check each point before you upgrade.
   address may assert any client address), together with
   `networkPolicy.edgeFrom` naming those proxies (rendering fails without it
   while policies are on), so nothing else can reach the frontend.
+  Admin password logins are limited to 5 failures per client IP (IPv6: per
+  /64) and 10 in total per 15 min window, per sbc-api replica; without
+  `sbcApi.trustedProxies` all clients behind nginx share one IP bucket. A
+  lock ends with its window. OIDC and API keys are not affected.
 - **`SBC_PROVISION_SECRET`** can now come from a Secret:
   `sbcProvision.provisionSecret.existingSecret` (key
   `sbcProvision.provisionSecret.key`, default `provision-secret`).

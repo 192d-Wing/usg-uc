@@ -81,8 +81,9 @@ Key properties:
   connections would fight all of that.)
 - **The local Postgres is the distributed read capability.** No new edge
   datastore; the existing tables become a materialized copy of that site's
-  shard. Rows carry `updated_by` — `'central'` (synced) vs `'local'`
-  (edited at the edge); the apply engine never overwrites a `'local'` row.
+  shard. Rows carry `updated_by` — `'central'` (synced) vs `'local:<actor>'`
+  (edited at the edge; legacy rows `'local'`); the apply engine never
+  overwrites a local row.
 - **Site code is the security boundary.** One OIDC `config-sync` credential
   per site, its `site_code` claim pinned to one shard; a site can read and
   upload only its own rows, never another's, and never fleet templates.
@@ -261,11 +262,11 @@ pod per base.
   snapshot (whole-shard replace), then resume deltas.
 - Crash-safe and idempotent: re-applying a delta is harmless (upserts +
   tombstones keyed by row id); applied rows are stamped
-  `updated_by = 'central'`, and the apply engine **never overwrites a
-  `updated_by = 'local'` row** (`... WHERE updated_by <> 'local'` on every
-  upsert/tombstone, and snapshot reload deletes only central-origin rows).
+  `updated_by = 'central'`, and the apply engine **never overwrites a local
+  row** (`updated_by = 'local'` or `LIKE 'local:%'`; every upsert/tombstone
+  is guarded, and snapshot reload deletes only central-origin rows).
 - **DDIL reconcile (each cycle, before pulling):** collect local edits
-  (`updated_by = 'local'` rows — live → upsert, tombstoned → delete), push
+  (local rows — live → upsert, tombstoned → delete), push
   them to `/upload`; on adoption, re-stamp them `'central'` with the
   returned epoch so they converge and aren't re-uploaded. Pulling only
   *after* the upload means a delta/snapshot can't clobber an edit central
@@ -380,10 +381,13 @@ fleet if applicable).
 How it works (no separate "override mode" — it's the normal write path):
 
 - The site writes to its local Postgres through the existing
-  `sbc-api-server`. Site-local writes are stamped `updated_by = 'local'`,
-  `revision = 0`, distinguishing them from synced rows (`'central'`).
-- The sync agent's apply engine **never overwrites a `'local'` row**: every
-  delta upsert/tombstone carries `... WHERE updated_by <> 'local'`, and a
+  `sbc-api-server`. Site-local writes are stamped
+  `updated_by = 'local:<actor>'` (the writer's principal; legacy rows
+  `'local'`), `revision = 0`, distinguishing them from synced rows
+  (`'central'`). sbc-config-sync must be at the same release as sbc-api or
+  later, because an older agent treats `'local:<actor>'` rows as central.
+- The sync agent's apply engine **never overwrites a local row**: every
+  delta upsert/tombstone is guarded on the local-origin marker, and a
   snapshot reload deletes only central-origin rows. So central traffic for
   *other* rows still applies, but the edge's own edits survive.
 - Each reconcile cycle, **before** pulling, the agent collects the

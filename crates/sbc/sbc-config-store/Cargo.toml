@@ -24,6 +24,8 @@ uuid = { version = "1", features = ["v4"] }
 # than redefining 30+ fields. Pulling it in keeps PostgresPhoneStore's
 # upsert/get signatures match what handlers already construct.
 uc-phone-mgmt.workspace = true
+# Shared actor-id cap with the audit records (`mgmt_audit::actor_field`).
+sbc-http-util = { workspace = true }
 
 [dev-dependencies]
 # Integration tests (tests/schema_pg.rs) drive the async migrator
