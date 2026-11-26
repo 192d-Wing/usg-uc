@@ -391,12 +391,29 @@ async fn https_server_with(
     response: Vec<u8>,
     server_provider: rustls::crypto::CryptoProvider,
 ) -> (std::net::SocketAddr, Arc<rustls::ClientConfig>) {
+    https_server_pki(
+        response,
+        server_provider,
+        &rcgen::PKCS_ECDSA_P384_SHA384,
+        &rcgen::PKCS_ECDSA_P384_SHA384,
+    )
+    .await
+}
+
+/// As [`https_server_with`], with the CA and server key algorithms chosen
+/// by the test.
+async fn https_server_pki(
+    response: Vec<u8>,
+    server_provider: rustls::crypto::CryptoProvider,
+    ca_alg: &'static rcgen::SignatureAlgorithm,
+    srv_alg: &'static rcgen::SignatureAlgorithm,
+) -> (std::net::SocketAddr, Arc<rustls::ClientConfig>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let ca_key = KeyPair::generate_for(ca_alg).unwrap();
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca_cert = ca.self_signed(&ca_key).unwrap();
-    let srv_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let srv_key = KeyPair::generate_for(srv_alg).unwrap();
     let srv = CertificateParams::new(vec!["cert.example.com".to_string()])
         .unwrap()
         .signed_by(&srv_key, &ca_cert, &ca_key)
@@ -461,13 +478,56 @@ async fn x5u_tls_is_cnsa_only() {
         ..rustls::crypto::aws_lc_rs::default_provider()
     };
     let (addr, tls) = https_server_with(ok, weak).await;
-    assert!(matches!(
+    // The server answers `handshake_failure`; the client cannot tell a
+    // suite/group mismatch from a missing P-384 key.
+    assert_eq!(
         fetcher(addr, tls, 16384)
             .fetch(&url, Duration::from_secs(2))
             .await
             .unwrap_err(),
-        FetchError::Transport(_)
-    ));
+        FetchError::Transport("tls-peer-refused")
+    );
+}
+
+/// SR-14: a repository chain the CNSA verifier refuses is reported as
+/// `tls-cert-policy`, not as a generic transport failure.
+#[tokio::test]
+async fn x5u_tls_chain_refusal_is_labelled_cert_policy() {
+    let url = X5uUrl::parse("https://cert.example.com/sti.pem", &[]).unwrap();
+    let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
+    let default = rustls::crypto::aws_lc_rs::default_provider;
+    // P-384 server key, issued by a P-256 or an RSA CA (web PKI style).
+    for ca_alg in [&rcgen::PKCS_ECDSA_P256_SHA256, &rcgen::PKCS_RSA_SHA256] {
+        let (addr, tls) = https_server_pki(
+            ok.clone(),
+            default(),
+            ca_alg,
+            &rcgen::PKCS_ECDSA_P384_SHA384,
+        )
+        .await;
+        let err = fetcher(addr, tls, 16384)
+            .fetch(&url, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(err, FetchError::TlsCertPolicy);
+        assert_eq!(err.label(), "tls-cert-policy");
+        assert_eq!(err.reason(), FailureReason::CertFetchFailed);
+    }
+    // P-256 server key from a P-384 CA: the server has no key for the only
+    // offered scheme and answers `handshake_failure`.
+    let (addr, tls) = https_server_pki(
+        ok,
+        default(),
+        &rcgen::PKCS_ECDSA_P384_SHA384,
+        &rcgen::PKCS_ECDSA_P256_SHA256,
+    )
+    .await;
+    let err = fetcher(addr, tls, 16384)
+        .fetch(&url, Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert_eq!(err, FetchError::Transport("tls-peer-refused"));
+    assert_eq!(err.reason(), FailureReason::CertFetchFailed);
 }
 
 fn fetcher(addr: std::net::SocketAddr, tls: Arc<rustls::ClientConfig>, max: usize) -> HttpsFetcher {
