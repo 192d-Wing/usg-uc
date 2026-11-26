@@ -9,6 +9,108 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, sbc chart: dashboard, login and client-config edge TLS, SR-53, POA&M-436, 437)
+
+Only the sbc Helm chart changes. No crate, image, config file, REST/gRPC API,
+audit event or CDR field changes, so SIEM and billing parsers are not affected.
+The soft client is not affected. Some installs that rendered before now fail
+to render until a value is supplied. Tested with helm v4.3.2 (`helm lint`,
+`helm template` and the `helm_render` tests). It was not tested against a
+live Traefik. The full upgrade text is in `deploy/helm/sbc/DEPLOYING.md` §3
+and §8 ("Upgrading to the edge TLS release (SR-53)").
+
+Before, the default render served the dashboard, `/api/v1/auth/login` and
+`/v1/client-config` (bearer token) on every Traefik entrypoint, including
+cleartext `web`. With no edge, the frontend was a cleartext port-80
+LoadBalancer.
+
+**Upgrade checklist for operators** (do these before `helm upgrade`):
+
+1. **A TLS secret is required.** (SC-8, SC-8(1), IA-5(1)(c), CM-6) With
+   `sbcClientConfig.enabled` (the default), rendering fails unless
+   `sbcClientConfig.ingressTlsSecretName` names a `kubernetes.io/tls` Secret
+   for the ingress host. This also applies with `sbcFrontend.enabled: false`.
+   Issue an ECDSA P-384 leaf signed with SHA-384.
+2. **There is no cleartext dashboard LoadBalancer any more.** With neither
+   `gateway.enabled` nor `sbcClientConfig.enabled` set, rendering fails.
+   Enable one of the two edges.
+3. **New `edge.*` values.** The defaults are `edge.insecureLabHttp: false`
+   and these `edge.traefik.*` keys: `entryPoint: websecure`,
+   `httpEntryPoint: web`, `httpRedirect: true`, `createTlsOption: true`,
+   `tlsOption: ""`, `allowHttpProvisioning: false`,
+   `hsts.maxAgeSeconds: 31536000` and `hsts.includeSubdomains: true`.
+   - The four flags must be YAML booleans. A quoted `"false"` fails the
+     render, so check `--set-string`, Argo CD `forceString` and Flux
+     `valuesFrom`.
+   - `hsts.maxAgeSeconds` must be at least 31536000.
+   - `entryPoint` and `httpEntryPoint` must differ while the redirect or the
+     provisioning router is on.
+   - `edge.insecureLabHttp: true` restores the old cleartext behaviour and
+     prints a warning. Use it in labs only.
+4. **Traefik v3 with the `kubernetescrd` provider is required.** The chart
+   now ships `traefik.io/v1alpha1` objects: TLSOption `sbc-<site-id>-cnsa`
+   and the Middlewares `-hsts`, `-https-redirect` and, when enabled,
+   `-provision-marker`. Without these CRDs, `helm install` fails with `no
+   matches for kind "TLSOption"`.
+   - The Ingress router is bound only to `edge.traefik.entryPoint`, with
+     `router.tls`, the TLSOption and HSTS (one year, `includeSubDomains`, no
+     preload).
+   - Plain HTTP on `httpEntryPoint` gets a 301 from a redirect-only Ingress,
+     `sbc-<site-id>-client-config-redirect`. With `httpRedirect: false` it
+     gets a 404 instead.
+   - If your entrypoints are not named `websecure` and `web`, set the names.
+     A wrong name makes the dashboard unreachable. It does not fall back to
+     HTTP.
+5. **The edge TLS profile is TLS 1.3 only, with P-384 only and `sniStrict`.**
+   (SC-13, SC-23) Clients that offer only TLS 1.2, X25519 or a hybrid ML-KEM
+   group fail the handshake. Go cannot restrict TLS 1.3 suites, so
+   AES-128-GCM and ChaCha20 can still be negotiated (POA&M-436).
+   - If the cluster has its own TLS policy, set `createTlsOption: false`
+     and set `tlsOption: "<ns>-<name>@kubernetescrd"`. An empty ref fails,
+     and so does a ref to the cluster `default` TLSOption. The profile then
+     depends on the operator's object.
+6. **Set the cluster `default` TLSOption once per cluster.** Handshakes
+   without SNI, or with an unknown SNI, use Traefik's `default` TLSOption
+   and not the chart's. Set it to TLS 1.3, `CurveP384` and `sniStrict`.
+   DEPLOYING §3 has an example manifest.
+7. **The Gateway certificate is re-issued as ECDSA P-384** (only with
+   `gateway.enabled`). The cert-manager Certificate now requests
+   `privateKey: {algorithm: ECDSA, size: 384, rotationPolicy: Always}`, so
+   an existing RSA certificate is re-issued on upgrade. Use an issuer that
+   signs with SHA-384, and update any clients that pin the old key. The
+   Gateway API has no TLS version or suite control (POA&M-437).
+8. **Phones that provision over plain HTTP** now get a 301 to https. Point
+   them at `https://`. For phones that cannot use HTTPS, the opt-in legacy
+   exception `edge.traefik.allowHttpProvisioning: true` (requires
+   `sbcFrontend.enabled`) adds a `/provision/`-only HTTP router,
+   `sbc-<site-id>-provision-http`. A marker header makes the frontend nginx
+   answer 403 to anything outside `/provision/`.
+   - **Credential exposure while it is on:** the static per-device
+     `?token=` (POA&M-120) and the provisioning documents, which hold the
+     phone's SIP digest password and any LDAP bind password, cross the
+     network in cleartext. A captured token can be replayed (POA&M-437).
+     Use it only on an isolated phone VLAN, for as short a time as
+     possible.
+   - **After turning it off,** rotate `SBC_PROVISION_SECRET` (re-mint the
+     tokens with `sbc-provision-server --mint-token`), and rotate the SIP
+     and LDAP credentials of every phone that provisioned over HTTP.
+
+The bundled Postgres `sslmode: disable` is unchanged (POA&M-384).
+
+### Changed (SBC, CI: Helm chart job)
+
+- **CI:** new `helm` job ("Helm charts"). It runs `helm lint` on both
+  charts and `cargo test -p sbc-integration-tests --lib helm_render --
+  --ignored`, and it is required by `ci-ok`. It is gated by a new `changes`
+  output, `sbc`, which is true on push, on shared changes, or when the
+  `sbc` filter fires (that filter already covers `deploy/helm/**`).
+- **Supply chain (SI-7, SR-3):** helm v4.3.2 is downloaded from the official
+  `get.helm.sh` tarball and checked against a pinned sha256. No third-party
+  action is added. The job token is `contents: read`. The existing actions
+  are reused at their pinned SHAs, and rust-cache runs with
+  `save-if: false`. No Rust dependency changes, and `Cargo.lock` is
+  unchanged.
+
 ### Security (SBC, stream framing and stream rate limiting, POA&M-445, 446, 447)
 
 - **Stream framing is incremental.** (SC-5, SI-10) Framing work is linear in

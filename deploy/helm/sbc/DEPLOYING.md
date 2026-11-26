@@ -105,7 +105,33 @@ externalDns: { enabled: false }
   - LoadBalancer pool CIDR + the SBC SIP/API VIP within it
   - Upstream router IP + ASN, cluster ASN
 - **Out-of-band TLS certs** if terminating SIP-TLS / HTTPS with your own PKI
-  (see §6): `kubernetes.io/tls` Secrets created before install.
+  (see §6): `kubernetes.io/tls` Secrets created before install. The
+  dashboard ingress cert (`sbcClientConfig.ingressTlsSecretName`) is
+  required: the chart does not render without it.
+- **Traefik v3** as the ingress controller (the k3s-bundled one), with the
+  `kubernetescrd` provider enabled (it serves the `traefik.io/v1alpha1`
+  `TLSOption` and `Middleware` CRDs), a TLS entrypoint (`websecure`) and an
+  HTTP entrypoint (`web`). Other entrypoint names go in `edge.traefik.*`.
+  Without the CRDs, `helm install` fails with `no matches for kind
+  "TLSOption"`; see "Upgrading to the edge TLS release" in §8.
+- **The cluster default TLSOption set to the same profile.** Handshakes
+  without SNI, or with an SNI that matches no router, use Traefik's
+  `default` TLSOption (TLS 1.2 and Traefik's default suites unless changed),
+  not the chart's. Create it once per cluster (only one TLSOption named
+  `default` may exist), for example:
+
+  ```yaml
+  apiVersion: traefik.io/v1alpha1
+  kind: TLSOption
+  metadata:
+    name: default
+    namespace: kube-system        # the namespace Traefik runs in
+  spec:
+    minVersion: VersionTLS13
+    maxVersion: VersionTLS13
+    curvePreferences: [CurveP384]
+    sniStrict: true
+  ```
 - One-time per cluster: **ExternalDNS** installed (Model A, if using FQDN
   publish) — see [BOOTSTRAP.md § Step 3](BOOTSTRAP.md).
 
@@ -151,6 +177,9 @@ sbcPostgres:
   enabled: true
   password: "CHANGE-ME-STRONG"           # REQUIRED for production, or use existingSecret
 
+sbcClientConfig:
+  ingressTlsSecretName: sbc-kfk-001-ingress-tls   # REQUIRED: kubernetes.io/tls Secret (see §6)
+
 sbcDaemon:
   config:
     max_calls: 5000
@@ -176,6 +205,7 @@ sbcDaemon:
 | `sbcDaemon.sipTls` | SIP-over-TLS | `secretName` of a `kubernetes.io/tls` Secret covering the registrar domain; empty = UDP/TCP only |
 | `sbcDaemon.oidc` | REGISTER authz | RFC 8898 bearer-token REGISTER; requires an IdP (see `sbcClientConfig.oidc`) |
 | `gateway` | Edge HTTPS | Opt-in Gateway API + cert-manager termination; needs the Gateway API CRDs + cert-manager |
+| `edge` | Dashboard / login / client-config TLS on the Traefik Ingress | The router is pinned to `edge.traefik.entryPoint` (`websecure`) with the chart's `sbc-<site-id>-cnsa` TLSOption (TLS 1.3, P-384) and an HSTS middleware. `httpRedirect` (default `true`) adds a redirect-only router on `httpEntryPoint` (`web`). `createTlsOption: false` + `tlsOption: "<ns>-<name>@kubernetescrd"` uses your own TLSOption. `allowHttpProvisioning` (default `false`) serves `/provision/` only over HTTP for legacy phones. `insecureLabHttp` is lab only. See "Upgrading to the edge TLS release" in §8 |
 | `sbcClientConfig.oidc` / `extraCaCert` | Soft-client OIDC | Set `issuer`/`clientId`/`audience`; supply `extraCaCert` when the IdP uses a private CA |
 
 Store the file at `deploy/helm/sites/sbc/<site-id>/values.yaml` (see
@@ -293,7 +323,7 @@ before install:
 | Secret referenced by | Covers | Values key |
 |----------------------|--------|-----------|
 | SIP-over-TLS server cert | registrar domain (`sbcClientConfig.registrarDomain`) | `sbcDaemon.sipTls.secretName` |
-| Client-config ingress cert | `sbcClientConfig.ingressHost` (defaults to `sbc.<fqdn_base>`) | `sbcClientConfig.ingressTlsSecretName` |
+| Dashboard / client-config ingress cert (**required**; ECDSA P-384 key, SHA-384 signature for CNSA 2.0) | `sbcClientConfig.ingressHost` (defaults to `sbc.<fqdn_base>`) | `sbcClientConfig.ingressTlsSecretName` |
 
 If the IdP uses a private CA, set `sbcClientConfig.extraCaCert` to the PEM block
 so the pods trust its OIDC metadata/JWKS. Alternatively, enable `gateway` to let
@@ -481,6 +511,98 @@ This upgrade has breaking changes. Check each point before you upgrade.
   policies off. On CNIs that enforce policy on host traffic, set
   `networkPolicy.probeFrom` to the node CIDR. Needs Kubernetes >= 1.25.
 - **sbc-media (mediaSplit) binds its controller to 127.0.0.1:9096**; a
+### Upgrading to the edge TLS release (SR-53)
+
+This upgrade has breaking changes. The dashboard, `/api/v1/auth/login` and
+`/v1/client-config` are now served over TLS only. Check each point before you
+upgrade.
+
+- **A TLS secret is required.** With `sbcClientConfig.enabled` (the default),
+  the chart fails to render unless `sbcClientConfig.ingressTlsSecretName`
+  names a `kubernetes.io/tls` Secret for the ingress host. Issue an ECDSA
+  P-384 leaf signed with SHA-384 (§6). This applies even with
+  `sbcFrontend.enabled: false`, because the client-config route carries
+  bearer tokens.
+- **No cleartext LoadBalancer for the dashboard.** With neither
+  `gateway.enabled` nor `sbcClientConfig.enabled`, the frontend used to be a
+  LoadBalancer on port 80. That now fails to render. Enable one of the two
+  edges.
+- **Traefik router.** The Ingress is bound to `edge.traefik.entryPoint`
+  (`websecure`) only, with `router.tls`, the TLSOption
+  `<namespace>-sbc-<site-id>-cnsa@kubernetescrd` and the HSTS middleware
+  `<namespace>-sbc-<site-id>-hsts@kubernetescrd` (one year, `includeSubDomains`,
+  no preload). Plain HTTP on `edge.traefik.httpEntryPoint` (`web`) gets a
+  301 to https from a redirect-only router (`sbc-<site-id>-client-config-redirect`).
+  With `edge.traefik.httpRedirect: false` there is no router on `web` for
+  this host, and Traefik answers 404.
+- **TLSOption `sbc-<site-id>-cnsa`.** It allows TLS 1.3 only, with the P-384
+  group only and `sniStrict`. Clients that offer only X25519 or a hybrid
+  ML-KEM group fail the handshake, as do TLS 1.2 clients. Go's TLS stack
+  does not allow TLS 1.3 cipher suites to be restricted, so a client that
+  prefers AES-128-GCM or ChaCha20 still gets it (POA&M-436). `sniStrict`
+  applies to handshakes that reach this TLSOption. Handshakes without SNI
+  use the cluster's `default` TLSOption; set it to the same profile (§3).
+- **Clusters with a central TLS policy**:
+  set `edge.traefik.createTlsOption: false` and
+  `edge.traefik.tlsOption: "<namespace>-<name>@kubernetescrd"` naming an
+  equivalent TLSOption. The chart fails if the ref is empty or names the
+  cluster `default` TLSOption (`default`, `default@<provider>`). The edge
+  TLS profile then depends on that object (operator-asserted). The HSTS and redirect middlewares are
+  still `traefik.io/v1alpha1` objects, so the `kubernetescrd` provider is
+  still required.
+- **Value checks.** The four `edge` flags (`insecureLabHttp`,
+  `traefik.httpRedirect`, `traefik.createTlsOption`,
+  `traefik.allowHttpProvisioning`) must be YAML booleans: a quoted `"false"`
+  fails the render (it would otherwise count as true). Tools that force
+  strings (`--set-string`, Argo CD `forceString`, Flux `valuesFrom`
+  targetPath) must pass these as booleans. `edge.traefik.hsts.maxAgeSeconds`
+  must be at least 31536000. `entryPoint` and `httpEntryPoint` must differ
+  while the redirect or provisioning router is on.
+- **Entrypoint names.** If your Traefik entrypoints are not called
+  `websecure` and `web`, set `edge.traefik.entryPoint` and
+  `edge.traefik.httpEntryPoint`. A wrong name leaves the dashboard
+  unreachable: it does not fall back to HTTP.
+- **Phones that provision over plain HTTP.** `http://sbc.<site>/provision/...`
+  now gets a 301 to https. Phones that cannot follow it to HTTPS stop
+  provisioning. Point them at the `https://` URL. As a legacy exception,
+  `edge.traefik.allowHttpProvisioning: true` adds an HTTP router for
+  `/provision/` only (`sbc-<site-id>-provision-http`, through the frontend
+  nginx; requires `sbcFrontend.enabled`). A marker header set by that
+  router makes the frontend nginx answer 403 for anything outside
+  `/provision/`, after nginx's own path normalisation, so the dashboard and
+  `/api` cannot be reached over HTTP whatever the Traefik version. On that
+  router, the device's provisioning token (`?token=`, static per device,
+  POA&M-120) and the provisioning documents, which carry the phone's SIP
+  digest password and any LDAP bind password, cross the network in
+  cleartext. A captured token can be replayed to fetch the document again
+  (POA&M-437). Use it only on an isolated phone VLAN, for as short a time
+  as possible. After turning it off, rotate `SBC_PROVISION_SECRET`
+  (re-mint every phone's token with `sbc-provision-server --mint-token`)
+  and the SIP credentials (and LDAP bind passwords) of every phone that
+  provisioned over HTTP.
+- **Lab only: `edge.insecureLabHttp: true`.** This restores the old
+  behaviour: no TLS requirement, no entrypoint pin, no TLSOption, no HSTS,
+  and a cleartext frontend LoadBalancer when there is no edge. Passwords and
+  tokens then cross the network unencrypted. `helm install`/`upgrade`
+  prints a warning. Never set it outside a lab.
+- **Gateway path** (`gateway.enabled`). HTTPS with a cert-manager
+  certificate and an HTTP to HTTPS redirect, as before. The Certificate now
+  requests an ECDSA P-384 key with `rotationPolicy: Always`, so cert-manager
+  re-issues an existing RSA certificate on upgrade. Use an issuer that signs
+  with SHA-384. The Gateway API has no TLS version or suite control
+  (POA&M-437).
+- **Bundled Postgres** still defaults to `sslmode: disable` (POA&M-384). That
+  is separate from this change.
+
+Check after the upgrade:
+
+```bash
+kubectl -n sbc-system get tlsoption,middleware.traefik.io -l app.kubernetes.io/instance=sbc-<site-id>
+curl -sI http://sbc.<fqdn_base>/ | head -1                 # 301 (or 404 with httpRedirect: false)
+curl -sI https://sbc.<fqdn_base>/ | grep -i strict-transport-security
+openssl s_client -connect sbc.<fqdn_base>:443 -servername sbc.<fqdn_base> -tls1_2 </dev/null   # handshake failure
+```
+
   non-loopback `SBC_MEDIA_GRPC_LISTEN` exits with code 2 unless mTLS
   (`SBC_MEDIA_GRPC_TLS_*` plus `SBC_MEDIA_GRPC_ALLOWED_CLIENT_NAMES`) is
   configured. The chart's co-located pod keeps loopback.

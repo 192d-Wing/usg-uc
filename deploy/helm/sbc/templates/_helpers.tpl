@@ -95,6 +95,57 @@
 {{- printf "%s://%s-grpc.%s.svc.cluster.local:9091" (ternary "https" "http" .Values.sbcDaemon.grpcMtls.enabled) (include "sbc.fullname" .) .Release.Namespace -}}
 {{- end }}
 
+{{/* SR-53 edge TLS. Hostname of the Traefik Ingress (dashboard, login,
+     client-config). */}}
+{{- define "sbc.ingressHost" -}}
+{{- .Values.sbcClientConfig.ingressHost | default (printf "sbc.%s" .Values.site.fqdn_base) -}}
+{{- end }}
+
+{{/* Traefik kubernetescrd ref of a chart-owned CRD object
+     ("<namespace>-<fullname>-<suffix>@kubernetescrd"). */}}
+{{- define "sbc.edgeCrdRef" -}}
+{{- printf "%s-%s-%s@kubernetescrd" .ctx.Release.Namespace (include "sbc.fullname" .ctx) .suffix -}}
+{{- end }}
+
+{{/* TLSOption for the Ingress router: the chart's -cnsa object, or the
+     operator's edge.traefik.tlsOption when createTlsOption=false (the
+     empty-ref check is in 22-sbc-ingress.yaml). */}}
+{{- define "sbc.edgeTlsOptionRef" -}}
+{{- if .Values.edge.traefik.createTlsOption -}}
+{{- include "sbc.edgeCrdRef" (dict "ctx" . "suffix" "cnsa") -}}
+{{- else -}}
+{{- .Values.edge.traefik.tlsOption -}}
+{{- end -}}
+{{- end }}
+
+{{/* HSTS headers middleware for the Ingress router. */}}
+{{- define "sbc.edgeHstsRef" -}}
+{{- include "sbc.edgeCrdRef" (dict "ctx" . "suffix" "hsts") -}}
+{{- end }}
+
+{{/* Edge flag type checks, included from 16-sbc-frontend.yaml and
+     22-sbc-ingress.yaml before either reads the flags. A string "false"
+     is truthy in templates and would turn cleartext modes on, so only
+     booleans are accepted (NIST 800-53 Rev5: CM-6, SC-8). */}}
+{{- define "sbc.edgePreflight" -}}
+{{- $flags := dict
+    "edge.insecureLabHttp" .Values.edge.insecureLabHttp
+    "edge.traefik.allowHttpProvisioning" .Values.edge.traefik.allowHttpProvisioning
+    "edge.traefik.httpRedirect" .Values.edge.traefik.httpRedirect
+    "edge.traefik.createTlsOption" .Values.edge.traefik.createTlsOption -}}
+{{- range $key := keys $flags | sortAlpha -}}
+{{- if not (kindIs "bool" (get $flags $key)) -}}
+{{- fail (printf "%s must be a boolean (true or false), got %q; a string value is not accepted" $key (toString (get $flags $key))) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/* True ("true") when the chart renders the Traefik edge TLS objects:
+     the Ingress is on and the lab flag is off. */}}
+{{- define "sbc.edgeTlsEnabled" -}}
+{{- if and .Values.sbcClientConfig.enabled (not .Values.edge.insecureLabHttp) -}}true{{- end -}}
+{{- end }}
+
 {{- define "sbc.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}

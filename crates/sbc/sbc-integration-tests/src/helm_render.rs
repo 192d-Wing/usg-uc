@@ -18,7 +18,11 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Values the sbc chart cannot render without.
-const SBC_MIN: &[&str] = &["sbcApi.ha1Key.existingSecret=x", "sbcPostgres.password=p"];
+const SBC_MIN: &[&str] = &[
+    "sbcApi.ha1Key.existingSecret=x",
+    "sbcPostgres.password=p",
+    "sbcClientConfig.ingressTlsSecretName=qa-edge-tls",
+];
 /// The extra input the daemon gRPC mTLS default needs.
 const SBC_ISSUER: &str = "sbcDaemon.grpcMtls.clusterIssuer=qa-issuer";
 /// Values the central-config chart cannot render without.
@@ -426,7 +430,8 @@ fn qa_helm_render_connection_caps() {
         ])
         .arg("-f")
         .arg(&values);
-    push_sets(&mut cmd, &[SBC_MIN[0], SBC_MIN[1], SBC_ISSUER]);
+    let sets: Vec<&str> = SBC_MIN.iter().copied().chain([SBC_ISSUER]).collect();
+    push_sets(&mut cmd, &sets);
     let res = cmd.output().expect("run helm");
     let _ = std::fs::remove_file(&values);
     assert!(
@@ -823,5 +828,587 @@ spec:
     assert_eq!(
         block_scalar(cm, "config.toml"),
         "[grpc]\nenabled = true\n\nx = 1\n"
+    );
+}
+
+// ── SR-53: dashboard / login edge TLS (Traefik) ───────────────────────
+// NIST 800-53 Rev5: SC-8, SC-8(1), SC-13, SC-23, AC-17(2), IA-5(1), CM-6, CM-7
+
+/// `helm template` with `-f <values_file>` (repo-relative) before the sets.
+fn render_values(chart: &str, values_file: &str, sets: &[&str]) -> Result<String, String> {
+    let mut cmd = Command::new("helm");
+    cmd.current_dir(repo_root())
+        .args(["template", "t", &format!("deploy/helm/{chart}")])
+        .args(["--kube-version", "1.30.0"])
+        .args(["-f", values_file]);
+    push_sets(&mut cmd, sets);
+    let out = cmd.output().expect("run helm (is it on PATH?)");
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+/// The value of the first `key: value` line (any indent), unquoted.
+fn scalar<'a>(doc: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}:");
+    doc.lines().find_map(|l| {
+        let v = l.trim_start().strip_prefix(&prefix)?;
+        Some(v.trim().trim_matches('"').trim_matches('\''))
+    })
+}
+
+/// A `metadata.annotations` value.
+fn annotation<'a>(doc: &'a str, key: &str) -> Option<&'a str> {
+    scalar(doc, key)
+}
+
+/// The list under `key:`, block (`- a`) or flow (`[a, b]`) style.
+fn yaml_list(doc: &str, key: &str) -> Vec<String> {
+    let marker = format!("{key}:");
+    let Some((i, head)) = doc
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.trim_start().starts_with(&marker))
+    else {
+        return Vec::new();
+    };
+    let unq = |s: &str| s.trim().trim_matches('"').trim_matches('\'').to_string();
+    let rest = head.trim_start()[marker.len()..].trim();
+    if let Some(flow) = rest.strip_prefix('[') {
+        return flow
+            .trim_end_matches(']')
+            .split(',')
+            .map(unq)
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    let base = head.len() - head.trim_start().len();
+    let mut items = Vec::new();
+    for l in doc.lines().skip(i + 1) {
+        if l.trim().is_empty() {
+            continue;
+        }
+        let ind = l.len() - l.trim_start().len();
+        let t = l.trim_start();
+        if ind < base || (ind == base && !t.starts_with("- ")) {
+            break;
+        }
+        if let Some(item) = t.strip_prefix("- ") {
+            items.push(unq(item));
+        }
+    }
+    items
+}
+
+/// Every `- path:` of an Ingress.
+fn ingress_paths(doc: &str) -> Vec<String> {
+    doc.lines()
+        .filter_map(|l| l.trim_start().strip_prefix("- path:"))
+        .map(|p| p.trim().trim_matches('"').to_string())
+        .collect()
+}
+
+fn has_spec_tls(doc: &str) -> bool {
+    doc.contains("\n  tls:\n")
+}
+
+const EP: &str = "traefik.ingress.kubernetes.io/router.entrypoints";
+const RTLS: &str = "traefik.ingress.kubernetes.io/router.tls";
+const RTLS_OPT: &str = "traefik.ingress.kubernetes.io/router.tls.options";
+const RMW: &str = "traefik.ingress.kubernetes.io/router.middlewares";
+const NO_SECRET: &str = "sbcClientConfig.ingressTlsSecretName=";
+const LAB: &str = "edge.insecureLabHttp=true";
+
+fn entrypoints(doc: &str) -> Vec<String> {
+    annotation(doc, EP)
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// T1: no TLS secret and no lab flag fails closed, naming the key.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_ingress_requires_tls_secret() {
+    must_fail(
+        sbc(&[SBC_ISSUER, NO_SECRET]),
+        "sbcClientConfig.ingressTlsSecretName",
+        "client-config Ingress without a TLS secret",
+    );
+    // The client-config route carries bearer tokens even without the dashboard.
+    must_fail(
+        sbc(&[SBC_ISSUER, NO_SECRET, "sbcFrontend.enabled=false"]),
+        "sbcClientConfig.ingressTlsSecretName",
+        "client-config Ingress (no frontend) without a TLS secret",
+    );
+}
+
+/// T2: the lab flag renders today's cleartext Ingress, with no TLS objects;
+/// the flag is off by default.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_ingress_insecure_lab_flag() {
+    let out = must_render(sbc(&[SBC_ISSUER, NO_SECRET, LAB]), "lab HTTP ingress");
+    let fname = fullname(&out);
+    let ing = get(&out, "Ingress", &format!("{fname}-client-config"));
+    assert!(!has_spec_tls(ing), "lab Ingress must not carry tls:\n{ing}");
+    assert!(annotation(ing, RTLS).is_none(), "{ing}");
+    assert!(annotation(ing, RTLS_OPT).is_none(), "{ing}");
+    assert!(
+        docs(&out).iter().all(|d| kind_of(d) != "TLSOption"),
+        "no TLSOption in lab mode"
+    );
+    assert!(find(&out, "Middleware", &format!("{fname}-hsts")).is_none());
+
+    // Off by default: the default render (secret set) is TLS-only.
+    let out = must_render(sbc(&[SBC_ISSUER]), "default ingress");
+    let ing = get(&out, "Ingress", &format!("{fname}-client-config"));
+    assert_eq!(annotation(ing, RTLS), Some("true"), "{ing}");
+}
+
+/// T3: the Ingress router is bound to websecure only, with the CNSA
+/// TLSOption and the HSTS middleware.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_ingress_websecure_only() {
+    let out = must_render(sbc(&[SBC_ISSUER]), "ingress with TLS secret");
+    let fname = fullname(&out);
+    let ing = get(&out, "Ingress", &format!("{fname}-client-config"));
+    assert_eq!(entrypoints(ing), vec!["websecure"], "{ing}");
+    assert_eq!(annotation(ing, RTLS), Some("true"), "{ing}");
+    assert_eq!(
+        annotation(ing, RTLS_OPT),
+        Some(format!("default-{fname}-cnsa@kubernetescrd").as_str()),
+        "{ing}"
+    );
+    let mw = annotation(ing, RMW).unwrap_or("");
+    assert!(
+        mw.split(',')
+            .any(|m| m.trim() == format!("default-{fname}-hsts@kubernetescrd")),
+        "router.middlewares must include the HSTS middleware: {mw:?}"
+    );
+    assert!(has_spec_tls(ing), "{ing}");
+    assert_eq!(scalar(ing, "secretName"), Some("qa-edge-tls"));
+    assert!(ing.contains("\"sbc.kfk-001.usg.example.com\""), "{ing}");
+}
+
+/// T4: the shipped TLSOption is TLS 1.3 only, AES-256-GCM, P-384, sniStrict.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_traefik_tlsoption_cnsa() {
+    let out = must_render(sbc(&[SBC_ISSUER]), "edge TLS objects");
+    let fname = fullname(&out);
+    let opt = get(&out, "TLSOption", &format!("{fname}-cnsa"));
+    assert_eq!(scalar(opt, "apiVersion"), Some("traefik.io/v1alpha1"));
+    assert_eq!(scalar(opt, "minVersion"), Some("VersionTLS13"));
+    assert_eq!(scalar(opt, "maxVersion"), Some("VersionTLS13"));
+    assert_eq!(
+        yaml_list(opt, "cipherSuites"),
+        vec!["TLS_AES_256_GCM_SHA384"]
+    );
+    assert_eq!(yaml_list(opt, "curvePreferences"), vec!["CurveP384"]);
+    assert_eq!(scalar(opt, "sniStrict"), Some("true"));
+    assert!(!opt.contains("VersionTLS12"), "{opt}");
+}
+
+/// T5: HSTS middleware.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_hsts_middleware() {
+    let out = must_render(sbc(&[SBC_ISSUER]), "edge TLS objects");
+    let fname = fullname(&out);
+    let mw = get(&out, "Middleware", &format!("{fname}-hsts"));
+    assert_eq!(scalar(mw, "apiVersion"), Some("traefik.io/v1alpha1"));
+    assert_eq!(scalar(mw, "stsSeconds"), Some("31536000"));
+    assert_eq!(scalar(mw, "stsIncludeSubdomains"), Some("true"));
+    assert_eq!(scalar(mw, "forceSTSHeader"), Some("true"));
+}
+
+/// T6: redirect-only router on `web`; switchable off.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_http_redirect_router() {
+    let out = must_render(sbc(&[SBC_ISSUER]), "default redirect");
+    let fname = fullname(&out);
+    let red = get(&out, "Ingress", &format!("{fname}-client-config-redirect"));
+    assert_eq!(entrypoints(red), vec!["web"], "{red}");
+    assert!(!has_spec_tls(red), "{red}");
+    assert_ne!(annotation(red, RTLS), Some("true"), "{red}");
+    let mw = annotation(red, RMW).unwrap_or("");
+    assert_eq!(
+        mw.trim(),
+        format!("default-{fname}-https-redirect@kubernetescrd"),
+        "the redirect router's only middleware is the scheme redirect"
+    );
+    let m = get(&out, "Middleware", &format!("{fname}-https-redirect"));
+    assert_eq!(scalar(m, "apiVersion"), Some("traefik.io/v1alpha1"));
+    assert_eq!(scalar(m, "scheme"), Some("https"));
+    assert_eq!(scalar(m, "permanent"), Some("true"));
+
+    let out = must_render(
+        sbc(&[SBC_ISSUER, "edge.traefik.httpRedirect=false"]),
+        "no redirect",
+    );
+    assert!(find(&out, "Ingress", &format!("{fname}-client-config-redirect")).is_none());
+    assert!(find(&out, "Middleware", &format!("{fname}-https-redirect")).is_none());
+    // The TLS router is unchanged.
+    let ing = get(&out, "Ingress", &format!("{fname}-client-config"));
+    assert_eq!(entrypoints(ing), vec!["websecure"], "{ing}");
+}
+
+/// T7: bring-your-own TLSOption.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_external_tlsoption_ref() {
+    let out = must_render(
+        sbc(&[
+            SBC_ISSUER,
+            "edge.traefik.createTlsOption=false",
+            "edge.traefik.tlsOption=infra-cnsa@kubernetescrd",
+        ]),
+        "external TLSOption",
+    );
+    let fname = fullname(&out);
+    assert!(
+        docs(&out).iter().all(|d| kind_of(d) != "TLSOption"),
+        "no chart TLSOption when createTlsOption=false"
+    );
+    let ing = get(&out, "Ingress", &format!("{fname}-client-config"));
+    assert_eq!(annotation(ing, RTLS_OPT), Some("infra-cnsa@kubernetescrd"));
+    must_fail(
+        sbc(&[SBC_ISSUER, "edge.traefik.createTlsOption=false"]),
+        "edge.traefik.tlsOption",
+        "createTlsOption=false without a tlsOption ref",
+    );
+}
+
+/// T8: a frontend LoadBalancer with no edge is cleartext; lab-only.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_frontend_loadbalancer_requires_edge() {
+    must_fail(
+        sbc(&[SBC_ISSUER, "sbcClientConfig.enabled=false"]),
+        "edge.insecureLabHttp",
+        "frontend LoadBalancer with no edge",
+    );
+    let out = must_render(
+        sbc(&[SBC_ISSUER, "sbcClientConfig.enabled=false", LAB]),
+        "lab frontend LoadBalancer",
+    );
+    let fname = fullname(&out);
+    let svc = get(&out, "Service", &format!("{fname}-frontend"));
+    assert_eq!(scalar(svc, "type"), Some("LoadBalancer"), "{svc}");
+
+    // Regression: the Gateway edge keeps working, with and without the Ingress.
+    for extra in [&[][..], &["sbcClientConfig.enabled=false"][..]] {
+        let mut sets = vec![
+            SBC_ISSUER,
+            "gateway.enabled=true",
+            "gateway.clusterIssuer=qa",
+        ];
+        sets.extend_from_slice(extra);
+        let out = must_render(sbc(&sets), "gateway edge");
+        let svc = get(&out, "Service", &format!("{fname}-frontend"));
+        assert_eq!(scalar(svc, "type"), Some("ClusterIP"), "{svc}");
+        let route = get(&out, "HTTPRoute", &format!("{fname}-redirect"));
+        assert_eq!(scalar(route, "scheme"), Some("https"), "{route}");
+    }
+}
+
+/// T9: the oopl-001 site values render with the edge TLS profile.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_site_oopl_001_edge_tls() {
+    let out = must_render(
+        render_values(
+            "sbc",
+            "deploy/helm/sites/sbc/oopl-001/values.yaml",
+            &["sbcPostgres.password=p", SBC_ISSUER],
+        ),
+        "oopl-001 site",
+    );
+    let fname = fullname(&out);
+    let ing = get(&out, "Ingress", &format!("{fname}-client-config"));
+    assert_eq!(entrypoints(ing), vec!["websecure"], "{ing}");
+    assert_eq!(scalar(ing, "secretName"), Some("sbc-oopl-001-ingress-tls"));
+    assert!(ing.contains("\"sbc.oopl.dev.mil\""), "{ing}");
+    assert_eq!(
+        annotation(ing, RTLS_OPT),
+        Some(format!("default-{fname}-cnsa@kubernetescrd").as_str())
+    );
+    let opt = get(&out, "TLSOption", &format!("{fname}-cnsa"));
+    assert_eq!(scalar(opt, "minVersion"), Some("VersionTLS13"));
+}
+
+/// T10: `helm lint` passes for both charts and the edge variants, and
+/// refuses the sbc chart without a TLS secret.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_lint_charts() {
+    let sbc_sets: Vec<&str> = SBC_MIN.iter().copied().chain([SBC_ISSUER]).collect();
+    must_render(lint("sbc", &[], &sbc_sets), "helm lint sbc");
+    let with = |extra: &[&'static str]| -> Vec<&str> {
+        sbc_sets
+            .iter()
+            .copied()
+            .chain(extra.iter().copied())
+            .collect()
+    };
+    must_render(
+        lint("sbc", &[], &with(&[NO_SECRET, LAB])),
+        "helm lint sbc lab",
+    );
+    must_render(
+        lint(
+            "sbc",
+            &[],
+            &with(&[
+                "edge.traefik.createTlsOption=false",
+                "edge.traefik.tlsOption=infra-cnsa@kubernetescrd",
+            ]),
+        ),
+        "helm lint sbc external TLSOption",
+    );
+    // `helm lint` reports a template `fail` as an INFO line and exits 0
+    // (v3.20, v4.3); T1 covers the fail-closed render. Assert the message.
+    let text = lint("sbc", &[], &with(&[NO_SECRET])).unwrap_or_else(|e| e);
+    assert!(
+        text.contains("sbcClientConfig.ingressTlsSecretName"),
+        "helm lint sbc without a TLS secret must report the fail message:\n{text}"
+    );
+    let central_sets: Vec<&str> = CENTRAL_MIN
+        .iter()
+        .copied()
+        .chain(["postgres.password=s3cret"])
+        .collect();
+    must_render(
+        lint("central-config", &[], &central_sets),
+        "helm lint central-config",
+    );
+}
+
+/// Decision Q2: plain-HTTP provisioning is an opt-in router for
+/// `/provision/` only; nothing else is served on `web`.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_http_provisioning_opt_in() {
+    let out = must_render(sbc(&[SBC_ISSUER]), "default");
+    let fname = fullname(&out);
+    let name = format!("{fname}-provision-http");
+    assert!(
+        find(&out, "Ingress", &name).is_none(),
+        "HTTP provisioning router must be off by default"
+    );
+
+    let out = must_render(
+        sbc(&[SBC_ISSUER, "edge.traefik.allowHttpProvisioning=true"]),
+        "HTTP provisioning opt-in",
+    );
+    let ing = get(&out, "Ingress", &name);
+    assert_eq!(entrypoints(ing), vec!["web"], "{ing}");
+    assert!(!has_spec_tls(ing), "{ing}");
+    assert!(annotation(ing, RTLS_OPT).is_none(), "{ing}");
+    assert!(
+        !annotation(ing, RMW).unwrap_or("").contains("-hsts@"),
+        "HSTS must not be sent over HTTP (RFC 6797 7.2)"
+    );
+    let paths = ingress_paths(ing);
+    assert_eq!(paths, vec!["/provision/"], "{ing}");
+    // Every Ingress on `web` is either the redirect or the provisioning router.
+    for d in docs(&out).into_iter().filter(|d| kind_of(d) == "Ingress") {
+        if entrypoints(d).iter().any(|e| e == "web") {
+            let n = name_of(d);
+            assert!(
+                n == name || n == format!("{fname}-client-config-redirect"),
+                "unexpected router on web: {n}"
+            );
+        }
+    }
+    // The TLS router is unchanged.
+    let main = get(&out, "Ingress", &format!("{fname}-client-config"));
+    assert_eq!(entrypoints(main), vec!["websecure"], "{main}");
+}
+
+/// The SR-53 text helpers, on a fixed document (runs without helm).
+#[test]
+fn qa_helm_render_edge_parsers_self_test() {
+    let d = "apiVersion: traefik.io/v1alpha1\nkind: TLSOption\nmetadata:\n  name: x-cnsa\n  annotations:\n    traefik.ingress.kubernetes.io/router.entrypoints: \"websecure\"\nspec:\n  minVersion: VersionTLS13\n  cipherSuites:\n    - TLS_AES_256_GCM_SHA384\n  curvePreferences: [CurveP384]\n  sniStrict: true\n  tls:\n    - hosts:\n        - a\n  rules:\n    - http:\n        paths:\n          - path: /provision/\n";
+    assert_eq!(entrypoints(d), vec!["websecure"]);
+    assert_eq!(scalar(d, "minVersion"), Some("VersionTLS13"));
+    assert_eq!(yaml_list(d, "cipherSuites"), vec!["TLS_AES_256_GCM_SHA384"]);
+    assert_eq!(yaml_list(d, "curvePreferences"), vec!["CurveP384"]);
+    assert!(has_spec_tls(d));
+    assert_eq!(ingress_paths(d), vec!["/provision/"]);
+    assert!(annotation(d, RTLS).is_none());
+}
+
+// ── SR-53 fix round 1: edge preflights and HTTP provisioning confinement ──
+// NIST 800-53 Rev5: CM-6, SC-7, SC-8, SC-13, IA-5(1)(c)
+
+/// SEC-001: a string "false"/"true" for an edge flag is truthy in templates,
+/// so each flag must be a boolean. Reached from 22 and, without the
+/// Ingress, from 16.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_edge_flags_must_be_bool() {
+    for key in [
+        "edge.insecureLabHttp",
+        "edge.traefik.allowHttpProvisioning",
+        "edge.traefik.httpRedirect",
+        "edge.traefik.createTlsOption",
+    ] {
+        for v in ["false", "true"] {
+            let set = format!("json:{key}=\"{v}\"");
+            must_fail(
+                sbc(&[SBC_ISSUER, &set]),
+                key,
+                &format!("string {key}={v:?}"),
+            );
+        }
+    }
+    // Frontend path (no Ingress): the check runs from 16-sbc-frontend.yaml.
+    must_fail(
+        sbc(&[
+            SBC_ISSUER,
+            "sbcClientConfig.enabled=false",
+            "gateway.enabled=true",
+            "gateway.clusterIssuer=qa",
+            "json:edge.insecureLabHttp=\"false\"",
+        ]),
+        "edge.insecureLabHttp",
+        "string lab flag on the Gateway path",
+    );
+}
+
+/// NIST-005: HSTS max-age has a one-year floor.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_hsts_max_age_floor() {
+    must_fail(
+        sbc(&[SBC_ISSUER, "edge.traefik.hsts.maxAgeSeconds=86400"]),
+        "edge.traefik.hsts.maxAgeSeconds",
+        "HSTS max-age below one year",
+    );
+    let out = must_render(
+        sbc(&[SBC_ISSUER, "edge.traefik.hsts.maxAgeSeconds=63072000"]),
+        "HSTS two years",
+    );
+    let fname = fullname(&out);
+    let mw = get(&out, "Middleware", &format!("{fname}-hsts"));
+    assert_eq!(scalar(mw, "stsSeconds"), Some("63072000"), "{mw}");
+}
+
+/// SEC-004 / NIST-009: the TLS router and the cleartext routers cannot
+/// share an entrypoint.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_edge_entrypoint_collision() {
+    must_fail(
+        sbc(&[SBC_ISSUER, "edge.traefik.entryPoint=web"]),
+        "edge.traefik.entryPoint",
+        "entryPoint == httpEntryPoint with the redirect router",
+    );
+    must_fail(
+        sbc(&[
+            SBC_ISSUER,
+            "edge.traefik.entryPoint=web",
+            "edge.traefik.httpRedirect=false",
+            "edge.traefik.allowHttpProvisioning=true",
+        ]),
+        "edge.traefik.entryPoint",
+        "entryPoint == httpEntryPoint with the provisioning router",
+    );
+    let out = must_render(
+        sbc(&[
+            SBC_ISSUER,
+            "edge.traefik.entryPoint=web",
+            "edge.traefik.httpRedirect=false",
+        ]),
+        "no cleartext router",
+    );
+    let fname = fullname(&out);
+    let ing = get(&out, "Ingress", &format!("{fname}-client-config"));
+    assert_eq!(annotation(ing, RTLS), Some("true"), "{ing}");
+}
+
+/// SEC-004 / NIST-004: Traefik's cluster default TLSOption is not a
+/// dedicated edge policy.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_tlsoption_default_rejected() {
+    for r in ["default", "default@internal", "default@kubernetescrd"] {
+        let set = format!("edge.traefik.tlsOption={r}");
+        must_fail(
+            sbc(&[SBC_ISSUER, "edge.traefik.createTlsOption=false", &set]),
+            "edge.traefik.tlsOption",
+            &format!("tlsOption {r}"),
+        );
+    }
+}
+
+/// SEC-003: the HTTP provisioning router tags its requests, the TLS router
+/// clears the tag, and the frontend nginx refuses tagged requests outside
+/// /provision/.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_http_provisioning_marker() {
+    let out = must_render(
+        sbc(&[SBC_ISSUER, "edge.traefik.allowHttpProvisioning=true"]),
+        "HTTP provisioning opt-in",
+    );
+    let fname = fullname(&out);
+    let ing = get(&out, "Ingress", &format!("{fname}-provision-http"));
+    assert_eq!(
+        annotation(ing, RMW),
+        Some(format!("default-{fname}-provision-marker@kubernetescrd").as_str()),
+        "{ing}"
+    );
+    let marker = get(&out, "Middleware", &format!("{fname}-provision-marker"));
+    assert_eq!(scalar(marker, "apiVersion"), Some("traefik.io/v1alpha1"));
+    assert_eq!(scalar(marker, "X-Sbc-Edge-Route"), Some("provision-http"));
+    let hsts = get(&out, "Middleware", &format!("{fname}-hsts"));
+    assert_eq!(scalar(hsts, "X-Sbc-Edge-Route"), Some(""), "{hsts}");
+    let nginx = get(&out, "ConfigMap", &format!("{fname}-frontend-nginx"));
+    assert!(
+        nginx.contains("map $http_x_sbc_edge_route $sbc_edge_marked"),
+        "{nginx}"
+    );
+    assert!(nginx.contains("\"~^1/provision/\" 0;"), "{nginx}");
+    assert!(nginx.contains("if ($sbc_edge_deny)"), "{nginx}");
+    assert!(nginx.contains("return 403;"), "{nginx}");
+
+    // Off by default: no marker middleware.
+    let out = must_render(sbc(&[SBC_ISSUER]), "default");
+    assert!(find(&out, "Middleware", &format!("{fname}-provision-marker")).is_none());
+}
+
+/// NIST-006: the Gateway edge certificate uses an ECDSA P-384 key.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_gateway_cert_ecdsa_p384() {
+    let out = must_render(
+        sbc(&[
+            SBC_ISSUER,
+            "gateway.enabled=true",
+            "gateway.clusterIssuer=qa",
+        ]),
+        "gateway edge",
+    );
+    let fname = fullname(&out);
+    let cert = get(&out, "Certificate", &format!("{fname}-tls"));
+    // The manifest is not echoed into the failure message.
+    assert_eq!(
+        scalar(cert, "algorithm"),
+        Some("ECDSA"),
+        "Gateway Certificate privateKey.algorithm"
+    );
+    assert_eq!(
+        scalar(cert, "size"),
+        Some("384"),
+        "Gateway Certificate privateKey.size"
     );
 }

@@ -24,6 +24,12 @@ metadata:
     {{- include "sbc.labels" . | nindent 4 }}
 spec:
   secretName: {{ $tlsSecret }}
+  # CNSA 2.0 leaf key (NIST 800-53 Rev5: SC-12, SC-13). rotationPolicy
+  # Always so an existing RSA key is replaced on the next issuance.
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+    rotationPolicy: Always
   dnsNames:
     - {{ $host | quote }}
   issuerRef:
