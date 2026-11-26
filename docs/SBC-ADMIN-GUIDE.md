@@ -187,7 +187,49 @@ first_message_timeout_secs = 30       # a new connection must send an accepted S
                                       # message within this (1..=tcp_idle_timeout_secs)
 tcp_idle_timeout_secs = 300           # idle limit afterwards (30..=3600)
 ws_require_sip_subprotocol = true     # refuse WS upgrades without `sip` (RFC 7118 §4)
+v6_aggregate_prefix_len = 48          # IPv6 aggregate for the caps below (32..=64)
+max_connections_per_v6_aggregate = 1024  # per IPv6 aggregate, all listeners (0 = off)
+max_connections_per_v4_24 = 1024      # per IPv4 /24, all listeners (0 = off)
 ```
+
+Aggregate caps (SR-58): every stream connection counts against its
+source (`max_connections_per_source`) and also against the source's IPv6
+`/v6_aggregate_prefix_len` prefix or IPv4 /24, so one delegated /56 or /48
+cannot rotate through its /64s and take the listener pools. 6to4
+(`2002::/16`) and NAT64 (`64:ff9b::/96`) sources count in the /24 of
+their embedded IPv4 address. The per-source cap is checked first. A
+connection refused at the aggregate is closed at accept, counted in
+`conn_rejected_per_aggregate` and audited as `per_prefix_conn` (source =
+the aggregate prefix or /24 network, threshold = the effective cap).
+Configured trunk addresses (the trunk-group hosts that `[rate_limit]`
+trusts) skip the aggregate level, so a co-tenant filling a trunk's /24 or
+/48 cannot lock the trunk out; the trunk's per-source cap and accept rate
+still apply. Only a `v6_aggregate_prefix_len` outside 32..=64 fails the
+load. A prefix longer than `rate_limit.ipv6_prefix_len` is clamped to it,
+and a cap above `max_connections_per_listener` is clamped to it; each
+clamp logs a warning and writes a `ConfigurationChange` audit record
+(`Modified`, admin `startup`) with the key and the configured and
+effective values. A cap below `max_connections_per_source` is applied as
+configured.
+
+> **Tuning for NAT and enterprise sites:** with the defaults, more than
+> 1024 concurrent TCP/TLS/WS connections from one IPv4 /24 or one IPv6 /48
+> are refused. Size `max_connections_per_v4_24` above the phone count
+> behind a large enterprise NAT or carrier-grade NAT pool in one /24, and
+> `max_connections_per_v6_aggregate` above the phone count of a site
+> delegated one /48 (raise `max_connections_per_source` as well when the
+> phones share one NAT address or one /64). A cap of 0 turns that level
+> off. The caps apply to every prefix; there is no per-prefix override
+> (POA&M-455). Watch for `per_prefix_conn` audit records after a change.
+>
+> **Many prefixes at once:** the aggregate caps bound one prefix, not a
+> spread of them. About `max_connections_per_listener /
+> max_connections_per_v6_aggregate` distinct /48s (about 10 at the
+> defaults) can still fill one listener pool (POA&M-454). Where no large
+> IPv6 site connects, lower `max_connections_per_v6_aggregate` (for
+> example to 256) so that more /48s are needed; a cap below
+> `max_connections_per_source` is allowed. No pool share is reserved for
+> trunks (POA&M-453).
 
 Before a connection's first accepted message (one that parses as SIP),
 bare CRLF keep-alives, partial-message drips and unparseable frames do
@@ -224,8 +266,22 @@ max_handshakes_per_source = 16  # TLS handshakes per source (>= 1; clamped to
 ```
 
 These checks apply even with `rate_limit.enabled = false`, and configured
-trunks are not exempt: a trunk that opens many TLS connections at once
-needs `accept_rate_per_source` / `accept_burst_per_source` sized for it.
+trunks are not exempt from the per-source checks: a trunk that opens many
+TLS connections at once needs `accept_rate_per_source` /
+`accept_burst_per_source` sized for it.
+
+Each IPv6 aggregate and IPv4 /24 (as for the aggregate connection caps)
+also has an accept bucket of 16 times `accept_rate_per_source` and
+`accept_burst_per_source` (320/s, 800 at once with the defaults) and may
+hold at most 1/8 of the node-wide handshake pool in TLS handshakes at
+once. Refusals are audited as `per_prefix_accept_rate` and
+`per_prefix_handshake_busy`. Configured trunks skip these aggregate
+checks. Size the per-source keys for a site whose phones reconnect
+together from one /24 or /48: the aggregate allowance grows with them.
+
+All the `[transport]` connection-limit keys in this section are read at
+startup. A SIGHUP that changes one reports it as restart-required and
+keeps the running values.
 
 An accept over the source's rate, or over the per-source handshake cap, is
 closed at once. The effective per-source handshake cap is the smallest of
@@ -1526,7 +1582,11 @@ so `trunk_rps_udp` does not prove the trunk sent the traffic; not subject to
 limiter),
 `global_rps` (source `0.0.0.0`), `overflow_rps` (source `::`),
 `per_ip_blocked_drops` (messages dropped while the source was blocked),
-`per_ip_conn` (connection-cap rejections), `listener_conn` / `total_conn`
+`per_ip_conn` (connection-cap rejections), `per_prefix_conn`,
+`per_prefix_accept_rate` and `per_prefix_handshake_busy` (aggregate
+connection-cap, accept-rate and handshake-cap rejections; source = the IPv6
+aggregate prefix or IPv4 /24 network, `threshold` = the effective cap or
+aggregate rate), `listener_conn` / `total_conn`
 (accepts dropped on a full listener or node-wide pool; source `0.0.0.0`,
 one warning logged per interval), `framing` (stream Content-Length
 framing rejections and discarded partial WS messages, per source),

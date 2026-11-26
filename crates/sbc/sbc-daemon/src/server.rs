@@ -43,6 +43,8 @@ use uc_types::address::{SbcSocketAddr, TransportType};
 ///
 /// `limit_name` values: `per_ip_rps`, `per_ip_blocked_drops`, `global_rps`
 /// (source `0.0.0.0`), `overflow_rps` (source `::`), `per_ip_conn`,
+/// `per_prefix_conn`, `per_prefix_accept_rate`, `per_prefix_handshake_busy`
+/// (source = IPv6 aggregate prefix or IPv4 /24 network),
 /// `listener_conn` / `total_conn` (source `0.0.0.0`), `framing`,
 /// `per_ip_block:/<prefix>:<secs>s` (source = blocked prefix),
 /// `per_ip_unblock`, `per_ip_rps_suppressed`.
@@ -389,6 +391,33 @@ fn handshakes_per_source(tc: &sbc_config::schema::TransportConfig, slots: usize)
         .min(tc.max_connections_per_source)
         .min(pool_share)
         .max(1)
+}
+
+/// Handshakes in progress allowed per aggregate (IPv6 aggregate prefix or
+/// IPv4 /24, SR-58): 1/8 of the node-wide pool (`slots`), at least 1, so
+/// one aggregate cannot hold the whole pool.
+///
+/// ## NIST 800-53 Rev5: SC-5
+fn aggregate_handshake_cap(slots: usize) -> u32 {
+    u32::try_from(slots / 8).unwrap_or(u32::MAX).max(1)
+}
+
+/// Logs and audits a startup clamp of `key` from `configured` to
+/// `effective`.
+///
+/// ## NIST 800-53 Rev5: CM-6, AU-12
+fn note_startup_clamp(key: &str, configured: u32, effective: u32, reason: &str) {
+    warn!(
+        key,
+        configured, effective, reason, "connection limit clamped at startup"
+    );
+    uc_audit::log_event(uc_audit::AuditEvent::ConfigurationChange(
+        uc_audit::event::ConfigurationChange {
+            admin: "startup".to_string(),
+            change_type: uc_audit::event::ConfigChangeType::Modified,
+            description: format!("{key} clamped from {configured} to {effective} ({reason})"),
+        },
+    ));
 }
 
 /// How a TLS handshake under a node-wide slot ended.
@@ -1153,17 +1182,22 @@ impl Server {
         let _ = stream.lock().await.set_trusted_sources(set.iter().copied());
     }
 
-    /// Re-applies the trunk address set to both limiters on every change
-    /// published by the SIP stack. Updates coalesce; the newest set wins.
+    /// Re-applies the trunk address set to both limiters, and to the
+    /// stream connection limiter's aggregate exemption (SR-58), on every
+    /// change published by the SIP stack. Updates coalesce; the newest set
+    /// wins.
     async fn trusted_source_sync(
         mut rx: tokio::sync::watch::Receiver<Arc<[std::net::IpAddr]>>,
         udp: Arc<Mutex<RateLimiter>>,
         stream: Arc<Mutex<RateLimiter>>,
+        conns: Arc<crate::conn_limit::ConnLimiter>,
     ) {
         while rx.changed().await.is_ok() {
             // Clone the Arc so the watch borrow is released before locking.
             let set = Arc::clone(&rx.borrow_and_update());
             Self::apply_trusted_sources(&set, &udp, &stream).await;
+            // SR-58: trunks skip the aggregate connection caps.
+            let _ = conns.set_trusted_sources(set.iter().copied());
             debug!(trusted = set.len(), "Trusted rate-limit sources updated");
         }
     }
@@ -1374,6 +1408,91 @@ impl Server {
         }
 
         media_failure_rx
+    }
+
+    /// Builds the stream connection limiter from `[transport]`: the
+    /// per-source cap keyed on `rate_limit.ipv6_prefix_len`; the IPv6
+    /// aggregate and IPv4 /24 caps (SR-58); the per-source and aggregate
+    /// accept buckets and handshake caps (SR-56, SR-58). An aggregate
+    /// prefix longer than the per-source prefix, or an aggregate cap above
+    /// the listener pool, is clamped; each clamp is logged and audited as a
+    /// startup `ConfigurationChange`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, CM-6, AU-12
+    pub(crate) fn build_conn_limiter(config: &SbcConfig) -> crate::conn_limit::ConnLimiter {
+        let tc = &config.transport;
+        let per_source_prefix = config.rate_limit.ipv6_prefix_len;
+        let v6_prefix = tc.effective_v6_aggregate_prefix_len(per_source_prefix);
+        let v6_cap = tc.effective_max_connections_per_v6_aggregate();
+        let v4_cap = tc.effective_max_connections_per_v4_24();
+        for (key, configured, effective, reason) in [
+            (
+                "transport.v6_aggregate_prefix_len",
+                u32::from(tc.v6_aggregate_prefix_len),
+                u32::from(v6_prefix),
+                "longer than rate_limit.ipv6_prefix_len",
+            ),
+            (
+                "transport.max_connections_per_v6_aggregate",
+                tc.max_connections_per_v6_aggregate,
+                v6_cap,
+                "above max_connections_per_listener",
+            ),
+            (
+                "transport.max_connections_per_v4_24",
+                tc.max_connections_per_v4_24,
+                v4_cap,
+                "above max_connections_per_listener",
+            ),
+        ] {
+            if configured != effective {
+                note_startup_clamp(key, configured, effective, reason);
+            }
+        }
+
+        // NIST 800-53 Rev5: SC-5 — per-source and aggregate accept buckets
+        // and handshake caps. Accept buckets are tracked for at most
+        // `max_connections_total` keys per map; the rest share an overflow
+        // bucket of 4x the rate.
+        // POAM: POA&M-441 — accept admission is keyed per source and per
+        // aggregate only, statically and per node; a flood spread over many
+        // aggregates gets one aggregate allowance each (SC-5).
+        let limits = HandshakeLimits::from_config(tc);
+        let slot_count = limits.slots;
+        let per_source_handshakes = limits.per_source;
+        // NIST 800-53 Rev5: AU-3, CM-6 — the values in force are logged
+        // whenever they differ from the configured ones.
+        if per_source_handshakes < tc.max_handshakes_per_source {
+            warn!(
+                configured = tc.max_handshakes_per_source,
+                max_connections_per_source = tc.max_connections_per_source,
+                handshake_slots = slot_count,
+                effective = per_source_handshakes,
+                "transport.max_handshakes_per_source clamped to \
+                 min(max_connections_per_source, handshake slots / 32)"
+            );
+        }
+        if limits.differ_from(tc) {
+            info!(
+                configured_in_flight = tc.max_handshakes_in_flight,
+                handshake_slots = slot_count,
+                configured_per_source = tc.max_handshakes_per_source,
+                per_source = per_source_handshakes,
+                per_aggregate = aggregate_handshake_cap(slot_count),
+                "Effective TLS handshake limits"
+            );
+        }
+        let accept_tracked =
+            (config.rate_limit.max_tracked_sources as usize).min(tc.max_connections_total as usize);
+        crate::conn_limit::ConnLimiter::new(tc.max_connections_per_source, per_source_prefix)
+            .with_aggregate_caps(v6_prefix, v6_cap, v4_cap)
+            .with_accept_rate(
+                tc.accept_rate_per_source,
+                tc.accept_burst_per_source,
+                accept_tracked,
+            )
+            .with_handshake_cap(per_source_handshakes)
+            .with_aggregate_handshake_cap(aggregate_handshake_cap(slot_count))
     }
 
     /// The out-of-process media plane node URLs, empty for the in-process
@@ -2208,18 +2327,24 @@ impl Server {
             return Ok(());
         }
 
-        // Configured trunks are trusted on both per-source limiters before
-        // any receive loop runs, then kept in step with trunk changes.
+        // Configured trunks are trusted on both per-source limiters, and
+        // exempt from the aggregate connection caps (SR-58), before any
+        // receive or accept loop runs, then kept in step with trunk changes.
         // NIST 800-53 Rev5: SC-5
+        let conn_limiter = Arc::new(Self::build_conn_limiter(&self.config));
         let mut handles = Vec::new();
         {
             let mut rx = self.sip_stack.trunk_sources();
             let set = Arc::clone(&rx.borrow_and_update());
             Self::apply_trusted_sources(&set, &self.udp_rate_limiter, &self.stream_rate_limiter)
                 .await;
+            let _ = conn_limiter.set_trusted_sources(set.iter().copied());
             let udp = Arc::clone(&self.udp_rate_limiter);
             let stream = Arc::clone(&self.stream_rate_limiter);
-            handles.push(tokio::spawn(Self::trusted_source_sync(rx, udp, stream)));
+            let conns = Arc::clone(&conn_limiter);
+            handles.push(tokio::spawn(Self::trusted_source_sync(
+                rx, udp, stream, conns,
+            )));
         }
 
         // Spawn receive tasks for each transport
@@ -2274,7 +2399,8 @@ impl Server {
         // NIST 800-53 Rev5: SC-5 — each listener has its own pool so a
         // flood on one (e.g. WS) cannot starve another (TLS); a node-wide
         // ceiling bounds the fd budget and a per-source cap stops one host
-        // from taking a whole pool.
+        // from taking a whole pool; aggregate caps stop one IPv6 /48 (or
+        // IPv4 /24) from doing the same across many sources (SR-58).
         // POAM: POA&M-453 - no part of a pool is reserved for trunks or
         // authenticated flows: any parseable request (e.g. OPTIONS) from an
         // unadmitted source earns first-message and idle credit, so such
@@ -2285,52 +2411,12 @@ impl Server {
         let total_conns = Arc::new(tokio::sync::Semaphore::new(
             tc.max_connections_total as usize,
         ));
-        // NIST 800-53 Rev5: SC-5 — per-source accept rate (TCP and TLS)
-        // and TLS in-handshake cap, checked at accept before any handshake.
-        // Accept buckets are tracked for at most `max_connections_total`
-        // sources; the rest share an overflow bucket of 4x the rate.
-        // POAM: POA&M-441 — the accept bucket and the per-source handshake
-        // cap are keyed per IPv4 address and per IPv6
-        // `rate_limit.ipv6_prefix_len` prefix only; no aggregate
-        // accept-rate key (SC-5).
-        let limits = HandshakeLimits::from_config(tc);
-        let slot_count = limits.slots;
-        let per_source_handshakes = limits.per_source;
-        // NIST 800-53 Rev5: AU-3, CM-6 — the values in force are logged
-        // whenever they differ from the configured ones.
-        if per_source_handshakes < tc.max_handshakes_per_source {
-            warn!(
-                configured = tc.max_handshakes_per_source,
-                max_connections_per_source = tc.max_connections_per_source,
-                handshake_slots = slot_count,
-                effective = per_source_handshakes,
-                "transport.max_handshakes_per_source clamped to \
-                 min(max_connections_per_source, handshake slots / 32)"
-            );
-        }
-        if limits.differ_from(tc) {
-            info!(
-                configured_in_flight = tc.max_handshakes_in_flight,
-                handshake_slots = slot_count,
-                configured_per_source = tc.max_handshakes_per_source,
-                per_source = per_source_handshakes,
-                "Effective TLS handshake limits"
-            );
-        }
-        let accept_tracked = (self.config.rate_limit.max_tracked_sources as usize)
-            .min(tc.max_connections_total as usize);
-        let conn_limiter = Arc::new(
-            crate::conn_limit::ConnLimiter::new(
-                tc.max_connections_per_source,
-                self.config.rate_limit.ipv6_prefix_len,
-            )
-            .with_accept_rate(
-                tc.accept_rate_per_source,
-                tc.accept_burst_per_source,
-                accept_tracked,
-            )
-            .with_handshake_cap(per_source_handshakes),
-        );
+        // NIST 800-53 Rev5: SC-5 — per-source and aggregate accept rate
+        // (TCP and TLS) and TLS in-handshake caps, checked at accept before
+        // any handshake; built (with the connection caps and the startup
+        // handshake-limit logging) by `build_conn_limiter` before the trunk
+        // sync above.
+        let slot_count = HandshakeLimits::from_config(tc).slots;
         let handshake_slots = Arc::new(tokio::sync::Semaphore::new(slot_count));
         let timeouts = StreamTimeouts::from_config(&self.config);
         let stream_ctx = |zone_name: Option<String>| StreamLoopContext {
@@ -2673,6 +2759,20 @@ impl Server {
                 debug!(peer = %peer, kind, "Per-source accept rate exceeded, dropping");
                 return None;
             }
+            Err(crate::conn_limit::Rejection::AggregateAcceptRate) => {
+                ctx.stats
+                    .accept_rate_limited
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Aggregate accept rate exceeded, dropping");
+                return None;
+            }
+            Err(crate::conn_limit::Rejection::PerAggregate) => {
+                ctx.stats
+                    .conn_rejected_per_aggregate
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Aggregate connection limit reached, dropping");
+                return None;
+            }
             Err(_) => {
                 ctx.stats
                     .conn_rejected_per_source
@@ -2732,14 +2832,23 @@ impl Server {
         peer: &SbcSocketAddr,
         kind: &str,
     ) -> Option<crate::conn_limit::HandshakeGuard> {
-        let guard = ctx.conn_limiter.try_begin_handshake(peer.ip());
-        if guard.is_none() {
-            ctx.stats
-                .handshake_busy_per_source
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(peer = %peer, kind, "Per-source handshake limit reached, dropping");
+        match ctx.conn_limiter.try_handshake(peer.ip()) {
+            Ok(guard) => Some(guard),
+            Err(crate::conn_limit::Rejection::AggregateHandshakeBusy) => {
+                ctx.stats
+                    .handshake_busy_per_aggregate
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Aggregate handshake limit reached, dropping");
+                None
+            }
+            Err(_) => {
+                ctx.stats
+                    .handshake_busy_per_source
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Per-source handshake limit reached, dropping");
+                None
+            }
         }
-        guard
     }
 
     /// Runs `handshake` on `stream` while holding a node-wide handshake
@@ -3735,6 +3844,9 @@ pub struct ServerStats {
     pub framing_errors: AtomicU64,
     /// Stream accepts dropped by `transport.max_connections_per_source`.
     pub conn_rejected_per_source: AtomicU64,
+    /// Stream accepts dropped by `transport.max_connections_per_v6_aggregate`
+    /// or `transport.max_connections_per_v4_24` (SR-58).
+    pub conn_rejected_per_aggregate: AtomicU64,
     /// WebSocket upgrades refused or failed (e.g. no `sip` subprotocol).
     pub ws_handshake_failures: AtomicU64,
     /// TLS / WebSocket handshakes that hit `handshake_timeout_secs`.
@@ -3753,6 +3865,8 @@ pub struct ServerStats {
     pub accept_rate_limited: AtomicU64,
     /// TLS accepts dropped by `transport.max_handshakes_per_source`.
     pub handshake_busy_per_source: AtomicU64,
+    /// TLS accepts dropped by the per-aggregate handshake cap (SR-58).
+    pub handshake_busy_per_aggregate: AtomicU64,
     /// TLS connections dropped because no node-wide handshake slot
     /// (`transport.max_handshakes_in_flight`) freed within the slot wait.
     pub handshake_slot_timeouts: AtomicU64,
@@ -4030,6 +4144,14 @@ struct RateLimitAudit {
     trunk_rps: u64,
     accept_rate: u64,
     per_source_handshakes: u64,
+    /// Threshold of `per_prefix_conn` records for IPv6 aggregates.
+    v6_aggregate_conns: u64,
+    /// Threshold of `per_prefix_conn` records for IPv4 /24s.
+    v4_aggregate_conns: u64,
+    /// Threshold of `per_prefix_accept_rate` records.
+    aggregate_accept_rate: u64,
+    /// Threshold of `per_prefix_handshake_busy` records.
+    aggregate_handshakes: u64,
 }
 
 impl RateLimitAudit {
@@ -4058,6 +4180,21 @@ impl RateLimitAudit {
             per_source_handshakes: u64::from(
                 HandshakeLimits::from_config(&config.transport).per_source,
             ),
+            v6_aggregate_conns: u64::from(
+                config
+                    .transport
+                    .effective_max_connections_per_v6_aggregate(),
+            ),
+            v4_aggregate_conns: u64::from(config.transport.effective_max_connections_per_v4_24()),
+            aggregate_accept_rate: u64::from(
+                config
+                    .transport
+                    .accept_rate_per_source
+                    .saturating_mul(crate::conn_limit::AGGREGATE_ACCEPT_FACTOR),
+            ),
+            aggregate_handshakes: u64::from(aggregate_handshake_cap(
+                HandshakeLimits::from_config(&config.transport).slots,
+            )),
         }
     }
 
@@ -4132,12 +4269,20 @@ impl RateLimitAudit {
 
     /// Drains the connection limiter's counters.
     fn collect_conns(&mut self, limiter: &crate::conn_limit::ConnLimiter) {
+        // Thresholds come from the limiter, which holds the effective caps.
+        self.v6_aggregate_conns = u64::from(limiter.v6_aggregate_cap());
+        self.v4_aggregate_conns = u64::from(limiter.v4_aggregate_cap());
+        self.aggregate_accept_rate = u64::from(limiter.aggregate_accept_rate());
+        self.aggregate_handshakes = u64::from(limiter.max_handshakes_per_aggregate());
         let totals = limiter.drain_rejections(|key, kind, n| {
             let limit = match kind {
                 crate::conn_limit::Rejection::PerSource => "per_ip_conn",
+                crate::conn_limit::Rejection::PerAggregate => "per_prefix_conn",
                 crate::conn_limit::Rejection::Framing => "framing",
                 crate::conn_limit::Rejection::AcceptRate => "per_ip_accept_rate",
+                crate::conn_limit::Rejection::AggregateAcceptRate => "per_prefix_accept_rate",
                 crate::conn_limit::Rejection::HandshakeBusy => "handshake_busy",
+                crate::conn_limit::Rejection::AggregateHandshakeBusy => "per_prefix_handshake_busy",
                 crate::conn_limit::Rejection::AcceptBlocked => "accept_blocked",
             };
             self.add(key, limit, n);
@@ -4154,7 +4299,14 @@ impl RateLimitAudit {
     /// buckets (picking up any accept-rate rejections counted in between).
     fn sweep_conns(&mut self, limiter: &crate::conn_limit::ConnLimiter) {
         self.collect_conns(limiter);
-        limiter.sweep_accept(|key, n| self.add(key, "per_ip_accept_rate", n));
+        limiter.sweep_accept(|key, kind, n| {
+            let limit = if kind == crate::conn_limit::Rejection::AggregateAcceptRate {
+                "per_prefix_accept_rate"
+            } else {
+                "per_ip_accept_rate"
+            };
+            self.add(key, limit, n);
+        });
     }
 
     /// Emits one record per pending (source, limit), the global and
@@ -4173,6 +4325,10 @@ impl RateLimitAudit {
                 "per_ip_conn" => self.per_source_conns,
                 "per_ip_accept_rate" => self.accept_rate,
                 "handshake_busy" => self.per_source_handshakes,
+                "per_prefix_conn" if source.is_ipv4() => self.v4_aggregate_conns,
+                "per_prefix_conn" => self.v6_aggregate_conns,
+                "per_prefix_accept_rate" => self.aggregate_accept_rate,
+                "per_prefix_handshake_busy" => self.aggregate_handshakes,
                 "framing" | "accept_blocked" => 0,
                 _ => self.per_ip_rps,
             };
@@ -6854,10 +7010,12 @@ mod tests {
             let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
             let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
             let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            let conns = Arc::new(Server::build_conn_limiter(&config));
             let task = tokio::spawn(Server::trusted_source_sync(
                 stack.trunk_sources(),
                 Arc::clone(&udp),
                 Arc::clone(&stream),
+                Arc::clone(&conns),
             ));
             let t = ip("203.0.113.13");
             stack
@@ -6866,7 +7024,10 @@ mod tests {
             let mut synced = false;
             for _ in 0..200 {
                 tokio::task::yield_now().await;
-                if udp.lock().await.is_trusted(t) && stream.lock().await.is_trusted(t) {
+                if udp.lock().await.is_trusted(t)
+                    && stream.lock().await.is_trusted(t)
+                    && conns.is_trusted(t)
+                {
                     synced = true;
                     break;
                 }
@@ -6876,7 +7037,10 @@ mod tests {
             let mut cleared = false;
             for _ in 0..200 {
                 tokio::task::yield_now().await;
-                if !udp.lock().await.is_trusted(t) && !stream.lock().await.is_trusted(t) {
+                if !udp.lock().await.is_trusted(t)
+                    && !stream.lock().await.is_trusted(t)
+                    && !conns.is_trusted(t)
+                {
                     cleared = true;
                     break;
                 }
@@ -7836,6 +8000,261 @@ mod tests {
                 .collect();
             assert_eq!(busy.len(), 1, "{records:?}");
             assert_eq!(busy[0].threshold, u64::from(effective));
+        }
+    }
+
+    /// SR-58: aggregate connection caps are wired from config and audited
+    /// as `per_prefix_conn` with the aggregate key as source. Compile-red
+    /// until `ConnLimiter::with_aggregate_caps`, `Rejection::PerAggregate`,
+    /// `Server::build_conn_limiter` and the `[transport]` keys exist.
+    mod sr58_aggregate_audit {
+        use super::*;
+
+        fn ip(s: &str) -> std::net::IpAddr {
+            s.parse().unwrap()
+        }
+
+        #[test]
+        fn per_prefix_conn_is_audited() {
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.transport.max_connections_per_v6_aggregate = 4;
+            config.transport.max_connections_per_v4_24 = 2;
+            let conns = Arc::new(
+                crate::conn_limit::ConnLimiter::new(128, 64).with_aggregate_caps(48, 4, 2),
+            );
+            let mut held = Vec::new();
+            for n in 1..=4u16 {
+                held.push(
+                    conns
+                        .try_acquire(ip(&format!("2001:db8:1:{n:x}::1")))
+                        .unwrap(),
+                );
+            }
+            assert!(conns.try_acquire(ip("2001:db8:1:5::1")).is_none());
+            assert!(conns.try_acquire(ip("2001:db8:1:6::1")).is_none());
+            held.push(conns.try_acquire(ip("192.0.2.1")).unwrap());
+            held.push(conns.try_acquire(ip("192.0.2.2")).unwrap());
+            assert!(conns.try_acquire(ip("192.0.2.3")).is_none());
+
+            let mut audit = RateLimitAudit::new(&config);
+            audit.collect_conns(&conns);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let prefix: Vec<_> = records
+                .iter()
+                .filter(|r| r.limit_name == "per_prefix_conn")
+                .collect();
+            assert_eq!(prefix.len(), 2, "{records:?}");
+            let v6 = prefix
+                .iter()
+                .find(|r| r.source_ip == ip("2001:db8:1::"))
+                .expect("v6 aggregate record keyed on the /48");
+            assert_eq!((v6.request_count, v6.threshold), (2, 4));
+            let v4 = prefix
+                .iter()
+                .find(|r| r.source_ip == ip("192.0.2.0"))
+                .expect("v4 aggregate record keyed on the /24");
+            assert_eq!((v4.request_count, v4.threshold), (1, 2));
+            // No per-source record: no /64 or host was at its own cap.
+            assert!(!records.iter().any(|r| r.limit_name == "per_ip_conn"));
+            drop(held);
+        }
+
+        /// Decision 9 defaults through the daemon's construction path: one
+        /// /56 with 128 connections per /64 gets exactly 1024.
+        #[test]
+        fn build_conn_limiter_defaults_bound_a_slash56() {
+            // Accept buckets off: this checks the concurrent caps, not the
+            // aggregate accept burst (800 at the defaults, tested below).
+            let mut config = SbcConfig::default();
+            config.transport.accept_rate_per_source = 0;
+            let conns = Arc::new(Server::build_conn_limiter(&config));
+            let mut held = Vec::new();
+            for sub in 0..=255u16 {
+                let a = ip(&format!("2001:db8:1:{:x}::1", 0xab00 | sub));
+                for _ in 0..128 {
+                    if let Some(g) = conns.try_acquire(a) {
+                        held.push(g);
+                    }
+                }
+            }
+            assert_eq!(held.len(), 1024);
+            let v4: Vec<_> = (0..=255u8)
+                .flat_map(|h| {
+                    let c = Arc::clone(&conns);
+                    (0..8).filter_map(move |_| c.try_acquire(ip(&format!("198.51.100.{h}"))))
+                })
+                .collect();
+            assert_eq!(v4.len(), 1024);
+        }
+
+        /// Every `[transport]` aggregate key reaches the limiter.
+        #[test]
+        fn build_conn_limiter_applies_aggregate_keys() {
+            let mut config = SbcConfig::default();
+            config.transport.max_connections_per_source = 1;
+            config.transport.v6_aggregate_prefix_len = 56;
+            config.transport.max_connections_per_v6_aggregate = 2;
+            config.transport.max_connections_per_v4_24 = 3;
+            let conns = Arc::new(Server::build_conn_limiter(&config));
+            let _a = conns.try_acquire(ip("2001:db8:1:100::1")).unwrap();
+            let _b = conns.try_acquire(ip("2001:db8:1:101::1")).unwrap();
+            assert!(conns.try_acquire(ip("2001:db8:1:102::1")).is_none());
+            // Next /56 in the same /48: the prefix key is /56, not /48.
+            let _c = conns.try_acquire(ip("2001:db8:1:200::1")).unwrap();
+            let v4: Vec<_> = (1..=4u8)
+                .filter_map(|h| conns.try_acquire(ip(&format!("192.0.2.{h}"))))
+                .collect();
+            assert_eq!(v4.len(), 3);
+            drop(v4);
+
+            // 0 turns both aggregate levels off.
+            config.transport.max_connections_per_v6_aggregate = 0;
+            config.transport.max_connections_per_v4_24 = 0;
+            let off = Arc::new(Server::build_conn_limiter(&config));
+            let all: Vec<_> = (1..=200u8)
+                .filter_map(|h| off.try_acquire(ip(&format!("192.0.2.{h}"))))
+                .collect();
+            assert_eq!(all.len(), 200);
+            drop(all);
+        }
+
+        /// SEC-002: the default aggregate accept burst is 16 x the
+        /// per-source burst (800), across the hosts of one /24.
+        #[test]
+        fn build_conn_limiter_wires_aggregate_accept_burst() {
+            let conns = Arc::new(Server::build_conn_limiter(&SbcConfig::default()));
+            let held: Vec<_> = (0..=255u8)
+                .flat_map(|h| {
+                    let c = Arc::clone(&conns);
+                    (0..4).filter_map(move |_| c.try_acquire(ip(&format!("198.51.100.{h}"))))
+                })
+                .collect();
+            assert_eq!(held.len(), 800);
+            assert_eq!(conns.aggregate_accept_rate(), 20 * 16);
+        }
+
+        /// SEC-003 / NIST-003: each startup clamp is logged and audited as
+        /// a `ConfigurationChange { Modified }` by `startup`; a stricter cap
+        /// is not a clamp.
+        #[test]
+        fn aggregate_clamp_emits_configuration_change() {
+            fn changes(
+                capture: &uc_audit::capture::CaptureGuard,
+            ) -> Vec<uc_audit::event::ConfigurationChange> {
+                capture
+                    .events()
+                    .iter()
+                    .filter_map(|e| match e {
+                        uc_audit::AuditEvent::ConfigurationChange(c) => Some(c.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.rate_limit.ipv6_prefix_len = 48;
+            config.transport.v6_aggregate_prefix_len = 56;
+            config.transport.max_connections_per_v6_aggregate = 20_000;
+            config.transport.max_connections_per_v4_24 = 20_001;
+            let conns = Server::build_conn_limiter(&config);
+            assert_eq!(
+                (conns.v6_aggregate_cap(), conns.v4_aggregate_cap()),
+                (10_000, 10_000)
+            );
+            let got = changes(&capture);
+            assert_eq!(got.len(), 3, "{got:?}");
+            for (key, from, to) in [
+                ("transport.v6_aggregate_prefix_len", 56, 48),
+                ("transport.max_connections_per_v6_aggregate", 20_000, 10_000),
+                ("transport.max_connections_per_v4_24", 20_001, 10_000),
+            ] {
+                assert!(
+                    got.iter().any(|c| c.admin == "startup"
+                        && c.change_type == uc_audit::event::ConfigChangeType::Modified
+                        && c.description.contains(key)
+                        && c.description.contains(&format!("from {from} to {to}"))),
+                    "{key}: {got:?}"
+                );
+            }
+            drop(capture);
+
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.transport.max_connections_per_v6_aggregate = 4;
+            config.transport.max_connections_per_v4_24 = 1;
+            let conns = Server::build_conn_limiter(&config);
+            assert_eq!((conns.v6_aggregate_cap(), conns.v4_aggregate_cap()), (4, 1));
+            assert!(changes(&capture).is_empty());
+        }
+
+        /// SEC-006 / NIST-001: an aggregate rejection is counted and logged
+        /// as one, not as a per-source rejection.
+        #[test]
+        fn aggregate_rejection_counted_per_aggregate() {
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(
+                crate::conn_limit::ConnLimiter::new(2, 64)
+                    .with_aggregate_caps(48, 4, 1)
+                    .with_aggregate_handshake_cap(1),
+            );
+            let v4 = |last| SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, last), 1);
+            let v6 = SbcSocketAddr::new(ip("2001:db8:1:1::1"), 1);
+            let _a = Server::admit_connection(&ctx, &v4(1), "tcp").unwrap();
+            assert!(Server::admit_connection(&ctx, &v4(2), "tcp").is_none());
+            let _b = Server::admit_connection(&ctx, &v6, "tcp").unwrap();
+            let _c = Server::admit_connection(&ctx, &v6, "tcp").unwrap();
+            assert!(Server::admit_connection(&ctx, &v6, "tcp").is_none());
+            let s = &ctx.stats;
+            assert_eq!(s.conn_rejected_per_aggregate.load(Ordering::Relaxed), 1);
+            assert_eq!(s.conn_rejected_per_source.load(Ordering::Relaxed), 1);
+
+            let _h = Server::begin_handshake(&ctx, &v4(3), "tls").unwrap();
+            assert!(Server::begin_handshake(&ctx, &v4(4), "tls").is_none());
+            assert_eq!(s.handshake_busy_per_aggregate.load(Ordering::Relaxed), 1);
+            assert_eq!(s.handshake_busy_per_source.load(Ordering::Relaxed), 0);
+        }
+
+        /// SEC-002: aggregate accept-rate and handshake refusals are
+        /// audited per aggregate key with the effective limit.
+        #[test]
+        fn per_prefix_accept_and_handshake_are_audited() {
+            let capture = uc_audit::capture::start();
+            let conns = Arc::new(
+                crate::conn_limit::ConnLimiter::new(128, 64)
+                    .with_aggregate_caps(48, 1024, 1024)
+                    .with_accept_rate(1, 1, 1024)
+                    .with_aggregate_handshake_cap(1),
+            );
+            let held: Vec<_> = (1..=17u8)
+                .filter_map(|h| conns.try_acquire(ip(&format!("192.0.2.{h}"))))
+                .collect();
+            assert_eq!(held.len(), 16, "aggregate burst 16 x 1");
+            let _h = conns.try_begin_handshake(ip("192.0.2.1")).unwrap();
+            assert!(conns.try_begin_handshake(ip("192.0.2.2")).is_none());
+
+            let mut audit = RateLimitAudit::new(&SbcConfig::default());
+            audit.sweep_conns(&conns);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let find = |name: &str| {
+                let found = records.iter().find(|r| r.limit_name == name);
+                assert!(found.is_some(), "{name}: {records:?}");
+                found.unwrap()
+            };
+            let rate = find("per_prefix_accept_rate");
+            assert_eq!(
+                (rate.source_ip, rate.request_count, rate.threshold),
+                (ip("192.0.2.0"), 1, 16)
+            );
+            let busy = find("per_prefix_handshake_busy");
+            assert_eq!(
+                (busy.source_ip, busy.request_count, busy.threshold),
+                (ip("192.0.2.0"), 1, 1)
+            );
+            assert!(!records.iter().any(|r| r.limit_name == "per_ip_accept_rate"));
+            drop(held);
         }
     }
 
