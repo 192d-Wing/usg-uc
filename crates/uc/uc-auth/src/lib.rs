@@ -32,7 +32,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha384};
+use sha2::{Digest, Sha384};
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
@@ -255,6 +255,52 @@ pub fn parse_signing_key(hex_key: &str) -> Result<TokenSigner, AuthError> {
     TokenSigner::new(key)
 }
 
+/// Hex length of a SHA-384 digest.
+const API_KEY_DIGEST_HEX_LEN: usize = 96;
+
+/// Parses the accepted API-key digests.
+///
+/// `sha256` is the removed `SBC_API_KEY_SHA256` value: any non-blank value
+/// fails startup so a key that would silently stop working is noticed.
+/// `sha384` is `SBC_API_KEY_SHA384`: comma-separated lowercase-or-uppercase
+/// hex SHA-384 digests; each must be exactly 96 hex characters.
+///
+/// ## NIST 800-53 Rev5: IA-5, SC-13, CM-6
+fn parse_api_key_digests(
+    sha256: Option<&str>,
+    sha384: Option<&str>,
+) -> Result<Vec<String>, AuthError> {
+    if sha256.is_some_and(|v| !v.trim().is_empty()) {
+        return Err(AuthError::Invalid {
+            var: "SBC_API_KEY_SHA256",
+            reason: "SHA-256 API-key digests are no longer accepted; set \
+                     SBC_API_KEY_SHA384 to the SHA-384 hex digests instead"
+                .to_string(),
+        });
+    }
+    let Some(list) = sha384 else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (i, entry) in list.split(',').enumerate() {
+        let h = entry.trim().to_ascii_lowercase();
+        if h.is_empty() {
+            continue;
+        }
+        if h.len() != API_KEY_DIGEST_HEX_LEN || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AuthError::Invalid {
+                var: "SBC_API_KEY_SHA384",
+                reason: format!(
+                    "entry {} is not a {API_KEY_DIGEST_HEX_LEN}-character hex SHA-384 digest",
+                    i + 1
+                ),
+            });
+        }
+        out.push(h);
+    }
+    Ok(out)
+}
+
 /// Parses and bounds `SBC_AUTH_TOKEN_TTL_SECS`.
 ///
 /// # Errors
@@ -337,8 +383,9 @@ impl Authenticator {
     ///   replicas; at least 32 bytes decoded (48 recommended). Set-but-empty,
     ///   non-hex or short keys are rejected. If unset a random key is generated and a warning is
     ///   logged (single-replica only — tokens won't validate across pods).
-    /// - `SBC_API_KEY_SHA256` — comma-separated SHA-256 hex digests of
-    ///   accepted API keys (optional).
+    /// - `SBC_API_KEY_SHA384` — comma-separated SHA-384 hex digests of
+    ///   accepted API keys (optional). The former `SBC_API_KEY_SHA256` is
+    ///   rejected at startup.
     /// - `SBC_AUTH_TOKEN_TTL_SECS` — token lifetime (default 43200; must be
     ///   within 60..=86400).
     ///
@@ -385,15 +432,10 @@ impl Authenticator {
             }
         };
 
-        let api_key_hashes: Vec<String> = std::env::var("SBC_API_KEY_SHA256")
-            .ok()
-            .map(|s| {
-                s.split(',')
-                    .map(|h| h.trim().to_lowercase())
-                    .filter(|h| !h.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let api_key_hashes = parse_api_key_digests(
+            std::env::var("SBC_API_KEY_SHA256").ok().as_deref(),
+            std::env::var("SBC_API_KEY_SHA384").ok().as_deref(),
+        )?;
 
         let token_ttl_secs = match std::env::var("SBC_AUTH_TOKEN_TTL_SECS") {
             Ok(v) => parse_token_ttl(&v)?,
@@ -471,9 +513,9 @@ impl Authenticator {
         if self.api_key_hashes.is_empty() {
             return None;
         }
-        // POAM: POA&M-211 — API-key lookup digests are SHA-256
-        // (SBC_API_KEY_SHA256); migrate to SHA-384 with dual-accept.
-        let digest = hex::encode(Sha256::digest(credential.as_bytes()));
+        // NIST 800-53 Rev5: IA-5, SC-13 — CNSA 2.0 SHA-384 lookup digest
+        // (POA&M-211 closed).
+        let digest = hex::encode(Sha384::digest(credential.as_bytes()));
         // Every configured digest is compared (no early exit).
         let mut matched: Option<&String> = None;
         for h in self.api_key_hashes.iter() {
@@ -730,7 +772,7 @@ mod tests {
         let signer = TokenSigner::new(key.clone()).expect("signer");
         let claims = serde_json::json!({ "sub": "admin", "exp": now_secs() + 300 });
         let input = format!("v1.{}", b64(&serde_json::to_vec(&claims).expect("json")));
-        let mut mac = Hmac::<Sha256>::new_from_slice(&key).expect("hmac");
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).expect("hmac");
         mac.update(input.as_bytes());
         let token = format!("{input}.{}", b64(&mac.finalize().into_bytes()));
         assert!(signer.verify(&token).is_none());
@@ -894,7 +936,7 @@ mod tests {
     /// `test_auth()` plus one accepted API key; returns (auth, key, digest).
     fn auth_with_api_key() -> (Authenticator, String, String) {
         let key = format!("qa-api-key-{}", std::process::id());
-        let digest = hex::encode(Sha256::digest(key.as_bytes()));
+        let digest = hex::encode(Sha384::digest(key.as_bytes()));
         let auth = Authenticator {
             api_key_hashes: Arc::new(vec![digest.clone()]),
             ..test_auth()
@@ -958,6 +1000,51 @@ mod tests {
         .expect("auth");
         let foreign = other.login("admin", "correct horse").expect("login");
         assert!(auth.identify(&foreign).is_none());
+    }
+
+    // ---- POA&M-211: SHA-384 API-key digests only -------------------------
+
+    #[test]
+    fn api_key_sha256_digest_no_longer_identifies() {
+        let key = format!("qa-api-key-{}", std::process::id());
+        let auth = Authenticator {
+            api_key_hashes: Arc::new(vec![hex::encode(sha2::Sha256::digest(key.as_bytes()))]),
+            ..test_auth()
+        };
+        assert!(auth.identify(&key).is_none());
+    }
+
+    #[test]
+    fn api_key_digest_parsing() {
+        let d = hex::encode(Sha384::digest(b"k"));
+        assert_eq!(parse_api_key_digests(None, None).ok(), Some(Vec::new()));
+        assert_eq!(
+            parse_api_key_digests(Some(" "), Some(&format!(" {}, ,", d.to_uppercase()))).ok(),
+            Some(vec![d.clone()])
+        );
+        // The removed SHA-256 variable fails startup when set.
+        let sha256 = hex::encode(sha2::Sha256::digest(b"k"));
+        assert!(matches!(
+            parse_api_key_digests(Some(&sha256), None),
+            Err(AuthError::Invalid {
+                var: "SBC_API_KEY_SHA256",
+                ..
+            })
+        ));
+        // A SHA-256 digest (64 hex) or non-hex value in the SHA-384 list fails.
+        for bad in [sha256.as_str(), &"g".repeat(96), &format!("{d}0")] {
+            assert!(
+                matches!(
+                    parse_api_key_digests(None, Some(bad)),
+                    Err(AuthError::Invalid {
+                        var: "SBC_API_KEY_SHA384",
+                        ..
+                    })
+                ),
+                "{} chars",
+                bad.len()
+            );
+        }
     }
 
     #[test]

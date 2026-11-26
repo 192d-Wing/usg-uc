@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, API-key digests are SHA-384 only, POA&M-211)
+
+SBC only (sbc-api, sbc-daemon REST). Affects every deployment that uses API
+keys.
+
+- **`SBC_API_KEY_SHA256` is replaced by `SBC_API_KEY_SHA384`.** (IA-5,
+  SC-13, CNSA 2.0) API keys are matched by their SHA-384 hex digest. A
+  non-blank `SBC_API_KEY_SHA256` now stops startup, and so does any
+  `SBC_API_KEY_SHA384` entry that is not 96 hex characters. There is no
+  dual-accept period. **Adapt:** for each key, set
+  `SBC_API_KEY_SHA384` to the output of
+  `printf %s "$KEY" | sha384sum | cut -d' ' -f1` (comma-separated), and
+  remove `SBC_API_KEY_SHA256`. The keys themselves do not change.
+- `apikey:<id>` audit ids are derived from the digest, so each key gets a
+  new id after the upgrade. **Adapt:** re-map API-key ids in the SIEM.
+
 ### BREAKING (SBC, management-API audit names the actor; `updated_by = 'local:<actor>'`, POA&M-386, 427, 428, 429)
 
 SBC only; the soft client is not affected. No config key or CDR field

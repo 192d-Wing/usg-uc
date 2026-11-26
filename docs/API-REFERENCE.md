@@ -19,6 +19,11 @@ curl -H "Authorization: Bearer <api-key>" \
   https://sbc.example.com:8443/api/v1/system/health
 ```
 
+API keys are configured by digest, never in clear:
+`SBC_API_KEY_SHA384` is a comma-separated list of SHA-384 hex digests
+(`printf %s "$KEY" | sha384sum | cut -d' ' -f1`). The former
+`SBC_API_KEY_SHA256` is no longer accepted and stops startup if set.
+
 ### Admin login (`POST /api/v1/auth/login`)
 
 Body: `{"username": "...", "password": "..."}`. Responses:
