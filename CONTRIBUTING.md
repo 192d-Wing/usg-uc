@@ -267,6 +267,8 @@ The following are **explicitly forbidden**:
 | PS384, PS512 | PS256 |
 | HS384, HS512 | HS256 |
 
+`proto-jwt` (OIDC access tokens) accepts ES384 only.
+
 ### Code Enforcement
 
 ```rust

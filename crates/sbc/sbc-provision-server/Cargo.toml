@@ -36,7 +36,12 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror.workspace = true
 ipnet.workspace = true
-hmac = "0.12"
-sha2 = "0.10"
+# Device-token HMAC-SHA-384 in the aws-lc FIPS module.
+uc-crypto.workspace = true
 hex = "0.4"
 zeroize.workspace = true
+
+[dev-dependencies]
+# SR-16 FIPS posture test. Without `fips` on purpose: only the binary's own
+# dependency graph (uc-crypto) may turn the FIPS module on.
+aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }

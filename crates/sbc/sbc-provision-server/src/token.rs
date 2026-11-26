@@ -13,11 +13,8 @@
 
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
-use sha2::Sha384;
+use uc_crypto::hash::{hmac_sha384, verify_hmac_sha384};
 use zeroize::Zeroizing;
-
-type HmacSha384 = Hmac<Sha384>;
 
 /// Minimum decoded `SBC_PROVISION_SECRET` length in bytes (256 bits).
 /// The env value is hex, so at least 64 hex chars (consistent with uc-auth).
@@ -75,13 +72,8 @@ pub fn normalize_mac(mac: &str) -> String {
 
 /// Mints the hex device token for an already-normalized MAC.
 pub fn mint_device_token(secret: &ProvisionSecret, mac_key: &str) -> String {
-    // HMAC accepts any key length; an error here is unreachable, and an
-    // empty token never verifies.
-    let Ok(mut mac) = HmacSha384::new_from_slice(secret.as_bytes()) else {
-        return String::new();
-    };
-    mac.update(mac_key.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+    // NIST 800-53 Rev5: SC-13 — HMAC-SHA-384 in the aws-lc FIPS module.
+    hex::encode(hmac_sha384(secret.as_bytes(), mac_key.as_bytes()))
 }
 
 /// Verifies `token_hex` for `mac_key` in constant time. Wrong-length
@@ -94,18 +86,13 @@ pub fn verify_device_token(secret: &ProvisionSecret, mac_key: &str, token_hex: &
     let Ok(token_bytes) = hex::decode(token_hex) else {
         return false;
     };
-    let Ok(mut mac) = HmacSha384::new_from_slice(secret.as_bytes()) else {
-        return false;
-    };
-    mac.update(mac_key.as_bytes());
-    mac.verify_slice(&token_bytes).is_ok()
+    verify_hmac_sha384(secret.as_bytes(), mac_key.as_bytes(), &token_bytes)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use sha2::Sha256;
 
     const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
@@ -124,9 +111,10 @@ mod tests {
 
     #[test]
     fn sha256_legacy_token_rejected() {
-        let mut mac = Hmac::<Sha256>::new_from_slice(&hex::decode(SECRET).unwrap()).unwrap();
-        mac.update(b"aabbccddeeff");
-        let legacy = hex::encode(mac.finalize().into_bytes());
+        // Legacy tokens were HMAC-SHA-256 (aws-lc-rs dev-dep; not in uc-crypto).
+        let key =
+            aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, &hex::decode(SECRET).unwrap());
+        let legacy = hex::encode(aws_lc_rs::hmac::sign(&key, b"aabbccddeeff"));
         assert!(!verify_device_token(&secret(), "aabbccddeeff", &legacy));
     }
 
@@ -167,6 +155,40 @@ mod tests {
         let err = ProvisionSecret::new("hunter2".to_string()).err().unwrap();
         assert!(!err.contains("hunter2"));
         assert!(!format!("{:?}", secret()).contains(SECRET));
+    }
+
+    // SR-16 golden vectors (captured from RustCrypto, cross-checked with
+    // openssl): the move to uc_crypto::hash::hmac_sha384 must keep every
+    // provisioned device token valid.
+
+    /// `printf %s aabbccddeeff | openssl dgst -sha384 -mac HMAC -macopt hexkey:<SECRET>`
+    const GOLDEN_TOKEN: &str = "0cacf2d0ac4e2422c81bd69ff3f7137b2f1eb727c83bdf48\
+                                f0d5b3ba2ca494edfb94ebf8b39a4258a49cf49811cf5d4a";
+
+    #[test]
+    fn device_token_golden_vector() {
+        let s = secret();
+        assert_eq!(mint_device_token(&s, "aabbccddeeff"), GOLDEN_TOKEN);
+        assert!(verify_device_token(&s, "aabbccddeeff", GOLDEN_TOKEN));
+        assert!(verify_device_token(
+            &s,
+            "aabbccddeeff",
+            &GOLDEN_TOKEN.to_uppercase()
+        ));
+        let mut flipped = GOLDEN_TOKEN.to_string();
+        flipped.replace_range(0..1, "1");
+        assert!(!verify_device_token(&s, "aabbccddeeff", &flipped));
+    }
+
+    #[test]
+    fn hmac_sha384_rfc4231_test_case_6() {
+        // RFC 4231 section 4.7: 131-byte key 0xaa.
+        let s = ProvisionSecret::new("aa".repeat(131)).unwrap();
+        let data = "Test Using Larger Than Block-Size Key - Hash Key First";
+        let expected = "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f\
+                        3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952";
+        assert_eq!(mint_device_token(&s, data), expected);
+        assert!(verify_device_token(&s, data, expected));
     }
 
     #[test]
