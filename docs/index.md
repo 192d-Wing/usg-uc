@@ -36,7 +36,8 @@ CNSA 2.0–compliant cryptography throughout.
   [Provisioning & OIDC design](CLIENT-PROVISIONING-OIDC.md).
 - Security and standards posture? See
   [CNSA 2.0 Compliance](CNSA-2-COMPLIANCE.md) and the
-  [NIST 800-53 control matrix](NIST-800-53-CONTROLS.md).
+  [NIST 800-53 control matrix](NIST-800-53-CONTROLS.md), and the
+  [TLS revocation design](TLS-REVOCATION-DESIGN.md) (POA&M-401).
 
 ## Building the project
 
