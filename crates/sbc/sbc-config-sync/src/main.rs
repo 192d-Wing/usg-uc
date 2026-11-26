@@ -3,6 +3,9 @@
 //! Polls `central-config-api` for this site's shard and applies deltas /
 //! snapshots into the local Postgres on an interval, surviving WAN
 //! outages by serving the last-applied state until the link returns.
+//!
+//! Exit codes: 2 config error, 3 local database connect failed, 4 HTTP
+//! client build failed (no trust anchors or bad TLS config).
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -54,10 +57,14 @@ async fn main() -> ExitCode {
         }
     };
 
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    // No fallback client: it would bypass the CNSA TLS policy.
+    let http = match sbc_config_sync::build_http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "http client build failed");
+            return ExitCode::from(4);
+        }
+    };
     let auth = match &cfg.auth {
         AuthConfig::Static(token) => Auth::Static(token.clone()),
         AuthConfig::Oidc {

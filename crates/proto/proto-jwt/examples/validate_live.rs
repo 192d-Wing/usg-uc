@@ -24,21 +24,29 @@ async fn main() {
     let token = std::fs::read_to_string(token_file).expect("read token file");
     let token = token.trim();
 
-    let mut http = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(10));
-    if let Ok(path) = std::env::var("JWT_EXTRA_CA_FILE") {
+    let extra_ca = std::env::var("JWT_EXTRA_CA_FILE").ok().map(|path| {
         let pem = std::fs::read(&path).expect("read CA file");
-        http = http.add_root_certificate(reqwest::Certificate::from_pem(&pem).expect("parse CA"));
         println!("loaded extra CA from {path}");
-    }
-    let http = http.build().expect("build http client");
+        pem
+    });
+    let tls = uc_transport::https_client::create_https_client_config(
+        extra_ca.as_deref(),
+        uc_transport::tls::MinTlsVersion::V1_2,
+    )
+    .expect("CNSA TLS config");
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .use_preconfigured_tls(tls)
+        .build()
+        .expect("build http client");
 
     let jwks = Arc::new(JwksCache::new(http, issuer.clone()));
     let validator = Validator::new(
         jwks,
         ValidatorConfig::new(issuer.clone(), vec![audience.clone()]),
-    );
+    )
+    .expect("validator config");
 
     println!("issuer:   {issuer}");
     println!("audience: {audience}");

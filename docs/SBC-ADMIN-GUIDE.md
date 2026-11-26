@@ -245,7 +245,7 @@ A REGISTER records the source address and the transport it actually arrived on (
 
 ### Authentication
 
-- **Bearer (wired)**: set `SBC_AUTH_MODE=bearer` and `SBC_OIDC_ISSUER` (optionally an extra CA for the internal IdP). Tokens are validated via `proto-jwt` (JWKS cache). Note: the validator currently accepts `RS256`, `PS256`, `ES256` and `ES384` tokens.
+- **Bearer (wired)**: set `SBC_AUTH_MODE=bearer` and `SBC_OIDC_ISSUER` (optionally an extra CA for the internal IdP). Tokens are validated via `proto-jwt` (JWKS cache). Only `ES384` tokens signed by an EC P-384 key are accepted (CNSA 2.0); `RS256`, `PS256` and `ES256` tokens get 401. The IdP must sign access tokens with ES384; Keycloak signs with RS256 by default (see `docs/CLIENT-PROVISIONING-OIDC.md` "Token signing"). Tokens must carry `exp`, `iss` and `aud`; `nbf` is checked when present. Accepted audiences come from `SBC_OIDC_AUDIENCE` (comma-separated, default `sbc`); if it resolves to an empty set, `SBC_OIDC_ISSUER` is unset, or the extra CA file cannot be read or parsed, the daemon does not start (`bearer_auth` init error).
 - **Digest (wired, off by default)**: `[digest_auth]` in `sbc.toml` with an HA1 credentials file; see the next section.
 - The two cannot be combined. With `SBC_AUTH_MODE=bearer` and `digest_auth.require_auth = true` the daemon refuses to start. `SBC_AUTH_MODE` is compared trimmed and case-insensitively, so a whitespace-padded value such as `" bearer "` now enables bearer mode (it did not before this change).
 

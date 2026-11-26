@@ -44,6 +44,8 @@ use tracing::debug;
 use uc_crypto::aead::Aes256GcmKey;
 use uc_crypto::ecdh::P384EphemeralKeyPair;
 use uc_crypto::hkdf;
+use uc_crypto::tls12::Tls12GcmSealer;
+use zeroize::Zeroize;
 
 /// `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` cipher suite ID.
 pub const TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: u16 = 0xC02C;
@@ -1128,13 +1130,13 @@ impl Handshake {
         // For AES-256-GCM: 32 byte key + 4 byte IV for each direction
         let key_material = prf_sha384(&master_secret, b"key expansion", &seed, 72);
 
-        let client_key_bytes: [u8; 32] =
+        let mut client_key_bytes: [u8; 32] =
             key_material[0..32]
                 .try_into()
                 .map_err(|_| DtlsError::KeyDerivationFailed {
                     reason: "key slice error".to_string(),
                 })?;
-        let server_key_bytes: [u8; 32] =
+        let mut server_key_bytes: [u8; 32] =
             key_material[32..64]
                 .try_into()
                 .map_err(|_| DtlsError::KeyDerivationFailed {
@@ -1153,23 +1155,29 @@ impl Handshake {
                     reason: "IV slice error".to_string(),
                 })?;
 
-        let client_key =
-            Aes256GcmKey::new(client_key_bytes).map_err(|e| DtlsError::KeyDerivationFailed {
-                reason: format!("invalid client key: {e}"),
-            })?;
-        let server_key =
-            Aes256GcmKey::new(server_key_bytes).map_err(|e| DtlsError::KeyDerivationFailed {
-                reason: format!("invalid server key: {e}"),
-            })?;
-
-        // Activate cipher with correct key direction based on role
-        if self.is_client {
-            self.record_layer
-                .activate_cipher(client_key, server_key, client_iv, server_iv);
+        // Write side seals through the module's TLS 1.2 GCM construction
+        // (approved service, explicit nonce checked monotonic); read side opens.
+        let (write_bytes, read_bytes, write_iv, read_iv) = if self.is_client {
+            (&client_key_bytes, &server_key_bytes, client_iv, server_iv)
         } else {
-            self.record_layer
-                .activate_cipher(server_key, client_key, server_iv, client_iv);
-        }
+            (&server_key_bytes, &client_key_bytes, server_iv, client_iv)
+        };
+        let keys = Tls12GcmSealer::new(write_bytes)
+            .map_err(|e| DtlsError::KeyDerivationFailed {
+                reason: format!("invalid write key: {e}"),
+            })
+            .and_then(|w| {
+                Aes256GcmKey::new(*read_bytes).map(|r| (w, r)).map_err(|e| {
+                    DtlsError::KeyDerivationFailed {
+                        reason: format!("invalid read key: {e}"),
+                    }
+                })
+            });
+        client_key_bytes.zeroize();
+        server_key_bytes.zeroize();
+        let (write_key, read_key) = keys?;
+        self.record_layer
+            .activate_cipher(write_key, read_key, write_iv, read_iv);
 
         debug!("Cipher activated");
         Ok(())

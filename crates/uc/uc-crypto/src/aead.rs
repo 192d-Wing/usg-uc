@@ -7,12 +7,21 @@
 //!
 //! This module only provides AES-256-GCM to enforce CNSA 2.0 compliance.
 //!
+//! ## FIPS 140-3 approved services (IG C.H)
+//!
+//! - [`RandomNonceKey`]: seal with a module-generated IV (approved). Use it
+//!   for data at rest.
+//! - [`Aes256GcmKey`]: open only (approved).
+//! - [`CachedAeadKey`]: seal with a caller-built IV for RFC 7714 SRTP; not an
+//!   approved service (POA&M-400). Its open is approved.
+//! - TLS 1.2 record seal: [`crate::tls12::Tls12GcmSealer`] (approved).
+//!
 //! ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection)
 
 use crate::error::{CryptoError, CryptoResult};
 use crate::random;
 use aws_lc_rs::aead::{
-    self, AES_256_GCM, Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey,
+    self, AES_256_GCM, Aad, BoundKey, Nonce, NonceSequence, OpeningKey, RandomizedNonceKey,
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -25,13 +34,16 @@ pub const NONCE_LEN: usize = 12;
 /// AES-256-GCM authentication tag length in bytes.
 pub const TAG_LEN: usize = 16;
 
-/// AES-256-GCM key for AEAD operations.
+/// AES-256-GCM opening key (DTLS read side and blobs sealed elsewhere).
+///
+/// Open-only: AES-GCM seal with a caller-built IV is not an approved FIPS
+/// 140-3 service (IG C.H). Seal data at rest with [`RandomNonceKey`].
 ///
 /// ## Key material lifecycle
 ///
 /// - The 32-byte key array owned by this struct is wiped when the key is
 ///   dropped (`ZeroizeOnDrop`).
-/// - Each `seal`/`open` builds a short-lived aws-lc AES key schedule from
+/// - Each `open` builds a short-lived aws-lc AES key schedule from
 ///   these bytes. aws-lc wipes it (`EVP_AEAD_CTX_cleanup` ->
 ///   `OPENSSL_cleanse`) when it is freed at the end of the call; Rust cannot
 ///   reach it.
@@ -86,38 +98,6 @@ impl Aes256GcmKey {
         &self.key_bytes
     }
 
-    /// Encrypts plaintext with additional authenticated data.
-    ///
-    /// Returns the ciphertext with the authentication tag appended.
-    ///
-    /// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection)
-    ///
-    /// ## Errors
-    ///
-    /// Returns an error if encryption fails.
-    pub fn seal(
-        &self,
-        nonce: &[u8; NONCE_LEN],
-        aad: &[u8],
-        plaintext: &[u8],
-    ) -> CryptoResult<Vec<u8>> {
-        let unbound_key = aead::UnboundKey::new(&AES_256_GCM, &self.key_bytes)
-            .map_err(|_| CryptoError::InvalidKeyMaterial)?;
-
-        let nonce_seq = SingleNonce::new(*nonce);
-        let mut sealing_key = SealingKey::new(unbound_key, nonce_seq);
-
-        // Allocate output buffer: plaintext + tag
-        let mut in_out = plaintext.to_vec();
-        in_out.reserve(TAG_LEN);
-
-        sealing_key
-            .seal_in_place_append_tag(Aad::from(aad), &mut in_out)
-            .map_err(|_| CryptoError::SealFailed)?;
-
-        Ok(in_out)
-    }
-
     /// Decrypts ciphertext with additional authenticated data.
     ///
     /// The ciphertext must include the authentication tag at the end. The
@@ -168,6 +148,105 @@ impl std::fmt::Debug for Aes256GcmKey {
     }
 }
 
+/// AES-256-GCM key whose seal IV is generated inside the FIPS module.
+///
+/// The approved internal-IV service (SP 800-38D §8.2.2, FIPS 140-3 IG C.H):
+/// aws-lc draws the 96-bit IV from its DRBG and returns it. Use this for
+/// data at rest. Output is plain AES-256-GCM, so blobs open with
+/// [`Aes256GcmKey`] and caller-IV blobs open here.
+///
+/// The key schedule is expanded once into an aws-lc `EVP_AEAD_CTX`, which
+/// aws-lc cleanses on drop; no Rust copy of the key is kept. Not `Clone`.
+///
+/// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection), SC-12, SC-28
+pub struct RandomNonceKey {
+    inner: RandomizedNonceKey,
+}
+
+impl RandomNonceKey {
+    /// Creates a key from raw bytes. The caller still owns (and should
+    /// zeroize) its copy.
+    ///
+    /// # Errors
+    /// Returns an error if the module rejects the key.
+    pub fn new(key_bytes: &[u8; KEY_LEN]) -> CryptoResult<Self> {
+        let inner = RandomizedNonceKey::new(&AES_256_GCM, key_bytes)
+            .map_err(|_| CryptoError::InvalidKeyMaterial)?;
+        Ok(Self { inner })
+    }
+
+    /// Generates a new random key.
+    ///
+    /// # Errors
+    /// Returns an error if random generation or key setup fails.
+    pub fn generate() -> CryptoResult<Self> {
+        let mut key_bytes = random::generate_key_256()?;
+        let key = Self::new(&key_bytes);
+        key_bytes.zeroize();
+        key
+    }
+
+    /// Encrypts `plaintext`; the module generates the IV.
+    ///
+    /// Returns `(nonce, ciphertext || tag)`.
+    ///
+    /// # Errors
+    /// Returns an error if encryption fails.
+    pub fn seal(&self, aad: &[u8], plaintext: &[u8]) -> CryptoResult<([u8; NONCE_LEN], Vec<u8>)> {
+        let mut in_out = Vec::with_capacity(plaintext.len() + TAG_LEN);
+        in_out.extend_from_slice(plaintext);
+        let Ok(nonce) = self
+            .inner
+            .seal_in_place_append_tag(Aad::from(aad), &mut in_out)
+        else {
+            in_out.zeroize();
+            return Err(CryptoError::SealFailed);
+        };
+        Ok((*nonce.as_ref(), in_out))
+    }
+
+    /// Decrypts `ciphertext || tag`, including blobs sealed with a
+    /// caller-built IV. The working buffer is wiped on failure; the
+    /// returned plaintext is the caller's to wipe.
+    ///
+    /// # Errors
+    /// Returns an error if decryption or authentication fails.
+    pub fn open(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> CryptoResult<Vec<u8>> {
+        if ciphertext.len() < TAG_LEN {
+            return Err(CryptoError::OpenFailed);
+        }
+        let mut in_out = ciphertext.to_vec();
+        let Ok(plaintext_len) = self
+            .inner
+            .open_in_place(
+                Nonce::assume_unique_for_key(*nonce),
+                Aad::from(aad),
+                &mut in_out,
+            )
+            .map(|p| p.len())
+        else {
+            in_out.zeroize();
+            return Err(CryptoError::OpenFailed);
+        };
+        in_out.truncate(plaintext_len);
+        Ok(in_out)
+    }
+}
+
+impl std::fmt::Debug for RandomNonceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RandomNonceKey")
+            .field("algorithm", &"AES-256-GCM")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// AES-256-GCM key with a pre-expanded key schedule for repeated use.
 ///
 /// Unlike [`Aes256GcmKey`], which creates a new `UnboundKey` (AES key schedule)
@@ -175,12 +254,16 @@ impl std::fmt::Debug for Aes256GcmKey {
 /// construction and reuses it across all subsequent operations. This saves
 /// ~100ns per packet on the SRTP hot path.
 ///
+/// RFC 7714 SRTP only; for data at rest use [`RandomNonceKey`].
+///
 /// Uses `LessSafeKey` from aws-lc-rs, which requires the caller to manage
-/// nonce uniqueness (appropriate for SRTP where nonces are derived from
-/// packet index + SSRC).
+/// nonce uniqueness (RFC 7714 §8.1: IV derived from SSRC, ROC, SEQ and the
+/// salt). Seal with a caller-built IV is not an approved FIPS 140-3 service
+/// (IG C.H); open is approved.
 ///
 /// The expanded key lives inside an opaque aws-lc `EVP_AEAD_CTX`; aws-lc
 /// cleanses it when this value is dropped. Rust code cannot wipe it.
+// POAM: POA&M-400 (SRTP/SRTCP seal: external IV, no approved aws-lc service fits RFC 7714).
 pub struct CachedAeadKey {
     inner: aead::LessSafeKey,
 }
@@ -204,6 +287,8 @@ impl CachedAeadKey {
     /// Encrypts plaintext with additional authenticated data.
     ///
     /// Returns the ciphertext with the authentication tag appended.
+    ///
+    /// Not an approved FIPS 140-3 service (caller-built IV; POA&M-400).
     ///
     /// # Errors
     /// Returns an error if encryption fails.
@@ -263,6 +348,8 @@ impl CachedAeadKey {
     /// The buffer is cleared, filled with plaintext, and sealed in-place.
     /// On return it contains `ciphertext || auth_tag`.
     ///
+    /// Not an approved FIPS 140-3 service (caller-built IV; POA&M-400).
+    ///
     /// # Errors
     /// Returns an error if encryption fails.
     pub fn seal_into(
@@ -296,6 +383,8 @@ impl CachedAeadKey {
     ///
     /// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection), SC-5 (no
     /// per-packet allocation)
+    ///
+    /// Not an approved FIPS 140-3 service (caller-built IV; POA&M-400).
     ///
     /// # Errors
     /// Returns an error if encryption fails. The contents of `in_out` are
@@ -380,27 +469,19 @@ impl NonceSequence for SingleNonce {
     }
 }
 
-/// Encrypts data with AES-256-GCM using a randomly generated nonce.
-///
-/// Returns (nonce, ciphertext_with_tag).
-///
-/// ## Errors
-///
-/// Returns an error if encryption or random generation fails.
-pub fn seal_with_random_nonce(
-    key: &Aes256GcmKey,
-    aad: &[u8],
-    plaintext: &[u8],
-) -> CryptoResult<([u8; NONCE_LEN], Vec<u8>)> {
-    let nonce = random::generate_nonce()?;
-    let ciphertext = key.seal(&nonce, aad, plaintext)?;
-    Ok((nonce, ciphertext))
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Caller-IV seal for test vectors (same bytes the removed
+    /// `Aes256GcmKey::seal` produced).
+    fn seal(key: &Aes256GcmKey, nonce: &[u8; NONCE_LEN], aad: &[u8], pt: &[u8]) -> Vec<u8> {
+        CachedAeadKey::new(key.as_bytes())
+            .unwrap()
+            .seal(nonce, aad, pt)
+            .unwrap()
+    }
 
     #[test]
     fn test_seal_open_roundtrip() {
@@ -409,7 +490,7 @@ mod tests {
         let aad = b"additional data";
         let plaintext = b"secret message";
 
-        let ciphertext = key.seal(&nonce, aad, plaintext).unwrap();
+        let ciphertext = seal(&key, &nonce, aad, plaintext);
         assert_ne!(ciphertext.as_slice(), plaintext);
         assert_eq!(ciphertext.len(), plaintext.len() + TAG_LEN);
 
@@ -425,7 +506,7 @@ mod tests {
         let aad = b"aad";
         let plaintext = b"secret";
 
-        let ciphertext = key1.seal(&nonce, aad, plaintext).unwrap();
+        let ciphertext = seal(&key1, &nonce, aad, plaintext);
         let result = key2.open(&nonce, aad, &ciphertext);
         assert!(result.is_err());
     }
@@ -436,7 +517,7 @@ mod tests {
         let nonce = random::generate_nonce().unwrap();
         let plaintext = b"secret";
 
-        let ciphertext = key.seal(&nonce, b"correct aad", plaintext).unwrap();
+        let ciphertext = seal(&key, &nonce, b"correct aad", plaintext);
         let result = key.open(&nonce, b"wrong aad", &ciphertext);
         assert!(result.is_err());
     }
@@ -448,7 +529,7 @@ mod tests {
         let aad = b"aad";
         let plaintext = b"secret";
 
-        let mut ciphertext = key.seal(&nonce, aad, plaintext).unwrap();
+        let mut ciphertext = seal(&key, &nonce, aad, plaintext);
         // Tamper with the ciphertext
         ciphertext[0] ^= 0xFF;
 
@@ -463,22 +544,11 @@ mod tests {
         let aad = b"aad";
         let plaintext = b"";
 
-        let ciphertext = key.seal(&nonce, aad, plaintext).unwrap();
+        let ciphertext = seal(&key, &nonce, aad, plaintext);
         assert_eq!(ciphertext.len(), TAG_LEN); // Just the tag
 
         let decrypted = key.open(&nonce, aad, &ciphertext).unwrap();
         assert_eq!(decrypted, [] as [u8; 0]);
-    }
-
-    #[test]
-    fn test_seal_with_random_nonce() {
-        let key = Aes256GcmKey::generate().unwrap();
-        let aad = b"aad";
-        let plaintext = b"secret";
-
-        let (nonce, ciphertext) = seal_with_random_nonce(&key, aad, plaintext).unwrap();
-        let decrypted = key.open(&nonce, aad, &ciphertext).unwrap();
-        assert_eq!(decrypted, plaintext);
     }
 
     // POA&M-160 (closed): the derive set must cover the key array. `Zeroize` and
@@ -499,7 +569,7 @@ mod tests {
     fn test_open_returns_single_buffer() {
         let key = Aes256GcmKey::generate().unwrap();
         let nonce = random::generate_nonce().unwrap();
-        let ct = key.seal(&nonce, b"", b"0123456789").unwrap();
+        let ct = seal(&key, &nonce, b"", b"0123456789");
         let pt = key.open(&nonce, b"", &ct).unwrap();
         assert_eq!(pt, b"0123456789");
         // Returned vec is the in-place working buffer (no second copy).
@@ -593,7 +663,7 @@ mod tests {
     fn test_open_tag_failure_paths() {
         let key = Aes256GcmKey::generate().unwrap();
         let nonce = random::generate_nonce().unwrap();
-        let ct = key.seal(&nonce, b"aad", b"secret plaintext").unwrap();
+        let ct = seal(&key, &nonce, b"aad", b"secret plaintext");
         // Shorter than the tag: rejected before any decryption.
         assert!(key.open(&nonce, b"aad", &ct[..TAG_LEN - 1]).is_err());
         assert!(key.open(&nonce, b"aad", &[]).is_err());
@@ -617,5 +687,176 @@ mod tests {
         let debug_str = format!("{key:?}");
         assert!(debug_str.contains("REDACTED"));
         assert!(!debug_str.contains(&format!("{:?}", key.as_bytes())));
+    }
+}
+
+// SR-15: removed caller-nonce seal on the general-purpose key. These doctests
+// fail if `Aes256GcmKey::seal` or `seal_with_random_nonce` comes back.
+/// ```compile_fail
+/// use uc_crypto::aead::Aes256GcmKey;
+/// let key = Aes256GcmKey::generate().unwrap();
+/// let nonce = uc_crypto::random::generate_nonce().unwrap();
+/// let _ = key.seal(&nonce, b"aad", b"plaintext");
+/// ```
+///
+/// ```compile_fail
+/// use uc_crypto::aead::{seal_with_random_nonce, Aes256GcmKey};
+/// let key = Aes256GcmKey::generate().unwrap();
+/// let _ = seal_with_random_nonce(&key, b"aad", b"plaintext");
+/// ```
+///
+/// The opener and the internal-IV key stay available (compile check only):
+///
+/// ```no_run
+/// use uc_crypto::aead::{Aes256GcmKey, RandomNonceKey};
+/// let bytes = uc_crypto::random::generate_key_256().unwrap();
+/// let sealer = RandomNonceKey::new(&bytes).unwrap();
+/// let opener = Aes256GcmKey::new(bytes).unwrap();
+/// let (nonce, ct) = sealer.seal(b"aad", b"plaintext").unwrap();
+/// assert_eq!(opener.open(&nonce, b"aad", &ct).unwrap(), b"plaintext");
+/// ```
+#[cfg(doctest)]
+mod sr15_no_caller_nonce_seal_on_aes256gcmkey {}
+
+/// SR-15: `RandomNonceKey`, the module-internal-IV AES-256-GCM service
+/// (plan section 4). Random runtime keys only.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod random_nonce_key_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use zeroize::Zeroizing;
+
+    /// Fails to compile if `$type` implements `$trait` (see
+    /// `proto-dtls/tests/secret_hygiene.rs`).
+    macro_rules! assert_not_impl {
+        ($type:ty: $trait:path) => {
+            const _: fn() = || {
+                trait AmbiguousIfImpl<A> {
+                    fn some_item() {}
+                }
+                impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+                #[allow(dead_code)]
+                struct Invalid;
+                impl<T: ?Sized + $trait> AmbiguousIfImpl<Invalid> for T {}
+                let _ = <$type as AmbiguousIfImpl<_>>::some_item;
+            };
+        };
+    }
+
+    assert_not_impl!(RandomNonceKey: Clone);
+    assert_not_impl!(RandomNonceKey: Copy);
+
+    fn random_key_bytes() -> Zeroizing<[u8; KEY_LEN]> {
+        Zeroizing::new(random::generate_key_256().unwrap())
+    }
+
+    #[test]
+    fn random_nonce_key_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RandomNonceKey>();
+    }
+
+    #[test]
+    fn random_nonce_seal_open_roundtrip() {
+        let key = RandomNonceKey::generate().unwrap();
+        for pt in [&b""[..], b"x", b"secret message", &[0x5a; 300][..]] {
+            let (nonce, ct) = key.seal(b"aad", pt).unwrap();
+            assert_eq!(ct.len(), pt.len() + TAG_LEN);
+            if !pt.is_empty() {
+                assert_ne!(&ct[..pt.len()], pt);
+            }
+            assert_eq!(key.open(&nonce, b"aad", &ct).unwrap(), pt);
+        }
+        // From caller bytes as well as `generate`.
+        let key = RandomNonceKey::new(&random_key_bytes()).unwrap();
+        let (nonce, ct) = key.seal(b"", b"pt").unwrap();
+        assert_eq!(key.open(&nonce, b"", &ct).unwrap(), b"pt");
+    }
+
+    #[test]
+    fn random_nonce_wrong_aad_or_key_fails() {
+        let a = RandomNonceKey::generate().unwrap();
+        let b = RandomNonceKey::generate().unwrap();
+        let (nonce, ct) = a.seal(b"correct aad", b"secret").unwrap();
+        assert!(a.open(&nonce, b"wrong aad", &ct).is_err());
+        assert!(a.open(&nonce, b"", &ct).is_err());
+        assert!(b.open(&nonce, b"correct aad", &ct).is_err());
+        let mut other = nonce;
+        other[NONCE_LEN - 1] ^= 1;
+        assert!(a.open(&other, b"correct aad", &ct).is_err());
+        assert_eq!(a.open(&nonce, b"correct aad", &ct).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn random_nonce_tamper_and_short_fail() {
+        let key = RandomNonceKey::generate().unwrap();
+        let (nonce, ct) = key.seal(b"aad", b"secret plaintext").unwrap();
+        // Every single-byte flip (body and tag) fails closed.
+        for i in 0..ct.len() {
+            let mut bad = ct.clone();
+            bad[i] ^= 0x01;
+            assert!(key.open(&nonce, b"aad", &bad).is_err(), "flip at {i}");
+        }
+        // Shorter than a tag, empty, tag-only, truncated tag.
+        assert!(key.open(&nonce, b"aad", &ct[..TAG_LEN - 1]).is_err());
+        assert!(key.open(&nonce, b"aad", &[]).is_err());
+        assert!(key.open(&nonce, b"aad", &[0u8; TAG_LEN]).is_err());
+        assert!(key.open(&nonce, b"aad", &ct[..ct.len() - 1]).is_err());
+        // Failures leave the key usable.
+        assert_eq!(key.open(&nonce, b"aad", &ct).unwrap(), b"secret plaintext");
+    }
+
+    #[test]
+    fn random_nonce_nonces_distinct() {
+        let key = RandomNonceKey::generate().unwrap();
+        let mut seen = HashSet::with_capacity(1024);
+        for _ in 0..1024 {
+            let (nonce, _) = key.seal(b"aad", b"same plaintext").unwrap();
+            assert!(seen.insert(nonce), "module repeated an IV");
+        }
+        assert_eq!(seen.len(), 1024);
+    }
+
+    /// Rolling upgrade: a blob sealed by the new key opens with the
+    /// pre-change opener (`Aes256GcmKey`) and with `CachedAeadKey`, and is
+    /// byte-identical to a caller-nonce seal under the returned IV.
+    #[test]
+    fn random_nonce_blob_opens_with_aes256gcmkey() {
+        let bytes = random_key_bytes();
+        let sealer = RandomNonceKey::new(&bytes).unwrap();
+        let opener = Aes256GcmKey::new(*bytes).unwrap();
+        let cached = CachedAeadKey::new(&bytes).unwrap();
+        let (nonce, ct) = sealer.seal(b"row-aad", b"ha1 value").unwrap();
+        assert_eq!(opener.open(&nonce, b"row-aad", &ct).unwrap(), b"ha1 value");
+        assert_eq!(cached.open(&nonce, b"row-aad", &ct).unwrap(), b"ha1 value");
+        assert_eq!(cached.seal(&nonce, b"row-aad", b"ha1 value").unwrap(), ct);
+    }
+
+    /// Old rows: a caller-nonce (pre-SR-15) blob opens with `RandomNonceKey`.
+    #[test]
+    fn caller_nonce_blob_opens_with_random_nonce_key() {
+        let bytes = random_key_bytes();
+        let legacy = CachedAeadKey::new(&bytes).unwrap();
+        let key = RandomNonceKey::new(&bytes).unwrap();
+        let nonce = random::generate_nonce().unwrap();
+        let ct = legacy.seal(&nonce, b"row-aad", b"ha1 value").unwrap();
+        assert_eq!(key.open(&nonce, b"row-aad", &ct).unwrap(), b"ha1 value");
+        let mut bad = ct;
+        bad[0] ^= 1;
+        assert!(key.open(&nonce, b"row-aad", &bad).is_err());
+    }
+
+    #[test]
+    fn random_nonce_key_debug_redacted() {
+        let bytes = random_key_bytes();
+        let key = RandomNonceKey::new(&bytes).unwrap();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        for s in [format!("{key:?}"), format!("{key:#?}")] {
+            assert!(s.contains("RandomNonceKey"), "{s}");
+            assert!(s.contains("AES-256-GCM"), "{s}");
+            assert!(!s.contains(&format!("{:?}", *bytes)), "{s}");
+            assert!(!s.to_ascii_lowercase().contains(&hex), "{s}");
+        }
     }
 }

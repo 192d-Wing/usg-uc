@@ -3,6 +3,8 @@
 `central-config-api` authorizes two distinct token populations, separated
 by OAuth scope. Both validate against the same realm/issuer and audience
 (`CENTRAL_OIDC_AUDIENCE`, default `usg-uc-config`).
+Tokens must be ES384, signed by an EC P-384 realm key; RS256 (the Keycloak
+default) is rejected. See [README.md → Signing algorithm](README.md#signing-algorithm-manual-required).
 
 ## 1. Per-site sync service accounts — `usg-uc-site-sync`
 
