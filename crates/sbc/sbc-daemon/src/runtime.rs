@@ -737,9 +737,9 @@ impl Runtime {
             signal.clone(),
             self.cluster.clone(),
             self.digest_credentials.clone(),
-        );
+        )?;
         #[cfg(not(feature = "cluster"))]
-        let mut server = Server::new(config, signal.clone(), self.digest_credentials.clone());
+        let mut server = Server::new(config, signal.clone(), self.digest_credentials.clone())?;
 
         // Set zone registry on server (and its SipStack) before starting
         if let Some(ref registry) = zone_registry {
@@ -2347,7 +2347,7 @@ mod tests {
         .unwrap();
         let store = Runtime::load_digest_credentials(&config, "").unwrap();
         assert!(store.is_some());
-        let server = Server::new(config, ShutdownSignal::new(), store);
+        let server = Server::new(config, ShutdownSignal::new(), store).unwrap();
         let stack = server.sip_stack();
         assert!(stack.register_auth_enabled());
 
@@ -2655,7 +2655,7 @@ mod tests {
         let store = Runtime::load_digest_credentials(&config, "")
             .unwrap()
             .expect("store");
-        let server = Server::new(config, ShutdownSignal::new(), Some(Arc::clone(&store)));
+        let server = Server::new(config, ShutdownSignal::new(), Some(Arc::clone(&store))).unwrap();
         let stack = server.sip_stack();
 
         let challenge = qa_register(stack, "alice", 1, None).await.expect("401");

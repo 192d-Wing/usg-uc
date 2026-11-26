@@ -41,7 +41,7 @@ uc-transport = { workspace = true, default-features = false, features = ["https-
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
-# Test-only token signing: ES256 keypair generation + JWT encode. No static
+# Test-only token signing: ES384 (P-384) keypair generation + JWT encode. No static
 # private key in the tree.
 jsonwebtoken.workspace = true
 aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }

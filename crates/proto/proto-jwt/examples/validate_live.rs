@@ -45,7 +45,8 @@ async fn main() {
     let validator = Validator::new(
         jwks,
         ValidatorConfig::new(issuer.clone(), vec![audience.clone()]),
-    );
+    )
+    .expect("validator config");
 
     println!("issuer:   {issuer}");
     println!("audience: {audience}");

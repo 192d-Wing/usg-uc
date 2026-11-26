@@ -39,6 +39,37 @@ Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
   module: admin password argon2id (POA&M-402) and sqlx-postgres Postgres
   client authentication (POA&M-403).
 
+### BREAKING (SBC, OIDC access tokens: ES384 only; exp/iss/aud required; SR-30, SR-34)
+
+Affects every service that validates OIDC tokens: sbc-daemon (bearer
+REGISTER), sbc-client-config-server, sbc-api-server and central-config-api.
+
+- **The IdP must sign access tokens with ES384 from an EC P-384 key.**
+  (SC-13, IA-5(2)) RS256, PS256 and ES256 tokens get 401. Keycloak defaults
+  to RS256: add an `ecdsa-generated` P-384 key provider and set the realm
+  default signature algorithm to `ES384` before upgrading.
+  `Configure-Voice.ps1` does not do this. A JWK that is not EC P-384, or
+  whose `alg` differs from the token's, whose `use` is not `sig`, or whose
+  `key_ops` lacks `verify`, is refused. Operator steps:
+  `docs/CLIENT-PROVISIONING-OIDC.md` "Token signing".
+- **Tokens must carry `exp`, `iss` and `aud`; `nbf` is checked when
+  present.** (IA-2) Previously `iss` and `aud` were checked only when
+  present, and `nbf` was not checked. A token with a `crit` header, a
+  header `typ` other than `JWT` / `at+jwt` (also as `application/jwt` / `application/at+jwt`, case-insensitive), or a Keycloak `typ` claim other
+  than `Bearer` (ID, refresh, logout tokens) is refused.
+- **An empty issuer or audience set is refused.** (IA-2) sbc-api-server and
+  central-config-api fail to start; sbc-client-config-server exits with
+  code 2. sbc-daemon with `SBC_AUTH_MODE=bearer` no longer starts when the
+  bearer authorizer cannot be built (issuer unset, empty audience set,
+  unreadable or invalid `SBC_OIDC_EXTRA_CA_CERT_FILE`); it used to log an
+  error and run with REGISTER unauthenticated. (IA-2, SC-24)
+- **`proto-jwt`: `Validator::new` returns `Result<Validator, ConfigError>`**
+  (`EmptyIssuer`, `EmptyAudiences`, `BlankAudience`, `Leeway` above
+  `MAX_LEEWAY_SECS` = 300) and is no longer `const`; it trims the issuer
+  and audience entries. `ALLOWED_ALGS` is `[ES384]`. proto-jwt enables the
+  aws-lc-rs `fips` feature, so sbc-client-config-server now links
+  aws-lc-fips-sys. sbc-daemon `Server::new` returns `Result`.
+
 ### BREAKING (uc-crypto API, AES-GCM seal services, SR-15, POA&M-400)
 
 - **uc-crypto: `Aes256GcmKey::seal` and `aead::seal_with_random_nonce` are

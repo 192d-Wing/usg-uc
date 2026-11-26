@@ -28951,10 +28951,13 @@ pub mod tests {
                 .build()
                 .expect("http client");
             let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer));
-            let validator = Arc::new(proto_jwt::Validator::new(
-                jwks,
-                proto_jwt::ValidatorConfig::new(issuer, vec!["sbc".to_string()]),
-            ));
+            let validator = Arc::new(
+                proto_jwt::Validator::new(
+                    jwks,
+                    proto_jwt::ValidatorConfig::new(issuer, vec!["sbc".to_string()]),
+                )
+                .expect("validator config"),
+            );
             Arc::new(BearerAuthenticator::new(
                 validator,
                 "example.com".to_string(),

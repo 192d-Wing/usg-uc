@@ -103,10 +103,17 @@ async fn main() -> ExitCode {
         warn!(issuer = %cfg.oidc_issuer, error = %e, "JWKS prefetch failed; pod stays not-ready until the IdP is reachable");
     }
 
-    let verifier = Arc::new(Validator::new(
+    // NIST 800-53 Rev5: IA-2, AC-3 (non-empty iss/aud enforced)
+    let verifier = match Validator::new(
         Arc::clone(&jwks),
         ValidatorConfig::new(cfg.oidc_issuer.clone(), vec![cfg.oidc_audience.clone()]),
-    ));
+    ) {
+        Ok(v) => Arc::new(v),
+        Err(e) => {
+            error!(error = %e, "OIDC validator config error");
+            return ExitCode::from(2);
+        }
+    };
     info!(
         issuer = %cfg.oidc_issuer,
         audience = %cfg.oidc_audience,
