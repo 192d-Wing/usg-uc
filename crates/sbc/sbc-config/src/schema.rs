@@ -688,10 +688,29 @@ pub struct CdrConfig {
     /// Rotate a non-empty file after this long (`"0"` = size only;
     /// otherwise 5m..=24h). Units: s, m, h.
     pub rotate_interval: String,
-    /// Closed files to keep (0 = unlimited).
+    /// Safety cap on closed calls-stream files (0 = unlimited). With a time
+    /// rotation, `retention_files x rotate_interval` must cover
+    /// `retention_days`; a cap deletion inside `retention_days` is audited
+    /// as early.
     pub retention_files: u32,
-    /// Days to keep closed files (0 = unlimited).
+    /// Days to keep closed files (0 = unlimited). Authoritative: older files
+    /// are deleted.
     pub retention_days: u32,
+    /// Write unanswered attempts (rejects, failed, busy, no answer,
+    /// cancelled) to a separate attempts stream (`cdra-{node}-*`, schema v5)
+    /// with its own chain, file size and retention, so traffic that never
+    /// completes a call cannot evict answered-call CDRs. `false` keeps the
+    /// single v4 stream.
+    pub separate_attempts: bool,
+    /// Safety cap on closed attempts-stream files (at least 1 with
+    /// `separate_attempts`); same coverage rule as `retention_files`.
+    pub attempts_retention_files: u32,
+    /// Days to keep closed attempts-stream files (0 = unlimited).
+    pub attempts_retention_days: u32,
+    /// Rotate an attempts-stream file at this size, 1..=4096 MiB (default
+    /// 4: the stream is attacker-drivable, so its byte bound
+    /// `attempts_retention_files x attempts_rotate_size_mb` stays small).
+    pub attempts_rotate_size_mb: u32,
     /// fsync at most this often (0 = after every record), 0..=60000 ms.
     pub fsync_interval_ms: u32,
     /// Writer queue capacity, `64..=1_000_000`.
@@ -724,8 +743,13 @@ impl Default for CdrConfig {
             node_id: None,
             rotate_size_mb: 100,
             rotate_interval: "1h".to_string(),
-            retention_files: 168,
+            // 93 days of hourly files: covers retention_days with margin.
+            retention_files: 2232,
             retention_days: 90,
+            separate_attempts: true,
+            attempts_retention_files: 2232,
+            attempts_retention_days: 90,
+            attempts_rotate_size_mb: 4,
             fsync_interval_ms: 1000,
             queue_capacity: 8192,
             ring_capacity: 10_000,
@@ -747,6 +771,26 @@ impl CdrConfig {
     #[must_use]
     pub fn rotate_interval_secs(&self) -> Option<u64> {
         parse_duration_secs(&self.rotate_interval)
+    }
+
+    /// Worst-case bytes on disk per stream, `(calls, attempts)`: closed
+    /// files plus the open one, each at its rotate size. `None` for a stream
+    /// without a count cap (bounded by age and traffic only) and for the
+    /// attempts stream when `separate_attempts` is false.
+    ///
+    /// ## NIST 800-53 Rev5: AU-4 (Audit Log Storage Capacity)
+    #[must_use]
+    pub fn worst_case_bytes(&self) -> (Option<u64>, Option<u64>) {
+        let mib = 1024 * 1024;
+        let bound = |files: u32, size_mb: u32| {
+            (files > 0).then(|| (u64::from(files) + 1) * u64::from(size_mb) * mib)
+        };
+        (
+            bound(self.retention_files, self.rotate_size_mb),
+            self.separate_attempts
+                .then(|| bound(self.attempts_retention_files, self.attempts_rotate_size_mb))
+                .flatten(),
+        )
     }
 }
 
@@ -1991,6 +2035,32 @@ pub struct LoggingConfig {
 
     /// Audit log output path.
     pub audit_path: Option<PathBuf>,
+
+    /// Rotate the audit file before it exceeds this size, 1..=4096 MiB.
+    pub audit_max_file_mb: u32,
+
+    /// Rotated audit files kept next to the current one, 1..=1024. The audit
+    /// trail on disk is at most `(audit_max_files + 1) x audit_max_file_mb`.
+    pub audit_max_files: u32,
+
+    /// Action when the audit capacity bound is reached.
+    pub audit_on_full: AuditOnFull,
+}
+
+/// Action when the audit file capacity bound is reached
+/// (`logging.audit_on_full`).
+///
+/// ## NIST 800-53 Rev5: AU-5 b (Response to Audit Logging Process Failures)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOnFull {
+    /// Delete the oldest rotated file; each deletion is audited, counted
+    /// and logged at error level.
+    #[default]
+    OverwriteOldest,
+    /// Refuse further audit records (counted, health unhealthy) until
+    /// rotated files are archived and removed.
+    Stop,
 }
 
 impl Default for LoggingConfig {
@@ -2001,6 +2071,9 @@ impl Default for LoggingConfig {
             output: "stdout".to_string(),
             audit_enabled: true,
             audit_path: None,
+            audit_max_file_mb: 64,
+            audit_max_files: 16,
+            audit_on_full: AuditOnFull::OverwriteOldest,
         }
     }
 }

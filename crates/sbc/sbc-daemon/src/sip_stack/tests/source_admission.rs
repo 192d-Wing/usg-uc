@@ -139,7 +139,10 @@ fn fix_content_length(msg: &str) -> String {
 }
 
 /// Outcome of one INVITE: its results and whether source admission refused
-/// it (403 with the `source-admission` audit record, nothing forwarded).
+/// it (403, nothing forwarded, `sbc_source_admission_rejects_total` +1). The
+/// first refusal per source prefix writes the `source-admission` record at
+/// once; repeats in the window are aggregated (SR-42), so a record is
+/// checked when present but not required.
 struct Sent {
     results: Vec<ProcessResult>,
     denied: bool,
@@ -152,6 +155,15 @@ async fn send_invite(
     transport: AddrTransport,
     conn: Option<ConnId>,
 ) -> Sent {
+    let rejects = || {
+        stack
+            .signaling_audit()
+            .metric_values()
+            .into_iter()
+            .find(|(n, _)| *n == "sbc_source_admission_rejects_total")
+            .map_or(0, |(_, v)| v)
+    };
+    let before = rejects();
     let cap = uc_audit::capture::start();
     let results = flatten(
         stack
@@ -160,20 +172,25 @@ async fn send_invite(
     );
     let audited: Vec<_> = authz_events(&cap.events())
         .into_iter()
-        .filter(|d| d.policy == "source-admission")
+        .filter(|d| d.policy.starts_with("source-admission"))
         .collect();
     drop(cap);
-    let denied = !audited.is_empty();
+    let denied = rejects() > before;
     if denied {
-        assert_eq!(audited.len(), 1, "one audit record");
-        assert!(!audited[0].granted);
-        assert_eq!(audited[0].action, "INVITE");
-        assert_eq!(audited[0].source_ip, Some(src.ip()));
+        assert_eq!(rejects() - before, 1, "one source-admission reject");
+        assert!(audited.len() <= 1, "at most one audit record");
+        if let Some(a) = audited.first() {
+            assert!(!a.granted);
+            assert_eq!(a.action, "INVITE");
+            assert_eq!(a.source_ip, Some(src.ip()));
+        }
         assert!(
             results.iter().any(is_forbidden),
-            "audited denial is a 403: {results:?}"
+            "source-admission denial is a 403: {results:?}"
         );
         assert!(forwarded(&results, &Method::Invite).is_none());
+    } else {
+        assert!(audited.is_empty(), "admitted INVITE wrote a denial record");
     }
     Sent { results, denied }
 }

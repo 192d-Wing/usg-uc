@@ -415,6 +415,12 @@ pub const METRIC_AUDIT_RECORDS_DROPPED: &str = "audit_records_dropped";
 pub const METRIC_AUDIT_WRITE_FAILURES: &str = "audit_write_failures";
 /// Gauge: 1 while the audit writer thread runs, 0 once it has exited.
 pub const METRIC_AUDIT_WRITER_ALIVE: &str = "audit_writer_alive";
+/// Gauge: audit files rotated at `logging.audit_max_file_mb`.
+pub const METRIC_AUDIT_FILE_ROTATIONS: &str = "audit_file_rotations_total";
+/// Gauge: rotated audit files deleted at the capacity bound.
+pub const METRIC_AUDIT_FILES_DELETED: &str = "audit_files_deleted_total";
+/// Gauge: 1 while audit records are refused for lack of space.
+pub const METRIC_AUDIT_CAPACITY_HALTED: &str = "audit_capacity_halted";
 /// Gauge: emergency INVITEs admitted through the emergency bypass.
 pub const METRIC_EMERGENCY_ADMISSIONS: &str = "emergency_calls_admitted";
 /// Call-path routing gauges mirroring monotonic counters (no labels).
@@ -493,6 +499,14 @@ pub const METRIC_CDR_ROTATIONS: &str = "cdr_rotations_total";
 pub const METRIC_CDR_WRITER_ALIVE: &str = "cdr_writer_alive";
 /// Gauge: epoch seconds of the last CDR file write (0 = never).
 pub const METRIC_CDR_LAST_WRITE: &str = "cdr_last_write_timestamp_seconds";
+/// Gauge: CDR files deleted for being older than `retention_days`.
+pub const METRIC_CDR_DELETED_AGE: &str = "cdr_files_deleted_age_total";
+/// Gauge: CDR files deleted by the `retention_files` safety cap.
+pub const METRIC_CDR_DELETED_CAP: &str = "cdr_files_deleted_cap_total";
+/// Gauge: of those, files deleted before `retention_days` elapsed.
+pub const METRIC_CDR_DELETED_EARLY: &str = "cdr_files_deleted_early_total";
+/// Gauge: CDRs written to the attempts stream (unanswered attempts).
+pub const METRIC_CDR_ATTEMPTS_WRITTEN: &str = "cdr_attempts_written_total";
 
 /// Egress flow-layer gauges (POA&M-5; bounded names, no per-peer labels).
 ///
@@ -625,6 +639,19 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
         METRIC_AUDIT_WRITER_ALIVE,
         "1 while the audit writer thread runs, 0 after it has exited",
     );
+    // NIST 800-53 Rev5: AU-4, AU-5 - audit file rotation and capacity bound.
+    metrics.register_gauge(
+        METRIC_AUDIT_FILE_ROTATIONS,
+        "Audit files rotated at logging.audit_max_file_mb",
+    );
+    metrics.register_gauge(
+        METRIC_AUDIT_FILES_DELETED,
+        "Rotated audit files deleted at the capacity bound (audit_on_full = overwrite_oldest)",
+    );
+    metrics.register_gauge(
+        METRIC_AUDIT_CAPACITY_HALTED,
+        "1 while audit records are refused for lack of space (audit_on_full = stop or volume full)",
+    );
     metrics.register_gauge(
         METRIC_EMERGENCY_ADMISSIONS,
         "Emergency INVITEs admitted through the emergency bypass (47 CFR 9.16)",
@@ -636,6 +663,8 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
     for name in crate::signaling_audit::DIGEST_METRIC_NAMES
         .iter()
         .chain(crate::signaling_audit::IN_DIALOG_METRIC_NAMES.iter())
+        .chain(crate::signaling_audit::UNAUTH_METRIC_NAMES.iter())
+        .chain(std::iter::once(&crate::signaling_audit::METRIC_OVER_BUDGET))
         .chain(std::iter::once(&crate::signaling_audit::METRIC_DROPPED))
     {
         metrics.register_gauge(*name, crate::signaling_audit::METRIC_HELP);
@@ -680,6 +709,22 @@ fn register_daemon_metrics(metrics: &mut MetricRegistry) {
         (
             METRIC_CDR_LAST_WRITE,
             "Epoch seconds of the last successful CDR file write (0 = never)",
+        ),
+        (
+            METRIC_CDR_DELETED_AGE,
+            "CDR files deleted by retention_days (both streams)",
+        ),
+        (
+            METRIC_CDR_DELETED_CAP,
+            "CDR files deleted by the retention_files safety cap (both streams)",
+        ),
+        (
+            METRIC_CDR_DELETED_EARLY,
+            "CDR files deleted by the count cap before retention_days elapsed",
+        ),
+        (
+            METRIC_CDR_ATTEMPTS_WRITTEN,
+            "CDRs written to the attempts stream (unanswered attempts)",
         ),
     ] {
         metrics.register_gauge(name, help);
@@ -808,6 +853,19 @@ impl AppState {
         if let Some(g) = self.metrics.gauge(METRIC_AUDIT_WRITE_FAILURES) {
             g.set(as_gauge(uc_audit::write_failures()));
         }
+        let audit = uc_audit::stats();
+        for (name, v) in [
+            (METRIC_AUDIT_FILE_ROTATIONS, audit.rotations),
+            (METRIC_AUDIT_FILES_DELETED, audit.capacity_deletions),
+            (
+                METRIC_AUDIT_CAPACITY_HALTED,
+                u64::from(audit.capacity_halted),
+            ),
+        ] {
+            if let Some(g) = self.metrics.gauge(name) {
+                g.set(as_gauge(v));
+            }
+        }
         if let (Some(g), Some(stack)) = (
             self.metrics.gauge(METRIC_EMERGENCY_ADMISSIONS),
             self.sip_stack.as_ref(),
@@ -885,6 +943,10 @@ impl AppState {
                 (METRIC_CDR_ROTATIONS, s.rotations),
                 (METRIC_CDR_WRITER_ALIVE, u64::from(s.writer_alive)),
                 (METRIC_CDR_LAST_WRITE, s.last_write_ms / 1000),
+                (METRIC_CDR_DELETED_AGE, s.deleted_age),
+                (METRIC_CDR_DELETED_CAP, s.deleted_cap),
+                (METRIC_CDR_DELETED_EARLY, s.deleted_early),
+                (METRIC_CDR_ATTEMPTS_WRITTEN, s.attempts_written),
             ] {
                 if let Some(g) = self.metrics.gauge(name) {
                     g.set(as_gauge(v));

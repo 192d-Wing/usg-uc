@@ -510,21 +510,37 @@ sbcDaemon:
   # Call Detail Records ([cdr] in config.toml), about 1 KiB per call.
   # Disabling CDRs is an AU-12 deviation. CDRs get their own volume
   # (cdr.persistence) mounted at `directory`, so a flood of rejected calls
-  # cannot fill the data volume above. Keep
-  # retentionFiles * rotateSizeMb below cdr.persistence.size (AU-4); the
-  # defaults use 48 * 16 MiB = 768 MiB of a 1 GiB volume. Retention deletes
-  # the oldest closed file once either limit is hit, so size the volume for
-  # the evidence window you need (retentionDays).
+  # cannot fill the data volume above.
+  # retentionDays is authoritative (AU-11): older files are deleted.
+  # retentionFiles is a safety cap and must cover retentionDays at
+  # rotateInterval (372 x 6h = 93 days); the daemon refuses a config where
+  # it does not. Unanswered attempts (rejects, failed, busy, no answer,
+  # cancelled) go to their own attempts files with their own size and cap,
+  # so traffic that never completes a call cannot evict answered-call CDRs.
+  # Volume: worst case (every file full, plus the open file) is
+  # (retentionFiles + 1) x rotateSizeMb + (attemptsRetentionFiles + 1) x
+  # attemptsRotateSizeMb = 373 x 16 + 373 x 4 MiB = 7.3 GiB; the default
+  # 8Gi adds about 5 % headroom. Keep persistence.size at or above
+  # ((retentionFiles + 2) x rotateSizeMb + (attemptsRetentionFiles + 2) x
+  # attemptsRotateSizeMb) x 1.05. A cap deletion before retentionDays is
+  # audited (CdrFileDeleted early=true) and counted
+  # (sbc_cdr_files_deleted_early_total); raise the volume and caps if it
+  # occurs.
   cdr:
     enabled: true
     directory: /var/lib/sbc/cdr
     format: jsonl          # jsonl | csv
     rotateSizeMb: 16
+    rotateInterval: "6h"   # 5m..24h; the .sha384 sidecar seals each file
     retentionDays: 90
-    retentionFiles: 48
+    retentionFiles: 372
+    separateAttempts: true
+    attemptsRotateSizeMb: 4
+    attemptsRetentionDays: 90
+    attemptsRetentionFiles: 372
     persistence:
       enabled: true
-      size: 1Gi
+      size: 8Gi
       storageClass: ""
       accessMode: ReadWriteOnce
   # mTLS on the daemon gRPC listener (on by default). sbc-api and the trunk

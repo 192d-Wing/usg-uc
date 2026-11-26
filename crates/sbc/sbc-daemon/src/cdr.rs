@@ -35,8 +35,9 @@ use sbc_config::schema::{
 use tracing::{info, warn};
 use uc_cdr::{
     CallRecord, CdrEmitter, CdrEmitterConfig, CdrFormat, CdrHealth, CdrObserver, CdrReload,
-    CdrSink, Direction, Disposition, FileSinkConfig, HmacKey, PiiPolicy, ReleaseCause, ReleaseSide,
-    SyslogConnector, SyslogSink, SyslogSinkConfig, Transport, TrunkAttempt, TrunkOutcome,
+    CdrSink, CdrStream, Direction, Disposition, FileSinkConfig, HmacKey, PiiPolicy, ReleaseCause,
+    ReleaseSide, SyslogConnector, SyslogSink, SyslogSinkConfig, Transport, TrunkAttempt,
+    TrunkOutcome,
 };
 use uc_types::address::{SbcSocketAddr, TransportType};
 
@@ -796,6 +797,27 @@ impl CdrObserver for AuditObserver {
         ));
     }
 
+    /// One `CdrFileDeleted` per retention deletion; the stream is taken
+    /// from the file prefix (`cdr-` calls, `cdra-` attempts).
+    ///
+    /// ## NIST 800-53 Rev5: AU-11, AU-12
+    fn on_deleted(&self, file: &Path, reason: uc_cdr::CdrDeleteReason, age: Duration, early: bool) {
+        let stream = file
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(CdrStream::of_file_name)
+            .unwrap_or_default();
+        uc_audit::log_event(uc_audit::AuditEvent::CdrFileDeleted(
+            uc_audit::event::CdrFileDeleted {
+                file: file.display().to_string(),
+                stream: stream.as_str().to_string(),
+                reason: reason.as_str().to_string(),
+                age_secs: age.as_secs(),
+                early,
+            },
+        ));
+    }
+
     fn on_write_error(&self, error: &io::Error) {
         uc_audit::log_event(uc_audit::AuditEvent::CdrSinkFailure(
             uc_audit::event::CdrSinkFailure {
@@ -1047,7 +1069,17 @@ pub fn start_from_config(
         retention_files: config.retention_files,
         retention_days: config.retention_days,
         fsync_interval: Duration::from_millis(u64::from(config.fsync_interval_ms)),
+        stream: CdrStream::Calls,
     };
+    // NIST 800-53 Rev5: AU-11, SC-5 - unanswered attempts get their own
+    // files, chain, size and retention so they cannot evict answered calls.
+    let attempts = config.separate_attempts.then(|| FileSinkConfig {
+        rotate_size_bytes: u64::from(config.attempts_rotate_size_mb) * 1024 * 1024,
+        retention_files: config.attempts_retention_files,
+        retention_days: config.attempts_retention_days,
+        stream: CdrStream::Attempts,
+        ..file.clone()
+    });
     let mut sinks: Vec<Box<dyn CdrSink>> = Vec::new();
     if config.syslog.enabled {
         let ca = config
@@ -1073,6 +1105,7 @@ pub fn start_from_config(
         hash_chain: config.hash_chain,
         pii: pii_policy(config)?,
         file: Some(file),
+        attempts,
     };
     let emitter =
         CdrEmitter::start(emitter_cfg, sinks, Some(Arc::new(AuditObserver))).map_err(|e| {
@@ -1083,9 +1116,14 @@ pub fn start_from_config(
                 config.directory.display()
             )
         })?;
+    // NIST 800-53 Rev5: AU-4 - the bytes the CDR volume must hold.
+    let (calls_max, attempts_max) = config.worst_case_bytes();
+    let mib = |b: Option<u64>| b.map_or_else(|| "unbounded".to_string(), |b| (b >> 20).to_string());
     info!(
         node_id = %node_id,
         directory = %config.directory.display(),
+        calls_worst_case_mib = %mib(calls_max),
+        attempts_worst_case_mib = %mib(attempts_max),
         "CDR pipeline started"
     );
     Ok(Some(Arc::new(CdrContext::new(emitter, config))))
@@ -1099,13 +1137,20 @@ pub fn reload(ctx: &CdrContext, old: &CdrConfig, new: &CdrConfig) {
     if old.retention_files != new.retention_files || old.retention_days != new.retention_days {
         r.retention = Some((new.retention_files, new.retention_days));
     }
+    if old.attempts_retention_files != new.attempts_retention_files
+        || old.attempts_retention_days != new.attempts_retention_days
+    {
+        r.attempts_retention = Some((new.attempts_retention_files, new.attempts_retention_days));
+    }
     if old.pii != new.pii || old.pii_hash_key_file != new.pii_hash_key_file {
         match pii_policy(new) {
             Ok(p) => r.pii = Some(p),
             Err(e) => warn!(error = %e, "CDR PII policy not reloaded"),
         }
     }
-    if (r.pii.is_some() || r.retention.is_some()) && !ctx.emitter.reload(r) {
+    if (r.pii.is_some() || r.retention.is_some() || r.attempts_retention.is_some())
+        && !ctx.emitter.reload(r)
+    {
         warn!("CDR reload not applied (writer queue full or writer stopped)");
     }
     let restart_only = old.enabled != new.enabled
@@ -1115,6 +1160,8 @@ pub fn reload(ctx: &CdrContext, old: &CdrConfig, new: &CdrConfig) {
         || old.queue_capacity != new.queue_capacity
         || old.ring_capacity != new.ring_capacity
         || old.hash_chain != new.hash_chain
+        || old.separate_attempts != new.separate_attempts
+        || old.attempts_rotate_size_mb != new.attempts_rotate_size_mb
         || old.on_failure != new.on_failure
         || old.record_auth_challenges != new.record_auth_challenges;
     if restart_only {
@@ -1382,6 +1429,50 @@ mod tests {
             })
             .collect();
         assert_eq!(reasons, ["write_error", "queue_full", "writer_dead"]);
+    }
+
+    /// SR-43 (QA-first, plan 8): every CDR file deletion becomes one
+    /// `CdrFileDeleted` audit record with the path, the stream (from the
+    /// `cdr-` / `cdra-` file prefix), the reason label, the age in seconds
+    /// and the `early` flag of a safety-cap deletion.
+    /// NIST 800-53 Rev5: AU-11, AU-12
+    #[test]
+    fn audit_observer_emits_cdr_file_deleted() {
+        let capture = uc_audit::capture::start();
+        let o = AuditObserver;
+        o.on_deleted(
+            Path::new("/var/lib/usg-sbc/cdr/cdr-n1-20261101T000000.jsonl"),
+            uc_cdr::CdrDeleteReason::CountCap,
+            Duration::from_secs(3_600),
+            true,
+        );
+        o.on_deleted(
+            Path::new("/var/lib/usg-sbc/cdr/cdra-n1-20260801T000000.jsonl"),
+            uc_cdr::CdrDeleteReason::Age,
+            Duration::from_hours(91 * 24),
+            false,
+        );
+        let got: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::CdrFileDeleted(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got[0].file,
+            "/var/lib/usg-sbc/cdr/cdr-n1-20261101T000000.jsonl"
+        );
+        assert_eq!(got[0].stream, "calls");
+        assert_eq!(got[0].reason, "count_cap");
+        assert_eq!(got[0].age_secs, 3_600);
+        assert!(got[0].early);
+        assert_eq!(got[1].stream, "attempts");
+        assert_eq!(got[1].reason, "age");
+        assert_eq!(got[1].age_secs, 91 * 86_400);
+        assert!(!got[1].early);
     }
 
     #[test]
