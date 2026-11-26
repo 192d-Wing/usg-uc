@@ -193,6 +193,18 @@ jobs:
       - name: Clippy client crates (default features)
         if: needs.changes.outputs.client == 'true'
         run: cargo clippy -p proto-dtls -p client-types -p client-audio -p client-sip-ua -p client-core -p client-ffi -p client-gui-tauri --all-targets -- -D warnings
+      # No ring in any shipped binary, FIPS module in every image binary,
+      # no first-party RustCrypto HMAC; third-party sqlx-postgres SCRAM is
+      # POA&M-403 (NIST 800-53 Rev5: SC-13, SR-3).
+      - name: Crypto dependency check
+        env:
+          CARGO_TREE_FLAGS: --locked
+        run: ci/check-crypto-deps.sh
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-deny@0.22
+      - name: cargo-deny bans
+        run: cargo deny --locked check bans
 
   test:
     name: Test

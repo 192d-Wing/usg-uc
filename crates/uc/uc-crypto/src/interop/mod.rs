@@ -1,17 +1,19 @@
 //! Interoperability-only algorithms that are **not** CNSA 2.0 compliant.
 //!
-//! Everything in this module exists because an external standard mandates an
-//! algorithm CNSA 2.0 does not permit. It is compiled only with an explicit
-//! cargo feature, is never re-exported from the crate root, and every call
-//! site outside this crate must carry a `// CNSA-EXCEPTION:` tag naming the
-//! mandating standard.
+//! Everything in this module exists because an external standard, or a
+//! stored legacy format with a tracked POA&M, requires an algorithm CNSA 2.0
+//! does not permit. It is compiled only with an explicit cargo feature, is
+//! never re-exported from the crate root, and every call site outside this
+//! crate must carry a `// CNSA-EXCEPTION:` tag naming the standard or POA&M.
 //!
-//! | Module | Feature | Mandated by |
+//! | Module | Feature | Required by |
 //! |--------|---------|-------------|
 //! | [`ecdsa_p256`] | `stir-shaken-es256` | ATIS-1000074, RFC 8225 §5.2 (ES256) |
+//! | [`sha256()`] | `legacy-sha256` | Stored API-key digest format (POA&M-211) |
 //!
-//! These algorithms are used for **authentication of caller identity only**
-//! (signatures). They are never used for confidentiality.
+//! ES256 is used for **authentication of caller identity only**
+//! (signatures); SHA-256 only to compare stored legacy digests. Neither is
+//! used for confidentiality.
 //!
 //! ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection)
 //!
@@ -22,6 +24,11 @@
 
 #[cfg(feature = "stir-shaken-es256")]
 pub mod ecdsa_p256;
+
+#[cfg(feature = "legacy-sha256")]
+mod sha256;
+#[cfg(feature = "legacy-sha256")]
+pub use sha256::{SHA256_OUTPUT_LEN, sha256};
 
 /// Minimal base64url decoder for test vectors (no padding).
 #[cfg(test)]

@@ -51,7 +51,7 @@
 //!   KDF for the extended master secret only; key expansion, `Finished` and
 //!   the RFC 5705 exporter compute inside the module without it (see
 //!   [`uc_crypto::tls12`], POA&M-332). The protocol logic in this file is
-//!   project code and is not part of the validated module.
+//!   project code and is not part of the FIPS module.
 //! - **SC-23 / IA-3**: fingerprint binding, peer authentication (mutual
 //!   whenever we are the server or the server asks for our certificate),
 //!   proof of possession, `Finished` verification, replay window.
