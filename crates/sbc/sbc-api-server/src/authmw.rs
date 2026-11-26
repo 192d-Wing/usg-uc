@@ -777,15 +777,18 @@ mod sr40_tests {
     }
 
     fn qa_validator(jwks: jsonwebtoken::jwk::JwkSet) -> Arc<Validator> {
-        Arc::new(Validator::new(
-            Arc::new(proto_jwt::JwksCache::with_static(jwks)),
-            proto_jwt::ValidatorConfig {
-                issuer: QA_ISSUER.to_string(),
-                audiences: vec![QA_AUD.to_string()],
-                required_scope: ADMIN_SCOPE,
-                leeway_secs: 30,
-            },
-        ))
+        Arc::new(
+            Validator::new(
+                Arc::new(proto_jwt::JwksCache::with_static(jwks)),
+                proto_jwt::ValidatorConfig {
+                    issuer: QA_ISSUER.to_string(),
+                    audiences: vec![QA_AUD.to_string()],
+                    required_scope: ADMIN_SCOPE,
+                    leeway_secs: 30,
+                },
+            )
+            .expect("validator config"),
+        )
     }
 
     const PW: &str = "sr40-qa-password";

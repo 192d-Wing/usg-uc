@@ -213,24 +213,24 @@ mod audit_tests {
 
     fn key() -> &'static (EncodingKey, JwkSet) {
         use aws_lc_rs::rand::SystemRandom;
-        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
+        use aws_lc_rs::signature::{ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
         use base64::Engine as _;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         static KEY: std::sync::OnceLock<(EncodingKey, JwkSet)> = std::sync::OnceLock::new();
         KEY.get_or_init(|| {
             let pkcs8 = EcdsaKeyPair::generate_pkcs8(
-                &ECDSA_P256_SHA256_FIXED_SIGNING,
+                &ECDSA_P384_SHA384_FIXED_SIGNING,
                 &SystemRandom::new(),
             )
             .unwrap();
             let pair =
-                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref()).unwrap();
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, pkcs8.as_ref()).unwrap();
             let point = pair.public_key().as_ref();
             let jwks = serde_json::from_value(json!({
                 "keys": [{
-                    "kty": "EC", "crv": "P-256", "kid": KID, "alg": "ES256", "use": "sig",
-                    "x": URL_SAFE_NO_PAD.encode(&point[1..33]),
-                    "y": URL_SAFE_NO_PAD.encode(&point[33..65]),
+                    "kty": "EC", "crv": "P-384", "kid": KID, "alg": "ES384", "use": "sig",
+                    "x": URL_SAFE_NO_PAD.encode(&point[1..49]),
+                    "y": URL_SAFE_NO_PAD.encode(&point[49..97]),
                 }]
             }))
             .unwrap();
@@ -248,6 +248,7 @@ mod audit_tests {
                 leeway_secs: 30,
             },
         )
+        .expect("validator config")
     }
 
     fn token(
@@ -269,7 +270,7 @@ mod audit_tests {
         if let Some(s) = site_code {
             c["site_code"] = json!(s);
         }
-        let mut h = Header::new(jsonwebtoken::Algorithm::ES256);
+        let mut h = Header::new(jsonwebtoken::Algorithm::ES384);
         h.kid = Some(KID.to_string());
         encode(&h, &c, &key().0).unwrap()
     }
