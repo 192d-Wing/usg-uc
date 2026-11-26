@@ -39,7 +39,7 @@ uc-storage = { path = "../../uc/uc-storage", optional = true }
 proto-jwt = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Bearer tests: sign ES256 tokens to drive the validator end-to-end.
+# Bearer tests: sign ES384 tokens to drive the validator end-to-end.
 jsonwebtoken.workspace = true
 serde_json.workspace = true
 aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }

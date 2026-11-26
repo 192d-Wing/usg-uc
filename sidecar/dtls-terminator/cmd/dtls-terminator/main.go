@@ -111,8 +111,8 @@ func main() {
 		log.Fatalf("refusing to start: -max-sessions must be at least 1, got %d", *maxSessions)
 	}
 
-	// Refuse to run outside the FIPS module — the entire reason this sidecar
-	// exists is FIPS-validated DTLS-SRTP.
+	// Refuse to run outside the FIPS module — the reason this sidecar exists
+	// is DTLS-SRTP on the Go FIPS module (record GCM seal: POA&M-400).
 	if !fips140.Enabled() {
 		log.Fatal("refusing to start: not in FIPS mode " +
 			"(build with GOFIPS140=v1.26.0 and run with GODEBUG=fips140=on)")

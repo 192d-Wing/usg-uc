@@ -68,7 +68,9 @@ struct RefreshState {
 
 /// What a detached refresh task needs to reach the `IdP`.
 struct Fetcher {
-    http: reqwest::Client,
+    /// `None` for a static cache: reqwest without a crypto provider panics
+    /// unless TLS is preconfigured, so none is built when nothing is fetched.
+    http: Option<reqwest::Client>,
     issuer: String,
 }
 
@@ -93,7 +95,7 @@ impl JwksCache {
     pub fn new(http: reqwest::Client, issuer: impl Into<String>) -> Self {
         Self {
             fetcher: Arc::new(Fetcher {
-                http,
+                http: Some(http),
                 issuer: issuer.into(),
             }),
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
@@ -108,7 +110,7 @@ impl JwksCache {
     pub fn with_static(keys: JwkSet) -> Self {
         Self {
             fetcher: Arc::new(Fetcher {
-                http: reqwest::Client::new(),
+                http: None,
                 issuer: String::new(),
             }),
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
@@ -249,10 +251,15 @@ async fn refresh_task(
 
 impl Fetcher {
     async fn fetch(&self) -> Result<JwkSet, JwksError> {
+        let Some(http) = self.http.as_ref() else {
+            return Err(JwksError::Unavailable(
+                "no issuer to fetch from".to_string(),
+            ));
+        };
         let issuer = reqwest::Url::parse(&self.issuer)
             .map_err(|e| JwksError::Metadata(format!("invalid issuer {}: {e}", self.issuer)))?;
         let metadata_url = format!("{}/.well-known/openid-configuration", self.issuer);
-        let metadata: OidcMetadata = self.get_json(&metadata_url, MAX_METADATA_BYTES).await?;
+        let metadata: OidcMetadata = get_json(http, &metadata_url, MAX_METADATA_BYTES).await?;
 
         // The metadata's issuer claim must round-trip exactly (OIDC
         // Discovery 1.0 §4.3) — a mismatch means we're being pointed at
@@ -268,61 +275,60 @@ impl Fetcher {
             JwksError::Metadata(format!("invalid jwks_uri {}: {e}", metadata.jwks_uri))
         })?;
         check_jwks_uri_scheme(&issuer, &jwks_uri)?;
-        self.get_json(jwks_uri.as_str(), MAX_JWKS_BYTES).await
+        get_json(http, jwks_uri.as_str(), MAX_JWKS_BYTES).await
     }
+}
 
-    /// GETs `url` and parses a JSON body of at most `max_bytes`. Refuses a
-    /// redirected or non-2xx response. Oversized or unparsable bodies are
-    /// [`JwksError::Metadata`], as JWKS parse failures have always been.
-    // NIST 800-53 Rev5: SC-5 (body size capped while reading)
-    // POAM: POA&M-424 a caller-supplied client that follows redirects still
-    // requests the redirect target before the response is refused here.
-    async fn get_json<T: DeserializeOwned>(
-        &self,
-        url: &str,
-        max_bytes: usize,
-    ) -> Result<T, JwksError> {
-        let requested = reqwest::Url::parse(url)
-            .map_err(|e| JwksError::Metadata(format!("invalid url {url}: {e}")))?;
-        let mut resp = self
-            .http
-            .get(requested.clone())
-            .send()
-            .await
-            .map_err(|e| JwksError::Unavailable(e.to_string()))?;
-        if resp.url() != &requested {
-            return Err(JwksError::Unavailable(format!(
-                "{url} redirected to {}; redirects are not followed",
-                resp.url()
-            )));
-        }
-        // error_for_status() lets 3xx through; only 2xx is a key source.
-        if !resp.status().is_success() {
-            return Err(JwksError::Unavailable(format!(
-                "{url} answered {}",
-                resp.status()
-            )));
-        }
-        let too_large = || JwksError::Metadata(format!("{url} body exceeds {max_bytes} bytes"));
-        if resp
-            .content_length()
-            .is_some_and(|len| len > max_bytes as u64)
-        {
+/// GETs `url` and parses a JSON body of at most `max_bytes`. Refuses a
+/// redirected or non-2xx response. Oversized or unparsable bodies are
+/// [`JwksError::Metadata`], as JWKS parse failures have always been.
+// NIST 800-53 Rev5: SC-5 (body size capped while reading)
+// POAM: POA&M-424 a caller-supplied client that follows redirects still
+// requests the redirect target before the response is refused here.
+async fn get_json<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    url: &str,
+    max_bytes: usize,
+) -> Result<T, JwksError> {
+    let requested = reqwest::Url::parse(url)
+        .map_err(|e| JwksError::Metadata(format!("invalid url {url}: {e}")))?;
+    let mut resp = http
+        .get(requested.clone())
+        .send()
+        .await
+        .map_err(|e| JwksError::Unavailable(e.to_string()))?;
+    if resp.url() != &requested {
+        return Err(JwksError::Unavailable(format!(
+            "{url} redirected to {}; redirects are not followed",
+            resp.url()
+        )));
+    }
+    // error_for_status() lets 3xx through; only 2xx is a key source.
+    if !resp.status().is_success() {
+        return Err(JwksError::Unavailable(format!(
+            "{url} answered {}",
+            resp.status()
+        )));
+    }
+    let too_large = || JwksError::Metadata(format!("{url} body exceeds {max_bytes} bytes"));
+    if resp
+        .content_length()
+        .is_some_and(|len| len > max_bytes as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| JwksError::Unavailable(e.to_string()))?
+    {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
             return Err(too_large());
         }
-        let mut body = Vec::new();
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| JwksError::Unavailable(e.to_string()))?
-        {
-            if body.len().saturating_add(chunk.len()) > max_bytes {
-                return Err(too_large());
-            }
-            body.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice(&body).map_err(|e| JwksError::Metadata(e.to_string()))
+        body.extend_from_slice(&chunk);
     }
+    serde_json::from_slice(&body).map_err(|e| JwksError::Metadata(e.to_string()))
 }
 
 /// Keys are fetched over https; a plain-http `jwks_uri` is accepted only
@@ -352,6 +358,21 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+
+    /// CNSA rustls config: reqwest has no default crypto provider, so
+    /// `reqwest::Client::new()` panics (SR-16).
+    fn test_builder() -> reqwest::ClientBuilder {
+        let tls = uc_transport::https_client::create_https_client_config(
+            None,
+            uc_transport::tls::MinTlsVersion::V1_2,
+        )
+        .expect("tls config");
+        reqwest::Client::builder().use_preconfigured_tls(tls)
+    }
+
+    fn test_http() -> reqwest::Client {
+        test_builder().build().expect("http client")
+    }
 
     const METADATA_PATH: &str = "/.well-known/openid-configuration";
     const JWKS_PATH: &str = "/jwks";
@@ -587,7 +608,7 @@ mod tests {
         let stub = StubIdp::start().await;
         stub.serve_metadata();
         stub.serve_jwks(&["k1"], Duration::ZERO);
-        let mut cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone());
+        let mut cache = JwksCache::new(test_http(), stub.issuer.clone());
         if let Some(t) = timeout {
             cache = cache.with_fetch_timeout(t);
         }
@@ -605,7 +626,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limited_refresh_without_keys_stays_an_error() {
         // Nothing listens on port 1 — connection refused, immediately.
-        let cache = JwksCache::new(reqwest::Client::new(), "https://127.0.0.1:1");
+        let cache = JwksCache::new(test_http(), "https://127.0.0.1:1");
 
         assert!(cache.refresh().await.is_err(), "real fetch failure");
         // Second call lands inside MIN_REFRESH_INTERVAL: rate-limited, and
@@ -644,7 +665,7 @@ mod tests {
         let stub = StubIdp::start().await;
         stub.serve_metadata();
         stub.serve_jwks(&["rotated"], Duration::from_millis(100));
-        let cache = Arc::new(JwksCache::new(reqwest::Client::new(), stub.issuer.clone()));
+        let cache = Arc::new(JwksCache::new(test_http(), stub.issuer.clone()));
 
         let tasks: Vec<_> = (0..16)
             .map(|_| {
@@ -667,7 +688,7 @@ mod tests {
     async fn fetch_timeout_bounds_refresh() {
         let stub = StubIdp::start().await;
         stub.hang_everything();
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone())
+        let cache = JwksCache::new(test_http(), stub.issuer.clone())
             .with_fetch_timeout(Duration::from_millis(200));
 
         let res = tokio::time::timeout(Duration::from_secs(1), cache.refresh())
@@ -701,7 +722,7 @@ mod tests {
             },
         );
         stub.serve_jwks(&["k1"], Duration::from_millis(300));
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone())
+        let cache = JwksCache::new(test_http(), stub.issuer.clone())
             .with_fetch_timeout(Duration::from_millis(450));
 
         let res = tokio::time::timeout(Duration::from_secs(2), cache.refresh())
@@ -717,7 +738,7 @@ mod tests {
         let stub = StubIdp::start().await;
         stub.serve_metadata();
         stub.set(JWKS_PATH, Route::HangAfterHeaders);
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone())
+        let cache = JwksCache::new(test_http(), stub.issuer.clone())
             .with_fetch_timeout(Duration::from_millis(200));
 
         let res = tokio::time::timeout(Duration::from_secs(1), cache.refresh())
@@ -730,7 +751,7 @@ mod tests {
     #[test]
     fn default_fetch_timeout_is_ten_seconds() {
         assert_eq!(DEFAULT_FETCH_TIMEOUT, Duration::from_secs(10));
-        let cache = JwksCache::new(reqwest::Client::new(), "https://idp.example");
+        let cache = JwksCache::new(test_http(), "https://idp.example");
         assert_eq!(cache.fetch_timeout, DEFAULT_FETCH_TIMEOUT);
         let cache = cache.with_fetch_timeout(Duration::from_secs(3));
         assert_eq!(cache.fetch_timeout, Duration::from_secs(3));
@@ -750,7 +771,7 @@ mod tests {
                 delay: Duration::ZERO,
             },
         );
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone());
+        let cache = JwksCache::new(test_http(), stub.issuer.clone());
         cache.refresh().await.expect("48 KiB key set accepted");
         assert!(cache.get_key("k1").await.is_ok());
     }
@@ -766,7 +787,7 @@ mod tests {
                 delay: Duration::ZERO,
             },
         );
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone());
+        let cache = JwksCache::new(test_http(), stub.issuer.clone());
         assert!(
             cache.refresh().await.is_err(),
             "512 KiB JWKS must be refused"
@@ -785,7 +806,7 @@ mod tests {
                 body: big_jwks_json(1024 * 1024),
             },
         );
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone());
+        let cache = JwksCache::new(test_http(), stub.issuer.clone());
         assert!(
             cache.refresh().await.is_err(),
             "1 MiB streamed JWKS must be refused"
@@ -804,7 +825,7 @@ mod tests {
             },
         );
         stub.serve_jwks(&["k1"], Duration::ZERO);
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone());
+        let cache = JwksCache::new(test_http(), stub.issuer.clone());
         assert!(
             cache.refresh().await.is_err(),
             "512 KiB metadata must be refused"
@@ -855,7 +876,7 @@ mod tests {
             },
         );
         stub.serve_jwks(&["k1"], Duration::ZERO);
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone());
+        let cache = JwksCache::new(test_http(), stub.issuer.clone());
         assert!(
             cache.refresh().await.is_err(),
             "redirected metadata must be refused"
@@ -881,7 +902,7 @@ mod tests {
                 delay: Duration::ZERO,
             },
         );
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone());
+        let cache = JwksCache::new(test_http(), stub.issuer.clone());
         assert!(
             cache.refresh().await.is_err(),
             "redirected JWKS must be refused"
@@ -908,7 +929,7 @@ mod tests {
                 delay: Duration::ZERO,
             },
         );
-        let http = reqwest::Client::builder()
+        let http = test_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
@@ -927,7 +948,7 @@ mod tests {
         let stub = StubIdp::start().await;
         stub.serve_metadata();
         stub.serve_jwks(&["rotated"], Duration::from_millis(300));
-        let cache = Arc::new(JwksCache::new(reqwest::Client::new(), stub.issuer.clone()));
+        let cache = Arc::new(JwksCache::new(test_http(), stub.issuer.clone()));
 
         let c = cache.clone();
         let caller = tokio::spawn(async move { c.get_key("rotated").await });
@@ -951,7 +972,7 @@ mod tests {
         let stub = StubIdp::start().await;
         stub.serve_metadata();
         stub.serve_jwks(&["k1"], Duration::from_millis(300));
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone());
+        let cache = JwksCache::new(test_http(), stub.issuer.clone());
 
         let before = Instant::now();
         cache.refresh().await.expect("refresh");
@@ -993,7 +1014,7 @@ mod tests {
             },
         );
         stub.serve_jwks(&["k1"], Duration::ZERO);
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone());
+        let cache = JwksCache::new(test_http(), stub.issuer.clone());
         let res = cache.refresh().await;
         assert!(matches!(res, Err(JwksError::Metadata(_))), "{res:?}");
         assert_eq!(stub.requests_for(JWKS_PATH), 0);
@@ -1009,7 +1030,7 @@ mod tests {
         let stub = StubIdp::start().await;
         stub.serve_metadata();
         stub.serve_jwks(&["rotated"], Duration::from_millis(300));
-        let cache = Arc::new(JwksCache::new(reqwest::Client::new(), stub.issuer.clone()));
+        let cache = Arc::new(JwksCache::new(test_http(), stub.issuer.clone()));
         let keys = Arc::clone(&cache.keys);
         let gate = Arc::clone(&cache.refresh);
 
@@ -1046,7 +1067,7 @@ mod tests {
     async fn gate_is_retaken_after_failed_fetch() {
         let stub = StubIdp::start().await;
         stub.hang_everything();
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone())
+        let cache = JwksCache::new(test_http(), stub.issuer.clone())
             .with_fetch_timeout(Duration::from_millis(100));
 
         assert!(matches!(
@@ -1070,7 +1091,7 @@ mod tests {
         let stub = StubIdp::start().await;
         stub.serve_metadata();
         stub.serve_jwks(&["k1"], Duration::ZERO);
-        let cache = JwksCache::new(reqwest::Client::new(), stub.issuer.clone());
+        let cache = JwksCache::new(test_http(), stub.issuer.clone());
 
         let gate = Arc::clone(&cache.refresh);
         let holder = tokio::spawn(async move {
@@ -1084,5 +1105,19 @@ mod tests {
             .expect("gate not released by the panicking holder");
         assert!(res.is_ok(), "{res:?}");
         assert!(cache.get_key("k1").await.is_ok());
+    }
+
+    /// SR-16: reqwest is built without a crypto provider, so a
+    /// `reqwest::Client` built without preconfigured TLS panics. A static
+    /// cache has nothing to fetch and must not construct one.
+    #[tokio::test]
+    async fn with_static_builds_without_tls_provider() {
+        let cache = JwksCache::with_static(JwkSet { keys: Vec::new() });
+        assert!(cache.ready().await);
+        assert!(cache.refresh().await.is_ok(), "static cache never fetches");
+        assert!(matches!(
+            cache.get_key("missing").await,
+            Err(JwksError::UnknownKid(_))
+        ));
     }
 }

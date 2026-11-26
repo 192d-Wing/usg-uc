@@ -22,6 +22,8 @@ pub enum SrtpDirection {
 ///
 /// AES key schedules are expanded once at construction and cached in
 /// `CachedAeadKey` instances, avoiding ~100ns of key expansion per packet.
+/// Seal through these keys is not an approved FIPS service (POA&M-400, see
+/// [`crate::protect`]).
 ///
 /// **One SSRC per context.** The ROC estimator, highest-sequence tracker, and
 /// replay window are a single shared sequence space (the AEAD nonce takes the

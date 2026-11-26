@@ -2,7 +2,7 @@
 
 DTLS-SRTP **key-agreement** sidecar for the SBC media plane.
 
-The Rust media relay cannot perform FIPS-validated DTLS-SRTP: the Rust
+The Rust media relay cannot perform DTLS-SRTP on a FIPS module: the Rust
 ecosystem has no FIPS DTLS (rustls has no DTLS; `aws-lc-fips-sys` ships no
 libssl; the `openssl` crate is non-FIPS). Go's native **FIPS 140-3 module**
 (`GOFIPS140`) plus `pion/dtls` does — restricted to the CNSA 2.0 profile
@@ -185,14 +185,16 @@ socket + record pump over this IPC, then SRTP protect/unprotect via
 Requires Go **1.26+** (the `go` directive in `go.mod`; the module uses the
 `crypto/fips140` reporting API and targets the v1.26.0 module. FIPS 140-3
 support itself landed in Go 1.24). The compliance posture is
-`GODEBUG=fips140=on` (all crypto primitives in the certified module; DTLS's
-protocol-mandated deterministic-IV GCM does not pass the stricter `fips140=only`
-audit — see `srtp-dtls-termination-plan` notes).
+`GODEBUG=fips140=on` (crypto primitives from the Go module; DTLS's
+protocol-mandated deterministic-IV GCM seal is a non-approved service and does
+not pass the stricter `fips140=only` audit, POA&M-400 — see
+`srtp-dtls-termination-plan` notes).
 
 ```sh
 # Module selection is build-time. v1.26.0 = Go Cryptographic Module frozen from
-# Go 1.26 (NIAP-certified per program); `certified` selects the latest CMVP-
-# validated module instead.
+# Go 1.26. Per the Go FIPS 140-3 documentation, `GOFIPS140=certified` selects
+# the latest CMVP-validated module; this README asserts no CMVP status for
+# either.
 GOFIPS140=v1.26.0 GODEBUG=fips140=on go test ./...
 ```
 
@@ -292,7 +294,8 @@ observation; there is no regression test for it.
   not a KDF service of the module (NIST POA&M-332 collects the evidence for
   this on both the Go and the Rust side).
 - pion's DTLS protocol logic and the wire guard are not part of the module.
-- DTLS's deterministic-IV GCM does not pass `fips140=only` (see above).
+- DTLS's deterministic-IV GCM seal (pion `cipher.NewGCM`, caller IV) is a
+  non-approved service and does not pass `fips140=only` (POA&M-400).
 - This README does not assert a CMVP certificate number or the validation
   status of the `v1.26.0` module; that evidence belongs to the ATO package.
 
