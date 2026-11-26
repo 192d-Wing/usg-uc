@@ -41,7 +41,7 @@
 | **RFC 4566** | SDP | Referenced |
 | **RFC 6086** | INFO Method | Method enum entry. Daemon relays in-dialog INFO (POA&M-182); out of dialog it returns 405 |
 | **RFC 6665** | SIP Events (SUBSCRIBE/NOTIFY) | Method enum entries, header support. Library-only — daemon relays in-dialog NOTIFY (POA&M-182) and returns 405 for SUBSCRIBE and out-of-dialog NOTIFY; client only reads Subscription-State on REFER NOTIFY |
-| **RFC 7118** | WebSocket Transport for SIP | Transport: WS/WSS. Wired (sbc-daemon `transport.ws_listen`, plain WS); WSS planned — the transport does not terminate TLS. §4: `sip` subprotocol required (HTTP 400 otherwise; `ws_require_sip_subprotocol = false` is a non-conformant opt-out). §5: one SIP message per WS message; incomplete messages discarded. RFC 6455 message/frame caps 65,535 bytes. See `docs/RFC_COMPLIANCE_GAPS.md` |
+| **RFC 7118** | WebSocket Transport for SIP | Transport: WS/WSS. Wired (sbc-daemon `transport.ws_listen`, plain WS); WSS planned — the transport does not terminate TLS. §4: `sip` subprotocol required (HTTP 400 otherwise; `ws_require_sip_subprotocol = false` is a non-conformant opt-out). §5: one SIP message per WS message; incomplete messages discarded. RFC 6455 message/frame caps 65,535 bytes. Behind a reverse proxy in `transport.ws_trusted_proxies` the client address comes from PROXY v2, `X-Forwarded-For` or RFC 7239 `Forwarded` and keys admission, rate limits, CDRs and audit; flows and response routing stay on the socket. WSS clients behind the proxy are handled as WS (POA&M-457). See `docs/RFC_COMPLIANCE_GAPS.md` |
 | **RFC 8224** | STIR Identity | Header name defined; reason phrases 428/436/437/438 in `response.rs` (test `stir_reason_phrases`). Wired (sbc-daemon STIR path, off by default) |
 
 ### Key Files
@@ -619,6 +619,9 @@ Since SIPREC phase 3 (2026-11-09) `sbc-daemon` calls `uc-siprec` to record calls
 | RFC 6910 | Auto-Configuration | proto-dialog | library |
 | RFC 7092 | B2BUA Taxonomy | proto-b2bua | sbc-daemon |
 | RFC 7118 | WebSocket Transport for SIP | proto-sip, uc-transport | sbc-daemon (ws); wss flag only, no TLS (POA&M-459) |
+| RFC 7239 | Forwarded HTTP Extension (`for=`) | uc-transport (`websocket.rs` `client_from_forwarded`) | sbc-daemon (Partial; WS behind a trusted proxy, `transport.ws_client_address = "forwarded"`) |
+| PROXY protocol v2 (haproxy.org, not an RFC) | Client address preamble from L4 proxies | uc-transport (`proxy_protocol.rs`) | sbc-daemon (Partial; WS behind a trusted proxy, `ws_client_address = "proxy_v2"`; v1 unsupported) |
+| `X-Forwarded-For` (de facto, no RFC) | Client address header | uc-transport (`websocket.rs` `client_from_x_forwarded_for`) | sbc-daemon (WS behind a trusted proxy, `ws_client_address = "x_forwarded_for"`) |
 | RFC 7614 | Location Conveyance | proto-dialog | library |
 | RFC 7616 | HTTP Digest (SHA-256, SHA-512-256) | proto-sip, proto-registrar | sbc-daemon REGISTER via proto-sip `DigestVerifier`, enabled by `[digest_auth]` (off by default); one challenge for the configured algorithm, SHA-256 or SHA-512-256; HA1 file credentials; no INVITE challenge (POA&M-271) |
 | RFC 7627 | Extended Master Secret | proto-dtls (mandatory in `DtlsAssociation`) | soft client (since 2026-11-17); required by the SBC Go sidecar |
