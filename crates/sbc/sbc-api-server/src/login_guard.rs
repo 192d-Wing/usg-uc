@@ -313,9 +313,21 @@ impl LoginGuard {
                 IpSlot::Overflow => "ip-overflow",
             };
             warn!(%client_ip, scope, "admin login lockout engaged");
+            crate::auth_audit::lockout_engaged(
+                client_ip,
+                scope,
+                ip_failures,
+                self.cfg.ip_max_failures,
+            );
         }
         if account_failures == self.cfg.account_max_failures {
             warn!(%client_ip, scope = "account", "admin login lockout engaged");
+            crate::auth_audit::lockout_engaged(
+                client_ip,
+                "account",
+                account_failures,
+                self.cfg.account_max_failures,
+            );
         }
         Admission::Admitted(permit)
     }

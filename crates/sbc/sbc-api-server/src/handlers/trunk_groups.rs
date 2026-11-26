@@ -9,10 +9,12 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use sbc_grpc_api::prelude::{RemoveTrunkGroupRequest, SyncTrunkGroupRequest};
+use sbc_http_util::mgmt_audit::Op;
 use tracing::warn;
 
+use super::write_audit::{audited, mark_absent, non_object, outcome_of, store_actor};
 use crate::authmw::Principal;
 use crate::handlers::redact;
 use crate::state::AppState;
@@ -28,8 +30,8 @@ async fn lookup(state: &Arc<AppState>, id: &str) -> Option<serde_json::Value> {
     }
 }
 
-async fn persist(state: &Arc<AppState>, id: &str, body: &serde_json::Value) -> bool {
-    if let Err(e) = state.trunk_groups.upsert(id, body).await {
+async fn persist(state: &Arc<AppState>, id: &str, body: &serde_json::Value, actor: &str) -> bool {
+    if let Err(e) = state.trunk_groups.upsert(id, body, actor).await {
         warn!(group_id = id, error = %e, "trunk group upsert failed");
         return false;
     }
@@ -94,7 +96,7 @@ fn audit_transport_change(
     };
     uc_audit::log_event(uc_audit::AuditEvent::ConfigurationChange(
         uc_audit::event::ConfigurationChange {
-            admin: principal.map_or_else(|| "unknown".to_string(), |p| p.user.clone()),
+            admin: principal.map_or_else(|| "unknown".to_string(), Principal::actor_id),
             change_type: uc_audit::event::ConfigChangeType::Modified,
             description: format!(
                 "trunk_group={} {diff} outcome=success",
@@ -185,7 +187,7 @@ pub async fn get_group(
     )
 }
 
-pub async fn add_group(
+async fn add_group_inner(
     State(state): State<Arc<AppState>>,
     principal: Option<Extension<Principal>>,
     Json(mut body): Json<serde_json::Value>,
@@ -207,7 +209,7 @@ pub async fn add_group(
         return rej;
     }
     redact::restore_passwords(&mut body, existing.as_ref());
-    if !persist(&state, &id, &body).await {
+    if !persist(&state, &id, &body, &store_actor(principal.as_deref())).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"success": false, "error": "trunk group store upsert failed"})),
@@ -225,7 +227,7 @@ pub async fn add_group(
     )
 }
 
-pub async fn update_group(
+async fn update_group_inner(
     State(state): State<Arc<AppState>>,
     principal: Option<Extension<Principal>>,
     Path(group_id): Path<String>,
@@ -241,7 +243,7 @@ pub async fn update_group(
         return rej;
     }
     redact::restore_passwords(&mut body, existing.as_ref());
-    if !persist(&state, &group_id, &body).await {
+    if !persist(&state, &group_id, &body, &store_actor(principal.as_deref())).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"success": false, "error": "trunk group store upsert failed"})),
@@ -264,28 +266,37 @@ pub async fn update_group(
     )
 }
 
-pub async fn delete_group(
+async fn delete_group_inner(
     State(state): State<Arc<AppState>>,
     principal: Option<Extension<Principal>>,
     Path(group_id): Path<String>,
 ) -> impl IntoResponse {
     let existing = lookup(&state, &group_id).await;
-    if let Err(e) = state.trunk_groups.delete(&group_id).await
-        && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
+    let absent = match state
+        .trunk_groups
+        .delete(&group_id, &store_actor(principal.as_deref()))
+        .await
     {
-        warn!(group_id, error = %e, "trunk group delete failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "failed to persist changes"})),
-        )
-            .into_response();
-    }
+        Ok(()) => false,
+        Err(sbc_config_store::ConfigStoreError::NotFound) => true,
+        Err(e) => {
+            warn!(group_id, error = %e, "trunk group delete failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to persist changes"})),
+            )
+                .into_response();
+        }
+    };
     audit_transport_change(principal.as_deref(), &group_id, existing.as_ref(), None);
     notify_remove(&state, &group_id).await;
-    Json(serde_json::json!({"success": true, "group_id": group_id})).into_response()
+    mark_absent(
+        Json(serde_json::json!({"success": true, "group_id": group_id})).into_response(),
+        absent,
+    )
 }
 
-pub async fn add_trunk(
+async fn add_trunk_inner(
     State(state): State<Arc<AppState>>,
     principal: Option<Extension<Principal>>,
     Path(group_id): Path<String>,
@@ -312,7 +323,14 @@ pub async fn add_trunk(
         Ok(w) => w,
         Err(rej) => return rej,
     };
-    if !persist(&state, &group_id, &group_json).await {
+    if !persist(
+        &state,
+        &group_id,
+        &group_json,
+        &store_actor(principal.as_deref()),
+    )
+    .await
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"success": false, "error": "failed to persist changes"})),
@@ -335,7 +353,7 @@ pub async fn add_trunk(
     )
 }
 
-pub async fn update_trunk(
+async fn update_trunk_inner(
     State(state): State<Arc<AppState>>,
     principal: Option<Extension<Principal>>,
     Path((group_id, trunk_id)): Path<(String, String)>,
@@ -383,7 +401,14 @@ pub async fn update_trunk(
         Ok(w) => w,
         Err(rej) => return rej,
     };
-    if !persist(&state, &group_id, &group_json).await {
+    if !persist(
+        &state,
+        &group_id,
+        &group_json,
+        &store_actor(principal.as_deref()),
+    )
+    .await
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"success": false, "error": "failed to persist changes"})),
@@ -406,16 +431,20 @@ pub async fn update_trunk(
     )
 }
 
-pub async fn delete_trunk(
+async fn delete_trunk_inner(
     State(state): State<Arc<AppState>>,
     principal: Option<Extension<Principal>>,
     Path((group_id, trunk_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let mut warnings = Vec::new();
+    // No group, or no such trunk in it: idempotent 200, recorded not_found.
+    let mut absent = true;
     if let Some(mut group_json) = lookup(&state, &group_id).await {
         let old = group_json.clone();
         if let Some(trunks) = group_json.get_mut("trunks").and_then(|v| v.as_array_mut()) {
+            let before = trunks.len();
             trunks.retain(|t| t.get("id").and_then(|v| v.as_str()) != Some(&trunk_id));
+            absent = trunks.len() == before;
         }
         // Deleting the last TLS trunk of a require_tls group is refused
         // (422); deleting the last trunk of one is accepted with a warning.
@@ -423,7 +452,14 @@ pub async fn delete_trunk(
             Ok(w) => w,
             Err(rej) => return rej.into_response(),
         };
-        if !persist(&state, &group_id, &group_json).await {
+        if !persist(
+            &state,
+            &group_id,
+            &group_json,
+            &store_actor(principal.as_deref()),
+        )
+        .await
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "failed to persist changes"})),
@@ -438,11 +474,128 @@ pub async fn delete_trunk(
         );
         notify_sync(&state, &group_id).await;
     }
-    Json(with_warnings(
-        serde_json::json!({"success": true, "group_id": group_id, "trunk_id": trunk_id}),
-        &warnings,
-    ))
-    .into_response()
+    mark_absent(
+        Json(with_warnings(
+            serde_json::json!({"success": true, "group_id": group_id, "trunk_id": trunk_id}),
+            &warnings,
+        ))
+        .into_response(),
+        absent,
+    )
+}
+
+// ---------------- Audited entry points ----------------
+//
+// Each write records one `ConfigurationChange` (entity, id, op, outcome of
+// the response status; an absent delete is `not_found`) besides the
+// transport-policy diff record above. Trunk ids are `<group>/<trunk>`.
+// NIST 800-53 Rev5: AU-2, AU-3, AU-12, CM-3
+
+fn status_audited(
+    p: Option<&Principal>,
+    entity: &'static str,
+    id: &str,
+    op: Op,
+    resp: impl IntoResponse,
+) -> Response {
+    let resp = resp.into_response();
+    let outcome = outcome_of(&resp);
+    audited(p, entity, id, op, outcome, resp)
+}
+
+/// Audit id of a trunk: `<group>/<trunk>` (`<group>/-` without a trunk id).
+fn trunk_audit_id(group_id: &str, trunk_id: &str) -> String {
+    let t = if trunk_id.is_empty() { "-" } else { trunk_id };
+    format!("{group_id}/{t}")
+}
+
+pub async fn add_group(
+    State(state): State<Arc<AppState>>,
+    principal: Option<Extension<Principal>>,
+    Json(mut body): Json<serde_json::Value>,
+) -> Response {
+    if !body.is_object() {
+        return non_object(principal.as_deref(), "trunk_group", "", Op::Create);
+    }
+    // Fix the id here so the record names the group the inner handler
+    // creates.
+    let id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
+    body["id"] = serde_json::json!(&id);
+    let p = principal.clone();
+    let resp = add_group_inner(State(state), principal, Json(body)).await;
+    status_audited(p.as_deref(), "trunk_group", &id, Op::Create, resp)
+}
+
+pub async fn update_group(
+    State(state): State<Arc<AppState>>,
+    principal: Option<Extension<Principal>>,
+    Path(group_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !body.is_object() {
+        return non_object(principal.as_deref(), "trunk_group", &group_id, Op::Update);
+    }
+    let p = principal.clone();
+    let resp =
+        update_group_inner(State(state), principal, Path(group_id.clone()), Json(body)).await;
+    status_audited(p.as_deref(), "trunk_group", &group_id, Op::Update, resp)
+}
+
+pub async fn delete_group(
+    State(state): State<Arc<AppState>>,
+    principal: Option<Extension<Principal>>,
+    Path(group_id): Path<String>,
+) -> Response {
+    let p = principal.clone();
+    let resp = delete_group_inner(State(state), principal, Path(group_id.clone())).await;
+    status_audited(p.as_deref(), "trunk_group", &group_id, Op::Delete, resp)
+}
+
+pub async fn add_trunk(
+    State(state): State<Arc<AppState>>,
+    principal: Option<Extension<Principal>>,
+    Path(group_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let id = trunk_audit_id(
+        &group_id,
+        body.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+    );
+    let p = principal.clone();
+    let resp = add_trunk_inner(State(state), principal, Path(group_id), Json(body)).await;
+    status_audited(p.as_deref(), "trunk", &id, Op::Create, resp)
+}
+
+pub async fn update_trunk(
+    State(state): State<Arc<AppState>>,
+    principal: Option<Extension<Principal>>,
+    Path((group_id, trunk_id)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let id = trunk_audit_id(&group_id, &trunk_id);
+    let p = principal.clone();
+    let resp = update_trunk_inner(
+        State(state),
+        principal,
+        Path((group_id, trunk_id)),
+        Json(body),
+    )
+    .await;
+    status_audited(p.as_deref(), "trunk", &id, Op::Update, resp)
+}
+
+pub async fn delete_trunk(
+    State(state): State<Arc<AppState>>,
+    principal: Option<Extension<Principal>>,
+    Path((group_id, trunk_id)): Path<(String, String)>,
+) -> Response {
+    let id = trunk_audit_id(&group_id, &trunk_id);
+    let p = principal.clone();
+    let resp = delete_trunk_inner(State(state), principal, Path((group_id, trunk_id))).await;
+    status_audited(p.as_deref(), "trunk", &id, Op::Delete, resp)
 }
 
 #[cfg(test)]
@@ -514,7 +667,7 @@ mod tests {
             })
             .collect();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].admin, "admin");
+        assert_eq!(changes[0].admin, "admin:admin");
         assert_eq!(
             changes[0].description,
             "trunk_group=g1 require_tls=false->true trunk_protocols=[a:udp->tls] outcome=success"

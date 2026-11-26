@@ -132,7 +132,7 @@ DORMANT items before anyone wires them in.
   bound `SBC_AUTH_TOKEN_TTL_SECS`; consider `iat`/`nbf`, audience, revocation.
   Fixed 2026-11-07 (fix/mgmt-api-hardening): key at least 32 bytes (warn under
   48), zeroized; TTL 60-86400; HMAC-SHA-384 `v2.` tokens with `aud`/`iat`.
-  Residuals: no revocation (POA&M-210), SHA-256 API-key digests (POA&M-211).
+  Residuals: no revocation (POA&M-210). SHA-256 API-key digests (POA&M-211) closed by SR-40.
 - [x] **MINOR, LIVE — unknown `pattern_type` silently becomes a prefix**
   (`runtime.rs:876`, `sip_stack.rs:3600`), so a mistyped block does nothing.
   Reject at config load and in the API (400).

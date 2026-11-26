@@ -10,13 +10,16 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use sbc_grpc_api::prelude::{DeleteRegistrationRequest, ListRegistrationsRequest};
+use sbc_http_util::mgmt_audit::{Op, Outcome};
 use std::collections::HashMap;
 use tracing::warn;
 
+use super::write_audit::{audited, daemon_outcome, grpc_reason};
+use crate::authmw::Principal;
 use crate::state::AppState;
 
 pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -64,7 +67,10 @@ pub async fn delete(
     State(state): State<Arc<AppState>>,
     Path(aor): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+    principal: Option<Extension<Principal>>,
+) -> Response {
+    let p = principal.as_ref().map(|Extension(p)| p);
+    let done = |outcome, resp| audited(p, "registration", &aor, Op::Delete, outcome, resp);
     let mut client = state.registrations.clone();
     let req = DeleteRegistrationRequest {
         aor: aor.clone(),
@@ -77,25 +83,31 @@ pub async fn delete(
     match client.delete_registration(req).await {
         Ok(resp) => {
             let r = resp.into_inner();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "success": r.success,
-                    "aor": aor,
-                    "contacts_removed": r.contacts_removed,
-                    "message": r.message,
-                })),
+            done(
+                daemon_outcome(r.success),
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "success": r.success,
+                        "aor": aor,
+                        "contacts_removed": r.contacts_removed,
+                        "message": r.message,
+                    })),
+                ),
             )
         }
         Err(status) => {
             warn!(aor, error = %status, "RegistrationService.DeleteRegistration failed");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "success": false,
-                    "aor": aor,
-                    "error": status.message(),
-                })),
+            done(
+                Outcome::Failed(grpc_reason(&status)),
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "aor": aor,
+                        "error": status.message(),
+                    })),
+                ),
             )
         }
     }

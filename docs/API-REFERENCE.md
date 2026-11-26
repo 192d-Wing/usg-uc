@@ -19,6 +19,14 @@ curl -H "Authorization: Bearer <api-key>" \
   https://sbc.example.com:8443/api/v1/system/health
 ```
 
+API keys are configured by digest, never in clear:
+`SBC_API_KEY_SHA384` is a comma-separated list of SHA-384 hex digests
+(`printf %s "$KEY" | sha384sum | cut -d' ' -f1`). The former
+`SBC_API_KEY_SHA256` is no longer accepted and stops startup if set.
+An API key must be a random value of at least 256 bits (for example
+`openssl rand -hex 32`), never a chosen password: the server stores only
+a fast SHA-384 digest, which protects a random key but not a guessable one.
+
 ### Admin login (`POST /api/v1/auth/login`)
 
 Body: `{"username": "...", "password": "..."}`. Responses:
@@ -33,6 +41,17 @@ Body: `{"username": "...", "password": "..."}`. Responses:
 | `429` | `login busy, retry shortly` | All password-verification slots are in use. `Retry-After: 1`. Not counted. |
 
 Windows open at the first failure and are kept per sbc-api replica. The client IP is the TCP peer, or `X-Real-IP` when the peer is in `SBC_TRUSTED_PROXIES`. IPv6 clients are counted per /64. The number of verification slots (at most 4) is lowered at startup when the `SBC_ADMIN_PASSWORD_HASH` memory cost would exceed 96 MiB in total.
+
+### Audit of logins and writes
+
+Every login and every write is recorded in the audit log.
+
+- **Logins.** A successful admin login is an `AuthenticationAttempt` with method `Password`. A failed login, a `400` or `429` refusal, and a rejected bearer token or session cookie are failure records; a rejected credential is tagged `Session` (cookie or `v2.` token), `Jwt` (three dot-separated segments) or `ApiKey`. Failures are aggregated per client and reason (`invalid_credentials`, `invalid_format`, `rate_limited`, `busy`, `invalid_token`) over 60 s. The client is the IPv4 address or the IPv6 /64, and the record keeps the full address. The first failure is recorded at once, and later ones are reported as `"<reason> count=<n>"` by a flush that runs every 5 s and emits at most 256 records. Each of the tables below is guaranteed a fifth of every flush, and unused share goes to the others. First failures are limited to 256 records per second across the whole process. A first failure over that limit is not written; it is counted in the next `AuditRecordsDropped` record (reason `Aggregated`), together with failures dropped because a table was full. Password failures, lockouts, other login refusals and token rejects are tracked in separate bounded tables, so one cannot crowd out another. The username is recorded only when it is the configured admin name; any other name is recorded as `unknown`. When a lockout bucket first locks, a `RateLimitTriggered` record is written with `limit_name` `admin-login-lockout:<ip|ip-overflow|account>`. A request with no credential is not audited.
+- **Writes.** Every `POST`, `PUT` and `DELETE`, including `/auth/logout`, produces one `ConfigurationChange`. Its `admin` field is the actor: `oidc:<sub>@<iss>`, `admin:<subject>` (session token) or `apikey:<id>`. The API-key id is the first 16 hex digits of HMAC-SHA-384 under the token-signing key, so it is stable only while `SBC_AUTH_SIGNING_KEY` is. Its `description` reads `entity=<e> id=<id> op=<op> outcome=<ok|failed> [reason=<r>] ... [iss=<iss>] [user=<preferred_username>] [src=<client ip>]`. Trunk ids are `<group>/<trunk>`. A delete of an absent id still answers `200` and is recorded `outcome=failed reason=not_found`. A body that is not a JSON object answers `400` and is recorded. Permission denials name the same actor id, with the same 250-byte cap.
+- **Stored rows.** Rows written through sbc-api carry `updated_by = 'local:<actor>'`. The actor is capped at 250 bytes, the same cap as the audit `admin` field. Rows written before this release keep `'local'`. When the site uploads them to central, each upload change carries the row's `updated_by` as `origin_actor`. Central records it on the `sync_change` record as `claimed_origin_actor` (capped at 250 bytes). It is the site's claim; the record's actor is still the site's service account.
+- **Central.** central-config-api records every operator write with the same grammar. A write whose body is refused before the token is checked is recorded with actor `unauthenticated` and `reason=invalid`, aggregated per client like an auth failure.
+
+Paths under `/api/v1` that sbc-api does not own are read-only: `GET` is forwarded to the daemon, and `POST`, `PUT` and `DELETE` answer `405` with `Allow: GET`.
 
 ## API Versioning
 
