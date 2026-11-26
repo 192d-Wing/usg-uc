@@ -11,14 +11,17 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use sbc_grpc_api::prelude::{
     ListTrunkHealthRequest, ListTrunkRegistrationsRequest, RegisterTrunkRequest,
 };
+use sbc_http_util::mgmt_audit::{Op, Outcome};
 use tracing::warn;
 
+use super::write_audit::{audited, daemon_outcome, grpc_reason};
+use crate::authmw::Principal;
 use crate::state::AppState;
 
 pub async fn list_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -98,7 +101,19 @@ pub async fn list_registrations(State(state): State<Arc<AppState>>) -> impl Into
 pub async fn register(
     State(state): State<Arc<AppState>>,
     Path(trunk_id): Path<String>,
-) -> impl IntoResponse {
+    principal: Option<Extension<Principal>>,
+) -> Response {
+    let p = principal.as_ref().map(|Extension(p)| p);
+    let done = |outcome, resp| {
+        audited(
+            p,
+            "trunk_registration",
+            &trunk_id,
+            Op::Action("register"),
+            outcome,
+            resp,
+        )
+    };
     let mut client = state.trunk_health.clone();
     match client
         .register_trunk(RegisterTrunkRequest {
@@ -108,24 +123,30 @@ pub async fn register(
     {
         Ok(resp) => {
             let r = resp.into_inner();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "success": r.success,
-                    "message": r.message,
-                    "trunk_id": trunk_id,
-                })),
+            done(
+                daemon_outcome(r.success),
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "success": r.success,
+                        "message": r.message,
+                        "trunk_id": trunk_id,
+                    })),
+                ),
             )
         }
         Err(status) => {
             warn!(trunk_id, error = %status, "TrunkHealthService.RegisterTrunk failed");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": status.message(),
-                    "trunk_id": trunk_id,
-                })),
+            done(
+                Outcome::Failed(grpc_reason(&status)),
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": status.message(),
+                        "trunk_id": trunk_id,
+                    })),
+                ),
             )
         }
     }

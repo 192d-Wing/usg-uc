@@ -17,6 +17,7 @@ mod config;
 mod handlers;
 mod policy;
 mod state;
+mod write_audit;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -53,6 +54,19 @@ async fn main() -> ExitCode {
         error!(error = %e, "audit logger init failed; refusing to start");
         return ExitCode::from(6);
     }
+    write_audit::set_trusted_proxies(cfg.trusted_proxies.clone());
+
+    // SR-40: emit suppressed token-reject counts and aggregator drops once
+    // the window closes. Ends with the runtime.
+    // NIST 800-53 Rev5: AU-5, SC-5
+    tokio::spawn(async {
+        let mut tick =
+            tokio::time::interval(sbc_http_util::mgmt_audit::AUTH_FAILURE_FLUSH_INTERVAL);
+        loop {
+            tick.tick().await;
+            sbc_http_util::mgmt_audit::flush_auth_failures(std::time::Instant::now());
+        }
+    });
 
     let app_state = match state::AppState::build(&cfg).await {
         Ok(s) => s,
@@ -92,9 +106,13 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Err(e) = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await
+    // Connect info: the TCP peer for the audit client IP (SR-40).
+    if let Err(e) = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
     {
         error!(error = %e, "server error");
         return ExitCode::from(5);

@@ -58,19 +58,27 @@ impl PostgresDialPlanStore {
     ///
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.
-    pub async fn upsert(&self, id: &str, data: &serde_json::Value) -> ConfigStoreResult<()> {
+    /// `actor` is the writer's principal; the row's `updated_by` becomes
+    /// `local:<actor>` ([`crate::origin::local_updated_by`]).
+    pub async fn upsert(
+        &self,
+        id: &str,
+        data: &serde_json::Value,
+        actor: &str,
+    ) -> ConfigStoreResult<()> {
         sqlx::query(
-            "INSERT INTO dial_plans (id, data)
-             VALUES ($1, $2)
+            "INSERT INTO dial_plans (id, data, updated_by)
+             VALUES ($1, $2, $3)
              ON CONFLICT (id) DO UPDATE SET
                  data       = EXCLUDED.data,
                  deleted    = FALSE,
                  revision   = 0,
-                 updated_by = 'local',
+                 updated_by = EXCLUDED.updated_by,
                  updated_at = NOW()",
         )
         .bind(id)
         .bind(data)
+        .bind(crate::origin::local_updated_by(actor))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -83,13 +91,16 @@ impl PostgresDialPlanStore {
     /// # Errors
     /// Returns `ConfigStoreError::NotFound` if no live row matched, or
     /// `ConfigStoreError::Storage` for other DB errors.
-    pub async fn delete(&self, id: &str) -> ConfigStoreResult<()> {
+    /// `actor` is the writer's principal; the row's `updated_by` becomes
+    /// `local:<actor>` ([`crate::origin::local_updated_by`]).
+    pub async fn delete(&self, id: &str, actor: &str) -> ConfigStoreResult<()> {
         let result = sqlx::query(
             "UPDATE dial_plans
-             SET deleted = TRUE, revision = 0, updated_by = 'local', updated_at = NOW()
+             SET deleted = TRUE, revision = 0, updated_by = $2, updated_at = NOW()
              WHERE id = $1 AND NOT deleted",
         )
         .bind(id)
+        .bind(crate::origin::local_updated_by(actor))
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {

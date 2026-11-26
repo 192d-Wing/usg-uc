@@ -48,7 +48,9 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 # HTTP server
 axum.workspace = true
 tower.workspace = true
-tower-http = { workspace = true, features = ["trace"] }
+# catch-panic: a panicking write handler still yields a 500 the write
+# audit backstop records (SR-40).
+tower-http = { workspace = true, features = ["trace", "catch-panic"] }
 hyper.workspace = true
 
 # Serde
@@ -77,6 +79,8 @@ ipnet.workspace = true
 nix = { workspace = true, features = ["fs", "user"] }
 
 [dev-dependencies]
+# Paused clock for the login lockout window tests.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 uc-user-mgmt = { path = "../../uc/uc-user-mgmt", default-features = false, features = ["postgres", "encryption", "sqlite"] }
 uc-audit = { workspace = true, features = ["test-capture"] }
@@ -84,6 +88,8 @@ uc-audit = { workspace = true, features = ["test-capture"] }
 jsonwebtoken.workspace = true
 aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
 base64 = "0.22"
+# SR-40 write-audit tests read updated_by back from Postgres.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 # SR-16 HTTPS client tests (uc-transport/tests/common/cnsa_*.rs): random
 # P-384 PKI + in-process TLS server. rustls is not `workspace = true` on
 # purpose: the workspace entry enables `fips`, which would mask the

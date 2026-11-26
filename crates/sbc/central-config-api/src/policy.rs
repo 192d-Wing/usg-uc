@@ -86,6 +86,11 @@ impl Action {
     pub const fn new(entity: Entity, verb: Verb) -> Self {
         Self { entity, verb }
     }
+
+    /// `entity:verb`, for audit records.
+    pub fn label(self) -> String {
+        format!("{}:{}", self.entity.as_str(), self.verb.as_str())
+    }
 }
 
 /// Managed role names → the action patterns they grant. Patterns are

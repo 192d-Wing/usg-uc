@@ -260,6 +260,14 @@ pub struct UploadChange {
     /// The row's canonical JSON payload for an upsert; `None` for a delete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
+    /// The site row's `updated_by` (`local:<actor>`, or legacy `local`),
+    /// as claimed by the uploading site. Audit attribution only: central
+    /// records it on the change record and never stores it. Optional on the
+    /// wire, so older agents and centrals interoperate.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3, CM-3
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_actor: Option<String>,
 }
 
 /// The body of a site's upload request.
