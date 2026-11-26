@@ -199,6 +199,26 @@ and WS messages and frames are capped at 65,535 bytes. Each WS message
 must hold one complete SIP message (RFC 7118 §5); an incomplete one is
 discarded (counted as a framing error) and never joined to the next.
 
+File descriptors (NIST SC-5, SC-6, CM-6): at startup the daemon raises
+its soft `RLIMIT_NOFILE` to the hard limit and checks that
+`max_connections_total` + 1024 egress connections + the RTP port range
+(`media.rtp_port_max - rtp_port_min + 1`, zero with an out-of-process
+media plane) + the SIP listeners + 512 fds of headroom fit. If not, it
+lowers `max_connections_total` (and `max_connections_per_listener` /
+`max_connections_per_source` to at most it) to fit, logs an error and
+records a configuration-change audit event; it refuses to start when
+fewer than 64 connections fit (audited as an ungraceful shutdown). The
+REST HTTPS connection cap (256) is counted too; the plain-HTTP API is not
+(POA&M-212). On systemd hosts set `LimitNOFILE=` in the unit (65536 or
+higher with in-process media). Each idle TCP/TLS connection holds a 4 KiB
+read buffer and each idle WebSocket connection 8 KiB of buffers. In the
+worst case a TLS connection holds about 128 KiB (a 64 KiB message buffer
+plus TLS state) and a WebSocket connection about 256 KiB (WS) or 300 KiB
+(WSS), because tungstenite buffers do not shrink after a maximum-size
+message (`deploy/helm/sbc/DEPLOYING.md` shows the arithmetic); size the
+caps against memory at those figures (the Helm chart's 6000 / 8000 fit a 2Gi
+pod for TLS).
+
 > **Note:** `ws_require_sip_subprotocol = false` admits WebSocket upgrades
 > that offer no subprotocol. This is **not conformant with RFC 7118 §4**
 > (the client MUST offer `sip`) and exists only for legacy clients; an
