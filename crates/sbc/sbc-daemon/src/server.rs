@@ -3687,6 +3687,9 @@ impl Drop for StirConnGuard {
     }
 }
 
+/// Audit `key_id` for bearer (OIDC) REGISTER authentication startup.
+const BEARER_AUDIT_KEY_ID: &str = "bearer_auth.oidc";
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -5713,6 +5716,3 @@ mod tests {
         wipe_wire_bytes(other);
     }
 }
-
-/// Audit `key_id` for bearer (OIDC) REGISTER authentication startup.
-const BEARER_AUDIT_KEY_ID: &str = "bearer_auth.oidc";
