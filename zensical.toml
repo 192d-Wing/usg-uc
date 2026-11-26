@@ -29,6 +29,7 @@ nav = [
     { "Compliance" = [
         { "CNSA 2.0" = "CNSA-2-COMPLIANCE.md" },
         { "NIST 800-53 Controls" = "NIST-800-53-CONTROLS.md" },
+        { "TLS Revocation Design" = "TLS-REVOCATION-DESIGN.md" },
         { "RFC Compliance Gaps" = "RFC_COMPLIANCE_GAPS.md" },
         { "Client RFC Compliance Audit" = "CLIENT_RFC_COMPLIANCE_AUDIT.md" },
         { "SDP RFC Compliance" = "SDP_RFC_Compliance.md" },
