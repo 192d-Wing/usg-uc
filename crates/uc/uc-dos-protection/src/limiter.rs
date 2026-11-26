@@ -3,8 +3,10 @@
 use crate::key::{DEFAULT_IPV6_PREFIX_LEN, source_key};
 use crate::{DEFAULT_BLOCK_DURATION_SECS, DEFAULT_BURST, DEFAULT_RPS};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 /// Rate limit action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +90,15 @@ pub struct RateLimiterConfig {
     pub overflow_rps: u32,
     /// Burst of the shared overflow bucket.
     pub overflow_burst: u32,
+    /// Whether a source over `block_threshold_multiplier` x `rps` is moved
+    /// to the block map. When `false` it is rejected per request only.
+    /// Explicit [`RateLimiter::block`] calls are unaffected. Trusted
+    /// sources are never auto-blocked, whatever this is set to.
+    pub auto_block: bool,
+    /// Rate of each trusted source's own bucket. `0` uses `rps`.
+    pub trusted_rps: u32,
+    /// Burst of each trusted source's own bucket. `0` uses `burst`.
+    pub trusted_burst: u32,
 }
 
 impl Default for RateLimiterConfig {
@@ -103,6 +114,9 @@ impl Default for RateLimiterConfig {
             max_blocked_sources: DEFAULT_MAX_BLOCKED_SOURCES,
             overflow_rps: DEFAULT_OVERFLOW_RPS,
             overflow_burst: DEFAULT_OVERFLOW_BURST,
+            auto_block: true,
+            trusted_rps: 0,
+            trusted_burst: 0,
         }
     }
 }
@@ -165,6 +179,39 @@ impl RateLimiterConfig {
         self.overflow_rps = rps;
         self.overflow_burst = burst;
         self
+    }
+
+    /// Sets whether over-threshold sources are blocked or only rejected.
+    #[must_use]
+    pub fn with_auto_block(mut self, on: bool) -> Self {
+        self.auto_block = on;
+        self
+    }
+
+    /// Sets the rate and burst of each trusted source's bucket.
+    #[must_use]
+    pub fn with_trusted_bucket(mut self, rps: u32, burst: u32) -> Self {
+        self.trusted_rps = rps;
+        self.trusted_burst = burst;
+        self
+    }
+
+    /// The trusted bucket rate in effect (`0` falls back to `rps`).
+    fn effective_trusted_rps(&self) -> u32 {
+        if self.trusted_rps == 0 {
+            self.rps
+        } else {
+            self.trusted_rps
+        }
+    }
+
+    /// The trusted bucket burst in effect (`0` falls back to `burst`).
+    fn effective_trusted_burst(&self) -> u32 {
+        if self.trusted_burst == 0 {
+            self.burst
+        } else {
+            self.trusted_burst
+        }
     }
 }
 
@@ -276,6 +323,77 @@ impl BlockEntry {
     }
 }
 
+/// Cap on [`RateLimiter::set_trusted_sources`]; addresses past it are not
+/// trusted. Bounds the trusted map and the cost of replacing it under the
+/// caller's lock.
+pub const MAX_TRUSTED_SOURCES: usize = 4_096;
+
+/// Multiplicative word hasher (Fx-style) for the trusted map. Its keys are
+/// operator-configured and capped at [`MAX_TRUSTED_SOURCES`]; attacker
+/// addresses are only looked up, never inserted, so a keyed hasher buys
+/// nothing on that map and SipHash costs every untrusted packet a lookup.
+#[derive(Default)]
+struct WordHasher(u64);
+
+impl WordHasher {
+    const SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::SEED);
+    }
+}
+
+impl Hasher for WordHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for word in words {
+            self.mix(u64::from_le_bytes(*word));
+        }
+        for &b in rest {
+            self.mix(u64::from(b));
+        }
+    }
+
+    fn write_u8(&mut self, n: u8) {
+        self.mix(u64::from(n));
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.mix(u64::from(n));
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.mix(n);
+    }
+
+    fn write_u128(&mut self, n: u128) {
+        #[allow(clippy::cast_possible_truncation)]
+        self.mix(n as u64);
+        self.mix((n >> 64) as u64);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.mix(n as u64);
+    }
+
+    fn write_isize(&mut self, n: isize) {
+        #[allow(clippy::cast_sign_loss)]
+        self.mix(n as u64);
+    }
+}
+
+/// A trusted source's bucket and any explicit [`RateLimiter::block`] of
+/// its exact address.
+#[derive(Debug)]
+struct TrustedEntry {
+    bucket: TokenBucket,
+    block: Option<BlockEntry>,
+}
+
 /// Token bucket rate limiter keyed by an opaque identity such as a SIP user
 /// (`rate_limit.per_user_rps`), one bucket per key.
 ///
@@ -334,7 +452,8 @@ impl KeyedRateLimiter {
     }
 }
 
-/// One report from [`RateLimiter::sweep_with`]; keys are [`source_key`]s.
+/// One report from [`RateLimiter::sweep_with`]; keys are [`source_key`]s,
+/// except [`SweepEvent::TrustedRejected`], which carries the exact address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepEvent {
     /// Over-rate rejections from a tracked source since the last sweep.
@@ -343,6 +462,8 @@ pub enum SweepEvent {
     BlockedDrops(IpAddr, u64),
     /// The source's block expired and was removed.
     Unblocked(IpAddr),
+    /// Over-rate rejections from a trusted source since the last sweep.
+    TrustedRejected(IpAddr, u64),
 }
 
 /// Token bucket rate limiter.
@@ -352,6 +473,11 @@ pub enum SweepEvent {
 /// one shared overflow bucket. Global mode (`!per_ip`) uses one bucket and
 /// never blocks: a global rejection cannot be attributed to the source that
 /// happened to trip it.
+///
+/// Trusted sources ([`Self::set_trusted_sources`]) are matched on the exact
+/// canonical address, not the /prefix key. Each has its own bucket, is
+/// checked before the block map, and is never auto-blocked; only an
+/// explicit [`Self::block`] of its exact address stops it.
 ///
 /// ## NIST 800-53 Rev5: SC-5, SC-5(2)
 #[derive(Debug)]
@@ -375,6 +501,9 @@ pub struct RateLimiter {
     global_rejected: u64,
     /// Overflow-bucket rejections since the last take.
     overflow_rejected: u64,
+    /// Trusted sources, keyed by exact canonical address. The key set is
+    /// the trusted set; at most [`MAX_TRUSTED_SOURCES`] entries.
+    trusted_buckets: HashMap<IpAddr, TrustedEntry, BuildHasherDefault<WordHasher>>,
 }
 
 impl RateLimiter {
@@ -392,6 +521,7 @@ impl RateLimiter {
             last_block_sweep: Instant::now(),
             global_rejected: 0,
             overflow_rejected: 0,
+            trusted_buckets: HashMap::default(),
         }
     }
 
@@ -410,15 +540,25 @@ impl RateLimiter {
         source_key(source, self.config.ipv6_prefix_len)
     }
 
-    /// Checks if a source is blocked.
+    /// Checks if a source is blocked. A trusted source is blocked only by
+    /// an explicit [`Self::block`] of its exact address, never by a block
+    /// on its prefix.
     pub fn is_blocked(&self, source: IpAddr) -> bool {
-        self.blocked
-            .get(&self.key(source))
-            .is_some_and(|entry| !entry.is_expired())
+        self.block_remaining(source).is_some()
     }
 
-    /// Returns the remaining block time for a source.
+    /// Returns the remaining block time for a source (see
+    /// [`Self::is_blocked`] for trusted sources).
     pub fn block_remaining(&self, source: IpAddr) -> Option<Duration> {
+        if !self.trusted_buckets.is_empty()
+            && let Some(entry) = self.trusted_buckets.get(&source.to_canonical())
+        {
+            return entry
+                .block
+                .as_ref()
+                .filter(|block| !block.is_expired())
+                .map(BlockEntry::remaining);
+        }
         self.blocked.get(&self.key(source)).and_then(|entry| {
             if entry.is_expired() {
                 None
@@ -430,10 +570,26 @@ impl RateLimiter {
 
     /// Blocks a source. Returns `false` (and does not block) when the block
     /// map is at `max_blocked_sources` and the source is not already in it.
+    ///
+    /// A trusted source is blocked on its exact address only (not its
+    /// prefix) and does not count against `max_blocked_sources`.
     // POAM: POA&M-90 — blocks are node-local and not replicated across the
     // cluster, so an attacker can rotate to a peer node (SC-5).
     pub fn block(&mut self, source: IpAddr, duration: Duration) -> bool {
-        let key = self.key(source);
+        if let Some(entry) = self.trusted_buckets.get_mut(&source.to_canonical()) {
+            // Re-block keeps the undrained drop count.
+            match &mut entry.block {
+                Some(block) => block.expires_at = Instant::now() + duration,
+                None => entry.block = Some(BlockEntry::new(duration)),
+            }
+            return true;
+        }
+        self.block_key(self.key(source), duration)
+    }
+
+    /// Adds `key` (already a [`source_key`]) to the block map. Auto-blocks
+    /// come here directly: they never target a trusted address.
+    fn block_key(&mut self, key: IpAddr, duration: Duration) -> bool {
         if let Some(entry) = self.blocked.get_mut(&key) {
             // Re-block keeps the undrained drop count.
             entry.expires_at = Instant::now() + duration;
@@ -457,10 +613,82 @@ impl RateLimiter {
         true
     }
 
-    /// Unblocks a source.
+    /// Unblocks a source. For a trusted source only its own explicit
+    /// block is cleared; a block-map entry on its key (an explicit block
+    /// made before it was trusted, or a neighbour's prefix block) is left
+    /// in place. Such an entry is bypassed while the source is trusted
+    /// and applies again once it is untrusted.
     pub fn unblock(&mut self, source: IpAddr) {
+        if let Some(entry) = self.trusted_buckets.get_mut(&source.to_canonical()) {
+            entry.block = None;
+            return;
+        }
         let key = self.key(source);
         self.blocked.remove(&key);
+    }
+
+    /// Replaces the trusted set. Addresses are canonicalised (IPv4-mapped
+    /// folded to IPv4); state of addresses still trusted is kept, that of
+    /// removed addresses dropped, except that a live explicit block moves
+    /// to the block map under the address's [`source_key`] (so an IPv6
+    /// exact-address block widens to its prefix). The move only extends
+    /// an existing entry's expiry, never shortens it, and carries over the
+    /// undrained drop count. Only the first [`MAX_TRUSTED_SOURCES`] distinct
+    /// addresses (in iteration order) are trusted; returns how many were
+    /// left out. Callers wanting a deterministic choice pass a sorted,
+    /// already capped list.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (configured peers)
+    pub fn set_trusted_sources(&mut self, ips: impl IntoIterator<Item = IpAddr>) -> usize {
+        let mut old = std::mem::take(&mut self.trusted_buckets);
+        let burst = self.config.effective_trusted_burst();
+        let mut skipped = 0;
+        for ip in ips.into_iter().map(|ip| ip.to_canonical()) {
+            if self.trusted_buckets.contains_key(&ip) {
+                continue;
+            }
+            if self.trusted_buckets.len() >= MAX_TRUSTED_SOURCES {
+                skipped += 1;
+                continue;
+            }
+            let entry = old.remove(&ip).unwrap_or_else(|| TrustedEntry {
+                bucket: TokenBucket::new(burst),
+                block: None,
+            });
+            self.trusted_buckets.insert(ip, entry);
+        }
+        for (ip, entry) in old {
+            if let Some(block) = entry.block.filter(|block| !block.is_expired()) {
+                self.migrate_block(ip, &block);
+            }
+        }
+        skipped
+    }
+
+    /// Moves the live explicit block of an untrusted `ip` to the block map.
+    fn migrate_block(&mut self, ip: IpAddr, block: &BlockEntry) {
+        let key = self.key(ip);
+        if let Some(existing) = self.blocked.get_mut(&key) {
+            existing.expires_at = existing.expires_at.max(block.expires_at);
+            existing.dropped = existing.dropped.saturating_add(block.dropped);
+            return;
+        }
+        if self.block_key(key, block.remaining()) {
+            if let Some(entry) = self.blocked.get_mut(&key) {
+                entry.expires_at = block.expires_at;
+                entry.dropped = block.dropped;
+            }
+        } else {
+            warn!(
+                source = %ip,
+                "Block map full; explicit block of an untrusted source not kept"
+            );
+        }
+    }
+
+    /// Whether `ip` (either IPv4 or IPv4-mapped form) is a trusted source.
+    pub fn is_trusted(&self, ip: IpAddr) -> bool {
+        self.trusted_buckets.contains_key(&ip.to_canonical())
     }
 
     /// Checks a request and returns the action to take.
@@ -488,6 +716,17 @@ impl RateLimiter {
             }
             self.global_rejected = self.global_rejected.saturating_add(1);
             return pass(RateLimitAction::Reject);
+        }
+
+        // Trusted sources use their own bucket ahead of the block map and
+        // are rejected, never auto-blocked. Only the emptiness test stays
+        // inline: the lookup is out of line so the untrusted path keeps
+        // its codegen when no trunk is configured.
+        // NIST 800-53 Rev5: SC-5, SC-5(2) (per-peer capacity)
+        if !self.trusted_buckets.is_empty()
+            && let Some(action) = self.check_trusted(source)
+        {
+            return pass(action);
         }
 
         let key = self.key(source);
@@ -520,8 +759,10 @@ impl RateLimiter {
             // Still full: charge the shared overflow bucket instead of
             // rejecting outright, so genuinely new sources keep a share of
             // service during a flood. The overflow bucket never blocks.
-            // POAM: POA&M-91 — /48-scale IPv6 rotation is bounded only by
-            // this bucket; no adaptive prefix aggregation (SC-5).
+            // POAM: POA&M-91 — in this rate limiter, /48-scale IPv6
+            // rotation is bounded only by this bucket; no adaptive prefix
+            // aggregation (SC-5). Stream connections have their own
+            // aggregate caps in sbc-daemon `conn_limit.rs` (SR-58).
             if self.buckets.len() >= self.config.max_tracked_sources {
                 let (allowed, _) = self
                     .overflow_bucket
@@ -544,11 +785,12 @@ impl RateLimiter {
             return pass(self.allow_or_throttle(rate));
         }
 
-        // Check if we should block
+        // Check if we should block. With `auto_block` off (spoofable
+        // transports) an over-threshold source is only rejected.
         let block_threshold = self.config.rps as f64 * self.config.block_threshold_multiplier;
-        if rate >= block_threshold {
+        if self.config.auto_block && rate >= block_threshold {
             let duration = Duration::from_secs(self.config.block_duration_secs);
-            if self.block(key, duration) {
+            if self.block_key(key, duration) {
                 return CheckOutcome {
                     action: RateLimitAction::Block {
                         duration_secs: self.config.block_duration_secs,
@@ -558,6 +800,33 @@ impl RateLimiter {
             }
         }
         pass(RateLimitAction::Reject)
+    }
+
+    /// The action for a trusted `source`, or `None` when it is not
+    /// trusted. An explicit block of its exact address wins; otherwise
+    /// `Allow` or `Reject` from its own bucket.
+    #[cold]
+    #[inline(never)]
+    fn check_trusted(&mut self, source: IpAddr) -> Option<RateLimitAction> {
+        let (rps, burst) = (
+            self.config.effective_trusted_rps(),
+            self.config.effective_trusted_burst(),
+        );
+        let entry = self.trusted_buckets.get_mut(&source.to_canonical())?;
+        if let Some(block) = entry.block.as_mut()
+            && !block.is_expired()
+        {
+            block.dropped = block.dropped.saturating_add(1);
+            return Some(RateLimitAction::Block {
+                duration_secs: block.remaining().as_secs(),
+            });
+        }
+        let (allowed, _) = entry.bucket.try_consume(rps, burst);
+        Some(if allowed {
+            RateLimitAction::Allow
+        } else {
+            RateLimitAction::Reject
+        })
     }
 
     /// `Allow`, or `Throttle` once the source is over 80% of its rate.
@@ -610,6 +879,30 @@ impl RateLimiter {
     /// ## NIST 800-53 Rev5: SC-5, AU-4, AU-12 (aggregated audit)
     pub fn sweep_with(&mut self, mut on_event: impl FnMut(SweepEvent)) -> usize {
         let mut ended = 0;
+        // Trusted sources first. Ordering only helps within one sweep: a
+        // caller that caps records across several sweeps must keep these
+        // apart from per-source events (the SBC daemon does). Their
+        // entries live as long as the source stays trusted.
+        for (ip, entry) in &mut self.trusted_buckets {
+            if entry.bucket.rejected > 0 {
+                on_event(SweepEvent::TrustedRejected(
+                    *ip,
+                    u64::from(entry.bucket.rejected),
+                ));
+                entry.bucket.rejected = 0;
+            }
+            if let Some(block) = entry.block.as_mut() {
+                if block.dropped > 0 {
+                    on_event(SweepEvent::BlockedDrops(*ip, block.dropped));
+                    block.dropped = 0;
+                }
+                if block.is_expired() {
+                    on_event(SweepEvent::Unblocked(*ip));
+                    ended += 1;
+                    entry.block = None;
+                }
+            }
+        }
         self.blocked.retain(|key, entry| {
             if entry.dropped > 0 {
                 on_event(SweepEvent::BlockedDrops(*key, entry.dropped));
@@ -638,6 +931,7 @@ impl RateLimiter {
 
     /// Reports and resets per-source rejection counts (`f(key, count)` for
     /// every bucket with at least one rejection since the last drain).
+    /// Trusted-source rejections are reported only by [`Self::sweep_with`].
     ///
     /// ## NIST 800-53 Rev5: AU-4, AU-12 (aggregated audit)
     pub fn drain_rejections(&mut self, mut f: impl FnMut(IpAddr, u64)) {
@@ -755,12 +1049,18 @@ mod tests {
         // First 5 requests should be allowed (burst)
         for _ in 0..5 {
             let action = limiter.check(ip);
-            assert!(action.is_allowed(), "Expected allowed, got {action:?}");
+            assert!(
+                action.is_allowed(),
+                "expected the request within the burst to be allowed"
+            );
         }
 
         // Next request should be rejected (out of tokens)
         let action = limiter.check(ip);
-        assert!(action.is_rejected(), "Expected rejected, got {action:?}");
+        assert!(
+            action.is_rejected(),
+            "expected the request past the burst to be rejected"
+        );
     }
 
     #[test]
@@ -1138,5 +1438,394 @@ mod tests {
         }
         assert_eq!(limiter.blocked_sources(), 0);
         assert_eq!(limiter.tracked_sources(), 1);
+    }
+}
+
+// SR-55: auto-block gate and trusted (configured trunk) sources. Written
+// against the planned API (`with_auto_block`, `with_trusted_bucket`,
+// `set_trusted_sources`, `is_trusted`, `SweepEvent::TrustedRejected`).
+#[cfg(test)]
+mod sr55_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn v4(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn is_block(action: RateLimitAction) -> bool {
+        matches!(action, RateLimitAction::Block { .. })
+    }
+
+    #[test]
+    fn auto_block_off_rejects_without_blocking() {
+        let mut limiter = RateLimiter::new(RateLimiterConfig::new(10, 10).with_auto_block(false));
+        let src = v4(1);
+        let mut rejects = 0;
+        for _ in 0..1_000 {
+            let outcome = limiter.check_outcome(src);
+            assert!(!outcome.block_started);
+            assert!(
+                !is_block(outcome.action),
+                "auto-block disabled: no block expected"
+            );
+            if outcome.action == RateLimitAction::Reject {
+                rejects += 1;
+            }
+        }
+        assert!(rejects > 0);
+        assert_eq!(limiter.blocked_sources(), 0);
+        assert!(!limiter.is_blocked(src));
+    }
+
+    #[test]
+    fn auto_block_off_explicit_block_still_applies() {
+        let mut limiter = RateLimiter::new(RateLimiterConfig::new(10, 10).with_auto_block(false));
+        assert!(limiter.block(v4(2), Duration::from_secs(30)));
+        assert!(limiter.is_blocked(v4(2)));
+        assert!(is_block(limiter.check(v4(2))));
+    }
+
+    #[test]
+    fn auto_block_default_unchanged() {
+        let config = RateLimiterConfig::default();
+        assert!(config.auto_block);
+        assert_eq!((config.trusted_rps, config.trusted_burst), (0, 0));
+        let mut limiter = RateLimiter::new(RateLimiterConfig::new(10, 10));
+        let mut started = 0;
+        for _ in 0..1_000 {
+            if limiter.check_outcome(v4(3)).block_started {
+                started += 1;
+            }
+        }
+        assert_eq!(started, 1);
+        assert!(limiter.is_blocked(v4(3)));
+    }
+
+    #[test]
+    fn trusted_source_never_blocked() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(50, 50));
+        let t = v4(5);
+        limiter.set_trusted_sources([t]);
+        assert!(limiter.is_trusted(t));
+        let mut rejects = 0;
+        for i in 0..5_000 {
+            let outcome = limiter.check_outcome(t);
+            assert!(!outcome.block_started);
+            assert!(
+                !is_block(outcome.action),
+                "trusted source must never be blocked (check {i})"
+            );
+            if i < 50 {
+                assert!(outcome.action.is_allowed(), "check {i} within burst");
+            } else if outcome.action == RateLimitAction::Reject {
+                rejects += 1;
+            }
+        }
+        assert!(rejects > 0, "trusted bucket never rejected");
+        assert!(!limiter.is_blocked(t));
+        assert_eq!(limiter.blocked_sources(), 0);
+        // Trusted traffic does not create a per-source bucket.
+        assert_eq!(limiter.tracked_sources(), 0);
+    }
+
+    #[test]
+    fn trusted_ignores_prefix_block() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(1_000, 1_000));
+        let trunk = ip("2001:db8::5");
+        let neighbour = ip("2001:db8::66");
+        limiter.set_trusted_sources([trunk]);
+        for _ in 0..1_000 {
+            let _ = limiter.check(neighbour);
+        }
+        assert!(limiter.is_blocked(neighbour), "/64 not blocked by flood");
+        assert_eq!(limiter.check(trunk), RateLimitAction::Allow);
+        assert!(!limiter.is_blocked(trunk));
+        assert_eq!(limiter.block_remaining(trunk), None);
+    }
+
+    #[test]
+    fn trusted_is_not_reported_blocked_under_prefix_block() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(1_000, 1_000));
+        let trunk = ip("2001:db8::5");
+        limiter.set_trusted_sources([trunk]);
+        // An explicit block of a neighbour blocks the shared /64.
+        assert!(limiter.block(ip("2001:db8::66"), Duration::from_secs(30)));
+        assert!(limiter.is_blocked(ip("2001:db8::77")));
+        assert!(!limiter.is_blocked(trunk));
+        assert_eq!(limiter.block_remaining(trunk), None);
+        // Untrusting it exposes the prefix block again.
+        limiter.set_trusted_sources(std::iter::empty());
+        assert!(limiter.is_blocked(trunk));
+    }
+
+    #[test]
+    fn explicit_block_of_trusted_source_is_enforced() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(1_000, 1_000));
+        let trunk = ip("2001:db8::5");
+        let neighbour = ip("2001:db8::66");
+        limiter.set_trusted_sources([trunk]);
+        assert!(limiter.block(trunk, Duration::from_secs(30)));
+        assert!(limiter.is_blocked(trunk));
+        assert!(limiter.block_remaining(trunk).is_some());
+        assert!(is_block(limiter.check(trunk)));
+        // Exact address only: the trunk's /64 is not blocked.
+        assert!(!limiter.is_blocked(neighbour));
+        assert_eq!(limiter.check(neighbour), RateLimitAction::Allow);
+        assert_eq!(
+            limiter.blocked_sources(),
+            0,
+            "trusted block is not in the block map"
+        );
+        // Drops are reported like other blocks.
+        let mut events = Vec::new();
+        let _ = limiter.sweep_with(|e| events.push(e));
+        assert!(
+            events.contains(&SweepEvent::BlockedDrops(trunk, 1)),
+            "{events:?}"
+        );
+        limiter.unblock(trunk);
+        assert!(!limiter.is_blocked(trunk));
+        assert_eq!(limiter.check(trunk), RateLimitAction::Allow);
+    }
+
+    #[test]
+    fn explicit_block_of_trusted_source_survives_untrust() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(1_000, 1_000));
+        let t = v4(40);
+        limiter.set_trusted_sources([t]);
+        assert!(limiter.block(t, Duration::from_secs(30)));
+        let _ = limiter.set_trusted_sources(std::iter::empty());
+        assert!(limiter.is_blocked(t));
+        assert!(is_block(limiter.check(t)));
+    }
+
+    // SEC-007: the move on untrust extends, never shortens, an existing
+    // block-map entry and carries over undrained drops.
+    #[test]
+    fn untrust_migration_extends_expiry_and_keeps_drops() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(1_000, 1_000));
+        let (long, short) = (v4(44), v4(45));
+        // Pre-trust blocks: `long` outlasts its later trusted block,
+        // `short` is outlasted by it.
+        assert!(limiter.block(long, Duration::from_secs(600)));
+        assert!(limiter.block(short, Duration::from_secs(5)));
+        limiter.set_trusted_sources([long, short]);
+        assert!(limiter.block(long, Duration::from_secs(30)));
+        assert!(limiter.block(short, Duration::from_secs(300)));
+        for _ in 0..3 {
+            assert!(is_block(limiter.check(short)));
+        }
+        let _ = limiter.set_trusted_sources(std::iter::empty());
+        let long_left = limiter.block_remaining(long).unwrap();
+        assert!(long_left > Duration::from_secs(500), "{long_left:?}");
+        let short_left = limiter.block_remaining(short).unwrap();
+        assert!(short_left > Duration::from_secs(200), "{short_left:?}");
+        let mut events = Vec::new();
+        let _ = limiter.sweep_with(|e| events.push(e));
+        assert!(
+            events.contains(&SweepEvent::BlockedDrops(short, 3)),
+            "{events:?}"
+        );
+    }
+
+    // SEC-007: an IPv6 exact-address block widens to the prefix on untrust.
+    #[test]
+    fn untrust_migration_widens_v6_block_to_prefix() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(1_000, 1_000));
+        let trunk = ip("2001:db8::5");
+        let neighbour = ip("2001:db8::66");
+        limiter.set_trusted_sources([trunk]);
+        assert!(limiter.block(trunk, Duration::from_secs(30)));
+        assert!(!limiter.is_blocked(neighbour));
+        let _ = limiter.set_trusted_sources(std::iter::empty());
+        assert!(limiter.is_blocked(trunk));
+        assert!(limiter.is_blocked(neighbour));
+        assert_eq!(limiter.blocked_sources(), 1);
+    }
+
+    // SEC-008: unblocking a trusted source clears only its own block; a
+    // pre-trust block-map entry is bypassed while trusted and applies
+    // again on untrust.
+    #[test]
+    fn unblock_trusted_keeps_pre_trust_block() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(1_000, 1_000));
+        let t = v4(46);
+        assert!(limiter.block(t, Duration::from_secs(60)));
+        limiter.set_trusted_sources([t]);
+        assert_eq!(limiter.check(t), RateLimitAction::Allow);
+        assert!(limiter.block(t, Duration::from_secs(30)));
+        assert!(is_block(limiter.check(t)));
+        limiter.unblock(t);
+        assert_eq!(limiter.check(t), RateLimitAction::Allow);
+        assert_eq!(limiter.blocked_sources(), 1, "pre-trust entry removed");
+        let _ = limiter.set_trusted_sources(std::iter::empty());
+        assert!(limiter.is_blocked(t));
+        assert!(is_block(limiter.check(t)));
+        limiter.unblock(t);
+        assert!(!limiter.is_blocked(t));
+    }
+
+    #[test]
+    fn trusted_block_expiry_reports_unblocked() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(1_000, 1_000));
+        let t = v4(41);
+        limiter.set_trusted_sources([t]);
+        assert!(limiter.block(t, Duration::ZERO));
+        let mut events = Vec::new();
+        assert_eq!(limiter.sweep_with(|e| events.push(e)), 1);
+        assert!(events.contains(&SweepEvent::Unblocked(t)), "{events:?}");
+        assert_eq!(limiter.check(t), RateLimitAction::Allow);
+    }
+
+    #[test]
+    fn sweep_reports_trusted_rejections_first() {
+        let mut limiter = RateLimiter::new(RateLimiterConfig::new(1, 1).with_trusted_bucket(1, 1));
+        let t = v4(42);
+        limiter.set_trusted_sources([t]);
+        for _ in 0..10 {
+            let _ = limiter.check(t);
+            let _ = limiter.check(v4(43));
+        }
+        let mut events = Vec::new();
+        let _ = limiter.sweep_with(|e| events.push(e));
+        assert!(
+            matches!(events.first(), Some(SweepEvent::TrustedRejected(ip, _)) if *ip == t),
+            "{events:?}"
+        );
+        assert!(events.len() > 1, "{events:?}");
+    }
+
+    #[test]
+    fn trusted_set_capped() {
+        let mut limiter = RateLimiter::new(RateLimiterConfig::new(10, 10));
+        let ips: Vec<IpAddr> = (0..MAX_TRUSTED_SOURCES as u32 + 10)
+            .map(|n| IpAddr::V4(Ipv4Addr::from(0x0A00_0000 | n)))
+            .collect();
+        let skipped = limiter.set_trusted_sources(ips.iter().copied().chain(ips.iter().copied()));
+        assert_eq!(skipped, 20);
+        assert_eq!(limiter.trusted_buckets.len(), MAX_TRUSTED_SOURCES);
+        assert!(limiter.is_trusted(ips[0]));
+        assert!(!limiter.is_trusted(ips[MAX_TRUSTED_SOURCES]));
+    }
+
+    #[test]
+    fn trusted_neighbour_not_trusted() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(1_000, 1_000));
+        let trunk = ip("2001:db8::5");
+        let neighbour = ip("2001:db8::66");
+        limiter.set_trusted_sources([trunk]);
+        assert!(!limiter.is_trusted(neighbour));
+        let _ = limiter.check(trunk);
+        assert_eq!(limiter.tracked_sources(), 0);
+        let _ = limiter.check(neighbour);
+        assert_eq!(limiter.tracked_sources(), 1);
+        // The neighbour's bucket is the shared /64 one.
+        assert!(limiter.token_count(ip("2001:db8::1")).is_some());
+    }
+
+    #[test]
+    fn trusted_matches_v4_mapped() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(5, 5));
+        limiter.set_trusted_sources([v4(1)]);
+        assert!(limiter.is_trusted(ip("::ffff:192.0.2.1")));
+        limiter.set_trusted_sources([ip("::ffff:192.0.2.7")]);
+        assert!(limiter.is_trusted(v4(7)));
+        assert!(!limiter.is_trusted(v4(1)));
+    }
+
+    #[test]
+    fn trusted_set_replace_drops_old() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(50, 50));
+        let (a, b) = (v4(10), v4(11));
+        limiter.set_trusted_sources([a]);
+        let _ = limiter.check(a);
+        assert_eq!(limiter.trusted_buckets.len(), 1);
+        limiter.set_trusted_sources([b]);
+        let _ = limiter.check(b);
+        assert!(!limiter.is_trusted(a));
+        assert!(limiter.is_trusted(b));
+        assert_eq!(limiter.trusted_buckets.len(), 1);
+        assert!(limiter.trusted_buckets.contains_key(&b));
+        assert_eq!(limiter.tracked_sources(), 0);
+        let _ = limiter.check(a);
+        assert_eq!(
+            limiter.tracked_sources(),
+            1,
+            "a not back on the normal bucket"
+        );
+    }
+
+    #[test]
+    fn sweep_reports_trusted_rejections() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(1, 1));
+        let t = v4(20);
+        limiter.set_trusted_sources([t]);
+        for _ in 0..10 {
+            let _ = limiter.check(t);
+        }
+        let mut events = Vec::new();
+        let _ = limiter.sweep_with(|e| events.push(e));
+        let trusted: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, SweepEvent::TrustedRejected(..)))
+            .collect();
+        assert_eq!(trusted.len(), 1, "{events:?}");
+        let SweepEvent::TrustedRejected(src, n) = *trusted[0] else {
+            unreachable!()
+        };
+        assert_eq!(src, t);
+        assert!(n >= 1);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SweepEvent::Rejected(k, _) if *k == t)),
+            "{events:?}"
+        );
+        events.clear();
+        let _ = limiter.sweep_with(|e| events.push(e));
+        assert!(events.is_empty(), "count not reset: {events:?}");
+    }
+
+    #[test]
+    fn trusted_bucket_not_evicted_by_idle_sweep() {
+        let mut limiter =
+            RateLimiter::new(RateLimiterConfig::new(10, 10).with_trusted_bucket(50, 50));
+        let t = v4(30);
+        limiter.set_trusted_sources([t]);
+        let _ = limiter.check(t);
+        let idle = Instant::now().checked_sub(BUCKET_IDLE_TIMEOUT * 2).unwrap();
+        limiter
+            .trusted_buckets
+            .get_mut(&t)
+            .unwrap()
+            .bucket
+            .last_update = idle;
+        let _ = limiter.sweep_with(|_| {});
+        limiter.cleanup();
+        assert!(
+            limiter.trusted_buckets.contains_key(&t),
+            "trusted bucket evicted"
+        );
+        limiter.set_trusted_sources(std::iter::empty());
+        assert!(limiter.trusted_buckets.is_empty());
+        assert!(!limiter.is_trusted(t));
     }
 }

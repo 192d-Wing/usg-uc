@@ -146,6 +146,13 @@ pub struct SipStack {
     /// on its configured `protocol` (SR-04). Used for source admission,
     /// RFC 3325 trust, the per-user limiter exemption, STIR and CSS routing.
     inbound_trunk_map: RwLock<InboundTrunkMap>,
+    /// Source IPs of `inbound_trunk_map` over any transport (sorted, at most
+    /// `uc_dos_protection::MAX_TRUSTED_SOURCES`), republished when a write
+    /// changes it. The server applies it to the per-source rate limiters as
+    /// trusted sources.
+    ///
+    /// NIST 800-53 Rev5: SC-5
+    trunk_sources: tokio::sync::watch::Sender<Arc<[std::net::IpAddr]>>,
     /// Trunk group → canonical IPs of its configured hosts, resolved when
     /// the group is loaded. A trunk leg's dialog peer is any of them (see
     /// `dialog_match`); unlike the IP-and-transport keys of
@@ -3118,6 +3125,7 @@ impl SipStack {
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(InboundTrunkMap::default()),
+            trunk_sources: tokio::sync::watch::Sender::new(Arc::from([])),
             trunk_group_hosts: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(crate::stir_binding::DidMap::default()),
             stir_flows: RwLock::new(crate::stir_binding::StirFlows::default()),
@@ -3206,6 +3214,7 @@ impl SipStack {
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(InboundTrunkMap::default()),
+            trunk_sources: tokio::sync::watch::Sender::new(Arc::from([])),
             trunk_group_hosts: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(crate::stir_binding::DidMap::default()),
             stir_flows: RwLock::new(crate::stir_binding::StirFlows::default()),
@@ -8620,6 +8629,7 @@ impl SipStack {
             let hosts: HashSet<std::net::IpAddr> = sources.iter().map(TrunkSourceKey::ip).collect();
             index_trunk_hosts(self.trunk_group_hosts.get_mut(), &tg_config.id, hosts);
         }
+        publish_trunk_sources(&self.trunk_sources, self.inbound_trunk_map.get_mut());
 
         // Load dial plans
         for dp_config in dial_plan_configs {
@@ -13475,7 +13485,11 @@ impl SipStack {
         }
         // NIST 800-53 Rev5: AC-3, AC-4, CM-3 - a removed group's addresses
         // are no longer admitted as trunk sources.
-        self.inbound_trunk_map.write().await.remove_group(id);
+        {
+            let mut map = self.inbound_trunk_map.write().await;
+            map.remove_group(id);
+            publish_trunk_sources(&self.trunk_sources, &map);
+        }
         self.trunk_group_hosts.write().await.remove(id);
         // NIST 800-53 Rev5: AC-21, CM-3 - a re-created group starts untrusted.
         self.trusted_trunk_groups.write().await.remove(id);
@@ -13555,11 +13569,20 @@ impl SipStack {
         css_id: Option<&str>,
         sources: &HashSet<TrunkSourceKey>,
     ) {
-        self.inbound_trunk_map
-            .write()
-            .await
-            .replace_group(trunk_group_id, css_id, sources);
+        {
+            let mut map = self.inbound_trunk_map.write().await;
+            map.replace_group(trunk_group_id, css_id, sources);
+            publish_trunk_sources(&self.trunk_sources, &map);
+        }
         info!(trunk_group = trunk_group_id, css = ?css_id, sources = sources.len(), "Registered inbound trunk for CSS routing");
+    }
+
+    /// Receiver of the configured trunk address set (the source IPs of
+    /// the inbound trunk map over any transport, canonical form, sorted
+    /// and capped), updated after
+    /// each change.
+    pub fn trunk_sources(&self) -> tokio::sync::watch::Receiver<Arc<[std::net::IpAddr]>> {
+        self.trunk_sources.subscribe()
     }
 
     /// Looks up which trunk group and CSS an inbound call belongs to by
@@ -14795,6 +14818,38 @@ impl DenyHint {
 /// Same IP (canonical form) and port.
 fn same_socket(a: SbcSocketAddr, b: SbcSocketAddr) -> bool {
     a.ip().to_canonical() == b.ip().to_canonical() && a.port() == b.port()
+}
+
+/// Publishes the source IPs of an already-locked `inbound_trunk_map`
+/// (deduplicated across transports: the per-source rate limiters are keyed
+/// by IP only) when they differ from the last snapshot. Called with the map's write lock held so
+/// snapshots follow write order; no await and no other lock. The set is
+/// sorted and capped at `MAX_TRUSTED_SOURCES` here, outside any limiter
+/// lock, so the addresses kept on overflow are deterministic (lowest
+/// first).
+///
+/// NIST 800-53 Rev5: SC-5
+fn publish_trunk_sources(
+    tx: &tokio::sync::watch::Sender<Arc<[std::net::IpAddr]>>,
+    map: &InboundTrunkMap,
+) {
+    let max = uc_dos_protection::MAX_TRUSTED_SOURCES;
+    let mut next: Vec<std::net::IpAddr> = map.source_ips();
+    if next.len() > max {
+        warn!(
+            configured = next.len(),
+            trusted = max,
+            "Trunk addresses over the trusted rate-limit cap; the rest use the per-source limit"
+        );
+        next.truncate(max);
+    }
+    tx.send_if_modified(|current| {
+        if **current == *next {
+            return false;
+        }
+        *current = Arc::from(next);
+        true
+    });
 }
 
 /// Stores `ips` as the host set of trunk group `group`, warning when an
