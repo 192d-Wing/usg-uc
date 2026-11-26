@@ -44,6 +44,8 @@ use uc_types::address::{SbcSocketAddr, TransportType};
 ///
 /// `limit_name` values: `per_ip_rps`, `per_ip_blocked_drops`, `global_rps`
 /// (source `0.0.0.0`), `overflow_rps` (source `::`), `per_ip_conn`,
+/// `per_prefix_conn`, `per_prefix_accept_rate`, `per_prefix_handshake_busy`
+/// (source = IPv6 aggregate prefix or IPv4 /24 network),
 /// `listener_conn` / `total_conn` (source `0.0.0.0`), `framing`,
 /// `per_ip_block:/<prefix>:<secs>s` (source = blocked prefix),
 /// `per_ip_unblock`, `per_ip_rps_suppressed`.
@@ -181,6 +183,33 @@ impl StreamTimeouts {
             idle: std::time::Duration::from_secs(config.transport.tcp_idle_timeout_secs),
         }
     }
+
+    /// Longest wait for a node-wide TLS handshake slot once the client has
+    /// sent its first bytes: a quarter of the handshake deadline, at most
+    /// 1 s. A connection that gets no slot in time is dropped and counted
+    /// (`handshake_slot_timeouts`), so a full pool sheds load quickly
+    /// instead of queueing clients up to the whole deadline.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    fn handshake_slot_wait(&self) -> std::time::Duration {
+        (self.handshake / 4).min(std::time::Duration::from_secs(1))
+    }
+
+    /// Longest a TLS handshake may hold a node-wide slot once it has one:
+    /// half the handshake deadline, at most 2 s. A client that sends one
+    /// byte and stalls loses the slot after this and is dropped and
+    /// counted (`handshake_slot_hold_timeouts`), so each slot turns over
+    /// at least every 2 s whatever `handshake_timeout_secs` is. A real
+    /// handshake takes a few round trips, well inside the budget.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    // POAM: POA&M-440 — the pool can still be kept full by about
+    // slots / hold one-byte connections per second spread over at least
+    // slots / per-source-cap sources (defaults on 2 cores: 2,500 slots,
+    // 16 per source, 2 s hold: 1,250 conn/s from 157 sources) (SC-5).
+    fn handshake_slot_hold(&self) -> std::time::Duration {
+        (self.handshake / 2).min(std::time::Duration::from_secs(2))
+    }
 }
 
 /// Resources one admitted stream connection holds for its whole life
@@ -190,6 +219,17 @@ struct ConnAdmission {
     _source: crate::conn_limit::ConnGuard,
     _listener: tokio::sync::OwnedSemaphorePermit,
     _total: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Which transport family a per-source rate limiter serves.
+///
+/// NIST 800-53 Rev5: SC-5 — UDP and stream sources are limited separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimiterKind {
+    /// UDP signaling (spoofable source addresses).
+    Udp,
+    /// TCP, TLS and WebSocket signaling (handshake-proven addresses).
+    Stream,
 }
 
 /// Shared handles a stream (TCP/TLS) accept loop and its per-connection
@@ -209,10 +249,199 @@ struct StreamLoopContext {
     total_conns: Arc<tokio::sync::Semaphore>,
     /// Per-source connection cap, shared by all stream listeners.
     conn_limiter: Arc<crate::conn_limit::ConnLimiter>,
+    /// Node-wide TLS handshakes in progress
+    /// (`transport.max_handshakes_in_flight`). A permit is taken only once
+    /// the client has sent data and held only for the handshake, never
+    /// for the receive loop. WebSocket upgrades do not use it (no crypto).
+    handshake_slots: Arc<tokio::sync::Semaphore>,
     timeouts: StreamTimeouts,
     flows: Arc<FlowTable>,
     /// `transport.max_header_bytes`: bytes buffered before CRLFCRLF.
     max_header_bytes: usize,
+}
+
+/// Accept-loop back-off for `accept()` errors.
+///
+/// Resource exhaustion (fd table full, no buffer space, out of memory)
+/// backs off, 10 ms doubling to 1 s, so a full fd table does not spin the
+/// loop. A per-connection error (peer aborted or reset, EPROTO, EPERM, ...;
+/// [`uc_transport::is_accept_per_connection_error`]) never backs off and
+/// never counts: the loop accepts again at once, so peers that reset
+/// before accept cannot stall the listener. Listener-level or unknown
+/// errors (EBADF, EINVAL, ENOTSOCK, EOPNOTSUPP, EFAULT, ...) also continue
+/// at once until [`Self::PERSISTENT`] of them arrive with no successful
+/// accept (a broken listener socket, not one peer); then they back off
+/// the same way.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial of Service Protection)
+#[derive(Debug)]
+struct AcceptBackoff {
+    /// Delay for the next backed-off error.
+    next: std::time::Duration,
+    /// Listener-level or unknown errors since the last successful accept.
+    consecutive: u32,
+    /// Last back-off warning, for one `warn!` per second at most.
+    last_warn: Option<std::time::Instant>,
+}
+
+impl AcceptBackoff {
+    const INITIAL: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(1);
+    const WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Listener-level or unknown errors, with no successful accept, after
+    /// which those errors back off too.
+    const PERSISTENT: u32 = 64;
+
+    const fn new() -> Self {
+        Self {
+            next: Self::INITIAL,
+            consecutive: 0,
+            last_warn: None,
+        }
+    }
+
+    /// The delay to sleep before the next accept, or `None` to continue at
+    /// once.
+    fn on_error(&mut self, err: &uc_transport::TransportError) -> Option<std::time::Duration> {
+        if err.is_per_connection_accept_error() {
+            return None;
+        }
+        if !err.is_resource_exhausted() {
+            self.consecutive = self.consecutive.saturating_add(1);
+            if self.consecutive < Self::PERSISTENT {
+                return None;
+            }
+        }
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(Self::MAX);
+        Some(delay)
+    }
+
+    /// Resets the delay and the error run after a successful accept.
+    const fn on_success(&mut self) {
+        self.next = Self::INITIAL;
+        self.consecutive = 0;
+    }
+
+    /// Whether a back-off warning may be logged now (AU-4: bounded log
+    /// volume while the fd table stays full or the listener stays broken).
+    fn should_warn(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if self
+            .last_warn
+            .is_some_and(|t| now.duration_since(t) < Self::WARN_INTERVAL)
+        {
+            return false;
+        }
+        self.last_warn = Some(now);
+        true
+    }
+}
+
+/// What an accept loop does after an `accept()` error.
+enum AcceptNext {
+    /// Accept again (after any back-off sleep).
+    Continue,
+    /// Shutdown or closed listener: end the loop.
+    Stop,
+}
+
+/// Node-wide handshake slots for `transport.max_handshakes_in_flight`; 0
+/// sizes it as `max(64 x cores, max_connections_total / 8)`, at most
+/// `max_connections_total` (defaults: 2,500 slots up to 39 cores).
+// POAM: POA&M-440 — handshake admission is per source plus this node-wide
+// concurrency bound and the per-slot hold budget
+// (`StreamTimeouts::handshake_slot_hold`); there is no node-wide accept or
+// handshake rate, so a flood spread over many sources is bounded only by
+// rate x sources and by this pool (SC-5).
+fn handshake_slot_count(tc: &sbc_config::schema::TransportConfig) -> usize {
+    let total = (tc.max_connections_total as usize).max(1);
+    if tc.max_handshakes_in_flight > 0 {
+        return (tc.max_handshakes_in_flight as usize).min(total);
+    }
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    cores.saturating_mul(64).max(total / 8).max(64).min(total)
+}
+
+/// Effective TLS handshake limits derived from `[transport]` at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HandshakeLimits {
+    /// Node-wide slots ([`handshake_slot_count`]).
+    slots: usize,
+    /// Per-source cap ([`handshakes_per_source`]).
+    per_source: u32,
+}
+
+impl HandshakeLimits {
+    fn from_config(tc: &sbc_config::schema::TransportConfig) -> Self {
+        let slots = handshake_slot_count(tc);
+        Self {
+            slots,
+            per_source: handshakes_per_source(tc, slots),
+        }
+    }
+
+    /// Whether the effective limits differ from the configured values
+    /// (an auto-sized pool, or a clamped per-source cap), so the startup
+    /// log must state the values in force.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3, CM-6
+    fn differ_from(&self, tc: &sbc_config::schema::TransportConfig) -> bool {
+        self.per_source != tc.max_handshakes_per_source
+            || self.slots != tc.max_handshakes_in_flight as usize
+    }
+}
+
+/// Effective per-source TLS handshake cap: `transport.max_handshakes_per_source`,
+/// at most `max_connections_per_source` (a source cannot hold more
+/// handshakes than connections) and at most 1/32 of the node-wide pool
+/// (`slots`), so at least 32 sources are needed to fill it.
+///
+/// ## NIST 800-53 Rev5: SC-5
+fn handshakes_per_source(tc: &sbc_config::schema::TransportConfig, slots: usize) -> u32 {
+    let pool_share = u32::try_from(slots / 32).unwrap_or(u32::MAX).max(1);
+    tc.max_handshakes_per_source
+        .min(tc.max_connections_per_source)
+        .min(pool_share)
+        .max(1)
+}
+
+/// Handshakes in progress allowed per aggregate (IPv6 aggregate prefix or
+/// IPv4 /24, SR-58): 1/8 of the node-wide pool (`slots`), at least 1, so
+/// one aggregate cannot hold the whole pool.
+///
+/// ## NIST 800-53 Rev5: SC-5
+fn aggregate_handshake_cap(slots: usize) -> u32 {
+    u32::try_from(slots / 8).unwrap_or(u32::MAX).max(1)
+}
+
+/// Logs and audits a startup clamp of `key` from `configured` to
+/// `effective`.
+///
+/// ## NIST 800-53 Rev5: CM-6, AU-12
+fn note_startup_clamp(key: &str, configured: u32, effective: u32, reason: &str) {
+    warn!(
+        key,
+        configured, effective, reason, "connection limit clamped at startup"
+    );
+    uc_audit::log_event(uc_audit::AuditEvent::ConfigurationChange(
+        uc_audit::event::ConfigurationChange {
+            admin: "startup".to_string(),
+            change_type: uc_audit::event::ConfigChangeType::Modified,
+            description: format!("{key} clamped from {configured} to {effective} ({reason})"),
+        },
+    ));
+}
+
+/// How a TLS handshake under a node-wide slot ended.
+enum SlottedHandshake<T> {
+    /// The handshake ran; its result.
+    Done(uc_transport::TransportResult<T>),
+    /// No node-wide slot within [`StreamTimeouts::handshake_slot_wait`].
+    SlotWaitExpired,
+    /// The handshake held a slot for [`StreamTimeouts::handshake_slot_hold`]
+    /// without finishing.
+    HoldExpired,
 }
 
 /// Where the message that produced a result arrived: replies to that peer
@@ -265,8 +494,14 @@ pub struct Server {
     /// Live transports per flow (UDP sockets, accepted and egress stream
     /// connections). NIST 800-53 Rev5: SC-8.
     flows: Arc<FlowTable>,
-    /// Per-source rate limiter for `DoS` protection.
-    rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Per-source rate limiter for UDP signaling. Source addresses are
+    /// spoofable, so by default it rejects but does not block
+    /// (`rate_limit.udp_auto_block`).
+    udp_rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Per-source rate limiter for stream (TCP/TLS/WS) signaling. Separate
+    /// from the UDP one so a UDP-earned block never reaches a peer that
+    /// completed a handshake. NIST 800-53 Rev5: SC-5.
+    stream_rate_limiter: Arc<Mutex<RateLimiter>>,
     /// Global (all-sources) rate limiter — backstop against distributed
     /// floods that stay under the per-IP limit.
     global_limiter: Arc<Mutex<RateLimiter>>,
@@ -407,7 +642,8 @@ impl Server {
         Self::warn_if_register_unauthenticated(&sip_stack);
         Self::warn_if_digest_over_cleartext(&config);
         let sip_stack = Arc::new(sip_stack);
-        let rate_limiter = Self::build_rate_limiter(&config);
+        let udp_rate_limiter = Self::build_rate_limiter(&config, LimiterKind::Udp);
+        let stream_rate_limiter = Self::build_rate_limiter(&config, LimiterKind::Stream);
         let global_limiter = Self::build_global_limiter(&config);
 
         Ok(Self {
@@ -422,7 +658,8 @@ impl Server {
             ws_listeners: RwLock::new(Vec::new()),
             sip_stack,
             flows: Arc::new(FlowTable::new(crate::flows::DEFAULT_MAX_EGRESS_CONNECTIONS)),
-            rate_limiter,
+            udp_rate_limiter,
+            stream_rate_limiter,
             global_limiter,
             zone_registry: None,
             media_failure_rx,
@@ -533,7 +770,8 @@ impl Server {
         Self::warn_if_digest_over_cleartext(&config);
         let sip_stack = Arc::new(sip_stack);
 
-        let rate_limiter = Self::build_rate_limiter(&config);
+        let udp_rate_limiter = Self::build_rate_limiter(&config, LimiterKind::Udp);
+        let stream_rate_limiter = Self::build_rate_limiter(&config, LimiterKind::Stream);
         let global_limiter = Self::build_global_limiter(&config);
 
         Ok(Self {
@@ -548,7 +786,8 @@ impl Server {
             ws_listeners: RwLock::new(Vec::new()),
             sip_stack,
             flows: Arc::new(FlowTable::new(crate::flows::DEFAULT_MAX_EGRESS_CONNECTIONS)),
-            rate_limiter,
+            udp_rate_limiter,
+            stream_rate_limiter,
             global_limiter,
             zone_registry: None,
             media_failure_rx,
@@ -867,8 +1106,11 @@ impl Server {
         );
     }
 
-    /// Builds the per-source rate limiter from config.
-    fn build_rate_limiter(config: &SbcConfig) -> Arc<Mutex<RateLimiter>> {
+    /// Builds a per-source rate limiter from config. The UDP limiter blocks
+    /// only with `rate_limit.udp_auto_block`; both give configured trunk
+    /// addresses (see [`Self::apply_trusted_sources`]) their own
+    /// `trunk_rps` bucket.
+    fn build_rate_limiter(config: &SbcConfig, kind: LimiterKind) -> Arc<Mutex<RateLimiter>> {
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -893,8 +1135,34 @@ impl Server {
             .with_max_tracked_sources(rl.max_tracked_sources as usize)
             .with_max_blocked_sources(rl.max_blocked_sources as usize)
             .with_overflow(rl.effective_overflow_rps(), overflow_burst.max(1));
+        // NIST 800-53 Rev5: SC-5 — spoofable UDP sources are rejected, not
+        // blocked, unless the operator opts in.
+        let auto_block = match kind {
+            LimiterKind::Udp => rl.udp_auto_block,
+            LimiterKind::Stream => true,
+        };
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let trunk_burst =
+            (f64::from(rl.effective_trunk_rps()) * f64::from(rl.burst_multiplier)) as u32;
+        // NIST 800-53 Rev5: SC-5, SC-5(2) — configured trunks get their own
+        // bucket and are rejected over it, never auto-blocked.
+        // POAM: POA&M-448 — spoofed UDP carrying a trunk's exact address can
+        // still exhaust that trunk's bucket (reject only), and is admitted
+        // at up to `trunk_rps` per trunk address instead of `per_ip_rps`,
+        // bounded only by `global_rps`; edge uRPF/ACL or TLS trunks are
+        // needed for full protection (SC-5).
+        let rate_limit_config = rate_limit_config
+            .with_auto_block(auto_block)
+            .with_trusted_bucket(rl.effective_trunk_rps(), trunk_burst.max(1));
 
         info!(
+            limiter = ?kind,
+            auto_block,
+            trunk_rps = rl.effective_trunk_rps(),
             enabled = config.rate_limit.enabled,
             per_ip_rps = config.rate_limit.per_ip_rps,
             global_rps = config.rate_limit.global_rps,
@@ -903,6 +1171,48 @@ impl Server {
         );
 
         Arc::new(Mutex::new(RateLimiter::new(rate_limit_config)))
+    }
+
+    /// Applies the configured trunk address set (sorted and capped at
+    /// [`uc_dos_protection::MAX_TRUSTED_SOURCES`] by the SIP stack) as
+    /// trusted sources to both per-source limiters, one lock at a time.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    // POAM: POA&M-449 — registered endpoints and NAT addresses are not
+    // trusted; a stream-earned block on their prefix still applies (SC-5).
+    // POAM: POA&M-450 — the set holds addresses resolved when the trunk
+    // group was loaded; a hostname trunk whose DNS changes is not
+    // re-trusted until the group is re-synced. An address configured in
+    // two trunk groups is held for the group that registered it last;
+    // removing that group untrusts it while the other group still lists
+    // it, until that group is re-synced (see POA&M-392) (SC-5, CM-3).
+    async fn apply_trusted_sources(
+        set: &[std::net::IpAddr],
+        udp: &Mutex<RateLimiter>,
+        stream: &Mutex<RateLimiter>,
+    ) {
+        let _ = udp.lock().await.set_trusted_sources(set.iter().copied());
+        let _ = stream.lock().await.set_trusted_sources(set.iter().copied());
+    }
+
+    /// Re-applies the trunk address set to both limiters, and to the
+    /// stream connection limiter's aggregate exemption (SR-58), on every
+    /// change published by the SIP stack. Updates coalesce; the newest set
+    /// wins.
+    async fn trusted_source_sync(
+        mut rx: tokio::sync::watch::Receiver<Arc<[std::net::IpAddr]>>,
+        udp: Arc<Mutex<RateLimiter>>,
+        stream: Arc<Mutex<RateLimiter>>,
+        conns: Arc<crate::conn_limit::ConnLimiter>,
+    ) {
+        while rx.changed().await.is_ok() {
+            // Clone the Arc so the watch borrow is released before locking.
+            let set = Arc::clone(&rx.borrow_and_update());
+            Self::apply_trusted_sources(&set, &udp, &stream).await;
+            // SR-58: trunks skip the aggregate connection caps.
+            let _ = conns.set_trusted_sources(set.iter().copied());
+            debug!(trusted = set.len(), "Trusted rate-limit sources updated");
+        }
     }
 
     /// Builds the global (all-sources) rate limiter from config.
@@ -1111,6 +1421,91 @@ impl Server {
         }
 
         media_failure_rx
+    }
+
+    /// Builds the stream connection limiter from `[transport]`: the
+    /// per-source cap keyed on `rate_limit.ipv6_prefix_len`; the IPv6
+    /// aggregate and IPv4 /24 caps (SR-58); the per-source and aggregate
+    /// accept buckets and handshake caps (SR-56, SR-58). An aggregate
+    /// prefix longer than the per-source prefix, or an aggregate cap above
+    /// the listener pool, is clamped; each clamp is logged and audited as a
+    /// startup `ConfigurationChange`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, CM-6, AU-12
+    pub(crate) fn build_conn_limiter(config: &SbcConfig) -> crate::conn_limit::ConnLimiter {
+        let tc = &config.transport;
+        let per_source_prefix = config.rate_limit.ipv6_prefix_len;
+        let v6_prefix = tc.effective_v6_aggregate_prefix_len(per_source_prefix);
+        let v6_cap = tc.effective_max_connections_per_v6_aggregate();
+        let v4_cap = tc.effective_max_connections_per_v4_24();
+        for (key, configured, effective, reason) in [
+            (
+                "transport.v6_aggregate_prefix_len",
+                u32::from(tc.v6_aggregate_prefix_len),
+                u32::from(v6_prefix),
+                "longer than rate_limit.ipv6_prefix_len",
+            ),
+            (
+                "transport.max_connections_per_v6_aggregate",
+                tc.max_connections_per_v6_aggregate,
+                v6_cap,
+                "above max_connections_per_listener",
+            ),
+            (
+                "transport.max_connections_per_v4_24",
+                tc.max_connections_per_v4_24,
+                v4_cap,
+                "above max_connections_per_listener",
+            ),
+        ] {
+            if configured != effective {
+                note_startup_clamp(key, configured, effective, reason);
+            }
+        }
+
+        // NIST 800-53 Rev5: SC-5 — per-source and aggregate accept buckets
+        // and handshake caps. Accept buckets are tracked for at most
+        // `max_connections_total` keys per map; the rest share an overflow
+        // bucket of 4x the rate.
+        // POAM: POA&M-441 — accept admission is keyed per source and per
+        // aggregate only, statically and per node; a flood spread over many
+        // aggregates gets one aggregate allowance each (SC-5).
+        let limits = HandshakeLimits::from_config(tc);
+        let slot_count = limits.slots;
+        let per_source_handshakes = limits.per_source;
+        // NIST 800-53 Rev5: AU-3, CM-6 — the values in force are logged
+        // whenever they differ from the configured ones.
+        if per_source_handshakes < tc.max_handshakes_per_source {
+            warn!(
+                configured = tc.max_handshakes_per_source,
+                max_connections_per_source = tc.max_connections_per_source,
+                handshake_slots = slot_count,
+                effective = per_source_handshakes,
+                "transport.max_handshakes_per_source clamped to \
+                 min(max_connections_per_source, handshake slots / 32)"
+            );
+        }
+        if limits.differ_from(tc) {
+            info!(
+                configured_in_flight = tc.max_handshakes_in_flight,
+                handshake_slots = slot_count,
+                configured_per_source = tc.max_handshakes_per_source,
+                per_source = per_source_handshakes,
+                per_aggregate = aggregate_handshake_cap(slot_count),
+                "Effective TLS handshake limits"
+            );
+        }
+        let accept_tracked =
+            (config.rate_limit.max_tracked_sources as usize).min(tc.max_connections_total as usize);
+        crate::conn_limit::ConnLimiter::new(tc.max_connections_per_source, per_source_prefix)
+            .with_aggregate_caps(v6_prefix, v6_cap, v4_cap)
+            .with_accept_rate(
+                tc.accept_rate_per_source,
+                tc.accept_burst_per_source,
+                accept_tracked,
+            )
+            .with_handshake_cap(per_source_handshakes)
+            .with_aggregate_handshake_cap(aggregate_handshake_cap(slot_count))
     }
 
     /// The out-of-process media plane node URLs, empty for the in-process
@@ -1945,14 +2340,33 @@ impl Server {
             return Ok(());
         }
 
-        // Spawn receive tasks for each transport
+        // Configured trunks are trusted on both per-source limiters, and
+        // exempt from the aggregate connection caps (SR-58), before any
+        // receive or accept loop runs, then kept in step with trunk changes.
+        // NIST 800-53 Rev5: SC-5
+        let conn_limiter = Arc::new(Self::build_conn_limiter(&self.config));
         let mut handles = Vec::new();
+        {
+            let mut rx = self.sip_stack.trunk_sources();
+            let set = Arc::clone(&rx.borrow_and_update());
+            Self::apply_trusted_sources(&set, &self.udp_rate_limiter, &self.stream_rate_limiter)
+                .await;
+            let _ = conn_limiter.set_trusted_sources(set.iter().copied());
+            let udp = Arc::clone(&self.udp_rate_limiter);
+            let stream = Arc::clone(&self.stream_rate_limiter);
+            let conns = Arc::clone(&conn_limiter);
+            handles.push(tokio::spawn(Self::trusted_source_sync(
+                rx, udp, stream, conns,
+            )));
+        }
+
+        // Spawn receive tasks for each transport
         for (idx, transport) in transports.iter().enumerate() {
             let transport = Arc::clone(transport);
             let shutdown = self.shutdown.clone();
             let stats = Arc::clone(&self.stats);
             let sip_stack = Arc::clone(&self.sip_stack);
-            let rate_limiter = Arc::clone(&self.rate_limiter);
+            let rate_limiter = Arc::clone(&self.udp_rate_limiter);
             let global_limiter = Arc::clone(&self.global_limiter);
             let rate_limit_enabled = self.config.rate_limit.enabled;
             let flows = Arc::clone(&self.flows);
@@ -1998,7 +2412,8 @@ impl Server {
         // NIST 800-53 Rev5: SC-5 — each listener has its own pool so a
         // flood on one (e.g. WS) cannot starve another (TLS); a node-wide
         // ceiling bounds the fd budget and a per-source cap stops one host
-        // from taking a whole pool.
+        // from taking a whole pool; aggregate caps stop one IPv6 /48 (or
+        // IPv4 /24) from doing the same across many sources (SR-58).
         // POAM: POA&M-453 - no part of a pool is reserved for trunks or
         // authenticated flows: any parseable request (e.g. OPTIONS) from an
         // unadmitted source earns first-message and idle credit, so such
@@ -2009,22 +2424,26 @@ impl Server {
         let total_conns = Arc::new(tokio::sync::Semaphore::new(
             tc.max_connections_total as usize,
         ));
-        let conn_limiter = Arc::new(crate::conn_limit::ConnLimiter::new(
-            tc.max_connections_per_source,
-            self.config.rate_limit.ipv6_prefix_len,
-        ));
+        // NIST 800-53 Rev5: SC-5 — per-source and aggregate accept rate
+        // (TCP and TLS) and TLS in-handshake caps, checked at accept before
+        // any handshake; built (with the connection caps and the startup
+        // handshake-limit logging) by `build_conn_limiter` before the trunk
+        // sync above.
+        let slot_count = HandshakeLimits::from_config(tc).slots;
+        let handshake_slots = Arc::new(tokio::sync::Semaphore::new(slot_count));
         let timeouts = StreamTimeouts::from_config(&self.config);
         let stream_ctx = |zone_name: Option<String>| StreamLoopContext {
             shutdown: self.shutdown.clone(),
             stats: Arc::clone(&self.stats),
             sip_stack: Arc::clone(&self.sip_stack),
-            rate_limiter: Arc::clone(&self.rate_limiter),
+            rate_limiter: Arc::clone(&self.stream_rate_limiter),
             global_limiter: Arc::clone(&self.global_limiter),
             rate_limit_enabled: self.config.rate_limit.enabled,
             zone_name,
             conn_semaphore: Arc::new(tokio::sync::Semaphore::new(per_listener)),
             total_conns: Arc::clone(&total_conns),
             conn_limiter: Arc::clone(&conn_limiter),
+            handshake_slots: Arc::clone(&handshake_slots),
             timeouts,
             flows: Arc::clone(&self.flows),
             max_header_bytes: tc.max_header_bytes as usize,
@@ -2073,10 +2492,11 @@ impl Server {
             let maint = RateLimitMaintenance::new(
                 &self.config,
                 self.shutdown.clone(),
-                Arc::clone(&self.rate_limiter),
+                Arc::clone(&self.stream_rate_limiter),
                 Arc::clone(&self.global_limiter),
                 Arc::clone(&conn_limiter),
-            );
+            )
+            .with_per_ip_limiter(LimiterKind::Udp, Arc::clone(&self.udp_rate_limiter));
             handles.push(tokio::spawn(maint.run()));
         }
 
@@ -2282,6 +2702,8 @@ impl Server {
         if verdict != RateVerdict::Allow {
             return verdict;
         }
+        // POAM: POA&M-451 — trusted trunks are charged here too, so a
+        // distributed flood at `global_rps` can reject trunk traffic (SC-5).
         let global_action = global_limiter.lock().await.check(source_ip);
         if global_action.is_rejected() {
             stats.rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -2346,9 +2768,9 @@ impl Server {
         RateVerdict::Allow
     }
 
-    /// Admits one accepted stream connection: per-source cap, then this
-    /// listener's pool, then the node-wide ceiling. `None` means the
-    /// connection must be dropped (closing the socket).
+    /// Admits one accepted stream connection: per-source accept rate and
+    /// cap, then this listener's pool, then the node-wide ceiling. `None`
+    /// means the connection must be dropped (closing the socket).
     ///
     /// ## NIST 800-53 Rev5: SC-5, SC-7
     fn admit_connection(
@@ -2356,12 +2778,54 @@ impl Server {
         peer: &SbcSocketAddr,
         kind: &str,
     ) -> Option<ConnAdmission> {
-        let Some(source) = ctx.conn_limiter.try_acquire(peer.ip()) else {
-            ctx.stats
-                .conn_rejected_per_source
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(peer = %peer, kind, "Per-source connection limit reached, dropping");
-            return None;
+        Self::admit_with(ctx, peer, kind, true)
+    }
+
+    /// [`Self::admit_connection`]; `metered` false skips the per-source
+    /// accept bucket (the caps still apply).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    fn admit_with(
+        ctx: &StreamLoopContext,
+        peer: &SbcSocketAddr,
+        kind: &str,
+        metered: bool,
+    ) -> Option<ConnAdmission> {
+        let admitted = if metered {
+            ctx.conn_limiter.try_admit(peer.ip())
+        } else {
+            ctx.conn_limiter.try_admit_unmetered(peer.ip())
+        };
+        let source = match admitted {
+            Ok(source) => source,
+            Err(crate::conn_limit::Rejection::AcceptRate) => {
+                ctx.stats
+                    .accept_rate_limited
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Per-source accept rate exceeded, dropping");
+                return None;
+            }
+            Err(crate::conn_limit::Rejection::AggregateAcceptRate) => {
+                ctx.stats
+                    .accept_rate_limited
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Aggregate accept rate exceeded, dropping");
+                return None;
+            }
+            Err(crate::conn_limit::Rejection::PerAggregate) => {
+                ctx.stats
+                    .conn_rejected_per_aggregate
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Aggregate connection limit reached, dropping");
+                return None;
+            }
+            Err(_) => {
+                ctx.stats
+                    .conn_rejected_per_source
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Per-source connection limit reached, dropping");
+                return None;
+            }
         };
         // Pool-full drops are counted and audited in aggregate
         // (`listener_conn` / `total_conn`) by RateLimitMaintenance, which
@@ -2384,15 +2848,178 @@ impl Server {
         })
     }
 
+    /// Whether `peer`'s source is blocked by the stream per-source rate
+    /// limiter (`ctx.rate_limiter` is `Server::stream_rate_limiter`, SR-55).
+    /// A blocked source is dropped at accept, before admission and before
+    /// any handshake; drops are counted and audited in aggregate
+    /// (`accept_blocked`). Blocks earned on the UDP limiter do not apply,
+    /// and `is_blocked` is trust-aware: a configured trunk is refused only
+    /// for an explicit block of its exact address, never for a block on its
+    /// IPv6 prefix.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    async fn accept_blocked(ctx: &StreamLoopContext, peer: &SbcSocketAddr, kind: &str) -> bool {
+        // Lock held for the lookup only.
+        let blocked = ctx.rate_limiter.lock().await.is_blocked(peer.ip());
+        if blocked {
+            ctx.stats.accept_blocked.fetch_add(1, Ordering::Relaxed);
+            ctx.conn_limiter.note_accept_blocked(peer.ip());
+            debug!(peer = %peer, kind, "Source blocked, dropping at accept");
+        }
+        blocked
+    }
+
+    /// Takes a per-source handshake slot (`max_handshakes_per_source`), or
+    /// `None` when the source already has that many handshakes running.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    fn begin_handshake(
+        ctx: &StreamLoopContext,
+        peer: &SbcSocketAddr,
+        kind: &str,
+    ) -> Option<crate::conn_limit::HandshakeGuard> {
+        match ctx.conn_limiter.try_handshake(peer.ip()) {
+            Ok(guard) => Some(guard),
+            Err(crate::conn_limit::Rejection::AggregateHandshakeBusy) => {
+                ctx.stats
+                    .handshake_busy_per_aggregate
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Aggregate handshake limit reached, dropping");
+                None
+            }
+            Err(_) => {
+                ctx.stats
+                    .handshake_busy_per_source
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, kind, "Per-source handshake limit reached, dropping");
+                None
+            }
+        }
+    }
+
+    /// Runs `handshake` on `stream` while holding a node-wide handshake
+    /// slot.
+    ///
+    /// The slot is requested only once the client has sent data (peeked,
+    /// not consumed), so a silent socket never holds one; it waits at most
+    /// `slot_wait` for a slot, and the handshake then has at most `hold`
+    /// to finish while holding it, so a client that sends one byte and
+    /// stalls frees the slot after `hold`. The caller wraps this in the
+    /// handshake deadline, which bounds the whole sequence. The slot and
+    /// `guard` are released as soon as the handshake ends, before any
+    /// receive loop.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    async fn with_handshake_slot<T, F, Fut>(
+        slots: Arc<tokio::sync::Semaphore>,
+        slot_wait: std::time::Duration,
+        hold: std::time::Duration,
+        guard: crate::conn_limit::HandshakeGuard,
+        stream: tokio::net::TcpStream,
+        handshake: F,
+    ) -> SlottedHandshake<T>
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut,
+        Fut: std::future::Future<Output = uc_transport::TransportResult<T>>,
+    {
+        // Wait for the first byte without consuming it. `readable()` alone
+        // is not enough: it can report ready on a socket with no data
+        // (seen with kqueue), which would let silent sockets take slots.
+        let mut first = [0u8; 1];
+        match stream.peek(&mut first).await {
+            Ok(0) => {
+                return SlottedHandshake::Done(Err(uc_transport::TransportError::ConnectionClosed));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return SlottedHandshake::Done(Err(uc_transport::TransportError::Io {
+                    reason: e.to_string(),
+                }));
+            }
+        }
+        let slot = match tokio::time::timeout(slot_wait, slots.acquire_owned()).await {
+            Ok(Ok(slot)) => slot,
+            Ok(Err(_)) => {
+                return SlottedHandshake::Done(Err(uc_transport::TransportError::ConnectionClosed));
+            }
+            Err(_) => return SlottedHandshake::SlotWaitExpired,
+        };
+        let result = tokio::time::timeout(hold, handshake(stream)).await;
+        drop(slot);
+        drop(guard);
+        result.map_or(SlottedHandshake::HoldExpired, SlottedHandshake::Done)
+    }
+
+    /// Handles an `accept()` error: per-connection errors are counted and
+    /// the loop continues at once; resource exhaustion, or a long run of
+    /// errors with no successful accept, backs off.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, AU-4
+    async fn on_accept_error(
+        ctx: &StreamLoopContext,
+        backoff: &mut AcceptBackoff,
+        err: &uc_transport::TransportError,
+        kind: &str,
+    ) -> AcceptNext {
+        if ctx.shutdown.is_shutdown_requested()
+            || matches!(err, uc_transport::TransportError::AlreadyClosed)
+        {
+            return AcceptNext::Stop;
+        }
+        let resource_exhausted = err.is_resource_exhausted();
+        if resource_exhausted {
+            ctx.stats
+                .accept_resource_errors
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            ctx.stats.accept_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        match backoff.on_error(err) {
+            None => {
+                debug!(error = %err, kind, "Stream accept failed for one connection");
+            }
+            Some(delay) => {
+                if backoff.should_warn() {
+                    warn!(
+                        error = %err,
+                        kind,
+                        resource_exhausted,
+                        backoff_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "Stream accept failing (resources exhausted or persistent errors); backing off"
+                    );
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+        AcceptNext::Continue
+    }
+
     /// Accept loop for a SIP-over-TCP listener.
+    ///
+    /// The connection is admitted (blocked check, accept rate, caps) before
+    /// its transport is built, so a refused accept allocates nothing.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    // POAM: POA&M-442 — the listen backlog is fixed (`ListenerConfig`
+    // default 128; tokio default for WS) and not configurable (SC-5).
     async fn tcp_accept_loop(listener: Arc<TcpListener>, ctx: StreamLoopContext) {
         info!(address = %listener.local_addr(), "SIP TCP accept loop started");
+        let mut backoff = AcceptBackoff::new();
         loop {
-            match listener.accept().await {
-                Ok((transport, peer)) => {
+            match listener.accept_tcp().await {
+                Ok((stream, peer)) => {
+                    backoff.on_success();
+                    if Self::accept_blocked(&ctx, &peer, "tcp").await {
+                        continue;
+                    }
                     let Some(admission) = Self::admit_connection(&ctx, &peer, "tcp") else {
                         continue;
                     };
+                    let transport = uc_transport::tcp::TcpTransport::from_accepted(
+                        stream,
+                        peer,
+                        *listener.local_addr(),
+                    );
                     debug!(peer = %peer, "Accepted SIP TCP connection");
                     let conn_ctx = ctx.clone();
                     tokio::spawn(async move {
@@ -2402,11 +3029,12 @@ impl Server {
                     });
                 }
                 Err(e) => {
-                    if ctx.shutdown.is_shutdown_requested() {
+                    if matches!(
+                        Self::on_accept_error(&ctx, &mut backoff, &e, "tcp").await,
+                        AcceptNext::Stop
+                    ) {
                         break;
                     }
-                    warn!(error = %e, "TCP accept failed");
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
         }
@@ -2415,18 +3043,28 @@ impl Server {
     /// Accept loop for a SIP-over-WebSocket listener (RFC 7118). Each
     /// WebSocket message is a complete SIP message.
     ///
-    /// The raw TCP accept runs inline; the HTTP upgrade runs in the spawned
-    /// connection task under `transport.handshake_timeout_secs`, after the
-    /// connection is admitted, so a silent or slow client holds only its own
-    /// slot and cannot stall the listener.
+    /// The raw TCP accept and admission run inline; the HTTP upgrade runs
+    /// in the spawned connection task under `transport.handshake_timeout_secs`,
+    /// so a silent or slow client holds only its own connection slot and
+    /// cannot stall the listener. The upgrade costs no crypto, so it takes
+    /// no handshake slot.
     ///
-    /// ## NIST 800-53 Rev5: SC-5, SC-10
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, SC-10
+    // POAM: POA&M-440 — the per-source accept bucket is off on WebSocket
+    // listeners: behind the recommended WSS proxy the accept address is the
+    // proxy's, so one bucket would be shared by every client. It is enabled
+    // once SR-59 keys WS admission on the client address (SC-5).
     async fn ws_accept_loop(listener: Arc<WebSocketListener>, ctx: StreamLoopContext) {
         info!(address = %listener.local_addr(), "SIP WebSocket accept loop started");
+        let mut backoff = AcceptBackoff::new();
         loop {
             match listener.accept_tcp().await {
                 Ok((tcp_stream, peer)) => {
-                    let Some(admission) = Self::admit_connection(&ctx, &peer, "ws") else {
+                    backoff.on_success();
+                    if Self::accept_blocked(&ctx, &peer, "ws").await {
+                        continue;
+                    }
+                    let Some(admission) = Self::admit_with(&ctx, &peer, "ws", false) else {
                         continue;
                     };
                     let conn_ctx = ctx.clone();
@@ -2467,11 +3105,12 @@ impl Server {
                     });
                 }
                 Err(e) => {
-                    if ctx.shutdown.is_shutdown_requested() {
+                    if matches!(
+                        Self::on_accept_error(&ctx, &mut backoff, &e, "ws").await,
+                        AcceptNext::Stop
+                    ) {
                         break;
                     }
-                    warn!(error = %e, "WebSocket accept failed");
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
         }
@@ -2479,16 +3118,30 @@ impl Server {
 
     /// Accept loop for a SIP-over-TLS listener.
     ///
-    /// The raw TCP accept runs inline so the loop stays responsive; the TLS
-    /// handshake is spawned under `transport.handshake_timeout_secs` so one
-    /// slow client cannot stall new connections on this listener.
+    /// The raw TCP accept and admission run inline so the loop stays
+    /// responsive and a refused source costs no crypto; the TLS handshake
+    /// is spawned under `transport.handshake_timeout_secs`, so one slow
+    /// client cannot stall new connections on this listener. The handshake
+    /// takes a node-wide slot only after the client sends data, and waits
+    /// for one at most [`StreamTimeouts::handshake_slot_wait`], then holds
+    /// it at most [`StreamTimeouts::handshake_slot_hold`].
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
     async fn tls_accept_loop(listener: Arc<TlsListener>, ctx: StreamLoopContext) {
         info!(address = %listener.local_addr(), "SIP TLS accept loop started");
+        let mut backoff = AcceptBackoff::new();
         loop {
             // Step 1: accept the raw TCP connection (fast, no crypto).
             match listener.accept_tcp().await {
                 Ok((tcp_stream, peer)) => {
+                    backoff.on_success();
+                    if Self::accept_blocked(&ctx, &peer, "tls").await {
+                        continue;
+                    }
                     let Some(admission) = Self::admit_connection(&ctx, &peer, "tls") else {
+                        continue;
+                    };
+                    let Some(handshake) = Self::begin_handshake(&ctx, &peer, "tls") else {
                         continue;
                     };
                     // Step 2: spawn the TLS handshake so the accept loop
@@ -2498,11 +3151,18 @@ impl Server {
                     tokio::spawn(async move {
                         match tokio::time::timeout(
                             conn_ctx.timeouts.handshake,
-                            listener_clone.complete_handshake(tcp_stream),
+                            Self::with_handshake_slot(
+                                Arc::clone(&conn_ctx.handshake_slots),
+                                conn_ctx.timeouts.handshake_slot_wait(),
+                                conn_ctx.timeouts.handshake_slot_hold(),
+                                handshake,
+                                tcp_stream,
+                                |tcp| listener_clone.complete_handshake(tcp, peer),
+                            ),
                         )
                         .await
                         {
-                            Ok(Ok(transport)) => {
+                            Ok(SlottedHandshake::Done(Ok(transport))) => {
                                 debug!(peer = %peer, "TLS handshake completed");
                                 Self::stream_connection_loop(
                                     Arc::new(transport),
@@ -2512,7 +3172,23 @@ impl Server {
                                 )
                                 .await;
                             }
-                            Ok(Err(e)) => {
+                            Ok(SlottedHandshake::SlotWaitExpired) => {
+                                conn_ctx
+                                    .stats
+                                    .handshake_slot_timeouts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                debug!(peer = %peer, "No TLS handshake slot in time, dropping");
+                            }
+                            Ok(SlottedHandshake::HoldExpired) => {
+                                conn_ctx
+                                    .stats
+                                    .handshake_slot_hold_timeouts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                debug!(peer = %peer, "TLS handshake held its slot too long, dropping");
+                            }
+                            Ok(SlottedHandshake::Done(Err(e))) => {
+                                // POAM: POA&M-443 — a failed TLS handshake
+                                // is still a per-connection warn! (AU-4).
                                 warn!(peer = %peer, error = %e, "TLS handshake failed");
                             }
                             Err(_) => {
@@ -2527,11 +3203,12 @@ impl Server {
                     });
                 }
                 Err(e) => {
-                    if ctx.shutdown.is_shutdown_requested() {
+                    if matches!(
+                        Self::on_accept_error(&ctx, &mut backoff, &e, "tls").await,
+                        AcceptNext::Stop
+                    ) {
                         break;
                     }
-                    warn!(error = %e, "TLS TCP accept failed");
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
         }
@@ -3447,10 +4124,36 @@ pub struct ServerStats {
     pub framing_errors: AtomicU64,
     /// Stream accepts dropped by `transport.max_connections_per_source`.
     pub conn_rejected_per_source: AtomicU64,
+    /// Stream accepts dropped by `transport.max_connections_per_v6_aggregate`
+    /// or `transport.max_connections_per_v4_24` (SR-58).
+    pub conn_rejected_per_aggregate: AtomicU64,
     /// WebSocket upgrades refused or failed (e.g. no `sip` subprotocol).
     pub ws_handshake_failures: AtomicU64,
     /// TLS / WebSocket handshakes that hit `handshake_timeout_secs`.
+    // POAM: POA&M-93 — these counters and the accept counters below are
+    // not yet exported on the REST/metrics API (api_server.rs is owned
+    // elsewhere); visible via the stats Debug output only (SI-4).
     pub handshake_timeouts: AtomicU64,
+    /// Stream `accept()` errors other than resource exhaustion (backed
+    /// off only after a long run with no successful accept).
+    pub accept_errors: AtomicU64,
+    /// Stream `accept()` errors from resource exhaustion (backed off).
+    pub accept_resource_errors: AtomicU64,
+    /// Stream accepts dropped because the source is blocked.
+    pub accept_blocked: AtomicU64,
+    /// Stream accepts dropped by `transport.accept_rate_per_source`.
+    pub accept_rate_limited: AtomicU64,
+    /// TLS accepts dropped by `transport.max_handshakes_per_source`.
+    pub handshake_busy_per_source: AtomicU64,
+    /// TLS accepts dropped by the per-aggregate handshake cap (SR-58).
+    pub handshake_busy_per_aggregate: AtomicU64,
+    /// TLS connections dropped because no node-wide handshake slot
+    /// (`transport.max_handshakes_in_flight`) freed within the slot wait.
+    pub handshake_slot_timeouts: AtomicU64,
+    /// TLS connections dropped because their handshake held a node-wide
+    /// slot for the hold budget (`min(2 s, handshake_timeout_secs / 2)`)
+    /// without finishing.
+    pub handshake_slot_hold_timeouts: AtomicU64,
     /// Stream connections closed for a header block over
     /// `transport.max_header_bytes` (SI-10; also counted in
     /// `framing_errors`).
@@ -3611,7 +4314,14 @@ struct RateLimitAudit {
     /// Per-source rejections (`per_ip_rps`, `per_ip_conn`), at most
     /// `max_records` keys.
     pending: std::collections::HashMap<(std::net::IpAddr, &'static str), u64>,
-    /// Rejections whose source did not fit in `pending`.
+    /// Trusted-trunk rejections (`trunk_rps_udp`, `trunk_rps_stream`),
+    /// kept apart from `pending` so a flood of per-source records across
+    /// the sweeps of one audit interval cannot crowd them out. At most
+    /// [`Self::MAX_TRUNK_RECORDS`] keys: one per trusted address per
+    /// limiter.
+    trunk_pending: std::collections::HashMap<(std::net::IpAddr, &'static str), u64>,
+    /// Rejections whose source did not fit in `pending` (or, after a
+    /// trusted-set change within the interval, `trunk_pending`).
     suppressed_count: u64,
     /// Number of drained (source, count) entries folded into
     /// `suppressed_count` (upper bound on distinct sources).
@@ -3627,12 +4337,29 @@ struct RateLimitAudit {
     global_rps: u64,
     overflow_rps: u64,
     per_source_conns: u64,
+    /// Effective `trunk_rps` (threshold of `trunk_rps` records).
+    trunk_rps: u64,
+    accept_rate: u64,
+    per_source_handshakes: u64,
+    /// Threshold of `per_prefix_conn` records for IPv6 aggregates.
+    v6_aggregate_conns: u64,
+    /// Threshold of `per_prefix_conn` records for IPv4 /24s.
+    v4_aggregate_conns: u64,
+    /// Threshold of `per_prefix_accept_rate` records.
+    aggregate_accept_rate: u64,
+    /// Threshold of `per_prefix_handshake_busy` records.
+    aggregate_handshakes: u64,
 }
 
 impl RateLimitAudit {
+    /// Bound on `trunk_pending`: [`uc_dos_protection::MAX_TRUSTED_SOURCES`]
+    /// addresses on each of the two per-source limiters (SC-5).
+    const MAX_TRUNK_RECORDS: usize = 2 * uc_dos_protection::MAX_TRUSTED_SOURCES;
+
     fn new(config: &SbcConfig) -> Self {
         Self {
             pending: std::collections::HashMap::new(),
+            trunk_pending: std::collections::HashMap::new(),
             suppressed_count: 0,
             suppressed_sources: 0,
             global: 0,
@@ -3644,6 +4371,27 @@ impl RateLimitAudit {
             global_rps: u64::from(config.rate_limit.global_rps),
             overflow_rps: u64::from(config.rate_limit.effective_overflow_rps()),
             per_source_conns: u64::from(config.transport.max_connections_per_source),
+            trunk_rps: u64::from(config.rate_limit.effective_trunk_rps()),
+            accept_rate: u64::from(config.transport.accept_rate_per_source),
+            // Effective cap (after the clamp), the limit actually enforced.
+            per_source_handshakes: u64::from(
+                HandshakeLimits::from_config(&config.transport).per_source,
+            ),
+            v6_aggregate_conns: u64::from(
+                config
+                    .transport
+                    .effective_max_connections_per_v6_aggregate(),
+            ),
+            v4_aggregate_conns: u64::from(config.transport.effective_max_connections_per_v4_24()),
+            aggregate_accept_rate: u64::from(
+                config
+                    .transport
+                    .accept_rate_per_source
+                    .saturating_mul(crate::conn_limit::AGGREGATE_ACCEPT_FACTOR),
+            ),
+            aggregate_handshakes: u64::from(aggregate_handshake_cap(
+                HandshakeLimits::from_config(&config.transport).slots,
+            )),
         }
     }
 
@@ -3659,14 +4407,43 @@ impl RateLimitAudit {
         }
     }
 
-    /// One pass over the per-source limiter: aggregates rejections and
-    /// blocked drops, evicts idle buckets and expired blocks, and pushes
-    /// each ended block onto `unblocked`.
-    fn sweep_per_ip(&mut self, limiter: &mut RateLimiter, unblocked: &mut Vec<std::net::IpAddr>) {
+    /// Adds `count` trusted-trunk rejections for `(source, limit)`. Not
+    /// subject to `audit_max_records_per_interval`; bounded by
+    /// [`Self::MAX_TRUNK_RECORDS`] instead.
+    // NIST 800-53 Rev5: AU-12, SC-5 — trunk records always reach the log.
+    fn add_trunk(&mut self, source: std::net::IpAddr, limit: &'static str, count: u64) {
+        if let Some(n) = self.trunk_pending.get_mut(&(source, limit)) {
+            *n = n.saturating_add(count);
+        } else if self.trunk_pending.len() < Self::MAX_TRUNK_RECORDS {
+            self.trunk_pending.insert((source, limit), count);
+        } else {
+            // Only reachable when the trusted set changed within the
+            // interval; still counted in the suppressed summary.
+            self.suppressed_count = self.suppressed_count.saturating_add(count);
+            self.suppressed_sources = self.suppressed_sources.saturating_add(1);
+        }
+    }
+
+    /// One pass over the `kind` per-source limiter: aggregates rejections
+    /// and blocked drops, evicts idle buckets and expired blocks, and
+    /// pushes each ended block onto `unblocked`.
+    fn sweep_per_ip(
+        &mut self,
+        limiter: &mut RateLimiter,
+        kind: LimiterKind,
+        unblocked: &mut Vec<std::net::IpAddr>,
+    ) {
+        let trunk_label = match kind {
+            LimiterKind::Udp => "trunk_rps_udp",
+            LimiterKind::Stream => "trunk_rps_stream",
+        };
         let _ = limiter.sweep_with(|event| match event {
             SweepEvent::Rejected(key, n) => self.add(key, "per_ip_rps", n),
             SweepEvent::BlockedDrops(key, n) => self.add(key, "per_ip_blocked_drops", n),
             SweepEvent::Unblocked(key) => unblocked.push(key),
+            // NIST 800-53 Rev5: AU-12 — a trusted trunk over its own
+            // bucket, by exact address and transport family.
+            SweepEvent::TrustedRejected(ip, n) => self.add_trunk(ip, trunk_label, n),
         });
         self.overflow = self
             .overflow
@@ -3689,10 +4466,21 @@ impl RateLimitAudit {
 
     /// Drains the connection limiter's counters.
     fn collect_conns(&mut self, limiter: &crate::conn_limit::ConnLimiter) {
+        // Thresholds come from the limiter, which holds the effective caps.
+        self.v6_aggregate_conns = u64::from(limiter.v6_aggregate_cap());
+        self.v4_aggregate_conns = u64::from(limiter.v4_aggregate_cap());
+        self.aggregate_accept_rate = u64::from(limiter.aggregate_accept_rate());
+        self.aggregate_handshakes = u64::from(limiter.max_handshakes_per_aggregate());
         let totals = limiter.drain_rejections(|key, kind, n| {
             let limit = match kind {
                 crate::conn_limit::Rejection::PerSource => "per_ip_conn",
+                crate::conn_limit::Rejection::PerAggregate => "per_prefix_conn",
                 crate::conn_limit::Rejection::Framing => "framing",
+                crate::conn_limit::Rejection::AcceptRate => "per_ip_accept_rate",
+                crate::conn_limit::Rejection::AggregateAcceptRate => "per_prefix_accept_rate",
+                crate::conn_limit::Rejection::HandshakeBusy => "handshake_busy",
+                crate::conn_limit::Rejection::AggregateHandshakeBusy => "per_prefix_handshake_busy",
+                crate::conn_limit::Rejection::AcceptBlocked => "accept_blocked",
             };
             self.add(key, limit, n);
         });
@@ -3704,17 +4492,41 @@ impl RateLimitAudit {
         self.total_full = self.total_full.saturating_add(totals.total_full);
     }
 
+    /// Drains the connection limiter's counters, then evicts idle accept
+    /// buckets (picking up any accept-rate rejections counted in between).
+    fn sweep_conns(&mut self, limiter: &crate::conn_limit::ConnLimiter) {
+        self.collect_conns(limiter);
+        limiter.sweep_accept(|key, kind, n| {
+            let limit = if kind == crate::conn_limit::Rejection::AggregateAcceptRate {
+                "per_prefix_accept_rate"
+            } else {
+                "per_ip_accept_rate"
+            };
+            self.add(key, limit, n);
+        });
+    }
+
     /// Emits one record per pending (source, limit), the global and
     /// overflow totals, and one summary for anything suppressed; then
-    /// resets. At most `max_records + 5` records per flush.
+    /// resets. At most `max_records + MAX_TRUNK_RECORDS + 5` records per
+    /// flush; trunk records are emitted first.
     // POAM: POA&M-92 — global/overflow records carry the placeholder
     // sources 0.0.0.0 / :: because RateLimitTriggered requires a source
     // address; a dedicated aggregate event needs a uc-audit change (AU-3).
     fn flush(&mut self) {
+        for ((source, limit), count) in self.trunk_pending.drain() {
+            audit_rate_limit(source, limit, count, self.trunk_rps);
+        }
         for ((source, limit), count) in self.pending.drain() {
             let threshold = match limit {
                 "per_ip_conn" => self.per_source_conns,
-                "framing" => 0,
+                "per_ip_accept_rate" => self.accept_rate,
+                "handshake_busy" => self.per_source_handshakes,
+                "per_prefix_conn" if source.is_ipv4() => self.v4_aggregate_conns,
+                "per_prefix_conn" => self.v6_aggregate_conns,
+                "per_prefix_accept_rate" => self.aggregate_accept_rate,
+                "per_prefix_handshake_busy" => self.aggregate_handshakes,
+                "framing" | "accept_blocked" => 0,
                 _ => self.per_ip_rps,
             };
             audit_rate_limit(source, limit, count, threshold);
@@ -3767,7 +4579,9 @@ impl RateLimitAudit {
 /// ## NIST 800-53 Rev5: SC-5, AU-4, AU-12
 struct RateLimitMaintenance {
     shutdown: ShutdownSignal,
-    rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Per-source limiters (stream, then UDP) and the transport family
+    /// each serves, swept one at a time.
+    per_ip_limiters: Vec<(LimiterKind, Arc<Mutex<RateLimiter>>)>,
     global_limiter: Arc<Mutex<RateLimiter>>,
     conn_limiter: Arc<crate::conn_limit::ConnLimiter>,
     sweep_interval: std::time::Duration,
@@ -3787,7 +4601,7 @@ impl RateLimitMaintenance {
     ) -> Self {
         Self {
             shutdown,
-            rate_limiter,
+            per_ip_limiters: vec![(LimiterKind::Stream, rate_limiter)],
             global_limiter,
             conn_limiter,
             sweep_interval: std::time::Duration::from_secs(config.rate_limit.sweep_interval_secs),
@@ -3797,18 +4611,25 @@ impl RateLimitMaintenance {
         }
     }
 
+    /// Adds another per-source limiter, serving `kind`, to the sweep.
+    fn with_per_ip_limiter(mut self, kind: LimiterKind, limiter: Arc<Mutex<RateLimiter>>) -> Self {
+        self.per_ip_limiters.push((kind, limiter));
+        self
+    }
+
     /// One sweep; flushes the audit aggregate when `flush` is set.
     async fn sweep(&mut self, flush: bool) {
-        {
-            let mut limiter = self.rate_limiter.lock().await;
+        for (kind, limiter) in &self.per_ip_limiters {
+            let mut limiter = limiter.lock().await;
             // One pass: counts are reported before an idle bucket is evicted.
-            self.audit.sweep_per_ip(&mut limiter, &mut self.unblocked);
+            self.audit
+                .sweep_per_ip(&mut limiter, *kind, &mut self.unblocked);
         }
         {
             let mut global = self.global_limiter.lock().await;
             self.audit.collect_global(&mut global);
         }
-        self.audit.collect_conns(&self.conn_limiter);
+        self.audit.sweep_conns(&self.conn_limiter);
         for key in self.unblocked.drain(..) {
             audit_rate_limit(key, "per_ip_unblock", 0, self.audit.per_ip_rps);
         }
@@ -4184,13 +5005,14 @@ mod tests {
             shutdown: ShutdownSignal::new(),
             stats: Arc::new(ServerStats::default()),
             sip_stack: Arc::new(SipStack::new(crate::sip_stack::SipStackConfig::default())),
-            rate_limiter: Server::build_rate_limiter(&config),
+            rate_limiter: Server::build_rate_limiter(&config, LimiterKind::Stream),
             global_limiter: Server::build_global_limiter(&config),
             rate_limit_enabled: true,
             zone_name: None,
             conn_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             total_conns: Arc::new(tokio::sync::Semaphore::new(4)),
             conn_limiter: Arc::new(crate::conn_limit::ConnLimiter::new(2, 64)),
+            handshake_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             timeouts,
             flows: Arc::new(FlowTable::new(4)),
             max_header_bytes: config.transport.max_header_bytes as usize,
@@ -4217,6 +5039,20 @@ mod tests {
         Arc<FakeStream>,
         tokio::task::JoinHandle<()>,
     ) {
+        let peer = SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, 20), 40000);
+        spawn_stream_from(ctx, kind, peer)
+    }
+
+    /// [`spawn_stream_kind`] with the connection's peer address.
+    fn spawn_stream_from(
+        ctx: StreamLoopContext,
+        kind: TransportType,
+        peer: SbcSocketAddr,
+    ) -> (
+        tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        Arc<FakeStream>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = Arc::new(FakeStream {
             local: SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, 10), 5060),
@@ -4225,7 +5061,6 @@ mod tests {
             closed: std::sync::atomic::AtomicBool::new(false),
             kind,
         });
-        let peer = SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, 20), 40000);
         let conn: Arc<dyn Transport> = Arc::clone(&fake) as Arc<dyn Transport>;
         let task = tokio::spawn(Server::stream_connection_loop(conn, peer, ctx, None));
         (tx, fake, task)
@@ -4462,7 +5297,7 @@ mod tests {
         config.rate_limit.per_ip_rps = per_ip_rps;
         config.rate_limit.burst_multiplier = burst_multiplier;
         let mut ctx = stream_test_ctx(short_timeouts());
-        ctx.rate_limiter = Server::build_rate_limiter(&config);
+        ctx.rate_limiter = Server::build_rate_limiter(&config, LimiterKind::Stream);
         ctx.global_limiter = Server::build_global_limiter(&config);
         ctx
     }
@@ -4824,12 +5659,15 @@ mod tests {
     #[tokio::test]
     async fn twenty_6k_messages_within_rate_are_processed() {
         let mut ctx = stream_test_ctx(short_timeouts());
-        ctx.rate_limiter = Server::build_rate_limiter(&{
-            let mut config = SbcConfig::default();
-            config.rate_limit.per_ip_rps = 20;
-            config.rate_limit.burst_multiplier = 1.0;
-            config
-        });
+        ctx.rate_limiter = Server::build_rate_limiter(
+            &{
+                let mut config = SbcConfig::default();
+                config.rate_limit.per_ip_rps = 20;
+                config.rate_limit.burst_multiplier = 1.0;
+                config
+            },
+            LimiterKind::Stream,
+        );
         let stats = Arc::clone(&ctx.stats);
         let (tx, fake, task) = spawn_stream(ctx);
         for i in 0..20 {
@@ -5131,7 +5969,7 @@ mod tests {
         let mut config = SbcConfig::default();
         config.rate_limit.per_ip_rps = 5;
         config.rate_limit.global_rps = 1_000;
-        let per_ip = Server::build_rate_limiter(&config);
+        let per_ip = Server::build_rate_limiter(&config, LimiterKind::Stream);
         let global = Server::build_global_limiter(&config);
         let stats = ServerStats::default();
         let flooder: std::net::IpAddr = "192.0.2.66".parse().unwrap();
@@ -5165,7 +6003,7 @@ mod tests {
         let mut config = SbcConfig::default();
         config.rate_limit.per_ip_rps = 1_000;
         config.rate_limit.global_rps = 5;
-        let per_ip = Server::build_rate_limiter(&config);
+        let per_ip = Server::build_rate_limiter(&config, LimiterKind::Stream);
         let global = Server::build_global_limiter(&config);
         let stats = ServerStats::default();
         let trunk: std::net::IpAddr = "192.0.2.5".parse().unwrap();
@@ -5240,7 +6078,7 @@ mod tests {
         let mut config = SbcConfig::default();
         config.rate_limit.per_ip_rps = 2;
         config.rate_limit.block_duration_secs = 1;
-        let per_ip = Server::build_rate_limiter(&config);
+        let per_ip = Server::build_rate_limiter(&config, LimiterKind::Stream);
         let global = Server::build_global_limiter(&config);
         let stats = ServerStats::default();
         let src: std::net::IpAddr = "192.0.2.99".parse().unwrap();
@@ -5422,7 +6260,7 @@ mod tests {
         let capture = uc_audit::capture::start();
         let mut config = SbcConfig::default();
         config.rate_limit.per_ip_rps = 1;
-        let per_ip = Server::build_rate_limiter(&config);
+        let per_ip = Server::build_rate_limiter(&config, LimiterKind::Stream);
         let global = Server::build_global_limiter(&config);
         let src: std::net::IpAddr = "192.0.2.45".parse().unwrap();
         {
@@ -5462,7 +6300,7 @@ mod tests {
         config.rate_limit.per_ip_rps = 1;
         config.rate_limit.sweep_interval_secs = 10;
         config.rate_limit.audit_interval_secs = 60;
-        let per_ip = Server::build_rate_limiter(&config);
+        let per_ip = Server::build_rate_limiter(&config, LimiterKind::Stream);
         let global = Server::build_global_limiter(&config);
         // Each batch uses a fresh source: packets dropped while a source is
         // blocked are not counted in the aggregate.
@@ -6467,6 +7305,1691 @@ mod tests {
         wipe_wire_bytes(other);
     }
 
+    // SR-55: separate UDP and stream limiters, UDP reject-not-block, and
+    // configured trunk IPs as trusted sources. Written against the planned
+    // API (`LimiterKind`, `udp_rate_limiter` / `stream_rate_limiter`,
+    // `SipStack::trunk_sources`, `Server::apply_trusted_sources`,
+    // `rate_limit.udp_auto_block` / `trunk_rps`).
+    mod sr55 {
+        use super::*;
+        use std::collections::HashSet;
+        use std::net::IpAddr;
+
+        fn ip(s: &str) -> IpAddr {
+            s.parse().unwrap()
+        }
+
+        fn trusted_set(ips: &[IpAddr]) -> HashSet<IpAddr> {
+            ips.iter().copied().collect()
+        }
+
+        /// UDP trunk source keys for `ips` (SR-04 keys trunks by transport).
+        fn trunk_keys(ips: &HashSet<IpAddr>) -> HashSet<crate::sip_stack::TrunkSourceKey> {
+            ips.iter()
+                .filter_map(|ip| {
+                    crate::sip_stack::TrunkSourceKey::new(
+                        *ip,
+                        uc_types::address::TransportType::Udp,
+                    )
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn udp_limiter_from_default_config_never_auto_blocks() {
+            let config = SbcConfig::default();
+            assert!(!config.rate_limit.udp_auto_block);
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let global = Server::build_global_limiter(&config);
+            let stats = ServerStats::default();
+            let src = ip("192.0.2.66");
+            let mut rejected = 0;
+            for _ in 0..1_000 {
+                if !Server::rate_limit_allows(src, &udp, &global, &stats).await {
+                    rejected += 1;
+                }
+            }
+            assert!(rejected > 0);
+            let l = udp.lock().await;
+            assert_eq!(l.blocked_sources(), 0);
+            assert!(!l.is_blocked(src));
+        }
+
+        #[tokio::test]
+        async fn udp_auto_block_true_restores_blocking() {
+            let mut config = SbcConfig::default();
+            config.rate_limit.udp_auto_block = true;
+            config.rate_limit.per_ip_rps = 2;
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let global = Server::build_global_limiter(&config);
+            let stats = ServerStats::default();
+            let src = ip("192.0.2.67");
+            for _ in 0..50 {
+                let _ = Server::rate_limit_allows(src, &udp, &global, &stats).await;
+            }
+            assert!(udp.lock().await.is_blocked(src));
+        }
+
+        #[tokio::test]
+        async fn stream_limiter_still_auto_blocks() {
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 2;
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let global = Server::build_global_limiter(&config);
+            let stats = ServerStats::default();
+            let src = ip("192.0.2.68");
+            for _ in 0..50 {
+                let _ = Server::rate_limit_allows(src, &stream, &global, &stats).await;
+            }
+            assert!(stream.lock().await.is_blocked(src));
+        }
+
+        #[tokio::test]
+        async fn udp_flood_does_not_reject_stream_frames() {
+            let config = SbcConfig::default();
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let global = Server::build_global_limiter(&config);
+            let stats = ServerStats::default();
+            let src = ip("192.0.2.69");
+            let mut rejected = 0;
+            for _ in 0..1_000 {
+                if !Server::rate_limit_allows(src, &udp, &global, &stats).await {
+                    rejected += 1;
+                }
+            }
+            assert!(rejected > 0);
+            assert!(Server::rate_limit_allows(src, &stream, &global, &stats).await);
+        }
+
+        // The daemon wires two distinct limiters; a UDP-earned block does
+        // not stop an established stream connection from that address.
+        #[tokio::test]
+        async fn stream_connection_ignores_udp_block() {
+            let mut config = SbcConfig::default();
+            config.rate_limit.udp_auto_block = true;
+            config.rate_limit.per_ip_rps = 2;
+            let server = Server::new(config, ShutdownSignal::new(), None).unwrap();
+            assert!(!Arc::ptr_eq(
+                &server.udp_rate_limiter,
+                &server.stream_rate_limiter
+            ));
+            // spawn_stream's peer address.
+            let peer = ip("192.0.2.20");
+            {
+                let mut udp = server.udp_rate_limiter.lock().await;
+                for _ in 0..50 {
+                    let _ = udp.check(peer);
+                }
+                assert!(udp.is_blocked(peer), "UDP limiter did not block");
+            }
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.rate_limiter = Arc::clone(&server.stream_rate_limiter);
+            ctx.global_limiter = Arc::clone(&server.global_limiter);
+            let stats = Arc::clone(&ctx.stats);
+            let (tx, fake, task) = spawn_stream(ctx);
+            tx.send(OPTIONS_KA.to_vec()).unwrap();
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                if !fake.sent.lock().unwrap().is_empty() {
+                    break;
+                }
+            }
+            let sent = fake.sent.lock().unwrap().clone();
+            assert_eq!(sent.len(), 1, "no response on the stream: {sent:?}");
+            assert!(sent[0].starts_with(b"SIP/2.0 "));
+            assert_eq!(stats.rate_limited.load(Ordering::Relaxed), 0);
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn trunk_ip_trusted_on_both_limiters_after_sync() {
+            let config = SbcConfig::default();
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            let mut rx = stack.trunk_sources();
+            let t = ip("203.0.113.9");
+            stack
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[t])))
+                .await;
+            assert!(rx.has_changed().unwrap(), "no snapshot published");
+            let set = rx.borrow_and_update().clone();
+            assert!(set.contains(&t));
+            Server::apply_trusted_sources(&set, &udp, &stream).await;
+            assert!(udp.lock().await.is_trusted(t));
+            assert!(stream.lock().await.is_trusted(t));
+        }
+
+        #[tokio::test]
+        async fn trunk_removal_untrusts() {
+            let config = SbcConfig::default();
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            let mut rx = stack.trunk_sources();
+            let t = ip("203.0.113.10");
+            stack
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[t])))
+                .await;
+            let set = rx.borrow_and_update().clone();
+            Server::apply_trusted_sources(&set, &udp, &stream).await;
+            assert!(udp.lock().await.is_trusted(t));
+
+            stack.remove_trunk_group_from_router("g").await;
+            assert!(rx.has_changed().unwrap(), "removal not published");
+            let set = rx.borrow_and_update().clone();
+            assert!(!set.contains(&t));
+            Server::apply_trusted_sources(&set, &udp, &stream).await;
+            assert!(!udp.lock().await.is_trusted(t));
+            assert!(!stream.lock().await.is_trusted(t));
+        }
+
+        #[tokio::test]
+        async fn config_file_trunks_trusted_at_start() {
+            let config = sbc_config::load_from_str(
+                r#"
+                [[trunk_groups]]
+                id = "g"
+                name = "g"
+                [[trunk_groups.trunks]]
+                id = "a"
+                host = "192.0.2.1"
+            "#,
+            )
+            .unwrap();
+            let server = Server::new(config, ShutdownSignal::new(), None).unwrap();
+            let t = ip("192.0.2.1");
+            let set = server.sip_stack.trunk_sources().borrow().clone();
+            assert!(set.contains(&t), "config trunk missing from snapshot");
+            Server::apply_trusted_sources(
+                &set,
+                &server.udp_rate_limiter,
+                &server.stream_rate_limiter,
+            )
+            .await;
+            assert!(server.udp_rate_limiter.lock().await.is_trusted(t));
+            assert!(server.stream_rate_limiter.lock().await.is_trusted(t));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn trunk_rps_rejections_audited_by_transport() {
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 1;
+            config.rate_limit.trunk_rps = 2;
+            let t = ip("203.0.113.11");
+            let mut unblocked = Vec::new();
+            let mut audit = RateLimitAudit::new(&config);
+            for kind in [LimiterKind::Udp, LimiterKind::Stream] {
+                let limiter = Server::build_rate_limiter(&config, kind);
+                let mut l = limiter.lock().await;
+                let _ = l.set_trusted_sources([t]);
+                for _ in 0..100 {
+                    let _ = l.check(t);
+                }
+                audit.sweep_per_ip(&mut l, kind, &mut unblocked);
+            }
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            for label in ["trunk_rps_udp", "trunk_rps_stream"] {
+                let trunk: Vec<_> = records.iter().filter(|r| r.limit_name == label).collect();
+                assert_eq!(trunk.len(), 1, "{label}: {records:?}");
+                assert_eq!(trunk[0].source_ip, t);
+                assert!(trunk[0].request_count > 0);
+                assert_eq!(
+                    trunk[0].threshold,
+                    u64::from(config.rate_limit.effective_trunk_rps())
+                );
+            }
+            assert!(
+                !records
+                    .iter()
+                    .any(|r| r.source_ip == t && r.limit_name.starts_with("per_ip")),
+                "{records:?}"
+            );
+        }
+
+        // NIST-004: with a record cap of 1, both the trunk record and one
+        // per-source record are kept.
+        #[tokio::test(flavor = "current_thread")]
+        async fn trunk_record_survives_audit_cap() {
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 1;
+            config.rate_limit.trunk_rps = 2;
+            config.rate_limit.audit_max_records_per_interval = 1;
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let t = ip("203.0.113.14");
+            let other = ip("198.51.100.7");
+            let mut unblocked = Vec::new();
+            {
+                let mut l = udp.lock().await;
+                let _ = l.set_trusted_sources([t]);
+                for _ in 0..100 {
+                    let _ = l.check(other);
+                    let _ = l.check(t);
+                }
+                let mut audit = RateLimitAudit::new(&config);
+                audit.sweep_per_ip(&mut l, LimiterKind::Udp, &mut unblocked);
+                audit.flush();
+            }
+            let records = rate_limit_records(&capture.events());
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r.source_ip == t && r.limit_name == "trunk_rps_udp"),
+                "{records:?}"
+            );
+            // The trunk record does not take a per-source slot.
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r.source_ip == other && r.limit_name == "per_ip_rps"),
+                "{records:?}"
+            );
+        }
+
+        // SEC-006: per-source records from an earlier sweep fill the cap;
+        // trunk records reported by later sweeps of the same interval, on
+        // either limiter, are still emitted.
+        #[tokio::test(flavor = "current_thread")]
+        async fn trunk_records_survive_cap_filled_by_earlier_sweep() {
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 1;
+            config.rate_limit.trunk_rps = 2;
+            config.rate_limit.audit_max_records_per_interval = 1;
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let t = ip("203.0.113.15");
+            let others = [ip("198.51.100.8"), ip("198.51.100.9")];
+            let mut unblocked = Vec::new();
+            let mut audit = RateLimitAudit::new(&config);
+            // Sweep 1: only untrusted sources reject; they fill the cap.
+            for (kind, limiter) in [(LimiterKind::Udp, &udp), (LimiterKind::Stream, &stream)] {
+                let mut l = limiter.lock().await;
+                let _ = l.set_trusted_sources([t]);
+                for other in others {
+                    for _ in 0..100 {
+                        let _ = l.check(other);
+                    }
+                }
+                audit.sweep_per_ip(&mut l, kind, &mut unblocked);
+            }
+            // Sweep 2: the trunk rejects on both limiters.
+            for (kind, limiter) in [(LimiterKind::Udp, &udp), (LimiterKind::Stream, &stream)] {
+                let mut l = limiter.lock().await;
+                for _ in 0..100 {
+                    let _ = l.check(t);
+                }
+                audit.sweep_per_ip(&mut l, kind, &mut unblocked);
+            }
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let per_source = records
+                .iter()
+                .filter(|r| r.limit_name == "per_ip_rps")
+                .count();
+            assert_eq!(per_source, 1, "cap not filled first: {records:?}");
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r.limit_name == "per_ip_rps_suppressed"),
+                "{records:?}"
+            );
+            for label in ["trunk_rps_udp", "trunk_rps_stream"] {
+                assert!(
+                    records
+                        .iter()
+                        .any(|r| r.source_ip == t && r.limit_name == label),
+                    "{label}: {records:?}"
+                );
+            }
+        }
+
+        // SEC-005: a stream-limiter flood from a /64 neighbour blocks the
+        // prefix, but the trusted trunk's stream connection is still
+        // answered.
+        #[tokio::test]
+        async fn trusted_trunk_stream_answered_under_prefix_block() {
+            let trunk = ip("2001:db8::5");
+            let neighbour = ip("2001:db8::66");
+            let mut ctx = stream_test_ctx(short_timeouts());
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            stack
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[trunk])))
+                .await;
+            let trunks = stack.trunk_sources().borrow().clone();
+            let other = Server::build_rate_limiter(&SbcConfig::default(), LimiterKind::Udp);
+            Server::apply_trusted_sources(&trunks, &other, &ctx.rate_limiter).await;
+            {
+                let mut l = ctx.rate_limiter.lock().await;
+                assert!(l.is_trusted(trunk));
+                let mut blocked = false;
+                for _ in 0..10_000 {
+                    if matches!(l.check(neighbour), RateLimitAction::Block { .. }) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                assert!(blocked, "/64 not blocked by the flood");
+                assert!(l.is_blocked(ip("2001:db8::77")));
+                assert!(!l.is_blocked(trunk));
+            }
+            ctx.global_limiter = Arc::new(Mutex::new(RateLimiter::new(
+                RateLimiterConfig::new(1_000_000, 1_000_000).with_per_ip(false),
+            )));
+            let stats = Arc::clone(&ctx.stats);
+            let peer = SbcSocketAddr::from(std::net::SocketAddr::new(trunk, 40000));
+            let (tx, fake, task) = spawn_stream_from(ctx, TransportType::Tcp, peer);
+            tx.send(OPTIONS_KA.to_vec()).unwrap();
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                if !fake.sent.lock().unwrap().is_empty() {
+                    break;
+                }
+            }
+            let sent = fake.sent.lock().unwrap().clone();
+            assert_eq!(sent.len(), 1, "trunk not answered: {sent:?}");
+            assert!(sent[0].starts_with(b"SIP/2.0 "));
+            assert_eq!(stats.rate_limited.load(Ordering::Relaxed), 0);
+            task.abort();
+        }
+
+        // SEC-004 / PERF-004: an unchanged key set is not republished.
+        #[tokio::test]
+        async fn unchanged_trunk_set_not_republished() {
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            let mut rx = stack.trunk_sources();
+            let t = ip("203.0.113.15");
+            stack
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[t])))
+                .await;
+            assert!(rx.has_changed().unwrap());
+            let _ = rx.borrow_and_update();
+            stack
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[t])))
+                .await;
+            assert!(!rx.has_changed().unwrap(), "unchanged set republished");
+        }
+
+        // SEC-004: the published set is capped, keeping the lowest
+        // addresses.
+        #[tokio::test]
+        async fn trunk_set_capped_deterministically() {
+            let max = uc_dos_protection::MAX_TRUSTED_SOURCES;
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            let ips: HashSet<IpAddr> = (0..u32::try_from(max).unwrap() + 5)
+                .map(|n| IpAddr::V4(Ipv4Addr::from(0x0A00_0000 | n)))
+                .collect();
+            stack
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&ips))
+                .await;
+            let set = stack.trunk_sources().borrow().clone();
+            assert_eq!(set.len(), max);
+            assert!(set.is_sorted());
+            assert_eq!(set[0], IpAddr::V4(Ipv4Addr::from(0x0A00_0000)));
+            assert!(!set.contains(&IpAddr::V4(Ipv4Addr::from(
+                0x0A00_0000 | u32::try_from(max).unwrap()
+            ))));
+        }
+
+        // The sync task applies each published snapshot to both limiters.
+        #[tokio::test]
+        async fn trusted_source_sync_task_follows_trunk_changes() {
+            let config = SbcConfig::default();
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let stream = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let stack = SipStack::new(crate::sip_stack::SipStackConfig::default());
+            let conns = Arc::new(Server::build_conn_limiter(&config));
+            let task = tokio::spawn(Server::trusted_source_sync(
+                stack.trunk_sources(),
+                Arc::clone(&udp),
+                Arc::clone(&stream),
+                Arc::clone(&conns),
+            ));
+            let t = ip("203.0.113.13");
+            stack
+                .register_inbound_trunk_sources("g", None, &trunk_keys(&trusted_set(&[t])))
+                .await;
+            let mut synced = false;
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                if udp.lock().await.is_trusted(t)
+                    && stream.lock().await.is_trusted(t)
+                    && conns.is_trusted(t)
+                {
+                    synced = true;
+                    break;
+                }
+            }
+            assert!(synced, "sync task did not apply the snapshot");
+            stack.remove_trunk_group_from_router("g").await;
+            let mut cleared = false;
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                if !udp.lock().await.is_trusted(t)
+                    && !stream.lock().await.is_trusted(t)
+                    && !conns.is_trusted(t)
+                {
+                    cleared = true;
+                    break;
+                }
+            }
+            assert!(cleared, "sync task did not apply the removal");
+            task.abort();
+        }
+
+        // POA&M-451: trusted sources still draw from the global bucket.
+        #[tokio::test]
+        async fn trusted_trunk_still_charged_to_global() {
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 1;
+            config.rate_limit.trunk_rps = 1_000;
+            let udp = Server::build_rate_limiter(&config, LimiterKind::Udp);
+            let global = Arc::new(Mutex::new(RateLimiter::new(
+                RateLimiterConfig::new(5, 5).with_per_ip(false),
+            )));
+            let stats = ServerStats::default();
+            let t = ip("203.0.113.12");
+            udp.lock().await.set_trusted_sources([t]);
+            let mut allowed = 0;
+            for _ in 0..100 {
+                if Server::rate_limit_allows(t, &udp, &global, &stats).await {
+                    allowed += 1;
+                }
+            }
+            assert!(allowed < 100);
+            assert!(global.lock().await.take_global_rejections() > 0);
+            assert!(!udp.lock().await.is_blocked(t));
+        }
+    }
+
+    // ---- SR-22 / SR-56 accept path (behaviour tests on existing APIs) ----
+
+    const LOCALHOST_IP: std::net::IpAddr = std::net::IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    /// Connects to `listen` and resets the connection (`SO_LINGER` 0)
+    /// before the server accepts it. The kernel keeps it in the accept
+    /// queue; `getpeername` on the accepted socket then fails.
+    #[cfg(unix)]
+    fn reset_before_accept(listen: std::net::SocketAddr) {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        sock.connect(&listen.into()).unwrap();
+        sock.set_linger(Some(std::time::Duration::ZERO)).unwrap();
+        drop(sock);
+    }
+
+    /// Polls the flow table for an inbound TCP flow to `peer` for up to
+    /// `within`; returns whether a `ping` could be sent on it.
+    async fn tcp_flow_registered(
+        flows: &FlowTable,
+        peer: &SbcSocketAddr,
+        within: std::time::Duration,
+    ) -> bool {
+        let flow = LegFlow::inbound(TransportType::Tcp);
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < within {
+            if flows.send(&flow, peer, b"ping", None).await.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    async fn ws_test_listener() -> (Arc<WebSocketListener>, std::net::SocketAddr) {
+        let bind = SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0);
+        let listener = WebSocketListener::bind(&bind, false)
+            .await
+            .unwrap()
+            .with_options(WebSocketListenerOptions {
+                require_sip_subprotocol: true,
+            });
+        let addr = listener.bound_addr().unwrap();
+        (Arc::new(listener), addr)
+    }
+
+    /// A TLS listener on 127.0.0.1 with a fresh P-384 certificate for
+    /// `sbc.example.test`, and a client config that trusts it.
+    async fn tls_test_listener() -> (Arc<TlsListener>, Arc<rustls::ClientConfig>) {
+        tls_test_listener_on(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0)).await
+    }
+
+    /// [`tls_test_listener`] bound to `bind`.
+    async fn tls_test_listener_on(
+        bind: SbcSocketAddr,
+    ) -> (Arc<TlsListener>, Arc<rustls::ClientConfig>) {
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["sbc.example.test".to_string()])
+            .unwrap()
+            .self_signed(&kp)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client =
+            uc_transport::tls::create_client_config_with(uc_transport::tls::TlsClientOptions {
+                roots,
+                min_version: uc_transport::tls::MinTlsVersion::V1_3,
+                client_auth: None,
+            })
+            .unwrap();
+        let server = uc_transport::tls::create_server_config(
+            vec![cert.der().clone()],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(
+                kp.serialize_der(),
+            )),
+        )
+        .unwrap();
+        let listener = TlsListener::bind(
+            ListenerConfig::new(bind, TransportType::Tls),
+            Arc::new(server),
+        )
+        .await
+        .unwrap();
+        (Arc::new(listener), Arc::new(client))
+    }
+
+    /// Runs a TLS client handshake against `addr` (5 s bound); `true` when
+    /// it completes.
+    async fn tls_handshake_ok(addr: SbcSocketAddr, client: &Arc<rustls::ClientConfig>) -> bool {
+        let connector = tokio_rustls::TlsConnector::from(Arc::clone(client));
+        let name = rustls_pki_types::ServerName::try_from("sbc.example.test").unwrap();
+        let attempt = async {
+            let tcp = tokio::net::TcpStream::connect(std::net::SocketAddr::from(addr)).await?;
+            connector.connect(name, tcp).await
+        };
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), attempt).await,
+            Ok(Ok(_))
+        )
+    }
+
+    // SR-22 (NIST 800-53 Rev5: SC-5): connections reset before accept must
+    // not stall the listener. Before SR-22 each one made
+    // `TcpListener::accept` fail (getpeername) and the loop slept 100 ms,
+    // so 20 of them delayed a good client by about 2 s.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_accept_loop_does_not_stall_on_reset_connections() {
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let listen: std::net::SocketAddr = (*listener.local_addr()).into();
+        let mut ctx = stream_test_ctx(short_timeouts());
+        // All clients share 127.0.0.1: give the source room so admission
+        // caps do not interfere with what is measured.
+        ctx.conn_limiter = Arc::new(crate::conn_limit::ConnLimiter::new(64, 64));
+        ctx.conn_semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        ctx.total_conns = Arc::new(tokio::sync::Semaphore::new(64));
+        let flows = Arc::clone(&ctx.flows);
+        for _ in 0..20 {
+            reset_before_accept(listen);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let accept = tokio::spawn(Server::tcp_accept_loop(Arc::new(listener), ctx));
+        let t0 = std::time::Instant::now();
+        let mut client = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let peer = SbcSocketAddr::from(client.local_addr().unwrap());
+        let served =
+            tcp_flow_registered(&flows, &peer, std::time::Duration::from_millis(300)).await;
+        let waited = t0.elapsed();
+        accept.abort();
+        assert!(
+            served,
+            "good client not registered within 300 ms behind 20 reset connections \
+             (waited {waited:?}): accept errors stall the listener (SR-22)"
+        );
+        let mut buf = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
+    // SR-56 (NIST 800-53 Rev5: SC-5, SC-7): a blocked source is refused at
+    // accept, before the HTTP upgrade. Before SR-56 the upgrade answered
+    // 101.
+    #[tokio::test]
+    async fn blocked_source_dropped_at_ws_accept_before_upgrade() {
+        let ctx = stream_test_ctx(short_timeouts());
+        {
+            let mut limiter = ctx.rate_limiter.lock().await;
+            assert!(limiter.block(LOCALHOST_IP, std::time::Duration::from_secs(60)));
+            assert!(limiter.is_blocked(LOCALHOST_IP));
+        }
+        let (listener, addr) = ws_test_listener().await;
+        let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
+        let reply = ws_upgrade_status(addr).await;
+        task.abort();
+        assert_eq!(
+            reply, None,
+            "blocked source got an upgrade reply: is_blocked not checked at accept (SR-56)"
+        );
+    }
+
+    // SR-56 (NIST 800-53 Rev5: SC-5, SC-7): a blocked source is refused
+    // before the TLS handshake, so it costs no crypto. Before SR-56 it
+    // completed.
+    #[tokio::test]
+    async fn blocked_source_dropped_at_tls_accept_before_handshake() {
+        let ctx = stream_test_ctx(short_timeouts());
+        assert!(
+            ctx.rate_limiter
+                .lock()
+                .await
+                .block(LOCALHOST_IP, std::time::Duration::from_secs(60))
+        );
+        let (listener, client) = tls_test_listener().await;
+        let addr = *listener.local_addr();
+        let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+        let completed = tls_handshake_ok(addr, &client).await;
+        task.abort();
+        assert!(
+            !completed,
+            "blocked source completed a TLS handshake: is_blocked not checked at accept (SR-56)"
+        );
+    }
+
+    // SR-56 / SR-55 (NIST 800-53 Rev5: SC-5): the accept check reads the
+    // stream limiter. A block on the daemon's UDP limiter does not refuse a
+    // TLS accept from the same address.
+    #[tokio::test]
+    async fn udp_block_does_not_refuse_tls_accept() {
+        let mut config = SbcConfig::default();
+        config.rate_limit.udp_auto_block = true;
+        let server = Server::new(config, ShutdownSignal::new(), None).unwrap();
+        assert!(
+            server
+                .udp_rate_limiter
+                .lock()
+                .await
+                .block(LOCALHOST_IP, std::time::Duration::from_secs(60))
+        );
+        assert!(
+            server
+                .udp_rate_limiter
+                .lock()
+                .await
+                .is_blocked(LOCALHOST_IP)
+        );
+        let mut ctx = stream_test_ctx(short_timeouts());
+        ctx.rate_limiter = Arc::clone(&server.stream_rate_limiter);
+        let stats = Arc::clone(&ctx.stats);
+        let (listener, client) = tls_test_listener().await;
+        let addr = *listener.local_addr();
+        let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+        let completed = tls_handshake_ok(addr, &client).await;
+        task.abort();
+        assert!(
+            completed,
+            "UDP-limiter block refused a TLS accept: accept_blocked must use the stream limiter"
+        );
+        assert_eq!(stats.accept_blocked.load(Ordering::Relaxed), 0);
+    }
+
+    // SR-56 / SR-55 (NIST 800-53 Rev5: SC-5): a stream block on a /64
+    // refuses the neighbour but not the configured trunk inside it.
+    #[tokio::test]
+    async fn trusted_trunk_accepted_under_prefix_block() {
+        let trunk = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let neighbour: std::net::IpAddr = "::2".parse().unwrap();
+        let ctx = stream_test_ctx(short_timeouts());
+        {
+            let mut l = ctx.rate_limiter.lock().await;
+            assert_eq!(l.set_trusted_sources([trunk]), 0);
+            assert!(l.block(neighbour, std::time::Duration::from_secs(60)));
+            assert!(l.is_blocked("::3".parse().unwrap()), "/64 not blocked");
+            assert!(!l.is_blocked(trunk));
+        }
+        let stats = Arc::clone(&ctx.stats);
+        let (listener, client) =
+            tls_test_listener_on(SbcSocketAddr::from(std::net::SocketAddr::new(trunk, 0))).await;
+        let addr = *listener.local_addr();
+        let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+        let completed = tls_handshake_ok(addr, &client).await;
+        task.abort();
+        assert!(
+            completed,
+            "trusted trunk refused at accept for a prefix block"
+        );
+        assert_eq!(stats.accept_blocked.load(Ordering::Relaxed), 0);
+    }
+
+    // SR-56 (NIST 800-53 Rev5: SC-5, SC-7): a blocked source's plain TCP
+    // connection is dropped at accept and never reaches the flow table.
+    #[tokio::test]
+    async fn blocked_source_dropped_at_tcp_accept() {
+        let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let listen: std::net::SocketAddr = (*listener.local_addr()).into();
+        let ctx = stream_test_ctx(short_timeouts());
+        assert!(
+            ctx.rate_limiter
+                .lock()
+                .await
+                .block(LOCALHOST_IP, std::time::Duration::from_secs(60))
+        );
+        let flows = Arc::clone(&ctx.flows);
+        let task = tokio::spawn(Server::tcp_accept_loop(Arc::new(listener), ctx));
+        let mut client = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let peer = SbcSocketAddr::from(client.local_addr().unwrap());
+        let registered =
+            tcp_flow_registered(&flows, &peer, std::time::Duration::from_millis(300)).await;
+        assert!(
+            !registered,
+            "blocked source's TCP connection was admitted (SR-56)"
+        );
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read(&mut client, &mut buf),
+        )
+        .await;
+        task.abort();
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "blocked connection must be closed by the server, got {read:?}"
+        );
+    }
+
+    /// SR-22 / SR-56 tests for the accept-path API (`AcceptBackoff`,
+    /// `StreamLoopContext::handshake_slots`, `ConnLimiter::with_accept_rate`
+    /// / `with_handshake_cap`, `ServerStats` counters and audit labels).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, AU-12
+    mod sr56_accept_api {
+        use super::*;
+        use crate::conn_limit::ConnLimiter;
+        use std::time::Duration as D;
+        use tokio::sync::Semaphore;
+        use uc_transport::TransportError as E;
+
+        fn transient() -> E {
+            E::AcceptFailed {
+                reason: "Software caused connection abort".into(),
+                resource_exhausted: false,
+                per_connection: true,
+            }
+        }
+
+        /// A listener-level error (EBADF-like): neither resource nor
+        /// per-connection.
+        fn listener_fault() -> E {
+            E::AcceptFailed {
+                reason: "Bad file descriptor".into(),
+                resource_exhausted: false,
+                per_connection: false,
+            }
+        }
+
+        fn exhausted() -> E {
+            E::AcceptFailed {
+                reason: "Too many open files".into(),
+                resource_exhausted: true,
+                per_connection: false,
+            }
+        }
+
+        /// Connects to `addr` and sends one byte: readable at the server,
+        /// so the TLS handshake takes a node-wide slot and then stalls.
+        async fn stalled_tls_client(addr: SbcSocketAddr) -> tokio::net::TcpStream {
+            use tokio::io::AsyncWriteExt;
+            let mut s = tokio::net::TcpStream::connect(std::net::SocketAddr::from(addr))
+                .await
+                .unwrap();
+            s.write_all(&[0x16]).await.unwrap();
+            s
+        }
+
+        /// A connected, silent TCP socket to `addr` from 127.0.0.1. The
+        /// slot-pool tests raise the per-source caps above the pool size
+        /// instead of binding loopback aliases (127.0.0.2+), which macOS
+        /// does not configure by default, so they run the same everywhere.
+        async fn silent_socket(addr: SbcSocketAddr) -> tokio::net::TcpStream {
+            tokio::net::TcpStream::connect(std::net::SocketAddr::from(addr))
+                .await
+                .unwrap()
+        }
+
+        // SR-22: only process-wide resource errors back off (10 ms doubling
+        // to 1 s); a per-connection error continues at once.
+        #[test]
+        fn accept_backoff_only_on_resource_exhaustion() {
+            let mut b = AcceptBackoff::new();
+            for e in [
+                transient(),
+                E::Io {
+                    reason: "Too many open files".into(),
+                },
+                E::ReceiveFailed {
+                    reason: "accept failed".into(),
+                },
+            ] {
+                assert_eq!(b.on_error(&e), None, "{e:?} must not back off");
+            }
+            let seq: Vec<Option<D>> = (0..9).map(|_| b.on_error(&exhausted())).collect();
+            let want: Vec<Option<D>> = [10, 20, 40, 80, 160, 320, 640, 1_000, 1_000]
+                .into_iter()
+                .map(|ms| Some(D::from_millis(ms)))
+                .collect();
+            assert_eq!(seq, want);
+            assert_eq!(
+                b.on_error(&transient()),
+                None,
+                "a per-connection error never sleeps, even mid-backoff"
+            );
+            b.on_success();
+            assert_eq!(b.on_error(&exhausted()), Some(D::from_millis(10)));
+        }
+
+        // SR-22 (PERF-002, SEC-009): a broken listener socket fails every
+        // accept with a listener-level error. After 64 in a row with no
+        // successful accept those errors back off too; a success resets the
+        // run. Per-connection errors (peer aborts) never count and never
+        // back off, however many arrive.
+        #[test]
+        fn accept_backoff_after_consecutive_non_resource_errors() {
+            let mut b = AcceptBackoff::new();
+            for i in 0..10_000 {
+                assert_eq!(b.on_error(&transient()), None, "per-connection {i}");
+            }
+            for i in 1..AcceptBackoff::PERSISTENT {
+                assert_eq!(b.on_error(&listener_fault()), None, "error {i}");
+                assert_eq!(b.on_error(&transient()), None, "interleaved abort");
+            }
+            assert_eq!(b.on_error(&listener_fault()), Some(D::from_millis(10)));
+            assert_eq!(b.on_error(&listener_fault()), Some(D::from_millis(20)));
+            assert_eq!(
+                b.on_error(&transient()),
+                None,
+                "a per-connection error never sleeps, even mid-backoff"
+            );
+            let capped: Vec<_> = (0..10)
+                .filter_map(|_| b.on_error(&listener_fault()))
+                .collect();
+            assert_eq!(capped.last(), Some(&D::from_secs(1)), "capped at 1 s");
+            b.on_success();
+            assert_eq!(b.on_error(&listener_fault()), None, "run reset on success");
+        }
+
+        // NIST-006: node-wide handshake pool sizing.
+        #[test]
+        fn handshake_slot_count_sizing() {
+            let mut tc = sbc_config::schema::TransportConfig {
+                max_connections_total: 10,
+                max_handshakes_in_flight: 0,
+                ..Default::default()
+            };
+            assert_eq!(
+                handshake_slot_count(&tc),
+                10,
+                "auto never exceeds the total"
+            );
+            tc.max_handshakes_in_flight = 5;
+            assert_eq!(handshake_slot_count(&tc), 5, "explicit value");
+            tc.max_handshakes_in_flight = 50;
+            assert_eq!(
+                handshake_slot_count(&tc),
+                10,
+                "explicit above total is clamped"
+            );
+            tc.max_handshakes_in_flight = 0;
+            let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+            for total in [1_000_u32, 20_000, 1_000_000] {
+                tc.max_connections_total = total;
+                let total = total as usize;
+                assert_eq!(
+                    handshake_slot_count(&tc),
+                    (cores * 64).max(total / 8).max(64).min(total),
+                    "max(64 per core, total / 8), at most the total"
+                );
+            }
+            // SEC-001: the default total gives at least 2,500 slots on any
+            // core count, so 157 sources are needed to fill the pool.
+            let defaults = sbc_config::schema::TransportConfig::default();
+            let limits = HandshakeLimits::from_config(&defaults);
+            assert!(limits.slots >= 2_500, "{limits:?}");
+            assert_eq!(limits.per_source, 16, "{limits:?}");
+        }
+
+        // SEC-001: a slot is held at most min(2 s, handshake / 2); the slot
+        // wait stays min(1 s, handshake / 4).
+        #[test]
+        fn handshake_slot_hold_budget() {
+            let t = |ms| StreamTimeouts {
+                handshake: D::from_millis(ms),
+                ..short_timeouts()
+            };
+            assert_eq!(t(10_000).handshake_slot_hold(), D::from_secs(2));
+            assert_eq!(t(60_000).handshake_slot_hold(), D::from_secs(2));
+            assert_eq!(t(1_000).handshake_slot_hold(), D::from_millis(500));
+            assert_eq!(t(10_000).handshake_slot_wait(), D::from_secs(1));
+            assert_eq!(t(1_000).handshake_slot_wait(), D::from_millis(250));
+        }
+
+        // SEC-008: the startup log states the values in force whenever they
+        // differ from the configured ones (auto pool, clamped cap).
+        #[test]
+        fn handshake_limits_differ_from_config() {
+            let mut tc = sbc_config::schema::TransportConfig {
+                max_connections_total: 1_024,
+                max_connections_per_source: 128,
+                max_handshakes_in_flight: 512,
+                max_handshakes_per_source: 16,
+                ..Default::default()
+            };
+            let limits = HandshakeLimits::from_config(&tc);
+            assert_eq!((limits.slots, limits.per_source), (512, 16));
+            assert!(!limits.differ_from(&tc), "explicit and unclamped");
+            tc.max_handshakes_in_flight = 64;
+            let limits = HandshakeLimits::from_config(&tc);
+            assert_eq!(limits.per_source, 2, "1/32 of 64 slots");
+            assert!(limits.differ_from(&tc), "clamped per-source cap");
+            tc.max_handshakes_in_flight = 0;
+            assert!(
+                HandshakeLimits::from_config(&tc).differ_from(&tc),
+                "auto-sized pool"
+            );
+        }
+
+        // NIST-002: the per-source handshake cap is clamped to
+        // max_connections_per_source and to 1/32 of the node-wide pool.
+        #[test]
+        fn handshakes_per_source_clamped() {
+            let mut tc = sbc_config::schema::TransportConfig::default();
+            assert_eq!(handshakes_per_source(&tc, 512), 16, "defaults");
+            tc.max_connections_per_source = 8;
+            assert_eq!(handshakes_per_source(&tc, 512), 8, "per-source connections");
+            tc.max_connections_per_source = 128;
+            assert_eq!(handshakes_per_source(&tc, 64), 2, "1/32 of the pool");
+            assert_eq!(handshakes_per_source(&tc, 10), 1, "at least 1");
+        }
+
+        // SR-56 (SEC-005): WebSocket accepts do not use the accept bucket
+        // (behind a WSS proxy the accept address is the proxy's) until
+        // SR-59 keys WS admission on the client address.
+        #[tokio::test]
+        async fn ws_accept_not_rate_limited_by_accept_bucket() {
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024));
+            let stats = Arc::clone(&ctx.stats);
+            let (listener, addr) = ws_test_listener().await;
+            let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
+            for i in 0..3 {
+                let reply = ws_upgrade_status(addr).await.expect("upgrade answered");
+                assert!(reply.starts_with("HTTP/1.1 101"), "upgrade {i}: {reply}");
+            }
+            task.abort();
+            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 0);
+        }
+
+        // SR-56: the TLS listener applies the same bucket before the
+        // handshake.
+        #[tokio::test]
+        async fn accept_rate_drops_excess_tls_connections_before_handshake() {
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024));
+            let stats = Arc::clone(&ctx.stats);
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            assert!(tls_handshake_ok(addr, &client).await, "first handshake");
+            assert!(
+                !tls_handshake_ok(addr, &client).await,
+                "second over the bucket"
+            );
+            task.abort();
+            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.handshake_timeouts.load(Ordering::Relaxed), 0);
+        }
+
+        // SR-56: plain TCP is admitted (bucket included) before the
+        // transport is built; a refused accept never reaches the flow table.
+        #[tokio::test]
+        async fn accept_rate_drops_excess_tcp_connections() {
+            let listener = TcpListener::bind(SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let listen: std::net::SocketAddr = (*listener.local_addr()).into();
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024));
+            let stats = Arc::clone(&ctx.stats);
+            let flows = Arc::clone(&ctx.flows);
+            let task = tokio::spawn(Server::tcp_accept_loop(Arc::new(listener), ctx));
+            let first = tokio::net::TcpStream::connect(listen).await.unwrap();
+            let p1 = SbcSocketAddr::from(first.local_addr().unwrap());
+            assert!(tcp_flow_registered(&flows, &p1, D::from_secs(1)).await);
+            let second = tokio::net::TcpStream::connect(listen).await.unwrap();
+            let p2 = SbcSocketAddr::from(second.local_addr().unwrap());
+            assert!(!tcp_flow_registered(&flows, &p2, D::from_millis(300)).await);
+            task.abort();
+            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
+        }
+
+        // SR-56: with the node-wide handshake pool full, a new TLS
+        // connection waits for a slot (it is not dropped) and proceeds once
+        // one frees within the slot wait (1 s here).
+        #[tokio::test]
+        async fn tls_handshake_slot_waits_then_proceeds() {
+            let mut ctx = stream_test_ctx(StreamTimeouts {
+                handshake: D::from_secs(4),
+                ..short_timeouts()
+            });
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(8));
+            ctx.handshake_slots = Arc::new(Semaphore::new(1));
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            let holder = stalled_tls_client(addr).await;
+            tokio::time::sleep(D::from_millis(100)).await;
+            let second = tokio::spawn(async move { tls_handshake_ok(addr, &client).await });
+            tokio::time::sleep(D::from_millis(200)).await;
+            assert!(
+                !second.is_finished(),
+                "second handshake finished while the only handshake slot was held"
+            );
+            drop(holder);
+            let done = tokio::time::timeout(D::from_secs(3), second)
+                .await
+                .expect("second handshake proceeds once the slot frees")
+                .unwrap();
+            task.abort();
+            assert!(done, "second handshake completes");
+        }
+
+        // SR-56: the handshake slot is released when the handshake ends,
+        // not when the connection closes.
+        #[tokio::test]
+        async fn handshake_slot_released_before_receive_loop() {
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(8));
+            ctx.handshake_slots = Arc::new(Semaphore::new(2));
+            let slots = Arc::clone(&ctx.handshake_slots);
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            let connector = tokio_rustls::TlsConnector::from(client);
+            let name = rustls_pki_types::ServerName::try_from("sbc.example.test").unwrap();
+            let tcp = tokio::net::TcpStream::connect(std::net::SocketAddr::from(addr))
+                .await
+                .unwrap();
+            let mut open = tokio::time::timeout(D::from_secs(5), connector.connect(name, tcp))
+                .await
+                .unwrap()
+                .unwrap();
+            let t0 = std::time::Instant::now();
+            while slots.available_permits() != 2 && t0.elapsed() < D::from_secs(1) {
+                tokio::time::sleep(D::from_millis(5)).await;
+            }
+            assert_eq!(
+                slots.available_permits(),
+                2,
+                "handshake slot still held by an established connection"
+            );
+            let mut buf = [0u8; 1];
+            let read = tokio::time::timeout(
+                D::from_millis(200),
+                tokio::io::AsyncReadExt::read(&mut open, &mut buf),
+            )
+            .await;
+            assert!(
+                read.is_err(),
+                "established connection must stay open: {read:?}"
+            );
+            task.abort();
+        }
+
+        // SR-56 (SEC-001, PERF-001): the slot wait and the slot hold have
+        // their own budgets inside the handshake deadline (1 s here: wait
+        // 250 ms, hold 500 ms). A sends a byte and holds the only slot; B
+        // arrives 100 ms later and is dropped after its 250 ms slot wait
+        // (about 350 ms), counted as a slot timeout. A loses the slot at
+        // its 500 ms hold budget, counted as a hold timeout, long before
+        // the handshake deadline. Real time: paused time auto-advances past
+        // socket I/O.
+        #[tokio::test]
+        async fn qa_handshake_slot_wait_has_own_budget() {
+            let mut ctx = stream_test_ctx(StreamTimeouts {
+                handshake: D::from_secs(1),
+                ..short_timeouts()
+            });
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(8));
+            ctx.handshake_slots = Arc::new(Semaphore::new(1));
+            let stats = Arc::clone(&ctx.stats);
+            let listener_pool = Arc::clone(&ctx.conn_semaphore);
+            let total = Arc::clone(&ctx.total_conns);
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let slots = Arc::clone(&ctx.handshake_slots);
+            let (listener, _client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            let t0 = std::time::Instant::now();
+            let _a = stalled_tls_client(addr).await;
+            tokio::time::sleep(D::from_millis(100)).await;
+            let _b = stalled_tls_client(addr).await;
+            tokio::time::sleep(D::from_millis(440).saturating_sub(t0.elapsed())).await;
+            assert_eq!(
+                stats.handshake_slot_timeouts.load(Ordering::Relaxed),
+                1,
+                "B gives up on the slot after its own budget"
+            );
+            assert_eq!(
+                stats.handshake_slot_hold_timeouts.load(Ordering::Relaxed),
+                0
+            );
+            tokio::time::sleep(D::from_millis(800).saturating_sub(t0.elapsed())).await;
+            assert_eq!(
+                stats.handshake_slot_hold_timeouts.load(Ordering::Relaxed),
+                1,
+                "A loses the slot at its hold budget"
+            );
+            assert_eq!(
+                stats.handshake_timeouts.load(Ordering::Relaxed),
+                0,
+                "the hold budget fires before the handshake deadline"
+            );
+            assert_eq!(listener_pool.available_permits(), 4);
+            assert_eq!(total.available_permits(), 4);
+            assert_eq!(limiter.active(LOCALHOST_IP), 0);
+            assert_eq!(slots.available_permits(), 1);
+            task.abort();
+        }
+
+        // SR-56 (SEC-001): one-byte clients cannot hold the node-wide pool.
+        // Slot-count clients from 127.0.0.1 (per-source caps raised above
+        // the pool so only the pool limits them) each send one byte and
+        // stall, taking every slot. Each loses its slot at the hold budget
+        // (500 ms with a 1 s handshake deadline), and a real TLS client,
+        // retrying as a client would after a dropped attempt, completes
+        // its handshake within hold budget + slot wait of the pool
+        // filling. The real handshake can take the first freed slot and
+        // finish before the other stalled clients' hold timers fire, so
+        // the hold-timeout count is awaited, bounded by the handshake
+        // deadline (a missed hold would count as a handshake timeout).
+        #[tokio::test]
+        async fn one_byte_tls_clients_do_not_starve_handshake_slots() {
+            use tokio::io::AsyncWriteExt;
+            const SLOTS: usize = 8;
+            let timeouts = StreamTimeouts {
+                handshake: D::from_secs(1),
+                ..short_timeouts()
+            };
+            let mut ctx = stream_test_ctx(timeouts);
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(64, 64).with_handshake_cap(64));
+            ctx.conn_semaphore = Arc::new(Semaphore::new(64));
+            ctx.total_conns = Arc::new(Semaphore::new(64));
+            ctx.handshake_slots = Arc::new(Semaphore::new(SLOTS));
+            let slots = Arc::clone(&ctx.handshake_slots);
+            let stats = Arc::clone(&ctx.stats);
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            let mut stalled = Vec::new();
+            for _ in 0..SLOTS {
+                let mut s = silent_socket(addr).await;
+                s.write_all(&[0x16]).await.unwrap();
+                stalled.push(s);
+            }
+            let t0 = std::time::Instant::now();
+            while slots.available_permits() != 0 && t0.elapsed() < D::from_secs(1) {
+                tokio::time::sleep(D::from_millis(2)).await;
+            }
+            assert_eq!(
+                slots.available_permits(),
+                0,
+                "one-byte clients hold every slot"
+            );
+            let filled = std::time::Instant::now();
+            let budget = timeouts.handshake_slot_hold() + timeouts.handshake_slot_wait();
+            let mut ok = false;
+            while !ok && filled.elapsed() < budget {
+                ok = tls_handshake_ok(addr, &client).await;
+            }
+            let took = filled.elapsed();
+            assert!(
+                ok,
+                "real TLS handshake behind {SLOTS} one-byte clients did not complete \
+                 within {budget:?} (took {took:?})"
+            );
+            let deadline = timeouts.handshake + D::from_millis(250);
+            while stats.handshake_slot_hold_timeouts.load(Ordering::Relaxed) < SLOTS as u64
+                && filled.elapsed() < deadline
+            {
+                tokio::time::sleep(D::from_millis(5)).await;
+            }
+            task.abort();
+            assert_eq!(
+                stats.handshake_slot_hold_timeouts.load(Ordering::Relaxed),
+                SLOTS as u64,
+                "every one-byte client lost its slot at the hold budget"
+            );
+            assert_eq!(stats.handshake_timeouts.load(Ordering::Relaxed), 0);
+            drop(stalled);
+        }
+
+        // SR-56 (SEC-001, PERF-001): silent sockets hold no node-wide
+        // handshake slot. Slot-count silent TLS sockets from 127.0.0.1
+        // (per-source caps raised above the pool) leave every slot free,
+        // and a real TLS handshake completes within 1 s.
+        #[tokio::test]
+        async fn silent_tls_sockets_do_not_starve_handshake_slots() {
+            const SLOTS: usize = 8;
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(64, 64).with_handshake_cap(64));
+            ctx.conn_semaphore = Arc::new(Semaphore::new(64));
+            ctx.total_conns = Arc::new(Semaphore::new(64));
+            ctx.handshake_slots = Arc::new(Semaphore::new(SLOTS));
+            let slots = Arc::clone(&ctx.handshake_slots);
+            let listener_pool = Arc::clone(&ctx.conn_semaphore);
+            let stats = Arc::clone(&ctx.stats);
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            let mut silent = Vec::new();
+            for _ in 0..SLOTS {
+                silent.push(silent_socket(addr).await);
+            }
+            let t0 = std::time::Instant::now();
+            while listener_pool.available_permits() != 64 - SLOTS && t0.elapsed() < D::from_secs(1)
+            {
+                tokio::time::sleep(D::from_millis(5)).await;
+            }
+            assert_eq!(
+                listener_pool.available_permits(),
+                64 - SLOTS,
+                "every silent socket admitted"
+            );
+            assert_eq!(
+                slots.available_permits(),
+                SLOTS,
+                "silent sockets hold no slot"
+            );
+            let ok = tokio::time::timeout(D::from_secs(1), tls_handshake_ok(addr, &client)).await;
+            task.abort();
+            assert!(
+                matches!(ok, Ok(true)),
+                "real TLS handshake behind {SLOTS} silent sockets did not complete within 1 s"
+            );
+            assert_eq!(stats.handshake_slot_timeouts.load(Ordering::Relaxed), 0);
+            drop(silent);
+        }
+
+        // SR-56 (AU-12): accept-rate and blocked-source drops are counted
+        // and audited in aggregate, one record per source per flush.
+        #[tokio::test]
+        async fn accept_rate_and_blocked_are_audited_in_aggregate() {
+            let capture = uc_audit::capture::start();
+            let config = SbcConfig::default();
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024));
+            let stats = Arc::clone(&ctx.stats);
+            let per_ip = Arc::clone(&ctx.rate_limiter);
+            let global = Arc::clone(&ctx.global_limiter);
+            let conns = Arc::clone(&ctx.conn_limiter);
+            let (listener, client) = tls_test_listener().await;
+            let addr = *listener.local_addr();
+            let task = tokio::spawn(Server::tls_accept_loop(listener, ctx));
+            assert!(tls_handshake_ok(addr, &client).await, "first handshake");
+            assert!(!tls_handshake_ok(addr, &client).await, "over the bucket");
+            assert!(per_ip.lock().await.block(LOCALHOST_IP, D::from_secs(60)));
+            assert!(!tls_handshake_ok(addr, &client).await, "blocked");
+            assert!(!tls_handshake_ok(addr, &client).await, "blocked");
+            task.abort();
+            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.accept_blocked.load(Ordering::Relaxed), 2);
+
+            let mut maint = RateLimitMaintenance::new(
+                &config,
+                ShutdownSignal::new(),
+                Arc::clone(&per_ip),
+                global,
+                conns,
+            );
+            maint.sweep(true).await;
+            let records = rate_limit_records(&capture.events());
+            let named = |name: &str| -> Vec<_> {
+                records
+                    .iter()
+                    .filter(|r| r.limit_name == name)
+                    .cloned()
+                    .collect()
+            };
+            let rate = named("per_ip_accept_rate");
+            assert_eq!(rate.len(), 1, "{records:?}");
+            assert_eq!(rate[0].source_ip, LOCALHOST_IP);
+            assert_eq!(rate[0].request_count, 1, "counted once, not per path");
+            assert_eq!(
+                rate[0].threshold,
+                u64::from(config.transport.accept_rate_per_source)
+            );
+            let blocked = named("accept_blocked");
+            assert_eq!(blocked.len(), 1, "{records:?}");
+            assert_eq!(blocked[0].source_ip, LOCALHOST_IP);
+            assert_eq!(blocked[0].request_count, 2);
+
+            maint.sweep(true).await;
+            let again = rate_limit_records(&capture.events());
+            assert_eq!(
+                again
+                    .iter()
+                    .filter(|r| r.limit_name == "per_ip_accept_rate"
+                        || r.limit_name == "accept_blocked")
+                    .count(),
+                2,
+                "an idle interval emits no new accept records"
+            );
+        }
+
+        // SR-56 (AU-12): per-source handshake-cap rejections are audited as
+        // `handshake_busy`.
+        #[test]
+        fn handshake_busy_is_audited_in_aggregate() {
+            let capture = uc_audit::capture::start();
+            let limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(1));
+            let src: std::net::IpAddr = "192.0.2.60".parse().unwrap();
+            let _held = limiter.try_begin_handshake(src).unwrap();
+            assert!(limiter.try_begin_handshake(src).is_none());
+            assert!(limiter.try_begin_handshake(src).is_none());
+            let mut audit = RateLimitAudit::new(&SbcConfig::default());
+            audit.collect_conns(&limiter);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let busy: Vec<_> = records
+                .iter()
+                .filter(|r| r.limit_name == "handshake_busy")
+                .collect();
+            assert_eq!(busy.len(), 1, "{records:?}");
+            assert_eq!((busy[0].source_ip, busy[0].request_count), (src, 2));
+        }
+
+        // SEC-008: the handshake_busy threshold is the effective per-source
+        // cap enforced at accept, not the configured value.
+        #[test]
+        fn handshake_busy_audit_threshold_is_effective_cap() {
+            let mut config = SbcConfig::default();
+            config.transport.max_connections_total = 1_024;
+            config.transport.max_handshakes_in_flight = 64;
+            config.transport.max_handshakes_per_source = 16;
+            let effective = HandshakeLimits::from_config(&config.transport).per_source;
+            assert_eq!(effective, 2, "1/32 of 64 slots");
+            let capture = uc_audit::capture::start();
+            let limiter = Arc::new(ConnLimiter::new(8, 64).with_handshake_cap(effective));
+            let src: std::net::IpAddr = "192.0.2.61".parse().unwrap();
+            let _a = limiter.try_begin_handshake(src).unwrap();
+            let _b = limiter.try_begin_handshake(src).unwrap();
+            assert!(limiter.try_begin_handshake(src).is_none());
+            let mut audit = RateLimitAudit::new(&config);
+            audit.collect_conns(&limiter);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let busy: Vec<_> = records
+                .iter()
+                .filter(|r| r.limit_name == "handshake_busy" && r.source_ip == src)
+                .collect();
+            assert_eq!(busy.len(), 1, "{records:?}");
+            assert_eq!(busy[0].threshold, u64::from(effective));
+        }
+    }
+
+    /// SR-58: aggregate connection caps are wired from config and audited
+    /// as `per_prefix_conn` with the aggregate key as source. Compile-red
+    /// until `ConnLimiter::with_aggregate_caps`, `Rejection::PerAggregate`,
+    /// `Server::build_conn_limiter` and the `[transport]` keys exist.
+    mod sr58_aggregate_audit {
+        use super::*;
+
+        fn ip(s: &str) -> std::net::IpAddr {
+            s.parse().unwrap()
+        }
+
+        #[test]
+        fn per_prefix_conn_is_audited() {
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.transport.max_connections_per_v6_aggregate = 4;
+            config.transport.max_connections_per_v4_24 = 2;
+            let conns = Arc::new(
+                crate::conn_limit::ConnLimiter::new(128, 64).with_aggregate_caps(48, 4, 2),
+            );
+            let mut held = Vec::new();
+            for n in 1..=4u16 {
+                held.push(
+                    conns
+                        .try_acquire(ip(&format!("2001:db8:1:{n:x}::1")))
+                        .unwrap(),
+                );
+            }
+            assert!(conns.try_acquire(ip("2001:db8:1:5::1")).is_none());
+            assert!(conns.try_acquire(ip("2001:db8:1:6::1")).is_none());
+            held.push(conns.try_acquire(ip("192.0.2.1")).unwrap());
+            held.push(conns.try_acquire(ip("192.0.2.2")).unwrap());
+            assert!(conns.try_acquire(ip("192.0.2.3")).is_none());
+
+            let mut audit = RateLimitAudit::new(&config);
+            audit.collect_conns(&conns);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let prefix: Vec<_> = records
+                .iter()
+                .filter(|r| r.limit_name == "per_prefix_conn")
+                .collect();
+            assert_eq!(prefix.len(), 2, "{records:?}");
+            let v6 = prefix
+                .iter()
+                .find(|r| r.source_ip == ip("2001:db8:1::"))
+                .expect("v6 aggregate record keyed on the /48");
+            assert_eq!((v6.request_count, v6.threshold), (2, 4));
+            let v4 = prefix
+                .iter()
+                .find(|r| r.source_ip == ip("192.0.2.0"))
+                .expect("v4 aggregate record keyed on the /24");
+            assert_eq!((v4.request_count, v4.threshold), (1, 2));
+            // No per-source record: no /64 or host was at its own cap.
+            assert!(!records.iter().any(|r| r.limit_name == "per_ip_conn"));
+            drop(held);
+        }
+
+        /// Decision 9 defaults through the daemon's construction path: one
+        /// /56 with 128 connections per /64 gets exactly 1024.
+        #[test]
+        fn build_conn_limiter_defaults_bound_a_slash56() {
+            // Accept buckets off: this checks the concurrent caps, not the
+            // aggregate accept burst (800 at the defaults, tested below).
+            let mut config = SbcConfig::default();
+            config.transport.accept_rate_per_source = 0;
+            let conns = Arc::new(Server::build_conn_limiter(&config));
+            let mut held = Vec::new();
+            for sub in 0..=255u16 {
+                let a = ip(&format!("2001:db8:1:{:x}::1", 0xab00 | sub));
+                for _ in 0..128 {
+                    if let Some(g) = conns.try_acquire(a) {
+                        held.push(g);
+                    }
+                }
+            }
+            assert_eq!(held.len(), 1024);
+            let v4: Vec<_> = (0..=255u8)
+                .flat_map(|h| {
+                    let c = Arc::clone(&conns);
+                    (0..8).filter_map(move |_| c.try_acquire(ip(&format!("198.51.100.{h}"))))
+                })
+                .collect();
+            assert_eq!(v4.len(), 1024);
+        }
+
+        /// Every `[transport]` aggregate key reaches the limiter.
+        #[test]
+        fn build_conn_limiter_applies_aggregate_keys() {
+            let mut config = SbcConfig::default();
+            config.transport.max_connections_per_source = 1;
+            config.transport.v6_aggregate_prefix_len = 56;
+            config.transport.max_connections_per_v6_aggregate = 2;
+            config.transport.max_connections_per_v4_24 = 3;
+            let conns = Arc::new(Server::build_conn_limiter(&config));
+            let _a = conns.try_acquire(ip("2001:db8:1:100::1")).unwrap();
+            let _b = conns.try_acquire(ip("2001:db8:1:101::1")).unwrap();
+            assert!(conns.try_acquire(ip("2001:db8:1:102::1")).is_none());
+            // Next /56 in the same /48: the prefix key is /56, not /48.
+            let _c = conns.try_acquire(ip("2001:db8:1:200::1")).unwrap();
+            let v4: Vec<_> = (1..=4u8)
+                .filter_map(|h| conns.try_acquire(ip(&format!("192.0.2.{h}"))))
+                .collect();
+            assert_eq!(v4.len(), 3);
+            drop(v4);
+
+            // 0 turns both aggregate levels off.
+            config.transport.max_connections_per_v6_aggregate = 0;
+            config.transport.max_connections_per_v4_24 = 0;
+            let off = Arc::new(Server::build_conn_limiter(&config));
+            let all: Vec<_> = (1..=200u8)
+                .filter_map(|h| off.try_acquire(ip(&format!("192.0.2.{h}"))))
+                .collect();
+            assert_eq!(all.len(), 200);
+            drop(all);
+        }
+
+        /// SEC-002: the default aggregate accept burst is 16 x the
+        /// per-source burst (800), across the hosts of one /24.
+        #[test]
+        fn build_conn_limiter_wires_aggregate_accept_burst() {
+            let conns = Arc::new(Server::build_conn_limiter(&SbcConfig::default()));
+            let held: Vec<_> = (0..=255u8)
+                .flat_map(|h| {
+                    let c = Arc::clone(&conns);
+                    (0..4).filter_map(move |_| c.try_acquire(ip(&format!("198.51.100.{h}"))))
+                })
+                .collect();
+            assert_eq!(held.len(), 800);
+            assert_eq!(conns.aggregate_accept_rate(), 20 * 16);
+        }
+
+        /// SEC-003 / NIST-003: each startup clamp is logged and audited as
+        /// a `ConfigurationChange { Modified }` by `startup`; a stricter cap
+        /// is not a clamp.
+        #[test]
+        fn aggregate_clamp_emits_configuration_change() {
+            fn changes(
+                capture: &uc_audit::capture::CaptureGuard,
+            ) -> Vec<uc_audit::event::ConfigurationChange> {
+                capture
+                    .events()
+                    .iter()
+                    .filter_map(|e| match e {
+                        uc_audit::AuditEvent::ConfigurationChange(c) => Some(c.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.rate_limit.ipv6_prefix_len = 48;
+            config.transport.v6_aggregate_prefix_len = 56;
+            config.transport.max_connections_per_v6_aggregate = 20_000;
+            config.transport.max_connections_per_v4_24 = 20_001;
+            let conns = Server::build_conn_limiter(&config);
+            assert_eq!(
+                (conns.v6_aggregate_cap(), conns.v4_aggregate_cap()),
+                (10_000, 10_000)
+            );
+            let got = changes(&capture);
+            assert_eq!(got.len(), 3, "{got:?}");
+            for (key, from, to) in [
+                ("transport.v6_aggregate_prefix_len", 56, 48),
+                ("transport.max_connections_per_v6_aggregate", 20_000, 10_000),
+                ("transport.max_connections_per_v4_24", 20_001, 10_000),
+            ] {
+                assert!(
+                    got.iter().any(|c| c.admin == "startup"
+                        && c.change_type == uc_audit::event::ConfigChangeType::Modified
+                        && c.description.contains(key)
+                        && c.description.contains(&format!("from {from} to {to}"))),
+                    "{key}: {got:?}"
+                );
+            }
+            drop(capture);
+
+            let capture = uc_audit::capture::start();
+            let mut config = SbcConfig::default();
+            config.transport.max_connections_per_v6_aggregate = 4;
+            config.transport.max_connections_per_v4_24 = 1;
+            let conns = Server::build_conn_limiter(&config);
+            assert_eq!((conns.v6_aggregate_cap(), conns.v4_aggregate_cap()), (4, 1));
+            assert!(changes(&capture).is_empty());
+        }
+
+        /// SEC-006 / NIST-001: an aggregate rejection is counted and logged
+        /// as one, not as a per-source rejection.
+        #[test]
+        fn aggregate_rejection_counted_per_aggregate() {
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(
+                crate::conn_limit::ConnLimiter::new(2, 64)
+                    .with_aggregate_caps(48, 4, 1)
+                    .with_aggregate_handshake_cap(1),
+            );
+            let v4 = |last| SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, last), 1);
+            let v6 = SbcSocketAddr::new(ip("2001:db8:1:1::1"), 1);
+            let _a = Server::admit_connection(&ctx, &v4(1), "tcp").unwrap();
+            assert!(Server::admit_connection(&ctx, &v4(2), "tcp").is_none());
+            let _b = Server::admit_connection(&ctx, &v6, "tcp").unwrap();
+            let _c = Server::admit_connection(&ctx, &v6, "tcp").unwrap();
+            assert!(Server::admit_connection(&ctx, &v6, "tcp").is_none());
+            let s = &ctx.stats;
+            assert_eq!(s.conn_rejected_per_aggregate.load(Ordering::Relaxed), 1);
+            assert_eq!(s.conn_rejected_per_source.load(Ordering::Relaxed), 1);
+
+            let _h = Server::begin_handshake(&ctx, &v4(3), "tls").unwrap();
+            assert!(Server::begin_handshake(&ctx, &v4(4), "tls").is_none());
+            assert_eq!(s.handshake_busy_per_aggregate.load(Ordering::Relaxed), 1);
+            assert_eq!(s.handshake_busy_per_source.load(Ordering::Relaxed), 0);
+        }
+
+        /// SEC-002: aggregate accept-rate and handshake refusals are
+        /// audited per aggregate key with the effective limit.
+        #[test]
+        fn per_prefix_accept_and_handshake_are_audited() {
+            let capture = uc_audit::capture::start();
+            let conns = Arc::new(
+                crate::conn_limit::ConnLimiter::new(128, 64)
+                    .with_aggregate_caps(48, 1024, 1024)
+                    .with_accept_rate(1, 1, 1024)
+                    .with_aggregate_handshake_cap(1),
+            );
+            let held: Vec<_> = (1..=17u8)
+                .filter_map(|h| conns.try_acquire(ip(&format!("192.0.2.{h}"))))
+                .collect();
+            assert_eq!(held.len(), 16, "aggregate burst 16 x 1");
+            let _h = conns.try_begin_handshake(ip("192.0.2.1")).unwrap();
+            assert!(conns.try_begin_handshake(ip("192.0.2.2")).is_none());
+
+            let mut audit = RateLimitAudit::new(&SbcConfig::default());
+            audit.sweep_conns(&conns);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let find = |name: &str| {
+                let found = records.iter().find(|r| r.limit_name == name);
+                assert!(found.is_some(), "{name}: {records:?}");
+                found.unwrap()
+            };
+            let rate = find("per_prefix_accept_rate");
+            assert_eq!(
+                (rate.source_ip, rate.request_count, rate.threshold),
+                (ip("192.0.2.0"), 1, 16)
+            );
+            let busy = find("per_prefix_handshake_busy");
+            assert_eq!(
+                (busy.source_ip, busy.request_count, busy.threshold),
+                (ip("192.0.2.0"), 1, 1)
+            );
+            assert!(!records.iter().any(|r| r.limit_name == "per_ip_accept_rate"));
+            drop(held);
+        }
+    }
+
     /// Raw WebSocket client: upgrades with `sip` and returns the socket
     /// (past the 101 response) and its local address.
     async fn ws_raw_client(addr: std::net::SocketAddr) -> (tokio::net::TcpStream, SbcSocketAddr) {
@@ -6504,18 +9027,6 @@ mod tests {
         (h[0] & 0x0f, payload)
     }
 
-    async fn ws_test_listener() -> Arc<WebSocketListener> {
-        let bind = SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0);
-        Arc::new(
-            WebSocketListener::bind(&bind, false)
-                .await
-                .unwrap()
-                .with_options(WebSocketListenerOptions {
-                    require_sip_subprotocol: true,
-                }),
-        )
-    }
-
     // NIST 800-53 Rev5: SC-5
     // A flow-table send to an accepted WS flow is not delayed by the
     // reader's pending recv.
@@ -6523,7 +9034,7 @@ mod tests {
     async fn ws_flow_send_not_delayed_by_reader_tick() {
         let ctx = stream_test_ctx(short_timeouts());
         let flows = Arc::clone(&ctx.flows);
-        let listener = ws_test_listener().await;
+        let (listener, _) = ws_test_listener().await;
         let addr = listener.bound_addr().unwrap();
         let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
         let (mut client, peer) = ws_raw_client(addr).await;
@@ -6572,7 +9083,7 @@ mod tests {
     async fn ws_flow_table_close_ends_reader() {
         let ctx = stream_test_ctx(short_timeouts());
         let flows = Arc::clone(&ctx.flows);
-        let listener = ws_test_listener().await;
+        let (listener, _) = ws_test_listener().await;
         let addr = listener.bound_addr().unwrap();
         let accept = {
             let l = Arc::clone(&listener);
@@ -6618,7 +9129,7 @@ mod tests {
             first_message: std::time::Duration::from_millis(500),
             ..short_timeouts()
         });
-        let listener = ws_test_listener().await;
+        let (listener, _) = ws_test_listener().await;
         let addr = listener.bound_addr().unwrap();
         let accept = {
             let l = Arc::clone(&listener);
