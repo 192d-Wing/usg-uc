@@ -5,8 +5,8 @@
 //! site-local Postgres the SBC daemon and provision/api servers already
 //! read — making that local database a synced replica of the site's
 //! central shard. The agent is the *only* writer of central-origin rows
-//! locally; local break-glass writes (`updated_by = 'local'`) are left
-//! alone.
+//! locally; local break-glass writes (`updated_by = 'local:<actor>'`, or
+//! the legacy `'local'`) are left alone.
 //!
 //! - [`apply`] — the transactional snapshot/delta apply engine.
 //! - [`source`] — the [`ConfigSource`] reads + the [`reconcile`] policy +

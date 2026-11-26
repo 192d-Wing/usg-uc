@@ -568,6 +568,30 @@ fn qa_helm_render_provision_trusted_proxies() {
     );
 }
 
+/// The sbc-api login limiter keys on `X-Real-IP` only from the networks in
+/// `SBC_TRUSTED_PROXIES`; the chart must pass `sbcApi.trustedProxies`
+/// through, and leave the variable unset when the value is empty.
+/// NIST 800-53 Rev5: AC-7, SC-7
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_sbc_api_trusted_proxies() {
+    let out = must_render(
+        sbc(&[SBC_ISSUER, "sbcApi.trustedProxies={10.42.0.0/16}"]),
+        "sbc-api with trusted proxies",
+    );
+    let fname = fullname(&out);
+    let api = get(&out, "Deployment", &format!("{fname}-sbc-api"));
+    let tp = env_entry(api, "SBC_TRUSTED_PROXIES").expect("SBC_TRUSTED_PROXIES on sbc-api");
+    assert!(tp.contains("value: \"10.42.0.0/16\""), "{tp}");
+
+    let out = must_render(sbc(&[SBC_ISSUER]), "sbc-api default");
+    let api = get(&out, "Deployment", &format!("{fname}-sbc-api"));
+    assert!(
+        env_entry(api, "SBC_TRUSTED_PROXIES").is_none(),
+        "SBC_TRUSTED_PROXIES must be absent without sbcApi.trustedProxies"
+    );
+}
+
 #[test]
 #[ignore = "requires the helm binary; run with --ignored"]
 fn qa_helm_render_frontend_real_ip_from() {

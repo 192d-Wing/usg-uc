@@ -9,8 +9,11 @@
 //! ## NIST 800-53 Rev5 Controls
 //!
 //! - **SC-7**: Boundary Protection (trusted-proxy verification)
+//! - **AU-2, AU-3, CM-3**: management-plane audit records ([`mgmt_audit`])
 
-use std::net::IpAddr;
+pub mod mgmt_audit;
+
+use std::net::{IpAddr, Ipv6Addr};
 
 use http::HeaderMap;
 use ipnet::IpNet;
@@ -73,10 +76,36 @@ pub fn resolve_client_ip(headers: &HeaderMap, peer: IpAddr, trusted_proxies: &[I
     peer
 }
 
+/// Per-client bucket for rate limits and audit aggregation: an IPv6 address
+/// masked to its /64 (one host usually controls a whole /64), an
+/// IPv4-mapped IPv6 address as its IPv4, IPv4 unchanged.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+#[must_use]
+pub fn bucket_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
+            IpAddr::V4,
+        ),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_key_masks_ipv6_to_64_and_unmaps_ipv4() {
+        assert_eq!(
+            bucket_key(ip("2001:db8:1:2:aaaa:bbbb:cccc:dddd")),
+            ip("2001:db8:1:2::")
+        );
+        assert_eq!(bucket_key(ip("::ffff:192.0.2.7")), ip("192.0.2.7"));
+        assert_eq!(bucket_key(ip("192.0.2.7")), ip("192.0.2.7"));
+    }
 
     fn hdrs(x_real_ip: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();

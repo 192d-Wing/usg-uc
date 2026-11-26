@@ -840,6 +840,7 @@ dependencies = [
  "base64 0.22.1",
  "central-config-store",
  "http-body-util",
+ "ipnet",
  "jsonwebtoken",
  "proto-jwt",
  "rcgen",
@@ -848,6 +849,7 @@ dependencies = [
  "sbc-config",
  "sbc-config-store",
  "sbc-config-sync",
+ "sbc-http-util",
  "serde",
  "serde_json",
  "sqlx",
@@ -6244,6 +6246,7 @@ dependencies = [
  "sbc-http-util",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -6334,6 +6337,7 @@ dependencies = [
 name = "sbc-config-store"
 version = "0.10.0"
 dependencies = [
+ "sbc-http-util",
  "serde",
  "serde_json",
  "sqlx",
@@ -6467,6 +6471,7 @@ version = "0.10.0"
 dependencies = [
  "http",
  "ipnet",
+ "uc-audit",
 ]
 
 [[package]]
@@ -8375,6 +8380,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "pin-project-lite",
  "tower",
  "tower-layer",
@@ -8842,6 +8848,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "uc-audit",
  "uc-crypto",
  "uc-transport",
  "uc-types",

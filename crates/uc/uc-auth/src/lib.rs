@@ -32,7 +32,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
-use uc_crypto::hash::{SHA384_OUTPUT_LEN, hmac_sha384, verify_hmac_sha384};
+use uc_crypto::hash::{SHA384_OUTPUT_LEN, hmac_sha384, sha384, verify_hmac_sha384};
 use zeroize::Zeroizing;
 
 /// Default admin username when `SBC_ADMIN_USER` is unset.
@@ -205,6 +205,20 @@ impl TokenSigner {
         Some(claims)
     }
 
+    /// Audit id for a configured API-key digest: the first
+    /// [`API_KEY_ID_HEX`] hex digits of HMAC-SHA-384(signing key,
+    /// `"sbc-api-key-id:" || digest`). Keyed, so it cannot be computed from
+    /// the key (or its digest) alone; stable for as long as the signing key.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3, IA-5, SC-13
+    fn api_key_id(&self, digest: &str) -> String {
+        let mut input = Vec::with_capacity(API_KEY_ID_LABEL.len() + digest.len());
+        input.extend_from_slice(API_KEY_ID_LABEL);
+        input.extend_from_slice(digest.as_bytes());
+        let mac = self.sign(&input);
+        hex::encode(mac.get(..API_KEY_ID_HEX / 2).unwrap_or_default())
+    }
+
     /// HMAC-SHA-384 over `data` (aws-lc FIPS module via uc-crypto).
     fn sign(&self, data: &[u8]) -> [u8; SHA384_OUTPUT_LEN] {
         hmac_sha384(&self.key, data)
@@ -230,6 +244,52 @@ pub fn parse_signing_key(hex_key: &str) -> Result<TokenSigner, AuthError> {
         reason: e.to_string(),
     })?;
     TokenSigner::new(key)
+}
+
+/// Hex length of a SHA-384 digest.
+const API_KEY_DIGEST_HEX_LEN: usize = 96;
+
+/// Parses the accepted API-key digests.
+///
+/// `sha256` is the removed `SBC_API_KEY_SHA256` value: any non-blank value
+/// fails startup so a key that would silently stop working is noticed.
+/// `sha384` is `SBC_API_KEY_SHA384`: comma-separated lowercase-or-uppercase
+/// hex SHA-384 digests; each must be exactly 96 hex characters.
+///
+/// ## NIST 800-53 Rev5: IA-5, SC-13, CM-6
+fn parse_api_key_digests(
+    sha256: Option<&str>,
+    sha384: Option<&str>,
+) -> Result<Vec<String>, AuthError> {
+    if sha256.is_some_and(|v| !v.trim().is_empty()) {
+        return Err(AuthError::Invalid {
+            var: "SBC_API_KEY_SHA256",
+            reason: "SHA-256 API-key digests are no longer accepted; set \
+                     SBC_API_KEY_SHA384 to the SHA-384 hex digests instead"
+                .to_string(),
+        });
+    }
+    let Some(list) = sha384 else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (i, entry) in list.split(',').enumerate() {
+        let h = entry.trim().to_ascii_lowercase();
+        if h.is_empty() {
+            continue;
+        }
+        if h.len() != API_KEY_DIGEST_HEX_LEN || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AuthError::Invalid {
+                var: "SBC_API_KEY_SHA384",
+                reason: format!(
+                    "entry {} is not a {API_KEY_DIGEST_HEX_LEN}-character hex SHA-384 digest",
+                    i + 1
+                ),
+            });
+        }
+        out.push(h);
+    }
+    Ok(out)
 }
 
 /// Parses and bounds `SBC_AUTH_TOKEN_TTL_SECS`.
@@ -317,8 +377,9 @@ impl Authenticator {
     ///   replicas; at least 32 bytes decoded (48 recommended). Set-but-empty,
     ///   non-hex or short keys are rejected. If unset a random key is generated and a warning is
     ///   logged (single-replica only — tokens won't validate across pods).
-    /// - `SBC_API_KEY_SHA256` — comma-separated SHA-256 hex digests of
-    ///   accepted API keys (optional).
+    /// - `SBC_API_KEY_SHA384` — comma-separated SHA-384 hex digests of
+    ///   accepted API keys (optional). The former `SBC_API_KEY_SHA256` is
+    ///   rejected at startup.
     /// - `SBC_AUTH_TOKEN_TTL_SECS` — token lifetime (default 43200; must be
     ///   within 60..=86400).
     ///
@@ -365,15 +426,10 @@ impl Authenticator {
             }
         };
 
-        let api_key_hashes: Vec<String> = std::env::var("SBC_API_KEY_SHA256")
-            .ok()
-            .map(|s| {
-                s.split(',')
-                    .map(|h| h.trim().to_lowercase())
-                    .filter(|h| !h.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let api_key_hashes = parse_api_key_digests(
+            std::env::var("SBC_API_KEY_SHA256").ok().as_deref(),
+            std::env::var("SBC_API_KEY_SHA384").ok().as_deref(),
+        )?;
 
         let token_ttl_secs = match std::env::var("SBC_AUTH_TOKEN_TTL_SECS") {
             Ok(v) => parse_token_ttl(&v)?,
@@ -432,20 +488,70 @@ impl Authenticator {
     /// Returns true if `credential` is a valid session token or API key.
     #[must_use]
     pub fn authorize(&self, credential: &str) -> bool {
-        if self.signer.verify(credential).is_some() {
-            return true;
+        self.identify(credential).is_some()
+    }
+
+    /// Identifies a valid session token or API key, for audit attribution.
+    ///
+    /// An API key is named by a keyed id derived from its configured digest
+    /// and the signing key, never by the key or its digest.
+    ///
+    /// ## NIST 800-53 Rev5: IA-2, AU-3 (actor in audit records)
+    #[must_use]
+    pub fn identify(&self, credential: &str) -> Option<CredentialId> {
+        if let Some(claims) = self.signer.verify(credential) {
+            return Some(CredentialId::Session {
+                subject: claims.sub,
+            });
         }
         if self.api_key_hashes.is_empty() {
-            return false;
+            return None;
         }
-        // POAM: POA&M-211 — API-key lookup digests are SHA-256
-        // (SBC_API_KEY_SHA256); migrate to SHA-384 with dual-accept.
-        // CNSA-EXCEPTION: POA&M-211 stored SHA-256 digest format.
-        let digest = hex::encode(uc_crypto::interop::sha256(credential.as_bytes()));
-        self.api_key_hashes
-            .iter()
-            .any(|h| uc_crypto::constant_time::eq(h.as_bytes(), digest.as_bytes()))
+        // NIST 800-53 Rev5: IA-5, SC-13 — CNSA 2.0 SHA-384 lookup digest
+        // (POA&M-211 closed). API keys are random 256-bit values
+        // (docs/API-REFERENCE.md), so a fast digest is sufficient; a slow
+        // password KDF per configured key per request would be a DoS lever.
+        let digest = hex::encode(sha384(credential.as_bytes()));
+        // Every configured digest is compared (no early exit).
+        let mut matched: Option<&String> = None;
+        for h in self.api_key_hashes.iter() {
+            if uc_crypto::constant_time::eq(h.as_bytes(), digest.as_bytes()) {
+                matched = Some(h);
+            }
+        }
+        matched.map(|h| CredentialId::ApiKey {
+            key_id: self.signer.api_key_id(h),
+        })
     }
+
+    /// True if `name` is the configured admin username (audit only: an
+    /// unknown name is recorded as `unknown`, so a password typed into the
+    /// username field is never stored).
+    #[must_use]
+    pub fn is_admin_user(&self, name: &str) -> bool {
+        uc_crypto::constant_time::eq(self.admin.username.as_bytes(), name.as_bytes())
+    }
+}
+
+/// Hex digits of the keyed API-key audit id (64 bits).
+const API_KEY_ID_HEX: usize = 16;
+/// Domain-separation label for the API-key audit id MAC (token MACs start
+/// with `v2.`, so the two inputs never coincide).
+const API_KEY_ID_LABEL: &[u8] = b"sbc-api-key-id:";
+
+/// Who a valid credential belongs to ([`Authenticator::identify`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialId {
+    /// A session token minted by [`Authenticator::login`].
+    Session {
+        /// The token's `sub` claim (the admin username).
+        subject: String,
+    },
+    /// A configured API key.
+    ApiKey {
+        /// Keyed audit id (16 hex digits; see [`Authenticator::identify`]).
+        key_id: String,
+    },
 }
 
 /// Extracts a credential from request headers: `Authorization: Bearer <t>`
@@ -819,6 +925,139 @@ mod tests {
         assert_eq!(parse_token_ttl(" 3600 ").ok(), Some(3600));
     }
 
+    // ---- SR-40: credential identity for audit attribution ----------------
+
+    /// `test_auth()` plus one accepted API key; returns (auth, key, digest).
+    fn auth_with_api_key() -> (Authenticator, String, String) {
+        let key = format!("qa-api-key-{}", std::process::id());
+        let digest = hex::encode(sha384(key.as_bytes()));
+        let auth = Authenticator {
+            api_key_hashes: Arc::new(vec![digest.clone()]),
+            ..test_auth()
+        };
+        (auth, key, digest)
+    }
+
+    #[test]
+    fn identify_session_token_returns_subject() {
+        let auth = test_auth();
+        let token = auth.login("admin", "correct horse").expect("login");
+        match auth.identify(&token) {
+            Some(CredentialId::Session { subject }) => assert_eq!(subject, "admin"),
+            other => panic!("expected a session credential, got {other:?}"),
+        }
+        assert!(auth.authorize(&token), "authorize delegates to identify");
+    }
+
+    /// SR-40 round 1 (SEC-006): the id is keyed by the signing key, so it
+    /// cannot be derived from the key or its digest alone.
+    #[test]
+    fn identify_api_key_returns_keyed_id_not_key() {
+        let (auth, key, digest) = auth_with_api_key();
+        let id = |a: &Authenticator| match a.identify(&key) {
+            Some(CredentialId::ApiKey { key_id }) => key_id,
+            other => panic!("expected an API-key credential, got {other:?}"),
+        };
+        let key_id = id(&auth);
+        assert_eq!(key_id.len(), 16);
+        assert!(key_id.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!key_id.contains(&key), "the key itself is never the id");
+        assert_ne!(key_id, digest[..16], "not the unkeyed digest prefix");
+        assert_eq!(key_id, id(&auth), "stable for one signing key");
+        let other_signer = Authenticator {
+            signer: TokenSigner::new(b"another-signing-key-32-bytes-ok!!".to_vec()).expect("key"),
+            ..auth.clone()
+        };
+        assert_ne!(key_id, id(&other_signer), "keyed by the signing key");
+        assert!(auth.authorize(&key));
+    }
+
+    #[test]
+    fn identify_rejects_unknown_credential() {
+        let (auth, key, _) = auth_with_api_key();
+        for cred in [
+            "",
+            "garbage",
+            "v2.aaaa.bbbb",
+            &format!("{key}x"),
+            &test_signer().mint("admin", 0),
+        ] {
+            assert!(auth.identify(cred).is_none(), "{cred:?}");
+            assert_eq!(auth.authorize(cred), auth.identify(cred).is_some());
+        }
+        // A token minted with another key does not identify.
+        let other = Authenticator::new(
+            "admin",
+            &hash_password("correct horse").expect("hash"),
+            b"another-signing-key-32-bytes-ok!!".to_vec(),
+        )
+        .expect("auth");
+        let foreign = other.login("admin", "correct horse").expect("login");
+        assert!(auth.identify(&foreign).is_none());
+    }
+
+    // ---- POA&M-211: SHA-384 API-key digests only -------------------------
+
+    /// SHA-256 for building the rejected legacy digests (aws-lc-rs dev-dep;
+    /// uc-auth no longer links `uc_crypto::interop::sha256`).
+    fn test_sha256(data: &[u8]) -> Vec<u8> {
+        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data)
+            .as_ref()
+            .to_vec()
+    }
+
+    #[test]
+    fn api_key_sha256_digest_no_longer_identifies() {
+        let key = format!("qa-api-key-{}", std::process::id());
+        let auth = Authenticator {
+            api_key_hashes: Arc::new(vec![hex::encode(test_sha256(key.as_bytes()))]),
+            ..test_auth()
+        };
+        assert!(auth.identify(&key).is_none());
+    }
+
+    #[test]
+    fn api_key_digest_parsing() {
+        let d = hex::encode(sha384(b"k"));
+        assert_eq!(parse_api_key_digests(None, None).ok(), Some(Vec::new()));
+        assert_eq!(
+            parse_api_key_digests(Some(" "), Some(&format!(" {}, ,", d.to_uppercase()))).ok(),
+            Some(vec![d.clone()])
+        );
+        // The removed SHA-256 variable fails startup when set.
+        let sha256 = hex::encode(test_sha256(b"k"));
+        assert!(matches!(
+            parse_api_key_digests(Some(&sha256), None),
+            Err(AuthError::Invalid {
+                var: "SBC_API_KEY_SHA256",
+                ..
+            })
+        ));
+        // A SHA-256 digest (64 hex) or non-hex value in the SHA-384 list fails.
+        for bad in [sha256.as_str(), &"g".repeat(96), &format!("{d}0")] {
+            assert!(
+                matches!(
+                    parse_api_key_digests(None, Some(bad)),
+                    Err(AuthError::Invalid {
+                        var: "SBC_API_KEY_SHA384",
+                        ..
+                    })
+                ),
+                "{} chars",
+                bad.len()
+            );
+        }
+    }
+
+    #[test]
+    fn is_admin_user_matches_only_configured_name() {
+        let auth = test_auth();
+        assert!(auth.is_admin_user("admin"));
+        for name in ["", "Admin", "admin ", " admin", "admin\0", "root", "adm"] {
+            assert!(!auth.is_admin_user(name), "{name:?}");
+        }
+    }
+
     // SR-16 golden vectors: MACs captured from the RustCrypto
     // implementation (cross-checked with openssl / Python hmac) so the
     // move to uc_crypto::hash::hmac_sha384 is proven byte-identical and
@@ -854,16 +1093,5 @@ mod tests {
             "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f\
              3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952"
         );
-    }
-
-    #[test]
-    fn api_key_sha256_digest_unchanged() {
-        // printf %s test-api-key-0001 | openssl dgst -sha256
-        const DIGEST: &str = "2809c93358750a2d9574fc2a2c1f3942c2d7c5b0e70ac2f8dc7e1422272f6fd6";
-        let mut auth = test_auth();
-        auth.api_key_hashes = Arc::new(vec![DIGEST.to_string()]);
-        assert!(auth.authorize("test-api-key-0001"));
-        assert!(!auth.authorize("test-api-key-0002"));
-        assert!(!auth.authorize(DIGEST));
     }
 }

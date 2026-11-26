@@ -7,8 +7,13 @@
 //! the read-only `/dialplans` views, which still live on
 //! the daemon (`/cdrs` moved to the gRPC `CdrService`) — they're cheap to expose locally there and have no
 //! Postgres or gRPC equivalent yet. The dashboard hits sbc-api as the
-//! single front door, so the catch-all forwards anything it doesn't
-//! own.
+//! single front door, so the catch-all forwards reads it doesn't own.
+//!
+//! Writes are never forwarded: no in-repo client writes through the
+//! catch-all, and a forwarded write would reach the daemon under
+//! sbc-api's service identity, not the operator's. POST/PUT/DELETE answer
+//! 405 (the router backstop audits the refusal).
+//! NIST 800-53 Rev5: AC-3, AU-2, CM-5
 //!
 //! Body forwarding uses reqwest's streaming-buffered shape (bytes in,
 //! bytes out). Headers are mostly stripped — the daemon will set its
@@ -17,9 +22,8 @@
 
 use std::sync::Arc;
 
-use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
 use tracing::warn;
@@ -32,52 +36,19 @@ pub async fn proxy_get(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    proxy(
-        state,
-        reqwest::Method::GET,
-        &path,
-        &query,
-        &headers,
-        Bytes::new(),
+    proxy(state, reqwest::Method::GET, &path, &query, &headers).await
+}
+
+/// POST/PUT/DELETE on a path sbc-api does not own: 405, never forwarded.
+pub async fn refuse_write() -> Response {
+    let mut resp = (
+        StatusCode::METHOD_NOT_ALLOWED,
+        axum::Json(serde_json::json!({"error": "method not allowed"})),
     )
-    .await
-}
-
-pub async fn proxy_post(
-    State(state): State<Arc<AppState>>,
-    Path(path): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    proxy(state, reqwest::Method::POST, &path, &query, &headers, body).await
-}
-
-pub async fn proxy_put(
-    State(state): State<Arc<AppState>>,
-    Path(path): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    proxy(state, reqwest::Method::PUT, &path, &query, &headers, body).await
-}
-
-pub async fn proxy_delete(
-    State(state): State<Arc<AppState>>,
-    Path(path): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    proxy(
-        state,
-        reqwest::Method::DELETE,
-        &path,
-        &query,
-        &headers,
-        Bytes::new(),
-    )
-    .await
+        .into_response();
+    resp.headers_mut()
+        .insert(header::ALLOW, HeaderValue::from_static("GET"));
+    resp
 }
 
 async fn proxy(
@@ -86,7 +57,6 @@ async fn proxy(
     path: &str,
     query: &HashMap<String, String>,
     headers: &HeaderMap,
-    body: Bytes,
 ) -> Response {
     // Reject path-traversal attempts: Axum percent-decodes the captured
     // segment, so `%2e%2e` arrives here as `..`.  If we interpolate it
@@ -121,9 +91,6 @@ async fn proxy(
     }
     if let Some(ref token) = state.daemon_api_token {
         req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
-    }
-    if !body.is_empty() {
-        req = req.body(body);
     }
 
     match req.send().await {

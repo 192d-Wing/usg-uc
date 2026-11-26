@@ -51,6 +51,14 @@ pub struct Config {
     /// volume sizing, rotation and retention)
     // POAM: POA&M-133 -- no in-process audit file rotation or retention.
     pub audit_path: Option<std::path::PathBuf>,
+    /// Proxies whose `X-Real-IP` is trusted for the client IP in audit
+    /// records (`CENTRAL_API_TRUSTED_PROXIES`, comma-separated CIDRs).
+    /// Empty (default): the TCP peer is recorded.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3
+    // POAM: POA&M-428 (AU-3) the Helm chart does not set this, so behind an
+    // ingress the recorded client IP is the ingress address.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl Config {
@@ -110,6 +118,13 @@ impl Config {
                 Some(p)
             }
         };
+        let trusted_proxies = sbc_http_util::parse_cidr_list(
+            &lookup("CENTRAL_API_TRUSTED_PROXIES").unwrap_or_default(),
+        )
+        .map_err(|reason| ConfigError::Invalid {
+            var: "CENTRAL_API_TRUSTED_PROXIES",
+            reason,
+        })?;
         Ok(Self {
             listen_addr,
             database_url,
@@ -119,6 +134,7 @@ impl Config {
             oidc_audience,
             oidc_extra_ca_cert_file,
             audit_path,
+            trusted_proxies,
         })
     }
 }
@@ -165,6 +181,30 @@ mod tests {
             err,
             Some(ConfigError::Invalid {
                 var: "CENTRAL_API_AUDIT_PATH",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_proxies_parsed_default_empty_and_invalid_rejected() -> Result<(), ConfigError> {
+        let cfg = Config::from_lookup(lookup_with(&[]))?;
+        assert_eq!(cfg.trusted_proxies.len(), 0);
+        let cfg = Config::from_lookup(lookup_with(&[(
+            "CENTRAL_API_TRUSTED_PROXIES",
+            "10.42.0.0/16, fd00::/8",
+        )]))?;
+        assert_eq!(cfg.trusted_proxies.len(), 2);
+        let err = Config::from_lookup(lookup_with(&[(
+            "CENTRAL_API_TRUSTED_PROXIES",
+            "10.0.0.0/8,nonsense",
+        )]))
+        .err();
+        assert!(matches!(
+            err,
+            Some(ConfigError::Invalid {
+                var: "CENTRAL_API_TRUSTED_PROXIES",
                 ..
             })
         ));
