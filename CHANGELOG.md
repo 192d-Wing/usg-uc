@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC and soft client, TLS peer certificates ECDSA P-384 / SHA-384 only, SR-14)
+
+- **TLS peers must use ECDSA P-384 / SHA-384 end to end.** (SC-13, IA-3,
+  IA-5(2)) `uc_transport::tls::cnsa_provider()` now verifies the peer's
+  handshake signature, every issuing CA key and every certificate signature
+  below the trust anchor with ECDSA P-384 / SHA-384 only. RSA, P-256, P-521, Ed25519 and ML-DSA leaves
+  are refused, as is a P-384 leaf issued by an RSA or P-256 CA. No override.
+- **Affected connections:** SIP-TLS client certificates under
+  `security.require_mtls`, trunk TLS and mTLS, the SIPREC recorder, RFC 5425
+  CDR syslog, STIR `x5u` fetch, soft-client SIP-TLS and provisioning HTTPS.
+  Reissue peer and CA certificates as P-384 before upgrading. Daemon REST
+  HTTPS requests no client certificate and is unaffected; gRPC channels do
+  not use this provider.
+- **STIR `x5u`:** a certificate repository whose HTTPS chain is RSA or P-256
+  cannot be fetched from, so calls signed with its certificates fail
+  verification (POA&M-404). STI certificates themselves may still be P-256
+  (ES256). `uc-sti` reports a repository chain or signature refusal as
+  `FetchError::TlsCertPolicy` (label `tls-cert-policy`) and a
+  `handshake_failure` from the repository as `Transport("tls-peer-refused")`
+  (was `Transport("tls")`), with a warning naming the host at most once a
+  minute.
+- **SBC certificate:** soft clients and other usg-uc SBCs refuse a P-521 SBC
+  certificate. Use P-384.
+
 ### BREAKING (soft client, smart-card login and provisioning trust, POA&M-370, 371)
 
 Tested locally on macOS arm64; Windows covered by the CI cross-target build only.
