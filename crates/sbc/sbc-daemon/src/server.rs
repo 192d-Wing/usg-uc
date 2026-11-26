@@ -34,7 +34,9 @@ use uc_transport::listener::ListenerConfig;
 use uc_transport::tcp::TcpListener;
 use uc_transport::tls::TlsListener;
 use uc_transport::udp::UdpTransport;
-use uc_transport::websocket::{WebSocketListener, WebSocketListenerOptions};
+use uc_transport::websocket::{
+    ClientAddressMode, TrustedProxyFn, WebSocketListener, WebSocketListenerOptions,
+};
 use uc_types::address::{SbcSocketAddr, TransportType};
 
 /// Records a rate-limit event on the audit trail (no-op when auditing is
@@ -201,13 +203,37 @@ impl StreamTimeouts {
     }
 }
 
+/// Whether a `transport.ws_trusted_proxies` network is broad enough to
+/// warn about at startup: shorter than /16 (IPv4) or /48 (IPv6).
+///
+/// ## NIST 800-53 Rev5: CM-6, SC-7
+fn is_broad_trusted_proxy(net: &ipnet::IpNet) -> bool {
+    match net {
+        ipnet::IpNet::V4(v4) => v4.prefix_len() < 16,
+        ipnet::IpNet::V6(v6) => v6.prefix_len() < 48,
+    }
+}
+
 /// Resources one admitted stream connection holds for its whole life
 /// (handshake and receive loop). All RAII: released on return, panic or
-/// abort.
+/// abort. `_source` is `None` for a connection from a trusted WS proxy:
+/// its client's slot is held in a [`WsClientAdmission`] (SR-59).
 struct ConnAdmission {
-    _source: crate::conn_limit::ConnGuard,
+    _source: Option<crate::conn_limit::ConnGuard>,
     _listener: tokio::sync::OwnedSemaphorePermit,
     _total: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// What a client behind a trusted WebSocket proxy holds once admitted
+/// (SR-59): its per-source and aggregate connection slot for the life of
+/// the connection, and its handshake slot until the upgrade completes.
+/// Released on drop.
+struct WsClientAdmission {
+    _source: crate::conn_limit::ConnGuard,
+    handshake: Option<crate::conn_limit::HandshakeGuard>,
+    /// The stream rate limiter was busy at admission: repeat the blocked
+    /// check after the upgrade.
+    recheck_blocked: bool,
 }
 
 /// Which transport family a per-source rate limiter serves.
@@ -1497,6 +1523,7 @@ impl Server {
                 accept_tracked,
             )
             .with_handshake_cap(per_source_handshakes)
+            .with_proxy_handshake_cap(tc.ws_max_handshakes_per_proxy)
             .with_aggregate_handshake_cap(aggregate_handshake_cap(slot_count))
     }
 
@@ -2287,19 +2314,85 @@ impl Server {
         Ok(())
     }
 
+    /// WS client-address mode and trusted-proxy predicate from
+    /// `transport.ws_client_address` / `transport.ws_trusted_proxies`. Each
+    /// entry is a CIDR or a bare IP (a host route), IPv4-mapped entries
+    /// canonicalised to IPv4 ([`sbc_config::validate::parse_trusted_proxy`]);
+    /// an IPv4-mapped IPv6 peer matches IPv4 entries. An entry broader than
+    /// /16 (IPv4) or /48 (IPv6) is logged as a warning. Entries were
+    /// validated at load (prefix 0 is refused there); one that still fails
+    /// to parse is skipped with an error log, so it trusts nobody.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7, AU-3; RFC 7239 §8.1
+    fn ws_client_address(
+        transport: &sbc_config::schema::TransportConfig,
+    ) -> (ClientAddressMode, TrustedProxyFn) {
+        use sbc_config::schema::WsClientAddress;
+        let mode = match transport.ws_client_address {
+            WsClientAddress::Peer => ClientAddressMode::Peer,
+            WsClientAddress::ProxyV2 => ClientAddressMode::ProxyV2,
+            WsClientAddress::XForwardedFor => ClientAddressMode::XForwardedFor,
+            WsClientAddress::Forwarded => ClientAddressMode::Forwarded,
+        };
+        let nets: Arc<[ipnet::IpNet]> = transport
+            .ws_trusted_proxies
+            .iter()
+            .filter_map(|entry| {
+                let net = sbc_config::validate::parse_trusted_proxy(entry)
+                    .ok()
+                    .and_then(|(addr, prefix)| ipnet::IpNet::new(addr, prefix).ok());
+                match net {
+                    None => {
+                        error!(entry = %entry, "Ignoring invalid transport.ws_trusted_proxies entry");
+                    }
+                    Some(net) if is_broad_trusted_proxy(&net) => {
+                        warn!(
+                            entry = %entry,
+                            "transport.ws_trusted_proxies entry is broader than /16 (IPv4) or \
+                             /48 (IPv6): every address in it can claim any client address"
+                        );
+                    }
+                    Some(_) => {}
+                }
+                net
+            })
+            .collect();
+        let trusted: TrustedProxyFn = Arc::new(move |ip: std::net::IpAddr| {
+            let ip = ip.to_canonical();
+            nets.iter().any(|net| net.contains(&ip))
+        });
+        (mode, trusted)
+    }
+
     /// Binds SIP-over-WebSocket listeners from `transport.ws_listen`
     /// (RFC 7118). Plain `ws` only: the WebSocket transport does not
     /// terminate TLS, and `validate_config` rejects `wss_listen`.
     async fn bind_ws_listeners(&mut self) -> Result<(), ServerError> {
         let mut listeners = self.ws_listeners.write().await;
+        let (mode, trusted) = Self::ws_client_address(&self.config.transport);
+        if mode == ClientAddressMode::Peer
+            && !self.config.transport.ws_trusted_proxies.is_empty()
+            && !self.config.transport.ws_listen.is_empty()
+        {
+            warn!(
+                "transport.ws_trusted_proxies is set but transport.ws_client_address is \
+                 \"peer\": the list has no effect"
+            );
+        }
         for socket_addr in &self.config.transport.ws_listen {
             let addr = SbcSocketAddr::from(*socket_addr);
             match WebSocketListener::bind(&addr, false).await {
                 Ok(listener) => {
                     // RFC 7118 §4; NIST 800-53 Rev5: SC-7.
-                    let listener = listener.with_options(WebSocketListenerOptions {
-                        require_sip_subprotocol: self.config.transport.ws_require_sip_subprotocol,
-                    });
+                    let listener = listener
+                        .with_options(WebSocketListenerOptions {
+                            require_sip_subprotocol: self
+                                .config
+                                .transport
+                                .ws_require_sip_subprotocol,
+                        })
+                        // SR-59; NIST 800-53 Rev5: SC-5, SC-7, AU-3.
+                        .with_client_address(mode, Arc::clone(&trusted));
                     info!(address = %listener.local_addr(), "WebSocket listener bound");
                     listeners.push(Arc::new(listener));
                 }
@@ -2737,55 +2830,71 @@ impl Server {
         peer: &SbcSocketAddr,
         kind: &str,
     ) -> Option<ConnAdmission> {
-        Self::admit_with(ctx, peer, kind, true)
+        let source = Self::admit_source(ctx, peer, kind)?;
+        let pools = Self::admit_pools(ctx, peer, kind)?;
+        Some(ConnAdmission {
+            _source: Some(source),
+            ..pools
+        })
     }
 
-    /// [`Self::admit_connection`]; `metered` false skips the per-source
-    /// accept bucket (the caps still apply).
+    /// Per-source half of [`Self::admit_connection`]: the accept buckets
+    /// and one slot of `transport.max_connections_per_source` and of the
+    /// aggregate caps for `source`, or `None` (counted, and audited under
+    /// `source`). For a client behind a trusted WebSocket proxy, `source`
+    /// is the client address (SR-59).
     ///
-    /// ## NIST 800-53 Rev5: SC-5, SC-7
-    fn admit_with(
+    /// ## NIST 800-53 Rev5: SC-5, AU-3
+    fn admit_source(
         ctx: &StreamLoopContext,
-        peer: &SbcSocketAddr,
+        source: &SbcSocketAddr,
         kind: &str,
-        metered: bool,
-    ) -> Option<ConnAdmission> {
-        let admitted = if metered {
-            ctx.conn_limiter.try_admit(peer.ip())
-        } else {
-            ctx.conn_limiter.try_admit_unmetered(peer.ip())
-        };
-        let source = match admitted {
-            Ok(source) => source,
+    ) -> Option<crate::conn_limit::ConnGuard> {
+        match ctx.conn_limiter.try_admit(source.ip()) {
+            Ok(guard) => Some(guard),
             Err(crate::conn_limit::Rejection::AcceptRate) => {
                 ctx.stats
                     .accept_rate_limited
                     .fetch_add(1, Ordering::Relaxed);
-                debug!(peer = %peer, kind, "Per-source accept rate exceeded, dropping");
-                return None;
+                debug!(peer = %source, kind, "Per-source accept rate exceeded, dropping");
+                None
             }
             Err(crate::conn_limit::Rejection::AggregateAcceptRate) => {
                 ctx.stats
                     .accept_rate_limited
                     .fetch_add(1, Ordering::Relaxed);
-                debug!(peer = %peer, kind, "Aggregate accept rate exceeded, dropping");
-                return None;
+                debug!(peer = %source, kind, "Aggregate accept rate exceeded, dropping");
+                None
             }
             Err(crate::conn_limit::Rejection::PerAggregate) => {
                 ctx.stats
                     .conn_rejected_per_aggregate
                     .fetch_add(1, Ordering::Relaxed);
-                debug!(peer = %peer, kind, "Aggregate connection limit reached, dropping");
-                return None;
+                debug!(peer = %source, kind, "Aggregate connection limit reached, dropping");
+                None
             }
             Err(_) => {
                 ctx.stats
                     .conn_rejected_per_source
                     .fetch_add(1, Ordering::Relaxed);
-                debug!(peer = %peer, kind, "Per-source connection limit reached, dropping");
-                return None;
+                debug!(peer = %source, kind, "Per-source connection limit reached, dropping");
+                None
             }
-        };
+        }
+    }
+
+    /// Pool half of [`Self::admit_connection`]: this listener's pool and the
+    /// node-wide ceiling, with no per-source slot yet. Used on its own for a
+    /// trusted WS proxy, whose client is admitted (per-source slot, accept
+    /// bucket, aggregate and handshake caps) once it is named, before the
+    /// upgrade completes (SR-59).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    fn admit_pools(
+        ctx: &StreamLoopContext,
+        peer: &SbcSocketAddr,
+        kind: &str,
+    ) -> Option<ConnAdmission> {
         // Pool-full drops are counted and audited in aggregate
         // (`listener_conn` / `total_conn`) by RateLimitMaintenance, which
         // also logs one warning per flush; a per-socket warn! would be an
@@ -2801,7 +2910,7 @@ impl Server {
             return None;
         };
         Some(ConnAdmission {
-            _source: source,
+            _source: None,
             _listener: listener,
             _total: total,
         })
@@ -2821,11 +2930,19 @@ impl Server {
         // Lock held for the lookup only.
         let blocked = ctx.rate_limiter.lock().await.is_blocked(peer.ip());
         if blocked {
-            ctx.stats.accept_blocked.fetch_add(1, Ordering::Relaxed);
-            ctx.conn_limiter.note_accept_blocked(peer.ip());
-            debug!(peer = %peer, kind, "Source blocked, dropping at accept");
+            Self::note_accept_blocked(ctx, peer, kind);
         }
         blocked
+    }
+
+    /// Counts (stats and aggregated audit) one accept dropped because its
+    /// source is blocked.
+    ///
+    /// ## NIST 800-53 Rev5: AU-12, SC-7
+    fn note_accept_blocked(ctx: &StreamLoopContext, peer: &SbcSocketAddr, kind: &str) {
+        ctx.stats.accept_blocked.fetch_add(1, Ordering::Relaxed);
+        ctx.conn_limiter.note_accept_blocked(peer.ip());
+        debug!(peer = %peer, kind, "Source blocked, dropping at accept");
     }
 
     /// Takes a per-source handshake slot (`max_handshakes_per_source`), or
@@ -3006,13 +3123,24 @@ impl Server {
     /// in the spawned connection task under `transport.handshake_timeout_secs`,
     /// so a silent or slow client holds only its own connection slot and
     /// cannot stall the listener. The upgrade costs no crypto, so it takes
-    /// no handshake slot.
+    /// no node-wide handshake slot. A direct peer is admitted on its socket
+    /// address (blocked check, accept bucket, per-source and aggregate caps).
     ///
-    /// ## NIST 800-53 Rev5: SC-5, SC-7, SC-10
-    // POAM: POA&M-440 — the per-source accept bucket is off on WebSocket
-    // listeners: behind the recommended WSS proxy the accept address is the
-    // proxy's, so one bucket would be shared by every client. It is enabled
-    // once SR-59 keys WS admission on the client address (SC-5).
+    /// Behind a trusted reverse proxy (`transport.ws_trusted_proxies`, mode
+    /// not `peer`) the accept takes the pool permits and one of the proxy's
+    /// `transport.ws_max_handshakes_per_proxy` pre-handshake slots; the
+    /// client is admitted as soon as its address is known, before the
+    /// upgrade completes (right after the PROXY v2 preamble, or in the
+    /// upgrade-request check with HTTP 503 + `Retry-After` on refusal):
+    /// blocked check, accept bucket, per-source and aggregate caps and the
+    /// per-source handshake cap, all keyed on the client. The socket peer
+    /// stays the flow, registration and response-routing key (unique per
+    /// connection); the client address keys rate limiting, CDRs and audit.
+    /// A missing or invalid client address refuses the connection (counted,
+    /// and audited per proxy as `ws_proxy_header`) and never falls back to
+    /// the proxy's own key.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, SC-10, AU-3
     async fn ws_accept_loop(listener: Arc<WebSocketListener>, ctx: StreamLoopContext) {
         info!(address = %listener.local_addr(), "SIP WebSocket accept loop started");
         let mut backoff = AcceptBackoff::new();
@@ -3020,23 +3148,66 @@ impl Server {
             match listener.accept_tcp().await {
                 Ok((tcp_stream, peer)) => {
                     backoff.on_success();
-                    if Self::accept_blocked(&ctx, &peer, "ws").await {
-                        continue;
-                    }
-                    let Some(admission) = Self::admit_with(&ctx, &peer, "ws", false) else {
-                        continue;
+                    let proxied = listener.learns_client_address(peer.ip());
+                    let (admission, proxy_slot) = if proxied {
+                        // SR-59: the client is admitted once named; until
+                        // then the connection counts against its proxy.
+                        let Some(pools) = Self::admit_pools(&ctx, &peer, "ws") else {
+                            continue;
+                        };
+                        let Some(slot) = Self::begin_proxy_handshake(&ctx, &peer) else {
+                            continue;
+                        };
+                        (pools, Some(slot))
+                    } else {
+                        if Self::accept_blocked(&ctx, &peer, "ws").await {
+                            continue;
+                        }
+                        let Some(admission) = Self::admit_connection(&ctx, &peer, "ws") else {
+                            continue;
+                        };
+                        (admission, None)
                     };
                     let conn_ctx = ctx.clone();
                     let listener = Arc::clone(&listener);
                     tokio::spawn(async move {
+                        let admit_ctx = conn_ctx.clone();
+                        // The proxy's pre-handshake slot ends when the
+                        // client is named (or the closure is dropped).
+                        let admit = move |client: SbcSocketAddr| {
+                            drop(proxy_slot);
+                            Self::admit_ws_client(&admit_ctx, &client)
+                        };
                         match tokio::time::timeout(
                             conn_ctx.timeouts.handshake,
-                            listener.complete_handshake(tcp_stream, peer),
+                            listener.complete_handshake_with(tcp_stream, peer, admit),
                         )
                         .await
                         {
-                            Ok(Ok(transport)) => {
-                                debug!(peer = %peer, "Accepted SIP WebSocket connection");
+                            Ok(Ok((transport, client_admission))) => {
+                                let client = transport.client_addr();
+                                // The upgrade is over: release the client's
+                                // handshake slot, keep its connection slot.
+                                let client_admission = client_admission.map(|mut a| {
+                                    a.handshake = None;
+                                    a
+                                });
+                                if let Some(a) = &client_admission
+                                    && a.recheck_blocked
+                                    && Self::accept_blocked(
+                                        &conn_ctx,
+                                        &client.unwrap_or(peer),
+                                        "ws",
+                                    )
+                                    .await
+                                {
+                                    return;
+                                }
+                                debug!(
+                                    peer = %peer,
+                                    client = ?client,
+                                    "Accepted SIP WebSocket connection"
+                                );
                                 Self::stream_connection_loop(
                                     Arc::new(transport),
                                     peer,
@@ -3044,13 +3215,10 @@ impl Server {
                                     None,
                                 )
                                 .await;
+                                drop(client_admission);
                             }
                             Ok(Err(e)) => {
-                                conn_ctx
-                                    .stats
-                                    .ws_handshake_failures
-                                    .fetch_add(1, Ordering::Relaxed);
-                                debug!(peer = %peer, error = %e, "WebSocket handshake failed");
+                                Self::on_ws_handshake_error(&conn_ctx, &peer, &e);
                             }
                             Err(_) => {
                                 conn_ctx
@@ -3073,6 +3241,95 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Counts a failed WebSocket upgrade. A refused trusted-proxy header is
+    /// also counted under the proxy for the aggregated `ws_proxy_header`
+    /// audit record; an admission refusal was counted by the admission.
+    ///
+    /// ## NIST 800-53 Rev5: AU-12, SC-7
+    fn on_ws_handshake_error(
+        ctx: &StreamLoopContext,
+        peer: &SbcSocketAddr,
+        e: &uc_transport::TransportError,
+    ) {
+        let stats = &ctx.stats;
+        match e {
+            uc_transport::TransportError::ClientRefused { .. } => {
+                debug!(peer = %peer, error = %e, "WebSocket client refused by admission");
+                return;
+            }
+            uc_transport::TransportError::ProxyHeaderMissing { .. } => {
+                stats
+                    .ws_proxy_header_missing
+                    .fetch_add(1, Ordering::Relaxed);
+                ctx.conn_limiter.note_proxy_header(peer.ip());
+            }
+            uc_transport::TransportError::ProxyHeaderInvalid { .. } => {
+                stats
+                    .ws_proxy_header_invalid
+                    .fetch_add(1, Ordering::Relaxed);
+                ctx.conn_limiter.note_proxy_header(peer.ip());
+            }
+            _ => {}
+        }
+        stats.ws_handshake_failures.fetch_add(1, Ordering::Relaxed);
+        debug!(peer = %peer, error = %e, "WebSocket handshake failed");
+    }
+
+    /// Takes one of trusted proxy `proxy`'s pre-handshake slots
+    /// (`transport.ws_max_handshakes_per_proxy`), or `None` (counted, and
+    /// audited as `ws_proxy_handshake_busy` under the proxy).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    fn begin_proxy_handshake(
+        ctx: &StreamLoopContext,
+        proxy: &SbcSocketAddr,
+    ) -> Option<crate::conn_limit::ProxyHandshakeGuard> {
+        let slot = ctx.conn_limiter.try_proxy_handshake(proxy.ip());
+        if slot.is_none() {
+            ctx.stats
+                .ws_proxy_handshake_busy
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(peer = %proxy, "Trusted proxy pre-handshake limit reached, dropping");
+        }
+        slot
+    }
+
+    /// Admits a client named by a trusted WebSocket proxy, before its
+    /// upgrade completes: the blocked check, the accept buckets, the
+    /// per-source and aggregate connection caps and the per-source
+    /// handshake cap, all keyed on `client`. `None` refuses it (each
+    /// refusal counted and audited under the client).
+    ///
+    /// Runs synchronously inside the upgrade check, so the stream rate
+    /// limiter is only tried: when its lock is busy the blocked check is
+    /// repeated once the upgrade completes (`recheck_blocked`); the
+    /// per-message rate limit enforces a block either way.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7
+    fn admit_ws_client(
+        ctx: &StreamLoopContext,
+        client: &SbcSocketAddr,
+    ) -> Option<WsClientAdmission> {
+        let recheck_blocked = match ctx.rate_limiter.try_lock() {
+            Ok(limiter) => {
+                if limiter.is_blocked(client.ip()) {
+                    drop(limiter);
+                    Self::note_accept_blocked(ctx, client, "ws");
+                    return None;
+                }
+                false
+            }
+            Err(_) => true,
+        };
+        let source = Self::admit_source(ctx, client, "ws")?;
+        let handshake = Self::begin_handshake(ctx, client, "ws")?;
+        Some(WsClientAdmission {
+            _source: source,
+            handshake: Some(handshake),
+            recheck_blocked,
+        })
     }
 
     /// Accept loop for a SIP-over-TLS listener.
@@ -3199,6 +3456,11 @@ impl Server {
     ) {
         let mut buf = bytes::BytesMut::new();
         let dialled = egress.is_some();
+        // NIST 800-53 Rev5: SC-5, AU-3 — behind a trusted WS proxy the
+        // client address keys rate limiting and audit; `peer` (the socket)
+        // stays the flow and routing key, unique per connection (SR-59).
+        let client = transport.client_addr();
+        let limit_ip = client.map_or_else(|| peer.ip(), |c| c.ip());
         let key = egress.unwrap_or_else(|| {
             ctx.flows
                 .register_accepted(transport.transport_type(), peer, Arc::clone(&transport));
@@ -3304,7 +3566,11 @@ impl Server {
                                     // RFC 7118 §5: an incomplete SIP message
                                     // in a WS message is discarded, never
                                     // spliced onto the next WS message.
-                                    Self::discard_partial_ws_message(&peer, &mut buf, &ctx);
+                                    Self::discard_partial_ws_message(
+                                        &client.unwrap_or(peer),
+                                        &mut buf,
+                                        &ctx,
+                                    );
                                 }
                                 break;
                             }
@@ -3322,7 +3588,7 @@ impl Server {
 
                         if ctx.rate_limit_enabled
                             && !Self::rate_limit_allows(
-                                peer.ip(),
+                                limit_ip,
                                 &ctx.rate_limiter,
                                 &ctx.global_limiter,
                                 &ctx.stats,
@@ -3342,9 +3608,10 @@ impl Server {
                             .sip_stack
                             // RFC 3261 §17: responses and forwards ride this
                             // stream, so its transactions use reliable timers.
-                            .process_message_conn(
+                            .process_message_from(
                                 &frame,
                                 peer,
+                                client,
                                 ctx.zone_name.as_deref(),
                                 transport.transport_type(),
                                 Some(conn_id),
@@ -3425,8 +3692,10 @@ impl Server {
         ctx: &StreamLoopContext,
     ) {
         ctx.stats.framing_errors.fetch_add(1, Ordering::Relaxed);
-        ctx.conn_limiter.note_framing_error(peer.ip());
-        warn!(peer = %peer, error = %err, "Invalid stream framing, closing connection");
+        // SR-59: audited under the client behind a trusted WS proxy.
+        let source = transport.client_addr().unwrap_or(*peer);
+        ctx.conn_limiter.note_framing_error(source.ip());
+        warn!(peer = %peer, source = %source, error = %err, "Invalid stream framing, closing connection");
         if let Some(response) = framing_error_response(buf) {
             let _ = tokio::time::timeout(
                 crate::flows::STREAM_WRITE_TIMEOUT,
@@ -3854,6 +4123,18 @@ pub struct ServerStats {
     pub conn_rejected_per_aggregate: AtomicU64,
     /// WebSocket upgrades refused or failed (e.g. no `sip` subprotocol).
     pub ws_handshake_failures: AtomicU64,
+    /// WS connections from a trusted proxy refused because the configured
+    /// forwarding header or PROXY v2 preamble was absent (subset of
+    /// `ws_handshake_failures`; SR-59).
+    pub ws_proxy_header_missing: AtomicU64,
+    /// WS connections from a trusted proxy refused because the client
+    /// address was malformed, obfuscated or unusable (subset of
+    /// `ws_handshake_failures`; SR-59).
+    pub ws_proxy_header_invalid: AtomicU64,
+    /// WS accepts from a trusted proxy dropped because it already held
+    /// `transport.ws_max_handshakes_per_proxy` connections whose client was
+    /// not yet known (SR-59).
+    pub ws_proxy_handshake_busy: AtomicU64,
     /// TLS / WebSocket handshakes that hit `handshake_timeout_secs`.
     // POAM: POA&M-93 — these counters and the accept counters below are
     // not yet exported on the REST/metrics API (api_server.rs is owned
@@ -4157,6 +4438,8 @@ struct RateLimitAudit {
     aggregate_accept_rate: u64,
     /// Threshold of `per_prefix_handshake_busy` records.
     aggregate_handshakes: u64,
+    /// Threshold of `ws_proxy_handshake_busy` records (SR-59).
+    proxy_handshakes: u64,
 }
 
 impl RateLimitAudit {
@@ -4200,6 +4483,7 @@ impl RateLimitAudit {
             aggregate_handshakes: u64::from(aggregate_handshake_cap(
                 HandshakeLimits::from_config(&config.transport).slots,
             )),
+            proxy_handshakes: u64::from(config.transport.ws_max_handshakes_per_proxy),
         }
     }
 
@@ -4279,6 +4563,7 @@ impl RateLimitAudit {
         self.v4_aggregate_conns = u64::from(limiter.v4_aggregate_cap());
         self.aggregate_accept_rate = u64::from(limiter.aggregate_accept_rate());
         self.aggregate_handshakes = u64::from(limiter.max_handshakes_per_aggregate());
+        self.proxy_handshakes = u64::from(limiter.max_handshakes_per_proxy());
         let totals = limiter.drain_rejections(|key, kind, n| {
             let limit = match kind {
                 crate::conn_limit::Rejection::PerSource => "per_ip_conn",
@@ -4289,6 +4574,8 @@ impl RateLimitAudit {
                 crate::conn_limit::Rejection::HandshakeBusy => "handshake_busy",
                 crate::conn_limit::Rejection::AggregateHandshakeBusy => "per_prefix_handshake_busy",
                 crate::conn_limit::Rejection::AcceptBlocked => "accept_blocked",
+                crate::conn_limit::Rejection::ProxyHandshakeBusy => "ws_proxy_handshake_busy",
+                crate::conn_limit::Rejection::ProxyHeader => "ws_proxy_header",
             };
             self.add(key, limit, n);
         });
@@ -4334,7 +4621,8 @@ impl RateLimitAudit {
                 "per_prefix_conn" => self.v6_aggregate_conns,
                 "per_prefix_accept_rate" => self.aggregate_accept_rate,
                 "per_prefix_handshake_busy" => self.aggregate_handshakes,
-                "framing" | "accept_blocked" => 0,
+                "ws_proxy_handshake_busy" => self.proxy_handshakes,
+                "framing" | "accept_blocked" | "ws_proxy_header" => 0,
                 _ => self.per_ip_rps,
             };
             audit_rate_limit(source, limit, count, threshold);
@@ -7582,22 +7870,22 @@ mod tests {
             assert_eq!(handshakes_per_source(&tc, 10), 1, "at least 1");
         }
 
-        // SR-56 (SEC-005): WebSocket accepts do not use the accept bucket
-        // (behind a WSS proxy the accept address is the proxy's) until
-        // SR-59 keys WS admission on the client address.
+        // SR-59 (replaces the SR-56 WS exemption): a direct WebSocket peer
+        // is charged to the accept bucket on its socket address, like TCP
+        // and TLS; clients behind a trusted proxy are charged on their own
+        // address (sr59_ws_client_address).
         #[tokio::test]
-        async fn ws_accept_not_rate_limited_by_accept_bucket() {
+        async fn ws_direct_peer_accept_rate_limited_by_bucket() {
             let mut ctx = stream_test_ctx(short_timeouts());
             ctx.conn_limiter = Arc::new(ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024));
             let stats = Arc::clone(&ctx.stats);
             let (listener, addr) = ws_test_listener().await;
             let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
-            for i in 0..3 {
-                let reply = ws_upgrade_status(addr).await.expect("upgrade answered");
-                assert!(reply.starts_with("HTTP/1.1 101"), "upgrade {i}: {reply}");
-            }
+            let reply = ws_upgrade_status(addr).await.expect("upgrade answered");
+            assert!(reply.starts_with("HTTP/1.1 101"), "{reply}");
+            assert_eq!(ws_upgrade_status(addr).await, None, "over the bucket");
             task.abort();
-            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 0);
+            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
         }
 
         // SR-56: the TLS listener applies the same bucket before the
@@ -8260,6 +8548,746 @@ mod tests {
             );
             assert!(!records.iter().any(|r| r.limit_name == "per_ip_accept_rate"));
             drop(held);
+        }
+    }
+
+    /// SR-59 (D3): a WS reverse proxy no longer puts every client behind one
+    /// source key. Admission, the flow table, rate limiting and audit see
+    /// the client address learned from a trusted proxy; untrusted peers
+    /// stay keyed on the socket address.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, SC-7, AU-3; RFC 7239 §8.1
+    mod sr59_ws_client_address {
+        use super::*;
+        use std::net::{IpAddr, SocketAddr};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use uc_transport::websocket::{ClientAddressMode, TrustedProxyFn};
+        use uc_types::address::TransportType as T;
+
+        fn loopback_trusted() -> TrustedProxyFn {
+            Arc::new(|ip: IpAddr| ip.is_loopback())
+        }
+
+        fn nobody_trusted() -> TrustedProxyFn {
+            Arc::new(|_: IpAddr| false)
+        }
+
+        fn ip(s: &str) -> IpAddr {
+            s.parse().unwrap()
+        }
+
+        async fn bind(mode: Option<(ClientAddressMode, TrustedProxyFn)>) -> Arc<WebSocketListener> {
+            let mut l =
+                WebSocketListener::bind(&SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, 0), false)
+                    .await
+                    .unwrap()
+                    .with_options(WebSocketListenerOptions {
+                        require_sip_subprotocol: true,
+                    });
+            if let Some((m, f)) = mode {
+                l = l.with_client_address(m, f);
+            }
+            Arc::new(l)
+        }
+
+        struct Client {
+            s: tokio::net::TcpStream,
+            local: SocketAddr,
+            head: String,
+        }
+
+        impl Client {
+            fn upgraded(&self) -> bool {
+                self.head.starts_with("HTTP/1.1 101")
+            }
+        }
+
+        /// Opens a TCP connection, writes `preface` (PROXY v2 bytes or
+        /// nothing), then a WS upgrade carrying `extra` header lines; reads
+        /// the HTTP response head.
+        async fn open(addr: SocketAddr, preface: &[u8], extra: &str) -> Client {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let local = s.local_addr().unwrap();
+            let mut wire = preface.to_vec();
+            wire.extend_from_slice(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\n\
+                     Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: sip\r\n{extra}\r\n"
+                )
+                .as_bytes(),
+            );
+            let _ = s.write_all(&wire).await;
+            let mut head = Vec::new();
+            let mut b = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && head.len() < 4096 {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut b)).await
+                {
+                    Ok(Ok(1)) => head.push(b[0]),
+                    _ => break,
+                }
+            }
+            Client {
+                s,
+                local,
+                head: String::from_utf8_lossy(&head).into_owned(),
+            }
+        }
+
+        /// True when the upgraded session stays up (no EOF / close frame
+        /// within 500 ms). Consumes at most one byte.
+        async fn still_open(c: &mut Client) -> bool {
+            if !c.upgraded() {
+                return false;
+            }
+            let mut b = [0u8; 1];
+            match tokio::time::timeout(std::time::Duration::from_millis(500), c.s.read(&mut b))
+                .await
+            {
+                Err(_) => true,
+                Ok(Ok(1)) => b[0] != 0x88,
+                Ok(_) => false,
+            }
+        }
+
+        /// Masked client text frame (RFC 6455 §5.3).
+        async fn ws_send_text(s: &mut tokio::net::TcpStream, data: &[u8]) {
+            let mask = [0x11u8, 0x22, 0x33, 0x44];
+            let mut f = vec![0x81u8];
+            if data.len() < 126 {
+                f.push(0x80 | u8::try_from(data.len()).unwrap());
+            } else {
+                f.push(0x80 | 0x7E);
+                f.extend_from_slice(&u16::try_from(data.len()).unwrap().to_be_bytes());
+            }
+            f.extend_from_slice(&mask);
+            f.extend(data.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+            s.write_all(&f).await.unwrap();
+        }
+
+        /// Reads one unmasked server data frame payload.
+        async fn ws_read(s: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut h = [0u8; 2];
+                s.read_exact(&mut h).await.ok()?;
+                let len = match h[1] & 0x7F {
+                    126 => {
+                        let mut l = [0u8; 2];
+                        s.read_exact(&mut l).await.ok()?;
+                        usize::from(u16::from_be_bytes(l))
+                    }
+                    127 => return None,
+                    n => usize::from(n),
+                };
+                let mut p = vec![0u8; len];
+                s.read_exact(&mut p).await.ok()?;
+                Some(p)
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+
+        fn proxy_v2_tcp4(src: SocketAddr, dst: SocketAddr, local_cmd: bool) -> Vec<u8> {
+            let mut v = vec![
+                0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+            ];
+            v.push(if local_cmd { 0x20 } else { 0x21 });
+            v.push(0x11);
+            v.extend_from_slice(&12u16.to_be_bytes());
+            let (IpAddr::V4(s), IpAddr::V4(d)) = (src.ip(), dst.ip()) else {
+                unreachable!("v4 only");
+            };
+            v.extend_from_slice(&s.octets());
+            v.extend_from_slice(&d.octets());
+            v.extend_from_slice(&src.port().to_be_bytes());
+            v.extend_from_slice(&dst.port().to_be_bytes());
+            v
+        }
+
+        const WS_OPTIONS: &[u8] = b"OPTIONS sip:sbc@example.mil SIP/2.0\r\n\
+            Via: SIP/2.0/WS df7jal23ls0d.invalid;branch=z9hG4bKsr59;rport\r\n\
+            From: <sip:a@example.mil>;tag=1\r\nTo: <sip:sbc@example.mil>\r\n\
+            Call-ID: sr59\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\n\
+            Content-Length: 0\r\n\r\n";
+
+        /// True once an accepted WS flow is registered under `peer`. Only
+        /// `NoConnection` means "not registered": a write timeout (the
+        /// SR-60 reader/writer mutex, fixed by group E) still proves the
+        /// key, so this does not depend on E.
+        async fn flow_registered(flows: &FlowTable, peer: SbcSocketAddr) -> bool {
+            let flow = LegFlow::inbound(T::WebSocket);
+            for _ in 0..100 {
+                match flows.send(&flow, &peer, b"x", None).await {
+                    Err(crate::flows::FlowError::NoConnection) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    _ => return true,
+                }
+            }
+            false
+        }
+
+        // Plan D3: per-source cap 1, trusted 127.0.0.0/8, mode XFF. Two
+        // clients behind one proxy address each get their own slot; a second
+        // connection from the first client is refused on the client key and
+        // audited under it. Red on main: every WS client shares 127.0.0.1.
+        #[tokio::test]
+        async fn ws_clients_behind_trusted_proxy_get_own_source_slots() {
+            let capture = uc_audit::capture::start();
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter = Arc::new(crate::conn_limit::ConnLimiter::new(1, 64));
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let pool = Arc::clone(&ctx.conn_semaphore);
+            let l = bind(Some((ClientAddressMode::XForwardedFor, loopback_trusted()))).await;
+            let addr = l.bound_addr().unwrap();
+            let task = tokio::spawn(Server::ws_accept_loop(l, ctx));
+
+            let mut a = open(addr, &[], "X-Forwarded-For: 192.0.2.1\r\n").await;
+            assert!(a.upgraded(), "{}", a.head);
+            let mut b = open(addr, &[], "X-Forwarded-For: 203.0.113.9, 192.0.2.2\r\n").await;
+            assert!(b.upgraded(), "{}", b.head);
+            let mut c = open(addr, &[], "X-Forwarded-For: 192.0.2.1\r\n").await;
+            assert!(
+                !still_open(&mut c).await,
+                "second 192.0.2.1 must be refused"
+            );
+            assert!(still_open(&mut a).await);
+            assert!(still_open(&mut b).await);
+
+            assert_eq!(limiter.active(ip("192.0.2.1")), 1);
+            assert_eq!(limiter.active(ip("192.0.2.2")), 1);
+            assert_eq!(
+                limiter.active(ip("127.0.0.1")),
+                0,
+                "proxy key must hold nothing"
+            );
+            // The refused connection gave its pool permits back.
+            assert_eq!(pool.available_permits(), 2);
+
+            let mut config = SbcConfig::default();
+            config.transport.max_connections_per_source = 1;
+            let mut audit = RateLimitAudit::new(&config);
+            audit.collect_conns(&limiter);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let conn: Vec<_> = records
+                .iter()
+                .filter(|r| r.limit_name == "per_ip_conn")
+                .collect();
+            assert_eq!(conn.len(), 1, "{records:?}");
+            assert_eq!(
+                conn[0].source_ip,
+                ip("192.0.2.1"),
+                "AU-3: audit names the client"
+            );
+            task.abort();
+        }
+
+        // An untrusted peer's XFF is ignored: the flow and the slot are the
+        // socket address.
+        #[tokio::test]
+        async fn ws_untrusted_peer_forwarded_header_ignored() {
+            let ctx = stream_test_ctx(short_timeouts());
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let flows = Arc::clone(&ctx.flows);
+            let l = bind(Some((ClientAddressMode::XForwardedFor, nobody_trusted()))).await;
+            let addr = l.bound_addr().unwrap();
+            let task = tokio::spawn(Server::ws_accept_loop(l, ctx));
+            let c = open(addr, &[], "X-Forwarded-For: 192.0.2.1\r\n").await;
+            assert!(c.upgraded(), "{}", c.head);
+            let port = c.local.port();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(limiter.active(ip("127.0.0.1")), 1);
+            assert_eq!(limiter.active(ip("192.0.2.1")), 0);
+            assert_eq!(
+                flows
+                    .send(
+                        &LegFlow::inbound(T::WebSocket),
+                        &SbcSocketAddr::new_v4(Ipv4Addr::new(192, 0, 2, 1), port),
+                        b"x",
+                        None
+                    )
+                    .await,
+                Err(crate::flows::FlowError::NoConnection)
+            );
+            assert!(
+                flow_registered(&flows, SbcSocketAddr::new_v4(Ipv4Addr::LOCALHOST, port)).await
+            );
+            task.abort();
+        }
+
+        // PROXY v2 for 192.0.2.33:5000 then the upgrade: admission is keyed
+        // on the client, the flow table on the socket (SEC-001: flow keys
+        // stay unique per connection).
+        #[tokio::test]
+        async fn ws_proxy_v2_flow_keyed_on_socket_admission_on_client() {
+            let ctx = stream_test_ctx(short_timeouts());
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let flows = Arc::clone(&ctx.flows);
+            let l = bind(Some((ClientAddressMode::ProxyV2, loopback_trusted()))).await;
+            let addr = l.bound_addr().unwrap();
+            let task = tokio::spawn(Server::ws_accept_loop(l, ctx));
+            let src: SocketAddr = "192.0.2.33:5000".parse().unwrap();
+            let c = open(addr, &proxy_v2_tcp4(src, addr, false), "").await;
+            assert!(c.upgraded(), "{}", c.head);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(limiter.active(ip("192.0.2.33")), 1);
+            assert_eq!(limiter.active(ip("127.0.0.1")), 0);
+            // Keyed on the socket, never on the client the proxy claimed.
+            assert!(flow_registered(&flows, SbcSocketAddr::from(c.local)).await);
+            assert_eq!(
+                flows
+                    .send(
+                        &LegFlow::inbound(T::WebSocket),
+                        &SbcSocketAddr::from(src),
+                        b"x",
+                        None
+                    )
+                    .await,
+                Err(crate::flows::FlowError::NoConnection)
+            );
+            task.abort();
+        }
+
+        // PROXY v2 LOCAL (health check): admitted under the proxy key.
+        #[tokio::test]
+        async fn ws_proxy_v2_local_admitted_under_proxy_key() {
+            let ctx = stream_test_ctx(short_timeouts());
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let l = bind(Some((ClientAddressMode::ProxyV2, loopback_trusted()))).await;
+            let addr = l.bound_addr().unwrap();
+            let task = tokio::spawn(Server::ws_accept_loop(l, ctx));
+            let src: SocketAddr = "192.0.2.33:5000".parse().unwrap();
+            let mut c = open(addr, &proxy_v2_tcp4(src, addr, true), "").await;
+            assert!(still_open(&mut c).await, "{}", c.head);
+            assert_eq!(limiter.active(ip("127.0.0.1")), 1);
+            assert_eq!(limiter.active(ip("192.0.2.33")), 0);
+            task.abort();
+        }
+
+        // A trusted proxy that omits the header is refused and counted; the
+        // daemon never falls back to the proxy address, and every permit
+        // is returned.
+        #[tokio::test]
+        async fn ws_trusted_proxy_without_header_refused_and_counted() {
+            let capture = uc_audit::capture::start();
+            let ctx = stream_test_ctx(short_timeouts());
+            let stats = Arc::clone(&ctx.stats);
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let pool = Arc::clone(&ctx.conn_semaphore);
+            let total = Arc::clone(&ctx.total_conns);
+            let l = bind(Some((ClientAddressMode::XForwardedFor, loopback_trusted()))).await;
+            let addr = l.bound_addr().unwrap();
+            let task = tokio::spawn(Server::ws_accept_loop(l, ctx));
+
+            let mut c = open(addr, &[], "").await;
+            assert!(c.head.starts_with("HTTP/1.1 400"), "{}", c.head);
+            assert!(!still_open(&mut c).await);
+            let mut d = open(addr, &[], "X-Forwarded-For: 192.0.2.1, nonsense\r\n").await;
+            assert!(d.head.starts_with("HTTP/1.1 400"), "{}", d.head);
+            assert!(!still_open(&mut d).await);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            assert_eq!(stats.ws_proxy_header_missing.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.ws_proxy_header_invalid.load(Ordering::Relaxed), 1);
+            assert_eq!(limiter.active(ip("127.0.0.1")), 0);
+            assert_eq!(pool.available_permits(), 4);
+            assert_eq!(total.available_permits(), 4);
+            task.abort();
+
+            // SEC-006: one aggregated record per flush, keyed on the proxy.
+            let mut audit = RateLimitAudit::new(&SbcConfig::default());
+            audit.collect_conns(&limiter);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let header: Vec<_> = records
+                .iter()
+                .filter(|r| r.limit_name == "ws_proxy_header")
+                .collect();
+            assert_eq!(header.len(), 1, "{records:?}");
+            assert_eq!(header[0].source_ip, ip("127.0.0.1"));
+            assert_eq!(header[0].request_count, 2);
+        }
+
+        #[tokio::test]
+        async fn ws_proxy_v2_trusted_without_preamble_refused_and_counted() {
+            let ctx = stream_test_ctx(short_timeouts());
+            let stats = Arc::clone(&ctx.stats);
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let l = bind(Some((ClientAddressMode::ProxyV2, loopback_trusted()))).await;
+            let addr = l.bound_addr().unwrap();
+            let task = tokio::spawn(Server::ws_accept_loop(l, ctx));
+            let mut c = open(addr, &[], "").await;
+            assert!(!still_open(&mut c).await, "{}", c.head);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let counted = stats.ws_proxy_header_missing.load(Ordering::Relaxed)
+                + stats.ws_proxy_header_invalid.load(Ordering::Relaxed);
+            assert_eq!(counted, 1);
+            assert_eq!(limiter.active(ip("127.0.0.1")), 0);
+            task.abort();
+        }
+
+        // Rate limiting and the reply path use the client address: the
+        // OPTIONS reply comes back on the same WS connection, the per-IP
+        // bucket exists for the client, and none for the proxy.
+        #[tokio::test]
+        async fn ws_rate_limit_and_reply_keyed_on_client() {
+            let ctx = stream_test_ctx(short_timeouts());
+            let rate = Arc::clone(&ctx.rate_limiter);
+            let l = bind(Some((ClientAddressMode::XForwardedFor, loopback_trusted()))).await;
+            let addr = l.bound_addr().unwrap();
+            let task = tokio::spawn(Server::ws_accept_loop(l, ctx));
+            let mut c = open(addr, &[], "X-Forwarded-For: 192.0.2.77\r\n").await;
+            assert!(c.upgraded(), "{}", c.head);
+            ws_send_text(&mut c.s, WS_OPTIONS).await;
+            let reply = ws_read(&mut c.s)
+                .await
+                .expect("OPTIONS reply on the WS flow");
+            let reply = String::from_utf8_lossy(&reply).into_owned();
+            assert!(reply.starts_with("SIP/2.0 200"), "{reply}");
+            // Via received/rport (RFC 3261 §18.2.1, RFC 3581): if stamped,
+            // it must name the client, never the proxy.
+            assert!(!reply.contains("received=127.0.0.1"), "{reply}");
+            let rl = rate.lock().await;
+            assert!(rl.token_count(ip("192.0.2.77")).is_some());
+            assert!(rl.token_count(ip("127.0.0.1")).is_none());
+            drop(rl);
+            task.abort();
+        }
+
+        // Config wiring: `transport.ws_client_address` and
+        // `transport.ws_trusted_proxies` reach the listener.
+        #[test]
+        fn ws_client_address_config_maps_mode_and_cidrs() {
+            let config = sbc_config::load_from_str(
+                r#"
+                [transport]
+                ws_listen = ["127.0.0.1:7080"]
+                ws_trusted_proxies = ["10.0.0.0/8", "2001:db8::/32", "192.0.2.7"]
+                ws_client_address = "proxy_v2"
+            "#,
+            )
+            .unwrap();
+            let (mode, trusted) = Server::ws_client_address(&config.transport);
+            assert_eq!(mode, ClientAddressMode::ProxyV2);
+            assert!(trusted(ip("10.1.2.3")));
+            assert!(trusted(ip("192.0.2.7")));
+            assert!(!trusted(ip("192.0.2.8")));
+            assert!(trusted(ip("2001:db8::5")));
+            assert!(!trusted(ip("2001:db9::1")));
+            assert!(
+                trusted(ip("::ffff:10.1.2.3")),
+                "v4-mapped peer matches v4 CIDR"
+            );
+
+            for (text, want) in [
+                ("x_forwarded_for", ClientAddressMode::XForwardedFor),
+                ("forwarded", ClientAddressMode::Forwarded),
+            ] {
+                let c = sbc_config::load_from_str(&format!(
+                    "[transport]\nws_listen = [\"127.0.0.1:7080\"]\n\
+                     ws_trusted_proxies = [\"10.0.0.0/8\"]\nws_client_address = \"{text}\"\n"
+                ))
+                .unwrap();
+                assert_eq!(Server::ws_client_address(&c.transport).0, want);
+            }
+
+            let (mode, trusted) = Server::ws_client_address(&SbcConfig::default().transport);
+            assert_eq!(mode, ClientAddressMode::Peer);
+            assert!(!trusted(ip("127.0.0.1")));
+            assert!(!trusted(ip("10.1.2.3")));
+        }
+
+        #[tokio::test]
+        async fn bind_ws_listeners_applies_trusted_proxies() {
+            let mut config = SbcConfig::default();
+            config.transport.ws_listen = vec!["127.0.0.1:0".parse().unwrap()];
+            config.transport.ws_trusted_proxies = vec!["127.0.0.0/8".to_string()];
+            config.transport.ws_client_address = sbc_config::schema::WsClientAddress::XForwardedFor;
+            let mut server = Server::new(config, ShutdownSignal::new(), None).unwrap();
+            server.bind_ws_listeners().await.unwrap();
+            let listeners = server.ws_listeners.read().await;
+            assert_eq!(listeners.len(), 1);
+            assert!(listeners[0].is_trusted_proxy(ip("127.0.0.1")));
+            assert!(!listeners[0].is_trusted_proxy(ip("192.0.2.1")));
+        }
+
+        // ---- SR-59 fix round ----
+
+        /// Reads one WS data frame and returns it as text.
+        async fn ws_read_text(s: &mut tokio::net::TcpStream) -> Option<String> {
+            ws_read(s)
+                .await
+                .map(|p| String::from_utf8_lossy(&p).into_owned())
+        }
+
+        // SEC-001 (BLOCKER): two trusted proxies (127.0.0.1 and ::1) present
+        // the same client ip:port. Both connections stay registered under
+        // their own socket, and a request on each is answered on that
+        // socket. SBC-originated flow sends to these keys are not exercised
+        // here (they land with SR-60). Skipped, with a note on stderr, where
+        // the host has no IPv6 loopback.
+        #[tokio::test]
+        async fn ws_two_proxies_same_client_flows_stay_distinct() {
+            let ctx = stream_test_ctx(short_timeouts());
+            let flows = Arc::clone(&ctx.flows);
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let l4 = bind(Some((ClientAddressMode::ProxyV2, loopback_trusted()))).await;
+            let Ok(l6) = WebSocketListener::bind(
+                &SbcSocketAddr::new_v6(std::net::Ipv6Addr::LOCALHOST, 0),
+                false,
+            )
+            .await
+            else {
+                eprintln!(
+                    "skipping ws_two_proxies_same_client_flows_stay_distinct: no IPv6 loopback"
+                );
+                return;
+            };
+            let l6 =
+                Arc::new(l6.with_client_address(ClientAddressMode::ProxyV2, loopback_trusted()));
+            let (a4, a6) = (l4.bound_addr().unwrap(), l6.bound_addr().unwrap());
+            let t4 = tokio::spawn(Server::ws_accept_loop(l4, ctx.clone()));
+            let t6 = tokio::spawn(Server::ws_accept_loop(l6, ctx));
+            let src: SocketAddr = "192.0.2.33:5000".parse().unwrap();
+            let mut a = open(a4, &proxy_v2_tcp4(src, a4, false), "").await;
+            let mut b = open(a6, &proxy_v2_tcp4(src, a4, false), "").await;
+            assert!(a.upgraded(), "{}", a.head);
+            assert!(b.upgraded(), "{}", b.head);
+            // One client, two connections: both slots on the client key.
+            assert_eq!(limiter.active(ip("192.0.2.33")), 2);
+            let (ka, kb) = (SbcSocketAddr::from(a.local), SbcSocketAddr::from(b.local));
+            assert_ne!(ka, kb);
+            // Each socket key maps to its own connection (no overwrite):
+            // the v4 listener's transport under A's socket, the v6 one
+            // under B's, both naming the same client.
+            let mut conns = (None, None);
+            for _ in 0..100 {
+                conns = (
+                    flows.accepted(T::WebSocket, ka),
+                    flows.accepted(T::WebSocket, kb),
+                );
+                if conns.0.is_some() && conns.1.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let (ca, cb) = (conns.0.unwrap(), conns.1.unwrap());
+            assert!(!Arc::ptr_eq(&ca, &cb));
+            assert!(ca.local_addr().is_ipv4(), "{:?}", ca.local_addr());
+            assert!(!cb.local_addr().is_ipv4(), "{:?}", cb.local_addr());
+            assert_eq!(ca.client_addr(), Some(SbcSocketAddr::from(src)));
+            assert_eq!(cb.client_addr(), Some(SbcSocketAddr::from(src)));
+            // No flow under the claimed client address.
+            assert!(
+                flows
+                    .accepted(T::WebSocket, SbcSocketAddr::from(src))
+                    .is_none()
+            );
+
+            // A request on each connection is answered on that connection.
+            for (c, id) in [(&mut a, "sr59-a"), (&mut b, "sr59-b")] {
+                let req = String::from_utf8_lossy(WS_OPTIONS)
+                    .replace("Call-ID: sr59", &format!("Call-ID: {id}"));
+                ws_send_text(&mut c.s, req.as_bytes()).await;
+                let reply = ws_read_text(&mut c.s).await.expect("reply on own socket");
+                assert!(reply.starts_with("SIP/2.0 200"), "{reply}");
+                assert!(reply.contains(&format!("Call-ID: {id}")), "{reply}");
+            }
+            // Closing one leaves the other registered.
+            drop(a);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(flows.accepted(T::WebSocket, ka).is_none());
+            assert!(flows.accepted(T::WebSocket, kb).is_some());
+            t4.abort();
+            t6.abort();
+        }
+
+        // SEC-003: the accept bucket is keyed on the client behind the
+        // proxy: one client exhausts its bucket (503 + Retry-After, before
+        // the upgrade), another client still connects.
+        #[tokio::test]
+        async fn ws_proxied_client_bucket_exhausted_other_client_connects() {
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter =
+                Arc::new(crate::conn_limit::ConnLimiter::new(8, 64).with_accept_rate(1, 1, 1_024));
+            let stats = Arc::clone(&ctx.stats);
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let pool = Arc::clone(&ctx.conn_semaphore);
+            let l = bind(Some((ClientAddressMode::XForwardedFor, loopback_trusted()))).await;
+            let addr = l.bound_addr().unwrap();
+            let task = tokio::spawn(Server::ws_accept_loop(l, ctx));
+            let mut a1 = open(addr, &[], "X-Forwarded-For: 192.0.2.50\r\n").await;
+            assert!(a1.upgraded(), "{}", a1.head);
+            let a2 = open(addr, &[], "X-Forwarded-For: 192.0.2.50\r\n").await;
+            let head = a2.head.to_ascii_lowercase();
+            assert!(head.starts_with("http/1.1 503"), "{head}");
+            assert!(head.contains("retry-after:"), "{head}");
+            let mut b = open(addr, &[], "X-Forwarded-For: 192.0.2.51\r\n").await;
+            assert!(b.upgraded(), "{}", b.head);
+            assert!(still_open(&mut a1).await);
+            assert!(still_open(&mut b).await);
+            assert_eq!(stats.accept_rate_limited.load(Ordering::Relaxed), 1);
+            assert_eq!(limiter.active(ip("192.0.2.50")), 1);
+            assert_eq!(limiter.active(ip("192.0.2.51")), 1);
+            assert_eq!(limiter.active(ip("127.0.0.1")), 0);
+            drop(a2);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // The refused connection gave its pool permit back.
+            assert_eq!(pool.available_permits(), 2);
+            task.abort();
+        }
+
+        // SEC-002/003: PROXY v2 clients that send the preamble and stall the
+        // upgrade are bounded by their own per-source handshake cap; another
+        // client behind the same proxy still upgrades.
+        #[tokio::test]
+        async fn ws_proxy_v2_stalled_upgrades_bounded_per_source() {
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+            ctx.total_conns = Arc::new(tokio::sync::Semaphore::new(8));
+            ctx.conn_limiter =
+                Arc::new(crate::conn_limit::ConnLimiter::new(8, 64).with_handshake_cap(2));
+            let stats = Arc::clone(&ctx.stats);
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let l = bind(Some((ClientAddressMode::ProxyV2, loopback_trusted()))).await;
+            let addr = l.bound_addr().unwrap();
+            let task = tokio::spawn(Server::ws_accept_loop(l, ctx));
+            let src: SocketAddr = "192.0.2.40:4000".parse().unwrap();
+            let mut stalled = Vec::new();
+            for _ in 0..3 {
+                let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                s.write_all(&proxy_v2_tcp4(src, addr, false)).await.unwrap();
+                stalled.push(s);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let mut closed = 0;
+            for s in &mut stalled {
+                let mut b = [0u8; 1];
+                if let Ok(Ok(0) | Err(_)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(300), s.read(&mut b))
+                        .await
+                {
+                    closed += 1;
+                }
+            }
+            assert_eq!(closed, 1, "only the third stalled upgrade is refused");
+            assert_eq!(stats.handshake_busy_per_source.load(Ordering::Relaxed), 1);
+            assert_eq!(limiter.active(ip("192.0.2.40")), 2);
+            let other: SocketAddr = "192.0.2.41:4000".parse().unwrap();
+            let c = open(addr, &proxy_v2_tcp4(other, addr, false), "").await;
+            assert!(c.upgraded(), "{}", c.head);
+            task.abort();
+        }
+
+        // SEC-002: a trusted proxy holds at most ws_max_handshakes_per_proxy
+        // connections whose client is not yet known; the next is dropped,
+        // counted and audited under the proxy.
+        #[tokio::test]
+        async fn ws_per_proxy_pre_handshake_cap_drops_and_audits() {
+            let capture = uc_audit::capture::start();
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.conn_limiter =
+                Arc::new(crate::conn_limit::ConnLimiter::new(8, 64).with_proxy_handshake_cap(2));
+            let stats = Arc::clone(&ctx.stats);
+            let limiter = Arc::clone(&ctx.conn_limiter);
+            let listener = bind(Some((ClientAddressMode::ProxyV2, loopback_trusted()))).await;
+            let addr = listener.bound_addr().unwrap();
+            let task = tokio::spawn(Server::ws_accept_loop(listener, ctx));
+            let mut silent = Vec::new();
+            for _ in 0..2 {
+                silent.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut third = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut byte = [0u8; 1];
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(2), third.read(&mut byte))
+                    .await;
+            assert!(
+                matches!(read, Ok(Ok(0) | Err(_))),
+                "third must be dropped: {read:?}"
+            );
+            assert_eq!(stats.ws_proxy_handshake_busy.load(Ordering::Relaxed), 1);
+            // A named client frees its proxy slot: the next connection fits.
+            let src: SocketAddr = "192.0.2.60:4000".parse().unwrap();
+            let s0 = silent.remove(0);
+            drop(s0);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let first = open(addr, &proxy_v2_tcp4(src, addr, false), "").await;
+            assert!(first.upgraded(), "{}", first.head);
+            let second = open(addr, &proxy_v2_tcp4(src, addr, false), "").await;
+            assert!(
+                second.upgraded(),
+                "proxy slot released once the client was named"
+            );
+
+            let mut config = SbcConfig::default();
+            config.transport.ws_max_handshakes_per_proxy = 2;
+            let mut audit = RateLimitAudit::new(&config);
+            audit.collect_conns(&limiter);
+            audit.flush();
+            let records = rate_limit_records(&capture.events());
+            let busy: Vec<_> = records
+                .iter()
+                .filter(|r| r.limit_name == "ws_proxy_handshake_busy")
+                .collect();
+            assert_eq!(busy.len(), 1, "{records:?}");
+            assert_eq!(busy[0].source_ip, ip("127.0.0.1"));
+            assert_eq!(busy[0].threshold, 2);
+            task.abort();
+        }
+
+        // SEC-003: is_blocked applies to the client behind the proxy, not to
+        // the proxy.
+        #[tokio::test]
+        async fn ws_blocked_client_behind_proxy_refused_other_admitted() {
+            let mut config = SbcConfig::default();
+            config.rate_limit.per_ip_rps = 1;
+            let mut ctx = stream_test_ctx(short_timeouts());
+            ctx.rate_limiter = Server::build_rate_limiter(&config, LimiterKind::Stream);
+            let stats = Arc::clone(&ctx.stats);
+            {
+                let mut rl = ctx.rate_limiter.lock().await;
+                for _ in 0..200 {
+                    let _ = rl.check(ip("192.0.2.70"));
+                }
+                assert!(rl.is_blocked(ip("192.0.2.70")));
+            }
+            let l = bind(Some((ClientAddressMode::Forwarded, loopback_trusted()))).await;
+            let addr = l.bound_addr().unwrap();
+            let task = tokio::spawn(Server::ws_accept_loop(l, ctx));
+            let a = open(addr, &[], "Forwarded: for=192.0.2.70\r\n").await;
+            assert!(a.head.starts_with("HTTP/1.1 503"), "{}", a.head);
+            let mut b = open(addr, &[], "Forwarded: for=192.0.2.71\r\n").await;
+            assert!(still_open(&mut b).await, "{}", b.head);
+            assert_eq!(stats.accept_blocked.load(Ordering::Relaxed), 1);
+            task.abort();
+        }
+
+        #[test]
+        fn broad_trusted_proxy_entries_are_flagged() {
+            for (net, broad) in [
+                ("10.0.0.0/8", true),
+                ("10.1.0.0/16", false),
+                ("192.0.2.7/32", false),
+                ("2001:db8::/32", true),
+                ("2001:db8:1::/48", false),
+            ] {
+                let net: ipnet::IpNet = net.parse().unwrap();
+                assert_eq!(is_broad_trusted_proxy(&net), broad, "{net}");
+            }
+            // v4-mapped entries are canonicalised to IPv4 before matching.
+            let c = sbc_config::load_from_str(
+                "[transport]\nws_listen = [\"127.0.0.1:7080\"]\n\
+                 ws_trusted_proxies = [\"::ffff:10.0.0.0/104\"]\nws_client_address = \"proxy_v2\"\n",
+            )
+            .unwrap();
+            let (_, trusted) = Server::ws_client_address(&c.transport);
+            assert!(trusted(ip("10.1.2.3")));
+            assert!(trusted(ip("::ffff:10.1.2.3")));
+            assert!(!trusted(ip("11.0.0.1")));
         }
     }
 
