@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, OIDC JWKS fetch bounds and sbc-api fail-closed OIDC client, POA&M-423, 424)
+
+Affects every SBC service that validates OIDC bearer tokens: `sbc-daemon`
+(REGISTER bearer), `sbc-client-config-server`, `central-config-api` and
+`sbc-api-server`. The soft client does not link the JWKS cache. Tested in
+local runs on macOS arm64; no CI run yet.
+
+- **sbc-api-server refuses to start when `SBC_OIDC_EXTRA_CA_CERT_FILE` is
+  set but unusable.** (SC-8, SC-23, SI-10) With `SBC_OIDC_ISSUER` and
+  `SBC_OIDC_AUDIENCE` set, a file that cannot be read, is not PEM, or holds
+  no certificate now stops startup with `state init failed` and
+  `operator OIDC http client setup failed: SBC_OIDC_EXTRA_CA_CERT_FILE
+  <path>: ...` (exit code 3). An HTTP client build error does the same.
+  Before, the error was logged, the pod started, every OIDC bearer got 401
+  and only the legacy admin login worked. Blank or unset is unchanged (no
+  extra CA). All certificates in a PEM bundle are added. Check the file
+  before upgrading. The chart default (`sbcClientConfig.extraCaCert`,
+  mounted at `/etc/ssl/extra-ca/oopl-ca.pem`) parses.
+- **sbc-api-server OIDC client: 5 s connect and 10 s per-request timeouts,
+  redirects not followed.** (SC-5, SC-8)
+- **JWKS and discovery fetches: redirects refused, bodies capped, whole
+  refresh bounded.** (SC-5, SC-8, SI-10) In every service listed above:
+  - A redirect on the discovery document or the `jwks_uri` fails the
+    refresh. The issuer's `/.well-known/openid-configuration` and its
+    `jwks_uri` must answer directly with 2xx. Callers whose client follows
+    redirects still send the request to the redirect target before the
+    response is refused (POA&M-424).
+  - The discovery document is capped at 64 KiB and the JWKS at 256 KiB
+    (Content-Length and the body read).
+  - A refresh (both GETs and body reads) is bounded to 10 s and fails as
+    unavailable (`fetch timed out`).
+  - The `jwks_uri` must be `https`, or use the issuer's own scheme. A
+    plain-`http` `jwks_uri` under an `https` issuer is refused, and so is
+    any other scheme.
+  A failed refresh leaves the cached keys in place. A token whose `kid` is
+  not cached gets 401 until a refresh succeeds.
+- **One JWKS refresh at a time per cache.** (SC-5) Concurrent misses for an
+  unknown `kid` wait for the single in-flight refresh and share its result.
+  The 30 s refresh window is restarted when the fetch ends. A caller that
+  is cancelled mid-fetch no longer abandons the fetch: it completes and the
+  keys are stored. Any token, including one with a made-up `kid`, can
+  still use the 30 s window and delay a real key rotation by up to 30 s
+  (POA&M-423).
+- **proto-jwt API (additive, plus one constraint).** New
+  `jwks::DEFAULT_FETCH_TIMEOUT` (10 s) and `JwksCache::with_fetch_timeout`.
+  `JwksCache::refresh` (and `get_key` on a miss) must now run inside a
+  Tokio runtime, because the fetch runs on a spawned task. All in-tree
+  callers already do. Other signatures are unchanged.
+- **Dependencies.** No new crates; `Cargo.lock` is unchanged. In proto-jwt,
+  `serde_json` moves from a dev-dependency to a normal dependency (capped
+  bodies are parsed from bytes), and tokio gains the `rt` and `time`
+  features. No crypto dependency changes.
+
 ### BREAKING (SBC, audit file rotation and capacity; CDR retention and attempts stream, SR-42, SR-43, POA&M-133 closed, POA&M-430..433)
 
 Operator details: `docs/SBC-ADMIN-GUIDE.md` (audit file rotation and
