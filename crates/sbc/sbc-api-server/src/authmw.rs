@@ -19,13 +19,16 @@
 //! fails, and only when an OIDC validator is configured.
 
 use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use proto_jwt::Validator;
+use sbc_http_util::mgmt_audit::{self, Actor};
+use uc_auth::CredentialId;
 
 /// The OIDC scope an operator token must carry to reach the management API.
 /// It is a coarse gate only and authorizes nothing by itself: the caller
@@ -45,6 +48,9 @@ pub struct AuthState {
     pub oidc: Option<Arc<Validator>>,
     /// Paths exempt from auth (exact match).
     pub public_paths: Arc<HashSet<String>>,
+    /// Proxies whose `X-Real-IP` is trusted when resolving the client IP
+    /// recorded on the principal (empty: the TCP peer).
+    pub trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
 
 impl AuthState {
@@ -58,6 +64,7 @@ impl AuthState {
             authenticator,
             oidc,
             public_paths: Arc::new(public_paths.iter().map(|s| (*s).to_string()).collect()),
+            trusted_proxies: Arc::new(Vec::new()),
         }
     }
 }
@@ -90,12 +97,29 @@ const CDR_EXPORT_ROLES: &[&str] = &["fleet-admin", "cdr-exporter"];
 /// ## NIST 800-53 Rev5: AC-3 (Access Enforcement), AC-6 (Least Privilege)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
-    /// Identity for audit records.
+    /// Display name: `preferred_username` (or `sub`) for OIDC, the token
+    /// subject or API-key id for the legacy credential. IdP-mutable, so
+    /// never the audit actor (see [`Self::actor_id`]).
     pub user: String,
+    /// Stable subject: OIDC `sub`, the session token's subject, or the
+    /// API-key id.
+    pub subject: String,
     /// Token issuer for OIDC principals (`None` for the legacy credential).
     pub issuer: Option<String>,
+    /// Resolved client IP (trusted-proxy aware), when known.
+    pub source_ip: Option<IpAddr>,
+    /// Which credential authenticated the caller.
+    kind: PrincipalKind,
     /// Granted permissions (bit set of `GRANT_*`).
     grants: u8,
+}
+
+/// Credential type behind a [`Principal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrincipalKind {
+    Session,
+    ApiKey,
+    Oidc,
 }
 
 const GRANT_CDR_READ: u8 = 1 << 0;
@@ -105,19 +129,41 @@ const GRANT_USERS_ADMIN: u8 = 1 << 3;
 const GRANT_CONFIG_ADMIN: u8 = 1 << 4;
 
 impl Principal {
-    /// The legacy admin credential (single administrator / API key): all
+    /// The legacy admin credential (session token or API key): all
     /// permissions.
+    // POAM: POA&M-429 (IA-2, AC-2, AU-3) the legacy admin credential and API
+    // keys are shared identities: records name `admin:<subject>` or
+    // `apikey:<id>`, not an individual operator.
     #[must_use]
-    pub fn admin() -> Self {
+    pub fn legacy(cred: CredentialId, source_ip: Option<IpAddr>) -> Self {
+        let (subject, kind) = match cred {
+            CredentialId::Session { subject } => (subject, PrincipalKind::Session),
+            CredentialId::ApiKey { key_id } => (key_id, PrincipalKind::ApiKey),
+        };
         Self {
-            user: "admin".to_string(),
+            user: subject.clone(),
+            subject,
             issuer: None,
+            source_ip,
+            kind,
             grants: GRANT_CDR_READ
                 | GRANT_CDR_EXPORT
                 | GRANT_USERS_READ
                 | GRANT_USERS_ADMIN
                 | GRANT_CONFIG_ADMIN,
         }
+    }
+
+    /// Test shorthand: the legacy session principal for `admin`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn admin() -> Self {
+        Self::legacy(
+            CredentialId::Session {
+                subject: "admin".to_string(),
+            },
+            None,
+        )
     }
 
     /// An OIDC operator: permissions from roles only (scopes grant nothing).
@@ -139,7 +185,10 @@ impl Principal {
                 .preferred_username
                 .clone()
                 .unwrap_or_else(|| c.sub.clone()),
+            subject: c.sub.clone(),
             issuer: None,
+            source_ip: None,
+            kind: PrincipalKind::Oidc,
             grants: bit(GRANT_CDR_READ, cdr_read)
                 | bit(GRANT_CDR_EXPORT, cdr_export)
                 | bit(GRANT_USERS_READ, users_read)
@@ -165,6 +214,34 @@ impl Principal {
         self
     }
 
+    /// Canonical actor id for audit records and `updated_by`:
+    /// `oidc:<sub>@<iss>`, `admin:<subject>` or `apikey:<id>`.
+    ///
+    /// ## NIST 800-53 Rev5: AU-3, IA-2
+    #[must_use]
+    pub fn actor_id(&self) -> String {
+        match self.kind {
+            PrincipalKind::Oidc => format!(
+                "oidc:{}@{}",
+                self.subject,
+                self.issuer.as_deref().unwrap_or_default()
+            ),
+            PrincipalKind::Session => format!("admin:{}", self.subject),
+            PrincipalKind::ApiKey => format!("apikey:{}", self.subject),
+        }
+    }
+
+    /// The audit actor (id, issuer, display name for OIDC, source IP).
+    #[must_use]
+    pub fn actor(&self) -> Actor {
+        Actor {
+            id: self.actor_id(),
+            issuer: self.issuer.clone(),
+            display: (self.kind == PrincipalKind::Oidc).then(|| self.user.clone()),
+            source_ip: self.source_ip,
+        }
+    }
+
     /// Whether `perm` is granted.
     #[must_use]
     pub fn has(&self, perm: &str) -> bool {
@@ -186,12 +263,12 @@ fn permitted(req: &Request, perm: &str) -> bool {
         .get::<Principal>()
         .is_some_and(|p| p.has(perm));
     if !ok {
-        let user = req
-            .extensions()
-            .get::<Principal>()
-            .map_or_else(|| "anonymous".to_string(), |p| p.user.clone());
+        let p = req.extensions().get::<Principal>();
+        // NIST 800-53 Rev5: AU-3 — the stable actor id, never the
+        // IdP-mutable display name.
+        let user = p.map_or_else(|| "anonymous".to_string(), Principal::actor_id);
         tracing::warn!(permission = perm, path = %req.uri().path(), %user, "permission denied");
-        audit_denied(&user, req.uri().path(), perm);
+        audit_denied(&user, req.uri().path(), perm, p.and_then(|p| p.source_ip));
     }
     ok
 }
@@ -200,26 +277,27 @@ fn permitted(req: &Request, perm: &str) -> bool {
 /// change).
 ///
 /// ## NIST 800-53 Rev5: AU-2 (Event Logging), AC-3 (Access Enforcement)
-fn audit_denied(user: &str, path: &str, perm: &str) {
+fn audit_denied(user: &str, path: &str, perm: &str, source_ip: Option<IpAddr>) {
     let policy = if perm.starts_with("users:") {
         "users-rbac"
     } else {
         "cdr-rbac"
     };
-    audit_deny(user, path, perm, policy);
+    audit_deny(user, path, perm, policy, source_ip);
 }
 
-/// One `AuthorizationDecision` deny record.
-// POAM: POA&M-386 (AU-3) `source_ip` is not recorded on these denials.
-fn audit_deny(user: &str, path: &str, action: &str, policy: &str) {
+/// One `AuthorizationDecision` deny record, with the resolved client IP.
+fn audit_deny(user: &str, path: &str, action: &str, policy: &str, source_ip: Option<IpAddr>) {
     uc_audit::log_event(uc_audit::AuditEvent::AuthorizationDecision(
         uc_audit::event::AuthorizationDecision {
-            identity: user.to_string(),
+            // NIST 800-53 Rev5: AU-3, SI-10 — same sanitising and 250 B cap
+            // as the `ConfigurationChange` actor (round 2, SEC-011).
+            identity: mgmt_audit::actor_field(user),
             resource: path.to_string(),
             action: action.to_string(),
             granted: false,
             policy: policy.to_string(),
-            source_ip: None,
+            source_ip,
         },
     ));
 }
@@ -295,12 +373,20 @@ pub async fn require_auth(State(auth): State<AuthState>, mut req: Request, next:
     if auth.public_paths.contains(req.uri().path()) {
         return next.run(req).await;
     }
+    // NIST 800-53 Rev5: AU-3 — the client IP recorded on the principal is
+    // resolved through the trusted-proxy list, never a raw X-Real-IP.
+    let source_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| {
+            sbc_http_util::resolve_client_ip(req.headers(), peer.ip(), &auth.trusted_proxies)
+        });
 
     // 1. Legacy cookie / HMAC token / API key.
-    if let Some(cred) = uc_auth::extract_credential(req.headers())
-        && auth.authenticator.authorize(&cred)
-    {
-        req.extensions_mut().insert(Principal::admin());
+    let cred = uc_auth::extract_credential(req.headers());
+    if let Some(id) = cred.as_deref().and_then(|c| auth.authenticator.identify(c)) {
+        req.extensions_mut()
+            .insert(Principal::legacy(id, source_ip));
         return next.run(req).await;
     }
 
@@ -311,14 +397,16 @@ pub async fn require_auth(State(auth): State<AuthState>, mut req: Request, next:
         && let Some(token) = bearer(req.headers())
         && let Ok(claims) = validator.validate(&token).await
     {
-        let principal = Principal::from_claims(&claims).with_issuer(validator.issuer());
+        let mut principal = Principal::from_claims(&claims).with_issuer(validator.issuer());
+        principal.source_ip = source_ip;
         if !principal.is_config_admin() {
             tracing::warn!(path = %req.uri().path(), user = %principal.user, "OIDC principal lacks fleet-admin on all sites");
             audit_deny(
-                &principal.user,
+                &principal.actor_id(),
                 req.uri().path(),
                 CONFIG_ADMIN_ROLE,
                 "sbc-api-oidc",
+                source_ip,
             );
             return (
                 StatusCode::FORBIDDEN,
@@ -328,6 +416,17 @@ pub async fn require_auth(State(auth): State<AuthState>, mut req: Request, next:
         }
         req.extensions_mut().insert(principal);
         return next.run(req).await;
+    }
+
+    // A credential was presented and rejected: audited, aggregated per
+    // (client bucket, reason). No credential at all is not audited (scanner
+    // noise; still a 401).
+    // NIST 800-53 Rev5: AU-2, AU-3, SC-5
+    if let Some(c) = cred.as_deref() {
+        let ip = source_ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let from_cookie = bearer(req.headers()).is_none();
+        let method = mgmt_audit::credential_method(c, from_cookie);
+        mgmt_audit::auth_failure("unknown", ip, method, "invalid_token");
     }
 
     (
@@ -428,7 +527,8 @@ mod tests {
             })
             .collect();
         assert_eq!(denials.len(), 1);
-        assert_eq!(denials[0].identity, "op1");
+        // SR-40 round 1 (SEC-001): the stable actor id, not preferred_username.
+        assert_eq!(denials[0].identity, "oidc:s-1@");
         assert_eq!(denials[0].action, PERM_CDR_EXPORT);
         assert_eq!(denials[0].resource, "/cdrs/export");
         assert!(!denials[0].granted);
@@ -607,5 +707,400 @@ mod tests {
             qa_get(&app, &qa_token(&key, &["fleet-admin"], &["MUHJ"])).await,
             StatusCode::FORBIDDEN
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod sr40_tests {
+    //! SR-40: the principal carries a stable subject and source IP for
+    //! audit attribution; bad credentials are audited (aggregated), absent
+    //! ones are not. Each test uses its own documentation-range source IP:
+    //! the auth-failure aggregator is process-global.
+    //!
+    //! ## NIST 800-53 Rev5: AU-2, AU-3, AC-3, IA-2, SC-5
+
+    use std::net::{IpAddr, SocketAddr};
+    use std::time::{Duration, Instant};
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::{ConnectInfo, Extension};
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use tower::ServiceExt;
+    use uc_audit::AuditEvent;
+    use uc_auth::CredentialId;
+
+    use super::*;
+
+    const QA_KID: &str = "sr40-es384";
+    const QA_ISSUER: &str = "https://idp.example/realms/sr40";
+    const QA_AUD: &str = "sbc-api";
+
+    /// A fresh P-384 key: (JWT signing key, static JWKS).
+    fn qa_key() -> (jsonwebtoken::EncodingKey, jsonwebtoken::jwk::JwkSet) {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &SystemRandom::new())
+                .unwrap();
+        let pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, pkcs8.as_ref()).unwrap();
+        let point = pair.public_key().as_ref();
+        let jwks = serde_json::from_value(serde_json::json!({
+            "keys": [{
+                "kty": "EC", "crv": "P-384", "kid": QA_KID, "alg": "ES384", "use": "sig",
+                "x": URL_SAFE_NO_PAD.encode(&point[1..49]),
+                "y": URL_SAFE_NO_PAD.encode(&point[49..97]),
+            }]
+        }))
+        .unwrap();
+        (jsonwebtoken::EncodingKey::from_ec_der(pkcs8.as_ref()), jwks)
+    }
+
+    fn qa_token(key: &jsonwebtoken::EncodingKey, roles: &[&str], sites: &[&str]) -> String {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES384);
+        header.kid = Some(QA_KID.to_string());
+        let claims = serde_json::json!({
+            "sub": "s-qa", "preferred_username": "qa-op", "iss": QA_ISSUER, "aud": QA_AUD,
+            "exp": exp, "scope": "openid config-admin", "roles": roles, "sites": sites,
+        });
+        jsonwebtoken::encode(&header, &claims, key).unwrap()
+    }
+
+    fn qa_validator(jwks: jsonwebtoken::jwk::JwkSet) -> Arc<Validator> {
+        Arc::new(
+            Validator::new(
+                Arc::new(proto_jwt::JwksCache::with_static(jwks)),
+                proto_jwt::ValidatorConfig {
+                    issuer: QA_ISSUER.to_string(),
+                    audiences: vec![QA_AUD.to_string()],
+                    required_scope: ADMIN_SCOPE,
+                    leeway_secs: 30,
+                },
+            )
+            .expect("validator config"),
+        )
+    }
+
+    const PW: &str = "sr40-qa-password";
+
+    fn authenticator() -> Arc<uc_auth::Authenticator> {
+        let hash = uc_auth::hash_password(PW).unwrap();
+        Arc::new(uc_auth::Authenticator::new("admin", &hash, vec![9u8; 48]).unwrap())
+    }
+
+    async fn whoami(Extension(p): Extension<Principal>) -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "subject": p.subject,
+            "actor_id": p.actor_id(),
+            "user": p.user,
+            "issuer": p.issuer,
+            "source_ip": p.source_ip.map(|i| i.to_string()),
+        }))
+    }
+
+    fn app(
+        authn: Arc<uc_auth::Authenticator>,
+        oidc: Option<Arc<Validator>>,
+        trusted: &[&str],
+    ) -> Router {
+        let mut auth = AuthState::new(authn, oidc, &["/healthz"]);
+        auth.trusted_proxies = Arc::new(trusted.iter().map(|s| s.parse().unwrap()).collect());
+        Router::new()
+            .route("/api/v1/whoami", get(whoami).post(whoami))
+            .layer(axum::middleware::from_fn_with_state(auth, require_auth))
+    }
+
+    async fn call(
+        app: &Router,
+        peer: &str,
+        headers: &[(&str, String)],
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = axum::http::Request::get("/api/v1/whoami");
+        for (k, v) in headers {
+            req = req.header(*k, v);
+        }
+        let mut req = req.body(Body::empty()).unwrap();
+        let peer: SocketAddr = peer.parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    fn auth_events(
+        events: &[AuditEvent],
+        from: IpAddr,
+    ) -> Vec<uc_audit::event::AuthenticationAttempt> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AuditEvent::AuthenticationAttempt(a) if a.source_ip == from => Some(a.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn legacy_session_principal_carries_token_subject() {
+        let authn = authenticator();
+        let token = authn.login("admin", PW).unwrap();
+        let app = app(authn, None, &[]);
+        let (s, b) = call(
+            &app,
+            "192.0.2.41:5000",
+            &[("authorization", format!("Bearer {token}"))],
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["subject"], "admin");
+        assert_eq!(b["actor_id"], "admin:admin");
+        assert_eq!(b["issuer"], serde_json::Value::Null);
+        assert_eq!(b["source_ip"], "192.0.2.41");
+        // The cookie path yields the same principal.
+        let (s, b) = call(
+            &app,
+            "192.0.2.41:5000",
+            &[("cookie", format!("sbc_session={token}"))],
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["actor_id"], "admin:admin");
+
+        let p = Principal::legacy(
+            CredentialId::Session {
+                subject: "admin".to_string(),
+            },
+            None,
+        );
+        assert_eq!(p.subject, "admin");
+        assert_eq!(p.actor_id(), "admin:admin");
+        assert!(p.is_config_admin() && p.has(PERM_USERS_ADMIN) && p.has(PERM_CDR_EXPORT));
+    }
+
+    #[test]
+    fn api_key_principal_carries_key_id() {
+        let ip: IpAddr = "192.0.2.42".parse().unwrap();
+        let p = Principal::legacy(
+            CredentialId::ApiKey {
+                key_id: "0123456789abcdef".to_string(),
+            },
+            Some(ip),
+        );
+        assert_eq!(p.subject, "0123456789abcdef");
+        assert_eq!(p.actor_id(), "apikey:0123456789abcdef");
+        assert_eq!(p.source_ip, Some(ip));
+        assert!(p.is_config_admin(), "API keys keep full legacy grants");
+        let a = p.actor();
+        assert_eq!(a.id, "apikey:0123456789abcdef");
+        assert_eq!(a.issuer, None);
+        assert_eq!(a.source_ip, Some(ip));
+    }
+
+    #[tokio::test]
+    async fn oidc_principal_subject_is_sub_not_preferred_username() {
+        let (key, jwks) = qa_key();
+        let app = app(authenticator(), Some(qa_validator(jwks)), &[]);
+        let t = qa_token(&key, &["fleet-admin"], &["*"]);
+        let (s, b) = call(
+            &app,
+            "192.0.2.43:5000",
+            &[("authorization", format!("Bearer {t}"))],
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["subject"], "s-qa");
+        assert_eq!(b["actor_id"], format!("oidc:s-qa@{QA_ISSUER}"));
+        assert_eq!(b["user"], "qa-op", "display name kept for humans");
+        assert_eq!(b["issuer"], QA_ISSUER);
+
+        let c: proto_jwt::Claims = serde_json::from_value(serde_json::json!({
+            "sub": "s-1", "preferred_username": "admin", "roles": ["fleet-admin"], "sites": ["*"],
+        }))
+        .unwrap();
+        let p = Principal::from_claims(&c).with_issuer(QA_ISSUER);
+        assert_eq!(p.subject, "s-1");
+        // A user who names themselves "admin" in the IdP is not the legacy admin.
+        assert_eq!(p.actor_id(), format!("oidc:s-1@{QA_ISSUER}"));
+        let a = p.actor();
+        assert_eq!(a.issuer.as_deref(), Some(QA_ISSUER));
+        assert_eq!(a.display.as_deref(), Some("admin"));
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_is_audited_and_aggregated() {
+        let _agg = crate::handlers::login_audit_tests::AGGREGATOR.write().await;
+        let (_, jwks) = qa_key();
+        let app = app(authenticator(), Some(qa_validator(jwks)), &[]);
+        let cap = uc_audit::capture::start();
+        let from: IpAddr = "2001:db8:8:1::1".parse().unwrap();
+        for i in 0..5 {
+            let (s, _) = call(
+                &app,
+                "[2001:db8:8:1::1]:5000",
+                &[("authorization", format!("Bearer not-a-token-{i}"))],
+            )
+            .await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED);
+        }
+        // A bad session cookie from the same source counts as well.
+        let (s, _) = call(
+            &app,
+            "[2001:db8:8:1::1]:5000",
+            &[("cookie", "sbc_session=v2.forged.token".to_string())],
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+        let a = auth_events(&cap.events(), from);
+        assert_eq!(a.len(), 1, "aggregated: {a:?}");
+        assert!(!a[0].success);
+        let r = a[0].failure_reason.clone().unwrap_or_default();
+        assert!(r.starts_with("invalid_token"), "{r}");
+        let all = serde_json::to_string(&cap.events()).unwrap();
+        assert!(
+            !all.contains("not-a-token") && !all.contains("forged"),
+            "credentials never logged"
+        );
+
+        sbc_http_util::mgmt_audit::flush_auth_failures(Instant::now() + Duration::from_secs(61));
+        let a = auth_events(&cap.events(), from);
+        assert_eq!(a.len(), 2, "{a:?}");
+        let r = a[1].failure_reason.clone().unwrap_or_default();
+        assert!(r.ends_with("count=5"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn missing_credential_is_not_audited() {
+        let (_, jwks) = qa_key();
+        let app = app(authenticator(), Some(qa_validator(jwks)), &[]);
+        let cap = uc_audit::capture::start();
+        let from: IpAddr = "2001:db8:8:2::1".parse().unwrap();
+        let (s, _) = call(&app, "[2001:db8:8:2::1]:5000", &[]).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let (s, _) = call(
+            &app,
+            "[2001:db8:8:2::1]:5000",
+            &[("authorization", "Basic dXNlcjpwYXNz".to_string())],
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert!(auth_events(&cap.events(), from).is_empty());
+        // Public paths never audit.
+        assert!(cap.events().is_empty(), "{:?}", cap.events());
+    }
+
+    #[tokio::test]
+    async fn denial_carries_resolved_source_ip() {
+        let (key, jwks) = qa_key();
+        let app = app(authenticator(), Some(qa_validator(jwks)), &["10.42.0.0/24"]);
+        let t = qa_token(&key, &[], &[]);
+        let cap = uc_audit::capture::start();
+
+        // Through the trusted proxy: the relayed client IP is recorded.
+        let (s, _) = call(
+            &app,
+            "10.42.0.9:5000",
+            &[
+                ("authorization", format!("Bearer {t}")),
+                ("x-real-ip", "198.51.100.77".to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        // Direct caller forging X-Real-IP: the TCP peer is recorded.
+        let (s, _) = call(
+            &app,
+            "203.0.113.40:5000",
+            &[
+                ("authorization", format!("Bearer {t}")),
+                ("x-real-ip", "198.51.100.78".to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        let ips: Vec<Option<IpAddr>> = cap
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                AuditEvent::AuthorizationDecision(d) => Some(d.source_ip),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ips,
+            vec![
+                Some("198.51.100.77".parse().unwrap()),
+                Some("203.0.113.40".parse().unwrap())
+            ]
+        );
+
+        // Route-level RBAC denials use the principal's source IP too.
+        let cap = uc_audit::capture::start();
+        let mut p = Principal::from_claims(
+            &serde_json::from_value(serde_json::json!({
+                "sub": "s-2", "roles": ["cdr-reader"]
+            }))
+            .unwrap(),
+        );
+        p.source_ip = Some("192.0.2.44".parse().unwrap());
+        let rbac = Router::new().route(
+            "/cdrs/export",
+            get(|| async { "ok" }).route_layer(axum::middleware::from_fn(require_cdr_export)),
+        );
+        let mut req = axum::http::Request::get("/cdrs/export")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(p);
+        assert_eq!(
+            rbac.oneshot(req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let d: Vec<_> = cap
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                AuditEvent::AuthorizationDecision(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].source_ip, Some("192.0.2.44".parse().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod sr40_round2_tests {
+    /// SR-40 round 2 (SEC-011): a deny identity is sanitised and capped at
+    /// the actor cap.
+    #[test]
+    fn deny_identity_uses_actor_field() {
+        let cap = uc_audit::capture::start();
+        let long = format!("oidc:{}\r\n", "s".repeat(400));
+        super::audit_deny(&long, "/api/v1/cdrs", "cdr:read", "cdr-rbac", None);
+        let ids: Vec<String> = cap
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::AuthorizationDecision(d) => Some(d.identity),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].len(), sbc_http_util::mgmt_audit::MAX_ACTOR_BYTES);
+        assert!(ids[0].starts_with("oidc:s") && !ids[0].contains('\r'));
     }
 }

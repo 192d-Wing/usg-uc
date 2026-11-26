@@ -43,6 +43,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+pub mod aggregate;
 pub mod event;
 pub mod record;
 pub mod sink;

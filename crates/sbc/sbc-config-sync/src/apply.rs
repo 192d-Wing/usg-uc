@@ -11,12 +11,15 @@
 //! Applied rows are stamped with the central `revision` (the epoch at
 //! which the change committed) and `updated_by = 'central'`, which is
 //! what distinguishes a synced row from a local break-glass write
-//! (`updated_by = 'local'`, `revision = 0`). Deletes are tombstones.
+//! (`updated_by = 'local:<actor>'`, or the legacy `'local'`; `revision = 0`).
+//! Deletes are tombstones. Origin predicates come from
+//! [`sbc_config_store::origin`] so every query agrees on what is local.
 
 use serde_json::Value;
 use sqlx::{Postgres, Row, Transaction};
 
 use central_config_store::{Change, ChangeOp, ConfigTable, Snapshot, UploadChange};
+use sbc_config_store::origin::{is_central_sql, is_local_sql};
 use sbc_config_store::{DirectoryNumber, PostgresPhoneStore};
 
 use serde_json::{Map, json};
@@ -56,12 +59,13 @@ pub async fn apply_snapshot(
     let mut tx = pool.begin().await?;
     for table in &snapshot.tables {
         // Replace the central-origin rows only; local-origin rows (edits
-        // made while partitioned, updated_by = 'local') are preserved so
-        // DDIL autonomy survives a snapshot reload. They'll be uploaded
-        // back to central separately.
+        // made while partitioned, updated_by = 'local[:<actor>]') are
+        // preserved so DDIL autonomy survives a snapshot reload. They'll be
+        // uploaded back to central separately.
         let sql = format!(
-            "DELETE FROM {} WHERE updated_by <> 'local'",
-            table.table.name()
+            "DELETE FROM {} WHERE {}",
+            table.table.name(),
+            is_central_sql("updated_by")
         );
         sqlx::query(&sql).execute(&mut *tx).await?;
         for row in &table.rows {
@@ -137,6 +141,8 @@ async fn upsert_local(
     payload: &Value,
     revision: i64,
 ) -> SyncResult<()> {
+    // A local edit is never overwritten by central.
+    let central = is_central_sql(&format!("{}.updated_by", table.name()));
     match table {
         ConfigTable::Phones => {
             let mac = payload
@@ -148,7 +154,7 @@ async fn upsert_local(
                     reason: "missing mac_address".to_string(),
                 })?;
             let mac_normalized = PostgresPhoneStore::normalize_mac(mac);
-            sqlx::query(
+            let sql = format!(
                 "INSERT INTO phones
                      (id, mac_normalized, data, revision, deleted, updated_by, site_code)
                  VALUES ($1, $2, $3, $4, FALSE, $5, $6)
@@ -160,16 +166,17 @@ async fn upsert_local(
                      updated_by     = EXCLUDED.updated_by,
                      site_code      = EXCLUDED.site_code,
                      updated_at     = NOW()
-                 WHERE phones.updated_by <> 'local'",
-            )
-            .bind(id)
-            .bind(&mac_normalized)
-            .bind(payload)
-            .bind(revision)
-            .bind(CENTRAL_ORIGIN)
-            .bind(site_code)
-            .execute(&mut **tx)
-            .await?;
+                 WHERE {central}"
+            );
+            sqlx::query(&sql)
+                .bind(id)
+                .bind(&mac_normalized)
+                .bind(payload)
+                .bind(revision)
+                .bind(CENTRAL_ORIGIN)
+                .bind(site_code)
+                .execute(&mut **tx)
+                .await?;
         }
         ConfigTable::DirectoryNumbers => {
             let dn =
@@ -179,7 +186,7 @@ async fn upsert_local(
                     reason: e.to_string(),
                 })?;
             let extra = serde_json::to_value(&dn.extra).unwrap_or(Value::Null);
-            sqlx::query(
+            let sql = format!(
                 "INSERT INTO directory_numbers
                      (did, sip_user, partition, description, extra,
                       revision, deleted, updated_by, site_code)
@@ -194,18 +201,19 @@ async fn upsert_local(
                      updated_by  = EXCLUDED.updated_by,
                      site_code   = EXCLUDED.site_code,
                      updated_at  = NOW()
-                 WHERE directory_numbers.updated_by <> 'local'",
-            )
-            .bind(&dn.did)
-            .bind(&dn.user)
-            .bind(&dn.partition)
-            .bind(&dn.description)
-            .bind(&extra)
-            .bind(revision)
-            .bind(CENTRAL_ORIGIN)
-            .bind(site_code)
-            .execute(&mut **tx)
-            .await?;
+                 WHERE {central}"
+            );
+            sqlx::query(&sql)
+                .bind(&dn.did)
+                .bind(&dn.user)
+                .bind(&dn.partition)
+                .bind(&dn.description)
+                .bind(&extra)
+                .bind(revision)
+                .bind(CENTRAL_ORIGIN)
+                .bind(site_code)
+                .execute(&mut **tx)
+                .await?;
         }
         json_table => {
             let sql = format!(
@@ -218,7 +226,7 @@ async fn upsert_local(
                      updated_by = EXCLUDED.updated_by,
                      site_code  = EXCLUDED.site_code,
                      updated_at = NOW()
-                 WHERE {tbl}.updated_by <> 'local'",
+                 WHERE {central}",
                 tbl = json_table.name(),
             );
             sqlx::query(&sql)
@@ -248,13 +256,14 @@ async fn tombstone_local(
     } else {
         "id"
     };
-    // `updated_by <> 'local'` preserves a local edit: central must not
+    // The central-origin guard preserves a local edit: central must not
     // tombstone a row the site changed while partitioned.
     let sql = format!(
         "UPDATE {} SET deleted = TRUE, revision = $1, updated_by = $2, site_code = $3, updated_at = NOW()
-         WHERE {} = $4 AND updated_by <> 'local'",
+         WHERE {} = $4 AND {}",
         table.name(),
-        id_col
+        id_col,
+        is_central_sql("updated_by")
     );
     sqlx::query(&sql)
         .bind(revision)
@@ -269,7 +278,7 @@ async fn tombstone_local(
 /// Collect the site's pending local edits as upload changes.
 ///
 /// These are rows written locally while partitioned
-/// (`updated_by = 'local'`), pushed to central on reconnect. Live rows
+/// (`updated_by = 'local'` or `'local:<actor>'`), pushed to central on reconnect. Live rows
 /// become upserts; tombstones become deletes.
 ///
 /// # Errors
@@ -281,45 +290,26 @@ pub async fn collect_local_changes(
     let mut out = Vec::new();
 
     // Phones: payload is the stored Phone JSON (`data`).
-    for row in sqlx::query("SELECT id, data, deleted FROM phones WHERE updated_by = 'local'")
-        .fetch_all(pool)
-        .await?
-    {
-        let id: String = row.try_get("id")?;
-        let deleted: bool = row.try_get("deleted")?;
-        out.push(if deleted {
-            UploadChange {
-                table: ConfigTable::Phones,
-                id,
-                op: ChangeOp::Delete,
-                payload: None,
-            }
-        } else {
-            UploadChange {
-                table: ConfigTable::Phones,
-                id,
-                op: ChangeOp::Upsert,
-                payload: Some(row.try_get::<Value, _>("data")?),
-            }
-        });
-    }
+    let local = is_local_sql("updated_by");
+    collect_data_rows(pool, ConfigTable::Phones, &local, &mut out).await?;
 
     // Directory numbers: reconstruct the canonical { did, user?, … } payload.
-    for row in sqlx::query(
-        "SELECT did, sip_user, partition, description, extra, deleted
-         FROM directory_numbers WHERE updated_by = 'local'",
-    )
-    .fetch_all(pool)
-    .await?
-    {
+    let sql = format!(
+        "SELECT did, sip_user, partition, description, extra, deleted, updated_by
+         FROM directory_numbers WHERE {local}"
+    );
+    for row in sqlx::query(&sql).fetch_all(pool).await? {
         let did: String = row.try_get("did")?;
         let deleted: bool = row.try_get("deleted")?;
+        // The site-local writer, for central's audit record (NIST-007).
+        let origin_actor = Some(row.try_get::<String, _>("updated_by")?);
         if deleted {
             out.push(UploadChange {
                 table: ConfigTable::DirectoryNumbers,
                 id: did,
                 op: ChangeOp::Delete,
                 payload: None,
+                origin_actor,
             });
             continue;
         }
@@ -344,6 +334,7 @@ pub async fn collect_local_changes(
             id: did,
             op: ChangeOp::Upsert,
             payload: Some(Value::Object(obj)),
+            origin_actor,
         });
     }
 
@@ -357,35 +348,53 @@ pub async fn collect_local_changes(
         ConfigTable::SbcRouteLists,
         ConfigTable::SiteTelephonyConfig,
     ] {
-        let sql = format!(
-            "SELECT id, data, deleted FROM {} WHERE updated_by = 'local'",
-            table.name()
-        );
-        for row in sqlx::query(&sql).fetch_all(pool).await? {
-            let id: String = row.try_get("id")?;
-            let deleted: bool = row.try_get("deleted")?;
-            out.push(if deleted {
-                UploadChange {
-                    table,
-                    id,
-                    op: ChangeOp::Delete,
-                    payload: None,
-                }
-            } else {
-                UploadChange {
-                    table,
-                    id,
-                    op: ChangeOp::Upsert,
-                    payload: Some(row.try_get::<Value, _>("data")?),
-                }
-            });
-        }
+        collect_data_rows(pool, table, &local, &mut out).await?;
     }
 
     Ok(out)
 }
 
-/// Clear the `'local'` marker on rows central has just adopted.
+/// Local rows of an `id, data, deleted` table as upload changes: live rows
+/// become upserts of `data`, tombstones deletes. Each carries the row's
+/// `updated_by`, so central's audit record names the site-local writer
+/// (NIST 800-53 Rev5: AU-3).
+async fn collect_data_rows(
+    pool: &sqlx::PgPool,
+    table: ConfigTable,
+    local: &str,
+    out: &mut Vec<UploadChange>,
+) -> SyncResult<()> {
+    let sql = format!(
+        "SELECT id, data, deleted, updated_by FROM {} WHERE {local}",
+        table.name()
+    );
+    for row in sqlx::query(&sql).fetch_all(pool).await? {
+        let id: String = row.try_get("id")?;
+        let deleted: bool = row.try_get("deleted")?;
+        let origin_actor = Some(row.try_get::<String, _>("updated_by")?);
+        out.push(if deleted {
+            UploadChange {
+                table,
+                id,
+                op: ChangeOp::Delete,
+                payload: None,
+                origin_actor,
+            }
+        } else {
+            UploadChange {
+                table,
+                id,
+                op: ChangeOp::Upsert,
+                payload: Some(row.try_get::<Value, _>("data")?),
+                origin_actor,
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Clear the local-origin marker (`'local'` or `'local:<actor>'`) on rows
+/// central has just adopted.
 ///
 /// Re-stamps them `'central'` (with the central `epoch` as revision) so
 /// they converge and aren't re-uploaded next cycle. Only flips rows still
@@ -407,13 +416,14 @@ pub async fn restamp_uploaded(
             "id"
         };
         // Only restamp rows whose updated_at predates the collection snapshot;
-        // rows edited after the collect keep updated_by = 'local' so the next
+        // rows edited after the collect keep their local marker so the next
         // cycle picks them up again instead of silently clobbering them.
         let sql = format!(
             "UPDATE {} SET updated_by = $1, revision = $2
-             WHERE {} = $3 AND updated_by = 'local' AND updated_at <= $4",
+             WHERE {} = $3 AND {} AND updated_at <= $4",
             change.table.name(),
-            id_col
+            id_col,
+            is_local_sql("updated_by")
         );
         sqlx::query(&sql)
             .bind(CENTRAL_ORIGIN)

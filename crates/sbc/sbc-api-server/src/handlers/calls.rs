@@ -11,13 +11,16 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use sbc_grpc_api::prelude::{GetCallRequest, ListCallsRequest, TerminateCallRequest};
+use sbc_http_util::mgmt_audit::{Op, Outcome};
 use tonic::Code;
 use tracing::warn;
 
+use super::write_audit::{audited, daemon_outcome, grpc_reason};
+use crate::authmw::Principal;
 use crate::state::AppState;
 
 pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -104,7 +107,10 @@ pub async fn ladder(
 pub async fn terminate(
     State(state): State<Arc<AppState>>,
     Path(call_id): Path<String>,
-) -> impl IntoResponse {
+    principal: Option<Extension<Principal>>,
+) -> Response {
+    let p = principal.as_ref().map(|Extension(p)| p);
+    let done = |outcome, resp| audited(p, "call", &call_id, Op::Action("terminate"), outcome, resp);
     let mut client = state.calls.clone();
     let req = TerminateCallRequest {
         call_id: call_id.clone(),
@@ -116,24 +122,30 @@ pub async fn terminate(
     match client.terminate_call(req).await {
         Ok(resp) => {
             let r = resp.into_inner();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "success": r.success,
-                    "call_id": call_id,
-                    "message": r.message,
-                })),
+            done(
+                daemon_outcome(r.success),
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "success": r.success,
+                        "call_id": call_id,
+                        "message": r.message,
+                    })),
+                ),
             )
         }
         Err(status) => {
             warn!(call_id, error = %status, "CallService.TerminateCall failed");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "success": false,
-                    "call_id": call_id,
-                    "error": status.message(),
-                })),
+            done(
+                Outcome::Failed(grpc_reason(&status)),
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "call_id": call_id,
+                        "error": status.message(),
+                    })),
+                ),
             )
         }
     }
