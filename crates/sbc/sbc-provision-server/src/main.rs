@@ -523,3 +523,18 @@ mod source_restriction_tests {
         );
     }
 }
+
+// SR-16: the device-token HMAC runs in the FIPS aws-lc module (uc-crypto).
+// The dev-dependency aws-lc-rs does not enable `fips`; only the binary's
+// own dependency graph (uc-crypto) can.
+#[cfg(test)]
+mod sr16_fips_tests {
+    #[test]
+    fn sbc_provision_server_links_fips_module() {
+        assert_eq!(
+            aws_lc_rs::try_fips_mode(),
+            Ok(()),
+            "aws-lc is not the FIPS module"
+        );
+    }
+}

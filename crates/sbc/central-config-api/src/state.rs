@@ -34,6 +34,10 @@ pub enum StateError {
     /// would be uselessly up. Fail fast instead.
     #[error("oidc CA cert: {0}")]
     OidcCa(String),
+    /// The OIDC issuer/audience policy was refused (empty issuer or
+    /// audience). Fatal: audience checking cannot be disabled.
+    #[error("oidc validator config: {0}")]
+    OidcConfig(String),
 }
 
 /// Handler-shared state: the store and the two scope-specific validators.
@@ -67,23 +71,20 @@ impl AppState {
         .await
         .map_err(|e| StateError::Store(e.to_string()))?;
 
-        // rustls-only HTTP client for JWKS fetches; one cache, two validators.
+        // CNSA-only HTTP client for JWKS fetches; one cache, two validators.
         // An extra CA cert is trusted when the IdP is fronted by an internal
-        // CA the bundled webpki roots don't include.
-        let mut http_builder = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10));
-        if let Some(path) = cfg.oidc_extra_ca_cert_file.as_deref() {
-            let pem =
-                std::fs::read(path).map_err(|e| StateError::OidcCa(format!("read {path}: {e}")))?;
-            let cert = reqwest::Certificate::from_pem(&pem)
-                .map_err(|e| StateError::OidcCa(format!("parse {path}: {e}")))?;
-            tracing::info!(path, "loaded extra CA certificate for IdP JWKS fetch");
-            http_builder = http_builder.add_root_certificate(cert);
-        }
-        let http = http_builder
-            .build()
-            .map_err(|e| StateError::OidcCa(format!("build HTTP client: {e}")))?;
+        // CA the OS trust store doesn't include.
+        let extra_ca = match cfg.oidc_extra_ca_cert_file.as_deref() {
+            Some(path) => {
+                let pem = tokio::fs::read(path)
+                    .await
+                    .map_err(|e| StateError::OidcCa(format!("read {path}: {e}")))?;
+                tracing::info!(path, "loaded extra CA certificate for IdP JWKS fetch");
+                Some(pem)
+            }
+            None => None,
+        };
+        let http = build_jwks_http_client(extra_ca.as_deref())?;
         let jwks = Arc::new(JwksCache::new(http, cfg.oidc_issuer.clone()));
         // Prime the JWKS once at startup (best-effort) so /readyz reflects
         // real IdP reachability instead of staying unready until the first
@@ -92,8 +93,9 @@ impl AppState {
             tracing::warn!(error = %e, issuer = %cfg.oidc_issuer,
                 "initial JWKS prime failed; will refresh on first token use");
         }
+        // NIST 800-53 Rev5: IA-2, AC-3 (non-empty iss/aud enforced)
         let validator_for = |scope: &'static str| {
-            Arc::new(Validator::new(
+            Validator::new(
                 Arc::clone(&jwks),
                 ValidatorConfig {
                     issuer: cfg.oidc_issuer.clone(),
@@ -101,14 +103,60 @@ impl AppState {
                     required_scope: scope,
                     leeway_secs: 30,
                 },
-            ))
+            )
+            .map(Arc::new)
+            .map_err(|e| StateError::OidcConfig(e.to_string()))
         };
 
         Ok(Arc::new(Self {
             store,
-            sync_validator: validator_for(SYNC_SCOPE),
-            admin_validator: validator_for(OPERATOR_SCOPE),
+            sync_validator: validator_for(SYNC_SCOPE)?,
+            admin_validator: validator_for(OPERATOR_SCOPE)?,
             start_time: Instant::now(),
         }))
+    }
+}
+
+/// Builds the `IdP` (OIDC metadata / JWKS) HTTP client: CNSA suites and
+/// groups only, OS trust store plus the optional extra CA bundle
+/// (`CENTRAL_OIDC_EXTRA_CA_CERT_FILE`).
+///
+/// ## NIST 800-53 Rev5: SC-8(1), SC-13, IA-5(2)
+///
+/// # Errors
+/// [`StateError::OidcCa`] if the extra CA holds no usable certificate, the
+/// trust store is empty, or the client cannot be built.
+pub fn build_jwks_http_client(extra_ca_pem: Option<&[u8]>) -> Result<reqwest::Client, StateError> {
+    let tls = uc_transport::https_client::create_https_client_config(
+        extra_ca_pem,
+        uc_transport::tls::MinTlsVersion::V1_2,
+    )
+    .map_err(|e| StateError::OidcCa(e.to_string()))?;
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(|e| StateError::OidcCa(format!("build HTTP client: {e}")))
+}
+
+// SR-16: the JWKS HTTP client is CNSA-only (uc-transport
+// `create_https_client_config` via reqwest `use_preconfigured_tls`).
+#[cfg(test)]
+#[path = "../../../uc/uc-transport/tests/common/cnsa_reqwest_checks.rs"]
+mod cnsa_reqwest_checks;
+
+#[cfg(test)]
+mod sr16_http_client_tests {
+    use super::cnsa_reqwest_checks as checks;
+
+    #[tokio::test]
+    async fn central_config_api_http_client_trusts_extra_ca() {
+        checks::assert_trusts_extra_ca(super::build_jwks_http_client).await;
+    }
+
+    #[tokio::test]
+    async fn central_config_api_http_client_refuses_non_cnsa_server() {
+        checks::assert_refuses_non_cnsa(super::build_jwks_http_client).await;
     }
 }
