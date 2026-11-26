@@ -46,7 +46,9 @@ struct CacheState {
 
 /// Cached JWKS for one OIDC issuer.
 pub struct JwksCache {
-    http: reqwest::Client,
+    /// `None` for a static cache: reqwest without a crypto provider panics
+    /// unless TLS is preconfigured, so none is built when nothing is fetched.
+    http: Option<reqwest::Client>,
     issuer: String,
     state: RwLock<CacheState>,
 }
@@ -56,7 +58,7 @@ impl JwksCache {
     /// [`JwksCache::refresh`] at startup).
     pub fn new(http: reqwest::Client, issuer: impl Into<String>) -> Self {
         Self {
-            http,
+            http: Some(http),
             issuer: issuer.into(),
             state: RwLock::new(CacheState::default()),
         }
@@ -67,7 +69,7 @@ impl JwksCache {
     #[must_use]
     pub fn with_static(keys: JwkSet) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: None,
             issuer: String::new(),
             state: RwLock::new(CacheState {
                 keys: Some(keys),
@@ -151,9 +153,13 @@ impl JwksCache {
     }
 
     async fn fetch(&self) -> Result<JwkSet, JwksError> {
+        let Some(http) = self.http.as_ref() else {
+            return Err(JwksError::Unavailable(
+                "no issuer to fetch from".to_string(),
+            ));
+        };
         let metadata_url = format!("{}/.well-known/openid-configuration", self.issuer);
-        let metadata: OidcMetadata = self
-            .http
+        let metadata: OidcMetadata = http
             .get(&metadata_url)
             .send()
             .await
@@ -173,8 +179,7 @@ impl JwksCache {
             )));
         }
 
-        self.http
-            .get(&metadata.jwks_uri)
+        http.get(&metadata.jwks_uri)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
@@ -197,12 +202,35 @@ mod tests {
     #[tokio::test]
     async fn rate_limited_refresh_without_keys_stays_an_error() {
         // Nothing listens on port 1 — connection refused, immediately.
-        let cache = JwksCache::new(reqwest::Client::new(), "https://127.0.0.1:1");
+        let tls = uc_transport::https_client::create_https_client_config(
+            None,
+            uc_transport::tls::MinTlsVersion::V1_2,
+        )
+        .expect("tls config");
+        let http = reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .build()
+            .expect("http client");
+        let cache = JwksCache::new(http, "https://127.0.0.1:1");
 
         assert!(cache.refresh().await.is_err(), "real fetch failure");
         // Second call lands inside MIN_REFRESH_INTERVAL: rate-limited, and
         // with no cached key set it must still be an error.
         assert!(cache.refresh().await.is_err(), "rate-limited + empty cache");
         assert!(!cache.ready().await);
+    }
+
+    /// SR-16: reqwest is built without a crypto provider, so a
+    /// `reqwest::Client` built without preconfigured TLS panics. A static
+    /// cache has nothing to fetch and must not construct one.
+    #[tokio::test]
+    async fn with_static_builds_without_tls_provider() {
+        let cache = JwksCache::with_static(JwkSet { keys: Vec::new() });
+        assert!(cache.ready().await);
+        assert!(cache.refresh().await.is_ok(), "static cache never fetches");
+        assert!(matches!(
+            cache.get_key("missing").await,
+            Err(JwksError::UnknownKid(_))
+        ));
     }
 }

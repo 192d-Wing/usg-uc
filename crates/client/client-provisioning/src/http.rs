@@ -78,9 +78,10 @@ pub(crate) fn build_http_client_with(
         }
         #[cfg(debug_assertions)]
         CaTrust::Insecure => {
-            // Development only (absent from release builds); reqwest's own
-            // stack is used so certificate checks can be disabled.
-            builder = builder.danger_accept_invalid_certs(true);
+            // Development only (absent from release builds). Still the CNSA
+            // provider: reqwest has no crypto provider of its own.
+            tracing::warn!("INSECURE: provisioning TLS certificates are not validated");
+            builder = builder.use_preconfigured_tls(build_insecure_tls_config()?);
         }
     }
 
@@ -129,6 +130,74 @@ fn build_tls_config(extra_pem: Option<&[u8]>) -> Result<rustls::ClientConfig, Pr
     Ok(config)
 }
 
+/// Development-only config (absent from release builds): CNSA provider and
+/// TLS 1.3, but the server certificate is not validated.
+#[cfg(debug_assertions)]
+fn build_insecure_tls_config() -> Result<rustls::ClientConfig, ProvisioningError> {
+    let provider = Arc::new(uc_transport::tls::cnsa_provider());
+    let verifier = Arc::new(InsecureCertVerifier(Arc::clone(&provider)));
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| ProvisioningError::Http(format!("failed to configure TLS 1.3: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    Ok(config)
+}
+
+/// Accepts any server certificate (mirrors client-core's
+/// `InsecureCertVerifier`). Handshake signatures are still checked with the
+/// provider's algorithms. **Development only.**
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+struct InsecureCertVerifier(Arc<rustls::crypto::CryptoProvider>);
+
+#[cfg(debug_assertions)]
+impl rustls::client::danger::ServerCertVerifier for InsecureCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +225,32 @@ mod tests {
     #[test]
     fn extra_pem_without_certs_is_rejected() {
         assert!(build_tls_config(Some(b"not a pem")).is_err());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn insecure_tls_config_uses_cnsa_provider() -> Result<(), ProvisioningError> {
+        let cfg = build_insecure_tls_config()?;
+        assert!(cfg.fips());
+        let want = uc_transport::tls::cnsa_provider();
+        let got = cfg.crypto_provider();
+        let suites = |p: &rustls::crypto::CryptoProvider| {
+            p.cipher_suites
+                .iter()
+                .map(rustls::SupportedCipherSuite::suite)
+                .collect::<Vec<_>>()
+        };
+        let groups = |p: &rustls::crypto::CryptoProvider| {
+            p.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>()
+        };
+        assert_eq!(suites(got), suites(&want));
+        assert_eq!(groups(got), groups(&want));
+        assert_eq!(
+            got.signature_verification_algorithms.supported_schemes(),
+            want.signature_verification_algorithms.supported_schemes()
+        );
+        build_http_client(&CaTrust::Insecure)?;
+        Ok(())
     }
 
     #[test]
