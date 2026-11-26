@@ -6387,6 +6387,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "criterion",
  "hyper",
  "hyper-util",
  "ipnet",
