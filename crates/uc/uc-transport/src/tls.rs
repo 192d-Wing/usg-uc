@@ -3,20 +3,22 @@
 //! ## CNSA 2.0 Compliance
 //!
 //! TLS is configured with CNSA 2.0 compliant settings only:
-//! - **TLS 1.3** required (no TLS 1.2 or earlier)
-//! - **Cipher Suite**: `TLS_AES_256_GCM_SHA384` only
-//! - **Key Exchange**: ML-KEM-1024 (preferred) or P-384 ECDHE
-//! - **Certificates**: P-384 ECDSA
+//! - **Protocol**: TLS 1.3 by default; TLS 1.2 only where a deployment sets
+//!   `min_tls_version = "1.2"`
+//! - **Cipher Suite**: `TLS_AES_256_GCM_SHA384` (1.3) and
+//!   `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` (1.2)
+//! - **Key Exchange**: ML-KEM-1024 (preferred) or P-384 ECDHE (1.2: P-384 only)
+//! - **Peer certificates and signatures**: ECDSA P-384 / SHA-384 only (SR-14)
 //!
-//! Every config built here uses [`cnsa_provider`]. Where a deployment sets
-//! `min_tls_version = "1.2"`, TLS 1.2 is limited to
-//! `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` over P-384.
+//! Every config built here uses [`cnsa_provider`].
 //!
 //! ## NIST 800-53 Rev5
 //!
 //! - **SC-8**: Transmission Confidentiality and Integrity
 //! - **SC-12**: Cryptographic Key Establishment and Management
 //! - **SC-13**: Cryptographic Protection
+//! - **IA-3 / IA-5(2)**: peer certificate path and signature algorithm
+//!   checks (revocation not checked: POA&M-401)
 //! - **SC-28 / IA-5(7)**: TLS private key files are checked fail-closed at
 //!   load (see [`load_private_key_with`]): symlinks, group/other-accessible
 //!   modes and foreign owners are rejected. Decision: this is a boundary
@@ -66,12 +68,18 @@ use uc_types::address::{SbcSocketAddr, TransportType};
 /// supports P-384 answers with a `HelloRetryRequest` (one extra round trip).
 /// TLS 1.2 cannot use ML-KEM, so 1.2 handshakes always use P-384.
 ///
-/// Signature verification algorithms are left at the provider defaults,
-/// so certificate chains signed with RSA or P-256 by a peer's CA still
-/// verify; the TLS 1.2 suite does require the peer's own certificate key
-/// to be ECDSA.
+/// - **Signature verification**: ECDSA P-384 with SHA-384 only (the CNSA
+///   1.0 / 2.0 transition profile), for the peer's handshake signature
+///   (TLS 1.3 `CertificateVerify`, TLS 1.2 `ServerKeyExchange`/
+///   `CertificateVerify`), which binds the end-entity key to P-384, and for
+///   every certificate signature below the trust anchor. A peer whose
+///   end-entity key or issuing CA keys are RSA, P-256, P-521, Ed25519 or
+///   ML-DSA is refused. Trust anchor self-signatures are not verified.
+///   ML-DSA-87, the CNSA 2.0 signature, is not yet accepted (POA&M-404).
 ///
-/// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection), SC-8, SC-12
+/// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection), SC-8, SC-12, IA-3,
+/// IA-5(2) (path and signature algorithm; revocation not checked: POA&M-401)
+// POAM: POA&M-404: ML-DSA-87 peer signatures are not accepted.
 #[must_use]
 pub fn cnsa_provider() -> rustls::crypto::CryptoProvider {
     use rustls::crypto::aws_lc_rs::{cipher_suite, kx_group};
@@ -81,9 +89,31 @@ pub fn cnsa_provider() -> rustls::crypto::CryptoProvider {
             cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
         ],
         kx_groups: vec![kx_group::MLKEM1024, kx_group::SECP384R1],
+        signature_verification_algorithms: CNSA_SIG_ALGS,
         ..rustls::crypto::aws_lc_rs::default_provider()
     }
 }
+
+/// Peer signature verification for [`cnsa_provider`].
+///
+/// CNSA 1.0 / 2.0 transition profile: ECDSA P-384 / SHA-384 only. P-521 and
+/// SHA-512 are not in either suite. ML-DSA-87 (the CNSA 2.0 signature) is
+/// not yet accepted.
+///
+/// NIST 800-53 Rev5: SC-13, IA-3, IA-5(2) (path and signature algorithm;
+/// revocation not checked: POA&M-401)
+// POAM: POA&M-404: ML-DSA-87 TLS peer signatures not accepted (no rustls/webpki
+// verifier in the FIPS provider yet).
+static CNSA_SIG_ALGS: rustls::crypto::WebPkiSupportedAlgorithms =
+    rustls::crypto::WebPkiSupportedAlgorithms {
+        // Every certificate signature below the trust anchor.
+        all: &[webpki::aws_lc_rs::ECDSA_P384_SHA384],
+        // Handshake signatures; also limits the schemes rustls advertises.
+        mapping: &[(
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            &[webpki::aws_lc_rs::ECDSA_P384_SHA384],
+        )],
+    };
 
 /// Creates a CNSA 2.0 compliant TLS server configuration.
 ///
@@ -165,6 +195,7 @@ pub fn create_server_config_with(
 
     let builder = match options.client_ca {
         Some(roots) => {
+            // POAM: POA&M-401: client certificate revocation is not checked.
             let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
                 Arc::new(roots),
                 provider,
@@ -228,6 +259,7 @@ pub fn create_client_config(root_certs: rustls::RootCertStore) -> TransportResul
         .map_err(|e| TransportError::TlsHandshakeFailed {
             reason: format!("failed to set TLS 1.3: {e}"),
         })?
+        // POAM: POA&M-401: server certificate revocation is not checked.
         .with_root_certificates(root_certs)
         .with_no_client_auth();
 
@@ -284,6 +316,7 @@ pub fn create_client_config_with(options: TlsClientOptions) -> TransportResult<C
         .map_err(|e| TransportError::TlsHandshakeFailed {
             reason: format!("failed to set TLS protocol versions: {e}"),
         })?
+        // POAM: POA&M-401: server certificate revocation is not checked.
         .with_root_certificates(options.roots);
     match options.client_auth {
         Some((chain, key)) => builder.with_client_auth_cert(chain, key).map_err(|e| {
@@ -306,6 +339,8 @@ pub fn create_client_config_with(options: TlsClientOptions) -> TransportResult<C
 ///
 /// # Errors
 /// Returns an error if the operation fails.
+// POAM: POA&M-404: the SBC's own chain is not checked against the peer
+// signature profile at load (only the key curve is).
 pub fn load_certs(path: &Path) -> TransportResult<Vec<CertificateDer<'static>>> {
     use rustls::pki_types::pem::PemObject;
 
@@ -1286,6 +1321,777 @@ mod tests {
         })
         .unwrap();
         assert!(handshake(client, server_with(weak_provider(), &pki)).is_err());
+    }
+
+    // ---- Peer signature algorithms (SR-14) ----
+    // NIST 800-53 Rev5: SC-13, IA-3, IA-5(2) (path and signature algorithm;
+    // revocation not checked: POA&M-401)
+    // Peers must authenticate with ECDSA P-384 / SHA-384 only: no RSA,
+    // P-256, P-521 or Ed25519 end-entity keys and no CA chain signed with
+    // anything but P-384 / SHA-384.
+
+    /// A CA with key `ca_alg` and a `localhost` leaf with key `leaf_alg`.
+    fn pki_with(
+        ca_alg: &'static rcgen::SignatureAlgorithm,
+        leaf_alg: &'static rcgen::SignatureAlgorithm,
+    ) -> Pki {
+        let ca_key = rcgen::KeyPair::generate_for(ca_alg).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate_for(leaf_alg).unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .unwrap();
+        Pki {
+            ca: ca.der().clone(),
+            chain: vec![leaf.der().clone()],
+            key: PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+        }
+    }
+
+    const P256: &rcgen::SignatureAlgorithm = &rcgen::PKCS_ECDSA_P256_SHA256;
+    const P384: &rcgen::SignatureAlgorithm = &rcgen::PKCS_ECDSA_P384_SHA384;
+    const P521: &rcgen::SignatureAlgorithm = &rcgen::PKCS_ECDSA_P521_SHA512;
+    const RSA: &rcgen::SignatureAlgorithm = &rcgen::PKCS_RSA_SHA256;
+    const ED25519: &rcgen::SignatureAlgorithm = &rcgen::PKCS_ED25519;
+
+    /// A server with the default provider (signs with whatever its key
+    /// allows), so only the CNSA client's verification policy decides.
+    fn permissive_server(pki: &Pki, v12_only: bool) -> ServerConfig {
+        let versions: &[&'static rustls::SupportedProtocolVersion] = if v12_only {
+            &[&rustls::version::TLS12]
+        } else {
+            &[&rustls::version::TLS13]
+        };
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+            .with_protocol_versions(versions)
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(pki.chain.clone(), pki.key.clone_key())
+            .unwrap()
+    }
+
+    fn cnsa_client(pki: &Pki, min: MinTlsVersion) -> ClientConfig {
+        create_client_config_with(TlsClientOptions {
+            roots: roots(pki),
+            min_version: min,
+            client_auth: None,
+        })
+        .unwrap()
+    }
+
+    /// CNSA client against a permissive server holding `pki`'s leaf.
+    fn client_verdict(pki: &Pki, v12: bool) -> Result<Negotiated, rustls::Error> {
+        let min = if v12 {
+            MinTlsVersion::V1_2
+        } else {
+            MinTlsVersion::V1_3
+        };
+        handshake(cnsa_client(pki, min), permissive_server(pki, v12))
+    }
+
+    #[test]
+    fn cnsa_provider_verifies_only_ecdsa_p384_sha384() {
+        let algs = cnsa_provider().signature_verification_algorithms;
+        let schemes: Vec<_> = algs.mapping.iter().map(|(s, _)| *s).collect();
+        assert_eq!(schemes, [rustls::SignatureScheme::ECDSA_NISTP384_SHA384]);
+        for (_, verifiers) in algs.mapping {
+            assert!(!verifiers.is_empty());
+            for v in *verifiers {
+                assert_eq!(v.public_key_alg_id(), rustls::pki_types::alg_id::ECDSA_P384);
+                assert_eq!(
+                    v.signature_alg_id(),
+                    rustls::pki_types::alg_id::ECDSA_SHA384
+                );
+            }
+        }
+        // CA chain signatures are held to the same profile.
+        assert!(!algs.all.is_empty());
+        for v in algs.all {
+            assert_eq!(v.public_key_alg_id(), rustls::pki_types::alg_id::ECDSA_P384);
+            assert_eq!(
+                v.signature_alg_id(),
+                rustls::pki_types::alg_id::ECDSA_SHA384
+            );
+        }
+    }
+
+    #[test]
+    fn cnsa_client_accepts_p384_server_tls13_and_tls12() {
+        let pki = pki_with(P384, P384);
+        let n = client_verdict(&pki, false).unwrap();
+        assert_eq!(n.suite, rustls::CipherSuite::TLS13_AES_256_GCM_SHA384);
+        let n = client_verdict(&pki, true).unwrap();
+        assert_eq!(
+            n.suite,
+            rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        );
+    }
+
+    /// The CNSA client advertises only `ECDSA_NISTP384_SHA384`, so a
+    /// server whose key cannot produce it fails before sending a
+    /// `CertificateVerify` (the error is the server's). The verifier itself
+    /// is exercised by the `cnsa_server_verifier_*` tests below.
+    fn assert_no_common_scheme<T: std::fmt::Debug>(r: &Result<T, rustls::Error>) {
+        assert!(
+            matches!(
+                r,
+                Err(rustls::Error::PeerIncompatible(
+                    rustls::PeerIncompatible::NoSignatureSchemesInCommon
+                ))
+            ),
+            "{r:?}"
+        );
+    }
+
+    /// TLS 1.2 form of [`assert_no_common_scheme`]: the server's
+    /// `ServerKeyExchange` signer refuses the only offered scheme.
+    fn assert_tls12_incompatible_key<T: std::fmt::Debug>(r: &Result<T, rustls::Error>) {
+        assert!(
+            matches!(r, Err(rustls::Error::General(m)) if m == "incompatible signing key"),
+            "{r:?}"
+        );
+    }
+
+    /// A chain certificate signed with `sig_alg` was refused by the CNSA
+    /// verifier, which lists ECDSA-with-SHA-384 as the only supported one.
+    fn assert_chain_err<T: std::fmt::Debug>(
+        r: &Result<T, rustls::Error>,
+        sig_alg: rustls::pki_types::AlgorithmIdentifier,
+    ) {
+        assert!(
+            matches!(
+                r,
+                Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnsupportedSignatureAlgorithmContext {
+                        signature_algorithm_id,
+                        supported_algorithms,
+                    },
+                )) if signature_algorithm_id.as_slice() == sig_alg.as_ref()
+                    && supported_algorithms.as_slice()
+                        == [rustls::pki_types::alg_id::ECDSA_SHA384]
+            ),
+            "chain was not refused as UnsupportedSignatureAlgorithmContext (ECDSA_SHA384 only)"
+        );
+    }
+
+    #[test]
+    fn cnsa_client_rejects_p256_server_tls13() {
+        assert_no_common_scheme(&client_verdict(&pki_with(P384, P256), false));
+    }
+
+    #[test]
+    fn cnsa_client_rejects_p256_server_tls12() {
+        assert_tls12_incompatible_key(&client_verdict(&pki_with(P384, P256), true));
+    }
+
+    #[test]
+    fn cnsa_client_rejects_rsa2048_server_tls13() {
+        assert_no_common_scheme(&client_verdict(&pki_with(P384, RSA), false));
+    }
+
+    /// Already refused before SR-14 (no ECDHE-RSA suite is offered); kept
+    /// as a regression guard.
+    #[test]
+    fn cnsa_client_rejects_rsa2048_server_tls12() {
+        let r = client_verdict(&pki_with(P384, RSA), true);
+        assert!(
+            matches!(
+                r,
+                Err(rustls::Error::PeerIncompatible(
+                    rustls::PeerIncompatible::NoCipherSuitesInCommon
+                ))
+            ),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn cnsa_client_rejects_p521_server_tls13() {
+        assert_no_common_scheme(&client_verdict(&pki_with(P384, P521), false));
+    }
+
+    #[test]
+    fn cnsa_client_rejects_ed25519_server_tls13() {
+        assert_no_common_scheme(&client_verdict(&pki_with(P384, ED25519), false));
+    }
+
+    #[test]
+    fn cnsa_client_rejects_p384_leaf_from_p256_ca() {
+        let pki = pki_with(P256, P384);
+        let sha256 = rustls::pki_types::alg_id::ECDSA_SHA256;
+        assert_chain_err(&client_verdict(&pki, false), sha256);
+        assert_chain_err(&client_verdict(&pki, true), sha256);
+    }
+
+    #[test]
+    fn cnsa_client_rejects_p384_leaf_from_rsa_ca() {
+        let pki = pki_with(RSA, P384);
+        let rsa = rustls::pki_types::alg_id::RSA_PKCS1_SHA256;
+        assert_chain_err(&client_verdict(&pki, false), rsa);
+        assert_chain_err(&client_verdict(&pki, true), rsa);
+    }
+
+    /// CNSA mTLS server (P-384 server cert) requiring a client cert from
+    /// `client_pki`'s CA.
+    fn mtls_server(client_pki: &Pki) -> ServerConfig {
+        let server_pki = pki_with(P384, P384);
+        create_server_config_with(
+            server_pki.chain,
+            server_pki.key,
+            TlsServerOptions {
+                min_version: MinTlsVersion::V1_2,
+                client_ca: Some(roots(client_pki)),
+            },
+        )
+        .unwrap()
+    }
+
+    /// Permissive client (default provider, server cert not checked)
+    /// presenting `client_pki`'s leaf.
+    fn mtls_client(client_pki: &Pki, v12: bool) -> ClientConfig {
+        let versions: &[&'static rustls::SupportedProtocolVersion] = if v12 {
+            &[&rustls::version::TLS12]
+        } else {
+            &[&rustls::version::TLS13]
+        };
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+            .with_protocol_versions(versions)
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServer))
+            .with_client_auth_cert(client_pki.chain.clone(), client_pki.key.clone_key())
+            .unwrap()
+    }
+
+    /// Server verification is not under test in the mTLS cases.
+    #[derive(Debug)]
+    struct AcceptAnyServer;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyServer {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &rustls::pki_types::ServerName<'_>,
+            _: &[u8],
+            _: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    fn mtls_verdict(client_pki: &Pki, v12: bool) -> Result<Negotiated, rustls::Error> {
+        handshake(mtls_client(client_pki, v12), mtls_server(client_pki))
+    }
+
+    #[test]
+    fn cnsa_server_accepts_p384_client_cert() {
+        let pki = pki_with(P384, P384);
+        mtls_verdict(&pki, false).unwrap();
+        mtls_verdict(&pki, true).unwrap();
+    }
+
+    /// The CNSA server requests only `ECDSA_NISTP384_SHA384`, so a client
+    /// whose key cannot produce it sends no certificate and the mandatory
+    /// client auth fails. The verifier itself is exercised by the
+    /// `cnsa_client_verifier_*` tests below.
+    fn assert_no_client_cert<T: std::fmt::Debug>(r: &Result<T, rustls::Error>) {
+        assert!(
+            matches!(r, Err(rustls::Error::NoCertificatesPresented)),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn cnsa_server_rejects_p256_client_cert() {
+        let pki = pki_with(P384, P256);
+        assert_no_client_cert(&mtls_verdict(&pki, false));
+        assert_no_client_cert(&mtls_verdict(&pki, true));
+    }
+
+    #[test]
+    fn cnsa_server_rejects_rsa2048_client_cert() {
+        let pki = pki_with(P384, RSA);
+        assert_no_client_cert(&mtls_verdict(&pki, false));
+        assert_no_client_cert(&mtls_verdict(&pki, true));
+    }
+
+    #[test]
+    fn cnsa_server_rejects_p384_client_leaf_from_p256_ca() {
+        let pki = pki_with(P256, P384);
+        let sha256 = rustls::pki_types::alg_id::ECDSA_SHA256;
+        assert_chain_err(&mtls_verdict(&pki, false), sha256);
+        assert_chain_err(&mtls_verdict(&pki, true), sha256);
+    }
+
+    /// The CNSA client presenting its own P-384 cert to a CNSA mTLS server
+    /// still works end to end.
+    #[test]
+    fn cnsa_client_and_server_mtls_p384() {
+        let server_pki = pki_with(P384, P384);
+        let client_pki = pki_with(P384, P384);
+        let client = create_client_config_with(TlsClientOptions {
+            roots: roots(&server_pki),
+            min_version: MinTlsVersion::V1_2,
+            client_auth: Some((client_pki.chain.clone(), client_pki.key.clone_key())),
+        })
+        .unwrap();
+        let server = create_server_config_with(
+            server_pki.chain.clone(),
+            server_pki.key.clone_key(),
+            TlsServerOptions {
+                min_version: MinTlsVersion::V1_2,
+                client_ca: Some(roots(&client_pki)),
+            },
+        )
+        .unwrap();
+        handshake(client, server).unwrap();
+    }
+
+    // ---- SR-14: verifiers built from cnsa_provider(), called directly ----
+    //
+    // The handshake tests above mostly stop at scheme negotiation. Here the
+    // peer is offered every default scheme so it signs with its own key,
+    // and the CNSA verifier must refuse that real signature.
+
+    type Verdict = std::sync::Mutex<Option<Result<(), rustls::Error>>>;
+
+    fn record<T>(slot: &Verdict, r: &Result<T, rustls::Error>) {
+        *slot.lock().unwrap() = Some(r.as_ref().map(|_| ()).map_err(Clone::clone));
+    }
+
+    fn verdict(slot: &Verdict) -> Result<(), rustls::Error> {
+        slot.lock().unwrap().clone().expect("verifier not called")
+    }
+
+    fn default_schemes() -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+
+    fn versions(v12: bool) -> Vec<&'static rustls::SupportedProtocolVersion> {
+        if v12 {
+            vec![&rustls::version::TLS12]
+        } else {
+            vec![&rustls::version::TLS13]
+        }
+    }
+
+    fn cnsa_server_verifier(pki: &Pki) -> Arc<rustls::client::WebPkiServerVerifier> {
+        rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots(pki)),
+            Arc::new(cnsa_provider()),
+        )
+        .build()
+        .unwrap()
+    }
+
+    fn cnsa_client_verifier(pki: &Pki) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
+        rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots(pki)),
+            Arc::new(cnsa_provider()),
+        )
+        .build()
+        .unwrap()
+    }
+
+    /// Wraps the CNSA server verifier: records the certificate verdict but
+    /// continues, advertises every default scheme, and returns the CNSA
+    /// verdict on the handshake signature.
+    #[derive(Debug)]
+    struct SpyServerVerifier {
+        inner: Arc<rustls::client::WebPkiServerVerifier>,
+        cert: Verdict,
+        sig: Verdict,
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for SpyServerVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
+            server_name: &rustls::pki_types::ServerName<'_>,
+            ocsp: &[u8],
+            now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            let r =
+                self.inner
+                    .verify_server_cert(end_entity, intermediates, server_name, ocsp, now);
+            record(&self.cert, &r);
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            let r = self.inner.verify_tls12_signature(message, cert, dss);
+            record(&self.sig, &r);
+            r
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            let r = self.inner.verify_tls13_signature(message, cert, dss);
+            record(&self.sig, &r);
+            r
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            default_schemes()
+        }
+    }
+
+    /// Default-provider client (offers ECDHE-RSA on 1.2) checking `pki`'s
+    /// server through a [`SpyServerVerifier`].
+    fn spy_client_verdict(
+        pki: &Pki,
+        v12: bool,
+    ) -> (Arc<SpyServerVerifier>, Result<Negotiated, rustls::Error>) {
+        let spy = Arc::new(SpyServerVerifier {
+            inner: cnsa_server_verifier(pki),
+            cert: Verdict::default(),
+            sig: Verdict::default(),
+        });
+        let client = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(&versions(v12))
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::clone(&spy) as _)
+        .with_no_client_auth();
+        let r = handshake(client, permissive_server(pki, v12));
+        (spy, r)
+    }
+
+    /// Wraps the CNSA client-certificate verifier the same way.
+    #[derive(Debug)]
+    struct SpyClientVerifier {
+        inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+        cert: Verdict,
+        sig: Verdict,
+    }
+
+    impl rustls::server::danger::ClientCertVerifier for SpyClientVerifier {
+        fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+            self.inner.root_hint_subjects()
+        }
+        fn verify_client_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
+            now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+            let r = self
+                .inner
+                .verify_client_cert(end_entity, intermediates, now);
+            record(&self.cert, &r);
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            let r = self.inner.verify_tls12_signature(message, cert, dss);
+            record(&self.sig, &r);
+            r
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            let r = self.inner.verify_tls13_signature(message, cert, dss);
+            record(&self.sig, &r);
+            r
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            default_schemes()
+        }
+    }
+
+    /// CNSA server (P-384 cert) checking `client_pki`'s client certificate
+    /// through a [`SpyClientVerifier`].
+    fn spy_mtls_verdict(
+        client_pki: &Pki,
+        v12: bool,
+    ) -> (Arc<SpyClientVerifier>, Result<Negotiated, rustls::Error>) {
+        let spy = Arc::new(SpyClientVerifier {
+            inner: cnsa_client_verifier(client_pki),
+            cert: Verdict::default(),
+            sig: Verdict::default(),
+        });
+        let server_pki = pki_with(P384, P384);
+        let server = ServerConfig::builder_with_provider(Arc::new(cnsa_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+            .unwrap()
+            .with_client_cert_verifier(Arc::clone(&spy) as _)
+            .with_single_cert(server_pki.chain, server_pki.key)
+            .unwrap();
+        let r = handshake(mtls_client(client_pki, v12), server);
+        (spy, r)
+    }
+
+    /// The handshake signature scheme was not one the CNSA verifier maps.
+    fn assert_unmapped_scheme<T: std::fmt::Debug>(r: &Result<T, rustls::Error>) {
+        assert!(
+            matches!(
+                r,
+                Err(rustls::Error::PeerMisbehaved(
+                    rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme
+                ))
+            ),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn cnsa_server_verifier_accepts_p384_signature() {
+        let pki = pki_with(P384, P384);
+        for v12 in [false, true] {
+            let (spy, r) = spy_client_verdict(&pki, v12);
+            r.unwrap();
+            verdict(&spy.cert).unwrap();
+            verdict(&spy.sig).unwrap();
+        }
+    }
+
+    #[test]
+    fn cnsa_server_verifier_rejects_p256_and_rsa_signatures() {
+        for leaf in [P256, RSA] {
+            let pki = pki_with(P384, leaf);
+            for v12 in [false, true] {
+                let (spy, r) = spy_client_verdict(&pki, v12);
+                // The chain itself is P-384 / SHA-384; the end-entity key is
+                // refused at the handshake signature.
+                verdict(&spy.cert).unwrap();
+                assert_unmapped_scheme(&verdict(&spy.sig));
+                assert_unmapped_scheme(&r);
+            }
+        }
+    }
+
+    #[test]
+    fn cnsa_client_verifier_accepts_p384_signature() {
+        let pki = pki_with(P384, P384);
+        for v12 in [false, true] {
+            let (spy, r) = spy_mtls_verdict(&pki, v12);
+            r.unwrap();
+            verdict(&spy.cert).unwrap();
+            verdict(&spy.sig).unwrap();
+        }
+    }
+
+    #[test]
+    fn cnsa_client_verifier_rejects_p256_and_rsa_signatures() {
+        for leaf in [P256, RSA] {
+            let pki = pki_with(P384, leaf);
+            for v12 in [false, true] {
+                let (spy, r) = spy_mtls_verdict(&pki, v12);
+                verdict(&spy.cert).unwrap();
+                assert_unmapped_scheme(&verdict(&spy.sig));
+                assert_unmapped_scheme(&r);
+            }
+        }
+    }
+
+    /// Root (`root_alg`) -> intermediate (`int_alg` key, signed by the root)
+    /// -> `localhost` leaf (`leaf_alg` key, signed by the intermediate).
+    fn pki_chain3(
+        root_alg: &'static rcgen::SignatureAlgorithm,
+        int_alg: &'static rcgen::SignatureAlgorithm,
+        leaf_alg: &'static rcgen::SignatureAlgorithm,
+    ) -> Pki {
+        let ca_params = || {
+            let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            p
+        };
+        let root_key = rcgen::KeyPair::generate_for(root_alg).unwrap();
+        let root = ca_params().self_signed(&root_key).unwrap();
+        let int_key = rcgen::KeyPair::generate_for(int_alg).unwrap();
+        let int = ca_params().signed_by(&int_key, &root, &root_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate_for(leaf_alg).unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &int, &int_key)
+            .unwrap();
+        Pki {
+            ca: root.der().clone(),
+            chain: vec![leaf.der().clone(), int.der().clone()],
+            key: PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+        }
+    }
+
+    fn direct_server_cert(pki: &Pki) -> Result<(), rustls::Error> {
+        use rustls::client::danger::ServerCertVerifier as _;
+        cnsa_server_verifier(pki)
+            .verify_server_cert(
+                &pki.chain[0],
+                &pki.chain[1..],
+                &"localhost".try_into().unwrap(),
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .map(|_| ())
+    }
+
+    fn direct_client_cert(pki: &Pki) -> Result<(), rustls::Error> {
+        cnsa_client_verifier(pki)
+            .verify_client_cert(
+                &pki.chain[0],
+                &pki.chain[1..],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .map(|_| ())
+    }
+
+    #[test]
+    fn cnsa_verifiers_accept_p384_three_level_chain() {
+        let pki = pki_chain3(P384, P384, P384);
+        direct_server_cert(&pki).unwrap();
+        direct_client_cert(&pki).unwrap();
+        client_verdict(&pki, false).unwrap();
+        client_verdict(&pki, true).unwrap();
+        mtls_verdict(&pki, false).unwrap();
+        mtls_verdict(&pki, true).unwrap();
+    }
+
+    /// The intermediate is signed P-384 / SHA-384 by the root, but its own
+    /// key is P-256, so the leaf carries a P-256 / SHA-256 signature.
+    #[test]
+    fn cnsa_verifiers_reject_p256_intermediate_in_p384_chain() {
+        let pki = pki_chain3(P384, P256, P384);
+        let sha256 = rustls::pki_types::alg_id::ECDSA_SHA256;
+        assert_chain_err(&direct_server_cert(&pki), sha256);
+        assert_chain_err(&direct_client_cert(&pki), sha256);
+        assert_chain_err(&client_verdict(&pki, false), sha256);
+        assert_chain_err(&client_verdict(&pki, true), sha256);
+        assert_chain_err(&mtls_verdict(&pki, false), sha256);
+        assert_chain_err(&mtls_verdict(&pki, true), sha256);
+    }
+
+    /// Records the `signature_algorithms` a CNSA client sends.
+    #[derive(Debug)]
+    struct HelloRecorder {
+        key: Arc<rustls::sign::CertifiedKey>,
+        seen: std::sync::Mutex<Vec<rustls::SignatureScheme>>,
+    }
+
+    impl rustls::server::ResolvesServerCert for HelloRecorder {
+        fn resolve(
+            &self,
+            hello: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            *self.seen.lock().unwrap() = hello.signature_schemes().to_vec();
+            Some(Arc::clone(&self.key))
+        }
+    }
+
+    /// Records the schemes a CNSA server puts in `CertificateRequest`.
+    #[derive(Debug)]
+    struct CertRequestRecorder {
+        key: Arc<rustls::sign::CertifiedKey>,
+        seen: std::sync::Mutex<Vec<rustls::SignatureScheme>>,
+    }
+
+    impl rustls::client::ResolvesClientCert for CertRequestRecorder {
+        fn resolve(
+            &self,
+            _: &[&[u8]],
+            schemes: &[rustls::SignatureScheme],
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            *self.seen.lock().unwrap() = schemes.to_vec();
+            Some(Arc::clone(&self.key))
+        }
+        fn has_certs(&self) -> bool {
+            true
+        }
+    }
+
+    fn certified_key(pki: &Pki) -> Arc<rustls::sign::CertifiedKey> {
+        let key = rustls::crypto::aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(pki.key.clone_key())
+            .unwrap();
+        Arc::new(rustls::sign::CertifiedKey::new(pki.chain.clone(), key))
+    }
+
+    #[test]
+    fn cnsa_client_config_advertises_only_p384_sha384() {
+        let pki = pki_with(P384, P384);
+        for (min, v12) in [(MinTlsVersion::V1_3, false), (MinTlsVersion::V1_2, true)] {
+            let rec = Arc::new(HelloRecorder {
+                key: certified_key(&pki),
+                seen: std::sync::Mutex::default(),
+            });
+            let server = ServerConfig::builder_with_provider(Arc::new(cnsa_provider()))
+                .with_protocol_versions(&versions(v12))
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::clone(&rec) as _);
+            handshake(cnsa_client(&pki, min), server).unwrap();
+            assert_eq!(
+                *rec.seen.lock().unwrap(),
+                [rustls::SignatureScheme::ECDSA_NISTP384_SHA384]
+            );
+        }
+    }
+
+    #[test]
+    fn cnsa_server_config_requests_only_p384_sha384() {
+        let client_pki = pki_with(P384, P384);
+        for v12 in [false, true] {
+            let rec = Arc::new(CertRequestRecorder {
+                key: certified_key(&client_pki),
+                seen: std::sync::Mutex::default(),
+            });
+            let client = ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_protocol_versions(&versions(v12))
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServer))
+            .with_client_cert_resolver(Arc::clone(&rec) as _);
+            handshake(client, mtls_server(&client_pki)).unwrap();
+            assert_eq!(
+                *rec.seen.lock().unwrap(),
+                [rustls::SignatureScheme::ECDSA_NISTP384_SHA384]
+            );
+        }
     }
 
     // ---- Key file checks (POA&M-164) and curve checks (POA&M-166) ----
