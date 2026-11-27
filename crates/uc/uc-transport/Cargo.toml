@@ -74,5 +74,9 @@ harness = false
 name = "stream_recv"
 harness = false
 
+[[bench]]
+name = "crl_handshake"
+harness = false
+
 [lints]
 workspace = true

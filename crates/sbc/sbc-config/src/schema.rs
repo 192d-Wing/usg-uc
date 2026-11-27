@@ -508,6 +508,12 @@ pub struct RecordingConfig {
     /// PEM CA bundle that validates the SRS certificate. Required when
     /// enabled; must exist.
     pub srs_tls_ca_file: Option<String>,
+    /// CRLs for the SRS certificate: a PEM or DER file, or a directory of
+    /// `*.pem`, `*.crl`, `*.der` files. Absolute. Policy from
+    /// `[security.revocation]`.
+    ///
+    /// ## NIST 800-53 Rev5: IA-5(2), SC-23
+    pub srs_tls_crl_file: Option<String>,
     /// Name verified against the SRS certificate; defaults to the URI host.
     pub srs_tls_server_name: Option<String>,
     /// Record every call (otherwise only `trunk_groups` / `zones` matches).
@@ -566,6 +572,7 @@ impl Default for RecordingConfig {
             notice_acknowledged: false,
             srs_uri: None,
             srs_tls_ca_file: None,
+            srs_tls_crl_file: None,
             srs_tls_server_name: None,
             record_all: false,
             trunk_groups: Vec::new(),
@@ -652,6 +659,13 @@ pub struct CdrSyslogConfig {
     /// daemon's configured trust store.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ca_path: Option<PathBuf>,
+    /// CRLs for the collector certificate: a PEM or DER file, or a
+    /// directory of `*.pem`, `*.crl`, `*.der` files. Absolute. Policy from
+    /// `[security.revocation]`.
+    ///
+    /// ## NIST 800-53 Rev5: IA-5(2), AU-9(2)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crl_path: Option<PathBuf>,
     /// Syslog facility, 0..=23 (16 = local0).
     pub facility: u8,
 }
@@ -662,6 +676,7 @@ impl Default for CdrSyslogConfig {
             enabled: false,
             target: "tls://collector:6514".to_string(),
             ca_path: None,
+            crl_path: None,
             facility: 16,
         }
     }
@@ -1515,6 +1530,95 @@ pub struct SecurityConfig {
     ///
     /// ## NIST 800-53 Rev5: SC-8 (POA&M-48)
     pub require_tls_trunks: bool,
+
+    /// CRLs for client certificates on the SIP-TLS listener (mutual TLS):
+    /// a PEM or DER file, or a directory of `*.pem`, `*.crl`, `*.der`
+    /// files. Absolute; needs `require_mtls` and `tls_ca_path`. Loaded at
+    /// startup only (restart to apply a new CRL).
+    ///
+    /// ## NIST 800-53 Rev5: IA-5(2), IA-3
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_crl_path: Option<PathBuf>,
+
+    /// CRLs for SIP trunk server certificates (trunk TLS and trunk mTLS).
+    /// Same format as `tls_crl_path`; needs `trunk_tls_ca_path`.
+    ///
+    /// ## NIST 800-53 Rev5: IA-5(2), SC-23
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trunk_tls_crl_path: Option<PathBuf>,
+
+    /// Revocation policy shared by every TLS path with a CRL
+    /// (`[security.revocation]`).
+    #[serde(skip_serializing_if = "RevocationConfig::is_default")]
+    pub revocation: RevocationConfig,
+}
+
+/// Which certificates of a chain are checked against CRLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationCheckDepth {
+    /// Every certificate below the trust anchor (RFC 5280 path
+    /// validation). Every CA in the chain needs a CRL from its issuer.
+    #[default]
+    Chain,
+    /// The end-entity certificate only.
+    EndEntity,
+}
+
+/// Handling of a certificate no configured CRL covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationUnknown {
+    /// Fail the handshake.
+    #[default]
+    Deny,
+    /// Accept the certificate.
+    Allow,
+}
+
+/// Handling of a CRL past its `nextUpdate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpiredCrlPolicy {
+    /// Fail handshakes that need the CRL (fail closed).
+    #[default]
+    Reject,
+    /// Use the CRL anyway (fail open; logged at startup).
+    Ignore,
+}
+
+/// `[security.revocation]`: one revocation policy for every TLS path.
+///
+/// Applies to every path that has a CRL (`security.tls_crl_path`,
+/// `security.trunk_tls_crl_path`, `recording.srs_tls_crl_file`,
+/// `cdr.syslog.crl_path`). See
+/// `docs/TLS-REVOCATION-DESIGN.md` decisions D1-D4 and D6.
+///
+/// ## NIST 800-53 Rev5: IA-5(2), CM-6
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RevocationConfig {
+    /// `chain` (default) or `end_entity`.
+    pub check_depth: RevocationCheckDepth,
+    /// Client certificates on the SIP-TLS listener: `deny` (default) or
+    /// `allow`.
+    pub client_unknown: RevocationUnknown,
+    /// Server certificates (trunks, SRS, CDR syslog): `deny` (default) or
+    /// `allow`.
+    pub server_unknown: RevocationUnknown,
+    /// `reject` (default) or `ignore`.
+    pub expired_crl: ExpiredCrlPolicy,
+    /// Every enabled TLS path must have a CRL path (hardening switch).
+    pub require: bool,
+}
+
+impl RevocationConfig {
+    /// Whether every field has its default value (skipped when
+    /// serializing).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Default for SecurityConfig {
@@ -1528,6 +1632,9 @@ impl Default for SecurityConfig {
             tls_ca_path: None,
             trunk_tls_ca_path: None,
             require_tls_trunks: false,
+            tls_crl_path: None,
+            trunk_tls_crl_path: None,
+            revocation: RevocationConfig::default(),
         }
     }
 }

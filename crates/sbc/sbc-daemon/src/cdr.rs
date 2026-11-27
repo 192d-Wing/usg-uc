@@ -883,12 +883,34 @@ impl TlsSyslogConnector {
     /// Builds the connector from `cdr.syslog` (CA from `cdr.syslog.ca_path`,
     /// else `security.tls_ca_path`).
     pub fn new(target: &str, ca_path: &Path) -> Result<Self, String> {
+        Self::with_revocation(target, ca_path, None)
+    }
+
+    /// [`Self::new`], checking the collector certificate against
+    /// `revocation` (`cdr.syslog.crl_path`, SR-29) when set.
+    ///
+    /// ## NIST 800-53 Rev5: IA-5(2), AU-9(2)
+    pub fn with_revocation(
+        target: &str,
+        ca_path: &Path,
+        revocation: Option<&uc_transport::revocation::Revocation>,
+    ) -> Result<Self, String> {
         let (host, port) = parse_tls_target(target)
             .ok_or_else(|| format!("invalid cdr.syslog.target {target:?}"))?;
         let roots = uc_transport::tls::load_root_store(ca_path)
             .map_err(|e| format!("cdr.syslog CA {}: {e}", ca_path.display()))?;
-        let config = uc_transport::tls::create_client_config(roots)
-            .map_err(|e| format!("cdr.syslog TLS config: {e}"))?;
+        let config = match revocation {
+            // TLS 1.3 only, as create_client_config.
+            Some(rev) => rev.server_verifier(Arc::new(roots)).and_then(|v| {
+                uc_transport::tls::create_client_config_verified(
+                    v,
+                    uc_transport::tls::MinTlsVersion::V1_3,
+                    None,
+                )
+            }),
+            None => uc_transport::tls::create_client_config(roots),
+        }
+        .map_err(|e| format!("cdr.syslog TLS config: {e}"))?;
         Ok(Self {
             host,
             port,
@@ -998,7 +1020,15 @@ impl SyslogConnector for TlsSyslogConnector {
         // Complete the handshake now so a bad certificate fails the connect,
         // not the first record (bounded by the socket timeouts).
         while stream.conn.is_handshaking() {
-            stream.conn.complete_io(&mut stream.sock)?;
+            stream.conn.complete_io(&mut stream.sock).inspect_err(|e| {
+                // SR-29: count and audit a revocation rejection; the
+                // collector is not connected.
+                crate::tls_revocation::note_io_error(
+                    crate::tls_revocation::Role::CdrSyslog,
+                    e,
+                    Some(addr.ip()),
+                );
+            })?;
         }
         Ok(Box::new(stream))
     }
@@ -1044,11 +1074,35 @@ fn pii_policy(config: &CdrConfig) -> Result<PiiPolicy, String> {
 /// not writable: CDR generation is an AU-12 requirement, so the error names
 /// the directory and the keys that control it.
 ///
+/// Test entry point with the default revocation policy; production uses
+/// [`start_from_config_with_revocation`].
+///
 /// ## NIST 800-53 Rev5: AU-5 (fail closed at startup), AU-12
+#[cfg(test)]
 pub fn start_from_config(
     config: &CdrConfig,
     instance_name: &str,
     security_ca_path: Option<&Path>,
+) -> Result<Option<Arc<CdrContext>>, String> {
+    start_from_config_with_revocation(
+        config,
+        instance_name,
+        security_ca_path,
+        sbc_config::schema::RevocationConfig::default(),
+    )
+}
+
+/// Starts the CDR pipeline from `[cdr]`, with the `[security.revocation]`
+/// policy applied to `cdr.syslog.crl_path` (SR-29). `Ok(None)` when
+/// `cdr.enabled` is false. Fails (and the daemon refuses to start) when the
+/// directory is not writable or a syslog CA or CRL does not load.
+///
+/// ## NIST 800-53 Rev5: AU-5, AU-12, IA-5(2)
+pub fn start_from_config_with_revocation(
+    config: &CdrConfig,
+    instance_name: &str,
+    security_ca_path: Option<&Path>,
+    revocation: sbc_config::schema::RevocationConfig,
 ) -> Result<Option<Arc<CdrContext>>, String> {
     if !config.enabled {
         info!("CDRs disabled by configuration (cdr.enabled = false)");
@@ -1088,7 +1142,14 @@ pub fn start_from_config(
             .as_deref()
             .or(security_ca_path)
             .ok_or("cdr.syslog.enabled needs cdr.syslog.ca_path or security.tls_ca_path")?;
-        let connector = TlsSyslogConnector::new(&config.syslog.target, ca)?;
+        let rev = crate::tls_revocation::load_opt(
+            crate::tls_revocation::Role::CdrSyslog,
+            config.syslog.crl_path.as_deref(),
+            revocation,
+        )
+        .map_err(|e| format!("cdr.syslog.crl_path: {e}"))?;
+        let connector =
+            TlsSyslogConnector::with_revocation(&config.syslog.target, ca, rev.as_ref())?;
         sinks.push(Box::new(SyslogSink::new(
             &SyslogSinkConfig {
                 hostname: node_id.clone(),

@@ -115,6 +115,7 @@ enabled = false
 notice_acknowledged = false
 # srs_uri = "sips:srs.example.net:5061"
 # srs_tls_ca_file = "/etc/sbc/certs/srs-ca.pem"
+# srs_tls_crl_file = "/etc/sbc/certs/srs-crl.pem"   # CRLs for the SRS certificate
 # srs_tls_server_name = "srs.example.net"
 # Trigger: every call, or calls with a leg on a listed trunk group / zone.
 record_all = false
@@ -146,6 +147,19 @@ require_mtls = false
 # NIST 800-53 Rev5: SC-8 — every trunk group sends only on TLS trunks (no
 # UDP/TCP fallback; 503 when none is usable). Per group: `require_tls = true`.
 # require_tls_trunks = false
+# Certificate revocation (CRL files; NIST 800-53 IA-5(2), SR-29). A path is a
+# PEM or DER file or a directory of *.pem, *.crl, *.der files, one CRL per
+# issuer. Loaded at startup only: restart to apply a new CRL. Without a CRL
+# path the TLS path does not check revocation.
+# tls_crl_path = "/etc/sbc/client-crl"       # SIP mTLS client certs; needs require_mtls
+# trunk_tls_crl_path = "/etc/sbc/trunk-crl"  # trunk server certs; needs trunk_tls_ca_path
+
+# [security.revocation]
+# check_depth = "chain"        # "chain" (every CA below the anchor needs a CRL) | "end_entity"
+# client_unknown = "deny"      # SIP mTLS clients no CRL covers: "deny" | "allow"
+# server_unknown = "deny"      # trunk, SRS, CDR syslog: "deny" | "allow"
+# expired_crl = "reject"       # CRL past nextUpdate: "reject" (fail closed) | "ignore"
+# require = false              # true: every enabled TLS path needs a CRL path
 
 [stir_shaken]
 # Verification is off until STI-CR trust anchors are configured (it was on by
@@ -226,6 +240,7 @@ on_failure = "continue"             # continue | reject_new_calls (emergency cal
 enabled = false
 target = "tls://collector.example.net:6514"   # RFC 5425; TLS only
 # ca_path = "/etc/usg-sbc/syslog-ca.pem"
+# crl_path = "/etc/usg-sbc/syslog-crl"         # CRLs for the collector certificate
 facility = 16                       # local0
 
 # Clustering and shared storage (only with sbc-daemon built --features cluster;

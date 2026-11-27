@@ -2000,14 +2000,30 @@ impl Server {
             }
             _ => None,
         };
-        let tls =
-            uc_transport::tls::create_client_config_with(uc_transport::tls::TlsClientOptions {
-                roots,
-                // CNSA 2.0: TLS 1.3 only toward the recorder.
-                min_version: uc_transport::tls::MinTlsVersion::V1_3,
-                client_auth,
-            })
-            .map_err(|e| refuse(format!("building the recorder TLS client config: {e}")))?;
+        // SR-29 (POA&M-401 phase (a)): recording.srs_tls_crl_file. A bad
+        // CRL refuses startup like a bad SRS CA.
+        let crl_path = rec.srs_tls_crl_file.as_deref().map(std::path::Path::new);
+        let revocation = crate::tls_revocation::load_opt(
+            crate::tls_revocation::Role::SrsTls,
+            crl_path,
+            sec.revocation,
+        )
+        .map_err(|e| refuse(format!("recording.srs_tls_crl_file: {e}")))?;
+        // CNSA 2.0: TLS 1.3 only toward the recorder.
+        let min_version = uc_transport::tls::MinTlsVersion::V1_3;
+        let tls = match &revocation {
+            Some(rev) => rev.server_verifier(Arc::new(roots)).and_then(|v| {
+                uc_transport::tls::create_client_config_verified(v, min_version, client_auth)
+            }),
+            None => {
+                uc_transport::tls::create_client_config_with(uc_transport::tls::TlsClientOptions {
+                    roots,
+                    min_version,
+                    client_auth,
+                })
+            }
+        }
+        .map_err(|e| refuse(format!("building the recorder TLS client config: {e}")))?;
 
         // The fork's address when no zone media address applies: the SBC's
         // source address toward the SRS, from the kernel's route lookup (a
@@ -2064,6 +2080,7 @@ impl Server {
             ca = %ca_path.display(),
             on_failure = ?rec.on_failure,
             max_sessions = rec.max_sessions,
+            crl = revocation.is_some(),
             "SIPREC recording enabled (TLS 1.3 to the recorder, certificate verification on)"
         );
         Ok(())
@@ -2108,12 +2125,42 @@ impl Server {
             uc_transport::tls::load_root_store(ca_path)
                 .map_err(|e| tls_error(format!("loading {}: {e}", ca_path.display())))
         };
-        let plain =
-            uc_transport::tls::create_client_config_with(uc_transport::tls::TlsClientOptions {
-                roots: roots()?,
+        // SR-29 (POA&M-401 phase (a)): with security.trunk_tls_crl_path,
+        // one CRL-checking verifier backs both the TLS and the mTLS client
+        // config (the CRLs are parsed once). Without it the configs are
+        // built exactly as before.
+        let verifier = crate::tls_revocation::load_opt(
+            crate::tls_revocation::Role::TrunkTls,
+            sec.trunk_tls_crl_path.as_deref(),
+            sec.revocation,
+        )
+        .map_err(tls_error)?
+        .map(|rev| {
+            rev.server_verifier(Arc::new(roots()?))
+                .map_err(|e| tls_error(format!("building trunk TLS verifier: {e}")))
+        })
+        .transpose()?;
+        let client_config = |client_auth| match &verifier {
+            Some(v) => uc_transport::tls::create_client_config_verified(
+                Arc::clone(v),
                 min_version,
-                client_auth: None,
-            })
+                client_auth,
+            ),
+            None => roots()
+                .map_err(|e| uc_transport::TransportError::TlsCertificateError {
+                    reason: e.to_string(),
+                })
+                .and_then(|roots| {
+                    uc_transport::tls::create_client_config_with(
+                        uc_transport::tls::TlsClientOptions {
+                            roots,
+                            min_version,
+                            client_auth,
+                        },
+                    )
+                }),
+        };
+        let plain = client_config(None)
             .map_err(|e| tls_error(format!("building trunk TLS client config: {e}")))?;
         let wants_mtls = self
             .config
@@ -2128,16 +2175,9 @@ impl Server {
                 // POA&M-166: key must be on security.curve; outcome audited.
                 let key = load_tls_key_audited("trunk-mtls-client", key, sec.curve)
                     .map_err(|e| tls_error(format!("loading {}: {e}", key.display())))?;
-                Some(Arc::new(
-                    uc_transport::tls::create_client_config_with(
-                        uc_transport::tls::TlsClientOptions {
-                            roots: roots()?,
-                            min_version,
-                            client_auth: Some((chain, key)),
-                        },
-                    )
-                    .map_err(|e| tls_error(format!("building trunk mTLS client config: {e}")))?,
-                ))
+                Some(Arc::new(client_config(Some((chain, key))).map_err(
+                    |e| tls_error(format!("building trunk mTLS client config: {e}")),
+                )?))
             }
             (true, _, _) => {
                 return Err(tls_error(
@@ -2151,6 +2191,7 @@ impl Server {
             ca = %ca_path.display(),
             min_tls_version = %sec.min_tls_version,
             mtls = wants_mtls,
+            crl = verifier.is_some(),
             "Trunk TLS client credentials loaded (certificate verification on)"
         );
         Ok(())
@@ -2295,18 +2336,38 @@ impl Server {
         } else {
             None
         };
+        // SR-29 (POA&M-401 phase (a)): client certificate CRLs, only with
+        // mutual TLS (validate_config rejects a CRL path without it). A bad
+        // CRL fails the listener like a bad CA bundle.
+        let revocation = if self.config.security.require_mtls {
+            crate::tls_revocation::load_opt(
+                crate::tls_revocation::Role::SipTls,
+                self.config.security.tls_crl_path.as_deref(),
+                self.config.security.revocation,
+            )
+            .map_err(tls_error)?
+        } else {
+            None
+        };
+        crate::tls_revocation::warn_on_config(&self.config.security);
         let options = uc_transport::tls::TlsServerOptions {
             min_version,
             client_ca,
         };
         let server_config = Arc::new(
-            uc_transport::tls::create_server_config_with(cert_chain, private_key, options)
-                .map_err(|e| tls_error(format!("building TLS server config: {e}")))?,
+            uc_transport::tls::create_server_config_with_revocation(
+                cert_chain,
+                private_key,
+                options,
+                revocation.as_ref(),
+            )
+            .map_err(|e| tls_error(format!("building TLS server config: {e}")))?,
         );
         info!(
             cert = %cert_path.display(),
             min_tls_version = %self.config.security.min_tls_version,
             mtls = self.config.security.require_mtls,
+            crl = revocation.is_some(),
             "TLS server credentials loaded for SIP listeners"
         );
 
@@ -2580,6 +2641,9 @@ impl Server {
                 Self::ws_accept_loop(listener, ctx).await;
             }));
         }
+
+        // Aggregated TLS revocation rejection audit (SR-29). AU-4, AU-5.
+        handles.push(crate::tls_revocation::spawn_flush(self.shutdown.clone()));
 
         // Rate-limited signaling audit flush (digest, in-dialog, route and
         // loop rejections; POA&M-236/252). NIST 800-53 Rev5: AU-4, AU-5.
@@ -3454,6 +3518,13 @@ impl Server {
                                 debug!(peer = %peer, "TLS handshake held its slot too long, dropping");
                             }
                             Ok(SlottedHandshake::Done(Err(e))) => {
+                                // SR-29: a revocation rejection is counted
+                                // and audited (aggregated per reason).
+                                crate::tls_revocation::note_transport_error(
+                                    crate::tls_revocation::Role::SipTls,
+                                    &e,
+                                    Some(peer.ip()),
+                                );
                                 // POAM: POA&M-443 — a failed TLS handshake
                                 // is still a per-connection warn! (AU-4).
                                 warn!(peer = %peer, error = %e, "TLS handshake failed");
@@ -5031,6 +5102,8 @@ const BEARER_AUDIT_KEY_ID: &str = "bearer_auth.oidc";
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    // SR-29: CRL revocation wiring (server/tests/revocation.rs).
+    mod revocation;
 
     /// Writes a fresh PKCS#8 EC key with mode 0600 into `dir`.
     #[cfg(unix)]

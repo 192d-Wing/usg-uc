@@ -637,6 +637,27 @@ sbcDaemon:
     # sends only on TLS trunks; with none usable the call gets 503, never
     # UDP/TCP. Groups cannot opt out. Needs caConfigMap/caSecretName.
     requireTlsTrunks: false
+    # CRLs for trunk server certificates (security.trunk_tls_crl_path; SR-29,
+    # NIST 800-53 Rev5: IA-5(2)). Name of a ConfigMap or Secret whose keys
+    # are CRL files (*.pem, *.crl or *.der; PEM or DER), mounted as a
+    # directory at /etc/sbc/trunk-crl (no subPath). With the default policy
+    # every CA in a trunk's chain needs a CRL from its issuer (the root's
+    # ARL for intermediates), one CRL per issuer. Loaded at startup only:
+    # roll the pods to apply a new CRL. Every replica gets the same set.
+    # Needs caConfigMap/caSecretName.
+    crlConfigMap: ""
+    crlSecretName: ""
+  # [security.revocation]: policy for every TLS path with a CRL (SR-29).
+  # Rendered only when a CRL is configured or require is true.
+  revocation:
+    # "chain" (every CA below the anchor) or "end_entity".
+    checkDepth: "chain"
+    # Trunk, SRS and CDR syslog certificates no CRL covers: "deny" or "allow".
+    serverUnknown: "deny"
+    # CRL past nextUpdate: "reject" (fail closed) or "ignore".
+    expiredCrl: "reject"
+    # true: every enabled TLS path must have a CRL (hardening switch).
+    require: false
   # STIR/SHAKEN (RFC 8224/8225/8588). Off by default. Note: per-trunk
   # sign/verify switches come only from [[trunk_groups]] in the config file
   # (POA&M-34); trunks synced over the API get neither.

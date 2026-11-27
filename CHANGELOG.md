@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### Security (SBC, TLS certificate revocation with CRL files, SR-29, POA&M-401 phase (a))
+
+Tested in local runs on macOS (2026-11-27). Operator details: SBC admin
+guide, "Certificate revocation (CRL files)"; design:
+`docs/TLS-REVOCATION-DESIGN.md`.
+
+- **New, off by default:** CRL checking of peer certificates on the
+  SIP-TLS mTLS listener (`security.tls_crl_path`), TLS trunks with or
+  without `tls_client_cert` (`security.trunk_tls_crl_path`), the SIPREC
+  recorder (`recording.srs_tls_crl_file`) and the CDR syslog collector
+  (`cdr.syslog.crl_path`). A CRL path is a PEM or DER file or a directory.
+  Without a CRL path nothing changes.
+- **New `[security.revocation]` table**, one policy for every path:
+  `check_depth` (`chain` | `end_entity`), `client_unknown` and
+  `server_unknown` (`deny` | `allow`), `expired_crl` (`reject` | `ignore`),
+  `require` (every enabled TLS path needs a CRL path). Defaults: `chain`,
+  `deny`, `deny`, `reject`, `false`. Unknown keys are rejected.
+- **Validation:** CRL paths must be absolute; a CRL path without its TLS path
+  (`require_mtls` + `tls_ca_path`, `trunk_tls_ca_path`, recording enabled,
+  CDR syslog enabled) is a config error.
+- **Startup:** a CRL that cannot be loaded fails that TLS path like a bad CA
+  bundle. A CRL past `nextUpdate` does not stop the SBC; it is logged and
+  audited, and with `expired_crl = "reject"` the handshakes that need it fail.
+  CRLs are read at startup only: restart to apply a new CRL.
+- **Audit and metrics:** `TlsRevocationListLoaded` at startup per path;
+  `TlsPeerCertificateRejected` per refused peer, aggregated per path and
+  reason over 60 s; `tls_revocation_rejections_total{role,reason}`,
+  `tls_revocation_enabled{role}`, `tls_crl_next_update_seconds{role}`.
+- **Helm (sbc chart):** `sbcDaemon.trunkTls.crlConfigMap` / `crlSecretName`
+  (mounted as a directory at `/etc/sbc/trunk-crl`) and
+  `sbcDaemon.revocation.*`.
+- **Libraries:** `uc-transport` adds the `revocation` module,
+  `create_server_config_with_revocation`, `create_client_config_verified`
+  and `TransportError::TlsPeerCertificateRejected`; `uc-syslog`
+  `SyslogTlsConfig` gains `crl_file` (code that builds the struct field by
+  field must add it); `uc-metrics` `Gauge::set_existing_with_labels`.
+- Still open (POA&M-401): CRL reload, expiry warnings, OCSP, CRL download,
+  gRPC mTLS, management-plane HTTPS.
+
 ### BREAKING (SBC, announcement server mTLS, destination policy and caps, SR-41, POA&M-434, 435)
 
 Tested in local runs on macOS (2026-11-23); the rendered-chart tests need

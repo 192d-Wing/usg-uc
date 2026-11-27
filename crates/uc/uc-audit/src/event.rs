@@ -158,6 +158,13 @@ pub enum AuditEvent {
     /// A call that matched the recording trigger was deliberately not
     /// recorded (participant opt-out).
     RecordingSkipped(RecordingSkipped),
+
+    /// CRLs were loaded for a TLS path at startup (SR-29).
+    TlsRevocationListLoaded(TlsRevocationListLoaded),
+
+    /// Peer certificates were refused by the revocation check (aggregated
+    /// per role and reason).
+    TlsPeerCertificateRejected(TlsPeerCertificateRejected),
 }
 
 impl AuditEvent {
@@ -183,8 +190,10 @@ impl AuditEvent {
             | Self::RateLimitTriggered(_)
             | Self::StirVerifyFailure(_)
             | Self::StirAuditEventsDropped(_)
-            | Self::AuditRecordsDropped(_) => AuditEventType::Security,
+            | Self::AuditRecordsDropped(_)
+            | Self::TlsPeerCertificateRejected(_) => AuditEventType::Security,
             Self::ConfigurationChange(_)
+            | Self::TlsRevocationListLoaded(_)
             | Self::StirTrustAnchorsReloaded(_)
             | Self::StirTrustAnchorReloadFailed(_)
             | Self::AccountManagement(_) => AuditEventType::Configuration,
@@ -829,6 +838,46 @@ pub enum AuditDropReason {
     Aggregated,
 }
 
+/// CRLs loaded for one TLS path at startup.
+///
+/// ## NIST 800-53 Rev5: IA-5(2), SC-17, CM-6, AU-3
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsRevocationListLoaded {
+    /// TLS path: `sip_tls`, `trunk_tls`, `srs_tls` or `cdr_syslog`.
+    pub role: String,
+    /// Configured CRL file or directory.
+    pub path: String,
+    /// CRLs loaded.
+    pub crl_count: u64,
+    /// Revoked entries across the CRLs.
+    pub revoked_entries: u64,
+    /// Earliest `nextUpdate` (Unix seconds), if any CRL has one.
+    pub next_update: Option<i64>,
+    /// CRLs already past `nextUpdate` at load.
+    pub expired_count: u64,
+    /// Policy applied: `check_depth`, `unknown`, `expired_crl` tokens,
+    /// e.g. `chain,deny,reject`.
+    pub policy: String,
+}
+
+/// Peer certificates refused by the revocation check, aggregated.
+///
+/// One event per (`role`, `reason`) per aggregation window (60 s); later
+/// rejections in the window are carried on `count`.
+///
+/// ## NIST 800-53 Rev5: IA-5(2), IA-3, AU-2, AU-3, SC-5
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsPeerCertificateRejected {
+    /// TLS path: `sip_tls`, `trunk_tls`, `srs_tls` or `cdr_syslog`.
+    pub role: String,
+    /// `revoked`, `unknown_status`, `crl_expired` or `crl_invalid`.
+    pub reason: String,
+    /// Peer address of the latest rejection, if known.
+    pub peer: Option<IpAddr>,
+    /// Rejections folded into this event (>= 1).
+    pub count: u64,
+}
+
 /// Signing key loaded.
 ///
 /// ## NIST 800-53 Rev5: SC-12, SC-17
@@ -1338,6 +1387,38 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn tls_revocation_events_serialize_and_categorize() {
+        let l = AuditEvent::TlsRevocationListLoaded(TlsRevocationListLoaded {
+            role: "trunk_tls".into(),
+            path: "/etc/sbc/trunk-crl".into(),
+            crl_count: 2,
+            revoked_entries: 5,
+            next_update: Some(1),
+            expired_count: 0,
+            policy: "chain,deny,reject".into(),
+        });
+        assert_eq!(l.event_type(), AuditEventType::Configuration);
+        let json = serde_json::to_string(&l).unwrap();
+        assert!(
+            json.contains(r#""type":"tls_revocation_list_loaded""#),
+            "{json}"
+        );
+        let r = AuditEvent::TlsPeerCertificateRejected(TlsPeerCertificateRejected {
+            role: "sip_tls".into(),
+            reason: "revoked".into(),
+            peer: Some(IpAddr::from([192, 0, 2, 1])),
+            count: 3,
+        });
+        assert_eq!(r.event_type(), AuditEventType::Security);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains(r#""type":"tls_peer_certificate_rejected""#),
+            "{json}"
+        );
+        assert!(json.contains(r#""count":3"#), "{json}");
+    }
 
     #[test]
     fn crypto_key_operation_success_is_byte_compatible() {

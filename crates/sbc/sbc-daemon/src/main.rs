@@ -80,6 +80,7 @@ mod stir;
 mod stir_binding;
 mod stream_framer;
 mod t38;
+mod tls_revocation;
 mod user_limiter;
 mod zone;
 

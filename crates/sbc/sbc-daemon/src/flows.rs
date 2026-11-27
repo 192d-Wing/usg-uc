@@ -663,6 +663,17 @@ impl FlowTable {
                     TlsTransport::connect(dest, &name, Arc::clone(cfg))
                         .await
                         .map(|t| Arc::new(t) as Arc<dyn Transport>)
+                        .inspect_err(|e| {
+                            // SR-29: count and audit a revocation rejection;
+                            // the dial still fails closed (no fallback).
+                            let role = match profile {
+                                FlowProfile::Recorder => crate::tls_revocation::Role::SrsTls,
+                                FlowProfile::Plain | FlowProfile::ClientCert => {
+                                    crate::tls_revocation::Role::TrunkTls
+                                }
+                            };
+                            crate::tls_revocation::note_transport_error(role, e, Some(dest.ip()));
+                        })
                         .map_err(|e| match e {
                             uc_transport::TransportError::ConnectFailed { reason, .. } => {
                                 FlowError::Connect(reason)
