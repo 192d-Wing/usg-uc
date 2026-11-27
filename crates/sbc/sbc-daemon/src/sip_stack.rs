@@ -3071,6 +3071,17 @@ impl std::fmt::Debug for ProcessResult {
     }
 }
 
+/// SIP status for a pod refusal: 503 when a play cap was hit
+/// (`RESOURCE_EXHAUSTED`), else 480 (NIST 800-53 Rev5: SC-5).
+#[cfg(feature = "grpc")]
+fn announcement_refusal_status(code: Option<tonic::Code>) -> StatusCode {
+    if code == Some(tonic::Code::ResourceExhausted) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::TEMPORARILY_UNAVAILABLE
+    }
+}
+
 /// Where announcement media for a failed call is produced: a locally
 /// bound RTP socket (in-process engine, pre-split behavior) or a session
 /// on the sbc-announcement-server pod (`SBC_ANNOUNCEMENT_URL`).
@@ -14088,11 +14099,7 @@ impl SipStack {
                 // POAM: POA&M-434 the refusal is logged, not audited.
                 Err(e) if !e.fallback_allowed() => {
                     warn!(error = %e, "Remote announcement refused; not playing in-process");
-                    let status = if e.refused_code() == Some(tonic::Code::ResourceExhausted) {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    } else {
-                        StatusCode::TEMPORARILY_UNAVAILABLE
-                    };
+                    let status = announcement_refusal_status(e.refused_code());
                     return ProcessResult::Response {
                         message: SipMessage::Response(create_response_from_request(req, status)),
                         destination: source,
