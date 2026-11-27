@@ -216,6 +216,44 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: announcement
 {{- end }}
 
+{{/* SR-41 announcement server mTLS. Secret with the announcement pod's
+     server certificate (sbcAnnouncement.grpcMtls). */}}
+{{- define "sbc.announcementServerTlsSecret" -}}
+{{- .Values.sbcAnnouncement.grpcMtls.serverSecretName | default (printf "%s-announcement-server-tls" (include "sbc.fullname" .)) -}}
+{{- end }}
+
+{{/* Secret with the daemon's client certificate for the announcement pod. */}}
+{{- define "sbc.announcementClientTlsSecret" -}}
+{{- .Values.sbcAnnouncement.grpcMtls.daemonClientSecretName | default (printf "%s-announcement-client-tls" (include "sbc.fullname" .)) -}}
+{{- end }}
+
+{{/* SBC_ANN_GRPC_ALLOWED_CLIENT_NAMES: the daemon client SAN by default. */}}
+{{- define "sbc.announcementAllowedClientNames" -}}
+{{- $names := .Values.sbcAnnouncement.grpcMtls.allowedClientNames | default (list (printf "%s-sbc-daemon" (include "sbc.fullname" .))) -}}
+{{- join "," $names -}}
+{{- end }}
+
+{{/* In-cluster URL of the AnnouncementService (always https: the pod
+     refuses plaintext off loopback). */}}
+{{- define "sbc.announcementUrl" -}}
+{{- printf "https://%s-announcement.%s.svc.cluster.local:9095" (include "sbc.fullname" .) .Release.Namespace -}}
+{{- end }}
+
+{{/* Render-time checks for the announcement pod (included from
+     23-sbc-announcement-server.yaml): mTLS is required, from the daemon
+     gRPC issuer or named Secrets (NIST 800-53 Rev5: IA-3, SC-8, CM-7). */}}
+{{- define "sbc.announcementPreflight" -}}
+{{- if .Values.sbcAnnouncement.enabled -}}
+{{- $m := .Values.sbcAnnouncement.grpcMtls -}}
+{{- if not .Values.sbcDaemon.grpcMtls.enabled -}}
+{{- fail "sbcAnnouncement.enabled requires sbcDaemon.grpcMtls.enabled: the announcement pod serves Play over mTLS only; see DEPLOYING.md \"Announcement server mTLS\"" -}}
+{{- end -}}
+{{- if not (or .Values.sbcDaemon.grpcMtls.clusterIssuer (and $m.serverSecretName $m.daemonClientSecretName)) -}}
+{{- fail "sbcAnnouncement.enabled requires sbcDaemon.grpcMtls.clusterIssuer (cert-manager) or sbcAnnouncement.grpcMtls.serverSecretName and daemonClientSecretName; see DEPLOYING.md \"Announcement server mTLS\"" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{/* Selector labels for the sbc-trunk-agent pod. Trunk registration and
      OPTIONS health-probe loops run outside the daemon. Deploy exactly ONE
      replica — two agents would double-REGISTER to carriers. */}}

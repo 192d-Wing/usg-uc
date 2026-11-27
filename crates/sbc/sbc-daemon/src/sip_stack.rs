@@ -3071,12 +3071,24 @@ impl std::fmt::Debug for ProcessResult {
     }
 }
 
+/// SIP status for a pod refusal: 503 when a play cap was hit
+/// (`RESOURCE_EXHAUSTED`), else 480 (NIST 800-53 Rev5: SC-5).
+#[cfg(feature = "grpc")]
+fn announcement_refusal_status(code: Option<tonic::Code>) -> StatusCode {
+    if code == Some(tonic::Code::ResourceExhausted) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::TEMPORARILY_UNAVAILABLE
+    }
+}
+
 /// Where announcement media for a failed call is produced: a locally
 /// bound RTP socket (in-process engine, pre-split behavior) or a session
 /// on the sbc-announcement-server pod (`SBC_ANNOUNCEMENT_URL`).
 enum AnnouncementPlayback {
-    /// In-process playback on this bound socket.
-    Local(tokio::net::UdpSocket),
+    /// In-process playback on this bound socket, holding one of the
+    /// in-process play slots (`announcement_local`) until it ends.
+    Local(tokio::net::UdpSocket, sbc_announcement::limits::PlayGuard),
     /// Remote playback; resolves when the pod reports Completed.
     /// Boxed: `RemoteAnnouncement` is far larger than the `Local` socket,
     /// so inlining it would bloat every `AnnouncementPlayback` value.
@@ -14012,12 +14024,14 @@ impl SipStack {
                 crate::announcement::extract_rtp_dest_from_sdp(&sdp_str)
             })
             .filter(|dest| {
-                let allowed = !sbc_announcement::is_disallowed_media_ip(dest.ip())
-                    && !dest.ip().is_unspecified();
-                if !allowed {
-                    warn!(destination = %dest, "Ignoring disallowed media address in SDP");
+                // The pod's destination policy (and, when configured, its
+                // media CIDR allow-list) for every announcement destination
+                // (NIST 800-53 Rev5: SC-7, SI-10).
+                let verdict = crate::announcement_local::check_destination(*dest);
+                if let Err(reason) = verdict {
+                    warn!(destination = %dest, %reason, "Ignoring disallowed media address in SDP");
                 }
-                allowed
+                verdict.is_ok()
             });
 
         let call_id = req.headers.call_id().unwrap_or("unknown").to_string();
@@ -14057,15 +14071,18 @@ impl SipStack {
                 std::net::IpAddr::V4(v4) => v4.to_string(),
             });
 
-        // Prefer the external announcement pod when configured. Any
-        // failure here falls back to in-process playback so a missing
-        // or crashed pod degrades to pre-split behavior.
+        // Prefer the external announcement pod when configured. An
+        // unreachable or timed-out pod falls back to in-process playback
+        // (pre-split behavior). A pod refusal (cap, destination policy,
+        // client certificate) is final: playing in-process would bypass the
+        // pod's controls, so the caller gets 503 for a cap, else 480
+        // (NIST 800-53 Rev5: SC-5, SC-7).
         #[cfg(feature = "grpc")]
         let remote_media: Option<(String, u16, AnnouncementPlayback)> = match (
             std::env::var(crate::announcement_client::ANNOUNCEMENT_URL_ENV),
             caller_rtp_dest,
         ) {
-            (Ok(url), Some(dest)) => crate::announcement_client::start_remote_announcement(
+            (Ok(url), Some(dest)) => match crate::announcement_client::start_remote_announcement(
                 &url,
                 announcement,
                 dest,
@@ -14073,17 +14090,29 @@ impl SipStack {
                 &call_id,
             )
             .await
-            .map_err(|e| {
-                warn!(error = %e, "Remote announcement unavailable; using in-process playback");
-            })
-            .ok()
-            .map(|session| {
-                (
+            {
+                Ok(session) => Some((
                     session.advertised_ip.clone(),
                     session.rtp_port,
                     AnnouncementPlayback::Remote(Box::new(session)),
-                )
-            }),
+                )),
+                // POAM: POA&M-434 the refusal is logged, not audited.
+                Err(e) if !e.fallback_allowed() => {
+                    warn!(error = %e, "Remote announcement refused; not playing in-process");
+                    let status = announcement_refusal_status(e.refused_code());
+                    return ProcessResult::Response {
+                        message: SipMessage::Response(create_response_from_request(req, status)),
+                        destination: source,
+                        flow: Flow::Reply,
+                    };
+                }
+                // POAM: POA&M-435 the fallback plays to the SDP-offered
+                // address (capped and policy-checked in-process).
+                Err(e) => {
+                    warn!(error = %e, "Remote announcement unavailable; using in-process playback");
+                    None
+                }
+            },
             _ => None,
         };
         #[cfg(not(feature = "grpc"))]
@@ -14092,8 +14121,20 @@ impl SipStack {
         let (sdp_ip, actual_rtp_port, playback) = if let Some(remote) = remote_media {
             remote
         } else {
-            // In-process playback: bind the announcement RTP socket now
-            // to discover the actual port before building the SDP.
+            // In-process playback: capped like the pod (503 when full,
+            // NIST 800-53 Rev5: SC-5), then bind the announcement RTP socket
+            // now to discover the actual port before building the SDP.
+            let Ok(slot) =
+                crate::announcement_local::try_local_slot(caller_rtp_dest.map(|d| d.ip()))
+            else {
+                warn!("In-process announcement cap reached; answering 503");
+                let busy = create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+                return ProcessResult::Response {
+                    message: SipMessage::Response(busy),
+                    destination: source,
+                    flow: Flow::Reply,
+                };
+            };
             let preferred_port = if let Some(ref pipeline) = self.media_pipeline {
                 pipeline.allocate_ports().await.map_or(0, |(rtp, _)| rtp)
             } else {
@@ -14102,9 +14143,11 @@ impl SipStack {
             match crate::announcement::AnnouncementServer::bind_socket(preferred_port, rtp_bind_ip)
                 .await
             {
-                Ok((socket, port)) => {
-                    (daemon_ip.clone(), port, AnnouncementPlayback::Local(socket))
-                }
+                Ok((socket, port)) => (
+                    daemon_ip.clone(),
+                    port,
+                    AnnouncementPlayback::Local(socket, slot),
+                ),
                 Err(e) => {
                     warn!(error = %e, "Cannot bind announcement socket");
                     let unavailable =
@@ -14202,12 +14245,13 @@ impl SipStack {
         // Spawn background task to play announcement then BYE
         tokio::spawn(async move {
             match playback {
-                AnnouncementPlayback::Local(ann_socket) => {
+                AnnouncementPlayback::Local(ann_socket, _slot) => {
                     // Wait for caller to process the 200 OK and send ACK
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
                     if let Some(rtp_dest) = caller_rtp_dest {
-                        if let Err(e) = crate::announcement::AnnouncementServer::play_on_socket(
+                        // Bounded like the pod (MAX_LOCAL_PLAY).
+                        if let Err(e) = crate::announcement_local::play_bounded(
                             announcement,
                             ann_socket,
                             rtp_dest,

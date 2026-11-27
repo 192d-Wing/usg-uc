@@ -831,6 +831,257 @@ spec:
     );
 }
 
+// ── announcement server (SR-41) ────────────────────────────────
+
+/// Announcement pod on, with the values it cannot render without.
+const ANN_ON: &[&str] = &[
+    "sbcAnnouncement.enabled=true",
+    "sbcAnnouncement.advertisedIp=203.0.113.9",
+];
+
+fn ann(extra: &[&str]) -> Result<String, String> {
+    let sets: Vec<&str> = ANN_ON.iter().chain(extra).copied().collect();
+    sbc(&sets)
+}
+
+/// The quoted `value:` of env `name` in `doc`, if any.
+fn env_value(doc: &str, name: &str) -> Option<String> {
+    let e = env_entry(doc, name)?;
+    let v = e.lines().find_map(|l| l.trim().strip_prefix("value: "))?;
+    Some(v.trim().trim_matches('"').to_string())
+}
+
+/// cert-manager Certificates whose spec mentions `needle`.
+fn certs_with<'a>(out: &'a str, needle: &str) -> Vec<&'a str> {
+    docs(out)
+        .into_iter()
+        .filter(|d| kind_of(d) == "Certificate" && d.contains(needle))
+        .collect()
+}
+
+/// mTLS with an issuer: server and daemon-client P-384 Certificates, an
+/// https URL on the daemon, TLS env on both sides.
+/// NIST 800-53 Rev5: IA-3, SC-8, SC-13
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_announcement_mtls_with_issuer() {
+    let out = must_render(ann(&[SBC_ISSUER]), "announcement + issuer");
+    let fname = fullname(&out);
+    let svc_host = format!("{fname}-announcement.default.svc.cluster.local");
+
+    let server: Vec<&str> = certs_with(&out, &format!("- {fname}-announcement"))
+        .into_iter()
+        .filter(|c| c.contains("server auth"))
+        .collect();
+    assert_eq!(server.len(), 1, "one announcement server Certificate");
+    let server = server[0];
+    assert!(server.contains(&format!("- {svc_host}")), "{server}");
+    assert!(server.contains("size: 384"), "P-384:\n{server}");
+
+    let client: Vec<&str> = certs_with(&out, &format!("{fname}-sbc-daemon"))
+        .into_iter()
+        .filter(|c| c.contains("client auth"))
+        .collect();
+    assert_eq!(client.len(), 1, "one daemon client Certificate");
+    let client = client[0];
+    // The pod gate matches SAN DNS names, not the CN.
+    assert!(
+        client.contains("dnsNames:") && client.contains(&format!("- {fname}-sbc-daemon")),
+        "daemon client Certificate needs SAN DNS {fname}-sbc-daemon:\n{client}"
+    );
+    assert!(client.contains("size: 384"), "P-384:\n{client}");
+
+    let daemon = get(&out, "Deployment", &fname);
+    let url = env_value(daemon, "SBC_ANNOUNCEMENT_URL").expect("SBC_ANNOUNCEMENT_URL");
+    assert_eq!(url, format!("https://{svc_host}:9095"));
+    for env in [
+        "SBC_ANNOUNCEMENT_TLS_CA_FILE",
+        "SBC_ANNOUNCEMENT_TLS_CERT_FILE",
+        "SBC_ANNOUNCEMENT_TLS_KEY_FILE",
+    ] {
+        assert!(env_entry(daemon, env).is_some(), "daemon lacks {env}");
+    }
+
+    let pod = get(&out, "Deployment", &format!("{fname}-announcement"));
+    for env in [
+        "SBC_ANN_GRPC_TLS_CERT_FILE",
+        "SBC_ANN_GRPC_TLS_KEY_FILE",
+        "SBC_ANN_GRPC_TLS_CLIENT_CA_FILE",
+    ] {
+        assert!(env_entry(pod, env).is_some(), "pod lacks {env}");
+    }
+    let names = env_value(pod, "SBC_ANN_GRPC_ALLOWED_CLIENT_NAMES").expect("allowed client names");
+    assert_eq!(names, format!("{fname}-sbc-daemon"));
+    assert!(
+        env_entry(pod, "SBC_ANN_ALLOW_LOOPBACK_DEST").is_none(),
+        "the lab loopback flag is not exposed in Helm"
+    );
+}
+
+/// Plaintext Play off loopback is not renderable.
+/// NIST 800-53 Rev5: IA-3, CM-7
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_announcement_without_grpc_mtls_fails() {
+    must_fail(
+        ann(&["sbcDaemon.grpcMtls.enabled=false", "sbcApi.enabled=false"]),
+        "sbcAnnouncement",
+        "announcement pod with grpcMtls off",
+    );
+}
+
+/// Explicit Secrets instead of an issuer; without them (and no issuer) the
+/// chart refuses.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_announcement_secrets_without_issuer() {
+    let daemon_secrets = [
+        "sbcDaemon.grpcMtls.serverSecretName=srv",
+        "sbcDaemon.grpcMtls.clientSecretName=cli",
+    ];
+    must_fail(
+        ann(&daemon_secrets),
+        "sbcAnnouncement.grpcMtls",
+        "announcement without issuer or announcement Secret names",
+    );
+    let mut sets: Vec<&str> = daemon_secrets.to_vec();
+    sets.extend([
+        "sbcAnnouncement.grpcMtls.serverSecretName=ann-srv",
+        "sbcAnnouncement.grpcMtls.daemonClientSecretName=ann-cli",
+    ]);
+    let out = must_render(ann(&sets), "announcement with explicit Secrets");
+    assert!(
+        docs(&out).iter().all(|d| kind_of(d) != "Certificate"),
+        "no Certificates without an issuer"
+    );
+    let fname = fullname(&out);
+    let pod = get(&out, "Deployment", &format!("{fname}-announcement"));
+    assert!(
+        pod.contains("secretName: ann-srv"),
+        "pod mounts ann-srv:\n{pod}"
+    );
+    let daemon = get(&out, "Deployment", &fname);
+    assert!(
+        daemon.contains("secretName: ann-cli"),
+        "daemon mounts ann-cli"
+    );
+    let url = env_value(daemon, "SBC_ANNOUNCEMENT_URL").expect("SBC_ANNOUNCEMENT_URL");
+    assert!(url.starts_with("https://"), "{url}");
+}
+
+/// Pins the #221 rule: TCP 9095 only from daemon pods of this release; RTP
+/// UDP stays open.
+/// NIST 800-53 Rev5: SC-7, AC-4
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_announcement_networkpolicy_daemon_only() {
+    let out = must_render(ann(&[SBC_ISSUER]), "announcement + issuer");
+    let fname = fullname(&out);
+    let np = get(&out, "NetworkPolicy", &format!("{fname}-announcement"));
+    assert!(
+        np.contains("app.kubernetes.io/component: announcement"),
+        "selects the announcement pods:\n{np}"
+    );
+    let rules = ingress_rules(np);
+    let grpc: Vec<&String> = rules.iter().filter(|r| r.contains("port: 9095")).collect();
+    assert_eq!(grpc.len(), 1, "{rules:?}");
+    assert_eq!(
+        components(grpc[0]),
+        vec!["daemon".to_string()],
+        "{}",
+        grpc[0]
+    );
+    assert!(
+        grpc[0].contains("app.kubernetes.io/instance: t"),
+        "same release only:\n{}",
+        grpc[0]
+    );
+    assert!(grpc[0].contains("protocol: TCP"), "{}", grpc[0]);
+    assert!(
+        !grpc[0].contains("namespaceSelector") && !grpc[0].contains("ipBlock"),
+        "no wider peers:\n{}",
+        grpc[0]
+    );
+    assert!(
+        rules
+            .iter()
+            .any(|r| r.contains("protocol: UDP") && !r.contains("from:")),
+        "RTP UDP rule:\n{np}"
+    );
+}
+
+/// Caps and the media CIDR allow-list reach the pod env; defaults follow
+/// the plan (128 / 32 / 30 s, no CIDR restriction).
+/// NIST 800-53 Rev5: SC-5, SC-7, CM-6
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_announcement_caps_and_cidrs_env() {
+    let out = must_render(ann(&[SBC_ISSUER]), "announcement defaults");
+    let fname = fullname(&out);
+    let pod = get(&out, "Deployment", &format!("{fname}-announcement"));
+    assert_eq!(env_value(pod, "SBC_ANN_MAX_PLAYS").as_deref(), Some("128"));
+    assert_eq!(
+        env_value(pod, "SBC_ANN_MAX_PLAYS_PER_DEST").as_deref(),
+        Some("32")
+    );
+    assert_eq!(
+        env_value(pod, "SBC_ANN_MAX_PLAY_SECS").as_deref(),
+        Some("30")
+    );
+    assert!(
+        env_entry(pod, "SBC_ANN_ALLOWED_DEST_CIDRS").is_none(),
+        "empty allowedMediaCidrs leaves the variable unset"
+    );
+
+    let out = must_render(
+        ann(&[
+            SBC_ISSUER,
+            "sbcAnnouncement.maxPlays=64",
+            "sbcAnnouncement.maxPlaysPerDestination=4",
+            "sbcAnnouncement.maxPlaySeconds=20",
+            "sbcAnnouncement.allowedMediaCidrs={10.0.0.0/8,192.0.2.0/24}",
+        ]),
+        "announcement caps and CIDRs",
+    );
+    let pod = get(&out, "Deployment", &format!("{fname}-announcement"));
+    assert_eq!(env_value(pod, "SBC_ANN_MAX_PLAYS").as_deref(), Some("64"));
+    assert_eq!(
+        env_value(pod, "SBC_ANN_MAX_PLAYS_PER_DEST").as_deref(),
+        Some("4")
+    );
+    assert_eq!(
+        env_value(pod, "SBC_ANN_MAX_PLAY_SECS").as_deref(),
+        Some("20")
+    );
+    assert_eq!(
+        env_value(pod, "SBC_ANN_ALLOWED_DEST_CIDRS").as_deref(),
+        Some("10.0.0.0/8,192.0.2.0/24")
+    );
+}
+
+/// kubelet gRPC probes carry no client certificate, so they cannot pass an
+/// mTLS-only listener: the pod must not probe 9095 with `grpc:`.
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_announcement_probes_work_with_mtls() {
+    let out = must_render(ann(&[SBC_ISSUER]), "announcement + issuer");
+    let fname = fullname(&out);
+    let pod = get(&out, "Deployment", &format!("{fname}-announcement"));
+    for probe in ["livenessProbe:", "readinessProbe:"] {
+        let at = pod.find(probe).unwrap_or_else(|| panic!("{probe} missing"));
+        let body: String = pod[at..]
+            .lines()
+            .skip(1)
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains("grpc:"),
+            "{probe} uses a gRPC probe against the mTLS listener:\n{body}"
+        );
+    }
+}
+
 // ── SR-43: CDR retention in the rendered [cdr] block ─────────────
 
 /// The `key = value` of `key` in the rendered `[cdr]` table.

@@ -168,7 +168,9 @@ sudo microk8s ctr image tag --force \
 ### sbc-announcement-server (optional — enable with `sbcAnnouncement.enabled: true`)
 
 Delegates announcement RTP playback ("number not in service", "all circuits
-busy") to a dedicated pod. The daemon falls back to in-process when absent.
+busy") to a dedicated pod. The daemon falls back to in-process when the pod is
+unreachable. Requires `sbcDaemon.grpcMtls` (Play is mTLS only; see
+DEPLOYING.md "Announcement server mTLS").
 
 ```bash
 sudo podman build --network=host -t localhost/usg-sbc-announcement-server:local \
@@ -182,9 +184,9 @@ sudo microk8s ctr image tag --force \
 ```
 
 Set `sbcAnnouncement.advertisedIp` in site values to the pod's public IP (must
-be reachable by calling phones/carriers). Set `SBC_ANNOUNCEMENT_URL` on the
-daemon (or add it to `sbcDaemon.extraEnv` once that field is wired) pointing at
-the ClusterIP service `http://<release>-announcement.<namespace>.svc:9095`.
+be reachable by calling phones/carriers). The chart sets the daemon's
+`SBC_ANNOUNCEMENT_URL` (`https://<fullname>-announcement.<namespace>.svc.cluster.local:9095`)
+and its client certificate.
 
 ### sbc-trunk-agent (optional — enable with `sbcTrunkAgent.enabled: true`)
 

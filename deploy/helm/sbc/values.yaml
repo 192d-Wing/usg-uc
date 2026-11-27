@@ -417,8 +417,35 @@ sbcAnnouncement:
   # node's ephemeral range, or set a pinned range and expose it.
   rtpPortMin: ""
   rtpPortMax: ""
-  # Initial silence before the first media frame (milliseconds).
+  # Initial silence before the first media frame (milliseconds, at most
+  # 2000).
   defaultDelayMs: 200
+  # Play caps per replica (NIST 800-53 Rev5: SC-5). Over a cap the pod
+  # refuses with RESOURCE_EXHAUSTED and the daemon answers 503 (no
+  # in-process fallback). The fleet cap is replicas x maxPlays.
+  maxPlays: 128                 # concurrent plays, 1..4096
+  maxPlaysPerDestination: 32    # concurrent plays to one destination IP
+  maxPlaySeconds: 30            # longest play incl. initial delay, 1..120
+  # Media networks the pod (and the daemon's in-process fallback) may send
+  # RTP to (CIDR list, at most 256). Empty = any unicast address, including
+  # cluster and node networks: set this to the phone/carrier media networks
+  # (NIST 800-53 Rev5: SC-7(5)). For NAT64 / 6to4 destinations, list the
+  # IPv4 networks too. Unspecified, broadcast, multicast, loopback and
+  # link-local destinations are always refused (NIST 800-53 Rev5: SC-7).
+  allowedMediaCidrs: []
+  # mTLS on the AnnouncementService (port 9095). Requires
+  # sbcDaemon.grpcMtls.enabled. With sbcDaemon.grpcMtls.clusterIssuer the
+  # chart issues ECDSA P-384 certificates from that issuer: a server
+  # certificate for <fullname>-announcement and a daemon client certificate
+  # (SAN DNS <fullname>-sbc-daemon). Without an issuer, name existing
+  # Secrets (tls.crt, tls.key, ca.crt); see DEPLOYING.md "Announcement
+  # server mTLS". Rendering fails without one or the other.
+  #   serverSecretName        default <fullname>-announcement-server-tls
+  #   daemonClientSecretName  default <fullname>-announcement-client-tls
+  #   allowedClientNames      client certificate SAN DNS names / URIs
+  #                           admitted on every Play; empty =
+  #                           [<fullname>-sbc-daemon]
+  grpcMtls: { serverSecretName: "", daemonClientSecretName: "", allowedClientNames: [] }
 
 # sbc-trunk-agent — trunk health + carrier registration pod (optional).
 # Runs the SIP OPTIONS health monitor and outbound carrier REGISTER loops

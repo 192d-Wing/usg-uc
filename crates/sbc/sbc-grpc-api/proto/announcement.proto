@@ -13,10 +13,20 @@
 //      ACK), the server streams the announcement audio via RTP.
 //   4. When playback finishes the server sends a Completed event and
 //      closes the stream; the daemon then sends the SIP BYE.
-// Dropping the stream (daemon restart, call abandoned) aborts playback.
+// Dropping the stream (daemon restart, call abandoned) or losing the
+// connection aborts playback.
+//
+// Off loopback the listener is mTLS only, with a client certificate SAN
+// allow-list (PERMISSION_DENIED otherwise). Play returns INVALID_ARGUMENT
+// for a refused destination (unspecified, broadcast, multicast, loopback,
+// link-local, port 0, outside the configured media CIDRs, an address family
+// the media socket cannot reach) or an initial_delay_ms over 2000, and
+// RESOURCE_EXHAUSTED over the global or per-destination-IP cap. A started
+// stream ends with DEADLINE_EXCEEDED at the maximum play time. The daemon
+// does not fall back to in-process playback on these refusals.
 //
 // NIST 800-53 Rev5: AU-6 (logged announcement events), SC-7 (controlled
-// call termination at the boundary).
+// call termination at the boundary), IA-3/SC-8 (mTLS), SC-5 (caps).
 syntax = "proto3";
 
 package sbc.api.v1;

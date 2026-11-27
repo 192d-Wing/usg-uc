@@ -17,6 +17,10 @@ cluster = []
 # SECURITY: reflection exposes the full admin API schema to any client that
 # can reach the gRPC port. Only enable in dev/staging, or gate behind auth.
 reflection = ["tonic-reflection"]
+# Shared gRPC mTLS helper (`mtls` module): listener rule, client-name gate,
+# client TLS and endpoint. Used by sbc-media, sbc-announcement-server and
+# the daemon's announcement client.
+mtls = ["dep:rustls-pki-types", "dep:webpki", "dep:tokio", "dep:tracing", "dep:rustls", "dep:hyper-util", "dep:tower-service"]
 
 [dependencies]
 # gRPC/protobuf
@@ -29,6 +33,31 @@ tonic-reflection = { version = "0.14", optional = true }
 # CDR schema v1 <-> CdrRecord conversion (`cdr` module).
 uc-cdr.workspace = true
 serde_json.workspace = true
+# `mtls`: client-certificate name parsing only (the TLS stack already
+# verified the chain), async PEM reads, refusal logging.
+rustls-pki-types = { workspace = true, optional = true }
+# `aws-lc-rs`: the ECDSA P-384 verifier for `cnsa_provider` (rustls already
+# enables this feature in the workspace; no new crate or build).
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "aws-lc-rs"], optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+# `mtls`: CNSA provider (aws-lc, as the rest of the workspace) and the
+# pre-TLS connector (TCP only; tonic layers TLS on top).
+rustls = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+tower-service = { version = "0.3", optional = true }
+
+[dev-dependencies]
+# SR-41 QA: certificate DER fixtures for the mTLS helper tests.
+rustls-pki-types.workspace = true
+# SR-41: cert-change watcher fixtures; CNSA listener handshake test.
+tempfile.workspace = true
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio-rustls.workspace = true
+
+[[test]]
+name = "cnsa_listener"
+required-features = ["mtls"]
 
 [build-dependencies]
 tonic-prost-build = "0.14"

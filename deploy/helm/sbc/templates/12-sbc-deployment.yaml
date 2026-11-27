@@ -175,9 +175,22 @@ spec:
             {{- if .Values.sbcAnnouncement.enabled }}
             # Announcement pod is deployed — point the daemon at it so
             # "number not in service" / "all circuits busy" RTP flows
-            # to the dedicated pod instead of running in-process.
+            # to the dedicated pod instead of running in-process. mTLS
+            # with the daemon's announcement client certificate
+            # (NIST 800-53 Rev5: IA-3, SC-8).
             - name: SBC_ANNOUNCEMENT_URL
-              value: "http://{{ include "sbc.fullname" . }}-announcement.{{ .Release.Namespace }}.svc.cluster.local:9095"
+              value: {{ include "sbc.announcementUrl" . | quote }}
+            - name: SBC_ANNOUNCEMENT_TLS_CA_FILE
+              value: /etc/sbc/announcement-tls/ca.crt
+            - name: SBC_ANNOUNCEMENT_TLS_CERT_FILE
+              value: /etc/sbc/announcement-tls/tls.crt
+            - name: SBC_ANNOUNCEMENT_TLS_KEY_FILE
+              value: /etc/sbc/announcement-tls/tls.key
+            {{- with .Values.sbcAnnouncement.allowedMediaCidrs }}
+            # The same media allow-list for the daemon's in-process fallback.
+            - name: SBC_ANNOUNCEMENT_ALLOWED_DEST_CIDRS
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- end }}
             {{- if .Values.mediaSplit.enabled }}
             # Signaling↔media split: the media plane runs as a co-located
@@ -256,6 +269,9 @@ spec:
             {{- end }}
             {{- if .Values.sbcDaemon.grpcMtls.enabled }}
             - { name: grpc-tls, mountPath: /etc/sbc/grpc-tls, readOnly: true }
+            {{- end }}
+            {{- if .Values.sbcAnnouncement.enabled }}
+            - { name: announcement-tls, mountPath: /etc/sbc/announcement-tls, readOnly: true }
             {{- end }}
             - { name: logs, mountPath: /var/log/sbc }
             {{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
@@ -349,6 +365,12 @@ spec:
         - name: grpc-tls
           secret:
             secretName: {{ include "sbc.grpcServerTlsSecret" . }}
+            defaultMode: 0440
+        {{- end }}
+        {{- if .Values.sbcAnnouncement.enabled }}
+        - name: announcement-tls
+          secret:
+            secretName: {{ include "sbc.announcementClientTlsSecret" . }}
             defaultMode: 0440
         {{- end }}
         - name: logs

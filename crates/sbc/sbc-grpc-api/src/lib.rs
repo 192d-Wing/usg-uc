@@ -147,6 +147,12 @@ pub mod health {
 
 pub mod cdr;
 
+#[cfg(feature = "mtls")]
+pub mod mtls;
+
+#[cfg(all(test, feature = "mtls"))]
+mod mtls_tests;
+
 /// Re-export commonly used types for convenience.
 pub mod prelude {
     // Config service

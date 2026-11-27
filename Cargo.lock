@@ -6206,6 +6206,8 @@ version = "0.10.0"
 dependencies = [
  "bytes",
  "include_dir",
+ "ipnet",
+ "proptest",
  "proto-rtp",
  "tokio",
  "tracing",
@@ -6216,9 +6218,13 @@ dependencies = [
 name = "sbc-announcement-server"
 version = "0.10.0"
 dependencies = [
+ "ipnet",
  "rand 0.8.8",
+ "rcgen",
+ "rustls",
  "sbc-announcement",
  "sbc-grpc-api",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -6456,13 +6462,23 @@ dependencies = [
 name = "sbc-grpc-api"
 version = "0.10.0"
 dependencies = [
+ "hyper-util",
  "prost",
  "prost-types",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
  "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tonic-reflection",
+ "tower-service",
+ "tracing",
  "uc-cdr",
 ]
 
@@ -6512,7 +6528,6 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
- "rustls-webpki",
  "sbc-grpc-api",
  "sbc-media-core",
  "tempfile",

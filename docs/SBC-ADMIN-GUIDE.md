@@ -2290,27 +2290,63 @@ terminate on the signaling node, set `SBC_ANNOUNCEMENT_URL` to point at a
 running `sbc-announcement-server` pod.
 
 ```sh
-SBC_ANNOUNCEMENT_URL=http://sbc-announcement.sbc-system.svc.cluster.local:9095
+SBC_ANNOUNCEMENT_URL=https://sbc-announcement.sbc-system.svc.cluster.local:9095
+SBC_ANNOUNCEMENT_TLS_CA_FILE=/etc/sbc/announcement-tls/ca.crt
+SBC_ANNOUNCEMENT_TLS_CERT_FILE=/etc/sbc/announcement-tls/tls.crt
+SBC_ANNOUNCEMENT_TLS_KEY_FILE=/etc/sbc/announcement-tls/tls.key
+# SBC_ANNOUNCEMENT_TLS_DOMAIN=<name>   optional server-name override
 ```
 
-**Fallback behaviour**: if the env var is unset, or the pod is unreachable at
-call time (connection refused, timeout > 2 s), the daemon silently falls back
-to in-process playback. No call is dropped due to the announcement pod being
-unavailable.
+The channel is mTLS. A plaintext `http://` URL is accepted only for a pod on
+loopback. The daemon refuses to start (exit 2) on an incomplete
+`SBC_ANNOUNCEMENT_TLS_*` set, an `http://` URL with TLS, or a remote URL
+without TLS. The Helm chart sets all of these when `sbcAnnouncement.enabled`.
 
-**Announcement pod configuration** (env vars on `sbc-announcement-server`):
+**Fallback behaviour**: if the env var is unset, or the pod is unreachable at
+call time (DNS failure, TCP connection refused or reset before TLS, no answer
+within 2 s), the daemon plays the announcement in-process. If the pod refuses
+the request (a limit is reached, the destination is refused, the client
+certificate is not allowed) or the TLS handshake or certificate check fails,
+the daemon does not play the announcement: the caller gets 503 (limit) or
+480. In-process playback has the pod's default limits (128 concurrent plays,
+32 per destination IP, 30 s per play; 503 beyond a cap) and applies the same
+destination checks; `SBC_ANNOUNCEMENT_ALLOWED_DEST_CIDRS`
+(comma-separated CIDRs, at most 256) restricts it to media networks. All
+plays share one connection to the pod, rebuilt after a failure or when the
+client certificate file changes.
+
+**Announcement pod configuration** (env vars on `sbc-announcement-server`;
+an invalid value stops startup with exit 2):
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SBC_ANN_GRPC_LISTEN` | `0.0.0.0:9095` | gRPC listener address |
+| `SBC_ANN_GRPC_LISTEN` | `0.0.0.0:9095` | gRPC listener address. Off loopback it requires the three TLS files and the client allow-list. |
+| `SBC_ANN_GRPC_TLS_CERT_FILE` / `_KEY_FILE` / `_CLIENT_CA_FILE` | *(none)* | Server certificate, key, and the CA that client certificates must chain to (all three or none). |
+| `SBC_ANN_GRPC_ALLOWED_CLIENT_NAMES` | *(none)* | Comma-separated client certificate SAN DNS names / URIs admitted on every Play (at most 64). |
 | `SBC_ANN_ADVERTISED_IP` | *(required)* | IP embedded in SDP and returned to the daemon in the `Bound` event. Must be reachable by calling phones/carriers. |
 | `SBC_ANN_BIND_IP` | `0.0.0.0` | Local IP to bind RTP sockets on. |
 | `SBC_ANN_RTP_PORT_MIN` | *(ephemeral)* | Lower bound of RTP port range. |
 | `SBC_ANN_RTP_PORT_MAX` | *(ephemeral)* | Upper bound of RTP port range. |
-| `SBC_ANN_DEFAULT_DELAY_MS` | `200` | Silence before the first media frame (ms). |
+| `SBC_ANN_DEFAULT_DELAY_MS` | `200` | Silence before the first media frame (ms, at most 2000). |
+| `SBC_ANN_MAX_PLAYS` | `128` | Concurrent plays per replica (1..4096). |
+| `SBC_ANN_MAX_PLAYS_PER_DEST` | `32` | Concurrent plays to one destination IP (at most `SBC_ANN_MAX_PLAYS`). |
+| `SBC_ANN_MAX_PLAY_SECS` | `30` | Longest play, initial delay included (1..120). |
+| `SBC_ANN_ALLOWED_DEST_CIDRS` | *(any)* | Comma-separated media CIDRs RTP may be sent to (at most 256). |
+| `SBC_ANN_ALLOW_LOOPBACK_DEST` | `false` | `true` admits loopback destinations. Lab only. |
 
-The pod is stateless and scales horizontally. The daemon picks one instance
-per call at gRPC connection time; any replica can serve any call.
+Unspecified, broadcast, multicast, link-local and (without the lab flag)
+loopback destinations and port 0 are always refused, also when embedded in a
+NAT64 or 6to4 address, and so is an IPv6 destination when RTP is bound on
+IPv4. Playback stops when the daemon drops the stream, the connection dies,
+or a send fails permanently. The listener accepts TLS 1.3
+`TLS_AES_256_GCM_SHA384` with ML-KEM-1024 / P-384 only and ECDSA P-384 /
+SHA-384 certificate signatures only, and exits with code 3, after a random
+0-10 s delay, when its certificate, key or client CA file changes (restart
+to reload). It serves no gRPC Health service; probe the port over TCP.
+
+The pod is stateless and scales horizontally, and any replica can serve any
+call. Each daemon keeps one connection to the pod Service, so its plays go to
+one replica until that connection is rebuilt. Caps are per replica.
 
 ---
 
