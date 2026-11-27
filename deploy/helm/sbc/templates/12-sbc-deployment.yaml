@@ -288,6 +288,12 @@ spec:
             {{- if or .Values.sbcDaemon.trunkTls.caConfigMap .Values.sbcDaemon.trunkTls.caSecretName }}
             - { name: trunk-ca, mountPath: /etc/sbc/trunk-ca, readOnly: true }
             {{- end }}
+            {{- if or .Values.sbcDaemon.trunkTls.crlConfigMap .Values.sbcDaemon.trunkTls.crlSecretName }}
+            {{- if not (or .Values.sbcDaemon.trunkTls.caConfigMap .Values.sbcDaemon.trunkTls.caSecretName) }}
+            {{- fail "sbcDaemon.trunkTls.crlConfigMap/crlSecretName needs sbcDaemon.trunkTls.caConfigMap or caSecretName" }}
+            {{- end }}
+            - { name: trunk-crl, mountPath: /etc/sbc/trunk-crl, readOnly: true }
+            {{- end }}
             {{- if .Values.sbcDaemon.stirShaken.trustAnchorsConfigMap }}
             - { name: sti-cr, mountPath: /etc/sbc/sti-cr, readOnly: true }
             {{- end }}
@@ -402,6 +408,17 @@ spec:
           configMap:
             name: {{ .Values.sbcDaemon.trunkTls.caConfigMap }}
             items: [{ key: {{ .Values.sbcDaemon.trunkTls.caKey | quote }}, path: ca.pem }]
+        {{- end }}
+        {{- if .Values.sbcDaemon.trunkTls.crlSecretName }}
+        # Whole Secret as a directory (no items, no subPath): each key is a
+        # CRL file (SR-29).
+        - name: trunk-crl
+          secret:
+            secretName: {{ .Values.sbcDaemon.trunkTls.crlSecretName }}
+        {{- else if .Values.sbcDaemon.trunkTls.crlConfigMap }}
+        - name: trunk-crl
+          configMap:
+            name: {{ .Values.sbcDaemon.trunkTls.crlConfigMap }}
         {{- end }}
         {{- if .Values.sbcDaemon.stirShaken.trustAnchorsConfigMap }}
         - name: sti-cr

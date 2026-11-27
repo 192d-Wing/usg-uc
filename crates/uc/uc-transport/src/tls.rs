@@ -18,7 +18,8 @@
 //! - **SC-12**: Cryptographic Key Establishment and Management
 //! - **SC-13**: Cryptographic Protection
 //! - **IA-3 / IA-5(2)**: peer certificate path and signature algorithm
-//!   checks (revocation not checked: POA&M-401)
+//!   checks; CRL revocation checks where a CRL is configured
+//!   ([`crate::revocation`], POA&M-401 phase (a))
 //! - **SC-28 / IA-5(7)**: TLS private key files are checked fail-closed at
 //!   load (see [`load_private_key_with`]): symlinks, group/other-accessible
 //!   modes and foreign owners are rejected. Decision: this is a boundary
@@ -81,7 +82,8 @@ use uc_types::address::{SbcSocketAddr, TransportType};
 ///   ML-DSA-87, the CNSA 2.0 signature, is not yet accepted (POA&M-404).
 ///
 /// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection), SC-8, SC-12, IA-3,
-/// IA-5(2) (path and signature algorithm; revocation not checked: POA&M-401)
+/// IA-5(2) (path and signature algorithm; revocation only where a CRL is
+/// configured, [`crate::revocation`], POA&M-401)
 // POAM: POA&M-404: ML-DSA-87 peer signatures are not accepted.
 #[must_use]
 pub fn cnsa_provider() -> rustls::crypto::CryptoProvider {
@@ -104,7 +106,7 @@ pub fn cnsa_provider() -> rustls::crypto::CryptoProvider {
 /// not yet accepted.
 ///
 /// NIST 800-53 Rev5: SC-13, IA-3, IA-5(2) (path and signature algorithm;
-/// revocation not checked: POA&M-401)
+/// revocation only where a CRL is configured: POA&M-401)
 // POAM: POA&M-404: ML-DSA-87 TLS peer signatures not accepted (no rustls/webpki
 // verifier in the FIPS provider yet).
 static CNSA_SIG_ALGS: rustls::crypto::WebPkiSupportedAlgorithms =
@@ -184,6 +186,27 @@ pub fn create_server_config_with(
     private_key: PrivateKeyDer<'static>,
     options: TlsServerOptions,
 ) -> TransportResult<ServerConfig> {
+    create_server_config_with_revocation(cert_chain, private_key, options, None)
+}
+
+/// [`create_server_config_with`] with optional client certificate CRLs.
+///
+/// Client certificates are checked against `revocation` (CRLs and policy)
+/// when it is set. `revocation` without `client_ca` is ignored (no client
+/// certificates are requested). `None` builds exactly the configuration
+/// [`create_server_config_with`] builds.
+///
+/// ## Errors
+///
+/// As [`create_server_config_with`], plus a CRL the verifier refuses.
+///
+/// ## NIST 800-53 Rev5: IA-5(2), IA-3, SC-23
+pub fn create_server_config_with_revocation(
+    cert_chain: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+    options: TlsServerOptions,
+    revocation: Option<&crate::revocation::Revocation>,
+) -> TransportResult<ServerConfig> {
     let provider = Arc::new(cnsa_provider());
     let versions: &[&'static rustls::SupportedProtocolVersion] = match options.min_version {
         MinTlsVersion::V1_3 => &[&rustls::version::TLS13],
@@ -198,15 +221,19 @@ pub fn create_server_config_with(
 
     let builder = match options.client_ca {
         Some(roots) => {
-            // POAM: POA&M-401: client certificate revocation is not checked.
-            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-                Arc::new(roots),
-                provider,
-            )
-            .build()
-            .map_err(|e| TransportError::TlsCertificateError {
-                reason: format!("client CA store rejected: {e}"),
-            })?;
+            let verifier = match revocation {
+                Some(rev) => rev.client_verifier(Arc::new(roots))?,
+                // POAM: POA&M-401: without a CRL (security.tls_crl_path)
+                // client certificate revocation is not checked.
+                None => rustls::server::WebPkiClientVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    provider,
+                )
+                .build()
+                .map_err(|e| TransportError::TlsCertificateError {
+                    reason: format!("client CA store rejected: {e}"),
+                })?,
+            };
             builder.with_client_cert_verifier(verifier)
         }
         None => builder.with_no_client_auth(),
@@ -309,19 +336,54 @@ impl std::fmt::Debug for TlsClientOptions {
 /// Returns an error if the protocol versions or client certificate cannot
 /// be configured.
 pub fn create_client_config_with(options: TlsClientOptions) -> TransportResult<ClientConfig> {
-    let provider = cnsa_provider();
-    let versions: &[&'static rustls::SupportedProtocolVersion] = match options.min_version {
+    let builder = client_builder(options.min_version)?
+        // POAM: POA&M-401: without a CRL configured for the path, server
+        // certificate revocation is not checked.
+        .with_root_certificates(options.roots);
+    finish_client(builder, options.client_auth)
+}
+
+/// A TLS client configuration with an explicit server verifier.
+///
+/// Server certificates are checked by `verifier` (built by
+/// [`Revocation::server_verifier`](crate::revocation::Revocation::server_verifier),
+/// so CRLs apply). Otherwise as [`create_client_config_with`]: CNSA
+/// provider, `min_version`, optional client certificate. One verifier can
+/// back several configs.
+///
+/// ## Errors
+///
+/// As [`create_client_config_with`].
+///
+/// ## NIST 800-53 Rev5: IA-5(2), IA-3, SC-23
+pub fn create_client_config_verified(
+    verifier: Arc<rustls::client::WebPkiServerVerifier>,
+    min_version: MinTlsVersion,
+    client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+) -> TransportResult<ClientConfig> {
+    let builder = client_builder(min_version)?.with_webpki_verifier(verifier);
+    finish_client(builder, client_auth)
+}
+
+fn client_builder(
+    min_version: MinTlsVersion,
+) -> TransportResult<rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier>> {
+    let versions: &[&'static rustls::SupportedProtocolVersion] = match min_version {
         MinTlsVersion::V1_3 => &[&rustls::version::TLS13],
         MinTlsVersion::V1_2 => &[&rustls::version::TLS12, &rustls::version::TLS13],
     };
-    let builder = ClientConfig::builder_with_provider(Arc::new(provider))
+    ClientConfig::builder_with_provider(Arc::new(cnsa_provider()))
         .with_protocol_versions(versions)
         .map_err(|e| TransportError::TlsHandshakeFailed {
             reason: format!("failed to set TLS protocol versions: {e}"),
-        })?
-        // POAM: POA&M-401: server certificate revocation is not checked.
-        .with_root_certificates(options.roots);
-    match options.client_auth {
+        })
+}
+
+fn finish_client(
+    builder: rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert>,
+    client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+) -> TransportResult<ClientConfig> {
+    match client_auth {
         Some((chain, key)) => builder.with_client_auth_cert(chain, key).map_err(|e| {
             TransportError::TlsCertificateError {
                 reason: format!("client certificate rejected: {e}"),
@@ -681,9 +743,7 @@ impl TlsTransport {
         let tls_stream = connector
             .connect(server_name, tcp_stream)
             .await
-            .map_err(|e| TransportError::TlsHandshakeFailed {
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| crate::revocation::handshake_error(&e))?;
 
         debug!(dest = %dest_addr, "TLS handshake completed");
 
@@ -958,11 +1018,11 @@ impl TlsListener {
         let peer_addr = canonical_peer(peer_addr);
         debug!(peer = %peer_addr, "accepted TCP connection, starting TLS handshake");
 
-        let tls_stream = self.acceptor.accept(tcp_stream).await.map_err(|e| {
-            TransportError::TlsHandshakeFailed {
-                reason: e.to_string(),
-            }
-        })?;
+        let tls_stream = self
+            .acceptor
+            .accept(tcp_stream)
+            .await
+            .map_err(|e| crate::revocation::handshake_error(&e))?;
 
         debug!(peer = %peer_addr, "TLS handshake completed");
 
@@ -1016,11 +1076,11 @@ impl TlsListener {
         tcp_stream: TcpStream,
         peer: SbcSocketAddr,
     ) -> TransportResult<TlsTransport> {
-        let tls_stream = self.acceptor.accept(tcp_stream).await.map_err(|e| {
-            TransportError::TlsHandshakeFailed {
-                reason: e.to_string(),
-            }
-        })?;
+        let tls_stream = self
+            .acceptor
+            .accept(tcp_stream)
+            .await
+            .map_err(|e| crate::revocation::handshake_error(&e))?;
 
         Ok(TlsTransport::from_accepted(
             TlsStream::Server(tls_stream),

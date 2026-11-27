@@ -116,6 +116,22 @@ impl Gauge {
         self.series(labels).store(value, Ordering::Relaxed);
     }
 
+    /// Sets an existing labelled series through a shared reference.
+    /// Returns `false` (and changes nothing) when the series was never
+    /// created with [`Self::set_with_labels`]; create the bounded set of
+    /// series at registration, then update them from `&self`.
+    pub fn set_existing_with_labels(&self, labels: &[&str], value: i64) -> bool {
+        if labels.len() != self.label_names.len() {
+            return false;
+        }
+        self.values
+            .get(&labels::lookup_key(labels))
+            .is_some_and(|v| {
+                v.store(value, Ordering::Relaxed);
+                true
+            })
+    }
+
     /// Increments the gauge by 1.
     pub fn inc(&self) {
         self.default_value.fetch_add(1, Ordering::Relaxed);
@@ -224,6 +240,18 @@ impl Gauge {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn set_existing_with_labels_updates_only_created_series() {
+        let mut g = super::Gauge::with_labels("g", "h", vec!["role".to_string()]);
+        g.set_with_labels(&["a"], 0);
+        assert!(g.set_existing_with_labels(&["a"], 5));
+        assert_eq!(g.get_with_labels(&["a"]), 5);
+        assert!(!g.set_existing_with_labels(&["b"], 1));
+        assert!(!g.set_existing_with_labels(&["a", "x"], 1));
+        assert_eq!(g.get_with_labels(&["b"]), 0);
+        assert!(g.export().contains("g{role=\"a\"} 5"));
+    }
+
     use super::*;
 
     #[test]

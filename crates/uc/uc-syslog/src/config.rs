@@ -61,6 +61,13 @@ pub struct SyslogTlsConfig {
     /// Also offer TLS 1.2 (CNSA suites only). Default: TLS 1.3 only.
     #[serde(default)]
     pub allow_tls12: bool,
+    /// CRLs for the collector certificate (PEM or DER file, or a directory
+    /// of `*.pem`, `*.crl`, `*.der`). Checked over the whole chain;
+    /// unknown status and an expired CRL fail the connection.
+    ///
+    /// NIST 800-53 Rev5: IA-5(2) (SR-29, POA&M-401 phase (a))
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crl_file: Option<PathBuf>,
 }
 
 impl Default for SyslogConfig {

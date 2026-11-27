@@ -1240,6 +1240,9 @@ fn qa_every_recording_config_key_reaches_the_settings() {
         notice_acknowledged: true,
         srs_uri: Some("sips:rec@srs.example.test:5099".to_string()),
         srs_tls_ca_file: Some("/unused".to_string()),
+        // Loaded by Server::wire_recording into the recorder TLS client,
+        // not part of RecordingSettings (SR-29).
+        srs_tls_crl_file: None,
         srs_tls_server_name: Some("recorder.internal.test".to_string()),
         record_all: false,
         trunk_groups: vec!["carriers".to_string()],

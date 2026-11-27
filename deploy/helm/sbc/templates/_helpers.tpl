@@ -376,6 +376,18 @@ trunk_tls_ca_path = "/etc/sbc/trunk-ca/ca.pem"
 # NIST 800-53 Rev5: SC-8 — every trunk group is TLS-only (POA&M-48).
 require_tls_trunks = true
 {{- end }}
+{{- if or .Values.sbcDaemon.trunkTls.crlConfigMap .Values.sbcDaemon.trunkTls.crlSecretName }}
+# CRLs for trunk server certificates (SR-29; NIST 800-53 Rev5: IA-5(2)).
+trunk_tls_crl_path = "/etc/sbc/trunk-crl"
+{{- end }}
+{{- if or .Values.sbcDaemon.trunkTls.crlConfigMap .Values.sbcDaemon.trunkTls.crlSecretName .Values.sbcDaemon.revocation.require }}
+
+[security.revocation]
+check_depth = {{ .Values.sbcDaemon.revocation.checkDepth | quote }}
+server_unknown = {{ .Values.sbcDaemon.revocation.serverUnknown | quote }}
+expired_crl = {{ .Values.sbcDaemon.revocation.expiredCrl | quote }}
+require = {{ .Values.sbcDaemon.revocation.require }}
+{{- end }}
 {{- if or .Values.sbcDaemon.stirShaken.verificationEnabled .Values.sbcDaemon.stirShaken.signingEnabled }}
 
 [stir_shaken]

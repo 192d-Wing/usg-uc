@@ -583,6 +583,31 @@ impl Runtime {
         if old.recording != new.recording {
             keys.push("recording".to_string());
         }
+        // NIST 800-53 Rev5: CM-6, IA-5(2) - CRLs and the revocation policy
+        // are loaded at startup only (SR-29 phase (a), D5); a reload must
+        // not report them as applied.
+        for (key, changed) in [
+            (
+                "security.tls_crl_path",
+                old.security.tls_crl_path != new.security.tls_crl_path,
+            ),
+            (
+                "security.trunk_tls_crl_path",
+                old.security.trunk_tls_crl_path != new.security.trunk_tls_crl_path,
+            ),
+            (
+                "security.revocation",
+                old.security.revocation != new.security.revocation,
+            ),
+            (
+                "cdr.syslog.crl_path",
+                old.cdr.syslog.crl_path != new.cdr.syslog.crl_path,
+            ),
+        ] {
+            if changed {
+                keys.push(key.to_string());
+            }
+        }
         // NIST 800-53 Rev5: CM-6, IA-5 - `[digest_auth]` (require_auth,
         // realm, algorithm, credentials_file path, nonce_ttl_secs) is read
         // at startup only. The credentials file contents are re-read on
@@ -782,10 +807,11 @@ impl Runtime {
         // (fail closed) with an error naming the directory and keys.
         //
         // ## NIST 800-53 Rev5: AU-5, AU-12
-        let cdr = crate::cdr::start_from_config(
+        let cdr = crate::cdr::start_from_config_with_revocation(
             &config.cdr,
             &instance_name,
             config.security.tls_ca_path.as_deref(),
+            config.security.revocation,
         )
         .map_err(|reason| {
             error!(error = %reason, "CDR pipeline failed to start — SBC cannot start");
@@ -2269,6 +2295,44 @@ mod tests {
         let old = SbcConfig::default();
         let mut new = old.clone();
         new.recording.max_sessions = 10;
+        assert_eq!(
+            Runtime::detect_restart_required(&old, &new),
+            vec!["recording".to_string()]
+        );
+    }
+
+    // SR-29: CRL paths and `[security.revocation]` are restart-only.
+    #[test]
+    fn reload_reports_crl_settings_as_restart_required() {
+        let old = SbcConfig::default();
+        let cases: [(fn(&mut SbcConfig), &str); 4] = [
+            (
+                |c| c.security.tls_crl_path = Some("/etc/sbc/client-crl".into()),
+                "security.tls_crl_path",
+            ),
+            (
+                |c| c.security.trunk_tls_crl_path = Some("/etc/sbc/trunk-crl".into()),
+                "security.trunk_tls_crl_path",
+            ),
+            (
+                |c| c.security.revocation.require = true,
+                "security.revocation",
+            ),
+            (
+                |c| c.cdr.syslog.crl_path = Some("/etc/sbc/syslog-crl".into()),
+                "cdr.syslog.crl_path",
+            ),
+        ];
+        for (set, key) in cases {
+            let mut new = old.clone();
+            set(&mut new);
+            assert_eq!(
+                Runtime::detect_restart_required(&old, &new),
+                vec![key.to_string()]
+            );
+        }
+        let mut new = old.clone();
+        new.recording.srs_tls_crl_file = Some("/etc/sbc/srs-crl.pem".into());
         assert_eq!(
             Runtime::detect_restart_required(&old, &new),
             vec!["recording".to_string()]

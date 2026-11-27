@@ -13,6 +13,7 @@
 use crate::error::{ConfigError, ConfigResult};
 use crate::schema::SbcConfig;
 use std::collections::HashSet;
+use std::path::Path;
 use uc_types::protocol::{CnsaCurve, CnsaHash, CnsaSrtpProfile};
 
 /// Trunk group selection strategies accepted by the daemon
@@ -83,6 +84,7 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_topology_hiding(config)?;
     validate_cdr(&config.cdr)?;
     validate_recording(config)?;
+    validate_revocation(config)?;
     validate_digest_auth(&config.digest_auth)?;
     validate_unimplemented(config)?;
     #[cfg(feature = "cluster")]
@@ -2417,6 +2419,90 @@ const fn validate_cnsa_srtp(config: &crate::schema::SrtpConfig) {
     match config.profile {
         CnsaSrtpProfile::AeadAes256Gcm => (),
     }
+}
+
+/// CRL paths and `[security.revocation]` (SR-29, POA&M-401 phase (a)).
+///
+/// - Every CRL path is absolute.
+/// - A CRL path needs its TLS path: `security.tls_crl_path` needs
+///   `security.require_mtls` (and so `tls_ca_path`);
+///   `security.trunk_tls_crl_path` needs `security.trunk_tls_ca_path`;
+///   `recording.srs_tls_crl_file` needs `recording.enabled`;
+///   `cdr.syslog.crl_path` needs `cdr.enabled` and `cdr.syslog.enabled`.
+///   A CRL that would be silently unused is an error (CM-6).
+/// - `security.revocation.require = true`: every enabled TLS path that
+///   verifies a peer certificate has a CRL path.
+///
+/// CRL file contents are checked at startup by the daemon.
+///
+/// ## NIST 800-53 Rev5: IA-5(2), CM-6, SI-10
+fn validate_revocation(config: &SbcConfig) -> ConfigResult<()> {
+    let err = |message: String| Err(ConfigError::Validation { message });
+    let sec = &config.security;
+    let srs_crl = config.recording.srs_tls_crl_file.as_deref().map(Path::new);
+    let syslog = &config.cdr.syslog;
+    for (key, path) in [
+        ("security.tls_crl_path", sec.tls_crl_path.as_deref()),
+        (
+            "security.trunk_tls_crl_path",
+            sec.trunk_tls_crl_path.as_deref(),
+        ),
+        ("recording.srs_tls_crl_file", srs_crl),
+        ("cdr.syslog.crl_path", syslog.crl_path.as_deref()),
+    ] {
+        if let Some(p) = path {
+            if !p.is_absolute() {
+                return err(format!("{key} must be an absolute path"));
+            }
+            if has_ascii_control(&p.to_string_lossy()) {
+                return err(format!("{key} must not contain control characters"));
+            }
+        }
+    }
+    if sec.tls_crl_path.is_some() && !(sec.require_mtls && sec.tls_ca_path.is_some()) {
+        return err(
+            "security.tls_crl_path needs security.require_mtls = true and \
+             security.tls_ca_path (client certificates are only requested with mutual TLS)"
+                .to_string(),
+        );
+    }
+    if sec.trunk_tls_crl_path.is_some() && sec.trunk_tls_ca_path.is_none() {
+        return err("security.trunk_tls_crl_path needs security.trunk_tls_ca_path".to_string());
+    }
+    if srs_crl.is_some() && !config.recording.enabled {
+        return err("recording.srs_tls_crl_file needs recording.enabled = true".to_string());
+    }
+    let syslog_on = config.cdr.enabled && syslog.enabled;
+    if syslog.crl_path.is_some() && !syslog_on {
+        return err(
+            "cdr.syslog.crl_path needs cdr.enabled = true and cdr.syslog.enabled = true"
+                .to_string(),
+        );
+    }
+    if sec.revocation.require {
+        let missing = [
+            (
+                sec.require_mtls && sec.tls_crl_path.is_none(),
+                "security.tls_crl_path (security.require_mtls is on)",
+            ),
+            (
+                sec.trunk_tls_ca_path.is_some() && sec.trunk_tls_crl_path.is_none(),
+                "security.trunk_tls_crl_path (security.trunk_tls_ca_path is set)",
+            ),
+            (
+                config.recording.enabled && srs_crl.is_none(),
+                "recording.srs_tls_crl_file (recording is enabled)",
+            ),
+            (
+                syslog_on && syslog.crl_path.is_none(),
+                "cdr.syslog.crl_path (cdr.syslog is enabled)",
+            ),
+        ];
+        if let Some((_, key)) = missing.iter().find(|(m, _)| *m) {
+            return err(format!("security.revocation.require = true needs {key}"));
+        }
+    }
+    Ok(())
 }
 
 /// Validates CNSA 2.0 hash algorithm compliance.
@@ -6567,5 +6653,196 @@ mod sr59_ws_proxy_fix_round {
         .unwrap();
         assert_eq!(loaded.transport.ws_max_handshakes_per_proxy, 64);
         assert!(crate::load_from_str("[transport]\nws_max_handshakes_per_proxy = 0\n").is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::field_reassign_with_default
+)]
+mod revocation_tests {
+    //! `validate_revocation` and the `[security.revocation]` schema
+    //! (SR-29, POA&M-401 phase (a)).
+    use super::*;
+    use crate::schema::{ExpiredCrlPolicy, RevocationCheckDepth, RevocationUnknown};
+    use std::path::PathBuf;
+
+    fn mtls() -> SbcConfig {
+        let mut c = SbcConfig::default();
+        c.security.tls_cert_path = Some(PathBuf::from("/etc/sbc/tls.crt"));
+        c.security.tls_key_path = Some(PathBuf::from("/etc/sbc/tls.key"));
+        c.security.require_mtls = true;
+        c.security.tls_ca_path = Some(PathBuf::from("/etc/sbc/client-ca.pem"));
+        c
+    }
+
+    fn rev_err(c: &SbcConfig) -> String {
+        match validate_revocation(c) {
+            Err(ConfigError::Validation { message }) => message,
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_config_has_no_revocation_and_validates() {
+        let c = SbcConfig::default();
+        assert!(c.security.revocation.is_default());
+        validate_revocation(&c).unwrap();
+        // Defaults per D1-D4: chain, deny, deny, reject, not required.
+        let r = c.security.revocation;
+        assert_eq!(r.check_depth, RevocationCheckDepth::Chain);
+        assert_eq!(r.client_unknown, RevocationUnknown::Deny);
+        assert_eq!(r.server_unknown, RevocationUnknown::Deny);
+        assert_eq!(r.expired_crl, ExpiredCrlPolicy::Reject);
+        assert!(!r.require);
+    }
+
+    #[test]
+    fn client_crl_needs_mtls_and_ca() {
+        let mut c = mtls();
+        c.security.tls_crl_path = Some(PathBuf::from("/etc/sbc/client-crl"));
+        validate_revocation(&c).unwrap();
+        validate_security(&c.security).unwrap();
+        c.security.require_mtls = false;
+        assert!(rev_err(&c).contains("require_mtls"));
+        let mut c = mtls();
+        c.security.tls_crl_path = Some(PathBuf::from("/etc/sbc/client-crl"));
+        c.security.tls_ca_path = None;
+        assert!(rev_err(&c).contains("tls_ca_path"));
+    }
+
+    #[test]
+    fn trunk_crl_needs_trunk_ca() {
+        let mut c = SbcConfig::default();
+        c.security.trunk_tls_crl_path = Some(PathBuf::from("/etc/sbc/trunk-crl"));
+        assert!(rev_err(&c).contains("trunk_tls_ca_path"));
+        c.security.trunk_tls_ca_path = Some(PathBuf::from("/etc/sbc/trunk-ca.pem"));
+        validate_revocation(&c).unwrap();
+    }
+
+    #[test]
+    fn srs_crl_needs_recording() {
+        let mut c = SbcConfig::default();
+        c.recording.srs_tls_crl_file = Some("/etc/sbc/srs-crl.pem".to_string());
+        assert!(rev_err(&c).contains("recording.enabled"));
+        c.recording.enabled = true;
+        validate_revocation(&c).unwrap();
+    }
+
+    #[test]
+    fn syslog_crl_needs_syslog() {
+        let mut c = SbcConfig::default();
+        c.cdr.syslog.crl_path = Some(PathBuf::from("/etc/sbc/syslog-crl"));
+        c.cdr.enabled = true;
+        assert!(rev_err(&c).contains("cdr.syslog.enabled"));
+        c.cdr.syslog.enabled = true;
+        validate_revocation(&c).unwrap();
+        c.cdr.enabled = false;
+        assert!(rev_err(&c).contains("cdr.enabled"));
+    }
+
+    #[test]
+    fn crl_paths_must_be_absolute() {
+        let mut c = mtls();
+        c.security.tls_crl_path = Some(PathBuf::from("client-crl"));
+        assert!(rev_err(&c).contains("security.tls_crl_path must be an absolute path"));
+        let mut c = SbcConfig::default();
+        c.security.trunk_tls_ca_path = Some(PathBuf::from("/ca.pem"));
+        c.security.trunk_tls_crl_path = Some(PathBuf::from("crl"));
+        assert!(rev_err(&c).contains("trunk_tls_crl_path must be an absolute"));
+        let mut c = SbcConfig::default();
+        c.recording.enabled = true;
+        c.recording.srs_tls_crl_file = Some("srs.pem".to_string());
+        assert!(rev_err(&c).contains("srs_tls_crl_file must be an absolute"));
+        let mut c = SbcConfig::default();
+        c.cdr.enabled = true;
+        c.cdr.syslog.enabled = true;
+        c.cdr.syslog.crl_path = Some(PathBuf::from("x.crl"));
+        assert!(rev_err(&c).contains("cdr.syslog.crl_path must be an absolute"));
+        let mut c = SbcConfig::default();
+        c.security.trunk_tls_ca_path = Some(PathBuf::from("/ca.pem"));
+        c.security.trunk_tls_crl_path = Some(PathBuf::from("/crl\nx"));
+        assert!(rev_err(&c).contains("control characters"));
+    }
+
+    #[test]
+    fn require_needs_a_crl_on_every_enabled_path() {
+        let mut c = SbcConfig::default();
+        c.security.revocation.require = true;
+        // Nothing enabled: nothing required.
+        validate_revocation(&c).unwrap();
+
+        let mut c = mtls();
+        c.security.revocation.require = true;
+        assert!(rev_err(&c).contains("security.tls_crl_path"));
+        c.security.tls_crl_path = Some(PathBuf::from("/etc/sbc/client-crl"));
+        validate_revocation(&c).unwrap();
+
+        c.security.trunk_tls_ca_path = Some(PathBuf::from("/etc/sbc/trunk-ca.pem"));
+        assert!(rev_err(&c).contains("trunk_tls_crl_path"));
+        c.security.trunk_tls_crl_path = Some(PathBuf::from("/etc/sbc/trunk-crl"));
+        validate_revocation(&c).unwrap();
+
+        c.recording.enabled = true;
+        assert!(rev_err(&c).contains("srs_tls_crl_file"));
+        c.recording.srs_tls_crl_file = Some("/etc/sbc/srs-crl.pem".to_string());
+        validate_revocation(&c).unwrap();
+
+        c.cdr.enabled = true;
+        c.cdr.syslog.enabled = true;
+        assert!(rev_err(&c).contains("cdr.syslog.crl_path"));
+        c.cdr.syslog.crl_path = Some(PathBuf::from("/etc/sbc/syslog-crl"));
+        validate_revocation(&c).unwrap();
+    }
+
+    #[test]
+    fn validate_config_runs_the_revocation_rules() {
+        let mut c = SbcConfig::default();
+        c.security.trunk_tls_crl_path = Some(PathBuf::from("/etc/sbc/trunk-crl"));
+        let e = validate_config(&c).unwrap_err().to_string();
+        assert!(e.contains("trunk_tls_crl_path"), "{e}");
+    }
+
+    #[test]
+    fn toml_round_trip_and_unknown_keys() {
+        let text = r#"
+[security]
+trunk_tls_ca_path = "/etc/sbc/trunk-ca.pem"
+trunk_tls_crl_path = "/etc/sbc/trunk-crl"
+
+[security.revocation]
+check_depth = "end_entity"
+client_unknown = "allow"
+server_unknown = "deny"
+expired_crl = "ignore"
+require = true
+"#;
+        let c: SbcConfig = toml::from_str(text).unwrap();
+        let r = c.security.revocation;
+        assert_eq!(r.check_depth, RevocationCheckDepth::EndEntity);
+        assert_eq!(r.client_unknown, RevocationUnknown::Allow);
+        assert_eq!(r.expired_crl, ExpiredCrlPolicy::Ignore);
+        assert!(r.require);
+        let back: SbcConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.security, c.security);
+        // Default policy is not written out.
+        let out = toml::to_string(&SbcConfig::default()).unwrap();
+        assert!(!out.contains("revocation"), "{out}");
+
+        let bad = "[security.revocation]\ncheck_depth = \"chain\"\nrequired = true\n";
+        assert!(toml::from_str::<SbcConfig>(bad).is_err());
+        let bad_value = "[security.revocation]\ncheck_depth = \"leaf\"\n";
+        assert!(toml::from_str::<SbcConfig>(bad_value).is_err());
+        let rec = "[recording]\nsrs_tls_crl_file = \"/x.pem\"\n";
+        let c: SbcConfig = toml::from_str(rec).unwrap();
+        assert_eq!(c.recording.srs_tls_crl_file.as_deref(), Some("/x.pem"));
+        let cdr = "[cdr.syslog]\ncrl_path = \"/etc/sbc/syslog-crl\"\n";
+        let c: SbcConfig = toml::from_str(cdr).unwrap();
+        assert_eq!(
+            c.cdr.syslog.crl_path.as_deref(),
+            Some(Path::new("/etc/sbc/syslog-crl"))
+        );
     }
 }

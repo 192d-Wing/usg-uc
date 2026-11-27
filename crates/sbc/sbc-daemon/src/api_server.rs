@@ -611,6 +611,8 @@ pub const STIR_METRICS: &[(&str, &str)] = &[
 ///
 /// ## NIST 800-53 Rev5: AU-5, SI-4 (System Monitoring)
 fn register_daemon_metrics(metrics: &mut MetricRegistry) {
+    // SR-29: CRL revocation gauges (bounded labels: role x reason).
+    crate::tls_revocation::register_metrics(metrics);
     metrics.register_counter(
         METRIC_API_TLS_HANDSHAKE_TIMEOUTS,
         "REST HTTPS handshakes abandoned after the handshake deadline",
@@ -844,6 +846,7 @@ impl AppState {
     /// ## NIST 800-53 Rev5: AU-5, SI-4 (System Monitoring)
     pub fn refresh_daemon_metrics(&self) {
         let as_gauge = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+        crate::tls_revocation::refresh_metrics(&self.metrics);
         if let Some(g) = self.metrics.gauge(METRIC_AUDIT_RECORDS_DROPPED) {
             g.set(as_gauge(uc_audit::dropped_records()));
         }

@@ -1666,7 +1666,7 @@ Notes on what the daemon actually does with these keys:
 - `curve` only constrains the configuration enum; the key type of the loaded certificate is not checked (P-256/RSA certificates are accepted by rustls).
 - `trunk_tls_ca_path` (wired): PEM bundle of the CAs that issue trunk server certificates. Required when any trunk uses `protocol = "tls"`; separate from `tls_ca_path` (client CA for the listener). See Trunk Groups.
 - `require_mtls` (wired for SIP-TLS and gRPC): the SIP-TLS listener requires a client certificate chaining to `tls_ca_path`; `validate_config` rejects `require_mtls = true` without `tls_cert_path` and `tls_ca_path`. The gRPC listener has its own `[grpc] require_mtls` / `tls_ca_path`.
-- Certificate revocation is not checked. A revoked client, trunk, recorder or syslog collector certificate that chains to the configured CA is accepted (POA&M-401). Remove the CA from the bundle to cut off a compromised issuer.
+- Certificate revocation is checked only on paths with a CRL configured (see "Certificate revocation (CRL files)" below). Without one, a revoked client, trunk, recorder or syslog collector certificate that chains to the configured CA is accepted (POA&M-401).
 
 **Peer certificate requirements (changed by SR-14, breaking).** Every TLS
 connection built on the CNSA provider accepts a peer only if it signs with
@@ -1684,13 +1684,117 @@ self-signature is not checked). This applies to:
 RSA (any size), P-256, P-521 and Ed25519 leaves are refused, and so is a
 P-384 leaf issued by an RSA or P-256 CA. There is no override. Reissue peer
 certificates and intermediate CAs as P-384 before upgrading. A failed
-handshake is not audited (POA&M-49). Revocation is not checked (POA&M-401).
+handshake is not audited (POA&M-49), except a revocation rejection (below).
+Revocation is checked only where a CRL is configured (POA&M-401).
 ML-DSA-87 peers are not accepted yet (POA&M-404). The daemon gRPC channels and the
 sbc-media controller channel do not use this provider and are unchanged.
 
 The SBC's own certificate (`tls_cert_path`) is not checked at load beyond
 its key curve (POA&M-404). Use a P-384 key and a P-384 / SHA-384 chain: soft clients and
 other usg-uc SBCs refuse a P-521 SBC certificate.
+
+### Certificate revocation (CRL files)
+
+The SBC can check peer certificates against CRL files on its TLS paths
+(SR-29; NIST 800-53 IA-5(2)). It is off until a CRL path is set, and each
+path is set on its own:
+
+| TLS path | CRL key | Needs |
+|---|---|---|
+| SIP-TLS listener, client certificates | `security.tls_crl_path` | `require_mtls = true`, `tls_ca_path` |
+| TLS trunks (with or without `tls_client_cert`) | `security.trunk_tls_crl_path` | `trunk_tls_ca_path` |
+| SIPREC recorder | `recording.srs_tls_crl_file` | `recording.enabled = true` |
+| CDR syslog collector | `cdr.syslog.crl_path` | `cdr.enabled` and `cdr.syslog.enabled` |
+
+```toml
+[security]
+require_mtls = true
+tls_ca_path = "/etc/sbc/client-ca.pem"
+tls_crl_path = "/etc/sbc/client-crl"        # file or directory
+trunk_tls_ca_path = "/etc/sbc/trunk-ca.pem"
+trunk_tls_crl_path = "/etc/sbc/trunk-crl"
+
+[security.revocation]                       # one policy for every path
+check_depth = "chain"        # "chain" (default) | "end_entity"
+client_unknown = "deny"      # SIP-TLS clients: "deny" (default) | "allow"
+server_unknown = "deny"      # trunks, recorder, syslog: "deny" (default) | "allow"
+expired_crl = "reject"       # "reject" (default) | "ignore"
+require = false              # true: every enabled TLS path needs a CRL path
+```
+
+**CRL files.** A CRL path is an absolute path to a PEM file (one or more
+`X509 CRL` blocks), a DER file, or a directory. In a directory the SBC reads
+`*.pem`, `*.crl` and `*.der` files and skips names that start with `.`; any
+other file name is an error (a misnamed CRL is never skipped silently). A
+symlink inside the directory is followed only when it points to a regular
+file inside the same directory (the layout of a Kubernetes ConfigMap or
+Secret volume); the path itself must not be a symlink. Limits: 256 files or
+CRLs, 64 MiB per file, 256 MiB in total. Each issuer may have only one CRL
+in a path. Delta CRLs and indirect CRLs are refused. A path that cannot be
+read, holds no CRL or breaks one of these rules fails that TLS path at
+startup in the same way as a bad CA bundle: the SIP-TLS listener, the trunk
+TLS clients, the recorder or the CDR pipeline does not start.
+
+**Coverage.** With `check_depth = "chain"` every certificate below the trust
+anchor is checked, so each CA in the chain needs a CRL from its issuer: the
+leaf's issuing CA's CRL, and for an intermediate CA the root's CRL (ARL).
+With `"deny"` a certificate that no CRL covers is refused (`unknown_status`).
+Use `"end_entity"` to check only the leaf, or `"allow"` to accept
+certificates no CRL covers. `client_unknown = "allow"` with mutual TLS logs a
+warning at startup.
+
+**Expiry.** A CRL whose `nextUpdate` has passed is "expired". With
+`expired_crl = "reject"` every handshake that needs it fails until a fresh
+CRL is installed (fail closed). An expired CRL at startup does not stop the
+SBC: it starts, logs an error, records the expired count in the startup
+audit event, and that path refuses the affected peers. `"ignore"` keeps using
+the expired CRL and logs a warning at startup. There is no grace period.
+
+**Updating CRLs.** CRLs are read once at startup. To apply a new CRL,
+replace the files and restart the SBC (with Helm, roll the pods). Plan the
+restart before the current CRL's `nextUpdate`; the
+`tls_crl_next_update_seconds` metric shows the time left. The SBC does not
+download CRLs from distribution points; fetch them with a separate job. In a
+cluster every node needs the same CRL files. With the sbc Helm chart, set
+`sbcDaemon.trunkTls.crlConfigMap` or `crlSecretName` (each key one CRL file;
+mounted as a directory at `/etc/sbc/trunk-crl`) and the
+`sbcDaemon.revocation` values.
+
+**Audit and metrics.** At startup each path with CRLs writes a
+`TlsRevocationListLoaded` event (Configuration: role, path, CRL count,
+revoked entries, earliest `nextUpdate`, expired count, policy). A refused
+peer writes `TlsPeerCertificateRejected` (Security: role, reason, peer
+address, count), at most once per role and reason per 60 s; later rejections
+in the window are counted on the next event. Reasons: `revoked`,
+`unknown_status`, `crl_expired`, `crl_invalid` (a CRL whose signature does
+not verify against its issuer). Roles: `sip_tls`, `trunk_tls`, `srs_tls`,
+`cdr_syslog`. Metrics: `tls_revocation_rejections_total{role,reason}`,
+`tls_revocation_enabled{role}` and `tls_crl_next_update_seconds{role}`
+(seconds until the earliest `nextUpdate`; negative once passed; 0 without a
+CRL).
+
+**Failure behaviour.** A trunk whose certificate is refused fails like any
+other trunk TLS failure: the call fails over to the next trunk on that
+trunk's protocol, or the caller gets a 503. Nothing is retried over UDP or
+TCP. A refused recorder is handled by `recording.on_failure`. A refused
+syslog collector is not connected; CDRs stay on disk.
+
+**Cost.** The CRL signature is checked on every full handshake. Measured
+locally (in-memory TLS 1.3 handshake, `cargo bench -p uc-transport --bench
+crl_handshake`): about 0.5 ms without a CRL, 0.7 ms with a 1,000-entry CRL
+and 2.0 ms with a 100,000-entry CRL (about 2.1 MB). Keep CRLs small on the
+SIP-TLS listener, where handshakes are driven by clients; a CRL set larger
+than 8 MiB is logged as a warning at startup.
+
+**Session resumption.** A resumed TLS session is not re-verified, so a
+session established before a CRL's `nextUpdate` can still be resumed after
+it (until the session or ticket expires or the SBC restarts). Restarting the
+SBC to load a fresh CRL also clears all sessions.
+
+**Not covered (POA&M-401).** CRL reload without restart, expiry warnings and
+grace periods, load-time checks of the CRL signature against the CA bundle,
+OCSP (stapling and client checks), CRL download, the daemon and sbc-media
+gRPC channels, and management-plane HTTPS.
 
 ### Rate Limiting
 

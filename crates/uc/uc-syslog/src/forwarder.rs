@@ -17,9 +17,10 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tracing::{debug, info, warn};
+use uc_transport::revocation::{CrlSet, Revocation, RevocationPolicy};
 use uc_transport::tls::{
-    MinTlsVersion, TlsClientOptions, create_client_config_with, load_certs, load_private_key,
-    load_root_store,
+    MinTlsVersion, TlsClientOptions, create_client_config_verified, create_client_config_with,
+    load_certs, load_private_key, load_root_store,
 };
 
 /// Upper bound on TCP connect plus TLS handshake.
@@ -60,15 +61,33 @@ impl TlsSink {
                 ));
             }
         };
-        let client_config = create_client_config_with(TlsClientOptions {
-            roots,
-            min_version: if tls.allow_tls12 {
-                MinTlsVersion::V1_2
-            } else {
-                MinTlsVersion::V1_3
-            },
-            client_auth,
-        })
+        let min_version = if tls.allow_tls12 {
+            MinTlsVersion::V1_2
+        } else {
+            MinTlsVersion::V1_3
+        };
+        let client_config = match &tls.crl_file {
+            // NIST 800-53 Rev5: IA-5(2) - default policy (chain, deny
+            // unknown, reject expired).
+            Some(crl) => {
+                let rev = Revocation {
+                    crls: Arc::new(
+                        CrlSet::load(crl)
+                            .map_err(|e| cfg_err(format!("syslog tls crl_file: {e}")))?,
+                    ),
+                    policy: RevocationPolicy::default(),
+                };
+                let verifier = rev
+                    .server_verifier(Arc::new(roots))
+                    .map_err(|e| cfg_err(format!("syslog tls: {e}")))?;
+                create_client_config_verified(verifier, min_version, client_auth)
+            }
+            None => create_client_config_with(TlsClientOptions {
+                roots,
+                min_version,
+                client_auth,
+            }),
+        }
         .map_err(|e| cfg_err(format!("syslog tls: {e}")))?;
         let server_name = ServerName::try_from(tls.server_name.clone())
             .map_err(|e| cfg_err(format!("syslog tls server_name: {e}")))?;
@@ -509,6 +528,7 @@ mod tests {
                 client_cert: None,
                 client_key: None,
                 allow_tls12: false,
+                crl_file: None,
             }
         }
 
@@ -619,6 +639,99 @@ mod tests {
             .await
             .unwrap_err();
             assert!(matches!(err, SyslogError::ConnectionFailed { .. }), "{err}");
+        }
+
+        /// A CRL-signing P-384 CA, a `localhost` leaf with `serial`, and a
+        /// CRL from the CA revoking `revoked`.
+        fn crl_pki(serial: u64, revoked: &[u64]) -> (Pki, String) {
+            let alg = &rcgen::PKCS_ECDSA_P384_SHA384;
+            let ca_key = rcgen::KeyPair::generate_for(alg).unwrap();
+            let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca_params.key_usages = vec![
+                rcgen::KeyUsagePurpose::KeyCertSign,
+                rcgen::KeyUsagePurpose::CrlSign,
+            ];
+            let ca = ca_params.self_signed(&ca_key).unwrap();
+            let leaf_key = rcgen::KeyPair::generate_for(alg).unwrap();
+            let mut leaf_params =
+                rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            leaf_params.serial_number = Some(rcgen::SerialNumber::from(serial));
+            let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+            let crl = rcgen::CertificateRevocationListParams {
+                this_update: rcgen::date_time_ymd(2020, 1, 1),
+                next_update: rcgen::date_time_ymd(2090, 1, 1),
+                crl_number: rcgen::SerialNumber::from(1u64),
+                issuing_distribution_point: None,
+                revoked_certs: revoked
+                    .iter()
+                    .map(|s| rcgen::RevokedCertParams {
+                        serial_number: rcgen::SerialNumber::from(*s),
+                        revocation_time: rcgen::date_time_ymd(2020, 1, 1),
+                        reason_code: None,
+                        invalidity_date: None,
+                    })
+                    .collect(),
+                key_identifier_method: rcgen::KeyIdMethod::Sha256,
+            }
+            .signed_by(&ca, &ca_key)
+            .unwrap();
+            (
+                Pki {
+                    ca_pem: ca.pem(),
+                    chain: vec![leaf.der().clone()],
+                    key: PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+                },
+                crl.pem().unwrap(),
+            )
+        }
+
+        /// SR-29: a collector whose certificate the CRL revokes is not
+        /// connected; a good one is.
+        #[tokio::test]
+        async fn revoked_collector_fails_to_connect() {
+            let (pki, crl) = crl_pki(7, &[7]);
+            let dir = tempfile::tempdir().unwrap();
+            let ca = write_ca(dir.path(), &pki.ca_pem);
+            let crl_file = dir.path().join("collector.crl.pem");
+            std::fs::write(&crl_file, crl).unwrap();
+            let (addr, _handle) = collector(&pki).await;
+            let mut cfg = tls_config(ca, "localhost");
+            cfg.crl_file = Some(crl_file);
+            let err = SyslogForwarder::new(SyslogConfig::tls(addr, cfg))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SyslogError::ConnectionFailed { .. }), "{err}");
+            assert!(err.to_string().contains("Revoked"), "{err}");
+
+            let (pki, crl) = crl_pki(8, &[7]);
+            let dir = tempfile::tempdir().unwrap();
+            let ca = write_ca(dir.path(), &pki.ca_pem);
+            let crl_file = dir.path().join("collector.crl.pem");
+            std::fs::write(&crl_file, crl).unwrap();
+            let (addr, handle) = collector(&pki).await;
+            let mut cfg = tls_config(ca, "localhost");
+            cfg.crl_file = Some(crl_file);
+            let fwd = SyslogForwarder::new(SyslogConfig::tls(addr, cfg))
+                .await
+                .unwrap();
+            fwd.info("hello").await.unwrap();
+            fwd.close().await.unwrap();
+            drop(fwd);
+            assert!(handle.await.unwrap().is_ok());
+        }
+
+        #[tokio::test]
+        async fn unreadable_crl_file_is_config_error() {
+            let pki = pki();
+            let dir = tempfile::tempdir().unwrap();
+            let ca = write_ca(dir.path(), &pki.ca_pem);
+            let mut cfg = tls_config(ca, "localhost");
+            cfg.crl_file = Some(dir.path().join("missing.crl"));
+            let err = SyslogForwarder::new(SyslogConfig::tls("127.0.0.1:1".parse().unwrap(), cfg))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SyslogError::ConfigError { .. }), "{err}");
         }
 
         #[tokio::test]

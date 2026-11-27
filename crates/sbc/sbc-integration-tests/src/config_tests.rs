@@ -507,6 +507,19 @@ fn qa_helm_rendered_sbc_config_validates() {
         ("{{ .Values.sbcDaemon.cdr.attemptsRetentionFiles }}", "372"),
         ("{{ .Values.sbcDaemon.grpcMtls.enabled }}", "true"),
         (
+            "{{ .Values.sbcDaemon.revocation.checkDepth | quote }}",
+            "\"chain\"",
+        ),
+        (
+            "{{ .Values.sbcDaemon.revocation.serverUnknown | quote }}",
+            "\"deny\"",
+        ),
+        (
+            "{{ .Values.sbcDaemon.revocation.expiredCrl | quote }}",
+            "\"reject\"",
+        ),
+        ("{{ .Values.sbcDaemon.revocation.require }}", "false"),
+        (
             "{{ include \"sbc.grpcAllowedClientNames\" . }}",
             "[\"sbc-sbc-api\"]",
         ),

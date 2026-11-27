@@ -1,9 +1,42 @@
 # TLS Certificate Revocation (CRL) Design
 
-Status: **design only, not implemented.** Tracked as POA&M-401 in
-[NIST 800-53 Controls](NIST-800-53-CONTROLS.md). No TLS path in the SBC checks
-certificate revocation today. Decisions D1-D6 below were accepted on 2026-11-25;
-phase (a) is next.
+Status: **phase (a) implemented (2026-11-27); phase (b) open.** Tracked as
+POA&M-401 in [NIST 800-53 Controls](NIST-800-53-CONTROLS.md). Decisions D1-D6
+below were accepted on 2026-11-25. Operator documentation: SBC admin guide,
+"Certificate revocation (CRL files)".
+
+## Phase (a) as built
+
+- `uc-transport/src/revocation.rs`: `CrlSet` (loader, caps, DER walk,
+  duplicate-issuer check), `Revocation` (policy plus CRLs; builds the client
+  and server verifiers), `classify` / `classify_io`. Handshake failures with a
+  revocation cause come back as `TransportError::TlsPeerCertificateRejected`.
+- The options structs are unchanged. The CRL-checking configs come from new
+  builders, `create_server_config_with_revocation` and
+  `create_client_config_verified`; with no CRL the old builders run, so
+  behaviour without a CRL is unchanged.
+- Directory loading follows a symlink only when its target is a regular file
+  inside the directory, so ConfigMap and Secret volumes (keys are symlinks
+  into `..data/`) load; a symlink out of the directory and a symlinked top
+  path are refused.
+- `sbc-daemon/src/tls_revocation.rs`: per-role loading, startup audit,
+  aggregated rejection audit, metrics. A CRL past `nextUpdate` at startup
+  does not stop the daemon (D1); with `expired_crl = "reject"` rustls fails
+  each handshake that needs that CRL.
+- The `client_unknown = "allow"` warning is logged by the daemon at startup
+  (sbc-config has no logger).
+- Session resumption: a resumed TLS session skips certificate verification
+  and so the CRL check. Phase (a) loads CRLs once, and session caches are in
+  memory, so every resumable session was checked against the current CRLs.
+  b1 (reload) must clear or bypass session caches when CRLs change. A
+  session resumed after a CRL's `nextUpdate` is not re-verified either, so
+  `expired_crl = "reject"` holds for full handshakes only (b2).
+- A directory with any file name other than `*.pem`, `*.crl`, `*.der` (or a
+  dotfile) is refused rather than skipped. A CRL set above 8 MiB is logged
+  as a warning (per-handshake cost, SC-5).
+- Bench (`uc-transport` `crl_handshake`, in-memory TLS 1.3, resumption off,
+  local run): 0.51 ms without a CRL, 0.67 ms with 1k entries, 2.0 ms with
+  100k entries (2.1 MB).
 
 Versions checked: rustls 0.23.46, rustls-webpki 0.103.16, rustls-pki-types
 1.15.1, tonic 0.14.6.

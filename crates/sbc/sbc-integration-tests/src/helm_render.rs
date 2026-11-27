@@ -1738,3 +1738,48 @@ fn qa_helm_render_gateway_cert_ecdsa_p384() {
         "Gateway Certificate privateKey.size"
     );
 }
+
+// ── trunk CRLs (SR-29) ─────────────────────────────────────────
+
+/// SR-29: a trunk CRL ConfigMap is mounted as a directory and wired to
+/// security.trunk_tls_crl_path with a [security.revocation] table; without
+/// it neither is rendered; a CRL without the trunk CA fails to render.
+/// NIST 800-53 Rev5: IA-5(2), CM-6
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_trunk_crl() {
+    let out = must_render(sbc(&[SBC_ISSUER]), "minimal + clusterIssuer");
+    let config = daemon_config(&out);
+    assert!(!config.contains("trunk_tls_crl_path"), "{config}");
+    assert!(!config.contains("[security.revocation]"), "{config}");
+
+    let out = must_render(
+        sbc(&[
+            SBC_ISSUER,
+            "sbcDaemon.trunkTls.caConfigMap=trunk-ca",
+            "sbcDaemon.trunkTls.crlConfigMap=trunk-crl",
+        ]),
+        "trunk CA + CRL",
+    );
+    let config = daemon_config(&out);
+    let cfg = sbc_config::load_from_str(&config)
+        .unwrap_or_else(|e| panic!("rendered config must validate: {e}\n{config}"));
+    assert_eq!(
+        cfg.security.trunk_tls_crl_path.as_deref(),
+        Some(std::path::Path::new("/etc/sbc/trunk-crl"))
+    );
+    assert!(cfg.security.revocation.is_default(), "{config}");
+    let deploy = get(&out, "Deployment", &fullname(&out));
+    let mount = deploy
+        .lines()
+        .find(|l| l.contains("mountPath: /etc/sbc/trunk-crl"))
+        .unwrap_or_else(|| panic!("CRL directory mounted:\n{deploy}"));
+    assert!(!mount.contains("subPath"), "no subPath: {mount}");
+    assert!(deploy.contains("name: trunk-crl"), "{deploy}");
+
+    must_fail(
+        sbc(&[SBC_ISSUER, "sbcDaemon.trunkTls.crlConfigMap=trunk-crl"]),
+        "caConfigMap",
+        "CRL without trunk CA",
+    );
+}

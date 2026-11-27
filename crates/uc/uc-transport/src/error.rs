@@ -6,6 +6,46 @@ use uc_types::address::SbcSocketAddr;
 /// Result type for transport operations.
 pub type TransportResult<T> = Result<T, TransportError>;
 
+/// Why a peer certificate failed the revocation check (SR-29).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RevocationFailure {
+    /// A CRL lists the certificate (or a CA in its chain) as revoked.
+    Revoked,
+    /// No CRL covers the certificate and unknown status is denied.
+    UnknownStatus,
+    /// The CRL needed for the check is past its `nextUpdate`.
+    CrlExpired,
+    /// A CRL failed its own checks (signature, issuer) at handshake time.
+    CrlInvalid,
+}
+
+impl RevocationFailure {
+    /// Every value, in a fixed order (metric series).
+    pub const ALL: [Self; 4] = [
+        Self::Revoked,
+        Self::UnknownStatus,
+        Self::CrlExpired,
+        Self::CrlInvalid,
+    ];
+
+    /// Stable token for audit and metric labels.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Revoked => "revoked",
+            Self::UnknownStatus => "unknown_status",
+            Self::CrlExpired => "crl_expired",
+            Self::CrlInvalid => "crl_invalid",
+        }
+    }
+}
+
+impl std::fmt::Display for RevocationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Transport errors.
 ///
 /// ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality and Integrity)
@@ -63,6 +103,18 @@ pub enum TransportError {
     TlsHandshakeFailed {
         /// Error description.
         reason: String,
+    },
+
+    /// The TLS handshake failed because the peer certificate did not pass
+    /// the revocation check (only possible when CRLs are configured).
+    ///
+    /// ## NIST 800-53 Rev5: IA-5(2), SC-23
+    #[error("TLS handshake failed: peer certificate rejected ({reason}): {detail}")]
+    TlsPeerCertificateRejected {
+        /// Revocation cause.
+        reason: RevocationFailure,
+        /// rustls error text.
+        detail: String,
     },
 
     /// TLS certificate error.

@@ -46,6 +46,9 @@ pub mod tcp;
 pub mod tls;
 
 #[cfg(feature = "tls")]
+pub mod revocation;
+
+#[cfg(feature = "tls")]
 pub mod cert_reload;
 
 #[cfg(feature = "https-client")]
@@ -79,7 +82,7 @@ pub mod websocket;
 )]
 pub mod sctp;
 
-pub use error::{TransportError, TransportResult};
+pub use error::{RevocationFailure, TransportError, TransportResult};
 pub use listener::TransportListener;
 pub use qos::{
     DscpValue, QosConfig, QosPolicyManager, TrafficType, TrunkQosPolicy, apply_dscp,
