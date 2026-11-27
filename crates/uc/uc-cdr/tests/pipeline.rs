@@ -142,7 +142,7 @@ fn answered_call_content_is_correct_on_disk() {
     assert!(r.media_anchored);
     assert!(r.emergency);
     // Stamped by the writer.
-    assert_eq!(r.schema_version, uc_cdr::SCHEMA_VERSION);
+    assert_eq!(r.schema_version, uc_cdr::CALLS_SCHEMA_VERSION);
     assert_eq!(r.node_id, "qa-node");
     assert_eq!(r.record_id, "qa-node-0");
     assert_eq!(r.hash.len(), 96);
@@ -703,4 +703,86 @@ fn qa_stir_v2_fields_on_disk_and_verify() {
     );
     assert_eq!(verify_all(dir.path()), 2);
     assert!(verify_sidecar(&files[0]).unwrap());
+}
+
+/// SR-43 (QA-first, plan 8): a v4 file written by release 6b6d8bba (frozen
+/// bytes, both an answered call and an SBC reject) still verifies under the
+/// v5 reader, every record and the header read as the `calls` stream and
+/// re-serialise byte-identically, and a v5 emitter continues its chain in
+/// the calls stream while new SBC rejects start their own attempts chain.
+/// NIST 800-53 Rev5: AU-9, AU-11
+#[test]
+fn v4_files_still_verify_and_read_as_calls_stream() {
+    use uc_cdr::{CdrStream, FileHeader, verify_reader};
+    const V4: &str = include_str!("fixtures/cdr-v4-release-6b6d8bba.jsonl");
+    assert_eq!(verify_reader(V4.as_bytes()).unwrap().records, 2);
+    assert!(!V4.contains("\"stream\""));
+    let mut lines = V4.lines();
+    let header: FileHeader = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(header.schema_version, 4);
+    assert_eq!(header.stream, CdrStream::Calls);
+    for line in lines {
+        let r: CallRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(r.schema_version, 4);
+        assert_eq!(r.stream, CdrStream::Calls, "{}", r.record_id);
+        assert_eq!(
+            uc_cdr::format::to_json_line(&r).unwrap(),
+            line,
+            "v4 record re-serialises as written"
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("cdr-node-a-20231114T000000.jsonl");
+    std::fs::write(&old, V4).unwrap();
+    let em = CdrEmitter::start(
+        CdrEmitterConfig {
+            node_id: "node-a".into(),
+            file: Some(file_cfg(dir.path())),
+            attempts: Some(FileSinkConfig {
+                stream: CdrStream::Attempts,
+                ..file_cfg(dir.path())
+            }),
+            ..CdrEmitterConfig::default()
+        },
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+    assert!(em.emit(answered()));
+    assert!(em.emit(CallRecord {
+        a_call_id: "v5-rejected@uac".into(),
+        disposition: Disposition::Rejected,
+        final_sip_status: 403,
+        release_side: ReleaseSide::Sbc,
+        release_cause: ReleaseCause::PolicyDenied,
+        ..CallRecord::default()
+    }));
+    assert!(em.shutdown(T));
+    let calls: Vec<PathBuf> = cdr_files(dir.path())
+        .into_iter()
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("cdr-"))
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], old);
+    let refs: Vec<&Path> = calls.iter().map(PathBuf::as_path).collect();
+    let reports = verify_files(&refs).unwrap();
+    assert_eq!(
+        reports[1].first_sequence, 2,
+        "calls chain continues the v4 file"
+    );
+    let new = records(&calls[1]);
+    assert_eq!(new[0].record_id, "node-a-2");
+    let attempts: Vec<PathBuf> = cdr_files(dir.path())
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("cdra-")
+        })
+        .collect();
+    let a = records(&attempts[0]);
+    assert_eq!(a[0].record_id, "node-a-a0");
+    assert_eq!(a[0].stream, CdrStream::Attempts);
 }

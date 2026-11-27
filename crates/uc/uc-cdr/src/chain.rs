@@ -177,9 +177,13 @@ pub fn verify_reader<R: Read>(reader: R) -> CdrResult<VerifyReport> {
         let rec: CallRecord = serde_json::from_slice(&buf)
             .map_err(|e| CdrError::verify(line_no, format!("bad record: {e}")))?;
         // A file holds one schema version (the writer opens a new file on
-        // start); v1..v4 files are all readable.
+        // start); v1..v5 files are all readable.
         if rec.schema_version != header.schema_version {
             return Err(CdrError::verify(line_no, "schema_version mismatch"));
+        }
+        // v5: a file holds one stream (calls or attempts).
+        if rec.stream != header.stream {
+            return Err(CdrError::verify(line_no, "stream differs from header"));
         }
         if rec.node_id != header.node_id {
             return Err(CdrError::verify(line_no, "node_id differs from header"));
@@ -291,7 +295,9 @@ pub fn verify_sidecar(path: &Path) -> CdrResult<bool> {
 mod tests {
     use super::*;
     use crate::format::{header_json_line, new_header, to_json_line};
-    use crate::record::{Attestation, MediaKindTag, RecordingTag, SCHEMA_VERSION, Verstat};
+    use crate::record::{
+        Attestation, CALLS_SCHEMA_VERSION, MediaKindTag, RecordingTag, SCHEMA_VERSION, Verstat,
+    };
 
     /// A v1 file (header and records at schema 1, no v2 fields) written by
     /// the previous release still verifies: unset v2 fields are not
@@ -322,7 +328,7 @@ mod tests {
         let mut out = header_json_line(&new_header("n1", 0, to_hex(&GENESIS), 0)).unwrap();
         out.push('\n');
         let mut r = CallRecord {
-            schema_version: SCHEMA_VERSION,
+            schema_version: CALLS_SCHEMA_VERSION,
             node_id: "n1".into(),
             record_id: "n1-0".into(),
             stir_verstat: Some(Verstat::TnValidationFailed),
@@ -396,7 +402,7 @@ mod tests {
     fn qa_v1_then_v2_files_verify_across_upgrade() {
         let dir = tempfile::tempdir().unwrap();
         let (v1, last) = versioned_file(1, 0, 3, GENESIS);
-        let (v2, _) = versioned_file(SCHEMA_VERSION, 3, 2, last);
+        let (v2, _) = versioned_file(CALLS_SCHEMA_VERSION, 3, 2, last);
         let p1 = dir.path().join("a.jsonl");
         let p2 = dir.path().join("b.jsonl");
         std::fs::write(&p1, v1).unwrap();
@@ -405,7 +411,7 @@ mod tests {
         assert_eq!(reps.iter().map(|r| r.records).sum::<u64>(), 5);
 
         // A v2 file that does not continue the v1 chain is rejected.
-        let (v2_bad, _) = versioned_file(SCHEMA_VERSION, 3, 2, GENESIS);
+        let (v2_bad, _) = versioned_file(CALLS_SCHEMA_VERSION, 3, 2, GENESIS);
         std::fs::write(&p2, v2_bad).unwrap();
         assert!(verify_files(&[p1.as_path(), p2.as_path()]).is_err());
     }
@@ -413,7 +419,7 @@ mod tests {
     /// QA: tampering with any v2 STIR field breaks the record hash.
     #[test]
     fn qa_v2_stir_field_tamper_detected() {
-        let (good, _) = versioned_file(SCHEMA_VERSION, 0, 2, GENESIS);
+        let (good, _) = versioned_file(CALLS_SCHEMA_VERSION, 0, 2, GENESIS);
         assert_eq!(verify_reader(good.as_bytes()).unwrap().records, 2);
         for (from, to) in [
             ("tn-validation-passed", "tn-validation-failed"),
@@ -471,7 +477,7 @@ mod tests {
     /// (reorder, add, inject an unknown tag) breaks verification or parsing.
     #[test]
     fn qa_v3_media_kinds_edits_detected() {
-        let (v3, _) = versioned_file(SCHEMA_VERSION, 0, 2, GENESIS);
+        let (v3, _) = versioned_file(CALLS_SCHEMA_VERSION, 0, 2, GENESIS);
         assert!(verify_reader(v3.as_bytes()).is_ok());
         for (from, to) in [
             (r#"["audio","image"]"#, r#"["image","audio"]"#),
@@ -491,11 +497,11 @@ mod tests {
     /// detected.
     #[test]
     fn v3_then_v4_recording_chain() {
-        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(CALLS_SCHEMA_VERSION, 4);
         let (v1, last) = versioned_file(1, 0, 1, GENESIS);
         let (v2, last) = versioned_file(2, 1, 1, last);
         let (v3, last) = versioned_file(3, 2, 2, last);
-        let (v4, _) = versioned_file(SCHEMA_VERSION, 4, 2, last);
+        let (v4, _) = versioned_file(CALLS_SCHEMA_VERSION, 4, 2, last);
         assert!(!v3.contains("recording"), "{v3}");
         assert!(
             v4.contains(r#""recording":"recorded","recording_session_id":"rs-0001""#),
@@ -516,7 +522,7 @@ mod tests {
         assert_eq!(reps.iter().map(|r| r.records).sum::<u64>(), 6);
 
         // A v4 file that does not continue the v3 chain is rejected.
-        let (v4_bad, _) = versioned_file(SCHEMA_VERSION, 4, 2, GENESIS);
+        let (v4_bad, _) = versioned_file(CALLS_SCHEMA_VERSION, 4, 2, GENESIS);
         std::fs::write(&paths[3], v4_bad).unwrap();
         assert!(verify_files(&path_refs).is_err());
 
@@ -562,7 +568,7 @@ mod tests {
     fn v4_recording_file(last: [u8; HASH_LEN]) -> String {
         let mut h = new_header("node-a", 1_700_000_100_000, to_hex(&last), 6);
         assert_eq!(h.schema_version, 4);
-        h.schema_version = SCHEMA_VERSION;
+        h.schema_version = CALLS_SCHEMA_VERSION;
         let mut v4 = header_json_line(&h).unwrap();
         v4.push('\n');
         let mut prev = last;
@@ -578,7 +584,7 @@ mod tests {
         {
             let seq = 6 + i as u64;
             let mut r = CallRecord {
-                schema_version: SCHEMA_VERSION,
+                schema_version: CALLS_SCHEMA_VERSION,
                 node_id: "node-a".into(),
                 sequence: seq,
                 record_id: format!("node-a-{seq}"),
@@ -707,7 +713,7 @@ mod tests {
         let mut prev = GENESIS;
         for i in 0..n {
             let mut r = CallRecord {
-                schema_version: SCHEMA_VERSION,
+                schema_version: CALLS_SCHEMA_VERSION,
                 node_id: "n1".into(),
                 sequence: i,
                 record_id: format!("n1-{i}"),

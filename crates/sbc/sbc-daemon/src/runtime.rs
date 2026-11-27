@@ -354,30 +354,50 @@ impl Runtime {
         let result = match config.logging.audit_path.as_deref() {
             None => {
                 info!("Audit events enabled on the tracing output (target \"audit\")");
+                let d = sbc_config::schema::LoggingConfig::default();
+                let l = &config.logging;
+                if (l.audit_max_file_mb, l.audit_max_files, l.audit_on_full)
+                    != (d.audit_max_file_mb, d.audit_max_files, d.audit_on_full)
+                {
+                    warn!(
+                        "logging.audit_max_file_mb / audit_max_files / audit_on_full apply only \
+                         to logging.audit_path; audit records go to the tracing output"
+                    );
+                }
                 uc_audit::init()
             }
-            Some(path) => match uc_audit::sink::FileSink::open(path) {
-                Ok(sink) => {
-                    info!(path = %path.display(), "Audit log enabled");
-                    uc_audit::init_with_sink(Box::new(sink))
+            Some(path) => {
+                match uc_audit::sink::FileSink::open_with(path, audit_sink_options(&config.logging))
+                {
+                    Ok(sink) => {
+                        let o = sink.options();
+                        info!(
+                            path = %path.display(),
+                            max_file_bytes = o.max_file_bytes,
+                            max_rotated_files = o.max_rotated_files,
+                            on_full = o.on_full.as_str(),
+                            "Audit log enabled"
+                        );
+                        uc_audit::init_with_sink(Box::new(sink))
+                    }
+                    Err(e) => {
+                        // NIST 800-53 Rev5: AU-5 (Response to Audit Logging
+                        // Process Failures) -- fail closed: an operator who
+                        // configured a protected audit file never gets a daemon
+                        // running without it. main() exits with
+                        // AUDIT_INIT_FAILED_EXIT_CODE.
+                        error!(
+                            path = %path.display(),
+                            error = %e,
+                            "Cannot open audit log; SBC cannot start"
+                        );
+                        return Err(RuntimeError::AuditFailed {
+                            path: path.display().to_string(),
+                            reason: e.to_string(),
+                        });
+                    }
                 }
-                Err(e) => {
-                    // NIST 800-53 Rev5: AU-5 (Response to Audit Logging
-                    // Process Failures) -- fail closed: an operator who
-                    // configured a protected audit file never gets a daemon
-                    // running without it. main() exits with
-                    // AUDIT_INIT_FAILED_EXIT_CODE.
-                    error!(
-                        path = %path.display(),
-                        error = %e,
-                        "Cannot open audit log; SBC cannot start"
-                    );
-                    return Err(RuntimeError::AuditFailed {
-                        path: path.display().to_string(),
-                        reason: e.to_string(),
-                    });
-                }
-            },
+            }
         };
         if let Err(e) = result {
             debug!(error = %e, "Audit logger already initialised");
@@ -569,6 +589,25 @@ impl Runtime {
         // every reload, from the path given at startup.
         if old.digest_auth != new.digest_auth {
             keys.push("digest_auth".to_string());
+        }
+        // NIST 800-53 Rev5: CM-6, AU-4, AU-5 - the audit sink and its size
+        // bound are built once at startup.
+        let (o, n) = (&old.logging, &new.logging);
+        for (key, changed) in [
+            ("logging.audit_path", o.audit_path != n.audit_path),
+            (
+                "logging.audit_max_file_mb",
+                o.audit_max_file_mb != n.audit_max_file_mb,
+            ),
+            (
+                "logging.audit_max_files",
+                o.audit_max_files != n.audit_max_files,
+            ),
+            ("logging.audit_on_full", o.audit_on_full != n.audit_on_full),
+        ] {
+            if changed {
+                keys.push(key.to_string());
+            }
         }
         // NIST 800-53 Rev5: CM-6, SC-5 - the stream connection limiter,
         // listener pools and handshake pool are built from these keys once
@@ -1838,6 +1877,22 @@ level = "debug"
 "#
 }
 
+/// Audit file size bound from `[logging]` (validated: 1..=4096 MiB,
+/// 1..=1024 files).
+///
+/// ## NIST 800-53 Rev5: AU-4, AU-5 b
+fn audit_sink_options(l: &sbc_config::schema::LoggingConfig) -> uc_audit::sink::FileSinkOptions {
+    use sbc_config::schema::AuditOnFull;
+    uc_audit::sink::FileSinkOptions {
+        max_file_bytes: u64::from(l.audit_max_file_mb) * 1024 * 1024,
+        max_rotated_files: l.audit_max_files,
+        on_full: match l.audit_on_full {
+            AuditOnFull::OverwriteOldest => uc_audit::sink::CapacityAction::OverwriteOldest,
+            AuditOnFull::Stop => uc_audit::sink::CapacityAction::Stop,
+        },
+    }
+}
+
 /// Starts OPTIONS monitoring for config-file trunks with
 /// `options_ping_enabled` (API-created trunks start theirs in
 /// `api_server::start_trunk_services`). Pings leave from the trunk group's
@@ -1928,6 +1983,47 @@ fn spawn_trunk_health_feed(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// SR-42 round 1 (NIST-006): a reload that changes the audit sink keys
+    /// reports them as restart-only instead of claiming they applied.
+    /// NIST 800-53 Rev5: CM-6
+    #[test]
+    fn audit_sink_keys_need_restart() {
+        let old = sbc_config::SbcConfig::default();
+        let mut new = old.clone();
+        new.logging.audit_max_file_mb = 8;
+        new.logging.audit_max_files = 2;
+        new.logging.audit_on_full = sbc_config::schema::AuditOnFull::Stop;
+        let keys = super::Runtime::detect_restart_required(&old, &new);
+        for k in [
+            "logging.audit_max_file_mb",
+            "logging.audit_max_files",
+            "logging.audit_on_full",
+        ] {
+            assert!(keys.iter().any(|x| x == k), "{k}: {keys:?}");
+        }
+        assert_eq!(
+            super::Runtime::detect_restart_required(&old, &old.clone()),
+            Vec::<String>::new()
+        );
+    }
+
+    /// SR-42: every `[logging]` audit rotation key reaches the file sink.
+    /// NIST 800-53 Rev5: AU-4, AU-5, CM-6
+    #[test]
+    fn audit_sink_options_follow_logging_keys() {
+        use uc_audit::sink::{CapacityAction, FileSinkOptions};
+        let d = super::audit_sink_options(&sbc_config::schema::LoggingConfig::default());
+        assert_eq!(d, FileSinkOptions::default());
+        let c = sbc_config::load_from_str(
+            "[logging]\naudit_max_file_mb = 2\naudit_max_files = 3\naudit_on_full = \"stop\"\n",
+        )
+        .unwrap();
+        let o = super::audit_sink_options(&c.logging);
+        assert_eq!(o.max_file_bytes, 2 * 1024 * 1024);
+        assert_eq!(o.max_rotated_files, 3);
+        assert_eq!(o.on_full, CapacityAction::Stop);
+    }
+
     #[cfg(feature = "cluster")]
     #[test]
     fn enabled_cluster_init_failure_fails_closed() {

@@ -1082,6 +1082,81 @@ fn qa_helm_render_announcement_probes_work_with_mtls() {
     }
 }
 
+// ── SR-43: CDR retention in the rendered [cdr] block ─────────────
+
+/// The `key = value` of `key` in the rendered `[cdr]` table.
+fn cdr_key<'a>(config: &'a str, key: &str) -> Option<&'a str> {
+    let block = config.split("\n[cdr]\n").nth(1)?;
+    let block = block.split("\n[").next().unwrap_or(block);
+    block.lines().find_map(|l| {
+        let (k, v) = l.split_once('=')?;
+        (k.trim() == key).then(|| v.split('#').next().unwrap_or(v).trim().trim_matches('"'))
+    })
+}
+
+/// SR-43 (QA-first, plan 8 / decision c): the rendered `[cdr]` passes
+/// `sbc_config` validation, rotates every 6 h, and its count caps cover
+/// `retention_days` on the calls and the attempts stream
+/// (`retention_files x rotate_interval >= retention_days`), with the
+/// attempts keys rendered.
+/// NIST 800-53 Rev5: AU-11, AU-4, CM-6
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_cdr_retention_covers_retention_days() {
+    let out = must_render(sbc(&[SBC_ISSUER]), "minimal + clusterIssuer");
+    let config = daemon_config(&out);
+    let cfg = sbc_config::load_from_str(&config)
+        .unwrap_or_else(|e| panic!("rendered config must validate: {e}\n{config}"));
+    let cdr = &cfg.cdr;
+    assert!(cdr.enabled);
+    assert!(
+        cdr_key(&config, "rotate_interval").is_some(),
+        "rotate_interval must be rendered:\n{config}"
+    );
+    let secs = cdr.rotate_interval_secs().expect("rotate_interval");
+    assert_eq!(secs, 6 * 3600, "decision (c): 6 h rotation");
+    assert!(cdr.retention_days >= 90, "{}", cdr.retention_days);
+    assert!(
+        u64::from(cdr.retention_files) * secs >= u64::from(cdr.retention_days) * 86_400,
+        "{} files x 6 h < {} days",
+        cdr.retention_files,
+        cdr.retention_days
+    );
+    assert_eq!(
+        cdr_key(&config, "separate_attempts"),
+        Some("true"),
+        "{config}"
+    );
+    let num = |k: &str| -> u64 {
+        cdr_key(&config, k)
+            .unwrap_or_else(|| panic!("{k} must be rendered:\n{config}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("{k}: {e}"))
+    };
+    let (files, days) = (
+        num("attempts_retention_files"),
+        num("attempts_retention_days"),
+    );
+    assert!(days > 0 || files > 0);
+    if files > 0 && days > 0 {
+        assert!(
+            files * secs >= days * 86_400,
+            "attempts: {files} files x 6 h < {days} days"
+        );
+    }
+}
+
+/// The `[cdr]` text helper, on a fixed document (runs without helm).
+#[test]
+fn qa_helm_cdr_key_parser_self_test() {
+    let c = "[logging]\nlevel = \"info\"\n\n[cdr]\nenabled = true\nrotate_interval = \"6h\"  # x\nretention_files = 400\n\n[cdr.syslog]\nenabled = false\n";
+    assert_eq!(cdr_key(c, "rotate_interval"), Some("6h"));
+    assert_eq!(cdr_key(c, "retention_files"), Some("400"));
+    assert_eq!(cdr_key(c, "level"), None);
+    assert_eq!(cdr_key(c, "enabled"), Some("true"));
+    assert_eq!(cdr_key(c, "attempts_retention_days"), None);
+}
+
 // ── SR-53: dashboard / login edge TLS (Traefik) ───────────────────────
 // NIST 800-53 Rev5: SC-8, SC-8(1), SC-13, SC-23, AC-17(2), IA-5(1), CM-6, CM-7
 

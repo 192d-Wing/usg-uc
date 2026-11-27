@@ -1127,6 +1127,23 @@ fn validate_logging(config: &crate::schema::LoggingConfig) -> ConfigResult<()> {
             message: "logging.output must be stdout, stderr or a file path".to_string(),
         });
     }
+    // NIST 800-53 Rev5: AU-4 (audit capacity bound), CM-6
+    if !(1..=4096).contains(&config.audit_max_file_mb) {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "logging.audit_max_file_mb must be 1..=4096 (got {})",
+                config.audit_max_file_mb
+            ),
+        });
+    }
+    if !(1..=1024).contains(&config.audit_max_files) {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "logging.audit_max_files must be 1..=1024 (got {})",
+                config.audit_max_files
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -2211,7 +2228,124 @@ fn validate_cdr(config: &crate::schema::CdrConfig) -> ConfigResult<()> {
                 .to_string(),
         );
     }
+    validate_cdr_retention(config)?;
     validate_cdr_syslog(&config.syslog)
+}
+
+/// `[cdr]` retention: attempts keys only with `separate_attempts`, and the
+/// count cap of each stream covers its `retention_days` at the configured
+/// rotation.
+///
+/// ## NIST 800-53 Rev5: AU-11 (Audit Record Retention), AU-4, CM-6
+fn validate_cdr_retention(config: &crate::schema::CdrConfig) -> ConfigResult<()> {
+    let err = |message: String| Err(ConfigError::Validation { message });
+    let defaults = crate::schema::CdrConfig::default();
+    if config.separate_attempts {
+        // SC-5, AU-4: the attempts stream is attacker-drivable, so its file
+        // count is always capped (its byte bound is files x size).
+        if config.attempts_retention_files == 0 {
+            return err("cdr.attempts_retention_files must be at least 1 with \
+                 cdr.separate_attempts = true (the attempts stream needs a byte bound)"
+                .to_string());
+        }
+        if !(1..=4096).contains(&config.attempts_rotate_size_mb) {
+            return err(format!(
+                "cdr.attempts_rotate_size_mb must be 1..=4096 (got {})",
+                config.attempts_rotate_size_mb
+            ));
+        }
+    } else if config.attempts_retention_files != defaults.attempts_retention_files
+        || config.attempts_retention_days != defaults.attempts_retention_days
+        || config.attempts_rotate_size_mb != defaults.attempts_rotate_size_mb
+    {
+        // Accepted keys must be enforced or rejected, never ignored.
+        return err(
+            "cdr.attempts_retention_files, cdr.attempts_retention_days and \
+             cdr.attempts_rotate_size_mb are only valid with cdr.separate_attempts = true"
+                .to_string(),
+        );
+    }
+    // AU-11: retention_days is authoritative; the count cap is a safety
+    // bound and must not cut retention short at the configured rotation.
+    let interval = config.rotate_interval_secs().unwrap_or(0);
+    let mut streams = vec![(
+        "retention_files",
+        "retention_days",
+        "rotate_size_mb",
+        " (or 0 for no cap)",
+        config.retention_files,
+        config.retention_days,
+    )];
+    if config.separate_attempts {
+        streams.push((
+            "attempts_retention_files",
+            "attempts_retention_days",
+            "attempts_rotate_size_mb",
+            "",
+            config.attempts_retention_files,
+            config.attempts_retention_days,
+        ));
+    }
+    for (files_key, days_key, size_key, no_cap, files, days) in streams {
+        if interval > 0
+            && files > 0
+            && days > 0
+            && u64::from(files).saturating_mul(interval) < u64::from(days) * 86_400
+        {
+            let needed = (u64::from(days) * 86_400).div_ceil(interval);
+            return err(format!(
+                "cdr.{files_key} ({files}) x cdr.rotate_interval ({}) covers less than \
+                 cdr.{days_key} ({days}); the count cap would delete CDRs early. Set \
+                 {files_key} >= {needed}{no_cap} and size the CDR volume for \
+                 {files_key} x {size_key}",
+                config.rotate_interval
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Non-fatal `[cdr]` findings, logged at startup.
+///
+/// With size-only rotation (`rotate_interval = "0"`) a count cap cannot be
+/// checked against the age bound: under load the cap may delete CDRs before
+/// `retention_days` (each such deletion is audited as early).
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings), AU-11, AU-4
+#[must_use]
+pub fn cdr_warnings(config: &SbcConfig) -> Vec<String> {
+    let cdr = &config.cdr;
+    let mut out = Vec::new();
+    if !cdr.enabled || cdr.rotate_interval_secs() != Some(0) {
+        return out;
+    }
+    let (calls_max, attempts_max) = cdr.worst_case_bytes();
+    let mut streams = vec![(
+        "retention_files",
+        cdr.retention_files,
+        cdr.retention_days,
+        calls_max,
+    )];
+    if cdr.separate_attempts {
+        streams.push((
+            "attempts_retention_files",
+            cdr.attempts_retention_files,
+            cdr.attempts_retention_days,
+            attempts_max,
+        ));
+    }
+    for (key, files, days, max) in streams {
+        if files > 0 && days > 0 {
+            let mib = max.map_or(0, |b| b / (1024 * 1024));
+            out.push(format!(
+                "cdr.{key} = {files} with cdr.rotate_interval = \"0\" (size-only rotation): \
+                 the count cap cannot be checked against {days} retention days and may delete \
+                 CDRs early under load (worst case on disk {mib} MiB); set a rotate_interval \
+                 or size {key} for the peak rate"
+            ));
+        }
+    }
+    out
 }
 
 /// `[cdr.syslog]` keys are validated even when syslog is disabled: accepted
@@ -4615,6 +4749,186 @@ max_passport_age_secs = 120
         assert!(validate_config(&c).is_ok());
     }
 
+    // ── SR-42/43 (QA-first): CDR retention coverage, attempts stream and
+    // audit file rotation keys. NIST 800-53 Rev5: AU-4, AU-5, AU-11, CM-6 ──
+
+    /// Plan 8: with a time rotation, `retention_files x rotate_interval`
+    /// shorter than `retention_days` is rejected (the count cap would
+    /// silently cut retention), for the calls and the attempts stream.
+    #[test]
+    fn cdr_retention_files_times_interval_shorter_than_days_rejected() {
+        let mut c = SbcConfig::default();
+        c.cdr.rotate_interval = "1h".to_string();
+        c.cdr.retention_days = 90;
+        c.cdr.retention_files = 2159;
+        assert_rejected(&c, "retention_files");
+        c.cdr.retention_files = 2160;
+        validate_config(&c).expect("90 days of hourly files");
+        c.cdr.rotate_interval = "24h".to_string();
+        c.cdr.retention_files = 89;
+        assert_rejected(&c, "retention_days");
+        c.cdr.retention_files = 90;
+        validate_config(&c).expect("90 daily files");
+        // Either bound off (0) disables the rule; size-only rotation warns
+        // instead (cdr_warnings).
+        c.cdr.retention_files = 0;
+        validate_config(&c).expect("no count cap");
+        c.cdr.retention_files = 1;
+        c.cdr.retention_days = 0;
+        validate_config(&c).expect("no age bound");
+        c.cdr.retention_days = 90;
+        c.cdr.rotate_interval = "0".to_string();
+        validate_config(&c).expect("size-only rotation is not rejected");
+
+        // Attempts stream, same rule on its own keys.
+        let mut c = SbcConfig::default();
+        c.cdr.rotate_interval = "1h".to_string();
+        c.cdr.attempts_retention_days = 90;
+        c.cdr.attempts_retention_files = 10;
+        assert_rejected(&c, "attempts_retention_files");
+        c.cdr.attempts_retention_files = 2160;
+        validate_config(&c).expect("attempts cover 90 days");
+    }
+
+    /// Plan 8: size-only rotation (`rotate_interval = "0"`) with a count
+    /// cap cannot be checked against `retention_days`, so it warns.
+    #[test]
+    fn cdr_size_only_rotation_with_count_cap_warns() {
+        assert_eq!(cdr_warnings(&SbcConfig::default()), Vec::<String>::new());
+        let mut c = SbcConfig::default();
+        c.cdr.rotate_interval = "0".to_string();
+        c.cdr.retention_files = 100;
+        c.cdr.retention_days = 90;
+        validate_config(&c).expect("accepted with a warning");
+        let w = cdr_warnings(&c);
+        assert_ne!(w, Vec::<String>::new());
+        assert!(
+            w.iter()
+                .any(|m| m.contains("retention_files") && m.contains("rotate_interval")),
+            "{w:?}"
+        );
+        // No count cap on either stream: nothing to warn about.
+        c.cdr.retention_files = 0;
+        c.cdr.attempts_retention_files = 0;
+        assert!(cdr_warnings(&c).is_empty(), "{:?}", cdr_warnings(&c));
+        // CDRs off: silent.
+        c.cdr.retention_files = 100;
+        c.cdr.enabled = false;
+        assert_eq!(cdr_warnings(&c), Vec::<String>::new());
+    }
+
+    /// Plan 8: shipped defaults keep `retention_days` (90) on both streams
+    /// (calls: 2232 hourly files = 93 days) and validate without warnings.
+    #[test]
+    fn cdr_defaults_cover_retention_days() {
+        let c = SbcConfig::default();
+        let cdr = &c.cdr;
+        assert_eq!(cdr.retention_files, 2232);
+        assert_eq!(cdr.retention_days, 90);
+        assert_eq!(cdr.rotate_interval, "1h");
+        assert!(cdr.separate_attempts);
+        assert_eq!(cdr.attempts_retention_days, 90);
+        let secs = cdr.rotate_interval_secs().unwrap();
+        for (files, days) in [
+            (cdr.retention_files, cdr.retention_days),
+            (cdr.attempts_retention_files, cdr.attempts_retention_days),
+        ] {
+            assert!(
+                u64::from(files) * secs >= u64::from(days) * 86_400,
+                "{files} files x {secs}s < {days} days"
+            );
+        }
+        validate_config(&c).expect("defaults valid");
+        assert_eq!(cdr_warnings(&c), Vec::<String>::new());
+    }
+
+    /// Plan 8 (SR-42b): `logging.audit_max_file_mb` 1..=4096 (default 64),
+    /// `audit_max_files` 1..=1024 (16), `audit_on_full` `overwrite_oldest`
+    /// (default, decision a) or `stop`; every key enforced or rejected.
+    #[test]
+    fn audit_rotation_keys_bounds() {
+        let d = SbcConfig::default().logging;
+        assert_eq!(d.audit_max_file_mb, 64);
+        assert_eq!(d.audit_max_files, 16);
+        let explicit: SbcConfig = toml::from_str(
+            "[logging]\naudit_max_file_mb = 64\naudit_max_files = 16\n\
+             audit_on_full = \"overwrite_oldest\"\n",
+        )
+        .unwrap();
+        assert_eq!(explicit.logging, d, "documented defaults");
+        let load = |kv: &str| -> Result<SbcConfig, String> {
+            let c: SbcConfig =
+                toml::from_str(&format!("[logging]\n{kv}\n")).map_err(|e| e.to_string())?;
+            validate_config(&c).map_err(|e| e.to_string())?;
+            Ok(c)
+        };
+        for ok in [
+            "audit_max_file_mb = 1",
+            "audit_max_file_mb = 4096",
+            "audit_max_files = 1",
+            "audit_max_files = 1024",
+            "audit_on_full = \"stop\"",
+            "audit_on_full = \"overwrite_oldest\"",
+        ] {
+            load(ok).map_err(|e| format!("{ok}: {e}")).unwrap();
+        }
+        let stop = load("audit_on_full = \"stop\"").unwrap();
+        assert_ne!(stop.logging, d, "stop is a distinct setting");
+        for (bad, key) in [
+            ("audit_max_file_mb = 0", "audit_max_file_mb"),
+            ("audit_max_file_mb = 4097", "audit_max_file_mb"),
+            ("audit_max_files = 0", "audit_max_files"),
+            ("audit_max_files = 1025", "audit_max_files"),
+            ("audit_on_full = \"halt\"", "audit_on_full"),
+            ("audit_on_full = \"\"", "audit_on_full"),
+        ] {
+            let e = load(bad).expect_err(bad);
+            assert!(
+                e.contains(key) || e.contains("unknown variant"),
+                "{bad}: {e}"
+            );
+        }
+    }
+
+    /// Plan 8: attempts keys are rejected when `separate_attempts = false`
+    /// (accepted keys are enforced or rejected, never ignored), and both
+    /// attempts bounds 0 is rejected like the calls stream.
+    #[test]
+    fn attempts_keys_require_separate_attempts() {
+        let mut c = SbcConfig::default();
+        c.cdr.separate_attempts = false;
+        validate_config(&c).expect("single stream with default attempts keys");
+        let mut f = c.clone();
+        f.cdr.attempts_retention_files = 5000;
+        assert_rejected(&f, "separate_attempts");
+        let mut d = c;
+        d.cdr.attempts_retention_days = 30;
+        assert_rejected(&d, "separate_attempts");
+
+        let mut z = SbcConfig::default();
+        z.cdr.attempts_retention_files = 0;
+        z.cdr.attempts_retention_days = 0;
+        assert_rejected(&z, "attempts_retention");
+        // SEC-009: the attempts count cap is required with separate_attempts.
+        z.cdr.attempts_retention_days = 1;
+        assert_rejected(&z, "attempts_retention_files");
+        z.cdr.attempts_retention_files = 24;
+        validate_config(&z).expect("attempts capped and aged");
+        let mut size = SbcConfig::default();
+        size.cdr.attempts_rotate_size_mb = 0;
+        assert_rejected(&size, "attempts_rotate_size_mb");
+        size.cdr.attempts_rotate_size_mb = 4097;
+        assert_rejected(&size, "attempts_rotate_size_mb");
+        size.cdr.attempts_rotate_size_mb = 8;
+        size.cdr.separate_attempts = false;
+        assert_rejected(&size, "separate_attempts");
+        let d = SbcConfig::default().cdr;
+        assert_eq!(
+            d.worst_case_bytes(),
+            (Some(2233 * 100 * 1024 * 1024), Some(2233 * 4 * 1024 * 1024))
+        );
+    }
+
     #[test]
     fn cdr_syslog_keys_validated_while_disabled() {
         let base = SbcConfig::default();
@@ -4647,6 +4961,11 @@ max_passport_age_secs = 120
         for good in ["0", "5m", "300", "24h", "3600s"] {
             let mut c = base.clone();
             c.cdr.rotate_interval = good.to_string();
+            // SR-43: no calls count cap, so the retention-coverage rule is
+            // off; the attempts cap is required (SEC-009) and covers 90 days
+            // at 5 minutes.
+            c.cdr.retention_files = 0;
+            c.cdr.attempts_retention_files = 25_920;
             assert!(validate_config(&c).is_ok(), "{good}");
         }
         let mut c = base.clone();
@@ -4993,7 +5312,7 @@ format = "jsonl"
 directory = "/var/lib/usg-sbc/cdr"
 rotate_size_mb = 100
 rotate_interval = "1h"
-retention_files = 168
+retention_files = 2232
 retention_days = 90
 fsync_interval_ms = 1000
 queue_capacity = 8192

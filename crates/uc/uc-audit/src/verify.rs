@@ -3,8 +3,11 @@
 //! Checks every line parses as an [`AuditRecord`], sequences are contiguous
 //! and each record's SHA-384 link to its predecessor. A file whose first
 //! record is sequence 0 is anchored at the zero hash; a file starting later
-//! (rotated by the platform) is accepted as an unanchored continuation, with
-//! the remaining links still checked, unless the previous file is given.
+//! (a `FileSink` rotation, `<name>.<n:020>`) is accepted as an unanchored
+//! continuation, with the remaining links still checked, unless the previous
+//! file is given. `<n>` is a monotonic rotation number, at least the file's
+//! first sequence, so name order is verify order: pass a rotated set to
+//! [`verify_files`] in name order, then the current file.
 //!
 //! A passing verification shows the file is self-consistent. The chain is
 //! unkeyed, so it does not prove who wrote it.
@@ -200,6 +203,83 @@ pub fn verify_files(paths: &[&Path]) -> Result<Vec<VerifyReport>, (usize, Verify
     Ok(reports)
 }
 
+/// Cross-checks of a verified file set against the chain's own file
+/// events (see [`cross_check`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetCheck {
+    /// `audit_file_rotated` digests compared with a supplied file.
+    pub digests_checked: u64,
+    /// Supplied files whose SHA-384 differs from their
+    /// `audit_file_rotated` record (path as recorded).
+    pub digest_mismatches: Vec<String>,
+    /// First sequence of the set when it does not start at genesis, and
+    /// whether an `audit_file_deleted` record in the set accounts for the
+    /// records before it (its `last_sequence` is the one before).
+    pub head_gap: Option<(u64, bool)>,
+}
+
+/// Cross-checks a set that [`verify_files`] accepted.
+///
+/// Every `audit_file_rotated` record whose file (by name) is in the set must
+/// match that file's SHA-384, and a set that starts after sequence 0 is
+/// checked for an `audit_file_deleted` record covering the missing head.
+///
+/// ## NIST 800-53 Rev5: AU-9 (rotated-file digests), AU-5, AU-6
+///
+/// # Errors
+/// [`VerifyError::Io`] when a file cannot be read again.
+pub fn cross_check(paths: &[&Path], reports: &[VerifyReport]) -> Result<SetCheck, VerifyError> {
+    let mut out = SetCheck::default();
+    let mut rotated: Vec<(String, String)> = Vec::new();
+    let mut deleted_last: Vec<u64> = Vec::new();
+    let mut buf = Vec::new();
+    for path in paths {
+        let mut r = BufReader::new(std::fs::File::open(path)?);
+        let mut line = 0u64;
+        loop {
+            line = line.saturating_add(1);
+            if !read_line_bounded(&mut r, &mut buf, line)? {
+                break;
+            }
+            let Ok(rec) = serde_json::from_slice::<AuditRecord>(&buf) else {
+                continue;
+            };
+            match rec.event {
+                AuditEvent::AuditFileRotated(e) => rotated.push((e.file, e.sha384)),
+                AuditEvent::AuditFileDeleted(e) => deleted_last.extend(e.last_sequence),
+                _ => {}
+            }
+        }
+    }
+    for (file, sha) in &rotated {
+        let name = Path::new(file).file_name();
+        if let Some(p) = paths.iter().find(|p| p.file_name() == name) {
+            let mut f = std::fs::File::open(p)?;
+            let mut h = uc_crypto::hash::Sha384::new();
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                let n = f.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                h.update(chunk.get(..n).unwrap_or_default());
+            }
+            out.digests_checked = out.digests_checked.saturating_add(1);
+            if hex::encode(h.finish()) != *sha {
+                out.digest_mismatches.push(file.clone());
+            }
+        }
+    }
+    if let Some(first) = reports
+        .first()
+        .and_then(|r| r.first_sequence)
+        .filter(|f| *f > 0)
+    {
+        out.head_gap = Some((first, deleted_last.contains(&(first - 1))));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -390,5 +470,51 @@ mod tests {
         // Whitespace.
         let r = reason(mutate(&|l| l.replacen(':', ": ", 1)));
         assert!(r.contains("canonical"), "{r}");
+    }
+
+    /// SR-42 round 1 (NIST-007): rotated digests are cross-checked and a
+    /// head gap is reported as explained only by a matching deletion.
+    #[test]
+    fn cross_check_digests_and_head_gap() {
+        use crate::event::{AuditFileDeleted, AuditFileRotated};
+        let dir = tempfile::tempdir().unwrap();
+        let (a, last) = chain(5, 3, [3u8; 48]);
+        let pa = dir.path().join("audit.log.00000000000000000005");
+        std::fs::write(&pa, text(&a)).unwrap();
+        let sha = hex::encode(uc_crypto::hash::sha384(&std::fs::read(&pa).unwrap()));
+        let mut prev = last;
+        let mut lines = Vec::new();
+        for (i, e) in [
+            AuditEvent::AuditFileRotated(AuditFileRotated {
+                file: pa.display().to_string(),
+                sha384: sha,
+                last_sequence: 7,
+            }),
+            AuditEvent::AuditFileDeleted(AuditFileDeleted {
+                file: "x".into(),
+                reason: "capacity".into(),
+                first_sequence: Some(0),
+                last_sequence: Some(4),
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = AuditRecord::new(8 + i as u64, e, chrono::Utc::now(), prev);
+            prev = r.hash_chain;
+            lines.push(serde_json::to_string(&r).unwrap());
+        }
+        let pb = dir.path().join("audit.log");
+        std::fs::write(&pb, text(&lines)).unwrap();
+        let paths = [pa.as_path(), pb.as_path()];
+        let reps = verify_files(&paths).unwrap();
+        let c = cross_check(&paths, &reps).unwrap();
+        assert_eq!(c.digests_checked, 1);
+        assert_eq!(c.digest_mismatches, Vec::<String>::new());
+        assert_eq!(c.head_gap, Some((5, true)));
+        // A rotated file changed after its digest was chained is reported.
+        std::fs::write(&pa, text(&a).replacen("r5", "r6", 1)).unwrap();
+        let c = cross_check(&paths, &reps).unwrap();
+        assert_eq!(c.digest_mismatches.len(), 1);
     }
 }

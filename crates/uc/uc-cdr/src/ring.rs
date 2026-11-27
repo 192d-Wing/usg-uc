@@ -7,6 +7,7 @@
 //!
 //! ## NIST 800-53 Rev5: AU-6 (Audit Record Review), SC-5 (bounded state)
 
+use crate::record::CdrStream;
 use crate::record::{CallRecord, Disposition};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -73,32 +74,62 @@ impl CdrFilter {
 pub struct CdrPage {
     /// Matching records.
     pub records: Vec<Arc<CallRecord>>,
-    /// Token for the next page (`None` when exhausted). It is the decimal
-    /// sequence of the last record returned.
+    /// Token for the next page (`None` when exhausted). Opaque decimal: the
+    /// ring position of the last record returned. It is not the record
+    /// `sequence`, which is per stream (calls and attempts interleave).
     pub next_page_token: Option<String>,
     /// Records currently held.
     pub total_in_ring: usize,
 }
 
-/// Bounded ring; the oldest record is evicted when full.
+/// Ring contents: records in arrival order, each with its ring position.
+type Entry = (u64, Arc<CallRecord>);
+
+/// Ring contents in arrival order, each record with its ring position.
+/// Attempts-stream records are held apart, in at most a quarter of the
+/// ring, and are evicted first, so a flood of unanswered attempts cannot
+/// push answered calls out of the API view (SC-5).
+#[derive(Debug, Default)]
+struct Slots {
+    calls: VecDeque<Entry>,
+    attempts: VecDeque<Entry>,
+    /// Position of the next pushed record (monotonic per ring).
+    next: u64,
+}
+
+impl Slots {
+    fn len(&self) -> usize {
+        self.calls.len() + self.attempts.len()
+    }
+}
+
+/// Bounded ring; the oldest record is evicted when full, attempts-stream
+/// records first.
 #[derive(Debug)]
 pub struct CdrRing {
     capacity: usize,
-    inner: Mutex<VecDeque<Arc<CallRecord>>>,
+    /// Most attempts-stream records held (a quarter of `capacity`).
+    attempts_capacity: usize,
+    inner: Mutex<Slots>,
 }
 
 impl CdrRing {
     /// Creates a ring of `capacity` records (0 disables it), capped at
-    /// [`MAX_RING_CAPACITY`].
+    /// [`MAX_RING_CAPACITY`]; attempts-stream records use at most a quarter.
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.min(MAX_RING_CAPACITY);
         Self {
             capacity,
-            inner: Mutex::new(VecDeque::with_capacity(capacity.min(4096))),
+            attempts_capacity: capacity / 4,
+            inner: Mutex::new(Slots {
+                calls: VecDeque::with_capacity(capacity.min(4096)),
+                attempts: VecDeque::new(),
+                next: 0,
+            }),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, VecDeque<Arc<CallRecord>>> {
+    fn lock(&self) -> MutexGuard<'_, Slots> {
         // A poisoned ring only holds finished records: keep serving them.
         self.inner
             .lock()
@@ -117,50 +148,74 @@ impl CdrRing {
 
     /// Whether the ring is empty.
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.lock().len() == 0
     }
 
-    /// Appends a record, evicting the oldest when full.
+    /// Appends a record. Attempts records beyond their share evict the
+    /// oldest attempt; a full ring evicts the oldest attempt first, then
+    /// the oldest call.
     pub fn push(&self, record: Arc<CallRecord>) {
         if self.capacity == 0 {
             return;
         }
-        let mut q = self.lock();
-        while q.len() >= self.capacity {
-            q.pop_front();
-        }
-        q.push_back(record);
-    }
-
-    /// Index of the first record with `sequence >= seq` (sequence is
-    /// monotonic within one writer run). Falls back to a linear scan if the
-    /// ring is not ordered (sequence restarted after an unclean resume).
-    fn lower_bound(q: &VecDeque<Arc<CallRecord>>, seq: u64) -> usize {
-        let ordered = match (q.front(), q.back()) {
-            (Some(f), Some(b)) => f.sequence <= b.sequence,
-            _ => true,
-        };
-        if ordered {
-            q.partition_point(|r| r.sequence < seq)
-        } else {
-            q.iter().position(|r| r.sequence >= seq).unwrap_or(q.len())
-        }
-    }
-
-    /// Finds a record by `record_id`.
-    pub fn get(&self, record_id: &str) -> Option<Arc<CallRecord>> {
-        let q = self.lock();
-        // Fast path: ids are `{node}-{sequence}`.
-        if let Some(seq) = record_id
-            .rsplit_once('-')
-            .and_then(|(_, s)| s.parse::<u64>().ok())
-        {
-            let i = Self::lower_bound(&q, seq);
-            if let Some(r) = q.get(i).filter(|r| r.record_id == record_id) {
-                return Some(Arc::clone(r));
+        let attempt = record.stream == CdrStream::Attempts;
+        let mut s = self.lock();
+        if attempt {
+            if self.attempts_capacity == 0 {
+                return;
+            }
+            while s.attempts.len() >= self.attempts_capacity {
+                s.attempts.pop_front();
             }
         }
-        q.iter().rev().find(|r| r.record_id == record_id).cloned()
+        while s.len() >= self.capacity {
+            if s.attempts.pop_front().is_none() {
+                s.calls.pop_front();
+            }
+        }
+        let pos = s.next;
+        s.next = s.next.wrapping_add(1);
+        if attempt {
+            s.attempts.push_back((pos, record));
+        } else {
+            s.calls.push_back((pos, record));
+        }
+    }
+
+    /// Index of the first record at ring position `>= pos` (positions are
+    /// strictly increasing in each deque).
+    fn lower_bound(q: &VecDeque<Entry>, pos: u64) -> usize {
+        q.partition_point(|(p, _)| *p < pos)
+    }
+
+    /// Binary search of one stream's deque by sequence (monotonic within a
+    /// stream). A miss is final: no scan under the ring lock.
+    fn find(q: &VecDeque<Entry>, seq: u64, record_id: &str) -> Option<Arc<CallRecord>> {
+        let i = q.partition_point(|(_, r)| r.sequence < seq);
+        q.get(i)
+            .filter(|(_, r)| r.record_id == record_id)
+            .map(|(_, r)| Arc::clone(r))
+    }
+
+    /// Finds a record by `record_id`: `{node}-{seq}` in the calls deque,
+    /// `{node}-a{seq}` in the attempts deque, O(log n) under the lock. Any
+    /// other form, or a miss, is `None` (the writer produces only these).
+    /// After an unclean resume restarted a stream's sequence, older records
+    /// of that stream may not be found until they leave the ring.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (bounded work per lookup)
+    pub fn get(&self, record_id: &str) -> Option<Arc<CallRecord>> {
+        let (_, tail) = record_id.rsplit_once('-')?;
+        let digits = |t: &str| {
+            (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| t.parse::<u64>().ok())
+                .flatten()
+        };
+        let s = self.lock();
+        match tail.strip_prefix('a') {
+            Some(t) => Self::find(&s.attempts, digits(t)?, record_id),
+            None => Self::find(&s.calls, digits(tail)?, record_id),
+        }
     }
 
     /// Returns matching records newest first. `page_token` is the token from
@@ -191,17 +246,32 @@ impl CdrRing {
             },
         };
         let (candidates, total_in_ring) = {
-            let q = self.lock();
-            let end = before.map_or(q.len(), |b| Self::lower_bound(&q, b));
-            let c: Vec<Arc<CallRecord>> = q.range(..end).cloned().collect();
-            (c, q.len())
+            let s = self.lock();
+            let range = |q: &VecDeque<Entry>| {
+                let end = before.map_or(q.len(), |b| Self::lower_bound(q, b));
+                q.range(..end).cloned().collect::<Vec<Entry>>()
+            };
+            let (c, a) = (range(&s.calls), range(&s.attempts));
+            let total = s.len();
+            drop(s);
+            // Merge both streams by ring position (each is ascending).
+            let mut merged = Vec::with_capacity(c.len() + a.len());
+            let (mut ci, mut ai) = (c.into_iter().peekable(), a.into_iter().peekable());
+            loop {
+                let take_c = match (ci.peek(), ai.peek()) {
+                    (Some((pc, _)), Some((pa, _))) => pc < pa,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                merged.extend(if take_c { ci.next() } else { ai.next() });
+            }
+            (merged, total)
         };
         let mut records = Vec::with_capacity(page_size.min(candidates.len()));
+        let mut last_pos = None;
         let mut more = false;
-        for r in candidates.iter().rev() {
-            if before.is_some_and(|b| r.sequence >= b) {
-                continue;
-            }
+        for (pos, r) in candidates.iter().rev() {
             if !filter.matches(r) {
                 continue;
             }
@@ -210,9 +280,10 @@ impl CdrRing {
                 break;
             }
             records.push(Arc::clone(r));
+            last_pos = Some(*pos);
         }
         let next_page_token = if more {
-            records.last().map(|r| r.sequence.to_string())
+            last_pos.map(|p| p.to_string())
         } else {
             None
         };
@@ -288,5 +359,90 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(ring.query(&t, None, 0).records.len(), 2);
+    }
+
+    /// SR-43: calls and attempts records interleave with overlapping
+    /// sequences; paging still returns each record once, newest first, and
+    /// `get` finds both id forms.
+    #[test]
+    fn paging_over_interleaved_streams() {
+        let ring = CdrRing::new(100);
+        for i in 0..6 {
+            ring.push(rec(i, Disposition::Answered));
+            ring.push(Arc::new(CallRecord {
+                sequence: i,
+                record_id: format!("n-a{i}"),
+                disposition: Disposition::Rejected,
+                stream: CdrStream::Attempts,
+                ..Default::default()
+            }));
+        }
+        let all = CdrFilter::default();
+        let mut seen = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let p = ring.query(&all, token.as_deref(), 5);
+            seen.extend(p.records.iter().map(|r| r.record_id.clone()));
+            match p.next_page_token {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 12, "{seen:?}");
+        assert_eq!(seen[0], "n-a5");
+        assert_eq!(seen[1], "n-5");
+        let mut dedup = seen.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(dedup.len(), 12);
+        assert_eq!(ring.get("n-a3").unwrap().sequence, 3);
+        assert_eq!(ring.get("n-3").unwrap().record_id, "n-3");
+    }
+
+    /// SR-43 round 1 (SEC-010): a flood of attempts records keeps at most a
+    /// quarter of the ring and never evicts answered calls.
+    #[test]
+    fn attempts_flood_does_not_evict_calls() {
+        let ring = CdrRing::new(100);
+        for i in 0..50 {
+            ring.push(rec(i, Disposition::Answered));
+        }
+        for i in 0..10_000 {
+            ring.push(Arc::new(CallRecord {
+                sequence: i,
+                record_id: format!("n-a{i}"),
+                stream: CdrStream::Attempts,
+                ..Default::default()
+            }));
+        }
+        assert_eq!(ring.len(), 75);
+        for i in 0..50 {
+            assert!(ring.get(&format!("n-{i}")).is_some(), "call {i} evicted");
+        }
+        assert!(ring.get("n-a9999").is_some());
+        assert!(ring.get("n-a9974").is_none());
+        // A full ring evicts attempts before calls.
+        for i in 50..200 {
+            ring.push(rec(i, Disposition::Answered));
+        }
+        assert_eq!(ring.len(), 100);
+        assert!(ring.get("n-a9999").is_none());
+        assert!(ring.get("n-199").is_some());
+    }
+
+    /// SEC-015 (round 2): a lookup is one binary search in its stream; a
+    /// malformed id or a miss returns `None` without scanning.
+    #[test]
+    fn get_is_stream_local_and_final() {
+        let ring = CdrRing::new(100);
+        for i in 0..10 {
+            ring.push(rec(i, Disposition::Answered));
+        }
+        assert!(ring.get("n-4").is_some());
+        assert!(ring.get("n-a4").is_none(), "no cross-stream fallback");
+        for bad in ["", "n", "n-", "n-x4", "n-4x", "n-a", "-"] {
+            assert!(ring.get(bad).is_none(), "{bad}");
+        }
+        assert!(ring.get("n-99").is_none());
     }
 }

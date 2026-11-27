@@ -100,6 +100,16 @@ pub enum AuditEvent {
     /// A CDR file was closed and its digest sidecar written.
     CdrFileRotated(CdrFileRotated),
 
+    /// A CDR file was deleted by retention (age or the count safety cap).
+    CdrFileDeleted(CdrFileDeleted),
+
+    /// The audit file reached its size bound and was closed; chained as the
+    /// first record of the new file.
+    AuditFileRotated(AuditFileRotated),
+
+    /// A rotated audit file was deleted to stay within the capacity bound.
+    AuditFileDeleted(AuditFileDeleted),
+
     /// CDRs were read in bulk through the management plane.
     CdrExport(CdrExport),
 
@@ -183,7 +193,10 @@ impl AuditEvent {
             | Self::TrunkFailover(_)
             | Self::TrunkReachabilityChanged(_)
             | Self::CdrSinkFailure(_)
-            | Self::CdrFileRotated(_) => AuditEventType::System,
+            | Self::CdrFileRotated(_)
+            | Self::CdrFileDeleted(_)
+            | Self::AuditFileRotated(_)
+            | Self::AuditFileDeleted(_) => AuditEventType::System,
         }
     }
 }
@@ -582,6 +595,55 @@ pub struct CdrFileRotated {
     pub sha384: String,
 }
 
+/// A CDR file was deleted by retention.
+///
+/// ## NIST 800-53 Rev5: AU-11 (Audit Record Retention), AU-4, SI-12
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdrFileDeleted {
+    /// Deleted file path.
+    pub file: String,
+    /// CDR stream of the file: `calls` or `attempts`.
+    pub stream: String,
+    /// `age` (older than `retention_days`) or `count_cap` (safety cap).
+    pub reason: String,
+    /// File age at deletion, in seconds.
+    pub age_secs: u64,
+    /// Deleted by the count cap before `retention_days` elapsed.
+    pub early: bool,
+}
+
+/// The audit file was closed at its size bound and a new file started.
+///
+/// ## NIST 800-53 Rev5: AU-4, AU-9 (chain continues across files)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditFileRotated {
+    /// Path the closed file was renamed to.
+    pub file: String,
+    /// Hex SHA-384 of the closed file.
+    pub sha384: String,
+    /// Sequence of the last record in the closed file.
+    pub last_sequence: u64,
+}
+
+/// A rotated audit file was deleted.
+///
+/// ## NIST 800-53 Rev5: AU-4, AU-5 (capacity action is itself audited)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditFileDeleted {
+    /// Deleted file path.
+    pub file: String,
+    /// Why: `capacity` (oldest file dropped at the capacity bound) or
+    /// `disk_full` (dropped to reclaim space after a failed write).
+    pub reason: String,
+    /// First sequence in the deleted file (from its name), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_sequence: Option<u64>,
+    /// Last sequence in the deleted file (the next file's first, minus one),
+    /// when known. Together with `first_sequence` the lost range (AU-5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sequence: Option<u64>,
+}
+
 /// Account-management action.
 ///
 /// ## NIST 800-53 Rev5: AC-2 (Account Management)
@@ -759,6 +821,9 @@ pub enum AuditDropReason {
     /// (crash-torn write or tamper); the chain resumes after the last good
     /// record.
     TornTail,
+    /// The sink refused the record because the audit capacity bound was
+    /// reached (`stop` capacity action) or the volume is full.
+    CapacityExhausted,
     /// The aggregator's key table was full of live keys, so a rate-limited
     /// failure record was not emitted (SC-5).
     Aggregated,
@@ -1480,6 +1545,65 @@ mod tests {
         assert!(r.len() <= MAX_KEY_OPERATION_REASON_LEN);
         assert_eq!(r.len() % 3, 0);
         assert_eq!(f(""), "");
+    }
+
+    /// SR-42/43 (QA-first): rotation, capacity deletion and CDR deletion
+    /// events round-trip, are `System` events, and carry only paths,
+    /// digests, counters and static labels. The new drop reason is
+    /// `capacity_exhausted`.
+    /// NIST 800-53 Rev5: AU-2, AU-5, AU-9, AU-11
+    #[test]
+    fn new_events_round_trip_and_are_system_type() {
+        let sha = "ab".repeat(48);
+        let rotated = AuditEvent::AuditFileRotated(AuditFileRotated {
+            file: "/var/log/sbc/audit.log.00000000000000000042".into(),
+            sha384: sha.clone(),
+            last_sequence: 57,
+        });
+        let deleted = AuditEvent::AuditFileDeleted(AuditFileDeleted {
+            file: "/var/log/sbc/audit.log.00000000000000000000".into(),
+            reason: "capacity".into(),
+            first_sequence: None,
+            last_sequence: None,
+        });
+        let cdr = AuditEvent::CdrFileDeleted(CdrFileDeleted {
+            file: "/var/lib/usg-sbc/cdr/cdra-n1-20261101T000000.jsonl".into(),
+            stream: "attempts".into(),
+            reason: "count_cap".into(),
+            age_secs: 3_600,
+            early: true,
+        });
+        for (e, tag) in [
+            (&rotated, "audit_file_rotated"),
+            (&deleted, "audit_file_deleted"),
+            (&cdr, "cdr_file_deleted"),
+        ] {
+            assert_eq!(e.event_type(), AuditEventType::System, "{tag}");
+            let json = serde_json::to_string(e).unwrap();
+            assert!(json.starts_with(&format!(r#"{{"type":"{tag}""#)), "{json}");
+            let back: AuditEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json, "{tag}");
+        }
+        let json = serde_json::to_string(&rotated).unwrap();
+        assert!(json.contains(&format!(r#""sha384":"{sha}""#)), "{json}");
+        assert!(json.contains(r#""last_sequence":57"#), "{json}");
+        let json = serde_json::to_string(&deleted).unwrap();
+        assert!(json.contains(r#""reason":"capacity""#), "{json}");
+        let json = serde_json::to_string(&cdr).unwrap();
+        for field in [
+            r#""stream":"attempts""#,
+            r#""reason":"count_cap""#,
+            r#""age_secs":3600"#,
+            r#""early":true"#,
+        ] {
+            assert!(json.contains(field), "{json} lacks {field}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AuditDropReason::CapacityExhausted).unwrap(),
+            r#""capacity_exhausted""#
+        );
+        let back: AuditDropReason = serde_json::from_str(r#""capacity_exhausted""#).unwrap();
+        assert_eq!(back, AuditDropReason::CapacityExhausted);
     }
 
     /// SR-40: admin password login is its own method; additive serde token.

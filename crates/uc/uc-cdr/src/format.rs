@@ -8,7 +8,7 @@
 //! ## NIST 800-53 Rev5: AU-3 (Content of Audit Records), SI-10 (Information Input Validation)
 
 use crate::error::CdrResult;
-use crate::record::{CallRecord, FileHeader, SCHEMA_VERSION};
+use crate::record::{CallRecord, CdrStream, FileHeader};
 use std::fmt::Write as _;
 
 /// On-disk file format.
@@ -128,6 +128,9 @@ pub fn csv_comment(header: &FileHeader) -> String {
         header.chain_start,
         header.first_sequence
     );
+    if !header.stream.is_calls() {
+        let _ = write!(s, " stream={}", header.stream.as_str());
+    }
     s
 }
 
@@ -267,20 +270,39 @@ pub fn to_csv_row(r: &CallRecord) -> CdrResult<String> {
     Ok(out)
 }
 
-/// Default file header for a new file.
+/// Default file header for a new calls-stream file.
+#[cfg(test)]
 pub(crate) fn new_header(
     node_id: &str,
     created_ms: u64,
     chain_start: String,
     first_sequence: u64,
 ) -> FileHeader {
+    stream_header(
+        CdrStream::Calls,
+        node_id,
+        created_ms,
+        chain_start,
+        first_sequence,
+    )
+}
+
+/// File header for a new file of `stream` (schema version per stream).
+pub(crate) fn stream_header(
+    stream: CdrStream,
+    node_id: &str,
+    created_ms: u64,
+    chain_start: String,
+    first_sequence: u64,
+) -> FileHeader {
     FileHeader {
-        schema_version: SCHEMA_VERSION,
+        schema_version: stream.schema_version(),
         kind: "header".to_string(),
         node_id: node_id.to_string(),
         created_ms,
         chain_start,
         first_sequence,
+        stream,
     }
 }
 
