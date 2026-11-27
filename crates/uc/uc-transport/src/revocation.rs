@@ -611,7 +611,7 @@ pub const fn classify(err: &rustls::Error) -> Option<RevocationFailure> {
 #[must_use]
 pub fn classify_io(err: &std::io::Error) -> Option<RevocationFailure> {
     err.get_ref()
-        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        .and_then(<dyn std::error::Error + Send + Sync>::downcast_ref::<rustls::Error>)
         .and_then(classify)
 }
 
