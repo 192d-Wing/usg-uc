@@ -36,6 +36,24 @@ Tested in local runs on macOS (2026-11-27). Applies with
   pre-handshake case). Helm defaults are unchanged. POA&M-335 and POA&M-342
   wording is corrected.
 
+### Security (SBC, SIP request-path load bounds, SR-20, SR-21, SR-24, POA&M-490, 491)
+
+Tested in local runs on macOS (2026-11-27).
+
+- **Transaction table cap:** each server transaction map (INVITE,
+  non-INVITE) holds at most 65,536 entries (fixed). A new request past the
+  cap gets 503 with `Retry-After: 5`; a CANCEL or an in-dialog non-INVITE is
+  processed statelessly; a re-INVITE gets 503; emergency INVITEs get 1,024
+  extra entries. New metric `sbc_transaction_table_full_total`.
+- **OPTIONS** no longer opens a server transaction: it is answered locally,
+  and a retransmission gets a fresh 200 instead of a stored copy.
+- **Transaction sweep:** the backstop age sweep runs at most once per second
+  instead of on every new transaction once a map passes 1,024 entries.
+- **Source admission and trunk resolution:** regression tests that INVITE
+  admission cost does not grow with the number of registrations and that
+  trunk host names are resolved before the trunk map lock is taken (both
+  fixed by SR-04, #262).
+
 ### Security (SBC, STIR/SHAKEN verification, SR-35, SR-36, POA&M-510 to 512)
 
 Tested in local runs on macOS (2026-11-27).
