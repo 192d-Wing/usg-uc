@@ -81,6 +81,10 @@ pub struct HandshakeSourceStats {
     pub dropped_after_exact: u64,
     /// Plausible DTLS from an accepted source over the forward rate limit.
     pub dropped_rate_limited: u64,
+    /// Plausible DTLS from an accepted source after the handshake's forward
+    /// budget ([`MAX_HANDSHAKE_FORWARD_DATAGRAMS`] /
+    /// [`MAX_HANDSHAKE_FORWARD_BYTES`]) was spent.
+    pub dropped_budget: u64,
     /// Flight sends to one target that failed (the others were still sent).
     pub send_failures: u64,
     /// Non-SDP same-IP sources kept (at most [`MAX_HANDSHAKE_SOURCES`]).
@@ -95,6 +99,7 @@ impl HandshakeSourceStats {
             || self.dropped_overflow > 0
             || self.dropped_after_exact > 0
             || self.dropped_rate_limited > 0
+            || self.dropped_budget > 0
             || self.send_failures > 0
     }
 }
@@ -106,6 +111,22 @@ impl HandshakeSourceStats {
 /// evicted, so a sender that arrives first cannot push the genuine peer out,
 /// and a flood cannot grow the set.
 pub const MAX_HANDSHAKE_SOURCES: usize = 4;
+
+/// Most datagrams one handshake forwards to the sidecar.
+///
+/// The sidecar keeps handshake fragments it has not reassembled for the
+/// life of the association (pion's fragment buffer is never trimmed), so the
+/// rate limit alone, which admits about 68 datagrams of up to 4 KiB in the
+/// 15 s handshake timeout, is not a bound on what a peer can make it keep.
+/// A genuine handshake forwards a handful of datagrams (about 3 and 1 KiB,
+/// measured with the sidecar's `TestGenuineHandshakeFitsTheBudget`), and a
+/// few retransmitted flights more. The sidecar applies the same numbers on
+/// its side (`dtlssession.PreHandshakeDatagrams` / `PreHandshakeBytes`).
+pub const MAX_HANDSHAKE_FORWARD_DATAGRAMS: u32 = 32;
+
+/// Most bytes one handshake forwards to the sidecar (see
+/// [`MAX_HANDSHAKE_FORWARD_DATAGRAMS`]).
+pub const MAX_HANDSHAKE_FORWARD_BYTES: usize = 16 * 1024;
 
 /// The sources a handshake pump forwarded DTLS from: the SDP address (when it
 /// spoke) and up to [`MAX_HANDSHAKE_SOURCES`] other same-IP ports. Fixed size,
@@ -203,8 +224,9 @@ fn is_plausible_dtls(datagram: &[u8]) -> bool {
 // dropped (`dropped_overflow`); one datagram spoofed from the SDP address
 // closes the set to new ports (`dropped_after_exact`) before a NAT'd peer's
 // first flight arrives; and a flood from an accepted source empties the
-// forward bucket (`dropped_rate_limited`). In each case the handshake times
-// out and the call ends (fail closed).
+// forward bucket (`dropped_rate_limited`) or spends the handshake's forward
+// budget (`dropped_budget`). In each case the handshake times out and the
+// call ends (fail closed).
 #[derive(Debug)]
 struct HandshakeSources<'a> {
     /// The SDP (signalled) address.
@@ -217,6 +239,9 @@ struct HandshakeSources<'a> {
     last_src: Option<SocketAddr>,
     /// Token bucket in front of the sidecar, shared by every source.
     bucket: DtlsForwardBucket,
+    /// Datagrams and bytes forwarded so far (the handshake's budget).
+    forwarded: u32,
+    forwarded_bytes: usize,
     stats: &'a mut HandshakeSourceStats,
 }
 
@@ -229,6 +254,8 @@ impl<'a> HandshakeSources<'a> {
             others: [None; MAX_HANDSHAKE_SOURCES],
             last_src: None,
             bucket: DtlsForwardBucket::new(now),
+            forwarded: 0,
+            forwarded_bytes: 0,
             stats,
         }
     }
@@ -261,6 +288,15 @@ impl<'a> HandshakeSources<'a> {
             self.stats.dropped_overflow += 1;
             return false;
         };
+        // NIST 800-53 Rev5: SC-5 / SC-6 -- a fixed budget per handshake for
+        // what the sidecar may be made to keep (SR-13). Checked before the
+        // bucket, so a datagram over budget spends no token.
+        if self.forwarded >= MAX_HANDSHAKE_FORWARD_DATAGRAMS
+            || self.forwarded_bytes.saturating_add(datagram.len()) > MAX_HANDSHAKE_FORWARD_BYTES
+        {
+            self.stats.dropped_budget += 1;
+            return false;
+        }
         // NIST 800-53 Rev5: SC-5 -- the sidecar is shared by every call on
         // the node. Charged after the cheap checks and before any state
         // change, so a rate-limited datagram does not claim a slot.
@@ -268,6 +304,8 @@ impl<'a> HandshakeSources<'a> {
             self.stats.dropped_rate_limited += 1;
             return false;
         }
+        self.forwarded += 1;
+        self.forwarded_bytes += datagram.len();
         if src == self.sdp {
             self.exact_seen = true;
         }
@@ -356,7 +394,10 @@ const RECV_BUF: usize = 4096;
 ///   Once it has spoken no new port is accepted; ports already kept stay.
 /// - Forwards to the sidecar pass a token bucket
 ///   ([`crate::srtp_relay::DTLS_FORWARD_BURST`] /
-///   [`crate::srtp_relay::DTLS_FORWARD_PER_SECOND`]) shared by all sources.
+///   [`crate::srtp_relay::DTLS_FORWARD_PER_SECOND`]) shared by all sources,
+///   and a budget per handshake ([`MAX_HANDSHAKE_FORWARD_DATAGRAMS`] /
+///   [`MAX_HANDSHAKE_FORWARD_BYTES`]); nothing is buffered here, a datagram
+///   over either is dropped and counted.
 /// - The sidecar's outbound records go to the SDP address and to every kept
 ///   source, so the genuine peer receives each flight whoever else spoke
 ///   first (at most five sends per record, all to the peer's IP; RFC 6347
@@ -1139,6 +1180,78 @@ mod tests {
         }
         assert_eq!(stats.dropped_rate_limited, 5);
         assert_eq!(stats.sources, 2);
+    }
+
+    // SR-13: a flood from an accepted source reaches the sidecar only up to
+    // the handshake's budget, in datagrams and in bytes, however long the
+    // rate limit would let it go on; the budget is spent by forwards only.
+    #[test]
+    fn handshake_sources_budget_bounds_forwards() {
+        use crate::srtp_relay::DTLS_FORWARD_PER_SECOND;
+        let ip = std::net::Ipv4Addr::LOCALHOST;
+        let sdp = SocketAddr::from((ip, 5000));
+        let tick = Duration::from_millis(1000 / u64::from(DTLS_FORWARD_PER_SECOND));
+        let start = Instant::now();
+
+        // Small datagrams: the datagram budget binds.
+        let small = record(22, 1, b"x");
+        let mut stats = HandshakeSourceStats::default();
+        let mut forwarded_bytes = 0usize;
+        {
+            let mut sources = HandshakeSources::new(sdp, start, &mut stats);
+            let mut admitted = 0u32;
+            // A whole minute at the rate limit: far more than the budget.
+            for i in 0..240u32 {
+                if sources.admit(sdp, &small, start + tick * i) {
+                    admitted += 1;
+                    forwarded_bytes += small.len();
+                }
+            }
+            assert_eq!(admitted, MAX_HANDSHAKE_FORWARD_DATAGRAMS);
+        }
+        assert_eq!(
+            stats.dropped_budget,
+            u64::from(240 - MAX_HANDSHAKE_FORWARD_DATAGRAMS)
+        );
+        assert_eq!(
+            stats.dropped_rate_limited, 0,
+            "the pace never exceeds the rate"
+        );
+        assert!(forwarded_bytes <= MAX_HANDSHAKE_FORWARD_BYTES);
+
+        // Full-size datagrams: the byte budget binds first.
+        let big = record(22, 1, &[0u8; RECV_BUF - 13]);
+        let mut stats = HandshakeSourceStats::default();
+        let mut forwarded_bytes = 0usize;
+        {
+            let mut sources = HandshakeSources::new(sdp, start, &mut stats);
+            for i in 0..240u32 {
+                if sources.admit(sdp, &big, start + tick * i) {
+                    forwarded_bytes += big.len();
+                }
+            }
+        }
+        assert_eq!(
+            forwarded_bytes,
+            (MAX_HANDSHAKE_FORWARD_BYTES / big.len()) * big.len()
+        );
+        assert!(forwarded_bytes <= MAX_HANDSHAKE_FORWARD_BYTES);
+        assert!(stats.any_dropped());
+
+        // A budget refusal spends no token: an implausible datagram, or one
+        // over budget, leaves the bucket for nothing else either way.
+        let mut stats = HandshakeSourceStats::default();
+        {
+            let mut sources = HandshakeSources::new(sdp, start, &mut stats);
+            sources.forwarded = MAX_HANDSHAKE_FORWARD_DATAGRAMS;
+            assert!(!sources.admit(sdp, &small, start));
+            assert!(
+                !sources.exact_seen,
+                "a datagram over budget changed the source state"
+            );
+        }
+        assert_eq!(stats.dropped_budget, 1);
+        assert_eq!(stats.dropped_rate_limited, 0);
     }
 
     // The caller owns the counters, so a handshake that times out still

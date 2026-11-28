@@ -30,8 +30,13 @@ const (
 // to MaxSessions at a time.
 //
 // NIST 800-53 Rev5: SC-5 / SC-6. A session holds its DTLS association, five
-// goroutines and about 70 KiB (see the README) for the whole call, so the number of sessions
-// is what sizes this process. The relay opens one per terminated leg and is
+// goroutines and about 70 KiB (measured, see the README) for the whole call,
+// so the number of sessions is what sizes this process. A session's own peer
+// can make it keep about 55 KiB more: 16 KiB of input during the handshake
+// (dtlssession.PreHandshakeBytes) and 16 KiB after it (the plaintext gate's
+// byte budget), in at most dtlssession.MaxHandshakeFragments fragments. Input of handshakes still in progress is bounded for the
+// process as a whole by dtlssession's handshake pool (32 MiB), returned when
+// each handshake ends. The relay opens one per terminated leg and is
 // itself bounded by the SBC's max_calls; the limit here is the sidecar's own
 // bound, so that a relay fault that leaks connections, or a sidecar sized
 // below the SBC's call limit, makes new legs fail (the call is refused, fail
@@ -58,11 +63,20 @@ type Stats struct {
 	Peak    int64  // most sessions at one time since start
 	Max     int64  // the limit
 	Refused uint64 // connections refused at the limit since start
+	// HandshakePoolBytes is the pre-handshake input now held by handshakes
+	// in progress; HandshakePoolRefused the datagrams dropped because the
+	// pool was full, since start.
+	HandshakePoolBytes   int64
+	HandshakePoolRefused uint64
 }
 
 // Stats returns the current counts.
 func (s *Server) Stats() Stats {
-	return Stats{Active: s.active.Load(), Peak: s.peak.Load(), Max: int64(s.max()), Refused: s.refused.Load()}
+	pool := dtlssession.DefaultHandshakePool()
+	return Stats{
+		Active: s.active.Load(), Peak: s.peak.Load(), Max: int64(s.max()), Refused: s.refused.Load(),
+		HandshakePoolBytes: pool.InUse(), HandshakePoolRefused: pool.Refused(),
+	}
 }
 
 func (s *Server) max() int {
@@ -172,7 +186,8 @@ func (s *Server) logStats(done <-chan struct{}) {
 				continue
 			}
 			last = st
-			log.Printf("sessions: active=%d peak=%d max=%d refused=%d", st.Active, st.Peak, st.Max, st.Refused)
+			log.Printf("sessions: active=%d peak=%d max=%d refused=%d handshake_pool_bytes=%d handshake_pool_refused=%d",
+				st.Active, st.Peak, st.Max, st.Refused, st.HandshakePoolBytes, st.HandshakePoolRefused)
 		}
 	}
 }

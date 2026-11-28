@@ -164,6 +164,10 @@ func holdAssociation(ctx context.Context, ft ipc.FrameTransport, ch *dtlsChannel
 			log.Printf("session: %d datagram(s) with an unprotected alert, application-data or malformed "+
 				"ChangeCipherSpec record dropped after the handshake (forged from the peer's address)", n)
 		}
+		if n := res.DroppedPreHandshake(); n > 0 {
+			log.Printf("session: %d datagram(s) withheld from the handshake: over the pre-handshake budget, "+
+				"the sidecar's handshake pool full, or a handshake message_seq the peer never sends", n)
+		}
 		if n := res.DroppedHandshake(); n > 0 {
 			log.Printf("session: %d datagram(s) with unprotected handshake records dropped after the "+
 				"handshake: over the association's budget (forged from the peer's address)", n)

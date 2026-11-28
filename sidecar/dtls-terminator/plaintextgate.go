@@ -22,14 +22,21 @@ const contentTypeChangeCipherSpec = 20
 // peers (10 s soft client, 30 s pion) end such retransmission well inside
 // the window.
 //
-// The gate passes or drops whole datagrams. Once the budget is spent or
-// the window is over, a datagram that coalesces the epoch-1 Finished with
-// epoch-0 records (the rest of a retransmitted final flight) is dropped
-// whole; a Finished sent in a datagram of its own still passes.
+// The gate passes or drops whole datagrams. A protected (epoch 1 or later)
+// handshake record counts as handshake class as well: after the handshake a
+// genuine peer sends one only as a retransmitted Finished, and pion would
+// otherwise buffer its fragments, whose message_seq is encrypted, for the
+// life of the connection. Once the budget is spent or the window is over,
+// a retransmitted final flight, Finished included, is dropped.
 const (
 	// handshakeClassBudget is how many datagrams with an epoch-0 handshake
 	// or ChangeCipherSpec record an established association accepts.
 	handshakeClassBudget = 32
+	// handshakeClassBytes is how many bytes of such datagrams it accepts.
+	// pion keeps the fragments of a handshake message it cannot yet
+	// reassemble for the life of the connection (fragment_buffer.go), so
+	// this, not the datagram count, is what bounds the memory they can pin.
+	handshakeClassBytes = 16 << 10
 	// handshakeClassWindow is how long after the handshake they are
 	// accepted at all.
 	handshakeClassWindow = 60 * time.Second
@@ -43,10 +50,11 @@ const (
 //   - a datagram with an epoch-0 record that is neither handshake nor a
 //     well-formed ChangeCipherSpec is dropped (alerts, application data, a
 //     ChangeCipherSpec whose body is not the single octet 0x01);
-//   - a datagram with epoch-0 handshake or well-formed ChangeCipherSpec
-//     records passes while the association's budget lasts
-//     (handshakeClassBudget datagrams, within handshakeClassWindow of the
-//     handshake's end) and is dropped afterwards.
+//   - a datagram with epoch-0 handshake, well-formed ChangeCipherSpec or
+//     protected handshake records passes while the association's budget
+//     lasts (handshakeClassBudget datagrams and handshakeClassBytes bytes,
+//     within handshakeClassWindow of the handshake's end) and is dropped
+//     afterwards.
 //
 // NIST 800-53 Rev5: SC-5 / SC-23. pion accepts epoch-0 records for the life
 // of a connection and does not authenticate them (conn.go:1042-1080: only
@@ -71,8 +79,8 @@ const (
 // ChangeCipherSpec, RFC 6347 §4.2.4): our handshake only completes once the
 // peer's Finished has been verified, and the peer sent that in epoch 1, so
 // everything it originates afterwards is in epoch 1 or later. The budget
-// lets a lost final flight be recovered and bounds what the cache can grow
-// by to handshakeClassBudget datagrams of at most one IPC frame each.
+// lets a lost final flight be recovered and bounds what the cache and the
+// fragment buffer can grow by to handshakeClassBytes.
 //
 // POAM: POA&M-335 -- what is left: (1) within the budget pion still acts on
 // forged handshake records (a resend of our final flight to the peer per
@@ -101,11 +109,13 @@ type plaintextGate struct {
 	armed time.Time
 	// budget and window are handshakeClassBudget and handshakeClassWindow
 	// (fields so that tests can shorten them).
-	budget uint64
-	window time.Duration
-	// handshakeClass counts epoch-0 handshake-class datagrams seen after
-	// the handshake, passed or not.
-	handshakeClass atomic.Uint64
+	budget     uint64
+	byteBudget uint64
+	window     time.Duration
+	// handshakeClass counts handshake-class datagrams seen after the
+	// handshake, passed or not; handshakeClassBytes their bytes.
+	handshakeClass      atomic.Uint64
+	handshakeClassBytes atomic.Uint64
 	// dropped counts datagrams withheld from pion because of an alert,
 	// application-data or malformed ChangeCipherSpec record.
 	dropped atomic.Uint64
@@ -115,7 +125,7 @@ type plaintextGate struct {
 }
 
 func newPlaintextGate(conn net.PacketConn) *plaintextGate {
-	return &plaintextGate{PacketConn: conn, budget: handshakeClassBudget, window: handshakeClassWindow}
+	return &plaintextGate{PacketConn: conn, budget: handshakeClassBudget, byteBudget: handshakeClassBytes, window: handshakeClassWindow}
 }
 
 // arm starts dropping: the handshake has completed.
@@ -136,7 +146,8 @@ func (g *plaintextGate) ReadFrom(p []byte) (int, net.Addr, error) {
 		case unprotectedHandshake:
 			// The clock is read only for these datagrams, never for a
 			// protected one.
-			if g.handshakeClass.Add(1) > g.budget || time.Since(g.armed) > g.window {
+			if g.handshakeClass.Add(1) > g.budget || g.handshakeClassBytes.Add(uint64(n)) > g.byteBudget ||
+				time.Since(g.armed) > g.window {
 				g.droppedHandshake.Add(1)
 				continue
 			}
@@ -153,8 +164,9 @@ type unprotectedKind int
 const (
 	// unprotectedNone: no epoch-0 record.
 	unprotectedNone unprotectedKind = iota
-	// unprotectedHandshake: epoch-0 records, all of them handshake or
-	// well-formed ChangeCipherSpec.
+	// unprotectedHandshake: handshake class: epoch-0 records, all of them
+	// handshake or well-formed ChangeCipherSpec, or a protected handshake
+	// record.
 	unprotectedHandshake
 	// unprotectedForged: an epoch-0 record a genuine peer cannot send after
 	// the handshake.
@@ -171,6 +183,9 @@ func scanUnprotected(d []byte) unprotectedKind {
 		epoch := binary.BigEndian.Uint16(d[3:5])
 		length := int(binary.BigEndian.Uint16(d[11:13]))
 		body := d[recordHeaderLen:]
+		if epoch != 0 && contentType == contentTypeHandshake {
+			kind = unprotectedHandshake
+		}
 		if epoch == 0 {
 			switch contentType {
 			case contentTypeHandshake:

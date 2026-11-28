@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### Security (SBC DTLS sidecar and media relay, bounded pre-handshake DTLS input, SR-13, POA&M-520)
+
+Tested in local runs on macOS (2026-11-27). Applies with
+`media.srtp.mode = "Terminate"`.
+
+- **Sidecar:** before a leg's handshake completes it hands at most 32
+  datagrams and 16 KiB to the DTLS stack; handshakes in progress share a
+  32 MiB pool, returned when each handshake ends (completed, failed or timed
+  out). Unprotected handshake fragments with a message sequence number the
+  peer's role never sends are dropped for the whole association, and an
+  association hands it at most 128 handshake fragments over its life
+  (protected handshake records longer than a `Finished` are dropped). Before,
+  this input was bounded only by the DTLS stack's own 2 MB per association.
+- **Sidecar, after the handshake:** the handshake-class budget (32
+  datagrams in 60 s) also has a 16 KiB byte limit and now counts protected
+  handshake records, so a retransmitted `Finished` is counted too.
+- **SBC relay:** the handshake pump forwards at most 32 datagrams and
+  16 KiB per handshake to the sidecar, in addition to its rate limit; drops
+  are counted as `dropped_budget` in the existing handshake warn line.
+- **Logs:** the sidecar's once-a-minute `sessions:` line adds
+  `handshake_pool_bytes` and `handshake_pool_refused`; one line per session
+  reports datagrams withheld from the handshake.
+- **Sizing:** for hostile peers, size the sidecar with
+  `16 MiB + max_calls x 260 KiB` (was `x 278 KiB`, which left out the
+  pre-handshake case). Helm defaults are unchanged. POA&M-335 and POA&M-342
+  wording is corrected.
+
 ### Security (SBC, TLS certificate revocation with CRL files, SR-29, POA&M-401 phase (a))
 
 Tested in local runs on macOS (2026-11-27). Operator details: SBC admin

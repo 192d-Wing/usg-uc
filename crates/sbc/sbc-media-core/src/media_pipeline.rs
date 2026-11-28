@@ -2695,6 +2695,7 @@ fn log_handshake_sources(
             dropped_overflow = stats.dropped_overflow,
             dropped_after_exact = stats.dropped_after_exact,
             dropped_rate_limited = stats.dropped_rate_limited,
+            dropped_budget = stats.dropped_budget,
             send_failures = stats.send_failures,
             sources = stats.sources,
             peer = ?peer,

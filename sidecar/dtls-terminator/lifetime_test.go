@@ -198,10 +198,12 @@ func TestHandshakeFloodAfterHandshakeIsBounded(t *testing.T) {
 		runtime.GC()
 		runtime.ReadMemStats(&after)
 
-		if got, want := victim.DroppedHandshake(), uint64(flood-handshakeClassBudget); got != want {
-			t.Fatalf("role %d: %d handshake datagrams dropped, want %d (budget %d)", role, got, want, handshakeClassBudget)
+		size := len(handshakeRecord(0, 0, body))
+		admitted := min(handshakeClassBudget, handshakeClassBytes/size)
+		if got, want := victim.DroppedHandshake(), uint64(flood-admitted); got != want {
+			t.Fatalf("role %d: %d handshake datagrams dropped, want %d (budget %d, %d bytes)", role, got, want, handshakeClassBudget, handshakeClassBytes)
 		}
-		// 20 MB were sent. What may stay is the budget's worth (32 x 4 KB)
+		// 20 MB were sent. What may stay is the budget's worth (16 KiB)
 		// plus noise; 4 MB is far above that and far below the flood.
 		if grown := int64(after.HeapAlloc) - int64(before.HeapAlloc); grown > 4<<20 {
 			t.Fatalf("role %d: live heap grew by %d bytes under a %d byte flood", role, grown, flood*body)
@@ -291,6 +293,30 @@ func TestPlaintextGateHandshakeBudget(t *testing.T) {
 	if got := g.droppedHandshake.Load(); got != 6 {
 		t.Fatalf("%d handshake datagrams dropped after the window, want 6", got)
 	}
+
+	// SR-13: 4 KB handshake-class datagrams: the byte budget binds first.
+	big := handshakeRecord(1, 0, 4000)
+	many := func(d []byte, n int) [][]byte {
+		out := make([][]byte, n)
+		for i := range out {
+			out[i] = d
+		}
+		return out
+	}
+	g = newPlaintextGate(&scriptedConn{datagrams: many(big, 10)})
+	g.arm()
+	if got, want := passed(g), handshakeClassBytes/len(big); got != want {
+		t.Fatalf("%d 4 KB handshake datagrams passed, want %d", got, want)
+	}
+
+	// SR-13: protected handshake records (their message_seq is encrypted)
+	// count against the budget too.
+	protectedHandshake := []byte{22, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 1, 0, 2, 9, 9}
+	g = newPlaintextGate(&scriptedConn{datagrams: many(protectedHandshake, 40)})
+	g.arm()
+	if got := passed(g); got != handshakeClassBudget {
+		t.Fatalf("%d protected handshake datagrams passed, want %d", got, handshakeClassBudget)
+	}
 }
 
 // After the handshake an unprotected alert "from the peer's address" must not
@@ -363,6 +389,8 @@ func TestUnprotectedScanner(t *testing.T) {
 		{"final flight", join(ccs, protected), handshake},
 		{"handshake after protected", join(protected, hs), handshake},
 		{"protected alert", protected, none},
+		{"protected handshake", []byte{22, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 1, 0, 2, 9, 9}, handshake},
+		{"protected handshake then alert", join([]byte{22, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 1, 0, 2, 9, 9}, alert), forged},
 		{"alert", alert, forged},
 		{"application data", plaintextRecord(23, 4, 0), forged},
 		{"alert after handshake", join(hs, alert), forged},

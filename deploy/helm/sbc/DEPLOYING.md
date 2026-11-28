@@ -847,7 +847,7 @@ sidecar operation".
 - **Post-handshake DTLS is rate limited** on each terminated leg (burst 8,
   then 4 per second); drops are counted and logged with the call id.
 - **Session count:** the sidecar logs
-  `sessions: active=N peak=N max=N refused=N` once a minute while it has
+  `sessions: active=N peak=N max=N refused=N handshake_pool_bytes=N handshake_pool_refused=N` once a minute while it has
   sessions. There is no metric for it.
 
 ### Upgrading to the data-plane wiring release (pr/data-plane-wiring-b403f0)

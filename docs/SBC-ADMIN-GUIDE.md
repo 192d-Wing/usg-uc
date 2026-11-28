@@ -1178,10 +1178,14 @@ sidecar and every call loses its DTLS association at once, without
   sessions). It was taken before the sidecar's per-session read buffer was
   reduced and was not repeated. **Linux memory use has not been measured.**
 - The 16 MiB for the process itself is an assumption, not a measurement.
-- Not included: after its handshake each session accepts up to 32
-  unauthenticated handshake datagrams, which the session's own peer can send
-  and which stay in memory until the call ends, up to about 64 KiB per
-  session. When sizing for hostile peers use `16 MiB + max_calls x 278 KiB`.
+- Not included: what a session's own peer can make the sidecar keep until
+  the call ends: up to 16 KiB of handshake input before the handshake
+  completes and 16 KiB after it, held in at most 128 fragments, about 55 KiB
+  per session. When sizing for hostile peers use
+  `16 MiB + max_calls x 260 KiB`. Handshakes still in
+  progress share a fixed 32 MiB pool for their input; when it is full, new
+  handshakes fail at their timeout until others end, and the once-a-minute
+  `sessions:` line shows `handshake_pool_bytes` and `handshake_pool_refused`.
 - The limit of 2 x `max_calls` has no slack: sessions that are still closing
   count against it, so at full load a new leg can be refused.
 - The sidecar does not check its file-descriptor limit against
@@ -1235,7 +1239,7 @@ by signalling only (NIST POA&M-335).
 
 **Sidecar log lines** (container log; the sidecar does not know call ids):
 
-- `sessions: active=N peak=N max=N refused=N`, once a minute while there
+- `sessions: active=N peak=N max=N refused=N handshake_pool_bytes=N handshake_pool_refused=N`, once a minute while there
   are sessions. This is the only view of the session count: there is no
   metric (NIST POA&M-342). Collect the container log and alert on `refused`
   rising or `active` approaching `max`.
@@ -1245,6 +1249,12 @@ by signalling only (NIST POA&M-335).
   shutdown. Nothing is logged for a normal call end.
 - `session: N datagram(s) ... dropped after the handshake`, once per
   session, when forged unprotected DTLS records were dropped.
+- `session: N datagram(s) withheld from the handshake: ...`, once per
+  session, when datagrams were over the pre-handshake budget, the handshake
+  pool was full, or carried a handshake message_seq the peer never sends
+  (NIST POA&M-520). The SBC logs the matching warn line
+  `DTLS handshake pump dropped datagrams from the peer's IP` with
+  `dropped_budget`.
 
 ### Call-leg SRTP keying (SDES)
 
