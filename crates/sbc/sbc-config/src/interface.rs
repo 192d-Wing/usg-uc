@@ -274,7 +274,7 @@ mod tests {
             name: "test".to_string(),
             signaling_interface: lo_name.to_string(),
             media_interface: lo_name.to_string(),
-            external_ip: Some("stun".to_string()),
+            external_ip: Some("stun:192.0.2.1:3478".to_string()),
         }];
 
         let resolved = resolve_zones(&zones).unwrap();
@@ -282,6 +282,9 @@ mod tests {
         assert_eq!(resolved[0].name, "test");
         // STUN should defer — external_ip is None, source is preserved
         assert!(resolved[0].external_ip.is_none());
-        assert_eq!(resolved[0].external_ip_source, Some("stun".to_string()));
+        assert_eq!(
+            resolved[0].external_ip_source,
+            Some("stun:192.0.2.1:3478".to_string())
+        );
     }
 }

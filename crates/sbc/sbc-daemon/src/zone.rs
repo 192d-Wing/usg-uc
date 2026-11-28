@@ -1,13 +1,20 @@
 //! Zone registry and external IP monitoring.
 //!
 //! Provides the runtime zone registry that maps zone names to resolved
-//! IP addresses, and the external IP monitor for STUN-based NAT discovery
-//! and Via received= parameter updates.
+//! IP addresses, and the external IP monitor for STUN-based NAT discovery.
+//!
+//! STUN answers are unauthenticated, so the monitor only queries the
+//! operator-pinned server (`stun:<ip>:<port>`, no default, no DNS), lets
+//! the first answer set the address, and does not let a later different
+//! answer replace it unless `transport.stun_accept_external_ip_change` is
+//! set (then only after two agreeing refreshes). Refused and applied
+//! changes are logged and audited.
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
-//! - **SC-7**: Boundary Protection (zone isolation)
+//! - **SC-7**: Boundary Protection (zone isolation, advertised address)
 //! - **SI-4**: System Monitoring (external IP changes)
+//! - **AU-2**: refused and applied changes are audited
 
 use proto_stun::client::StunClient;
 use sbc_config::interface::ResolvedZone;
@@ -144,7 +151,9 @@ impl ResolvedZoneRegistry {
             .map(|(name, _)| name.clone())
     }
 
-    /// Updates the external IP for a zone (called from STUN or Via received=).
+    /// Sets the external IP for a zone unconditionally (tests only; the
+    /// STUN monitor goes through [`Self::apply_stun_answer`]).
+    #[cfg(test)]
     pub async fn update_external_ip(&self, zone_name: &str, ip: IpAddr) {
         if let Some(entry) = self.zones.get(zone_name) {
             let mut ext = entry.external_ip.write().await;
@@ -161,18 +170,93 @@ impl ResolvedZoneRegistry {
         }
     }
 
-    /// Returns zones that need STUN resolution (external_ip_source starts with "stun").
-    fn stun_zones(&self) -> Vec<(String, String)> {
+    /// Applies one STUN answer for a zone (SR-33).
+    ///
+    /// - No address yet: the answer sets it.
+    /// - Same address: nothing changes.
+    /// - Different address with `accept_change = false`: refused; logged
+    ///   and audited once per distinct answer.
+    /// - Different address with `accept_change = true`: applied only when
+    ///   the previous refresh returned the same new address; logged and
+    ///   audited.
+    ///
+    /// `pending` carries the last differing answer between refreshes.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7, SI-4, AU-2
+    // POAM: POA&M-502 (STUN answers are unauthenticated; the first one is trusted).
+    pub async fn apply_stun_answer(
+        &self,
+        zone_name: &str,
+        answer: IpAddr,
+        accept_change: bool,
+        pending: &mut Option<IpAddr>,
+    ) -> StunDecision {
+        let Some(entry) = self.zones.get(zone_name) else {
+            return StunDecision::Unchanged;
+        };
+        let mut ext = entry.external_ip.write().await;
+        let Some(current) = *ext else {
+            *ext = Some(answer);
+            *pending = None;
+            info!(zone = zone_name, external_ip = %answer, "External IP set from STUN");
+            return StunDecision::Set;
+        };
+        if current == answer {
+            *pending = None;
+            return StunDecision::Unchanged;
+        }
+        let repeated = *pending == Some(answer);
+        *pending = Some(answer);
+        if !accept_change {
+            if !repeated {
+                warn!(
+                    zone = zone_name,
+                    current = %current,
+                    answer = %answer,
+                    "STUN answer differs from the zone's external IP; not applied \
+                     (transport.stun_accept_external_ip_change = false)"
+                );
+                audit_external_ip(zone_name, current, answer, "refused");
+            }
+            return StunDecision::Refused;
+        }
+        if !repeated {
+            warn!(
+                zone = zone_name,
+                current = %current,
+                answer = %answer,
+                "STUN answer differs from the zone's external IP; applying if the next refresh agrees"
+            );
+            return StunDecision::Pending;
+        }
+        *ext = Some(answer);
+        *pending = None;
+        warn!(
+            zone = zone_name,
+            old = %current,
+            new = %answer,
+            "External IP changed from STUN (confirmed by two refreshes)"
+        );
+        audit_external_ip(zone_name, current, answer, "applied");
+        StunDecision::Changed
+    }
+
+    /// Zones whose external IP comes from STUN, with their pinned server.
+    /// A source that is not `stun:<ip>:<port>` is skipped with a warning
+    /// (config validation already rejects it).
+    fn stun_zones(&self) -> Vec<(String, SocketAddr)> {
         self.zones
             .iter()
             .filter_map(|(name, entry)| {
-                entry.external_ip_source.as_ref().and_then(|src| {
-                    if src.starts_with("stun") {
-                        Some((name.clone(), src.clone()))
-                    } else {
-                        None
-                    }
-                })
+                let src = entry.external_ip_source.as_deref()?;
+                if !src.starts_with("stun") {
+                    return None;
+                }
+                let server = parse_stun_server(src);
+                if server.is_none() {
+                    warn!(zone = %name, source = src, "STUN external_ip needs stun:<ip>:<port>; skipped");
+                }
+                server.map(|s| (name.clone(), s))
             })
             .collect()
     }
@@ -183,21 +267,55 @@ impl ResolvedZoneRegistry {
     }
 }
 
-/// Default STUN server for NAT discovery.
-const DEFAULT_STUN_SERVER: &str = "stun.l.google.com:19302";
+/// What [`ResolvedZoneRegistry::apply_stun_answer`] did with an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StunDecision {
+    /// First answer; the zone had no external IP.
+    Set,
+    /// Same address as before.
+    Unchanged,
+    /// A different address, not applied by policy.
+    Refused,
+    /// A different address, waiting for the next refresh to agree.
+    Pending,
+    /// A different address, confirmed and applied.
+    Changed,
+}
+
+/// Audits a refused or applied STUN external-IP change.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-3, SI-4
+fn audit_external_ip(zone: &str, current: IpAddr, answer: IpAddr, outcome: &str) {
+    uc_audit::log_event(uc_audit::AuditEvent::ConfigurationChange(
+        uc_audit::event::ConfigurationChange {
+            admin: "stun-monitor".to_string(),
+            change_type: uc_audit::event::ConfigChangeType::Modified,
+            description: format!(
+                "zone external_ip change {outcome}: zone={zone} current={current} stun_answer={answer}"
+            ),
+        },
+    ));
+}
 
 /// Monitors and periodically refreshes STUN-based external IPs.
 pub struct ExternalIpMonitor {
     registry: Arc<ResolvedZoneRegistry>,
     interval: Duration,
+    accept_change: bool,
 }
 
 impl ExternalIpMonitor {
-    /// Creates a new monitor.
-    pub fn new(registry: Arc<ResolvedZoneRegistry>, interval_secs: u64) -> Self {
+    /// Creates a new monitor. `accept_change` is
+    /// `transport.stun_accept_external_ip_change`.
+    pub fn new(
+        registry: Arc<ResolvedZoneRegistry>,
+        interval_secs: u64,
+        accept_change: bool,
+    ) -> Self {
         Self {
             registry,
             interval: Duration::from_secs(interval_secs),
+            accept_change,
         }
     }
 
@@ -212,93 +330,57 @@ impl ExternalIpMonitor {
             info!(
                 zones = ?stun_zones.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
                 interval_secs = self.interval.as_secs(),
+                accept_change = self.accept_change,
                 "Starting external IP monitor (STUN)"
             );
 
-            // Initial resolution
-            for (zone_name, stun_src) in &stun_zones {
-                let bind_ip = self
-                    .registry
-                    .signaling_ip(zone_name)
-                    .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                if let Err(e) = self.resolve_stun(zone_name, stun_src, bind_ip).await {
-                    warn!(zone = zone_name, error = %e, "Initial STUN resolution failed");
-                }
-            }
-
-            // Periodic refresh
+            let mut pending: HashMap<String, Option<IpAddr>> = HashMap::new();
             let mut ticker = tokio::time::interval(self.interval);
-            ticker.tick().await; // skip immediate first tick (already did initial)
             loop {
+                // The first tick fires immediately (initial resolution).
                 ticker.tick().await;
-                for (zone_name, stun_src) in &stun_zones {
+                for (zone_name, server) in &stun_zones {
                     let bind_ip = self
                         .registry
                         .signaling_ip(zone_name)
                         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                    if let Err(e) = self.resolve_stun(zone_name, stun_src, bind_ip).await {
-                        warn!(zone = zone_name, error = %e, "STUN refresh failed");
+                    match discover(*server, bind_ip).await {
+                        Ok(ip) => {
+                            let slot = pending.entry(zone_name.clone()).or_default();
+                            self.registry
+                                .apply_stun_answer(zone_name, ip, self.accept_change, slot)
+                                .await;
+                        }
+                        Err(e) => {
+                            warn!(zone = zone_name, error = %e, stun_server = %server, "STUN refresh failed");
+                        }
                     }
                 }
             }
         })
     }
-
-    /// Performs a single STUN resolution for a zone.
-    async fn resolve_stun(
-        &self,
-        zone_name: &str,
-        stun_src: &str,
-        bind_ip: IpAddr,
-    ) -> Result<(), String> {
-        let stun_server = parse_stun_server(stun_src);
-
-        // Async DNS — std::net::ToSocketAddrs blocks the tokio worker
-        // thread for up to the resolver timeout (5s per nameserver).
-        let server_addr: SocketAddr = match stun_server.parse() {
-            Ok(addr) => addr,
-            Err(_) => tokio::net::lookup_host(&stun_server)
-                .await
-                .map_err(|e| format!("Cannot resolve STUN server {stun_server}: {e}"))?
-                .find(SocketAddr::is_ipv4)
-                .ok_or_else(|| format!("No IPv4 address found for STUN server {stun_server}"))?,
-        };
-
-        let socket = UdpSocket::bind(SocketAddr::new(bind_ip, 0))
-            .await
-            .map_err(|e| format!("Bind failed: {e}"))?;
-
-        let client = StunClient::new(Arc::new(socket), server_addr);
-        let srflx = client
-            .discover_srflx()
-            .await
-            .map_err(|e| format!("STUN discovery failed: {e}"))?;
-
-        info!(
-            zone = zone_name,
-            external_ip = %srflx.ip(),
-            stun_server = stun_server,
-            "STUN discovery complete"
-        );
-
-        self.registry
-            .update_external_ip(zone_name, srflx.ip())
-            .await;
-        Ok(())
-    }
 }
 
-/// Parses a STUN source string. Supports:
-/// - `"stun"` → default server
-/// - `"stun:host:port"` → custom server
-fn parse_stun_server(src: &str) -> String {
-    if src == "stun" {
-        DEFAULT_STUN_SERVER.to_string()
-    } else if let Some(server) = src.strip_prefix("stun:") {
-        server.to_string()
-    } else {
-        DEFAULT_STUN_SERVER.to_string()
-    }
+/// One STUN Binding to the pinned server; returns the mapped IP.
+async fn discover(server: SocketAddr, bind_ip: IpAddr) -> Result<IpAddr, String> {
+    let socket = UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+        .await
+        .map_err(|e| format!("Bind failed: {e}"))?;
+    let client = StunClient::new(Arc::new(socket), server);
+    let srflx = client
+        .discover_srflx()
+        .await
+        .map_err(|e| format!("STUN discovery failed: {e}"))?;
+    Ok(srflx.ip())
+}
+
+/// Parses `stun:<ip>:<port>`. There is no default server and no host-name
+/// form (SR-33): a name would be re-resolved on every refresh.
+fn parse_stun_server(src: &str) -> Option<SocketAddr> {
+    src.strip_prefix("stun:")?
+        .parse::<SocketAddr>()
+        .ok()
+        .filter(|a| a.port() != 0 && !a.ip().is_unspecified())
 }
 
 #[cfg(test)]
@@ -394,11 +476,94 @@ mod tests {
 
     #[test]
     fn test_parse_stun_server() {
-        assert_eq!(parse_stun_server("stun"), "stun.l.google.com:19302");
+        assert_eq!(parse_stun_server("stun"), None);
+        assert_eq!(parse_stun_server("stun:stun.example.com:3478"), None);
+        assert_eq!(parse_stun_server("stun:192.0.2.1:0"), None);
         assert_eq!(
-            parse_stun_server("stun:stun.example.com:3478"),
-            "stun.example.com:3478"
+            parse_stun_server("stun:192.0.2.1:3478"),
+            Some("192.0.2.1:3478".parse().unwrap())
         );
+        assert_eq!(
+            parse_stun_server("stun:[2001:db8::1]:3478"),
+            Some("[2001:db8::1]:3478".parse().unwrap())
+        );
+    }
+
+    fn stun_registry() -> ResolvedZoneRegistry {
+        ResolvedZoneRegistry::from_resolved(vec![ResolvedZone {
+            name: "ext".to_string(),
+            signaling_ip: "10.0.1.1".parse().unwrap(),
+            media_ip: "10.0.1.1".parse().unwrap(),
+            external_ip: None,
+            external_ip_source: Some("stun:192.0.2.1:3478".to_string()),
+        }])
+    }
+
+    /// SR-33: with the default policy the first answer sets the address
+    /// and a later different answer never replaces it.
+    #[tokio::test]
+    async fn stun_answer_cannot_change_the_address_by_default() {
+        let reg = stun_registry();
+        let mut pending = None;
+        let a: IpAddr = "203.0.113.10".parse().unwrap();
+        let b: IpAddr = "198.51.100.66".parse().unwrap();
+        assert_eq!(
+            reg.apply_stun_answer("ext", a, false, &mut pending).await,
+            StunDecision::Set
+        );
+        assert_eq!(
+            reg.apply_stun_answer("ext", a, false, &mut pending).await,
+            StunDecision::Unchanged
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                reg.apply_stun_answer("ext", b, false, &mut pending).await,
+                StunDecision::Refused
+            );
+        }
+        assert_eq!(reg.external_ip("ext"), Some(a));
+    }
+
+    /// With `stun_accept_external_ip_change = true` a change needs two
+    /// agreeing refreshes; an alternating answer never lands.
+    #[tokio::test]
+    async fn stun_change_needs_two_agreeing_refreshes_when_allowed() {
+        let reg = stun_registry();
+        let mut pending = None;
+        let a: IpAddr = "203.0.113.10".parse().unwrap();
+        let b: IpAddr = "198.51.100.66".parse().unwrap();
+        let c: IpAddr = "198.51.100.77".parse().unwrap();
+        reg.apply_stun_answer("ext", a, true, &mut pending).await;
+        assert_eq!(
+            reg.apply_stun_answer("ext", b, true, &mut pending).await,
+            StunDecision::Pending
+        );
+        assert_eq!(
+            reg.apply_stun_answer("ext", c, true, &mut pending).await,
+            StunDecision::Pending
+        );
+        assert_eq!(
+            reg.apply_stun_answer("ext", a, true, &mut pending).await,
+            StunDecision::Unchanged
+        );
+        assert_eq!(
+            reg.apply_stun_answer("ext", b, true, &mut pending).await,
+            StunDecision::Pending
+        );
+        assert_eq!(reg.external_ip("ext"), Some(a));
+        assert_eq!(
+            reg.apply_stun_answer("ext", b, true, &mut pending).await,
+            StunDecision::Changed
+        );
+        assert_eq!(reg.external_ip("ext"), Some(b));
+    }
+
+    /// A configured literal external IP is never touched by STUN: the zone
+    /// is not a STUN zone at all.
+    #[test]
+    fn configured_external_ip_is_not_a_stun_zone() {
+        let reg = ResolvedZoneRegistry::from_resolved(make_test_zones());
+        assert_eq!(reg.stun_zones(), Vec::new());
     }
 
     #[test]
@@ -409,7 +574,7 @@ mod tests {
                 signaling_ip: "10.0.1.1".parse().unwrap(),
                 media_ip: "10.0.1.1".parse().unwrap(),
                 external_ip: None,
-                external_ip_source: Some("stun".to_string()),
+                external_ip_source: Some("stun:192.0.2.1:3478".to_string()),
             },
             ResolvedZone {
                 name: "int".to_string(),

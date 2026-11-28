@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### Security (soft client ICE and SBC zone STUN discovery, SR-17, SR-33, POA&M-500..502)
+
+Tested in local runs on macOS (2026-11-27); no interoperability run against
+another ICE agent. Operator details: SBC admin guide, "Zone external IP and
+STUN discovery".
+
+- **proto-stun:** MESSAGE-INTEGRITY is now standard HMAC-SHA1 over the
+  RFC 8489 §14.5 byte range, verified on receive (`verify_integrity`,
+  `has_valid_fingerprint`), and tested against the RFC 5769 vectors. It was
+  HMAC-SHA-384 truncated to 20 bytes over the wrong length, which no other
+  agent accepts. Attributes after MESSAGE-INTEGRITY (other than FINGERPRINT)
+  are ignored. HMAC-SHA1 is a documented CNSA exception (POA&M-500), in
+  `uc_crypto::interop` behind the new `stun-hmac-sha1` feature.
+- **proto-ice / soft client:** connectivity-check requests and responses are
+  acted on only after FINGERPRINT, USERNAME and MESSAGE-INTEGRITY verify;
+  other requests get an unsigned 400/401 or are dropped, other responses are
+  discarded. A response from an address other than the check target fails
+  the check. Role conflicts follow RFC 8445 §7.3.1.1 (both branches were
+  inverted). ufrag, password, tie-breaker and transaction IDs come from the
+  aws-lc DRBG instead of a clock-seeded generator. Remote candidates are
+  capped at 32 and pairs at 100. Residuals: POA&M-501.
+- **Breaking (proto-ice API):** `ConnectivityCheck::process_response` takes
+  the raw datagram and source; `IceStunServer::process_request` takes the
+  raw datagram and returns `RequestOutcome` (encode it with
+  `encode_response`); `ConnectivityChecker::perform_check` no longer takes a
+  password; new `ConnectivityCheck::encode_request`, `IceError::Unauthenticated`.
+- **Breaking (SBC config):** `[[zones]] external_ip = "stun"` (public default
+  server) and host-name STUN servers are rejected; use a literal IP or
+  `"stun:<ip>:<port>"` for a server you operate. After the first answer a
+  different STUN answer is not applied; it is logged and audited. New
+  `[transport] stun_accept_external_ip_change` (default `false`) applies a
+  change after two agreeing refreshes. Residual: POA&M-502.
+- **Breaking (Helm, sbc chart):** new required value
+  `sbcDaemon.config.outside_external_ip` (public IP or `stun:<ip>:<port>`);
+  the outside zone no longer renders `external_ip = "stun"`. Site values
+  must set it before upgrading.
+
 ### Security (SBC, SIP request-path load bounds, SR-20, SR-21, SR-24, POA&M-490, 491)
 
 Tested in local runs on macOS (2026-11-27).

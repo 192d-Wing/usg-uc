@@ -476,6 +476,7 @@ impl ConsentKeepaliveManager {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
+    // POAM: POA&M-501 (no MESSAGE-INTEGRITY check; library-only, do not wire as is).
     pub fn process_response(&mut self, response: &StunMessage) -> IceResult<()> {
         // Check if this is a response to our consent check
         if let Some(expected_tid) = self.current_transaction

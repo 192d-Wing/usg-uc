@@ -11,7 +11,8 @@ categories.workspace = true
 
 [dependencies]
 uc-types.workspace = true
-uc-crypto.workspace = true
+# CNSA-EXCEPTION: RFC 8489 §14.5 MESSAGE-INTEGRITY is HMAC-SHA1 (POA&M-500).
+uc-crypto = { workspace = true, features = ["stun-hmac-sha1"] }
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

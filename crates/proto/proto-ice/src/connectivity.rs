@@ -13,6 +13,7 @@
 use crate::agent::{IceCredentials, IceRole};
 use crate::candidate::Candidate;
 use crate::error::{IceError, IceResult};
+use bytes::Bytes;
 use proto_stun::{StunAttribute, StunClass, StunMessage, StunMessageType, StunMethod};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -90,15 +91,10 @@ impl ConnectivityCheck {
         role: IceRole,
         tie_breaker: u64,
     ) -> Self {
-        let mut transaction_id = [0u8; 12];
-        // Generate random transaction ID
-        if uc_crypto::random::fill_random(&mut transaction_id).is_err() {
-            // Fallback to time-based ID
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64);
-            transaction_id[..8].copy_from_slice(&now.to_be_bytes());
-        }
+        // RFC 8489 §6: the transaction ID is uniformly random.
+        #[allow(clippy::expect_used)]
+        let transaction_id: [u8; 12] = uc_crypto::random::generate_random()
+            .expect("DRBG failure generating STUN transaction ID");
 
         Self {
             local,
@@ -110,6 +106,23 @@ impl ConnectivityCheck {
             nominate: false,
             transaction_id,
         }
+    }
+
+    /// Creates the request and encodes it with MESSAGE-INTEGRITY (keyed
+    /// with the remote password, RFC 8445 §7.2.2) and FINGERPRINT
+    /// (RFC 8445 §7.1).
+    ///
+    /// # Errors
+    /// Returns an error if the request cannot be encoded.
+    pub fn encode_request(&self) -> IceResult<Bytes> {
+        self.create_request()?
+            .encode_with_integrity_and_fingerprint(self.remote_credentials.pwd.as_bytes())
+            .map_err(IceError::from)
+    }
+
+    /// Returns the role this check was sent in.
+    pub fn role(&self) -> IceRole {
+        self.role
     }
 
     /// Sets whether to nominate this pair (controlling agent only).
@@ -186,20 +199,46 @@ impl ConnectivityCheck {
 
     /// Processes a STUN response for this check.
     ///
-    /// ## RFC 8445 §7.2 Processing the Response
+    /// ## RFC 8445 §7.2.5, RFC 8489 §9.1.4
     ///
-    /// Handles:
-    /// - Success responses: Extract XOR-MAPPED-ADDRESS
-    /// - Error responses: Handle role conflicts (487)
-    /// - Validate MESSAGE-INTEGRITY
+    /// `raw` is the datagram as received and `from` its source. Before any
+    /// state is touched the response must carry a valid FINGERPRINT and a
+    /// MESSAGE-INTEGRITY keyed with the remote password; otherwise
+    /// [`IceError::Unauthenticated`] is returned and the caller must keep
+    /// waiting (the response is discarded). An authenticated response from
+    /// an address other than the check's target fails the check
+    /// (§7.2.5.2.1, non-symmetric transport addresses).
+    ///
+    /// ## NIST 800-53 Rev5: IA-3, SC-8, SI-10
     ///
     /// # Errors
-    /// Returns an error if the operation fails.
-    pub fn process_response(&self, response: &StunMessage) -> IceResult<CheckResult> {
+    /// [`IceError::Unauthenticated`] for a response to discard;
+    /// [`IceError::ProtocolError`] for a transaction ID mismatch.
+    pub fn process_response(
+        &self,
+        response: &StunMessage,
+        raw: &[u8],
+        from: SocketAddr,
+    ) -> IceResult<CheckResult> {
         // Verify transaction ID
         if response.transaction_id != self.transaction_id {
             return Err(IceError::ProtocolError {
                 reason: "transaction ID mismatch".to_string(),
+            });
+        }
+        if !StunMessage::has_valid_fingerprint(raw) {
+            return Err(IceError::Unauthenticated {
+                reason: "missing or invalid FINGERPRINT".to_string(),
+            });
+        }
+        if !StunMessage::verify_integrity(raw, self.remote_credentials.pwd.as_bytes()) {
+            return Err(IceError::Unauthenticated {
+                reason: "missing or invalid MESSAGE-INTEGRITY".to_string(),
+            });
+        }
+        if from != self.remote.address() {
+            return Ok(CheckResult::Failure {
+                reason: "response source does not match check target".to_string(),
             });
         }
 
@@ -219,7 +258,6 @@ impl ConnectivityCheck {
                 })
             }
             StunClass::ErrorResponse => {
-                // Check for role conflict (487)
                 let error_code = response.attributes.iter().find_map(|a| {
                     if let StunAttribute::ErrorCode { code, reason } = a {
                         Some((*code, reason.clone()))
@@ -230,7 +268,8 @@ impl ConnectivityCheck {
 
                 if let Some((code, reason)) = error_code {
                     if code == 487 {
-                        // Role conflict per RFC 8445 §7.2.5.1
+                        // RFC 8445 §7.2.5.1: switch to the role opposite
+                        // the one the request was sent in.
                         let new_role = match self.role {
                             IceRole::Controlling => IceRole::Controlled,
                             IceRole::Controlled => IceRole::Controlling,
@@ -296,24 +335,16 @@ impl ConnectivityChecker {
     /// 1. Send STUN Binding request to remote candidate
     /// 2. Wait for response with retransmissions
     /// 3. Process response and return result
-    #[instrument(skip(self, check, password), fields(
+    ///
+    /// The request is signed with the check's remote password; responses
+    /// that fail authentication are discarded while waiting.
+    #[instrument(skip(self, check), fields(
         local = %check.local().address(),
         remote = %check.remote().address(),
     ))]
-    pub async fn perform_check(
-        &self,
-        check: &ConnectivityCheck,
-        password: &[u8],
-    ) -> IceResult<CheckResult> {
-        let request = check.create_request()?;
-
+    pub async fn perform_check(&self, check: &ConnectivityCheck) -> IceResult<CheckResult> {
         // Encode with MESSAGE-INTEGRITY and FINGERPRINT
-        let request_bytes =
-            request
-                .encode_with_integrity(password)
-                .map_err(|e| IceError::ProtocolError {
-                    reason: format!("failed to encode request: {e}"),
-                })?;
+        let request_bytes = check.encode_request()?;
 
         let remote_addr = check.remote().address();
 
@@ -414,8 +445,13 @@ impl ConnectivityChecker {
                 continue;
             }
 
-            // Process the response
-            return check.process_response(&response);
+            // Process the response; unauthenticated ones are discarded.
+            match check.process_response(&response, &buf[..n], from) {
+                Err(IceError::Unauthenticated { reason }) => {
+                    debug!(from = %from, %reason, "Discarding unauthenticated STUN response");
+                }
+                other => return other,
+            }
         }
     }
 }
@@ -452,22 +488,33 @@ impl IceStunServer {
 
     /// Processes an incoming STUN Binding request.
     ///
-    /// ## RFC 8445 §7.3 STUN Server Procedures
+    /// ## RFC 8445 §7.3, RFC 8489 §9.1.3
     ///
-    /// 1. Validate MESSAGE-INTEGRITY using local password
-    /// 2. Check for role conflicts
-    /// 3. Generate success response with XOR-MAPPED-ADDRESS
+    /// `raw` is the datagram as received. In order:
+    /// 1. A request without a valid FINGERPRINT is discarded
+    ///    ([`IceError::Unauthenticated`], no response).
+    /// 2. Without both USERNAME and MESSAGE-INTEGRITY: 400, unsigned.
+    /// 3. USERNAME not `<local ufrag>:<remote ufrag>`, or MESSAGE-INTEGRITY
+    ///    not valid under the local password: 401, unsigned.
+    /// 4. Role conflicts are resolved per §7.3.1.1 (487 or a role switch).
+    /// 5. Success response with XOR-MAPPED-ADDRESS, signed.
     ///
-    /// ## Returns
+    /// Only an authenticated request yields [`TriggeredCheckInfo`]; the
+    /// caller must not change any state for any other outcome. Encode the
+    /// response with [`Self::encode_response`].
     ///
-    /// - `Ok((response, triggered_check))` - Response to send and optional triggered check info
-    /// - `Err` - Request was invalid or rejected
+    /// ## NIST 800-53 Rev5: IA-3, SC-8, SI-10
+    ///
+    /// # Errors
+    /// [`IceError::ProtocolError`] for a message that is not a Binding
+    /// request; [`IceError::Unauthenticated`] for one to drop silently.
     pub fn process_request(
         &self,
         request: &StunMessage,
+        raw: &[u8],
         source_addr: SocketAddr,
         _local_addr: SocketAddr,
-    ) -> IceResult<(StunMessage, Option<TriggeredCheckInfo>)> {
+    ) -> IceResult<RequestOutcome> {
         // Verify this is a Binding request
         if request.msg_type.method != StunMethod::Binding
             || request.msg_type.class != StunClass::Request
@@ -477,51 +524,56 @@ impl IceStunServer {
             });
         }
 
-        // Extract and validate USERNAME
-        let username = request
+        if !StunMessage::has_valid_fingerprint(raw) {
+            return Err(IceError::Unauthenticated {
+                reason: "missing or invalid FINGERPRINT".to_string(),
+            });
+        }
+
+        let username = request.attributes.iter().find_map(|a| {
+            if let StunAttribute::Username(u) = a {
+                Some(u.as_str())
+            } else {
+                None
+            }
+        });
+        let has_integrity = request
             .attributes
             .iter()
-            .find_map(|a| {
-                if let StunAttribute::Username(u) = a {
-                    Some(u.clone())
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| IceError::ProtocolError {
-                reason: "missing USERNAME attribute".to_string(),
-            })?;
+            .any(|a| matches!(a, StunAttribute::MessageIntegrity(_)));
+        let Some(username) = username.filter(|_| has_integrity) else {
+            return Ok(RequestOutcome::unsigned(StunMessage::binding_error(
+                request,
+                400,
+                "Bad Request",
+            )));
+        };
 
-        // USERNAME format should be local-ufrag:remote-ufrag
-        let parts: Vec<&str> = username.split(':').collect();
-        if parts.len() != 2 {
-            return Err(IceError::ProtocolError {
-                reason: format!("invalid USERNAME format: {username}"),
-            });
+        // USERNAME is <our ufrag>:<their ufrag> (RFC 8445 §7.2.2).
+        let ufrag_ok = username.split_once(':').is_some_and(|(local, remote)| {
+            local == self.local_credentials.ufrag && !remote.is_empty()
+        });
+        if !ufrag_ok || !StunMessage::verify_integrity(raw, self.local_credentials.pwd.as_bytes()) {
+            return Ok(RequestOutcome::unsigned(StunMessage::binding_error(
+                request,
+                401,
+                "Unauthorized",
+            )));
         }
 
-        // Verify local ufrag matches
-        if parts[0] != self.local_credentials.ufrag {
-            return Err(IceError::ProtocolError {
-                reason: "USERNAME ufrag mismatch".to_string(),
-            });
-        }
-
-        // Check for role conflict per RFC 8445 §7.3.1.1
-        let role_conflict = self.check_role_conflict(request);
-        if let Some(new_role) = role_conflict {
-            // Return 487 error
-            let error_response = StunMessage::binding_error(request, 487, "Role Conflict");
-            return Ok((
-                error_response,
-                Some(TriggeredCheckInfo {
-                    source_addr,
-                    priority: 0,
-                    use_candidate: false,
-                    role_conflict: Some(new_role),
-                }),
-            ));
-        }
+        // Role conflict per RFC 8445 §7.3.1.1.
+        let role_switch = match self.check_role_conflict(request) {
+            RoleCheck::NoConflict => None,
+            RoleCheck::Reject => {
+                return Ok(RequestOutcome {
+                    response: StunMessage::binding_error(request, 487, "Role Conflict"),
+                    signed: true,
+                    triggered: None,
+                });
+            }
+            RoleCheck::SwitchTo(role) => Some(role),
+        };
+        let role = role_switch.unwrap_or(self.role);
 
         // Extract PRIORITY for triggered check
         let priority = request
@@ -536,11 +588,13 @@ impl IceStunServer {
             })
             .unwrap_or(0);
 
-        // Check for USE-CANDIDATE
-        let use_candidate = request
-            .attributes
-            .iter()
-            .any(|a| matches!(a, StunAttribute::UseCandidate));
+        // USE-CANDIDATE only means something to a controlled agent
+        // (RFC 8445 §7.3.1.5).
+        let use_candidate = role == IceRole::Controlled
+            && request
+                .attributes
+                .iter()
+                .any(|a| matches!(a, StunAttribute::UseCandidate));
 
         // Create success response with XOR-MAPPED-ADDRESS
         let mut response = StunMessage::binding_response(request);
@@ -548,19 +602,42 @@ impl IceStunServer {
             proto_stun::XorMappedAddress::new(source_addr),
         ));
 
-        // Return triggered check info
-        let triggered = TriggeredCheckInfo {
-            source_addr,
-            priority,
-            use_candidate,
-            role_conflict: None,
-        };
-
-        Ok((response, Some(triggered)))
+        Ok(RequestOutcome {
+            response,
+            signed: true,
+            triggered: Some(TriggeredCheckInfo {
+                source_addr,
+                priority,
+                use_candidate,
+                role_conflict: role_switch,
+            }),
+        })
     }
 
-    /// Checks for role conflict per RFC 8445 §7.3.1.1.
-    fn check_role_conflict(&self, request: &StunMessage) -> Option<IceRole> {
+    /// Encodes a response from [`Self::process_request`]: signed with the
+    /// local password and FINGERPRINT for an authenticated request (RFC
+    /// 8445 §7.3), FINGERPRINT only for a 400/401 (RFC 8489 §9.1.3).
+    ///
+    /// # Errors
+    /// Returns an error if the response cannot be encoded.
+    pub fn encode_response(&self, outcome: &RequestOutcome) -> IceResult<Bytes> {
+        if outcome.signed {
+            outcome
+                .response
+                .encode_with_integrity_and_fingerprint(self.local_credentials.pwd.as_bytes())
+                .map_err(IceError::from)
+        } else {
+            Ok(outcome.response.encode_with_fingerprint())
+        }
+    }
+
+    /// Resolves a role conflict per RFC 8445 §7.3.1.1.
+    ///
+    /// - Both controlling: if our tie-breaker is >= theirs we keep the
+    ///   role and answer 487; otherwise we switch to controlled.
+    /// - Both controlled: if our tie-breaker is >= theirs we switch to
+    ///   controlling; otherwise we keep the role and answer 487.
+    fn check_role_conflict(&self, request: &StunMessage) -> RoleCheck {
         let remote_controlling = request.attributes.iter().find_map(|a| {
             if let StunAttribute::IceControlling(tb) = a {
                 Some(*tb)
@@ -578,16 +655,51 @@ impl IceStunServer {
         });
 
         match (self.role, remote_controlling, remote_controlled) {
-            // We're controlling, they claim controlling
-            (IceRole::Controlling, Some(remote_tb), None) => {
-                (self.tie_breaker >= remote_tb).then_some(IceRole::Controlled)
+            (IceRole::Controlling, Some(remote_tb), _) => {
+                if self.tie_breaker >= remote_tb {
+                    RoleCheck::Reject
+                } else {
+                    RoleCheck::SwitchTo(IceRole::Controlled)
+                }
             }
-            // We're controlled, they claim controlled
             (IceRole::Controlled, None, Some(remote_tb)) => {
-                (self.tie_breaker < remote_tb).then_some(IceRole::Controlling)
+                if self.tie_breaker >= remote_tb {
+                    RoleCheck::SwitchTo(IceRole::Controlling)
+                } else {
+                    RoleCheck::Reject
+                }
             }
-            // No conflict
-            _ => None,
+            _ => RoleCheck::NoConflict,
+        }
+    }
+}
+
+/// Outcome of [`IceStunServer::check_role_conflict`].
+enum RoleCheck {
+    NoConflict,
+    /// Keep our role and answer 487.
+    Reject,
+    /// Switch to this role and process the request.
+    SwitchTo(IceRole),
+}
+
+/// Result of [`IceStunServer::process_request`].
+#[derive(Debug, Clone)]
+pub struct RequestOutcome {
+    /// Response to send back to the request's source.
+    pub response: StunMessage,
+    /// Whether the response is signed (the request authenticated).
+    pub signed: bool,
+    /// Present only for an authenticated, accepted request.
+    pub triggered: Option<TriggeredCheckInfo>,
+}
+
+impl RequestOutcome {
+    fn unsigned(response: StunMessage) -> Self {
+        Self {
+            response,
+            signed: false,
+            triggered: None,
         }
     }
 }
@@ -601,7 +713,8 @@ pub struct TriggeredCheckInfo {
     pub priority: u32,
     /// Whether USE-CANDIDATE was present.
     pub use_candidate: bool,
-    /// Role conflict result if any.
+    /// Role the agent must switch to before acting on this request
+    /// (RFC 8445 §7.3.1.1); the request was otherwise accepted.
     pub role_conflict: Option<IceRole>,
 }
 
@@ -751,112 +864,280 @@ mod tests {
         assert!(!has_controlling);
     }
 
-    #[test]
-    fn test_process_success_response() {
-        let local = test_candidate([192, 168, 1, 100], 5060);
-        let remote = test_candidate([10, 0, 0, 1], 5060);
-        let local_creds = test_credentials();
-        let remote_creds = IceCredentials::new("remote".to_string(), "remotepwd".to_string());
+    fn remote_creds() -> IceCredentials {
+        IceCredentials::new("remote".to_string(), "remotepwd-remotepwd-rem".to_string())
+    }
 
-        let check = ConnectivityCheck::new(
-            local,
-            remote,
-            local_creds,
-            remote_creds,
-            IceRole::Controlling,
+    fn check_for(role: IceRole) -> ConnectivityCheck {
+        ConnectivityCheck::new(
+            test_candidate([192, 168, 1, 100], 5060),
+            test_candidate([10, 0, 0, 1], 5060),
+            test_credentials(),
+            remote_creds(),
+            role,
             12345,
-        );
+        )
+    }
 
-        // Create mock success response
+    fn success_for(check: &ConnectivityCheck) -> StunMessage {
         let mut response =
             StunMessage::new(StunMessageType::binding_response(), check.transaction_id);
-        let mapped_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 32853);
         response.add_attribute(StunAttribute::XorMappedAddress(
-            proto_stun::XorMappedAddress::new(mapped_addr),
+            proto_stun::XorMappedAddress::new(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)),
+                32853,
+            )),
         ));
+        response
+    }
 
-        let result = check.process_response(&response).unwrap();
+    fn signed(msg: &StunMessage, pwd: &str) -> Vec<u8> {
+        msg.encode_with_integrity_and_fingerprint(pwd.as_bytes())
+            .unwrap()
+            .to_vec()
+    }
 
-        match result {
+    fn deliver(check: &ConnectivityCheck, raw: &[u8], from: SocketAddr) -> IceResult<CheckResult> {
+        check.process_response(&StunMessage::parse(raw).unwrap(), raw, from)
+    }
+
+    #[test]
+    fn test_process_success_response() {
+        let check = check_for(IceRole::Controlling);
+        let raw = signed(&success_for(&check), &remote_creds().pwd);
+        match deliver(&check, &raw, check.remote().address()).unwrap() {
             CheckResult::Success {
                 mapped_address,
                 nominated,
             } => {
-                assert_eq!(mapped_address, mapped_addr);
+                assert_eq!(mapped_address.port(), 32853);
                 assert!(!nominated);
             }
-            _ => panic!("Expected success result"),
+            other => panic!("Expected success result, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_process_role_conflict_response() {
-        let local = test_candidate([192, 168, 1, 100], 5060);
-        let remote = test_candidate([10, 0, 0, 1], 5060);
-        let local_creds = test_credentials();
-        let remote_creds = IceCredentials::new("remote".to_string(), "remotepwd".to_string());
+    fn encoded_request_is_signed_with_the_remote_password() {
+        let check = check_for(IceRole::Controlling);
+        let raw = check.encode_request().unwrap();
+        assert!(StunMessage::has_valid_fingerprint(&raw));
+        assert!(StunMessage::verify_integrity(
+            &raw,
+            remote_creds().pwd.as_bytes()
+        ));
+        assert!(!StunMessage::verify_integrity(
+            &raw,
+            test_credentials().pwd.as_bytes()
+        ));
+    }
 
-        let check = ConnectivityCheck::new(
-            local,
-            remote,
-            local_creds,
-            remote_creds,
-            IceRole::Controlling,
-            12345,
-        );
-
-        // Create 487 error response
-        let response = StunMessage::binding_error(
+    #[test]
+    fn unauthenticated_responses_are_discarded() {
+        let check = check_for(IceRole::Controlling);
+        let to = check.remote().address();
+        let resp = success_for(&check);
+        // Unsigned, FINGERPRINT only.
+        let raw = resp.encode_with_fingerprint();
+        assert!(matches!(
+            deliver(&check, &raw, to),
+            Err(IceError::Unauthenticated { .. })
+        ));
+        // Signed with the wrong password.
+        let raw = signed(&resp, "not-the-remote-password");
+        assert!(matches!(
+            deliver(&check, &raw, to),
+            Err(IceError::Unauthenticated { .. })
+        ));
+        // Signed but no FINGERPRINT.
+        let raw = resp
+            .encode_with_integrity(remote_creds().pwd.as_bytes())
+            .unwrap();
+        assert!(matches!(
+            deliver(&check, &raw, to),
+            Err(IceError::Unauthenticated { .. })
+        ));
+        // An unsigned 487 does not switch roles.
+        let conflict = StunMessage::binding_error(
             &StunMessage::new(StunMessageType::binding_request(), check.transaction_id),
             487,
             "Role Conflict",
         );
+        let raw = conflict.encode_with_fingerprint();
+        assert!(matches!(
+            deliver(&check, &raw, to),
+            Err(IceError::Unauthenticated { .. })
+        ));
+    }
 
-        // Fix transaction ID
-        let mut response = response;
-        response.transaction_id = check.transaction_id;
+    #[test]
+    fn authenticated_response_from_another_source_fails_the_check() {
+        let check = check_for(IceRole::Controlling);
+        let raw = signed(&success_for(&check), &remote_creds().pwd);
+        let elsewhere = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5060);
+        assert!(matches!(
+            deliver(&check, &raw, elsewhere).unwrap(),
+            CheckResult::Failure { .. }
+        ));
+    }
 
-        let result = check.process_response(&response).unwrap();
-
-        match result {
-            CheckResult::RoleConflict { new_role } => {
-                assert_eq!(new_role, IceRole::Controlled);
+    #[test]
+    fn test_process_role_conflict_response() {
+        for (role, expected) in [
+            (IceRole::Controlling, IceRole::Controlled),
+            (IceRole::Controlled, IceRole::Controlling),
+        ] {
+            let check = check_for(role);
+            let response = StunMessage::binding_error(
+                &StunMessage::new(StunMessageType::binding_request(), check.transaction_id),
+                487,
+                "Role Conflict",
+            );
+            let raw = signed(&response, &remote_creds().pwd);
+            match deliver(&check, &raw, check.remote().address()).unwrap() {
+                CheckResult::RoleConflict { new_role } => assert_eq!(new_role, expected),
+                other => panic!("Expected role conflict result, got {other:?}"),
             }
-            _ => panic!("Expected role conflict result"),
         }
+    }
+
+    fn peer_request(local_ufrag: &str, role_attr: StunAttribute) -> StunMessage {
+        let mut request = StunMessage::new(StunMessageType::binding_request(), [1u8; 12]);
+        request.add_attribute(StunAttribute::Username(format!("{local_ufrag}:remote")));
+        request.add_attribute(StunAttribute::Priority(2130706431));
+        request.add_attribute(role_attr);
+        request
+    }
+
+    fn src() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5060)
+    }
+
+    fn local() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060)
+    }
+
+    fn serve(server: &IceStunServer, raw: &[u8]) -> IceResult<RequestOutcome> {
+        server.process_request(&StunMessage::parse(raw).unwrap(), raw, src(), local())
+    }
+
+    fn error_code(msg: &StunMessage) -> Option<u16> {
+        msg.attributes.iter().find_map(|a| match a {
+            StunAttribute::ErrorCode { code, .. } => Some(*code),
+            _ => None,
+        })
     }
 
     #[test]
     fn test_stun_server_process_request() {
         let local_creds = test_credentials();
         let server = IceStunServer::new(local_creds.clone(), IceRole::Controlled, 54321);
+        let request = peer_request(&local_creds.ufrag, StunAttribute::IceControlling(12345));
+        let raw = signed(&request, &local_creds.pwd);
 
-        // Create incoming request
-        let mut request = StunMessage::new(StunMessageType::binding_request(), [1u8; 12]);
-        request.add_attribute(StunAttribute::Username(format!(
-            "{}:remote",
-            local_creds.ufrag
-        )));
-        request.add_attribute(StunAttribute::Priority(2130706431));
-        request.add_attribute(StunAttribute::IceControlling(12345));
+        let outcome = serve(&server, &raw).unwrap();
+        assert!(outcome.signed);
+        assert_eq!(outcome.response.msg_type.class, StunClass::SuccessResponse);
+        assert_eq!(outcome.response.xor_mapped_address(), Some(src()));
 
-        let source_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5060);
-        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060);
+        // The encoded response is signed with our password.
+        let bytes = server.encode_response(&outcome).unwrap();
+        assert!(StunMessage::verify_integrity(
+            &bytes,
+            local_creds.pwd.as_bytes()
+        ));
+        assert!(StunMessage::has_valid_fingerprint(&bytes));
 
-        let (response, triggered) = server
-            .process_request(&request, source_addr, local_addr)
-            .unwrap();
-
-        // Verify response is a success
-        assert_eq!(response.msg_type.class, StunClass::SuccessResponse);
-
-        // Verify XOR-MAPPED-ADDRESS
-        assert_eq!(response.xor_mapped_address(), Some(source_addr));
-
-        // Verify triggered check info
-        let triggered = triggered.unwrap();
-        assert_eq!(triggered.source_addr, source_addr);
+        let triggered = outcome.triggered.unwrap();
+        assert_eq!(triggered.source_addr, src());
         assert_eq!(triggered.priority, 2130706431);
         assert!(!triggered.use_candidate);
+        assert!(triggered.role_conflict.is_none());
+    }
+
+    #[test]
+    fn unauthenticated_requests_change_nothing() {
+        let creds = test_credentials();
+        let server = IceStunServer::new(creds.clone(), IceRole::Controlling, 54321);
+        // A forged request: right ufrag (it is in the SDP), ICE-CONTROLLING
+        // with a larger tie-breaker, USE-CANDIDATE, no valid integrity.
+        let mut request = peer_request(&creds.ufrag, StunAttribute::IceControlling(u64::MAX));
+        request.add_attribute(StunAttribute::UseCandidate);
+
+        // No MESSAGE-INTEGRITY: 400, unsigned, no triggered check.
+        let raw = request.encode_with_fingerprint();
+        let out = serve(&server, &raw).unwrap();
+        assert_eq!(error_code(&out.response), Some(400));
+        assert!(!out.signed && out.triggered.is_none());
+        let bytes = server.encode_response(&out).unwrap();
+        assert!(!StunMessage::verify_integrity(&bytes, creds.pwd.as_bytes()));
+
+        // Wrong password: 401, unsigned, no triggered check.
+        let raw = signed(&request, "guessed-password-guessed");
+        let out = serve(&server, &raw).unwrap();
+        assert_eq!(error_code(&out.response), Some(401));
+        assert!(!out.signed && out.triggered.is_none());
+
+        // Wrong ufrag, right password: 401.
+        let other = peer_request("someone-else", StunAttribute::IceControlled(1));
+        let out = serve(&server, &signed(&other, &creds.pwd)).unwrap();
+        assert_eq!(error_code(&out.response), Some(401));
+
+        // No FINGERPRINT: dropped without a response.
+        let raw = request.encode_with_integrity(creds.pwd.as_bytes()).unwrap();
+        assert!(matches!(
+            serve(&server, &raw),
+            Err(IceError::Unauthenticated { .. })
+        ));
+    }
+
+    /// RFC 8445 §7.3.1.1, all four tie-breaker cases.
+    #[test]
+    fn role_conflict_follows_rfc8445_7_3_1_1() {
+        let creds = test_credentials();
+        let ours = 1_000u64;
+
+        // Both controlling, ours >= theirs: 487, keep controlling.
+        let server = IceStunServer::new(creds.clone(), IceRole::Controlling, ours);
+        let req = peer_request(&creds.ufrag, StunAttribute::IceControlling(ours));
+        let out = serve(&server, &signed(&req, &creds.pwd)).unwrap();
+        assert_eq!(error_code(&out.response), Some(487));
+        assert!(out.signed && out.triggered.is_none());
+
+        // Both controlling, ours < theirs: switch to controlled, accept,
+        // and honour USE-CANDIDATE under the new role.
+        let mut req = peer_request(&creds.ufrag, StunAttribute::IceControlling(ours + 1));
+        req.add_attribute(StunAttribute::UseCandidate);
+        let out = serve(&server, &signed(&req, &creds.pwd)).unwrap();
+        assert_eq!(out.response.msg_type.class, StunClass::SuccessResponse);
+        let t = out.triggered.unwrap();
+        assert_eq!(t.role_conflict, Some(IceRole::Controlled));
+        assert!(t.use_candidate);
+
+        // Both controlled, ours >= theirs: switch to controlling, accept.
+        let server = IceStunServer::new(creds.clone(), IceRole::Controlled, ours);
+        let req = peer_request(&creds.ufrag, StunAttribute::IceControlled(ours));
+        let out = serve(&server, &signed(&req, &creds.pwd)).unwrap();
+        assert_eq!(out.response.msg_type.class, StunClass::SuccessResponse);
+        assert_eq!(
+            out.triggered.unwrap().role_conflict,
+            Some(IceRole::Controlling)
+        );
+
+        // Both controlled, ours < theirs: 487, keep controlled.
+        let req = peer_request(&creds.ufrag, StunAttribute::IceControlled(ours + 1));
+        let out = serve(&server, &signed(&req, &creds.pwd)).unwrap();
+        assert_eq!(error_code(&out.response), Some(487));
+        assert!(out.triggered.is_none());
+    }
+
+    #[test]
+    fn use_candidate_is_ignored_by_a_controlling_agent() {
+        let creds = test_credentials();
+        let server = IceStunServer::new(creds.clone(), IceRole::Controlling, 5);
+        let mut req = peer_request(&creds.ufrag, StunAttribute::IceControlled(9));
+        req.add_attribute(StunAttribute::UseCandidate);
+        let out = serve(&server, &signed(&req, &creds.pwd)).unwrap();
+        assert!(!out.triggered.unwrap().use_candidate);
     }
 }

@@ -50,6 +50,16 @@
 {{- end -}}
 {{- end }}
 
+{{/* SR-33: the outside zone's external_ip is required and is never bare
+     "stun" (there is no default STUN server). Included from
+     11-sbc-configmap.yaml. */}}
+{{- define "sbc.outsideExternalIpPreflight" -}}
+{{- $ext := .Values.sbcDaemon.config.outside_external_ip | default "" | toString -}}
+{{- if or (eq $ext "") (eq $ext "stun") -}}
+{{- fail "sbcDaemon.config.outside_external_ip is required: the outside zone's public IP, or \"stun:<ip>:<port>\" for an operator-run STUN server (there is no default STUN server)" -}}
+{{- end -}}
+{{- end }}
+
 {{/* Render-time checks for the daemon gRPC settings (included from
      13-sbc-services.yaml and 26-sbc-grpc-mtls.yaml). */}}
 {{- define "sbc.grpcMtlsPreflight" -}}
@@ -297,12 +307,12 @@ signaling_interface = "__POD_IP__"
 media_interface = "__POD_IP__"
 # Outside zone faces the public internet (PSTN/SIP trunks). The pod's
 # RFC1918 address is unreachable from carriers, so SDP must advertise the
-# public NAT IP. "stun" tells the daemon to discover it at startup via
-# STUN — carriers like BulkVS need this to route initial RTP packets
-# rather than dropping them at our SDP'd private IP and waiting to latch
-# on outgoing RTP (which causes audible crackle as the jitter buffer
-# recovers).
-external_ip = "stun"
+# public NAT IP: sbcDaemon.config.outside_external_ip, either the public IP
+# itself (preferred) or "stun:<ip>:<port>" naming an operator-run STUN
+# server (SR-33: no public default, no DNS; a later different answer is
+# not applied unless transport.stun_accept_external_ip_change is set).
+# Checked at render time by sbc.outsideExternalIpPreflight.
+external_ip = {{ .Values.sbcDaemon.config.outside_external_ip | quote }}
 
 [[zones]]
 name = "oobm"

@@ -1443,9 +1443,39 @@ fn validate_zones(zones: &[crate::schema::ZoneConfig]) -> ConfigResult<()> {
                 message: format!("zone '{}': media_interface cannot be empty", zone.name),
             });
         }
+
+        if let Some(ext) = zone.external_ip.as_deref() {
+            validate_zone_external_ip(&zone.name, ext)?;
+        }
     }
 
     Ok(())
+}
+
+/// `zones[].external_ip` in STUN form must name an operator-run server as
+/// `stun:<ip>:<port>`. There is no default public server, and no host name
+/// (re-resolved on every refresh, it would let DNS choose the server).
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection), CM-6, SI-10
+fn validate_zone_external_ip(zone: &str, ext: &str) -> ConfigResult<()> {
+    if !ext.starts_with("stun") {
+        return Ok(());
+    }
+    let ok = ext
+        .strip_prefix("stun:")
+        .and_then(|server| server.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|addr| addr.port() != 0 && !addr.ip().is_unspecified());
+    if ok {
+        Ok(())
+    } else {
+        Err(ConfigError::Validation {
+            message: format!(
+                "zone '{zone}': external_ip {ext:?}: STUN discovery needs an operator-run \
+                 server as \"stun:<ip>:<port>\" (IP literal, no default server); \
+                 or set the public IP directly"
+            ),
+        })
+    }
 }
 
 fn validate_trunk_groups(config: &SbcConfig) -> ConfigResult<()> {
@@ -3339,6 +3369,42 @@ bogus = 1
 "
             )
             .is_err()
+        );
+    }
+
+    /// SR-33: STUN discovery needs an operator-pinned server given as an
+    /// IP literal; bare "stun" (formerly a public default) and host names
+    /// fail the load. Literal IPs and interface names are unaffected.
+    #[test]
+    fn zone_external_ip_stun_requires_pinned_ip_server() {
+        for bad in [
+            "stun",
+            "stun:",
+            "stun:stun.example.com:3478",
+            "stun:192.0.2.1",
+            "stun:192.0.2.1:0",
+            "stun:0.0.0.0:3478",
+            "stunx",
+        ] {
+            let mut z = zone("outside");
+            z.external_ip = Some(bad.to_string());
+            let e = validate_zones(&[z]).unwrap_err().to_string();
+            assert!(e.contains("operator-run"), "{bad}: {e}");
+        }
+        for good in [
+            "stun:192.0.2.1:3478",
+            "stun:[2001:db8::1]:3478",
+            "203.0.113.10",
+            "eth2",
+        ] {
+            let mut z = zone("outside");
+            z.external_ip = Some(good.to_string());
+            validate_zones(&[z]).unwrap();
+        }
+        assert!(
+            !SbcConfig::default()
+                .transport
+                .stun_accept_external_ip_change
         );
     }
 

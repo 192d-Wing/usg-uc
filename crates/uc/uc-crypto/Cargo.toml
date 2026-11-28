@@ -21,6 +21,9 @@ stir-shaken-es256 = ["dep:webpki", "dep:rustls-pki-types"]
 # CNSA-EXCEPTION: POA&M-211. Enables `interop::sha256` for the stored
 # SHA-256 API-key digest format (uc-auth).
 legacy-sha256 = []
+# CNSA-EXCEPTION: RFC 8489 §14.5 (POA&M-500). Enables `interop::hmac_sha1`
+# for STUN MESSAGE-INTEGRITY (proto-stun, ICE connectivity checks).
+stun-hmac-sha1 = []
 
 [dependencies]
 aws-lc-rs.workspace = true

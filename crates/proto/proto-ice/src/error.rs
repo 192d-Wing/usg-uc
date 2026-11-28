@@ -54,6 +54,17 @@ pub enum IceError {
     #[error("ICE role conflict detected")]
     RoleConflict,
 
+    /// A STUN message failed authentication (FINGERPRINT, USERNAME or
+    /// MESSAGE-INTEGRITY) and must be discarded without changing any
+    /// state (RFC 8489 §9.1.3, §9.1.4; RFC 8445 §7.2.5, §7.3).
+    ///
+    /// ## NIST 800-53 Rev5: IA-3, SC-8, SI-10
+    #[error("unauthenticated STUN message: {reason}")]
+    Unauthenticated {
+        /// Why it was discarded.
+        reason: String,
+    },
+
     /// STUN error.
     #[error("STUN error: {0}")]
     Stun(#[from] proto_stun::StunError),

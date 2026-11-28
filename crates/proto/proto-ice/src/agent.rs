@@ -137,46 +137,82 @@ pub struct IceCredentials {
     pub pwd: String,
 }
 
-impl IceCredentials {
-    /// Creates new credentials with random values.
-    pub fn generate() -> Self {
-        // Generate random ufrag (4-256 chars) and pwd (22-256 chars)
-        // Using simple random for now
-        let ufrag = Self::random_string(8);
-        let pwd = Self::random_string(24);
+/// `ice-char` alphabet (RFC 8839 §5.4: ALPHA / DIGIT / "+" / "/"). 64
+/// symbols, so each random byte masked to 6 bits picks one without bias.
+const ICE_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-        Self { ufrag, pwd }
+/// Length of a generated ufrag: 8 ice-chars, 48 random bits
+/// (RFC 8445 §5.3 requires at least 24).
+pub const UFRAG_LEN: usize = 8;
+
+/// Length of a generated password: 24 ice-chars, 144 random bits
+/// (RFC 8445 §5.3 requires at least 128).
+pub const PWD_LEN: usize = 24;
+
+impl IceCredentials {
+    /// Creates new credentials from the aws-lc DRBG (via `uc-crypto`).
+    ///
+    /// ## RFC 8445 §5.3; NIST 800-53 Rev5: IA-5, SC-13
+    ///
+    /// # Panics
+    /// Panics if the DRBG fails. That only happens when the crypto module
+    /// is in an error state; continuing with guessable credentials would be
+    /// worse. Use [`Self::try_generate`] to handle the failure instead.
+    #[allow(clippy::expect_used)]
+    pub fn generate() -> Self {
+        Self::try_generate().expect("DRBG failure generating ICE credentials")
+    }
+
+    /// Fallible form of [`Self::generate`].
+    ///
+    /// # Errors
+    /// Returns an error if the DRBG fails.
+    pub fn try_generate() -> IceResult<Self> {
+        Ok(Self {
+            ufrag: random_ice_string::<UFRAG_LEN>()?,
+            pwd: random_ice_string::<PWD_LEN>()?,
+        })
     }
 
     /// Creates credentials with specified values.
     pub fn new(ufrag: String, pwd: String) -> Self {
         Self { ufrag, pwd }
     }
-
-    fn random_string(len: usize) -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos()) as u64;
-
-        let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-            .chars()
-            .collect();
-
-        let mut result = String::with_capacity(len);
-        let mut state = seed;
-
-        for _ in 0..len {
-            // Simple LCG
-            state = state.wrapping_mul(1103515245).wrapping_add(12345);
-            let idx = (state >> 16) as usize % chars.len();
-            result.push(chars[idx]);
-        }
-
-        result
-    }
 }
+
+/// `N` ice-chars from the DRBG, 6 bits each.
+fn random_ice_string<const N: usize>() -> IceResult<String> {
+    let bytes: [u8; N] =
+        uc_crypto::random::generate_random().map_err(|_| IceError::ProtocolError {
+            reason: "DRBG failure".to_string(),
+        })?;
+    Ok(bytes
+        .iter()
+        .map(|b| char::from(ICE_CHARS[usize::from(b & 0x3F)]))
+        .collect())
+}
+
+/// Random 64-bit tie-breaker (RFC 8445 §7.1.1) from the DRBG.
+///
+/// # Panics
+/// Panics if the DRBG fails; see [`IceCredentials::generate`].
+#[allow(clippy::expect_used)]
+fn random_tie_breaker() -> u64 {
+    u64::from_be_bytes(
+        uc_crypto::random::generate_random().expect("DRBG failure generating ICE tie-breaker"),
+    )
+}
+
+/// Most remote candidates an agent accepts from the peer's SDP.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+pub const MAX_REMOTE_CANDIDATES: usize = 32;
+
+/// Most candidate pairs in a check list (RFC 8445 §6.1.2.5 recommends a
+/// limit, 100 by default).
+///
+/// ## NIST 800-53 Rev5: SC-5
+pub const MAX_CANDIDATE_PAIRS: usize = 100;
 
 /// ICE agent.
 #[derive(Debug)]
@@ -205,12 +241,11 @@ pub struct IceAgent {
 
 impl IceAgent {
     /// Creates a new ICE agent.
+    ///
+    /// # Panics
+    /// Panics if the DRBG fails; see [`IceCredentials::generate`].
     pub fn new(role: IceRole, config: IceConfig) -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let tie_breaker = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
+        let tie_breaker = random_tie_breaker();
 
         Self {
             role,
@@ -312,7 +347,20 @@ impl IceAgent {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
+    ///
+    /// At most [`MAX_REMOTE_CANDIDATES`] are kept; past it the candidate is
+    /// dropped and an error returned. Pairs are bounded by that cap times
+    /// the (local) candidate count, and the check list formed at
+    /// `start_checks` keeps the [`MAX_CANDIDATE_PAIRS`] highest-priority
+    /// pairs (RFC 8445 §6.1.2.5).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
     pub fn add_remote_candidate(&mut self, candidate: &Candidate) -> IceResult<()> {
+        if self.remote_candidates.len() >= MAX_REMOTE_CANDIDATES {
+            return Err(IceError::ProtocolError {
+                reason: "too many remote candidates".to_string(),
+            });
+        }
         // Add to remote candidates
         self.remote_candidates.push(candidate.clone());
 
@@ -1097,5 +1145,40 @@ mod tests {
             .iter()
             .any(|a| matches!(a, proto_stun::StunAttribute::UseCandidate));
         assert!(!has_use_candidate, "Controlled agent cannot nominate");
+    }
+
+    #[test]
+    fn credentials_come_from_the_drbg_in_ice_chars() {
+        let a = IceCredentials::generate();
+        let b = IceCredentials::generate();
+        assert_eq!(a.ufrag.len(), UFRAG_LEN);
+        assert_eq!(a.pwd.len(), PWD_LEN);
+        for c in a.ufrag.bytes().chain(a.pwd.bytes()) {
+            assert!(ICE_CHARS.contains(&c), "{c} is not an ice-char");
+        }
+        // Back-to-back calls differ (the old generator seeded from the
+        // clock repeated within one tick).
+        assert_ne!(a.ufrag, b.ufrag);
+        assert_ne!(a.pwd, b.pwd);
+        assert_ne!(
+            IceAgent::new(IceRole::Controlling, IceConfig::default()).tie_breaker(),
+            IceAgent::new(IceRole::Controlling, IceConfig::default()).tie_breaker()
+        );
+    }
+
+    #[test]
+    fn remote_candidates_are_capped() {
+        let mut agent = IceAgent::new(IceRole::Controlling, IceConfig::default());
+        agent.add_local_candidate(Candidate::host("192.0.2.1:5000".parse().unwrap(), 1));
+        for port in 0..MAX_REMOTE_CANDIDATES {
+            let addr = SocketAddr::new("198.51.100.1".parse().unwrap(), 10_000 + port as u16);
+            agent
+                .add_remote_candidate(&Candidate::host(addr, 1))
+                .unwrap();
+        }
+        let extra = Candidate::host("198.51.100.2:9".parse().unwrap(), 1);
+        assert!(agent.add_remote_candidate(&extra).is_err());
+        assert_eq!(agent.remote_candidates().len(), MAX_REMOTE_CANDIDATES);
+        assert!(agent.checklist().len() <= MAX_CANDIDATE_PAIRS);
     }
 }

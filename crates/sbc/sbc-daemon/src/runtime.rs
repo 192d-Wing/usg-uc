@@ -756,8 +756,11 @@ impl Runtime {
 
                     // Start external IP monitor for STUN-based zones
                     let stun_interval = config.transport.stun_refresh_interval_secs.unwrap_or(300);
-                    let monitor =
-                        crate::zone::ExternalIpMonitor::new(Arc::clone(&registry), stun_interval);
+                    let monitor = crate::zone::ExternalIpMonitor::new(
+                        Arc::clone(&registry),
+                        stun_interval,
+                        config.transport.stun_accept_external_ip_change,
+                    );
                     monitor.start();
                     info!(
                         "Zone registry initialized with {} zone(s)",

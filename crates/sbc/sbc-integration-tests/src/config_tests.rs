@@ -430,6 +430,11 @@ fn qa_helm_rendered_sbc_config_validates() {
             "\"Relay\"",
         ),
         ("{{ .Values.sbcDaemon.config.srtp_required }}", "true"),
+        // SR-33: required outside zone address (sbc.outsideExternalIpPreflight).
+        (
+            "{{ .Values.sbcDaemon.config.outside_external_ip | quote }}",
+            "\"203.0.113.10\"",
+        ),
         (
             "{{ .Values.sbcDaemon.config.metrics_listen | quote }}",
             "\"0.0.0.0:9090\"",

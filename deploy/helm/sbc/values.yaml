@@ -752,6 +752,13 @@ sbcDaemon:
     # The daemon also clamps them to RLIMIT_NOFILE at startup.
     max_connections_per_listener: 6000
     max_connections_total: 8000
+    # Required. Public address the outside zone advertises in SDP/Contact
+    # (behind NAT). Either the public IP (preferred, e.g. "203.0.113.10") or
+    # "stun:<ip>:<port>" for a STUN server you operate (IP literal; host
+    # names and bare "stun" are rejected, there is no default server). With
+    # STUN the first answer sets the address and later different answers
+    # are logged and audited but not applied (SR-33, NIST SC-7/SI-4).
+    outside_external_ip: ""
     media_mode: Relay
     srtp_required: true
     api_listen: "0.0.0.0:80"
