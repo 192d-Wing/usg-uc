@@ -367,6 +367,10 @@ pub struct RoutingCounters {
     /// `MAX_AORS_PER_FLOW` AORs (`sbc_flow_index_overflow_total`). Such a
     /// flow cannot place calls (SR-04, POA&M-398).
     pub flow_index_overflow: AtomicU64,
+    /// Requests refused (503) or processed statelessly because a server
+    /// transaction map was full (`sbc_transaction_table_full_total`,
+    /// SR-20).
+    pub transaction_table_full: AtomicU64,
 }
 
 /// Route patterns rejected (unknown `pattern_type`) at seed or sync time.
@@ -405,6 +409,11 @@ pub struct SipStackConfig {
     /// past it gets 503 + Retry-After; refreshes and de-registrations are
     /// always accepted.
     pub max_registrations: u32,
+    /// Bound of each server transaction map ([`MAX_SERVER_TRANSACTIONS`]
+    /// by default; not an `SbcConfig` key). A new request past it gets 503
+    /// with Retry-After; an in-dialog non-INVITE or a CANCEL is processed
+    /// statelessly (SC-5, SR-20).
+    pub max_server_transactions: usize,
     /// Extra concurrent calls above `max_calls` that only emergency calls
     /// may use (`general.emergency_reserve_calls`). Emergency INVITEs past
     /// `max_calls + emergency_reserve_calls` get 503 (SC-5).
@@ -467,6 +476,7 @@ impl Default for SipStackConfig {
             max_calls: 1000,
             emergency_reserve_calls: sbc_config::schema::default_emergency_reserve(1000),
             max_registrations: 50_000,
+            max_server_transactions: MAX_SERVER_TRANSACTIONS,
             admission_divisor: 1,
             emergency_numbers: uc_vps::EmergencyNumbers::new(&uc_vps::default_emergency_numbers()),
             trunk_retry_after_max_secs: sbc_config::schema::DEFAULT_TRUNK_RETRY_AFTER_MAX_SECS,
@@ -499,6 +509,9 @@ struct TransactionStore {
     /// INVITE's branch: picked up when that transaction is opened (RFC 3261
     /// §9.1). Capped at [`MAX_EARLY_CANCELS`], aged out after 64*T1 (SC-5).
     early_cancels: HashMap<String, EarlyCancel>,
+    /// When [`TransactionStore::sweep_if_needed`] last ran its full pass;
+    /// `None` before the first. Rate-limits the O(n) sweep (SR-20).
+    last_sweep: Option<Instant>,
 }
 
 /// A CANCEL waiting for its INVITE's client transaction
@@ -657,10 +670,40 @@ struct ClientNonInviteState {
     call: Option<CallId>,
 }
 
+/// Bound of each server transaction map (`server_invite`,
+/// `server_non_invite`). A new request that would open a server
+/// transaction past it gets 503 + Retry-After (SC-5, SR-20).
+///
+/// POAM: POA&M-490 fixed and shared by all sources; no per-source or
+/// trunk share.
+pub const MAX_SERVER_TRANSACTIONS: usize = 65_536;
+
+/// Extra server INVITE transactions above [`MAX_SERVER_TRANSACTIONS`] that
+/// only emergency INVITEs may open (RFC 6881 §5, 47 CFR 9.16).
+const EMERGENCY_TRANSACTION_HEADROOM: usize = 1024;
+
+/// `Retry-After` (seconds) on the 503 sent when a server transaction map
+/// is full (RFC 3261 §21.5.4).
+const TRANSACTION_TABLE_RETRY_AFTER_SECS: u32 = 5;
+
+/// Whether a server transaction may be opened (see
+/// [`TransactionStore::server_capacity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxnCapacity {
+    /// Room in the map.
+    Open,
+    /// The map is at its bound.
+    Full,
+}
+
 impl TransactionStore {
-    /// Sweep threshold: once any map exceeds this, stale entries are purged
-    /// on the next insert. Bounds memory against INVITE floods.
+    /// Sweep threshold: below it the backstop sweep never runs.
     const SWEEP_THRESHOLD: usize = 1024;
+
+    /// Shortest time between two backstop sweeps. Each sweep walks all
+    /// four maps, so it runs at most once per interval however fast
+    /// transactions are opened (SR-20).
+    const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// Backstop lifetime for a transaction that never reached Terminated.
     /// Terminated ones are pruned by `poll_timers` as their RFC 3261 timers
@@ -670,8 +713,20 @@ impl TransactionStore {
     const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 
     /// Removes transactions older than [`Self::MAX_AGE`] once any map has
-    /// grown past [`Self::SWEEP_THRESHOLD`]. Amortized O(1) per insert.
+    /// grown past [`Self::SWEEP_THRESHOLD`], at most once per
+    /// [`Self::SWEEP_INTERVAL`]. An insert costs O(1) plus at most one
+    /// O(n) pass per interval. Memory is bounded by the server map caps
+    /// ([`MAX_SERVER_TRANSACTIONS`]); client transactions are opened only
+    /// for requests the SBC sends, which admitted calls and server
+    /// transactions bound (POA&M-490).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
     fn sweep_if_needed(&mut self) {
+        self.sweep_if_needed_at(Instant::now());
+    }
+
+    /// [`Self::sweep_if_needed`] at `now`. Returns whether the full pass ran.
+    fn sweep_if_needed_at(&mut self, now: Instant) -> bool {
         let over = self
             .server_invite
             .len()
@@ -679,15 +734,42 @@ impl TransactionStore {
             .max(self.server_non_invite.len())
             .max(self.client_non_invite.len())
             > Self::SWEEP_THRESHOLD;
-        if !over {
-            return;
+        if !over
+            || self
+                .last_sweep
+                .is_some_and(|t| now.saturating_duration_since(t) < Self::SWEEP_INTERVAL)
+        {
+            return false;
         }
-        let now = std::time::Instant::now();
-        let young = |created: std::time::Instant| now.duration_since(created) < Self::MAX_AGE;
+        self.last_sweep = Some(now);
+        let young = |created: Instant| now.saturating_duration_since(created) < Self::MAX_AGE;
         self.server_invite.retain(|_, s| young(s.created_at));
         self.server_non_invite.retain(|_, s| young(s.created_at));
         self.client_invite.retain(|_, s| young(s.created_at));
         self.client_non_invite.retain(|_, s| young(s.created_at));
+        true
+    }
+
+    /// Whether a new server transaction for `method` fits under `cap`
+    /// (an emergency INVITE also gets [`EMERGENCY_TRANSACTION_HEADROOM`]).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    fn server_capacity(&self, method: &Method, cap: usize, emergency: bool) -> TxnCapacity {
+        let (len, cap) = if *method == Method::Invite {
+            let headroom = if emergency {
+                EMERGENCY_TRANSACTION_HEADROOM
+            } else {
+                0
+            };
+            (self.server_invite.len(), cap.saturating_add(headroom))
+        } else {
+            (self.server_non_invite.len(), cap)
+        };
+        if len < cap {
+            TxnCapacity::Open
+        } else {
+            TxnCapacity::Full
+        }
     }
 
     /// Drops transactions whose state machine has reached Terminated, and
@@ -3740,16 +3822,24 @@ impl SipStack {
     /// Opens a server transaction for a newly received request so later
     /// retransmissions are answered from the stored response and a non-2xx
     /// INVITE final is retransmitted on Timer G until ACKed.
+    ///
+    /// Returns [`TxnCapacity::Full`], opening nothing, when the request
+    /// would add an entry to a server map already at
+    /// `max_server_transactions` (emergency INVITEs get
+    /// [`EMERGENCY_TRANSACTION_HEADROOM`] more). One map probe per call;
+    /// the backstop sweep is rate-limited (SR-20).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
     async fn open_server_transaction(
         &self,
         req: &SipRequest,
         source: SbcSocketAddr,
         transport: AddrTransport,
         conn: Option<crate::stir_binding::ConnId>,
-    ) {
+    ) -> TxnCapacity {
         let txn_transport = txn_transport(transport);
         let Some(branch) = req.headers.via_branch() else {
-            return;
+            return TxnCapacity::Open;
         };
         let key = if req.method == Method::Invite {
             TransactionKey::server(&branch, "INVITE")
@@ -3761,8 +3851,22 @@ impl SipStack {
         };
         let call_id = req.headers.call_id().unwrap_or("").to_string();
         let now = Instant::now();
+        let cap = self.config.max_server_transactions;
         let mut txns = self.transactions.write().await;
         txns.sweep_if_needed();
+        let present = if req.method == Method::Invite {
+            txns.server_invite.contains_key(&key)
+        } else {
+            txns.server_non_invite.contains_key(&key)
+        };
+        if !present
+            && txns.server_capacity(&req.method, cap, false) == TxnCapacity::Full
+            && (req.method != Method::Invite
+                || !self.is_emergency_request_uri(req)
+                || txns.server_capacity(&req.method, cap, true) == TxnCapacity::Full)
+        {
+            return TxnCapacity::Full;
+        }
         // An entry with the same branch but another Call-ID belongs to an
         // earlier request (see `answer_request_retransmit`); replace it.
         if req.method == Method::Invite {
@@ -3771,7 +3875,7 @@ impl SipStack {
                 .get(&key)
                 .is_some_and(|st| st.call_id == call_id)
             {
-                return;
+                return TxnCapacity::Open;
             }
             txns.server_invite.insert(
                 key.clone(),
@@ -3791,8 +3895,8 @@ impl SipStack {
             );
         } else {
             // Never replaced (see `answer_request_retransmit`).
-            if txns.server_non_invite.contains_key(&key) {
-                return;
+            if present {
+                return TxnCapacity::Open;
             }
             txns.server_non_invite.insert(
                 key.clone(),
@@ -3811,6 +3915,50 @@ impl SipStack {
                 },
             );
         }
+        TxnCapacity::Open
+    }
+
+    /// Whether `req`'s Request-URI user is a configured emergency number
+    /// (the canonicaliser `handle_invite` uses).
+    fn is_emergency_request_uri(&self, req: &SipRequest) -> bool {
+        self.config
+            .emergency_numbers
+            .matches_number(&uc_types::DialedNumber::parse(
+                req.uri.user.as_deref().unwrap_or(""),
+            ))
+    }
+
+    /// What to do with a request whose server transaction map is full
+    /// (SR-20): an INVITE or an out-of-dialog request (no To tag) gets
+    /// 503 + Retry-After; a CANCEL or an in-dialog non-INVITE (BYE, UPDATE,
+    /// ...) of an established call is processed statelessly (`None`), so a
+    /// full table never strands a call that is already up.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
+    fn transaction_table_full(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+    ) -> Option<ProcessResult> {
+        self.routing_counters
+            .transaction_table_full
+            .fetch_add(1, Ordering::Relaxed);
+        let in_dialog = req.headers.to_tag().is_some();
+        if req.method == Method::Cancel || (in_dialog && req.method != Method::Invite) {
+            debug!(method = %req.method, source = %source, "Server transaction table full; processed statelessly");
+            return None;
+        }
+        warn!(method = %req.method, source = %source, "Server transaction table full, 503");
+        let mut response = create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+        response.headers.set(
+            HeaderName::RetryAfter,
+            TRANSACTION_TABLE_RETRY_AFTER_SECS.to_string(),
+        );
+        Some(ProcessResult::Response {
+            message: SipMessage::Response(response),
+            destination: source,
+            flow: Flow::Reply,
+        })
     }
 
     /// Bookkeeping for everything a handler puts on the wire: responses are
@@ -4049,6 +4197,9 @@ impl SipStack {
     /// A/E/G re-sends, Timer B/F timeouts turned into 408s, and BYEs for 2xx
     /// responses that were never ACKed. The daemon calls this every ~100 ms
     /// (a fraction of T1).
+    ///
+    /// POAM: POA&M-491 walks every transaction map per tick under the
+    /// write lock (bounded by the caps, O(n) per tick).
     pub async fn poll_timers(&self) -> Vec<ProcessResult> {
         // Requests queued off the request path (POA&M-184) open their client
         // transaction here (Timer E/F, RFC 3261 §17.1.2) and go out through
@@ -8139,14 +8290,7 @@ impl SipStack {
         // RFC 6881 §5, 47 CFR 9.16: an emergency INVITE is never refused by
         // the per-user limiter. Classified with the same canonicaliser as
         // `handle_invite`, so `9-1-1` / `%39%311` cannot slip past either.
-        if req.method == Method::Invite
-            && self
-                .config
-                .emergency_numbers
-                .matches_number(&uc_types::DialedNumber::parse(
-                    req.uri.user.as_deref().unwrap_or(""),
-                ))
-        {
+        if req.method == Method::Invite && self.is_emergency_request_uri(req) {
             self.routing_counters
                 .user_limiter_emergency_bypass
                 .fetch_add(1, Ordering::Relaxed);
@@ -9153,11 +9297,23 @@ impl SipStack {
             if let Some(rejected) = self.user_rate_limit(req, source, transport, conn).await {
                 return rejected;
             }
-            if matches!(check, TxnCheck::Stateless) {
+            // OPTIONS is always answered locally with the same 200
+            // (`handle_options`), so a copy needs no stored answer: it opens
+            // no server transaction and cannot fill the table (SC-5,
+            // SR-20).
+            if matches!(check, TxnCheck::Stateless) || method == Method::Options {
                 *stateless = true;
-            } else {
-                self.open_server_transaction(req, source, transport, conn)
-                    .await;
+            } else if self
+                .open_server_transaction(req, source, transport, conn)
+                .await
+                == TxnCapacity::Full
+            {
+                // SC-5 (SR-20): the table is bounded; see
+                // `transaction_table_full`.
+                if let Some(rejected) = self.transaction_table_full(req, source) {
+                    return rejected;
+                }
+                *stateless = true;
             }
         }
 
@@ -13629,15 +13785,31 @@ impl SipStack {
 
     /// Resolves trunk hosts to canonical (IP, transport) source keys off the
     /// async workers. A transport no trunk can use yields no key.
+    ///
+    /// Callers resolve before taking `trunk_sync` or `inbound_trunk_map`, so
+    /// a slow resolver never stalls admission (SR-24).
+    ///
+    /// ## NIST 800-53 Rev5: SC-5
     pub async fn resolve_trunk_sources(
         hosts: &[(String, AddrTransport)],
     ) -> HashSet<TrunkSourceKey> {
+        Self::resolve_trunk_sources_with(hosts, resolve_trunk_host_ips).await
+    }
+
+    /// [`Self::resolve_trunk_sources`] with the name resolver given.
+    pub(crate) async fn resolve_trunk_sources_with<R>(
+        hosts: &[(String, AddrTransport)],
+        resolve: R,
+    ) -> HashSet<TrunkSourceKey>
+    where
+        R: Fn(&str) -> Vec<std::net::IpAddr> + Send + 'static,
+    {
         let hosts: Vec<(String, AddrTransport)> = hosts.to_vec();
         tokio::task::spawn_blocking(move || {
             hosts
                 .iter()
                 .flat_map(|(h, t)| {
-                    resolve_trunk_host_ips(h)
+                    resolve(h)
                         .into_iter()
                         .filter_map(|ip| TrunkSourceKey::new(ip, *t))
                 })
@@ -13652,14 +13824,31 @@ impl SipStack {
     /// group ID and CSS, replacing the group's earlier entries; empty
     /// `hosts` clears the group.
     ///
-    /// NIST 800-53 Rev5: AC-3, AC-4, CM-3, SC-7
+    /// Names are resolved off the async workers before the map lock is
+    /// taken; the lock is held only to swap the group's entries (SR-24).
+    ///
+    /// NIST 800-53 Rev5: AC-3, AC-4, CM-3, SC-5, SC-7
     pub async fn register_inbound_trunk(
         &self,
         trunk_group_id: &str,
         css_id: Option<&str>,
         hosts: &[(String, AddrTransport)],
     ) {
-        let sources = Self::resolve_trunk_sources(hosts).await;
+        self.register_inbound_trunk_with(trunk_group_id, css_id, hosts, resolve_trunk_host_ips)
+            .await;
+    }
+
+    /// [`Self::register_inbound_trunk`] with the name resolver given.
+    async fn register_inbound_trunk_with<R>(
+        &self,
+        trunk_group_id: &str,
+        css_id: Option<&str>,
+        hosts: &[(String, AddrTransport)],
+        resolve: R,
+    ) where
+        R: Fn(&str) -> Vec<std::net::IpAddr> + Send + 'static,
+    {
+        let sources = Self::resolve_trunk_sources_with(hosts, resolve).await;
         self.register_inbound_trunk_sources(trunk_group_id, css_id, &sources)
             .await;
     }
@@ -15419,6 +15608,9 @@ pub mod tests {
     mod unauth_audit;
     // INVITE source admission by exact flow; trunk identity by transport (SR-04).
     mod source_admission;
+    // Transaction-table bound, admission scaling, trunk resolution off the
+    // admission lock (SR-20, SR-21, SR-24).
+    mod load_bounds;
 
     /// For server tests: a stack with trunks t1 (127.0.0.2:5061) and t2
     /// (127.0.0.3:5061), both TLS, and a placed call's primary B-leg INVITE
@@ -19750,14 +19942,16 @@ pub mod tests {
         assert!(responded(&r, 503).is_some());
     }
 
-    fn qa_options(n: u32) -> Bytes {
+    /// An out-of-dialog MESSAGE (405): a server non-INVITE transaction.
+    /// OPTIONS opens none (SR-20), so these tests use MESSAGE.
+    fn qa_nit(n: u32) -> Bytes {
         Bytes::from(format!(
-            "OPTIONS sip:sbc.local SIP/2.0\r\n\
+            "MESSAGE sip:bob@sbc.local SIP/2.0\r\n\
              Via: SIP/2.0/TCP 192.168.1.1:5060;branch=z9hG4bK-qopt-{n}\r\n\
              From: <sip:alice@example.com>;tag=q{n}\r\n\
-             To: <sip:sbc.local>\r\n\
+             To: <sip:bob@sbc.local>\r\n\
              Call-ID: qopt-{n}@test\r\n\
-             CSeq: 1 OPTIONS\r\n\
+             CSeq: 1 MESSAGE\r\n\
              Content-Length: 0\r\n\r\n"
         ))
     }
@@ -19769,14 +19963,19 @@ pub mod tests {
         let stack = SipStack::new(SipStackConfig::default());
         let out = flatten(
             stack
-                .process_message_on(&qa_options(1), alice(), None, AddrTransport::Tcp)
+                .process_message_on(&qa_nit(1), alice(), None, AddrTransport::Tcp)
                 .await,
         );
-        assert!(responded(&out, 200).is_some(), "{out:?}");
+        assert!(responded(&out, 405).is_some(), "{out:?}");
+        assert_eq!(
+            stack.transactions.read().await.server_non_invite.len(),
+            1,
+            "NIT opened"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let timers = stack.poll_timers().await;
         assert!(
-            responded(&timers, 200).is_none(),
+            responded(&timers, 405).is_none(),
             "no NIT response retransmit on TCP"
         );
         assert!(
@@ -19788,8 +19987,9 @@ pub mod tests {
     #[tokio::test]
     async fn qa_udp_server_non_invite_txn_absorbs_retransmit_during_timer_j() {
         let stack = SipStack::new(SipStackConfig::default());
-        let first = flatten(stack.process_message(&qa_options(2), alice(), None).await);
-        assert!(responded(&first, 200).is_some());
+        let message = qa_nit(2);
+        let first = flatten(stack.process_message(&message, alice(), None).await);
+        assert!(responded(&first, 405).is_some(), "{first:?}");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         stack.poll_timers().await;
         assert!(
@@ -19797,8 +19997,8 @@ pub mod tests {
             "UDP server NIT kept for Timer J"
         );
         // Retransmission is answered from the stored response.
-        let again = flatten(stack.process_message(&qa_options(2), alice(), None).await);
-        assert!(responded(&again, 200).is_some(), "{again:?}");
+        let again = flatten(stack.process_message(&message, alice(), None).await);
+        assert!(responded(&again, 405).is_some(), "{again:?}");
     }
 
     #[tokio::test]
