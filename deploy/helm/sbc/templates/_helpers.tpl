@@ -50,6 +50,16 @@
 {{- end -}}
 {{- end }}
 
+{{/* SR-33: the outside zone's external_ip is required and is never bare
+     "stun" (there is no default STUN server). Included from
+     11-sbc-configmap.yaml. */}}
+{{- define "sbc.outsideExternalIpPreflight" -}}
+{{- $ext := .Values.sbcDaemon.config.outside_external_ip | default "" | toString -}}
+{{- if or (eq $ext "") (eq $ext "stun") -}}
+{{- fail "sbcDaemon.config.outside_external_ip is required: the outside zone's public IP, or \"stun:<ip>:<port>\" for an operator-run STUN server (there is no default STUN server)" -}}
+{{- end -}}
+{{- end }}
+
 {{/* Render-time checks for the daemon gRPC settings (included from
      13-sbc-services.yaml and 26-sbc-grpc-mtls.yaml). */}}
 {{- define "sbc.grpcMtlsPreflight" -}}
@@ -301,11 +311,8 @@ media_interface = "__POD_IP__"
 # itself (preferred) or "stun:<ip>:<port>" naming an operator-run STUN
 # server (SR-33: no public default, no DNS; a later different answer is
 # not applied unless transport.stun_accept_external_ip_change is set).
-{{- $ext := .Values.sbcDaemon.config.outside_external_ip | default "" | toString }}
-{{- if or (eq $ext "") (eq $ext "stun") }}
-{{- fail "sbcDaemon.config.outside_external_ip is required: the outside zone's public IP, or \"stun:<ip>:<port>\" for an operator-run STUN server (there is no default STUN server)" }}
-{{- end }}
-external_ip = {{ $ext | quote }}
+# Checked at render time by sbc.outsideExternalIpPreflight.
+external_ip = {{ .Values.sbcDaemon.config.outside_external_ip | quote }}
 
 [[zones]]
 name = "oobm"
