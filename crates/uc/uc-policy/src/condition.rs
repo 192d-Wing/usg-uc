@@ -165,9 +165,9 @@ pub enum Condition {
     /// Always false.
     Never,
     /// Match source IP/network.
-    SourceIp(String),
+    SourceIp(IpMatch),
     /// Match destination IP/network.
-    DestIp(String),
+    DestIp(IpMatch),
     /// Match SIP method.
     Method(StringMatch),
     /// Match From URI.
@@ -207,12 +207,74 @@ pub enum Condition {
     Not(Box<Condition>),
 }
 
-/// Matches an IP address against a pattern with wildcard support.
-fn match_ip(value: Option<&str>, pattern: &str) -> ConditionMatch {
-    match value {
-        Some(ip) if ip.contains(pattern) || pattern == "*" => ConditionMatch::Matched,
-        Some(_) => ConditionMatch::NotMatched,
-        None => ConditionMatch::Unknown,
+/// A parsed IP address or network for [`Condition::SourceIp`] and
+/// [`Condition::DestIp`].
+///
+/// Patterns are parsed once, when the condition is built, so a malformed
+/// pattern is a configuration error rather than a condition that silently
+/// never matches. Matching is by network containment on the parsed address,
+/// never by substring (POA&M-490).
+// NIST 800-53 Rev5: AC-3 (access enforcement), SC-7 (boundary protection),
+// SI-10 (input validation)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpMatch {
+    /// `*`: any address.
+    Any,
+    /// An exact address (stored as a host network) or a CIDR network.
+    Net(ipnet::IpNet),
+}
+
+impl IpMatch {
+    /// Parses `*`, an exact IPv4/IPv6 address, or a CIDR network.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::InvalidCondition`] for anything else,
+    /// including partial-octet wildcards such as `198.51.100.*`.
+    pub fn parse(pattern: &str) -> PolicyResult<Self> {
+        let pattern = pattern.trim();
+        if pattern == "*" {
+            return Ok(Self::Any);
+        }
+        if let Ok(ip) = pattern.parse::<std::net::IpAddr>() {
+            return Ok(Self::Net(ipnet::IpNet::from(ip.to_canonical())));
+        }
+        pattern
+            .parse::<ipnet::IpNet>()
+            .map(|net| Self::Net(net.trunc()))
+            .map_err(|_| PolicyError::InvalidCondition {
+                reason: format!(
+                    "invalid IP pattern {pattern:?}: expected an IP address, a CIDR network or *"
+                ),
+            })
+    }
+
+    /// Returns `true` if `ip` is covered by this pattern. IPv4-mapped IPv6
+    /// addresses are compared as IPv4.
+    #[must_use]
+    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Net(net) => net.contains(&ip.to_canonical()),
+        }
+    }
+}
+
+impl std::str::FromStr for IpMatch {
+    type Err = PolicyError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+/// Matches a request address against a parsed IP pattern. An absent or
+/// unparseable address is `Unknown`, which never satisfies a condition.
+fn match_ip(value: Option<&str>, pattern: &IpMatch) -> ConditionMatch {
+    match value.map(|v| v.trim().parse::<std::net::IpAddr>()) {
+        Some(Ok(ip)) if pattern.contains(ip) => ConditionMatch::Matched,
+        Some(Ok(_)) => ConditionMatch::NotMatched,
+        Some(Err(_)) | None => ConditionMatch::Unknown,
     }
 }
 
@@ -614,5 +676,40 @@ mod tests {
         assert_eq!(ctx.source_ip.as_deref(), Some("192.168.1.100"));
         assert_eq!(ctx.method.as_deref(), Some("INVITE"));
         assert!(ctx.headers.contains_key("User-Agent"));
+    }
+
+    /// POA&M-490: IP conditions match by containment on a parsed pattern.
+    #[test]
+    fn ip_match_containment_not_substring() {
+        let exact = IpMatch::parse("3.0.113.5").unwrap();
+        let ctx = |ip: &str| RequestContext::new().with_source_ip(ip);
+        let cond = Condition::SourceIp(exact);
+        assert!(cond.matches(&ctx("3.0.113.5")));
+        assert!(cond.matches(&ctx("::ffff:3.0.113.5")));
+        for other in ["203.0.113.5", "13.0.113.57", "3.0.113.50"] {
+            assert!(!cond.matches(&ctx(other)), "{other}");
+        }
+        let net = Condition::SourceIp(IpMatch::parse("198.51.100.0/24").unwrap());
+        assert!(net.matches(&ctx("198.51.100.200")));
+        assert!(!net.matches(&ctx("198.51.101.1")));
+        // Host bits in a CIDR are ignored.
+        assert_eq!(
+            IpMatch::parse("198.51.100.7/24").unwrap(),
+            IpMatch::parse("198.51.100.0/24").unwrap()
+        );
+        assert!(Condition::SourceIp(IpMatch::Any).matches(&ctx("2001:db8::1")));
+        // An unparseable request address never satisfies the condition.
+        assert_eq!(
+            Condition::SourceIp(IpMatch::Any).evaluate(&ctx("not-an-ip")),
+            ConditionMatch::Unknown
+        );
+    }
+
+    #[test]
+    fn ip_match_rejects_malformed_patterns() {
+        for bad in ["198.51.100.*", "10.0.0", "10.0.0.0/33", "", "host.example"] {
+            assert!(IpMatch::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!("*".parse::<IpMatch>().unwrap(), IpMatch::Any);
     }
 }

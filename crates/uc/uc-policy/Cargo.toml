@@ -16,3 +16,4 @@ workspace = true
 uc-types.workspace = true
 tracing.workspace = true
 regex.workspace = true
+ipnet.workspace = true

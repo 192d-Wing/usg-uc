@@ -116,6 +116,11 @@ impl VpsConfig {
             {
                 return Err(format!("rule {}: day of week > 6", rule.id));
             }
+            if let Some(ref source) = rule.source_ip
+                && let Err(e) = uc_policy::IpMatch::parse(source)
+            {
+                return Err(format!("rule {}: source_ip: {e}", rule.id));
+            }
         }
         for source in &self.blocked_sources {
             if source.parse::<std::net::IpAddr>().is_err() {
@@ -288,7 +293,8 @@ pub struct VpsRuleConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callee_prefix: Option<String>,
 
-    /// Match source IP (substring/wildcard per `uc-policy` semantics).
+    /// Match source IP: an exact address, a CIDR network, or `*`. Anything
+    /// else fails validation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_ip: Option<String>,
 

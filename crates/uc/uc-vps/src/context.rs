@@ -132,19 +132,34 @@ impl CallAttempt {
     }
 }
 
+/// Strips a leading `scheme:` from `uri`, comparing the scheme ASCII
+/// case-insensitively (RFC 3261 §19.1.4: `SIP:` and `sip:` are the same
+/// scheme). Returns the remainder and whether the scheme was `tel`.
+fn strip_scheme(uri: &str) -> (&str, bool) {
+    for (scheme, is_tel) in [("sips:", false), ("sip:", false), ("tel:", true)] {
+        if let Some(head) = uri.get(..scheme.len())
+            && head.eq_ignore_ascii_case(scheme)
+        {
+            return (&uri[scheme.len()..], is_tel);
+        }
+    }
+    (uri, false)
+}
+
 /// Extracts the user part from a SIP URI string
 /// (`"sip:alice@example.com"` → `"alice"`). Returns `None` if there is no
 /// user part.
+///
+/// The scheme is matched case-insensitively, so `SIP:` and `Tel:` callers are screened like their lower-case forms (POA&M-491).
+///
+/// ## NIST 800-53 Rev5: SI-10 (Information Input Validation), AC-3
 pub fn uri_user(uri: &str) -> Option<&str> {
-    let rest = uri
-        .strip_prefix("sips:")
-        .or_else(|| uri.strip_prefix("sip:"))
-        .or_else(|| uri.strip_prefix("tel:"))
-        .unwrap_or(uri);
+    let uri = uri.trim();
+    let (rest, is_tel) = strip_scheme(uri);
     let user = rest.split('@').next()?;
     // Strip URI parameters from a tel: or user-only form.
     let user = user.split(';').next().unwrap_or(user);
-    if user.is_empty() || (!rest.contains('@') && !uri.starts_with("tel:")) {
+    if user.is_empty() || (!rest.contains('@') && !is_tel) {
         return None;
     }
     Some(user)
@@ -165,6 +180,14 @@ mod tests {
         assert_eq!(uri_user("tel:+15551234567"), Some("+15551234567"));
         assert_eq!(uri_user("sip:example.com"), None);
         assert_eq!(uri_user("sip:bob;p=x@host"), Some("bob"));
+        // POA&M-491: schemes are case-insensitive (RFC 3261 §19.1.4).
+        assert_eq!(uri_user("SIP:+19005551234@host"), Some("+19005551234"));
+        assert_eq!(uri_user("SipS:alice@host"), Some("alice"));
+        assert_eq!(uri_user("TEL:+15551234567;x=y"), Some("+15551234567"));
+        assert_eq!(uri_user(" sip:alice@host"), Some("alice"));
+        assert_eq!(uri_user("SIP:example.com"), None);
+        // Multi-byte input near the scheme boundary must not panic.
+        assert_eq!(uri_user("s\u{e9}:x"), None);
     }
 
     #[test]
