@@ -46,6 +46,26 @@ STUN discovery".
   the outside zone no longer renders `external_ip = "stun"`. Site values
   must set it before upgrading.
 
+### Security (SBC, STIR/SHAKEN verification, SR-35, SR-36, POA&M-510 to 512)
+
+Tested in local runs on macOS (2026-11-27).
+
+- **Changed:** the STI certificate cache is keyed by the canonical `x5u`
+  URL (host case, explicit `:443`, trailing root dot and an empty path no
+  longer make separate entries or fetches).
+- **Changed:** an `x5u`/`info` URL with a fragment (`#...`) is refused by
+  URL policy without a fetch (the existing bad-`info` failure, 436 under
+  `reject`).
+- **Changed:** one SIP source can run at most 2 concurrent certificate
+  fetches to one `x5u` host (the per-host cap stays 4); over the cap the
+  call takes the existing `cert-fetch-busy` path.
+- **Fixed:** with `stir_shaken.verification.require_identity = true`, an
+  INVITE whose Identity headers are all non-SHAKEN (for example
+  `ppt=div`) is now rejected with 428, as an INVITE without Identity is.
+  Before, it passed with `verstat=No-TN-Validation`.
+- POA&M-512 (open, accepted risk): URLs differing only in query string are
+  still separate cache entries.
+
 ### Security (SBC, TLS certificate revocation with CRL files, SR-29, POA&M-401 phase (a))
 
 Tested in local runs on macOS (2026-11-27). Operator details: SBC admin
