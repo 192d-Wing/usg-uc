@@ -110,7 +110,7 @@ impl VpsEngine {
         }
         if let Some(ref source) = rule.source_ip {
             // NIST 800-53 Rev5: AC-3, SC-7, SI-10 — parsed as an address or
-            // CIDR and matched by containment (POA&M-490).
+            // CIDR and matched by containment (POA&M-530).
             conditions.push(Condition::SourceIp(IpMatch::parse(source)?));
         }
         if let (Some(start), Some(end)) = (rule.time_start_hour, rule.time_end_hour) {
@@ -348,7 +348,7 @@ impl VpsEngine {
     /// rules are evaluated again with the callee replaced by `translated`
     /// (the number a carrier will receive), so a deny rule cannot be
     /// evaded by dialing a form that a transform rewrites into the denied
-    /// number (POA&M-492).
+    /// number (POA&M-532).
     ///
     /// Only an explicit deny rule rejects here; the default action already
     /// applied to the dialed number. No rate-limit token or per-callee slot
@@ -1167,7 +1167,7 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
     }
 
-    /// POA&M-490: a CIDR deny rule matches every address in the network
+    /// POA&M-530: a CIDR deny rule matches every address in the network
     /// and nothing outside it.
     #[test]
     fn source_ip_cidr_deny_matches_by_containment() {
@@ -1197,7 +1197,7 @@ mod tests {
         );
     }
 
-    /// POA&M-490: an exact-IP allow under default deny admits only that
+    /// POA&M-530: an exact-IP allow under default deny admits only that
     /// address, not addresses that contain it as a substring.
     #[test]
     fn source_ip_exact_allow_is_not_a_substring_match() {
@@ -1215,7 +1215,7 @@ mod tests {
         }
     }
 
-    /// POA&M-490: `*` and IPv6 networks keep working.
+    /// POA&M-530: `*` and IPv6 networks keep working.
     #[test]
     fn source_ip_wildcard_and_ipv6() {
         let config = VpsConfig {
@@ -1240,7 +1240,7 @@ mod tests {
         );
     }
 
-    /// POA&M-490: a malformed `source_ip` (including partial-octet
+    /// POA&M-530: a malformed `source_ip` (including partial-octet
     /// wildcards) fails validation instead of never matching.
     #[test]
     fn source_ip_invalid_pattern_is_a_config_error() {
@@ -1257,7 +1257,7 @@ mod tests {
         }
     }
 
-    /// POA&M-491: an upper- or mixed-case From scheme does not evade the
+    /// POA&M-531: an upper- or mixed-case From scheme does not evade the
     /// caller blocklist or a `caller_prefix` rule.
     #[test]
     fn caller_screening_ignores_from_scheme_case() {
@@ -1291,7 +1291,7 @@ mod tests {
         );
     }
 
-    /// POA&M-492: a callee deny rule is applied to the translated number,
+    /// POA&M-532: a callee deny rule is applied to the translated number,
     /// not only to the dialed one; default deny is not re-applied.
     #[test]
     fn translated_callee_rescreened_against_deny_rules() {

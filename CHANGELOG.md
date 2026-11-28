@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
-### BREAKING (SBC, VPS rule matching and translated-number screening, SR-28, SR-31, SR-32, POA&M-490..492 closed)
+### BREAKING (SBC, VPS rule matching and translated-number screening, SR-28, SR-31, SR-32, POA&M-530..532 closed)
 
 Tested in local runs on macOS (2026-11-27). Operator details: SBC admin
 guide, "VPS Rule Matching".
@@ -18,16 +18,34 @@ guide, "VPS Rule Matching".
   network or `*`. Other values, including partial wildcards such as
   `198.51.100.*`, now fail config validation. Matching is by address or
   network, no longer by substring, so CIDR deny rules now take effect and
-  an exact-IP allow rule admits only that address (POA&M-490). Exact-IP
+  an exact-IP allow rule admits only that address (POA&M-530). Exact-IP
   rules keep working. Rewrite `a.b.c.*` as `a.b.c.0/24`.
 - The caller number for `blocked_caller_prefixes` and `caller_prefix`
   rules is read from From URIs whatever the case of the scheme
-  (POA&M-491).
+  (POA&M-531).
 - When a route-pattern or dial-plan transform changes the called number,
   route-pattern blocks and VPS deny rules run again on the translated
   number. A match refuses the call with 403 (or the rule's status) before
   it reaches the trunk. `default_action` is not applied a second time, and
-  emergency calls are not screened again (POA&M-492).
+  emergency calls are not screened again (POA&M-532).
+
+### Security (SBC, SIP request-path load bounds, SR-20, SR-21, SR-24, POA&M-490, 491)
+
+Tested in local runs on macOS (2026-11-27).
+
+- **Transaction table cap:** each server transaction map (INVITE,
+  non-INVITE) holds at most 65,536 entries (fixed). A new request past the
+  cap gets 503 with `Retry-After: 5`; a CANCEL or an in-dialog non-INVITE is
+  processed statelessly; a re-INVITE gets 503; emergency INVITEs get 1,024
+  extra entries. New metric `sbc_transaction_table_full_total`.
+- **OPTIONS** no longer opens a server transaction: it is answered locally,
+  and a retransmission gets a fresh 200 instead of a stored copy.
+- **Transaction sweep:** the backstop age sweep runs at most once per second
+  instead of on every new transaction once a map passes 1,024 entries.
+- **Source admission and trunk resolution:** regression tests that INVITE
+  admission cost does not grow with the number of registrations and that
+  trunk host names are resolved before the trunk map lock is taken (both
+  fixed by SR-04, #262).
 
 ### Security (SBC, STIR/SHAKEN verification, SR-35, SR-36, POA&M-510 to 512)
 

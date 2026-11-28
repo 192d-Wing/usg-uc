@@ -150,7 +150,7 @@ fn strip_scheme(uri: &str) -> (&str, bool) {
 /// (`"sip:alice@example.com"` → `"alice"`). Returns `None` if there is no
 /// user part.
 ///
-/// The scheme is matched case-insensitively, so `SIP:` and `Tel:` callers are screened like their lower-case forms (POA&M-491).
+/// The scheme is matched case-insensitively, so `SIP:` and `Tel:` callers are screened like their lower-case forms (POA&M-531).
 ///
 /// ## NIST 800-53 Rev5: SI-10 (Information Input Validation), AC-3
 pub fn uri_user(uri: &str) -> Option<&str> {
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(uri_user("tel:+15551234567"), Some("+15551234567"));
         assert_eq!(uri_user("sip:example.com"), None);
         assert_eq!(uri_user("sip:bob;p=x@host"), Some("bob"));
-        // POA&M-491: schemes are case-insensitive (RFC 3261 §19.1.4).
+        // POA&M-531: schemes are case-insensitive (RFC 3261 §19.1.4).
         assert_eq!(uri_user("SIP:+19005551234@host"), Some("+19005551234"));
         assert_eq!(uri_user("SipS:alice@host"), Some("alice"));
         assert_eq!(uri_user("TEL:+15551234567;x=y"), Some("+15551234567"));

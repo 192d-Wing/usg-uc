@@ -213,7 +213,7 @@ pub enum Condition {
 /// Patterns are parsed once, when the condition is built, so a malformed
 /// pattern is a configuration error rather than a condition that silently
 /// never matches. Matching is by network containment on the parsed address,
-/// never by substring (POA&M-490).
+/// never by substring (POA&M-530).
 // NIST 800-53 Rev5: AC-3 (access enforcement), SC-7 (boundary protection),
 // SI-10 (input validation)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -678,7 +678,7 @@ mod tests {
         assert!(ctx.headers.contains_key("User-Agent"));
     }
 
-    /// POA&M-490: IP conditions match by containment on a parsed pattern.
+    /// POA&M-530: IP conditions match by containment on a parsed pattern.
     #[test]
     fn ip_match_containment_not_substring() {
         let exact = IpMatch::parse("3.0.113.5").unwrap();
