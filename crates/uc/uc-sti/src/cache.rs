@@ -1,15 +1,20 @@
 //! Bounded, single-flight STI certificate cache.
 //!
+//! - Entries are keyed by the canonical URL ([`X5uUrl::cache_key`]), so
+//!   spelling aliases of one URL (case, `:443`, trailing dot) share one
+//!   entry and one fetch; fragments are refused outright (POA&M-510).
 //! - Positive entries live for `min(ttl, Cache-Control max-age, notAfter)`
 //!   in a sharded O(1) LRU of at most `entries` URLs.
 //! - Fetch/validation failures are cached for `negative_ttl` in a separate,
-//!   smaller LRU (`entries / 4`), so a flood of bad `x5u` values can never
-//!   evict good certificates. URLs refused by the URL policy are not cached
+//!   smaller LRU (`entries / 4`), so a flood of bad `x5u` values never
+//!   evicts good certificates. URLs refused by the URL policy are not cached
 //!   at all (refusing them is already free).
 //! - One fetch per URL at a time; concurrent callers wait on it.
-//! - At most `max_concurrent_fetches` fetches run at once, and at most
-//!   [`MAX_FETCHES_PER_HOST`] per `x5u` host; beyond either a caller fails
-//!   fast with [`FetchError::Busy`] (never queues).
+//! - At most `max_concurrent_fetches` fetches run at once, at most
+//!   [`MAX_FETCHES_PER_HOST`] per `x5u` host, and at most
+//!   [`MAX_FETCHES_PER_SOURCE_HOST`] per (SIP source, host), so one source
+//!   cannot hold every slot of a host other peers' calls depend on; beyond
+//!   any cap a caller fails fast with [`FetchError::Busy`] (never queues).
 //! - At most `max_fetches_per_source` new fetches started on behalf of one
 //!   SIP source (IPv4 address or IPv6 /64), so one peer presenting `x5u`
 //!   URLs on many hosts it controls cannot hold every fetch permit
@@ -43,6 +48,12 @@ const MAX_CHAIN_CERTS: usize = 8;
 /// Most concurrent fetches to one `x5u` host (on top of the global cap), so
 /// one slow or hostile host cannot take every fetch permit.
 pub const MAX_FETCHES_PER_HOST: usize = 4;
+/// Most concurrent fetches one SIP source ([`SourceKey`]) may hold to one
+/// `x5u` host; below [`MAX_FETCHES_PER_HOST`] so a single source always
+/// leaves host slots for others.
+///
+/// NIST 800-53 Rev5: SC-5 (POA&M-510)
+pub const MAX_FETCHES_PER_SOURCE_HOST: usize = 2;
 /// Default most concurrent fetches started for one SIP source
 /// ([`CacheConfig::max_fetches_per_source`]).
 pub const DEFAULT_MAX_FETCHES_PER_SOURCE: usize = 4;
@@ -207,8 +218,8 @@ pub struct CacheStats {
     pub fetches: AtomicU64,
     /// Fetches refused (busy).
     pub busy: AtomicU64,
-    /// Fetches refused because the source's budget was spent (also
-    /// counted in `busy`).
+    /// Fetches refused because the source's budget, overall or for the
+    /// host, was spent (also counted in `busy`).
     pub busy_source: AtomicU64,
     /// Fetch results dropped because the anchors changed meanwhile.
     pub stale_results: AtomicU64,
@@ -226,10 +237,19 @@ struct Inflight {
     /// Running fetches by source (bounded by the global permit count;
     /// entries removed at zero).
     sources: HashMap<SourceKey, usize>,
+    /// Running fetches by (source, host) (entries removed at zero).
+    source_hosts: HashMap<(SourceKey, String), usize>,
 }
 
 impl Inflight {
     fn release(&mut self, host: &str, source: SourceKey) {
+        let sh = (source, host.to_owned());
+        if let Some(n) = self.source_hosts.get_mut(&sh) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.source_hosts.remove(&sh);
+            }
+        }
         if let Some(n) = self.hosts.get_mut(host) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -364,6 +384,12 @@ impl StiCertCache {
         })
     }
 
+    /// Distinct (source, host) pairs with a running fetch.
+    #[must_use]
+    pub fn inflight_source_hosts(&self) -> usize {
+        self.inflight.lock().map_or(0, |m| m.source_hosts.len())
+    }
+
     /// Distinct sources with a running fetch.
     #[must_use]
     pub fn inflight_sources(&self) -> usize {
@@ -407,12 +433,13 @@ impl StiCertCache {
         self.negative.clear();
     }
 
-    fn lookup(&self, x5u: &str) -> Option<Outcome> {
+    /// Looks up a canonical key ([`X5uUrl::cache_key`]).
+    fn lookup(&self, key: &str) -> Option<Outcome> {
         let now = (self.clock)();
-        if let Some(k) = self.positive.get(x5u, now) {
+        if let Some(k) = self.positive.get(key, now) {
             return Some(Ok(k));
         }
-        self.negative.get(x5u, now).map(Err)
+        self.negative.get(key, now).map(Err)
     }
 
     /// Stores a fetch result unless the anchor generation moved on since
@@ -420,19 +447,19 @@ impl StiCertCache {
     /// [`Self::invalidate`] bumps it before clearing, so a result validated
     /// under removed anchors can never outlive the clear (SEC-010).
     /// Returns false when the result is stale.
-    fn store(&self, x5u: &str, outcome: &Outcome, ttl: u64, generation: u64) -> bool {
+    fn store(&self, key: &str, outcome: &Outcome, ttl: u64, generation: u64) -> bool {
         let current = || self.generation() == generation;
         let expires = (self.clock)().saturating_add(ttl);
         let stored = current()
             && match outcome {
                 Ok(k) => {
-                    self.negative.remove(x5u);
+                    self.negative.remove(key);
                     self.positive
-                        .insert_if(x5u, Arc::clone(k), expires, current)
+                        .insert_if(key, Arc::clone(k), expires, current)
                 }
                 Err(e) => {
-                    self.positive.remove(x5u);
-                    self.negative.insert_if(x5u, e.clone(), expires, current)
+                    self.positive.remove(key);
+                    self.negative.insert_if(key, e.clone(), expires, current)
                 }
             };
         if !stored && !current() {
@@ -488,7 +515,11 @@ impl StiCertCache {
         x5u: &str,
         deadline: Duration,
     ) -> Outcome {
-        if let Some(o) = self.lookup(x5u) {
+        // Policy refusals are not cached: re-checking is cheaper than a
+        // cache slot an attacker could fill with unique bad URLs.
+        let url = X5uUrl::parse(x5u, &self.cfg.allow_hosts)?;
+        let key = url.cache_key();
+        if let Some(o) = self.lookup(&key) {
             let counter = if o.is_ok() {
                 &self.stats.hits
             } else {
@@ -497,23 +528,27 @@ impl StiCertCache {
             counter.fetch_add(1, Ordering::Relaxed);
             return o;
         }
-        // Policy refusals are not cached: re-checking is cheaper than a
-        // cache slot an attacker could fill with unique bad URLs.
-        let url = X5uUrl::parse(x5u, &self.cfg.allow_hosts)?;
 
         let mut rx = {
             let Ok(mut inflight) = self.inflight.lock() else {
                 return Err(FetchError::Busy);
             };
-            if let Some(rx) = inflight.urls.get(x5u) {
+            if let Some(rx) = inflight.urls.get(&key) {
                 rx.clone()
-            } else if let Some(o) = self.lookup(x5u) {
+            } else if let Some(o) = self.lookup(&key) {
                 // Filled between the first lookup and taking `inflight`.
                 return o;
             } else {
                 let per_host = inflight.hosts.get(&url.host).copied().unwrap_or(0);
                 if per_host >= MAX_FETCHES_PER_HOST {
                     self.stats.busy.fetch_add(1, Ordering::Relaxed);
+                    return Err(FetchError::Busy);
+                }
+                let sh = (source, url.host.clone());
+                let per_source_host = inflight.source_hosts.get(&sh).copied().unwrap_or(0);
+                if per_source_host >= MAX_FETCHES_PER_SOURCE_HOST {
+                    self.stats.busy.fetch_add(1, Ordering::Relaxed);
+                    self.stats.busy_source.fetch_add(1, Ordering::Relaxed);
                     return Err(FetchError::Busy);
                 }
                 let per_source = inflight.sources.get(&source).copied().unwrap_or(0);
@@ -527,14 +562,15 @@ impl StiCertCache {
                     return Err(FetchError::Busy);
                 };
                 let (tx, rx) = watch::channel(None);
-                inflight.urls.insert(x5u.to_owned(), rx.clone());
+                inflight.urls.insert(key.clone(), rx.clone());
                 *inflight.hosts.entry(url.host.clone()).or_insert(0) += 1;
                 *inflight.sources.entry(source).or_insert(0) += 1;
+                *inflight.source_hosts.entry(sh).or_insert(0) += 1;
                 self.stats.fetches.fetch_add(1, Ordering::Relaxed);
                 let generation = self.generation();
                 let slot = FetchSlot {
                     cache: Arc::clone(self),
-                    key: x5u.to_owned(),
+                    key,
                     host: url.host.clone(),
                     source,
                     generation,
@@ -629,7 +665,8 @@ impl StiCertCache {
 
 impl KeyResolver for StiCertCache {
     fn cached(&self, x5u: &str) -> Option<Arc<VerifiedKey>> {
-        self.lookup(x5u).and_then(Result::ok)
+        let url = X5uUrl::parse(x5u, &self.cfg.allow_hosts).ok()?;
+        self.lookup(&url.cache_key()).and_then(Result::ok)
     }
 }
 
