@@ -2828,6 +2828,14 @@ struct PendingReinvite {
     switch: Option<PendingSwitch>,
 }
 
+/// The call and side that sent a T.38-involved re-INVITE offer.
+#[derive(Clone, Copy)]
+struct Offerer<'a> {
+    addrs: &'a CallAddresses,
+    /// The offer came from the A-leg.
+    a_leg: bool,
+}
+
 /// A re-INVITE whose offer involves an `m=image` stream or leaves image
 /// mode. RFC 3261 §14.1: the relay changes only when the far side accepts.
 #[derive(Clone)]
@@ -6358,8 +6366,10 @@ impl SipStack {
             self.apply_t38_answer(
                 sdp_str,
                 sw,
-                addrs,
-                pending.from_a_leg,
+                Offerer {
+                    addrs,
+                    a_leg: pending.from_a_leg,
+                },
                 session_key,
                 &local_media,
                 t38,
@@ -6491,12 +6501,15 @@ impl SipStack {
         &self,
         sdp: &str,
         sw: &PendingSwitch,
-        addrs: &CallAddresses,
-        from_a_leg: bool,
+        offerer: Offerer<'_>,
         session_key: &str,
         local_media: &MediaAddress,
         out: &mut T38AnswerOutcome,
     ) -> String {
+        let Offerer {
+            addrs,
+            a_leg: from_a_leg,
+        } = offerer;
         let kind_change = sw.offered_kind != sw.prev_kind;
         match crate::t38::check_answer(sdp, sw.offered_index, sw.offered_kind, &self.t38) {
             crate::t38::AnswerCheck::Accepted(c) => {
