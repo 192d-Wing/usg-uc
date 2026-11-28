@@ -45,6 +45,9 @@ type Params struct {
 	// SHA-384 (CNSA 2.0), e.g. "sha-384 AB:CD:...". DTLS-SRTP is authenticated
 	// by this fingerprint, so it must be present.
 	PeerFingerprint string
+	// Pool bounds the pre-handshake bytes of every association sharing it
+	// (see handshakeLimiter); nil means the process-wide default pool.
+	Pool *HandshakePool
 }
 
 // Result is a DTLS-SRTP association whose handshake has completed.
@@ -52,8 +55,21 @@ type Result struct {
 	SRTPKeys []byte                     // exported keying material (srtpKeyLen)
 	Profile  dtls.SRTPProtectionProfile // negotiated SRTP profile
 
-	conn *dtls.Conn // owned by the caller; tear down via Close() at session end
-	gate *plaintextGate
+	conn    *dtls.Conn // owned by the caller; tear down via Close() at session end
+	gate    *plaintextGate
+	limiter *handshakeLimiter
+}
+
+// DroppedPreHandshake returns how many inbound datagrams were withheld from
+// pion during the handshake because the association's or the process's
+// pre-handshake budget was spent, and, for the life of the association, how
+// many carried an unprotected handshake fragment with a message_seq the
+// peer's role never sends (see handshakeLimiter).
+func (r *Result) DroppedPreHandshake() uint64 {
+	if r == nil || r.limiter == nil {
+		return 0
+	}
+	return r.limiter.dropped()
 }
 
 // DroppedUnprotected returns how many inbound datagrams were withheld from
@@ -227,7 +243,12 @@ func Run(ctx context.Context, conn net.PacketConn, rAddr net.Addr, p Params) (*R
 	// Under the guard, for the life of the association: after the handshake
 	// unprotected alerts are no longer let through to pion.
 	gate := newPlaintextGate(conn)
-	guard := newGroupGuard(gate, p.Role == RoleClient, abort)
+	// NIST 800-53 Rev5: SC-5. Bounds what the handshake can make pion keep;
+	// the pool charge is returned when Run returns (deferred, so after the
+	// gate is armed on success).
+	limiter := newHandshakeLimiter(gate, p.Pool, p.Role == RoleClient)
+	defer limiter.release()
+	guard := newGroupGuard(limiter, p.Role == RoleClient, abort)
 
 	var conn2 *dtls.Conn
 	var err error
@@ -261,9 +282,13 @@ func Run(ctx context.Context, conn net.PacketConn, rAddr net.Addr, p Params) (*R
 		if n := guard.dropped.Load(); n > 0 {
 			return nil, fmt.Errorf("%w (%d datagram(s) dropped: %w)", err, n, errPeerGroupOutsideProfile)
 		}
+		if n := limiter.dropped(); n > 0 {
+			return nil, fmt.Errorf("%w (%d datagram(s) dropped: %w)", err, n, errPreHandshakeBudget)
+		}
 		return nil, err
 	}
 	res.gate = gate
+	res.limiter = limiter
 	gate.arm()
 	return res, nil
 }
@@ -282,6 +307,10 @@ var (
 	// ServerKeyExchange on another group were dropped. Unauthenticated: it
 	// explains a failed handshake, it does not prove what the peer sent.
 	errPeerGroupOutsideProfile = errors.New("ServerKeyExchange on a group outside the profile (CNSA 2.0 requires ECDHE on P-384)")
+	// errPreHandshakeBudget: datagrams were withheld from the handshake by
+	// handshakeLimiter (over budget, pool full, or an out-of-range
+	// message_seq). Explains a failed handshake; unauthenticated.
+	errPreHandshakeBudget = errors.New("pre-handshake datagram budget exceeded")
 )
 
 // finishHandshake completes the handshake, confirms the required SRTP profile

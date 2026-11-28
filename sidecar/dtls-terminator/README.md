@@ -103,10 +103,23 @@ only that and keeps passing), and its `Start` is answered with
 `Error{"session-limit: ..."}`: that leg's handshake fails and the call is
 refused, the calls in progress are not touched. Refusals are logged (the first
 and every 1000th), and once a minute the sidecar logs
-`sessions: active=N peak=N max=N refused=N` while it has sessions. That line
+`sessions: active=N peak=N max=N refused=N handshake_pool_bytes=N handshake_pool_refused=N` while it has sessions. That line
 is the only view of the count: there is no metric, the sizing below has not
 been measured on Linux, and the descriptor limit is not checked against the
 cap (NIST POA&M-342).
+
+Not in the 150 KiB: what a session's own peer can make it keep until the call
+ends. Before the handshake completes each session delivers at most 32
+datagrams and 16 KiB to pion, and epoch-0 handshake fragments with a
+message_seq the peer's role never sends are dropped (`prehandshake.go`);
+handshakes in progress share a 32 MiB pool, returned as each handshake ends.
+After the handshake the plaintext gate admits at most 32 handshake-class
+datagrams and 16 KiB, and an association hands pion at most 128 handshake
+fragments over its life (pion keeps each fragment as an object of its own). So
+about 55 KiB per session more; for hostile peers size with
+`16 MiB + max_calls x 260 KiB` (NIST POA&M-520, POA&M-342). The
+once-a-minute line also carries `handshake_pool_bytes` and
+`handshake_pool_refused`.
 
 Memory limit of the container: `16 MiB + max_calls x 150 KiB`, with headroom
 for the garbage collector, and `GOMEMLIMIT` set to about 90 % of the limit so
