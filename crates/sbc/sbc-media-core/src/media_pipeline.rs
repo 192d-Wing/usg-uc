@@ -526,7 +526,23 @@ pub trait MediaController: Send + Sync {
 
     /// Allocates a standalone RTP/RTCP port pair (for announcement playback),
     /// returning `(rtp, rtcp)`. Replaces reaching into the internal allocator.
+    /// The pair stays allocated until [`Self::release_ports`].
     async fn allocate_ports(&self) -> Result<(u16, u16), MediaPipelineError>;
+
+    /// Whether [`Self::allocate_ports`] draws from this process's relay port
+    /// pool, so the caller may bind the port locally and must hand it back
+    /// with [`Self::release_ports`]. Default `false` (remote media nodes: a
+    /// port allocated there is not this host's to bind, and the RPC has no
+    /// release).
+    fn allocates_local_ports(&self) -> bool {
+        false
+    }
+
+    /// Returns a pair from [`Self::allocate_ports`] to the pool (SR-25: a
+    /// pair that is never returned shrinks the relay range for good).
+    /// Default: no-op.
+    // NIST 800-53 Rev5: SC-5 (resource availability)
+    async fn release_ports(&self, _rtp_port: u16) {}
 
     /// Records what the anchored stream carries (audio or T.38 image), for
     /// metrics attribution and latching grace. Default: no-op; the in-process
@@ -666,6 +682,14 @@ impl MediaController for MediaPipeline {
 
     async fn allocate_ports(&self) -> Result<(u16, u16), MediaPipelineError> {
         self.port_allocator().allocate_pair().await
+    }
+
+    fn allocates_local_ports(&self) -> bool {
+        true
+    }
+
+    async fn release_ports(&self, rtp_port: u16) {
+        self.port_allocator().release_pair(rtp_port).await;
     }
 
     async fn set_media_kind(
@@ -4866,6 +4890,31 @@ mod tests {
     /// The free list hands out each pair once, takes a released pair back
     /// once (a repeated or stray release does not duplicate it), and ignores
     /// ports that are not the RTP port of a pair in range.
+    /// SR-25: standalone pairs (announcements) go back to the pool through
+    /// the controller trait, so repeated plays never exhaust the range.
+    #[tokio::test]
+    async fn controller_standalone_pairs_are_released() {
+        let pipeline = MediaPipeline::new(MediaPipelineConfig {
+            rtp_port_min: 41_000,
+            rtp_port_max: 41_003,
+            ..MediaPipelineConfig::default()
+        });
+        let ctl: &dyn MediaController = &pipeline;
+        assert!(ctl.allocates_local_ports());
+        for _ in 0..10 {
+            let (rtp_port, control_port) = ctl.allocate_ports().await.unwrap();
+            assert_eq!(control_port, rtp_port + 1);
+            ctl.release_ports(rtp_port).await;
+        }
+        assert_eq!(pipeline.port_allocator().allocated_port_count().await, 0);
+        let a = ctl.allocate_ports().await.unwrap();
+        let b = ctl.allocate_ports().await.unwrap();
+        assert!(ctl.allocate_ports().await.is_err());
+        ctl.release_ports(a.0).await;
+        ctl.release_ports(b.0).await;
+        assert_eq!(pipeline.port_allocator().allocated_port_count().await, 0);
+    }
+
     #[tokio::test]
     async fn port_allocator_free_list_release_is_idempotent() {
         let allocator = RtpPortAllocator::new(40_000, 40_007);

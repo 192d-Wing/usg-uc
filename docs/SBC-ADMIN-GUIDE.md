@@ -1057,7 +1057,10 @@ default_mode = "Relay"
 # Must be the default set (order-insensitive); any other list is rejected
 codecs = ["Opus", "G722", "G711Ulaw", "G711Alaw"]
 
-# RTP port range for media relay
+# RTP port range for media relay. A relayed call takes 2 pairs; size the
+# range for 2 pairs per call (max_calls plus the emergency reserve), or
+# calls beyond it are refused with 503 (startup warning
+# config.media_capacity_warning).
 rtp_port_min = 16384
 rtp_port_max = 32768
 
@@ -1618,6 +1621,13 @@ matched as IP addresses or DNS labels, not by string prefix, so
 /128 (IPv6), a malformed CIDR, or an invalid domain fails validation, and
 the daemon will not start. All three keys are optional. Older configurations
 that omit them load with the defaults shown.
+
+The same internal set (or the built-in set alone when topology hiding is
+off) also limits relayed media: a caller whose signalling address is outside
+it cannot name an internal address in its SDP as the relay target. Callers
+that are not configured trunks also cannot name a port below 1024 or a
+trunk host, and no leg can name an SBC address. A refused SDP address is
+logged ("Ignoring disallowed media address in SDP") and not relayed to.
 
 Scope: topology hiding is applied to every request and response sent
 toward a hidden leg (POA&M-155). Toward a hidden leg the SBC also removes

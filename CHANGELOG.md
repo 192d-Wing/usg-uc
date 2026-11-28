@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### Security (SBC, anchored SDP and media targets; no-route announcement ports, SR-18, SR-19, SR-25, POA&M-480..482)
+
+Tested in local runs on macOS (2026-11-27).
+
+- **SDP rewrite (anchored media):** `a=candidate`, `a=remote-candidates`,
+  `a=end-of-candidates`, all `a=ice-*` attributes and `a=rtcp:` are now
+  removed from SDP the SBC anchors (offer, answer, re-INVITE, hold, resume).
+  RTCP defaults to the anchored RTP port + 1. `a=rtcp-mux`, `a=rtcp-fb` and
+  `a=rtcp-rsize` are kept. ICE-only peers (WebRTC browsers) cannot use
+  anchored media (POA&M-480).
+- **Media relay targets:** an SDP media address is used as the relay remote
+  only when admitted for its leg. Every leg: no SBC address (zone signalling,
+  media or external IP). A leg that is not a configured trunk: no port below
+  1024, no configured trunk host, and no internal address
+  (`topology_hiding.internal_networks`, or the built-in private ranges when
+  hiding is off) when its signalling peer is external. A refused address is
+  logged and not relayed to. Residuals: POA&M-481.
+- **Behaviour change:** a relayed INVITE whose media session cannot be
+  created (for example the RTP port range is exhausted) is now refused with
+  503 and `Retry-After` (CDR release cause `media_failure`) instead of being
+  answered with no relay.
+- **No-route announcements:** the in-process player returns its RTP pair to
+  the relay pool when playback ends; with a remote media plane it binds an
+  ephemeral port and no longer allocates on a media node. Audio is sent only
+  to the INVITE's source IP unless the INVITE came from a configured trunk.
+- **New startup warning** `config.media_capacity_warning`: the RTP port range
+  has fewer than 2 pairs per admissible call (`general.max_calls` share plus
+  the emergency reserve). The shipped defaults trigger it; it is a warning,
+  not an error (POA&M-482).
+- **Libraries:** `sbc-media-core` `MediaController` gains
+  `allocates_local_ports` and `release_ports` (both defaulted);
+  `sbc-config` adds `validate::media_capacity_warnings` and
+  `RTP_PAIRS_PER_CALL`.
+
 ### Security (SBC, SIP request-path load bounds, SR-20, SR-21, SR-24, POA&M-490, 491)
 
 Tested in local runs on macOS (2026-11-27).

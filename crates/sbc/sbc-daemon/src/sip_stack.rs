@@ -84,6 +84,10 @@ use dialog_match::{
     RequestIdentity,
 };
 
+// SDP media address admission as a relay target (SR-19): pure.
+mod media_target;
+use media_target::{MediaLeg, MediaTargetFacts};
+
 // Inbound trunk identity by (canonical source IP, arrival transport): pure.
 mod trunk_source;
 pub use trunk_source::TrunkSourceKey;
@@ -2906,6 +2910,14 @@ struct PendingReinvite {
     switch: Option<PendingSwitch>,
 }
 
+/// The call and side that sent a T.38-involved re-INVITE offer.
+#[derive(Clone, Copy)]
+struct Offerer<'a> {
+    addrs: &'a CallAddresses,
+    /// The offer came from the A-leg.
+    a_leg: bool,
+}
+
 /// A re-INVITE whose offer involves an `m=image` stream or leaves image
 /// mode. RFC 3261 §14.1: the relay changes only when the far side accepts.
 #[derive(Clone)]
@@ -4456,6 +4468,67 @@ impl SipStack {
             .map(LegHiding::of)
     }
 
+    /// Turns an SDP media address named by `leg` into a relay target, or
+    /// `None` when the SR-19 policy refuses it ([`media_target`]).
+    /// `call_media_ips` are the media addresses this call advertises; they
+    /// count as SBC-owned only with a zone registry, because without one the
+    /// advertised address falls back to the caller's own source IP
+    /// (`zone_media_bind`).
+    ///
+    /// Locks are taken one at a time (hider, then trunk map), never nested.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7, AC-4
+    async fn admitted_media_addr(
+        &self,
+        media: &MediaAddress,
+        leg: MediaLeg,
+        call_media_ips: [&str; 2],
+    ) -> Option<SbcSocketAddr> {
+        let internal: Vec<proto_sip::IpCidr> = match self.topology_hider {
+            Some(ref h) => h.read().await.config().internal_cidrs.clone(),
+            None => DEFAULT_INTERNAL_MEDIA_CIDRS.clone(),
+        };
+        let trunks = self.inbound_trunk_map.read().await;
+        let facts = StackMediaFacts {
+            internal: &internal,
+            trunks: &trunks,
+            zones: self.zone_registry.as_deref(),
+            call_ips: call_media_ips.map(|ip| {
+                self.zone_registry
+                    .as_ref()
+                    .and_then(|_| ip.parse::<std::net::IpAddr>().ok())
+            }),
+        };
+        match media_target::admit_media_target(&media.address, media.port, leg, &facts) {
+            Ok(addr) => Some(addr),
+            Err(reason) => {
+                warn!(
+                    address = %media.address.escape_default(),
+                    port = media.port,
+                    reason = reason.label(),
+                    trunk_leg = leg.trunk,
+                    "Ignoring disallowed media address in SDP"
+                );
+                None
+            }
+        }
+    }
+
+    /// The signalling peer of one leg of `addrs`, for media admission.
+    fn media_leg(addrs: &CallAddresses, a_leg: bool) -> MediaLeg {
+        if a_leg {
+            MediaLeg {
+                peer: addrs.a_leg_source.ip(),
+                trunk: addrs.a_leg_trunk_group.is_some(),
+            }
+        } else {
+            MediaLeg {
+                peer: addrs.b_leg_destination.ip(),
+                trunk: addrs.b_leg_peer_kind == BLegPeerKind::Trunk,
+            }
+        }
+    }
+
     /// Hiding decision for traffic with no call record (out-of-dialog
     /// responses, the announcement BYE): hide toward a trunk (over any of
     /// its transports: hiding more is fail-safe) or any address outside
@@ -5615,13 +5688,21 @@ impl SipStack {
                 };
             }
         };
-        let offer_addr = t38
-            .as_ref()
-            .map_or_else(
-                || extract_media_address(&sdp_str),
-                |c| extract_media_address_for(&c.sdp, c.stream.index),
-            )
-            .and_then(|m| admitted_media_addr(&m));
+        let offer_media = t38.as_ref().map_or_else(
+            || extract_media_address(&sdp_str),
+            |c| extract_media_address_for(&c.sdp, c.stream.index),
+        );
+        let offer_addr = match offer_media {
+            Some(m) => {
+                self.admitted_media_addr(
+                    &m,
+                    Self::media_leg(&addrs, from_a_leg),
+                    [addrs.media_a_leg_ip.as_str(), addrs.media_b_leg_ip.as_str()],
+                )
+                .await
+            }
+            None => None,
+        };
         let kind_change = t38.as_ref().is_some_and(|c| c.kind != addrs.media_kind);
         // RFC 3261 §14.1: a kind change (audio <-> T.38) moves the relay only
         // when the far side accepts; a plain address change follows the
@@ -5950,7 +6031,13 @@ impl SipStack {
                 };
                 if let Some(ref pipeline) = self.media_pipeline
                     && let Some(media) = extract_media_address(&sdp_str)
-                    && let Some(addr) = admitted_media_addr(&media)
+                    && let Some(addr) = self
+                        .admitted_media_addr(
+                            &media,
+                            Self::media_leg(&addrs, from_a_leg),
+                            [addrs.media_a_leg_ip.as_str(), addrs.media_b_leg_ip.as_str()],
+                        )
+                        .await
                 {
                     let _ = pipeline
                         .set_remote_address(&internal_id.to_string(), from_a_leg, addr)
@@ -6430,7 +6517,10 @@ impl SipStack {
             self.apply_t38_answer(
                 sdp_str,
                 sw,
-                pending.from_a_leg,
+                Offerer {
+                    addrs,
+                    a_leg: pending.from_a_leg,
+                },
                 session_key,
                 &local_media,
                 t38,
@@ -6439,7 +6529,13 @@ impl SipStack {
         } else {
             if let Some(ref pipeline) = self.media_pipeline
                 && let Some(media) = extract_media_address(sdp_str)
-                && let Some(addr) = admitted_media_addr(&media)
+                && let Some(addr) = self
+                    .admitted_media_addr(
+                        &media,
+                        Self::media_leg(addrs, !pending.from_a_leg),
+                        [addrs.media_a_leg_ip.as_str(), addrs.media_b_leg_ip.as_str()],
+                    )
+                    .await
             {
                 let _ = pipeline
                     .set_remote_address(session_key, !pending.from_a_leg, addr)
@@ -6556,16 +6652,29 @@ impl SipStack {
         &self,
         sdp: &str,
         sw: &PendingSwitch,
-        from_a_leg: bool,
+        offerer: Offerer<'_>,
         session_key: &str,
         local_media: &MediaAddress,
         out: &mut T38AnswerOutcome,
     ) -> String {
+        let Offerer {
+            addrs,
+            a_leg: from_a_leg,
+        } = offerer;
         let kind_change = sw.offered_kind != sw.prev_kind;
         match crate::t38::check_answer(sdp, sw.offered_index, sw.offered_kind, &self.t38) {
             crate::t38::AnswerCheck::Accepted(c) => {
-                let answerer = extract_media_address_for(&c.sdp, c.stream.index)
-                    .and_then(|m| admitted_media_addr(&m));
+                let answerer = match extract_media_address_for(&c.sdp, c.stream.index) {
+                    Some(m) => {
+                        self.admitted_media_addr(
+                            &m,
+                            Self::media_leg(addrs, !from_a_leg),
+                            [addrs.media_a_leg_ip.as_str(), addrs.media_b_leg_ip.as_str()],
+                        )
+                        .await
+                    }
+                    None => None,
+                };
                 out.remote_media = answerer.map(Into::into);
                 if let Some(ref pipeline) = self.media_pipeline {
                     // PERF-004: both remotes and the kind move under one
@@ -9844,10 +9953,19 @@ impl SipStack {
             // and the caller tears the fax call down. UDPTL over DTLS is
             // refused (POA&M-291), so a T.38 answer is always a plain relay.
             // NIST 800-53 Rev5: SC-24 (fail closed), AU-2.
-            let Some(callee_addr) = extract_media_address_for(&c.sdp, c.stream.index)
-                .as_ref()
-                .and_then(admitted_media_addr)
-            else {
+            let callee_media = extract_media_address_for(&c.sdp, c.stream.index);
+            let callee_addr = match callee_media {
+                Some(m) => {
+                    self.admitted_media_addr(
+                        &m,
+                        Self::media_leg(addrs, false),
+                        [addrs.media_a_leg_ip.as_str(), addrs.media_b_leg_ip.as_str()],
+                    )
+                    .await
+                }
+                None => None,
+            };
+            let Some(callee_addr) = callee_addr else {
                 warn!(call_id = %addrs.a_leg_sip_call_id, "T.38 answer has no admitted media address");
                 return (false, Some(SwitchoverReason::RelayUpdateFailed));
             };
@@ -9865,7 +9983,13 @@ impl SipStack {
             return (false, None);
         }
         if let Some(callee_media) = extract_media_address(sdp_str)
-            && let Some(callee_addr) = admitted_media_addr(&callee_media)
+            && let Some(callee_addr) = self
+                .admitted_media_addr(
+                    &callee_media,
+                    Self::media_leg(addrs, false),
+                    [addrs.media_a_leg_ip.as_str(), addrs.media_b_leg_ip.as_str()],
+                )
+                .await
         {
             let _ = pipeline
                 .set_remote_address(session_key, false, callee_addr)
@@ -11905,8 +12029,18 @@ impl SipStack {
                         },
                         |c| extract_media_address_for(&c.sdp, c.stream.index),
                     );
+                    let caller_leg = MediaLeg {
+                        peer: source.ip(),
+                        trunk: inbound_trunk.is_some(),
+                    };
                     if let Some(caller_media) = caller_media
-                        && let Some(caller_addr) = admitted_media_addr(&caller_media)
+                        && let Some(caller_addr) = self
+                            .admitted_media_addr(
+                                &caller_media,
+                                caller_leg,
+                                [a_media_ip_str.as_str(), b_media_ip_str.as_str()],
+                            )
+                            .await
                     {
                         let _ = pipeline
                             .set_remote_address(&session_key, true, caller_addr)
@@ -11915,8 +12049,29 @@ impl SipStack {
                     (ports.b_leg_rtp_port, Some(ports.a_leg_rtp_port))
                 }
                 Err(e) => {
-                    warn!(error = %e, "media create_session failed; RTP relay disabled for this call");
-                    (self.allocate_rtp_port(), None)
+                    // SR-25: no relay means SDP pointing at an unbound port
+                    // (a silent "answered" call); refuse instead of failing
+                    // open. NIST 800-53 Rev5: SC-5, SC-24.
+                    warn!(error = %e, call_id = %a_leg_call_id, "media create_session failed; INVITE refused, 503");
+                    self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                    reject_cdr(503, uc_cdr::ReleaseCause::MediaFailure);
+                    self.release_slots(
+                        trunk_lease.as_ref(),
+                        vps_callee.as_deref(),
+                        TrunkOutcome::Abandoned,
+                    )
+                    .await;
+                    let mut busy =
+                        create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+                    busy.headers.set(
+                        HeaderName::RetryAfter,
+                        TRUNK_UNAVAILABLE_RETRY_AFTER_SECS.to_string(),
+                    );
+                    return ProcessResult::Response {
+                        message: SipMessage::Response(busy),
+                        destination: source,
+                        flow: Flow::Reply,
+                    };
                 }
             }
         } else {
@@ -14202,6 +14357,13 @@ impl SipStack {
         transport: AddrTransport,
         announcement: crate::announcement::AnnouncementType,
     ) -> ProcessResult {
+        // SR-25: audio goes only to the INVITE's own source address; a
+        // configured trunk may name a separate media gateway. Anything else
+        // would let a caller reflect the announcement at a third host.
+        let from_trunk = self
+            .lookup_inbound_trunk(source.ip(), transport)
+            .await
+            .is_some();
         // Extract the caller's RTP destination from their SDP offer up
         // front: the remote announcement pod needs it before we can
         // build our 200 OK.
@@ -14221,6 +14383,13 @@ impl SipStack {
                     warn!(destination = %dest, %reason, "Ignoring disallowed media address in SDP");
                 }
                 verdict.is_ok()
+            })
+            .filter(|dest| {
+                let own = announcement_dest_allowed(dest.ip(), source.ip(), from_trunk);
+                if !own {
+                    warn!(destination = %dest, "Announcement media address is not the caller's source; not playing audio");
+                }
+                own
             });
 
         let call_id = req.headers.call_id().unwrap_or("unknown").to_string();
@@ -14307,6 +14476,12 @@ impl SipStack {
         #[cfg(not(feature = "grpc"))]
         let remote_media: Option<(String, u16, AnnouncementPlayback)> = None;
 
+        // SR-25: a relay-range pair taken for in-process playback goes back
+        // to the pool when playback ends (or the bind fails).
+        let mut port_lease: Option<(
+            Arc<dyn sbc_media_core::media_pipeline::MediaController>,
+            u16,
+        )> = None;
         let (sdp_ip, actual_rtp_port, playback) = if let Some(remote) = remote_media {
             remote
         } else {
@@ -14324,11 +14499,18 @@ impl SipStack {
                     flow: Flow::Reply,
                 };
             };
-            let preferred_port = if let Some(ref pipeline) = self.media_pipeline {
-                pipeline.allocate_ports().await.map_or(0, |(rtp, _)| rtp)
-            } else {
-                0
-            };
+            // Only a pool in this process: a remote media node's port is not
+            // this host's to bind and could not be released. Exhausted pool:
+            // an ephemeral port (0).
+            if let Some(pipeline) = self
+                .media_pipeline
+                .as_ref()
+                .filter(|p| p.allocates_local_ports())
+                && let Ok((rtp, _)) = pipeline.allocate_ports().await
+            {
+                port_lease = Some((Arc::clone(pipeline), rtp));
+            }
+            let preferred_port = port_lease.as_ref().map_or(0, |(_, rtp)| *rtp);
             match crate::announcement::AnnouncementServer::bind_socket(preferred_port, rtp_bind_ip)
                 .await
             {
@@ -14339,6 +14521,9 @@ impl SipStack {
                 ),
                 Err(e) => {
                     warn!(error = %e, "Cannot bind announcement socket");
+                    if let Some((pipeline, rtp)) = port_lease.take() {
+                        pipeline.release_ports(rtp).await;
+                    }
                     let unavailable =
                         create_response_from_request(req, StatusCode::TEMPORARILY_UNAVAILABLE);
                     return ProcessResult::Response {
@@ -14464,6 +14649,11 @@ impl SipStack {
                         warn!(error = %e, "Remote announcement playback failed");
                     }
                 }
+            }
+
+            // The socket is gone with the playback: return its pair.
+            if let Some((pipeline, rtp)) = port_lease {
+                pipeline.release_ports(rtp).await;
             }
 
             // Send BYE after announcement
@@ -14640,6 +14830,19 @@ fn unsupported_scheme_response(data: &[u8]) -> Option<proto_sip::message::SipRes
 /// §12.1.1 / §12.2.1.1), sanitised by [`sanitize_remote_target`]; else
 /// `source`. The destination stays `source` (the transport peer), so an
 /// attacker-chosen Contact cannot turn the SBC into a BYE reflector.
+/// SR-25: the no-route announcement streams only to the INVITE's own source
+/// IP; a configured trunk may name a separate media gateway (still subject
+/// to the announcement destination policy).
+///
+/// ## NIST 800-53 Rev5: SC-5, SC-7
+fn announcement_dest_allowed(
+    dest: std::net::IpAddr,
+    source: std::net::IpAddr,
+    from_trunk: bool,
+) -> bool {
+    from_trunk || dest.to_canonical() == source.to_canonical()
+}
+
 fn build_announcement_bye(
     sent_by: &str,
     flow: &LegFlow,
@@ -15198,18 +15401,39 @@ fn index_trunk_hosts(
     map.insert(group.to_string(), Arc::new(ips));
 }
 
-/// Turns an SDP `c=`/`m=` address into a relay target, refusing addresses a
-/// peer must not be able to make the SBC send to: loopback, link-local,
-/// multicast and unspecified. Hostnames are not resolved.
-fn admitted_media_addr(media: &MediaAddress) -> Option<SbcSocketAddr> {
-    let ip: std::net::IpAddr = media.address.parse().ok()?;
-    if sbc_announcement::is_disallowed_media_ip(ip) || ip.is_unspecified() {
-        warn!(address = %media.address, port = media.port, "Ignoring disallowed media address in SDP");
-        return None;
+/// Built-in internal ranges used for SR-19 zone checks when topology hiding
+/// (and so `topology_hiding.internal_networks`) is not configured.
+static DEFAULT_INTERNAL_MEDIA_CIDRS: std::sync::LazyLock<Vec<proto_sip::IpCidr>> =
+    std::sync::LazyLock::new(|| {
+        proto_sip::topology::DEFAULT_INTERNAL_CIDRS
+            .iter()
+            .filter_map(|c| c.parse().ok())
+            .collect()
+    });
+
+/// Stack-side facts for [`media_target::admit_media_target`].
+struct StackMediaFacts<'a> {
+    internal: &'a [proto_sip::IpCidr],
+    trunks: &'a InboundTrunkMap,
+    zones: Option<&'a crate::zone::ResolvedZoneRegistry>,
+    call_ips: [Option<std::net::IpAddr>; 2],
+}
+
+impl MediaTargetFacts for StackMediaFacts<'_> {
+    fn is_internal(&self, ip: std::net::IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        self.internal.iter().any(|c| c.contains(ip))
     }
-    Some(SbcSocketAddr::from(std::net::SocketAddr::new(
-        ip, media.port,
-    )))
+    fn is_sbc_owned(&self, ip: std::net::IpAddr) -> bool {
+        self.call_ips
+            .iter()
+            .flatten()
+            .any(|c| c.to_canonical() == ip)
+            || self.zones.is_some_and(|z| z.owns_ip(ip))
+    }
+    fn is_trunk_host(&self, ip: std::net::IpAddr) -> bool {
+        self.trunks.contains_ip(ip)
+    }
 }
 
 /// Resolves a trunk host (IP literal or hostname) to every address it names.
@@ -16966,22 +17190,95 @@ pub mod tests {
         }
     }
 
-    #[test]
-    fn admitted_media_addr_rejects_local_and_group_addresses() {
-        let m = |a: &str| MediaAddress::new(a.to_string(), 4000);
-        assert_eq!(
-            admitted_media_addr(&m("203.0.113.5")),
+    /// SR-19: SDP media addresses are admitted per leg (zone, trunk hosts,
+    /// SBC addresses, privileged ports), not only by address class.
+    #[tokio::test]
+    async fn admitted_media_addr_constrains_untrusted_legs() {
+        let stack = SipStack::new(SipStackConfig::default());
+        let trunk_ip: std::net::IpAddr = "10.20.0.5".parse().unwrap();
+        stack.inbound_trunk_map.write().await.replace_group(
+            "pbx",
+            None,
+            &HashSet::from([TrunkSourceKey::new(trunk_ip, AddrTransport::Udp).unwrap()]),
+        );
+        let m = |a: &str, p: u16| MediaAddress::new(a.to_string(), p);
+        let ext = MediaLeg {
+            peer: "198.51.100.7".parse().unwrap(),
+            trunk: false,
+        };
+        let internal = MediaLeg {
+            peer: "10.30.1.2".parse().unwrap(),
+            trunk: false,
+        };
+        let trunk = MediaLeg {
+            peer: trunk_ip,
+            trunk: true,
+        };
+        let own = ["192.0.2.10", "192.0.2.10"];
+        let ok = |a: &str| {
             Some(SbcSocketAddr::from(
-                "203.0.113.5:4000".parse::<std::net::SocketAddr>().unwrap()
+                a.parse::<std::net::SocketAddr>().unwrap(),
             ))
+        };
+
+        assert_eq!(
+            stack
+                .admitted_media_addr(&m("203.0.113.5", 40000), ext, own)
+                .await,
+            ok("203.0.113.5:40000")
         );
         assert_eq!(
-            admitted_media_addr(&m("2001:db8::7")),
-            Some(SbcSocketAddr::from(
-                "[2001:db8::7]:4000"
-                    .parse::<std::net::SocketAddr>()
-                    .unwrap()
-            ))
+            stack
+                .admitted_media_addr(&m("2001:db8::7", 40000), ext, own)
+                .await,
+            ok("[2001:db8::7]:40000")
+        );
+        // External caller naming an internal host (built-in private ranges
+        // apply without topology hiding).
+        for a in ["10.20.0.9", "192.168.1.1", "172.16.0.1", "::ffff:10.1.1.1"] {
+            assert!(
+                stack
+                    .admitted_media_addr(&m(a, 40000), ext, own)
+                    .await
+                    .is_none(),
+                "{a} must be refused for an external leg"
+            );
+        }
+        // An internal phone keeps internal media, but not a trunk host, a
+        // privileged port or the SBC's own address.
+        assert_eq!(
+            stack
+                .admitted_media_addr(&m("10.30.1.2", 40000), internal, own)
+                .await,
+            ok("10.30.1.2:40000")
+        );
+        assert!(
+            stack
+                .admitted_media_addr(&m("10.20.0.5", 5060), internal, own)
+                .await
+                .is_none()
+        );
+        assert!(
+            stack
+                .admitted_media_addr(&m("10.30.1.2", 161), internal, own)
+                .await
+                .is_none()
+        );
+
+        // A trunk leg is trusted for zone and port, not for SBC addresses.
+        assert_eq!(
+            stack
+                .admitted_media_addr(&m("10.20.0.6", 1000), trunk, own)
+                .await,
+            ok("10.20.0.6:1000")
+        );
+        // Without a zone registry the advertised call address is the
+        // caller's own (fallback), so it is not treated as the SBC's.
+        assert_eq!(
+            stack
+                .admitted_media_addr(&m("192.0.2.10", 40000), trunk, own)
+                .await,
+            ok("192.0.2.10:40000")
         );
         for bad in [
             "127.0.0.1",
@@ -16992,13 +17289,53 @@ pub mod tests {
             "::",
             "ff02::1",
         ] {
-            assert!(
-                admitted_media_addr(&m(bad)).is_none(),
-                "{bad} must be refused"
-            );
+            for leg in [ext, internal, trunk] {
+                assert!(
+                    stack
+                        .admitted_media_addr(&m(bad, 40000), leg, own)
+                        .await
+                        .is_none(),
+                    "{bad} must be refused"
+                );
+            }
         }
         // Hostnames are not resolved.
-        assert!(admitted_media_addr(&m("media.example.com")).is_none());
+        assert!(
+            stack
+                .admitted_media_addr(&m("media.example.com", 40000), trunk, own)
+                .await
+                .is_none()
+        );
+
+        // With zones, zone addresses and the call's advertised addresses are
+        // the SBC's own, on every leg.
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.set_zone_registry(Arc::new(crate::zone::ResolvedZoneRegistry::from_resolved(
+            vec![sbc_config::interface::ResolvedZone {
+                name: "outside".to_string(),
+                signaling_ip: "192.0.2.20".parse().unwrap(),
+                media_ip: "192.0.2.21".parse().unwrap(),
+                external_ip: Some("198.51.100.250".parse().unwrap()),
+                external_ip_source: None,
+            }],
+        )));
+        for a in ["192.0.2.20", "192.0.2.21", "198.51.100.250", "192.0.2.10"] {
+            for leg in [ext, trunk] {
+                assert!(
+                    stack
+                        .admitted_media_addr(&m(a, 40000), leg, own)
+                        .await
+                        .is_none(),
+                    "{a} is an SBC address"
+                );
+            }
+        }
+        assert_eq!(
+            stack
+                .admitted_media_addr(&m("203.0.113.5", 40000), ext, own)
+                .await,
+            ok("203.0.113.5:40000")
+        );
     }
 
     #[test]
@@ -22300,6 +22637,106 @@ pub mod tests {
         assert_eq!(c.disposition, uc_cdr::Disposition::Rejected);
         assert_eq!(c.release_cause, uc_cdr::ReleaseCause::NoRoute);
         assert_eq!(c.final_sip_status, status);
+    }
+
+    /// SR-25: an exhausted relay port pool refuses the INVITE with 503
+    /// (no answered call pointing at an unbound port) and frees the trunk.
+    #[tokio::test]
+    async fn invite_refused_503_when_media_session_cannot_be_created() {
+        let (mut stack, em) = cdr_stack().await;
+        // One pair: a relayed call needs two, so create_session fails.
+        let media = Arc::new(sbc_media_core::media_pipeline::MediaPipeline::new(
+            sbc_media_core::media_pipeline::MediaPipelineConfig {
+                rtp_port_min: 41_200,
+                rtp_port_max: 41_201,
+                ..Default::default()
+            },
+        ));
+        stack.set_media_pipeline(Arc::clone(&media) as _);
+        let r = place_call(&stack, "noports@cdr").await;
+        let (busy, _) = responded(&r, 503).unwrap_or_else(|| panic!("503 expected: {r:?}"));
+        assert!(busy.headers.get_value(&HeaderName::RetryAfter).is_some());
+        assert!(
+            !r.iter().any(|x| matches!(x, ProcessResult::Forward { .. })),
+            "no B-leg INVITE without media: {r:?}"
+        );
+        let c = one_cdr(&em);
+        assert_eq!(c.release_cause, uc_cdr::ReleaseCause::MediaFailure);
+        assert_eq!(c.final_sip_status, 503);
+        assert_eq!(active(&stack, "t1").await, 0);
+        assert_eq!(active(&stack, "t2").await, 0);
+    }
+
+    #[test]
+    fn announcement_plays_only_to_the_invite_source() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(announcement_dest_allowed(
+            ip("192.0.2.5"),
+            ip("192.0.2.5"),
+            false
+        ));
+        assert!(announcement_dest_allowed(
+            ip("::ffff:192.0.2.5"),
+            ip("192.0.2.5"),
+            false
+        ));
+        assert!(!announcement_dest_allowed(
+            ip("198.51.100.9"),
+            ip("192.0.2.5"),
+            false
+        ));
+        assert!(announcement_dest_allowed(
+            ip("198.51.100.9"),
+            ip("192.0.2.5"),
+            true
+        ));
+    }
+
+    /// SR-25: the in-process announcement's relay-range pair returns to the
+    /// pool when playback ends, so unrouted calls cannot drain the range.
+    #[tokio::test(start_paused = true)]
+    async fn no_route_announcement_returns_its_port_pair() {
+        use sbc_media_core::media_pipeline::MediaController as _;
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.set_media_security_policy(&srtp_not_required());
+        // Two pairs.
+        let media = Arc::new(sbc_media_core::media_pipeline::MediaPipeline::new(
+            sbc_media_core::media_pipeline::MediaPipelineConfig {
+                rtp_port_min: 41_300,
+                rtp_port_max: 41_303,
+                ..Default::default()
+            },
+        ));
+        stack.set_media_pipeline(Arc::clone(&media) as _);
+        stack
+            .register_inbound_trunk(
+                "pbx",
+                None,
+                &[("192.168.1.1".to_string(), AddrTransport::Udp)],
+            )
+            .await;
+        // No usable media address: answered, nothing sent on the wire.
+        let offer = "v=0\r\no=- 1 1 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 0.0.0.0\r\n\
+                     t=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=sendrecv\r\n";
+        let r = flatten(
+            stack
+                .process_message(
+                    &caller_request("INVITE", DIALED, "ann-ports", 1, None, Some(offer)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&r, 200).is_some(), "announcement answer: {r:?}");
+        // While it plays, the announcement holds one of the two pairs.
+        let mine = media.allocate_ports().await.unwrap();
+        assert!(media.allocate_ports().await.is_err());
+        media.release_ports(mine.0).await;
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let a = media.allocate_ports().await.expect("pair returned");
+        let b = media.allocate_ports().await.expect("pair returned");
+        media.release_ports(a.0).await;
+        media.release_ports(b.0).await;
     }
 
     #[tokio::test]
