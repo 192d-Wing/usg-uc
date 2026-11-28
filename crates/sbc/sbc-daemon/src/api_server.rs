@@ -480,6 +480,12 @@ pub const ROUTING_METRICS: &[(&str, &str)] = &[
         "sbc_flow_index_overflow_total",
         "REGISTERs whose flow was not indexed (flow index full or per-flow AOR limit); that flow cannot place calls",
     ),
+    // NIST 800-53 Rev5: SC-5, SI-4 - server transaction map at its bound
+    // (SR-20).
+    (
+        "sbc_transaction_table_full_total",
+        "Requests refused with 503 or processed statelessly because a server transaction map was full",
+    ),
 ];
 /// Gauge: CDRs accepted onto the writer queue.
 pub const METRIC_CDR_EMITTED: &str = "cdr_emitted_total";
@@ -894,6 +900,7 @@ impl AppState {
                 load(&c.late_2xx_teardowns),
                 stack.deferred_send_dropped(),
                 load(&c.flow_index_overflow),
+                load(&c.transaction_table_full),
             ];
             for (&(name, _), v) in ROUTING_METRICS.iter().zip(values) {
                 if let Some(g) = self.metrics.gauge(name) {
@@ -1931,6 +1938,22 @@ pub async fn sync_trunk_group_to_router(
     state: &Arc<AppState>,
     group_json: &serde_json::Value,
 ) -> Result<(), String> {
+    sync_trunk_group_to_router_with(state, group_json, crate::sip_stack::resolve_trunk_host_ips)
+        .await
+}
+
+/// [`sync_trunk_group_to_router`] with the trunk name resolver given.
+/// Resolution finishes before the trunk-sync guard and any trunk map lock
+/// is taken, so a slow resolver stalls only this sync (SR-24; NIST 800-53
+/// Rev5: SC-5).
+async fn sync_trunk_group_to_router_with<R>(
+    state: &Arc<AppState>,
+    group_json: &serde_json::Value,
+    resolve: R,
+) -> Result<(), String>
+where
+    R: Fn(&str) -> Vec<std::net::IpAddr> + Send + 'static,
+{
     let Some(ref sip_stack) = state.sip_stack else {
         return Ok(());
     };
@@ -1970,7 +1993,7 @@ pub async fn sync_trunk_group_to_router(
                 .collect()
         });
     // Names are resolved before the trunk-sync guard is taken.
-    let sources = crate::sip_stack::SipStack::resolve_trunk_sources(&hosts).await;
+    let sources = crate::sip_stack::SipStack::resolve_trunk_sources_with(&hosts, resolve).await;
 
     // NIST 800-53 Rev5: AC-3, AC-4, CM-3 - router add, source map and peer
     // set change under the trunk-sync guard, so a concurrent removal runs
@@ -2428,6 +2451,64 @@ mod tests {
             .get_trunk_group(group)
             .and_then(|g| g.get_trunk(trunk))
             .map(|t| t.config().max_calls)
+    }
+
+    /// SR-24: while a REST/gRPC trunk sync is blocked in name resolution,
+    /// the trunk-sync guard and the inbound trunk map are free; the
+    /// group's sources land once resolution finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_sync_resolves_before_taking_trunk_locks() {
+        let state = divided_state(1).await;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let resolver = move |_: &str| -> Vec<std::net::IpAddr> {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            vec![std::net::IpAddr::from([203, 0, 113, 78])]
+        };
+        let g = serde_json::json!({"id": "slow", "trunks": [
+            {"id": "a", "host": "slow.carrier.test"}
+        ]});
+        let sync = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { sync_trunk_group_to_router_with(&state, &g, resolver).await })
+        };
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        let stack = state.sip_stack.as_ref().unwrap();
+        let second = std::time::Duration::from_secs(1);
+        drop(
+            tokio::time::timeout(second, stack.trunk_sync_guard())
+                .await
+                .expect("trunk-sync guard free during resolution"),
+        );
+        let ip = std::net::IpAddr::from([203, 0, 113, 78]);
+        let found = tokio::time::timeout(
+            second,
+            stack.lookup_inbound_trunk(ip, uc_types::address::TransportType::Udp),
+        )
+        .await
+        .expect("trunk map free during resolution");
+        assert!(found.is_none());
+        assert!(!sync.is_finished());
+        release_tx.send(()).unwrap();
+        sync.await.unwrap().expect("accepted");
+        assert!(
+            stack
+                .lookup_inbound_trunk(ip, uc_types::address::TransportType::Udp)
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
