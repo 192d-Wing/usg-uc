@@ -1483,6 +1483,13 @@ enum TrunkRouting {
         pattern_id: String,
         partition_id: String,
     },
+    /// A VPS deny rule matched the translated (wire) number
+    /// (NIST 800-53 Rev5: AC-3, POA&M-532).
+    VpsDenied {
+        status_code: u16,
+        reason: String,
+        rule: String,
+    },
 }
 
 /// `Retry-After` (seconds) on the 503 sent when every trunk of the matched
@@ -6942,6 +6949,66 @@ impl SipStack {
         Some(vps.lock().await.callee_concurrent_calls(callee))
     }
 
+    /// Screens the translated number of a trunk-routed call: the
+    /// route-pattern blocks of the call's CSS and the VPS deny rules run
+    /// again on the number the carrier will receive, so a transform cannot
+    /// turn an allowed dialed number into a denied one. Returns the refusal,
+    /// or `None` when the number is unchanged, the call is an emergency
+    /// call (47 CFR 9.16), or nothing blocks it.
+    ///
+    /// ## NIST 800-53 Rev5: AC-3 (Access Enforcement), SI-10
+    async fn screen_translated(
+        &self,
+        call: &TrunkCall<'_>,
+        translated: &str,
+    ) -> Option<TrunkRouting> {
+        if call.emergency {
+            return None;
+        }
+        let wire = uc_types::DialedNumber::parse(translated);
+        if wire.as_str() == call.dialed.as_str() {
+            return None;
+        }
+        if let Some(ref sbc) = self.sbc_router
+            && let SbcRouteOutcome::Blocked {
+                pattern_id,
+                partition_id,
+            } = sbc.read().await.route(wire.as_str(), call.css)
+        {
+            return Some(TrunkRouting::Blocked {
+                pattern_id,
+                partition_id,
+            });
+        }
+        let vps = self.vps.as_ref()?;
+        let mut attempt = uc_vps::CallAttempt::new(client_of(call.source).ip().to_canonical())
+            .with_callee(call.dialed.screening_key())
+            .with_request_uri(call.req.uri.to_string())
+            .with_direction(if call.inbound_trunk_group.is_some() {
+                uc_vps::CallDirection::Inbound
+            } else {
+                uc_vps::CallDirection::Unknown
+            });
+        if let Some(from) = call.req.headers.get_value(&HeaderName::From) {
+            attempt = attempt.with_from_uri(extract_uri_from_header(from));
+        }
+        let verdict = vps
+            .lock()
+            .await
+            .screen_translated(&attempt, wire.screening_key());
+        match verdict.action() {
+            uc_vps::VpsAction::Reject {
+                status_code,
+                reason,
+            } => Some(TrunkRouting::VpsDenied {
+                status_code: *status_code,
+                reason: reason.clone(),
+                rule: verdict.matched_rule().unwrap_or("-").to_string(),
+            }),
+            uc_vps::VpsAction::Allow | uc_vps::VpsAction::Drop => None,
+        }
+    }
+
     /// Routes a number no registered user answers to a trunk: the SBC
     /// router's route groups (CSS / partition / route pattern / route list)
     /// first, then the dial plan (direction, source trunk group and
@@ -7153,6 +7220,18 @@ impl SipStack {
                 TrunkOutcome::Abandoned,
             );
             return TrunkRouting::InvalidTranslation;
+        }
+
+        // Deny screening ran on the dialed number; when a transform changed
+        // it, the number the carrier receives is screened again against the
+        // route-pattern blocks and the VPS deny rules (POA&M-532).
+        if let Some(denied) = self.screen_translated(call, &translated).await {
+            router_lock.write().await.release_trunk(
+                &lease.group_id,
+                &lease.trunk_id,
+                TrunkOutcome::Abandoned,
+            );
+            return denied;
         }
 
         let mut uri = decision.trunk_uri;
@@ -11685,6 +11764,35 @@ impl SipStack {
                         let forbidden = create_response_from_request(req, StatusCode::FORBIDDEN);
                         return ProcessResult::Response {
                             message: SipMessage::Response(forbidden),
+                            destination: source,
+                            flow: Flow::Reply,
+                        };
+                    }
+                    TrunkRouting::VpsDenied {
+                        status_code,
+                        reason,
+                        rule,
+                    } => {
+                        // ## NIST 800-53 Rev5: AC-3, AU-2 (POA&M-532)
+                        warn!(
+                            call_id = %a_leg_call_id,
+                            status_code,
+                            reason = %reason,
+                            rule = %rule,
+                            "VPS rejected INVITE on translated number"
+                        );
+                        audit_invite_denied(req, source, &format!("vps:{rule}"));
+                        self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                        reject_cdr(status_code, uc_cdr::ReleaseCause::PolicyDenied);
+                        self.release_slots(None, vps_callee.as_deref(), TrunkOutcome::Abandoned)
+                            .await;
+                        let rejection = create_response_from_request(
+                            req,
+                            StatusCode::new(status_code)
+                                .unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
+                        );
+                        return ProcessResult::Response {
+                            message: SipMessage::Response(rejection),
                             destination: source,
                             flow: Flow::Reply,
                         };
@@ -19303,6 +19411,104 @@ pub mod tests {
         })
         .await;
         assert!(forwarded(&place_call(&stack, "dom-hit@test").await, &Method::Invite).is_some());
+    }
+
+    /// First final (>= 300) status sent back to the caller.
+    fn reject_status(results: &[ProcessResult]) -> Option<u16> {
+        results.iter().find_map(|r| match r {
+            ProcessResult::Response {
+                message: SipMessage::Response(resp),
+                ..
+            } if resp.status.code() >= 300 => Some(resp.status.code()),
+            _ => None,
+        })
+    }
+
+    fn vps_with_rules(
+        rules: Vec<uc_vps::VpsRuleConfig>,
+        blocked_callers: &[&str],
+    ) -> uc_vps::VpsEngine {
+        uc_vps::VpsEngine::new(&uc_vps::VpsConfig {
+            enabled: true,
+            rules,
+            blocked_caller_prefixes: blocked_callers.iter().map(|p| (*p).to_string()).collect(),
+            tdos: uc_vps::TdosConfig {
+                per_source_cps: 0,
+                register_per_source_rps: 0,
+                ..uc_vps::TdosConfig::default()
+            },
+            ..uc_vps::VpsConfig::default()
+        })
+        .expect("valid VPS config")
+    }
+
+    /// POA&M-532: a route-pattern block on the translated number refuses
+    /// the call even though the dialed number is not blocked.
+    #[tokio::test]
+    async fn translated_number_hits_partition_block() {
+        // `+15551234567` → strip 2 → `5551234567` on the wire.
+        let mut stack = trunk_stack(10, ("strip_prefix", "2"), None).await;
+        stack.set_sbc_router(blocking_sbc_router(&["555"]));
+        let results = place_call(&stack, "xlate-block@test").await;
+        assert!(forwarded(&results, &Method::Invite).is_none(), "not routed");
+        assert_eq!(reject_status(&results), Some(403));
+        assert_all_released(&stack).await;
+
+        // A block that matches neither form leaves the call routed.
+        let mut stack = trunk_stack(10, ("strip_prefix", "2"), None).await;
+        stack.set_sbc_router(blocking_sbc_router(&["1900"]));
+        let results = place_call(&stack, "xlate-ok@test").await;
+        assert!(forwarded(&results, &Method::Invite).is_some());
+    }
+
+    /// POA&M-532: a VPS `callee_prefix` deny rule is applied to the
+    /// translated number sent to the carrier.
+    #[tokio::test]
+    async fn translated_number_hits_vps_deny_rule() {
+        let deny = |prefix: &str| uc_vps::VpsRuleConfig {
+            id: "deny-xlate".to_string(),
+            callee_prefix: Some(prefix.to_string()),
+            ..uc_vps::VpsRuleConfig::default()
+        };
+        let stack = trunk_stack(
+            10,
+            ("strip_prefix", "2"),
+            Some(vps_with_rules(vec![deny("555")], &[])),
+        )
+        .await;
+        let results = place_call(&stack, "xlate-vps@test").await;
+        assert!(forwarded(&results, &Method::Invite).is_none(), "not routed");
+        assert_eq!(reject_status(&results), Some(403));
+        assert_all_released(&stack).await;
+
+        // The rule does not match the dialed or translated form: routed.
+        let stack = trunk_stack(
+            10,
+            ("strip_prefix", "2"),
+            Some(vps_with_rules(vec![deny("1900")], &[])),
+        )
+        .await;
+        let results = place_call(&stack, "xlate-vps-ok@test").await;
+        assert!(forwarded(&results, &Method::Invite).is_some());
+    }
+
+    /// POA&M-531: an upper-case From scheme is screened like `sip:`.
+    #[tokio::test]
+    async fn upper_case_from_scheme_hits_caller_blocklist() {
+        let stack = trunk_stack(10, ("none", ""), Some(vps_with_rules(vec![], &["1900"]))).await;
+        let raw = caller_request("INVITE", DIALED, "from-case@test", 1, None, Some(ALICE_SDP));
+        let raw = String::from_utf8_lossy(&raw).replacen(
+            "From: <sip:alice@example.com>",
+            "From: <SIP:+19005550100@example.com>",
+            1,
+        );
+        let results = flatten(
+            stack
+                .process_message(&Bytes::from(raw), alice(), None)
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Invite).is_none(), "not routed");
+        assert_eq!(reject_status(&results), Some(403));
     }
 
     #[tokio::test]

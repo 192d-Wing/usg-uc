@@ -15,7 +15,7 @@ use uc_dos_protection::RateLimitAction;
 use uc_policy::condition::{RequestContext, StringMatch};
 use uc_policy::engine::PolicyEngineConfig;
 use uc_policy::rule::RulePriority;
-use uc_policy::{Condition, PolicyAction, PolicyEngine, PolicyRule};
+use uc_policy::{Condition, IpMatch, PolicyAction, PolicyEngine, PolicyRule};
 
 /// Screening statistics, by outcome.
 #[derive(Debug, Clone, Copy, Default)]
@@ -70,7 +70,7 @@ impl VpsEngine {
             ..PolicyEngineConfig::default()
         });
         for rule in &config.rules {
-            policy.add_global_rule(Self::compile_rule(rule))?;
+            policy.add_global_rule(Self::compile_rule(rule)?)?;
         }
 
         let mut blocklist = Blocklist::new();
@@ -94,7 +94,7 @@ impl VpsEngine {
     }
 
     /// Compiles a declarative rule into a `uc-policy` rule.
-    fn compile_rule(rule: &VpsRuleConfig) -> PolicyRule {
+    fn compile_rule(rule: &VpsRuleConfig) -> VpsResult<PolicyRule> {
         let mut conditions = Vec::new();
         if let Some(ref prefix) = rule.caller_prefix {
             // NIST 800-53 Rev5: AC-3, SI-10 — prefixes are canonicalised at
@@ -109,7 +109,9 @@ impl VpsEngine {
             )));
         }
         if let Some(ref source) = rule.source_ip {
-            conditions.push(Condition::SourceIp(source.clone()));
+            // NIST 800-53 Rev5: AC-3, SC-7, SI-10 — parsed as an address or
+            // CIDR and matched by containment (POA&M-530).
+            conditions.push(Condition::SourceIp(IpMatch::parse(source)?));
         }
         if let (Some(start), Some(end)) = (rule.time_start_hour, rule.time_end_hour) {
             if start <= end {
@@ -145,8 +147,10 @@ impl VpsEngine {
             VpsRuleAction::Deny => PolicyAction::deny(rule.status_code, rule.reason.clone()),
         };
 
-        PolicyRule::new(rule.id.clone(), rule.description.clone(), condition, action)
-            .with_priority(RulePriority::custom(rule.priority))
+        Ok(
+            PolicyRule::new(rule.id.clone(), rule.description.clone(), condition, action)
+                .with_priority(RulePriority::custom(rule.priority)),
+        )
     }
 
     /// Whether `dialed` (a Request-URI, or its user part) is a configured
@@ -338,6 +342,52 @@ impl VpsEngine {
             crate::STIR_SHAKEN_FAILED_STATUS,
             "Bad Identity Info",
         ))
+    }
+
+    /// Re-screens a call after number translation: the declarative policy
+    /// rules are evaluated again with the callee replaced by `translated`
+    /// (the number a carrier will receive), so a deny rule cannot be
+    /// evaded by dialing a form that a transform rewrites into the denied
+    /// number (POA&M-532).
+    ///
+    /// Only an explicit deny rule rejects here; the default action already
+    /// applied to the dialed number. No rate-limit token or per-callee slot
+    /// is consumed and `screened` is not incremented. Emergency calls (by
+    /// the dialed callee) are not re-screened (47 CFR 9.16).
+    ///
+    /// ## NIST 800-53 Rev5: AC-3 (Access Enforcement), SI-10
+    pub fn screen_translated(&mut self, attempt: &CallAttempt, translated: &str) -> VpsVerdict {
+        if !self.config.enabled {
+            return VpsVerdict::allow(VerdictSource::Disabled);
+        }
+        if attempt
+            .callee
+            .as_deref()
+            .is_some_and(|c| self.is_emergency(c))
+        {
+            return VpsVerdict::allow(VerdictSource::EmergencyBypass);
+        }
+        let mut canon = Self::canonical_attempt(attempt);
+        canon.callee = Some(crate::emergency::screening_key(translated));
+        let decision = self.policy.evaluate(&Self::request_context(&canon));
+        let Some(rule) = decision.matched_rule_id() else {
+            return VpsVerdict::allow(VerdictSource::Default);
+        };
+        if decision.is_allowed() {
+            return VpsVerdict::allow(VerdictSource::PolicyRule).with_rule(rule);
+        }
+        self.stats.rejected_policy += 1;
+        let (status_code, reason) = match decision.action() {
+            PolicyAction::Deny {
+                status_code,
+                reason,
+            } => (*status_code, reason.clone()),
+            _ => (
+                crate::DEFAULT_DENY_STATUS,
+                "Forbidden by voice protection policy".to_string(),
+            ),
+        };
+        VpsVerdict::reject(VerdictSource::PolicyRule, status_code, reason).with_rule(rule)
     }
 
     /// Screens a REGISTER attempt from a source.
@@ -1102,5 +1152,224 @@ mod tests {
         );
         let parsed: VpsConfig = toml::from_str("enabled = true").unwrap();
         assert_eq!(parsed.emergency_numbers, vec!["911", "933", "112"]);
+    }
+
+    fn source_rule(id: &str, source: &str, action: VpsRuleAction) -> VpsRuleConfig {
+        VpsRuleConfig {
+            id: id.to_string(),
+            action,
+            source_ip: Some(source.to_string()),
+            ..VpsRuleConfig::default()
+        }
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    /// POA&M-530: a CIDR deny rule matches every address in the network
+    /// and nothing outside it.
+    #[test]
+    fn source_ip_cidr_deny_matches_by_containment() {
+        let config = VpsConfig {
+            rules: vec![source_rule(
+                "deny-net",
+                "198.51.100.0/24",
+                VpsRuleAction::Deny,
+            )],
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        for last in [0, 7, 255] {
+            let v = engine.screen_call(&attempt(v4(198, 51, 100, last)));
+            assert_eq!(v.matched_rule(), Some("deny-net"), "198.51.100.{last}");
+        }
+        assert!(
+            engine
+                .screen_call(&attempt(v4(198, 51, 101, 7)))
+                .is_allowed()
+        );
+        // An IPv4-mapped source is matched as IPv4.
+        let mapped: IpAddr = "::ffff:198.51.100.9".parse().unwrap();
+        assert_eq!(
+            engine.screen_call(&attempt(mapped)).matched_rule(),
+            Some("deny-net")
+        );
+    }
+
+    /// POA&M-530: an exact-IP allow under default deny admits only that
+    /// address, not addresses that contain it as a substring.
+    #[test]
+    fn source_ip_exact_allow_is_not_a_substring_match() {
+        let config = VpsConfig {
+            default_action: crate::config::VpsDefaultAction::Deny,
+            rules: vec![source_rule("allow-one", "3.0.113.5", VpsRuleAction::Allow)],
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        assert!(engine.screen_call(&attempt(v4(3, 0, 113, 5))).is_allowed());
+        for other in [v4(203, 0, 113, 5), v4(13, 0, 113, 57), v4(3, 0, 113, 50)] {
+            let v = engine.screen_call(&attempt(other));
+            assert!(!v.is_allowed(), "{other}");
+            assert_eq!(v.source(), VerdictSource::Default, "{other}");
+        }
+    }
+
+    /// POA&M-530: `*` and IPv6 networks keep working.
+    #[test]
+    fn source_ip_wildcard_and_ipv6() {
+        let config = VpsConfig {
+            rules: vec![
+                source_rule("deny-v6", "2001:db8::/32", VpsRuleAction::Deny),
+                VpsRuleConfig {
+                    priority: 1000,
+                    ..source_rule("deny-all", "*", VpsRuleAction::Deny)
+                },
+            ],
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        let v6: IpAddr = "2001:db8:1::5".parse().unwrap();
+        assert_eq!(
+            engine.screen_call(&attempt(v6)).matched_rule(),
+            Some("deny-v6")
+        );
+        assert_eq!(
+            engine.screen_call(&attempt(ip(1))).matched_rule(),
+            Some("deny-all")
+        );
+    }
+
+    /// POA&M-530: a malformed `source_ip` (including partial-octet
+    /// wildcards) fails validation instead of never matching.
+    #[test]
+    fn source_ip_invalid_pattern_is_a_config_error() {
+        for bad in ["198.51.100.*", "198.51.100.0/33", "10.0.0", "bogus", ""] {
+            let config = VpsConfig {
+                rules: vec![source_rule("bad", bad, VpsRuleAction::Deny)],
+                ..enabled_config()
+            };
+            let Err(err) = config.validate() else {
+                panic!("{bad} accepted");
+            };
+            assert!(err.contains("source_ip"), "{bad}: {err}");
+            assert!(VpsEngine::new(&config).is_err(), "{bad}");
+        }
+    }
+
+    /// POA&M-531: an upper- or mixed-case From scheme does not evade the
+    /// caller blocklist or a `caller_prefix` rule.
+    #[test]
+    fn caller_screening_ignores_from_scheme_case() {
+        let config = VpsConfig {
+            blocked_caller_prefixes: vec!["1900".to_string()],
+            rules: vec![VpsRuleConfig {
+                id: "deny-caller".to_string(),
+                caller_prefix: Some("1212".to_string()),
+                ..VpsRuleConfig::default()
+            }],
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        let base = || CallAttempt::new(ip(1)).with_callee("+12135552000");
+        for from in [
+            "SIP:+19005551234@203.0.113.1",
+            "Sips:+19005551234@203.0.113.1",
+            "TEL:+19005551234",
+        ] {
+            let v = engine.screen_call(&base().with_from_uri(from));
+            assert_eq!(v.source(), VerdictSource::Blocklist, "{from}");
+        }
+        for from in ["SIP:+12125551234@203.0.113.1", "tEl:+1-212-555-1234"] {
+            let v = engine.screen_call(&base().with_from_uri(from));
+            assert_eq!(v.matched_rule(), Some("deny-caller"), "{from}");
+        }
+        assert!(
+            engine
+                .screen_call(&base().with_from_uri("SIP:+13105551234@203.0.113.1"))
+                .is_allowed()
+        );
+    }
+
+    /// POA&M-532: a callee deny rule is applied to the translated number,
+    /// not only to the dialed one; default deny is not re-applied.
+    #[test]
+    fn translated_callee_rescreened_against_deny_rules() {
+        let config = VpsConfig {
+            rules: vec![
+                VpsRuleConfig {
+                    id: "deny-900".to_string(),
+                    callee_prefix: Some("1900".to_string()),
+                    ..VpsRuleConfig::default()
+                },
+                VpsRuleConfig {
+                    id: "deny-uk".to_string(),
+                    callee_prefix: Some("+44".to_string()),
+                    ..VpsRuleConfig::default()
+                },
+            ],
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        let dialed = attempt(ip(1)).with_callee("9005551234");
+        assert!(engine.screen_call(&dialed).is_allowed());
+        let v = engine.screen_translated(&dialed, "19005551234");
+        assert!(!v.is_allowed());
+        assert_eq!(v.matched_rule(), Some("deny-900"));
+        let intl = attempt(ip(1)).with_callee("01144207946000");
+        assert!(engine.screen_call(&intl).is_allowed());
+        assert_eq!(
+            engine
+                .screen_translated(&intl, "+44207946000")
+                .matched_rule(),
+            Some("deny-uk")
+        );
+        assert!(
+            engine
+                .screen_translated(&dialed, "12135552000")
+                .is_allowed()
+        );
+
+        // Default deny applied once, to the dialed number, not again.
+        let config = VpsConfig {
+            default_action: crate::config::VpsDefaultAction::Deny,
+            rules: vec![VpsRuleConfig {
+                id: "allow-9".to_string(),
+                action: VpsRuleAction::Allow,
+                callee_prefix: Some("9".to_string()),
+                ..VpsRuleConfig::default()
+            }],
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        assert!(
+            engine
+                .screen_translated(&dialed, "19005551234")
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn translated_rescreen_skips_emergency_and_disabled() {
+        let config = VpsConfig {
+            emergency_numbers: vec!["911".to_string()],
+            rules: vec![VpsRuleConfig {
+                id: "deny-all".to_string(),
+                source_ip: Some("*".to_string()),
+                ..VpsRuleConfig::default()
+            }],
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        let call = emergency(ip(1), "911");
+        assert_eq!(
+            engine.screen_translated(&call, "1911").source(),
+            VerdictSource::EmergencyBypass
+        );
+        let mut off = VpsEngine::new(&VpsConfig::default()).unwrap();
+        assert!(
+            off.screen_translated(&attempt(ip(1)), "19005551234")
+                .is_allowed()
+        );
     }
 }

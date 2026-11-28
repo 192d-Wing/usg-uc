@@ -8788,6 +8788,7 @@ dependencies = [
 name = "uc-policy"
 version = "0.10.0"
 dependencies = [
+ "ipnet",
  "regex",
  "tracing",
  "uc-types",

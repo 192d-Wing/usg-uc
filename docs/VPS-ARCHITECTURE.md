@@ -84,7 +84,15 @@ it:
      prefix, source IP, time-of-day, day-of-week) compiled into
      `uc_policy::PolicyEngine` rules at startup. First match in priority
      order wins.
+     `source_ip` is an exact address, a CIDR network or `*`, parsed at load
+     (anything else is a config error) and matched by containment.
   6. **Default action** — allow (default) or deny.
+
+- **`screen_translated()`** — called by the SIP stack after number
+  translation when the number changed: the policy rules run again with the
+  translated callee, and only an explicit deny rule rejects (no rate-limit
+  token, no callee slot, emergency calls skipped). The SIP stack also
+  re-checks the CSS route-pattern blocks on the translated number.
 
 - **`CallAttempt`** (`context.rs`) — what the daemon hands the engine:
   source IP, caller/callee numbers, URIs, call direction (trunk-inbound vs.

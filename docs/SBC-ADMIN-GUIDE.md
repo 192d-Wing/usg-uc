@@ -1002,6 +1002,14 @@ Limitations: the failover INVITE keeps the original Request-URI host and scheme 
 - Emergency calls may exceed a trunk's `max_calls` by its `emergency_reserve_calls` (default 10% of `max_calls`, at least 1; when set must be 1..=`max_calls`). Normal calls never use the reserve.
 - After `max_failures` consecutive failures a trunk enters cooldown for `cooldown_secs` and is excluded from selection; it becomes available again afterwards. `max_failures = 0` is rejected.
 
+### VPS Rule Matching
+
+Notes on `[[vps.rules]]` and the VPS blocklists (full schema: [VPS-ARCHITECTURE.md](VPS-ARCHITECTURE.md)).
+
+- **`source_ip`** takes an exact IPv4 or IPv6 address (`203.0.113.5`), a CIDR network (`198.51.100.0/24`, `2001:db8::/32`) or `*` (any source). An exact address matches only that address. A CIDR matches every address in the network; host bits are ignored. An IPv4-mapped IPv6 source (`::ffff:198.51.100.7`) matches IPv4 rules. Anything else, including partial wildcards such as `198.51.100.*`, fails config validation and the SBC does not start. Rewrite `198.51.100.*` as `198.51.100.0/24`. Before this release the value was compared as a substring, so CIDR and wildcard rules never matched and an exact-IP rule also matched any address containing it. Check allow rules under `default_action = "deny"`: they now admit only the listed address or network.
+- **Caller number** (`blocked_caller_prefixes`, `caller_prefix`) comes from the From URI. The URI scheme is matched case-insensitively (`SIP:`, `Sips:`, `TEL:`).
+- **Translated numbers.** VPS deny rules and route-pattern blocks first run on the dialed number. When a route-pattern or dial-plan transform changes the number, they run again on the translated number before the call goes to the trunk. A match refuses the call with 403 (or the deny rule's `status_code`) and is audited like a block on the dialed number. Example: with a `callee_prefix = "1900"` deny rule and a dial-plan entry that adds a leading `1` to 10-digit numbers, a call to `9005551234` is refused. On the second pass only an explicit deny rule refuses a call. `default_action = "deny"` applies once, to the dialed number. An allow rule written for the dialed form does not need a copy for the translated form. Emergency calls are not screened again.
+
 ### Emergency Calls
 
 Emergency numbers are set in the VPS section and apply whether or not the VPS is enabled. If `[vps]` is absent or disabled, the default list is used.

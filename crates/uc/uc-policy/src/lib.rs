@@ -47,7 +47,7 @@ pub use cac::{
     AdmissionDecision, CallAdmissionController, CallPriority, CodecBandwidth, RejectionReason,
     TrunkCacLimits, TrunkStats,
 };
-pub use condition::{Condition, ConditionMatch};
+pub use condition::{Condition, ConditionMatch, IpMatch};
 pub use engine::{PolicyDecision, PolicyEngine};
 pub use error::{PolicyError, PolicyResult};
 pub use rule::{PolicyRule, RuleSet};

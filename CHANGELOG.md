@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 Planned SBC 0.11.0. The proto-sip hardening below also affects the soft client.
 
+### BREAKING (SBC, VPS rule matching and translated-number screening, SR-28, SR-31, SR-32, POA&M-530..532 closed)
+
+Tested in local runs on macOS (2026-11-27). Operator details: SBC admin
+guide, "VPS Rule Matching".
+
+- **BREAKING:** `[[vps.rules]] source_ip` takes an exact IP address, a CIDR
+  network or `*`. Other values, including partial wildcards such as
+  `198.51.100.*`, now fail config validation. Matching is by address or
+  network, no longer by substring, so CIDR deny rules now take effect and
+  an exact-IP allow rule admits only that address (POA&M-530). Exact-IP
+  rules keep working. Rewrite `a.b.c.*` as `a.b.c.0/24`.
+- The caller number for `blocked_caller_prefixes` and `caller_prefix`
+  rules is read from From URIs whatever the case of the scheme
+  (POA&M-531).
+- When a route-pattern or dial-plan transform changes the called number,
+  route-pattern blocks and VPS deny rules run again on the translated
+  number. A match refuses the call with 403 (or the rule's status) before
+  it reaches the trunk. `default_action` is not applied a second time, and
+  emergency calls are not screened again (POA&M-532).
+
 ### Security (SBC, SIP request-path load bounds, SR-20, SR-21, SR-24, POA&M-490, 491)
 
 Tested in local runs on macOS (2026-11-27).

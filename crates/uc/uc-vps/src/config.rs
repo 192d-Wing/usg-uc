@@ -76,6 +76,44 @@ impl Default for VpsConfig {
     }
 }
 
+/// Field checks for one `[[vps.rules]]` entry (status code, time window,
+/// days, `source_ip`).
+fn validate_rule(rule: &VpsRuleConfig) -> Result<(), String> {
+    if !(400..700).contains(&rule.status_code) {
+        return Err(format!(
+            "rule {}: status_code {} outside 400-699",
+            rule.id, rule.status_code
+        ));
+    }
+    if let Some(h) = rule.time_start_hour
+        && h > 23
+    {
+        return Err(format!("rule {}: time_start_hour {h} > 23", rule.id));
+    }
+    if let Some(h) = rule.time_end_hour
+        && h > 23
+    {
+        return Err(format!("rule {}: time_end_hour {h} > 23", rule.id));
+    }
+    if rule.time_start_hour.is_some() != rule.time_end_hour.is_some() {
+        return Err(format!(
+            "rule {}: time_start_hour and time_end_hour must be set together",
+            rule.id
+        ));
+    }
+    if let Some(ref days) = rule.days
+        && days.iter().any(|d| *d > 6)
+    {
+        return Err(format!("rule {}: day of week > 6", rule.id));
+    }
+    if let Some(ref source) = rule.source_ip
+        && let Err(e) = uc_policy::IpMatch::parse(source)
+    {
+        return Err(format!("rule {}: source_ip: {e}", rule.id));
+    }
+    Ok(())
+}
+
 impl VpsConfig {
     /// Validates the configuration, returning a human-readable reason on
     /// failure. Intended to be called at config-load time so an invalid
@@ -89,33 +127,7 @@ impl VpsConfig {
             if !seen.insert(rule.id.as_str()) {
                 return Err(format!("duplicate rule id: {}", rule.id));
             }
-            if !(400..700).contains(&rule.status_code) {
-                return Err(format!(
-                    "rule {}: status_code {} outside 400-699",
-                    rule.id, rule.status_code
-                ));
-            }
-            if let Some(h) = rule.time_start_hour
-                && h > 23
-            {
-                return Err(format!("rule {}: time_start_hour {h} > 23", rule.id));
-            }
-            if let Some(h) = rule.time_end_hour
-                && h > 23
-            {
-                return Err(format!("rule {}: time_end_hour {h} > 23", rule.id));
-            }
-            if rule.time_start_hour.is_some() != rule.time_end_hour.is_some() {
-                return Err(format!(
-                    "rule {}: time_start_hour and time_end_hour must be set together",
-                    rule.id
-                ));
-            }
-            if let Some(ref days) = rule.days
-                && days.iter().any(|d| *d > 6)
-            {
-                return Err(format!("rule {}: day of week > 6", rule.id));
-            }
+            validate_rule(rule)?;
         }
         for source in &self.blocked_sources {
             if source.parse::<std::net::IpAddr>().is_err() {
@@ -288,7 +300,8 @@ pub struct VpsRuleConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callee_prefix: Option<String>,
 
-    /// Match source IP (substring/wildcard per `uc-policy` semantics).
+    /// Match source IP: an exact address, a CIDR network, or `*`. Anything
+    /// else fails validation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_ip: Option<String>,
 
