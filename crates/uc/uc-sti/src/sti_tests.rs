@@ -710,10 +710,13 @@ async fn per_host_fetch_cap() {
         anchors_for(&p),
     );
     let mut tasks = Vec::new();
+    // One source per fetch: the (source, host) cap is tested separately.
     for i in 0..crate::cache::MAX_FETCHES_PER_HOST {
         let c = Arc::clone(&cache);
+        let ip = std::net::IpAddr::from([192, 0, 2, u8::try_from(i + 1).unwrap()]);
         tasks.push(tokio::spawn(async move {
-            c.get_or_fetch(
+            c.get_or_fetch_from(
+                ip,
                 &format!("https://slow.example.com/{i}"),
                 Duration::from_secs(2),
             )
@@ -742,6 +745,106 @@ async fn per_host_fetch_cap() {
     assert!(
         cache
             .get_or_fetch("https://slow.example.com/extra", Duration::from_secs(2))
+            .await
+            .is_ok()
+    );
+}
+
+/// SR-35 (POA&M-510): spelling aliases of one x5u URL share one cache
+/// entry and one fetch, a fragment is refused before any fetch, and a
+/// query variant is a distinct entry.
+#[tokio::test]
+async fn x5u_aliases_share_canonical_entry() {
+    let p = pki(true);
+    let src = source(p.ee_pem.clone(), 0);
+    let cache = StiCertCache::new(CacheConfig::default(), src.clone(), anchors_for(&p));
+    let d = Duration::from_secs(1);
+    assert!(cache.get_or_fetch(X5U, d).await.is_ok());
+    for alias in [
+        "HTTPS://CERT.EXAMPLE.COM/sti.pem",
+        "https://cert.example.com:443/sti.pem",
+        "https://Cert.Example.Com.:443/sti.pem",
+    ] {
+        assert!(cache.get_or_fetch(alias, d).await.is_ok(), "{alias}");
+        assert!(cache.cached(alias).is_some(), "{alias}");
+    }
+    assert_eq!(
+        src.calls.load(Ordering::SeqCst),
+        1,
+        "aliases never re-fetch"
+    );
+    assert_eq!(cache.len(), 1, "aliases never add entries");
+    for i in 0..4 {
+        let frag = format!("{X5U}#{i}");
+        assert_eq!(
+            cache.get_or_fetch(&frag, d).await.unwrap_err(),
+            FetchError::Policy("fragment")
+        );
+        assert!(cache.cached(&frag).is_none());
+    }
+    assert_eq!(src.calls.load(Ordering::SeqCst), 1, "fragments never fetch");
+    assert_eq!(cache.len(), 1);
+    assert!(cache.get_or_fetch(&format!("{X5U}?v=2"), d).await.is_ok());
+    assert_eq!(src.calls.load(Ordering::SeqCst), 2);
+}
+
+/// SR-35 (POA&M-510): one source holds at most
+/// `MAX_FETCHES_PER_SOURCE_HOST` of a host's `MAX_FETCHES_PER_HOST` slots,
+/// so another source's call to the same certificate host still fetches;
+/// the attacker's budget on other hosts is unaffected and nothing leaks.
+#[tokio::test]
+async fn per_source_host_fetch_cap() {
+    use crate::cache::{MAX_FETCHES_PER_HOST, MAX_FETCHES_PER_SOURCE_HOST};
+    use std::net::IpAddr;
+    const { assert!(MAX_FETCHES_PER_SOURCE_HOST < MAX_FETCHES_PER_HOST) };
+    let p = pki(true);
+    let src = source(p.ee_pem.clone(), 300);
+    let cache = StiCertCache::new(CacheConfig::default(), src.clone(), anchors_for(&p));
+    let attacker: IpAddr = "192.0.2.10".parse().unwrap();
+    let victim: IpAddr = "198.51.100.7".parse().unwrap();
+    let d = Duration::from_secs(2);
+    let mut tasks = Vec::new();
+    for i in 0..MAX_FETCHES_PER_SOURCE_HOST {
+        let c = Arc::clone(&cache);
+        tasks.push(tokio::spawn(async move {
+            c.get_or_fetch_from(attacker, &format!("https://carrier-b.example/x{i}"), d)
+                .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        cache
+            .get_or_fetch_from(attacker, "https://carrier-b.example/x99", d)
+            .await
+            .unwrap_err(),
+        FetchError::Busy
+    );
+    assert_eq!(cache.stats.busy_source.load(Ordering::Relaxed), 1);
+    // The attacker's own budget on another host is still there.
+    let c = Arc::clone(&cache);
+    let other_host = tokio::spawn(async move {
+        c.get_or_fetch_from(attacker, "https://h1.example/c", d)
+            .await
+    });
+    // The victim's genuine call to the same host still gets a slot.
+    assert!(
+        cache
+            .get_or_fetch_from(victim, "https://carrier-b.example/cert.pem", d)
+            .await
+            .is_ok()
+    );
+    assert!(other_host.await.unwrap().is_ok());
+    for t in tasks {
+        assert!(t.await.unwrap().is_ok());
+    }
+    assert_eq!(
+        cache.inflight_source_hosts(),
+        0,
+        "no (source, host) entries leak"
+    );
+    assert!(
+        cache
+            .get_or_fetch_from(attacker, "https://carrier-b.example/x99", d)
             .await
             .is_ok()
     );

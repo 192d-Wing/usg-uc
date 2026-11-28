@@ -4,7 +4,7 @@
 //! sent the INVITE. Before anything is dereferenced:
 //!
 //! - only `https://` is accepted (RFC 8224 §12, ATIS-1000074 §5.3.1),
-//! - userinfo is refused, the port must be 443 unless the host is on the
+//! - userinfo and fragments are refused, the port must be 443 unless the host is on the
 //!   operator allow-list,
 //! - every resolved address must be public: loopback, RFC 1918, CGNAT,
 //!   link-local (incl. 169.254.169.254 metadata), multicast, ULA, reserved,
@@ -33,6 +33,23 @@ pub struct X5uUrl {
 }
 
 impl X5uUrl {
+    /// Canonical cache key, `host:port/path?query`: case, an explicit
+    /// `:443`, a trailing root dot and an empty path do not make distinct
+    /// keys, so aliases of one certificate URL share one cache entry and one
+    /// in-flight fetch.
+    ///
+    /// NIST 800-53 Rev5: SC-5 (POA&M-510)
+    #[must_use]
+    pub fn cache_key(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}{}", self.host, self.port, self.path)
+        } else {
+            format!("{}:{}{}", self.host, self.port, self.path)
+        }
+    }
+}
+
+impl X5uUrl {
     /// Parses and applies the URL-level policy.
     ///
     /// # Errors
@@ -41,18 +58,27 @@ impl X5uUrl {
         if url.len() > MAX_URL_LEN || url.bytes().any(|b| b.is_ascii_control() || b == b' ') {
             return Err(FetchError::Policy("url-chars"));
         }
+        // A fragment is never sent to the server, so it only mints aliases
+        // of one URL (RFC 3986 §3.5). SC-5 (POA&M-510)
+        if url.contains('#') {
+            return Err(FetchError::Policy("fragment"));
+        }
         let rest = url
             .get(..8)
             .filter(|p| p.eq_ignore_ascii_case("https://"))
             .and_then(|_| url.get(8..))
             .ok_or(FetchError::Policy("scheme"))?;
-        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let end = rest.find(['/', '?']).unwrap_or(rest.len());
         let (authority, tail) = rest.split_at(end);
         if authority.is_empty() || authority.contains('@') {
             return Err(FetchError::Policy("authority"));
         }
         let (host, port) = split_host_port(authority)?;
-        let host = host.to_ascii_lowercase();
+        // `example.com.` and `example.com` are one DNS name.
+        let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        if host.is_empty() || host.ends_with('.') {
+            return Err(FetchError::Policy("authority"));
+        }
         let allow_listed = allow_hosts.iter().any(|h| h.eq_ignore_ascii_case(&host));
         if !allow_hosts.is_empty() && !allow_listed {
             return Err(FetchError::Policy("host-not-allowed"));
@@ -66,7 +92,6 @@ impl X5uUrl {
         {
             return Err(FetchError::Policy("address"));
         }
-        let tail = tail.split('#').next().unwrap_or("");
         let path = if tail.is_empty() || tail.starts_with('?') {
             format!("/{tail}")
         } else {
@@ -242,6 +267,7 @@ mod tests {
             FetchError::Policy("address")
         );
         assert!(X5uUrl::parse("https://bad_host/a", &[]).is_err());
+        assert!(X5uUrl::parse("https://./a", &[]).is_err());
         assert!(X5uUrl::parse("https:///a", &[]).is_err());
         assert!(X5uUrl::parse("https://h.example/a\r\nb", &[]).is_err());
         let allow = vec!["cert.example.com".to_string()];
@@ -252,5 +278,38 @@ mod tests {
                 .port,
             8443
         );
+    }
+
+    /// SR-35 (POA&M-510): fragments are refused, and spelling variants of
+    /// one URL share a canonical cache key; a different path or query does
+    /// not.
+    #[test]
+    fn fragment_refused_and_cache_key_canonical() {
+        let p = |u: &str| X5uUrl::parse(u, &[]);
+        assert_eq!(
+            p("https://cert.example.com/a.pem#1").unwrap_err(),
+            FetchError::Policy("fragment")
+        );
+        assert_eq!(
+            p("https://cert.example.com#x").unwrap_err(),
+            FetchError::Policy("fragment")
+        );
+        let k = |u: &str| p(u).unwrap().cache_key();
+        let base = k("https://cert.example.com/a.pem");
+        assert_eq!(base, "cert.example.com:443/a.pem");
+        for alias in [
+            "HTTPS://CERT.EXAMPLE.COM/a.pem",
+            "https://cert.example.com:443/a.pem",
+            "https://cert.example.com./a.pem",
+            "https://Cert.Example.Com.:443/a.pem",
+        ] {
+            assert_eq!(k(alias), base, "{alias}");
+        }
+        assert_eq!(k("https://h.example"), k("https://h.example/"));
+        assert_ne!(k("https://cert.example.com/A.pem"), base);
+        assert_ne!(k("https://cert.example.com/a.pem?v=2"), base);
+        assert_eq!(k("https://[2606:4700::1111]/c"), "[2606:4700::1111]:443/c");
+        let allow = vec!["cert.example.com".to_string()];
+        assert!(X5uUrl::parse("https://cert.example.com./a", &allow).is_ok());
     }
 }

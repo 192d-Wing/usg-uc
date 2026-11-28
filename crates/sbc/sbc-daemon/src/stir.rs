@@ -641,6 +641,14 @@ impl StirService {
         } else {
             match v.verifier.prepare(identities.iter().copied()) {
                 Err(r) => Err(r),
+                // Only non-SHAKEN Identity values (e.g. `ppt=div`): no
+                // SHAKEN identity to verify, so `require_identity` still
+                // answers 428 (RFC 8224 §6.2.2, RFC 8588 §6).
+                // NIST 800-53 Rev5: IA-9, SC-7 (POA&M-511)
+                Ok(None) if v.require_identity => {
+                    self.metrics.verify_absent.fetch_add(1, Ordering::Relaxed);
+                    Err(FailureReason::Missing)
+                }
                 Ok(None) => Ok(None),
                 Ok(Some(p)) => {
                     out.x5u_host = uc_sti::x5u_host(p.x5u());
@@ -1558,6 +1566,40 @@ mod tests {
             .inbound(&req, ip, Some((shared_key("udp"), "gb")), "c3")
             .await;
         assert_eq!(wrong.reject, None);
+    }
+
+    // NIST 800-53 Rev5: IA-9, SC-7 (SR-36, POA&M-511)
+    /// With `require_identity`, an INVITE whose only Identity values are
+    /// non-SHAKEN (`ppt=div`, or a token whose header names another ppt) is
+    /// rejected as Missing (428), never passed as No-TN-Validation. Without
+    /// `require_identity` it stays No-TN-Validation.
+    #[tokio::test]
+    async fn require_identity_rejects_non_shaken_only_identity() {
+        let f = test_support::sti_files();
+        let mut c = shared_host_config(&f, &[("ga", &[("a-udp", "udp", true, true)])]);
+        c.stir_shaken.verification.require_identity = true;
+        let svc = test_support::service(&c);
+        let ip: IpAddr = "192.0.2.20".parse().unwrap();
+        for id in [
+            "a.b.c;info=<https://x/c>;ppt=div",
+            // ppt "div" in the PASSporT header, no ppt param.
+            "eyJhbGciOiJFUzI1NiIsInBwdCI6ImRpdiIsInR5cCI6InBhc3Nwb3J0IiwieDV1IjoiaHR0cHM6Ly94L2MifQ.e30.sig;info=<https://x/c>",
+        ] {
+            let req = invite_with(Some(id));
+            let r = svc
+                .inbound(&req, ip, Some((shared_key("udp"), "ga")), "c1")
+                .await;
+            assert_eq!(r.reject, Some(FailureReason::Missing), "{id}");
+            assert_eq!(r.cdr_verstat, Some(Verstat::Failed), "{id}");
+        }
+        c.stir_shaken.verification.require_identity = false;
+        let svc = test_support::service(&c);
+        let req = invite_with(Some("a.b.c;info=<https://x/c>;ppt=div"));
+        let r = svc
+            .inbound(&req, ip, Some((shared_key("udp"), "ga")), "c2")
+            .await;
+        assert_eq!(r.reject, None);
+        assert_eq!(r.cdr_verstat, Some(Verstat::NoValidation));
     }
 
     // NIST 800-53 Rev5: AC-4, SC-7, IA-9 (SEC-005)
