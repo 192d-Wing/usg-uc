@@ -859,9 +859,15 @@ pub struct ZoneConfig {
     /// Media interface name (e.g., "eth1"). Resolved to IP at startup.
     pub media_interface: String,
     /// External/public IP for NAT traversal. Supports:
-    /// - Literal IP: `"203.0.113.10"`
+    /// - Literal IP: `"203.0.113.10"` (preferred)
     /// - Interface name: `"eth2"` (resolved at startup)
-    /// - STUN: `"stun"` or `"stun:server:port"` (auto-discovered)
+    /// - STUN: `"stun:<ip>:<port>"` with an operator-run server given as an
+    ///   IP literal (no DNS). Bare `"stun"` and host names are rejected;
+    ///   there is no default server. The first answer sets the address; a
+    ///   later different answer is not applied unless
+    ///   `transport.stun_accept_external_ip_change = true`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7, CM-6, SI-4
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_ip: Option<String>,
 }
@@ -1198,6 +1204,15 @@ pub struct TransportConfig {
 
     /// STUN refresh interval in seconds for external IP re-resolution (default: 300).
     pub stun_refresh_interval_secs: Option<u64>,
+
+    /// Whether a STUN refresh may change a zone's external IP after the
+    /// first answer set it. Default `false`: a different answer is logged
+    /// and audited but not applied (STUN answers are unauthenticated).
+    /// When `true` the change is applied only after the same new address
+    /// is returned on two refreshes in a row, and is logged and audited.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7, SI-4, AU-2
+    pub stun_accept_external_ip_change: bool,
 }
 
 impl Default for TransportConfig {
@@ -1241,6 +1256,7 @@ impl Default for TransportConfig {
             api_listen: None,
             api_tls_listen: None,
             stun_refresh_interval_secs: None,
+            stun_accept_external_ip_change: false,
         }
     }
 }

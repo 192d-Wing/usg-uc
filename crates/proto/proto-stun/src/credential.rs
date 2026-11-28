@@ -19,12 +19,13 @@
 //! ## CNSA 2.0 Compliance
 //!
 //! This implementation uses SHA-384 for key derivation instead of MD5
-//! as specified in RFC 5389 §15.4. This is a security-conscious deviation
-//! for CNSA 2.0 compliance. Both endpoints must use this implementation
-//! for interoperability.
+//! as specified in RFC 5389 §15.4, so it does not interoperate with other
+//! STUN/TURN stacks; only this implementation can talk to itself. No
+//! shipped binary uses the long-term mechanism.
 //!
 //! Key derivation: `SHA384(username ":" realm ":" password)`
-//! MESSAGE-INTEGRITY: HMAC-SHA384 truncated to 20 bytes
+//! MESSAGE-INTEGRITY: HMAC-SHA1 over the RFC 8489 §14.5 byte range
+//! (CNSA-EXCEPTION, POA&M-500), shared with the short-term mechanism.
 
 use crate::attribute::StunAttribute;
 use crate::error::{StunError, StunResult};
@@ -346,21 +347,18 @@ impl LongTermCredentialValidator {
         F: FnOnce(&str) -> Option<String>,
     {
         // Check for MESSAGE-INTEGRITY
-        let integrity = msg.attributes.iter().find_map(|a| {
-            if let StunAttribute::MessageIntegrity(data) = a {
-                Some(data.clone())
-            } else {
-                None
-            }
-        });
+        let has_integrity = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, StunAttribute::MessageIntegrity(_)));
 
-        let Some(received_integrity) = integrity else {
+        if !has_integrity {
             // No authentication - require challenge
             return AuthResult::ChallengeRequired {
                 realm: self.realm.clone(),
                 nonce: self.generate_nonce(),
             };
-        };
+        }
 
         // Extract credentials from message
         let username = msg.attributes.iter().find_map(|a| {
@@ -448,7 +446,7 @@ impl LongTermCredentialValidator {
         };
 
         // Verify MESSAGE-INTEGRITY
-        if verify_message_integrity(raw_data, &key, &received_integrity) {
+        if StunMessage::verify_integrity(raw_data, &key) {
             AuthResult::Success
         } else {
             AuthResult::Failed {
@@ -472,62 +470,6 @@ impl LongTermCredentialValidator {
         response.add_attribute(StunAttribute::Nonce(self.generate_nonce()));
         response
     }
-}
-
-/// Verifies MESSAGE-INTEGRITY against the raw message data.
-///
-/// ## RFC 5389 §15.4
-///
-/// The MESSAGE-INTEGRITY is computed over the STUN message, starting
-/// with the header, up to (but not including) the MESSAGE-INTEGRITY
-/// attribute. The length field in the header is adjusted to point to
-/// the end of the MESSAGE-INTEGRITY attribute.
-fn verify_message_integrity(raw_data: &[u8], key: &[u8], received: &[u8]) -> bool {
-    // Find MESSAGE-INTEGRITY attribute offset
-    // The MESSAGE-INTEGRITY should be at the end (before optional FINGERPRINT)
-    if raw_data.len() < 20 {
-        return false;
-    }
-
-    // MESSAGE-INTEGRITY is 24 bytes (4 header + 20 value)
-    // We need to find where it starts
-    let integrity_attr_size = 24;
-
-    // Check if there's a FINGERPRINT after MESSAGE-INTEGRITY
-    let has_fingerprint = raw_data.len() >= 20 + integrity_attr_size + 8;
-
-    let integrity_offset = if has_fingerprint {
-        raw_data.len() - integrity_attr_size - 8
-    } else {
-        raw_data.len() - integrity_attr_size
-    };
-
-    if integrity_offset < 20 {
-        return false;
-    }
-
-    // Create message copy with adjusted length
-    let mut adjusted = raw_data[..integrity_offset].to_vec();
-
-    // Adjust length to include MESSAGE-INTEGRITY but not FINGERPRINT
-    let new_len = (integrity_offset - 20 + integrity_attr_size) as u16;
-    adjusted[2] = (new_len >> 8) as u8;
-    adjusted[3] = new_len as u8;
-
-    // Compute HMAC
-    let hmac = uc_crypto::hash::hmac_sha384(key, &adjusted);
-
-    // Compare (truncated to 20 bytes for compatibility)
-    if received.len() != 20 {
-        return false;
-    }
-
-    // Constant-time comparison
-    let mut result = 0u8;
-    for (a, b) in hmac[..20].iter().zip(received.iter()) {
-        result |= a ^ b;
-    }
-    result == 0
 }
 
 /// Encodes bytes as lowercase hex.

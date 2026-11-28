@@ -59,7 +59,8 @@ pub use agent::{IceAgent, IceConfig, IceCredentials, IceRole};
 pub use candidate::{Candidate, CandidateType, TransportProtocol};
 pub use checklist::{CandidatePair, CheckList, PairState};
 pub use connectivity::{
-    CheckResult, ConnectivityCheck, ConnectivityChecker, IceStunServer, TriggeredCheckInfo,
+    CheckResult, ConnectivityCheck, ConnectivityChecker, IceStunServer, RequestOutcome,
+    TriggeredCheckInfo,
 };
 pub use consent::{
     ConsentKeepaliveAction, ConsentKeepaliveManager, ConsentState, ConsentTracker, KeepaliveTracker,

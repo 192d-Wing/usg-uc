@@ -213,16 +213,16 @@
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| **RFC 5389** | STUN — message format, magic cookie, Binding request/response, retransmission (§7.2.1), FINGERPRINT (CRC32), MESSAGE-INTEGRITY, error codes | **Full**. **Wired (sbc-daemon `zone.rs`: `StunClient::discover_srflx` for external-IP discovery, driven by `runtime.rs` `ExternalIpMonitor`; soft client via proto-ice connectivity checks)** |
-| **RFC 5389** | STUN long-term credential mechanism (§10.2) | **Full**. **Library-only** — only exercised by proto-turn `TurnClient`, which no binary configures |
-| **RFC 8489** | STUN (updated) | Referenced alongside 5389 |
+| **RFC 5389** | STUN — message format, magic cookie, Binding request/response, retransmission (§7.2.1), FINGERPRINT (CRC32), error codes | **Full**. **Wired (sbc-daemon `zone.rs`: `StunClient::discover_srflx` for external-IP discovery against an operator-pinned `stun:<ip>:<port>` server, driven by `ExternalIpMonitor`, no default server, later changes not applied by default (SR-33, NIST POA&M-502); soft client via proto-ice connectivity checks)** |
+| **RFC 8489** | MESSAGE-INTEGRITY (§14.5): HMAC-SHA1 over the header and attributes before it, length field adjusted to end at it; attributes after it other than FINGERPRINT ignored; FINGERPRINT (§14.7) must be last | **Full** since SR-17 (`message.rs` `encode_with_integrity`, `verify_integrity`, `has_valid_fingerprint`). Tested against the RFC 5769 §2.1-2.3 vectors (`rfc5769_*` tests); §2.4 (long-term, MD5 key) not run because the long-term key derivation deviates (below). HMAC-SHA1 is a CNSA exception (NIST POA&M-500). MESSAGE-INTEGRITY-SHA256 is not implemented |
+| **RFC 5389** | STUN long-term credential mechanism (§10.2) | **Partial, not interoperable**: SHA-384 key derivation instead of MD5 (below); MESSAGE-INTEGRITY uses the shared §14.5 code. **Library-only** — only exercised by proto-turn `TurnClient`, which no binary configures |
 | **RFC 4013** | SASLprep | Referenced (simplified implementation). Library-only |
 | **RFC 5245/8445** | ICE | Attribute types (ICE-CONTROLLING, ICE-CONTROLLED, USE-CANDIDATE, PRIORITY). Wired (soft client only, via proto-ice) |
 | **RFC 5766** | TURN | Allocate method. Library-only |
 
 ### Key Files
 - `src/lib.rs` — STUN magic cookie, message types
-- `src/message.rs` — message encoding, MESSAGE-INTEGRITY (HMAC), FINGERPRINT (CRC32)
+- `src/message.rs` — message encoding, MESSAGE-INTEGRITY (HMAC-SHA1, RFC 8489 §14.5), FINGERPRINT (CRC32), RFC 5769 vectors
 - `src/attribute.rs` — attribute types per RFC 5389/8489, ICE attributes per RFC 5245/8445
 - `src/client.rs` — retransmission per §7.2.1 (500ms initial, 1.6s max, 7 retries)
 - `src/credential.rs` — long-term credential (§10.2), nonce lifecycle (library-only)
@@ -232,9 +232,10 @@
 
 | RFC Standard | Deviation | Reason |
 |-------------|-----------|--------|
-| RFC 5389 (MD5 key derivation) | SHA-384 | CNSA 2.0 |
-| RFC 5389 (HMAC-SHA1) | HMAC-SHA256 | RFC 8445 requirement |
+| RFC 5389 (MD5 long-term key derivation) | SHA-384; not interoperable with other stacks | CNSA 2.0 (library-only) |
 | RFC 4013 SASLprep | Simplified | Noted in comments |
+
+Until SR-17 the "HMAC-SHA1 → HMAC-SHA256" row here was wrong: the code sent HMAC-SHA-384 truncated to 20 bytes over the wrong length, which no other ICE agent accepts, and never verified received integrity. MESSAGE-INTEGRITY is now standard HMAC-SHA1.
 
 ---
 
@@ -276,9 +277,9 @@
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| **RFC 8445** | ICE | **Full** — candidate types and priority (§5.1.2), pair priority (§6.1.2.3), checklist initialization (§6.1.2.6), connectivity checks (§6-7), role conflict (§7.3.1.1), aggressive nomination (§7.2.2), keepalives (§10), retransmission (§14.3). **Wired (soft client only)**; the SBC does not run ICE |
+| **RFC 8445** | ICE | **Partial** — candidate types and priority (§5.1.2), pair priority (§6.1.2.3), checklist initialization (§6.1.2.6) with a 100-pair limit (§6.1.2.5) and 32 remote candidates, connectivity checks (§6-7), retransmission (§14.3). Since SR-17 (NIST POA&M-501): ufrag/pwd (§5.3) and tie-breaker from the aws-lc DRBG; requests and responses carry MESSAGE-INTEGRITY and FINGERPRINT (§7.1, §7.2.2, §7.3); a request is acted on (role, USE-CANDIDATE) only after FINGERPRINT, USERNAME and MESSAGE-INTEGRITY verify, otherwise 400/401 unsigned or dropped (RFC 8489 §9.1.3); a response is acted on only when authenticated, and fails the check if its source is not the check target (§7.2.5.2.1); role conflict follows §7.3.1.1 (487 or switch) and §7.2.5.1. Not implemented: peer-reflexive candidates from triggered checks, triggered-check queue. **Wired (soft client only)**; the SBC does not run ICE |
 | **RFC 5245** | ICE (legacy) | Referenced |
-| **RFC 7675** | Consent Freshness | **Full** — 5s interval, 30s timeout, consent revocation (§6), MUST cease sending. **Library-only** — `consent.rs` is not driven by `IceAgent` or any binary |
+| **RFC 7675** | Consent Freshness | **Partial** — 5s interval, 30s timeout, consent revocation (§6), MUST cease sending; `ConsentKeepaliveManager::process_response` does not verify MESSAGE-INTEGRITY, so it must not be wired as is. **Library-only** — `consent.rs` is not driven by `IceAgent` or any binary |
 | **RFC 8839** | SDP for ICE | Referenced — soft client parses `a=candidate`/ufrag/pwd itself (`IceHandler::parse_sdp_candidate`, `call_manager.rs`) |
 
 ### Key Files
@@ -286,7 +287,7 @@
 - `src/agent.rs` — ICE agent, candidate gathering (§5), aggressive nomination (§7.2.2)
 - `src/candidate.rs` — candidate priority (§5.1.2.1), foundation (§5.1.1.3)
 - `src/checklist.rs` — pair priority (§6.1.2.3), pair state initialization (§6.1.2.6)
-- `src/connectivity.rs` — connectivity checks (§6-7), STUN request (§7.1.1), role conflict (§7.3.1.1)
+- `src/connectivity.rs` — connectivity checks (§6-7), STUN request (§7.1.1), request/response authentication (§7.2.5, §7.3), role conflict (§7.3.1.1)
 - `src/consent.rs` — RFC 7675 consent freshness, RFC 8445 §10 keepalives (library-only)
 
 ### Key Constants
@@ -518,8 +519,7 @@
 |-------|-------------|-----------|--------|
 | proto-srtp | RFC 3711 KDF (SHA-1) | HKDF-SHA384 | CNSA 2.0 |
 | proto-srtp | RFC 3711 cipher | Only AES-256-GCM | CNSA 2.0 |
-| proto-stun | RFC 5389 (MD5 key derivation) | SHA-384 | CNSA 2.0 |
-| proto-stun | RFC 5389 (HMAC-SHA1) | HMAC-SHA256 | RFC 8445 requirement |
+| proto-stun | RFC 5389 (MD5 long-term key derivation) | SHA-384 (library-only, not interoperable) | CNSA 2.0 |
 | proto-stun | RFC 4013 SASLprep | Simplified | Noted in comments |
 | proto-b2bua | RFC 4568 crypto suites (any registered suite) | Only `AEAD_AES_256_GCM` SDES is relayed; other suites are stripped from offers and refused in answers; answer tags are not cross-checked against the offer | CNSA 2.0 |
 

@@ -22,7 +22,10 @@ const SBC_MIN: &[&str] = &[
     "sbcApi.ha1Key.existingSecret=x",
     "sbcPostgres.password=p",
     "sbcClientConfig.ingressTlsSecretName=qa-edge-tls",
+    "sbcDaemon.config.outside_external_ip=203.0.113.10",
 ];
+/// The outside zone's public address (required, SR-33).
+const SBC_OUTSIDE_IP: &str = "sbcDaemon.config.outside_external_ip=203.0.113.10";
 /// The extra input the daemon gRPC mTLS default needs.
 const SBC_ISSUER: &str = "sbcDaemon.grpcMtls.clusterIssuer=qa-issuer";
 /// Values the central-config chart cannot render without.
@@ -377,6 +380,51 @@ fn qa_helm_render_media_split_loopback() {
         !daemon.contains("containerPort: 9096"),
         "media controller port must not be advertised"
     );
+}
+
+// ── SR-33: outside zone external IP ───────────────────
+// NIST 800-53 Rev5: SC-7, CM-6
+
+#[test]
+#[ignore = "requires the helm binary; run with --ignored"]
+fn qa_helm_render_outside_external_ip_required_and_pinned() {
+    let base: Vec<&str> = SBC_MIN
+        .iter()
+        .copied()
+        .filter(|s| !s.starts_with("sbcDaemon.config.outside_external_ip="))
+        .chain([SBC_ISSUER])
+        .collect();
+    for (extra, what) in [
+        (None, "unset"),
+        (
+            Some("sbcDaemon.config.outside_external_ip=stun"),
+            "bare stun",
+        ),
+    ] {
+        let sets: Vec<&str> = base.iter().copied().chain(extra).collect();
+        must_fail(
+            render("sbc", &sets, None),
+            "sbcDaemon.config.outside_external_ip",
+            what,
+        );
+    }
+    for value in ["203.0.113.10", "stun:192.0.2.1:3478"] {
+        let set = format!("sbcDaemon.config.outside_external_ip={value}");
+        let sets: Vec<&str> = base.iter().copied().chain([set.as_str()]).collect();
+        let out = must_render(render("sbc", &sets, None), value);
+        let cfg = sbc_config::load_from_str(&daemon_config(&out)).expect("rendered config loads");
+        let outside = cfg.zones.iter().find(|z| z.name == "outside").unwrap();
+        assert_eq!(outside.external_ip.as_deref(), Some(value));
+        assert!(!cfg.transport.stun_accept_external_ip_change);
+    }
+    // A host-name STUN server renders but the daemon config refuses it.
+    let sets: Vec<&str> = base
+        .iter()
+        .copied()
+        .chain(["sbcDaemon.config.outside_external_ip=stun:stun.example.com:3478"])
+        .collect();
+    let out = must_render(render("sbc", &sets, None), "stun host name");
+    assert!(sbc_config::load_from_str(&daemon_config(&out)).is_err());
 }
 
 // ── SR-57: connection caps sized for the pod ───────────────────
@@ -1453,7 +1501,7 @@ fn qa_helm_render_site_oopl_001_edge_tls() {
         render_values(
             "sbc",
             "deploy/helm/sites/sbc/oopl-001/values.yaml",
-            &["sbcPostgres.password=p", SBC_ISSUER],
+            &["sbcPostgres.password=p", SBC_ISSUER, SBC_OUTSIDE_IP],
         ),
         "oopl-001 site",
     );

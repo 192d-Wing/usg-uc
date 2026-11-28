@@ -65,7 +65,7 @@ impl StunClient {
     /// ## Arguments
     ///
     /// * `socket` - Bound UDP socket for STUN communication
-    /// * `server` - STUN server address (e.g., stun.l.google.com:19302)
+    /// * `server` - STUN server address (an operator-run server, e.g. 192.0.2.1:3478)
     ///
     /// ## Example
     ///
@@ -73,7 +73,7 @@ impl StunClient {
     /// let socket = UdpSocket::bind("0.0.0.0:0").await?;
     /// let client = StunClient::new(
     ///     Arc::new(socket),
-    ///     "stun.l.google.com:19302".parse()?,
+    ///     "192.0.2.1:3478".parse()?,
     /// );
     /// ```
     pub fn new(socket: Arc<UdpSocket>, server: SocketAddr) -> Self {

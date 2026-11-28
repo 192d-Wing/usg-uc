@@ -287,10 +287,12 @@ impl IceHandler {
             .socket
             .clone()
             .ok_or_else(|| SipUaError::IceError("media socket not set".to_string()))?;
-        let remote_creds =
-            self.agent.remote_credentials().cloned().ok_or_else(|| {
-                SipUaError::IceError("remote ICE credentials not set".to_string())
-            })?;
+        // Checks are signed with the remote password, so it must be known.
+        if self.agent.remote_credentials().is_none() {
+            return Err(SipUaError::IceError(
+                "remote ICE credentials not set".to_string(),
+            ));
+        }
         self.agent
             .start_checks()
             .map_err(|e| SipUaError::IceError(e.to_string()))?;
@@ -346,20 +348,14 @@ impl IceHandler {
                 && let Some(check) = self.build_check(idx, true)
             {
                 nominated_sent = true;
-                Self::send_check(&socket, &remote_creds, &check).await;
+                Self::send_check(&socket, &check).await;
                 Self::track(&mut outstanding, idx, check);
             }
 
-            self.send_next_check(&socket, &remote_creds, &mut outstanding)
-                .await;
+            self.send_next_check(&socket, &mut outstanding).await;
 
-            for idx in Self::retransmit_expired(
-                &socket,
-                &remote_creds,
-                &mut outstanding,
-                max_retransmissions,
-            )
-            .await
+            for idx in
+                Self::retransmit_expired(&socket, &mut outstanding, max_retransmissions).await
             {
                 debug!(pair = idx, "Connectivity check timed out");
                 let _ = self.agent.check_failed(idx);
@@ -404,14 +400,25 @@ impl IceHandler {
         };
         match msg.msg_type.class {
             StunClass::Request => {
-                self.answer_peer_check(socket, &msg, from).await;
+                self.answer_peer_check(socket, &msg, datagram, from).await;
             }
             StunClass::SuccessResponse | StunClass::ErrorResponse => {
-                let Some(oc) = outstanding.remove(&msg.transaction_id) else {
+                let Some(oc) = outstanding.get(&msg.transaction_id) else {
                     trace!("STUN response for unknown transaction, ignored");
                     return;
                 };
-                self.handle_check_response(&oc, &msg);
+                // NIST 800-53 Rev5: IA-3, SC-8 -- a response that fails
+                // FINGERPRINT/MESSAGE-INTEGRITY is discarded and the check
+                // keeps waiting (RFC 8489 §9.1.4).
+                let result = oc.check.process_response(&msg, datagram, from);
+                if let Err(proto_ice::IceError::Unauthenticated { reason }) = &result {
+                    debug!(from = %from, %reason, "Discarding unauthenticated check response");
+                    return;
+                }
+                let Some(oc) = outstanding.remove(&msg.transaction_id) else {
+                    return;
+                };
+                self.handle_check_response(&oc, result);
             }
             StunClass::Indication => {}
         }
@@ -422,14 +429,13 @@ impl IceHandler {
     async fn send_next_check(
         &mut self,
         socket: &UdpSocket,
-        remote_creds: &IceCredentials,
         outstanding: &mut HashMap<[u8; 12], OutstandingCheck>,
     ) {
         if let Some(idx) = self.agent.next_check()
             && let Some(check) = self.build_check(idx, self.agent.should_nominate_check())
         {
             let _ = self.agent.start_check(idx);
-            Self::send_check(socket, remote_creds, &check).await;
+            Self::send_check(socket, &check).await;
             Self::track(outstanding, idx, check);
         }
     }
@@ -458,7 +464,6 @@ impl IceHandler {
     /// pair indices that gave up.
     async fn retransmit_expired(
         socket: &UdpSocket,
-        remote_creds: &IceCredentials,
         outstanding: &mut HashMap<[u8; 12], OutstandingCheck>,
         max_retransmissions: u32,
     ) -> Vec<usize> {
@@ -475,7 +480,7 @@ impl IceHandler {
             oc.attempts += 1;
             oc.sent_at = now;
             oc.rto = (oc.rto * 2).min(MAX_RTO);
-            Self::send_check(socket, remote_creds, &oc.check).await;
+            Self::send_check(socket, &oc.check).await;
         }
         gave_up
             .iter()
@@ -510,16 +515,10 @@ impl IceHandler {
     }
 
     /// Sends a check signed with the peer's password (§7.2.2: the request's
-    /// MESSAGE-INTEGRITY uses the remote agent's password).
-    async fn send_check(
-        socket: &UdpSocket,
-        remote_creds: &IceCredentials,
-        check: &ConnectivityCheck,
-    ) {
-        let Ok(request) = check.create_request() else {
-            return;
-        };
-        match request.encode_with_integrity(remote_creds.pwd.as_bytes()) {
+    /// MESSAGE-INTEGRITY uses the remote agent's password) and carrying
+    /// FINGERPRINT (§7.1).
+    async fn send_check(socket: &UdpSocket, check: &ConnectivityCheck) {
+        match check.encode_request() {
             Ok(bytes) => {
                 if let Err(e) = socket.send_to(&bytes, check.remote().address()).await {
                     warn!(error = %e, remote = %check.remote().address(), "Failed to send connectivity check");
@@ -532,10 +531,17 @@ impl IceHandler {
     /// Answers a Binding request from the peer (§7.3): the response carries
     /// XOR-MAPPED-ADDRESS and is signed with our password. A USE-CANDIDATE
     /// from the controlling peer nominates the matching pair on our side.
+    ///
+    /// Only a request that passed FINGERPRINT, USERNAME and
+    /// MESSAGE-INTEGRITY changes state (role or nomination); anything else
+    /// gets an unsigned 400/401 or no answer at all.
+    ///
+    /// ## NIST 800-53 Rev5: IA-3, SC-8, SI-10
     async fn answer_peer_check(
         &mut self,
         socket: &UdpSocket,
         request: &StunMessage,
+        raw: &[u8],
         from: SocketAddr,
     ) {
         let server = IceStunServer::new(
@@ -543,15 +549,14 @@ impl IceHandler {
             self.agent.role(),
             self.agent.tie_breaker(),
         );
-        let (response, triggered) = match server.process_request(request, from, self.local_addr) {
+        let outcome = match server.process_request(request, raw, from, self.local_addr) {
             Ok(r) => r,
             Err(e) => {
                 debug!(error = %e, from = %from, "Rejected peer connectivity check");
                 return;
             }
         };
-        let pwd = self.agent.local_credentials().pwd.clone();
-        match response.encode_with_integrity(pwd.as_bytes()) {
+        match server.encode_response(&outcome) {
             Ok(bytes) => {
                 if let Err(e) = socket.send_to(&bytes, from).await {
                     warn!(error = %e, "Failed to answer connectivity check");
@@ -559,13 +564,14 @@ impl IceHandler {
             }
             Err(e) => warn!(error = %e, "Failed to encode check response"),
         }
-        let Some(info) = triggered else {
+        let Some(info) = outcome.triggered else {
             return;
         };
+        // RFC 8445 §7.3.1.1: the role switch happens before the request is
+        // acted on; the request itself was accepted.
         if let Some(new_role) = info.role_conflict {
             info!(?new_role, "ICE role conflict; switching role");
             self.agent.set_role(new_role);
-            return;
         }
         // The peer reached us on this pair, so it is valid from its side; if
         // it nominated it and the pair already succeeded for us, select it.
@@ -581,8 +587,12 @@ impl IceHandler {
     }
 
     /// Applies the peer's response to one of our checks.
-    fn handle_check_response(&mut self, oc: &OutstandingCheck, response: &StunMessage) {
-        match oc.check.process_response(response) {
+    fn handle_check_response(
+        &mut self,
+        oc: &OutstandingCheck,
+        result: proto_ice::IceResult<CheckResult>,
+    ) {
+        match result {
             Ok(CheckResult::Success { nominated, .. }) => {
                 let _ = self.agent.check_succeeded(oc.pair_index);
                 if nominated {
@@ -590,11 +600,15 @@ impl IceHandler {
                 }
             }
             Ok(CheckResult::RoleConflict { new_role }) => {
-                info!(
-                    ?new_role,
-                    "ICE role conflict reported by peer; switching role"
-                );
-                self.agent.set_role(new_role);
+                // RFC 8445 §7.2.5.1: switch away from the role the request
+                // was sent in, unless an earlier 487 already did.
+                if self.agent.role() == oc.check.role() {
+                    info!(
+                        ?new_role,
+                        "ICE role conflict reported by peer; switching role"
+                    );
+                    self.agent.set_role(new_role);
+                }
                 // The pair goes back to Waiting so it is re-checked under the new role.
                 if let Some(p) = self.agent.checklist_mut().get_mut(oc.pair_index) {
                     p.set_state(PairState::Waiting);
@@ -875,6 +889,42 @@ mod tests {
             "bounded by the phase timeout"
         );
         assert!(h.selected_pair().is_none());
+    }
+
+    /// A request that knows our ufrag (it is in the SDP) but not our
+    /// password cannot flip the role or nominate; an authenticated
+    /// ICE-CONTROLLING with a smaller tie-breaker gets 487 and we stay
+    /// controlling (RFC 8445 §7.3.1.1).
+    #[tokio::test]
+    async fn forged_role_conflict_does_not_switch_roles() {
+        use proto_stun::{StunAttribute, StunMessageType};
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let from = peer.local_addr().unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut h = IceHandler::for_outbound(sock.local_addr().unwrap(), IceConfig::default(), tx);
+        let creds = h.local_credentials();
+
+        let mut forged = StunMessage::new(StunMessageType::binding_request(), [9u8; 12]);
+        forged.add_attribute(StunAttribute::Username(format!("{}:evil", creds.ufrag)));
+        forged.add_attribute(StunAttribute::IceControlling(0));
+        forged.add_attribute(StunAttribute::UseCandidate);
+
+        for raw in [
+            forged.encode_with_fingerprint().to_vec(),
+            forged
+                .encode_with_integrity_and_fingerprint(b"not-the-password")
+                .unwrap()
+                .to_vec(),
+            forged
+                .encode_with_integrity_and_fingerprint(creds.pwd.as_bytes())
+                .unwrap()
+                .to_vec(),
+        ] {
+            let msg = StunMessage::parse(&raw).unwrap();
+            h.answer_peer_check(&sock, &msg, &raw, from).await;
+            assert_eq!(h.role(), IceRole::Controlling);
+        }
     }
 
     #[test]

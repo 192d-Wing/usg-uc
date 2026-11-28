@@ -541,6 +541,24 @@ earlier line of its own:
 
 ---
 
+### Zone external IP and STUN discovery (`[[zones]] external_ip`; changed 2026-11-27)
+
+`external_ip` is the address a zone advertises in SDP, Via and Contact when it sits behind NAT. Set it in one of three ways:
+
+| Value | Meaning |
+|-------|---------|
+| `"203.0.113.10"` | Literal public IP. Preferred: nothing on the network can change it. |
+| `"eth2"` | Address of a local interface, resolved at startup. |
+| `"stun:<ip>:<port>"` | Ask a STUN server **you operate** (IP literal, e.g. `"stun:192.0.2.1:3478"`) at startup and every `transport.stun_refresh_interval_secs` (default 300). |
+
+**Breaking change (SR-33):** bare `"stun"`, which used a public Internet STUN server, and host-name servers (`"stun:stun.example.com:3478"`) now fail the config load. There is no default STUN server. STUN answers are not authenticated, so:
+
+- The first answer sets the zone's external IP.
+- A later answer with a different address is **not applied**. The SBC logs a warning and writes a `ConfigurationChange` audit record (admin `stun-monitor`, description `zone external_ip change refused: ...`) once per distinct answer. Restart the daemon to accept a new address, or set a literal IP.
+- `[transport] stun_accept_external_ip_change = true` (default `false`) lets a different address replace the current one, but only after two refreshes in a row return it; the change is logged and audited (`... change applied: ...`). Use it only where the public address really changes (dynamic NAT) and the path to the STUN server is trusted.
+
+Helm (sbc chart): the outside zone's address now comes from `sbcDaemon.config.outside_external_ip`, which is **required**: the public IP, or `stun:<ip>:<port>`. Rendering fails when it is unset or `stun`. Residual risk: NIST POA&M-502.
+
 ## SIP Registration
 
 The SBC acts as a B2BUA registrar, storing user bindings in an in-memory location service. When clustering is enabled, bindings are replicated to Redis or PostgreSQL.

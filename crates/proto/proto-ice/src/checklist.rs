@@ -375,6 +375,9 @@ impl CheckList {
     fn sort_by_priority(&mut self) {
         // We need to rebuild indices after sorting
         self.pairs.sort_by_key(|b| std::cmp::Reverse(b.priority()));
+        // RFC 8445 §6.1.2.5: prune the lowest-priority pairs past the limit.
+        // NIST 800-53 Rev5: SC-5
+        self.pairs.truncate(crate::agent::MAX_CANDIDATE_PAIRS);
 
         // Rebuild component and foundation indices
         self.by_component.clear();

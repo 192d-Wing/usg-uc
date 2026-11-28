@@ -267,10 +267,24 @@ impl StunMessage {
         let mut offset = HEADER_SIZE;
         let end = HEADER_SIZE + length;
 
+        // RFC 8489 §14.5/§14.7: attributes after MESSAGE-INTEGRITY other
+        // than FINGERPRINT, and anything after FINGERPRINT, are not covered
+        // by the integrity check and MUST be ignored.
+        let mut seen_integrity = false;
+        let mut seen_fingerprint = false;
         while offset < end {
             let (attr, consumed) = StunAttribute::parse(&data[offset..end], &transaction_id)?;
-            attributes.push(attr);
             offset += consumed;
+            if seen_fingerprint {
+                continue;
+            }
+            match attr {
+                StunAttribute::Fingerprint(_) => seen_fingerprint = true,
+                StunAttribute::MessageIntegrity(_) if !seen_integrity => seen_integrity = true,
+                _ if seen_integrity => continue,
+                _ => {}
+            }
+            attributes.push(attr);
         }
 
         Ok(Self {
@@ -307,27 +321,118 @@ impl StunMessage {
         buf.freeze()
     }
 
-    /// Encodes with MESSAGE-INTEGRITY attribute.
+    /// Encodes with a MESSAGE-INTEGRITY attribute (RFC 8489 §14.5).
     ///
-    /// The key should be derived from the password per RFC 5389.
+    /// The HMAC-SHA1 is computed over the header and every attribute
+    /// before MESSAGE-INTEGRITY, with the header length field already
+    /// counting the 24-byte MESSAGE-INTEGRITY attribute. For ICE
+    /// short-term credentials `key` is the password itself (§9.1.1). Any
+    /// MESSAGE-INTEGRITY or FINGERPRINT already in `attributes` is dropped
+    /// first.
+    ///
+    /// CNSA-EXCEPTION: HMAC-SHA1 is mandated by RFC 8489 §14.5 (POA&M-500);
+    /// it authenticates the message only.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8 (Transmission Integrity), SC-13
     ///
     /// # Errors
-    /// Returns an error if the operation fails.
+    /// Returns an error if the message is too large to encode.
     pub fn encode_with_integrity(&self, key: &[u8]) -> StunResult<Bytes> {
-        let mut msg = self.clone();
-
-        // Encode without integrity to compute HMAC
-        let partial = msg.encode();
-
-        // Compute HMAC-SHA1 (RFC 5389 uses SHA1, but we could use SHA256 for ICE)
-        // For now, use SHA384 for CNSA compliance in long-term credentials
-        let hmac = compute_hmac_sha384(key, &partial);
-
-        // Truncate to 20 bytes for compatibility (HMAC-SHA1 length)
-        msg.attributes
-            .push(StunAttribute::MessageIntegrity(hmac[..20].to_vec()));
-
+        let msg = self.with_integrity(key)?;
         Ok(msg.encode())
+    }
+
+    /// Encodes with MESSAGE-INTEGRITY followed by FINGERPRINT, the form
+    /// RFC 8445 §7.1/§7.3 requires for ICE connectivity checks and their
+    /// responses.
+    ///
+    /// # Errors
+    /// Returns an error if the message is too large to encode.
+    pub fn encode_with_integrity_and_fingerprint(&self, key: &[u8]) -> StunResult<Bytes> {
+        let msg = self.with_integrity(key)?;
+        Ok(msg.encode_with_fingerprint())
+    }
+
+    /// Returns a copy with MESSAGE-INTEGRITY appended (see
+    /// [`Self::encode_with_integrity`]).
+    fn with_integrity(&self, key: &[u8]) -> StunResult<Self> {
+        let mut msg = self.clone();
+        msg.attributes.retain(|a| {
+            !matches!(
+                a,
+                StunAttribute::MessageIntegrity(_) | StunAttribute::Fingerprint(_)
+            )
+        });
+        let partial = msg.encode();
+        let new_len =
+            u16::try_from(partial.len() - HEADER_SIZE + INTEGRITY_ATTR_LEN).map_err(|_| {
+                StunError::InvalidMessage {
+                    reason: "message too large for MESSAGE-INTEGRITY".to_string(),
+                }
+            })?;
+        let mut covered = BytesMut::from(partial.as_ref());
+        covered[2..4].copy_from_slice(&new_len.to_be_bytes());
+        // CNSA-EXCEPTION: RFC 8489 §14.5 HMAC-SHA1 (POA&M-500).
+        let tag = uc_crypto::interop::hmac_sha1(key, &covered);
+        msg.attributes
+            .push(StunAttribute::MessageIntegrity(tag.to_vec()));
+        Ok(msg)
+    }
+
+    /// Verifies the MESSAGE-INTEGRITY attribute of a received message
+    /// (RFC 8489 §14.5, §9.1.3).
+    ///
+    /// `raw` is the datagram as received. The HMAC-SHA1 is recomputed over
+    /// the bytes before the first MESSAGE-INTEGRITY attribute with the
+    /// length field adjusted to end at that attribute, and compared in
+    /// constant time. Returns `false` when the message has no
+    /// MESSAGE-INTEGRITY, when it is not 20 bytes, or when it does not
+    /// match.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8, IA-3 (Device Authentication), SC-13
+    #[must_use]
+    pub fn verify_integrity(raw: &[u8], key: &[u8]) -> bool {
+        let Some(off) = find_attribute(raw, ATTR_MESSAGE_INTEGRITY) else {
+            return false;
+        };
+        let Some(value) = raw.get(off + 4..off + INTEGRITY_ATTR_LEN) else {
+            return false;
+        };
+        if u16::from_be_bytes([raw[off + 2], raw[off + 3]]) != 20 {
+            return false;
+        }
+        let Ok(new_len) = u16::try_from(off - HEADER_SIZE + INTEGRITY_ATTR_LEN) else {
+            return false;
+        };
+        let mut covered = raw[..off].to_vec();
+        covered[2..4].copy_from_slice(&new_len.to_be_bytes());
+        // CNSA-EXCEPTION: RFC 8489 §14.5 HMAC-SHA1 (POA&M-500).
+        uc_crypto::interop::verify_hmac_sha1(key, &covered, value)
+    }
+
+    /// True when `raw` ends with a FINGERPRINT attribute whose CRC-32
+    /// matches (RFC 8489 §14.7). A message without FINGERPRINT fails.
+    #[must_use]
+    pub fn has_valid_fingerprint(raw: &[u8]) -> bool {
+        let Some(total) = message_len(raw) else {
+            return false;
+        };
+        if total < HEADER_SIZE + FINGERPRINT_ATTR_LEN {
+            return false;
+        }
+        let fp_off = total - FINGERPRINT_ATTR_LEN;
+        if find_attribute(raw, ATTR_FINGERPRINT) != Some(fp_off)
+            || raw[fp_off + 2..fp_off + 4] != [0, 4]
+        {
+            return false;
+        }
+        let received = u32::from_be_bytes([
+            raw[fp_off + 4],
+            raw[fp_off + 5],
+            raw[fp_off + 6],
+            raw[fp_off + 7],
+        ]);
+        compute_crc32(&raw[..fp_off]) ^ FINGERPRINT_XOR == received
     }
 
     /// Encodes with FINGERPRINT attribute.
@@ -336,8 +441,11 @@ impl StunMessage {
     /// including the header, but with the length field adjusted to include
     /// the FINGERPRINT attribute (8 bytes).
     pub fn encode_with_fingerprint(&self) -> Bytes {
+        let mut msg = self.clone();
+        msg.attributes
+            .retain(|a| !matches!(a, StunAttribute::Fingerprint(_)));
         // First encode without fingerprint
-        let partial = self.encode();
+        let partial = msg.encode();
 
         // Create buffer with adjusted length for fingerprint (add 8 bytes)
         let mut adjusted = BytesMut::from(partial.as_ref());
@@ -352,48 +460,59 @@ impl StunMessage {
         let fingerprint = crc ^ FINGERPRINT_XOR;
 
         // Now encode with the fingerprint attribute
-        let mut msg = self.clone();
         msg.attributes.push(StunAttribute::Fingerprint(fingerprint));
         msg.encode()
     }
 
     /// Verifies the FINGERPRINT attribute if present.
     ///
-    /// Per RFC 5389, the FINGERPRINT is computed over the message
-    /// up to (but not including) the FINGERPRINT attribute, with
-    /// the length field as it appears in the actual message.
+    /// Returns `Ok(true)` when the message has no FINGERPRINT; use
+    /// [`Self::has_valid_fingerprint`] where FINGERPRINT is mandatory.
     ///
     /// # Errors
-    /// Returns an error if the operation fails.
+    /// Never fails; the `Result` is kept for API compatibility.
     pub fn verify_fingerprint(&self, raw_data: &[u8]) -> StunResult<bool> {
-        // Find fingerprint attribute
-        let fp_attr = self
+        if !self
             .attributes
             .iter()
-            .find(|a| matches!(a, StunAttribute::Fingerprint(_)));
-
-        let Some(StunAttribute::Fingerprint(received_fp)) = fp_attr else {
-            return Ok(true); // No fingerprint to verify
-        };
-
-        if raw_data.len() < HEADER_SIZE + 8 {
-            return Ok(false);
+            .any(|a| matches!(a, StunAttribute::Fingerprint(_)))
+        {
+            return Ok(true);
         }
-
-        // FINGERPRINT attribute is 8 bytes (4 header + 4 value)
-        let fp_offset = raw_data.len() - 8;
-
-        // Compute CRC32 over message up to (but not including) FINGERPRINT
-        let crc = compute_crc32(&raw_data[..fp_offset]);
-        let expected_fp = crc ^ FINGERPRINT_XOR;
-
-        Ok(*received_fp == expected_fp)
+        Ok(Self::has_valid_fingerprint(raw_data))
     }
 }
 
-/// Computes HMAC-SHA384 (CNSA 2.0 compliant).
-fn compute_hmac_sha384(key: &[u8], data: &[u8]) -> [u8; 48] {
-    uc_crypto::hash::hmac_sha384(key, data)
+/// MESSAGE-INTEGRITY attribute type.
+const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
+/// FINGERPRINT attribute type.
+const ATTR_FINGERPRINT: u16 = 0x8028;
+/// MESSAGE-INTEGRITY attribute size on the wire (4-byte header + 20).
+const INTEGRITY_ATTR_LEN: usize = 24;
+/// FINGERPRINT attribute size on the wire (4-byte header + 4).
+const FINGERPRINT_ATTR_LEN: usize = 8;
+
+/// Header-declared message size (header + attributes), if `raw` holds it.
+fn message_len(raw: &[u8]) -> Option<usize> {
+    let header = raw.get(..HEADER_SIZE)?;
+    let total = HEADER_SIZE + usize::from(u16::from_be_bytes([header[2], header[3]]));
+    (raw.len() >= total).then_some(total)
+}
+
+/// Offset of the first attribute of `attr_type` in `raw`, walking the
+/// attribute TLVs within the header-declared length.
+fn find_attribute(raw: &[u8], attr_type: u16) -> Option<usize> {
+    let total = message_len(raw)?;
+    let mut off = HEADER_SIZE;
+    while off + 4 <= total {
+        let t = u16::from_be_bytes([raw[off], raw[off + 1]]);
+        let len = usize::from(u16::from_be_bytes([raw[off + 2], raw[off + 3]]));
+        if t == attr_type {
+            return (off + 4 + len <= total).then_some(off);
+        }
+        off += 4 + ((len + 3) & !3);
+    }
+    None
 }
 
 /// Computes CRC32 for fingerprint.
@@ -519,5 +638,146 @@ mod tests {
         let data = b"123456789";
         let crc = compute_crc32(data);
         assert_eq!(crc, 0xCBF43926);
+    }
+
+    /// RFC 5769 §2.1 sample request (short-term credentials).
+    const RFC5769_REQUEST: [u8; 108] = [
+        0x00, 0x01, 0x00, 0x58, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6,
+        0x86, 0xfa, 0x87, 0xdf, 0xae, 0x80, 0x22, 0x00, 0x10, 0x53, 0x54, 0x55, 0x4e, 0x20, 0x74,
+        0x65, 0x73, 0x74, 0x20, 0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x00, 0x24, 0x00, 0x04, 0x6e,
+        0x00, 0x01, 0xff, 0x80, 0x29, 0x00, 0x08, 0x93, 0x2f, 0xf9, 0xb1, 0x51, 0x26, 0x3b, 0x36,
+        0x00, 0x06, 0x00, 0x09, 0x65, 0x76, 0x74, 0x6a, 0x3a, 0x68, 0x36, 0x76, 0x59, 0x20, 0x20,
+        0x20, 0x00, 0x08, 0x00, 0x14, 0x9a, 0xea, 0xa7, 0x0c, 0xbf, 0xd8, 0xcb, 0x56, 0x78, 0x1e,
+        0xf2, 0xb5, 0xb2, 0xd3, 0xf2, 0x49, 0xc1, 0xb5, 0x71, 0xa2, 0x80, 0x28, 0x00, 0x04, 0xe5,
+        0x7a, 0x3b, 0xcf,
+    ];
+
+    /// RFC 5769 §2.2 sample IPv4 response.
+    const RFC5769_RESPONSE_V4: [u8; 80] = [
+        0x01, 0x01, 0x00, 0x3c, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6,
+        0x86, 0xfa, 0x87, 0xdf, 0xae, 0x80, 0x22, 0x00, 0x0b, 0x74, 0x65, 0x73, 0x74, 0x20, 0x76,
+        0x65, 0x63, 0x74, 0x6f, 0x72, 0x20, 0x00, 0x20, 0x00, 0x08, 0x00, 0x01, 0xa1, 0x47, 0xe1,
+        0x12, 0xa6, 0x43, 0x00, 0x08, 0x00, 0x14, 0x2b, 0x91, 0xf5, 0x99, 0xfd, 0x9e, 0x90, 0xc3,
+        0x8c, 0x74, 0x89, 0xf9, 0x2a, 0xf9, 0xba, 0x53, 0xf0, 0x6b, 0xe7, 0xd7, 0x80, 0x28, 0x00,
+        0x04, 0xc0, 0x7d, 0x4c, 0x96,
+    ];
+
+    /// RFC 5769 §2.3 sample IPv6 response.
+    const RFC5769_RESPONSE_V6: [u8; 92] = [
+        0x01, 0x01, 0x00, 0x48, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6,
+        0x86, 0xfa, 0x87, 0xdf, 0xae, 0x80, 0x22, 0x00, 0x0b, 0x74, 0x65, 0x73, 0x74, 0x20, 0x76,
+        0x65, 0x63, 0x74, 0x6f, 0x72, 0x20, 0x00, 0x20, 0x00, 0x14, 0x00, 0x02, 0xa1, 0x47, 0x01,
+        0x13, 0xa9, 0xfa, 0xa5, 0xd3, 0xf1, 0x79, 0xbc, 0x25, 0xf4, 0xb5, 0xbe, 0xd2, 0xb9, 0xd9,
+        0x00, 0x08, 0x00, 0x14, 0xa3, 0x82, 0x95, 0x4e, 0x4b, 0xe6, 0x7b, 0xf1, 0x17, 0x84, 0xc9,
+        0x7c, 0x82, 0x92, 0xc2, 0x75, 0xbf, 0xe3, 0xed, 0x41, 0x80, 0x28, 0x00, 0x04, 0xc8, 0xfb,
+        0x0b, 0x4c,
+    ];
+
+    /// RFC 5769 §2 short-term password.
+    const RFC5769_PASSWORD: &[u8] = b"VOkJxbRl1RmTxUk/WvJxBt";
+
+    #[test]
+    fn rfc5769_request_integrity_and_fingerprint() {
+        assert!(StunMessage::verify_integrity(
+            &RFC5769_REQUEST,
+            RFC5769_PASSWORD
+        ));
+        assert!(StunMessage::has_valid_fingerprint(&RFC5769_REQUEST));
+        assert!(!StunMessage::verify_integrity(&RFC5769_REQUEST, b"wrong"));
+        let msg = StunMessage::parse(&RFC5769_REQUEST).unwrap();
+        assert_eq!(
+            msg.get_attribute(0x0006),
+            Some(&StunAttribute::Username("evtj:h6vY".to_string()))
+        );
+        assert_eq!(
+            msg.get_attribute(0x8029),
+            Some(&StunAttribute::IceControlled(0x932f_f9b1_5126_3b36))
+        );
+        assert_eq!(
+            msg.get_attribute(0x0024),
+            Some(&StunAttribute::Priority(0x6e00_01ff))
+        );
+    }
+
+    #[test]
+    fn rfc5769_responses_integrity_fingerprint_and_address() {
+        let v4: SocketAddr = "192.0.2.1:32853".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8:1234:5678:11:2233:4455:6677]:32853"
+            .parse()
+            .unwrap();
+        for (raw, addr) in [
+            (&RFC5769_RESPONSE_V4[..], v4),
+            (&RFC5769_RESPONSE_V6[..], v6),
+        ] {
+            assert!(StunMessage::verify_integrity(raw, RFC5769_PASSWORD));
+            assert!(StunMessage::has_valid_fingerprint(raw));
+            let msg = StunMessage::parse(raw).unwrap();
+            assert_eq!(msg.xor_mapped_address(), Some(addr));
+            assert!(msg.verify_fingerprint(raw).unwrap());
+        }
+    }
+
+    #[test]
+    fn rfc5769_any_flipped_bit_fails_integrity() {
+        // Every byte covered by MESSAGE-INTEGRITY (header, attributes and
+        // the tag itself), except the length field and the magic cookie
+        // (which break parsing first), is authenticated.
+        let mi_end = RFC5769_REQUEST.len() - 8;
+        for i in (0..mi_end).filter(|i| !(2..8).contains(i)) {
+            let mut raw = RFC5769_REQUEST;
+            raw[i] ^= 0x01;
+            assert!(
+                !StunMessage::verify_integrity(&raw, RFC5769_PASSWORD),
+                "byte {i} not covered"
+            );
+        }
+    }
+
+    #[test]
+    fn encoder_output_verifies_and_round_trips() {
+        let mut msg = StunMessage::new(StunMessageType::binding_request(), [7u8; 12]);
+        msg.add_attribute(StunAttribute::Username("evtj:h6vY".to_string()));
+        msg.add_attribute(StunAttribute::Priority(0x6e00_01ff));
+        msg.add_attribute(StunAttribute::IceControlled(0x932f_f9b1_5126_3b36));
+        let raw = msg
+            .encode_with_integrity_and_fingerprint(RFC5769_PASSWORD)
+            .unwrap();
+        assert!(StunMessage::verify_integrity(&raw, RFC5769_PASSWORD));
+        assert!(StunMessage::has_valid_fingerprint(&raw));
+        // MI is 24 bytes and FP is 8; the header length counts both.
+        assert_eq!(
+            usize::from(u16::from_be_bytes([raw[2], raw[3]])),
+            raw.len() - 20
+        );
+        // Without FINGERPRINT the integrity still verifies (length ends at MI).
+        let raw = msg.encode_with_integrity(RFC5769_PASSWORD).unwrap();
+        assert!(StunMessage::verify_integrity(&raw, RFC5769_PASSWORD));
+        assert!(!StunMessage::has_valid_fingerprint(&raw));
+        // Re-signing a parsed message drops the old MI/FP first.
+        let parsed = StunMessage::parse(&raw).unwrap();
+        let again = parsed.encode_with_integrity(RFC5769_PASSWORD).unwrap();
+        assert_eq!(again, raw);
+    }
+
+    #[test]
+    fn message_without_integrity_does_not_verify() {
+        let msg = StunMessage::new(StunMessageType::binding_request(), [1u8; 12]);
+        let raw = msg.encode_with_fingerprint();
+        assert!(!StunMessage::verify_integrity(&raw, RFC5769_PASSWORD));
+        assert!(StunMessage::has_valid_fingerprint(&raw));
+    }
+
+    #[test]
+    fn attributes_after_integrity_are_ignored() {
+        let mut msg = StunMessage::new(StunMessageType::binding_request(), [1u8; 12]);
+        msg.add_attribute(StunAttribute::Username("a:b".to_string()));
+        let mut raw = BytesMut::from(msg.encode_with_integrity(b"pw").unwrap().as_ref());
+        // Append an unauthenticated USE-CANDIDATE after MESSAGE-INTEGRITY.
+        raw.put_slice(&[0x00, 0x25, 0x00, 0x00]);
+        let len = u16::from_be_bytes([raw[2], raw[3]]) + 4;
+        raw[2..4].copy_from_slice(&len.to_be_bytes());
+        let parsed = StunMessage::parse(&raw).unwrap();
+        assert!(parsed.get_attribute(0x0025).is_none());
+        assert!(StunMessage::verify_integrity(&raw, b"pw"));
     }
 }

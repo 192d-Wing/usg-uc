@@ -289,7 +289,8 @@ jobs:
             --set sbcApi.ha1Key.existingSecret=x \
             --set sbcPostgres.password=p \
             --set sbcClientConfig.ingressTlsSecretName=ci-edge-tls \
-            --set sbcDaemon.grpcMtls.clusterIssuer=ci-issuer
+            --set sbcDaemon.grpcMtls.clusterIssuer=ci-issuer \
+            --set sbcDaemon.config.outside_external_ip=203.0.113.10
           helm lint deploy/helm/central-config --kube-version 1.30.0 \
             --set api.oidc.issuer=https://idp.example/realms/r \
             --set postgres.password=ci

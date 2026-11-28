@@ -10,10 +10,11 @@
 //! |--------|---------|-------------|
 //! | [`ecdsa_p256`] | `stir-shaken-es256` | ATIS-1000074, RFC 8225 §5.2 (ES256) |
 //! | [`sha256()`] | `legacy-sha256` | Stored API-key digest format (POA&M-211) |
+//! | [`hmac_sha1()`] | `stun-hmac-sha1` | STUN MESSAGE-INTEGRITY, RFC 8489 §14.5 (POA&M-500) |
 //!
 //! ES256 is used for **authentication of caller identity only**
-//! (signatures); SHA-256 only to compare stored legacy digests. Neither is
-//! used for confidentiality.
+//! (signatures); SHA-256 only to compare stored legacy digests; HMAC-SHA1
+//! only to authenticate STUN/ICE messages. None is used for confidentiality.
 //!
 //! ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection)
 //!
@@ -29,6 +30,11 @@ pub mod ecdsa_p256;
 mod sha256;
 #[cfg(feature = "legacy-sha256")]
 pub use sha256::{SHA256_OUTPUT_LEN, sha256};
+
+#[cfg(feature = "stun-hmac-sha1")]
+mod hmac_sha1;
+#[cfg(feature = "stun-hmac-sha1")]
+pub use hmac_sha1::{HMAC_SHA1_OUTPUT_LEN, hmac_sha1, verify_hmac_sha1};
 
 /// Minimal base64url decoder for test vectors (no padding).
 #[cfg(test)]
