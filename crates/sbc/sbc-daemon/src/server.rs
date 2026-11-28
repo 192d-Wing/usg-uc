@@ -1273,6 +1273,11 @@ impl Server {
         for w in sbc_config::validate::cdr_warnings(config) {
             warn!(event = "config.cdr_warning", "{w}");
         }
+        // NIST 800-53 Rev5: CM-6, SC-5 - an RTP range smaller than the
+        // admitted calls need (those calls get 503, SR-25).
+        for w in sbc_config::validate::media_capacity_warnings(config) {
+            warn!(event = "config.media_capacity_warning", "{w}");
+        }
     }
 
     /// Initializes SipStack routing, manipulation, and topology hiding from config.

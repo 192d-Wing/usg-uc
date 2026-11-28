@@ -950,6 +950,50 @@ pub fn recording_warnings(config: &SbcConfig) -> Vec<String> {
     out
 }
 
+/// RTP/RTCP pairs a relayed call takes from `media.rtp_port_min..=max`
+/// (one per leg).
+pub const RTP_PAIRS_PER_CALL: u32 = 2;
+
+/// Non-fatal media capacity problems (SR-25).
+///
+/// Warns when the RTP port range has fewer than [`RTP_PAIRS_PER_CALL`] pairs
+/// per admissible call (this node's `general.max_calls` share plus the
+/// emergency reserve). Calls past the range are refused with 503 rather than
+/// admitted, so this is a sizing warning, not an error: the shipped defaults
+/// (16384-32768, 10000 calls) are below it and a hard error would refuse
+/// them at load.
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings), SC-5
+// POAM: POA&M-482 - a warning, not an error, until the defaults are resized.
+#[must_use]
+pub fn media_capacity_warnings(config: &SbcConfig) -> Vec<String> {
+    let media = &config.media;
+    let pairs = if media.rtp_port_max > media.rtp_port_min {
+        u32::from(media.rtp_port_max - media.rtp_port_min).div_ceil(2)
+    } else {
+        0
+    };
+    let calls = crate::schema::cluster_share(
+        config
+            .general
+            .max_calls
+            .saturating_add(config.general.effective_emergency_reserve_calls()),
+        config.admission_divisor(),
+    );
+    let needed = u64::from(calls) * u64::from(RTP_PAIRS_PER_CALL);
+    if u64::from(pairs) >= needed {
+        return Vec::new();
+    }
+    vec![format!(
+        "media.rtp_port_min..rtp_port_max ({}-{}) gives {pairs} RTP/RTCP pairs, below \
+         {needed} ({RTP_PAIRS_PER_CALL} per call for {calls} calls on this node, emergency \
+         reserve included): relayed calls beyond {} concurrent are refused with 503",
+        media.rtp_port_min,
+        media.rtp_port_max,
+        pairs / RTP_PAIRS_PER_CALL
+    )]
+}
+
 /// Returns the host of a `sips:` SRS URI, or why it is refused: not
 /// `sips:`, no host, a bad port, an `maddr` parameter (RFC 3261 §19.1.1,
 /// would steer the RS away from the configured host) or any `transport`
@@ -3477,6 +3521,29 @@ bogus = 1
         let mut config = SbcConfig::default();
         config.general.instance_name = String::new();
         assert!(validate_config(&config).is_err());
+    }
+
+    /// SR-25: an RTP range too small for the admitted calls is reported.
+    #[test]
+    fn media_capacity_warning_when_range_below_calls() {
+        let mut c = SbcConfig::default();
+        c.general.max_calls = 1000;
+        c.general.emergency_reserve_calls = Some(100);
+        c.media.rtp_port_min = 20000;
+        c.media.rtp_port_max = 20000 + 4400 - 1;
+        assert!(
+            media_capacity_warnings(&c).is_empty(),
+            "2200 pairs fit 1100 calls"
+        );
+        c.media.rtp_port_max = 20000 + 4000 - 1;
+        let w = media_capacity_warnings(&c);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("2000 RTP/RTCP pairs"), "{w:?}");
+        assert!(w[0].contains("beyond 1000 concurrent"), "{w:?}");
+        // The shipped defaults are below the bound: warned, not refused.
+        let d = SbcConfig::default();
+        assert_eq!(media_capacity_warnings(&d).len(), 1);
+        assert!(validate_config(&d).is_ok());
     }
 
     #[test]

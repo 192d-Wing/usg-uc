@@ -205,6 +205,9 @@ impl SdpRewriter {
         };
 
         for line in sdp.lines() {
+            if is_unanchored_transport_attr(line) {
+                continue;
+            }
             if line.starts_with("c=") {
                 // Replace connection line
                 // Format: c=<nettype> <addrtype> <connection-address>
@@ -274,6 +277,9 @@ impl SdpRewriter {
         let mut result = String::with_capacity(sdp.len() + 100);
         let mut m_index = 0usize;
         for line in sdp.lines() {
+            if is_unanchored_transport_attr(line) {
+                continue;
+            }
             if line.starts_with("c=") {
                 result.push_str("c=IN ");
                 result.push_str(addr_type);
@@ -302,6 +308,43 @@ impl SdpRewriter {
         }
         result
     }
+}
+
+/// Attributes that carry a peer transport address or ICE state and so would
+/// bypass, or leak around, an anchored relay (SR-18).
+///
+/// - `a=candidate`, `a=remote-candidates`, `a=end-of-candidates` and every
+///   `a=ice-*` attribute (RFC 8839): the relay is not an ICE agent, so a
+///   forwarded candidate lets the far end pick a direct pair past the relay
+///   and exposes the other leg's addresses.
+/// - `a=rtcp:` (RFC 3605): its explicit port or address points at the other
+///   leg. Dropped, RTCP defaults to the anchored RTP port + 1 on the
+///   rewritten `c=` address. `a=rtcp-mux`, `a=rtcp-fb` and `a=rtcp-rsize`
+///   are not transport addresses and are kept.
+///
+/// Attribute names are matched ignoring ASCII case, so a case variant cannot
+/// slip past.
+// NIST 800-53 Rev5: SC-7 (boundary protection), AC-4 (information flow
+// enforcement)
+// POAM: POA&M-480 - the relay is not an ICE-lite agent; ICE-only peers
+// (WebRTC) cannot use anchored media.
+fn is_unanchored_transport_attr(line: &str) -> bool {
+    let Some(attr) = line.strip_prefix("a=") else {
+        return false;
+    };
+    let name = attr
+        .split(|c: char| c == ':' || c.is_ascii_whitespace())
+        .next()
+        .unwrap_or_default();
+    let has_prefix = |p: &str| {
+        name.get(..p.len())
+            .is_some_and(|h| h.eq_ignore_ascii_case(p))
+    };
+    name.eq_ignore_ascii_case("candidate")
+        || name.eq_ignore_ascii_case("remote-candidates")
+        || name.eq_ignore_ascii_case("end-of-candidates")
+        || name.eq_ignore_ascii_case("rtcp")
+        || has_prefix("ice-")
 }
 
 /// Kind of an anchored media stream.
@@ -827,5 +870,60 @@ mod tests {
             assert!(result.rewritten.contains("c=IN IP4 10.0.0.1"));
             assert!(result.rewritten.contains("m=audio 20002"));
         }
+    }
+
+    /// SR-18: no peer transport address or ICE state survives an anchored
+    /// rewrite, on any path.
+    #[test]
+    fn test_anchored_rewrite_strips_ice_and_rtcp_address() {
+        const INTERNAL: &str = "v=0\r\n\
+o=- 1 1 IN IP4 10.1.2.3\r\n\
+s=-\r\n\
+c=IN IP4 10.1.2.3\r\n\
+t=0 0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ICE-PWD:secretsecretsecretsecret\r\n\
+a=ice-options:trickle\r\n\
+a=ice-lite\r\n\
+m=audio 40000 RTP/SAVP 0\r\n\
+c=IN IP4 10.1.2.3\r\n\
+a=rtcp:40001 IN IP4 10.1.2.3\r\n\
+a=RTCP:40001\r\n\
+a=rtcp-mux\r\n\
+a=rtcp-fb:* nack\r\n\
+a=candidate:1 1 UDP 2130706431 10.1.2.3 40000 typ host\r\n\
+a=Candidate:2 1 UDP 1694498815 198.51.100.9 40000 typ srflx raddr 10.1.2.3 rport 40000\r\n\
+a=remote-candidates:1 10.1.2.3 40000\r\n\
+a=end-of-candidates\r\n\
+a=sendrecv\r\n";
+        let local = MediaAddress::new("203.0.113.1", 20000);
+        let relay = SdpRewriter::new(B2buaMode::MediaRelay);
+        let selected = select_anchored_stream(INTERNAL, StreamPreference::Audio).unwrap();
+        let outputs = [
+            relay.rewrite_offer_for_b_leg(INTERNAL, &local).rewritten,
+            relay.rewrite_answer_for_a_leg(INTERNAL, &local).rewritten,
+            relay.rewrite_for_hold(INTERNAL, &local).rewritten,
+            relay.rewrite_for_resume(INTERNAL, &local).rewritten,
+            SdpRewriter::rewrite_with_selection(INTERNAL, &local, &selected),
+        ];
+        for out in outputs {
+            for line in out.lines().filter(|l| !l.starts_with("o=")) {
+                assert!(!line.contains("10.1.2.3"), "internal address kept: {line}");
+                assert!(!line.contains("198.51.100.9"), "candidate kept: {line}");
+                let lower = line.to_ascii_lowercase();
+                assert!(!lower.starts_with("a=ice-"), "ICE kept: {line}");
+                assert!(!lower.starts_with("a=candidate"), "candidate kept: {line}");
+                assert!(!lower.starts_with("a=rtcp:"), "rtcp address kept: {line}");
+                assert!(!lower.contains("candidates"), "candidate list kept: {line}");
+            }
+            assert!(out.contains("a=rtcp-mux\r\n"));
+            assert!(out.contains("a=rtcp-fb:* nack\r\n"));
+            assert!(out.contains("m=audio 20000 RTP/SAVP 0\r\n"));
+        }
+        // Signalling-only mode does not anchor, so it forwards SDP as-is.
+        let pass = SdpRewriter::new(B2buaMode::SignalingOnly)
+            .rewrite_offer_for_b_leg(INTERNAL, &local)
+            .rewritten;
+        assert_eq!(pass, INTERNAL);
     }
 }

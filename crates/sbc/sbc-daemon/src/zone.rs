@@ -177,6 +177,27 @@ impl ResolvedZoneRegistry {
             .collect()
     }
 
+    /// Whether `ip` is one of the SBC's own zone addresses (signalling,
+    /// media or current external address of any zone). Unspecified bind
+    /// addresses are not counted. Used to refuse SDP media addresses that
+    /// would make the relay send to the SBC itself (SR-19; NIST 800-53
+    /// Rev5: SC-7).
+    pub fn owns_ip(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        if ip.is_unspecified() {
+            return false;
+        }
+        self.zones.values().any(|e| {
+            e.signaling_ip.to_canonical() == ip
+                || e.media_ip.to_canonical() == ip
+                || e.external_ip
+                    .try_read()
+                    .ok()
+                    .and_then(|v| *v)
+                    .is_some_and(|x| x.to_canonical() == ip)
+        })
+    }
+
     /// Returns true if the registry has any zones.
     pub fn is_empty(&self) -> bool {
         self.zones.is_empty()
